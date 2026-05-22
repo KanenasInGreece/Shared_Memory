@@ -403,9 +403,16 @@ LM Studio does not manage this path — you reference it by absolute path in `mc
 
 Edit `mcp.json` from this repo: replace all `YOUR_*` placeholders with real values and update the absolute path to `vector-skill.py` in the `rag-orchestrator` entry. Then save it to LM Studio's MCP config location (`~/.lmstudio/mcp.json` on Linux and macOS).
 
-**Step 3 — Load the system prompt**
+**Step 3 — Configure and load the system prompt**
 
-`system-prompt.md` contains the operational instructions — the search-first directive, when to save artifacts, and the reasoning protocol. Import it in LM Studio as a preset system prompt (Settings → System Prompt → Import).
+`system-prompt.md` is the operational contract for the LM Studio model. It defines:
+
+- **Search-first directive** — the model must query `rag-orchestrator` (semantic) and `neo4j-memory` (relational) before falling back to training data or web search.
+- **Gateway mandate** — the architectural context explicitly states that all embedding and reranking calls route through port 8888; the model must never reference 8070 or 8071 directly.
+- **Consolidation awareness** — the model knows that every save triggers a Postgres `pg_notify` and that the consolidation daemon (auto-started with the gateway) synthesises Tier 3 summaries. It also knows to warn you if the daemon is not running.
+- **Memory cycle** — when to absorb (end of task, new decision) and that `"entities"` in save metadata is required for Tier 3 eligibility.
+
+Before importing, fill in the `[YOUR ...]` placeholder fields at the top (name, location, hardware, OS). Then import in LM Studio: **Settings → System Prompt → Import**.
 
 **Step 4 — Verify**
 
