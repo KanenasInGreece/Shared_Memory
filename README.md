@@ -693,5 +693,16 @@ The consolidation daemon clusters facts by the entity names the caller supplies 
 
 ---
 
+## Connect
+
+If this framework is useful to you, or you are building something in the same space — local AI memory, multi-agent architectures, or knowledge graph systems — I would be glad to connect.
+
+I write about these projects and the ideas behind them on LinkedIn and X. Follow for articles, updates, and the reasoning behind architectural decisions that do not fit in a README.
+
+- **LinkedIn:** [linkedin.com/in/xsmotsenigos](https://www.linkedin.com/in/xsmotsenigos/)
+- **X:** [x.com/xsmotsenigos](https://x.com/xsmotsenigos/)
+
+---
+
 Copyright 2026 Xenofon S. Motsenigos. Licensed under the [Apache License, Version 2.0](LICENSE).
 If you reuse or build on this work, attribution to the original author is appreciated.
