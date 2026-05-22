@@ -67,6 +67,10 @@ Run the full suite before opening a PR. A PR that breaks existing tests will not
 - Match the style of the file you are editing. There is no linter enforced; use judgment.
 - Keep changes focused. A PR that fixes a bug and also refactors unrelated code is harder to review and easier to reject.
 
+## AI Tools
+
+You are welcome to use AI coding assistants (Claude Code, Copilot, Cursor, or similar) when working on contributions. They are tools, not authors. Do not add `Co-Authored-By` AI attribution lines to commit messages — the human submitting the PR is the author and is responsible for every line in it.
+
 ## Licensing
 
 By submitting a Pull Request you agree that your contribution will be licensed under the [Apache License, Version 2.0](LICENSE), the same licence as this project.
