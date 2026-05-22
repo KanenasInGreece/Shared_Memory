@@ -51,12 +51,9 @@ Stopping the proxy (Ctrl+C) also stops the daemon. No separate daemon management
 
 ### 🚀 MCP Orchestrator
 If the MCP server is not responding in LM Studio/Claude, restart it from here:
-- **Command:** `uv run --with mcp --with httpx --with psycopg2-binary python /home/xenofon/claude-labs/projects/shared_mem/vector-skill.py`
+- **Command:** `uv run --with mcp --with httpx --with psycopg2-binary python /path/to/your/vector-skill.py`
 
 ## Reference
-- **Database Schema:** Detailed table and graph definitions can be found in [schema.md](Documentation/schema.md).
+- **Full documentation:** See the project [README.md](../../README.md) — architecture, save path, consolidation cycle, retrieval chain, and open problems.
+- **Database Schema:** Neo4j labels, relationship types, and Postgres tables: [schema.md](Documentation/schema.md).
 - **Standardization:** All embedding and reranking requests route through the **Hive-Mind Gateway (Port 8888)**. Never call port 8070 (BGE-M3) or 8071 (BGE-Reranker-v2-m3) directly — the gateway enforces 1024-dim consistency and unified routing for all agents.
-- **Global Scripts:**
-  - Gateway (async, aiohttp v6): `/home/xenofon/.gemini/skills/shared-memory/scripts/hive_mind_proxy.py`
-  - Consolidation: `/home/xenofon/.gemini/skills/shared-memory/scripts/consolidation_loop.py`
-  - Bridge: `/home/xenofon/.gemini/skills/shared-memory/scripts/memory_bridge.py`

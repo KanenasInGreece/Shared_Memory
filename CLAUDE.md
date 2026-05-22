@@ -81,8 +81,6 @@ Copy `.env.example` to `.env` and fill in `NEO4J_PASSWORD`, `PG_PASSWORD`, and `
 
 ## Documentation
 
-All design docs are in `shared-memory/Documentation/`:
-- `dreaming-cycle-v6.md` — authoritative consolidation spec; read before changing consolidation logic
-- `ADR.md` — architectural decision records
-- `proxy_implementation.md` — proxy v2→v6 decision log
-- `schema.md` — full Postgres + Neo4j schema with relationship types
+`README.md` is the primary reference — architecture, save path, consolidation cycle, retrieval chain, open problems, and full setup instructions.
+
+`shared-memory/Documentation/schema.md` — full Postgres + Neo4j schema with all labels and relationship types.
