@@ -335,6 +335,8 @@ INFO  Listening for 'new_artifact' notifications...
 
 Step 4 is the only manual step required after databases and models are running. The proxy starts the daemon; the daemon registers its Postgres listener; both shut down cleanly when the proxy receives SIGINT or SIGTERM.
 
+> **Network exposure:** The gateway binds to `0.0.0.0:8888` by default — all machines on your local network can reach it. On an untrusted network, restrict it to `127.0.0.1` by editing line 245 of `hive_mind_proxy.py`, or firewall the port at the OS level. See [SECURITY.md](SECURITY.md) for details.
+
 ---
 
 ## 10. Agent Integration: First-Time Setup
@@ -600,6 +602,12 @@ The `rag-orchestrator` entry runs the custom MCP server for this framework. The 
 ```
 
 > **Why `neo4j-memory` uses the gateway:** The `neo4j-agent-memory` package calls the OpenAI embeddings API to vectorise entity names before storing them. By pointing both API base URLs at port 8888, every embedding it generates uses BGE-M3 — the same model and the same space as everything else in the framework.
+
+### Attribution — neo4j-agent-memory
+
+The `neo4j-memory` MCP server entry uses [**neo4j-agent-memory**](https://github.com/neo4j-labs/agent-memory), an open-source package by [Neo4j Labs](https://github.com/neo4j-labs). It provides graph-backed agent memory with MCP and OpenAI-compatible interfaces.
+
+Licensed under the [Apache License 2.0](https://github.com/neo4j-labs/agent-memory/blob/main/LICENSE) — the same licence as this framework. No modifications are made to the package; it is used as a runtime dependency via `uvx`.
 
 ### Web search — choose your provider
 
