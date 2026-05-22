@@ -341,7 +341,7 @@ Step 4 is the only manual step required after databases and models are running. 
 
 This section covers where to place files and how to register each agent. For runtime usage (commands and examples) see [§11: Agent Access: CLI and MCP](#11-agent-access-cli-and-mcp).
 
-### Clone the repository
+### Clone the repository and set up the environment
 
 ```bash
 git clone https://github.com/KanenasInGreece/Shared_Memory.git
@@ -349,6 +349,27 @@ cd Shared_Memory
 cp .env.example .env
 # Edit .env — fill in NEO4J_PASSWORD and PG_PASSWORD
 ```
+
+Create a virtual environment and install dependencies:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+
+# Runtime only
+pip install -r requirements.txt
+
+# Runtime + test dependencies
+pip install -r requirements-dev.txt
+```
+
+Activate the venv in every new shell session before running any script:
+
+```bash
+source .venv/bin/activate
+```
+
+> **uv users:** all commands in this README use `uv run --with ...` which handles dependencies automatically without a venv. Both approaches work — use whichever fits your workflow.
 
 ### Claude Code
 
