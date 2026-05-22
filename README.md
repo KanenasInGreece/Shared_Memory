@@ -1,4 +1,4 @@
-# Oratotis Shared Memory Framework
+# Shared Memory Framework
 
 **Claude Code, Gemini CLI, and LM Studio — three different tools, one brain.**
 Every insight one agent gains is available to every other. Knowledge stays local, private, and shared across all your smart tools.
@@ -42,7 +42,7 @@ A unified semantic and relational memory layer built to survive the interference
 
 Every AI workstation today runs several tools in parallel — a terminal agent, a desktop chat model, a coding assistant. Each of them works hard in a session, reasons through a problem, discovers something useful. Then the session ends, and all of that is gone. The next tool starts cold, the next session starts from zero. They do not talk to each other. They cannot.
 
-The Oratotis Shared Memory Framework is built around one idea: those tools should share a brain. When Gemini CLI figures out why the proxy was failing, Claude Code should already know the next time it is asked about the proxy. When LM Studio runs a consolidation on a set of architectural facts, those summaries should be there for any agent that searches next.
+This framework is built around one idea: those tools should share a brain. When Gemini CLI figures out why the proxy was failing, Claude Code should already know the next time it is asked about the proxy. When LM Studio runs a consolidation on a set of architectural facts, those summaries should be there for any agent that searches next.
 
 **The three consumers, and how they connect:**
 
@@ -616,3 +616,8 @@ The consolidation daemon clusters facts by the entity names the caller supplies 
 ---
 
 *Neo4j · PostgreSQL/pgvector · BGE-M3 · aiohttp · FastMCP · Docker*
+
+---
+
+Copyright 2026 Xenofon S. Motsenigos. Licensed under the [Apache License, Version 2.0](LICENSE).
+If you reuse or build on this work, attribution to the original author is appreciated.

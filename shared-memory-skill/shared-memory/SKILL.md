@@ -1,7 +1,7 @@
-# Shared Memory (Oratotis Hive-Mind)
+# Shared Memory (Hive-Mind)
 
 ## Overview
-This skill provides a bridge to the Oratotis Shared Memory Framework. It enables persistence of technical decisions, entity relationships, and document embeddings across sessions and different agents.
+This skill provides a bridge to the Shared Memory Framework. It enables persistence of technical decisions, entity relationships, and document embeddings across sessions and different agents.
 
 ## Core Tasks
 
