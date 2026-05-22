@@ -680,10 +680,7 @@ Web-retrieved content enters the same ingestion pipeline as internally authored 
 
 This is a stored injection (not reflected). The attack surface is not the agent's context window — it is the shared brain itself. The geometry that makes the vector store useful (organising information by meaning, retrieving by proximity) is the same geometry that makes a well-crafted injection hard to distinguish from a legitimate fact.
 
-**Two defences are planned but not built:**
-
-- **Ingestion boundary sanitisation:** strip instructional patterns, enforce source provenance metadata, quarantine external content before promoting it to the same trust level as internal facts.
-- **Counterfactual simulation pass:** before committing a synthesised narrative, verify that every claim traces back to a source fact in the cluster.
+Two defences are planned (ingestion boundary sanitisation; counterfactual simulation pass) but not yet implemented. Full details, planned mitigations, and manual remediation SQL are in [SECURITY.md](SECURITY.md).
 
 **Do not ingest external or web-retrieved content at volume before implementing these defences.**
 

@@ -31,9 +31,40 @@ This is intentional for workstation use where the LAN is trusted, but you should
 
 The MCP server (`vector-skill.py`) and the CLI bridge (`memory_bridge.py`) perform no authentication. They are designed for local use only. Do not expose port 8888 or the MCP server to the public internet.
 
-### Stored prompt injection (unmitigated — see README §17)
+### Stored prompt injection (unmitigated)
 
-Web-retrieved content ingested into the memory backend can contaminate `community_summaries` after consolidation. See the Open Problems section of the README for a full description and planned mitigations. Do not ingest untrusted external content at volume until those defences are implemented.
+**Status: known, no fix yet. Do not ingest untrusted external content at volume.**
+
+Web-retrieved content enters the same ingestion pipeline as internally authored facts. A crafted document retrieved during a search session can embed geometrically close to a cluster of legitimate facts and — after consolidation — contaminate `community_summaries` as trusted context for all agents, persisting across all future sessions and across all tools sharing the backend.
+
+This is a **stored injection**, not a reflected one. The attack surface is not the agent's context window — it is the shared brain itself. The geometry that makes the vector store useful (organising information by semantic proximity) is the same geometry that makes a well-crafted injection hard to distinguish from a legitimate fact. Once consolidated into Tier 3, the injected narrative is treated with the same weight as any internally authored summary.
+
+**Two defences are planned but not yet implemented:**
+
+- **Ingestion boundary sanitisation:** strip instructional patterns from web-retrieved content, enforce source provenance metadata, and quarantine external content in a separate trust tier before promoting it alongside internally authored facts.
+- **Counterfactual simulation pass:** before committing a synthesised community narrative, verify that every claim in the output traces back to a source Fact node in the cluster. Narratives that introduce claims without a traceable source are rejected.
+
+### Community staleness compounds injection persistence
+
+Each consolidation cycle writes a **new** record to `community_summaries`. Superseded summaries are never deleted or marked inactive — they accumulate alongside newer ones. This means a successfully injected community summary, once written, is never automatically removed. It will continue to surface in Tier 3 retrieval results until manually identified and deleted from the database.
+
+There is currently no tooling to audit, diff, or prune community summaries. Manual remediation requires direct Postgres access:
+
+```sql
+-- Inspect all community summaries for a given entity
+SELECT id, content, metadata->>'entity', metadata->>'created_at'
+FROM community_summaries
+WHERE metadata->>'entity' = 'EntityName'
+ORDER BY id DESC;
+
+-- Delete a specific suspect summary
+DELETE FROM community_summaries WHERE id = <suspect_id>;
+```
+
+And the corresponding Neo4j cleanup:
+```cypher
+MATCH (s:CommunitySummary {pg_id: <suspect_id>}) DETACH DELETE s;
+```
 
 ## Supported Versions
 
