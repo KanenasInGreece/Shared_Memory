@@ -401,12 +401,7 @@ LM Studio does not manage this path — you reference it by absolute path in `mc
 
 **Step 2 — Configure and place `mcp.json`**
 
-Edit `mcp.json` from this repo: replace all `YOUR_*` placeholders with real values and update the absolute path to `vector-skill.py` in the `rag-orchestrator` entry. Then save it to LM Studio's MCP config location:
-
-| OS | Path |
-|---|---|
-| Linux / macOS | `~/.lmstudio/mcp.json` |
-| Windows | `%APPDATA%\LM Studio\mcp.json` |
+Edit `mcp.json` from this repo: replace all `YOUR_*` placeholders with real values and update the absolute path to `vector-skill.py` in the `rag-orchestrator` entry. Then save it to LM Studio's MCP config location (`~/.lmstudio/mcp.json` on Linux and macOS).
 
 **Step 3 — Load the system prompt**
 
