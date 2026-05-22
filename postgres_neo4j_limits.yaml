@@ -1,0 +1,89 @@
+services:
+#---------- STORAGE LAYER ---------
+  neo4j:
+    image: neo4j:5-community
+    container_name: neo4j-memory
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - /your/data/path/neo4j/data:/data:z
+      - /your/data/path/neo4j/logs:/logs:z
+      - /your/data/path/neo4j/import:/import:z
+      - /your/data/path/neo4j/plugins:/plugins:z
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD}
+      - NEO4J_PLUGINS=["apoc"]
+      # APOC Security Procedures
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+      - NEO4J_dbms_security_procedures_allowlist=apoc.*
+      # Corrected Neo4j 5 Memory Mapping (Note the double underscores __)
+      - NEO4J_server_memory_heap_initial__size=1G
+      - NEO4J_server_memory_heap_max__size=2G
+      - NEO4J_server_memory_pagecache_size=2G
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 2G
+    restart: always
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: postgres-vector
+    ports:
+      - "5432:5432"
+    volumes:
+      - /your/data/path/postgres/data:/var/lib/postgresql/data:z
+    command: >
+      postgres
+      -c shared_buffers=1GB
+      -c work_mem=64MB
+    environment:
+      - POSTGRES_PASSWORD=${PG_PASSWORD}
+      - POSTGRES_DB=agent_data
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+    restart: always
+
+# --- INFERENCE LAYER (CPU Optimized) ---
+  # Retriever: BGE-M3
+  retriever-api:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: llama-retriever
+    ports: ["8070:8070"]
+    volumes:
+      - /path/to/your/LLM_Models:/models:ro,z
+    command: >
+      -m /models/gpustack/bge-m3-GGUF/bge-m3-Q8_0.gguf
+      --embedding --host 0.0.0.0 --port 8070 --threads 4  -c 8192 -b 8192 -ub 8192
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8070/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: always
+
+  # Reranker: BGE-Reranker-v2
+  reranker-api:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: llama-reranker
+    ports: ["8071:8071"]
+    volumes:
+      - /path/to/your/LLM_Models:/models:ro,z
+    command: >
+      -m /models/gpustack/bge-reranker-v2-m3-GGUF/bge-reranker-v2-m3-Q8_0.gguf
+      --rerank --host 0.0.0.0 --port 8071 --threads 4  -c 8192 -b 8192 -ub 8192
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8071/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: always

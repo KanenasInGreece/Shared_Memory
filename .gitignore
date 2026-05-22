@@ -1,0 +1,11 @@
+.env
+*.env
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.log
+memory/
+MEMORY.md
+.claude/
+shared-memory-skill/*.skill

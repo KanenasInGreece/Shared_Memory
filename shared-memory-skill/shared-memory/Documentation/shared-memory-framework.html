@@ -1,0 +1,949 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Oratotis Shared Memory Framework — Complete Implementation Guide</title>
+    <style>
+        :root {
+            --primary: #3b82f6;
+            --primary-dark: #2563eb;
+            --secondary: #8b5cf6;
+            --accent: #06b6d4;
+            --bg: #0f172a;
+            --bg-secondary: #1e293b;
+            --bg-tertiary: #334155;
+            --text: #f1f5f9;
+            --text-secondary: #94a3b8;
+            --border: #475569;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --code-bg: #1e1e1e;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.7;
+        }
+
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+
+        header {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            padding: 60px 20px;
+            text-align: center;
+            margin-bottom: 40px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+        }
+
+        header h1 { font-size: 2.8em; margin-bottom: 15px; text-shadow: 2px 2px 4px rgba(0,0,0,0.3); }
+        header p { font-size: 1.2em; opacity: 0.95; max-width: 820px; margin: 0 auto 20px; }
+
+        .badge {
+            display: inline-block;
+            background: var(--accent);
+            color: var(--bg);
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 0.85em;
+            font-weight: bold;
+            margin: 4px;
+        }
+
+        h2 { color: var(--accent); font-size: 1.9em; margin: 50px 0 20px; padding-bottom: 10px; border-bottom: 3px solid var(--primary); }
+        h3 { color: var(--primary); font-size: 1.4em; margin: 30px 0 14px; }
+        h4 { color: var(--text); font-size: 1.1em; margin: 20px 0 10px; }
+
+        p { margin: 12px 0; }
+
+        .section {
+            background: var(--bg-secondary);
+            padding: 30px;
+            margin: 30px 0;
+            border-radius: 10px;
+            border-left: 5px solid var(--primary);
+            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+        }
+
+        .architecture-box {
+            background: var(--bg-tertiary);
+            padding: 25px;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            white-space: pre;
+            overflow-x: auto;
+            margin: 20px 0;
+            border: 1px solid var(--border);
+            line-height: 1.4;
+            font-size: 0.9em;
+        }
+
+        code {
+            background: var(--code-bg);
+            color: #e2e8f0;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-family: 'Courier New', Consolas, monospace;
+            font-size: 0.92em;
+        }
+
+        pre {
+            background: var(--code-bg);
+            color: #e2e8f0;
+            padding: 20px;
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 20px 0;
+            border: 1px solid var(--border);
+            line-height: 1.6;
+        }
+
+        pre code { background: none; padding: 0; font-size: 0.9em; }
+        .comment { color: #6a9955; }
+        .keyword { color: #569cd6; }
+        .string { color: #ce9178; }
+        .function { color: #dcdcaa; }
+        .number { color: #b5cea8; }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        th { background: var(--primary); color: white; padding: 14px 16px; text-align: left; font-weight: 600; }
+        td { padding: 12px 16px; border-bottom: 1px solid var(--border); vertical-align: top; }
+        tr:last-child td { border-bottom: none; }
+        tr:hover { background: rgba(37,99,235,0.1); }
+
+        .highlight-box {
+            background: linear-gradient(135deg, rgba(37,99,235,0.15), rgba(124,58,237,0.15));
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+            border-left: 4px solid var(--accent);
+        }
+
+        .warning-box {
+            background: rgba(245,158,11,0.1);
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+            border-left: 4px solid var(--warning);
+        }
+
+        .danger-box {
+            background: rgba(239,68,68,0.1);
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+            border-left: 4px solid var(--danger);
+        }
+
+        .success-box {
+            background: rgba(16,185,129,0.1);
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+            border-left: 4px solid var(--success);
+        }
+
+        .tip {
+            background: rgba(6,182,212,0.1);
+            padding: 15px 18px;
+            border-radius: 6px;
+            margin: 15px 0;
+            border-left: 3px solid var(--accent);
+        }
+
+        .tip strong { color: var(--accent); }
+
+        ul, ol { margin: 12px 0; padding-left: 28px; }
+        li { margin: 8px 0; }
+
+        a { color: var(--accent); text-decoration: none; }
+        a:hover { text-decoration: underline; }
+
+        .step-number {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 32px;
+            height: 32px;
+            background: var(--primary);
+            border-radius: 50%;
+            font-weight: bold;
+            font-size: 0.95em;
+            margin-right: 10px;
+            flex-shrink: 0;
+        }
+
+        .step {
+            display: flex;
+            align-items: flex-start;
+            margin: 18px 0;
+        }
+
+        .step-content { flex: 1; }
+
+        .toc {
+            background: var(--bg-secondary);
+            padding: 25px 30px;
+            border-radius: 10px;
+            margin: 30px 0;
+            border: 2px solid var(--primary);
+        }
+
+        .toc h3 { margin-top: 0; color: var(--accent); }
+        .toc ol { padding-left: 22px; }
+        .toc li { margin: 8px 0; }
+        .toc a { color: var(--text); font-size: 1.05em; }
+        .toc a:hover { color: var(--accent); }
+
+        .changelog-entry { margin: 12px 0; padding: 12px 16px; background: var(--bg-tertiary); border-radius: 6px; border-left: 3px solid var(--success); }
+        .changelog-entry .commit { font-family: 'Courier New', monospace; color: var(--accent); font-size: 0.9em; }
+
+        footer {
+            background: var(--bg-secondary);
+            padding: 30px;
+            text-align: center;
+            margin-top: 60px;
+            border-top: 3px solid var(--primary);
+            color: var(--text-secondary);
+        }
+
+        footer strong { color: var(--text); }
+
+        @media (max-width: 768px) {
+            header h1 { font-size: 2em; }
+            .container { padding: 10px; }
+            .section { padding: 20px; }
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <h1>Oratotis Shared Memory Framework</h1>
+    <p>Gemini CLI, LM Studio, and Claude Code — three different tools, one brain. Every insight one agent gains is available to every other. Knowledge stays local, private, and shared across all your smart tools.</p>
+    <p style="font-size:1em; margin-top:12px; opacity:0.85">A unified semantic and relational memory layer built to survive the interference problem — explained from first principles to a running stack.</p>
+    <div>
+        <span class="badge">Claude Code</span>
+        <span class="badge">Gemini CLI</span>
+        <span class="badge">LM Studio</span>
+        <span class="badge">Neo4j Graph</span>
+        <span class="badge">Postgres + pgvector</span>
+        <span class="badge">BGE-M3 1024-dim</span>
+        <span class="badge">Local &amp; Private</span>
+    </div>
+</header>
+
+<div class="container">
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ol>
+            <li><a href="#vision">The Vision: One Brain, Three Tools</a></li>
+            <li><a href="#problem">The Problem: Why RAG Systems Forget</a></li>
+            <li><a href="#architecture">Architecture Overview: Three Tiers</a></li>
+            <li><a href="#os-prereqs">OS Prerequisites — Fedora / Linux</a></li>
+            <li><a href="#infrastructure">Infrastructure Setup: Docker Compose</a></li>
+            <li><a href="#schema">Database Schema</a></li>
+            <li><a href="#inference">Inference Backends (llama.cpp)</a></li>
+            <li><a href="#gateway">The Hive-Mind Gateway: Why It Exists</a></li>
+            <li><a href="#starting">Starting the Full Stack</a></li>
+            <li><a href="#agent-access">Agent Access: CLI and MCP</a></li>
+            <li><a href="#save-path">The Save Path — From Artifact to Memory</a></li>
+            <li><a href="#consolidation">The Sleep Cycle — Consolidation</a></li>
+            <li><a href="#retrieval">Retrieval: Three-Tier Lookup</a></li>
+            <li><a href="#mcp-config">LM Studio MCP Configuration</a></li>
+            <li><a href="#testing">Testing</a></li>
+            <li><a href="#what-was-fixed">What Was Broken and What Was Fixed</a></li>
+            <li><a href="#open-problems">Open Problems</a></li>
+        </ol>
+    </div>
+
+
+    <!-- ================================================================ -->
+    <h2 id="vision">1. The Vision: One Brain, Three Tools</h2>
+    <div class="section">
+        <p>Every AI workstation today runs several tools in parallel — a terminal agent, a desktop chat model, a coding assistant. Each of them works hard in a session, reasons through a problem, discovers something useful. Then the session ends, and all of that is gone. The next tool starts cold, the next session starts from zero. They do not talk to each other. They cannot.</p>
+
+        <p>The Oratotis Shared Memory Framework is built around one idea: those tools should share a brain. When Gemini CLI figures out why the proxy was failing, Claude Code should already know the next time it is asked about the proxy. When LM Studio runs a consolidation on a set of architectural facts, those summaries should be there for any agent that searches next. When you move from one tool to another, your context should move with you.</p>
+
+        <div class="highlight-box">
+            <strong>The three consumers, and how they connect:</strong>
+            <ul style="margin-top:10px">
+                <li><strong>Claude Code</strong> — uses a CLI bridge (<code>memory_bridge.py</code>) to search, save, and query the graph. No MCP server required; the CLI is the interface.</li>
+                <li><strong>Gemini CLI</strong> — uses the same CLI bridge, packaged as a skill (<code>/activate shared-memory</code>). The same scripts, the same backend, a different invocation surface.</li>
+                <li><strong>LM Studio</strong> — uses an MCP server (<code>vector-skill.py</code>), registered in <code>mcp.json</code>. The model calls <code>save_artifact</code> and <code>hybrid_search_and_rerank</code> as tools, same backend as the others.</li>
+            </ul>
+        </div>
+
+        <p>The infrastructure underneath all three is identical: one Postgres instance holding vectors, one Neo4j instance holding the graph, one BGE-M3 embedding model providing the coordinate system. The tools differ; the memory layer does not.</p>
+
+        <h3>Local mounts — your work stays yours</h3>
+        <p>Both databases are deployed via Docker Compose with host-mounted volumes. The data lives on your filesystem, not inside a container. This has two consequences that matter for a working system: you can back it up with any standard tool (rsync, tar, borgbackup), and a container restart or upgrade does not lose what you have accumulated.</p>
+
+        <pre><code><span class="comment"># Postgres data on the host filesystem — survives container rebuilds</span>
+volumes:
+  - /home/xenofon/databases/postgres/data:/var/lib/postgresql/data:z
+
+<span class="comment"># Neo4j data on the host filesystem — same guarantee</span>
+volumes:
+  - /home/xenofon/databases/neo4j/data:/data:z</code></pre>
+
+        <p>The <code>:z</code> suffix is required on Fedora: it sets the SELinux label so the container process can read and write the host directory. Without it, Neo4j and Postgres fail silently — they appear to start, but write nothing to disk.</p>
+
+        <h3>The binding element: 1024-dimensional BGE-M3</h3>
+        <p>Skills, MCP servers, and CLI bridges are all just surfaces. What makes them a unified memory system rather than three separate tools that happen to share a database is the embedding model. Every vector in the system — saved by Claude Code, saved by Gemini CLI, saved by LM Studio, re-embedded by the consolidation daemon — was generated by the same BGE-M3 instance through the same gateway. The coordinate system is shared.</p>
+
+        <p>This is what makes cross-agent retrieval meaningful. Cosine similarity between a vector Claude Code saved last Tuesday and a query Gemini CLI is making right now is a genuine semantic comparison, not a comparison between two different notions of "similar." Remove the shared embedding space and you have three isolated keyword stores that happen to use the same tables. Keep it, and you have one brain.</p>
+    </div>
+
+
+    <!-- ================================================================ -->
+    <h2 id="problem">2. The Problem: Why RAG Systems Forget</h2>
+    <div class="section">
+        <p>The common assumption in RAG architectures is that you can save everything and the vector database will sort it out. This assumption has been formally disproved.</p>
+
+        <p>Barman et al. (2026) in <em>"The Geometry of Forgetting"</em> expose what they call the <strong>Dimensionality Illusion</strong>: BGE-M3 is nominally 1024-dimensional but concentrates its variance in approximately 16 effective dimensions — a figure that holds across MiniLM at 384 dimensions and BGE-base at 768 as well, regardless of what the model card claims.</p>
+
+        <p>An agent navigating that space is not moving through a vast semantic landscape. It is moving through a narrow corridor, and every new memory saved into the same neighborhood is another body crowding that corridor. Retrieval accuracy does not dip gradually — it degrades as a power law with database size, driven by the mechanism the paper names: <strong>semantic interference</strong>. It is not time that triggers forgetting in these systems, it is competition by accumulation. You are most vulnerable where you would expect to gain the most value from your memory.</p>
+
+        <p>This is the problem the Shared Memory Framework is designed to address. The solution has three parts: a dual-store architecture that separates episodic from structural memory, a consolidation loop that synthesizes high-density clusters into a thematic semantic tier before interference pressure accumulates, and a single shared embedding space enforced across all agents so that what one saves the others can retrieve.</p>
+
+        <div class="highlight-box">
+            <strong>The biological parallel:</strong> The <strong>Complementary Learning Systems</strong> hypothesis (McClelland, McNaughton &amp; O'Reilly, 1995) proposes that the hippocampus holds fast, episodic, pattern-separated traces while the neocortex extracts slow statistical patterns across episodes — abstract, generalizable, thematic. This transfer happens primarily during offline states, including sleep. The architecture in this document implements the same division: Neo4j as the hippocampus, <code>community_summaries</code> as the neocortex, and the consolidation daemon as the sleep cycle.
+        </div>
+    </div>
+
+
+    <!-- ================================================================ -->
+    <h2 id="architecture">2. Architecture Overview: Three Tiers</h2>
+    <div class="section">
+
+        <div class="architecture-box">
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          AGENT LAYER                                     │
+│                                                                          │
+│   Claude Code (CLI)        Gemini CLI (skill)       LM Studio (MCP)      │
+│   memory_bridge.py         memory_bridge.py         vector-skill.py      │
+└─────────────┬──────────────────────┬─────────────────────┬──────────────┘
+              │                      │                     │
+              └──────────────────────▼─────────────────────┘
+                                     │
+                         ┌───────────▼───────────┐
+                         │  Hive-Mind Gateway    │
+                         │  hive_mind_proxy.py   │
+                         │  :8888 (aiohttp v6)   │
+                         │                       │
+                         │  /v1/embeddings→:8070 │
+                         │  /v1/reranking →:8071 │
+                         │  default      →:5000  │
+                         └───────────┬───────────┘
+                                     │ spawns
+                         ┌───────────▼───────────┐
+                         │  Consolidation Daemon  │
+                         │  consolidation_loop.py │
+                         │  LISTEN new_artifact   │
+                         └───────────┬───────────┘
+                                     │ writes
+              ┌──────────────────────▼──────────────────────┐
+              │                MEMORY LAYER                  │
+              │                                              │
+              │  ┌─────────────────────┐  ┌───────────────┐ │
+              │  │  PostgreSQL+pgvector│  │    Neo4j      │ │
+              │  │                     │  │               │ │
+              │  │ technical_docs      │  │ Fact nodes    │ │
+              │  │  (Tier 1 — Episodic)│  │ Entity hubs   │ │
+              │  │                     │  │ MENTIONS edges│ │
+              │  │ community_summaries │  │ CommunitySumm │ │
+              │  │  (Tier 3 — Semantic)│  │ SUMMARIZED_BY │ │
+              │  └─────────────────────┘  └───────────────┘ │
+              └──────────────────────────────────────────────┘
+        </div>
+
+        <table>
+            <tr>
+                <th>Tier</th>
+                <th>Store</th>
+                <th>Role</th>
+                <th>Biological Analogy</th>
+            </tr>
+            <tr>
+                <td><strong>1 — Episodic</strong></td>
+                <td><code>technical_docs</code> (Postgres + vector)</td>
+                <td>Original facts, full content, surgical precision via cosine similarity</td>
+                <td>Hippocampus — fast, specific, pattern-separated</td>
+            </tr>
+            <tr>
+                <td><strong>2 — Structural</strong></td>
+                <td>Neo4j <code>Fact</code> nodes (keyed by <code>pg_id</code>)</td>
+                <td>Relationships, provenance, <code>consolidated</code> flag, Entity hubs</td>
+                <td>Hippocampus — relational context that cosine similarity cannot express</td>
+            </tr>
+            <tr>
+                <td><strong>3 — Semantic</strong></td>
+                <td><code>community_summaries</code> (Postgres + vector)</td>
+                <td>Consolidated thematic narratives; queried first on retrieval</td>
+                <td>Neocortex — slow, abstract, statistical regularities across episodes</td>
+            </tr>
+        </table>
+
+        <p><strong>Retrieval always queries Tier 3 first</strong> (thematic orientation), then Tier 1 (surgical precision), then expands through Neo4j (relational context). Artifacts saved by one agent become retrievable by all others once the consolidation daemon runs.</p>
+    </div>
+
+
+    <!-- ================================================================ -->
+    <h2 id="os-prereqs">3. OS Prerequisites — Fedora / Linux</h2>
+    <div class="section">
+        <p>An agentic workstation running Neo4j, Postgres, LM Studio, and multiple MCP servers creates many more filesystem watchers than a standard desktop. Fedora's default kernel limits will cause failures under this load — Neo4j and Postgres especially will refuse to start or log inotify errors.</p>
+
+        <h3>Raise inotify limits</h3>
+        <pre><code><span class="comment"># Create a persistent sysctl override</span>
+echo "fs.inotify.max_user_instances=1024" | sudo tee /etc/sysctl.d/90-inotify.conf
+echo "fs.inotify.max_user_watches=524288" | sudo tee -a /etc/sysctl.d/90-inotify.conf
+
+<span class="comment"># Apply immediately (no reboot required)</span>
+sudo sysctl -p /etc/sysctl.d/90-inotify.conf
+
+<span class="comment"># Verify</span>
+sysctl fs.inotify.max_user_instances fs.inotify.max_user_watches</code></pre>
+
+        <div class="tip">
+            <strong>Why these numbers:</strong> <code>max_user_instances=1024</code> covers the number of independent inotify handles (one per watcher process). <code>max_user_watches=524288</code> covers total watched paths. A stock Fedora workstation defaults to 128 instances and 65536 watches — adequate for a desktop, not for a workstation running five database services, two MCP runtimes, and a file watcher per active LLM tool.
+        </div>
+
+        <h3>SELinux volume labels for Docker</h3>
+        <p>On Fedora and RHEL-family systems with SELinux enforcing, Docker bind-mounted volumes require the <code>:z</code> label to allow the container process to read and write. Without it, Neo4j and Postgres silently fail to write to their data directories.</p>
+        <pre><code><span class="comment"># The :z suffix is required on Fedora — containers cannot access host volumes without it</span>
+volumes:
+  - /home/xenofon/databases/neo4j/data:/data:z
+  - /home/xenofon/databases/postgres/data:/var/lib/postgresql/data:z</code></pre>
+    </div>
+
+
+    <!-- ================================================================ -->
+    <h2 id="infrastructure">4. Infrastructure Setup: Docker Compose</h2>
+    <div class="section">
+        <p>Neo4j and Postgres are the two persistent stores. Both run in Docker. Memory tuning is set explicitly rather than left to defaults — the Neo4j double-underscore convention for environment variables is a known source of confusion.</p>
+
+        <pre><code><span class="keyword">services</span>:
+  <span class="keyword">neo4j</span>:
+    <span class="keyword">image</span>: <span class="string">neo4j:5-community</span>
+    <span class="keyword">ports</span>:
+      - <span class="string">"7474:7474"</span>   <span class="comment"># Browser UI</span>
+      - <span class="string">"7687:7687"</span>   <span class="comment"># Bolt protocol</span>
+    <span class="keyword">volumes</span>:
+      - <span class="string">/home/xenofon/databases/neo4j/data:/data:z</span>
+    <span class="keyword">environment</span>:
+      - <span class="string">NEO4J_AUTH=neo4j/your-password</span>
+      - <span class="string">NEO4J_PLUGINS=["apoc"]</span>
+      <span class="comment"># Neo4j 5 uses double underscores (__) for nested config keys</span>
+      - <span class="string">NEO4J_server_memory_heap_max__size=2G</span>
+      - <span class="string">NEO4J_server_memory_pagecache_size=2G</span>
+    <span class="keyword">restart</span>: <span class="string">always</span>
+
+  <span class="keyword">postgres</span>:
+    <span class="keyword">image</span>: <span class="string">pgvector/pgvector:pg17</span>
+    <span class="keyword">ports</span>:
+      - <span class="string">"5432:5432"</span>
+    <span class="keyword">volumes</span>:
+      - <span class="string">/home/xenofon/databases/postgres/data:/var/lib/postgresql/data:z</span>
+    <span class="keyword">command</span>: postgres -c shared_buffers=1GB -c work_mem=64MB
+    <span class="keyword">environment</span>:
+      - <span class="string">POSTGRES_PASSWORD=your-password</span>
+      - <span class="string">POSTGRES_DB=agent_data</span>
+    <span class="keyword">restart</span>: <span class="string">always</span></code></pre>
+
+        <pre><code><span class="comment"># Start both services</span>
+docker compose up -d
+
+<span class="comment"># Verify</span>
+docker compose ps</code></pre>
+    </div>
+
+
+    <!-- ================================================================ -->
+    <h2 id="schema">5. Database Schema</h2>
+    <div class="section">
+        <p>Run these once against the Postgres instance to create the vector extension and both tables.</p>
+
+        <pre><code><span class="comment">-- Connect: psql postgresql://postgres:your-password@localhost:5432/agent_data</span>
+
+CREATE EXTENSION IF NOT EXISTS vector;
+
+<span class="comment">-- Tier 1: episodic facts from all agents</span>
+CREATE TABLE IF NOT EXISTS technical_docs (
+    id            SERIAL PRIMARY KEY,
+    content       TEXT NOT NULL,
+    metadata      JSONB,
+    embedding     vector(1024),
+    content_hash  TEXT UNIQUE
+);
+CREATE INDEX IF NOT EXISTS technical_docs_embedding_idx
+    ON technical_docs USING ivfflat (embedding vector_cosine_ops);
+
+<span class="comment">-- Tier 3: consolidated thematic narratives</span>
+CREATE TABLE IF NOT EXISTS community_summaries (
+    id        SERIAL PRIMARY KEY,
+    content   TEXT NOT NULL,
+    metadata  JSONB,
+    embedding vector(1024)
+);
+CREATE INDEX IF NOT EXISTS community_summaries_embedding_idx
+    ON community_summaries USING ivfflat (embedding vector_cosine_ops);</code></pre>
+
+        <h3>Neo4j constraints</h3>
+        <pre><code><span class="comment">// Run in Neo4j Browser or cypher-shell</span>
+CREATE CONSTRAINT fact_pg_id IF NOT EXISTS FOR (f:Fact) REQUIRE f.pg_id IS UNIQUE;
+CREATE CONSTRAINT entity_name IF NOT EXISTS FOR (e:Entity) REQUIRE e.name IS UNIQUE;
+CREATE CONSTRAINT summary_pg_id IF NOT EXISTS FOR (s:CommunitySummary) REQUIRE s.pg_id IS UNIQUE;</code></pre>
+
+        <div class="tip">
+            <strong>Key schema rule:</strong> Every fact saved must include <code>"entities": ["Name1", "Name2"]</code> in its metadata. The saver creates <code>Entity</code> nodes and <code>MENTIONS</code> edges for each name. Without them the fact is stored and retrievable by vector search, but the consolidation daemon will never cluster it into Tier 3. The graph layer is the prerequisite for the semantic layer.
+        </div>
+    </div>
+
+
+    <!-- ================================================================ -->
+    <h2 id="inference">6. Inference Backends (llama.cpp)</h2>
+    <div class="section">
+        <p>Two models serve the embedding and reranking paths. Both are hosted via <code>llama-server</code> on separate ports. A third port (5000) hosts the reasoning LLM — this is typically LM Studio's inference server, but any OpenAI-compatible endpoint works.</p>
+
+        <pre><code><span class="comment"># BGE-M3 — embedding model, port 8070</span>
+llama-server --model /path/to/bge-m3.gguf --port 8070 --embedding --pooling mean
+
+<span class="comment"># BGE-Reranker-v2-m3 — reranking model, port 8071</span>
+llama-server --model /path/to/bge-reranker-v2-m3.gguf --port 8071 --reranking</code></pre>
+
+        <div class="warning-box">
+            <strong>Never call ports 8070 or 8071 directly.</strong> All agents must go through the Hive-Mind Gateway on port 8888. The gateway is what enforces the shared embedding space — if any agent bypasses it, the 1024-dim consistency guarantee is broken in operational practice, even if the same underlying model is running.
+        </div>
+    </div>
+
+
+    <!-- ================================================================ -->
+    <h2 id="gateway">7. The Hive-Mind Gateway: Why It Exists</h2>
+    <div class="section">
+
+        <h3>The hardcoded embedder problem</h3>
+        <p>Many tools in this stack are built around the OpenAI API. The <code>neo4j-agent-memory</code> MCP server, for instance, accepts an <code>--embedding</code> flag and calls it via the standard <code>/v1/embeddings</code> endpoint. LM Studio's internal agent tooling does the same. The problem is that none of these tools were written with a local multi-backend setup in mind — they assume a single API base URL and call <code>/v1/embeddings</code> against it.</p>
+
+        <p>Without a gateway, the choices are:</p>
+        <ul>
+            <li>Point every tool individually at port 8070 — fragile, breaks reranking which lives on 8071</li>
+            <li>Accept that each tool calls whatever model it prefers — produces different vector spaces, destroying cross-agent retrieval</li>
+            <li>Let credentials leak to the real OpenAI API if a tool ignores the local override</li>
+        </ul>
+
+        <p>The gateway solves all three. Every tool points at <code>http://localhost:8888/v1</code>. The gateway routes internally:</p>
+
+        <div class="highlight-box">
+            <ul>
+                <li><code>/v1/embeddings</code> → port 8070 (BGE-M3, 1024-dim)</li>
+                <li><code>/v1/reranking</code> → port 8071 (BGE-Reranker-v2-m3)</li>
+                <li>All other requests → port 5000 (reasoning LLM)</li>
+            </ul>
+            <p style="margin-top:10px">One endpoint. All agents. Same vector space.</p>
+        </div>
+
+        <h3>The insight: a single embedder forces a shared coordinate system</h3>
+        <p>Cross-agent retrieval only works if every agent's saves and queries are projected into the same coordinate space. Embedding models are not interchangeable — a vector from <code>text-embedding-3-small</code> is not comparable to one from BGE-M3. Even different quantizations of the same model can introduce drift. The gateway removes the variability entirely: because every embedding call — from Claude Code, from Gemini CLI, from LM Studio, from the consolidation daemon — passes through the same BGE-M3 instance on port 8070, every vector in the database was generated by the same model with the same weights in the same process. Cosine similarity scores are meaningful across agents. A fact saved by LM Studio is genuinely retrievable by Claude Code.</p>
+
+        <h3>From ThreadingHTTPServer to async aiohttp — why streaming required a rewrite</h3>
+        <p>The first two versions of the gateway used Python's stdlib <code>http.server.ThreadingHTTPServer</code> with <code>urllib</code> for upstream calls. This worked for embedding and reranking (which return quickly), but it broke fundamentally for LLM streaming: <code>urllib</code> buffers the entire upstream response before returning. A 4,000-token generation at 20 tokens/second takes 200 seconds. The threaded gateway held all 4,000 tokens in RAM, then delivered them as a single write 200 seconds after the request. That is not streaming. It is late delivery of a complete document.</p>
+
+        <p>The v6 async rewrite (ADR-004) replaced the entire implementation with <code>aiohttp.web</code> + <code>aiohttp.ClientSession</code>. Key properties:</p>
+        <ul>
+            <li><strong>True streaming:</strong> <code>iter_any()</code> pipes upstream chunks to the client as they arrive. The first token reaches the client in milliseconds.</li>
+            <li><strong>RFC 7230 hop-by-hop filtering:</strong> <code>Transfer-Encoding</code>, <code>Content-Length</code>, <code>Connection</code>, and other hop-by-hop headers are stripped from both request and response. Forwarding a stale <code>Content-Length</code> alongside a chunked stream causes clients to truncate or hang — a bug invisible until it manifests as a stalled terminal.</li>
+            <li><strong><code>auto_decompress=False</code>:</strong> aiohttp decompresses upstream responses by default but still forwards <code>Content-Encoding: gzip</code>. A client receiving decompressed bytes labelled as compressed double-decompresses — corruption. Disabled so compressed bytes and headers travel together.</li>
+            <li><strong><code>CancelledError</code> always re-raised:</strong> swallowing it leaves tasks as zombies; graceful shutdown stalls indefinitely waiting for tasks that returned without acknowledging cancellation.</li>
+            <li><strong>Self-defusing signal handler:</strong> after the first SIGINT/SIGTERM, both handlers are removed. A second Ctrl+C falls back to Python's default disposition — <code>KeyboardInterrupt</code> — providing an emergency hard-abort if the drain stalls on a hung backend.</li>
+            <li><strong>HTTP 503 for unreachable backends, 504 for connect timeout:</strong> the proxy is fine; the backend is not. Correct semantics matter for client retry logic.</li>
+        </ul>
+
+        <p>The full decision log for every accepted and rejected change across versions v2–v6 is in <a href="proxy_implementation.md"><code>proxy_implementation.md</code></a>.</p>
+    </div>
+
+
+    <!-- ================================================================ -->
+    <h2 id="starting">8. Starting the Full Stack</h2>
+    <div class="section">
+        <p>The startup sequence is order-dependent. The gateway must be up before any embedding or save operation. As of commit <code>23e5736</code>, starting the gateway also starts the consolidation daemon — you no longer need to manage them separately.</p>
+
+        <div class="step">
+            <span class="step-number">1</span>
+            <div class="step-content">
+                <strong>Start databases</strong>
+                <pre><code>docker compose up -d</code></pre>
+            </div>
+        </div>
+
+        <div class="step">
+            <span class="step-number">2</span>
+            <div class="step-content">
+                <strong>Start BGE-M3 and BGE-Reranker-v2-m3</strong> (llama-server, ports 8070 and 8071)
+            </div>
+        </div>
+
+        <div class="step">
+            <span class="step-number">3</span>
+            <div class="step-content">
+                <strong>Start the reasoning LLM</strong> (LM Studio or any OpenAI-compatible server on port 5000)
+            </div>
+        </div>
+
+        <div class="step">
+            <span class="step-number">4</span>
+            <div class="step-content">
+                <strong>Start the Hive-Mind Gateway</strong> — this also starts the consolidation daemon automatically
+                <pre><code>uv run --with aiohttp python shared-memory/scripts/hive_mind_proxy.py 8888</code></pre>
+                <p>You will see two log lines confirming both are up:</p>
+                <pre><code>INFO  ### Hive-Mind Proxy on :8888 [aiohttp]
+INFO  Consolidation daemon started (pid XXXXX)
+INFO  Listening for 'new_artifact' notifications...</code></pre>
+            </div>
+        </div>
+
+        <div class="step">
+            <span class="step-number">5</span>
+            <div class="step-content">
+                <strong>LM Studio</strong> — start the application; it will pick up the MCP servers from <code>mcp.json</code> automatically.
+            </div>
+        </div>
+
+        <div class="success-box">
+            <strong>Single command for the memory stack:</strong> Steps 4 is the only manual step required after databases and models are running. The proxy starts the daemon; the daemon registers its Postgres listener; both shut down cleanly when the proxy receives SIGINT or SIGTERM.
+        </div>
+    </div>
+
+
+    <!-- ================================================================ -->
+    <h2 id="agent-access">9. Agent Access: CLI and MCP</h2>
+    <div class="section">
+        <table>
+            <tr>
+                <th>Consumer</th>
+                <th>Interface</th>
+                <th>Entry point</th>
+                <th>Consolidation trigger</th>
+            </tr>
+            <tr>
+                <td><strong>Claude Code</strong></td>
+                <td>CLI only</td>
+                <td><code>shared-memory/scripts/memory_bridge.py</code></td>
+                <td><code>pg_notify</code> on save</td>
+            </tr>
+            <tr>
+                <td><strong>Gemini CLI</strong></td>
+                <td>CLI (skill)</td>
+                <td><code>~/.gemini/skills/shared-memory/scripts/memory_bridge.py</code></td>
+                <td><code>pg_notify</code> on save</td>
+            </tr>
+            <tr>
+                <td><strong>LM Studio</strong></td>
+                <td>MCP (FastMCP)</td>
+                <td><code>vector-skill.py</code> → <code>rag-orchestrator</code> in <code>mcp.json</code></td>
+                <td><code>pg_notify</code> on save</td>
+            </tr>
+        </table>
+
+        <p>All three paths write to the same Postgres and Neo4j backend, all route embeddings through port 8888, and all fire the same <code>pg_notify</code> that wakes the consolidation daemon. Cross-agent retrieval works because the embedding space is shared.</p>
+
+        <h3>CLI usage (Claude Code and Gemini CLI)</h3>
+        <pre><code><span class="comment"># Search — semantic + rerank + Neo4j expansion</span>
+uv run --with httpx --with psycopg2-binary --with neo4j \
+  python shared-memory/scripts/memory_bridge.py search "bgem3 interference problem" 5
+
+<span class="comment"># Save — always include entities for consolidation eligibility</span>
+uv run --with httpx --with psycopg2-binary --with neo4j \
+  python shared-memory/scripts/memory_bridge.py save \
+  "Architectural decision: proxy routes all embeddings through :8888" \
+  '{"source":"claude_code","entities":["hive_mind_proxy","BGE-M3"]}'
+
+<span class="comment"># Graph query — direct Cypher</span>
+uv run --with neo4j \
+  python shared-memory/scripts/memory_bridge.py graph \
+  "MATCH (e:Entity)<-[:MENTIONS]-(f:Fact) RETURN e.name, count(f) ORDER BY count(f) DESC LIMIT 10"</code></pre>
+
+        <h3>Gemini CLI skill activation</h3>
+        <pre><code>/activate shared-memory</code></pre>
+        <p>Once activated, Gemini CLI uses the MCP primary method for search and falls back to the CLI scripts for save operations.</p>
+    </div>
+
+
+    <!-- ================================================================ -->
+    <h2 id="save-path">10. The Save Path — From Artifact to Memory</h2>
+    <div class="section">
+        <p>Both <code>memory_bridge.py</code> and <code>vector-skill.py</code> implement the same save contract. The sequence is:</p>
+
+        <div class="architecture-box">caller supplies: content + metadata["entities"] (required for consolidation)
+       ↓
+get_embedding(content) via :8888 (BGE-M3, 1024-dim)
+       ↓ abort if gateway is down — hard mandate
+INSERT INTO technical_docs ... ON CONFLICT (content_hash) DO UPDATE
+       ↓ idempotent: SHA-256 hash prevents duplicates
+CHECK pg_stat_activity WHERE application_name = 'consolidation_daemon'
+       ↓ warns in response if daemon not registered
+SELECT pg_notify('new_artifact', {"pg_id": id})   ← inside transaction, before commit
+conn.commit()
+       ↓
+MERGE (f:Fact {pg_id}) in Neo4j
+for each entity name in metadata["entities"]:
+    MERGE (e:Entity {name})
+    MERGE (f)-[:MENTIONS]->(e)
+       ↓
+daemon receives NOTIFY → adds pg_id to pending_pg_ids → idle timer starts</div>
+
+        <div class="warning-box">
+            <strong>Hard Mandate — Embedding Integrity:</strong> Saves abort if the Hive-Mind Gateway is unreachable. An artifact stored without a vector is invisible to semantic search — the failure must surface, never be swallowed. The error is returned to the caller; no partial writes occur.
+        </div>
+
+        <div class="tip">
+            <strong>Daemon liveness check:</strong> Before issuing <code>pg_notify</code>, both save paths query <code>pg_stat_activity</code> for the consolidation daemon's registered connection (<code>application_name = 'consolidation_daemon'</code>). If the daemon is not running, the save succeeds but the response includes: <code>WARNING: Consolidation daemon not running — NOTIFY dropped.</code> Since <code>pg_notify</code> is fire-and-forget, undelivered notifications are permanently lost. Starting the proxy (which auto-starts the daemon) before any save session prevents this.
+        </div>
+    </div>
+
+
+    <!-- ================================================================ -->
+    <h2 id="consolidation">11. The Sleep Cycle — Consolidation</h2>
+    <div class="section">
+        <p>The consolidation daemon is the neocortical layer of the architecture. It does not poll — polling would compete with inference workloads that need full GPU headroom. It waits for a Postgres <code>NOTIFY</code>, then applies a dual gate before acting: an idle timer and a graph density check.</p>
+
+        <h3>Trigger logic</h3>
+        <ul>
+            <li>Each <code>pg_notify</code> adds the artifact's <code>pg_id</code> to <code>pending_pg_ids</code> and resets a 15-minute idle timer.</li>
+            <li>After 15 minutes with no new notifications (idle threshold), consolidation runs.</li>
+            <li>A 45-minute hard backstop fires during continuous ingestion even if notifications never stop — preventing indefinite deferral.</li>
+        </ul>
+
+        <h3>Per-community consolidation</h3>
+        <p>The daemon uses the queued <code>pg_id</code>s as entry points into Neo4j, not as the consolidation targets themselves. From each entry point it traverses to Entity hubs and counts unconsolidated Fact neighbors. Communities with fewer than 5 unconsolidated Facts wait — sparse neighborhoods are not ready for synthesis.</p>
+
+        <p>For each community that meets the threshold:</p>
+        <ol>
+            <li>Fetch the most recent <code>CommunitySummary</code> for that Entity from Postgres (if any).</li>
+            <li>Call the LLM via <code>:8888 → :5000</code> to integrate new facts into the existing narrative — <em>cumulative</em>, not a new isolated snapshot. This prevents content drift from parallel summary fragments about the same entity.</li>
+            <li>Re-embed the new narrative via BGE-M3 through <code>:8888</code>.</li>
+            <li>Write to <code>community_summaries</code>; create/update <code>CommunitySummary</code> node in Neo4j; link source Facts via <code>SUMMARIZED_BY</code>; set <code>Fact.consolidated = true</code>.</li>
+        </ol>
+
+        <div class="highlight-box">
+            <strong>Why centroid averaging is not used:</strong> The obvious compression approach — averaging related embeddings into a centroid — collapses the angular distinctions that cosine similarity depends on (Vangara &amp; Gopinath, 2026, <em>"The Geometry of Consolidation"</em>). The LLM instead generates new language representing the theme of the cluster, which is then re-embedded from scratch. This produces a new semantic point that did not exist before — not a mathematical blend. The result: retrievable volume grows O(log n) with LLM-based consolidation versus O(n) without it.
+        </div>
+
+        <h3>Re-consolidation</h3>
+        <p>The <code>consolidated</code> flag is not permanent. If future ingestion introduces unflagged Facts with sufficient neighborhood density that pull previously-consolidated Facts back into a candidate community, the entire cluster becomes eligible again. The flag is conditional on the stability of the surrounding graph, not on whether synthesis has ever occurred.</p>
+    </div>
+
+
+    <!-- ================================================================ -->
+    <h2 id="retrieval">12. Retrieval: Three-Tier Lookup</h2>
+    <div class="section">
+        <p>Both the MCP tool (<code>hybrid_search_and_rerank</code> in <code>vector-skill.py</code>) and the CLI (<code>memory_bridge.py search</code>) implement the same retrieval chain.</p>
+
+        <ol>
+            <li><strong>Embed the query</strong> via BGE-M3 through <code>:8888</code>.</li>
+            <li><strong>Global context scan:</strong> query <code>community_summaries</code> — top-1 thematic match. This orients the result set toward the most relevant synthesized narrative before drilling into individual facts.</li>
+            <li><strong>Semantic hit:</strong> query <code>technical_docs</code> — top-20 candidates by cosine similarity.</li>
+            <li><strong>Rerank:</strong> BGE-Reranker-v2-m3 via <code>:8888</code> scores all 20 candidates against the original query and returns the top-N by cross-encoder relevance.</li>
+            <li><strong>Relational expansion:</strong> for each top-N hit, query Neo4j for related entities and facts — surfaces structural context that vector similarity cannot express.</li>
+        </ol>
+
+        <p>Vector retrieval and graph traversal fail differently. Cosine similarity degrades with semantic crowding (the interference mechanism). Graph traversal does not operate on cosine similarity — it executes structural logic: path length, relationship type, graph density. As <code>technical_docs</code> accumulates interference pressure over time, the graph retains full structural fidelity. Facts that become harder to surface through vector retrieval remain fully reachable through graph traversal. The two layers compensate for each other's weaknesses, which is the only honest reason to pay the operational cost of running both.</p>
+    </div>
+
+
+    <!-- ================================================================ -->
+    <h2 id="mcp-config">13. LM Studio MCP Configuration</h2>
+    <div class="section">
+        <p>Save this as <code>~/.lmstudio/mcp.json</code>. The <code>rag-orchestrator</code> entry is the custom MCP server for this framework. The <code>neo4j-memory</code> entry points the neo4j-agent-memory package at the gateway so it uses BGE-M3 rather than calling OpenAI.</p>
+
+        <pre><code>{
+  <span class="string">"mcpServers"</span>: {
+    <span class="string">"rag-orchestrator"</span>: {
+      <span class="string">"command"</span>: <span class="string">"uv"</span>,
+      <span class="string">"args"</span>: [
+        <span class="string">"run"</span>, <span class="string">"--with"</span>, <span class="string">"fastmcp"</span>,
+        <span class="string">"--with"</span>, <span class="string">"httpx"</span>,
+        <span class="string">"--with"</span>, <span class="string">"psycopg2-binary"</span>,
+        <span class="string">"--with"</span>, <span class="string">"neo4j"</span>,
+        <span class="string">"python"</span>, <span class="string">"/home/xenofon/claude-labs/projects/shared_mem/vector-skill.py"</span>
+      ]
+    },
+    <span class="string">"neo4j-memory"</span>: {
+      <span class="string">"command"</span>: <span class="string">"uvx"</span>,
+      <span class="string">"args"</span>: [
+        <span class="string">"--with"</span>, <span class="string">"neo4j-agent-memory[mcp,openai]"</span>,
+        <span class="string">"--with"</span>, <span class="string">"click"</span>, <span class="string">"--with"</span>, <span class="string">"rich"</span>,
+        <span class="string">"neo4j-agent-memory"</span>, <span class="string">"mcp"</span>, <span class="string">"serve"</span>,
+        <span class="string">"--uri"</span>, <span class="string">"bolt://localhost:7687"</span>,
+        <span class="string">"--user"</span>, <span class="string">"neo4j"</span>, <span class="string">"--password"</span>, <span class="string">"your-password"</span>,
+        <span class="string">"--llm"</span>, <span class="string">"openai/qwen"</span>,
+        <span class="string">"--llm-api-base"</span>, <span class="string">"http://localhost:8888/v1"</span>,
+        <span class="string">"--embedding"</span>, <span class="string">"openai/bge-m3"</span>,
+        <span class="string">"--embedding-dimensions"</span>, <span class="string">"1024"</span>
+      ],
+      <span class="string">"env"</span>: {
+        <span class="string">"OPENAI_BASE_URL"</span>: <span class="string">"http://localhost:8888/v1"</span>,
+        <span class="string">"OPENAI_API_KEY"</span>: <span class="string">"sk-no-key-required"</span>
+      }
+    },
+    <span class="string">"tavily-mcp"</span>: {
+      <span class="string">"command"</span>: <span class="string">"npx"</span>,
+      <span class="string">"args"</span>: [<span class="string">"-y"</span>, <span class="string">"tavily-mcp@latest"</span>],
+      <span class="string">"env"</span>: {
+        <span class="string">"TAVILY_API_KEY"</span>: <span class="string">"your-tavily-key"</span>
+      }
+    },
+    <span class="string">"postgres-vector"</span>: {
+      <span class="string">"command"</span>: <span class="string">"npx"</span>,
+      <span class="string">"args"</span>: [
+        <span class="string">"-y"</span>, <span class="string">"@modelcontextprotocol/server-postgres"</span>,
+        <span class="string">"postgresql://postgres:your-password@localhost:5432/agent_data"</span>
+      ]
+    }
+  }
+}</code></pre>
+
+        <div class="tip">
+            <strong>Why <code>neo4j-memory</code> uses the gateway:</strong> The <code>neo4j-agent-memory</code> package calls the OpenAI embeddings API to vectorize entity names before storing them. By pointing <code>--embedding-dimensions 1024</code> and both API base URLs at port 8888, every embedding it generates uses BGE-M3 — the same model and the same space as everything else in the framework.
+        </div>
+    </div>
+
+
+    <!-- ================================================================ -->
+    <h2 id="testing">14. Testing</h2>
+    <div class="section">
+        <p>All tests are fully mocked — no live database or gateway required. Run from the project root.</p>
+
+        <pre><code><span class="comment"># Full suite</span>
+uv run --with pytest --with pytest-asyncio --with fastmcp \
+       --with psycopg2-binary --with httpx --with neo4j \
+       pytest tests/ -v
+
+<span class="comment"># Single file</span>
+uv run --with pytest --with pytest-asyncio --with fastmcp \
+       --with psycopg2-binary --with httpx --with neo4j \
+       pytest tests/test_vector_skill.py
+
+<span class="comment"># Skip LLM calls in consolidation tests</span>
+MOCK_LLM=1 uv run --with pytest ... pytest tests/test_consolidation_e2e.py</code></pre>
+
+        <div class="success-box">
+            <strong>12/12 passing</strong> as of commit <code>df0a2e1</code>. Tests cover: embedding hard mandate (abort on gateway down), save idempotency, search + rerank + fallback, Neo4j expansion, MCP tool contracts, and consolidation e2e flow with mock LLM.
+        </div>
+    </div>
+
+
+    <!-- ================================================================ -->
+    <h2 id="what-was-fixed">15. What Was Broken and What Was Fixed</h2>
+    <div class="section">
+        <p>The architecture was correct in design before the work documented here. What the design articles did not say — because it was not yet true — is that several components were failing silently. Three failures meant that no consolidation ever occurred, regardless of how much was saved. Two subsequent improvements closed operational gaps that the initial fixes exposed.</p>
+
+        <h3>Silent Failure 1: pg_notify was never sent</h3>
+        <p>The consolidation daemon's entire trigger mechanism is a Postgres <code>LISTEN/NOTIFY</code> subscription. Both <code>memory_bridge.py</code> and <code>vector-skill.py</code> never sent the notification. The daemon's <code>pending_pg_ids</code> set stayed empty across every session since the daemon was written. No error, no symptom — the daemon waited in perfect health for a signal that never came.</p>
+        <div class="changelog-entry">
+            <span class="commit">Fix (commit 2f15321):</span> Added <code>SELECT pg_notify('new_artifact', %s)</code> inside the same cursor context as the INSERT, before <code>conn.commit()</code>. The NOTIFY fires atomically with the transaction — no window where a committed fact goes unannounced.
+        </div>
+
+        <h3>Silent Failure 2: no entity graph</h3>
+        <p>The consolidation density query traverses <code>(f:Fact)-[:MENTIONS]->(e:Entity)</code>. Both save paths created bare <code>Fact</code> nodes with no entity links. Every fact was structurally isolated — stored, embedded, retrievable by vector search, but invisible to the consolidation cycle that depends on hub-and-spoke clusters around Entity anchors.</p>
+        <div class="changelog-entry">
+            <span class="commit">Fix (commit 2f15321):</span> Both save paths now create <code>Entity</code> nodes and <code>MENTIONS</code> edges for each name in <code>metadata["entities"]</code>. The entity ingestion contract is documented in SKILL.md and surfaced at the point of use for all agent interfaces. Facts without entities are stored but explicitly excluded from Tier 3 consolidation — this is intentional, not a bug.
+        </div>
+
+        <h3>Silent Failure 3: daemon called the embedding service directly</h3>
+        <p>The consolidation loop re-embeds every synthesized summary using BGE-M3. It was calling port 8070 directly, bypassing the Hive-Mind Gateway. This violated the hard mandate: all embeddings must route through port 8888. An agent bypassing the gateway is not sharing the same embedding space in the operational sense, even if the underlying model is the same.</p>
+        <div class="changelog-entry">
+            <span class="commit">Fix (commit 2f15321):</span> URL changed from <code>http://localhost:8070</code> to <code>http://localhost:8888</code>. Single-line fix; significant invariant restoration.
+        </div>
+
+        <h3>Proxy streaming rewrite</h3>
+        <p>The <code>ThreadingHTTPServer</code> gateway buffered entire LLM responses in RAM before delivery. For a 4,000-token generation, this meant a 200-second wait with no visible progress. Eight further bugs (incorrect routing, missing imports, no structured logging, no graceful shutdown) were found and fixed through six iterative proxy versions, documented in <a href="proxy_implementation.md"><code>proxy_implementation.md</code></a>.</p>
+        <div class="changelog-entry">
+            <span class="commit">Fix (commit 377c9d1):</span> Full async aiohttp v6 rewrite. True token streaming. RFC 7230 hop-by-hop header filtering. <code>auto_decompress=False</code>. Graceful shutdown with drain sequence. Self-defusing signal handler. 503/504 semantics.
+        </div>
+
+        <h3>Daemon liveness: silent notification drops</h3>
+        <p><code>pg_notify</code> is fire-and-forget. If the consolidation daemon is not listening when a fact is saved, the notification is permanently lost — no consolidation, no error surfaced to the agent.</p>
+        <div class="changelog-entry">
+            <span class="commit">Fix (commit 23e5736, ADR-005):</span> The daemon connects with <code>application_name='consolidation_daemon'</code>. Both save paths query <code>pg_stat_activity</code> before notifying. If the daemon is not registered, the save response includes an explicit WARNING. The save itself always completes — the check informs, it does not block.
+        </div>
+
+        <h3>Proxy auto-starts daemon</h3>
+        <p>The daemon was a separate manual step. Two independent processes to manage, one easy to forget, no coupling between them.</p>
+        <div class="changelog-entry">
+            <span class="commit">Fix (commit 23e5736, ADR-006):</span> <code>hive_mind_proxy.py</code> spawns <code>consolidation_loop.py</code> via <code>asyncio.create_subprocess_exec</code> immediately after binding the listen socket. A monitor task logs unexpected exits. The drain sequence sends SIGTERM, waits 5 seconds, then SIGKILL. One command starts the full memory stack.
+        </div>
+    </div>
+
+
+    <!-- ================================================================ -->
+    <h2 id="open-problems">16. Open Problems</h2>
+    <div class="section">
+        <div class="danger-box">
+            <strong>Security Risk: Stored Prompt Injection (unmitigated)</strong>
+            <p style="margin-top:10px">Web-retrieved content enters the same ingestion pipeline as internally authored facts. A crafted document retrieved during a search can embed plausibly near a cluster of legitimate facts and — after consolidation — contaminate <code>community_summaries</code> as trusted context for all agents, persisting across all future sessions.</p>
+            <p>This is a stored injection (not reflected). The attack surface is not the agent's context window — it is the shared brain itself. The geometry that makes the vector store useful (organizing information by meaning, retrieving by proximity) is the same geometry that makes a well-crafted injection hard to distinguish from a legitimate fact.</p>
+            <p><strong>Two defenses are planned but not built:</strong></p>
+            <ul>
+                <li><strong>Ingestion boundary sanitization:</strong> strip instructional patterns, enforce source provenance metadata, quarantine external content before promoting it to the same trust level as internal facts. Neo4j's explicit provenance on every node offers a partial advantage — a Cypher query can identify facts originating from external retrieval and apply different confidence weights to any community summary that contains them.</li>
+                <li><strong>Counterfactual simulation pass:</strong> before committing a synthesized narrative, verify that every claim traces back to a source fact in the cluster. A correct summary of poisoned facts is still a poisoned summary — this pass targets the synthesis quality, not the ingestion path.</li>
+            </ul>
+            <p><strong>Do not ingest external or web-retrieved content at volume before implementing these defenses.</strong></p>
+        </div>
+
+        <h3>Community Staleness</h3>
+        <p>Each consolidation cycle writes a new record to <code>community_summaries</code>. Superseded summaries are never retired — they remain in the vector store, occupying space in the same narrow effective-dimensional corridor that consolidation was designed to clear. Over time this becomes a slow re-accumulation of the interference problem the architecture was built to solve. A pruning or invalidation mechanism for superseded summaries is needed; none exists.</p>
+
+        <h3>Consolidation Quality</h3>
+        <p>The daemon trusts the LLM to synthesize accurately. There is no quantitative signal for whether a generated narrative is a sharp thematic abstraction of its cluster or a lossy blur that loses the distinctions that matter. Without a quality measure, the loop cannot distinguish a good synthesis from a bad one.</p>
+
+        <h3>Observability</h3>
+        <p>Related but distinct from quality: there is no mechanism for measuring whether consolidation is improving retrieval at a system level over time. The loop runs, summaries are written, but whether the overall retrieval trajectory is improving or quietly degrading is not tracked. Without that signal, tuning any other parameter is guesswork.</p>
+
+        <h3>Density Threshold Calibration</h3>
+        <p>The graph density threshold of 5 unconsolidated Facts per Entity hub is architecturally necessary but empirically uncalibrated. Too low and the loop synthesizes sparse, noisy clusters. Too high and interference accumulates faster than consolidation can address it. This number needs to be found empirically, not assumed.</p>
+
+        <h3>Entity Resolution</h3>
+        <p>The consolidation daemon clusters facts by the entity names the caller supplies at save time. If two callers use different names for the same concept — <code>"hive_mind_proxy"</code> versus <code>"Hive-Mind Gateway"</code> — those facts land in different clusters and produce separate community summaries. Neither is wrong, but the graph fails to recognize that they describe the same thing. As the number of agents writing to shared memory grows, this becomes a real structural problem. Entity resolution — merging synonymous nodes — is not implemented.</p>
+
+        <div class="tip">
+            <strong>Status:</strong> This document reflects the architecture as of commit <code>df0a2e1</code> (2026-05-21). The open problems above are the current frontier. See <a href="ADR.md">ADR.md</a> for the full decision history and <a href="dreaming-cycle-v6.md">dreaming-cycle-v6.md</a> + <a href="After_Dreaming.md">After_Dreaming.md</a> for the theoretical foundation and post-mortem.
+        </div>
+    </div>
+
+
+    <!-- ================================================================ -->
+    <h2>References</h2>
+    <div class="section">
+        <ul>
+            <li><strong>The Geometry of Forgetting</strong> (Barman et al., 2026) — <em>Exposing the Dimensionality Illusion</em>. arXiv:2604.06222</li>
+            <li><strong>The Geometry of Consolidation</strong> (Vangara &amp; Gopinath, 2026) — NeurIPS 2026 submission. Proves centroid averaging collapses retrieval identity.</li>
+            <li><strong>Active Dreaming Memory (ADM)</strong> (Dudekula Kasim Vali, 2025) — Biologically-Inspired Episodic Consolidation. engrXiv preprint, DOI: 10.31224/5919</li>
+            <li><strong>Complementary Learning Systems</strong> (McClelland, McNaughton &amp; O'Reilly, 1995) — <em>Psychological Review</em> 102(3):419–457</li>
+        </ul>
+    </div>
+
+    <footer>
+        <p><strong>Oratotis Shared Memory Framework</strong></p>
+        <p>Neo4j · PostgreSQL/pgvector · BGE-M3 · aiohttp · FastMCP · Docker</p>
+        <p style="margin-top:14px">Last updated: 2026-05-21 · Commit df0a2e1</p>
+        <p style="margin-top:8px; font-size:0.9em">Built for local, secure, and extensible AI development on a real workstation.</p>
+    </footer>
+
+</div>
+</body>
+</html>
