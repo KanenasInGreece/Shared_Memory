@@ -19,7 +19,7 @@ Never rely on training data for local infrastructure decisions. You must follow 
 
 1.  **Semantic Retrieval (`rag-orchestrator`):** Query for technical artifacts, code snippets, and specific procedures.
 2.  **Relational Context (`neo4j-memory`):** Query for "Why" decisions, project dependencies, and POLE (People, Objects, Locations, Events) entities.
-3.  **Global Knowledge (`tavily-mcp`):** Use ONLY if local memory is exhausted or for emerging industry news.
+3.  **Global Knowledge (`tavily-mcp` / `brave-search`):** Use ONLY if local memory is exhausted or for emerging industry news. Replace the tool name here with whichever web search MCP server you registered in `mcp.json`.
 
 # OPERATIONAL PROTOCOL: THE MEMORY CYCLE
 You are responsible for the persistence of this workstation's intelligence.

@@ -580,6 +580,37 @@ The `rag-orchestrator` entry runs the custom MCP server for this framework. The 
 
 > **Why `neo4j-memory` uses the gateway:** The `neo4j-agent-memory` package calls the OpenAI embeddings API to vectorise entity names before storing them. By pointing both API base URLs at port 8888, every embedding it generates uses BGE-M3 — the same model and the same space as everything else in the framework.
 
+### Web search — choose your provider
+
+The framework treats web search as a pluggable MCP slot. The `mcp.json` above uses Tavily; Brave Search is a fully local-key alternative with no per-query metering. Use whichever fits your setup — the rest of the stack does not care which one is registered, as long as the tool name you reference in your system prompt matches the MCP server key.
+
+**Tavily** (default — advanced search, image results, 15-result depth):
+```json
+"tavily-mcp": {
+  "command": "npx",
+  "args": ["-y", "tavily-mcp@latest"],
+  "env": {
+    "TAVILY_API_KEY": "YOUR_TAVILY_API_KEY",
+    "DEFAULT_PARAMETERS": "{\"include_images\": true, \"max_results\": 15, \"search_depth\": \"advanced\"}"
+  }
+}
+```
+Get a key at [tavily.com](https://tavily.com).
+
+**Brave Search** (alternative — privacy-focused, independent index, no per-query cost on paid plans):
+```json
+"brave-search": {
+  "command": "npx",
+  "args": ["-y", "@modelcontextprotocol/server-brave-search"],
+  "env": {
+    "BRAVE_API_KEY": "YOUR_BRAVE_API_KEY"
+  }
+}
+```
+Get a key at [brave.com/search/api](https://brave.com/search/api).
+
+> **Adjust your system prompt to match.** The `COGNITIVE HIERARCHY` section in `system-prompt.md` references the search tool by its MCP server key. If you switch from `tavily-mcp` to `brave-search`, update that reference so the model knows which tool to call for web lookups.
+
 ---
 
 ## 16. Testing
