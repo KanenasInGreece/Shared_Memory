@@ -26,13 +26,13 @@ A unified semantic and relational memory layer built to survive the interference
 7. [Inference Backends (llama.cpp)](#7-inference-backends-llamacpp)
 8. [The Hive-Mind Gateway: Why It Exists](#8-the-hive-mind-gateway-why-it-exists)
 9. [Starting the Full Stack](#9-starting-the-full-stack)
-10. [Agent Access: CLI and MCP](#10-agent-access-cli-and-mcp)
-11. [The Save Path — From Artifact to Memory](#11-the-save-path--from-artifact-to-memory)
-12. [The Sleep Cycle — Consolidation](#12-the-sleep-cycle--consolidation)
-13. [Retrieval: Three-Tier Lookup](#13-retrieval-three-tier-lookup)
-14. [LM Studio MCP Configuration](#14-lm-studio-mcp-configuration)
-15. [Testing](#15-testing)
-16. [What Was Broken and What Was Fixed](#16-what-was-broken-and-what-was-fixed)
+10. [Agent Integration: First-Time Setup](#10-agent-integration-first-time-setup)
+11. [Agent Access: CLI and MCP](#11-agent-access-cli-and-mcp)
+12. [The Save Path — From Artifact to Memory](#12-the-save-path--from-artifact-to-memory)
+13. [The Sleep Cycle — Consolidation](#13-the-sleep-cycle--consolidation)
+14. [Retrieval: Three-Tier Lookup](#14-retrieval-three-tier-lookup)
+15. [LM Studio MCP Configuration](#15-lm-studio-mcp-configuration)
+16. [Testing](#16-testing)
 17. [Open Problems](#17-open-problems)
 18. [References](#18-references)
 
@@ -337,7 +337,88 @@ Step 4 is the only manual step required after databases and models are running. 
 
 ---
 
-## 10. Agent Access: CLI and MCP
+## 10. Agent Integration: First-Time Setup
+
+This section covers where to place files and how to register each agent. For runtime usage (commands and examples) see [§11: Agent Access: CLI and MCP](#11-agent-access-cli-and-mcp).
+
+### Clone the repository
+
+```bash
+git clone https://github.com/KanenasInGreece/Shared_Memory.git
+cd Shared_Memory
+cp .env.example .env
+# Edit .env — fill in NEO4J_PASSWORD and PG_PASSWORD
+```
+
+### Claude Code
+
+Claude Code uses `memory_bridge.py` as a plain CLI command — no MCP server or skill registration required. The script lives in `shared-memory/scripts/` inside the repo; reference it by absolute path from any Claude Code session.
+
+**Wire it into Claude Code's context** so it knows when and how to use shared memory. Copy `shared-memory/SKILL.md` into your project's `CLAUDE.md` (or add it as a project instruction) — it defines the task triggers, the save contract, and the retrieval workflow Claude Code should follow.
+
+```bash
+# Smoke-test the bridge after the full stack is running
+uv run --with httpx --with psycopg2-binary --with neo4j \
+  python /path/to/Shared_Memory/shared-memory/scripts/memory_bridge.py search "test" 3
+```
+
+### Gemini CLI
+
+Gemini CLI loads skills from `~/.gemini/skills/`. Drop the `shared-memory` skill directory there:
+
+```bash
+mkdir -p ~/.gemini/skills
+
+# Copy (standalone — updates require a re-copy)
+cp -r shared-memory-skill/shared-memory ~/.gemini/skills/shared-memory
+
+# Or symlink (always in sync with the repo)
+ln -s /path/to/Shared_Memory/shared-memory-skill/shared-memory ~/.gemini/skills/shared-memory
+```
+
+The skill is self-contained: `SKILL.md` describes the task triggers and workflows; `scripts/memory_bridge.py` is the runtime bridge. Activate in any Gemini CLI session:
+
+```
+/activate shared-memory
+```
+
+The `SKILL.md` inside the skill directory drives the behavior — Gemini reads it to know when to search, when to save, and what format the commands take.
+
+### LM Studio
+
+LM Studio integrates through two files: an MCP config (`mcp.json`) and the MCP server script (`vector-skill.py`).
+
+**Step 1 — Place `vector-skill.py`**
+
+Put it anywhere that stays accessible, for example:
+
+```bash
+mkdir -p ~/ai/shared-memory
+cp vector-skill.py ~/ai/shared-memory/vector-skill.py
+```
+
+LM Studio does not manage this path — you reference it by absolute path in `mcp.json`.
+
+**Step 2 — Configure and place `mcp.json`**
+
+Edit `mcp.json` from this repo: replace all `YOUR_*` placeholders with real values and update the absolute path to `vector-skill.py` in the `rag-orchestrator` entry. Then save it to LM Studio's MCP config location:
+
+| OS | Path |
+|---|---|
+| Linux / macOS | `~/.lmstudio/mcp.json` |
+| Windows | `%APPDATA%\LM Studio\mcp.json` |
+
+**Step 3 — Load the system prompt**
+
+`system-prompt.md` contains the operational instructions — the search-first directive, when to save artifacts, and the reasoning protocol. Import it in LM Studio as a preset system prompt (Settings → System Prompt → Import).
+
+**Step 4 — Verify**
+
+Start LM Studio. The `rag-orchestrator` MCP server should appear in the tool panel. If it shows an error, confirm the full stack is running (gateway on :8888, databases up) and that there are no remaining `YOUR_*` placeholders in `mcp.json`.
+
+---
+
+## 11. Agent Access: CLI and MCP
 
 | Consumer | Interface | Entry point | Consolidation trigger |
 |---|---|---|---|
@@ -374,7 +455,7 @@ uv run --with neo4j \
 
 ---
 
-## 11. The Save Path — From Artifact to Memory
+## 12. The Save Path — From Artifact to Memory
 
 Both `memory_bridge.py` and `vector-skill.py` implement the same save contract:
 
@@ -404,7 +485,7 @@ daemon receives NOTIFY → adds pg_id to pending_pg_ids → idle timer starts
 
 ---
 
-## 12. The Sleep Cycle — Consolidation
+## 13. The Sleep Cycle — Consolidation
 
 The consolidation daemon is the neocortical layer of the architecture. It does not poll — polling would compete with inference workloads that need full GPU headroom. It waits for a Postgres `NOTIFY`, then applies a dual gate before acting: an idle timer and a graph density check.
 
@@ -433,7 +514,7 @@ The `consolidated` flag is not permanent. If future ingestion introduces unflagg
 
 ---
 
-## 13. Retrieval: Three-Tier Lookup
+## 14. Retrieval: Three-Tier Lookup
 
 Both the MCP tool (`hybrid_search_and_rerank` in `vector-skill.py`) and the CLI (`memory_bridge.py search`) implement the same retrieval chain:
 
@@ -447,7 +528,7 @@ Vector retrieval and graph traversal fail differently. Cosine similarity degrade
 
 ---
 
-## 14. LM Studio MCP Configuration
+## 15. LM Studio MCP Configuration
 
 Edit `mcp.json` — replace all `YOUR_*` placeholders with real values and update the absolute path to `vector-skill.py`. Save it to `~/.lmstudio/mcp.json` (or wherever LM Studio reads MCP config on your system).
 
@@ -499,7 +580,7 @@ The `rag-orchestrator` entry runs the custom MCP server for this framework. The 
 
 ---
 
-## 15. Testing
+## 16. Testing
 
 All tests are fully mocked — no live database or gateway required. Run from the project root.
 
@@ -526,46 +607,6 @@ MOCK_LLM=1 uv run --with pytest --with pytest-asyncio --with fastmcp \
 ```
 
 Tests cover: embedding hard mandate (abort on gateway down), save idempotency, search + rerank + fallback, Neo4j expansion, MCP tool contracts, and consolidation e2e flow with mock LLM.
-
----
-
-## 16. What Was Broken and What Was Fixed
-
-The architecture was correct in design before the work documented here. What the design did not say — because it was not yet true — is that several components were failing silently. Three failures meant that no consolidation ever occurred, regardless of how much was saved.
-
-### Silent Failure 1: pg_notify was never sent
-
-The consolidation daemon's entire trigger mechanism is a Postgres `LISTEN/NOTIFY` subscription. Both `memory_bridge.py` and `vector-skill.py` never sent the notification. The daemon's `pending_pg_ids` set stayed empty across every session since the daemon was written. No error, no symptom — the daemon waited in perfect health for a signal that never came.
-
-**Fix:** Added `SELECT pg_notify('new_artifact', %s)` inside the same cursor context as the INSERT, before `conn.commit()`. The NOTIFY fires atomically with the transaction — no window where a committed fact goes unannounced.
-
-### Silent Failure 2: no entity graph
-
-The consolidation density query traverses `(f:Fact)-[:MENTIONS]->(e:Entity)`. Both save paths created bare `Fact` nodes with no entity links. Every fact was structurally isolated — stored, embedded, retrievable by vector search, but invisible to the consolidation cycle that depends on hub-and-spoke clusters around Entity anchors.
-
-**Fix:** Both save paths now create `Entity` nodes and `MENTIONS` edges for each name in `metadata["entities"]`. Facts without entities are stored but explicitly excluded from Tier 3 consolidation — this is intentional, not a bug.
-
-### Silent Failure 3: daemon called the embedding service directly
-
-The consolidation loop re-embeds every synthesised summary. It was calling port 8070 directly, bypassing the Hive-Mind Gateway. This violated the hard mandate: all embeddings must route through port 8888.
-
-**Fix:** URL changed from `http://localhost:8070` to `http://localhost:8888`. Single-line fix; significant invariant restoration.
-
-### Proxy streaming rewrite
-
-The `ThreadingHTTPServer` gateway buffered entire LLM responses in RAM before delivery. For a 4,000-token generation, this meant a 200-second wait with no visible progress. The full async aiohttp v6 rewrite introduced true token streaming, RFC 7230 hop-by-hop header filtering, `auto_decompress=False`, graceful shutdown with drain sequence, a self-defusing signal handler, and correct 503/504 semantics.
-
-### Daemon liveness: silent notification drops
-
-`pg_notify` is fire-and-forget. If the consolidation daemon is not listening when a fact is saved, the notification is permanently lost.
-
-**Fix:** The daemon connects with `application_name='consolidation_daemon'`. Both save paths query `pg_stat_activity` before notifying. If the daemon is not registered, the save response includes an explicit WARNING. The save itself always completes — the check informs, it does not block.
-
-### Proxy auto-starts daemon
-
-The daemon was a separate manual step — easy to forget, no coupling between the two processes.
-
-**Fix:** `hive_mind_proxy.py` spawns `consolidation_loop.py` via `asyncio.create_subprocess_exec` immediately after binding the listen socket. A monitor task logs unexpected exits. The drain sequence sends SIGTERM, waits 5 seconds, then SIGKILL. One command starts the full memory stack.
 
 ---
 
