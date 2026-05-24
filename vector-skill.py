@@ -19,6 +19,25 @@ mcp = FastMCP("Local_RAG_Orchestrator")
 # Standardized endpoints via Hive-Mind Gateway (8888)
 RETRIEVER_URL = "http://localhost:8888/v1/embeddings"
 RERANKER_URL = "http://localhost:8888/v1/reranking"
+
+_CONTENT_SIZE_WARN_BYTES = 10 * 1024
+
+def _append_log(tool: str, min_level: int, event: str, data: dict, content: str = None) -> None:
+    log_level = int(os.environ.get("MEMORY_LOG_LEVEL", "0"))
+    if log_level < min_level:
+        return
+    log_dir = os.path.expanduser(os.environ.get("MEMORY_LOG_PATH", "~/.shared-memory/logs"))
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        entry = {"ts": datetime.now().isoformat(), "tool": tool, "event": event, **data}
+        if log_level >= 4 and content is not None:
+            entry["content"] = content
+            if len(content.encode()) > _CONTENT_SIZE_WARN_BYTES:
+                entry["content_size_warn"] = f"content is {len(content.encode())} bytes — reduce log level to avoid large logs"
+        with open(os.path.join(log_dir, f"{tool}.log"), "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass  # logging must never break the save path
 _pg_pass = os.environ.get("PG_PASSWORD", "")
 DB_CONN = os.environ.get(
     "PG_CONN",
@@ -178,14 +197,24 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
     try:
         embedding = await get_embedding(content)
         if not embedding:
+            _append_log("vector_skill", 2, "gateway_down", {"content_preview": content[:100]}, content)
             return "Error: Hive-Mind Gateway (8888) is DOWN. Save aborted to protect memory integrity. Start hive_mind_proxy.py first."
 
-        try:
-            m_data = json.loads(metadata_json) if isinstance(metadata_json, str) else metadata_json
-        except:
-            m_data = {"raw_metadata": metadata_json}
+        if isinstance(metadata_json, str):
+            try:
+                m_data = json.loads(metadata_json)
+            except (json.JSONDecodeError, ValueError) as e:
+                _append_log("vector_skill", 2, "bad_metadata", {"error": str(e), "content_preview": content[:100]}, content)
+                return f"Error: Invalid metadata JSON: {e}"
+        else:
+            m_data = metadata_json
+
+        if not isinstance(m_data, dict):
+            _append_log("vector_skill", 2, "bad_metadata_type", {"got": type(m_data).__name__, "content_preview": content[:100]}, content)
+            return f"Error: Metadata must be a JSON object, got {type(m_data).__name__}"
 
         m_data["timestamp"] = datetime.now().isoformat()
+        entities = m_data.get("entities", [])
 
         content_hash = hashlib.sha256(content.encode()).hexdigest()
 
@@ -221,7 +250,6 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
                         f.source = $source
                 """, pg_id=pg_id, content=content[:200], embedding=embedding, source=m_data.get("source", "mcp_sync"))
 
-                entities = m_data.get("entities", [])
                 for entity_name in entities:
                     session.run("""
                         MATCH (f:Fact {pg_id: $pg_id})
@@ -232,9 +260,15 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
             sync_msg = f"Successfully linked to Graph (Neo4j){f' with {len(entities)} entities' if entities else ''}."
         except Exception as ne:
             sync_msg = f"Postgres saved (ID: {pg_id}), but Graph sync failed: {str(ne)}"
+            _append_log("vector_skill", 2, "neo4j_sync_failed", {"pg_id": pg_id, "error": str(ne)}, content)
 
+        if not entities:
+            _append_log("vector_skill", 1, "no_entities", {"pg_id": pg_id, "source": m_data.get("source")}, content)
+        _append_log("vector_skill", 3, "save_success", {"pg_id": pg_id, "source": m_data.get("source"), "entity_count": len(entities)}, content)
+
+        entities_warning = "" if entities else "\nWARNING: No 'entities' in metadata — fact stored but ineligible for Tier 3 consolidation."
         daemon_warning = "" if daemon_up else "\nWARNING: Consolidation daemon not running — NOTIFY dropped. Start consolidation_loop.py."
-        return f"Success: {sync_msg}{daemon_warning}"
+        return f"Success: {sync_msg}{entities_warning}{daemon_warning}"
     except Exception as e:
         logger.error(f"Save failed: {str(e)}")
         return f"Error saving artifact: {str(e)}"

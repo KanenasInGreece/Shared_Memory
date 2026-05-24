@@ -30,11 +30,12 @@ A unified semantic and relational memory layer built to survive the interference
 11. [Agent Access: CLI and MCP](#11-agent-access-cli-and-mcp)
 12. [The Save Path — From Artifact to Memory](#12-the-save-path--from-artifact-to-memory)
 13. [The Sleep Cycle — Consolidation](#13-the-sleep-cycle--consolidation)
-14. [Retrieval: Three-Tier Lookup](#14-retrieval-three-tier-lookup)
-15. [LM Studio MCP Configuration](#15-lm-studio-mcp-configuration)
-16. [Testing](#16-testing)
-17. [Open Problems](#17-open-problems)
-18. [References](#18-references)
+14. [Audit Logging](#14-audit-logging)
+15. [Retrieval: Three-Tier Lookup](#15-retrieval-three-tier-lookup)
+16. [LM Studio MCP Configuration](#16-lm-studio-mcp-configuration)
+17. [Testing](#17-testing)
+18. [Open Problems](#18-open-problems)
+19. [References](#19-references)
 
 ---
 
@@ -508,6 +509,8 @@ daemon receives NOTIFY → adds pg_id to pending_pg_ids → idle timer starts
 
 > **Daemon liveness check:** Before issuing `pg_notify`, both save paths query `pg_stat_activity` for the consolidation daemon's registered connection (`application_name = 'consolidation_daemon'`). If the daemon is not running, the save succeeds but the response includes: `WARNING: Consolidation daemon not running — NOTIFY dropped.` Since `pg_notify` is fire-and-forget, undelivered notifications are permanently lost. Starting the proxy (which auto-starts the daemon) before any save session prevents this.
 
+> **Audit logging:** Every event in the save path — gateway down, malformed metadata, missing entities, Neo4j sync failures, and successful saves — is optionally logged to a per-tool JSON file based on `MEMORY_LOG_LEVEL`. See [§14: Audit Logging](#14-audit-logging).
+
 ---
 
 ## 13. The Sleep Cycle — Consolidation
@@ -539,7 +542,72 @@ The `consolidated` flag is not permanent. If future ingestion introduces unflagg
 
 ---
 
-## 14. Retrieval: Three-Tier Lookup
+## 14. Audit Logging
+
+The save path in both `memory_bridge.py` and `vector-skill.py` writes structured JSON log entries to per-tool files. Logging is **off by default** — enable it by setting `MEMORY_LOG_LEVEL` in `.env`.
+
+### Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `MEMORY_LOG_LEVEL` | `0` (off) | Controls which events are logged |
+| `MEMORY_LOG_PATH` | `~/.shared-memory/logs` | Directory where log files are written |
+
+### Log levels
+
+| Level | Events logged |
+|---|---|
+| `0` | Nothing (default) |
+| `1` | **Warnings** — save succeeded but `entities` missing; fact is stored but ineligible for consolidation |
+| `2` | Warnings + **errors** — gateway down (save aborted), malformed metadata JSON, non-dict metadata, Neo4j sync failure |
+| `3` | All above + **successful saves** — records `pg_id`, `source`, and entity count on every completed save |
+| `4` | All above + **full content copy** — includes the complete `content` field in each entry; warns if content exceeds 10 KB |
+
+### Per-tool log files
+
+Each entry point writes to its own file. Concurrent writes from Claude Code and Gemini CLI (both using `memory_bridge.py`) are safe — `O_APPEND` mode writes are atomic on Linux for writes smaller than `PIPE_BUF` (4096 bytes); individual log lines are well within that limit. Rotation is excluded from the writing tools to eliminate any write/rotate race condition.
+
+| Tool | Log file |
+|---|---|
+| Claude Code / Gemini CLI | `{MEMORY_LOG_PATH}/memory_bridge.log` |
+| LM Studio MCP | `{MEMORY_LOG_PATH}/vector_skill.log` |
+
+### Log format
+
+Each line is a self-contained JSON object:
+
+```json
+{"ts": "2026-05-24T14:32:01.123456", "tool": "memory_bridge", "event": "no_entities", "pg_id": 42, "source": "claude_code"}
+{"ts": "2026-05-24T14:35:17.891234", "tool": "memory_bridge", "event": "save_success", "pg_id": 43, "source": "gemini_cli", "entity_count": 2}
+{"ts": "2026-05-24T14:41:03.552109", "tool": "vector_skill",   "event": "gateway_down", "content_preview": "Architectural dec..."}
+```
+
+`event` is one of: `gateway_down`, `bad_metadata`, `bad_metadata_type`, `neo4j_sync_failed`, `no_entities`, `save_success`.
+
+### Daily merge by the consolidation daemon
+
+The consolidation daemon runs `merge_logs()` once per calendar day on the first 1-second poll of a new day. It uses the logrotate pattern:
+
+1. Rename `memory_bridge.log` → `memory_bridge.log.rotating` and `vector_skill.log` → `vector_skill.log.rotating`. Writing tools create fresh files on next open.
+2. Parse all entries from both rotating files, sort by timestamp, group by calendar date.
+3. For each date, merge with any existing archive and write `shared_memory_YYYY-MM-DD.log.gz` (atomic `os.replace`).
+4. Delete the `.rotating` files.
+
+The `shared_memory_` prefix distinguishes merged archives from agent memory files in the same directory.
+
+```
+~/.shared-memory/logs/
+  memory_bridge.log               ← active, append-only
+  vector_skill.log                ← active, append-only
+  shared_memory_2026-05-23.log.gz ← yesterday, merged
+  shared_memory_2026-05-22.log.gz ← two days ago, merged
+```
+
+If the daemon is not running, per-tool logs accumulate; entries from multiple days are correctly split into separate dated archives on the next merge run.
+
+---
+
+## 15. Retrieval: Three-Tier Lookup
 
 Both the MCP tool (`hybrid_search_and_rerank` in `vector-skill.py`) and the CLI (`memory_bridge.py search`) implement the same retrieval chain:
 
@@ -553,7 +621,7 @@ Vector retrieval and graph traversal fail differently. Cosine similarity degrade
 
 ---
 
-## 15. LM Studio MCP Configuration
+## 16. LM Studio MCP Configuration
 
 Edit `mcp.json` — replace all `YOUR_*` placeholders with real values and update the absolute path to `vector-skill.py`. Save it to `~/.lmstudio/mcp.json` (or wherever LM Studio reads MCP config on your system).
 
@@ -642,7 +710,7 @@ Get a key at [brave.com/search/api](https://brave.com/search/api).
 
 ---
 
-## 16. Testing
+## 17. Testing
 
 All tests are fully mocked — no live database or gateway required. Run from the project root.
 
@@ -668,11 +736,16 @@ MOCK_LLM=1 uv run --with pytest --with pytest-asyncio --with fastmcp \
            pytest tests/test_consolidation_e2e.py
 ```
 
-Tests cover: embedding hard mandate (abort on gateway down), save idempotency, search + rerank + fallback, Neo4j expansion, MCP tool contracts, and consolidation e2e flow with mock LLM.
+| Test file | Coverage |
+|---|---|
+| `test_memory_bridge.py` | Embedding hard mandate, save idempotency, search + rerank + fallback, Neo4j expansion |
+| `test_vector_skill.py` | MCP tool contracts (save, search, health check, reasoning trace) |
+| `test_consolidation_e2e.py` | Consolidation cycle with mock LLM, density threshold, community summary write |
+| `test_logging.py` | `_append_log` level filtering, per-tool file routing, content size warnings; `save_artifact` logging at each event type; `merge_logs` sort order, multi-tool merge, malformed line handling, daily archive merge, logrotate cleanup |
 
 ---
 
-## 17. Open Problems
+## 18. Open Problems
 
 ### Security Risk: Stored Prompt Injection (unmitigated)
 
@@ -694,7 +767,7 @@ The daemon trusts the LLM to synthesise accurately. There is no quantitative sig
 
 ### Observability
 
-There is no mechanism for measuring whether consolidation is improving retrieval at a system level over time. Without that signal, tuning any other parameter is guesswork.
+Audit logging (§14) records per-save events — entities missing, gateway failures, Neo4j sync errors — and the daily merge gives a timestamped cross-tool history. What it does not provide is a signal for whether consolidation is improving retrieval quality at a system level over time. Without that measure, tuning the density threshold or LLM summarisation prompt is guesswork.
 
 ### Density Threshold Calibration
 
@@ -706,7 +779,7 @@ The consolidation daemon clusters facts by the entity names the caller supplies 
 
 ---
 
-## 18. References
+## 19. References
 
 - **The Geometry of Forgetting** (Barman et al., 2026) — *Exposing the Dimensionality Illusion*. arXiv:2604.06222
 - **The Geometry of Consolidation** (Vangara & Gopinath, 2026) — NeurIPS 2026 submission. Proves centroid averaging collapses retrieval identity.

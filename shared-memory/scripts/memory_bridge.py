@@ -6,6 +6,7 @@ import httpx
 import asyncio
 import logging
 import hashlib
+from datetime import datetime
 from neo4j import GraphDatabase
 
 # Configuration — set via environment variables or .env file
@@ -19,6 +20,25 @@ PG_CONN = os.environ.get(
 )
 RETRIEVER_URL = "http://localhost:8888/v1/embeddings"
 RERANKER_URL = "http://localhost:8888/v1/reranking"
+
+_CONTENT_SIZE_WARN_BYTES = 10 * 1024
+
+def _append_log(tool: str, min_level: int, event: str, data: dict, content: str = None) -> None:
+    log_level = int(os.environ.get("MEMORY_LOG_LEVEL", "0"))
+    if log_level < min_level:
+        return
+    log_dir = os.path.expanduser(os.environ.get("MEMORY_LOG_PATH", "~/.shared-memory/logs"))
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        entry = {"ts": datetime.now().isoformat(), "tool": tool, "event": event, **data}
+        if log_level >= 4 and content is not None:
+            entry["content"] = content
+            if len(content.encode()) > _CONTENT_SIZE_WARN_BYTES:
+                entry["content_size_warn"] = f"content is {len(content.encode())} bytes — reduce log level to avoid large logs"
+        with open(os.path.join(log_dir, f"{tool}.log"), "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass  # logging must never break the save path
 
 def query_graph(cypher):
     try:
@@ -133,16 +153,27 @@ async def save_artifact(content, metadata_json="{}"):
         # 1. HARD MANDATE: No saving without vectors
         embedding = await get_embedding(content)
         if not embedding:
+            _append_log("memory_bridge", 2, "gateway_down", {"content_preview": content[:100]}, content)
             return {
                 "status": "error",
                 "message": "CRITICAL: Hive-Mind Gateway (port 8888) is DOWN. Save aborted to prevent memory degradation. Please start hive_mind_proxy.py first."
             }
 
         # 2. Parse Metadata
-        try:
-            m_data = json.loads(metadata_json) if isinstance(metadata_json, str) else metadata_json
-        except:
-            m_data = {"raw_metadata": metadata_json}
+        if isinstance(metadata_json, str):
+            try:
+                m_data = json.loads(metadata_json)
+            except (json.JSONDecodeError, ValueError) as e:
+                _append_log("memory_bridge", 2, "bad_metadata", {"error": str(e), "content_preview": content[:100]}, content)
+                return {"status": "error", "message": f"Invalid metadata JSON: {e}"}
+        else:
+            m_data = metadata_json
+
+        if not isinstance(m_data, dict):
+            _append_log("memory_bridge", 2, "bad_metadata_type", {"got": type(m_data).__name__, "content_preview": content[:100]}, content)
+            return {"status": "error", "message": f"Metadata must be a JSON object, got {type(m_data).__name__}"}
+
+        entities = m_data.get("entities", [])
 
         # 3. Insert into Postgres (Semantic Anchor - Idempotent)
         content_hash = hashlib.sha256(content.encode()).hexdigest()
@@ -175,7 +206,6 @@ async def save_artifact(content, metadata_json="{}"):
                         f.source = $source
                 """, pg_id=pg_id, content=content[:200], embedding=embedding, source=m_data.get("source", "manual_sync"))
 
-                entities = m_data.get("entities", [])
                 for entity_name in entities:
                     session.run("""
                         MATCH (f:Fact {pg_id: $pg_id})
@@ -187,11 +217,17 @@ async def save_artifact(content, metadata_json="{}"):
             sync_status = f"Linked to Neo4j Fact{f' with {len(entities)} entities' if entities else ''}."
         except Exception as e:
             sync_status = f"Postgres saved, but Neo4j sync failed: {str(e)}"
+            _append_log("memory_bridge", 2, "neo4j_sync_failed", {"pg_id": pg_id, "error": str(e)}, content)
 
+        if not entities:
+            _append_log("memory_bridge", 1, "no_entities", {"pg_id": pg_id, "source": m_data.get("source")}, content)
+        _append_log("memory_bridge", 3, "save_success", {"pg_id": pg_id, "source": m_data.get("source"), "entity_count": len(entities)}, content)
+
+        entities_warning = "" if entities else " WARNING: No 'entities' in metadata — fact stored but ineligible for Tier 3 consolidation."
         daemon_warning = "" if daemon_up else " WARNING: Consolidation daemon not running — NOTIFY dropped. Start consolidation_loop.py."
         return {
             "status": "success",
-            "message": f"Artifact stored with ID {pg_id}. {sync_status}{daemon_warning}"
+            "message": f"Artifact stored with ID {pg_id}. {sync_status}{entities_warning}{daemon_warning}"
         }
     except Exception as e:
         return {"error": str(e)}

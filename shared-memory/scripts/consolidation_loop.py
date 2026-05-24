@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import gzip
 import psycopg2
 import psycopg2.extensions
 import httpx
@@ -28,6 +29,92 @@ DENSITY_THRESHOLD = 5
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ConsolidationDaemon")
 
+_LOG_TOOLS = ["memory_bridge", "vector_skill"]
+
+def merge_logs(log_dir: str) -> None:
+    """Logrotate pattern: rename per-tool logs, merge by timestamp, write shared_memory_YYYY-MM-DD.log.gz."""
+    all_entries = []
+    rotating_files = []
+
+    for tool in _LOG_TOOLS:
+        log_path = os.path.join(log_dir, f"{tool}.log")
+        if not os.path.exists(log_path) or os.path.getsize(log_path) == 0:
+            if os.path.exists(log_path):
+                os.remove(log_path)  # clean up empty file
+            continue
+        rotating_path = log_path + ".rotating"
+        try:
+            os.rename(log_path, rotating_path)
+        except OSError as e:
+            logger.warning(f"merge_logs: could not rename {log_path}: {e}")
+            continue
+        rotating_files.append(rotating_path)
+        with open(rotating_path, "r", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    all_entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    logger.warning(f"merge_logs: skipping malformed line in {rotating_path}: {line[:80]}")
+
+    if not all_entries:
+        for rp in rotating_files:
+            try:
+                os.remove(rp)
+            except OSError:
+                pass
+        return
+
+    # Group by calendar date (entries may span multiple days if daemon was down)
+    by_date: dict = {}
+    for entry in all_entries:
+        try:
+            entry_date = datetime.fromisoformat(entry["ts"]).date()
+        except (KeyError, ValueError):
+            entry_date = datetime.now().date()
+        by_date.setdefault(entry_date, []).append(entry)
+
+    for date, entries in by_date.items():
+        out_path = os.path.join(log_dir, f"shared_memory_{date}.log.gz")
+        tmp_path = out_path + ".tmp"
+
+        # Merge with existing archive for this date if present
+        existing: list = []
+        if os.path.exists(out_path):
+            try:
+                with gzip.open(out_path, "rt", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                existing.append(json.loads(line))
+                            except json.JSONDecodeError:
+                                pass
+            except Exception as e:
+                logger.warning(f"merge_logs: could not read existing archive {out_path}: {e}")
+
+        merged = sorted(existing + entries, key=lambda e: e.get("ts", ""))
+        try:
+            with gzip.open(tmp_path, "wt", encoding="utf-8") as f:
+                for entry in merged:
+                    f.write(json.dumps(entry) + "\n")
+            os.replace(tmp_path, out_path)
+            logger.info(f"merge_logs: {len(merged)} entries → {os.path.basename(out_path)}")
+        except Exception as e:
+            logger.error(f"merge_logs: failed writing {out_path}: {e}")
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    for rp in rotating_files:
+        try:
+            os.remove(rp)
+        except OSError:
+            pass
+
 class ConsolidationDaemon:
     def __init__(self):
         self.pending_pg_ids = set()
@@ -35,6 +122,7 @@ class ConsolidationDaemon:
         self.first_notification_time = None
         self.driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
         self.is_running = True
+        self.last_log_merge_date = None
 
     async def get_embedding(self, text):
         """Standardized 1024-dim BGE-M3 embedding call."""
@@ -213,6 +301,15 @@ class ConsolidationDaemon:
             while self.is_running:
                 if select.select([conn], [], [], 1.0) == ([], [], []):
                     now = datetime.now()
+
+                    # Daily log merge — runs once per calendar day on first poll of the new day
+                    today = now.date()
+                    if self.last_log_merge_date != today:
+                        log_dir = os.path.expanduser(os.environ.get("MEMORY_LOG_PATH", "~/.shared-memory/logs"))
+                        if os.path.isdir(log_dir):
+                            merge_logs(log_dir)
+                        self.last_log_merge_date = today
+
                     seconds_since_activity = (now - self.last_activity).total_seconds()
 
                     should_consolidate = False
