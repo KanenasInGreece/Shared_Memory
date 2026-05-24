@@ -253,6 +253,28 @@ CREATE CONSTRAINT summary_pg_id IF NOT EXISTS FOR (s:CommunitySummary) REQUIRE s
 
 Full schema with all Neo4j labels and relationship types: [`shared-memory/Documentation/schema.md`](shared-memory/Documentation/schema.md)
 
+### Ontology configuration
+
+All Neo4j label names and relationship types are defined in `ontology.yaml` at the repo root. The defaults match the schema above. Override any value to adapt the graph to your naming conventions without touching Python source — then restart the scripts.
+
+```yaml
+# ontology.yaml — excerpt showing defaults
+labels:
+  fact: Fact
+  entity: Entity
+  community_summary: CommunitySummary
+
+relationships:
+  entity_link: MENTIONS       # Fact → Entity, written on save
+  entity_link_alias: REPORTS_ON  # legacy alias accepted by consolidation
+  summarized_by: SUMMARIZED_BY
+
+consolidation:
+  density_threshold: 5        # unconsolidated Facts per Entity to trigger synthesis
+```
+
+Set `SMEM_ONTOLOGY_PATH=/path/to/your/ontology.yaml` to load from a non-default location. If the file is absent the stack starts with the built-in defaults — no configuration required for a standard deployment.
+
 ---
 
 ## 7. Inference Backends (llama.cpp)
@@ -770,7 +792,7 @@ Audit logging (§14) records per-save events — entities missing, gateway failu
 
 ### Density Threshold Calibration
 
-The graph density threshold of 5 unconsolidated Facts per Entity hub is architecturally necessary but empirically uncalibrated. Too low and the loop synthesises sparse, noisy clusters. Too high and interference accumulates faster than consolidation can address it.
+The graph density threshold (`density_threshold` in `ontology.yaml`, default 5) is architecturally necessary but empirically uncalibrated. Too low and the loop synthesises sparse, noisy clusters. Too high and interference accumulates faster than consolidation can address it. The value is now configurable without code changes, but the right value for a given corpus still requires empirical tuning.
 
 ### Entity Resolution
 
