@@ -1,5 +1,7 @@
 # Shared Memory Schema
 
+> Label and relationship names are configurable via `ontology.yaml` at the repo root (override `SMEM_ONTOLOGY_PATH` to point elsewhere). All names shown here are the defaults.
+
 ## PostgreSQL (Semantic Memory)
 
 ### `technical_docs` — Tier 1 (Episodic)
@@ -46,6 +48,9 @@ Written exclusively by the consolidation daemon. Each row is an LLM-synthesised 
 **Growth behaviour:** each consolidation cycle appends a **new row**. Superseded summaries are never deleted or marked inactive — they accumulate alongside newer ones. Query `ORDER BY id DESC LIMIT 1` to get the latest summary for a given entity, or use the retrieval path which surfaces the embedding-closest match regardless of age.
 
 ## Neo4j (Relational Memory)
+
+> Configurable via `ontology.yaml`. Label and relationship keys map directly to the `labels:` and `relationships:` sections.
+
 **Core Labels:**
 - `Project`: Root node for a project.
 - `File`: A file within a project.

@@ -1,0 +1,22 @@
+# Shared Memory Ontology Configuration
+#
+# Override any value to customise the Neo4j graph schema for your deployment.
+# Restart all scripts after editing — values are read at startup.
+#
+# To use a non-default location: set SMEM_ONTOLOGY_PATH=/path/to/ontology.yaml
+
+labels:
+  fact: Fact                           # primary node for every saved artifact
+  entity: Entity                       # named entity extracted from artifact metadata
+  community_summary: CommunitySummary  # LLM-synthesised thematic narrative (daemon-written)
+  reasoning_trace: ReasoningTrace      # root node of an agent reasoning session
+  reasoning_step: ReasoningStep        # individual step within a ReasoningTrace chain
+
+relationships:
+  entity_link: MENTIONS          # primary Fact→Entity relationship written on save
+  entity_link_alias: REPORTS_ON  # legacy alias accepted by consolidation clustering
+  summarized_by: SUMMARIZED_BY   # Fact→CommunitySummary, written by consolidation daemon
+  reasoning_next: NEXT_STEP      # links consecutive ReasoningStep nodes
+
+consolidation:
+  density_threshold: 5           # min unconsolidated Facts per Entity hub to trigger synthesis

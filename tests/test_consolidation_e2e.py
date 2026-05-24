@@ -6,8 +6,12 @@ import logging
 import subprocess
 import time
 import os
+import sys
 from datetime import datetime
 from neo4j import GraphDatabase
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
+from ontology import ONT
 
 # Configuration — set via environment variables or .env file
 _pg_pass = os.environ.get("PG_PASSWORD", "")
@@ -62,11 +66,11 @@ async def run_test():
 
             # Mirror to Neo4j (Mocking the agent behavior)
             with driver.session() as session:
-                session.run("""
-                    MERGE (e:Entity {name: $entity})
-                    CREATE (f:Fact {pg_id: $pg_id, content: $content, consolidated: false})
-                    CREATE (f)-[:REPORTS_ON]->(e)
-                """, entity=entity_name, pg_id=pg_id, content=content)
+                session.run(
+                    f"MERGE (e:{ONT.entity} {{name: $entity}})"
+                    f" CREATE (f:{ONT.fact} {{pg_id: $pg_id, content: $content, consolidated: false}})"
+                    f" CREATE (f)-[:{ONT.entity_link_alias}]->(e)",
+                    entity=entity_name, pg_id=pg_id, content=content)
 
             logger.info(f"Inserted fact {i} (PG ID: {pg_id})")
 
@@ -89,7 +93,10 @@ async def run_test():
                 success = False
 
         with driver.session() as session:
-            result = session.run("MATCH (f:Fact)-[:REPORTS_ON]->(e:Entity {name: $entity}) RETURN count(f) as total, sum(case when f.consolidated = true then 1 else 0 end) as consolidated", entity=entity_name)
+            result = session.run(
+                f"MATCH (f:{ONT.fact})-[:{ONT.entity_link_alias}]->(e:{ONT.entity} {{name: $entity}})"
+                " RETURN count(f) as total, sum(case when f.consolidated = true then 1 else 0 end) as consolidated",
+                entity=entity_name)
             record = result.single()
             if record["consolidated"] == 6:
                 logger.info("SUCCESS: All facts in Neo4j marked as consolidated!")

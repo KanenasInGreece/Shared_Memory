@@ -8,6 +8,7 @@ import logging
 import hashlib
 from datetime import datetime
 from neo4j import GraphDatabase
+from ontology import ONT
 
 # Configuration — set via environment variables or .env file
 NEO4J_URI = "bolt://localhost:7687"
@@ -124,12 +125,12 @@ async def search_and_rerank(query, limit=5):
             relational_context = []
             try:
                 with driver.session() as session:
-                    graph_result = session.run("""
-                        MATCH (f:Fact {pg_id: $pg_id})
-                        OPTIONAL MATCH (f)-[r]-(related)
-                        RETURN labels(related) as labels, related.name as name, type(r) as rel_type
-                        LIMIT 5
-                    """, pg_id=pg_id)
+                    graph_result = session.run(
+                        f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
+                        " OPTIONAL MATCH (f)-[r]-(related)"
+                        " RETURN labels(related) as labels, related.name as name, type(r) as rel_type"
+                        " LIMIT 5",
+                        pg_id=pg_id)
                     for record in graph_result:
                         if record["name"]:
                             relational_context.append(f"{record['rel_type']} -> {record['name']} ({record['labels'][0]})")
@@ -198,20 +199,20 @@ async def save_artifact(content, metadata_json="{}"):
         try:
             driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
             with driver.session() as session:
-                session.run("""
-                    MERGE (f:Fact {pg_id: $pg_id})
-                    SET f.content = $content,
-                        f.embedding = $embedding,
-                        f.created_at = datetime(),
-                        f.source = $source
-                """, pg_id=pg_id, content=content[:200], embedding=embedding, source=m_data.get("source", "manual_sync"))
+                session.run(
+                    f"MERGE (f:{ONT.fact} {{pg_id: $pg_id}})"
+                    " SET f.content = $content,"
+                    "     f.embedding = $embedding,"
+                    "     f.created_at = datetime(),"
+                    "     f.source = $source",
+                    pg_id=pg_id, content=content[:200], embedding=embedding, source=m_data.get("source", "manual_sync"))
 
                 for entity_name in entities:
-                    session.run("""
-                        MATCH (f:Fact {pg_id: $pg_id})
-                        MERGE (e:Entity {name: $name})
-                        MERGE (f)-[:MENTIONS]->(e)
-                    """, pg_id=pg_id, name=entity_name)
+                    session.run(
+                        f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
+                        f" MERGE (e:{ONT.entity} {{name: $name}})"
+                        f" MERGE (f)-[:{ONT.entity_link}]->(e)",
+                        pg_id=pg_id, name=entity_name)
 
             driver.close()
             sync_status = f"Linked to Neo4j Fact{f' with {len(entities)} entities' if entities else ''}."

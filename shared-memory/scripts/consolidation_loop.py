@@ -10,6 +10,7 @@ import logging
 import select
 from datetime import datetime
 from neo4j import GraphDatabase
+from ontology import ONT
 
 # Configuration — set via environment variables or .env file
 NEO4J_URI = "bolt://localhost:7687"
@@ -24,7 +25,7 @@ RETRIEVER_URL = "http://localhost:8888/v1/embeddings"
 REASONER_URL = "http://localhost:8888/v1/chat/completions"
 IDLE_THRESHOLD_SEC = 60  # 1 minute for testing, change to 900 for 15 mins
 MAX_DEFERRAL_SEC = IDLE_THRESHOLD_SEC * 3
-DENSITY_THRESHOLD = 5
+DENSITY_THRESHOLD = ONT.density_threshold
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ConsolidationDaemon")
@@ -185,18 +186,18 @@ class ConsolidationDaemon:
         clusters = []
         try:
             with self.driver.session() as session:
-                result = session.run("""
-                    MATCH (f:Fact) WHERE f.pg_id IN $ids
-                    MATCH (f)-[:REPORTS_ON|MENTIONS]->(e:Entity)
-                    WITH DISTINCT e
-                    MATCH (e)<-[:REPORTS_ON|MENTIONS]-(neighbor:Fact)
-                    WHERE coalesce(neighbor.consolidated, false) = false
-                    WITH e, collect(neighbor) as unflagged_facts
-                    WHERE size(unflagged_facts) >= $threshold
-                    RETURN e.name as entity,
-                           [fact IN unflagged_facts | fact.content] as contents,
-                           [fact IN unflagged_facts | fact.pg_id] as pg_ids
-                """, ids=ids_to_process, threshold=DENSITY_THRESHOLD)
+                result = session.run(
+                    f"MATCH (f:{ONT.fact}) WHERE f.pg_id IN $ids"
+                    f" MATCH (f)-[:{ONT.entity_link_alias}|{ONT.entity_link}]->(e:{ONT.entity})"
+                    f" WITH DISTINCT e"
+                    f" MATCH (e)<-[:{ONT.entity_link_alias}|{ONT.entity_link}]-(neighbor:{ONT.fact})"
+                    f" WHERE coalesce(neighbor.consolidated, false) = false"
+                    f" WITH e, collect(neighbor) as unflagged_facts"
+                    f" WHERE size(unflagged_facts) >= $threshold"
+                    f" RETURN e.name as entity,"
+                    f"        [fact IN unflagged_facts | fact.content] as contents,"
+                    f"        [fact IN unflagged_facts | fact.pg_id] as pg_ids",
+                    ids=ids_to_process, threshold=DENSITY_THRESHOLD)
                 clusters = result.data()
 
             if not clusters:
@@ -262,19 +263,19 @@ class ConsolidationDaemon:
 
                         # NOTE: CROSS-DB ATOMICITY RISK — see ADR.md
                         with self.driver.session() as session:
-                            session.run("""
-                                UNWIND $fact_ids as fid
-                                MATCH (f:Fact {pg_id: fid})
-                                SET f.consolidated = true
-                                WITH collect(f) as facts
-                                MERGE (s:CommunitySummary {pg_id: $summary_pg_id})
-                                ON CREATE SET s.created_at = datetime()
-                                SET s.entity = $entity,
-                                    s.updated_at = datetime()
-                                WITH s, facts
-                                UNWIND facts as f
-                                MERGE (f)-[:SUMMARIZED_BY]->(s)
-                            """, fact_ids=pg_ids, summary_pg_id=summary_pg_id, entity=entity)
+                            session.run(
+                                f"UNWIND $fact_ids as fid"
+                                f" MATCH (f:{ONT.fact} {{pg_id: fid}})"
+                                f" SET f.consolidated = true"
+                                f" WITH collect(f) as facts"
+                                f" MERGE (s:{ONT.community_summary} {{pg_id: $summary_pg_id}})"
+                                f" ON CREATE SET s.created_at = datetime()"
+                                f" SET s.entity = $entity,"
+                                f"     s.updated_at = datetime()"
+                                f" WITH s, facts"
+                                f" UNWIND facts as f"
+                                f" MERGE (f)-[:{ONT.summarized_by}]->(s)",
+                                fact_ids=pg_ids, summary_pg_id=summary_pg_id, entity=entity)
 
                         conn.commit()
                         logger.info(f"Successfully consolidated {len(pg_ids)} facts for '{entity}'.")

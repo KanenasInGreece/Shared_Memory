@@ -3,12 +3,16 @@ import psycopg2
 from psycopg2 import pool
 import json
 import os
+import sys
 import logging
 import asyncio
 import hashlib
 from datetime import datetime
 from fastmcp import FastMCP
 from neo4j import GraphDatabase
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "shared-memory", "scripts"))
+from ontology import ONT
 
 # Configure logging to stderr for MCP visibility
 logging.basicConfig(level=logging.INFO)
@@ -159,12 +163,12 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5) -> str:
             relational_context = ""
             try:
                 with driver.session() as session:
-                    graph_result = session.run("""
-                        MATCH (f:Fact {pg_id: $pg_id})
-                        OPTIONAL MATCH (f)-[r]-(related)
-                        RETURN labels(related) as labels, related.name as name, type(r) as rel_type
-                        LIMIT 5
-                    """, pg_id=pg_id)
+                    graph_result = session.run(
+                        f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
+                        " OPTIONAL MATCH (f)-[r]-(related)"
+                        " RETURN labels(related) as labels, related.name as name, type(r) as rel_type"
+                        " LIMIT 5",
+                        pg_id=pg_id)
 
                     rels = []
                     for record in graph_result:
@@ -242,20 +246,20 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
         try:
             driver = get_neo4j()
             with driver.session() as session:
-                session.run("""
-                    MERGE (f:Fact {pg_id: $pg_id})
-                    SET f.content = $content,
-                        f.embedding = $embedding,
-                        f.created_at = datetime(),
-                        f.source = $source
-                """, pg_id=pg_id, content=content[:200], embedding=embedding, source=m_data.get("source", "mcp_sync"))
+                session.run(
+                    f"MERGE (f:{ONT.fact} {{pg_id: $pg_id}})"
+                    " SET f.content = $content,"
+                    "     f.embedding = $embedding,"
+                    "     f.created_at = datetime(),"
+                    "     f.source = $source",
+                    pg_id=pg_id, content=content[:200], embedding=embedding, source=m_data.get("source", "mcp_sync"))
 
                 for entity_name in entities:
-                    session.run("""
-                        MATCH (f:Fact {pg_id: $pg_id})
-                        MERGE (e:Entity {name: $name})
-                        MERGE (f)-[:MENTIONS]->(e)
-                    """, pg_id=pg_id, name=entity_name)
+                    session.run(
+                        f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
+                        f" MERGE (e:{ONT.entity} {{name: $name}})"
+                        f" MERGE (f)-[:{ONT.entity_link}]->(e)",
+                        pg_id=pg_id, name=entity_name)
 
             sync_msg = f"Successfully linked to Graph (Neo4j){f' with {len(entities)} entities' if entities else ''}."
         except Exception as ne:
@@ -284,12 +288,12 @@ async def archive_reasoning_trace(session_id: str, task: str, steps: list) -> st
 
         driver = get_neo4j()
         with driver.session() as session:
-            session.run("""
-                MERGE (t:ReasoningTrace {id: $session_id})
-                SET t.task = $task,
-                    t.task_embedding = $embedding,
-                    t.timestamp = datetime()
-            """, session_id=session_id, task=task, embedding=task_embedding)
+            session.run(
+                f"MERGE (t:{ONT.reasoning_trace} {{id: $session_id}})"
+                " SET t.task = $task,"
+                "     t.task_embedding = $embedding,"
+                "     t.timestamp = datetime()",
+                session_id=session_id, task=task, embedding=task_embedding)
 
             prev_id = session_id
             for i, step in enumerate(steps):
@@ -298,16 +302,16 @@ async def archive_reasoning_trace(session_id: str, task: str, steps: list) -> st
 
                 step_embedding = await get_embedding(content)
 
-                session.run("""
-                    MATCH (prev) WHERE prev.id = $prev_id
-                    CREATE (s:ReasoningStep {id: $step_id})
-                    SET s.content = $content,
-                        s.result = $result,
-                        s.embedding = $embedding,
-                        s.index = $i
-                    CREATE (prev)-[:NEXT_STEP]->(s)
-                """, prev_id=prev_id, step_id=step_id, content=content,
-                   result=str(step.get('result', '')), embedding=step_embedding, i=i)
+                session.run(
+                    " MATCH (prev) WHERE prev.id = $prev_id"
+                    f" CREATE (s:{ONT.reasoning_step} {{id: $step_id}})"
+                    " SET s.content = $content,"
+                    "     s.result = $result,"
+                    "     s.embedding = $embedding,"
+                    "     s.index = $i"
+                    f" CREATE (prev)-[:{ONT.reasoning_next}]->(s)",
+                    prev_id=prev_id, step_id=step_id, content=content,
+                    result=str(step.get('result', '')), embedding=step_embedding, i=i)
 
                 prev_id = step_id
 
