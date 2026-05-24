@@ -11,3 +11,4 @@ __pycache__/
 memory/
 MEMORY.md
 shared-memory-skill/*.skill
+CLAUDE.md
