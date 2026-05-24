@@ -1,6 +1,5 @@
 .env
 *.env
-CLAUDE.md
 .venv/
 __pycache__/
 *.pyc
@@ -11,5 +10,4 @@ __pycache__/
 *.log
 memory/
 MEMORY.md
-.claude/
 shared-memory-skill/*.skill
