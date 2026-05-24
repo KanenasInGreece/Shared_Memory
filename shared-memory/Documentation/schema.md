@@ -1,11 +1,49 @@
 # Shared Memory Schema
 
 ## PostgreSQL (Semantic Memory)
-**Table:** `technical_docs`
-- `id`: Primary Key (Serial)
-- `content`: Text content of the artifact or document.
-- `metadata`: JSONB field for additional context (source, type, timestamp).
-- `embedding`: Vector(1024) - BGE-M3 semantic embedding.
+
+### `technical_docs` — Tier 1 (Episodic)
+
+Holds every artifact saved by any agent. This is the authoritative fact store.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `SERIAL PRIMARY KEY` | Auto-incrementing row ID; used as `pg_id` in Neo4j `Fact` nodes |
+| `content` | `TEXT NOT NULL` | Full text of the saved artifact |
+| `metadata` | `JSONB` | Caller-supplied context: `source`, `type`, `timestamp`, `entities`, etc. |
+| `embedding` | `vector(1024)` | BGE-M3 embedding routed through the gateway on port 8888 |
+| `content_hash` | `TEXT UNIQUE` | SHA-256 of `content`; `ON CONFLICT DO UPDATE` makes saves idempotent |
+
+**Index:** `technical_docs_embedding_idx` — `ivfflat (embedding vector_cosine_ops)`
+
+---
+
+### `community_summaries` — Tier 3 (Semantic)
+
+Written exclusively by the consolidation daemon. Each row is an LLM-synthesised narrative that distils a dense cluster of facts grouped around a shared `Entity` hub in Neo4j. Never written directly by agents.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `SERIAL PRIMARY KEY` | Referenced as `pg_id` on the matching `CommunitySummary` node in Neo4j |
+| `content` | `TEXT NOT NULL` | LLM-generated cumulative narrative for the entity cluster |
+| `metadata` | `JSONB` | Written by the daemon — see structure below |
+| `embedding` | `vector(1024)` | BGE-M3 embedding of the synthesised `content`; used for top-1 retrieval |
+
+**`metadata` structure (written by `consolidation_loop.py`):**
+```json
+{
+  "type": "community_summary",
+  "entity": "<Entity.name that anchors the cluster>",
+  "source_pg_ids": [<list of technical_docs.id values that were consolidated>],
+  "timestamp": "<ISO-8601 datetime of this consolidation run>"
+}
+```
+
+**Index:** `community_summaries_embedding_idx` — `ivfflat (embedding vector_cosine_ops)`
+
+**Retrieval role:** queried first on every search — top-1 cosine match is prepended to results as "Global Context Summary" to orient the response before the Tier 1 vector search runs.
+
+**Growth behaviour:** each consolidation cycle appends a **new row**. Superseded summaries are never deleted or marked inactive — they accumulate alongside newer ones. Query `ORDER BY id DESC LIMIT 1` to get the latest summary for a given entity, or use the retrieval path which surfaces the embedding-closest match regardless of age.
 
 ## Neo4j (Relational Memory)
 **Core Labels:**
