@@ -50,7 +50,7 @@ INFO  Listening for 'new_artifact' notifications...
 Stopping the proxy (Ctrl+C) also stops the daemon. No separate daemon management needed.
 
 ### 🚀 MCP Orchestrator
-If the MCP server is not responding in LM Studio/Claude, restart it from here:
+If the MCP server is not responding in LM Studio, restart it from here:
 - **Command:** `uv run --with mcp --with httpx --with psycopg2-binary python /path/to/your/vector-skill.py`
 
 ## Reference

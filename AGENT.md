@@ -1,10 +1,10 @@
 # AGENT.md
 
-Guidance for AI coding agents (Claude Code, Gemini CLI, and others) working in this repository.
+Guidance for AI coding agents (Gemini CLI, and others) working in this repository.
 
 ## What This Repository Is
 
-The **Shared Memory Framework** — a three-tier semantic memory system that lets Claude Code, Gemini CLI, and LM Studio share a single persistent memory backend (Postgres + pgvector + Neo4j). All credentials are read from environment variables; no secrets are hardcoded.
+The **Shared Memory Framework** — a three-tier semantic memory system that lets Gemini CLI, LM Studio, and other AI tools share a single persistent memory backend (Postgres + pgvector + Neo4j). All credentials are read from environment variables; no secrets are hardcoded.
 
 ## Commands
 
@@ -23,7 +23,7 @@ uv run --with aiohttp python shared-memory/scripts/hive_mind_proxy.py 8888
 uv run --with httpx --with psycopg2-binary --with neo4j \
   python shared-memory/scripts/memory_bridge.py search "<query>" 5
 uv run --with httpx --with psycopg2-binary --with neo4j \
-  python shared-memory/scripts/memory_bridge.py save "<content>" '{"source":"claude","entities":["Entity1"]}'
+  python shared-memory/scripts/memory_bridge.py save "<content>" '{"source":"agent","entities":["Entity1"]}'
 uv run --with httpx --with psycopg2-binary --with neo4j \
   python shared-memory/scripts/memory_bridge.py graph "MATCH (n:Entity) RETURN n LIMIT 10"
 ```
@@ -36,10 +36,10 @@ Set `MOCK_LLM=1` to bypass LLM calls in consolidation tests. Tests are fully moc
 
 | Consumer | Interface | Entry point |
 |---|---|---|
-| Claude Code, Gemini CLI | CLI only | `shared-memory/scripts/memory_bridge.py` |
+| Gemini CLI, other CLI agents | CLI only | `shared-memory/scripts/memory_bridge.py` |
 | LM Studio | MCP (FastMCP) | `vector-skill.py` |
 
-`vector-skill.py` is registered in `mcp.json` for LM Studio — it is **not** used by Claude Code or Gemini CLI.
+`vector-skill.py` is registered in `mcp.json` for LM Studio — it is **not** used by CLI-based agents.
 
 ### Three-Tier Storage
 
