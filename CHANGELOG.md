@@ -7,6 +7,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Reranker timeout in LM Studio** (`vector-skill.py`): `hybrid_search_and_rerank` was sending up to 20 full-content candidates to BGE-Reranker in a single call. With large documents (observed max ~12 KB, total ~44 KB), inference exceeded the previous 20-second timeout, producing `httpx.ReadTimeout` with an empty error string. Fixed by: (1) reducing the Postgres candidate pool from 20 to 10 (vector similarity already ranks the best matches first), and (2) raising the rerank-specific timeout to 120 seconds (`RERANK_TIMEOUT`). Embedding calls keep the existing 20-second timeout (`EMBED_TIMEOUT`). No content truncation — documents are sent in full to preserve the context that was intentionally saved.
+
+### Added
+
+- **Entity-graph fallback for low-confidence searches** (`vector-skill.py`): When all reranker scores fall below `LOW_CONFIDENCE_THRESHOLD = -3.0`, `hybrid_search_and_rerank` now triggers `_graph_entity_fallback()`. The helper extracts significant words (>3 chars) from the query, matches them against `Entity.name` nodes in Neo4j via `MENTIONS` edges to `Fact` nodes, then fetches full content from Postgres. Results are appended under a clearly labelled "Entity Graph Results (low confidence — supplementary)" section. The main episodic results are always returned regardless; the graph fallback is additive context, not a replacement.
+
 ---
 
 ## [0.2.5] — 2026-05-26
