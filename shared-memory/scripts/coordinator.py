@@ -1,5 +1,5 @@
 """
-Memory Coordinator — Phase 1
+Memory Coordinator — Phase 2
 
 Owns all Postgres and Neo4j I/O for the memory system.
 Embedded in hive_mind_proxy.py via attach(); designed so the only change
@@ -8,20 +8,24 @@ needed to extract it into a standalone process (Phase 4) is the attach() call.
 Isolation principle: no import-time dependency on aiohttp internals beyond
 web.Request / web.Response / web.Application. All storage logic lives here.
 
-Phase 1 scope
-─────────────
-  asyncpg pool (replaces per-call psycopg2)
-  Per-entity asyncio.Lock for write serialization
-  Embedding with exponential-backoff retry
-  Outbox row written atomically with each Postgres fact (Phase 2 worker drains it)
-  Direct Neo4j writes (replaced by outbox worker in Phase 2)
+Phase 2 additions (over Phase 1)
+─────────────────────────────────
+  Outbox worker — background asyncio task that drains neo4j_outbox:
+    - polls every OUTBOX_POLL_INTERVAL seconds
+    - applies each pending row to Neo4j (MERGE Fact + Entity + MENTIONS)
+    - marks rows applied or failed (up to OUTBOX_MAX_RETRIES attempts)
+    - started with the coordinator, cancelled on clean shutdown
+  Direct Neo4j writes removed from handle_save — all Neo4j writes now
+    go through the outbox worker (eliminates ADR-001 atomicity risk)
+  ?consistency=neo4j query param on /memory/save — blocks until the
+    outbox row for the saved fact is marked applied (or timeout)
 
 Routes registered by attach()
 ──────────────────────────────
   POST /memory/save              Postgres-ack; returns 200 + pg_id
   POST /memory/search            Tier 3 → Tier 1 → rerank → Neo4j expand
   POST /memory/graph             Raw Cypher passthrough
-  GET  /memory/status/{pg_id}   Outbox row state for ?consistency=neo4j callers
+  GET  /memory/status/{pg_id}   Outbox row state
 """
 
 import asyncio
@@ -57,8 +61,13 @@ EMBED_URL  = "http://localhost:8888/v1/embeddings"
 RERANK_URL = "http://localhost:8071/v1/reranking"
 
 EMBED_RETRIES = 4
-EMBED_BACKOFF = 0.5   # seconds × attempt number  (0.5 s, 1 s, 1.5 s, 2 s)
+EMBED_BACKOFF = 0.5      # seconds × attempt number  (0.5 s, 1 s, 1.5 s, 2 s)
 POOL_MIN, POOL_MAX = 2, 10
+
+OUTBOX_POLL_INTERVAL = 2.0   # seconds between outbox drain cycles
+OUTBOX_BATCH_SIZE    = 20    # rows processed per cycle
+OUTBOX_MAX_RETRIES   = 5     # row marked 'failed' after this many Neo4j errors
+CONSISTENCY_TIMEOUT  = 15.0  # seconds to wait for ?consistency=neo4j
 
 
 # ── Coordinator ───────────────────────────────────────────────────────────────
@@ -76,15 +85,26 @@ class MemoryCoordinator:
         self._neo4j: Any = None
         self._locks: dict[str, asyncio.Lock] = {}
         self._locks_mu = asyncio.Lock()
+        self._outbox_task: asyncio.Task | None = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        self._pool = await asyncpg.create_pool(PG_DSN, min_size=POOL_MIN, max_size=POOL_MAX)
+        self._pool = await asyncpg.create_pool(
+            PG_DSN, min_size=POOL_MIN, max_size=POOL_MAX,
+            init=self._init_connection,
+        )
         self._neo4j = AsyncGraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
-        log.info("coordinator ready (pool %d–%d)", POOL_MIN, POOL_MAX)
+        self._outbox_task = asyncio.create_task(self._outbox_worker(), name="outbox-worker")
+        log.info("coordinator ready (pool %d–%d, outbox worker running)", POOL_MIN, POOL_MAX)
 
     async def stop(self) -> None:
+        if self._outbox_task:
+            self._outbox_task.cancel()
+            try:
+                await self._outbox_task
+            except asyncio.CancelledError:
+                pass
         if self._pool:
             await self._pool.close()
         if self._neo4j:
@@ -92,6 +112,17 @@ class MemoryCoordinator:
         log.info("coordinator stopped")
 
     # ── Internal helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    async def _init_connection(conn: asyncpg.Connection) -> None:
+        """Register JSONB codec so columns decode to Python dicts, not raw strings."""
+        await conn.set_type_codec(
+            "jsonb",
+            encoder=json.dumps,
+            decoder=json.loads,
+            schema="pg_catalog",
+            format="text",
+        )
 
     async def _lock_for(self, entity: str) -> asyncio.Lock:
         async with self._locks_mu:
@@ -118,6 +149,105 @@ class MemoryCoordinator:
                     attempt, EMBED_RETRIES, exc, wait,
                 )
                 await asyncio.sleep(wait)
+
+    # ── Outbox worker ─────────────────────────────────────────────────────────
+
+    async def _outbox_worker(self) -> None:
+        """Background task: drain neo4j_outbox, applying pending rows to Neo4j."""
+        log.info("outbox worker started (poll every %.1f s)", OUTBOX_POLL_INTERVAL)
+        while True:
+            try:
+                await self._drain_outbox()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.error("outbox worker error: %s", exc, exc_info=True)
+            await asyncio.sleep(OUTBOX_POLL_INTERVAL)
+
+    async def _drain_outbox(self) -> None:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, pg_id, cypher_params, retries
+                FROM neo4j_outbox
+                WHERE status = 'pending' AND retries < $1
+                ORDER BY id
+                LIMIT $2
+                """,
+                OUTBOX_MAX_RETRIES, OUTBOX_BATCH_SIZE,
+            )
+        if not rows:
+            return
+        log.debug("outbox: draining %d row(s)", len(rows))
+        for row in rows:
+            # asyncpg returns JSONB as a string in some configurations;
+            # parse defensively rather than relying on codec registration.
+            params = row["cypher_params"]
+            if isinstance(params, str):
+                params = json.loads(params)
+            await self._apply_outbox_row(row["id"], row["pg_id"], params, row["retries"])
+
+    async def _apply_outbox_row(
+        self, outbox_id: int, pg_id: int, params: dict, retries: int
+    ) -> None:
+        try:
+            async with self._neo4j.session() as session:
+                await session.run(
+                    f"MERGE (f:{ONT.fact} {{pg_id: $pg_id}})"
+                    " SET f.content = $content, f.source = $source",
+                    pg_id=pg_id,
+                    content=params.get("content_snippet", "")[:200],
+                    source=params.get("source", "coordinator"),
+                )
+                for name in params.get("entities", []):
+                    await session.run(
+                        f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
+                        f" MERGE (e:{ONT.entity} {{name: $name}})"
+                        f" MERGE (f)-[:{ONT.entity_link}]->(e)",
+                        pg_id=pg_id, name=name,
+                    )
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE neo4j_outbox SET status='applied', applied_at=now() WHERE id=$1",
+                    outbox_id,
+                )
+            log.debug("outbox: applied pg_id=%d (outbox_id=%d)", pg_id, outbox_id)
+        except Exception as exc:
+            attempt = retries + 1
+            log.warning(
+                "outbox: neo4j write failed pg_id=%d attempt %d/%d: %s",
+                pg_id, attempt, OUTBOX_MAX_RETRIES, exc,
+            )
+            async with self._pool.acquire() as conn:
+                if attempt >= OUTBOX_MAX_RETRIES:
+                    await conn.execute(
+                        "UPDATE neo4j_outbox SET status='failed', retries=$1 WHERE id=$2",
+                        attempt, outbox_id,
+                    )
+                    log.error(
+                        "outbox: pg_id=%d permanently failed after %d attempts",
+                        pg_id, attempt,
+                    )
+                else:
+                    await conn.execute(
+                        "UPDATE neo4j_outbox SET retries=$1 WHERE id=$2",
+                        attempt, outbox_id,
+                    )
+
+    async def _wait_for_outbox(self, pg_id: int) -> bool:
+        """Poll until the outbox row for pg_id is applied, or CONSISTENCY_TIMEOUT expires."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + CONSISTENCY_TIMEOUT
+        while loop.time() < deadline:
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT status FROM neo4j_outbox WHERE pg_id=$1 ORDER BY id DESC LIMIT 1",
+                    pg_id,
+                )
+            if row and row["status"] == "applied":
+                return True
+            await asyncio.sleep(0.25)
+        return False
 
     # ── POST /memory/save ─────────────────────────────────────────────────────
 
@@ -202,28 +332,13 @@ class MemoryCoordinator:
             for lk in entity_locks:
                 lk.release()
 
-        # Neo4j direct write — Phase 1.
-        # In Phase 2 the outbox worker takes over; this block is removed.
-        neo4j_status = "synced"
-        try:
-            async with self._neo4j.session() as session:
-                await session.run(
-                    f"MERGE (f:{ONT.fact} {{pg_id: $pg_id}})"
-                    " SET f.content = $content, f.source = $source",
-                    pg_id=pg_id,
-                    content=content[:200],
-                    source=metadata.get("source", "coordinator"),
-                )
-                for name in entities:
-                    await session.run(
-                        f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
-                        f" MERGE (e:{ONT.entity} {{name: $name}})"
-                        f" MERGE (f)-[:{ONT.entity_link}]->(e)",
-                        pg_id=pg_id, name=name,
-                    )
-        except Exception as exc:
-            log.warning("neo4j sync failed for pg_id=%d: %s", pg_id, exc)
-            neo4j_status = "pending"  # outbox worker retries in Phase 2
+        # Neo4j is applied asynchronously by the outbox worker.
+        # ?consistency=neo4j blocks until the row is marked applied.
+        if request.rel_url.query.get("consistency") == "neo4j":
+            applied = await self._wait_for_outbox(pg_id)
+            neo4j_status = "applied" if applied else "timeout"
+        else:
+            neo4j_status = "pending"
 
         warn = (
             ""
