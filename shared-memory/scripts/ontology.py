@@ -1,5 +1,8 @@
 import os
+import re
 from dataclasses import dataclass
+
+_VALID_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 try:
     import yaml
@@ -54,4 +57,15 @@ def _load() -> OntologyConfig:
         return OntologyConfig()
 
 
-ONT = _load()
+def _validate(cfg: OntologyConfig) -> OntologyConfig:
+    """Reject label/relationship names that could inject Cypher when interpolated."""
+    for field, val in vars(cfg).items():
+        if isinstance(val, str) and not _VALID_IDENTIFIER.match(val):
+            raise ValueError(
+                f"ontology.yaml: {field}={val!r} is not a valid Cypher identifier "
+                "(must match [A-Za-z_][A-Za-z0-9_]*)"
+            )
+    return cfg
+
+
+ONT = _validate(_load())

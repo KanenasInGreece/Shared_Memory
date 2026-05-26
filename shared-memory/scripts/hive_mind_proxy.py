@@ -267,7 +267,11 @@ async def main() -> None:
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    # Bind to localhost by default — the coordinator API is not authenticated and
+    # must not be reachable from the network. Set PROXY_BIND=0.0.0.0 to opt into
+    # all-interfaces binding (e.g. inside a Docker network or VM).
+    bind_host = os.environ.get("PROXY_BIND", "127.0.0.1")
+    site = web.TCPSite(runner, bind_host, PORT)
     await site.start()
 
     log.info("### Hive-Mind Proxy on :%d [aiohttp]", PORT)

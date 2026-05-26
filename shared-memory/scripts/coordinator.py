@@ -33,6 +33,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from typing import Any
 
 import asyncpg
@@ -68,6 +69,15 @@ OUTBOX_POLL_INTERVAL = 2.0   # seconds between outbox drain cycles
 OUTBOX_BATCH_SIZE    = 20    # rows processed per cycle
 OUTBOX_MAX_RETRIES   = 5     # row marked 'failed' after this many Neo4j errors
 CONSISTENCY_TIMEOUT  = 15.0  # seconds to wait for ?consistency=neo4j
+
+# Cypher write-operation guard — reject queries containing mutating keywords.
+# Defence-in-depth: blocks obvious destructive ops while a deeper Neo4j RBAC
+# solution is built. Regex is intentionally strict (SET followed by a space
+# avoids matching property names that contain "set" as a substring).
+_WRITE_CYPHER = re.compile(
+    r"\b(CREATE|DELETE|DETACH\s+DELETE|SET\s|REMOVE|MERGE|CALL|LOAD\s+CSV|DROP)\b",
+    re.IGNORECASE,
+)
 
 
 # ── Coordinator ───────────────────────────────────────────────────────────────
@@ -165,17 +175,24 @@ class MemoryCoordinator:
             await asyncio.sleep(OUTBOX_POLL_INTERVAL)
 
     async def _drain_outbox(self) -> None:
+        # FOR UPDATE SKIP LOCKED: if two coordinator instances overlap (e.g. during
+        # proxy restart), each instance claims a disjoint set of rows — no row is
+        # processed twice. Rows held by another transaction are silently skipped and
+        # picked up on the next poll cycle.
         async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, pg_id, cypher_params, retries
-                FROM neo4j_outbox
-                WHERE status = 'pending' AND retries < $1
-                ORDER BY id
-                LIMIT $2
-                """,
-                OUTBOX_MAX_RETRIES, OUTBOX_BATCH_SIZE,
-            )
+            async with conn.transaction():
+                rows = await conn.fetch(
+                    """
+                    SELECT id, pg_id, cypher_params, retries
+                    FROM neo4j_outbox
+                    WHERE status = 'pending' AND retries < $1
+                    ORDER BY id
+                    LIMIT $2
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                    OUTBOX_MAX_RETRIES, OUTBOX_BATCH_SIZE,
+                )
+                rows = list(rows)   # copy out before the transaction closes
         if not rows:
             return
         log.debug("outbox: draining %d row(s)", len(rows))
@@ -191,21 +208,21 @@ class MemoryCoordinator:
         self, outbox_id: int, pg_id: int, params: dict, retries: int
     ) -> None:
         try:
+            # All Neo4j writes in one round-trip via UNWIND so they succeed or
+            # fail atomically. MERGE is idempotent — safe to retry on transient errors.
             async with self._neo4j.session() as session:
                 await session.run(
                     f"MERGE (f:{ONT.fact} {{pg_id: $pg_id}})"
-                    " SET f.content = $content, f.source = $source",
+                    f" SET f.content = $content, f.source = $source"
+                    f" WITH f"
+                    f" UNWIND $entities AS ename"
+                    f" MERGE (e:{ONT.entity} {{name: ename}})"
+                    f" MERGE (f)-[:{ONT.entity_link}]->(e)",
                     pg_id=pg_id,
                     content=params.get("content_snippet", "")[:200],
                     source=params.get("source", "coordinator"),
+                    entities=params.get("entities", []),
                 )
-                for name in params.get("entities", []):
-                    await session.run(
-                        f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
-                        f" MERGE (e:{ONT.entity} {{name: $name}})"
-                        f" MERGE (f)-[:{ONT.entity_link}]->(e)",
-                        pg_id=pg_id, name=name,
-                    )
             async with self._pool.acquire() as conn:
                 await conn.execute(
                     "UPDATE neo4j_outbox SET status='applied', applied_at=now() WHERE id=$1",
@@ -213,25 +230,27 @@ class MemoryCoordinator:
                 )
             log.debug("outbox: applied pg_id=%d (outbox_id=%d)", pg_id, outbox_id)
         except Exception as exc:
-            attempt = retries + 1
             log.warning(
                 "outbox: neo4j write failed pg_id=%d attempt %d/%d: %s",
-                pg_id, attempt, OUTBOX_MAX_RETRIES, exc,
+                pg_id, retries + 1, OUTBOX_MAX_RETRIES, exc,
             )
             async with self._pool.acquire() as conn:
-                if attempt >= OUTBOX_MAX_RETRIES:
+                if retries + 1 >= OUTBOX_MAX_RETRIES:
+                    # Atomic: bump retries AND flip status in one statement
                     await conn.execute(
-                        "UPDATE neo4j_outbox SET status='failed', retries=$1 WHERE id=$2",
-                        attempt, outbox_id,
+                        "UPDATE neo4j_outbox SET status='failed', retries=retries+1 WHERE id=$1",
+                        outbox_id,
                     )
                     log.error(
                         "outbox: pg_id=%d permanently failed after %d attempts",
-                        pg_id, attempt,
+                        pg_id, retries + 1,
                     )
                 else:
+                    # retries+1 at DB level prevents lost updates if two instances
+                    # process the same row concurrently (last-write-wins is avoided).
                     await conn.execute(
-                        "UPDATE neo4j_outbox SET retries=$1 WHERE id=$2",
-                        attempt, outbox_id,
+                        "UPDATE neo4j_outbox SET retries=retries+1 WHERE id=$1 AND status='pending'",
+                        outbox_id,
                     )
 
     async def _wait_for_outbox(self, pg_id: int) -> bool:
@@ -284,11 +303,15 @@ class MemoryCoordinator:
         except RuntimeError as exc:
             return web.json_response({"status": "error", "message": str(exc)}, status=503)
 
-        # Acquire per-entity write locks (sorted to prevent deadlocks across concurrent saves)
+        # Acquire per-entity write locks (sorted to prevent deadlocks across concurrent saves).
+        # Track only the locks we actually acquired: if acquire() is cancelled mid-list,
+        # the finally block releases only what we hold — avoiding RuntimeError on unacquired locks.
         entity_locks = [await self._lock_for(e) for e in sorted(set(entities))]
-        for lk in entity_locks:
-            await lk.acquire()
+        acquired: list[asyncio.Lock] = []
         try:
+            for lk in entity_locks:
+                await lk.acquire()
+                acquired.append(lk)
             async with self._pool.acquire() as conn:
                 async with conn.transaction():
                     row = await conn.fetchrow(
@@ -298,8 +321,9 @@ class MemoryCoordinator:
                              agent_id, scope, visibility)
                         VALUES ($1, $2::jsonb, $3::vector, $4, $5, $6, $7)
                         ON CONFLICT (content_hash) DO UPDATE
-                            SET metadata = EXCLUDED.metadata,
-                                agent_id = EXCLUDED.agent_id
+                            SET metadata  = EXCLUDED.metadata,
+                                agent_id  = EXCLUDED.agent_id,
+                                embedding = EXCLUDED.embedding
                         RETURNING id
                         """,
                         content, json.dumps(metadata), str(embedding),
@@ -329,7 +353,7 @@ class MemoryCoordinator:
                         json.dumps({"pg_id": pg_id}),
                     )
         finally:
-            for lk in entity_locks:
+            for lk in acquired:
                 lk.release()
 
         # Neo4j is applied asynchronously by the outbox worker.
@@ -363,7 +387,7 @@ class MemoryCoordinator:
             )
 
         query = body.get("query", "")
-        limit = int(body.get("limit", 5))
+        limit = min(max(1, int(body.get("limit", 5))), 100)
         scope = body.get("scope")  # None = no scope filter
 
         if not query:
@@ -499,12 +523,22 @@ class MemoryCoordinator:
                 {"status": "error", "message": "cypher is required"}, status=400
             )
 
+        if _WRITE_CYPHER.search(cypher):
+            return web.json_response(
+                {
+                    "status": "error",
+                    "message": "only read-only Cypher (MATCH/RETURN/WITH/WHERE/OPTIONAL MATCH) is permitted",
+                },
+                status=400,
+            )
+
         try:
             async with self._neo4j.session() as session:
                 result  = await session.run(cypher, **params)
                 records = await result.data()
         except Exception as exc:
-            return web.json_response({"status": "error", "message": str(exc)}, status=500)
+            log.error("graph query error for cypher=%r: %s", cypher[:120], exc, exc_info=True)
+            return web.json_response({"status": "error", "message": "query failed"}, status=500)
 
         return web.json_response({"status": "success", "records": records})
 
