@@ -9,6 +9,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Coordinator Phase 2 — outbox worker** (`coordinator.py`):
+  - Background `asyncio.Task` (`_outbox_worker`) started with the coordinator, cancelled on clean shutdown
+  - `_drain_outbox()` polls `neo4j_outbox` every 2 s, processes up to 20 `status='pending'` rows per cycle
+  - `_apply_outbox_row()` applies each row to Neo4j (MERGE Fact + Entity + MENTIONS); marks `applied` on success, increments `retries` on failure; marks `failed` after 5 attempts
+  - `_wait_for_outbox()` polls outbox status for `?consistency=neo4j` callers (15 s timeout, 0.25 s poll interval)
+  - Direct Neo4j writes removed from `handle_save` — all Neo4j writes now routed through the outbox worker; ADR-001 cross-DB atomicity risk eliminated
+  - `POST /memory/save?consistency=neo4j` blocks until the outbox row is applied before returning
+
+### Added
+
 - **Memory Coordinator — Phase 1** (`shared-memory/scripts/coordinator.py`) — all Postgres and Neo4j I/O centralised in a single module embedded in the Hive-Mind Gateway:
   - `asyncpg` connection pool (min 2, max 10) replaces per-call `psycopg2` connections; eliminates the connection-per-save burst problem under concurrent agent writes
   - Per-entity `asyncio.Lock` — concurrent saves to the same entity cluster are serialized; prevents duplicate hub creation under agent-swarm concurrency
