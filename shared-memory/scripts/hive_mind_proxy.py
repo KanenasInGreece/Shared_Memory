@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import shutil
 import signal
 import sys
@@ -9,6 +10,22 @@ from aiohttp.client_exceptions import (
     ClientError,
     ServerDisconnectedError,
 )
+
+# Load .env BEFORE importing coordinator — coordinator reads env vars at module
+# level, so credentials must be in os.environ by the time that import runs.
+def _load_env() -> None:
+    env_path = Path(__file__).parent.parent.parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        os.environ.setdefault(key.strip(), val.strip())
+
+_load_env()
+
 from coordinator import MemoryCoordinator, attach as attach_coordinator
 
 # Unified Hive-Mind Async Proxy v6
