@@ -5,6 +5,8 @@ Every insight one agent gains is available to every other — across sessions, a
 
 A unified semantic and relational memory layer built from first principles to survive the interference problem and scale safely to concurrent multi-agent workloads.
 
+![Claude Code](https://img.shields.io/badge/Claude_Code-Skill-blue)
+![Grok](https://img.shields.io/badge/Grok-Skill-blue)
 ![Gemini CLI](https://img.shields.io/badge/Gemini_CLI-Skill-blue)
 ![LM Studio](https://img.shields.io/badge/LM_Studio-MCP-blue)
 ![Neo4j](https://img.shields.io/badge/Neo4j-Graph-green)
@@ -16,7 +18,7 @@ A unified semantic and relational memory layer built from first principles to su
 
 ## Table of Contents
 
-1. [The Vision: One Brain, Three Tools](#1-the-vision-one-brain-three-tools)
+1. [The Vision: One Brain, Many Agents](#1-the-vision-one-brain-many-agents)
 2. [The Problem: Why RAG Systems Forget](#2-the-problem-why-rag-systems-forget)
 3. [Architecture Overview: Three Tiers](#3-architecture-overview-three-tiers)
 4. [OS Prerequisites — Fedora / Linux](#4-os-prerequisites--fedora--linux)
@@ -39,7 +41,7 @@ A unified semantic and relational memory layer built from first principles to su
 
 ---
 
-## 1. The Vision: One Brain, Three Tools
+## 1. The Vision: One Brain, Many Agents
 
 Every AI workstation today runs several tools in parallel — a terminal agent, a desktop chat model, a coding assistant. Each of them works hard in a session, reasons through a problem, discovers something useful. Then the session ends, and all of that is gone. The next tool starts cold, the next session starts from zero. They do not talk to each other. They cannot.
 
@@ -47,11 +49,15 @@ This framework is built around one idea: those tools should share a brain. When 
 
 **The consumers, and how they connect:**
 
-- **Gemini CLI** — uses `memory_bridge.py` packaged as a Gemini skill (`/activate shared-memory`). No MCP server required; the CLI is the interface.
+- **Claude Code** — uses `memory_bridge.py` packaged as a Claude skill (`/shared-memory`). Install the skill directory under `~/.claude/skills/`.
+
+- **Grok** — uses `memory_bridge.py` packaged as a Grok skill (`/shared-memory`). Install the skill directory under `~/.grok/skills/`.
+
+- **Gemini CLI** — uses `memory_bridge.py` packaged as a Gemini skill (`/activate shared-memory`). Install the skill directory under `~/.gemini/skills/`.
 
 - **LM Studio** — uses an MCP server (`vector-skill.py`), registered in `mcp.json`. The model calls `save_artifact` and `hybrid_search_and_rerank` as tools against the same backend.
 
-The infrastructure underneath all three is identical: one coordinator managing all Postgres and Neo4j connections, one embedding space enforced by BGE-M3, one consolidation daemon synthesising shared narratives. The tools differ; the memory layer does not.
+The infrastructure underneath all agents is identical: one coordinator managing all Postgres and Neo4j connections, one embedding space enforced by BGE-M3, one consolidation daemon synthesising shared narratives. The agents differ; the memory layer does not.
 
 The design is intentionally agent-agnostic: any tool that can make HTTP calls can reach the coordinator directly on port 8888. Adding a new agent type is a matter of packaging — not changing the backend.
 
@@ -95,10 +101,11 @@ This is the problem the Shared Memory Framework is designed to address. The solu
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                          AGENT LAYER                                     │
+│                              AGENT LAYER                                 │
 │                                                                          │
-│   CLI Agent (CLI)      Gemini CLI (skill)  LM Studio (MCP)  Any HTTP     │
-│   memory_bridge.py    memory_bridge.py    vector-skill.py  client        │
+│  Claude Code   Grok    Gemini CLI   LM Studio (MCP)    Any HTTP          │
+│  (skill)       (skill) (skill)      vector-skill.py    client            │
+│  memory_bridge.py ←→ memory_bridge.py ←→ memory_bridge.py               │
 └─────────────┬──────────────────────┬─────────────────────┬──────────────┘
               │                      │                     │
               └──────────────────────▼─────────────────────┘
@@ -403,16 +410,53 @@ source .venv/bin/activate
 
 > **uv users:** all commands in this README use `uv run --with ...` which handles dependencies automatically without a venv. Both approaches work — use whichever fits your workflow.
 
-### CLI Tools
+### Smoke-test the bridge
 
-Any CLI-based agent uses `memory_bridge.py` as a plain CLI command — no MCP server or skill registration required. The script lives in `shared-memory/scripts/` inside the repo; reference it by absolute path from your agent's session.
-
-**Wire it into your agent's context** so it knows when and how to use shared memory. Copy `shared-memory/SKILL.md` into your project's instructions file — it defines the task triggers, the save contract, and the retrieval workflow.
+After the full stack is running, verify the bridge works from any shell:
 
 ```bash
-# Smoke-test the bridge after the full stack is running
-uv run --with httpx --with psycopg2-binary --with neo4j \
+uv run --with httpx --with python-dotenv \
   python /path/to/Shared_Memory/shared-memory/scripts/memory_bridge.py search "test" 3
+```
+
+### Claude Code
+
+Claude Code loads skills from `~/.claude/skills/`. Create the skill directory with a symlink so scripts always stay in sync with the repo:
+
+```bash
+mkdir -p ~/.claude/skills/shared-memory
+
+# Symlink scripts — always in sync with the repo
+ln -s /path/to/Shared_Memory/shared-memory/scripts ~/.claude/skills/shared-memory/scripts
+
+# Copy SKILL.md (or symlink it too)
+cp shared-memory-skill/shared-memory/SKILL.md ~/.claude/skills/shared-memory/SKILL.md
+```
+
+Invoke in any Claude Code session:
+
+```
+/shared-memory
+```
+
+### Grok
+
+Grok loads skills from `~/.grok/skills/`. Same symlink pattern:
+
+```bash
+mkdir -p ~/.grok/skills/shared-memory
+
+# Symlink scripts — always in sync with the repo
+ln -s /path/to/Shared_Memory/shared-memory/scripts ~/.grok/skills/shared-memory/scripts
+
+# Copy SKILL.md
+cp shared-memory-skill/shared-memory/SKILL.md ~/.grok/skills/shared-memory/SKILL.md
+```
+
+Invoke in any Grok session:
+
+```
+/shared-memory
 ```
 
 ### Gemini CLI
@@ -429,13 +473,11 @@ cp -r shared-memory-skill/shared-memory ~/.gemini/skills/shared-memory
 ln -s /path/to/Shared_Memory/shared-memory-skill/shared-memory ~/.gemini/skills/shared-memory
 ```
 
-The skill is self-contained: `SKILL.md` describes the task triggers and workflows; `scripts/memory_bridge.py` is the runtime bridge. Activate in any Gemini CLI session:
+Activate in any Gemini CLI session:
 
 ```
 /activate shared-memory
 ```
-
-The `SKILL.md` inside the skill directory drives the behavior — Gemini reads it to know when to search, when to save, and what format the commands take.
 
 ### LM Studio
 
@@ -477,6 +519,8 @@ Start LM Studio. The `rag-orchestrator` MCP server should appear in the tool pan
 
 | Consumer | Interface | Entry point | Consolidation trigger |
 |---|---|---|---|
+| **Claude Code** | CLI (skill `/shared-memory`) | `~/.claude/skills/shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
+| **Grok** | CLI (skill `/shared-memory`) | `~/.grok/skills/shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
 | **Gemini CLI** | CLI (skill `/activate shared-memory`) | `~/.gemini/skills/shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
 | **LM Studio** | MCP (FastMCP) | `vector-skill.py` → `rag-orchestrator` in `mcp.json` | via coordinator → `pg_notify` |
 | **Any HTTP client** | REST | `POST http://localhost:8888/memory/save\|search\|graph` | via coordinator → `pg_notify` |
@@ -517,10 +561,11 @@ The coordinator exposes four endpoints on port 8888. These can be called directl
 
 **Write acknowledgment:** saves return `200 OK` once the fact is committed to Postgres. The outbox row for Neo4j is written in the same transaction; Neo4j application is asynchronous. Use `GET /memory/status/{pg_id}` to confirm Neo4j application, or pass `?consistency=neo4j` (Phase 2) to block until the outbox row is applied.
 
-### Gemini CLI skill activation
+### Skill activation
 
 ```
-/activate shared-memory
+/shared-memory          # Claude Code and Grok
+/activate shared-memory # Gemini CLI
 ```
 
 ---
@@ -842,7 +887,7 @@ This framework is actively evolving toward a workstation where any number of AI 
 | **Concurrency hardening** | FOR UPDATE SKIP LOCKED, atomic retry increment, single UNWIND batch query, acquired-lock tracking, ON CONFLICT upsert for community_summaries, embedding refresh on re-save, LISTEN reconnect, event-loop non-blocking poll | ✅ Done |
 | **Security baseline** | Read-only Cypher guard, localhost-only bind (PROXY_BIND opt-in), opaque error responses, bounded limit, ONT label validation at startup, prompt injection delimiters | ✅ Done |
 | **Configurable ontology — Path A** | All Neo4j labels and relationship types in `ontology.yaml`; ONT singleton with validation; falls back to hardcoded defaults; density threshold configurable | ✅ Done |
-| **Agent integration** | Gemini CLI (skill directory), LM Studio (MCP via vector-skill.py) | ✅ Done |
+| **Agent integration** | Claude Code (skill), Grok (skill), Gemini CLI (skill), LM Studio (MCP via vector-skill.py) | ✅ Done |
 | **Schema migrations** | Migration runner; 001 (multi-agent schema: agent_id, scope, visibility, neo4j_outbox); 002 (concurrency hardening: unique index on community_summaries, covering index on outbox) | ✅ Done |
 
 ### In Progress / Planned
