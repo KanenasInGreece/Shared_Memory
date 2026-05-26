@@ -28,7 +28,7 @@ _load_env()
 
 from coordinator import MemoryCoordinator, attach as attach_coordinator
 
-# Unified Hive-Mind Async Proxy v6
+# Unified Hive-Mind Async Proxy v7
 # Routes /v1/embeddings -> 8070 (BGE-M3)
 # Routes /v1/reranking  -> 8071 (BGE-Reranker-v2-m3)
 # Routes everything else -> 5000 (LM Studio / local LLM)
@@ -40,6 +40,18 @@ logging.basicConfig(
     stream=sys.stderr,
 )
 log = logging.getLogger("hive-proxy")
+
+# --------------------------------------------------------------------------- #
+# Watchdog configuration
+# --------------------------------------------------------------------------- #
+_DAEMON_MAX_RESTARTS    = 5    # circuit-breaker trip count
+_DAEMON_RESTART_WINDOW  = 600  # rolling window (seconds) for the trip counter
+_DAEMON_MIN_STABLE_SEC  = 30   # uptime needed to reset backoff — avoids boot-loop penalty
+_DAEMON_MAX_BACKOFF_SEC = 60   # exponential backoff ceiling (seconds)
+
+# Shared state written by the watchdog, read by the health handler.
+_daemon_proc:    "asyncio.subprocess.Process | None" = None
+_daemon_healthy: bool = False  # True while the subprocess is alive
 
 # --------------------------------------------------------------------------- #
 # Routing
@@ -235,13 +247,120 @@ async def _start_daemon() -> "asyncio.subprocess.Process | None":
     return proc
 
 
-async def _monitor_daemon(proc: "asyncio.subprocess.Process") -> None:
-    await proc.wait()
-    # -SIGTERM means we terminated it cleanly during shutdown
-    if proc.returncode not in (0, -signal.SIGTERM):
-        log.warning("Consolidation daemon exited unexpectedly (code %d)", proc.returncode)
-    else:
-        log.info("Consolidation daemon stopped (code %d).", proc.returncode)
+async def _watchdog_daemon(stop_event: asyncio.Event) -> None:
+    """Start the consolidation daemon and restart it on unexpected crashes.
+
+    False-positive protection:
+    - Only restarts on unexpected exits (not returncode 0 or -SIGTERM).
+    - Exponential backoff (1 s → … → 60 s) so a boot-loop fails slowly.
+    - Backoff resets when the daemon ran stably for ≥ _DAEMON_MIN_STABLE_SEC.
+    - Circuit breaker: ≥ _DAEMON_MAX_RESTARTS crashes inside _DAEMON_RESTART_WINDOW
+      seconds → log CRITICAL and stop restarting (requires gateway restart to reset).
+    """
+    global _daemon_proc, _daemon_healthy
+
+    restart_times: list[float] = []
+    backoff = 1.0
+
+    while not stop_event.is_set():
+        proc = await _start_daemon()
+        if proc is None:
+            _daemon_healthy = False
+            return
+
+        _daemon_proc    = proc
+        _daemon_healthy = True
+        t_start = asyncio.get_event_loop().time()
+
+        await proc.wait()
+        _daemon_healthy = False
+
+        if stop_event.is_set():
+            # Clean shutdown — gateway is going down; don't restart.
+            break
+
+        uptime   = asyncio.get_event_loop().time() - t_start
+        exitcode = proc.returncode
+
+        if exitcode in (0, -signal.SIGTERM):
+            log.info("Consolidation daemon exited cleanly (code %d).", exitcode)
+            break
+
+        log.warning(
+            "Consolidation daemon crashed (code %d, uptime %.1fs) — evaluating restart.",
+            exitcode, uptime,
+        )
+
+        # Reset backoff if the daemon was stable long enough — avoids penalising
+        # recoverable transient failures (brief Postgres blip, LLM timeout).
+        if uptime >= _DAEMON_MIN_STABLE_SEC:
+            backoff = 1.0
+
+        # Circuit breaker: count crashes inside the rolling window.
+        now = asyncio.get_event_loop().time()
+        restart_times = [t for t in restart_times if now - t < _DAEMON_RESTART_WINDOW]
+        if len(restart_times) >= _DAEMON_MAX_RESTARTS:
+            log.critical(
+                "Consolidation daemon crashed %d times in %ds — "
+                "circuit breaker open. Restart the gateway to reset.",
+                _DAEMON_MAX_RESTARTS, _DAEMON_RESTART_WINDOW,
+            )
+            break
+
+        restart_times.append(now)
+        log.info(
+            "Restarting consolidation daemon in %.1fs (crash %d/%d this window)...",
+            backoff, len(restart_times), _DAEMON_MAX_RESTARTS,
+        )
+        try:
+            # Sleep with backoff — but wake immediately if shutdown fires.
+            await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+            break  # stop_event fired during backoff — clean exit
+        except asyncio.TimeoutError:
+            pass
+        backoff = min(backoff * 2, _DAEMON_MAX_BACKOFF_SEC)
+
+    log.info("Daemon watchdog exiting.")
+
+
+# --------------------------------------------------------------------------- #
+# Health endpoint
+# --------------------------------------------------------------------------- #
+async def handle_health(request: web.Request) -> web.Response:
+    """GET /health — probe all upstream backends and report daemon liveness.
+
+    HTTP 200: embedder + reranker both reachable (save/search path is healthy).
+    HTTP 503: at least one critical backend is down.
+
+    LLM (:5000) is non-critical for saves and searches — its status is reported
+    but does not affect the overall HTTP status code (it only affects consolidation).
+    """
+    proxy: AsyncHiveMindProxy = request.app["proxy"]
+    checks: dict[str, str] = {}
+
+    for name, url in [
+        ("embedder", "http://localhost:8070/health"),
+        ("reranker",  "http://localhost:8071/health"),
+        ("llm",       "http://localhost:5000/health"),
+    ]:
+        try:
+            timeout = ClientTimeout(total=2.0)
+            async with proxy.session.get(url, timeout=timeout) as r:
+                checks[name] = "ok" if r.status < 400 else f"http_{r.status}"
+        except asyncio.TimeoutError:
+            checks[name] = "timeout"
+        except Exception:
+            checks[name] = "down"
+
+    checks["daemon"] = "running" if _daemon_healthy else "stopped"
+
+    # Embedder and reranker are the critical path — every save and search
+    # depends on them.  LLM and daemon degradation is reported but does not
+    # fail the health check so agents can still read/write memory.
+    critical_ok = checks["embedder"] == "ok" and checks["reranker"] == "ok"
+    checks["status"] = "ok" if critical_ok else "degraded"
+
+    return web.json_response(checks, status=200 if critical_ok else 503)
 
 
 # --------------------------------------------------------------------------- #
@@ -259,10 +378,11 @@ async def main() -> None:
     # 50 MB ceiling applies to requests buffered via request.read().
     # The streaming path (request.content) bypasses this — see handle_proxy.
     app = web.Application(client_max_size=50 * 1024 * 1024)
+    app["proxy"] = proxy  # shared with health handler
 
-    # Coordinator routes must be registered before the catch-all proxy route.
+    # Coordinator routes and health endpoint before the catch-all proxy route.
     attach_coordinator(app, coordinator)
-
+    app.router.add_get("/health", handle_health)
     app.router.add_route("*", "/{tail:.*}", proxy.handle_proxy)
 
     runner = web.AppRunner(app)
@@ -277,10 +397,8 @@ async def main() -> None:
     log.info("### Hive-Mind Proxy on :%d [aiohttp]", PORT)
     log.info("### /v1/embeddings->8070 | /v1/reranking->8071 | default->5000")
 
-    daemon_proc = await _start_daemon()
-    monitor_task = asyncio.create_task(_monitor_daemon(daemon_proc)) if daemon_proc else None
-
     stop_event = asyncio.Event()
+    watchdog_task = asyncio.create_task(_watchdog_daemon(stop_event))
     loop = asyncio.get_running_loop()
 
     def _on_shutdown_signal():
@@ -300,21 +418,26 @@ async def main() -> None:
     # Drain sequence — order is load-bearing:
     # 1. site.stop()      — close the listen socket; no new connections accepted
     # 2. runner.cleanup() — wait for in-flight requests to finish
-    # 3. proxy.cleanup()  — close the upstream connection pool last
+    # 3. terminate daemon — unblocks watchdog's proc.wait()
+    # 4. watchdog_task    — wait for watchdog to confirm it has exited
+    # 5. coordinator/proxy cleanup last
     log.info("Stopping listener...")
     await site.stop()
     log.info("Draining in-flight requests...")
     await runner.cleanup()
-    if daemon_proc:
-        log.info("Stopping consolidation daemon (pid %d)...", daemon_proc.pid)
-        daemon_proc.terminate()
+    if _daemon_proc and _daemon_proc.returncode is None:
+        log.info("Stopping consolidation daemon (pid %d)...", _daemon_proc.pid)
+        _daemon_proc.terminate()
         try:
-            await asyncio.wait_for(daemon_proc.wait(), timeout=5.0)
+            await asyncio.wait_for(_daemon_proc.wait(), timeout=5.0)
         except asyncio.TimeoutError:
             log.warning("Daemon did not exit in 5 s — sending SIGKILL")
-            daemon_proc.kill()
-    if monitor_task:
-        monitor_task.cancel()
+            _daemon_proc.kill()
+    watchdog_task.cancel()
+    try:
+        await watchdog_task
+    except asyncio.CancelledError:
+        pass
     await coordinator.stop()
     await proxy.cleanup()
     log.info("Clean shutdown complete.")
