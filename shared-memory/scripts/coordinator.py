@@ -292,6 +292,18 @@ class MemoryCoordinator:
             return web.json_response(
                 {"status": "error", "message": "metadata must be a JSON object"}, status=400
             )
+        if not metadata.get("source"):
+            return web.json_response(
+                {
+                    "status": "error",
+                    "message": (
+                        "metadata.source is required — identify the saving agent "
+                        "(e.g. 'claude_code', 'grok', 'antigravity'). "
+                        "Facts without provenance are rejected to protect memory integrity."
+                    ),
+                },
+                status=400,
+            )
 
         entities     = metadata.get("entities", [])
         content_hash = hashlib.sha256(content.encode()).hexdigest()
