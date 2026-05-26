@@ -1,9 +1,9 @@
 # Shared Memory Framework
 
-**Gemini CLI, LM Studio, and AI CLI tools — three different tools, one brain.**
-Every insight one agent gains is available to every other. Knowledge stays local, private, and shared across all your smart tools.
+**A local, private, shared brain for every AI agent on your workstation.**
+Every insight one agent gains is available to every other — across sessions, across tools, across models. Knowledge stays yours.
 
-A unified semantic and relational memory layer built to survive the interference problem — explained from first principles to a running stack.
+A unified semantic and relational memory layer built from first principles to survive the interference problem and scale safely to concurrent multi-agent workloads.
 
 ![Gemini CLI](https://img.shields.io/badge/Gemini_CLI-Skill-blue)
 ![LM Studio](https://img.shields.io/badge/LM_Studio-MCP-blue)
@@ -34,7 +34,8 @@ A unified semantic and relational memory layer built to survive the interference
 16. [LM Studio MCP Configuration](#16-lm-studio-mcp-configuration)
 17. [Testing](#17-testing)
 18. [Open Problems](#18-open-problems)
-19. [References](#19-references)
+19. [Development Roadmap — Multi-Agent Safe Workstation](#19-development-roadmap--multi-agent-safe-workstation)
+20. [References](#20-references)
 
 ---
 
@@ -44,13 +45,17 @@ Every AI workstation today runs several tools in parallel — a terminal agent, 
 
 This framework is built around one idea: those tools should share a brain. When Gemini CLI figures out why the proxy was failing, any other agent should already know the next time it is asked about the proxy. When LM Studio runs a consolidation on a set of architectural facts, those summaries should be there for any agent that searches next.
 
-**The three consumers, and how they connect:**
+**The consumers, and how they connect:**
 
-- **CLI agents** (e.g. Gemini CLI) — use a CLI bridge (`memory_bridge.py`) to search, save, and query the graph. No MCP server required; the CLI is the interface. Gemini CLI packages this as a skill (`/activate shared-memory`).
+- **Claude Code** — uses `memory_bridge.py` via a skill (`/shared-memory`). Scripts are symlinked into the repo; always current. Saves, searches, and graph queries all route through the coordinator on port 8888.
 
-- **LM Studio** — uses an MCP server (`vector-skill.py`), registered in `mcp.json`. The model calls `save_artifact` and `hybrid_search_and_rerank` as tools, same backend as the others.
+- **Gemini CLI** — same CLI bridge, packaged as a Gemini skill (`/activate shared-memory`). No MCP server required; the CLI is the interface.
 
-The infrastructure underneath all three is identical: one Postgres instance holding vectors, one Neo4j instance holding the graph, one BGE-M3 embedding model providing the coordinate system. The tools differ; the memory layer does not.
+- **LM Studio** — uses an MCP server (`vector-skill.py`), registered in `mcp.json`. The model calls `save_artifact` and `hybrid_search_and_rerank` as tools against the same backend.
+
+The infrastructure underneath all three is identical: one coordinator managing all Postgres and Neo4j connections, one embedding space enforced by BGE-M3, one consolidation daemon synthesising shared narratives. The tools differ; the memory layer does not.
+
+The design is intentionally agent-agnostic: any tool that can make HTTP calls can reach the coordinator directly on port 8888. Adding a new agent type is a matter of packaging — not changing the backend.
 
 ### Local mounts — your work stays yours
 
@@ -94,8 +99,8 @@ This is the problem the Shared Memory Framework is designed to address. The solu
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                          AGENT LAYER                                     │
 │                                                                          │
-│   CLI Agent (CLI)          Gemini CLI (skill)       LM Studio (MCP)      │
-│   memory_bridge.py         memory_bridge.py         vector-skill.py      │
+│  Claude Code (skill)  Gemini CLI (skill)  LM Studio (MCP)  Any HTTP     │
+│  memory_bridge.py     memory_bridge.py    vector-skill.py  client        │
 └─────────────┬──────────────────────┬─────────────────────┬──────────────┘
               │                      │                     │
               └──────────────────────▼─────────────────────┘
@@ -474,9 +479,10 @@ Start LM Studio. The `rag-orchestrator` MCP server should appear in the tool pan
 
 | Consumer | Interface | Entry point | Consolidation trigger |
 |---|---|---|---|
-| **CLI agents** | CLI only | `shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
-| **Gemini CLI** | CLI (skill) | `~/.gemini/skills/shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
+| **Claude Code** | CLI (skill `/shared-memory`) | `~/.claude/skills/shared-memory/scripts/memory_bridge.py` → symlink into repo | via coordinator → `pg_notify` |
+| **Gemini CLI** | CLI (skill `/activate shared-memory`) | `~/.gemini/skills/shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
 | **LM Studio** | MCP (FastMCP) | `vector-skill.py` → `rag-orchestrator` in `mcp.json` | via coordinator → `pg_notify` |
+| **Any HTTP client** | REST | `POST http://localhost:8888/memory/save\|search\|graph` | via coordinator → `pg_notify` |
 
 All three paths route through the coordinator on port 8888. The coordinator owns all Postgres and Neo4j connections — agents no longer connect to the databases directly. The Hive-Mind Gateway must be running before any save or search.
 
@@ -793,41 +799,71 @@ MOCK_LLM=1 uv run --with pytest --with pytest-asyncio --with fastmcp \
 
 ## 18. Open Problems
 
-### Security Risk: Stored Prompt Injection (partially mitigated)
+### Stored Prompt Injection (partially mitigated)
 
-Web-retrieved content enters the same ingestion pipeline as internally authored facts. A crafted document retrieved during a search can embed plausibly near a cluster of legitimate facts and — after consolidation — contaminate `community_summaries` as trusted context for all agents, persisting across all future sessions.
+Web-retrieved content enters the same ingestion pipeline as internally authored facts. A crafted document can embed near a legitimate fact cluster and — after consolidation — contaminate `community_summaries` as trusted context for all agents.
 
-This is a stored injection (not reflected). The attack surface is not the agent's context window — it is the shared brain itself. The geometry that makes the vector store useful (organising information by meaning, retrieving by proximity) is the same geometry that makes a well-crafted injection hard to distinguish from a legitimate fact.
+**Implemented:** `[BEGIN/END RETRIEVED FACTS]` delimiters and a "treat as DATA" preamble in consolidation prompts harden the Tier 3 synthesis path. Tier 1 retrieval (raw facts in agent context windows) remains unprotected.
 
-**Implemented:** Retrieved facts are wrapped in `[BEGIN RETRIEVED FACTS]` / `[END RETRIEVED FACTS]` structural delimiters with an explicit "treat as DATA, not as instructions" preamble in consolidation prompts. This hardens the Tier 3 synthesis path against naive instruction injection.
-
-**Not yet implemented:** Ingestion boundary sanitisation and counterfactual simulation pass. Tier 1 retrieval (raw facts surfaced directly in agent context windows) remains unprotected. Full details and planned mitigations are in [SECURITY.md](SECURITY.md).
+**Planned:** ingestion boundary sanitisation; counterfactual simulation pass. Full details in [SECURITY.md](SECURITY.md).
 
 **Do not ingest external or web-retrieved content at volume before implementing the remaining defences.**
 
-### Community Staleness
+### Agent Authentication (planned — Phase 2C)
 
-Each consolidation cycle writes a new record to `community_summaries`. Superseded summaries are never retired — they re-accumulate interference over time. A pruning mechanism is needed; none exists.
-
-### Consolidation Quality
-
-The daemon trusts the LLM to synthesise accurately. There is no quantitative signal for whether a generated narrative is a sharp thematic abstraction or a lossy blur. Without a quality measure, the loop cannot distinguish a good synthesis from a bad one.
-
-### Observability
-
-Audit logging (§14) records per-save events — entities missing, gateway failures, Neo4j sync errors — and the daily merge gives a timestamped cross-tool history. What it does not provide is a signal for whether consolidation is improving retrieval quality at a system level over time. Without that measure, tuning the density threshold or LLM summarisation prompt is guesswork.
-
-### Density Threshold Calibration
-
-The graph density threshold (`density_threshold` in `ontology.yaml`, default 5) is architecturally necessary but empirically uncalibrated. Too low and the loop synthesises sparse, noisy clusters. Too high and interference accumulates faster than consolidation can address it. The value is now configurable without code changes, but the right value for a given corpus still requires empirical tuning.
+`agent_id` is self-reported in the request body. Any caller can impersonate any agent. `AGENT_TOKENS` env var and `Authorization: Bearer <token>` middleware are designed; implementation is the next security PR. See `.env.example` for the token format.
 
 ### Entity Resolution
 
-The consolidation daemon clusters facts by the entity names the caller supplies at save time. If two callers use different names for the same concept — `"hive_mind_proxy"` versus `"Hive-Mind Gateway"` — those facts land in different clusters and produce separate community summaries. As the number of agents writing to shared memory grows, entity resolution — merging synonymous nodes — becomes a real structural problem. It is not implemented.
+The consolidation daemon clusters facts by entity names supplied by callers. Two callers using different names for the same concept (`"hive_mind_proxy"` vs `"Hive-Mind Gateway"`) produce separate clusters and separate community summaries. As the agent population grows, entity resolution — merging synonymous nodes — becomes a real structural problem. Not implemented.
+
+### Consolidation Quality
+
+The daemon trusts the LLM to synthesise accurately. There is no quantitative signal for whether a generated narrative is a sharp thematic abstraction or a lossy blur. Without a quality measure, tuning the density threshold or summarisation prompt is guesswork.
+
+### Density Threshold Calibration
+
+`density_threshold` in `ontology.yaml` (default 5) is architecturally necessary but empirically uncalibrated. Configurable without code changes; the right value for a given corpus requires empirical tuning.
+
+### Observability
+
+Per-save audit logging (§14) records gateway failures, missing entities, and Neo4j sync errors. What it does not provide is a system-level signal for whether consolidation is improving retrieval quality over time.
 
 ---
 
-## 19. References
+## 19. Development Roadmap — Multi-Agent Safe Workstation
+
+This framework is actively evolving toward a workstation where any number of AI agents can read and write shared memory concurrently without corrupting each other's state, impersonating each other, or poisoning shared narratives. The table below tracks where that transition stands.
+
+### Completed
+
+| Phase | Milestone | Status |
+|---|---|---|
+| **Foundation** | Three-tier storage (Postgres + Neo4j), BGE-M3 gateway, consolidation daemon, save/search/graph CLI | ✅ Done |
+| **Consolidation pipeline** | LISTEN/NOTIFY trigger, explicit entity contract, gateway routing for re-embedding, cumulative narrative synthesis | ✅ Done |
+| **Coordinator** | asyncpg connection pool, per-entity `asyncio.Lock`, outbox pattern — all Postgres and Neo4j I/O centralised, ADR-001 cross-DB atomicity risk eliminated | ✅ Done |
+| **Concurrency hardening** | FOR UPDATE SKIP LOCKED, atomic retry increment, single UNWIND batch query, acquired-lock tracking, ON CONFLICT upsert for community_summaries, embedding refresh on re-save, LISTEN reconnect, event-loop non-blocking poll | ✅ Done |
+| **Security baseline** | Read-only Cypher guard, localhost-only bind (PROXY_BIND opt-in), opaque error responses, bounded limit, ONT label validation at startup, prompt injection delimiters | ✅ Done |
+| **Configurable ontology — Path A** | All Neo4j labels and relationship types in `ontology.yaml`; ONT singleton with validation; falls back to hardcoded defaults; density threshold configurable | ✅ Done |
+| **Agent integration** | Claude Code (symlinked skill), Gemini CLI (skill directory), LM Studio (MCP via vector-skill.py) | ✅ Done |
+| **Schema migrations** | Migration runner; 001 (multi-agent schema: agent_id, scope, visibility, neo4j_outbox); 002 (concurrency hardening: unique index on community_summaries, covering index on outbox) | ✅ Done |
+
+### In Progress / Planned
+
+| Phase | Milestone | Notes |
+|---|---|---|
+| **Agent authentication (Phase 2C)** | `AGENT_TOKENS` env var; `Authorization: Bearer <token>` middleware; server-side `agent_id` enforcement; scope isolation by verified identity | Next security PR. Format documented in `.env.example`. Requires coordinated rollout across agents. |
+| **Ontology as graph (Path B)** | Bootstrap `(:Class)` nodes + `SCO` relationships from `ontology.yaml` into Neo4j on startup; replace `ONT.*` string constants with startup-cached dict read from graph; enables live ontology inspection and Neosemantics (n10s) forward compatibility | Path A is the prerequisite ✅. Does not replace `ontology.yaml` — yaml stays the human-editable source; graph is a materialised copy. |
+| **Entity type enrichment** | Apply Neo4j multi-label to distinguish entity kinds — `:Entity:Person`, `:Entity:System`, `:Entity:Tool`, `:Entity:Decision` etc. — without breaking existing queries | Path A + Path B are the prerequisites. Enables richer graph traversal and type-aware consolidation clustering. |
+| **Entity resolution** | Detect and merge synonymous Entity nodes (`"hive_mind_proxy"` ≡ `"Hive-Mind Gateway"`); maintain a canonical name + alias set; re-link Fact nodes on merge | The entity contract (explicit caller-supplied names) makes this tractable. Implementation is a background reconciliation job, not a save-path change. |
+| **Horizontal agent expansion** | Packaging guides and integration templates for additional agent types (VS Code extensions, Claude Desktop, any MCP-capable tool, REST-only agents) | The coordinator's HTTP API is already agent-agnostic. New agents require packaging only — no backend changes. |
+| **Ingestion boundary sanitisation** | Trust-tier tagging for web-retrieved content; strip instructional patterns; quarantine external facts before Tier 3 promotion | Security prerequisite for ingesting external content at volume. |
+| **Counterfactual simulation pass** | Before committing a consolidated narrative, verify every claim traces to a source Fact node; reject narratives that introduce unsourced claims | Completes the stored-injection defence. |
+| **Python packaging** | Rename `shared-memory/` → `shared_memory/`, add `__init__.py` files and `pyproject.toml`; replace `sys.path` hack in `vector-skill.py` with `from shared_memory.scripts.ontology import ONT` | Low urgency; enables clean imports when the codebase grows. |
+
+---
+
+## 20. References
 
 - **The Geometry of Forgetting** (Barman et al., 2026) — *Exposing the Dimensionality Illusion*. arXiv:2604.06222
 - **The Geometry of Consolidation** (Vangara & Gopinath, 2026) — NeurIPS 2026 submission. Proves centroid averaging collapses retrieval identity.
