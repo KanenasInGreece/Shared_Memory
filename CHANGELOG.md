@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.2.0] — 2026-05-26
+
 ### Fixed — Concurrency hardening (coordinator + consolidation daemon)
 
 - **C1 — Lock release on partial acquisition** (`coordinator.py`): The lock-release loop in `handle_save` iterated over all entity locks including ones never acquired. If `lk.acquire()` was cancelled mid-list, `RuntimeError: release unlocked lock` would surface. Fixed by tracking an `acquired` list and releasing only locks that were actually acquired.
@@ -124,4 +128,5 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+[0.2.0]: https://github.com/KanenasInGreece/Shared_Memory/releases/tag/v0.2.0
 [0.1.0]: https://github.com/KanenasInGreece/Shared_Memory/releases/tag/v0.1.0
