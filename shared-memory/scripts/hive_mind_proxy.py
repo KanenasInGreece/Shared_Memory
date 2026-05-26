@@ -9,6 +9,7 @@ from aiohttp.client_exceptions import (
     ClientError,
     ServerDisconnectedError,
 )
+from coordinator import MemoryCoordinator, attach as attach_coordinator
 
 # Unified Hive-Mind Async Proxy v6
 # Routes /v1/embeddings -> 8070 (BGE-M3)
@@ -235,9 +236,16 @@ async def main() -> None:
     proxy = AsyncHiveMindProxy()
     await proxy.start_session()
 
+    coordinator = MemoryCoordinator()
+    await coordinator.start()
+
     # 50 MB ceiling applies to requests buffered via request.read().
     # The streaming path (request.content) bypasses this — see handle_proxy.
     app = web.Application(client_max_size=50 * 1024 * 1024)
+
+    # Coordinator routes must be registered before the catch-all proxy route.
+    attach_coordinator(app, coordinator)
+
     app.router.add_route("*", "/{tail:.*}", proxy.handle_proxy)
 
     runner = web.AppRunner(app)
@@ -286,6 +294,7 @@ async def main() -> None:
             daemon_proc.kill()
     if monitor_task:
         monitor_task.cancel()
+    await coordinator.stop()
     await proxy.cleanup()
     log.info("Clean shutdown complete.")
 

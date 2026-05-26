@@ -3,7 +3,8 @@
 # Install into a clean venv: pip install -r requirements.txt
 
 aiohttp>=3.11.0        # Hive-Mind Gateway (hive_mind_proxy.py)
+asyncpg>=0.29.0        # Async Postgres pool — coordinator.py
 httpx>=0.27.0          # HTTP client — memory_bridge.py, vector-skill.py
-psycopg2-binary>=2.9.9 # Postgres driver — all save/search paths
-neo4j>=5.0.0           # Neo4j driver — graph queries and Fact node writes
+psycopg2-binary>=2.9.9 # Postgres driver — consolidation_loop.py, migrations
+neo4j>=5.0.0           # Neo4j driver — coordinator.py, consolidation_loop.py
 fastmcp>=2.0.0         # MCP server — vector-skill.py (LM Studio only)

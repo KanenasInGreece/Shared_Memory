@@ -9,6 +9,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Memory Coordinator — Phase 1** (`shared-memory/scripts/coordinator.py`) — all Postgres and Neo4j I/O centralised in a single module embedded in the Hive-Mind Gateway:
+  - `asyncpg` connection pool (min 2, max 10) replaces per-call `psycopg2` connections; eliminates the connection-per-save burst problem under concurrent agent writes
+  - Per-entity `asyncio.Lock` — concurrent saves to the same entity cluster are serialized; prevents duplicate hub creation under agent-swarm concurrency
+  - Embedding with exponential-backoff retry (4 attempts, 0.5 s × attempt) — replaces hard abort; gateway downtime is retried rather than propagated as an error
+  - Outbox row written atomically with each `technical_docs` row in a single Postgres transaction — Phase 2 worker drains `neo4j_outbox` asynchronously; ADR-001 cross-DB atomicity risk eliminated from Phase 2 onward
+  - Routes: `POST /memory/save` (Postgres-ack, 200 + pg_id), `POST /memory/search` (Tier 3 → Tier 1 → rerank → Neo4j expand), `POST /memory/graph` (raw Cypher), `GET /memory/status/{pg_id}` (outbox state for `?consistency=neo4j` callers)
+  - Reranker called directly on port 8071 — avoids circular path through the proxy
+
+- **`memory_bridge.py` — thin HTTP client** — direct `psycopg2` and `neo4j` imports removed; all storage I/O delegated to the coordinator via `httpx`. CLI interface (`save`, `search`, `graph`) is unchanged. `COORDINATOR_URL` env var overrides the default `http://localhost:8888`. `AGENT_ID` env var stamps writes with a caller identity.
+
+- **`hive_mind_proxy.py`** — coordinator started on proxy startup, stopped on clean shutdown. `/memory/*` routes registered before the catch-all proxy route. Two-line change: `attach_coordinator(app, coordinator)` + lifecycle hooks.
+
+- **`asyncpg>=0.29.0`** added to `requirements.txt`; `psycopg2-binary` comment updated to reflect remaining uses.
+
+- **README §3, §11, §12** updated — architecture diagram shows coordinator layer; §11 documents the coordinator HTTP API table; §12 shows the updated save path with per-entity locking, outbox, and Postgres-ack semantics.
+
+### Added
+
 - **Multi-agent schema migration** (`shared-memory/migrations/001_multiagent_schema.sql`) — additive schema changes preparing the storage layer for coordinator-based multi-agent support:
   - `technical_docs` and `community_summaries` gain `agent_id TEXT DEFAULT 'legacy'`, `scope TEXT DEFAULT 'global'`, and `visibility TEXT DEFAULT 'global'` columns with btree indexes. Existing rows are unaffected — defaults preserve current single-agent behaviour.
   - New `neo4j_outbox` table for the coordinator outbox pattern: each pending Neo4j write is committed atomically alongside its `technical_docs` row, then applied asynchronously by the outbox worker. Eliminates the ADR-001 cross-DB atomicity window and makes the system resilient to Neo4j downtime and workstation crashes.

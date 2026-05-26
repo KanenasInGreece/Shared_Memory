@@ -1,28 +1,34 @@
-import sys
-import json
-import os
-import psycopg2
-import httpx
-import asyncio
-import logging
-import hashlib
-from datetime import datetime
-from neo4j import GraphDatabase
-from ontology import ONT
+"""
+Memory Bridge — thin CLI client for the Memory Coordinator.
 
-# Configuration — set via environment variables or .env file
-NEO4J_URI = "bolt://localhost:7687"
-NEO4J_USER = "neo4j"
-NEO4J_PASS = os.environ.get("NEO4J_PASSWORD", "")
-_pg_pass = os.environ.get("PG_PASSWORD", "")
-PG_CONN = os.environ.get(
-    "PG_CONN",
-    f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
-)
-RETRIEVER_URL = "http://localhost:8888/v1/embeddings"
-RERANKER_URL = "http://localhost:8888/v1/reranking"
+Delegates all storage I/O to the coordinator running inside hive_mind_proxy
+on port 8888. Direct Postgres and Neo4j access has been removed; the
+coordinator owns those connections.
+
+CLI usage (unchanged from previous versions):
+    python memory_bridge.py save   "<content>" '<metadata_json>'
+    python memory_bridge.py search "<query>" [limit]
+    python memory_bridge.py graph  "<cypher>"
+"""
+
+import asyncio
+import json
+import logging
+import os
+import sys
+from datetime import datetime
+
+import httpx
+
+COORDINATOR_BASE = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
+AGENT_ID         = os.environ.get("AGENT_ID", "memory_bridge")
+
+logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
+
+# ── Audit logging ─────────────────────────────────────────────────────────────
 
 _CONTENT_SIZE_WARN_BYTES = 10 * 1024
+
 
 def _append_log(tool: str, min_level: int, event: str, data: dict, content: str = None) -> None:
     log_level = int(os.environ.get("MEMORY_LOG_LEVEL", "0"))
@@ -35,207 +41,102 @@ def _append_log(tool: str, min_level: int, event: str, data: dict, content: str 
         if log_level >= 4 and content is not None:
             entry["content"] = content
             if len(content.encode()) > _CONTENT_SIZE_WARN_BYTES:
-                entry["content_size_warn"] = f"content is {len(content.encode())} bytes — reduce log level to avoid large logs"
+                entry["content_size_warn"] = (
+                    f"content is {len(content.encode())} bytes"
+                    " — reduce log level to avoid large logs"
+                )
         with open(os.path.join(log_dir, f"{tool}.log"), "a") as f:
             f.write(json.dumps(entry) + "\n")
     except Exception:
         pass  # logging must never break the save path
 
-def query_graph(cypher):
-    try:
-        driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
-        with driver.session() as session:
-            result = session.run(cypher)
-            return [record.data() for record in result]
-    except Exception as e:
-        return {"error": f"Neo4j Error: {str(e)}"}
 
-async def get_embedding(text):
+# ── Coordinator HTTP helpers ──────────────────────────────────────────────────
+
+def _coordinator_unavailable(exc: Exception) -> dict:
+    return {
+        "status": "error",
+        "message": (
+            f"Memory coordinator unreachable at {COORDINATOR_BASE} — "
+            f"is hive_mind_proxy.py running? ({exc})"
+        ),
+    }
+
+
+async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
+    if isinstance(metadata_json, str):
+        try:
+            metadata = json.loads(metadata_json)
+        except (json.JSONDecodeError, ValueError) as e:
+            _append_log("memory_bridge", 2, "bad_metadata", {"error": str(e), "content_preview": content[:100]}, content)
+            return {"status": "error", "message": f"Invalid metadata JSON: {e}"}
+    else:
+        metadata = metadata_json
+
+    if not isinstance(metadata, dict):
+        _append_log("memory_bridge", 2, "bad_metadata_type", {"got": type(metadata).__name__, "content_preview": content[:100]}, content)
+        return {"status": "error", "message": f"Metadata must be a JSON object, got {type(metadata).__name__}"}
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                f"{COORDINATOR_BASE}/memory/save",
+                json={"content": content, "metadata": metadata, "agent_id": AGENT_ID},
+            )
+            result = r.json()
+    except Exception as exc:
+        _append_log("memory_bridge", 2, "coordinator_down", {"content_preview": content[:100]}, content)
+        return _coordinator_unavailable(exc)
+
+    if result.get("status") == "success":
+        pg_id    = result.get("pg_id")
+        entities = metadata.get("entities", [])
+        _append_log("memory_bridge", 3, "save_success",
+                    {"pg_id": pg_id, "source": metadata.get("source"), "entity_count": len(entities)},
+                    content)
+        if not entities:
+            _append_log("memory_bridge", 1, "no_entities", {"pg_id": pg_id, "source": metadata.get("source")}, content)
+    else:
+        _append_log("memory_bridge", 2, "save_failed", {"response": result, "content_preview": content[:100]}, content)
+
+    return result
+
+
+async def search_and_rerank(query: str, limit: int = 5) -> list | dict:
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(RETRIEVER_URL, json={"input": text, "model": "bge-m3"})
-            resp.raise_for_status()
-            return resp.json()["data"][0]["embedding"]
-    except Exception:
-        return None
+            r = await client.post(
+                f"{COORDINATOR_BASE}/memory/search",
+                json={"query": query, "limit": limit, "agent_id": AGENT_ID},
+            )
+            result = r.json()
+    except Exception as exc:
+        return _coordinator_unavailable(exc)
 
-async def search_and_rerank(query, limit=5):
+    return result.get("results", result)
+
+
+def query_graph(cypher: str, params: dict = None) -> list | dict:
     try:
-        # 1. Attempt Vector Search
-        query_vector = await get_embedding(query)
+        r = httpx.post(
+            f"{COORDINATOR_BASE}/memory/graph",
+            json={"cypher": cypher, "params": params or {}},
+            timeout=30.0,
+        )
+        result = r.json()
+    except Exception as exc:
+        return _coordinator_unavailable(exc)
 
-        conn = psycopg2.connect(PG_CONN)
-        ids = []
-        candidates = []
-        meta = []
+    return result.get("records", result)
 
-        if query_vector:
-            # High-signal Vector Search
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT id, content, metadata FROM technical_docs
-                    ORDER BY embedding <=> %s::vector LIMIT 20
-                """, (query_vector,))
-                rows = cur.fetchall()
-                ids = [row[0] for row in rows]
-                candidates = [row[1] for row in rows]
-                meta = [row[2] for row in rows]
-        else:
-            # Fallback 1: Keyword Search (Model is down)
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT id, content, metadata FROM technical_docs
-                    WHERE content ILIKE %s OR metadata::text ILIKE %s
-                    LIMIT %s
-                """, (f"%{query}%", f"%{query}%", limit))
-                rows = cur.fetchall()
-                ids = [row[0] for row in rows]
-                candidates = [row[1] for row in rows]
-                meta = [row[2] for row in rows]
-                conn.close()
-                return [{"content": c, "score": 0.0, "metadata": m, "note": "Keyword search fallback"} for c, m in zip(candidates, meta)]
 
-        conn.close()
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
-        if not candidates:
-            return {"results": [], "message": "No candidates found."}
-
-        # 2. Attempt Rerank
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.post(RERANKER_URL, json={
-                    "query": query,
-                    "documents": candidates,
-                    "top_k": limit
-                })
-                resp.raise_for_status()
-                rerank_results = resp.json()["results"]
-        except Exception:
-            # Fallback: Top vector hits
-            rerank_results = [{"index": i, "relevance_score": 1.0} for i in range(min(limit, len(candidates)))]
-
-        # 3. Relational Expansion (Neo4j)
-        driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
-        final_results = []
-        for res in rerank_results:
-            idx = res["index"]
-            pg_id = ids[idx]
-
-            # Query Neo4j for related context
-            relational_context = []
-            try:
-                with driver.session() as session:
-                    graph_result = session.run(
-                        f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
-                        " OPTIONAL MATCH (f)-[r]-(related)"
-                        " RETURN labels(related) as labels, related.name as name, type(r) as rel_type"
-                        " LIMIT 5",
-                        pg_id=pg_id)
-                    for record in graph_result:
-                        if record["name"]:
-                            relational_context.append(f"{record['rel_type']} -> {record['name']} ({record['labels'][0]})")
-            except:
-                pass
-
-            final_results.append({
-                "content": candidates[idx],
-                "score": res["relevance_score"],
-                "metadata": meta[idx],
-                "graph_context": " | ".join(relational_context) if relational_context else None
-            })
-        driver.close()
-        return final_results
-
-    except Exception as e:
-        return {"error": str(e)}
-
-async def save_artifact(content, metadata_json="{}"):
-    try:
-        # 1. HARD MANDATE: No saving without vectors
-        embedding = await get_embedding(content)
-        if not embedding:
-            _append_log("memory_bridge", 2, "gateway_down", {"content_preview": content[:100]}, content)
-            return {
-                "status": "error",
-                "message": "CRITICAL: Hive-Mind Gateway (port 8888) is DOWN. Save aborted to prevent memory degradation. Please start hive_mind_proxy.py first."
-            }
-
-        # 2. Parse Metadata
-        if isinstance(metadata_json, str):
-            try:
-                m_data = json.loads(metadata_json)
-            except (json.JSONDecodeError, ValueError) as e:
-                _append_log("memory_bridge", 2, "bad_metadata", {"error": str(e), "content_preview": content[:100]}, content)
-                return {"status": "error", "message": f"Invalid metadata JSON: {e}"}
-        else:
-            m_data = metadata_json
-
-        if not isinstance(m_data, dict):
-            _append_log("memory_bridge", 2, "bad_metadata_type", {"got": type(m_data).__name__, "content_preview": content[:100]}, content)
-            return {"status": "error", "message": f"Metadata must be a JSON object, got {type(m_data).__name__}"}
-
-        entities = m_data.get("entities", [])
-
-        # 3. Insert into Postgres (Semantic Anchor - Idempotent)
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
-        daemon_up = True
-        conn = psycopg2.connect(PG_CONN)
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO technical_docs (content, metadata, embedding, content_hash)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (content_hash)
-                DO UPDATE SET metadata = EXCLUDED.metadata
-                RETURNING id
-            """, (content, json.dumps(m_data), embedding, content_hash))
-            pg_id = cur.fetchone()[0]
-            cur.execute("SELECT count(*) FROM pg_stat_activity WHERE application_name = 'consolidation_daemon'")
-            daemon_up = cur.fetchone()[0] > 0
-            cur.execute("SELECT pg_notify('new_artifact', %s)", (json.dumps({"pg_id": pg_id}),))
-        conn.commit()
-        conn.close()
-
-        # 4. Sync to Neo4j (Relational Anchor)
-        try:
-            driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
-            with driver.session() as session:
-                session.run(
-                    f"MERGE (f:{ONT.fact} {{pg_id: $pg_id}})"
-                    " SET f.content = $content,"
-                    "     f.embedding = $embedding,"
-                    "     f.created_at = datetime(),"
-                    "     f.source = $source",
-                    pg_id=pg_id, content=content[:200], embedding=embedding, source=m_data.get("source", "manual_sync"))
-
-                for entity_name in entities:
-                    session.run(
-                        f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
-                        f" MERGE (e:{ONT.entity} {{name: $name}})"
-                        f" MERGE (f)-[:{ONT.entity_link}]->(e)",
-                        pg_id=pg_id, name=entity_name)
-
-            driver.close()
-            sync_status = f"Linked to Neo4j Fact{f' with {len(entities)} entities' if entities else ''}."
-        except Exception as e:
-            sync_status = f"Postgres saved, but Neo4j sync failed: {str(e)}"
-            _append_log("memory_bridge", 2, "neo4j_sync_failed", {"pg_id": pg_id, "error": str(e)}, content)
-
-        if not entities:
-            _append_log("memory_bridge", 1, "no_entities", {"pg_id": pg_id, "source": m_data.get("source")}, content)
-        _append_log("memory_bridge", 3, "save_success", {"pg_id": pg_id, "source": m_data.get("source"), "entity_count": len(entities)}, content)
-
-        entities_warning = "" if entities else " WARNING: No 'entities' in metadata — fact stored but ineligible for Tier 3 consolidation."
-        daemon_warning = "" if daemon_up else " WARNING: Consolidation daemon not running — NOTIFY dropped. Start consolidation_loop.py."
-        return {
-            "status": "success",
-            "message": f"Artifact stored with ID {pg_id}. {sync_status}{entities_warning}{daemon_warning}"
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-async def main():
+async def main() -> None:
     if len(sys.argv) < 3:
-        print(json.dumps({"error": "Usage: python memory_bridge.py [graph|search|save] <query/content> [metadata/limit]"}))
+        print(json.dumps({
+            "error": "Usage: python memory_bridge.py [graph|search|save] <query/content> [metadata/limit]"
+        }))
         sys.exit(1)
 
     action = sys.argv[1]
@@ -250,6 +151,7 @@ async def main():
         print(json.dumps(await save_artifact(sys.argv[2], metadata), indent=2))
     else:
         print(json.dumps({"error": f"Unknown action: {action}"}))
+
 
 if __name__ == "__main__":
     asyncio.run(main())
