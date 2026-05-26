@@ -297,8 +297,8 @@ class MemoryCoordinator:
                 {
                     "status": "error",
                     "message": (
-                        "metadata.source is required — identify the saving agent "
-                        "(e.g. 'claude_code', 'grok', 'antigravity'). "
+                        "metadata.source is required — use the agent or model name "
+                        "(e.g. 'claude_code', 'grok', 'qwen3-27b'). "
                         "Facts without provenance are rejected to protect memory integrity."
                     ),
                 },
