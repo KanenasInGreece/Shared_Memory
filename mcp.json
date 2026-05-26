@@ -11,38 +11,6 @@
         "DEFAULT_PARAMETERS": "{\"include_images\": true, \"max_results\": 15, \"search_depth\": \"advanced\"}"
       }
     },
-    "neo4j-memory": {
-      "command": "uvx",
-      "args": [
-        "--with",
-        "neo4j-agent-memory[mcp,openai]",
-        "--with",
-        "click",
-        "--with",
-        "rich",
-        "neo4j-agent-memory",
-        "mcp",
-        "serve",
-        "--uri",
-        "bolt://localhost:7687",
-        "--user",
-        "neo4j",
-        "--password",
-        "YOUR_NEO4J_PASSWORD",
-        "--llm",
-        "openai/qwen",
-        "--llm-api-base",
-        "http://localhost:8888/v1",
-        "--embedding",
-        "openai/bge-m3",
-        "--embedding-dimensions",
-        "1024"
-      ],
-      "env": {
-        "OPENAI_BASE_URL": "http://localhost:8888/v1",
-        "OPENAI_API_KEY": "sk-no-key-required"
-      }
-    },
     "rag-orchestrator": {
       "command": "uv",
       "args": [
