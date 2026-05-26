@@ -1,9 +1,9 @@
 # Shared Memory (Hive-Mind)
 
 ## Overview
-This skill bridges the Shared Memory Framework — a three-tier semantic and relational memory layer shared across all AI agents on your workstation (Claude Code, Gemini CLI, LM Studio). Facts saved by one agent are retrievable by all others. Knowledge persists across sessions and tools.
+This skill bridges the Shared Memory Framework — a three-tier semantic and relational memory layer shared across all AI agents on your workstation (Gemini CLI, LM Studio, and any CLI agent). Facts saved by one agent are retrievable by all others. Knowledge persists across sessions and tools.
 
-**Agents currently supported:** Claude Code (skill), Gemini CLI (skill), LM Studio (MCP), any HTTP client.
+**Agents currently supported:** Gemini CLI (skill), LM Studio (MCP), any HTTP client or CLI agent.
 
 ## Core Tasks
 

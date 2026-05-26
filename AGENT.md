@@ -34,7 +34,7 @@ Set `MOCK_LLM=1` to bypass LLM calls in consolidation tests. Tests are fully moc
 
 | Consumer | Interface | Entry point |
 |---|---|---|
-| Claude Code, Gemini CLI, other CLI agents | CLI only | `shared-memory/scripts/memory_bridge.py` |
+| Gemini CLI, other CLI agents | CLI only | `shared-memory/scripts/memory_bridge.py` |
 | LM Studio | MCP (FastMCP) | `vector-skill.py` |
 
 `vector-skill.py` is registered in `mcp.json` for LM Studio — it is **not** used by CLI-based agents.

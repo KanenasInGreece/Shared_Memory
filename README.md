@@ -47,9 +47,7 @@ This framework is built around one idea: those tools should share a brain. When 
 
 **The consumers, and how they connect:**
 
-- **Claude Code** — uses `memory_bridge.py` via a skill (`/shared-memory`). Scripts are symlinked into the repo; always current. Saves, searches, and graph queries all route through the coordinator on port 8888.
-
-- **Gemini CLI** — same CLI bridge, packaged as a Gemini skill (`/activate shared-memory`). No MCP server required; the CLI is the interface.
+- **Gemini CLI** — uses `memory_bridge.py` packaged as a Gemini skill (`/activate shared-memory`). No MCP server required; the CLI is the interface.
 
 - **LM Studio** — uses an MCP server (`vector-skill.py`), registered in `mcp.json`. The model calls `save_artifact` and `hybrid_search_and_rerank` as tools against the same backend.
 
@@ -99,8 +97,8 @@ This is the problem the Shared Memory Framework is designed to address. The solu
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                          AGENT LAYER                                     │
 │                                                                          │
-│  Claude Code (skill)  Gemini CLI (skill)  LM Studio (MCP)  Any HTTP     │
-│  memory_bridge.py     memory_bridge.py    vector-skill.py  client        │
+│   CLI Agent (CLI)      Gemini CLI (skill)  LM Studio (MCP)  Any HTTP     │
+│   memory_bridge.py    memory_bridge.py    vector-skill.py  client        │
 └─────────────┬──────────────────────┬─────────────────────┬──────────────┘
               │                      │                     │
               └──────────────────────▼─────────────────────┘
@@ -479,7 +477,6 @@ Start LM Studio. The `rag-orchestrator` MCP server should appear in the tool pan
 
 | Consumer | Interface | Entry point | Consolidation trigger |
 |---|---|---|---|
-| **Claude Code** | CLI (skill `/shared-memory`) | `~/.claude/skills/shared-memory/scripts/memory_bridge.py` → symlink into repo | via coordinator → `pg_notify` |
 | **Gemini CLI** | CLI (skill `/activate shared-memory`) | `~/.gemini/skills/shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
 | **LM Studio** | MCP (FastMCP) | `vector-skill.py` → `rag-orchestrator` in `mcp.json` | via coordinator → `pg_notify` |
 | **Any HTTP client** | REST | `POST http://localhost:8888/memory/save\|search\|graph` | via coordinator → `pg_notify` |
@@ -845,7 +842,7 @@ This framework is actively evolving toward a workstation where any number of AI 
 | **Concurrency hardening** | FOR UPDATE SKIP LOCKED, atomic retry increment, single UNWIND batch query, acquired-lock tracking, ON CONFLICT upsert for community_summaries, embedding refresh on re-save, LISTEN reconnect, event-loop non-blocking poll | ✅ Done |
 | **Security baseline** | Read-only Cypher guard, localhost-only bind (PROXY_BIND opt-in), opaque error responses, bounded limit, ONT label validation at startup, prompt injection delimiters | ✅ Done |
 | **Configurable ontology — Path A** | All Neo4j labels and relationship types in `ontology.yaml`; ONT singleton with validation; falls back to hardcoded defaults; density threshold configurable | ✅ Done |
-| **Agent integration** | Claude Code (symlinked skill), Gemini CLI (skill directory), LM Studio (MCP via vector-skill.py) | ✅ Done |
+| **Agent integration** | Gemini CLI (skill directory), LM Studio (MCP via vector-skill.py) | ✅ Done |
 | **Schema migrations** | Migration runner; 001 (multi-agent schema: agent_id, scope, visibility, neo4j_outbox); 002 (concurrency hardening: unique index on community_summaries, covering index on outbox) | ✅ Done |
 
 ### In Progress / Planned
