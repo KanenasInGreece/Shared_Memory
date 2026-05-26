@@ -16,16 +16,14 @@ uv run --with pytest --with pytest-asyncio --with fastmcp --with psycopg2-binary
 uv run --with pytest --with pytest-asyncio --with fastmcp --with psycopg2-binary --with httpx --with neo4j pytest tests/test_vector_skill.py
 uv run --with pytest --with pytest-asyncio --with fastmcp --with psycopg2-binary --with httpx --with neo4j pytest tests/test_vector_skill.py::test_mcp_save_artifact_success
 
-# Start Hive-Mind Gateway (also auto-starts the consolidation daemon)
-uv run --with aiohttp python shared-memory/scripts/hive_mind_proxy.py 8888
+# Start Hive-Mind Gateway + Coordinator + Consolidation Daemon (single command)
+uv run --with aiohttp --with asyncpg --with neo4j --with httpx \
+  python shared-memory/scripts/hive_mind_proxy.py 8888
 
-# CLI memory bridge (requires gateway to be running for embed/save)
-uv run --with httpx --with psycopg2-binary --with neo4j \
-  python shared-memory/scripts/memory_bridge.py search "<query>" 5
-uv run --with httpx --with psycopg2-binary --with neo4j \
-  python shared-memory/scripts/memory_bridge.py save "<content>" '{"source":"agent","entities":["Entity1"]}'
-uv run --with httpx --with psycopg2-binary --with neo4j \
-  python shared-memory/scripts/memory_bridge.py graph "MATCH (n:Entity) RETURN n LIMIT 10"
+# CLI memory bridge — thin HTTP client, only needs httpx (gateway must be running)
+uv run --with httpx python shared-memory/scripts/memory_bridge.py search "<query>" 5
+uv run --with httpx python shared-memory/scripts/memory_bridge.py save "<content>" '{"source":"agent","entities":["Entity1"]}'
+uv run --with httpx python shared-memory/scripts/memory_bridge.py graph "MATCH (n:Entity) RETURN n LIMIT 10"
 ```
 
 Set `MOCK_LLM=1` to bypass LLM calls in consolidation tests. Tests are fully mocked — no live infrastructure needed.
@@ -36,7 +34,7 @@ Set `MOCK_LLM=1` to bypass LLM calls in consolidation tests. Tests are fully moc
 
 | Consumer | Interface | Entry point |
 |---|---|---|
-| Gemini CLI, other CLI agents | CLI only | `shared-memory/scripts/memory_bridge.py` |
+| Claude Code, Gemini CLI, other CLI agents | CLI only | `shared-memory/scripts/memory_bridge.py` |
 | LM Studio | MCP (FastMCP) | `vector-skill.py` |
 
 `vector-skill.py` is registered in `mcp.json` for LM Studio — it is **not** used by CLI-based agents.
@@ -51,14 +49,15 @@ Set `MOCK_LLM=1` to bypass LLM calls in consolidation tests. Tests are fully moc
 
 Retrieval queries **Tier 3 first** (thematic orientation), then Tier 1 (precision), then expands through Neo4j. Artifacts saved by one agent become retrievable by all others once consolidation runs.
 
-### Hive-Mind Gateway (`hive_mind_proxy.py`)
+### Hive-Mind Gateway + Coordinator (`hive_mind_proxy.py` + `coordinator.py`)
 
-Async aiohttp reverse proxy on port 8888:
+Async aiohttp server on port 8888:
+- `POST /memory/save|search|graph`, `GET /memory/status/{pg_id}` → `coordinator.py`
 - `POST /v1/embeddings` → BGE-M3 on port 8070
 - `POST /v1/reranking` → BGE-Reranker-v2-m3 on port 8071
 - everything else → reasoning LLM on port 5000
 
-On startup it spawns `consolidation_loop.py` as a subprocess. Stopping the proxy (Ctrl+C) also stops the daemon.
+On startup it starts the coordinator (asyncpg pool, per-entity locks, outbox worker) and spawns `consolidation_loop.py`. Stopping the proxy (Ctrl+C) cleanly shuts down both.
 
 ### Consolidation Daemon (`consolidation_loop.py`)
 
@@ -71,7 +70,7 @@ Triggered by Postgres `LISTEN/NOTIFY` on the `new_artifact` channel. After a 15-
 - **1024-dim via :8888 only** — always route embedding calls through the gateway. Never call 8070 or 8071 directly.
 - **Hard embedding mandate** — saves abort if the gateway is unreachable. An orphaned row without a vector is invisible to semantic search.
 - **SHA-256 idempotency** — `ON CONFLICT (content_hash) DO UPDATE`. Safe to re-save identical content.
-- **Cross-DB atomicity is an accepted risk** — a Neo4j write followed by a Postgres commit failure creates a dangling Fact node. See `shared-memory/Documentation/ADR.md`.
+- **Outbox atomicity** — every save writes a `neo4j_outbox` row in the same Postgres transaction. The outbox worker applies it to Neo4j asynchronously; ADR-001 dangling-Fact risk is eliminated.
 
 ## Configuration
 
