@@ -1,10 +1,10 @@
 # AGENT.md
 
-Guidance for AI coding agents (Gemini CLI, and others) working in this repository.
+Guidance for AI coding agents (Claude Code, Grok, Gemini CLI, LM Studio, and others) working in this repository.
 
 ## What This Repository Is
 
-The **Shared Memory Framework** — a three-tier semantic memory system that lets Gemini CLI, LM Studio, and other AI tools share a single persistent memory backend (Postgres + pgvector + Neo4j). All credentials are read from environment variables; no secrets are hardcoded.
+The **Shared Memory Framework** — a three-tier semantic memory system that lets Claude Code, Grok, Gemini CLI, LM Studio, and other AI tools share a single persistent memory backend (Postgres + pgvector + Neo4j). All credentials are read from environment variables; no secrets are hardcoded.
 
 ## Commands
 
@@ -34,10 +34,14 @@ Set `MOCK_LLM=1` to bypass LLM calls in consolidation tests. Tests are fully moc
 
 | Consumer | Interface | Entry point |
 |---|---|---|
-| Gemini CLI, other CLI agents | CLI only | `shared-memory/scripts/memory_bridge.py` |
-| LM Studio | MCP (FastMCP) | `vector-skill.py` |
+| Claude Code | CLI skill (`/shared-memory`) | `~/.claude/skills/shared-memory/scripts/memory_bridge.py` |
+| Grok | CLI skill (`/shared-memory`) | `~/.grok/skills/shared-memory/scripts/memory_bridge.py` |
+| Gemini CLI | CLI skill (`/activate shared-memory`) | `~/.gemini/skills/shared-memory/scripts/memory_bridge.py` |
+| LM Studio | MCP (FastMCP) | `vector-skill.py` → `rag-orchestrator` in `mcp.json` |
 
-`vector-skill.py` is registered in `mcp.json` for LM Studio — it is **not** used by CLI-based agents.
+`vector-skill.py` is registered in `mcp.json` for LM Studio — it is **not** used by CLI-based agents. `memory_bridge.py` is a thin HTTP client that delegates all storage to the coordinator; it requires only `httpx` and `python-dotenv`.
+
+**No separate graph MCP (e.g. neo4j-agent-memory) should be registered.** Direct-bolt Neo4j MCP servers bypass the coordinator's per-entity locks, outbox atomicity, and SHA-256 deduplication — writes produce orphaned Neo4j nodes invisible to semantic search. `rag-orchestrator` already includes Neo4j graph expansion on every search call.
 
 ### Three-Tier Storage
 
@@ -75,6 +79,8 @@ Triggered by Postgres `LISTEN/NOTIFY` on the `new_artifact` channel. After a 15-
 ## Configuration
 
 Copy `.env.example` to `.env` and fill in `NEO4J_PASSWORD` and `PG_PASSWORD`. For `mcp.json`, replace all `YOUR_*` placeholders and update the absolute path to `vector-skill.py`.
+
+Both `vector-skill.py` and `memory_bridge.py` load `.env` automatically via `python-dotenv` at startup — credentials are available even when the agent spawns the script without inheriting the shell environment.
 
 ## Documentation
 
