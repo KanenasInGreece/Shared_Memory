@@ -20,6 +20,15 @@ from datetime import datetime
 
 import httpx
 
+# Load .env by searching up from this script's location so env overrides
+# (COORDINATOR_URL, MEMORY_LOG_LEVEL, etc.) are picked up when invoked by
+# any agent that doesn't inherit the shell environment (Grok, LM Studio, CI).
+try:
+    from dotenv import find_dotenv, load_dotenv
+    load_dotenv(find_dotenv(usecwd=False))
+except ImportError:
+    pass
+
 COORDINATOR_BASE = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
 AGENT_ID         = os.environ.get("AGENT_ID", "memory_bridge")
 
