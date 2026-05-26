@@ -90,7 +90,10 @@ class MemoryCoordinator:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        self._pool = await asyncpg.create_pool(PG_DSN, min_size=POOL_MIN, max_size=POOL_MAX)
+        self._pool = await asyncpg.create_pool(
+            PG_DSN, min_size=POOL_MIN, max_size=POOL_MAX,
+            init=self._init_connection,
+        )
         self._neo4j = AsyncGraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
         self._outbox_task = asyncio.create_task(self._outbox_worker(), name="outbox-worker")
         log.info("coordinator ready (pool %d–%d, outbox worker running)", POOL_MIN, POOL_MAX)
@@ -109,6 +112,17 @@ class MemoryCoordinator:
         log.info("coordinator stopped")
 
     # ── Internal helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    async def _init_connection(conn: asyncpg.Connection) -> None:
+        """Register JSONB codec so columns decode to Python dicts, not raw strings."""
+        await conn.set_type_codec(
+            "jsonb",
+            encoder=json.dumps,
+            decoder=json.loads,
+            schema="pg_catalog",
+            format="text",
+        )
 
     async def _lock_for(self, entity: str) -> asyncio.Lock:
         async with self._locks_mu:
@@ -166,9 +180,12 @@ class MemoryCoordinator:
             return
         log.debug("outbox: draining %d row(s)", len(rows))
         for row in rows:
-            await self._apply_outbox_row(
-                row["id"], row["pg_id"], row["cypher_params"], row["retries"]
-            )
+            # asyncpg returns JSONB as a string in some configurations;
+            # parse defensively rather than relying on codec registration.
+            params = row["cypher_params"]
+            if isinstance(params, str):
+                params = json.loads(params)
+            await self._apply_outbox_row(row["id"], row["pg_id"], params, row["retries"])
 
     async def _apply_outbox_row(
         self, outbox_id: int, pg_id: int, params: dict, retries: int
