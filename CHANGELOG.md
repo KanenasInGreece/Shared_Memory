@@ -7,17 +7,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.2.6] — 2026-05-26
+
 ### Added
 
 - **Mandatory `source` provenance on save** (`coordinator.py`, `vector-skill.py`): The coordinator now rejects saves with HTTP 400 if `metadata.source` is absent or empty. `vector-skill.py`'s `save_artifact` MCP tool applies the same check before reaching Postgres. Facts without a declared source (agent or model name) are refused to prevent unattributed content from polluting the memory store. The system prompt for LM Studio updated to instruct the model to self-identify by model name (e.g. `"source":"qwen3-27b"`) in every save call.
 
+- **Entity-graph fallback for low-confidence searches** (`vector-skill.py`): When all reranker scores fall below `LOW_CONFIDENCE_THRESHOLD = -3.0`, `hybrid_search_and_rerank` triggers `_graph_entity_fallback()`. The helper extracts significant words from the query, matches them against `Entity.name` nodes in Neo4j via `MENTIONS` edges to `Fact` nodes, and fetches full content from Postgres. Results are appended as a clearly labelled supplementary section; main episodic results are always returned regardless.
+
 ### Fixed
 
-- **Reranker timeout in LM Studio** (`vector-skill.py`): `hybrid_search_and_rerank` was sending up to 20 full-content candidates to BGE-Reranker in a single call. With large documents (observed max ~12 KB, total ~44 KB), inference exceeded the previous 20-second timeout, producing `httpx.ReadTimeout` with an empty error string. Fixed by: (1) reducing the Postgres candidate pool from 20 to 10 (vector similarity already ranks the best matches first), and (2) raising the rerank-specific timeout to 120 seconds (`RERANK_TIMEOUT`). Embedding calls keep the existing 20-second timeout (`EMBED_TIMEOUT`). No content truncation — documents are sent in full to preserve the context that was intentionally saved.
+- **Reranker timeout in LM Studio** (`vector-skill.py`): `hybrid_search_and_rerank` was sending up to 20 full-content candidates (~44 KB total) to BGE-Reranker in a single call, exceeding the 20-second timeout and producing `httpx.ReadTimeout` with empty `str(e)`. Fixed by reducing the Postgres candidate pool from 20 to 10 and raising the rerank-specific timeout to 120 s (`RERANK_TIMEOUT`). Embedding calls retain the 20 s timeout (`EMBED_TIMEOUT`). Documents are sent in full — no truncation.
 
-### Added
+### Maintenance
 
-- **Entity-graph fallback for low-confidence searches** (`vector-skill.py`): When all reranker scores fall below `LOW_CONFIDENCE_THRESHOLD = -3.0`, `hybrid_search_and_rerank` now triggers `_graph_entity_fallback()`. The helper extracts significant words (>3 chars) from the query, matches them against `Entity.name` nodes in Neo4j via `MENTIONS` edges to `Fact` nodes, then fetches full content from Postgres. Results are appended under a clearly labelled "Entity Graph Results (low confidence — supplementary)" section. The main episodic results are always returned regardless; the graph fallback is additive context, not a replacement.
+- **Database cleanup**: Removed 54 garbage entries from `technical_docs` — `RECONSTRUCTION COMPONENT` source-code blobs (including an old `vector-skill.py` with plaintext credentials), test fixtures (`TestEntity_*`), smoke-test entries, and stale duplicate documentation files. Removed the mocked `TestEntity` community summary. Cleaned 50 orphaned Neo4j `Fact` nodes and 14 orphaned `Entity` nodes.
 
 ---
 
