@@ -75,6 +75,8 @@ Triggered by Postgres `LISTEN/NOTIFY` on the `new_artifact` channel. After a 15-
 - **Hard embedding mandate** — saves abort if the gateway is unreachable. An orphaned row without a vector is invisible to semantic search.
 - **SHA-256 idempotency** — `ON CONFLICT (content_hash) DO UPDATE`. Safe to re-save identical content.
 - **Outbox atomicity** — every save writes a `neo4j_outbox` row in the same Postgres transaction. The outbox worker applies it to Neo4j asynchronously; ADR-001 dangling-Fact risk is eliminated.
+- **Health check before saves** — `GET http://localhost:8888/health` returns `{"status":"ok"}` when embedder and reranker are both up. HTTP 503 means saves will fail; do not attempt until resolved.
+- **Daemon watchdog** — the gateway auto-restarts the consolidation daemon on crash with exponential backoff. Circuit breaker trips after 5 crashes / 10 min; restart the gateway to reset.
 
 ## Configuration
 

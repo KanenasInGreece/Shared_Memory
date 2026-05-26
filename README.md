@@ -372,6 +372,16 @@ INFO  Listening for 'new_artifact' notifications...
 
 Step 4 is the only manual step required after databases and models are running. The proxy starts the daemon; the daemon registers its Postgres listener; both shut down cleanly when the proxy receives SIGINT or SIGTERM.
 
+**Verify the full stack is healthy:**
+```bash
+curl http://localhost:8888/health
+# {"status":"ok","embedder":"ok","reranker":"ok","llm":"ok","daemon":"running"}
+```
+
+HTTP 200 means the save/search path (embedder + reranker) is operational. HTTP 503 means at least one critical backend is down — do not attempt saves until resolved. The `llm` and `daemon` fields are informational; their degradation affects consolidation only.
+
+**Daemon watchdog:** the gateway automatically restarts the consolidation daemon if it crashes, with exponential backoff and a circuit breaker (5 crashes / 10 min). If the circuit breaker trips, restart the gateway.
+
 > **Network exposure:** The gateway binds to `127.0.0.1:8888` by default — localhost only. Set `PROXY_BIND=0.0.0.0` in `.env` to opt into all-interfaces binding (e.g. inside an isolated Docker or VM network). The coordinator API is unauthenticated — do not expose port 8888 on an untrusted network. See [SECURITY.md](SECURITY.md) for details.
 
 ---
