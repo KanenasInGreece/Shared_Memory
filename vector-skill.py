@@ -11,6 +11,14 @@ from datetime import datetime
 from fastmcp import FastMCP
 from neo4j import GraphDatabase
 
+# Load .env from the same directory as this script so credentials are available
+# when LM Studio (or any MCP host) spawns this process without inheriting the shell env.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass  # python-dotenv not installed; rely on env vars being set externally
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "shared-memory", "scripts"))
 from ontology import ONT
 
