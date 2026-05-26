@@ -18,14 +18,23 @@ Search the shared memory with semantic similarity, reranking, and Neo4j relation
 
 Returns: Tier 3 community summary (global context) + Tier 1 semantic hits + Neo4j relational expansion.
 
+If all results score below −3.0, an entity-graph fallback runs automatically and appears as a supplementary section in the output.
+
 ### 2. Artifact Persistence (Save)
 Commit findings, decisions, and technical facts to long-term shared memory.
 - **Trigger:** At the conclusion of any significant task or decision.
-- **CLI:**
+- **MCP (LM Studio):** Call `save_artifact` from the `rag-orchestrator` MCP server:
+  ```json
+  { "content": "<fact>", "metadata": "{\"source\":\"qwen3-27b\",\"entities\":[\"EntityA\",\"EntityB\"]}" }
+  ```
+  Set `source` to the **loaded model name** (e.g. `"qwen3-27b"`, `"llama3-70b"`) — not a generic label.
+- **CLI (other agents):**
   ```
   uv run --with httpx python scripts/memory_bridge.py save "<content>" \
     '{"source":"<agent_name>","entities":["EntityA","EntityB"]}'
   ```
+
+**`source` is required** — saves without it are rejected with HTTP 400. Use the agent or model name that generated the fact (e.g. `"claude_code"`, `"grok"`, `"qwen3-27b"`).
 
 **`entities` is required for Tier 3 consolidation.** Supply 1–4 named concepts the fact is about. Facts saved without `entities` are stored and searchable but never synthesised into community summaries.
 

@@ -298,8 +298,8 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
         if not m_data.get("source"):
             _append_log("vector_skill", 2, "missing_source", {"content_preview": content[:100]}, content)
             return (
-                "Error: metadata.source is required — identify the saving agent "
-                "(e.g. 'lm_studio', 'antigravity'). "
+                "Error: metadata.source is required — set it to the loaded model name "
+                "(e.g. 'qwen3-27b', 'llama3-70b'). "
                 "Facts without provenance are rejected to protect memory integrity."
             )
 
