@@ -99,36 +99,41 @@ This is the problem the Shared Memory Framework is designed to address. The solu
 └─────────────┬──────────────────────┬─────────────────────┬──────────────┘
               │                      │                     │
               └──────────────────────▼─────────────────────┘
-                                     │
-                         ┌───────────▼───────────┐
-                         │  Hive-Mind Gateway    │
-                         │  hive_mind_proxy.py   │
-                         │  :8888 (aiohttp v6)   │
-                         │                       │
-                         │  /v1/embeddings→:8070 │
-                         │  /v1/reranking →:8071 │
-                         │  default      →:5000  │
-                         └───────────┬───────────┘
-                                     │ spawns
-                         ┌───────────▼───────────┐
+                                     │ HTTP (all memory ops)
+                         ┌───────────▼────────────────────────┐
+                         │  Hive-Mind Gateway + Coordinator   │
+                         │  hive_mind_proxy.py  :8888         │
+                         │                                    │
+                         │  /memory/save   → coordinator.py  │
+                         │  /memory/search → coordinator.py  │
+                         │  /memory/graph  → coordinator.py  │
+                         │  /v1/embeddings → :8070 (BGE-M3)  │
+                         │  /v1/reranking  → :8071            │
+                         │  default        → :5000 (LLM)     │
+                         └────────┬──────────────────────────┘
+                                  │ spawns
+                         ┌────────▼───────────────┐
                          │  Consolidation Daemon  │
                          │  consolidation_loop.py │
                          │  LISTEN new_artifact   │
-                         └───────────┬───────────┘
-                                     │ writes
-              ┌──────────────────────▼──────────────────────┐
-              │                MEMORY LAYER                  │
-              │                                              │
-              │  ┌─────────────────────┐  ┌───────────────┐ │
-              │  │  PostgreSQL+pgvector│  │    Neo4j      │ │
-              │  │                     │  │               │ │
-              │  │ technical_docs      │  │ Fact nodes    │ │
-              │  │  (Tier 1 — Episodic)│  │ Entity hubs   │ │
-              │  │                     │  │ MENTIONS edges│ │
-              │  │ community_summaries │  │ CommunitySumm │ │
-              │  │  (Tier 3 — Semantic)│  │ SUMMARIZED_BY │ │
-              │  └─────────────────────┘  └───────────────┘ │
-              └──────────────────────────────────────────────┘
+                         └────────┬───────────────┘
+                                  │ writes
+              ┌───────────────────▼───────────────────────────┐
+              │                MEMORY LAYER                    │
+              │                                                │
+              │  ┌──────────────────────┐  ┌───────────────┐  │
+              │  │  PostgreSQL+pgvector │  │    Neo4j      │  │
+              │  │                      │  │               │  │
+              │  │ technical_docs       │  │ Fact nodes    │  │
+              │  │  (Tier 1 — Episodic) │  │ Entity hubs   │  │
+              │  │                      │  │ MENTIONS edges│  │
+              │  │ community_summaries  │  │ CommunitySumm │  │
+              │  │  (Tier 3 — Semantic) │  │ SUMMARIZED_BY │  │
+              │  │                      │  └───────────────┘  │
+              │  │ neo4j_outbox         │                      │
+              │  │  (coordinator WAL)   │                      │
+              │  └──────────────────────┘                      │
+              └────────────────────────────────────────────────┘
 ```
 
 | Tier | Store | Role | Biological Analogy |
@@ -469,30 +474,43 @@ Start LM Studio. The `rag-orchestrator` MCP server should appear in the tool pan
 
 | Consumer | Interface | Entry point | Consolidation trigger |
 |---|---|---|---|
-| **CLI agents** | CLI only | `shared-memory/scripts/memory_bridge.py` | `pg_notify` on save |
-| **Gemini CLI** | CLI (skill) | `~/.gemini/skills/shared-memory/scripts/memory_bridge.py` | `pg_notify` on save |
-| **LM Studio** | MCP (FastMCP) | `vector-skill.py` → `rag-orchestrator` in `mcp.json` | `pg_notify` on save |
+| **CLI agents** | CLI only | `shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
+| **Gemini CLI** | CLI (skill) | `~/.gemini/skills/shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
+| **LM Studio** | MCP (FastMCP) | `vector-skill.py` → `rag-orchestrator` in `mcp.json` | via coordinator → `pg_notify` |
 
-All three paths write to the same Postgres and Neo4j backend, all route embeddings through port 8888, and all fire the same `pg_notify` that wakes the consolidation daemon.
+All three paths route through the coordinator on port 8888. The coordinator owns all Postgres and Neo4j connections — agents no longer connect to the databases directly. The Hive-Mind Gateway must be running before any save or search.
 
 ### CLI usage (Gemini CLI and other CLI agents)
 
 ```bash
 # Search — semantic + rerank + Neo4j expansion
-uv run --with httpx --with psycopg2-binary --with neo4j \
+uv run --with httpx \
   python shared-memory/scripts/memory_bridge.py search "bgem3 interference problem" 5
 
 # Save — always include entities for consolidation eligibility
-uv run --with httpx --with psycopg2-binary --with neo4j \
+uv run --with httpx \
   python shared-memory/scripts/memory_bridge.py save \
   "Architectural decision: proxy routes all embeddings through :8888" \
   '{"source":"gemini_cli","entities":["hive_mind_proxy","BGE-M3"]}'
 
-# Graph query — direct Cypher
-uv run --with neo4j \
+# Graph query — raw Cypher
+uv run --with httpx \
   python shared-memory/scripts/memory_bridge.py graph \
   "MATCH (e:Entity)<-[:MENTIONS]-(f:Fact) RETURN e.name, count(f) ORDER BY count(f) DESC LIMIT 10"
 ```
+
+### Coordinator HTTP API
+
+The coordinator exposes four endpoints on port 8888. These can be called directly by any HTTP client — agents, scripts, or future tools.
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| `POST` | `/memory/save` | `{content, metadata, agent_id?, scope?, visibility?}` | `{status, pg_id, neo4j, message}` |
+| `POST` | `/memory/search` | `{query, limit?, scope?, agent_id?}` | `{status, results[]}` |
+| `POST` | `/memory/graph` | `{cypher, params?}` | `{status, records[]}` |
+| `GET` | `/memory/status/{pg_id}` | — | `{pg_id, neo4j, retries, applied_at}` |
+
+**Write acknowledgment:** saves return `200 OK` once the fact is committed to Postgres. The outbox row for Neo4j is written in the same transaction; Neo4j application is asynchronous. Use `GET /memory/status/{pg_id}` to confirm Neo4j application, or pass `?consistency=neo4j` (Phase 2) to block until the outbox row is applied.
 
 ### Gemini CLI skill activation
 
@@ -504,21 +522,24 @@ uv run --with neo4j \
 
 ## 12. The Save Path — From Artifact to Memory
 
-Both `memory_bridge.py` and `vector-skill.py` implement the same save contract:
+The save path runs inside the coordinator (`coordinator.py`) on every `POST /memory/save`:
 
 ```
-caller supplies: content + metadata["entities"] (required for consolidation)
+caller: POST /memory/save {content, metadata, agent_id, scope, visibility}
        ↓
-get_embedding(content) via :8888 (BGE-M3, 1024-dim)
-       ↓ abort if gateway is down — hard mandate
-INSERT INTO technical_docs ... ON CONFLICT (content_hash) DO UPDATE
-       ↓ idempotent: SHA-256 hash prevents duplicates
-CHECK pg_stat_activity WHERE application_name = 'consolidation_daemon'
-       ↓ warns in response if daemon not registered
-SELECT pg_notify('new_artifact', {"pg_id": id})   ← inside transaction, before commit
-conn.commit()
+embed(content) via :8888 — retry with exponential backoff (4 attempts)
+       ↓ 503 if all retries fail — hard mandate: no save without a vector
+acquire per-entity asyncio.Lock for each name in metadata["entities"]
+       ↓ serializes concurrent writes to the same entity cluster
+BEGIN TRANSACTION
+  INSERT INTO technical_docs ... ON CONFLICT (content_hash) DO UPDATE
+       ↓ idempotent: SHA-256 hash prevents duplicates; agent_id/scope/visibility stored
+  INSERT INTO neo4j_outbox (pg_id, cypher_params)
+       ↓ outbox row committed atomically — Phase 2 worker drains this
+  SELECT pg_notify('new_artifact', {"pg_id": id})
+COMMIT  ← 200 OK returned to caller here (Postgres-ack)
        ↓
-MERGE (f:Fact {pg_id}) in Neo4j
+MERGE (f:Fact {pg_id}) in Neo4j  [Phase 1 — direct write; replaced by outbox worker in Phase 2]
 for each entity name in metadata["entities"]:
     MERGE (e:Entity {name})
     MERGE (f)-[:MENTIONS]->(e)
@@ -526,11 +547,13 @@ for each entity name in metadata["entities"]:
 daemon receives NOTIFY → adds pg_id to pending_pg_ids → idle timer starts
 ```
 
-> **Hard Mandate — Embedding Integrity:** Saves abort if the Hive-Mind Gateway is unreachable. An artifact stored without a vector is invisible to semantic search — the failure must surface, never be swallowed.
+> **Hard Mandate — Embedding Integrity:** Saves return 503 if the embedding service is unreachable after all retries. An artifact without a vector is invisible to semantic search — this failure must surface, never be swallowed.
 
-> **Daemon liveness check:** Before issuing `pg_notify`, both save paths query `pg_stat_activity` for the consolidation daemon's registered connection (`application_name = 'consolidation_daemon'`). If the daemon is not running, the save succeeds but the response includes: `WARNING: Consolidation daemon not running — NOTIFY dropped.` Since `pg_notify` is fire-and-forget, undelivered notifications are permanently lost. Starting the proxy (which auto-starts the daemon) before any save session prevents this.
+> **Per-entity write serialization:** Concurrent saves targeting the same entity are serialized via `asyncio.Lock[entity_name]`. This prevents duplicate `Entity` hub creation under agent-swarm concurrency and ensures the consolidation daemon sees a consistent cluster. (Phase 4 replaces this with Postgres advisory locks for multi-process deployment.)
 
-> **Audit logging:** Every event in the save path — gateway down, malformed metadata, missing entities, Neo4j sync failures, and successful saves — is optionally logged to a per-tool JSON file based on `MEMORY_LOG_LEVEL`. See [§14: Audit Logging](#14-audit-logging).
+> **Cross-DB atomicity:** The outbox row is written in the same Postgres transaction as the fact. If the process crashes after commit, the outbox row survives and the Phase 2 worker replays the Neo4j write on restart. The ADR-001 dangling-Fact window is eliminated in Phase 2.
+
+> **Audit logging:** Every event in the save path — coordinator unreachable, malformed metadata, missing entities, Neo4j sync failures, and successful saves — is optionally logged based on `MEMORY_LOG_LEVEL`. See [§14: Audit Logging](#14-audit-logging).
 
 ---
 
