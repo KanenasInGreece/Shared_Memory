@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Mandatory `source` provenance on save** (`coordinator.py`, `vector-skill.py`): The coordinator now rejects saves with HTTP 400 if `metadata.source` is absent or empty. `vector-skill.py`'s `save_artifact` MCP tool applies the same check before reaching Postgres. Facts without a declared source (agent or model name) are refused to prevent unattributed content from polluting the memory store. The system prompt for LM Studio updated to instruct the model to self-identify by model name (e.g. `"source":"qwen3-27b"`) in every save call.
+
 ### Fixed
 
 - **Reranker timeout in LM Studio** (`vector-skill.py`): `hybrid_search_and_rerank` was sending up to 20 full-content candidates to BGE-Reranker in a single call. With large documents (observed max ~12 KB, total ~44 KB), inference exceeded the previous 20-second timeout, producing `httpx.ReadTimeout` with an empty error string. Fixed by: (1) reducing the Postgres candidate pool from 20 to 10 (vector similarity already ranks the best matches first), and (2) raising the rerank-specific timeout to 120 seconds (`RERANK_TIMEOUT`). Embedding calls keep the existing 20-second timeout (`EMBED_TIMEOUT`). No content truncation — documents are sent in full to preserve the context that was intentionally saved.

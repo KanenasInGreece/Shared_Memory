@@ -47,8 +47,10 @@ async def test_mcp_save_artifact_success():
         # Neo4j mock
         mock_session = mock_neo4j.return_value.session.return_value.__enter__.return_value
         
-        result = await vector_skill.save_artifact(MOCK_CONTENT)
-        
+        result = await vector_skill.save_artifact(
+            MOCK_CONTENT, '{"source":"test_agent","entities":["TestEntity"]}'
+        )
+
         assert "Success" in result
         assert "linked to Graph" in result
         mock_cur.execute.assert_called()

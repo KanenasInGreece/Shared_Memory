@@ -295,6 +295,14 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
             _append_log("vector_skill", 2, "bad_metadata_type", {"got": type(m_data).__name__, "content_preview": content[:100]}, content)
             return f"Error: Metadata must be a JSON object, got {type(m_data).__name__}"
 
+        if not m_data.get("source"):
+            _append_log("vector_skill", 2, "missing_source", {"content_preview": content[:100]}, content)
+            return (
+                "Error: metadata.source is required — identify the saving agent "
+                "(e.g. 'lm_studio', 'antigravity'). "
+                "Facts without provenance are rejected to protect memory integrity."
+            )
+
         m_data["timestamp"] = datetime.now().isoformat()
         entities = m_data.get("entities", [])
 
