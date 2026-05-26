@@ -58,9 +58,16 @@ DB_CONN = os.environ.get(
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_AUTH = ("neo4j", os.environ.get("NEO4J_PASSWORD", ""))
 
-# Global timeout configuration - balanced for local inference
-# Increased to 20s to handle heavy BGE-M3 processing on AMD/Intel stack
-TIMEOUT = httpx.Timeout(20.0, connect=5.0)
+# Embedding timeout: BGE-M3 is fast even for long inputs.
+EMBED_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
+# Reranking timeout: BGE-Reranker processes each (query, doc) pair sequentially;
+# 10 full-content candidates can exceed 20s on CPU-only inference stacks.
+RERANK_TIMEOUT = httpx.Timeout(120.0, connect=5.0)
+# Legacy alias kept for callers not yet updated.
+TIMEOUT = EMBED_TIMEOUT
+# If the top reranker score is below this value, episodic results are not
+# confidently relevant and the entity-graph fallback is triggered.
+LOW_CONFIDENCE_THRESHOLD = -3.0
 
 # Global Drivers
 _neo4j_driver = None
@@ -85,7 +92,7 @@ def release_pg_conn(conn):
 async def get_embedding(text: str):
     """Internal helper to get embeddings with retry logic."""
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=EMBED_TIMEOUT) as client:
             headers = {"Authorization": "Bearer none"}
             resp = await client.post(
                 RETRIEVER_URL,
@@ -97,6 +104,52 @@ async def get_embedding(text: str):
     except Exception as e:
         logger.warning(f"Embedding service unreachable or slow: {str(e)}")
         return None
+
+
+def _graph_entity_fallback(query: str, limit: int = 5) -> str:
+    """Entity-graph search used when reranker confidence is low.
+    Extracts significant words from the query, matches against Entity.name nodes,
+    follows MENTIONS edges to Fact nodes, fetches full content from Postgres."""
+    terms = [w.lower() for w in query.split() if len(w) > 3]
+    if not terms:
+        return ""
+    try:
+        driver = get_neo4j()
+        with driver.session() as session:
+            result = session.run(
+                f"MATCH (e:{ONT.entity})"
+                f" WHERE any(term IN $terms WHERE toLower(e.name) CONTAINS term)"
+                f" MATCH (f:{ONT.fact})-[:{ONT.entity_link}]->(e)"
+                f" RETURN DISTINCT f.pg_id LIMIT $cap",
+                terms=terms, cap=limit * 2
+            )
+            pg_ids = [r["f.pg_id"] for r in result if r["f.pg_id"] is not None]
+    except Exception as e:
+        logger.warning(f"Graph entity fallback Neo4j query failed: {e}")
+        return ""
+    if not pg_ids:
+        return ""
+    try:
+        conn = get_pg_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT content, metadata FROM technical_docs"
+                    " WHERE id = ANY(%s) LIMIT %s",
+                    (pg_ids, limit)
+                )
+                rows = cur.fetchall()
+        finally:
+            release_pg_conn(conn)
+    except Exception as e:
+        logger.warning(f"Graph entity fallback Postgres fetch failed: {e}")
+        return ""
+    docs = []
+    for content, meta in rows:
+        source = meta.get("source", "unknown") if isinstance(meta, dict) else "unknown"
+        docs.append(f"[Graph Fallback | Source: {source}]\n{content}")
+    return "\n\n---\n\n".join(docs)
+
 
 @mcp.tool()
 async def hybrid_search_and_rerank(query: str, limit: int = 5) -> str:
@@ -136,7 +189,7 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5) -> str:
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT id, content, metadata FROM technical_docs
-                    ORDER BY embedding <=> %s::vector LIMIT 20
+                    ORDER BY embedding <=> %s::vector LIMIT 10
                 """, (query_vector,))
                 rows = cur.fetchall()
                 ids = [row[0] for row in rows]
@@ -148,8 +201,8 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5) -> str:
         if not candidates:
             return "Result: No relevant documentation found."
 
-        # 4. Rerank
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        # 4. Rerank — full document content, no truncation.
+        async with httpx.AsyncClient(timeout=RERANK_TIMEOUT) as client:
             resp = await client.post(RERANKER_URL, json={
                 "query": query,
                 "documents": candidates,
@@ -157,6 +210,17 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5) -> str:
             })
             resp.raise_for_status()
             rerank_results = resp.json()["results"]
+
+        # Low-confidence check — trigger entity-graph fallback if no result is
+        # confidently relevant (best score below threshold).
+        best_score = max((r["relevance_score"] for r in rerank_results), default=-999.0)
+        graph_supplement = ""
+        if best_score < LOW_CONFIDENCE_THRESHOLD:
+            logger.warning(
+                "Reranker low confidence (best=%.2f < %.1f) — querying entity graph",
+                best_score, LOW_CONFIDENCE_THRESHOLD,
+            )
+            graph_supplement = _graph_entity_fallback(query, limit)
 
         # 5. Relational Expansion (Neo4j)
         driver = get_neo4j()
@@ -193,7 +257,13 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5) -> str:
 
         duration = (datetime.now() - start_time).total_seconds()
         header = f"### Unified Memory Results ({len(output_docs)} items found in {duration:.2f}s)\n\n"
-        return global_context + header + "\n\n---\n\n".join(output_docs)
+        result_text = global_context + header + "\n\n---\n\n".join(output_docs)
+        if graph_supplement:
+            result_text += (
+                "\n\n---\n\n### Entity Graph Results (low confidence — supplementary)\n\n"
+                + graph_supplement
+            )
+        return result_text
 
     except Exception as e:
         logger.error(f"Search failed: {str(e)}")
