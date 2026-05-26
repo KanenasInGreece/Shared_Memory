@@ -1,9 +1,9 @@
 # Shared Memory (Hive-Mind)
 
 ## Overview
-This skill bridges the Shared Memory Framework — a three-tier semantic and relational memory layer shared across all AI agents on your workstation (Gemini CLI, LM Studio, and any CLI agent). Facts saved by one agent are retrievable by all others. Knowledge persists across sessions and tools.
+This skill bridges the Shared Memory Framework — a three-tier semantic and relational memory layer shared across all AI agents on your workstation. Facts saved by one agent are retrievable by all others. Knowledge persists across sessions and tools.
 
-**Agents currently supported:** Gemini CLI (skill), LM Studio (MCP), any HTTP client or CLI agent.
+**Agents currently supported:** Claude Code (skill), Grok (skill), Gemini CLI (skill), LM Studio (MCP), any HTTP client or CLI agent.
 
 ## Core Tasks
 
@@ -65,6 +65,14 @@ INFO  Listening for 'new_artifact' notifications...
 ```
 
 The proxy binds to `127.0.0.1:8888` by default (localhost only). Set `PROXY_BIND=0.0.0.0` in `.env` to opt into all-interfaces binding for Docker/VM setups.
+
+**Daemon watchdog:** The gateway auto-restarts the consolidation daemon on unexpected crashes with exponential backoff. A circuit breaker stops retrying after 5 crashes in 10 minutes — restart the gateway to reset.
+
+**Check gateway health before saving:**
+```
+curl http://localhost:8888/health
+```
+Returns `{"status":"ok"}` when embedder and reranker are both reachable. HTTP 503 means the save/search path is degraded.
 
 ### MCP Server (LM Studio only)
 ```

@@ -7,6 +7,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Daemon watchdog with auto-restart** (`hive_mind_proxy.py`): Replaced the one-shot `_monitor_daemon()` with a persistent `_watchdog_daemon()` asyncio task. The watchdog restarts the consolidation daemon on unexpected crashes with exponential backoff (1 s → 60 s ceiling), resets backoff after ≥ 30 s of stable uptime, and trips a circuit breaker after ≥ 5 crashes within 10 minutes (logs CRITICAL, stops restarting, requires gateway restart to reset). Clean exits (`0` or `-SIGTERM`) are not restarted.
+
+- **`GET /health` endpoint** (`hive_mind_proxy.py`): Probes embedder (:8070), reranker (:8071), and LLM (:5000) with 2 s timeouts using the proxy's existing connection pool. Reports consolidation daemon liveness from watchdog state. Returns HTTP 200 if embedder + reranker are both reachable (the critical save/search path); HTTP 503 if either is down. LLM and daemon status are reported informationally — their unavailability degrades consolidation only, not saves or searches. Note: embedder and reranker already have Docker `healthcheck` + `restart: always` as primary recovery; this endpoint provides immediate observability and covers non-Docker backends.
+
+- **Four-agent skill integration**: Claude Code (`~/.claude/skills/shared-memory/`), Grok (`~/.grok/skills/shared-memory/`), Gemini CLI (`~/.gemini/skills/shared-memory/`), LM Studio (MCP via `rag-orchestrator`). Claude Code and Grok scripts are symlinked to the repo; Gemini CLI uses flat copies.
+
+### Fixed
+
+- **`python-dotenv` loading in `vector-skill.py` and `memory_bridge.py`**: Both scripts now load `.env` from the repo root at startup via `python-dotenv`. Agents such as LM Studio and Grok spawn these scripts as subprocesses without inheriting the shell environment; credentials were silently empty strings. Graceful `ImportError` fallback if `python-dotenv` is absent. Added `--with python-dotenv` to `mcp.json` `uv run` args.
+
+- **Removed `neo4j-memory` from `mcp.json`**: The `neo4j-agent-memory` MCP server connects directly to Neo4j via bolt, bypassing the coordinator's per-entity locks, outbox atomicity, SHA-256 deduplication, and read-only Cypher guard. Writes produced orphaned Neo4j nodes invisible to semantic search. `rag-orchestrator` already performs Neo4j graph expansion on every search call; no separate graph MCP is needed.
+
+- **System prompt search-first directive** (`system-prompt.md`): Rewrote the `COGNITIVE HIERARCHY` section with explicit "MUST call `rag-orchestrator` first, no exceptions" language. Added explanation that `rag-orchestrator` already includes Neo4j expansion; demoted `neo4j-memory` to a deprecated note. A weak ordinal list was insufficient — the model was calling `neo4j-memory` first.
+
 ---
 
 ## [0.2.0] — 2026-05-26
