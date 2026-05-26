@@ -312,7 +312,7 @@ llama-server --model /path/to/bge-reranker-v2-m3.gguf --port 8071 --reranking
 
 ### The hardcoded embedder problem
 
-Many tools in this stack are built around the OpenAI API. The `neo4j-agent-memory` MCP server, LM Studio's internal agent tooling, and others accept an API base URL and call `/v1/embeddings` against it. Without a gateway, the choices are:
+Many tools in this stack are built around the OpenAI API. LM Studio's internal agent tooling and other OpenAI-compatible clients accept an API base URL and call `/v1/embeddings` against it. Without a gateway, the choices are:
 
 - Point every tool individually at port 8070 — fragile, breaks reranking which lives on 8071
 - Accept that each tool calls whatever model it prefers — produces different vector spaces, destroying cross-agent retrieval
@@ -502,7 +502,7 @@ Edit `mcp.json` from this repo: replace all `YOUR_*` placeholders with real valu
 
 `system-prompt.md` is the operational contract for the LM Studio model. It defines:
 
-- **Search-first directive** — the model must query `rag-orchestrator` (semantic) and `neo4j-memory` (relational) before falling back to training data or web search.
+- **Search-first directive** — the model must call `rag-orchestrator` → `hybrid_search_and_rerank` as the first tool on every query. `rag-orchestrator` already includes Neo4j graph expansion internally; no separate graph MCP is needed.
 - **Gateway mandate** — the architectural context explicitly states that all embedding and reranking calls route through port 8888; the model must never reference 8070 or 8071 directly.
 - **Consolidation awareness** — the model knows that every save triggers a Postgres `pg_notify` and that the consolidation daemon (auto-started with the gateway) synthesises Tier 3 summaries. It also knows to warn you if the daemon is not running.
 - **Memory cycle** — when to absorb (end of task, new decision) and that `"entities"` in save metadata is required for Tier 3 eligibility.
@@ -719,7 +719,9 @@ Vector retrieval and graph traversal fail differently. Cosine similarity degrade
 
 Edit `mcp.json` — replace all `YOUR_*` placeholders with real values and update the absolute path to `vector-skill.py`. Save it to `~/.lmstudio/mcp.json` (or wherever LM Studio reads MCP config on your system).
 
-The `rag-orchestrator` entry runs the custom MCP server for this framework. The `neo4j-memory` entry points the `neo4j-agent-memory` package at the gateway so it uses BGE-M3 rather than calling OpenAI.
+The `rag-orchestrator` entry runs the custom MCP server for this framework. It is the only memory MCP server needed — it covers semantic retrieval (Tier 1 + Tier 3) and Neo4j graph expansion in a single call, and routes all writes through the coordinator's atomicity and locking guarantees.
+
+> **Why no separate graph MCP?** A direct-bolt Neo4j MCP server (e.g. `neo4j-agent-memory`) bypasses the coordinator entirely: no per-entity locks, no outbox atomicity, no SHA-256 deduplication, and no read-only Cypher guard. Any write it makes produces orphaned Neo4j nodes with no corresponding Postgres record — invisible to semantic search and outside the consolidation pipeline. `rag-orchestrator` already includes Neo4j graph expansion; a separate graph MCP adds ambiguity and write-safety risk without adding capability.
 
 ```json
 {
@@ -731,26 +733,9 @@ The `rag-orchestrator` entry runs the custom MCP server for this framework. The 
         "--with", "httpx",
         "--with", "psycopg2-binary",
         "--with", "neo4j",
+        "--with", "python-dotenv",
         "python", "/path/to/your/vector-skill.py"
       ]
-    },
-    "neo4j-memory": {
-      "command": "uvx",
-      "args": [
-        "--with", "neo4j-agent-memory[mcp,openai]",
-        "--with", "click", "--with", "rich",
-        "neo4j-agent-memory", "mcp", "serve",
-        "--uri", "bolt://localhost:7687",
-        "--user", "neo4j", "--password", "YOUR_NEO4J_PASSWORD",
-        "--llm", "openai/qwen",
-        "--llm-api-base", "http://localhost:8888/v1",
-        "--embedding", "openai/bge-m3",
-        "--embedding-dimensions", "1024"
-      ],
-      "env": {
-        "OPENAI_BASE_URL": "http://localhost:8888/v1",
-        "OPENAI_API_KEY": "sk-no-key-required"
-      }
     },
     "tavily-mcp": {
       "command": "npx",
@@ -762,14 +747,6 @@ The `rag-orchestrator` entry runs the custom MCP server for this framework. The 
   }
 }
 ```
-
-> **Why `neo4j-memory` uses the gateway:** The `neo4j-agent-memory` package calls the OpenAI embeddings API to vectorise entity names before storing them. By pointing both API base URLs at port 8888, every embedding it generates uses BGE-M3 — the same model and the same space as everything else in the framework.
-
-### Attribution — neo4j-agent-memory
-
-The `neo4j-memory` MCP server entry uses [**neo4j-agent-memory**](https://github.com/neo4j-labs/agent-memory), an open-source package by [Neo4j Labs](https://github.com/neo4j-labs). It provides graph-backed agent memory with MCP and OpenAI-compatible interfaces.
-
-Licensed under the [Apache License 2.0](https://github.com/neo4j-labs/agent-memory/blob/main/LICENSE) — the same licence as this framework. No modifications are made to the package; it is used as a runtime dependency via `uvx`.
 
 ### Web search — choose your provider
 
