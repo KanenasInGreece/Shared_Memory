@@ -94,4 +94,4 @@ uv run --with fastmcp --with httpx --with psycopg2-binary --with neo4j \
 - **Schema:** Neo4j labels, relationship types, Postgres tables — [schema.md](Documentation/schema.md)
 - **Embedding mandate:** All calls route through the gateway (:8888). Never call port 8070 (BGE-M3) or 8071 (BGE-Reranker) directly — the gateway enforces 1024-dim consistency across all agents.
 - **Ontology:** All Neo4j labels and relationship types are configurable in `ontology.yaml` at the repo root.
-- **Security posture:** Read-only Cypher guard active. Agent authentication (Phase 2C) is planned.
+- **Security posture:** Read-only Cypher guard active. `starlette>=1.0.1` floor enforced (BadHost CVE-2026-48710). Agent authentication (Phase 2C) is planned.

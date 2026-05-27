@@ -3,5 +3,5 @@
 
 -r requirements.txt
 
-pytest>=8.0.0           # Test runner
-pytest-asyncio>=0.24.0  # Async test support
+pytest>=9.0.3           # Test runner
+pytest-asyncio>=1.4.0   # Async test support
