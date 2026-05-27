@@ -83,11 +83,19 @@ async def run_test():
         # 4. Verify consolidation
         success = True
         with conn.cursor() as cur:
-            cur.execute("SELECT content, metadata FROM community_summaries WHERE metadata->>'entity' = %s", (entity_name,))
+            cur.execute(
+                "SELECT content, metadata, source_pg_ids FROM community_summaries WHERE metadata->>'entity' = %s",
+                (entity_name,)
+            )
             summary = cur.fetchone()
             if summary:
                 logger.info("SUCCESS: Found community summary in Postgres!")
                 logger.info(f"Summary Content: {summary[0]}")
+                if summary[2]:
+                    logger.info(f"SUCCESS: source_pg_ids populated: {summary[2]}")
+                else:
+                    logger.error("FAILURE: source_pg_ids is NULL — migration 003 may not have run.")
+                    success = False
             else:
                 logger.error("FAILURE: No community summary found in Postgres.")
                 success = False

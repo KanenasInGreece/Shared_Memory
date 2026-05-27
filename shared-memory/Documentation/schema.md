@@ -33,6 +33,7 @@ Written exclusively by the consolidation daemon. Each row is an LLM-synthesised 
 | `content` | `TEXT NOT NULL` | LLM-generated cumulative narrative for the entity cluster |
 | `metadata` | `JSONB` | Written by the daemon — see structure below |
 | `embedding` | `vector(1024)` | BGE-M3 embedding of the synthesised `content`; used for top-1 retrieval |
+| `source_pg_ids` | `INTEGER[]` | IDs of `technical_docs` rows that contributed to this summary. Added by migration 003; back-filled from `metadata` for existing rows. Enables `WHERE $fact_id = ANY(source_pg_ids)` provenance queries without JSON parsing. |
 | `agent_id` | `TEXT NOT NULL DEFAULT 'legacy'` | Agent that triggered consolidation; `'legacy'` for pre-coordinator rows |
 | `scope` | `TEXT NOT NULL DEFAULT 'global'` | Inherited from the source `Fact` cluster's scope |
 | `visibility` | `TEXT NOT NULL DEFAULT 'global'` | Read policy, same semantics as `technical_docs.visibility` |
@@ -46,6 +47,8 @@ Written exclusively by the consolidation daemon. Each row is an LLM-synthesised 
   "timestamp": "<ISO-8601 datetime of this consolidation run>"
 }
 ```
+
+> **Note:** `source_pg_ids` is stored both as the dedicated column above and inside `metadata` JSONB. The column is the authoritative query path; the JSONB key is retained for backwards compatibility with tooling that reads raw metadata.
 
 **Indexes:** `community_summaries_embedding_idx` — `ivfflat (embedding vector_cosine_ops)`; btree indexes on `agent_id`, `scope`, `visibility`
 

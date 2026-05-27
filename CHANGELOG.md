@@ -9,6 +9,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.2.7] — 2026-05-27
+
+### Added
+
+- **`source_pg_ids INTEGER[]` column on `community_summaries`** (`migrations/003_source_pg_ids.sql`, both `consolidation_loop.py` copies): Promotes contributing fact IDs from the `metadata` JSONB blob to a first-class queryable array column. Enables `WHERE $pg_id = ANY(source_pg_ids)` provenance queries — any caller can now trace which `technical_docs` rows contributed to a consolidated summary without parsing JSON. Existing rows are back-filled from `metadata` in the migration. The `ON CONFLICT DO UPDATE` clause in the skill-copy consolidation loop was also corrected (missing since migration 002). Apply: `uv run --with psycopg2-binary python shared-memory/migrations/apply.py 003_source_pg_ids.sql`.
+
+---
+
 ## [0.2.6] — 2026-05-26
 
 ### Added
@@ -166,5 +174,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+[0.2.7]: https://github.com/KanenasInGreece/Shared_Memory/releases/tag/v0.2.7
 [0.2.0]: https://github.com/KanenasInGreece/Shared_Memory/releases/tag/v0.2.0
 [0.1.0]: https://github.com/KanenasInGreece/Shared_Memory/releases/tag/v0.1.0

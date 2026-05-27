@@ -246,10 +246,11 @@ CREATE INDEX IF NOT EXISTS technical_docs_embedding_idx
 
 -- Tier 3: consolidated thematic narratives
 CREATE TABLE IF NOT EXISTS community_summaries (
-    id        SERIAL PRIMARY KEY,
-    content   TEXT NOT NULL,
-    metadata  JSONB,
-    embedding vector(1024)
+    id             SERIAL PRIMARY KEY,
+    content        TEXT NOT NULL,
+    metadata       JSONB,
+    embedding      vector(1024),
+    source_pg_ids  integer[]       -- IDs of technical_docs rows that contributed to this summary
 );
 CREATE INDEX IF NOT EXISTS community_summaries_embedding_idx
     ON community_summaries USING ivfflat (embedding vector_cosine_ops);
@@ -821,7 +822,7 @@ MOCK_LLM=1 uv run --with pytest --with pytest-asyncio --with fastmcp \
 |---|---|
 | `test_memory_bridge.py` | Embedding hard mandate, save idempotency, search + rerank + fallback, Neo4j expansion |
 | `test_vector_skill.py` | MCP tool contracts (save, search, health check, reasoning trace) |
-| `test_consolidation_e2e.py` | Consolidation cycle with mock LLM, density threshold, community summary write |
+| `test_consolidation_e2e.py` | Consolidation cycle with mock LLM, density threshold, community summary write, `source_pg_ids` populated |
 | `test_logging.py` | `_append_log` level filtering, per-tool file routing, content size warnings; `save_artifact` logging at each event type; `merge_logs` sort order, multi-tool merge, malformed line handling, daily archive merge, logrotate cleanup |
 
 ---
@@ -875,7 +876,7 @@ This framework is actively evolving toward a workstation where any number of AI 
 | **Security baseline** | Read-only Cypher guard, localhost-only bind (PROXY_BIND opt-in), opaque error responses, bounded limit, ONT label validation at startup, prompt injection delimiters | ✅ Done |
 | **Configurable ontology — Path A** | All Neo4j labels and relationship types in `ontology.yaml`; ONT singleton with validation; falls back to hardcoded defaults; density threshold configurable | ✅ Done |
 | **Agent integration** | Claude Code (skill), Grok (skill), Gemini CLI (skill), LM Studio (MCP via vector-skill.py) | ✅ Done |
-| **Schema migrations** | Migration runner; 001 (multi-agent schema: agent_id, scope, visibility, neo4j_outbox); 002 (concurrency hardening: unique index on community_summaries, covering index on outbox) | ✅ Done |
+| **Schema migrations** | Migration runner; 001 (multi-agent schema: agent_id, scope, visibility, neo4j_outbox); 002 (concurrency hardening: unique index on community_summaries, covering index on outbox); 003 (source provenance: `source_pg_ids integer[]` on community_summaries, back-fill from metadata) | ✅ Done |
 
 ### In Progress / Planned
 
