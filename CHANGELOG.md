@@ -9,6 +9,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.2.8] — 2026-05-27
+
+### Security
+
+- **Starlette BadHost floor (`requirements.txt`)**: Added explicit `starlette>=1.0.1` dependency to enforce the minimum version that contains the fix for **CVE-2026-48710** (BadHost). The vulnerability allows a crafted `Host` header containing `/`, `?`, or `#` to shift path parsing so that `request.url.path` no longer matches the path the ASGI router received — bypassing any path-based auth middleware while the route still executes. Our `vector-skill.py` runs over `stdio` (no HTTP surface) and `hive_mind_proxy.py` uses `aiohttp` (unaffected), so real-world exposure was nil. The floor is added defensively in case the transport ever changes.
+
+### Maintenance
+
+- **Dependency lower bounds raised** (`requirements.txt`, `requirements-dev.txt`): All minimum versions advanced to match currently tested releases — `aiohttp` 3.13.5, `asyncpg` 0.31.0, `httpx` 0.28.1, `psycopg2-binary` 2.9.12, `neo4j` 6.2.0, `fastmcp` 3.3.1, `python-dotenv` 1.2.2, `pytest` 9.0.3, `pytest-asyncio` 1.4.0.
+
+---
+
 ## [0.2.7] — 2026-05-27
 
 ### Added
@@ -174,6 +186,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+[0.2.8]: https://github.com/KanenasInGreece/Shared_Memory/releases/tag/v0.2.8
 [0.2.7]: https://github.com/KanenasInGreece/Shared_Memory/releases/tag/v0.2.7
 [0.2.0]: https://github.com/KanenasInGreece/Shared_Memory/releases/tag/v0.2.0
 [0.1.0]: https://github.com/KanenasInGreece/Shared_Memory/releases/tag/v0.1.0

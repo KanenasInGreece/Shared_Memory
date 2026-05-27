@@ -15,6 +15,26 @@ You will receive a response within 72 hours. Once the issue is confirmed and a f
 
 ## Known Security Considerations
 
+### Starlette BadHost (CVE-2026-48710) — mitigated
+
+**Status: not exposed; `starlette>=1.0.1` floor enforced in `requirements.txt`.**
+
+A crafted `Host` header containing `/`, `?`, or `#` causes Starlette to misparse `request.url.path`: the path the middleware sees no longer matches the path the ASGI router received and dispatched. Any path-based auth check (e.g. `if request.url.path.startswith("/admin")`) can be bypassed while the underlying route still executes normally. The vulnerability affects all Starlette versions before 1.0.1 and by extension FastAPI, LiteLLM, vLLM, most OpenAI-shim proxies, MCP servers, and agent harnesses built on the same stack.
+
+**This project's exposure:**
+
+- `vector-skill.py` uses FastMCP over **stdio** — no HTTP listener is opened, so the attack surface does not exist at all. When LM Studio launches it via `uv run --with fastmcp`, the resolved environment uses Starlette 1.1.0 (patched).
+- `hive_mind_proxy.py` uses **aiohttp**, which has a separate, unaffected HTTP parser.
+
+**Requirement added:** `starlette>=1.0.1` is now explicit in `requirements.txt` as a security floor, so that any future change to the MCP transport (e.g. switching to SSE or HTTP) cannot silently introduce a vulnerable Starlette version.
+
+**References:**
+- [CVE-2026-48710 — BadHost](https://badhost.org/)
+- [OSTIF disclosure: BadHost in Starlette](https://ostif.org/disclosing-the-badhost-vulnerability-in-starlette/)
+- Fixed in [Starlette 1.0.1](https://github.com/encode/starlette/releases/tag/1.0.1)
+
+---
+
 ### Gateway network exposure
 
 `hive_mind_proxy.py` binds to **`127.0.0.1:8888` by default** — localhost only. The coordinator API is unauthenticated; binding to a wider address would expose memory read/write to any machine on the same network.
