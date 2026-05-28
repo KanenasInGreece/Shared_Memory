@@ -9,6 +9,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.2.9] — 2026-05-28
+
+### Added
+
+- **Decision provenance layer — Phase A** (`ontology.yaml`, `shared-memory/scripts/ontology.py`, `shared-memory/scripts/coordinator.py`, `tests/test_coordinator.py`): PROV-O-inspired provenance nodes and relationships for recording architectural and design decisions with full attribution context.
+
+  - **`ontology.yaml`** — 6 new provenance labels (`Decision`, `Human`, `AIAgent`, `Project`, `Activity`, `Milestone`) and 8 provenance relationships (`WAS_ATTRIBUTED_TO`, `WAS_ASSISTED_BY`, `PROJECT_OF`, `WAS_GENERATED_BY`, `ACTED_ON_BEHALF_OF`, `SUPERSEDES`, `INFORMED_BY`, `HAD_OUTCOME`). All configurable via the existing `ontology.yaml` override mechanism.
+
+  - **`coordinator.py` ingress validation** — saves with `metadata["type"] == "decision"` are validated at ingress before any DB write. Missing required fields (`decided_by`, `project`, `rationale`) return HTTP 400 with a descriptive error listing the missing fields. Plain fact saves are unaffected.
+
+  - **`coordinator.py` outbox dispatch** — `_apply_outbox_row` routes `type=decision` saves to the new `_apply_decision_outbox_row` method. Writes a `Decision→Human→Project→AIAgent` subgraph in a single Neo4j session with `WAS_ATTRIBUTED_TO`, `PROJECT_OF`, `WAS_ASSISTED_BY`, and `MENTIONS` edges. `FOREACH` (not `UNWIND`) used for `assisted_by` and `entities` lists — handles empty lists safely without dropping the write.
+
+  - **`tests/test_coordinator.py`** — 8 new tests: ingress validation (missing all required fields → 400; single missing field named in error); plain fact regression; valid decision passes validation; outbox dispatch routing to decision path and not to it for plain facts; Neo4j write shape (correct labels + relationship types + kwargs); empty `assisted_by` does not crash.
+
+- **Schema documentation** (`shared-memory/Documentation/schema.md`): Full Neo4j section replaced with provenance labels table (Phase A), provenance relationships table with PROV-O patterns and meanings, Cypher query examples (who-decided, agent contributions, Why-To loop), and the decision save protocol JSON example.
+
+- **All 5 SKILL.md locations**: Task 4 — Decision Provenance — added to every agent skill file with CLI save example, required fields list, three-step write flow, and Cypher query template for retrieving saved decisions.
+
+- **README** (`README.md`): "What we are building toward" vision subsection with target question and answer shape; "Saving everything vs. saving what matters" with concrete queryable examples (who/when/why/conditions/outcome) and counter-examples (what stays in Git); roadmap updated — Phase A marked done, Phases B–E (CLI/MCP tools, retrospectives, named query templates, pruning) listed as planned.
+
+- **CLAUDE.md** — test command updated to include `--with asyncpg --with aiohttp` (required since `coordinator.py` imports both at module level).
+
+---
+
 ## [0.2.8] — 2026-05-27
 
 ### Security
@@ -186,6 +210,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+[0.2.9]: https://github.com/KanenasInGreece/Shared_Memory/releases/tag/v0.2.9
 [0.2.8]: https://github.com/KanenasInGreece/Shared_Memory/releases/tag/v0.2.8
 [0.2.7]: https://github.com/KanenasInGreece/Shared_Memory/releases/tag/v0.2.7
 [0.2.0]: https://github.com/KanenasInGreece/Shared_Memory/releases/tag/v0.2.0
