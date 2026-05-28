@@ -6,6 +6,7 @@ on port 8888. Direct Postgres and Neo4j access has been removed; the
 coordinator owns those connections.
 
 CLI usage:
+    python memory_bridge.py --version
     python memory_bridge.py save   "<content>" '<metadata_json>'
     python memory_bridge.py search "<query>" [limit]
     python memory_bridge.py graph  "<cypher>"
@@ -24,6 +25,8 @@ import sys
 from datetime import datetime
 
 import httpx
+
+VERSION = "0.3.0"
 
 # Load .env by searching up from this script's location so env overrides
 # (COORDINATOR_URL, MEMORY_LOG_LEVEL, etc.) are picked up when invoked by
@@ -191,13 +194,16 @@ def build_decision_metadata(
 async def main() -> None:
     if len(sys.argv) < 2:
         print(json.dumps({
-            "error": "Usage: python memory_bridge.py [graph|search|save|save_decision] ..."
+            "error": "Usage: python memory_bridge.py [--version|graph|search|save|save_decision] ..."
         }))
         sys.exit(1)
 
     action = sys.argv[1]
 
-    if action == "graph":
+    if action in ("--version", "version", "-v"):
+        print(json.dumps({"version": VERSION, "tool": "shared-memory-framework"}))
+        return
+    elif action == "graph":
         if len(sys.argv) < 3:
             print(json.dumps({"error": "Usage: memory_bridge.py graph <cypher>"}))
             sys.exit(1)
