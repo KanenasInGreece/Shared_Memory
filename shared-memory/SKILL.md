@@ -46,6 +46,46 @@ Query the knowledge graph for structural and dependency context.
   ```
 - **Read-only enforced:** The coordinator rejects any Cypher containing `CREATE`, `DELETE`, `DETACH DELETE`, `SET`, `MERGE`, `CALL`, `LOAD CSV`, or `DROP`. Use only `MATCH`/`RETURN`/`WITH`/`WHERE`/`OPTIONAL MATCH`.
 
+### 4. Decision Provenance (Save a Decision)
+Record architectural or design decisions with full PROV-O provenance — who decided, which AI assisted, which project, and why.
+- **Trigger:** When a significant architectural, design, or process decision is made.
+- **CLI:**
+  ```
+  uv run --with httpx python scripts/memory_bridge.py save \
+    "We decided to add a consolidation daemon to simulate dreaming." \
+    '{
+      "source": "<agent_name>",
+      "type": "decision",
+      "entities": ["Consolidator", "SharedMemory"],
+      "decision": {
+        "title": "Add consolidation daemon",
+        "decided_by": "Xenofon",
+        "project": "shared_memory",
+        "rationale": "simulate dreaming; reduce hot-path latency via outbox",
+        "assisted_by": ["claude-code"],
+        "date": "2026-05-28",
+        "alternatives_considered": ["synchronous writes", "no consolidation"],
+        "confidence_at_time": 0.8
+      }
+    }'
+  ```
+
+**Required fields:** `decided_by`, `project`, `rationale`. All others optional. Missing required fields return HTTP 400.
+
+**What happens on save:**
+1. Coordinator validates required decision fields at ingress (before any DB write)
+2. Upserts into Postgres `technical_docs` (same idempotency as plain facts)
+3. Outbox worker writes Decision→Human→Project→AIAgent subgraph in Neo4j with PROV-O edges: `WAS_ATTRIBUTED_TO`, `PROJECT_OF`, `WAS_ASSISTED_BY`, `MENTIONS`
+
+**Query decisions later:**
+```
+uv run --with httpx python scripts/memory_bridge.py graph \
+  "MATCH (h:Human)-[:WAS_ATTRIBUTED_TO]-(d:Decision)-[:PROJECT_OF]->(p:Project)
+   OPTIONAL MATCH (d)-[:WAS_ASSISTED_BY]->(ai:AIAgent)
+   WHERE toLower(d.title) CONTAINS 'consolidat'
+   RETURN h.name, ai.name, d.title, d.rationale, d.date, p.name"
+```
+
 ## Infrastructure
 
 ### Gateway + Coordinator + Consolidation Daemon

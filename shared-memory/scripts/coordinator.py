@@ -208,8 +208,12 @@ class MemoryCoordinator:
         self, outbox_id: int, pg_id: int, params: dict, retries: int
     ) -> None:
         try:
-            # All Neo4j writes in one round-trip via UNWIND so they succeed or
-            # fail atomically. MERGE is idempotent — safe to retry on transient errors.
+            if params.get("type") == "decision":
+                await self._apply_decision_outbox_row(outbox_id, pg_id, params)
+                return
+
+            # Standard Fact + Entity MERGE — all writes in one round-trip so they
+            # succeed or fail atomically. MERGE is idempotent — safe to retry.
             async with self._neo4j.session() as session:
                 await session.run(
                     f"MERGE (f:{ONT.fact} {{pg_id: $pg_id}})"
@@ -252,6 +256,58 @@ class MemoryCoordinator:
                         "UPDATE neo4j_outbox SET retries=retries+1 WHERE id=$1 AND status='pending'",
                         outbox_id,
                     )
+
+    async def _apply_decision_outbox_row(
+        self, outbox_id: int, pg_id: int, params: dict
+    ) -> None:
+        """
+        Materialise a Decision node and its PROV-O edges in Neo4j.
+
+        Creates: Decision, Human (decided_by), Project, AIAgent(s) (assisted_by),
+        and Entity nodes for each name in entities.  FOREACH handles empty lists
+        so the query is safe regardless of whether assisted_by or entities are set.
+        All writes in one session — atomic on transient failures (MERGE is idempotent).
+        """
+        decision = params.get("decision", {})
+        async with self._neo4j.session() as session:
+            await session.run(
+                f"MERGE (d:{ONT.decision} {{pg_id: $pg_id}})"
+                f"  SET d.title     = $title,"
+                f"      d.rationale = $rationale,"
+                f"      d.date      = $date,"
+                f"      d.source    = $source"
+                f" WITH d"
+                f" MERGE (h:{ONT.human} {{name: $decided_by}})"
+                f" MERGE (d)-[:{ONT.was_attributed_to}]->(h)"
+                f" WITH d"
+                f" MERGE (p:{ONT.project} {{name: $project}})"
+                f" MERGE (d)-[:{ONT.project_of}]->(p)"
+                f" WITH d"
+                f" FOREACH (ai_name IN $assisted_by |"
+                f"   MERGE (a:{ONT.ai_agent} {{name: ai_name}})"
+                f"   MERGE (d)-[:{ONT.was_assisted_by}]->(a)"
+                f" )"
+                f" WITH d"
+                f" FOREACH (ename IN $entities |"
+                f"   MERGE (e:{ONT.entity} {{name: ename}})"
+                f"   MERGE (d)-[:{ONT.entity_link}]->(e)"
+                f" )",
+                pg_id=pg_id,
+                title=decision.get("title", params.get("content_snippet", "")[:100]),
+                rationale=decision.get("rationale", ""),
+                date=decision.get("date", ""),
+                source=params.get("source", "coordinator"),
+                decided_by=decision.get("decided_by", "unknown"),
+                project=decision.get("project", "unknown"),
+                assisted_by=decision.get("assisted_by", []),
+                entities=params.get("entities", []),
+            )
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE neo4j_outbox SET status='applied', applied_at=now() WHERE id=$1",
+                outbox_id,
+            )
+        log.debug("outbox: applied decision pg_id=%d (outbox_id=%d)", pg_id, outbox_id)
 
     async def _wait_for_outbox(self, pg_id: int) -> bool:
         """Poll until the outbox row for pg_id is applied, or CONSISTENCY_TIMEOUT expires."""
@@ -305,6 +361,28 @@ class MemoryCoordinator:
                 status=400,
             )
 
+        # Decision saves require structured provenance fields — validated at ingress
+        # before the row touches the outbox WAL.  Bad data from an LLM is rejected
+        # here rather than replayed on every restart from a corrupt outbox entry.
+        if metadata.get("type") == "decision":
+            decision_data = metadata.get("decision", {})
+            missing = [
+                f for f in ("decided_by", "project", "rationale")
+                if not decision_data.get(f)
+            ]
+            if missing:
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "message": (
+                            f"decision save missing required fields: {missing}. "
+                            "Include a 'decision' object in metadata with "
+                            "'decided_by', 'project', and 'rationale'."
+                        ),
+                    },
+                    status=400,
+                )
+
         entities     = metadata.get("entities", [])
         content_hash = hashlib.sha256(content.encode()).hexdigest()
 
@@ -356,6 +434,8 @@ class MemoryCoordinator:
                             "source": metadata.get("source", "coordinator"),
                             "entities": entities,
                             "agent_id": agent_id,
+                            "type": metadata.get("type", "fact"),
+                            "decision": metadata.get("decision", {}),
                         }),
                     )
 
