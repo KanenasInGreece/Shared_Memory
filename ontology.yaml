@@ -11,12 +11,28 @@ labels:
   community_summary: CommunitySummary  # LLM-synthesised thematic narrative (daemon-written)
   reasoning_trace: ReasoningTrace      # root node of an agent reasoning session
   reasoning_step: ReasoningStep        # individual step within a ReasoningTrace chain
+  # Provenance layer (Phase A — PROV-O inspired)
+  decision: Decision                   # an architectural or design decision
+  human: Human                         # a person who makes or owns a decision
+  ai_agent: AIAgent                    # an AI tool that assisted in a session
+  project: Project                     # project scope — root for decisions and milestones
+  activity: Activity                   # a work session or task context
+  milestone: Milestone                 # a significant achievement marker
 
 relationships:
   entity_link: MENTIONS          # primary Fact→Entity relationship written on save
   entity_link_alias: REPORTS_ON  # legacy alias accepted by consolidation clustering
   summarized_by: SUMMARIZED_BY   # Fact→CommunitySummary, written by consolidation daemon
   reasoning_next: NEXT_STEP      # links consecutive ReasoningStep nodes
+  # Provenance relationships (Phase A — PROV-O inspired)
+  was_attributed_to: WAS_ATTRIBUTED_TO     # Decision→Human: who owns the decision
+  was_assisted_by: WAS_ASSISTED_BY         # Decision→AIAgent: which AI tool assisted
+  was_generated_by: WAS_GENERATED_BY       # Decision→Activity: which session produced it
+  project_of: PROJECT_OF                   # Decision/Activity→Project: project context
+  acted_on_behalf_of: ACTED_ON_BEHALF_OF   # AIAgent→Human: delegation chain
+  supersedes: SUPERSEDES                   # Decision→Decision: replaces a prior decision
+  informed_by: INFORMED_BY                 # Decision→Decision: prior knowledge used
+  had_outcome: HAD_OUTCOME                 # Decision→Decision/Milestone: retrospective edge
 
 consolidation:
   density_threshold: 5           # min unconsolidated Facts per Entity hub to trigger synthesis
