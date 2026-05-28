@@ -82,24 +82,101 @@ Written by the coordinator on every save, in the same Postgres transaction as `t
 
 > Configurable via `ontology.yaml`. Label and relationship keys map directly to the `labels:` and `relationships:` sections.
 
-**Core Labels:**
-- `Project`: Root node for a project.
-- `File`: A file within a project.
-- `Concept`: An abstract idea or technical component.
-- `Entity`: Generic POLE (Person, Object, Location, Event).
-- `Fact`: A specific technical truth or decision.
+### Core labels (Tier 1 / Tier 3 nodes)
 
-**Common Relationships:**
-- `(:File)-[:BELONGS_TO]->(:Project)`
-- `(:Concept)-[:IMPLEMENTED_IN]->(:File)`
-- `(:Fact)-[:VALID_FOR]->(:Project)`
-- `(:Entity)-[:PARTICIPATES_IN]->(:Event)`
-- `(:Fact)-[:MENTIONS]->(:Entity)` — created at save time from `metadata["entities"]`; required for consolidation clustering
-- `(:Fact)-[:REPORTS_ON]->(:Entity)` — alias accepted by consolidation query; use MENTIONS for new saves
-- `(:Fact)-[:SUMMARIZED_BY]->(:CommunitySummary)` — written by consolidation daemon after synthesis
+| Label | Written by | Purpose |
+|---|---|---|
+| `Fact` | Outbox worker (on every save) | Primary node — one per `technical_docs` row, keyed by `pg_id` |
+| `Entity` | Outbox worker | Named entity extracted from `metadata["entities"]`; anchors consolidation clusters |
+| `CommunitySummary` | Consolidation daemon | Synthesised thematic narrative — one per Entity hub |
+| `ReasoningTrace` | Agent (via `archive_reasoning_trace`) | Root of a reasoning session |
+| `ReasoningStep` | Agent (via `archive_reasoning_trace`) | Individual step within a trace |
+
+### Provenance labels (Phase A — PROV-O inspired)
+
+Written by the outbox worker when `metadata["type"] == "decision"`.
+
+| Label | Purpose |
+|---|---|
+| `Decision` | An architectural or design decision — keyed by `pg_id`, links to all PROV-O edges |
+| `Human` | A person who owns or makes a decision (`decided_by` field) |
+| `AIAgent` | An AI tool that assisted in the decision (`assisted_by` list) |
+| `Project` | Project scope — root node for decisions and milestones |
+| `Activity` | A work session or task context (reserved; not yet written automatically) |
+| `Milestone` | A significant achievement marker (reserved; not yet written automatically) |
+
+### Core relationships
+
+| Relationship | Pattern | Written by |
+|---|---|---|
+| `MENTIONS` | `(:Fact)-[:MENTIONS]->(:Entity)` | Outbox worker — from `metadata["entities"]`; required for consolidation clustering |
+| `REPORTS_ON` | `(:Fact)-[:REPORTS_ON]->(:Entity)` | Legacy alias; accepted by consolidation query. Use `MENTIONS` for new saves. |
+| `SUMMARIZED_BY` | `(:Fact)-[:SUMMARIZED_BY]->(:CommunitySummary)` | Consolidation daemon after synthesis |
+| `NEXT_STEP` | `(:ReasoningStep)-[:NEXT_STEP]->(:ReasoningStep)` | Agent — links consecutive steps in a trace |
+
+### Provenance relationships (Phase A — PROV-O inspired)
+
+Written by the outbox worker for `type:decision` saves.
+
+| Relationship | Pattern | Meaning |
+|---|---|---|
+| `WAS_ATTRIBUTED_TO` | `(:Decision)-[:WAS_ATTRIBUTED_TO]->(:Human)` | Who owns the decision |
+| `WAS_ASSISTED_BY` | `(:Decision)-[:WAS_ASSISTED_BY]->(:AIAgent)` | Which AI tool(s) assisted |
+| `PROJECT_OF` | `(:Decision)-[:PROJECT_OF]->(:Project)` | Which project the decision belongs to |
+| `WAS_GENERATED_BY` | `(:Decision)-[:WAS_GENERATED_BY]->(:Activity)` | Which session produced it (reserved) |
+| `ACTED_ON_BEHALF_OF` | `(:AIAgent)-[:ACTED_ON_BEHALF_OF]->(:Human)` | Delegation chain (reserved) |
+| `SUPERSEDES` | `(:Decision)-[:SUPERSEDES]->(:Decision)` | Replaces a prior decision |
+| `INFORMED_BY` | `(:Decision)-[:INFORMED_BY]->(:Decision)` | Prior decision used as input |
+| `HAD_OUTCOME` | `(:Decision)-[:HAD_OUTCOME {rating,date,notes}]->()` | Retrospective — dated edge property, not a node |
+
+### Provenance query examples
+
+```cypher
+// Who decided X on project Y?
+MATCH (h:Human)-[:WAS_ATTRIBUTED_TO]-(d:Decision)-[:PROJECT_OF]->(p:Project)
+      OPTIONAL MATCH (d)-[:WAS_ASSISTED_BY]->(ai:AIAgent)
+WHERE toLower(d.title) CONTAINS 'consolidat'
+RETURN h.name, ai.name, d.title, d.rationale, d.date, p.name
+
+// What decisions did claude-code assist with?
+MATCH (ai:AIAgent {name:'claude-code'})<-[:WAS_ASSISTED_BY]-(d:Decision)-[:PROJECT_OF]->(p:Project)
+RETURN d.title, p.name, d.date ORDER BY d.date DESC
+
+// Why-To loop: retrospectives before acting in an area
+MATCH (d:Decision)-[o:HAD_OUTCOME]->()
+WHERE toLower(d.title) CONTAINS 'write safety'
+RETURN d.title, o.rating, o.notes, o.date ORDER BY o.date DESC LIMIT 1
+```
+
+### Decision save protocol
+
+To create a Decision node, save with `metadata["type"] == "decision"` and a nested `decision` object. The coordinator validates the required fields at ingress (before the outbox WAL) and returns HTTP 400 if any are missing.
+
+```json
+{
+  "content": "We decided to add a consolidation daemon to simulate dreaming.",
+  "metadata": {
+    "source": "claude-code",
+    "type": "decision",
+    "entities": ["Consolidator", "SharedMemory"],
+    "decision": {
+      "title": "Add consolidation daemon",
+      "decided_by": "Xenofon",
+      "project": "shared_memory",
+      "rationale": "simulate dreaming; reduce hot-path latency via outbox",
+      "assisted_by": ["claude-code"],
+      "date": "2026-05-20",
+      "alternatives_considered": ["synchronous writes", "no consolidation"],
+      "confidence_at_time": 0.8
+    }
+  }
+}
+```
+
+Required fields: `decided_by`, `project`, `rationale`. All others optional.
 
 **Entity Ingestion Protocol:**
-Supply `"entities": ["Name1", "Name2"]` in the metadata JSON when saving. The saver creates `Entity` nodes and `MENTIONS` relationships for each name. Facts saved without entities are stored and retrievable but are **never eligible for consolidation** — the daemon clusters only via `Entity` hubs.
+Supply `"entities": ["Name1", "Name2"]` in the metadata JSON when saving. The saver creates `Entity` nodes and `MENTIONS` relationships for each name. Facts saved without entities are stored and retrievable but are **never eligible for consolidation** — the daemon clusters only via `Entity` hubs. Decision nodes also receive `MENTIONS` edges to their entities.
 
 **Vector Indexes (1024 Dimensions):**
 - `entity_embedding_idx`

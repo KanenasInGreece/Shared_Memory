@@ -61,6 +61,98 @@ The infrastructure underneath all agents is identical: one coordinator managing 
 
 The design is intentionally agent-agnostic: any tool that can make HTTP calls can reach the coordinator directly on port 8888. Adding a new agent type is a matter of packaging — not changing the backend.
 
+### What we are building toward
+
+Beyond storing facts, the framework is evolving to answer questions that no other tool on your workstation can answer today:
+
+> *"Who decided on a consolidator on project shared\_memory, when, and was that a good decision?"*
+
+Target answer shape: *"Xenofon, using Claude Code, decided that project shared\_memory should have a consolidator — to simulate dreaming — on 2026-05-20. The related document is ADR-001. He was using Postgres with pgvector as an outbox to achieve non-blocking Neo4j writes, giving optional consistency guarantees on Neo4j and hard guarantees on Postgres. Retrospective as of 2026-05-28: good — held up under multi-agent load."*
+
+This requires not just storing knowledge, but storing **who decided what, with which tool, in which context, and whether it held up**. It requires a provenance layer with first-class nodes for people, AI agents, projects, and decisions — not just facts.
+
+### The signal we are saving
+
+The governing rule: **save what GitHub cannot tell you.** Code is on GitHub. Git blame gives you what changed and when. What is permanently lost without explicit capture:
+
+| Save — signal | Skip — noise |
+|---|---|
+| Why a decision was made + alternatives rejected | The code that resulted from it |
+| What was known / unknown at decision time | Raw web search results |
+| Who participated and with which AI tool | Debug output, stack traces |
+| Milestones + the context that made them significant | Test results (unless they caused a decision) |
+| Retrospectives: was the decision right after N weeks? | Health checks, routine saves |
+| Abandoned approaches and why they were dropped | Intermediate build artifacts |
+
+Every memory save should answer at least one of: **Who? Why? What was rejected? Was it right?**
+
+### Saving everything vs. saving what matters
+
+This distinction is not cosmetic — it directly determines what you can query later.
+
+If you adopt a "save everything" policy (logs, test output, status checks, raw search results), the shared memory fills with low-signal noise. Consolidation groups semantically similar content into community summaries, so noise consolidates into more noise: you end up with thematic summaries of debug sessions rather than thematic summaries of decisions. Retrieval accuracy degrades because high-density noisy clusters crowd out the sparse, high-signal facts.
+
+**What you can query with disciplined saves:**
+
+```
+# Who decided, when, under what conditions, and with which tool?
+"Who decided to use an outbox for Neo4j writes on the shared_memory project?"
+→ Xenofon, using Claude Code, on 2026-05-20.
+   Condition at the time: Neo4j had no native async write path compatible with asyncpg.
+   Rationale: non-blocking — Postgres guarantees hard consistency, Neo4j is eventual.
+   Alternatives rejected: synchronous writes (too slow), no Neo4j (lost graph queries).
+
+# Provenance chain — who + what AI assisted
+"What decisions did Claude Code assist with on project shared_memory?"
+→ Decision: Add outbox-as-WAL for Neo4j writes (2026-05-20)
+   Decision: Use FOREACH over UNWIND for empty-list safety in Cypher (2026-05-28)
+   Decision: Add consolidation daemon as a dreaming analogue (2026-05-20)
+
+# Reasoning behind a specific approach
+"Why does the coordinator use FOREACH instead of UNWIND?"
+→ UNWIND produces zero rows for an empty list — the write silently drops.
+   FOREACH handles empty lists safely. Saved 2026-05-28 by Claude Code.
+
+# What was abandoned and why
+"What embedding models were considered before BGE-M3?"
+→ MiniLM-384: rejected — too few dimensions for cross-agent coherence.
+   BGE-base-768: evaluated — acceptable, not best-in-class for multilingual.
+   BGE-M3-1024: selected — highest multilingual retrieval quality in class.
+
+# Was a past decision successful? (Phase C — retrospectives)
+"Was the outbox-as-WAL approach a good decision for the shared_memory project?"
+→ Retrospective 2026-06-15 (rating: 8/10): held up under multi-agent load.
+   Note: outbox replay on crash worked correctly; Neo4j lag < 200 ms typical.
+   Suggested follow-up: add TTL pruning for applied rows > 30 days.
+
+# Context available now vs. in the future
+# Phase A (done): who decided + which AI + which project + why
+# Phase C (planned): outcomes, retrospectives, was it right after N weeks?
+```
+
+**What you cannot query if you save noise:**
+
+```
+# Only works if the reasoning was explicitly saved
+"Why was the consolidation threshold set to 5 facts?"
+→ No result — this tuning choice was never recorded with rationale.
+   Fix: save a decision with rationale when the threshold is next changed.
+
+# Transient runtime state is never here
+"What did the health check return yesterday at 14:30?"
+→ Not in memory. Routine health checks are not saved — check Prometheus or logs.
+
+# Current code state lives in Git, not memory
+"What is the current value of DENSITY_THRESHOLD in consolidation_loop.py?"
+→ Read the file. Memory holds decisions about code, not code itself.
+
+# Retrospectives are only available once Phase C is implemented
+"Was the BGE-M3 selection the right call?"
+→ No retrospective saved yet. Phase C will add HAD_OUTCOME edges for this.
+```
+
+The governing heuristic: **if you can get the answer in 3 seconds from `git log`, `grep`, or `cat`, don't save it here.** Memory is for context that evaporates without capture — the why behind a decision, the options that were weighed, the outcome after the fact.
+
 ### Local mounts — your work stays yours
 
 Both databases are deployed via Docker Compose with host-mounted volumes. The data lives on your filesystem, not inside a container — you can back it up with any standard tool, and a container restart or upgrade does not lose what you have accumulated.
@@ -279,11 +371,25 @@ labels:
   fact: Fact
   entity: Entity
   community_summary: CommunitySummary
+  # Provenance layer (Phase A)
+  decision: Decision       # architectural / design decision
+  human: Human             # person who owns a decision
+  ai_agent: AIAgent        # AI tool that assisted
+  project: Project         # project scope
+  activity: Activity       # work session context
+  milestone: Milestone     # significant achievement marker
 
 relationships:
-  entity_link: MENTIONS       # Fact → Entity, written on save
+  entity_link: MENTIONS          # Fact → Entity, written on save
   entity_link_alias: REPORTS_ON  # legacy alias accepted by consolidation
   summarized_by: SUMMARIZED_BY
+  # Provenance relationships (Phase A)
+  was_attributed_to: WAS_ATTRIBUTED_TO  # Decision → Human
+  was_assisted_by: WAS_ASSISTED_BY      # Decision → AIAgent
+  project_of: PROJECT_OF                # Decision → Project
+  supersedes: SUPERSEDES                # Decision → Decision
+  informed_by: INFORMED_BY              # Decision → Decision
+  had_outcome: HAD_OUTCOME              # Decision → (self or Milestone)
 
 consolidation:
   density_threshold: 5        # unconsolidated Facts per Entity to trigger synthesis
@@ -877,11 +983,16 @@ This framework is actively evolving toward a workstation where any number of AI 
 | **Configurable ontology — Path A** | All Neo4j labels and relationship types in `ontology.yaml`; ONT singleton with validation; falls back to hardcoded defaults; density threshold configurable | ✅ Done |
 | **Agent integration** | Claude Code (skill), Grok (skill), Gemini CLI (skill), LM Studio (MCP via vector-skill.py) | ✅ Done |
 | **Schema migrations** | Migration runner; 001 (multi-agent schema: agent_id, scope, visibility, neo4j_outbox); 002 (concurrency hardening: unique index on community_summaries, covering index on outbox); 003 (source provenance: `source_pg_ids integer[]` on community_summaries, back-fill from metadata) | ✅ Done |
+| **Provenance layer — Phase A** | PROV-O-inspired ontology: 6 new node labels (`Decision`, `Human`, `AIAgent`, `Project`, `Activity`, `Milestone`) and 8 provenance relationships (`WAS_ATTRIBUTED_TO`, `WAS_ASSISTED_BY`, `WAS_GENERATED_BY`, `PROJECT_OF`, `ACTED_ON_BEHALF_OF`, `SUPERSEDES`, `INFORMED_BY`, `HAD_OUTCOME`). Coordinator ingress validates `type:decision` saves (rejects missing `decided_by` / `project` / `rationale` before the row touches the outbox WAL). Outbox dispatches decision rows to a dedicated `_apply_decision_outbox_row` that materialises the full PROV-O subgraph in a single atomic Neo4j session. Plain `Fact` saves unchanged. | ✅ Done |
 
 ### In Progress / Planned
 
 | Phase | Milestone | Notes |
 |---|---|---|
+| **Provenance layer — Phase B** | `save_decision` tool in `vector-skill.py` (MCP) and `memory_bridge.py` (CLI); validated structured fields surfaced as a first-class interface rather than raw metadata JSON; `save_retrospective` for post-hoc outcome tagging | Phase A is the prerequisite ✅. |
+| **Provenance layer — Phase C** | Retrospective layer: `HAD_OUTCOME` edge written as a dated edge property (not a node) so lineage is preserved without node explosion; Why-To loop — agents query past retrospectives before executing new work in the same area | Phase B is the prerequisite. |
+| **Provenance layer — Phase D** | Named Cypher query templates exposed via `memory_bridge.py`: `who_decided`, `agent_contributions`, `project_timeline`, `milestone_history`, `why_to`, `decision_chain` | Phase A is the prerequisite ✅. |
+| **Provenance layer — Phase E** | Separate `pruning_loop.py` on a slow cron; enforces the information foraging heuristic (save if retrieval utility + decision impact > storage cost); `type:decision` and `decision_impact`-flagged rows are unconditionally shielded; plain facts compete on retrieval frequency × age | Decoupled from the consolidation daemon — different cadence. |
 | **Agent authentication (Phase 2C)** | `AGENT_TOKENS` env var; `Authorization: Bearer <token>` middleware; server-side `agent_id` enforcement; scope isolation by verified identity | Next security PR. Format documented in `.env.example`. Requires coordinated rollout across agents. |
 | **Ontology as graph (Path B)** | Bootstrap `(:Class)` nodes + `SCO` relationships from `ontology.yaml` into Neo4j on startup; replace `ONT.*` string constants with startup-cached dict read from graph; enables live ontology inspection and Neosemantics (n10s) forward compatibility | Path A is the prerequisite ✅. Does not replace `ontology.yaml` — yaml stays the human-editable source; graph is a materialised copy. |
 | **Entity type enrichment** | Apply Neo4j multi-label to distinguish entity kinds — `:Entity:Person`, `:Entity:System`, `:Entity:Tool`, `:Entity:Decision` etc. — without breaking existing queries | Path A + Path B are the prerequisites. Enables richer graph traversal and type-aware consolidation clustering. |
