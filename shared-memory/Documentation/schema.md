@@ -21,6 +21,17 @@ Holds every artifact saved by any agent. This is the authoritative fact store.
 
 **Indexes:** `technical_docs_embedding_idx` — `ivfflat (embedding vector_cosine_ops)`; btree indexes on `agent_id`, `scope`, `visibility`
 
+**`source_ref` convention (optional metadata key):** agents may include `"source_ref"` in metadata to record the sub-document origin of a fact. The coordinator passes it through unchanged; the outbox worker stores it as a property on the `Fact` Neo4j node. No schema enforcement — supply it when the source is a specific document location.
+
+| Example value | Meaning |
+|---|---|
+| `"design-doc.pdf#p12"` | PDF page 12 |
+| `"meeting-2026-05-15.mp4@00:04:32"` | Video timestamp |
+| `"screenshot-2026-05-20.png"` | Image file |
+| `"CLAUDE.md#L45-50"` | File line range |
+
+Query example: `MATCH (f:Fact) WHERE f.source_ref IS NOT NULL RETURN f.pg_id, f.source_ref LIMIT 20`
+
 ---
 
 ### `community_summaries` — Tier 3 (Semantic)
@@ -34,6 +45,7 @@ Written exclusively by the consolidation daemon. Each row is an LLM-synthesised 
 | `metadata` | `JSONB` | Written by the daemon — see structure below |
 | `embedding` | `vector(1024)` | BGE-M3 embedding of the synthesised `content`; used for top-1 retrieval |
 | `source_pg_ids` | `INTEGER[]` | IDs of `technical_docs` rows that contributed to this summary. Added by migration 003; back-filled from `metadata` for existing rows. Enables `WHERE $fact_id = ANY(source_pg_ids)` provenance queries without JSON parsing. |
+| `summary_history` | `JSONB NOT NULL DEFAULT '[]'` | Append-only array of previous summaries, capped at 20. Written by the daemon on every `DO UPDATE` — the outgoing content, `source_pg_ids`, and `timestamp` are pushed to the array before the row is overwritten. Enables drift auditing without a temporal schema. Added by migration 004. |
 | `agent_id` | `TEXT NOT NULL DEFAULT 'legacy'` | Agent that triggered consolidation; `'legacy'` for pre-coordinator rows |
 | `scope` | `TEXT NOT NULL DEFAULT 'global'` | Inherited from the source `Fact` cluster's scope |
 | `visibility` | `TEXT NOT NULL DEFAULT 'global'` | Read policy, same semantics as `technical_docs.visibility` |
@@ -54,7 +66,7 @@ Written exclusively by the consolidation daemon. Each row is an LLM-synthesised 
 
 **Retrieval role:** queried first on every search — top-1 cosine match is prepended to results as "Global Context Summary" to orient the response before the Tier 1 vector search runs.
 
-**Growth behaviour:** each consolidation cycle appends a **new row**. Superseded summaries are never deleted or marked inactive — they accumulate alongside newer ones. Query `ORDER BY id DESC LIMIT 1` to get the latest summary for a given entity, or use the retrieval path which surfaces the embedding-closest match regardless of age.
+**Growth behaviour:** there is **one row per entity**, keyed by `metadata->>'entity'`. Each consolidation cycle replaces the existing row via `ON CONFLICT DO UPDATE` — the new LLM synthesis overwrites `content` and `embedding`, while the previous `content` is appended to `summary_history` (capped at 20 entries). The row ID (`id`) is stable across updates. Retrieval surfaces the embedding-closest match, which is always the latest synthesis for a qualifying entity.
 
 ---
 

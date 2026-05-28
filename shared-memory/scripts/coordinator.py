@@ -32,6 +32,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 from typing import Any
@@ -78,6 +79,19 @@ _WRITE_CYPHER = re.compile(
     r"\b(CREATE|DELETE|DETACH\s+DELETE|SET\s|REMOVE|MERGE|CALL|LOAD\s+CSV|DROP)\b",
     re.IGNORECASE,
 )
+
+
+def _sigmoid(x: float) -> float:
+    """Sigmoid normalization for raw reranker logits → [0, 1]."""
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def _matched_entities(query: str, metadata: dict | None) -> list[str]:
+    """Return entities from metadata whose names appear in the query string."""
+    if not metadata or not isinstance(metadata, dict):
+        return []
+    q = query.lower()
+    return [e for e in metadata.get("entities", []) if isinstance(e, str) and e.lower() in q]
 
 
 # ── Coordinator ───────────────────────────────────────────────────────────────
@@ -214,11 +228,13 @@ class MemoryCoordinator:
 
             # Standard Fact + Entity MERGE — all writes in one round-trip so they
             # succeed or fail atomically. MERGE is idempotent — safe to retry.
+            source_ref = params.get("source_ref") or None
             async with self._neo4j.session() as session:
                 await session.run(
                     f"MERGE (f:{ONT.fact} {{pg_id: $pg_id}})"
                     f" SET f.content = $content, f.source = $source"
-                    f" WITH f"
+                    + (" SET f.source_ref = $source_ref" if source_ref else "")
+                    + f" WITH f"
                     f" UNWIND $entities AS ename"
                     f" MERGE (e:{ONT.entity} {{name: ename}})"
                     f" MERGE (f)-[:{ONT.entity_link}]->(e)",
@@ -226,6 +242,7 @@ class MemoryCoordinator:
                     content=params.get("content_snippet", "")[:200],
                     source=params.get("source", "coordinator"),
                     entities=params.get("entities", []),
+                    **( {"source_ref": source_ref} if source_ref else {} ),
                 )
             async with self._pool.acquire() as conn:
                 await conn.execute(
@@ -436,6 +453,7 @@ class MemoryCoordinator:
                             "agent_id": agent_id,
                             "type": metadata.get("type", "fact"),
                             "decision": metadata.get("decision", {}),
+                            "source_ref": metadata.get("source_ref") or None,
                         }),
                     )
 
@@ -508,7 +526,15 @@ class MemoryCoordinator:
                     "status": "success",
                     "fallback": "keyword",
                     "results": [
-                        {"content": r["content"], "score": 0.0, "metadata": r["metadata"]}
+                        {
+                            "tier": "fact",
+                            "content": r["content"],
+                            "score": 0.0,
+                            "score_normalized": 0.5,
+                            "matched_entities": _matched_entities(query, r["metadata"]),
+                            "metadata": r["metadata"],
+                            "graph_context": [],
+                        }
                         for r in rows
                     ],
                 })
@@ -561,18 +587,21 @@ class MemoryCoordinator:
         final: list[dict] = []
         if summary:
             final.append({
-                "type": "community_summary",
+                "tier": "community_summary",
                 "content": summary["content"],
                 "score": None,
+                "score_normalized": None,
+                "matched_entities": [],
                 "metadata": None,
-                "graph_context": None,
+                "graph_context": [],
             })
 
         async with self._neo4j.session() as session:
             for hit in ranked:
                 idx   = hit["index"]
                 pg_id = ids[idx]
-                ctx: list[str] = []
+                raw_score = hit["relevance_score"]
+                ctx: list[dict] = []
                 try:
                     result = await session.run(
                         f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
@@ -583,16 +612,21 @@ class MemoryCoordinator:
                     )
                     async for rec in result:
                         if rec["name"]:
-                            ctx.append(
-                                f"{rec['rel_type']} -> {rec['name']} ({rec['labels'][0]})"
-                            )
+                            ctx.append({
+                                "rel_type": rec["rel_type"],
+                                "name": rec["name"],
+                                "label": rec["labels"][0] if rec["labels"] else None,
+                            })
                 except Exception:
                     pass
                 final.append({
+                    "tier": "fact",
                     "content": contents[idx],
-                    "score": hit["relevance_score"],
+                    "score": raw_score,
+                    "score_normalized": _sigmoid(raw_score),
+                    "matched_entities": _matched_entities(query, metas[idx]),
                     "metadata": metas[idx],
-                    "graph_context": " | ".join(ctx) or None,
+                    "graph_context": ctx,
                 })
 
         return web.json_response({"status": "success", "results": final})

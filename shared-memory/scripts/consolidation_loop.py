@@ -262,14 +262,31 @@ class ConsolidationDaemon:
                             # ON CONFLICT prevents duplicate rows when two consolidation
                             # cycles run concurrently for the same entity (e.g. proxy
                             # restart overlap). The unique index is on metadata->>'entity'.
+                            # Before overwriting, append the current content to summary_history
+                            # (capped at 20 entries) so drift can be audited over time.
                             cur.execute("""
                                 INSERT INTO community_summaries (content, metadata, embedding, source_pg_ids)
                                 VALUES (%s, %s, %s, %s)
                                 ON CONFLICT ((metadata->>'entity')) DO UPDATE
-                                    SET content       = EXCLUDED.content,
-                                        embedding     = EXCLUDED.embedding,
-                                        metadata      = EXCLUDED.metadata,
-                                        source_pg_ids = EXCLUDED.source_pg_ids
+                                    SET content         = EXCLUDED.content,
+                                        embedding       = EXCLUDED.embedding,
+                                        metadata        = EXCLUDED.metadata,
+                                        source_pg_ids   = EXCLUDED.source_pg_ids,
+                                        summary_history = (
+                                            SELECT jsonb_agg(entry)
+                                            FROM (
+                                                SELECT entry FROM jsonb_array_elements(
+                                                    COALESCE(community_summaries.summary_history, '[]'::jsonb)
+                                                    || jsonb_build_array(jsonb_build_object(
+                                                        'content',        community_summaries.content,
+                                                        'source_pg_ids',  community_summaries.source_pg_ids,
+                                                        'timestamp',      community_summaries.metadata->>'timestamp'
+                                                    ))
+                                                ) AS entry
+                                                ORDER BY (entry->>'timestamp') DESC
+                                                LIMIT 20
+                                            ) sub
+                                        )
                                 RETURNING id
                             """, (summary, json.dumps(metadata), embedding, pg_ids))
                             summary_pg_id = cur.fetchone()[0]

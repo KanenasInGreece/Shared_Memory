@@ -51,6 +51,8 @@ Commit findings, decisions, and technical facts to long-term shared memory.
 
 **`entities` is required for Tier 3 consolidation.** Supply 1–4 named concepts the fact is about. Facts saved without `entities` are stored and searchable but never synthesised into community summaries.
 
+**`source_ref` (optional):** supply a sub-document citation string to preserve lineage back to the original asset. Passed through unchanged by the coordinator; stored on the `Fact` Neo4j node as `source_ref`. Examples: `"design-doc.pdf#p12"`, `"meeting-2026-05-15.mp4@00:04:32"`, `"CLAUDE.md#L45-50"`.
+
 **What happens on save:**
 1. Sends request to Memory Coordinator (gateway :8888)
 2. Coordinator embeds via BGE-M3, upserts into Postgres `technical_docs` (SHA-256 idempotent)

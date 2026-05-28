@@ -7,6 +7,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — Three-Test Fixes (retrieval visibility · consolidation history · lineage)
+
+- **Retrieval visibility** (`coordinator.py`): search results now include `tier` ("fact" | "community_summary"), `score_normalized` (sigmoid of raw reranker logit → [0, 1]), `matched_entities` (intersection of query string against `metadata["entities"]`), and `graph_context` as a structured list of `{rel_type, name, label}` objects instead of an opaque pipe-separated string. Keyword-fallback results carry the same shape. Zero new infrastructure — coordinator response shape only.
+
+- **Consolidation history** (`consolidation_loop.py`, migration `004_summary_history.sql`): `community_summaries` gains a `summary_history JSONB NOT NULL DEFAULT '[]'` column. On every `ON CONFLICT DO UPDATE`, the outgoing `content`, `source_pg_ids`, and `timestamp` are appended to the array (capped at 20 entries) before the row is overwritten. Enables drift auditing without a temporal schema. Pre-existing rows start with an empty array.
+
+- **`source_ref` lineage convention** (`coordinator.py` outbox, `schema.md`, both `SKILL.md` copies): agents may include `"source_ref"` in metadata to record the sub-document origin of a fact (e.g. `"design-doc.pdf#p12"`, `"meeting-2026-05-15.mp4@00:04:32"`). The coordinator passes it through to `cypher_params`; the outbox worker stores it as a `source_ref` property on the `Fact` Neo4j node. No schema enforcement — supply when the source is a specific document location.
+
+### Fixed
+
+- **`schema.md` inaccuracy** (`shared-memory/Documentation/schema.md`): the "Growth behaviour" section of `community_summaries` incorrectly stated that consolidation "appends a new row" per cycle. The code applies `ON CONFLICT DO UPDATE` — one row per entity, replaced. Documentation now matches the code.
+
 ---
 
 ## [0.3.0] — 2026-05-28
