@@ -9,6 +9,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.3.0] — 2026-05-28
+
+### Added
+
+- **Decision shortcut — Phase B** (`shared-memory/scripts/memory_bridge.py`, `vector-skill.py`, `tests/test_memory_bridge_decision.py`, `tests/test_vector_skill.py`): Low-friction `save_decision` command and MCP tool so agents don't need to hand-craft the full `type=decision` JSON payload.
+
+  - **`memory_bridge.py save_decision` subcommand** — accepts named flags (`--title`, `--decided-by`, `--project`, `--rationale`, `--source`, `--assisted-by`, `--alternatives`, `--confidence`, `--entities`). Comma-separated strings for list fields. Builds the correct `type=decision` metadata shape via `build_decision_metadata()` and forwards to the coordinator. Required flags: `--title`, `--decided-by`, `--project`, `--rationale`; missing flags print usage and exit non-zero.
+
+  - **`vector-skill.py save_decision` MCP tool** — individual typed parameters instead of raw JSON. Routes through the coordinator (HTTP to port 8888) so the Decision outbox path and PROV-O subgraph write are handled consistently. Required: `title`, `decided_by`, `project`, `rationale`, `source`. Optional: `assisted_by`, `alternatives`, `confidence`, `entities` (all comma-separated).
+
+  - **`build_decision_metadata()` pure helper** (`memory_bridge.py`) — separates metadata construction from I/O for clean unit testing. Returns `(content_str, metadata_dict)`.
+
+  - **`tests/test_memory_bridge_decision.py`** — 7 new tests covering shape, optional fields, ISO date, empty commas, source default, CLI forwarding, and missing-flag exit code.
+
+  - **`tests/test_vector_skill.py`** — 3 new tests: success (correct payload + pg_id), coordinator unreachable (error references `hive_mind_proxy.py`), 400 error surfaced to caller.
+
+  - **SKILL.md** (both locations): Task 4 updated — `save_decision` shortcut is now the recommended path; MCP tool noted; raw-JSON path marked as legacy.
+
+  - **`shared-memory-skill/shared-memory/scripts/memory_bridge.py`** (Gemini copy): `save_decision` action added, routes through coordinator.
+
+---
+
 ## [0.2.9] — 2026-05-28
 
 ### Added

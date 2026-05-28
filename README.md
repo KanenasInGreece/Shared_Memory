@@ -1017,7 +1017,7 @@ This framework is actively evolving toward a workstation where any number of AI 
 
 | Phase | Milestone | Notes |
 |---|---|---|
-| **Provenance layer — Phase B** | `save_decision` tool in `vector-skill.py` (MCP) and `memory_bridge.py` (CLI); validated structured fields surfaced as a first-class interface rather than raw metadata JSON; `save_retrospective` for post-hoc outcome tagging | Phase A is the prerequisite ✅. |
+| **Provenance layer — Phase B** | `save_decision` subcommand in `memory_bridge.py` (named flags, no raw JSON) and `save_decision` MCP tool in `vector-skill.py`; `build_decision_metadata()` pure helper; 10 new tests | ✅ Done |
 | **Provenance layer — Phase C** | Retrospective layer: `HAD_OUTCOME` edge written as a dated edge property (not a node) so lineage is preserved without node explosion; Why-To loop — agents query past retrospectives before executing new work in the same area | Phase B is the prerequisite. |
 | **Provenance layer — Phase D** | Named Cypher query templates exposed via `memory_bridge.py`: `who_decided`, `agent_contributions`, `project_timeline`, `milestone_history`, `why_to`, `decision_chain` | Phase A is the prerequisite ✅. |
 | **Provenance layer — Phase E** | Separate `pruning_loop.py` on a slow cron; enforces the information foraging heuristic (save if retrieval utility + decision impact > storage cost); `type:decision` and `decision_impact`-flagged rows are unconditionally shielded; plain facts compete on retrieval frequency × age | Decoupled from the consolidation daemon — different cadence. |
