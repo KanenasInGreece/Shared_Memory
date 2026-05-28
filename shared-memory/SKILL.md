@@ -1,9 +1,22 @@
+---
+name: shared-memory
+description: Search, save, and query a three-tier semantic memory shared across all AI agents on your workstation. Use before starting any task (search first for prior context) and after completing significant work (save findings with entities for consolidation). Supports save_decision for recording architectural decisions with full PROV-O provenance.
+---
+
 # Shared Memory (Hive-Mind)
 
 ## Overview
-This skill bridges the Shared Memory Framework — a three-tier semantic and relational memory layer shared across all AI agents on your workstation (Gemini CLI, LM Studio, and any CLI agent). Facts saved by one agent are retrievable by all others. Knowledge persists across sessions and tools.
+This skill bridges the Shared Memory Framework — a three-tier semantic and relational memory layer shared across all AI agents on your workstation. Facts saved by one agent are retrievable by all others. Knowledge persists across sessions and tools.
 
-**Agents currently supported:** Gemini CLI (skill), LM Studio (MCP), any HTTP client or CLI agent.
+**Agents currently integrated:**
+
+| Agent | Skill invocation | Install path |
+|---|---|---|
+| Claude Code | `/shared-memory` | `~/.claude/skills/shared-memory/` |
+| Grok | `/shared-memory` | `~/.grok/skills/shared-memory/` |
+| Codex CLI | `$shared-memory` | `~/.codex/skills/shared-memory/` |
+| Gemini CLI | `/activate shared-memory` | `~/.gemini/skills/shared-memory/` |
+| LM Studio | MCP `rag-orchestrator` | `vector-skill.py` via `mcp.json` |
 
 ## Core Tasks
 

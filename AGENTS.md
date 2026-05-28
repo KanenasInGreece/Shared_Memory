@@ -1,6 +1,18 @@
-# AGENT.md
+# AGENTS.md
+
+This file is the **Codex CLI project context file** (equivalent to `CLAUDE.md` for Claude Code). Codex CLI reads it automatically before each session. Other agents should refer to `AGENT.md`.
 
 Guidance for AI coding agents (Claude Code, Codex CLI, Grok, Gemini CLI, LM Studio, and others) working in this repository.
+
+## Skill invocation (Codex CLI)
+
+This repo's shared memory skill is installed at `~/.codex/skills/shared-memory/`. Invoke it explicitly with:
+
+```
+$shared-memory
+```
+
+Or let Codex pick it up implicitly — the SKILL.md description matches memory-related tasks automatically.
 
 ## What This Repository Is
 
@@ -22,8 +34,10 @@ uv run --with aiohttp --with asyncpg --with neo4j --with httpx \
 
 # CLI memory bridge — thin HTTP client, only needs httpx (gateway must be running)
 uv run --with httpx python shared-memory/scripts/memory_bridge.py search "<query>" 5
-uv run --with httpx python shared-memory/scripts/memory_bridge.py save "<content>" '{"source":"agent","entities":["Entity1"]}'
+uv run --with httpx python shared-memory/scripts/memory_bridge.py save "<content>" '{"source":"codex-cli","entities":["Entity1"]}'
 uv run --with httpx python shared-memory/scripts/memory_bridge.py graph "MATCH (n:Entity) RETURN n LIMIT 10"
+uv run --with httpx python shared-memory/scripts/memory_bridge.py save_decision \
+  --title "..." --decided-by "..." --project "..." --rationale "..."
 ```
 
 Set `MOCK_LLM=1` to bypass LLM calls in consolidation tests. Tests are fully mocked — no live infrastructure needed.
@@ -40,9 +54,9 @@ Set `MOCK_LLM=1` to bypass LLM calls in consolidation tests. Tests are fully moc
 | Gemini CLI | CLI skill (`/activate shared-memory`) | `~/.gemini/skills/shared-memory/scripts/memory_bridge.py` |
 | LM Studio | MCP (FastMCP) | `vector-skill.py` → `rag-orchestrator` in `mcp.json` |
 
-`vector-skill.py` is registered in `mcp.json` for LM Studio — it is **not** used by CLI-based agents. `memory_bridge.py` is a thin HTTP client that delegates all storage to the coordinator; it requires only `httpx` and `python-dotenv`.
+`memory_bridge.py` is a thin HTTP client that delegates all storage to the coordinator; it requires only `httpx` and `python-dotenv`.
 
-**No separate graph MCP (e.g. neo4j-agent-memory) should be registered.** Direct-bolt Neo4j MCP servers bypass the coordinator's per-entity locks, outbox atomicity, and SHA-256 deduplication — writes produce orphaned Neo4j nodes invisible to semantic search. `rag-orchestrator` already includes Neo4j graph expansion on every search call.
+**No separate graph MCP (e.g. neo4j-agent-memory) should be registered.** Direct-bolt Neo4j MCP servers bypass the coordinator's per-entity locks, outbox atomicity, and SHA-256 deduplication — writes produce orphaned Neo4j nodes invisible to semantic search.
 
 ### Three-Tier Storage
 
