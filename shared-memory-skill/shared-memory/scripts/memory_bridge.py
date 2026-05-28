@@ -10,6 +10,8 @@ import hashlib
 from datetime import datetime
 from neo4j import GraphDatabase
 
+VERSION = "0.3.0"
+
 # Configuration — set via environment variables or .env file
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_USER = "neo4j"
@@ -294,12 +296,15 @@ async def save_decision_via_coordinator(content: str, metadata: dict) -> dict:
 
 async def main():
     if len(sys.argv) < 2:
-        print(json.dumps({"error": "Usage: python memory_bridge.py [graph|search|save|save_decision] ..."}))
+        print(json.dumps({"error": "Usage: python memory_bridge.py [--version|graph|search|save|save_decision] ..."}))
         sys.exit(1)
 
     action = sys.argv[1]
 
-    if action == "graph":
+    if action in ("--version", "version", "-v"):
+        print(json.dumps({"version": VERSION, "tool": "shared-memory-framework"}))
+        return
+    elif action == "graph":
         print(json.dumps(query_graph(sys.argv[2]), indent=2))
     elif action == "search":
         limit = int(sys.argv[3]) if len(sys.argv) > 3 else 5

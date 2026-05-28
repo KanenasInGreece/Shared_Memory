@@ -672,23 +672,47 @@ Start LM Studio. The `rag-orchestrator` MCP server should appear in the tool pan
 
 All three paths route through the coordinator on port 8888. The coordinator owns all Postgres and Neo4j connections — agents no longer connect to the databases directly. The Hive-Mind Gateway must be running before any save or search.
 
-### CLI usage (Gemini CLI and other CLI agents)
+### CLI usage
 
 ```bash
+# Check the framework version
+python shared-memory/scripts/memory_bridge.py --version
+# → {"version": "0.3.0", "tool": "shared-memory-framework"}
+
 # Search — semantic + rerank + Neo4j expansion
 uv run --with httpx \
   python shared-memory/scripts/memory_bridge.py search "bgem3 interference problem" 5
 
-# Save — always include entities for consolidation eligibility
+# Save — always include source and entities
 uv run --with httpx \
   python shared-memory/scripts/memory_bridge.py save \
-  "Architectural decision: proxy routes all embeddings through :8888" \
-  '{"source":"gemini_cli","entities":["hive_mind_proxy","BGE-M3"]}'
+  "The proxy routes all embeddings through :8888 to enforce 1024-dim consistency." \
+  '{"source":"claude-code","entities":["hive_mind_proxy","BGE-M3","SharedMemory"]}'
 
-# Graph query — raw Cypher
+# Save a decision — structured flags, no JSON blob required
+uv run --with httpx \
+  python shared-memory/scripts/memory_bridge.py save_decision \
+  --title "Route all embeddings through the gateway" \
+  --decided-by "Xenofon" \
+  --project "shared-memory" \
+  --rationale "Enforces 1024-dim consistency across all agents; prevents dimension mismatch on retrieval" \
+  --assisted-by "claude-sonnet-4-6" \
+  --alternatives "direct port 8070 calls, per-agent embedding models" \
+  --confidence "high" \
+  --entities "BGE-M3,hive_mind_proxy,SharedMemory"
+
+# Query decisions — who decided what, with which AI, on which project
 uv run --with httpx \
   python shared-memory/scripts/memory_bridge.py graph \
-  "MATCH (e:Entity)<-[:MENTIONS]-(f:Fact) RETURN e.name, count(f) ORDER BY count(f) DESC LIMIT 10"
+  "MATCH (h:Human)-[:WAS_ATTRIBUTED_TO]-(d:Decision)-[:PROJECT_OF]->(p:Project)
+   OPTIONAL MATCH (d)-[:WAS_ASSISTED_BY]->(ai:AIAgent)
+   RETURN h.name, d.title, d.rationale, d.date, p.name, ai.name
+   ORDER BY d.date DESC LIMIT 5"
+
+# Graph query — entity hub sizes (top referenced concepts)
+uv run --with httpx \
+  python shared-memory/scripts/memory_bridge.py graph \
+  "MATCH (e:Entity)<-[:MENTIONS]-(f:Fact) RETURN e.name, count(f) AS refs ORDER BY refs DESC LIMIT 10"
 ```
 
 ### Coordinator HTTP API
@@ -710,6 +734,7 @@ The coordinator exposes four endpoints on port 8888. These can be called directl
 
 ```
 /shared-memory          # Claude Code and Grok
+$shared-memory          # Codex CLI (explicit); also auto-matched via SKILL.md description
 /activate shared-memory # Gemini CLI
 ```
 
@@ -1009,15 +1034,15 @@ This framework is actively evolving toward a workstation where any number of AI 
 | **Concurrency hardening** | FOR UPDATE SKIP LOCKED, atomic retry increment, single UNWIND batch query, acquired-lock tracking, ON CONFLICT upsert for community_summaries, embedding refresh on re-save, LISTEN reconnect, event-loop non-blocking poll | ✅ Done |
 | **Security baseline** | Read-only Cypher guard, localhost-only bind (PROXY_BIND opt-in), opaque error responses, bounded limit, ONT label validation at startup, prompt injection delimiters | ✅ Done |
 | **Configurable ontology — Path A** | All Neo4j labels and relationship types in `ontology.yaml`; ONT singleton with validation; falls back to hardcoded defaults; density threshold configurable | ✅ Done |
-| **Agent integration** | Claude Code (skill), Grok (skill), Gemini CLI (skill), LM Studio (MCP via vector-skill.py) | ✅ Done |
+| **Agent integration** | Claude Code, Grok, Gemini CLI, LM Studio (MCP), Codex CLI — all 5 agents live, SKILL.md carries YAML frontmatter for implicit Codex invocation, `AGENTS.md` project context file added | ✅ Done |
 | **Schema migrations** | Migration runner; 001 (multi-agent schema: agent_id, scope, visibility, neo4j_outbox); 002 (concurrency hardening: unique index on community_summaries, covering index on outbox); 003 (source provenance: `source_pg_ids integer[]` on community_summaries, back-fill from metadata) | ✅ Done |
 | **Provenance layer — Phase A** | PROV-O-inspired ontology: 6 new node labels (`Decision`, `Human`, `AIAgent`, `Project`, `Activity`, `Milestone`) and 8 provenance relationships (`WAS_ATTRIBUTED_TO`, `WAS_ASSISTED_BY`, `WAS_GENERATED_BY`, `PROJECT_OF`, `ACTED_ON_BEHALF_OF`, `SUPERSEDES`, `INFORMED_BY`, `HAD_OUTCOME`). Coordinator ingress validates `type:decision` saves (rejects missing `decided_by` / `project` / `rationale` before the row touches the outbox WAL). Outbox dispatches decision rows to a dedicated `_apply_decision_outbox_row` that materialises the full PROV-O subgraph in a single atomic Neo4j session. Plain `Fact` saves unchanged. | ✅ Done |
+| **Provenance layer — Phase B** | `save_decision` subcommand in `memory_bridge.py` (named flags — `--title`, `--decided-by`, `--project`, `--rationale` required; `--assisted-by`, `--alternatives`, `--confidence`, `--entities` optional) and `save_decision` MCP tool in `vector-skill.py`. `build_decision_metadata()` pure helper. `--version` flag added to `memory_bridge.py`. | ✅ Done |
 
 ### In Progress / Planned
 
 | Phase | Milestone | Notes |
 |---|---|---|
-| **Provenance layer — Phase B** | `save_decision` subcommand in `memory_bridge.py` (named flags, no raw JSON) and `save_decision` MCP tool in `vector-skill.py`; `build_decision_metadata()` pure helper; 10 new tests | ✅ Done |
 | **Provenance layer — Phase C** | Retrospective layer: `HAD_OUTCOME` edge written as a dated edge property (not a node) so lineage is preserved without node explosion; Why-To loop — agents query past retrospectives before executing new work in the same area | Phase B is the prerequisite. |
 | **Provenance layer — Phase D** | Named Cypher query templates exposed via `memory_bridge.py`: `who_decided`, `agent_contributions`, `project_timeline`, `milestone_history`, `why_to`, `decision_chain` | Phase A is the prerequisite ✅. |
 | **Provenance layer — Phase E** | Separate `pruning_loop.py` on a slow cron; enforces the information foraging heuristic (save if retrieval utility + decision impact > storage cost); `type:decision` and `decision_impact`-flagged rows are unconditionally shielded; plain facts compete on retrieval frequency × age | Decoupled from the consolidation daemon — different cadence. |
