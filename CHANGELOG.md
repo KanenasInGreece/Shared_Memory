@@ -29,6 +29,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
   - **`shared-memory-skill/shared-memory/scripts/memory_bridge.py`** (Gemini copy): `save_decision` action added, routes through coordinator.
 
+- **Codex CLI integration** (`AGENTS.md`, `shared-memory/SKILL.md`, `shared-memory-skill/shared-memory/SKILL.md`, `AGENT.md`, `README.md`): OpenAI Codex CLI documented and supported as a fifth skill-based agent.
+
+  - **`AGENTS.md` (new)** — Codex CLI project context file (their `CLAUDE.md` equivalent); read automatically before each Codex session. Contains architecture, commands, key invariants, and a `$shared-memory` invocation note.
+
+  - **SKILL.md YAML frontmatter** — both `shared-memory/SKILL.md` and `shared-memory-skill/shared-memory/SKILL.md` now carry `name` and `description` frontmatter required by Codex CLI for implicit skill matching.
+
+  - **Agent table in SKILL.md Overview** — "agents currently integrated" section upgraded from a prose list to a summary table covering all five agents (Claude Code, Grok, Codex CLI, Gemini CLI, LM Studio) with invocation syntax and install path.
+
+  - **`AGENT.md`** — Codex CLI row added to agent access split table.
+
+  - **`README.md`** — Codex CLI badge; §1 agent overview; full §10 setup section (install path, explicit `$shared-memory` invocation, implicit invocation via frontmatter description matching, `AGENTS.md` note); §11 agent access table row.
+
 ---
 
 ## [0.2.9] — 2026-05-28
