@@ -9,6 +9,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.3.1] — 2026-05-28
+
+### Added
+
+- **Retrieval visibility** (`coordinator.py`): search results now include `tier` ("fact" | "community_summary"), `score_normalized` (sigmoid of raw reranker logit → [0, 1]), `matched_entities` (intersection of query string against `metadata["entities"]`), and `graph_context` as a structured list of `{rel_type, name, label}` objects instead of an opaque pipe-separated string. Keyword-fallback results carry the same shape.
+
+- **Consolidation history** (`consolidation_loop.py`, migration `004_summary_history.sql`): `community_summaries` gains a `summary_history JSONB NOT NULL DEFAULT '[]'` column. On every `ON CONFLICT DO UPDATE`, the outgoing `content`, `source_pg_ids`, and `timestamp` are appended (capped at 20 entries) before the row is overwritten. Enables drift auditing without a temporal schema.
+
+- **`source_ref` lineage convention** (`coordinator.py` outbox, `schema.md`, both `SKILL.md` copies): agents may include `"source_ref"` in metadata to record the sub-document origin of a fact (e.g. `"design-doc.pdf#p12"`, `"meeting-2026-05-15.mp4@00:04:32"`). Propagated through coordinator to `cypher_params`; outbox worker stores it as `Fact.source_ref` property in Neo4j.
+
+- **14 new tests** (`tests/test_coordinator.py`): `_sigmoid()` (4 tests), `_matched_entities()` (6 tests), `source_ref` outbox propagation (2 tests), search response shape — `tier` / `score_normalized` / `matched_entities` / `graph_context` list (2 tests). Total: 74 tests passing.
+
+- **ApertureData reference + three diagnostic tests** (`README.md §1`): Vishakha Gupta's *AI Memory & Cognition: The Architect's Playbook* (May 2026) attributed in §20 References. Three diagnostic questions (Retrieval · Consolidation · Lineage) asked and answered with current implementation state at the end of the Vision section. Updated with every release.
+
+### Fixed
+
+- **`schema.md` inaccuracy**: `community_summaries` "Growth behaviour" section incorrectly stated "appends a new row" per cycle. The code applies `ON CONFLICT DO UPDATE` — one row per entity, replaced. Documentation now matches the code.
+
+---
+
 ## [0.3.0] — 2026-05-28
 
 ### Added

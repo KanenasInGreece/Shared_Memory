@@ -51,6 +51,8 @@ Commit findings, decisions, and technical facts to long-term shared memory.
 
 **`entities` is required for Tier 3 consolidation.** Supply 1–4 named concepts the fact is about. Facts saved without `entities` are stored and searchable but never synthesised into community summaries.
 
+**`source_ref` (optional):** supply a sub-document citation string to preserve lineage back to the original asset. Passed through unchanged by the coordinator; stored on the `Fact` Neo4j node as `source_ref`. Examples: `"design-doc.pdf#p12"`, `"meeting-2026-05-15.mp4@00:04:32"`, `"CLAUDE.md#L45-50"`.
+
 **What happens on save:**
 1. Sends request to Memory Coordinator (gateway :8888)
 2. Coordinator embeds via BGE-M3, upserts into Postgres `technical_docs` (SHA-256 idempotent)
@@ -138,7 +140,7 @@ uv run --with fastmcp --with httpx --with psycopg2-binary --with neo4j \
 
 ## Reference
 
-- **Version:** `python scripts/memory_bridge.py --version` → `{"version": "0.3.0", "tool": "shared-memory-framework"}`
+- **Version:** `python scripts/memory_bridge.py --version` → `{"version": "0.3.1", "tool": "shared-memory-framework"}`
 - **Schema:** Neo4j labels, relationship types, Postgres tables — [schema.md](Documentation/schema.md)
 - **Embedding mandate:** All calls route through the gateway (:8888). Never call port 8070 (BGE-M3) or 8071 (BGE-Reranker) directly — the gateway enforces 1024-dim consistency across all agents.
 - **Ontology:** All Neo4j labels and relationship types are configurable in `ontology.yaml` at the repo root.

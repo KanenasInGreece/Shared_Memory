@@ -64,6 +64,22 @@ The infrastructure underneath all agents is identical: one coordinator managing 
 
 The design is intentionally agent-agnostic: any tool that can make HTTP calls can reach the coordinator directly on port 8888. Adding a new agent type is a matter of packaging — not changing the backend.
 
+### Three diagnostic tests
+
+Vishakha Gupta's *AI Memory & Cognition: The Architect's Playbook* (ApertureData, May 2026) proposes three questions that any serious AI memory system must be able to answer. They are reproduced here with the current state of this framework's answers — updated with every release.
+
+**The Retrieval Test:** *Can the agent explain why it retrieved a specific memory? Not just what was retrieved, but which specific context, session, and principal metadata informed the decision.*
+
+> As of v0.3.1: search results now carry `tier` (fact | community_summary), `score_normalized` (sigmoid of raw reranker logit → [0, 1]), `matched_entities` (intersection of the query string against the saved entity list), and `graph_context` as a structured list of `{rel_type, name, label}` triples instead of an opaque string. An agent can reason: *"I returned a Tier-3 community synthesis — normalized score 0.91, matching entity OutboxPattern — alongside two Tier-1 precision hits."* **Gap remaining:** retrieval events are not yet audited (no record of who searched, when, from which agent); cross-encoder span attribution is not yet exposed.
+
+**The Consolidation Test:** *When the agent learns something new, does the system update a coherent knowledge base, or does it just accumulate versions? After six months, do you have one "truth" or three conflicting ones?*
+
+> As of v0.3.1: one row per entity, not three. The `community_summaries` table uses `ON CONFLICT (metadata->>'entity') DO UPDATE` — each consolidation cycle replaces the row with a cumulatively synthesised narrative (the LLM receives the prior summary as context). `summary_history JSONB` (migration 004) records the previous N versions before each overwrite, enabling drift auditing. **Gap remaining:** consolidation is per-entity; two summaries for overlapping entities may diverge slightly if the LLM synthesises them in separate calls. No cross-entity reconciliation step yet.
+
+**The Lineage Test:** *Can I trace a decision back to the original source — the raw image, the specific video frame, or the precise document page — or just the text summary extracted from it?*
+
+> As of v0.3.1: decisions trace fully to human (`WAS_ATTRIBUTED_TO`), AI agent (`WAS_ASSISTED_BY`), and project (`PROJECT_OF`). Community summaries link back to their source facts via `source_pg_ids`. The optional `source_ref` metadata key (e.g. `"design-doc.pdf#p12"`, `"meeting.mp4@00:04:32"`) propagates through the coordinator to the `Fact` Neo4j node — sub-document provenance is now capturable without schema changes. **Gap remaining:** `source_ref` is not enforced — agents supply it when they can. No back-edge yet from a raw `Fact` to the `Decision` it influenced (planned for Phase C).
+
 ### What we are building toward
 
 Beyond storing facts, the framework is evolving to answer questions that no other tool on your workstation can answer today:
@@ -1038,6 +1054,7 @@ This framework is actively evolving toward a workstation where any number of AI 
 | **Schema migrations** | Migration runner; 001 (multi-agent schema: agent_id, scope, visibility, neo4j_outbox); 002 (concurrency hardening: unique index on community_summaries, covering index on outbox); 003 (source provenance: `source_pg_ids integer[]` on community_summaries, back-fill from metadata) | ✅ Done |
 | **Provenance layer — Phase A** | PROV-O-inspired ontology: 6 new node labels (`Decision`, `Human`, `AIAgent`, `Project`, `Activity`, `Milestone`) and 8 provenance relationships (`WAS_ATTRIBUTED_TO`, `WAS_ASSISTED_BY`, `WAS_GENERATED_BY`, `PROJECT_OF`, `ACTED_ON_BEHALF_OF`, `SUPERSEDES`, `INFORMED_BY`, `HAD_OUTCOME`). Coordinator ingress validates `type:decision` saves (rejects missing `decided_by` / `project` / `rationale` before the row touches the outbox WAL). Outbox dispatches decision rows to a dedicated `_apply_decision_outbox_row` that materialises the full PROV-O subgraph in a single atomic Neo4j session. Plain `Fact` saves unchanged. | ✅ Done |
 | **Provenance layer — Phase B** | `save_decision` subcommand in `memory_bridge.py` (named flags — `--title`, `--decided-by`, `--project`, `--rationale` required; `--assisted-by`, `--alternatives`, `--confidence`, `--entities` optional) and `save_decision` MCP tool in `vector-skill.py`. `build_decision_metadata()` pure helper. `--version` flag added to `memory_bridge.py`. | ✅ Done |
+| **Three-test fixes (v0.3.1)** | Retrieval visibility: search results carry `tier`, `score_normalized` (sigmoid), `matched_entities`, structured `graph_context` list. Consolidation history: `summary_history JSONB` column on `community_summaries` (migration 004) — prior summary appended before each `DO UPDATE`, capped at 20. Lineage: `source_ref` optional metadata key flows from coordinator to Neo4j `Fact.source_ref` property. 14 new tests added. `schema.md` "appends new rows" inaccuracy corrected. | ✅ Done |
 
 ### In Progress / Planned
 
@@ -1059,6 +1076,7 @@ This framework is actively evolving toward a workstation where any number of AI 
 
 ## 20. References
 
+- **AI Memory & Cognition: The Architect's Playbook** (Vishakha Gupta, ApertureData, May 2026) — Proposes the KMC Blueprint (Knowledge · Memory · Context) and the three diagnostic tests used in the [§1 Vision](#1-the-vision-one-brain-many-agents) section: Retrieval, Consolidation, and Lineage. [aperturedata.io/resources/ai-memory-cognition-the-architects-playbook](https://www.aperturedata.io/resources/ai-memory-cognition-the-architects-playbook)
 - **The Geometry of Forgetting** (Barman et al., 2026) — *Exposing the Dimensionality Illusion*. arXiv:2604.06222
 - **The Geometry of Consolidation** (Vangara & Gopinath, 2026) — NeurIPS 2026 submission. Proves centroid averaging collapses retrieval identity.
 - **Active Dreaming Memory (ADM)** (Dudekula Kasim Vali, 2025) — Biologically-Inspired Episodic Consolidation. engrXiv preprint, DOI: 10.31224/5919
