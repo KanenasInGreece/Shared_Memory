@@ -408,6 +408,74 @@ async def archive_reasoning_trace(session_id: str, task: str, steps: list) -> st
         return f"Error: {str(e)}"
 
 @mcp.tool()
+async def save_decision(
+    title: str,
+    decided_by: str,
+    project: str,
+    rationale: str,
+    source: str,
+    assisted_by: str = "",
+    alternatives: str = "",
+    confidence: str = "",
+    entities: str = "",
+) -> str:
+    """
+    Save an architectural or design decision with full PROV-O provenance.
+
+    Routes through the Memory Coordinator so the Decision→Human→Project→AIAgent
+    subgraph is written by the outbox worker — no direct Neo4j writes here.
+
+    Required: title, decided_by, project, rationale, source (loaded model name).
+    Optional: assisted_by, alternatives, confidence, entities — all comma-separated.
+    """
+    decision_data: dict = {
+        "title": title,
+        "decided_by": decided_by,
+        "project": project,
+        "rationale": rationale,
+        "date": datetime.now().date().isoformat(),
+    }
+    if assisted_by:
+        decision_data["assisted_by"] = [a.strip() for a in assisted_by.split(",") if a.strip()]
+    if alternatives:
+        decision_data["alternatives"] = [a.strip() for a in alternatives.split(",") if a.strip()]
+    if confidence:
+        decision_data["confidence"] = confidence
+
+    metadata = {
+        "type": "decision",
+        "source": source,
+        "entities": [e.strip() for e in entities.split(",") if e.strip()],
+        "decision": decision_data,
+    }
+    content = f"{title}\n\n{rationale}"
+
+    coordinator_url = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
+    agent_id = os.environ.get("AGENT_ID", "lm_studio")
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                f"{coordinator_url}/memory/save",
+                json={"content": content, "metadata": metadata, "agent_id": agent_id},
+            )
+            result = r.json()
+    except Exception as exc:
+        return (
+            f"Error: Memory coordinator unreachable at {coordinator_url} — "
+            f"is hive_mind_proxy.py running? ({exc})"
+        )
+
+    if result.get("status") == "success":
+        pg_id = result.get("pg_id")
+        ent_count = len(metadata["entities"])
+        ent_note = f" with {ent_count} entities" if ent_count else ""
+        return f"Decision saved (pg_id={pg_id}){ent_note}: {title}"
+
+    return f"Error: {result.get('message', result)}"
+
+
+@mcp.tool()
 async def check_memory_health() -> str:
     """Full-stack diagnostic for the Shared Memory infrastructure."""
     stats = {"status": "healthy", "components": {}}

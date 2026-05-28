@@ -119,6 +119,63 @@ async def test_mcp_archive_reasoning_trace_success():
         assert mock_session.run.call_count >= 2
 
 @pytest.mark.asyncio
+async def test_mcp_save_decision_success():
+    """save_decision routes through coordinator and returns pg_id on success."""
+    mock_response = MagicMock()
+    mock_response.json = lambda: {"status": "success", "pg_id": 77}
+
+    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
+        result = await vector_skill.save_decision(
+            title="Use asyncpg over psycopg2",
+            decided_by="Xenofon",
+            project="shared-memory",
+            rationale="asyncpg does not block the event loop",
+            source="qwen3-30b",
+            assisted_by="claude-sonnet-4-6",
+            confidence="high",
+            entities="asyncpg,PostgreSQL",
+        )
+
+    assert "pg_id=77" in result
+    assert "Use asyncpg over psycopg2" in result
+    call_kwargs = mock_post.call_args
+    payload = call_kwargs[1]["json"] if "json" in call_kwargs[1] else call_kwargs.kwargs["json"]
+    assert payload["metadata"]["type"] == "decision"
+    assert payload["metadata"]["decision"]["decided_by"] == "Xenofon"
+    assert payload["metadata"]["decision"]["confidence"] == "high"
+    assert "asyncpg" in payload["metadata"]["entities"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_save_decision_coordinator_down():
+    """save_decision returns a readable error when the coordinator is unreachable."""
+    with patch("httpx.AsyncClient.post", side_effect=Exception("connection refused")):
+        result = await vector_skill.save_decision(
+            title="T", decided_by="X", project="P",
+            rationale="R", source="test-model",
+        )
+    assert "Error" in result
+    assert "hive_mind_proxy.py" in result
+
+
+@pytest.mark.asyncio
+async def test_mcp_save_decision_coordinator_returns_400():
+    """save_decision surfaces coordinator error messages (e.g. missing required fields)."""
+    mock_response = MagicMock()
+    mock_response.json = lambda: {
+        "status": "error",
+        "message": "decision save missing required fields: ['rationale']",
+    }
+    with patch("httpx.AsyncClient.post", return_value=mock_response):
+        result = await vector_skill.save_decision(
+            title="T", decided_by="X", project="P",
+            rationale="", source="test-model",
+        )
+    assert "Error" in result
+    assert "rationale" in result
+
+
+@pytest.mark.asyncio
 async def test_mcp_check_memory_health():
     with patch("vector_skill.get_pg_conn") as mock_pg_conn, \
          patch("vector_skill.release_pg_conn") as mock_pg_release, \

@@ -58,28 +58,22 @@ Query the knowledge graph for structural and dependency context.
 ### 4. Decision Provenance (Save a Decision)
 Record architectural or design decisions with full PROV-O provenance — who decided, which AI assisted, which project, and why.
 - **Trigger:** When a significant architectural, design, or process decision is made.
-- **CLI:**
+- **CLI shortcut (Phase B — recommended):**
   ```
-  uv run --with httpx python scripts/memory_bridge.py save \
-    "We decided to add a consolidation daemon to simulate dreaming." \
-    '{
-      "source": "<agent_name>",
-      "type": "decision",
-      "entities": ["Consolidator", "SharedMemory"],
-      "decision": {
-        "title": "Add consolidation daemon",
-        "decided_by": "Xenofon",
-        "project": "shared_memory",
-        "rationale": "simulate dreaming; reduce hot-path latency via outbox",
-        "assisted_by": ["claude-code"],
-        "date": "2026-05-28",
-        "alternatives_considered": ["synchronous writes", "no consolidation"],
-        "confidence_at_time": 0.8
-      }
-    }'
+  uv run --with httpx python scripts/memory_bridge.py save_decision \
+    --title "Add consolidation daemon" \
+    --decided-by "Xenofon" \
+    --project "shared_memory" \
+    --rationale "Simulate dreaming; reduce hot-path latency via outbox" \
+    --assisted-by "claude-sonnet-4-6" \
+    --alternatives "synchronous writes, no consolidation" \
+    --confidence "high" \
+    --entities "Consolidator,SharedMemory"
   ```
+- **MCP tool (LM Studio — Phase B):** Call `save_decision(title=..., decided_by=..., project=..., rationale=..., source=<model_name>)` — all comma-separated list fields optional.
+- **Raw JSON (legacy):** Pass a full `type=decision` metadata blob to `save`.
 
-**Required fields:** `decided_by`, `project`, `rationale`. All others optional. Missing required fields return HTTP 400.
+**Required flags/fields:** `--title`, `--decided-by`, `--project`, `--rationale` (CLI); `title`, `decided_by`, `project`, `rationale`, `source` (MCP). Missing required fields return HTTP 400.
 
 **What happens on save:**
 1. Coordinator validates required decision fields at ingress (before any DB write)

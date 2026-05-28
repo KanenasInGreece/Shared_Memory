@@ -1,3 +1,4 @@
+import argparse
 import sys
 import json
 import os
@@ -232,9 +233,68 @@ async def save_artifact(content, metadata_json="{}"):
     except Exception as e:
         return {"error": str(e)}
 
+COORDINATOR_BASE = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
+AGENT_ID = os.environ.get("AGENT_ID", "memory_bridge")
+
+
+def build_decision_metadata(
+    title: str,
+    decided_by: str,
+    project: str,
+    rationale: str,
+    source: str = None,
+    assisted_by: str = "",
+    alternatives: str = "",
+    confidence: str = "",
+    entities: str = "",
+) -> tuple:
+    """Build (content, metadata) for a decision save. Pure function — no I/O."""
+    content = f"{title}\n\n{rationale}"
+    decision = {
+        "title": title,
+        "decided_by": decided_by,
+        "project": project,
+        "rationale": rationale,
+        "date": datetime.now().date().isoformat(),
+    }
+    if assisted_by:
+        decision["assisted_by"] = [a.strip() for a in assisted_by.split(",") if a.strip()]
+    if alternatives:
+        decision["alternatives"] = [a.strip() for a in alternatives.split(",") if a.strip()]
+    if confidence:
+        decision["confidence"] = confidence
+
+    metadata = {
+        "type": "decision",
+        "source": source or AGENT_ID,
+        "entities": [e.strip() for e in entities.split(",") if e.strip()],
+        "decision": decision,
+    }
+    return content, metadata
+
+
+async def save_decision_via_coordinator(content: str, metadata: dict) -> dict:
+    """Route a decision save through the coordinator (handles Decision outbox path)."""
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                f"{COORDINATOR_BASE}/memory/save",
+                json={"content": content, "metadata": metadata, "agent_id": AGENT_ID},
+            )
+            return r.json()
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": (
+                f"Memory coordinator unreachable at {COORDINATOR_BASE} — "
+                f"is hive_mind_proxy.py running? ({exc})"
+            ),
+        }
+
+
 async def main():
-    if len(sys.argv) < 3:
-        print(json.dumps({"error": "Usage: python memory_bridge.py [graph|search|save] <query/content> [metadata/limit]"}))
+    if len(sys.argv) < 2:
+        print(json.dumps({"error": "Usage: python memory_bridge.py [graph|search|save|save_decision] ..."}))
         sys.exit(1)
 
     action = sys.argv[1]
@@ -247,8 +307,35 @@ async def main():
     elif action == "save":
         metadata = sys.argv[3] if len(sys.argv) > 3 else "{}"
         print(json.dumps(await save_artifact(sys.argv[2], metadata), indent=2))
+    elif action == "save_decision":
+        p = argparse.ArgumentParser(
+            prog="memory_bridge.py save_decision",
+            description="Save an architectural or design decision with PROV-O provenance.",
+        )
+        p.add_argument("--title",       required=True)
+        p.add_argument("--decided-by",  required=True)
+        p.add_argument("--project",     required=True)
+        p.add_argument("--rationale",   required=True)
+        p.add_argument("--source",      default=AGENT_ID)
+        p.add_argument("--assisted-by", default="")
+        p.add_argument("--alternatives", default="")
+        p.add_argument("--confidence",  default="")
+        p.add_argument("--entities",    default="")
+        args = p.parse_args(sys.argv[2:])
+        content, metadata = build_decision_metadata(
+            title=args.title,
+            decided_by=args.decided_by,
+            project=args.project,
+            rationale=args.rationale,
+            source=args.source,
+            assisted_by=args.assisted_by,
+            alternatives=args.alternatives,
+            confidence=args.confidence,
+            entities=args.entities,
+        )
+        print(json.dumps(await save_decision_via_coordinator(content, metadata), indent=2))
     else:
-        print(json.dumps({"error": f"Unknown action: {action}"}))
+        print(json.dumps({"error": f"Unknown action: {action}. Use graph|search|save|save_decision"}))
 
 if __name__ == "__main__":
     asyncio.run(main())

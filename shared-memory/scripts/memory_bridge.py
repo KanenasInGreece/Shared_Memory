@@ -5,12 +5,17 @@ Delegates all storage I/O to the coordinator running inside hive_mind_proxy
 on port 8888. Direct Postgres and Neo4j access has been removed; the
 coordinator owns those connections.
 
-CLI usage (unchanged from previous versions):
+CLI usage:
     python memory_bridge.py save   "<content>" '<metadata_json>'
     python memory_bridge.py search "<query>" [limit]
     python memory_bridge.py graph  "<cypher>"
+    python memory_bridge.py save_decision --title "..." --decided-by "..." \
+        --project "..." --rationale "..." [--source "..."] \
+        [--assisted-by "a,b"] [--alternatives "x,y"] \
+        [--confidence "high"] [--entities "E1,E2"]
 """
 
+import argparse
 import asyncio
 import json
 import logging
@@ -139,27 +144,110 @@ def query_graph(cypher: str, params: dict = None) -> list | dict:
     return result.get("records", result)
 
 
+# ── Decision shortcut ─────────────────────────────────────────────────────────
+
+def build_decision_metadata(
+    title: str,
+    decided_by: str,
+    project: str,
+    rationale: str,
+    source: str = None,
+    assisted_by: str = "",
+    alternatives: str = "",
+    confidence: str = "",
+    entities: str = "",
+) -> tuple:
+    """Build (content, metadata) for a decision save.
+
+    Returns a (content_str, metadata_dict) tuple ready for save_artifact().
+    Pure function — no I/O, no side effects.
+    """
+    content = f"{title}\n\n{rationale}"
+    decision = {
+        "title": title,
+        "decided_by": decided_by,
+        "project": project,
+        "rationale": rationale,
+        "date": datetime.now().date().isoformat(),
+    }
+    if assisted_by:
+        decision["assisted_by"] = [a.strip() for a in assisted_by.split(",") if a.strip()]
+    if alternatives:
+        decision["alternatives"] = [a.strip() for a in alternatives.split(",") if a.strip()]
+    if confidence:
+        decision["confidence"] = confidence
+
+    metadata = {
+        "type": "decision",
+        "source": source or AGENT_ID,
+        "entities": [e.strip() for e in entities.split(",") if e.strip()],
+        "decision": decision,
+    }
+    return content, metadata
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 2:
         print(json.dumps({
-            "error": "Usage: python memory_bridge.py [graph|search|save] <query/content> [metadata/limit]"
+            "error": "Usage: python memory_bridge.py [graph|search|save|save_decision] ..."
         }))
         sys.exit(1)
 
     action = sys.argv[1]
 
     if action == "graph":
+        if len(sys.argv) < 3:
+            print(json.dumps({"error": "Usage: memory_bridge.py graph <cypher>"}))
+            sys.exit(1)
         print(json.dumps(query_graph(sys.argv[2]), indent=2))
     elif action == "search":
+        if len(sys.argv) < 3:
+            print(json.dumps({"error": "Usage: memory_bridge.py search <query> [limit]"}))
+            sys.exit(1)
         limit = int(sys.argv[3]) if len(sys.argv) > 3 else 5
         print(json.dumps(await search_and_rerank(sys.argv[2], limit), indent=2))
     elif action == "save":
+        if len(sys.argv) < 3:
+            print(json.dumps({"error": "Usage: memory_bridge.py save <content> [metadata_json]"}))
+            sys.exit(1)
         metadata = sys.argv[3] if len(sys.argv) > 3 else "{}"
         print(json.dumps(await save_artifact(sys.argv[2], metadata), indent=2))
+    elif action == "save_decision":
+        p = argparse.ArgumentParser(
+            prog="memory_bridge.py save_decision",
+            description="Save an architectural or design decision with PROV-O provenance.",
+        )
+        p.add_argument("--title",       required=True,  help="Short decision title")
+        p.add_argument("--decided-by",  required=True,  help="Human who made the decision")
+        p.add_argument("--project",     required=True,  help="Project context")
+        p.add_argument("--rationale",   required=True,  help="Why this decision was made")
+        p.add_argument("--source",      default=AGENT_ID,
+                       help="Agent/model saving this record (default: $AGENT_ID)")
+        p.add_argument("--assisted-by", default="",
+                       help="Comma-separated AI agents that assisted")
+        p.add_argument("--alternatives", default="",
+                       help="Comma-separated alternatives that were considered")
+        p.add_argument("--confidence",  default="",
+                       help="Confidence level (e.g. high, medium, low)")
+        p.add_argument("--entities",    default="",
+                       help="Comma-separated Neo4j entities to link")
+        args = p.parse_args(sys.argv[2:])
+        content, metadata = build_decision_metadata(
+            title=args.title,
+            decided_by=args.decided_by,
+            project=args.project,
+            rationale=args.rationale,
+            source=args.source,
+            assisted_by=args.assisted_by,
+            alternatives=args.alternatives,
+            confidence=args.confidence,
+            entities=args.entities,
+        )
+        print(json.dumps(await save_artifact(content, metadata), indent=2))
     else:
-        print(json.dumps({"error": f"Unknown action: {action}"}))
+        print(json.dumps({"error": f"Unknown action: {action}. Use graph|search|save|save_decision"}))
 
 
 if __name__ == "__main__":
