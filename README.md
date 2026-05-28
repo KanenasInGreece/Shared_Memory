@@ -6,6 +6,7 @@ Every insight one agent gains is available to every other — across sessions, a
 A unified semantic and relational memory layer built from first principles to survive the interference problem and scale safely to concurrent multi-agent workloads.
 
 ![Claude Code](https://img.shields.io/badge/Claude_Code-Skill-blue)
+![Codex CLI](https://img.shields.io/badge/Codex_CLI-Skill-blue)
 ![Grok](https://img.shields.io/badge/Grok-Skill-blue)
 ![Gemini CLI](https://img.shields.io/badge/Gemini_CLI-Skill-blue)
 ![LM Studio](https://img.shields.io/badge/LM_Studio-MCP-blue)
@@ -50,6 +51,8 @@ This framework is built around one idea: those tools should share a brain. When 
 **The consumers, and how they connect:**
 
 - **Claude Code** — uses `memory_bridge.py` packaged as a Claude skill (`/shared-memory`). Install the skill directory under `~/.claude/skills/`.
+
+- **Codex CLI** — uses `memory_bridge.py` packaged as a Codex skill (`$shared-memory`). Install the skill directory under `~/.codex/skills/`. SKILL.md frontmatter enables implicit invocation when the task description matches.
 
 - **Grok** — uses `memory_bridge.py` packaged as a Grok skill (`/shared-memory`). Install the skill directory under `~/.grok/skills/`.
 
@@ -576,6 +579,30 @@ Invoke in any Grok session:
 /shared-memory
 ```
 
+### Codex CLI
+
+Codex CLI loads skills from `~/.codex/skills/` (global) or `.agents/skills/` (project-level). Install globally so the skill is available in every project:
+
+```bash
+mkdir -p ~/.codex/skills/shared-memory
+
+# Symlink scripts — always in sync with the repo
+ln -s /path/to/Shared_Memory/shared-memory/scripts ~/.codex/skills/shared-memory/scripts
+
+# Copy SKILL.md
+cp shared-memory/SKILL.md ~/.codex/skills/shared-memory/SKILL.md
+```
+
+Invoke explicitly in any Codex CLI session:
+
+```
+$shared-memory
+```
+
+Codex CLI also supports **implicit invocation**: if the description in SKILL.md's frontmatter matches the task, the skill is loaded automatically without an explicit `$` call.
+
+> **AGENTS.md:** Codex CLI reads `AGENTS.md` at the project root before each session (their equivalent of `CLAUDE.md`). This repo provides `AGENTS.md` alongside `AGENT.md` — both contain the same architectural guidance.
+
 ### Gemini CLI
 
 Gemini CLI loads skills from `~/.gemini/skills/`. Drop the `shared-memory` skill directory there:
@@ -637,6 +664,7 @@ Start LM Studio. The `rag-orchestrator` MCP server should appear in the tool pan
 | Consumer | Interface | Entry point | Consolidation trigger |
 |---|---|---|---|
 | **Claude Code** | CLI (skill `/shared-memory`) | `~/.claude/skills/shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
+| **Codex CLI** | CLI (skill `$shared-memory`) | `~/.codex/skills/shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
 | **Grok** | CLI (skill `/shared-memory`) | `~/.grok/skills/shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
 | **Gemini CLI** | CLI (skill `/activate shared-memory`) | `~/.gemini/skills/shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
 | **LM Studio** | MCP (FastMCP) | `vector-skill.py` → `rag-orchestrator` in `mcp.json` | via coordinator → `pg_notify` |
