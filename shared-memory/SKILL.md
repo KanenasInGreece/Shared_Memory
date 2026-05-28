@@ -123,7 +123,7 @@ uv run --with fastmcp --with httpx --with psycopg2-binary --with neo4j \
 
 ## Reference
 
-- **Version:** `python scripts/memory_bridge.py --version` → `{"version": "0.3.0", "tool": "shared-memory-framework"}`
+- **Version:** `python scripts/memory_bridge.py --version` → `{"version": "0.3.1", "tool": "shared-memory-framework"}`
 - **Schema:** Neo4j labels, relationship types, Postgres tables — [schema.md](Documentation/schema.md)
 - **Embedding mandate:** All calls route through the gateway (:8888). Never call port 8070 (BGE-M3) or 8071 (BGE-Reranker) directly — the gateway enforces 1024-dim consistency across all agents.
 - **Ontology:** All Neo4j labels and relationship types are configurable in `ontology.yaml` at the repo root.

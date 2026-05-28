@@ -10,7 +10,7 @@ import hashlib
 from datetime import datetime
 from neo4j import GraphDatabase
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 # Configuration — set via environment variables or .env file
 NEO4J_URI = "bolt://localhost:7687"

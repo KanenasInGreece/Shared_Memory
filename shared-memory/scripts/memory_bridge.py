@@ -26,7 +26,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 # Load .env by searching up from this script's location so env overrides
 # (COORDINATOR_URL, MEMORY_LOG_LEVEL, etc.) are picked up when invoked by

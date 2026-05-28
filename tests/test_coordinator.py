@@ -278,3 +278,201 @@ async def test_apply_decision_outbox_row_handles_empty_assisted_by():
     await c._apply_decision_outbox_row(outbox_id=2, pg_id=50, params=params)
     assert mock_session.run.await_count == 1
     mock_conn.execute.assert_awaited()
+
+
+# ── Pure function tests — Fix 1: retrieval visibility ─────────────────────────
+
+def test_sigmoid_midpoint():
+    assert coordinator_mod._sigmoid(0.0) == pytest.approx(0.5)
+
+
+def test_sigmoid_large_positive_approaches_one():
+    assert coordinator_mod._sigmoid(10.0) > 0.99
+
+
+def test_sigmoid_large_negative_approaches_zero():
+    assert coordinator_mod._sigmoid(-10.0) < 0.01
+
+
+def test_sigmoid_score_2_is_in_unit_interval():
+    v = coordinator_mod._sigmoid(2.0)
+    assert 0.0 < v < 1.0
+
+
+def test_matched_entities_single_match():
+    meta = {"entities": ["OutboxPattern", "Neo4j", "Postgres"]}
+    result = coordinator_mod._matched_entities("query about Neo4j consolidation", meta)
+    assert result == ["Neo4j"]
+
+
+def test_matched_entities_empty_entity_list():
+    assert coordinator_mod._matched_entities("anything", {"entities": []}) == []
+
+
+def test_matched_entities_none_metadata():
+    assert coordinator_mod._matched_entities("anything", None) == []
+
+
+def test_matched_entities_missing_key():
+    assert coordinator_mod._matched_entities("anything", {}) == []
+
+
+def test_matched_entities_multiple_matches():
+    meta = {"entities": ["Neo4j", "Postgres", "BGE-M3"]}
+    result = coordinator_mod._matched_entities("Neo4j and Postgres together", meta)
+    assert "Neo4j"   in result
+    assert "Postgres" in result
+    assert "BGE-M3"  not in result
+
+
+def test_matched_entities_case_insensitive():
+    meta = {"entities": ["SharedMemory"]}
+    result = coordinator_mod._matched_entities("query about sharedmemory", meta)
+    assert result == ["SharedMemory"]
+
+
+# ── source_ref propagation — Fix 3: lineage ──────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_save_propagates_source_ref_to_outbox_cypher_params():
+    """source_ref in metadata must appear in the outbox cypher_params JSON."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "Fact with sub-document reference",
+            "metadata": {
+                "source": "claude-code",
+                "entities": ["SharedMemory"],
+                "source_ref": "design-doc.pdf#p12",
+            },
+        })
+        resp = await c.handle_save(req)
+
+    assert resp.status == 200
+
+    # Find the outbox INSERT among the execute() calls and verify source_ref is present.
+    outbox_call = next(
+        (c for c in mock_conn.execute.call_args_list
+         if "neo4j_outbox" in c.args[0]),
+        None,
+    )
+    assert outbox_call is not None, "outbox INSERT not found in execute() calls"
+    # args: (sql, pg_id, cypher_params_json) — cypher_params is args[2]
+    params = json.loads(outbox_call.args[2])
+    assert params["source_ref"] == "design-doc.pdf#p12"
+
+
+@pytest.mark.asyncio
+async def test_save_without_source_ref_stores_none_in_outbox():
+    """Saves without source_ref must not crash — outbox params carry source_ref=None."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "Plain fact with no source reference",
+            "metadata": {"source": "claude-code", "entities": ["SharedMemory"]},
+        })
+        resp = await c.handle_save(req)
+
+    assert resp.status == 200
+
+    outbox_call = next(
+        (c for c in mock_conn.execute.call_args_list
+         if "neo4j_outbox" in c.args[0]),
+        None,
+    )
+    assert outbox_call is not None
+    params = json.loads(outbox_call.args[2])
+    assert params["source_ref"] is None
+
+
+# ── Search response shape — Fix 1: retrieval visibility ──────────────────────
+
+class _AsyncIter:
+    """Minimal async iterable that yields zero items — simulates empty Neo4j result."""
+    def __aiter__(self):
+        return self
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+
+@pytest.mark.asyncio
+async def test_search_response_fact_carries_tier_and_normalized_score():
+    """Fact results must include tier='fact', score_normalized in (0,1), matched_entities list."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+
+    # Tier 3: top community summary
+    mock_conn.fetchrow = AsyncMock(return_value={"content": "Global context summary"})
+    # Tier 1: one candidate
+    mock_conn.fetch = AsyncMock(return_value=[
+        {"id": 1, "content": "fact about Neo4j outbox", "metadata": {"entities": ["Neo4j"], "source": "claude-code"}},
+    ])
+    # Neo4j expansion: no related nodes (empty async iterator)
+    mock_session.run = AsyncMock(return_value=_AsyncIter())
+
+    mock_reranker = MagicMock()
+    mock_reranker.raise_for_status = MagicMock()
+    mock_reranker.json = MagicMock(return_value={
+        "results": [{"index": 0, "relevance_score": 2.0}]
+    })
+
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        with patch("httpx.AsyncClient") as mock_cls:
+            mock_http = AsyncMock()
+            mock_http.post = AsyncMock(return_value=mock_reranker)
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_http)
+            mock_cls.return_value.__aexit__  = AsyncMock(return_value=None)
+
+            req = _make_request({"query": "Neo4j outbox", "limit": 5})
+            resp = await c.handle_search(req)
+
+    assert resp.status == 200
+    body    = json.loads(resp.text)
+    results = body["results"]
+
+    # Community summary is prepended
+    assert results[0]["tier"] == "community_summary"
+    assert results[0]["graph_context"] == []
+
+    # Fact result shape
+    fact = results[1]
+    assert fact["tier"] == "fact"
+    assert isinstance(fact["score_normalized"], float)
+    assert 0.0 < fact["score_normalized"] < 1.0
+    assert isinstance(fact["matched_entities"], list)
+    assert "Neo4j" in fact["matched_entities"]
+    assert isinstance(fact["graph_context"], list)
+
+
+@pytest.mark.asyncio
+async def test_search_response_community_summary_has_tier_field():
+    """The community summary prepended to results must carry tier='community_summary'."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+
+    mock_conn.fetchrow = AsyncMock(return_value={"content": "A community narrative"})
+    # Provide one candidate so the early-return path is not taken
+    mock_conn.fetch = AsyncMock(return_value=[
+        {"id": 1, "content": "fact content", "metadata": {"entities": [], "source": "claude-code"}},
+    ])
+    mock_session.run = AsyncMock(return_value=_AsyncIter())
+
+    mock_reranker = MagicMock()
+    mock_reranker.raise_for_status = MagicMock()
+    mock_reranker.json = MagicMock(return_value={
+        "results": [{"index": 0, "relevance_score": 0.0}]
+    })
+
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        with patch("httpx.AsyncClient") as mock_cls:
+            mock_http = AsyncMock()
+            mock_http.post = AsyncMock(return_value=mock_reranker)
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_http)
+            mock_cls.return_value.__aexit__  = AsyncMock(return_value=None)
+
+            req = _make_request({"query": "anything", "limit": 5})
+            resp = await c.handle_search(req)
+
+    assert resp.status == 200
+    results = json.loads(resp.text)["results"]
+    assert results[0]["tier"] == "community_summary"
