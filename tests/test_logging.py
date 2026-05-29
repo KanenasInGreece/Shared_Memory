@@ -29,7 +29,7 @@ def load_consolidation_loop():
     )
     spec = importlib.util.spec_from_file_location("consolidation_loop_logging_test", path)
     mod = importlib.util.module_from_spec(spec)
-    with patch("neo4j.GraphDatabase.driver"):
+    with patch("neo4j.AsyncGraphDatabase.driver"):
         spec.loader.exec_module(mod)
     return mod
 
@@ -141,18 +141,17 @@ class TestAppendLog:
 async def test_save_logs_gateway_down(tmp_path, monkeypatch):
     monkeypatch.setenv("MEMORY_LOG_LEVEL", "2")
     monkeypatch.setenv("MEMORY_LOG_PATH", str(tmp_path))
-    with patch(f"{_MB_MODULE}.get_embedding", return_value=None):
+    with patch("httpx.AsyncClient.post", side_effect=Exception("coordinator down")):
         result = await memory_bridge.save_artifact("content", '{"source":"test"}')
     assert result["status"] == "error"
     entry = json.loads((tmp_path / "memory_bridge.log").read_text().strip())
-    assert entry["event"] == "gateway_down"
+    assert entry["event"] == "coordinator_down"
 
 @pytest.mark.asyncio
 async def test_save_logs_bad_metadata_json(tmp_path, monkeypatch):
     monkeypatch.setenv("MEMORY_LOG_LEVEL", "2")
     monkeypatch.setenv("MEMORY_LOG_PATH", str(tmp_path))
-    with patch(f"{_MB_MODULE}.get_embedding", return_value=MOCK_EMBEDDING):
-        result = await memory_bridge.save_artifact("content", "not-json")
+    result = await memory_bridge.save_artifact("content", "not-json")
     assert result["status"] == "error"
     entry = json.loads((tmp_path / "memory_bridge.log").read_text().strip())
     assert entry["event"] == "bad_metadata"
@@ -161,8 +160,7 @@ async def test_save_logs_bad_metadata_json(tmp_path, monkeypatch):
 async def test_save_logs_bad_metadata_type(tmp_path, monkeypatch):
     monkeypatch.setenv("MEMORY_LOG_LEVEL", "2")
     monkeypatch.setenv("MEMORY_LOG_PATH", str(tmp_path))
-    with patch(f"{_MB_MODULE}.get_embedding", return_value=MOCK_EMBEDDING):
-        result = await memory_bridge.save_artifact("content", "[1,2,3]")
+    result = await memory_bridge.save_artifact("content", "[1,2,3]")
     assert result["status"] == "error"
     entry = json.loads((tmp_path / "memory_bridge.log").read_text().strip())
     assert entry["event"] == "bad_metadata_type"
@@ -171,11 +169,8 @@ async def test_save_logs_bad_metadata_type(tmp_path, monkeypatch):
 async def test_save_logs_no_entities_warning(tmp_path, monkeypatch):
     monkeypatch.setenv("MEMORY_LOG_LEVEL", "1")
     monkeypatch.setenv("MEMORY_LOG_PATH", str(tmp_path))
-    with patch(f"{_MB_MODULE}.get_embedding", return_value=MOCK_EMBEDDING), \
-         patch("psycopg2.connect") as mock_pg, \
-         patch("neo4j.GraphDatabase.driver"):
-        mock_cur = mock_pg.return_value.cursor.return_value.__enter__.return_value
-        mock_cur.fetchone.return_value = [MOCK_PG_ID]
+    mock_resp = MagicMock(json=lambda: {"status": "success", "pg_id": MOCK_PG_ID})
+    with patch("httpx.AsyncClient.post", return_value=mock_resp):
         result = await memory_bridge.save_artifact("content", '{"source":"test"}')
     assert result["status"] == "success"
     entry = json.loads((tmp_path / "memory_bridge.log").read_text().strip())
@@ -186,11 +181,8 @@ async def test_save_logs_no_entities_warning(tmp_path, monkeypatch):
 async def test_save_logs_success_at_level_3(tmp_path, monkeypatch):
     monkeypatch.setenv("MEMORY_LOG_LEVEL", "3")
     monkeypatch.setenv("MEMORY_LOG_PATH", str(tmp_path))
-    with patch(f"{_MB_MODULE}.get_embedding", return_value=MOCK_EMBEDDING), \
-         patch("psycopg2.connect") as mock_pg, \
-         patch("neo4j.GraphDatabase.driver"):
-        mock_cur = mock_pg.return_value.cursor.return_value.__enter__.return_value
-        mock_cur.fetchone.return_value = [MOCK_PG_ID]
+    mock_resp = MagicMock(json=lambda: {"status": "success", "pg_id": MOCK_PG_ID})
+    with patch("httpx.AsyncClient.post", return_value=mock_resp):
         result = await memory_bridge.save_artifact("content", '{"source":"test","entities":["E1"]}')
     assert result["status"] == "success"
     lines = (tmp_path / "memory_bridge.log").read_text().strip().split("\n")
@@ -201,16 +193,16 @@ async def test_save_logs_success_at_level_3(tmp_path, monkeypatch):
 async def test_save_no_log_at_level_0(tmp_path, monkeypatch):
     monkeypatch.setenv("MEMORY_LOG_LEVEL", "0")
     monkeypatch.setenv("MEMORY_LOG_PATH", str(tmp_path))
-    with patch(f"{_MB_MODULE}.get_embedding", return_value=None):
+    with patch("httpx.AsyncClient.post", side_effect=Exception("down")):
         await memory_bridge.save_artifact("content", '{"source":"test"}')
     assert not (tmp_path / "memory_bridge.log").exists()
 
 @pytest.mark.asyncio
 async def test_save_gateway_down_not_logged_at_level_1(tmp_path, monkeypatch):
-    # gateway_down is an ERROR (min_level=2), should not appear at level 1
+    # coordinator_down is min_level=2, should not appear at level 1
     monkeypatch.setenv("MEMORY_LOG_LEVEL", "1")
     monkeypatch.setenv("MEMORY_LOG_PATH", str(tmp_path))
-    with patch(f"{_MB_MODULE}.get_embedding", return_value=None):
+    with patch("httpx.AsyncClient.post", side_effect=Exception("down")):
         await memory_bridge.save_artifact("content", '{"source":"test"}')
     assert not (tmp_path / "memory_bridge.log").exists()
 
