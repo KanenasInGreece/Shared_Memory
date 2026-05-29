@@ -26,7 +26,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 
 # Load .env by searching up from this script's location so env overrides
 # (COORDINATOR_URL, MEMORY_LOG_LEVEL, etc.) are picked up when invoked by
@@ -189,12 +189,50 @@ def build_decision_metadata(
     return content, metadata
 
 
+# ── Retrospective shortcut ────────────────────────────────────────────────────
+
+def build_retrospective_payload(
+    pg_id: int,
+    rating: str,
+    notes: str,
+    date: str = "",
+    source: str = None,
+) -> dict:
+    """Build the JSON payload for POST /memory/retrospective.
+
+    Pure function — no I/O, no side effects.
+    """
+    return {
+        "pg_id": pg_id,
+        "rating": rating,
+        "notes": notes,
+        "date": date or datetime.now().date().isoformat(),
+        "agent_id": source or AGENT_ID,
+    }
+
+
+async def save_retrospective_artifact(
+    pg_id: int,
+    rating: str,
+    notes: str,
+    date: str = "",
+    source: str = None,
+) -> dict:
+    payload = build_retrospective_payload(pg_id, rating, notes, date, source)
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(f"{COORDINATOR_BASE}/memory/retrospective", json=payload)
+            return r.json()
+    except httpx.ConnectError as exc:
+        return _coordinator_unavailable(exc)
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
     if len(sys.argv) < 2:
         print(json.dumps({
-            "error": "Usage: python memory_bridge.py [--version|graph|search|save|save_decision] ..."
+            "error": "Usage: python memory_bridge.py [--version|graph|search|save|save_decision|save_retrospective] ..."
         }))
         sys.exit(1)
 
@@ -252,8 +290,34 @@ async def main() -> None:
             entities=args.entities,
         )
         print(json.dumps(await save_artifact(content, metadata), indent=2))
+    elif action == "save_retrospective":
+        p = argparse.ArgumentParser(
+            prog="memory_bridge.py save_retrospective",
+            description="Record an outcome for a past decision (HAD_OUTCOME edge).",
+        )
+        p.add_argument("--pg-id",  required=True, type=int,
+                       help="pg_id of the target Decision")
+        p.add_argument("--rating", required=True,
+                       help="Outcome rating (e.g. high, medium, low)")
+        p.add_argument("--notes",  required=True,
+                       help="What actually happened / lessons learned")
+        p.add_argument("--date",   default="",
+                       help="ISO date of outcome (default: today)")
+        p.add_argument("--source", default=AGENT_ID,
+                       help="Agent/model recording the outcome (default: $AGENT_ID)")
+        args = p.parse_args(sys.argv[2:])
+        print(json.dumps(
+            await save_retrospective_artifact(
+                pg_id=args.pg_id,
+                rating=args.rating,
+                notes=args.notes,
+                date=args.date,
+                source=args.source,
+            ),
+            indent=2,
+        ))
     else:
-        print(json.dumps({"error": f"Unknown action: {action}. Use graph|search|save|save_decision"}))
+        print(json.dumps({"error": f"Unknown action: {action}. Use graph|search|save|save_decision|save_retrospective"}))
 
 
 if __name__ == "__main__":

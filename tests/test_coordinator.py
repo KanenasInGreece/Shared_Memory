@@ -280,6 +280,70 @@ async def test_apply_decision_outbox_row_handles_empty_assisted_by():
     mock_conn.execute.assert_awaited()
 
 
+# ── Retrospective outbox dispatch and Neo4j writes (Phase C) ─────────────────
+
+@pytest.mark.asyncio
+async def test_apply_outbox_row_dispatches_retrospective_type():
+    """_apply_outbox_row must delegate to _apply_retrospective_outbox_row for type=retrospective."""
+    c = MemoryCoordinator()
+    c._pool  = MagicMock()
+    c._neo4j = MagicMock()
+
+    params = {
+        "type": "retrospective",
+        "target_pg_id": 42,
+        "retrospective": {"rating": "high", "date": "2026-05-29", "notes": "Held up well."},
+        "source": "claude-code",
+    }
+
+    with patch.object(c, "_apply_retrospective_outbox_row", new=AsyncMock()) as mock_retro:
+        await c._apply_outbox_row(outbox_id=10, pg_id=42, params=params, retries=0)
+        mock_retro.assert_awaited_once_with(10, 42, params)
+
+
+@pytest.mark.asyncio
+async def test_apply_retrospective_outbox_row_creates_had_outcome():
+    """_apply_retrospective_outbox_row must issue a HAD_OUTCOME CREATE and mark the outbox row applied."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+
+    params = {
+        "type": "retrospective",
+        "target_pg_id": 42,
+        "retrospective": {"rating": "high", "date": "2026-05-29", "notes": "Held up well."},
+        "source": "claude-code",
+    }
+
+    await c._apply_retrospective_outbox_row(outbox_id=10, pg_id=42, params=params)
+
+    assert mock_session.run.await_count == 1
+    cypher_call = mock_session.run.call_args
+    cypher = cypher_call.args[0]
+    assert "Decision" in cypher
+    assert "HAD_OUTCOME" in cypher
+    assert "CREATE" in cypher
+
+    kwargs = cypher_call.kwargs
+    assert kwargs["pg_id"]  == 42
+    assert kwargs["rating"] == "high"
+    assert kwargs["notes"]  == "Held up well."
+
+    mock_conn.execute.assert_awaited()
+    execute_sql = mock_conn.execute.call_args.args[0]
+    assert "applied" in execute_sql
+
+
+@pytest.mark.asyncio
+async def test_handle_retrospective_missing_fields_returns_400():
+    """handle_retrospective must return 400 when rating or notes are absent."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+
+    req = _make_request({"pg_id": 42, "rating": "", "notes": ""})
+    resp = await c.handle_retrospective(req)
+    assert resp.status == 400
+    body = json.loads(resp.body)
+    assert body["status"] == "error"
+
+
 # ── Pure function tests — Fix 1: retrieval visibility ─────────────────────────
 
 def test_sigmoid_midpoint():

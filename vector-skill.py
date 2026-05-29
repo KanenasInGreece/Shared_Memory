@@ -476,6 +476,53 @@ async def save_decision(
 
 
 @mcp.tool()
+async def save_retrospective(
+    pg_id: int,
+    rating: str,
+    notes: str,
+    source: str,
+    date: str = "",
+) -> str:
+    """
+    Record an outcome on an existing Decision node (HAD_OUTCOME edge).
+
+    Use this after a decision has been acted on to close the Why-To loop.
+    Each call appends a new dated edge — multiple retrospectives per decision are allowed.
+
+    Required: pg_id (returned by save_decision), rating, notes, source.
+    Optional: date (ISO string, default: today).
+    """
+    coordinator_url = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
+    agent_id = os.environ.get("AGENT_ID", "lm_studio")
+
+    payload = {
+        "pg_id": pg_id,
+        "rating": rating,
+        "notes": notes,
+        "date": date or datetime.now().date().isoformat(),
+        "agent_id": source or agent_id,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                f"{coordinator_url}/memory/retrospective",
+                json=payload,
+            )
+            result = r.json()
+    except Exception as exc:
+        return (
+            f"Error: Memory coordinator unreachable at {coordinator_url} — "
+            f"is hive_mind_proxy.py running? ({exc})"
+        )
+
+    if result.get("status") == "success":
+        return f"Retrospective recorded on Decision pg_id={result['target_pg_id']}."
+
+    return f"Error: {result.get('message', result)}"
+
+
+@mcp.tool()
 async def check_memory_health() -> str:
     """Full-stack diagnostic for the Shared Memory infrastructure."""
     stats = {"status": "healthy", "components": {}}

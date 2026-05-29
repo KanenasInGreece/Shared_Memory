@@ -9,6 +9,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.3.2] — 2026-05-29
+
+### Added
+
+- **Retrospective layer — Phase C** (`shared-memory/scripts/coordinator.py`, `shared-memory/scripts/memory_bridge.py`, `vector-skill.py`, `shared-memory-skill/shared-memory/scripts/memory_bridge.py`): Closes the Why-To loop — agents can now record whether a past decision held up, enabling retrospective queries before executing new tasks in the same area.
+
+  - **`POST /memory/retrospective` endpoint** (`coordinator.py`): Accepts `{pg_id, rating, notes, date?, agent_id?}`. Verifies the target `pg_id` exists in `technical_docs`, then writes to `neo4j_outbox` with `type=retrospective`. No new `technical_docs` row — retrospectives do not pollute semantic search.
+
+  - **`_apply_retrospective_outbox_row()`** (`coordinator.py`): Outbox worker method. Issues `MATCH (d:Decision {pg_id}) CREATE (d)-[:HAD_OUTCOME {rating, date, notes}]->(d)` — a self-loop per call. Multiple retrospectives per Decision are allowed; the Why-To query uses `ORDER BY o.date DESC` to surface the most recent.
+
+  - **`build_retrospective_payload()` + `save_retrospective_artifact()`** (`memory_bridge.py`): Pure helper and async HTTP client for `POST /memory/retrospective`. Pattern mirrors `build_decision_metadata()` / `save_artifact()` from Phase B.
+
+  - **`memory_bridge.py save_retrospective` subcommand**: Flags: `--pg-id` (required, int), `--rating` (required), `--notes` (required), `--date` (optional ISO, default today), `--source` (optional, default `$AGENT_ID`).
+
+  - **`vector-skill.py save_retrospective` MCP tool**: LM Studio can record retrospectives through the same coordinator path.
+
+  - **`shared-memory-skill` Gemini copy updated**: `build_retrospective_payload()`, `save_retrospective_via_coordinator()`, and `save_retrospective` subcommand added.
+
+  - **`datetime` import added** to `coordinator.py` (was missing; required by `handle_retrospective`).
+
+  - **10 new tests**: 7 in `tests/test_memory_bridge_retrospective.py` (new file — pure helper shape, date default, explicit date, source default, source override, CLI forwarding, CLI missing-flag exit) and 3 additions to `tests/test_coordinator.py` (outbox dispatch, HAD_OUTCOME Cypher, 400 on missing fields). Total: **84 tests passing**.
+
+  - **`shared-memory/SKILL.md`** (both copies): Task 5 — Save a Retrospective added with CLI, MCP, and Why-To query examples.
+
+  - **`shared-memory/Documentation/schema.md`**: Retrospective write protocol section added under `HAD_OUTCOME` relationship row.
+
+---
+
 ## [0.3.1] — 2026-05-28
 
 ### Added

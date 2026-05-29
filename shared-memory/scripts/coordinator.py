@@ -35,6 +35,7 @@ import logging
 import math
 import os
 import re
+from datetime import datetime
 from typing import Any
 
 import asyncpg
@@ -226,6 +227,10 @@ class MemoryCoordinator:
                 await self._apply_decision_outbox_row(outbox_id, pg_id, params)
                 return
 
+            if params.get("type") == "retrospective":
+                await self._apply_retrospective_outbox_row(outbox_id, pg_id, params)
+                return
+
             # Standard Fact + Entity MERGE — all writes in one round-trip so they
             # succeed or fail atomically. MERGE is idempotent — safe to retry.
             source_ref = params.get("source_ref") or None
@@ -325,6 +330,31 @@ class MemoryCoordinator:
                 outbox_id,
             )
         log.debug("outbox: applied decision pg_id=%d (outbox_id=%d)", pg_id, outbox_id)
+
+    async def _apply_retrospective_outbox_row(
+        self, outbox_id: int, pg_id: int, params: dict
+    ) -> None:
+        """Materialise a HAD_OUTCOME self-loop on an existing Decision node in Neo4j.
+
+        Each call creates a new dated edge — multiple retrospectives per decision are allowed.
+        MATCH only (no MERGE) so a missing Decision surfaces as a no-op rather than a phantom node.
+        """
+        retro = params.get("retrospective", {})
+        async with self._neo4j.session() as session:
+            await session.run(
+                f"MATCH (d:{ONT.decision} {{pg_id: $pg_id}})"
+                f" CREATE (d)-[:{ONT.had_outcome} {{rating: $rating, date: $date, notes: $notes}}]->(d)",
+                pg_id=pg_id,
+                rating=retro.get("rating", ""),
+                date=retro.get("date", ""),
+                notes=retro.get("notes", ""),
+            )
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE neo4j_outbox SET status='applied', applied_at=now() WHERE id=$1",
+                outbox_id,
+            )
+        log.debug("outbox: applied retrospective pg_id=%d (outbox_id=%d)", pg_id, outbox_id)
 
     async def _wait_for_outbox(self, pg_id: int) -> bool:
         """Poll until the outbox row for pg_id is applied, or CONSISTENCY_TIMEOUT expires."""
@@ -485,6 +515,48 @@ class MemoryCoordinator:
             "neo4j": neo4j_status,
             "message": f"Artifact stored with ID {pg_id}.{warn}",
         })
+
+    # ── POST /memory/retrospective ────────────────────────────────────────────
+
+    async def handle_retrospective(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {"status": "error", "message": "request body must be JSON"}, status=400
+            )
+
+        pg_id    = body.get("pg_id")
+        rating   = body.get("rating", "")
+        notes    = body.get("notes", "")
+        date     = body.get("date") or datetime.now().date().isoformat()
+        agent_id = body.get("agent_id", "unknown")
+
+        if not isinstance(pg_id, int) or not rating or not notes:
+            return web.json_response(
+                {"status": "error", "message": "pg_id (int), rating, and notes are required"},
+                status=400,
+            )
+
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT id FROM technical_docs WHERE id=$1", pg_id)
+            if not row:
+                return web.json_response(
+                    {"status": "error", "message": f"No record found with pg_id={pg_id}"},
+                    status=404,
+                )
+            await conn.execute(
+                "INSERT INTO neo4j_outbox (pg_id, cypher_params) VALUES ($1, $2::jsonb)",
+                pg_id,
+                json.dumps({
+                    "type": "retrospective",
+                    "target_pg_id": pg_id,
+                    "retrospective": {"rating": rating, "date": date, "notes": notes},
+                    "source": agent_id,
+                }),
+            )
+
+        return web.json_response({"status": "success", "target_pg_id": pg_id})
 
     # ── POST /memory/search ───────────────────────────────────────────────────
 
@@ -708,6 +780,7 @@ def attach(app: web.Application, coordinator: MemoryCoordinator) -> None:
     (Phase 4), only this call site changes.
     """
     app.router.add_post("/memory/save",           coordinator.handle_save)
+    app.router.add_post("/memory/retrospective",  coordinator.handle_retrospective)
     app.router.add_post("/memory/search",         coordinator.handle_search)
     app.router.add_post("/memory/graph",          coordinator.handle_graph)
     app.router.add_get( "/memory/status/{pg_id}", coordinator.handle_status)

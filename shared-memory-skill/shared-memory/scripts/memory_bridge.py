@@ -10,7 +10,7 @@ import hashlib
 from datetime import datetime
 from neo4j import GraphDatabase
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 
 # Configuration — set via environment variables or .env file
 NEO4J_URI = "bolt://localhost:7687"
@@ -294,9 +294,48 @@ async def save_decision_via_coordinator(content: str, metadata: dict) -> dict:
         }
 
 
+def build_retrospective_payload(
+    pg_id: int,
+    rating: str,
+    notes: str,
+    date: str = "",
+    source: str = None,
+) -> dict:
+    """Build the JSON payload for POST /memory/retrospective. Pure function — no I/O."""
+    return {
+        "pg_id": pg_id,
+        "rating": rating,
+        "notes": notes,
+        "date": date or datetime.now().date().isoformat(),
+        "agent_id": source or AGENT_ID,
+    }
+
+
+async def save_retrospective_via_coordinator(
+    pg_id: int,
+    rating: str,
+    notes: str,
+    date: str = "",
+    source: str = None,
+) -> dict:
+    payload = build_retrospective_payload(pg_id, rating, notes, date, source)
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(f"{COORDINATOR_BASE}/memory/retrospective", json=payload)
+            return r.json()
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": (
+                f"Memory coordinator unreachable at {COORDINATOR_BASE} — "
+                f"is hive_mind_proxy.py running? ({exc})"
+            ),
+        }
+
+
 async def main():
     if len(sys.argv) < 2:
-        print(json.dumps({"error": "Usage: python memory_bridge.py [--version|graph|search|save|save_decision] ..."}))
+        print(json.dumps({"error": "Usage: python memory_bridge.py [--version|graph|search|save|save_decision|save_retrospective] ..."}))
         sys.exit(1)
 
     action = sys.argv[1]
@@ -339,8 +378,34 @@ async def main():
             entities=args.entities,
         )
         print(json.dumps(await save_decision_via_coordinator(content, metadata), indent=2))
+    elif action == "save_retrospective":
+        p = argparse.ArgumentParser(
+            prog="memory_bridge.py save_retrospective",
+            description="Record an outcome for a past decision (HAD_OUTCOME edge).",
+        )
+        p.add_argument("--pg-id",  required=True, type=int,
+                       help="pg_id of the target Decision")
+        p.add_argument("--rating", required=True,
+                       help="Outcome rating (e.g. high, medium, low)")
+        p.add_argument("--notes",  required=True,
+                       help="What actually happened / lessons learned")
+        p.add_argument("--date",   default="",
+                       help="ISO date of outcome (default: today)")
+        p.add_argument("--source", default=AGENT_ID,
+                       help="Agent/model recording the outcome (default: $AGENT_ID)")
+        args = p.parse_args(sys.argv[2:])
+        print(json.dumps(
+            await save_retrospective_via_coordinator(
+                pg_id=args.pg_id,
+                rating=args.rating,
+                notes=args.notes,
+                date=args.date,
+                source=args.source,
+            ),
+            indent=2,
+        ))
     else:
-        print(json.dumps({"error": f"Unknown action: {action}. Use graph|search|save|save_decision"}))
+        print(json.dumps({"error": f"Unknown action: {action}. Use graph|search|save|save_decision|save_retrospective"}))
 
 if __name__ == "__main__":
     asyncio.run(main())
