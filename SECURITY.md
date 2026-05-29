@@ -124,7 +124,7 @@ MATCH (s:CommunitySummary {pg_id: <suspect_id>}) DETACH DELETE s;
 
 Seven findings from a rigorous code review. All are resolved in v0.3.4 unless marked otherwise.
 
-**Audit cadence:** Security reviews run at every **x.y.5 release** (next: v0.4.0 or v0.3.5 post-release review) and on demand via `/security-review`. The review covers four vectors: Concurrency & State, Database & Persistence Integrity, Dependency & Supply Chain, and Edge-Case Resilience.
+**Audit cadence:** Security reviews run at every **x.y.5 release** and on demand via `/security-review`. The review covers four vectors: Concurrency & State, Database & Persistence Integrity, Dependency & Supply Chain, and Edge-Case Resilience. Next scheduled: v0.4.0 (or v0.3.10 if reached first).
 
 ---
 
@@ -134,7 +134,7 @@ Seven findings from a rigorous code review. All are resolved in v0.3.4 unless ma
 
 The `/memory/graph` endpoint's only write guard was a keyword regex. Any local process could bypass it with novel Cypher patterns and read the full graph schema.
 
-**Fix:** Neo4j session opened with `default_access_mode="READ"`. Driver-level enforcement rejects write operations even if the regex is bypassed. **Phase 2C will add caller authentication** as the next layer.
+**Fix:** Neo4j session opened with `default_access_mode="READ"`. Driver-level enforcement rejects write operations even if the regex is bypassed. **v0.3.5 added `Authorization: Bearer <token>` caller authentication** as the third layer — only registered agents can reach the endpoint at all.
 
 ---
 
@@ -195,6 +195,64 @@ The LM Studio MCP path stored the full 1024-float BGE-M3 embedding on every `Fac
 `FOR UPDATE SKIP LOCKED` only held locks while the selection transaction was open. After the transaction committed, rows were still `pending` while Neo4j apply was in-flight. A second coordinator instance could claim the same rows and double-increment the retry counter, causing a row to hit `OUTBOX_MAX_RETRIES` prematurely and be permanently marked `failed`.
 
 **Fix:** Selection query changed to `UPDATE ... SET status='in_progress' WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING ...` — rows are atomically claimed before the lock is released. On startup, `start()` resets any `in_progress` rows (crash survivors) back to `pending`. The failure-path update now resets to `pending` instead of filtering on the old `AND status='pending'` condition.
+
+---
+
+## Post-release Fixes — v0.3.5 (2026-05-29)
+
+Four security-relevant bugs discovered on first live deployment of the v0.3.5 auth system. All fixed same day.
+
+---
+
+### P1 — Auth middleware blocked coordinator's own embedding calls ✅ Fixed
+
+**Severity:** HIGH (breaks all saves) | **File:** `coordinator.py`
+
+`EMBED_URL` pointed to `http://localhost:8888/v1/embeddings` — the proxy the coordinator runs inside. The DEFAULT DENY auth middleware rejected these internal calls with 401 because the coordinator has no `AGENT_TOKEN`. Every `POST /memory/save` failed at the embedding step.
+
+**Fix:** `EMBED_URL` changed to `http://localhost:8070/v1/embeddings` (direct to BGE-M3), consistent with `RERANK_URL` which already used `:8071` direct for the same reason. External agents still route embeddings through `:8888` and must authenticate; the coordinator is trusted and bypasses auth by calling the backend directly.
+
+---
+
+### P2 — `_auth_headers()` missing from three call sites in `vector-skill.py` ✅ Fixed
+
+**Severity:** HIGH (LM Studio search/health broken) | **File:** `vector-skill.py`
+
+`_auth_headers()` was added to `save_decision()` and `save_retrospective()` coordinator calls but missed three HTTP call sites that go through port 8888: the reranker call in `hybrid_search_and_rerank()` and both health-check probes in `check_memory_health()`. Every LM Studio search returned `401` and the health check reported the retriever and reranker as `FAIL`.
+
+**Fix:** All six `client.post()` call sites in `vector-skill.py` now pass `headers=_auth_headers()`.
+
+---
+
+### P3 — Dotenv `or`-chain loaded only the first file found ✅ Fixed
+
+**Severity:** MEDIUM (auth token silently not loaded) | **File:** `memory_bridge.py`
+
+The three-tier dotenv fallback used Python `or` chaining: `find_dotenv() or path2 or path3`. Once `find_dotenv()` returned the gateway `.env` (which has `AGENT_TOKENS` but not `AGENT_TOKEN`), the chain short-circuited and the agent's own token file was never read. `_auth_headers()` returned `{}`, every request got 401, and there was no warning — the failure was silent.
+
+**Fix:** Changed to a `for` loop with `load_dotenv(..., override=False)` so all three sources are loaded and the first definition of each variable wins.
+
+---
+
+### P4 — Auth token not loaded when `python-dotenv` absent ✅ Fixed
+
+**Severity:** MEDIUM (auth bypass via dependency gap) | **File:** `memory_bridge.py`
+
+Agents running `uv run --with httpx python scripts/memory_bridge.py` without `--with python-dotenv` hit `except ImportError: pass` silently — no `.env` was parsed, `AGENT_TOKEN` stayed unset, and every call got 401. Grok's standard invocation pattern triggered this: it ran without `python-dotenv` and fell back to reading local filesystem files to answer queries, bypassing shared memory entirely.
+
+**Fix:** Added a plain-Python fallback in the `except ImportError` block that manually parses the skill-root `.env` (one directory above `scripts/`, covering `~/.grok/skills/shared-memory/.env` etc.) and `~/.config/shared-memory/client.env`. Auth tokens load with no external dependencies.
+
+---
+
+## Security Audit — v0.3.5 post-release (2026-05-29)
+
+Run after the post-release fixes above were applied. Zero confirmed findings above the 8/10 confidence threshold.
+
+| Candidate | Verdict |
+|---|---|
+| Cypher injection via `_safe()` regex in `memory_bridge.py` | **False positive** — allowed characters (alphanumerics, space, `_`, `.`, `-`) cannot break out of a single-quoted Cypher string. Single quotes and backslashes are both stripped. CLI tool, not a network endpoint. |
+| Write-Cypher guard bypass via tabs/comments | **False positive** — `\s` already matches tabs and newlines. The Neo4j session `default_access_mode="READ"` is a second independent layer at the driver level; both layers would have to fail simultaneously. |
+| Cross-DB atomicity in `consolidation_loop.py` | **Not a security issue** — data consistency concern with no exploitation path (no new access, no code execution, no privilege escalation). Documented accepted trade-off in ADR-001. |
 
 ---
 
