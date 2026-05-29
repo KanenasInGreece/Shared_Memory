@@ -21,12 +21,13 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime
 
 import httpx
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 
 # Load .env by searching up from this script's location so env overrides
 # (COORDINATOR_URL, MEMORY_LOG_LEVEL, etc.) are picked up when invoked by
@@ -227,12 +228,94 @@ async def save_retrospective_artifact(
         return _coordinator_unavailable(exc)
 
 
+# ── Named query templates ─────────────────────────────────────────────────────
+
+def _build_query(template: str, args) -> str:
+    """Return a read-only Cypher string for the named provenance template.
+
+    Filter values are scrubbed to [A-Za-z0-9 _.-] before interpolation —
+    prevents quote-escape injection and avoids false-positive hits against
+    the coordinator's write-keyword guard on strings like 'delete'.
+    Pure function — no I/O, no side effects.
+    """
+    def _safe(v: str) -> str:
+        return re.sub(r"[^A-Za-z0-9 _.\-]", "", v or "")
+
+    if template == "who-decided":
+        title   = _safe(getattr(args, "title",   ""))
+        project = _safe(getattr(args, "project", ""))
+        lines = ["MATCH (d:Decision)-[:WAS_ATTRIBUTED_TO]->(h:Human)"]
+        if title:
+            lines.append(f"WHERE d.title CONTAINS '{title}'")
+        lines += [
+            "OPTIONAL MATCH (d)-[:WAS_ASSISTED_BY]->(a:AIAgent)",
+            "OPTIONAL MATCH (d)-[:PROJECT_OF]->(p:Project)",
+        ]
+        if project:
+            lines.append(f"WHERE p.name CONTAINS '{project}'")
+        lines.append(
+            "RETURN d.title, d.pg_id, h.name AS decided_by, "
+            "a.name AS assisted_by, d.date, p.name AS project ORDER BY d.date DESC"
+        )
+        return "\n".join(lines)
+
+    elif template == "agent-decisions":
+        assisted_by = _safe(getattr(args, "assisted_by", ""))
+        project     = _safe(getattr(args, "project",     ""))
+        lines = ["MATCH (d:Decision)-[:WAS_ASSISTED_BY]->(a:AIAgent)"]
+        if assisted_by:
+            lines.append(f"WHERE a.name CONTAINS '{assisted_by}'")
+        lines.append("OPTIONAL MATCH (d)-[:PROJECT_OF]->(p:Project)")
+        if project:
+            lines.append(f"WHERE p.name CONTAINS '{project}'")
+        lines.append(
+            "RETURN d.title, d.pg_id, a.name AS assisted_by, "
+            "d.date, p.name AS project ORDER BY d.date DESC"
+        )
+        return "\n".join(lines)
+
+    elif template == "retrospectives":
+        rating = _safe(getattr(args, "rating", ""))
+        lines = ["MATCH (d:Decision)-[o:HAD_OUTCOME]->()"]
+        if rating:
+            lines.append(f"WHERE o.rating CONTAINS '{rating}'")
+        lines.append(
+            "RETURN d.title, d.pg_id, o.rating, o.notes, o.date ORDER BY o.date DESC"
+        )
+        return "\n".join(lines)
+
+    elif template == "why-to-check":
+        title   = _safe(getattr(args, "title",   ""))
+        project = _safe(getattr(args, "project", ""))
+        lines = ["MATCH (d:Decision)-[o:HAD_OUTCOME]->()"]
+        if title:
+            lines.append(f"WHERE d.title CONTAINS '{title}'")
+        lines += [
+            "OPTIONAL MATCH (d)-[:WAS_ATTRIBUTED_TO]->(h:Human)",
+            "OPTIONAL MATCH (d)-[:PROJECT_OF]->(p:Project)",
+        ]
+        if project:
+            lines.append(f"WHERE p.name CONTAINS '{project}'")
+        lines.append(
+            "RETURN d.title, d.pg_id, o.rating, o.notes, "
+            "o.date, h.name AS decided_by ORDER BY o.date DESC"
+        )
+        return "\n".join(lines)
+
+    else:
+        print(json.dumps({
+            "error": f"Unknown template '{template}'.",
+            "available": ["who-decided", "agent-decisions", "retrospectives", "why-to-check"],
+        }))
+        sys.exit(1)
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
     if len(sys.argv) < 2:
         print(json.dumps({
-            "error": "Usage: python memory_bridge.py [--version|graph|search|save|save_decision|save_retrospective] ..."
+            "error": "Usage: python memory_bridge.py [--version|graph|query|search|save|save_decision|save_retrospective] ..."
         }))
         sys.exit(1)
 
@@ -258,6 +341,35 @@ async def main() -> None:
             sys.exit(1)
         metadata = sys.argv[3] if len(sys.argv) > 3 else "{}"
         print(json.dumps(await save_artifact(sys.argv[2], metadata), indent=2))
+    elif action == "query":
+        if len(sys.argv) < 3:
+            print(json.dumps({
+                "error": "Usage: memory_bridge.py query <template> [filters]",
+                "available": ["who-decided", "agent-decisions", "retrospectives", "why-to-check"],
+            }))
+            sys.exit(1)
+        template = sys.argv[2]
+        p = argparse.ArgumentParser(prog=f"memory_bridge.py query {template}")
+        if template == "who-decided":
+            p.add_argument("--title",   default="", help="Filter by decision title (substring)")
+            p.add_argument("--project", default="", help="Filter by project name (substring)")
+        elif template == "agent-decisions":
+            p.add_argument("--assisted-by", default="", help="Filter by AI agent name (substring)")
+            p.add_argument("--project",     default="", help="Filter by project name (substring)")
+        elif template == "retrospectives":
+            p.add_argument("--rating", default="", help="Filter by outcome rating (substring)")
+        elif template == "why-to-check":
+            p.add_argument("--title",   required=True, help="Decision title to look up (required)")
+            p.add_argument("--project", default="",    help="Filter by project name (substring)")
+        else:
+            print(json.dumps({
+                "error": f"Unknown template '{template}'.",
+                "available": ["who-decided", "agent-decisions", "retrospectives", "why-to-check"],
+            }))
+            sys.exit(1)
+        args = p.parse_args(sys.argv[3:])
+        cypher = _build_query(template, args)
+        print(json.dumps(query_graph(cypher), indent=2))
     elif action == "save_decision":
         p = argparse.ArgumentParser(
             prog="memory_bridge.py save_decision",
@@ -317,7 +429,7 @@ async def main() -> None:
             indent=2,
         ))
     else:
-        print(json.dumps({"error": f"Unknown action: {action}. Use graph|search|save|save_decision|save_retrospective"}))
+        print(json.dumps({"error": f"Unknown action: {action}. Use graph|query|search|save|save_decision|save_retrospective"}))
 
 
 if __name__ == "__main__":

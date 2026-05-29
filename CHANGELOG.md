@@ -9,6 +9,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.3.3] — 2026-05-29
+
+### Added
+
+- **Named query templates — Phase D** (`shared-memory/scripts/memory_bridge.py`, `shared-memory-skill/shared-memory/scripts/memory_bridge.py`, `tests/test_memory_bridge_query.py`): Converts the provenance graph from a queryable archive into a usable pre-task protocol — four named shortcuts so agents never need to write raw Cypher for standard provenance questions.
+
+  - **`memory_bridge.py query <template> [filters]` subcommand**: Routes through the existing `query_graph()` → `/memory/graph` coordinator path. No new endpoint, no coordinator changes.
+
+  - **Four templates**:
+    - `who-decided [--title TEXT] [--project TEXT]` — returns Decision + Human + AIAgent + Project attribution chain.
+    - `agent-decisions [--assisted-by TEXT] [--project TEXT]` — all decisions an AI agent assisted with.
+    - `retrospectives [--rating TEXT]` — all HAD_OUTCOME records, optionally filtered by rating.
+    - `why-to-check --title TEXT [--project TEXT]` — HAD_OUTCOME records for a given decision topic; `--title` is required (without a topic the result is unscoped). **Intended as the standard pre-task check**: run before starting work in any area with prior decisions.
+
+  - **`_build_query(template, args) -> str`** pure function: builds the Cypher string from template name and parsed args. Filter values are scrubbed with `re.sub(r"[^A-Za-z0-9 _.-]", "", ...)` before interpolation — prevents quote-escape injection. OPTIONAL MATCH + WHERE is used for joined filters (project, assisted_by) so rows without the optional edge are still returned (p/a is NULL, not excluded).
+
+  - **Raw Cypher path preserved**: the existing `graph` subcommand is unchanged and explicitly documented in SKILL.md alongside the named shortcuts. Custom traversals, multi-hop paths, and cross-entity queries still use `memory_bridge.py graph "<cypher>"`.
+
+  - **`shared-memory/SKILL.md` and `shared-memory-skill/shared-memory/SKILL.md`** — Task 3 restructured: named shortcuts section (with `why-to-check` trigger) + raw Cypher section (with read-only enforcement note). No new task section added; every added line carries unique information not present elsewhere.
+
+  - **7 new tests** (`tests/test_memory_bridge_query.py`): pure-function shape tests for all four templates, sanitisation check (`;` and `'` stripped), unknown-template exit, and CLI integration (mock `query_graph`, assert called with non-empty Cypher). Total: **91 tests passing**.
+
+---
+
 ## [0.3.2] — 2026-05-29
 
 ### Added
