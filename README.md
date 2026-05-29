@@ -484,7 +484,8 @@ docker compose -f postgres_neo4j_limits.yaml up -d
 
 **4. Start the Hive-Mind Gateway** — this also starts the consolidation daemon automatically
 ```bash
-uv run --with aiohttp python shared-memory/scripts/hive_mind_proxy.py 8888
+uv run --with aiohttp --with asyncpg --with neo4j --with httpx \
+  python shared-memory/scripts/hive_mind_proxy.py 8888
 ```
 
 You will see two log lines confirming both are up:
@@ -593,6 +594,13 @@ echo 'AGENT_TOKEN=tok_abc123...' > ~/.config/shared-memory/client.env
 ```
 INFO  coordinator auth enabled — 6 agent(s): antigravity, claude, codex, gemini, grok, lm_studio
 ```
+
+**Token search order** — `memory_bridge.py` finds `AGENT_TOKEN` via three paths tried in order (first match wins):
+1. `python-dotenv`'s `find_dotenv()` — searches parent directories from the script's location
+2. `.env` in the same directory as `memory_bridge.py` — skill root installs (e.g. `~/.grok/skills/shared-memory/.env`)
+3. `~/.config/shared-memory/client.env` — universal per-machine fallback
+
+If `python-dotenv` is not installed (e.g. bare `uv run --with httpx python ...`), a built-in plain-Python parser reads paths 2 and 3 directly — auth works regardless.
 
 **Backward compatible:** If `AGENT_TOKENS` is unset, the coordinator accepts all requests (existing installs are unaffected until you add the variable).
 
@@ -762,17 +770,17 @@ python shared-memory/scripts/memory_bridge.py --version
 # → {"version": "0.3.5", "tool": "shared-memory-framework"}
 
 # Search — semantic + rerank + Neo4j expansion
-uv run --with httpx \
+uv run --with httpx --with python-dotenv \
   python shared-memory/scripts/memory_bridge.py search "bgem3 interference problem" 5
 
 # Save — always include source and entities
-uv run --with httpx \
+uv run --with httpx --with python-dotenv \
   python shared-memory/scripts/memory_bridge.py save \
   "The proxy routes all embeddings through :8888 to enforce 1024-dim consistency." \
   '{"source":"claude_code","entities":["hive_mind_proxy","BGE-M3","SharedMemory"]}'
 
 # Save a decision — structured flags, no JSON blob required
-uv run --with httpx \
+uv run --with httpx --with python-dotenv \
   python shared-memory/scripts/memory_bridge.py save_decision \
   --title "Route all embeddings through the gateway" \
   --decided-by "Xenofon" \
@@ -784,19 +792,19 @@ uv run --with httpx \
   --entities "BGE-M3,hive_mind_proxy,SharedMemory"
 
 # Query decisions — who decided what, with which AI, on which project
-uv run --with httpx \
+uv run --with httpx --with python-dotenv \
   python shared-memory/scripts/memory_bridge.py query who-decided --project shared-memory
 
 # Named query shortcuts (no raw Cypher required)
-uv run --with httpx \
+uv run --with httpx --with python-dotenv \
   python shared-memory/scripts/memory_bridge.py query why-to-check --title "gateway"
-uv run --with httpx \
+uv run --with httpx --with python-dotenv \
   python shared-memory/scripts/memory_bridge.py query agent-decisions --assisted-by claude
-uv run --with httpx \
+uv run --with httpx --with python-dotenv \
   python shared-memory/scripts/memory_bridge.py query retrospectives --rating good
 
 # Raw Cypher — entity hub sizes (top referenced concepts)
-uv run --with httpx \
+uv run --with httpx --with python-dotenv \
   python shared-memory/scripts/memory_bridge.py graph \
   "MATCH (e:Entity)<-[:MENTIONS]-(f:Fact) RETURN e.name, count(f) AS refs ORDER BY refs DESC LIMIT 10"
 ```
@@ -838,7 +846,7 @@ Claude Code works through an architectural choice and saves it with full provena
 
 ```bash
 # Claude Code session — invoked via /shared-memory or by the model directly
-uv run --with httpx \
+uv run --with httpx --with python-dotenv \
   python ~/.claude/skills/shared-memory/scripts/memory_bridge.py save_decision \
   --title "Use outbox-as-WAL for Neo4j writes" \
   --decided-by "Xenofon" \
@@ -868,7 +876,7 @@ Later the same day, Gemini CLI is debugging the proxy restart sequence and disco
 
 ```bash
 # Gemini CLI session — invoked via /activate shared-memory
-uv run --with httpx \
+uv run --with httpx --with python-dotenv \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py save \
   "On gateway restart, any neo4j_outbox rows with status='in_progress' are reset to 'pending' by coordinator.start(). This prevents double-processing when a crash left rows claimed but not applied." \
   '{"source":"gemini_cli","entities":["OutboxPattern","coordinator","SharedMemory"],"source_ref":"coordinator.py#start()"}'
@@ -902,7 +910,7 @@ The next morning, Grok (or any other agent) starts a session with no prior conte
 
 ```bash
 # Grok session — invoked via /shared-memory
-uv run --with httpx \
+uv run --with httpx --with python-dotenv \
   python ~/.grok/skills/shared-memory/scripts/memory_bridge.py search \
   "how does the coordinator handle Neo4j writes safely" 5
 ```
@@ -959,7 +967,7 @@ Any agent can query the knowledge graph to understand the decision chain:
 
 ```bash
 # Who decided, and which AI assisted — named shortcut
-uv run --with httpx \
+uv run --with httpx --with python-dotenv \
   python shared-memory/scripts/memory_bridge.py query who-decided \
   --title "outbox" --project "shared-memory"
 
@@ -970,12 +978,12 @@ uv run --with httpx \
 #     project: "shared-memory"}]
 
 # What decisions has Claude Code assisted with?
-uv run --with httpx \
+uv run --with httpx --with python-dotenv \
   python shared-memory/scripts/memory_bridge.py query agent-decisions \
   --assisted-by "claude-sonnet-4-6"
 
 # Check retrospectives before starting work in this area (the Why-To protocol)
-uv run --with httpx \
+uv run --with httpx --with python-dotenv \
   python shared-memory/scripts/memory_bridge.py query why-to-check \
   --title "outbox"
 # → No retrospective yet — the decision is recent. Record one after 30 days.
@@ -992,7 +1000,7 @@ Four weeks later, the outbox has been running in production. Any agent can recor
 #   source="qwen3-27b")
 
 # Or from the CLI (any agent):
-uv run --with httpx \
+uv run --with httpx --with python-dotenv \
   python shared-memory/scripts/memory_bridge.py save_retrospective \
   --pg-id 42 \
   --rating "high" \
@@ -1008,7 +1016,7 @@ Response:
 Now the Why-To check returns something useful for any future agent:
 
 ```bash
-uv run --with httpx \
+uv run --with httpx --with python-dotenv \
   python shared-memory/scripts/memory_bridge.py query why-to-check \
   --title "outbox"
 
