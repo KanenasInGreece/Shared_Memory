@@ -215,7 +215,7 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5) -> str:
                 "query": query,
                 "documents": candidates,
                 "top_k": limit
-            })
+            }, headers=_auth_headers())
             resp.raise_for_status()
             rerank_results = resp.json()["results"]
 
@@ -555,7 +555,8 @@ async def check_memory_health() -> str:
     # Check Retriever (via Gateway)
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(RETRIEVER_URL, json={"input": "healthcheck", "model": "bge-m3"})
+            resp = await client.post(RETRIEVER_URL, json={"input": "healthcheck", "model": "bge-m3"},
+                                     headers=_auth_headers())
             stats["components"]["retriever"] = {"status": "OK" if resp.status_code == 200 else "FAIL"}
     except Exception as e:
         stats["status"] = "degraded"
@@ -564,7 +565,8 @@ async def check_memory_health() -> str:
     # Check Reranker (via Gateway)
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(RERANKER_URL, json={"query": "health", "documents": ["check"]})
+            resp = await client.post(RERANKER_URL, json={"query": "health", "documents": ["check"]},
+                                     headers=_auth_headers())
             stats["components"]["reranker"] = {"status": "OK" if resp.status_code == 200 else "FAIL"}
     except Exception as e:
         stats["status"] = "degraded"
