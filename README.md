@@ -30,6 +30,7 @@ A unified semantic and relational memory layer built from first principles to su
 9. [Starting the Full Stack](#9-starting-the-full-stack)
 10. [Agent Integration: First-Time Setup](#10-agent-integration-first-time-setup)
 11. [Agent Access: CLI and MCP](#11-agent-access-cli-and-mcp)
+    - [11a. Complete Cycle: End-to-End Workflow with Cross-Agent Examples](#11a-complete-cycle-end-to-end-workflow-with-cross-agent-examples)
 12. [The Save Path — From Artifact to Memory](#12-the-save-path--from-artifact-to-memory)
 13. [The Sleep Cycle — Consolidation](#13-the-sleep-cycle--consolidation)
 14. [Audit Logging](#14-audit-logging)
@@ -70,15 +71,15 @@ Vishakha Gupta's *AI Memory & Cognition: The Architect's Playbook* (ApertureData
 
 **The Retrieval Test:** *Can the agent explain why it retrieved a specific memory? Not just what was retrieved, but which specific context, session, and principal metadata informed the decision.*
 
-> As of v0.3.4: search results carry `tier` (fact | community_summary), `score_normalized` (sigmoid of raw reranker logit → [0, 1]), `matched_entities` (intersection of the query string against the saved entity list), and `graph_context` as a structured list of `{rel_type, name, label}` triples. An agent can reason: *"I returned a Tier-3 community synthesis — normalized score 0.91, matching entity OutboxPattern — alongside two Tier-1 precision hits."* **Gap remaining:** retrieval events are not yet audited (no record of who searched, when, from which agent); cross-encoder span attribution is not yet exposed.
+> As of v0.3.5: search results carry `tier` (fact | community_summary), `score_normalized` (sigmoid of raw reranker logit → [0, 1]), `matched_entities` (intersection of the query string against the saved entity list), and `graph_context` as a structured list of `{rel_type, name, label}` triples. An agent can reason: *"I returned a Tier-3 community synthesis — normalized score 0.91, matching entity OutboxPattern — alongside two Tier-1 precision hits."* **Gap remaining:** retrieval events are not yet audited (no record of who searched, when, from which agent); cross-encoder span attribution is not yet exposed.
 
 **The Consolidation Test:** *When the agent learns something new, does the system update a coherent knowledge base, or does it just accumulate versions? After six months, do you have one "truth" or three conflicting ones?*
 
-> As of v0.3.4: one row per entity, not three. The `community_summaries` table uses `ON CONFLICT (metadata->>'entity') DO UPDATE` — each consolidation cycle replaces the row with a cumulatively synthesised narrative (the LLM receives the prior summary as context). `summary_history JSONB` (migration 004) records the previous N versions before each overwrite, enabling drift auditing. The consolidation daemon now uses `AsyncGraphDatabase` + `loop.run_in_executor()` — `LISTEN/NOTIFY` signals are no longer dropped under write bursts. **Gap remaining:** consolidation is per-entity; two summaries for overlapping entities may diverge slightly if the LLM synthesises them in separate calls. No cross-entity reconciliation step yet.
+> As of v0.3.5: one row per entity, not three. The `community_summaries` table uses `ON CONFLICT (metadata->>'entity') DO UPDATE` — each consolidation cycle replaces the row with a cumulatively synthesised narrative (the LLM receives the prior summary as context). `summary_history JSONB` (migration 004) records the previous N versions before each overwrite, enabling drift auditing. The consolidation daemon now uses `AsyncGraphDatabase` + `loop.run_in_executor()` — `LISTEN/NOTIFY` signals are no longer dropped under write bursts. **Gap remaining:** consolidation is per-entity; two summaries for overlapping entities may diverge slightly if the LLM synthesises them in separate calls. No cross-entity reconciliation step yet.
 
 **The Lineage Test:** *Can I trace a decision back to the original source — the raw image, the specific video frame, or the precise document page — or just the text summary extracted from it?*
 
-> As of v0.3.4: decisions trace fully to human (`WAS_ATTRIBUTED_TO`), AI agent (`WAS_ASSISTED_BY`), and project (`PROJECT_OF`). Community summaries link back to their source facts via `source_pg_ids`. The optional `source_ref` metadata key (e.g. `"design-doc.pdf#p12"`, `"meeting.mp4@00:04:32"`) propagates through the coordinator to the `Fact` Neo4j node. `HAD_OUTCOME` self-loop edges on Decision nodes close the forward trace: decision → outcome → rating + notes. `/memory/graph` enforces read-only access at the driver level (`default_access_mode="READ"`); outbox rows cannot be double-processed during restart (atomic `in_progress` claim + startup recovery). **Gap remaining:** `source_ref` is not enforced — agents supply it when they can. No back-edge yet from a raw `Fact` to the `Decision` it influenced (planned for a later phase).
+> As of v0.3.5: decisions trace fully to human (`WAS_ATTRIBUTED_TO`), AI agent (`WAS_ASSISTED_BY`), and project (`PROJECT_OF`). Community summaries link back to their source facts via `source_pg_ids`. The optional `source_ref` metadata key (e.g. `"design-doc.pdf#p12"`, `"meeting.mp4@00:04:32"`) propagates through the coordinator to the `Fact` Neo4j node. `HAD_OUTCOME` self-loop edges on Decision nodes close the forward trace: decision → outcome → rating + notes. `/memory/graph` enforces read-only access at the driver level (`default_access_mode="READ"`); outbox rows cannot be double-processed during restart (atomic `in_progress` claim + startup recovery). **Gap remaining:** `source_ref` is not enforced — agents supply it when they can. No back-edge yet from a raw `Fact` to the `Decision` it influenced (planned for a later phase).
 
 ### What we are building toward
 
@@ -500,14 +501,14 @@ Step 4 is the only manual step required after databases and models are running. 
 **Verify the full stack is healthy:**
 ```bash
 curl http://localhost:8888/health
-# {"status":"ok","embedder":"ok","reranker":"ok","llm":"ok","daemon":"running"}
+# {"status":"ok","embedder":"ok","reranker":"ok","llm":"ok","daemon":"running","auth_required":true}
 ```
 
-HTTP 200 means the save/search path (embedder + reranker) is operational. HTTP 503 means at least one critical backend is down — do not attempt saves until resolved. The `llm` and `daemon` fields are informational; their degradation affects consolidation only.
+HTTP 200 means the save/search path (embedder + reranker) is operational. HTTP 503 means at least one critical backend is down — do not attempt saves until resolved. The `llm` and `daemon` fields are informational; their degradation affects consolidation only. `auth_required: true` confirms token authentication is enforced.
 
 **Daemon watchdog:** the gateway automatically restarts the consolidation daemon if it crashes, with exponential backoff and a circuit breaker (5 crashes / 10 min). If the circuit breaker trips, restart the gateway.
 
-> **Network exposure:** The gateway binds to `127.0.0.1:8888` by default — localhost only. Set `PROXY_BIND=0.0.0.0` in `.env` to opt into all-interfaces binding (e.g. inside an isolated Docker or VM network). The coordinator API is unauthenticated — do not expose port 8888 on an untrusted network. See [SECURITY.md](SECURITY.md) for details.
+> **Network exposure:** The gateway binds to `127.0.0.1:8888` by default — localhost only. Set `PROXY_BIND=0.0.0.0` in `.env` to opt into all-interfaces binding, but only over an encrypted overlay network (Tailscale, WireGuard, or TLS). Bearer tokens are plaintext over HTTP. See [SECURITY.md](SECURITY.md) for details.
 
 ---
 
@@ -545,9 +546,59 @@ source .venv/bin/activate
 
 > **uv users:** all commands in this README use `uv run --with ...` which handles dependencies automatically without a venv. Both approaches work — use whichever fits your workflow.
 
+### Token setup — one-time, all agents
+
+The coordinator requires `Authorization: Bearer <token>` on all memory routes. Generate tokens once, then configure each agent's install.
+
+```bash
+# Step 1 — generate tokens (run from repo root)
+uv run python shared-memory/scripts/generate_tokens.py
+```
+
+This prints something like:
+
+```
+=== Gateway .env — add this line ===
+AGENT_TOKENS=claude:tok_abc123...,gemini:tok_def456...,lm_studio:tok_ghi789...,...
+
+=== Per-agent .env — copy the matching AGENT_TOKEN line ===
+  claude           AGENT_TOKEN=tok_abc123...
+  gemini           AGENT_TOKEN=tok_def456...
+  lm_studio        AGENT_TOKEN=tok_ghi789...
+  ...
+```
+
+```bash
+# Step 2 — add AGENT_TOKENS to the gateway .env (already open from above)
+echo 'AGENT_TOKENS=claude:tok_abc123...,gemini:tok_def456...,lm_studio:tok_ghi789...' >> .env
+
+# Step 3a — Claude Code: add AGENT_TOKEN to the skill .env
+echo 'AGENT_TOKEN=tok_abc123...' >> ~/.claude/skills/shared-memory/.env
+
+# Step 3b — Gemini CLI: add to the skill .env
+echo 'AGENT_TOKEN=tok_def456...' >> ~/.gemini/skills/shared-memory/.env
+
+# Step 3c — LM Studio: add to mcp.json env block (see §16)
+# "env": { "AGENT_TOKEN": "tok_ghi789..." }
+# Then restart LM Studio completely.
+
+# Step 3d — Universal fallback (any agent, any install path)
+mkdir -p ~/.config/shared-memory
+echo 'AGENT_TOKEN=tok_abc123...' > ~/.config/shared-memory/client.env
+
+# Step 4 — restart the gateway to load AGENT_TOKENS
+```
+
+**After the gateway restarts**, its startup log confirms auth is active:
+```
+INFO  coordinator auth enabled — 6 agent(s): antigravity, claude, codex, gemini, grok, lm_studio
+```
+
+**Backward compatible:** If `AGENT_TOKENS` is unset, the coordinator accepts all requests (existing installs are unaffected until you add the variable).
+
 ### Smoke-test the bridge
 
-After the full stack is running, verify the bridge works from any shell:
+After the full stack is running and tokens are configured, verify the bridge works from any shell:
 
 ```bash
 uv run --with httpx --with python-dotenv \
@@ -655,7 +706,23 @@ LM Studio does not manage this path — you reference it by absolute path in `mc
 
 **Step 2 — Configure and place `mcp.json`**
 
-Edit `mcp.json` from this repo: replace all `YOUR_*` placeholders with real values and update the absolute path to `vector-skill.py` in the `rag-orchestrator` entry. Then save it to LM Studio's MCP config location (`~/.lmstudio/mcp.json` on Linux and macOS).
+Edit `mcp.json` from this repo: replace all `YOUR_*` placeholders with real values, update the absolute path to `vector-skill.py`, and add `AGENT_TOKEN` to the `rag-orchestrator` env block:
+
+```json
+"rag-orchestrator": {
+  "command": "uv",
+  "args": ["run", "--with", "fastmcp", "--with", "httpx",
+           "--with", "psycopg2-binary", "--with", "neo4j",
+           "--with", "python-dotenv", "python", "/path/to/vector-skill.py"],
+  "env": {
+    "NEO4J_PASSWORD":  "your-neo4j-password",
+    "PG_PASSWORD":     "your-postgres-password",
+    "AGENT_TOKEN":     "tok_your_lm_studio_token"
+  }
+}
+```
+
+Save it to LM Studio's MCP config location (`~/.lmstudio/mcp.json` on Linux and macOS). **Restart LM Studio completely after any `AGENT_TOKEN` change** — the MCP server process is cached and does not hot-reload env vars.
 
 **Step 3 — Configure and load the system prompt**
 
@@ -692,7 +759,7 @@ All three paths route through the coordinator on port 8888. The coordinator owns
 ```bash
 # Check the framework version
 python shared-memory/scripts/memory_bridge.py --version
-# → {"version": "0.3.0", "tool": "shared-memory-framework"}
+# → {"version": "0.3.5", "tool": "shared-memory-framework"}
 
 # Search — semantic + rerank + Neo4j expansion
 uv run --with httpx \
@@ -702,7 +769,7 @@ uv run --with httpx \
 uv run --with httpx \
   python shared-memory/scripts/memory_bridge.py save \
   "The proxy routes all embeddings through :8888 to enforce 1024-dim consistency." \
-  '{"source":"claude-code","entities":["hive_mind_proxy","BGE-M3","SharedMemory"]}'
+  '{"source":"claude_code","entities":["hive_mind_proxy","BGE-M3","SharedMemory"]}'
 
 # Save a decision — structured flags, no JSON blob required
 uv run --with httpx \
@@ -718,13 +785,17 @@ uv run --with httpx \
 
 # Query decisions — who decided what, with which AI, on which project
 uv run --with httpx \
-  python shared-memory/scripts/memory_bridge.py graph \
-  "MATCH (h:Human)-[:WAS_ATTRIBUTED_TO]-(d:Decision)-[:PROJECT_OF]->(p:Project)
-   OPTIONAL MATCH (d)-[:WAS_ASSISTED_BY]->(ai:AIAgent)
-   RETURN h.name, d.title, d.rationale, d.date, p.name, ai.name
-   ORDER BY d.date DESC LIMIT 5"
+  python shared-memory/scripts/memory_bridge.py query who-decided --project shared-memory
 
-# Graph query — entity hub sizes (top referenced concepts)
+# Named query shortcuts (no raw Cypher required)
+uv run --with httpx \
+  python shared-memory/scripts/memory_bridge.py query why-to-check --title "gateway"
+uv run --with httpx \
+  python shared-memory/scripts/memory_bridge.py query agent-decisions --assisted-by claude
+uv run --with httpx \
+  python shared-memory/scripts/memory_bridge.py query retrospectives --rating good
+
+# Raw Cypher — entity hub sizes (top referenced concepts)
 uv run --with httpx \
   python shared-memory/scripts/memory_bridge.py graph \
   "MATCH (e:Entity)<-[:MENTIONS]-(f:Fact) RETURN e.name, count(f) AS refs ORDER BY refs DESC LIMIT 10"
@@ -732,18 +803,20 @@ uv run --with httpx \
 
 ### Coordinator HTTP API
 
-The coordinator exposes four endpoints on port 8888. These can be called directly by any HTTP client — agents, scripts, or future tools.
+The coordinator exposes four endpoints on port 8888. All routes (except `/health`) require `Authorization: Bearer <token>`.
 
 | Method | Path | Body | Response |
 |---|---|---|---|
 | `POST` | `/memory/save` | `{content, metadata, agent_id?, scope?, visibility?}` | `{status, pg_id, neo4j, message}` |
 | `POST` | `/memory/search` | `{query, limit?, scope?, agent_id?}` | `{status, results[]}` |
 | `POST` | `/memory/graph` | `{cypher, params?}` | `{status, records[]}` |
+| `POST` | `/memory/retrospective` | `{pg_id, rating, notes, date?, agent_id?}` | `{status, target_pg_id}` |
 | `GET` | `/memory/status/{pg_id}` | — | `{pg_id, neo4j, retries, applied_at}` |
+| `GET` | `/health` | — | `{status, embedder, reranker, llm, daemon, auth_required}` |
 
-> **`/memory/graph` is read-only enforced.** Queries containing `CREATE`, `DELETE`, `DETACH DELETE`, `SET`, `MERGE`, `CALL`, `LOAD CSV`, or `DROP` are rejected with HTTP 400 before reaching Neo4j. Use it for `MATCH`/`RETURN`/`WITH`/`WHERE` exploration only.
+> **`/memory/graph` is read-only enforced.** Queries containing `CREATE`, `DELETE`, `DETACH DELETE`, `SET`, `MERGE`, `CALL`, `LOAD CSV`, or `DROP` are rejected with HTTP 400 before reaching Neo4j.
 
-**Write acknowledgment:** saves return `200 OK` once the fact is committed to Postgres. The outbox row for Neo4j is written in the same transaction; Neo4j application is asynchronous. Use `GET /memory/status/{pg_id}` to confirm Neo4j application, or pass `?consistency=neo4j` (Phase 2) to block until the outbox row is applied.
+**Write acknowledgment:** saves return `200 OK` once the fact is committed to Postgres. Use `GET /memory/status/{pg_id}` to confirm Neo4j application, or pass `?consistency=neo4j` to block until the outbox row is applied.
 
 ### Skill activation
 
@@ -755,12 +828,256 @@ $shared-memory          # Codex CLI (explicit); also auto-matched via SKILL.md d
 
 ---
 
+## 11a. Complete Cycle: End-to-End Workflow with Cross-Agent Examples
+
+This section shows the full memory lifecycle: one agent saves knowledge, the consolidation daemon synthesises it, a different agent retrieves it later, then a retrospective closes the loop.
+
+### Step 1 — Claude Code saves a decision
+
+Claude Code works through an architectural choice and saves it with full provenance:
+
+```bash
+# Claude Code session — invoked via /shared-memory or by the model directly
+uv run --with httpx \
+  python ~/.claude/skills/shared-memory/scripts/memory_bridge.py save_decision \
+  --title "Use outbox-as-WAL for Neo4j writes" \
+  --decided-by "Xenofon" \
+  --project "shared-memory" \
+  --rationale "Postgres transaction commits atomically with the outbox row. If the process crashes, the row survives and is replayed on restart — Neo4j can never be ahead of Postgres." \
+  --assisted-by "claude-sonnet-4-6" \
+  --alternatives "synchronous writes,no Neo4j,event sourcing" \
+  --confidence "high" \
+  --entities "OutboxPattern,Neo4j,Postgres,SharedMemory"
+```
+
+Response:
+```json
+{
+  "status": "success",
+  "pg_id": 42,
+  "neo4j": "pending",
+  "message": "Artifact stored with ID 42."
+}
+```
+
+`pg_id=42` is the Postgres row ID. Note it — you'll use it to attach a retrospective later. `neo4j: "pending"` means the outbox worker will apply the Neo4j write asynchronously (typically within seconds).
+
+### Step 2 — Plain fact saved by Gemini CLI
+
+Later the same day, Gemini CLI is debugging the proxy restart sequence and discovers something worth preserving:
+
+```bash
+# Gemini CLI session — invoked via /activate shared-memory
+uv run --with httpx \
+  python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py save \
+  "On gateway restart, any neo4j_outbox rows with status='in_progress' are reset to 'pending' by coordinator.start(). This prevents double-processing when a crash left rows claimed but not applied." \
+  '{"source":"gemini_cli","entities":["OutboxPattern","coordinator","SharedMemory"],"source_ref":"coordinator.py#start()"}'
+```
+
+Response:
+```json
+{
+  "status": "success",
+  "pg_id": 47,
+  "neo4j": "pending",
+  "message": "Artifact stored with ID 47."
+}
+```
+
+Note `"source_ref":"coordinator.py#start()"` — this propagates to the Neo4j `Fact` node, preserving the back-link to the exact code location.
+
+### Step 3 — Consolidation runs (automatic, no action needed)
+
+After 15 minutes of idle time on the `new_artifact` Postgres channel, the consolidation daemon fires. It finds that the `OutboxPattern` entity now has ≥ 5 unconsolidated `Fact` nodes. It calls the LLM to synthesise a cumulative narrative and writes the result to `community_summaries`.
+
+You can watch it happen in the gateway log:
+```
+INFO  consolidation: community OutboxPattern — 6 facts → synthesising
+INFO  consolidation: pg_id=88 written to community_summaries
+```
+
+### Step 4 — A different agent searches and finds both pieces
+
+The next morning, Grok (or any other agent) starts a session with no prior context about the outbox:
+
+```bash
+# Grok session — invoked via /shared-memory
+uv run --with httpx \
+  python ~/.grok/skills/shared-memory/scripts/memory_bridge.py search \
+  "how does the coordinator handle Neo4j writes safely" 5
+```
+
+Condensed response:
+```json
+{
+  "status": "success",
+  "results": [
+    {
+      "tier": "community_summary",
+      "content": "The SharedMemory coordinator uses an outbox pattern (neo4j_outbox table) to guarantee that Postgres and Neo4j remain consistent. Every save commits the fact and an outbox row atomically. An asynchronous worker applies the Neo4j write and marks it 'applied'. On restart, any rows stuck in 'in_progress' are reset to 'pending', preventing double-processing. This design means Neo4j can never be ahead of Postgres, and a crash never creates orphaned Fact nodes.",
+      "score": null,
+      "score_normalized": null,
+      "matched_entities": [],
+      "graph_context": []
+    },
+    {
+      "tier": "fact",
+      "content": "Use outbox-as-WAL for Neo4j writes\n\nPostgres transaction commits atomically...",
+      "score": 3.21,
+      "score_normalized": 0.96,
+      "matched_entities": ["OutboxPattern", "Neo4j", "Postgres"],
+      "graph_context": [
+        {"rel_type": "WAS_ATTRIBUTED_TO", "name": "Xenofon",         "label": "Human"},
+        {"rel_type": "WAS_ASSISTED_BY",   "name": "claude-sonnet-4-6","label": "AIAgent"},
+        {"rel_type": "PROJECT_OF",        "name": "shared-memory",    "label": "Project"}
+      ]
+    },
+    {
+      "tier": "fact",
+      "content": "On gateway restart, any neo4j_outbox rows with status='in_progress' are reset...",
+      "score": 2.88,
+      "score_normalized": 0.95,
+      "matched_entities": ["OutboxPattern"],
+      "graph_context": [
+        {"rel_type": "MENTIONS", "name": "OutboxPattern", "label": "Entity"}
+      ]
+    }
+  ]
+}
+```
+
+Grok gets:
+- **Tier-3** — the consolidated narrative synthesised from everything Claude Code and Gemini CLI saved (the first result always orients the agent)
+- **Tier-1 fact** — the original decision Claude Code saved, with full provenance (who, which AI, which project)
+- **Tier-1 fact** — Gemini CLI's finding about restart recovery, with a `source_ref` link back to the code
+
+Neither piece of knowledge was created by Grok. Neither existed in Grok's context window before this search. The shared brain made both available.
+
+### Step 5 — Query the provenance graph directly
+
+Any agent can query the knowledge graph to understand the decision chain:
+
+```bash
+# Who decided, and which AI assisted — named shortcut
+uv run --with httpx \
+  python shared-memory/scripts/memory_bridge.py query who-decided \
+  --title "outbox" --project "shared-memory"
+
+# → [{d.title: "Use outbox-as-WAL for Neo4j writes",
+#     decided_by: "Xenofon",
+#     assisted_by: "claude-sonnet-4-6",
+#     d.date: "2026-05-29",
+#     project: "shared-memory"}]
+
+# What decisions has Claude Code assisted with?
+uv run --with httpx \
+  python shared-memory/scripts/memory_bridge.py query agent-decisions \
+  --assisted-by "claude-sonnet-4-6"
+
+# Check retrospectives before starting work in this area (the Why-To protocol)
+uv run --with httpx \
+  python shared-memory/scripts/memory_bridge.py query why-to-check \
+  --title "outbox"
+# → No retrospective yet — the decision is recent. Record one after 30 days.
+```
+
+### Step 6 — Record a retrospective (closing the loop)
+
+Four weeks later, the outbox has been running in production. Any agent can record the outcome:
+
+```bash
+# LM Studio records the retrospective via MCP tool:
+# save_retrospective(pg_id=42, rating="high",
+#   notes="Held up under multi-agent concurrent load. Outbox replay on crash worked correctly. Neo4j lag < 200 ms typical. No orphaned Fact nodes after 4 weeks.",
+#   source="qwen3-27b")
+
+# Or from the CLI (any agent):
+uv run --with httpx \
+  python shared-memory/scripts/memory_bridge.py save_retrospective \
+  --pg-id 42 \
+  --rating "high" \
+  --notes "Held up under multi-agent concurrent load. Outbox replay on crash worked correctly. Neo4j lag < 200 ms typical. No orphaned Fact nodes after 4 weeks." \
+  --source "gemini_cli"
+```
+
+Response:
+```json
+{"status": "success", "target_pg_id": 42}
+```
+
+Now the Why-To check returns something useful for any future agent:
+
+```bash
+uv run --with httpx \
+  python shared-memory/scripts/memory_bridge.py query why-to-check \
+  --title "outbox"
+
+# → [{d.title: "Use outbox-as-WAL for Neo4j writes",
+#     o.rating: "high",
+#     o.notes:  "Held up under multi-agent concurrent load...",
+#     o.date:   "2026-06-26",
+#     decided_by: "Xenofon"}]
+```
+
+Before touching outbox logic, any agent can check whether past decisions held up. This is the Why-To loop — decision → outcome → inform the next decision.
+
+### Step 7 — LM Studio (MCP path)
+
+LM Studio uses the MCP tools from `rag-orchestrator`. The model calls them automatically when the system prompt's search-first directive is active.
+
+**Save a fact:**
+```
+Tool: save_artifact
+Args: {
+  "content": "The consolidation daemon uses AsyncGraphDatabase (neo4j async driver) so the event loop is never blocked during Neo4j I/O. psycopg2 calls use run_in_executor for the same reason.",
+  "metadata": "{\"source\":\"qwen3-27b\",\"entities\":[\"consolidation_loop\",\"AsyncGraphDatabase\",\"SharedMemory\"]}"
+}
+```
+
+**Search:**
+```
+Tool: hybrid_search_and_rerank
+Args: {"query": "why does the consolidation daemon use async neo4j driver", "limit": 5}
+```
+
+The model receives Tier-3 orientation + Tier-1 precision hits + Neo4j graph context — the same result shape as the CLI, but surfaced inline in the chat.
+
+**Save a decision:**
+```
+Tool: save_decision
+Args: {
+  "title": "Use AsyncGraphDatabase in consolidation daemon",
+  "decided_by": "Xenofon",
+  "project": "shared-memory",
+  "rationale": "Sync GraphDatabase inside async def blocked the event loop for every Neo4j round-trip, causing LISTEN/NOTIFY drops under write bursts.",
+  "source": "qwen3-27b",
+  "assisted_by": "qwen3-27b",
+  "entities": "AsyncGraphDatabase,consolidation_loop,SharedMemory"
+}
+```
+
+**Save a retrospective (close the Why-To loop from LM Studio):**
+```
+Tool: save_retrospective
+Args: {
+  "pg_id": 42,
+  "rating": "high",
+  "notes": "No NOTIFY drops observed after migration to async. Event loop latency stable under 6-agent concurrent write test.",
+  "source": "qwen3-27b"
+}
+```
+
+---
+
 ## 12. The Save Path — From Artifact to Memory
 
 The save path runs inside the coordinator (`coordinator.py`) on every `POST /memory/save`:
 
 ```
 caller: POST /memory/save {content, metadata, agent_id, scope, visibility}
+  Authorization: Bearer <token>  ← verified against AGENT_TOKENS registry
+       ↓ 401 if token missing or unrecognised
+  metadata["source"] ← overwritten with verified agent name (server-side)
        ↓
 embed(content) via :8888 — retry with exponential backoff (4 attempts)
        ↓ 503 if all retries fail — hard mandate: no save without a vector
@@ -768,17 +1085,12 @@ acquire per-entity asyncio.Lock for each name in metadata["entities"]
        ↓ serializes concurrent writes to the same entity cluster
 BEGIN TRANSACTION
   INSERT INTO technical_docs ... ON CONFLICT (content_hash) DO UPDATE
-       ↓ idempotent: SHA-256 hash prevents duplicates; agent_id/scope/visibility stored
+       ↓ idempotent: SHA-256 hash prevents duplicates; verified source stored
   INSERT INTO neo4j_outbox (pg_id, cypher_params)
-       ↓ outbox row committed atomically — Phase 2 worker drains this
+       ↓ outbox row committed atomically with the fact
   SELECT pg_notify('new_artifact', {"pg_id": id})
 COMMIT  ← 200 OK returned to caller here (Postgres-ack)
-       ↓
-MERGE (f:Fact {pg_id}) in Neo4j  [Phase 1 — direct write; replaced by outbox worker in Phase 2]
-for each entity name in metadata["entities"]:
-    MERGE (e:Entity {name})
-    MERGE (f)-[:MENTIONS]->(e)
-       ↓
+       ↓ async outbox worker applies Neo4j write (MERGE Fact + Entity + MENTIONS)
 daemon receives NOTIFY → adds pg_id to pending_pg_ids → idle timer starts
 ```
 

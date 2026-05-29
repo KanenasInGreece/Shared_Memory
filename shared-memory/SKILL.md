@@ -1,6 +1,6 @@
 ---
 name: shared-memory
-description: Search, save, and query a three-tier semantic memory shared across all AI agents on your workstation. Use before starting any task (search first for prior context) and after completing significant work (save findings with entities for consolidation). Supports save_decision for recording architectural decisions with full PROV-O provenance.
+description: Search, save, and query a three-tier semantic memory shared across all AI agents on your workstation. Use before starting any task (search first for prior context) and after completing significant work (save findings with entities for consolidation). Supports save_decision for full PROV-O provenance and save_retrospective to record whether decisions held up — closing the Why-To loop.
 ---
 
 # Shared Memory (Hive-Mind)
@@ -139,6 +139,154 @@ uv run --with httpx python scripts/memory_bridge.py graph \
    RETURN d.title, o.rating, o.notes, o.date ORDER BY o.date DESC LIMIT 1"
 ```
 
+## Complete Workflow: Save → Consolidate → Retrieve → Retrospective
+
+This section is a concrete runbook for the full memory cycle. Copy-paste each block directly.
+
+### A. Save a fact (any agent)
+
+```bash
+uv run --with httpx \
+  python scripts/memory_bridge.py save \
+  "The coordinator acquires per-entity asyncio.Lock before each write. Locks are sorted by entity name to prevent deadlocks across concurrent saves." \
+  '{"source":"claude_code","entities":["coordinator","OutboxPattern","SharedMemory"]}'
+# → {"status":"success","pg_id":42,"neo4j":"pending","message":"Artifact stored with ID 42."}
+```
+
+`pg_id` is the row identifier — use it for retrospectives later. `neo4j:"pending"` is normal; the outbox worker applies Neo4j writes within seconds.
+
+### B. Save a decision (structured provenance)
+
+```bash
+uv run --with httpx \
+  python scripts/memory_bridge.py save_decision \
+  --title "Sort entity locks by name to prevent deadlocks" \
+  --decided-by "Xenofon" \
+  --project "shared-memory" \
+  --rationale "Two concurrent saves with overlapping entity sets can deadlock if each acquires locks in a different order. Sorting guarantees a consistent acquisition order." \
+  --assisted-by "claude-sonnet-4-6" \
+  --alternatives "single global lock,no per-entity locking" \
+  --confidence "high" \
+  --entities "coordinator,OutboxPattern,SharedMemory"
+# → {"status":"success","pg_id":43,...}
+```
+
+Note the `pg_id` — you'll attach a retrospective to it.
+
+### C. Search from a different agent
+
+From Gemini CLI (or any other agent), with no prior context about this decision:
+
+```bash
+uv run --with httpx \
+  python scripts/memory_bridge.py search \
+  "how does the coordinator prevent deadlocks with concurrent writes" 5
+```
+
+Result shape:
+```json
+{
+  "results": [
+    {
+      "tier": "community_summary",
+      "content": "The coordinator uses per-entity asyncio locks sorted by name to prevent deadlocks. Concurrent saves with overlapping entity sets acquire locks in consistent order...",
+      "score": null
+    },
+    {
+      "tier": "fact",
+      "content": "Sort entity locks by name to prevent deadlocks\n\nTwo concurrent saves...",
+      "score": 3.1,
+      "score_normalized": 0.96,
+      "matched_entities": ["coordinator", "OutboxPattern"],
+      "graph_context": [
+        {"rel_type": "WAS_ATTRIBUTED_TO", "name": "Xenofon",           "label": "Human"},
+        {"rel_type": "WAS_ASSISTED_BY",   "name": "claude-sonnet-4-6", "label": "AIAgent"},
+        {"rel_type": "PROJECT_OF",        "name": "shared-memory",     "label": "Project"}
+      ]
+    }
+  ]
+}
+```
+
+The first result is the **Tier-3 community summary** — the synthesised narrative across all related facts. The second is the **Tier-1 precision hit** — the original decision, with its full provenance chain in `graph_context`.
+
+### D. Query the provenance graph
+
+```bash
+# Who decided this, and was any AI involved?
+uv run --with httpx \
+  python scripts/memory_bridge.py query who-decided \
+  --title "deadlock" --project "shared-memory"
+
+# What decisions has Claude Code assisted with?
+uv run --with httpx \
+  python scripts/memory_bridge.py query agent-decisions \
+  --assisted-by "claude-sonnet-4-6"
+
+# Before touching coordinator lock logic: check prior outcomes
+uv run --with httpx \
+  python scripts/memory_bridge.py query why-to-check \
+  --title "lock"
+# → No retrospective yet. Record one after the next production test.
+```
+
+### E. Record a retrospective (close the loop)
+
+After 3 weeks running multi-agent concurrent writes:
+
+```bash
+uv run --with httpx \
+  python scripts/memory_bridge.py save_retrospective \
+  --pg-id 43 \
+  --rating "high" \
+  --notes "No deadlocks observed across 30-day multi-agent test. 6-agent concurrent writes at 50 req/s — zero lock contention errors. Sorted acquisition order held." \
+  --source "gemini_cli"
+# → {"status":"success","target_pg_id":43}
+```
+
+Now the Why-To check is informative for any future agent:
+
+```bash
+uv run --with httpx \
+  python scripts/memory_bridge.py query why-to-check --title "lock"
+# → [{d.title: "Sort entity locks by name...",
+#     o.rating: "high",
+#     o.notes: "No deadlocks observed...",
+#     o.date: "2026-06-19"}]
+```
+
+### F. LM Studio (MCP tools — same operations)
+
+```
+# Search first (always)
+Tool: hybrid_search_and_rerank
+Args: {"query": "coordinator deadlock prevention", "limit": 5}
+
+# Save a fact
+Tool: save_artifact
+Args: {
+  "content": "Lock acquisition order: sort entity names alphabetically before acquiring.",
+  "metadata": "{\"source\":\"qwen3-27b\",\"entities\":[\"coordinator\",\"OutboxPattern\"]}"
+}
+
+# Save a decision
+Tool: save_decision
+Args: {
+  "title": "Sort entity locks by name",
+  "decided_by": "Xenofon",
+  "project": "shared-memory",
+  "rationale": "Consistent acquisition order eliminates deadlock risk.",
+  "source": "qwen3-27b",
+  "entities": "coordinator,OutboxPattern,SharedMemory"
+}
+
+# Save a retrospective
+Tool: save_retrospective
+Args: {"pg_id": 43, "rating": "high", "notes": "No deadlocks in 30-day test.", "source": "qwen3-27b"}
+```
+
+---
+
 ## Authentication Setup (v0.3.5)
 
 All coordinator routes require `Authorization: Bearer <token>`. One-time setup:
@@ -146,21 +294,47 @@ All coordinator routes require `Authorization: Bearer <token>`. One-time setup:
 ```bash
 # 1. Generate tokens (run from repo root)
 uv run python shared-memory/scripts/generate_tokens.py
+# Prints AGENT_TOKENS line (for gateway) and per-agent AGENT_TOKEN lines
 
-# 2. Add AGENT_TOKENS line to the gateway .env
-echo "AGENT_TOKENS=claude:tok_...,gemini:tok_...,...,lm_studio:tok_..." >> .env
+# 2. Add AGENT_TOKENS to the gateway .env
+echo "AGENT_TOKENS=claude:tok_abc...,gemini:tok_def...,lm_studio:tok_ghi..." >> .env
 
-# 3. Add per-agent token — one of:
-#   a) This agent's skill .env:
-echo "AGENT_TOKEN=tok_your_token" >> ~/.claude/skills/shared-memory/.env
-#   b) Universal fallback (works for any agent on this machine):
-mkdir -p ~/.config/shared-memory && echo "AGENT_TOKEN=tok_your_token" > ~/.config/shared-memory/client.env
-#   c) LM Studio: add to the mcp.json env block (full restart required)
+# 3a. Claude Code — add AGENT_TOKEN to the skill .env
+echo "AGENT_TOKEN=tok_abc..." >> ~/.claude/skills/shared-memory/.env
+
+# 3b. Gemini CLI — add to the skill .env
+echo "AGENT_TOKEN=tok_def..." >> ~/.gemini/skills/shared-memory/.env
+
+# 3c. Universal fallback — works for any agent or install path
+mkdir -p ~/.config/shared-memory
+echo "AGENT_TOKEN=tok_abc..." > ~/.config/shared-memory/client.env
+
+# 3d. LM Studio — add to mcp.json env block for rag-orchestrator, then restart LM Studio
 
 # 4. Restart the gateway (CLI agents pick up AGENT_TOKEN on next invocation)
 ```
 
-**Sub-agent identity:** All Claude Code instances (including spawned sub-agents) share one token. Use `metadata.subagent` to record the sub-role — the server stamps `source` with the verified tool name.
+The dotenv search order for CLI agents:
+1. `find_dotenv()` — searches parent directories from CWD
+2. Script-adjacent `.env` — for skill dir installs
+3. `~/.config/shared-memory/client.env` — universal per-machine fallback
+
+**Verify auth is active:**
+```bash
+curl http://localhost:8888/health
+# {"status":"ok",...,"auth_required":true}
+```
+
+**401 error?** The error message tells you exactly what to do:
+```
+Coordinator rejected token. Set AGENT_TOKEN in this agent's .env.
+```
+Check that `AGENT_TOKEN` in the agent's `.env` matches one of the `name:token` pairs in the gateway's `AGENT_TOKENS`.
+
+**Sub-agent identity:** All Claude Code instances (including spawned sub-agents) share one token. Use `metadata.subagent` to record the sub-role — the server stamps `source` with the verified tool name:
+```json
+{"source": "claude_code", "subagent": "research_agent", "entities": ["OutboxPattern"]}
+```
 
 **Backward compatible:** `AGENT_TOKENS` unset → auth disabled (existing installs unaffected).
 
