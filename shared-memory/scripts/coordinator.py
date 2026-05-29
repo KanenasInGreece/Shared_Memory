@@ -112,11 +112,11 @@ PG_DSN   = os.environ.get(
 NEO4J_URI  = "bolt://localhost:7687"
 NEO4J_AUTH = ("neo4j", os.environ.get("NEO4J_PASSWORD", ""))
 
-# Embedding routes through the gateway.
-# Reranker is called directly (port 8071) to avoid a circular path —
-# the coordinator runs inside the proxy, so calling :8888/v1/reranking
-# would be the proxy calling itself.
-EMBED_URL  = "http://localhost:8888/v1/embeddings"
+# Both inference backends are called directly so the coordinator does not
+# route through its own auth middleware (which would require a valid token
+# for an internal call).  External agents still go through :8888 and must
+# authenticate; the coordinator is trusted and bypasses that layer.
+EMBED_URL  = "http://localhost:8070/v1/embeddings"
 RERANK_URL = "http://localhost:8071/v1/reranking"
 
 EMBED_RETRIES = 4
