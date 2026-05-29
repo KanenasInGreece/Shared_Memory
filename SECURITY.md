@@ -106,6 +106,8 @@ MATCH (s:CommunitySummary {pg_id: <suspect_id>}) DETACH DELETE s;
 
 Seven findings from a rigorous code review. All are resolved in v0.3.4 unless marked otherwise.
 
+**Audit cadence:** Security reviews run at every **x.y.5 release** (next: v0.3.5) and on demand via `/security-review`. The review covers four vectors: Concurrency & State, Database & Persistence Integrity, Dependency & Supply Chain, and Edge-Case Resilience.
+
 ---
 
 ### S1 — Unrestricted Cypher Execution via `/memory/graph` ✅ Fixed

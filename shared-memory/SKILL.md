@@ -31,14 +31,23 @@ Search the shared memory with semantic similarity, reranking, and Neo4j relation
 
 Returns: Tier 3 community summary (global context) + Tier 1 semantic hits + Neo4j relational expansion.
 
+If all results score below −3.0, an entity-graph fallback runs automatically and appears as a supplementary section in the output.
+
 ### 2. Artifact Persistence (Save)
 Commit findings, decisions, and technical facts to long-term shared memory.
 - **Trigger:** At the conclusion of any significant task or decision.
-- **CLI:**
+- **MCP (LM Studio):** Call `save_artifact` from the `rag-orchestrator` MCP server:
+  ```json
+  { "content": "<fact>", "metadata": "{\"source\":\"qwen3-27b\",\"entities\":[\"EntityA\",\"EntityB\"]}" }
+  ```
+  Set `source` to the **loaded model name** (e.g. `"qwen3-27b"`, `"llama3-70b"`) — not a generic label.
+- **CLI (other agents):**
   ```
   uv run --with httpx python scripts/memory_bridge.py save "<content>" \
     '{"source":"<agent_name>","entities":["EntityA","EntityB"]}'
   ```
+
+**`source` is required** — saves without it are rejected with HTTP 400. Use the agent or model name that generated the fact (e.g. `"claude_code"`, `"grok"`, `"qwen3-27b"`).
 
 **`entities` is required for Tier 3 consolidation.** Supply 1–4 named concepts the fact is about. Facts saved without `entities` are stored and searchable but never synthesised into community summaries.
 
@@ -149,6 +158,14 @@ INFO  Listening for 'new_artifact' notifications...
 ```
 
 The proxy binds to `127.0.0.1:8888` by default (localhost only). Set `PROXY_BIND=0.0.0.0` in `.env` to opt into all-interfaces binding for Docker/VM setups.
+
+**Daemon watchdog:** The gateway auto-restarts the consolidation daemon on unexpected crashes with exponential backoff. A circuit breaker stops retrying after 5 crashes in 10 minutes — restart the gateway to reset.
+
+**Check gateway health before saving:**
+```
+curl http://localhost:8888/health
+```
+Returns `{"status":"ok"}` when embedder and reranker are both reachable. HTTP 503 means the save/search path is degraded.
 
 ### MCP Server (LM Studio only)
 ```
