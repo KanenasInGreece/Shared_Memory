@@ -9,6 +9,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.3.4] — 2026-05-29
+
+### Security
+
+- **S1 (HIGH) — `/memory/graph` read-only enforcement** (`coordinator.py`): Neo4j session for `handle_graph` now opens with `default_access_mode="READ"`. Driver-level write enforcement is layered on top of the existing `_WRITE_CYPHER` keyword regex — a regex-bypassing query can no longer execute writes at the Neo4j protocol level.
+
+- **S2 (HIGH) — Async consolidation daemon** (`consolidation_loop.py`): Migrated from synchronous `GraphDatabase` driver and `psycopg2` calls inside `async def` to `AsyncGraphDatabase` + `loop.run_in_executor()`. The event loop no longer blocks during Neo4j or Postgres I/O, preventing `LISTEN/NOTIFY` signal drops under write bursts. `connect_timeout=5` added to all `psycopg2.connect()` calls.
+
+- **S3 (HIGH) — TOCTOU fix in `handle_retrospective`** (`coordinator.py`): The `SELECT` existence check and `INSERT INTO neo4j_outbox` are now wrapped in a single `conn.transaction()` with `SELECT ... FOR SHARE`. A concurrent delete of the target row between check and insert can no longer produce a dangling outbox entry and a silent missing `HAD_OUTCOME` edge.
+
+- **S4 (MEDIUM) — `--project` filter in named query templates** (`memory_bridge.py`): The `WHERE p.name CONTAINS '...'` clause appended directly after `OPTIONAL MATCH ... (p:Project)` was parsed as an inline WHERE (filtering what value `p` gets, not which rows return). Added `WITH d, [vars], p` before the project WHERE in `who-decided`, `agent-decisions`, and `why-to-check` — the filter now correctly excludes decisions not linked to the specified project.
+
+- **S5 (MEDIUM) — Dead embedding property on Neo4j nodes** (`vector-skill.py`): `f.embedding`, `t.task_embedding`, and `s.embedding` removed from all three Neo4j write calls in the LM Studio MCP path. The property was never used in any Cypher query (all similarity search goes through `pgvector`) and consumed ~8 KB of Neo4j heap per node.
+
+- **S6 (MEDIUM) — Audit log OSError surfaced to stderr** (`memory_bridge.py`, `vector-skill.py`): `_append_log` now catches `OSError` (disk full, permission denied) and prints a warning to `stderr` before the bare `except Exception: pass` fallback. Disk/permission failures are no longer silent.
+
+- **S7 (MEDIUM) — Outbox double-processing on concurrent restart** (`coordinator.py`): `_drain_outbox` now atomically claims rows with `UPDATE ... SET status='in_progress' WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING ...` before releasing the lock. A second coordinator instance SKIP LOCKs `in_progress` rows. `start()` resets any `in_progress` rows (crash survivors) back to `pending` on startup. The failure-path update no longer conditions on `AND status='pending'`, correctly resetting claimed-but-failed rows.
+
+---
+
 ## [0.3.3] — 2026-05-29
 
 ### Added
