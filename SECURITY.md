@@ -37,28 +37,43 @@ A crafted `Host` header containing `/`, `?`, or `#` causes Starlette to misparse
 
 ### Gateway network exposure
 
-`hive_mind_proxy.py` binds to **`127.0.0.1:8888` by default** — localhost only. The coordinator API is unauthenticated; binding to a wider address would expose memory read/write to any machine on the same network.
+`hive_mind_proxy.py` binds to **`127.0.0.1:8888` by default** — localhost only.
 
-To opt into all-interfaces binding (e.g. inside an isolated Docker or VM network), set `PROXY_BIND=0.0.0.0` in your `.env` file. Only do this if port 8888 is firewalled at the network level.
+To opt into all-interfaces binding (e.g. inside a Docker or VM network), set `PROXY_BIND=0.0.0.0` in your `.env` file. **Only safe over an encrypted overlay network (Tailscale, WireGuard) or behind TLS termination.** Bearer tokens are transmitted in plaintext over HTTP and are interceptable on an unencrypted network.
 
-### No agent authentication
+### Agent authentication — implemented (v0.3.5)
 
-The coordinator API (`/memory/save`, `/memory/search`, `/memory/graph`) does not authenticate callers. Any process that can reach port 8888 can read and write shared memory. `agent_id` is self-reported in the request body — there is no server-side verification.
+`Authorization: Bearer <token>` middleware is now enforced on all coordinator routes. Unregistered callers receive HTTP 401. The verified agent identity is stamped server-side onto every saved artifact — `agent_id` from the request body is no longer trusted.
 
-**Planned (Phase 2C):** Pre-shared token registry via `AGENT_TOKENS` env var. Each agent includes its token in `Authorization: Bearer <token>`; the coordinator verifies it and stamps the write with the verified identity. See `.env.example` for the expected format.
+**Setup:**
+1. Run `uv run python shared-memory/scripts/generate_tokens.py` to generate tokens
+2. Add `AGENT_TOKENS=claude:tok_...,gemini:tok_...,...` to the gateway `.env`
+3. Add `AGENT_TOKEN=<your-token>` to each agent's skill `.env` (or `~/.config/shared-memory/client.env`)
+4. Restart the gateway; LM Studio requires a full application restart
 
-The MCP server (`vector-skill.py`) and CLI bridge (`memory_bridge.py`) are designed for local use only. Do not expose port 8888 to the public internet.
+**Backward compatible:** `AGENT_TOKENS` unset → auth disabled (no-op for existing installs).
+
+**Token rotation** requires: edit gateway `.env`, restart gateway, update agent `.env` files (CLI agents take effect on next invocation; LM Studio requires full restart).
+
+### Network transport — tokens require an encrypted channel
+
+Bearer tokens are sent in plaintext over HTTP. `PROXY_BIND=0.0.0.0` is only safe when the network between gateway and agents is encrypted end-to-end:
+
+- **Safe:** Tailscale overlay, WireGuard tunnel, or TLS termination at a reverse proxy
+- **Unsafe:** Raw LAN, unencrypted Docker bridge network exposed to other hosts
+
+Never expose port 8888 to an untrusted network, even with authentication enabled.
 
 ### Raw Cypher execution — mitigated
 
-**Status: two-layer defence in place (v0.3.4). Caller authentication pending Phase 2C.**
+**Status: two-layer defence in place (v0.3.4). Caller authentication implemented in v0.3.5.**
 
 `POST /memory/graph` now has two independent controls:
 
 1. **Keyword regex guard** (`_WRITE_CYPHER`): rejects queries containing `CREATE`, `DELETE`, `DETACH DELETE`, `SET`, `REMOVE`, `MERGE`, `CALL`, `LOAD CSV`, or `DROP` before they reach Neo4j — fast-fail, no round-trip.
 2. **Driver-level read-only session** (`default_access_mode="READ"`): the Neo4j session is opened in read-only mode. Even if the regex is bypassed by a novel query pattern, the Neo4j driver rejects any write at the protocol level.
 
-The remaining gap is caller identity: any process that can reach port 8888 can issue read queries. **Phase 2C** will add `Authorization: Bearer <token>` authentication so only registered agents can reach the endpoint at all.
+The remaining gap is caller identity: any process that can reach port 8888 can issue read queries. **v0.3.5** adds `Authorization: Bearer <token>` authentication so only registered agents can reach the endpoint at all.
 
 ### Stored prompt injection — partially mitigated
 
@@ -109,7 +124,7 @@ MATCH (s:CommunitySummary {pg_id: <suspect_id>}) DETACH DELETE s;
 
 Seven findings from a rigorous code review. All are resolved in v0.3.4 unless marked otherwise.
 
-**Audit cadence:** Security reviews run at every **x.y.5 release** (next: v0.3.5) and on demand via `/security-review`. The review covers four vectors: Concurrency & State, Database & Persistence Integrity, Dependency & Supply Chain, and Edge-Case Resilience.
+**Audit cadence:** Security reviews run at every **x.y.5 release** (next: v0.4.0 or v0.3.5 post-release review) and on demand via `/security-review`. The review covers four vectors: Concurrency & State, Database & Persistence Integrity, Dependency & Supply Chain, and Edge-Case Resilience.
 
 ---
 

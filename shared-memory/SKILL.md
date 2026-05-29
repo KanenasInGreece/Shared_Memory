@@ -139,6 +139,31 @@ uv run --with httpx python scripts/memory_bridge.py graph \
    RETURN d.title, o.rating, o.notes, o.date ORDER BY o.date DESC LIMIT 1"
 ```
 
+## Authentication Setup (v0.3.5)
+
+All coordinator routes require `Authorization: Bearer <token>`. One-time setup:
+
+```bash
+# 1. Generate tokens (run from repo root)
+uv run python shared-memory/scripts/generate_tokens.py
+
+# 2. Add AGENT_TOKENS line to the gateway .env
+echo "AGENT_TOKENS=claude:tok_...,gemini:tok_...,...,lm_studio:tok_..." >> .env
+
+# 3. Add per-agent token — one of:
+#   a) This agent's skill .env:
+echo "AGENT_TOKEN=tok_your_token" >> ~/.claude/skills/shared-memory/.env
+#   b) Universal fallback (works for any agent on this machine):
+mkdir -p ~/.config/shared-memory && echo "AGENT_TOKEN=tok_your_token" > ~/.config/shared-memory/client.env
+#   c) LM Studio: add to the mcp.json env block (full restart required)
+
+# 4. Restart the gateway (CLI agents pick up AGENT_TOKEN on next invocation)
+```
+
+**Sub-agent identity:** All Claude Code instances (including spawned sub-agents) share one token. Use `metadata.subagent` to record the sub-role — the server stamps `source` with the verified tool name.
+
+**Backward compatible:** `AGENT_TOKENS` unset → auth disabled (existing installs unaffected).
+
 ## Infrastructure
 
 ### Gateway + Coordinator + Consolidation Daemon
@@ -152,12 +177,13 @@ uv run --with aiohttp --with asyncpg --with neo4j --with httpx \
 Confirm startup:
 ```
 INFO  coordinator ready (pool 2–10, outbox worker running)
+INFO  coordinator auth enabled — N agent(s): antigravity, claude, gemini, ...
 INFO  ### Hive-Mind Proxy on :8888 [aiohttp]
 INFO  Consolidation daemon started (pid XXXXX)
 INFO  Listening for 'new_artifact' notifications...
 ```
 
-The proxy binds to `127.0.0.1:8888` by default (localhost only). Set `PROXY_BIND=0.0.0.0` in `.env` to opt into all-interfaces binding for Docker/VM setups.
+The proxy binds to `127.0.0.1:8888` by default (localhost only). Set `PROXY_BIND=0.0.0.0` in `.env` to opt into all-interfaces binding — only safe over an encrypted overlay network (Tailscale, WireGuard) or behind TLS.
 
 **Daemon watchdog:** The gateway auto-restarts the consolidation daemon on unexpected crashes with exponential backoff. A circuit breaker stops retrying after 5 crashes in 10 minutes — restart the gateway to reset.
 
@@ -165,7 +191,7 @@ The proxy binds to `127.0.0.1:8888` by default (localhost only). Set `PROXY_BIND
 ```
 curl http://localhost:8888/health
 ```
-Returns `{"status":"ok"}` when embedder and reranker are both reachable. HTTP 503 means the save/search path is degraded.
+Returns `{"status":"ok","auth_required":true,...}` when embedder and reranker are both reachable. HTTP 503 means the save/search path is degraded.
 
 ### MCP Server (LM Studio only)
 ```
@@ -173,10 +199,12 @@ uv run --with fastmcp --with httpx --with psycopg2-binary --with neo4j \
   python /path/to/vector-skill.py
 ```
 
+After changing `AGENT_TOKEN` in `mcp.json`, restart LM Studio completely.
+
 ## Reference
 
-- **Version:** `python scripts/memory_bridge.py --version` → `{"version": "0.3.4", "tool": "shared-memory-framework"}`
+- **Version:** `python scripts/memory_bridge.py --version` → `{"version": "0.3.5", "tool": "shared-memory-framework"}`
 - **Schema:** Neo4j labels, relationship types, Postgres tables — [schema.md](Documentation/schema.md)
 - **Embedding mandate:** All calls route through the gateway (:8888). Never call port 8070 (BGE-M3) or 8071 (BGE-Reranker) directly — the gateway enforces 1024-dim consistency across all agents.
 - **Ontology:** All Neo4j labels and relationship types are configurable in `ontology.yaml` at the repo root.
-- **Security posture:** Read-only Cypher guard active. `starlette>=1.0.1` floor enforced (BadHost CVE-2026-48710). Agent authentication (Phase 2C) is planned.
+- **Security posture:** Read-only Cypher guard active. `Authorization: Bearer <token>` auth enforced (v0.3.5). `starlette>=1.0.1` floor enforced (BadHost CVE-2026-48710).

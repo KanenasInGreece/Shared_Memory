@@ -1013,9 +1013,11 @@ Web-retrieved content enters the same ingestion pipeline as internally authored 
 
 **Do not ingest external or web-retrieved content at volume before implementing the remaining defences.**
 
-### Agent Authentication (planned — Phase 2C)
+### Agent Authentication — implemented (v0.3.5)
 
-`agent_id` is self-reported in the request body. Any caller can impersonate any agent. `AGENT_TOKENS` env var and `Authorization: Bearer <token>` middleware are designed; implementation is the next security PR. See `.env.example` for the token format.
+All coordinator routes require `Authorization: Bearer <token>`. The gateway verifies the token against the `AGENT_TOKENS` registry and stamps the verified agent identity onto every saved artifact — `agent_id` from the request body is no longer trusted.
+
+Setup: run `uv run python shared-memory/scripts/generate_tokens.py`, add the `AGENT_TOKENS` line to the gateway `.env`, and add `AGENT_TOKEN=<your-token>` to each agent's skill `.env` (or `~/.config/shared-memory/client.env` as a universal fallback). LM Studio requires a full restart after any `AGENT_TOKEN` change. See `SECURITY.md` for the full rollout procedure and token rotation instructions.
 
 ### Entity Resolution
 
@@ -1062,7 +1064,7 @@ This framework is actively evolving toward a workstation where any number of AI 
 | **Provenance layer — Phase C** | Retrospective layer: `HAD_OUTCOME` edge written as a dated edge property (not a node) so lineage is preserved without node explosion; Why-To loop — agents query past retrospectives before executing new work in the same area | Phase B is the prerequisite. |
 | **Provenance layer — Phase D** ✅ | Four named query shortcuts in `memory_bridge.py query <template>`: `who-decided`, `agent-decisions`, `retrospectives`, `why-to-check`. Filter values sanitised before Cypher interpolation. Raw `graph` subcommand preserved for custom traversals. SKILL.md Task 3 restructured to document both paths. 7 new tests — 91 total. | v0.3.3. |
 | **Provenance layer — Phase E** | Separate `pruning_loop.py` on a slow cron; enforces the information foraging heuristic (save if retrieval utility + decision impact > storage cost); `type:decision` and `decision_impact`-flagged rows are unconditionally shielded; plain facts compete on retrieval frequency × age | Decoupled from the consolidation daemon — different cadence. |
-| **Agent authentication (Phase 2C)** | `AGENT_TOKENS` env var; `Authorization: Bearer <token>` middleware; server-side `agent_id` enforcement; scope isolation by verified identity | Next security PR. Format documented in `.env.example`. Requires coordinated rollout across agents. |
+| **Agent authentication (Phase 2C)** ✅ | `AGENT_TOKENS` env var; `Authorization: Bearer <token>` DEFAULT DENY middleware; server-side source overwrite; duplicate-token guard; trailing-slash normalisation; 22 new tests | v0.3.5. |
 | **Ontology as graph (Path B)** | Bootstrap `(:Class)` nodes + `SCO` relationships from `ontology.yaml` into Neo4j on startup; replace `ONT.*` string constants with startup-cached dict read from graph; enables live ontology inspection and Neosemantics (n10s) forward compatibility | Path A is the prerequisite ✅. Does not replace `ontology.yaml` — yaml stays the human-editable source; graph is a materialised copy. |
 | **Entity type enrichment** | Apply Neo4j multi-label to distinguish entity kinds — `:Entity:Person`, `:Entity:System`, `:Entity:Tool`, `:Entity:Decision` etc. — without breaking existing queries | Path A + Path B are the prerequisites. Enables richer graph traversal and type-aware consolidation clustering. |
 | **Entity resolution** | Detect and merge synonymous Entity nodes (`"hive_mind_proxy"` ≡ `"Hive-Mind Gateway"`); maintain a canonical name + alias set; re-link Fact nodes on merge | The entity contract (explicit caller-supplied names) makes this tractable. Implementation is a background reconciliation job, not a save-path change. |

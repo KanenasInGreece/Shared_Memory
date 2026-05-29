@@ -27,19 +27,33 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.3.4"
+VERSION = "0.3.5"
 
-# Load .env by searching up from this script's location so env overrides
-# (COORDINATOR_URL, MEMORY_LOG_LEVEL, etc.) are picked up when invoked by
-# any agent that doesn't inherit the shell environment (Grok, LM Studio, CI).
+# Three-tier dotenv search so AGENT_TOKEN (and other env vars) are loaded
+# regardless of where the agent install lives:
+#   1. find_dotenv() — searches parent dirs from CWD (standard for project-local installs)
+#   2. script-adjacent .env — for installs where the skill dir IS the working dir
+#   3. ~/.config/shared-memory/client.env — universal per-machine fallback
 try:
     from dotenv import find_dotenv, load_dotenv
-    load_dotenv(find_dotenv(usecwd=False))
+    _env = (
+        find_dotenv(usecwd=False)
+        or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        or os.path.expanduser("~/.config/shared-memory/client.env")
+    )
+    if _env and os.path.exists(_env):
+        load_dotenv(_env)
 except ImportError:
     pass
 
 COORDINATOR_BASE = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
 AGENT_ID         = os.environ.get("AGENT_ID", "memory_bridge")
+
+
+def _auth_headers() -> dict:
+    """Return Authorization header dict if AGENT_TOKEN is set, else empty dict."""
+    token = os.environ.get("AGENT_TOKEN", "").strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}
 
 logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
 
@@ -102,7 +116,13 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
             r = await client.post(
                 f"{COORDINATOR_BASE}/memory/save",
                 json={"content": content, "metadata": metadata, "agent_id": AGENT_ID},
+                headers=_auth_headers(),
             )
+            if r.status_code == 401:
+                _append_log("memory_bridge", 2, "auth_failed",
+                            {"hint": "Check AGENT_TOKEN in .env matches an entry in gateway AGENT_TOKENS"})
+                return {"status": "error",
+                        "message": "Coordinator rejected token. Set AGENT_TOKEN in this agent's .env."}
             result = r.json()
     except Exception as exc:
         _append_log("memory_bridge", 2, "coordinator_down", {"content_preview": content[:100]}, content)
@@ -128,7 +148,13 @@ async def search_and_rerank(query: str, limit: int = 5) -> list | dict:
             r = await client.post(
                 f"{COORDINATOR_BASE}/memory/search",
                 json={"query": query, "limit": limit, "agent_id": AGENT_ID},
+                headers=_auth_headers(),
             )
+            if r.status_code == 401:
+                _append_log("memory_bridge", 2, "auth_failed",
+                            {"hint": "Check AGENT_TOKEN in .env matches an entry in gateway AGENT_TOKENS"})
+                return {"status": "error",
+                        "message": "Coordinator rejected token. Set AGENT_TOKEN in this agent's .env."}
             result = r.json()
     except Exception as exc:
         return _coordinator_unavailable(exc)
@@ -141,8 +167,14 @@ def query_graph(cypher: str, params: dict = None) -> list | dict:
         r = httpx.post(
             f"{COORDINATOR_BASE}/memory/graph",
             json={"cypher": cypher, "params": params or {}},
+            headers=_auth_headers(),
             timeout=30.0,
         )
+        if r.status_code == 401:
+            _append_log("memory_bridge", 2, "auth_failed",
+                        {"hint": "Check AGENT_TOKEN in .env matches an entry in gateway AGENT_TOKENS"})
+            return {"status": "error",
+                    "message": "Coordinator rejected token. Set AGENT_TOKEN in this agent's .env."}
         result = r.json()
     except Exception as exc:
         return _coordinator_unavailable(exc)
@@ -224,7 +256,16 @@ async def save_retrospective_artifact(
     payload = build_retrospective_payload(pg_id, rating, notes, date, source)
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.post(f"{COORDINATOR_BASE}/memory/retrospective", json=payload)
+            r = await client.post(
+                f"{COORDINATOR_BASE}/memory/retrospective",
+                json=payload,
+                headers=_auth_headers(),
+            )
+            if r.status_code == 401:
+                _append_log("memory_bridge", 2, "auth_failed",
+                            {"hint": "Check AGENT_TOKEN in .env matches an entry in gateway AGENT_TOKENS"})
+                return {"status": "error",
+                        "message": "Coordinator rejected token. Set AGENT_TOKEN in this agent's .env."}
             return r.json()
     except httpx.ConnectError as exc:
         return _coordinator_unavailable(exc)

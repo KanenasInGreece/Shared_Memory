@@ -69,3 +69,48 @@ async def test_search_and_rerank_coordinator_unreachable():
         result = await memory_bridge.search_and_rerank(MOCK_QUERY)
     assert isinstance(result, dict)
     assert result["status"] == "error"
+
+
+# ── Auth headers — Phase 2C ───────────────────────────────────────────────────
+
+def test_auth_headers_returns_empty_when_no_token(monkeypatch):
+    monkeypatch.delenv("AGENT_TOKEN", raising=False)
+    assert memory_bridge._auth_headers() == {}
+
+
+def test_auth_headers_returns_bearer_header_when_token_set(monkeypatch):
+    monkeypatch.setenv("AGENT_TOKEN", "tok_testtoken123")
+    headers = memory_bridge._auth_headers()
+    assert headers == {"Authorization": "Bearer tok_testtoken123"}
+
+
+def test_auth_headers_strips_whitespace(monkeypatch):
+    monkeypatch.setenv("AGENT_TOKEN", "  tok_abc  ")
+    headers = memory_bridge._auth_headers()
+    assert headers == {"Authorization": "Bearer tok_abc"}
+
+
+def test_auth_headers_empty_string_returns_empty(monkeypatch):
+    monkeypatch.setenv("AGENT_TOKEN", "")
+    assert memory_bridge._auth_headers() == {}
+
+
+@pytest.mark.asyncio
+async def test_save_artifact_returns_error_on_401():
+    mock_resp = MagicMock()
+    mock_resp.status_code = 401
+    with patch("httpx.AsyncClient.post", return_value=mock_resp):
+        result = await memory_bridge.save_artifact(MOCK_CONTENT, '{"source":"test"}')
+    assert result["status"] == "error"
+    assert "token" in result["message"].lower() or "AGENT_TOKEN" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_search_and_rerank_returns_error_on_401():
+    mock_resp = MagicMock()
+    mock_resp.status_code = 401
+    with patch("httpx.AsyncClient.post", return_value=mock_resp):
+        result = await memory_bridge.search_and_rerank(MOCK_QUERY)
+    assert isinstance(result, dict)
+    assert result["status"] == "error"
+    assert "token" in result["message"].lower() or "AGENT_TOKEN" in result["message"]

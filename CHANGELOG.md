@@ -9,6 +9,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.3.5] — 2026-05-29
+
+### Security
+
+- **Phase 2C — Agent token authentication** (`coordinator.py`, `hive_mind_proxy.py`, `memory_bridge.py`, `vector-skill.py`): The Memory Coordinator now enforces `Authorization: Bearer <token>` authentication on all routes. Any process that cannot present a registered token is rejected with HTTP 401. This closes the last open security finding — previously any localhost process could read/write shared memory and claim any agent identity.
+
+  - **`coordinator.py` — `_load_agent_tokens()` + `auth_middleware`**: Parses `AGENT_TOKENS` env var (`name:token,...`) into a token→agent mapping. Middleware is DEFAULT DENY — every route except `_UNPROTECTED_PATHS = {"/health"}` requires a valid token. Trailing-slash normalisation (`/health/` passes). Duplicate-token guard: if two agents share a token the second mapping is discarded and a WARNING is logged. `source` in saved metadata is forcefully overwritten with the server-verified agent name — clients cannot spoof identity.
+
+  - **`hive_mind_proxy.py`**: `auth_middleware` registered globally on the aiohttp app — applies to all routes including the catch-all proxy (which would otherwise be an unauthenticated SSRF relay if `PROXY_BIND=0.0.0.0` is used). `/health` reports `auth_required` flag.
+
+  - **`memory_bridge.py` + skill copy**: `_auth_headers()` reads `AGENT_TOKEN` and injects `Authorization: Bearer` on all coordinator calls. Three-tier dotenv fallback: `find_dotenv()` → script-adjacent `.env` → `~/.config/shared-memory/client.env`. Explicit 401 handling with clear error message and hint.
+
+  - **`vector-skill.py`**: Same `_auth_headers()` pattern. Replaces `"Bearer none"` placeholder. Auth headers added to `save_decision()` and `save_retrospective()` coordinator calls.
+
+  - **`scripts/generate_tokens.py`** (new): Bootstrap utility — generates cryptographically random `tok_` prefixed tokens for all 6 agents and prints ready-to-paste `.env` lines.
+
+  - **Backward compatible**: `AGENT_TOKENS` unset → auth disabled, all requests pass through (no behaviour change for existing installs).
+
+  - **22 new tests** — token loading, middleware DEFAULT DENY, allowlist, valid token, rejection cases, source overwrite, `_auth_headers()`, 401 response handling. **Total: 113 tests.**
+
+---
+
 ## [0.3.4] — 2026-05-29
 
 ### Security

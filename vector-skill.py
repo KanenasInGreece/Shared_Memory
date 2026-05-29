@@ -32,6 +32,12 @@ mcp = FastMCP("Local_RAG_Orchestrator")
 RETRIEVER_URL = "http://localhost:8888/v1/embeddings"
 RERANKER_URL = "http://localhost:8888/v1/reranking"
 
+
+def _auth_headers() -> dict:
+    """Return Authorization header dict if AGENT_TOKEN is set, else empty dict."""
+    token = os.environ.get("AGENT_TOKEN", "").strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
 _CONTENT_SIZE_WARN_BYTES = 10 * 1024
 
 def _append_log(tool: str, min_level: int, event: str, data: dict, content: str = None) -> None:
@@ -96,11 +102,10 @@ async def get_embedding(text: str):
     """Internal helper to get embeddings with retry logic."""
     try:
         async with httpx.AsyncClient(timeout=EMBED_TIMEOUT) as client:
-            headers = {"Authorization": "Bearer none"}
             resp = await client.post(
                 RETRIEVER_URL,
                 json={"input": text, "model": "bge-m3"},
-                headers=headers
+                headers=_auth_headers(),
             )
             resp.raise_for_status()
             return resp.json()["data"][0]["embedding"]
@@ -458,7 +463,10 @@ async def save_decision(
             r = await client.post(
                 f"{coordinator_url}/memory/save",
                 json={"content": content, "metadata": metadata, "agent_id": agent_id},
+                headers=_auth_headers(),
             )
+            if r.status_code == 401:
+                return "Error: Coordinator rejected token. Set AGENT_TOKEN in mcp.json env block."
             result = r.json()
     except Exception as exc:
         return (
@@ -508,7 +516,10 @@ async def save_retrospective(
             r = await client.post(
                 f"{coordinator_url}/memory/retrospective",
                 json=payload,
+                headers=_auth_headers(),
             )
+            if r.status_code == 401:
+                return "Error: Coordinator rejected token. Set AGENT_TOKEN in mcp.json env block."
             result = r.json()
     except Exception as exc:
         return (
