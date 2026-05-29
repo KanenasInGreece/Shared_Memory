@@ -141,6 +141,23 @@ Written by the outbox worker for `type:decision` saves.
 | `INFORMED_BY` | `(:Decision)-[:INFORMED_BY]->(:Decision)` | Prior decision used as input |
 | `HAD_OUTCOME` | `(:Decision)-[:HAD_OUTCOME {rating,date,notes}]->()` | Retrospective — dated edge property, not a node |
 
+### Retrospective write protocol
+
+To record an outcome on an existing Decision, `POST /memory/retrospective` with:
+
+```json
+{"pg_id": 42, "rating": "high", "notes": "Held up in prod.", "agent_id": "claude_code"}
+```
+
+The coordinator verifies the `pg_id` exists in `technical_docs`, then writes a `neo4j_outbox` row with `type=retrospective`. The outbox worker issues:
+
+```cypher
+MATCH (d:Decision {pg_id: $pg_id})
+CREATE (d)-[:HAD_OUTCOME {rating: $rating, date: $date, notes: $notes}]->(d)
+```
+
+Self-loop pattern — each call creates a new dated edge; multiple retrospectives per Decision are allowed. `date` defaults to today (ISO) if omitted.
+
 ### Provenance query examples
 
 ```cypher

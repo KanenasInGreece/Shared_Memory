@@ -95,6 +95,32 @@ uv run --with httpx python scripts/memory_bridge.py graph \
    RETURN h.name, ai.name, d.title, d.rationale, d.date, p.name"
 ```
 
+### Task 5 — Save a Retrospective (record a decision outcome)
+
+After a decision has been acted on, close the Why-To loop with `save_retrospective`. Each call appends a new dated `HAD_OUTCOME` edge on the Decision node — multiple retrospectives per decision are allowed.
+
+**CLI (Claude Code, Gemini CLI, Codex CLI):**
+```
+uv run --with httpx python scripts/memory_bridge.py save_retrospective \
+  --pg-id 42 \
+  --rating "high" \
+  --notes "Outbox-as-WAL held under concurrent load; no orphaned rows in 30-day prod run." \
+  --source claude_code
+```
+
+**MCP tool (LM Studio):** `save_retrospective(pg_id=42, rating="high", notes="...", source="qwen3")`
+
+**Required:** `--pg-id` (int, returned by `save_decision`), `--rating`, `--notes`
+**Optional:** `--date` (ISO string, default: today), `--source` (default: `$AGENT_ID`)
+
+**Why-To loop query (raw Cypher; Phase D will add a named shortcut):**
+```
+uv run --with httpx python scripts/memory_bridge.py graph \
+  "MATCH (d:Decision)-[o:HAD_OUTCOME]->()
+   WHERE toLower(d.title) CONTAINS 'outbox'
+   RETURN d.title, o.rating, o.notes, o.date ORDER BY o.date DESC LIMIT 1"
+```
+
 ## Infrastructure
 
 ### Gateway + Coordinator + Consolidation Daemon

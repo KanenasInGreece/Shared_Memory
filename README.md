@@ -78,7 +78,7 @@ Vishakha Gupta's *AI Memory & Cognition: The Architect's Playbook* (ApertureData
 
 **The Lineage Test:** *Can I trace a decision back to the original source — the raw image, the specific video frame, or the precise document page — or just the text summary extracted from it?*
 
-> As of v0.3.1: decisions trace fully to human (`WAS_ATTRIBUTED_TO`), AI agent (`WAS_ASSISTED_BY`), and project (`PROJECT_OF`). Community summaries link back to their source facts via `source_pg_ids`. The optional `source_ref` metadata key (e.g. `"design-doc.pdf#p12"`, `"meeting.mp4@00:04:32"`) propagates through the coordinator to the `Fact` Neo4j node — sub-document provenance is now capturable without schema changes. **Gap remaining:** `source_ref` is not enforced — agents supply it when they can. No back-edge yet from a raw `Fact` to the `Decision` it influenced (planned for Phase C).
+> As of v0.3.1 + Phase C: decisions trace fully to human (`WAS_ATTRIBUTED_TO`), AI agent (`WAS_ASSISTED_BY`), and project (`PROJECT_OF`). Community summaries link back to their source facts via `source_pg_ids`. The optional `source_ref` metadata key (e.g. `"design-doc.pdf#p12"`, `"meeting.mp4@00:04:32"`) propagates through the coordinator to the `Fact` Neo4j node — sub-document provenance is now capturable without schema changes. Phase C adds `HAD_OUTCOME` self-loop edges on Decision nodes, closing the forward trace: decision → outcome → rating + notes. **Gap remaining:** `source_ref` is not enforced — agents supply it when they can. No back-edge yet from a raw `Fact` to the `Decision` it influenced (planned for a later phase).
 
 ### What we are building toward
 
@@ -144,9 +144,8 @@ If you adopt a "save everything" policy (logs, test output, status checks, raw s
    Note: outbox replay on crash worked correctly; Neo4j lag < 200 ms typical.
    Suggested follow-up: add TTL pruning for applied rows > 30 days.
 
-# Context available now vs. in the future
 # Phase A (done): who decided + which AI + which project + why
-# Phase C (planned): outcomes, retrospectives, was it right after N weeks?
+# Phase C (done): outcomes, retrospectives, was it right after N weeks?
 ```
 
 **What you cannot query if you save noise:**
@@ -165,9 +164,9 @@ If you adopt a "save everything" policy (logs, test output, status checks, raw s
 "What is the current value of DENSITY_THRESHOLD in consolidation_loop.py?"
 → Read the file. Memory holds decisions about code, not code itself.
 
-# Retrospectives are only available once Phase C is implemented
+# Retrospectives require save_retrospective (Phase C — now available)
 "Was the BGE-M3 selection the right call?"
-→ No retrospective saved yet. Phase C will add HAD_OUTCOME edges for this.
+→ No retrospective saved yet. Use save_retrospective --pg-id <id> --rating high --notes "..."
 ```
 
 The governing heuristic: **if you can get the answer in 3 seconds from `git log`, `grep`, or `cat`, don't save it here.** Memory is for context that evaporates without capture — the why behind a decision, the options that were weighed, the outcome after the fact.
