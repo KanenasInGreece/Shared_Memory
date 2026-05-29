@@ -9,6 +9,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.3.5-post] — 2026-05-29
+
+### Fixed
+
+- **Auth self-loop in coordinator embedding calls** (`coordinator.py`): `EMBED_URL` was pointing to `:8888` (the proxy the coordinator lives inside), causing internal embedding calls to hit the auth middleware — which has no token and returns 401, aborting every save. Changed to `:8070` direct, consistent with `RERANK_URL` which already used `:8071` direct for the same reason. External agents still route embeddings through `:8888` and must authenticate.
+
+- **Dotenv `or`-chain only loaded one file** (`memory_bridge.py`, skill copy): The three-tier fallback used Python `or` chaining — once `find_dotenv()` returned the project `.env` (which has `AGENT_TOKENS` for the gateway but not `AGENT_TOKEN` for the agent), the skill `.env` and `~/.config/shared-memory/client.env` were never reached. Changed to a `for` loop with `load_dotenv(..., override=False)` so all three sources contribute and the first definition of each variable wins.
+
+- **`python-dotenv` not available in bare `uv run --with httpx`** (`memory_bridge.py`, skill copy): When agents run `uv run --with httpx python scripts/memory_bridge.py` without `--with python-dotenv`, the `try: from dotenv import ...` block hit `ImportError` silently and no `.env` was ever loaded, causing `_auth_headers()` to return `{}` and every call to get 401. Added a plain-Python fallback in the `except ImportError` block that manually parses the skill-root `.env` (one directory above `scripts/`) and `~/.config/shared-memory/client.env` — auth tokens are loaded with no dependencies.
+
+- **Missing `_auth_headers()` on reranker and health-check calls** (`vector-skill.py`): `_auth_headers()` was added to `save_decision()` and `save_retrospective()` in v0.3.5 but missed three HTTP call sites that go through port 8888: the reranker call in `hybrid_search_and_rerank()` and both health-check probes in `check_memory_health()`. All six `client.post()` call sites in `vector-skill.py` now pass `_auth_headers()`.
+
+- **Gemini CLI skill was at v0.3.3** (pre-coordinator): The Gemini skill directory at `~/.gemini/skills/shared-memory/scripts/memory_bridge.py` had never been synced after the coordinator refactor. It still had direct `import psycopg2` and `import neo4j` at the top, no auth support, and crashed on every call with `ModuleNotFoundError`. Synced to v0.3.5 — all five skill install locations now verified identical to canonical source after every change.
+
+### Documentation
+
+- **README `uv run` commands**: Added `--with python-dotenv` to every `memory_bridge.py` invocation. Added full dependency list (`--with asyncpg --with neo4j --with httpx`) to gateway startup command. Added "Token search order" section explaining the three-tier dotenv fallback. Fixed smoke-test command (had literal `\n` instead of a real line break).
+
+- **SKILL.md** (all copies): Added `--with python-dotenv` to all `uv run` commands. Updated Authentication Setup section with dotenv search order, `curl /health` verify step, 401 error hint.
+
+- **Complete Cycle section** (README §11a): End-to-end walkthrough — Claude Code saves a decision, Gemini CLI saves a plain fact, consolidation synthesises, Grok retrieves both (annotated response showing Tier-3 + Tier-1 + `graph_context`), named query shortcuts, retrospective closes the loop, LM Studio MCP equivalents.
+
+- **Security review** (v0.3.5 post-release): All three candidate findings filtered as false positives — Cypher injection (regex strips single quotes and backslashes, no breakout possible), write-Cypher guard bypass (Neo4j read-only session is a second independent layer), cross-DB atomicity in consolidation (data integrity issue, no security exploitation path).
+
+---
+
 ## [0.3.5] — 2026-05-29
 
 ### Security
