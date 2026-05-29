@@ -51,11 +51,14 @@ The MCP server (`vector-skill.py`) and CLI bridge (`memory_bridge.py`) are desig
 
 ### Raw Cypher execution — mitigated
 
-**Status: defence-in-depth guard in place. Read-only enforcement is not parser-grade.**
+**Status: two-layer defence in place (v0.3.4). Caller authentication pending Phase 2C.**
 
-`POST /memory/graph` previously executed arbitrary user-supplied Cypher without restriction. Any agent could run `MATCH (n) DETACH DELETE n` or invoke APOC procedures. A regex guard (`_WRITE_CYPHER`) now blocks queries containing `CREATE`, `DELETE`, `DETACH DELETE`, `SET`, `REMOVE`, `MERGE`, `CALL`, `LOAD CSV`, or `DROP` before they reach Neo4j.
+`POST /memory/graph` now has two independent controls:
 
-This is a keyword filter, not a parser. Obfuscated or multi-statement Cypher might bypass it. The complete solution is Neo4j RBAC with a read-only role for coordinator queries — not yet implemented.
+1. **Keyword regex guard** (`_WRITE_CYPHER`): rejects queries containing `CREATE`, `DELETE`, `DETACH DELETE`, `SET`, `REMOVE`, `MERGE`, `CALL`, `LOAD CSV`, or `DROP` before they reach Neo4j — fast-fail, no round-trip.
+2. **Driver-level read-only session** (`default_access_mode="READ"`): the Neo4j session is opened in read-only mode. Even if the regex is bypassed by a novel query pattern, the Neo4j driver rejects any write at the protocol level.
+
+The remaining gap is caller identity: any process that can reach port 8888 can issue read queries. **Phase 2C** will add `Authorization: Bearer <token>` authentication so only registered agents can reach the endpoint at all.
 
 ### Stored prompt injection — partially mitigated
 
@@ -82,8 +85,8 @@ Each entity now has exactly **one** `community_summaries` row. Consolidation cyc
 
 This eliminates the previous accumulation problem (where duplicate summaries from concurrent consolidation runs would both survive and surface non-deterministically). However:
 
-- The replaced summary is gone — there is no versioning or diff history.
-- A successfully injected summary, once written, replaces the legitimate one and persists until the next consolidation cycle overwrites it with a corrected narrative.
+- The previous summary is preserved in `summary_history JSONB` (migration 004, v0.3.1) — an append-only array capped at 20 entries, written before each overwrite. Full drift history is auditable, but rollback requires manual `DELETE` + re-consolidation.
+- A successfully injected summary, once written, replaces the legitimate one and persists until the next consolidation cycle overwrites it with a corrected narrative. The `summary_history` column records the injected version but does not auto-remediate it.
 
 Manual remediation if a suspect summary is detected:
 
