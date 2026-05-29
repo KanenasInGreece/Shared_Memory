@@ -119,6 +119,13 @@ class MemoryCoordinator:
             PG_DSN, min_size=POOL_MIN, max_size=POOL_MAX,
             init=self._init_connection,
         )
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE neo4j_outbox SET status='pending' WHERE status='in_progress'"
+            )
+            recovered = int(result.split()[-1])
+            if recovered:
+                log.warning("outbox startup: recovered %d in_progress row(s) → pending", recovered)
         self._neo4j = AsyncGraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
         self._outbox_task = asyncio.create_task(self._outbox_worker(), name="outbox-worker")
         log.info("coordinator ready (pool %d–%d, outbox worker running)", POOL_MIN, POOL_MAX)
@@ -190,24 +197,26 @@ class MemoryCoordinator:
             await asyncio.sleep(OUTBOX_POLL_INTERVAL)
 
     async def _drain_outbox(self) -> None:
-        # FOR UPDATE SKIP LOCKED: if two coordinator instances overlap (e.g. during
-        # proxy restart), each instance claims a disjoint set of rows — no row is
-        # processed twice. Rows held by another transaction are silently skipped and
-        # picked up on the next poll cycle.
+        # Atomically claim rows by flipping status to 'in_progress' before releasing
+        # the lock. A concurrent coordinator instance SKIP LOCKs these rows and moves on.
+        # Any rows stuck in 'in_progress' after a crash are reset to 'pending' by start().
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 rows = await conn.fetch(
                     """
-                    SELECT id, pg_id, cypher_params, retries
-                    FROM neo4j_outbox
-                    WHERE status = 'pending' AND retries < $1
-                    ORDER BY id
-                    LIMIT $2
-                    FOR UPDATE SKIP LOCKED
+                    UPDATE neo4j_outbox SET status = 'in_progress'
+                    WHERE id IN (
+                        SELECT id FROM neo4j_outbox
+                        WHERE status = 'pending' AND retries < $1
+                        ORDER BY id
+                        LIMIT $2
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    RETURNING id, pg_id, cypher_params, retries
                     """,
                     OUTBOX_MAX_RETRIES, OUTBOX_BATCH_SIZE,
                 )
-                rows = list(rows)   # copy out before the transaction closes
+                rows = list(rows)
         if not rows:
             return
         log.debug("outbox: draining %d row(s)", len(rows))
@@ -272,10 +281,8 @@ class MemoryCoordinator:
                         pg_id, retries + 1,
                     )
                 else:
-                    # retries+1 at DB level prevents lost updates if two instances
-                    # process the same row concurrently (last-write-wins is avoided).
                     await conn.execute(
-                        "UPDATE neo4j_outbox SET retries=retries+1 WHERE id=$1 AND status='pending'",
+                        "UPDATE neo4j_outbox SET retries=retries+1, status='pending' WHERE id=$1",
                         outbox_id,
                     )
 
@@ -539,22 +546,26 @@ class MemoryCoordinator:
             )
 
         async with self._pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT id FROM technical_docs WHERE id=$1", pg_id)
-            if not row:
-                return web.json_response(
-                    {"status": "error", "message": f"No record found with pg_id={pg_id}"},
-                    status=404,
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT id FROM technical_docs WHERE id=$1 FOR SHARE",
+                    pg_id,
                 )
-            await conn.execute(
-                "INSERT INTO neo4j_outbox (pg_id, cypher_params) VALUES ($1, $2::jsonb)",
-                pg_id,
-                json.dumps({
-                    "type": "retrospective",
-                    "target_pg_id": pg_id,
-                    "retrospective": {"rating": rating, "date": date, "notes": notes},
-                    "source": agent_id,
-                }),
-            )
+                if not row:
+                    return web.json_response(
+                        {"status": "error", "message": f"No record found with pg_id={pg_id}"},
+                        status=404,
+                    )
+                await conn.execute(
+                    "INSERT INTO neo4j_outbox (pg_id, cypher_params) VALUES ($1, $2::jsonb)",
+                    pg_id,
+                    json.dumps({
+                        "type": "retrospective",
+                        "target_pg_id": pg_id,
+                        "retrospective": {"rating": rating, "date": date, "notes": notes},
+                        "source": agent_id,
+                    }),
+                )
 
         return web.json_response({"status": "success", "target_pg_id": pg_id})
 
@@ -731,7 +742,7 @@ class MemoryCoordinator:
             )
 
         try:
-            async with self._neo4j.session() as session:
+            async with self._neo4j.session(default_access_mode="READ") as session:
                 result  = await session.run(cypher, **params)
                 records = await result.data()
         except Exception as exc:

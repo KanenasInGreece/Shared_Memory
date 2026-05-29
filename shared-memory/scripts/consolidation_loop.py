@@ -9,7 +9,7 @@ import asyncio
 import logging
 import select
 from datetime import datetime
-from neo4j import GraphDatabase
+from neo4j import AsyncGraphDatabase
 from ontology import ONT
 
 # Configuration — set via environment variables or .env file
@@ -121,7 +121,7 @@ class ConsolidationDaemon:
         self.pending_pg_ids = set()
         self.last_activity = datetime.now()
         self.first_notification_time = None
-        self.driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+        self.driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
         self.is_running = True
         self.last_log_merge_date = None
 
@@ -190,10 +190,11 @@ class ConsolidationDaemon:
         self.pending_pg_ids.clear()
         self.first_notification_time = None
 
+        loop = asyncio.get_running_loop()
         clusters = []
         try:
-            with self.driver.session() as session:
-                result = session.run(
+            async with self.driver.session() as session:
+                result = await session.run(
                     f"MATCH (f:{ONT.fact}) WHERE f.pg_id IN $ids"
                     f" MATCH (f)-[:{ONT.entity_link_alias}|{ONT.entity_link}]->(e:{ONT.entity})"
                     f" WITH DISTINCT e"
@@ -205,13 +206,15 @@ class ConsolidationDaemon:
                     f"        [fact IN unflagged_facts | fact.content] as contents,"
                     f"        [fact IN unflagged_facts | fact.pg_id] as pg_ids",
                     ids=ids_to_process, threshold=DENSITY_THRESHOLD)
-                clusters = result.data()
+                clusters = await result.data()
 
             if not clusters:
                 logger.info("No high-density clusters found to consolidate.")
                 return
 
-            conn = psycopg2.connect(PG_CONN)
+            conn = await loop.run_in_executor(
+                None, lambda: psycopg2.connect(PG_CONN, connect_timeout=5)
+            )
             try:
                 for cluster in clusters:
                     entity = cluster['entity']
@@ -221,15 +224,16 @@ class ConsolidationDaemon:
                     # 1. Fetch previous summary (Postgres)
                     previous_summary = None
                     try:
-                        with conn.cursor() as cur:
-                            cur.execute("""
-                                SELECT content FROM community_summaries
-                                WHERE metadata->>'entity' = %s
-                                ORDER BY id DESC LIMIT 1
-                            """, (entity,))
-                            row = cur.fetchone()
-                            if row:
-                                previous_summary = row[0]
+                        def _fetch_prev(ent=entity):
+                            with conn.cursor() as cur:
+                                cur.execute("""
+                                    SELECT content FROM community_summaries
+                                    WHERE metadata->>'entity' = %s
+                                    ORDER BY id DESC LIMIT 1
+                                """, (ent,))
+                                row = cur.fetchone()
+                                return row[0] if row else None
+                        previous_summary = await loop.run_in_executor(None, _fetch_prev)
                     except Exception as e:
                         logger.warning(f"Failed to fetch previous summary for {entity}: {str(e)}")
 
@@ -258,44 +262,48 @@ class ConsolidationDaemon:
                     }
 
                     try:
-                        with conn.cursor() as cur:
-                            # ON CONFLICT prevents duplicate rows when two consolidation
-                            # cycles run concurrently for the same entity (e.g. proxy
-                            # restart overlap). The unique index is on metadata->>'entity'.
-                            # Before overwriting, append the current content to summary_history
-                            # (capped at 20 entries) so drift can be audited over time.
-                            cur.execute("""
-                                INSERT INTO community_summaries (content, metadata, embedding, source_pg_ids)
-                                VALUES (%s, %s, %s, %s)
-                                ON CONFLICT ((metadata->>'entity')) DO UPDATE
-                                    SET content         = EXCLUDED.content,
-                                        embedding       = EXCLUDED.embedding,
-                                        metadata        = EXCLUDED.metadata,
-                                        source_pg_ids   = EXCLUDED.source_pg_ids,
-                                        summary_history = (
-                                            SELECT jsonb_agg(entry)
-                                            FROM (
-                                                SELECT entry FROM jsonb_array_elements(
-                                                    COALESCE(community_summaries.summary_history, '[]'::jsonb)
-                                                    || jsonb_build_array(jsonb_build_object(
-                                                        'content',        community_summaries.content,
-                                                        'source_pg_ids',  community_summaries.source_pg_ids,
-                                                        'timestamp',      community_summaries.metadata->>'timestamp'
-                                                    ))
-                                                ) AS entry
-                                                ORDER BY (entry->>'timestamp') DESC
-                                                LIMIT 20
-                                            ) sub
-                                        )
-                                RETURNING id
-                            """, (summary, json.dumps(metadata), embedding, pg_ids))
-                            summary_pg_id = cur.fetchone()[0]
+                        _meta_json = json.dumps(metadata)
+                        _summary, _embedding, _pg_ids = summary, embedding, pg_ids
+                        def _write_summary():
+                            with conn.cursor() as cur:
+                                # ON CONFLICT prevents duplicate rows when two consolidation
+                                # cycles run concurrently for the same entity (e.g. proxy
+                                # restart overlap). The unique index is on metadata->>'entity'.
+                                # Before overwriting, append the current content to summary_history
+                                # (capped at 20 entries) so drift can be audited over time.
+                                cur.execute("""
+                                    INSERT INTO community_summaries (content, metadata, embedding, source_pg_ids)
+                                    VALUES (%s, %s, %s, %s)
+                                    ON CONFLICT ((metadata->>'entity')) DO UPDATE
+                                        SET content         = EXCLUDED.content,
+                                            embedding       = EXCLUDED.embedding,
+                                            metadata        = EXCLUDED.metadata,
+                                            source_pg_ids   = EXCLUDED.source_pg_ids,
+                                            summary_history = (
+                                                SELECT jsonb_agg(entry)
+                                                FROM (
+                                                    SELECT entry FROM jsonb_array_elements(
+                                                        COALESCE(community_summaries.summary_history, '[]'::jsonb)
+                                                        || jsonb_build_array(jsonb_build_object(
+                                                            'content',        community_summaries.content,
+                                                            'source_pg_ids',  community_summaries.source_pg_ids,
+                                                            'timestamp',      community_summaries.metadata->>'timestamp'
+                                                        ))
+                                                    ) AS entry
+                                                    ORDER BY (entry->>'timestamp') DESC
+                                                    LIMIT 20
+                                                ) sub
+                                            )
+                                    RETURNING id
+                                """, (_summary, _meta_json, _embedding, _pg_ids))
+                                return cur.fetchone()[0]
+                        summary_pg_id = await loop.run_in_executor(None, _write_summary)
 
                         logger.info(f"Saved summary (ID: {summary_pg_id}) to Postgres. Syncing to Graph...")
 
                         # NOTE: CROSS-DB ATOMICITY RISK — see ADR.md
-                        with self.driver.session() as session:
-                            session.run(
+                        async with self.driver.session() as session:
+                            await session.run(
                                 f"UNWIND $fact_ids as fid"
                                 f" MATCH (f:{ONT.fact} {{pg_id: fid}})"
                                 f" SET f.consolidated = true"
@@ -309,31 +317,36 @@ class ConsolidationDaemon:
                                 f" MERGE (f)-[:{ONT.summarized_by}]->(s)",
                                 fact_ids=pg_ids, summary_pg_id=summary_pg_id, entity=entity)
 
-                        conn.commit()
+                        await loop.run_in_executor(None, conn.commit)
                         logger.info(f"Successfully consolidated {len(pg_ids)} facts for '{entity}'.")
                     except Exception as e:
-                        conn.rollback()
+                        await loop.run_in_executor(None, conn.rollback)
                         logger.error(f"Database write error for {entity}: {str(e)}")
                         self.pending_pg_ids.update(pg_ids)
             finally:
-                conn.close()
+                await loop.run_in_executor(None, conn.close)
 
         except Exception as e:
             logger.error(f"Consolidation cycle failed: {str(e)}")
             self.pending_pg_ids.update(ids_to_process)
 
-    def _make_listen_conn(self):
+    async def _make_listen_conn(self):
         """Open a Postgres LISTEN connection and return (conn, cur)."""
-        conn = psycopg2.connect(PG_CONN, application_name="consolidation_daemon")
-        conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
-        cur = conn.cursor()
-        cur.execute("LISTEN new_artifact;")
-        return conn, cur
+        loop = asyncio.get_running_loop()
+        def _sync_connect():
+            c = psycopg2.connect(
+                PG_CONN, application_name="consolidation_daemon", connect_timeout=5
+            )
+            c.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+            cur = c.cursor()
+            cur.execute("LISTEN new_artifact;")
+            return c, cur
+        return await loop.run_in_executor(None, _sync_connect)
 
     async def listen_for_events(self):
         """Asynchronous LISTEN on Postgres with non-blocking poll and hard backstop."""
         loop = asyncio.get_running_loop()
-        conn, cur = self._make_listen_conn()
+        conn, cur = await self._make_listen_conn()
         logger.info("Listening for 'new_artifact' notifications...")
         try:
             while self.is_running:
@@ -383,7 +396,7 @@ class ConsolidationDaemon:
                             conn.close()
                         except Exception:
                             pass
-                        conn, cur = self._make_listen_conn()
+                        conn, cur = await self._make_listen_conn()
                         logger.info("Reconnected to Postgres LISTEN")
                         continue
 
@@ -407,9 +420,9 @@ class ConsolidationDaemon:
                 pass
             logger.info("Postgres listener connection closed.")
 
-    def stop(self):
+    async def stop(self):
         self.is_running = False
-        self.driver.close()
+        await self.driver.close()
 
 async def main():
     daemon = ConsolidationDaemon()
@@ -417,7 +430,7 @@ async def main():
         await daemon.listen_for_events()
     except KeyboardInterrupt:
         logger.info("Stopping daemon...")
-        daemon.stop()
+        await daemon.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())

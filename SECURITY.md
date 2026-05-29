@@ -102,6 +102,82 @@ And the corresponding Neo4j cleanup:
 MATCH (s:CommunitySummary {pg_id: <suspect_id>}) DETACH DELETE s;
 ```
 
+## Security Audit — v0.3.4 (2026-05-29)
+
+Seven findings from a rigorous code review. All are resolved in v0.3.4 unless marked otherwise.
+
+---
+
+### S1 — Unrestricted Cypher Execution via `/memory/graph` ✅ Fixed
+
+**Severity:** HIGH | **File:** `coordinator.py` `handle_graph`
+
+The `/memory/graph` endpoint's only write guard was a keyword regex. Any local process could bypass it with novel Cypher patterns and read the full graph schema.
+
+**Fix:** Neo4j session opened with `default_access_mode="READ"`. Driver-level enforcement rejects write operations even if the regex is bypassed. **Phase 2C will add caller authentication** as the next layer.
+
+---
+
+### S2 — Blocking Sync I/O in Consolidation Daemon Starves Event Loop ✅ Fixed
+
+**Severity:** HIGH | **File:** `consolidation_loop.py` `run_consolidation_cycle`
+
+Sync `GraphDatabase` driver and `psycopg2` calls inside `async def` blocked the single event loop thread for the duration of every DB round-trip, preventing new `LISTEN/NOTIFY` signals from being processed and causing NOTIFY drops under write bursts.
+
+**Fix:** Migrated to `AsyncGraphDatabase` for Neo4j; all `psycopg2` calls wrapped in `loop.run_in_executor()`. Added `connect_timeout=5` to all `psycopg2.connect()` calls.
+
+---
+
+### S3 — TOCTOU Race in `handle_retrospective` ✅ Fixed
+
+**Severity:** HIGH | **File:** `coordinator.py` `handle_retrospective`
+
+`SELECT` existence check and `INSERT` into `neo4j_outbox` were two separate auto-committed statements. A concurrent `DELETE` of the target row between them left a dangling outbox entry, causing silent `HAD_OUTCOME` edge loss.
+
+**Fix:** Both statements wrapped in `async with conn.transaction()` with `SELECT ... FOR SHARE` to lock the target row for the duration of the insert.
+
+---
+
+### S4 — `--project` Filter in Named Query Templates Had No Effect ✅ Fixed
+
+**Severity:** MEDIUM | **File:** `memory_bridge.py` `_build_query`
+
+`WHERE p.name CONTAINS '...'` appended after `OPTIONAL MATCH ... (p:Project)` was parsed as an inline WHERE on the optional match — it filtered what value `p` got, not which rows returned. All decisions were returned regardless of the `--project` flag.
+
+**Fix:** Added `WITH d, [h/a/o], p` before the project `WHERE` clause in all three affected templates (`who-decided`, `agent-decisions`, `why-to-check`). The `WITH` promotes the WHERE to a result filter, correctly excluding decisions not linked to the specified project.
+
+---
+
+### S5 — 8 KB Dead Embedding Property on Every Neo4j Node (LM Studio path) ✅ Fixed
+
+**Severity:** MEDIUM | **File:** `vector-skill.py` `save_artifact`, `archive_reasoning_trace`
+
+The LM Studio MCP path stored the full 1024-float BGE-M3 embedding on every `Fact`, `ReasoningTrace`, and `ReasoningStep` Neo4j node. The property was never used for any Cypher query — all similarity search goes through `pgvector`. At scale this bloated Neo4j heap and risked OOM kills.
+
+**Fix:** `f.embedding`, `t.task_embedding`, and `s.embedding` properties removed from all three Neo4j write calls. The `coordinator.py` path was already correct and unchanged.
+
+---
+
+### S6 — Audit Log Write Failures Swallowed Silently ✅ Fixed
+
+**Severity:** MEDIUM | **Files:** `memory_bridge.py`, `vector-skill.py` `_append_log`
+
+`except Exception: pass` in `_append_log` also swallowed `OSError` (disk full, permission denied). Audit logging would silently stop with no indication anywhere in the process output.
+
+**Fix:** `except OSError as e` caught first and printed to `stderr` before the bare `except Exception: pass` fallback. Disk/permission failures are now visible; other unexpected failures remain non-fatal.
+
+---
+
+### S7 — Outbox Double-Processing Race During Coordinator Restart ✅ Fixed
+
+**Severity:** MEDIUM | **File:** `coordinator.py` `_drain_outbox`
+
+`FOR UPDATE SKIP LOCKED` only held locks while the selection transaction was open. After the transaction committed, rows were still `pending` while Neo4j apply was in-flight. A second coordinator instance could claim the same rows and double-increment the retry counter, causing a row to hit `OUTBOX_MAX_RETRIES` prematurely and be permanently marked `failed`.
+
+**Fix:** Selection query changed to `UPDATE ... SET status='in_progress' WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING ...` — rows are atomically claimed before the lock is released. On startup, `start()` resets any `in_progress` rows (crash survivors) back to `pending`. The failure-path update now resets to `pending` instead of filtering on the old `AND status='pending'` condition.
+
+---
+
 ## Supported Versions
 
 This project is in active development. Security fixes are applied to the latest commit on `main` only.
