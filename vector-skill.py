@@ -48,6 +48,9 @@ def _append_log(tool: str, min_level: int, event: str, data: dict, content: str 
                 entry["content_size_warn"] = f"content is {len(content.encode())} bytes — reduce log level to avoid large logs"
         with open(os.path.join(log_dir, f"{tool}.log"), "a") as f:
             f.write(json.dumps(entry) + "\n")
+    except OSError as e:
+        import sys
+        print(f"[WARN] shared-memory: audit log unavailable ({e})", file=sys.stderr)
     except Exception:
         pass  # logging must never break the save path
 _pg_pass = os.environ.get("PG_PASSWORD", "")
@@ -335,10 +338,9 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
                 session.run(
                     f"MERGE (f:{ONT.fact} {{pg_id: $pg_id}})"
                     " SET f.content = $content,"
-                    "     f.embedding = $embedding,"
                     "     f.created_at = datetime(),"
                     "     f.source = $source",
-                    pg_id=pg_id, content=content[:200], embedding=embedding, source=m_data.get("source", "mcp_sync"))
+                    pg_id=pg_id, content=content[:200], source=m_data.get("source", "mcp_sync"))
 
                 for entity_name in entities:
                     session.run(
@@ -377,9 +379,8 @@ async def archive_reasoning_trace(session_id: str, task: str, steps: list) -> st
             session.run(
                 f"MERGE (t:{ONT.reasoning_trace} {{id: $session_id}})"
                 " SET t.task = $task,"
-                "     t.task_embedding = $embedding,"
                 "     t.timestamp = datetime()",
-                session_id=session_id, task=task, embedding=task_embedding)
+                session_id=session_id, task=task)
 
             prev_id = session_id
             for i, step in enumerate(steps):
@@ -393,11 +394,10 @@ async def archive_reasoning_trace(session_id: str, task: str, steps: list) -> st
                     f" CREATE (s:{ONT.reasoning_step} {{id: $step_id}})"
                     " SET s.content = $content,"
                     "     s.result = $result,"
-                    "     s.embedding = $embedding,"
                     "     s.index = $i"
                     f" CREATE (prev)-[:{ONT.reasoning_next}]->(s)",
                     prev_id=prev_id, step_id=step_id, content=content,
-                    result=str(step.get('result', '')), embedding=step_embedding, i=i)
+                    result=str(step.get('result', '')), i=i)
 
                 prev_id = step_id
 

@@ -65,6 +65,8 @@ def _append_log(tool: str, min_level: int, event: str, data: dict, content: str 
                 )
         with open(os.path.join(log_dir, f"{tool}.log"), "a") as f:
             f.write(json.dumps(entry) + "\n")
+    except OSError as e:
+        print(f"[WARN] shared-memory: audit log unavailable ({e})", file=sys.stderr)
     except Exception:
         pass  # logging must never break the save path
 
@@ -252,6 +254,7 @@ def _build_query(template: str, args) -> str:
             "OPTIONAL MATCH (d)-[:PROJECT_OF]->(p:Project)",
         ]
         if project:
+            lines.append("WITH d, h, a, p")
             lines.append(f"WHERE p.name CONTAINS '{project}'")
         lines.append(
             "RETURN d.title, d.pg_id, h.name AS decided_by, "
@@ -267,6 +270,7 @@ def _build_query(template: str, args) -> str:
             lines.append(f"WHERE a.name CONTAINS '{assisted_by}'")
         lines.append("OPTIONAL MATCH (d)-[:PROJECT_OF]->(p:Project)")
         if project:
+            lines.append("WITH d, a, p")
             lines.append(f"WHERE p.name CONTAINS '{project}'")
         lines.append(
             "RETURN d.title, d.pg_id, a.name AS assisted_by, "
@@ -295,6 +299,7 @@ def _build_query(template: str, args) -> str:
             "OPTIONAL MATCH (d)-[:PROJECT_OF]->(p:Project)",
         ]
         if project:
+            lines.append("WITH d, o, h, p")
             lines.append(f"WHERE p.name CONTAINS '{project}'")
         lines.append(
             "RETURN d.title, d.pg_id, o.rating, o.notes, "

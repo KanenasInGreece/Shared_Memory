@@ -79,7 +79,7 @@ Written by the coordinator on every save, in the same Postgres transaction as `t
 | `id` | `BIGSERIAL PRIMARY KEY` | Monotonic outbox entry ID |
 | `pg_id` | `BIGINT NOT NULL` | References the `technical_docs.id` row this write belongs to |
 | `cypher_params` | `JSONB NOT NULL` | Parameters passed to the Neo4j Cypher write (content snippet, source, entities, etc.) |
-| `status` | `TEXT NOT NULL DEFAULT 'pending'` | `pending` → `applied` or `failed` |
+| `status` | `TEXT NOT NULL DEFAULT 'pending'` | `pending` → `in_progress` → `applied` or `failed`. `in_progress` means a coordinator instance has claimed the row for Neo4j apply but has not yet completed. Rows stuck in `in_progress` after a crash are reset to `pending` on coordinator startup. |
 | `retries` | `INT NOT NULL DEFAULT 0` | Incremented on each failed application attempt |
 | `created_at` | `TIMESTAMPTZ DEFAULT now()` | When the outbox row was written |
 | `applied_at` | `TIMESTAMPTZ` | Set when status transitions to `applied` |
