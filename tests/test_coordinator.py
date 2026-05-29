@@ -40,11 +40,17 @@ MemoryCoordinator = coordinator_mod.MemoryCoordinator
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _make_request(body: dict) -> MagicMock:
-    """Minimal aiohttp Request mock with an async .json() method."""
+def _make_request(body: dict, authenticated_agent: str | None = None) -> MagicMock:
+    """Minimal aiohttp Request mock with an async .json() method.
+
+    authenticated_agent: simulates the value set by auth_middleware after token validation.
+    Defaults to None so existing tests run without auth overwrite.
+    """
     req = MagicMock()
     req.json = AsyncMock(return_value=body)
     req.rel_url.query.get = MagicMock(return_value=None)
+    req.get = MagicMock(return_value=authenticated_agent)
+    req.__getitem__ = MagicMock(return_value=authenticated_agent)
     return req
 
 
@@ -540,3 +546,34 @@ async def test_search_response_community_summary_has_tier_field():
     assert resp.status == 200
     results = json.loads(resp.text)["results"]
     assert results[0]["tier"] == "community_summary"
+
+
+# ── Auth source overwrite — Phase 2C ─────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_handle_save_source_overwritten_by_authenticated_agent():
+    """When auth is active the coordinator must stamp source with the verified agent name,
+    not the value the client supplied."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request(
+            {
+                "content": "some content",
+                "metadata": {"source": "imposter", "entities": ["Entity1"]},
+            },
+            authenticated_agent="claude",
+        )
+        resp = await c.handle_save(req)
+
+    assert resp.status == 200
+
+    # The outbox INSERT carries the server-verified source, not "imposter"
+    outbox_call = next(
+        (c for c in mock_conn.execute.call_args_list
+         if "neo4j_outbox" in c.args[0]),
+        None,
+    )
+    assert outbox_call is not None
+    params = json.loads(outbox_call.args[2])
+    assert params["source"] == "claude"

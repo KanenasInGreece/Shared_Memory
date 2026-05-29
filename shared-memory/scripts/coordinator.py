@@ -47,6 +47,62 @@ from ontology import ONT
 
 log = logging.getLogger("coordinator")
 
+# ── Agent authentication ───────────────────────────────────────────────────────
+
+_UNPROTECTED_PATHS = {"/health"}
+
+
+def _load_agent_tokens() -> dict[str, str]:
+    """Parse AGENT_TOKENS env var into a token→agent_name mapping.
+
+    Format: AGENT_TOKENS=claude:tok_abc,gemini:tok_xyz,...
+    Returns empty dict if AGENT_TOKENS is not set (auth disabled, backward compat).
+    """
+    raw = os.environ.get("AGENT_TOKENS", "").strip()
+    if not raw:
+        return {}
+    result: dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if ":" not in pair:
+            log.warning("AGENT_TOKENS: malformed entry %r (expected name:token)", pair)
+            continue
+        name, token = pair.split(":", 1)
+        name  = name.strip()
+        token = token.strip()
+        if token in result:
+            log.warning(
+                "AGENT_TOKENS: token for %r is already assigned to %r — "
+                "ignoring duplicate; fix .env to prevent misattribution",
+                name, result[token],
+            )
+            continue
+        result[token] = name
+    return result
+
+
+_AGENT_TOKENS: dict[str, str] = _load_agent_tokens()
+
+
+@web.middleware
+async def auth_middleware(request: web.Request, handler):
+    """DEFAULT DENY — every route requires a valid Bearer token unless explicitly allowlisted."""
+    if not _AGENT_TOKENS:
+        return await handler(request)
+    if request.path.rstrip("/") in _UNPROTECTED_PATHS or request.path in _UNPROTECTED_PATHS:
+        return await handler(request)
+    raw_header = request.headers.get("Authorization", "")
+    parts = raw_header.split(maxsplit=1)
+    if len(parts) != 2 or parts[0] != "Bearer":
+        raise web.HTTPUnauthorized(reason="Authorization: Bearer <token> required")
+    agent_name = _AGENT_TOKENS.get(parts[1])
+    if not agent_name:
+        raise web.HTTPUnauthorized(reason="Unrecognised token")
+    request["authenticated_agent"] = agent_name
+    return await handler(request)
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 _pg_pass = os.environ.get("PG_PASSWORD", "")
@@ -129,6 +185,15 @@ class MemoryCoordinator:
         self._neo4j = AsyncGraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
         self._outbox_task = asyncio.create_task(self._outbox_worker(), name="outbox-worker")
         log.info("coordinator ready (pool %d–%d, outbox worker running)", POOL_MIN, POOL_MAX)
+        if _AGENT_TOKENS:
+            log.info(
+                "coordinator auth enabled — %d agent(s): %s",
+                len(_AGENT_TOKENS), ", ".join(sorted(_AGENT_TOKENS.values())),
+            )
+            log.info("NOTE: MCP clients (LM Studio) must be fully restarted after .env changes")
+        else:
+            log.warning("AGENT_TOKENS not set — coordinator running unauthenticated")
+            log.warning("Run: uv run python shared-memory/scripts/generate_tokens.py to bootstrap")
 
     async def stop(self) -> None:
         if self._outbox_task:
@@ -393,6 +458,13 @@ class MemoryCoordinator:
         agent_id   = body.get("agent_id", "unknown")
         scope      = body.get("scope", "global")
         visibility = body.get("visibility", "global")
+
+        # Server-side identity enforcement — verified agent name overrides client claim.
+        # body["metadata"] is explicitly reattached; dict.get() returns an independent
+        # dict when the key is absent, so the mutation would otherwise be discarded.
+        if request.get("authenticated_agent"):
+            metadata["source"] = request["authenticated_agent"]
+            body["metadata"] = metadata
 
         if not content:
             return web.json_response(

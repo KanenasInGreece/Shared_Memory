@@ -26,7 +26,7 @@ def _load_env() -> None:
 
 _load_env()
 
-from coordinator import MemoryCoordinator, attach as attach_coordinator
+from coordinator import MemoryCoordinator, attach as attach_coordinator, auth_middleware, _AGENT_TOKENS
 
 # Unified Hive-Mind Async Proxy v7
 # Routes /v1/embeddings -> 8070 (BGE-M3)
@@ -359,6 +359,7 @@ async def handle_health(request: web.Request) -> web.Response:
     # fail the health check so agents can still read/write memory.
     critical_ok = checks["embedder"] == "ok" and checks["reranker"] == "ok"
     checks["status"] = "ok" if critical_ok else "degraded"
+    checks["auth_required"] = bool(_AGENT_TOKENS)
 
     return web.json_response(checks, status=200 if critical_ok else 503)
 
@@ -377,7 +378,7 @@ async def main() -> None:
 
     # 50 MB ceiling applies to requests buffered via request.read().
     # The streaming path (request.content) bypasses this — see handle_proxy.
-    app = web.Application(client_max_size=50 * 1024 * 1024)
+    app = web.Application(client_max_size=50 * 1024 * 1024, middlewares=[auth_middleware])
     app["proxy"] = proxy  # shared with health handler
 
     # Coordinator routes and health endpoint before the catch-all proxy route.
@@ -387,9 +388,9 @@ async def main() -> None:
 
     runner = web.AppRunner(app)
     await runner.setup()
-    # Bind to localhost by default — the coordinator API is not authenticated and
-    # must not be reachable from the network. Set PROXY_BIND=0.0.0.0 to opt into
-    # all-interfaces binding (e.g. inside a Docker network or VM).
+    # Bind to localhost by default. Set PROXY_BIND=0.0.0.0 to opt into
+    # all-interfaces binding — only safe over an encrypted overlay network
+    # (Tailscale, WireGuard) or behind TLS. Bearer tokens are plaintext over HTTP.
     bind_host = os.environ.get("PROXY_BIND", "127.0.0.1")
     site = web.TCPSite(runner, bind_host, PORT)
     await site.start()
