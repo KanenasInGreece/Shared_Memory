@@ -32,8 +32,8 @@ VERSION = "0.3.5"
 # Three-tier dotenv search — all three sources are tried so that a variable
 # absent from the first file (e.g. AGENT_TOKEN missing from the gateway .env)
 # is still found in the next. override=False means the first definition wins.
-#   1. find_dotenv() — searches parent dirs from CWD (picks up project .env)
-#   2. script-adjacent .env — skill dir installs (e.g. ~/.claude/skills/shared-memory/.env)
+#   1. find_dotenv() — searches parent dirs from script location
+#   2. script-adjacent .env — skill dir installs (e.g. ~/.grok/skills/shared-memory/.env)
 #   3. ~/.config/shared-memory/client.env — universal per-machine fallback
 try:
     from dotenv import find_dotenv, load_dotenv
@@ -45,7 +45,26 @@ try:
         if _env and os.path.exists(_env):
             load_dotenv(_env, override=False)
 except ImportError:
-    pass
+    # python-dotenv not installed — manually parse the two most important paths
+    # so auth tokens are found even when running bare `python` or `uv run --with httpx`
+    def _read_env_file(path: str) -> None:
+        try:
+            with open(path) as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if not _line or _line.startswith("#") or "=" not in _line:
+                        continue
+                    _k, _, _v = _line.partition("=")
+                    _k = _k.strip()
+                    if _k and _k not in os.environ:   # first definition wins
+                        os.environ[_k] = _v.strip()
+        except OSError:
+            pass
+    # skill-adjacent .env (one dir above scripts/ — covers ~/.grok/skills/shared-memory/.env etc.)
+    _read_env_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+    _read_env_file(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+    # universal fallback
+    _read_env_file(os.path.expanduser("~/.config/shared-memory/client.env"))
 
 COORDINATOR_BASE = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
 AGENT_ID         = os.environ.get("AGENT_ID", "memory_bridge")

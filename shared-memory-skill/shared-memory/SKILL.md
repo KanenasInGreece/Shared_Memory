@@ -25,7 +25,7 @@ Search the shared memory with semantic similarity, reranking, and Neo4j relation
 - **Trigger:** Before working on a topic that may have prior context — search first.
 - **CLI:**
   ```
-  uv run --with httpx python scripts/memory_bridge.py search "<query>" 5
+  uv run --with httpx --with python-dotenv python scripts/memory_bridge.py search "<query>" 5
   ```
 - **MCP (LM Studio):** Use the `hybrid_search_and_rerank` tool from the `rag-orchestrator` MCP server.
 
@@ -43,7 +43,7 @@ Commit findings, decisions, and technical facts to long-term shared memory.
   Set `source` to the **loaded model name** (e.g. `"qwen3-27b"`, `"llama3-70b"`) — not a generic label.
 - **CLI (other agents):**
   ```
-  uv run --with httpx python scripts/memory_bridge.py save "<content>" \
+  uv run --with httpx --with python-dotenv python scripts/memory_bridge.py save "<content>" \
     '{"source":"<agent_name>","entities":["EntityA","EntityB"]}'
   ```
 
@@ -67,15 +67,15 @@ Query the knowledge graph for structural and provenance context.
 **Named shortcuts** (no Cypher required):
 - **Trigger:** Run `why-to-check` before starting work on any area with prior decisions.
   ```
-  uv run --with httpx python scripts/memory_bridge.py query why-to-check --title "outbox"
-  uv run --with httpx python scripts/memory_bridge.py query who-decided --project shared_memory
-  uv run --with httpx python scripts/memory_bridge.py query retrospectives --rating good
-  uv run --with httpx python scripts/memory_bridge.py query agent-decisions --assisted-by claude
+  uv run --with httpx --with python-dotenv python scripts/memory_bridge.py query why-to-check --title "outbox"
+  uv run --with httpx --with python-dotenv python scripts/memory_bridge.py query who-decided --project shared_memory
+  uv run --with httpx --with python-dotenv python scripts/memory_bridge.py query retrospectives --rating good
+  uv run --with httpx --with python-dotenv python scripts/memory_bridge.py query agent-decisions --assisted-by claude
   ```
 
 **Raw Cypher** (multi-hop paths, cross-entity queries, anything the shortcuts don't cover):
   ```
-  uv run --with httpx python scripts/memory_bridge.py graph "<cypher_query>"
+  uv run --with httpx --with python-dotenv python scripts/memory_bridge.py graph "<cypher_query>"
   ```
   Read-only enforced: `CREATE`, `DELETE`, `DETACH DELETE`, `SET`, `MERGE`, `CALL`, `LOAD CSV`, `DROP` are blocked.
 
@@ -84,7 +84,7 @@ Record architectural or design decisions with full PROV-O provenance — who dec
 - **Trigger:** When a significant architectural, design, or process decision is made.
 - **CLI shortcut (Phase B — recommended):**
   ```
-  uv run --with httpx python scripts/memory_bridge.py save_decision \
+  uv run --with httpx --with python-dotenv python scripts/memory_bridge.py save_decision \
     --title "Add consolidation daemon" \
     --decided-by "Xenofon" \
     --project "shared_memory" \
@@ -106,7 +106,7 @@ Record architectural or design decisions with full PROV-O provenance — who dec
 
 **Query decisions later:**
 ```
-uv run --with httpx python scripts/memory_bridge.py graph \
+uv run --with httpx --with python-dotenv python scripts/memory_bridge.py graph \
   "MATCH (h:Human)-[:WAS_ATTRIBUTED_TO]-(d:Decision)-[:PROJECT_OF]->(p:Project)
    OPTIONAL MATCH (d)-[:WAS_ASSISTED_BY]->(ai:AIAgent)
    WHERE toLower(d.title) CONTAINS 'consolidat'
@@ -119,7 +119,7 @@ After a decision has been acted on, close the Why-To loop with `save_retrospecti
 
 **CLI (Claude Code, Gemini CLI, Codex CLI):**
 ```
-uv run --with httpx python scripts/memory_bridge.py save_retrospective \
+uv run --with httpx --with python-dotenv python scripts/memory_bridge.py save_retrospective \
   --pg-id 42 \
   --rating "high" \
   --notes "Outbox-as-WAL held under concurrent load; no orphaned rows in 30-day prod run." \
@@ -133,7 +133,7 @@ uv run --with httpx python scripts/memory_bridge.py save_retrospective \
 
 **Why-To loop query (raw Cypher; Phase D will add a named shortcut):**
 ```
-uv run --with httpx python scripts/memory_bridge.py graph \
+uv run --with httpx --with python-dotenv python scripts/memory_bridge.py graph \
   "MATCH (d:Decision)-[o:HAD_OUTCOME]->()
    WHERE toLower(d.title) CONTAINS 'outbox'
    RETURN d.title, o.rating, o.notes, o.date ORDER BY o.date DESC LIMIT 1"
