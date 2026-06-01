@@ -29,6 +29,7 @@ A unified semantic and relational memory layer built from first principles to su
 8. [The Hive-Mind Gateway: Why It Exists](#8-the-hive-mind-gateway-why-it-exists)
 9. [Starting the Full Stack](#9-starting-the-full-stack)
 10. [Agent Integration: First-Time Setup](#10-agent-integration-first-time-setup)
+    - [10a. Remote Clients: SSH Tunnel Access](#10a-remote-clients-ssh-tunnel-access)
 11. [Agent Access: CLI and MCP](#11-agent-access-cli-and-mcp)
     - [11a. Complete Cycle: End-to-End Workflow with Cross-Agent Examples](#11a-complete-cycle-end-to-end-workflow-with-cross-agent-examples)
 12. [The Save Path — From Artifact to Memory](#12-the-save-path--from-artifact-to-memory)
@@ -748,7 +749,9 @@ Before importing, fill in the `[YOUR ...]` placeholder fields at the top (name, 
 
 Start LM Studio. The `rag-orchestrator` MCP server should appear in the tool panel. If it shows an error, confirm the full stack is running (gateway on :8888, databases up) and that there are no remaining `YOUR_*` placeholders in `mcp.json`.
 
-### Remote Clients (lightweight machines via SSH tunnel)
+---
+
+## 10a. Remote Clients: SSH Tunnel Access
 
 A remote client is any machine that runs an AI CLI tool (Antigravity CLI, Claude Code, Grok, etc.) but **cannot run the infrastructure** — no Docker, no Postgres, no Neo4j, no BGE models. Only `memory_bridge.py` runs on the remote machine; all storage and compute stay on the host.
 
@@ -757,16 +760,48 @@ A remote client is any machine that runs an AI CLI tool (Antigravity CLI, Claude
 - SSH access to the machine running the gateway
 - A distinct token registered in the gateway's `AGENT_TOKENS`
 
-**Step 1 — Open an SSH tunnel to the gateway**
+### Step 1 — Register a token for this remote agent
+
+On the **host machine**, add a new named entry to `AGENT_TOKENS` in the gateway `.env`. Use a descriptive name that identifies both the tool and the machine (e.g. `laptop-agy`, `chromebook-agy`):
 
 ```bash
-# Keep this running in a terminal (or add to ~/.ssh/config as a persistent tunnel):
+# Generate a token for the remote agent
+python3 -c "import secrets; print('tok_' + secrets.token_urlsafe(24))"
+
+# Add to the gateway .env — append to the existing AGENT_TOKENS line:
+# AGENT_TOKENS=claude:tok_...,gemini:tok_...,laptop-agy:tok_<generated>
+```
+
+**Restart the gateway** and confirm the new agent appears in the startup log:
+```
+INFO  coordinator auth enabled — N agent(s): ..., laptop-agy, ...
+```
+
+> **Identity matters:** the token name is the agent's identity. The coordinator stamps it as `source` on every saved artifact — it is how the knowledge graph distinguishes which machine contributed which fact. Never share tokens across agents or machines.
+
+### Step 2 — Open an SSH tunnel to the gateway
+
+```bash
+# Keep this running in a terminal while using shared memory:
 ssh -N -L 8888:localhost:8888 user@your-gateway-host
 ```
 
-This maps `localhost:8888` on the remote machine to port `8888` on the gateway host. `memory_bridge.py` defaults to `http://localhost:8888` and will reach the gateway through the tunnel.
+This maps `localhost:8888` on the remote machine to port `8888` on the gateway host. `memory_bridge.py` defaults to `http://localhost:8888` and reaches the gateway transparently through the tunnel.
 
-**Step 2 — Install the skill**
+**Persistent tunnel via `~/.ssh/config`** (recommended — survives shell restarts):
+
+```
+Host gateway-tunnel
+    HostName your-gateway-host
+    User your-user
+    LocalForward 8888 localhost:8888
+    ServerAliveInterval 60
+    ServerAliveCountMax 3
+```
+
+Then `ssh -N gateway-tunnel` or set `ExitOnForwardFailure yes` and add it to your session startup.
+
+### Step 3 — Install the skill
 
 ```bash
 mkdir -p ~/.gemini/skills/shared-memory/scripts
@@ -778,36 +813,16 @@ curl -fsSL https://raw.githubusercontent.com/KanenasInGreece/Shared_Memory/main/
   -o ~/.gemini/skills/shared-memory/SKILL.md
 ```
 
-**Step 3 — Register a token for this remote agent**
-
-On the **host machine**, add a new named entry to `AGENT_TOKENS` in the gateway `.env`:
+### Step 4 — Configure the remote `.env`
 
 ```bash
-# Generate a token for the remote agent
-python3 -c "import secrets; print('tok_' + secrets.token_urlsafe(24))"
-
-# Add to the gateway .env (append to existing AGENT_TOKENS line):
-# my-laptop-agy:tok_<generated>
-```
-
-Then **restart the gateway** and confirm the new agent appears in the startup log:
-```
-INFO  coordinator auth enabled — N agent(s): ..., my-laptop-agy, ...
-```
-
-**Step 4 — Configure the remote `.env`**
-
-On the **remote machine**:
-
-```bash
-# Use a name that identifies this specific remote instance
 printf 'AGENT_TOKEN=tok_<your-token>\nCOORDINATOR_URL=http://localhost:8888\n' \
   > ~/.gemini/skills/shared-memory/.env
 ```
 
-> **Identity matters:** each remote agent instance must have its own token and a descriptive name (e.g. `laptop-agy`, `chromebook-agy`). The coordinator stamps this name as `source` on every saved artifact — it is how the knowledge graph distinguishes which machine contributed which fact.
+`COORDINATOR_URL` defaults to `http://localhost:8888` — correct for SSH-tunnel clients since the tunnel maps the remote gateway port to local. Set it explicitly only if your tunnel uses a different local port.
 
-**Step 5 — Verify**
+### Step 5 — Verify
 
 ```bash
 uv run --with httpx \
@@ -818,7 +833,11 @@ uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py search "test" 3
 ```
 
-A valid response (even empty results) confirms the tunnel, token, and `.env` are all working.
+A valid response (even empty results) confirms the tunnel, token, and `.env` are all working correctly.
+
+### Updating the skill
+
+When a new version is released, re-run the two `curl` commands from Step 3 to pull the latest `memory_bridge.py` and `SKILL.md`. No other files are needed on the remote machine.
 
 ---
 
