@@ -302,7 +302,7 @@ Args: {"pg_id": 43, "rating": "high", "notes": "No deadlocks in 30-day test.", "
 
 ---
 
-## Authentication Setup (v0.3.5)
+## Authentication Setup (v0.3.6)
 
 All coordinator routes require `Authorization: Bearer <token>`. One-time setup:
 
@@ -389,8 +389,8 @@ After changing `AGENT_TOKEN` in `mcp.json`, restart LM Studio completely.
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.3.5", "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.3.6", "tool": "shared-memory-framework"}`
 - **Schema:** Neo4j labels, relationship types, Postgres tables — [schema.md](Documentation/schema.md)
 - **Embedding mandate:** All calls route through the gateway (:8888). Never call port 8070 (BGE-M3) or 8071 (BGE-Reranker) directly — the gateway enforces 1024-dim consistency across all agents.
 - **Ontology:** All Neo4j labels and relationship types are configurable in `ontology.yaml` at the repo root.
-- **Security posture:** Read-only Cypher guard active. `Authorization: Bearer <token>` auth enforced (v0.3.5). `starlette>=1.0.1` floor enforced (BadHost CVE-2026-48710).
+- **Security posture:** Read-only Cypher guard active. `Authorization: Bearer <token>` auth enforced (v0.3.6). `starlette>=1.0.1` floor enforced (BadHost CVE-2026-48710).

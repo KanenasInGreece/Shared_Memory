@@ -9,6 +9,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.3.6] — 2026-06-01
+
+### Fixed
+
+- **Relative path in SKILL.md broke remote installs (Bug 1 — script not found):** All 20 CLI commands used bare `scripts/memory_bridge.py`. Skill runners execute from the user's project directory, not the skill directory — the script was silently not found on any non-local install. All commands now use the canonical absolute path `~/.gemini/skills/shared-memory/scripts/memory_bridge.py` with an AI-instruction block providing the per-agent prefix substitution table.
+- **Relative path broke token loading (Bug 2 — same root cause):** `memory_bridge.py` resolves `.env` files via `os.path.abspath(__file__)`. With a relative invocation path, `__file__` resolved against CWD, pointing `.env` lookups at the wrong directory and silently dropping the agent token. Fixed by the same absolute-path change.
+
+### Changed
+
+- **Removed `client.env` universal token fallback:** `~/.config/shared-memory/client.env` removed from `memory_bridge.py` (both branches), `generate_tokens.py`, SKILL.md, `.env.example`, and README. Agent tokens are identity — the coordinator stamps verified `source` on every saved artifact. A shared fallback token collapses all agent attribution in the knowledge graph. Per-agent skill `.env` is now the only supported method.
+- **Antigravity CLI (`agy`) added as primary replacement for Gemini CLI.** Both tools share `~/.gemini/skills/`. Gemini CLI marked legacy in SKILL.md and README. `chromebook-antigravity` token documented for remote instances of `agy`.
+
+---
+
 ## [0.3.5-post] — 2026-05-29
 
 ### Fixed
