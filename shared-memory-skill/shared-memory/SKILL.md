@@ -15,8 +15,23 @@ This skill bridges the Shared Memory Framework — a three-tier semantic and rel
 | Claude Code | `/shared-memory` | `~/.claude/skills/shared-memory/` |
 | Grok | `/shared-memory` | `~/.grok/skills/shared-memory/` |
 | Codex CLI | `$shared-memory` | `~/.codex/skills/shared-memory/` |
-| Gemini CLI | `/activate shared-memory` | `~/.gemini/skills/shared-memory/` |
+| Antigravity CLI (`agy`) | `/activate shared-memory` | `~/.gemini/skills/shared-memory/` |
+| Gemini CLI *(legacy)* | `/activate shared-memory` | `~/.gemini/skills/shared-memory/` |
 | LM Studio | MCP `rag-orchestrator` | `vector-skill.py` via `mcp.json` |
+
+---
+
+> **AI instruction — use absolute paths for every CLI command.** Skill runners execute commands from the user's project directory, not the skill directory, so a bare `scripts/memory_bridge.py` fails with "No such file or directory." Commands below use the Gemini CLI path as the canonical example — **substitute `~/.gemini` with the correct prefix for this agent:**
+>
+> | Agent | Replace `~/.gemini` with |
+> |---|---|
+> | Claude Code | `~/.claude` |
+> | Grok | `~/.grok` |
+> | Codex CLI | `~/.codex` |
+>
+> Example for Claude Code: `python ~/.claude/skills/shared-memory/scripts/memory_bridge.py search "..."`.
+
+---
 
 ## Core Tasks
 
@@ -25,7 +40,7 @@ Search the shared memory with semantic similarity, reranking, and Neo4j relation
 - **Trigger:** Before working on a topic that may have prior context — search first.
 - **CLI:**
   ```
-  uv run --with httpx --with python-dotenv python scripts/memory_bridge.py search "<query>" 5
+  uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py search "<query>" 5
   ```
 - **MCP (LM Studio):** Use the `hybrid_search_and_rerank` tool from the `rag-orchestrator` MCP server.
 
@@ -43,7 +58,7 @@ Commit findings, decisions, and technical facts to long-term shared memory.
   Set `source` to the **loaded model name** (e.g. `"qwen3-27b"`, `"llama3-70b"`) — not a generic label.
 - **CLI (other agents):**
   ```
-  uv run --with httpx --with python-dotenv python scripts/memory_bridge.py save "<content>" \
+  uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py save "<content>" \
     '{"source":"<agent_name>","entities":["EntityA","EntityB"]}'
   ```
 
@@ -67,15 +82,15 @@ Query the knowledge graph for structural and provenance context.
 **Named shortcuts** (no Cypher required):
 - **Trigger:** Run `why-to-check` before starting work on any area with prior decisions.
   ```
-  uv run --with httpx --with python-dotenv python scripts/memory_bridge.py query why-to-check --title "outbox"
-  uv run --with httpx --with python-dotenv python scripts/memory_bridge.py query who-decided --project shared_memory
-  uv run --with httpx --with python-dotenv python scripts/memory_bridge.py query retrospectives --rating good
-  uv run --with httpx --with python-dotenv python scripts/memory_bridge.py query agent-decisions --assisted-by claude
+  uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query why-to-check --title "outbox"
+  uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query who-decided --project shared_memory
+  uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query retrospectives --rating good
+  uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query agent-decisions --assisted-by claude
   ```
 
 **Raw Cypher** (multi-hop paths, cross-entity queries, anything the shortcuts don't cover):
   ```
-  uv run --with httpx --with python-dotenv python scripts/memory_bridge.py graph "<cypher_query>"
+  uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py graph "<cypher_query>"
   ```
   Read-only enforced: `CREATE`, `DELETE`, `DETACH DELETE`, `SET`, `MERGE`, `CALL`, `LOAD CSV`, `DROP` are blocked.
 
@@ -84,7 +99,7 @@ Record architectural or design decisions with full PROV-O provenance — who dec
 - **Trigger:** When a significant architectural, design, or process decision is made.
 - **CLI shortcut (Phase B — recommended):**
   ```
-  uv run --with httpx --with python-dotenv python scripts/memory_bridge.py save_decision \
+  uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py save_decision \
     --title "Add consolidation daemon" \
     --decided-by "Xenofon" \
     --project "shared_memory" \
@@ -106,7 +121,7 @@ Record architectural or design decisions with full PROV-O provenance — who dec
 
 **Query decisions later:**
 ```
-uv run --with httpx --with python-dotenv python scripts/memory_bridge.py graph \
+uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py graph \
   "MATCH (h:Human)-[:WAS_ATTRIBUTED_TO]-(d:Decision)-[:PROJECT_OF]->(p:Project)
    OPTIONAL MATCH (d)-[:WAS_ASSISTED_BY]->(ai:AIAgent)
    WHERE toLower(d.title) CONTAINS 'consolidat'
@@ -119,7 +134,7 @@ After a decision has been acted on, close the Why-To loop with `save_retrospecti
 
 **CLI (Claude Code, Gemini CLI, Codex CLI):**
 ```
-uv run --with httpx --with python-dotenv python scripts/memory_bridge.py save_retrospective \
+uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py save_retrospective \
   --pg-id 42 \
   --rating "high" \
   --notes "Outbox-as-WAL held under concurrent load; no orphaned rows in 30-day prod run." \
@@ -133,7 +148,7 @@ uv run --with httpx --with python-dotenv python scripts/memory_bridge.py save_re
 
 **Why-To loop query (raw Cypher; Phase D will add a named shortcut):**
 ```
-uv run --with httpx --with python-dotenv python scripts/memory_bridge.py graph \
+uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py graph \
   "MATCH (d:Decision)-[o:HAD_OUTCOME]->()
    WHERE toLower(d.title) CONTAINS 'outbox'
    RETURN d.title, o.rating, o.notes, o.date ORDER BY o.date DESC LIMIT 1"
@@ -147,7 +162,7 @@ This section is a concrete runbook for the full memory cycle. Copy-paste each bl
 
 ```bash
 uv run --with httpx \
-  python scripts/memory_bridge.py save \
+  python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py save \
   "The coordinator acquires per-entity asyncio.Lock before each write. Locks are sorted by entity name to prevent deadlocks across concurrent saves." \
   '{"source":"claude_code","entities":["coordinator","OutboxPattern","SharedMemory"]}'
 # → {"status":"success","pg_id":42,"neo4j":"pending","message":"Artifact stored with ID 42."}
@@ -159,7 +174,7 @@ uv run --with httpx \
 
 ```bash
 uv run --with httpx \
-  python scripts/memory_bridge.py save_decision \
+  python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py save_decision \
   --title "Sort entity locks by name to prevent deadlocks" \
   --decided-by "Xenofon" \
   --project "shared-memory" \
@@ -179,7 +194,7 @@ From Gemini CLI (or any other agent), with no prior context about this decision:
 
 ```bash
 uv run --with httpx \
-  python scripts/memory_bridge.py search \
+  python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py search \
   "how does the coordinator prevent deadlocks with concurrent writes" 5
 ```
 
@@ -215,17 +230,17 @@ The first result is the **Tier-3 community summary** — the synthesised narrati
 ```bash
 # Who decided this, and was any AI involved?
 uv run --with httpx \
-  python scripts/memory_bridge.py query who-decided \
+  python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query who-decided \
   --title "deadlock" --project "shared-memory"
 
 # What decisions has Claude Code assisted with?
 uv run --with httpx \
-  python scripts/memory_bridge.py query agent-decisions \
+  python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query agent-decisions \
   --assisted-by "claude-sonnet-4-6"
 
 # Before touching coordinator lock logic: check prior outcomes
 uv run --with httpx \
-  python scripts/memory_bridge.py query why-to-check \
+  python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query why-to-check \
   --title "lock"
 # → No retrospective yet. Record one after the next production test.
 ```
@@ -236,7 +251,7 @@ After 3 weeks running multi-agent concurrent writes:
 
 ```bash
 uv run --with httpx \
-  python scripts/memory_bridge.py save_retrospective \
+  python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py save_retrospective \
   --pg-id 43 \
   --rating "high" \
   --notes "No deadlocks observed across 30-day multi-agent test. 6-agent concurrent writes at 50 req/s — zero lock contention errors. Sorted acquisition order held." \
@@ -248,7 +263,7 @@ Now the Why-To check is informative for any future agent:
 
 ```bash
 uv run --with httpx \
-  python scripts/memory_bridge.py query why-to-check --title "lock"
+  python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query why-to-check --title "lock"
 # → [{d.title: "Sort entity locks by name...",
 #     o.rating: "high",
 #     o.notes: "No deadlocks observed...",
@@ -302,22 +317,19 @@ echo "AGENT_TOKENS=claude:tok_abc...,gemini:tok_def...,lm_studio:tok_ghi..." >> 
 # 3a. Claude Code — add AGENT_TOKEN to the skill .env
 echo "AGENT_TOKEN=tok_abc..." >> ~/.claude/skills/shared-memory/.env
 
-# 3b. Gemini CLI — add to the skill .env
+# 3b. Gemini CLI / Antigravity — add AGENT_TOKEN to the skill .env
 echo "AGENT_TOKEN=tok_def..." >> ~/.gemini/skills/shared-memory/.env
 
-# 3c. Universal fallback — works for any agent or install path
-mkdir -p ~/.config/shared-memory
-echo "AGENT_TOKEN=tok_abc..." > ~/.config/shared-memory/client.env
-
-# 3d. LM Studio — add to mcp.json env block for rag-orchestrator, then restart LM Studio
+# 3c. LM Studio — add to mcp.json env block for rag-orchestrator, then restart LM Studio
 
 # 4. Restart the gateway (CLI agents pick up AGENT_TOKEN on next invocation)
 ```
 
-The dotenv search order for CLI agents:
-1. `find_dotenv()` — searches parent directories from CWD
-2. Script-adjacent `.env` — for skill dir installs
-3. `~/.config/shared-memory/client.env` — universal per-machine fallback
+The dotenv search order for CLI agents (first match wins):
+1. `find_dotenv()` — searches parent directories from the script's location (requires absolute-path invocation — see path note above)
+2. `~/.{agent}/skills/shared-memory/.env` — found via parent-dir walk from `scripts/` (also requires absolute-path invocation)
+
+Each token maps to a verified agent identity. All agents on a multi-agent machine must use separate skill `.env` files with distinct tokens — tokens must never be shared across agents.
 
 **Verify auth is active:**
 ```bash
@@ -377,7 +389,7 @@ After changing `AGENT_TOKEN` in `mcp.json`, restart LM Studio completely.
 
 ## Reference
 
-- **Version:** `python scripts/memory_bridge.py --version` → `{"version": "0.3.5", "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.3.5", "tool": "shared-memory-framework"}`
 - **Schema:** Neo4j labels, relationship types, Postgres tables — [schema.md](Documentation/schema.md)
 - **Embedding mandate:** All calls route through the gateway (:8888). Never call port 8070 (BGE-M3) or 8071 (BGE-Reranker) directly — the gateway enforces 1024-dim consistency across all agents.
 - **Ontology:** All Neo4j labels and relationship types are configurable in `ontology.yaml` at the repo root.

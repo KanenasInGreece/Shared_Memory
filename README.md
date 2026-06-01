@@ -576,16 +576,12 @@ echo 'AGENT_TOKENS=claude:tok_abc123...,gemini:tok_def456...,lm_studio:tok_ghi78
 # Step 3a — Claude Code: add AGENT_TOKEN to the skill .env
 echo 'AGENT_TOKEN=tok_abc123...' >> ~/.claude/skills/shared-memory/.env
 
-# Step 3b — Gemini CLI: add to the skill .env
+# Step 3b — Gemini CLI / Antigravity: add to the skill .env
 echo 'AGENT_TOKEN=tok_def456...' >> ~/.gemini/skills/shared-memory/.env
 
 # Step 3c — LM Studio: add to mcp.json env block (see §16)
 # "env": { "AGENT_TOKEN": "tok_ghi789..." }
 # Then restart LM Studio completely.
-
-# Step 3d — Universal fallback (any agent, any install path)
-mkdir -p ~/.config/shared-memory
-echo 'AGENT_TOKEN=tok_abc123...' > ~/.config/shared-memory/client.env
 
 # Step 4 — restart the gateway to load AGENT_TOKENS
 ```
@@ -595,12 +591,15 @@ echo 'AGENT_TOKEN=tok_abc123...' > ~/.config/shared-memory/client.env
 INFO  coordinator auth enabled — 6 agent(s): antigravity, claude, codex, gemini, grok, lm_studio
 ```
 
-**Token search order** — `memory_bridge.py` finds `AGENT_TOKEN` via three paths tried in order (first match wins):
+**Token search order** — `memory_bridge.py` finds `AGENT_TOKEN` via two paths tried in order (first match wins):
 1. `python-dotenv`'s `find_dotenv()` — searches parent directories from the script's location
-2. `.env` in the same directory as `memory_bridge.py` — skill root installs (e.g. `~/.grok/skills/shared-memory/.env`)
-3. `~/.config/shared-memory/client.env` — universal per-machine fallback
+2. `~/.{agent}/skills/shared-memory/.env` — found via parent-dir walk from the `scripts/` directory
 
-If `python-dotenv` is not installed (e.g. bare `uv run --with httpx python ...`), a built-in plain-Python parser reads paths 2 and 3 directly — auth works regardless.
+Both paths require `memory_bridge.py` to be invoked by absolute path so `__file__` resolves to the skill directory. See the skill's path note for the correct invocation form.
+
+If `python-dotenv` is not installed (e.g. bare `uv run --with httpx python ...`), a built-in plain-Python parser reads the same paths directly — auth works regardless.
+
+Each token maps to a verified agent identity. Never share tokens across agents on a multi-agent machine.
 
 **Backward compatible:** If `AGENT_TOKENS` is unset, the coordinator accepts all requests (existing installs are unaffected until you add the variable).
 
@@ -677,9 +676,9 @@ Codex CLI also supports **implicit invocation**: if the description in SKILL.md'
 
 > **AGENTS.md:** Codex CLI reads `AGENTS.md` at the project root before each session (their equivalent of `CLAUDE.md`). This repo provides `AGENTS.md` alongside `AGENT.md` — both contain the same architectural guidance.
 
-### Gemini CLI
+### Antigravity CLI (and Gemini CLI)
 
-Gemini CLI loads skills from `~/.gemini/skills/`. Drop the `shared-memory` skill directory there:
+**Antigravity CLI** (`agy`) is the current CLI for this skill, replacing Gemini CLI. Both tools load skills from `~/.gemini/skills/` — the same install directory works for both.
 
 ```bash
 mkdir -p ~/.gemini/skills
@@ -691,11 +690,13 @@ cp -r shared-memory-skill/shared-memory ~/.gemini/skills/shared-memory
 ln -s /path/to/Shared_Memory/shared-memory-skill/shared-memory ~/.gemini/skills/shared-memory
 ```
 
-Activate in any Gemini CLI session:
+Activate in any Antigravity CLI session:
 
 ```
 /activate shared-memory
 ```
+
+> **New clients:** install the skill to `~/.gemini/skills/shared-memory/`, place your `AGENT_TOKEN` in `~/.gemini/skills/shared-memory/.env`, and invoke `memory_bridge.py` by its absolute path: `~/.gemini/skills/shared-memory/scripts/memory_bridge.py`. See the [Path Setup note](#path-setup) in SKILL.md for the substitution table.
 
 ### LM Studio
 
@@ -756,7 +757,8 @@ Start LM Studio. The `rag-orchestrator` MCP server should appear in the tool pan
 | **Claude Code** | CLI (skill `/shared-memory`) | `~/.claude/skills/shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
 | **Codex CLI** | CLI (skill `$shared-memory`) | `~/.codex/skills/shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
 | **Grok** | CLI (skill `/shared-memory`) | `~/.grok/skills/shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
-| **Gemini CLI** | CLI (skill `/activate shared-memory`) | `~/.gemini/skills/shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
+| **Antigravity CLI** (`agy`) | CLI (skill `/activate shared-memory`) | `~/.gemini/skills/shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
+| **Gemini CLI** *(legacy)* | CLI (skill `/activate shared-memory`) | `~/.gemini/skills/shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
 | **LM Studio** | MCP (FastMCP) | `vector-skill.py` → `rag-orchestrator` in `mcp.json` | via coordinator → `pg_notify` |
 | **Any HTTP client** | REST | `POST http://localhost:8888/memory/save\|search\|graph` | via coordinator → `pg_notify` |
 
@@ -1337,7 +1339,7 @@ Web-retrieved content enters the same ingestion pipeline as internally authored 
 
 All coordinator routes require `Authorization: Bearer <token>`. The gateway verifies the token against the `AGENT_TOKENS` registry and stamps the verified agent identity onto every saved artifact — `agent_id` from the request body is no longer trusted.
 
-Setup: run `uv run python shared-memory/scripts/generate_tokens.py`, add the `AGENT_TOKENS` line to the gateway `.env`, and add `AGENT_TOKEN=<your-token>` to each agent's skill `.env` (or `~/.config/shared-memory/client.env` as a universal fallback). LM Studio requires a full restart after any `AGENT_TOKEN` change. See `SECURITY.md` for the full rollout procedure and token rotation instructions.
+Setup: run `uv run python shared-memory/scripts/generate_tokens.py`, add the `AGENT_TOKENS` line to the gateway `.env`, and add the matching `AGENT_TOKEN` to each agent's skill `.env` (e.g. `~/.gemini/skills/shared-memory/.env`). Each agent must use its own distinct token — tokens must never be shared across agents. LM Studio requires a full restart after any `AGENT_TOKEN` change. See `SECURITY.md` for the full rollout procedure and token rotation instructions.
 
 ### Entity Resolution
 
