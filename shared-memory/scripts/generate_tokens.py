@@ -6,8 +6,9 @@ Run once from the repo root:
     uv run python shared-memory/scripts/generate_tokens.py
 
 1. Add the AGENT_TOKENS line to the gateway .env
-2. Copy the matching AGENT_TOKEN line to each agent's skill .env
-   (or to ~/.config/shared-memory/client.env as a universal fallback)
+2. Copy each AGENT_TOKEN line to the matching agent's skill .env
+   (e.g. ~/.gemini/skills/shared-memory/.env for Gemini CLI)
+   Each agent must use its own distinct token — never share tokens across agents.
 """
 import secrets
 
@@ -21,6 +22,4 @@ print("=== Per-agent .env — copy the matching AGENT_TOKEN line ===")
 for a, t in tokens.items():
     print(f"  {a:15}  AGENT_TOKEN={t}")
 print()
-print("=== Universal fallback (~/.config/shared-memory/client.env) ===")
-print("# Create this file and add ONE line for the agent on this machine:")
-print("# AGENT_TOKEN=<paste the matching value from above>")
+print("Each agent must use its own distinct token — never share tokens across agents.")
