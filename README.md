@@ -748,6 +748,78 @@ Before importing, fill in the `[YOUR ...]` placeholder fields at the top (name, 
 
 Start LM Studio. The `rag-orchestrator` MCP server should appear in the tool panel. If it shows an error, confirm the full stack is running (gateway on :8888, databases up) and that there are no remaining `YOUR_*` placeholders in `mcp.json`.
 
+### Remote Clients (lightweight machines via SSH tunnel)
+
+A remote client is any machine that runs an AI CLI tool (Antigravity CLI, Claude Code, Grok, etc.) but **cannot run the infrastructure** — no Docker, no Postgres, no Neo4j, no BGE models. Only `memory_bridge.py` runs on the remote machine; all storage and compute stay on the host.
+
+**Requirements on the remote machine:**
+- `uv` — install with `curl -LsSf https://astral.sh/uv/install.sh | sh` (handles all Python dependencies automatically). Alternatively: `python3` + `pip install httpx python-dotenv` and replace `uv run --with httpx --with python-dotenv python` with `python3` in all commands.
+- SSH access to the machine running the gateway
+- A distinct token registered in the gateway's `AGENT_TOKENS`
+
+**Step 1 — Open an SSH tunnel to the gateway**
+
+```bash
+# Keep this running in a terminal (or add to ~/.ssh/config as a persistent tunnel):
+ssh -N -L 8888:localhost:8888 user@your-gateway-host
+```
+
+This maps `localhost:8888` on the remote machine to port `8888` on the gateway host. `memory_bridge.py` defaults to `http://localhost:8888` and will reach the gateway through the tunnel.
+
+**Step 2 — Install the skill**
+
+```bash
+mkdir -p ~/.gemini/skills/shared-memory/scripts
+
+curl -fsSL https://raw.githubusercontent.com/KanenasInGreece/Shared_Memory/main/shared-memory/scripts/memory_bridge.py \
+  -o ~/.gemini/skills/shared-memory/scripts/memory_bridge.py
+
+curl -fsSL https://raw.githubusercontent.com/KanenasInGreece/Shared_Memory/main/shared-memory-skill/shared-memory/SKILL.md \
+  -o ~/.gemini/skills/shared-memory/SKILL.md
+```
+
+**Step 3 — Register a token for this remote agent**
+
+On the **host machine**, add a new named entry to `AGENT_TOKENS` in the gateway `.env`:
+
+```bash
+# Generate a token for the remote agent
+python3 -c "import secrets; print('tok_' + secrets.token_urlsafe(24))"
+
+# Add to the gateway .env (append to existing AGENT_TOKENS line):
+# my-laptop-agy:tok_<generated>
+```
+
+Then **restart the gateway** and confirm the new agent appears in the startup log:
+```
+INFO  coordinator auth enabled — N agent(s): ..., my-laptop-agy, ...
+```
+
+**Step 4 — Configure the remote `.env`**
+
+On the **remote machine**:
+
+```bash
+# Use a name that identifies this specific remote instance
+printf 'AGENT_TOKEN=tok_<your-token>\nCOORDINATOR_URL=http://localhost:8888\n' \
+  > ~/.gemini/skills/shared-memory/.env
+```
+
+> **Identity matters:** each remote agent instance must have its own token and a descriptive name (e.g. `laptop-agy`, `chromebook-agy`). The coordinator stamps this name as `source` on every saved artifact — it is how the knowledge graph distinguishes which machine contributed which fact.
+
+**Step 5 — Verify**
+
+```bash
+uv run --with httpx \
+  python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version
+# → {"version": "0.3.6", "tool": "shared-memory-framework"}
+
+uv run --with httpx \
+  python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py search "test" 3
+```
+
+A valid response (even empty results) confirms the tunnel, token, and `.env` are all working.
+
 ---
 
 ## 11. Agent Access: CLI and MCP
