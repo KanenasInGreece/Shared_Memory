@@ -256,6 +256,50 @@ Run after the post-release fixes above were applied. Zero confirmed findings abo
 
 ---
 
+---
+
+## Security Audit — v0.4.0 (2026-06-04)
+
+Run during the REM/NREM release. Covered: `rem_loop.py` (new), modified `coordinator.py`,
+`consolidation_loop.py`, `hive_mind_proxy.py`, `ontology.py`, migration 006.
+
+### Confirmed findings (all fixed before release)
+
+**A2 — Coordinator search crashes with 500 if migration 006 not applied**
+
+`coordinator.py` `handle_search` added `WHERE NOT superseded` to the Tier 3 query.
+If an operator restarted the gateway after a `git pull` without running `apply.py`, the
+column was absent and every vector-backed search returned HTTP 500.
+
+**Fix:** Wrapped in try/except with a fallback to the unsupervised query and a warning log.
+
+**A3 — Structurally incompatible labels in REM's `_KNOWN_LABELS`**
+
+`_KNOWN_LABELS` included `CommunitySummary`, `ReasoningTrace`, `ReasoningStep`.
+The REM writer uses this set to build `MERGE (e:{label} {name: n})` patterns. Those
+three node types are keyed by `pg_id`, not `name` — a MERGE on `name` would create
+a phantom node structurally incompatible with the rest of the graph.
+
+The immediate risk was low because `_fetch_closed_entity_set` does not query those labels,
+so the registry would not normally contain them. Removed as a defence-in-depth fix.
+
+**Fix:** Removed `ONT.community_summary`, `ONT.reasoning_trace`, `ONT.reasoning_step`
+from `_KNOWN_LABELS`. The set now contains only labels whose identity key is `name`.
+
+### Candidates reviewed and excluded
+
+| Candidate | Verdict |
+|---|---|
+| Cypher injection via `label`/`rel_type` f-string interpolation in `rem_loop.py` | **Refuted** — labels and rel types pass through `ontology.py` `_validate()` regex at module load; only `^[A-Za-z_][A-Za-z0-9_]*$` identifiers reach any Cypher. |
+| Prompt injection via entity node names in LLM prompt | **Excluded by policy** — "Including user-controlled content in AI system prompts is not a vulnerability" (security review guidelines). |
+| `_daemon_env` full env passthrough exposes new secrets | **Not a new regression** — consolidation daemon already inherited the full env before v0.4.0. |
+| SQL injection in `_check_supersession` `UPDATE WHERE id = %s` | **Refuted** — `old_id` is a database-sourced integer, not user input; parameterised `%s` binding. |
+| `AUDIT_LOG_PATH` path traversal | **Below threshold** — requires write access to the `.env` file, implying full local system access. |
+
+**Audit cadence note:** Next scheduled review at v0.4.5 or on demand.
+
+---
+
 ## Supported Versions
 
 This project is in active development. Security fixes are applied to the latest commit on `main` only.

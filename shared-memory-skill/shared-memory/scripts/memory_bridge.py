@@ -27,26 +27,24 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.3.5"
+VERSION = "0.4.0"
 
-# Three-tier dotenv search — all three sources are tried so that a variable
-# absent from the first file (e.g. AGENT_TOKEN missing from the gateway .env)
-# is still found in the next. override=False means the first definition wins.
-#   1. find_dotenv() — searches parent dirs from script location
-#   2. script-adjacent .env — skill dir installs (e.g. ~/.grok/skills/shared-memory/.env)
-#   3. ~/.config/shared-memory/client.env — universal per-machine fallback
+# Two-source dotenv search — both sources tried; first definition wins.
+# Always invoke memory_bridge.py by absolute path so __file__ resolves
+# to the skill directory (e.g. ~/.gemini/skills/shared-memory/scripts/).
+#   1. find_dotenv() — searches parent dirs from the script's location
+#   2. script-adjacent .env — covers ~/.{agent}/skills/shared-memory/.env
 try:
     from dotenv import find_dotenv, load_dotenv
     for _env in (
         find_dotenv(usecwd=False),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
-        os.path.expanduser("~/.config/shared-memory/client.env"),
     ):
         if _env and os.path.exists(_env):
             load_dotenv(_env, override=False)
 except ImportError:
-    # python-dotenv not installed — manually parse the two most important paths
-    # so auth tokens are found even when running bare `python` or `uv run --with httpx`
+    # python-dotenv not installed — manually parse skill-adjacent .env files
+    # so auth tokens are found when running bare `python` or `uv run --with httpx`
     def _read_env_file(path: str) -> None:
         try:
             with open(path) as _f:
@@ -60,11 +58,9 @@ except ImportError:
                         os.environ[_k] = _v.strip()
         except OSError:
             pass
-    # skill-adjacent .env (one dir above scripts/ — covers ~/.grok/skills/shared-memory/.env etc.)
+    # covers ~/.{agent}/skills/shared-memory/scripts/.env and the parent dir
     _read_env_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
     _read_env_file(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
-    # universal fallback
-    _read_env_file(os.path.expanduser("~/.config/shared-memory/client.env"))
 
 COORDINATOR_BASE = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
 AGENT_ID         = os.environ.get("AGENT_ID", "memory_bridge")

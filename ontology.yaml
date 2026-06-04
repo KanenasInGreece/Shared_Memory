@@ -33,6 +33,11 @@ relationships:
   supersedes: SUPERSEDES                   # Decision→Decision: replaces a prior decision
   informed_by: INFORMED_BY                 # Decision→Decision: prior knowledge used
   had_outcome: HAD_OUTCOME                 # Decision→Decision/Milestone: retrospective edge
+  # REM-enrichment relationships (written by rem_loop.py during idle processing)
+  produces_insight: PRODUCES_INSIGHT       # Fact/Decision→Entity: insight or knowledge this node generates
+  under_conditions: UNDER_CONDITIONS       # Decision→Entity: constraints or conditions that bound the decision
+  considered: CONSIDERED                   # Decision→Entity: alternatives that were evaluated
+  rejected: REJECTED                       # Decision→Entity: alternatives explicitly ruled out
 
 consolidation:
   density_threshold: 5           # min unconsolidated Facts per Entity hub to trigger synthesis

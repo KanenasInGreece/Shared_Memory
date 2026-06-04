@@ -49,9 +49,11 @@ _DAEMON_RESTART_WINDOW  = 600  # rolling window (seconds) for the trip counter
 _DAEMON_MIN_STABLE_SEC  = 30   # uptime needed to reset backoff — avoids boot-loop penalty
 _DAEMON_MAX_BACKOFF_SEC = 60   # exponential backoff ceiling (seconds)
 
-# Shared state written by the watchdog, read by the health handler.
+# Shared state written by the watchdogs, read by the health handler.
 _daemon_proc:    "asyncio.subprocess.Process | None" = None
-_daemon_healthy: bool = False  # True while the subprocess is alive
+_daemon_healthy: bool = False  # True while the consolidation subprocess is alive
+_rem_proc:       "asyncio.subprocess.Process | None" = None
+_rem_healthy:    bool = False  # True while the REM subprocess is alive
 
 # --------------------------------------------------------------------------- #
 # Routing
@@ -225,6 +227,39 @@ class AsyncHiveMindProxy:
 
 
 # --------------------------------------------------------------------------- #
+# Daemon token helpers
+# --------------------------------------------------------------------------- #
+
+def _daemon_env(agent_name: str) -> dict:
+    """Build a subprocess environment that includes AGENT_TOKEN for the named daemon.
+
+    The daemon uses this token to authenticate its outbound calls through the
+    proxy (embeddings, LLM).  The token identifies the daemon as a trusted
+    internal caller — it does NOT change the source attribution of the facts
+    it enriches.  Fact.source always reflects the original saving agent.
+
+    If no token is registered for the daemon, AGENT_TOKEN is omitted and the
+    daemon's calls will be rejected 401 when auth is active — this surfaces
+    a misconfiguration rather than silently bypassing auth.
+    """
+    env = os.environ.copy()
+    for pair in env.get("AGENT_TOKENS", "").split(","):
+        pair = pair.strip()
+        if ":" not in pair:
+            continue
+        name, token = pair.split(":", 1)
+        if name.strip() == agent_name:
+            env["AGENT_TOKEN"] = token.strip()
+            break
+    else:
+        log.warning(
+            "No token registered for daemon %r — add %s:<token> to AGENT_TOKENS",
+            agent_name, agent_name,
+        )
+    return env
+
+
+# --------------------------------------------------------------------------- #
 # Consolidation daemon lifecycle
 # --------------------------------------------------------------------------- #
 async def _start_daemon() -> "asyncio.subprocess.Process | None":
@@ -242,9 +277,97 @@ async def _start_daemon() -> "asyncio.subprocess.Process | None":
         "--with", "psycopg2-binary",
         "--with", "neo4j",
         "python", str(daemon_path),
+        env=_daemon_env("consolidation"),
     )
     log.info("Consolidation daemon started (pid %d)", proc.pid)
     return proc
+
+
+async def _start_rem_daemon() -> "asyncio.subprocess.Process | None":
+    rem_path = Path(__file__).parent / "rem_loop.py"
+    if not rem_path.exists():
+        log.warning("REM script not found at %s — REM enrichment will not run", rem_path)
+        return None
+    uv = shutil.which("uv")
+    if not uv:
+        log.warning("uv not in PATH — cannot start REM daemon")
+        return None
+    proc = await asyncio.create_subprocess_exec(
+        uv, "run",
+        "--with", "httpx",
+        "--with", "psycopg2-binary",
+        "--with", "neo4j",
+        "python", str(rem_path),
+        env=_daemon_env("rem_daemon"),
+    )
+    log.info("REM daemon started (pid %d)", proc.pid)
+    return proc
+
+
+async def _watchdog_rem_daemon(stop_event: asyncio.Event) -> None:
+    """Start the REM daemon and restart it on unexpected crashes.
+
+    Uses identical watchdog logic to the consolidation daemon:
+    exponential backoff, stable-uptime reset, and circuit-breaker trip.
+    """
+    global _rem_proc, _rem_healthy
+
+    restart_times: list[float] = []
+    backoff = 1.0
+
+    while not stop_event.is_set():
+        proc = await _start_rem_daemon()
+        if proc is None:
+            _rem_healthy = False
+            return
+
+        _rem_proc    = proc
+        _rem_healthy = True
+        t_start = asyncio.get_event_loop().time()
+
+        await proc.wait()
+        _rem_healthy = False
+
+        if stop_event.is_set():
+            break
+
+        uptime   = asyncio.get_event_loop().time() - t_start
+        exitcode = proc.returncode
+
+        if exitcode in (0, -signal.SIGTERM):
+            log.info("REM daemon exited cleanly (code %d).", exitcode)
+            break
+
+        log.warning(
+            "REM daemon crashed (code %d, uptime %.1fs) — evaluating restart.",
+            exitcode, uptime,
+        )
+
+        if uptime >= _DAEMON_MIN_STABLE_SEC:
+            backoff = 1.0
+
+        now = asyncio.get_event_loop().time()
+        restart_times = [t for t in restart_times if now - t < _DAEMON_RESTART_WINDOW]
+        if len(restart_times) >= _DAEMON_MAX_RESTARTS:
+            log.critical(
+                "REM daemon crashed %d times in %ds — circuit breaker open.",
+                _DAEMON_MAX_RESTARTS, _DAEMON_RESTART_WINDOW,
+            )
+            break
+
+        restart_times.append(now)
+        log.info(
+            "Restarting REM daemon in %.1fs (crash %d/%d this window)...",
+            backoff, len(restart_times), _DAEMON_MAX_RESTARTS,
+        )
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+            break
+        except asyncio.TimeoutError:
+            pass
+        backoff = min(backoff * 2, _DAEMON_MAX_BACKOFF_SEC)
+
+    log.info("REM daemon watchdog exiting.")
 
 
 async def _watchdog_daemon(stop_event: asyncio.Event) -> None:
@@ -352,7 +475,8 @@ async def handle_health(request: web.Request) -> web.Response:
         except Exception:
             checks[name] = "down"
 
-    checks["daemon"] = "running" if _daemon_healthy else "stopped"
+    checks["daemon"]     = "running" if _daemon_healthy else "stopped"
+    checks["rem_daemon"] = "running" if _rem_healthy    else "stopped"
 
     # Embedder and reranker are the critical path — every save and search
     # depends on them.  LLM and daemon degradation is reported but does not
@@ -399,7 +523,8 @@ async def main() -> None:
     log.info("### /v1/embeddings->8070 | /v1/reranking->8071 | default->5000")
 
     stop_event = asyncio.Event()
-    watchdog_task = asyncio.create_task(_watchdog_daemon(stop_event))
+    watchdog_task     = asyncio.create_task(_watchdog_daemon(stop_event))
+    rem_watchdog_task = asyncio.create_task(_watchdog_rem_daemon(stop_event))
     loop = asyncio.get_running_loop()
 
     def _on_shutdown_signal():
@@ -432,13 +557,23 @@ async def main() -> None:
         try:
             await asyncio.wait_for(_daemon_proc.wait(), timeout=5.0)
         except asyncio.TimeoutError:
-            log.warning("Daemon did not exit in 5 s — sending SIGKILL")
+            log.warning("Consolidation daemon did not exit in 5 s — sending SIGKILL")
             _daemon_proc.kill()
+    if _rem_proc and _rem_proc.returncode is None:
+        log.info("Stopping REM daemon (pid %d)...", _rem_proc.pid)
+        _rem_proc.terminate()
+        try:
+            await asyncio.wait_for(_rem_proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            log.warning("REM daemon did not exit in 5 s — sending SIGKILL")
+            _rem_proc.kill()
     watchdog_task.cancel()
-    try:
-        await watchdog_task
-    except asyncio.CancelledError:
-        pass
+    rem_watchdog_task.cancel()
+    for task in (watchdog_task, rem_watchdog_task):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     await coordinator.stop()
     await proxy.cleanup()
     log.info("Clean shutdown complete.")

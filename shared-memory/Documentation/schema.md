@@ -46,6 +46,7 @@ Written exclusively by the consolidation daemon. Each row is an LLM-synthesised 
 | `embedding` | `vector(1024)` | BGE-M3 embedding of the synthesised `content`; used for top-1 retrieval |
 | `source_pg_ids` | `INTEGER[]` | IDs of `technical_docs` rows that contributed to this summary. Added by migration 003; back-filled from `metadata` for existing rows. Enables `WHERE $fact_id = ANY(source_pg_ids)` provenance queries without JSON parsing. |
 | `summary_history` | `JSONB NOT NULL DEFAULT '[]'` | Append-only array of previous summaries, capped at 20. Written by the daemon on every `DO UPDATE` — the outgoing content, `source_pg_ids`, and `timestamp` are pushed to the array before the row is overwritten. Enables drift auditing without a temporal schema. Added by migration 004. |
+| `superseded` | `BOOLEAN NOT NULL DEFAULT false` | Set to `true` when another summary's `source_pg_ids` is a strict superset of this row's `source_pg_ids` — the newer summary subsumes this one. Retrieval (`coordinator.py`) always filters `WHERE NOT superseded`. Partial index `community_summaries_active_idx` keeps this scan fast. Added by migration 006. |
 | `agent_id` | `TEXT NOT NULL DEFAULT 'legacy'` | Agent that triggered consolidation; `'legacy'` for pre-coordinator rows |
 | `scope` | `TEXT NOT NULL DEFAULT 'global'` | Inherited from the source `Fact` cluster's scope |
 | `visibility` | `TEXT NOT NULL DEFAULT 'global'` | Read policy, same semantics as `technical_docs.visibility` |
@@ -66,7 +67,9 @@ Written exclusively by the consolidation daemon. Each row is an LLM-synthesised 
 
 **Retrieval role:** queried first on every search — top-1 cosine match is prepended to results as "Global Context Summary" to orient the response before the Tier 1 vector search runs.
 
-**Growth behaviour:** there is **one row per entity**, keyed by `metadata->>'entity'`. Each consolidation cycle replaces the existing row via `ON CONFLICT DO UPDATE` — the new LLM synthesis overwrites `content` and `embedding`, while the previous `content` is appended to `summary_history` (capped at 20 entries). The row ID (`id`) is stable across updates. Retrieval surfaces the embedding-closest match, which is always the latest synthesis for a qualifying entity.
+**Growth behaviour:** there is **one row per entity**, keyed by `metadata->>'entity'`. Each consolidation cycle replaces the existing row via `ON CONFLICT DO UPDATE` — the new LLM synthesis overwrites `content` and `embedding`, while the previous `content` is appended to `summary_history` (capped at 20 entries). The row ID (`id`) is stable across updates. Retrieval surfaces the embedding-closest `WHERE NOT superseded` match — always the latest non-superseded synthesis for a qualifying entity.
+
+**Supersession rule (v0.4.0):** if summary A's `source_pg_ids` is a strict subset of summary B's `source_pg_ids`, A is superseded by B. The consolidation daemon sets `A.superseded = true` in Postgres and writes `(B)-[:SUPERSEDES]->(A)` in Neo4j. Cross-entity supersession is supported — an "Outbox" summary can supersede a "Neo4j" summary if it absorbed all the same source facts.
 
 ---
 
@@ -79,7 +82,7 @@ Written by the coordinator on every save, in the same Postgres transaction as `t
 | `id` | `BIGSERIAL PRIMARY KEY` | Monotonic outbox entry ID |
 | `pg_id` | `BIGINT NOT NULL` | References the `technical_docs.id` row this write belongs to |
 | `cypher_params` | `JSONB NOT NULL` | Parameters passed to the Neo4j Cypher write (content snippet, source, entities, etc.) |
-| `status` | `TEXT NOT NULL DEFAULT 'pending'` | `pending` → `in_progress` → `applied` or `failed`. `in_progress` means a coordinator instance has claimed the row for Neo4j apply but has not yet completed. Rows stuck in `in_progress` after a crash are reset to `pending` on coordinator startup. |
+| `status` | `TEXT NOT NULL DEFAULT 'pending'` | `pending` → `in_progress` → `applied` → `rem_reviewed` or `failed`. `in_progress` means a coordinator instance has claimed the row for Neo4j apply. `applied` means Neo4j write succeeded. `rem_reviewed` means REM has enriched the fact and verified Neo4j consistency — the row is safe to prune (handled by future `pruning_loop.py`). Rows stuck in `in_progress` after a crash are reset to `pending` on coordinator startup. |
 | `retries` | `INT NOT NULL DEFAULT 0` | Incremented on each failed application attempt |
 | `created_at` | `TIMESTAMPTZ DEFAULT now()` | When the outbox row was written |
 | `applied_at` | `TIMESTAMPTZ` | Set when status transitions to `applied` |
@@ -140,6 +143,22 @@ Written by the outbox worker for `type:decision` saves.
 | `SUPERSEDES` | `(:Decision)-[:SUPERSEDES]->(:Decision)` | Replaces a prior decision |
 | `INFORMED_BY` | `(:Decision)-[:INFORMED_BY]->(:Decision)` | Prior decision used as input |
 | `HAD_OUTCOME` | `(:Decision)-[:HAD_OUTCOME {rating,date,notes}]->()` | Retrospective — dated edge property, not a node |
+| `SUPERSEDES` | `(:CommunitySummary)-[:SUPERSEDES]->(:CommunitySummary)` | Also written between CommunitySummary nodes when supersession rule fires (v0.4.0) |
+
+### REM-enrichment relationships (v0.4.0 — written by `rem_loop.py`)
+
+Written by the REM daemon during idle-time fact enrichment. These relationships are **never** written by the save path — they require full Postgres content and the closed typed-node set.
+
+| Relationship | Pattern | Meaning |
+|---|---|---|
+| `PRODUCES_INSIGHT` | `(:Fact\|:Decision)-[:PRODUCES_INSIGHT]->(:Entity)` | Insight or knowledge this fact/decision generates |
+| `UNDER_CONDITIONS` | `(:Decision)-[:UNDER_CONDITIONS]->(:Entity)` | Constraints or conditions that bound the decision |
+| `CONSIDERED` | `(:Decision)-[:CONSIDERED]->(:Entity)` | Alternatives evaluated for the decision |
+| `REJECTED` | `(:Decision)-[:REJECTED]->(:Entity)` | Alternatives explicitly ruled out |
+
+**`rem_processed` Fact property:** after REM enriches a Fact node, it sets `rem_processed = true`. NREM (`consolidation_loop.py`) requires this flag before including a Fact in a consolidation cluster — `WHERE coalesce(neighbor.rem_processed, false) = true`. A Fact whose Neo4j write is still pending in the outbox is never marked `rem_processed`.
+
+**Entity type registry:** REM builds a closed registry from all existing typed nodes (`Human`, `AIAgent`, `Project`, `Decision`, `Entity`) before each batch. Once a name is registered (e.g. "Xenofon → Human"), every occurrence in the batch uses the same label and a compatible relationship type. The LLM cannot reclassify existing nodes.
 
 ### Retrospective write protocol
 

@@ -302,7 +302,7 @@ Args: {"pg_id": 43, "rating": "high", "notes": "No deadlocks in 30-day test.", "
 
 ---
 
-## Authentication Setup (v0.3.6)
+## Authentication Setup (v0.4.0)
 
 All coordinator routes require `Authorization: Bearer <token>`. One-time setup:
 
@@ -352,8 +352,8 @@ Check that `AGENT_TOKEN` in the agent's `.env` matches one of the `name:token` p
 
 ## Infrastructure
 
-### Gateway + Coordinator + Consolidation Daemon
-All three start from a single command. Must be running before any save, search, or embed operation.
+### Gateway + Coordinator + REM & NREM Daemons
+All start from a single command. Must be running before any save, search, or embed operation.
 
 ```
 uv run --with aiohttp --with asyncpg --with neo4j --with httpx \
@@ -366,18 +366,30 @@ INFO  coordinator ready (pool 2–10, outbox worker running)
 INFO  coordinator auth enabled — N agent(s): antigravity, claude, gemini, ...
 INFO  ### Hive-Mind Proxy on :8888 [aiohttp]
 INFO  Consolidation daemon started (pid XXXXX)
+INFO  REM daemon started (pid XXXXX)
 INFO  Listening for 'new_artifact' notifications...
+INFO:REMDaemon:REM daemon started (poll=120s, batch=5)
 ```
 
 The proxy binds to `127.0.0.1:8888` by default (localhost only). Set `PROXY_BIND=0.0.0.0` in `.env` to opt into all-interfaces binding — only safe over an encrypted overlay network (Tailscale, WireGuard) or behind TLS.
 
-**Daemon watchdog:** The gateway auto-restarts the consolidation daemon on unexpected crashes with exponential backoff. A circuit breaker stops retrying after 5 crashes in 10 minutes — restart the gateway to reset.
+**Two-phase sleep cycle (v0.4.0):**
+- **REM** (`rem_loop.py`) — idle daemon; enriches each Fact with a full LLM summary and typed entity relationships. Oldest facts processed first. Sets `rem_processed=true` on the Fact node after enriching. Sends `pg_notify` to wake NREM.
+- **NREM** (`consolidation_loop.py`) — synthesises community summaries from `rem_processed=true` facts once 5+ are available per entity hub. Superseded summaries are marked `superseded=true` and filtered from all searches.
+
+**Daemon watchdogs:** The gateway auto-restarts both daemons on unexpected crashes with exponential backoff. A circuit breaker stops retrying after 5 crashes in 10 minutes — restart the gateway to reset.
+
+**Audit log (optional):** Set `AUDIT_LOG_PATH=~/shared_memory.log` to enable JSON-lines logging of outbox rows before REM marks them reviewed.
+
+**Write quiesce:** REM skips its cycle if any fact was saved within `WRITE_QUIESCE_SEC` seconds (default 30). This prevents REM's `pg_notify` calls from resetting NREM's idle timer during active write sessions from any agent including remote ones. Set `WRITE_QUIESCE_SEC=0` in `.env` to disable.
+
+**After upgrade from v0.3.x:** NREM will be silent until REM has enriched at least 5 facts per entity cluster (`rem_processed=true`). At default settings (batch=5, poll=120s) a graph with ~80 facts clears the backlog in ~30 minutes. This is intentional — NREM synthesis quality depends on REM enrichment.
 
 **Check gateway health before saving:**
 ```
 curl http://localhost:8888/health
 ```
-Returns `{"status":"ok","auth_required":true,...}` when embedder and reranker are both reachable. HTTP 503 means the save/search path is degraded.
+Returns `{"status":"ok","auth_required":true,"daemon":"running","rem_daemon":"running",...}` when embedder and reranker are both reachable. HTTP 503 means the save/search path is degraded.
 
 ### MCP Server (LM Studio only)
 ```
@@ -389,7 +401,7 @@ After changing `AGENT_TOKEN` in `mcp.json`, restart LM Studio completely.
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.3.6", "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.4.0", "tool": "shared-memory-framework"}`
 - **Schema:** Neo4j labels, relationship types, Postgres tables — [schema.md](Documentation/schema.md)
 - **Embedding mandate:** All calls route through the gateway (:8888). Never call port 8070 (BGE-M3) or 8071 (BGE-Reranker) directly — the gateway enforces 1024-dim consistency across all agents.
 - **Ontology:** All Neo4j labels and relationship types are configurable in `ontology.yaml` at the repo root.

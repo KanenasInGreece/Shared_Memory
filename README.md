@@ -76,7 +76,7 @@ Vishakha Gupta's *AI Memory & Cognition: The Architect's Playbook* (ApertureData
 
 **The Consolidation Test:** *When the agent learns something new, does the system update a coherent knowledge base, or does it just accumulate versions? After six months, do you have one "truth" or three conflicting ones?*
 
-> **Grade: Passes (v0.3.6).** One row per entity, not three. Each consolidation cycle synthesises new facts into a single cumulative narrative (the LLM reads the prior version before writing the next — knowledge deepens, not fragments). `summary_history JSONB` (migration 004) preserves the previous N versions before each overwrite, enabling drift auditing. The consolidation daemon uses `AsyncGraphDatabase` + `loop.run_in_executor()` — `LISTEN/NOTIFY` signals no longer drop under write bursts. **Gaps remaining:** consolidation is per-entity; two summaries for overlapping entities may diverge slightly (no cross-entity reconciliation step). During the consolidation timing window (density ≥ 5 facts + 15-min idle), Tier 1 raw facts are available but the synthesised Tier 3 narrative may not yet reflect them — accurate results, not yet consolidated.
+> **Grade: Passes (v0.4.0).** Two-phase REM/NREM sleep cycle now in place. **REM** (idle daemon): enriches each Fact with a full LLM summary and typed entity relationships before it can enter NREM — first-pass entity extraction is agent-supplied only; REM is the first LLM-based entity extraction pass. **NREM** (consolidation daemon): synthesises community summaries only from `rem_processed=true` facts (density ≥ 5 per entity hub). `summary_history JSONB` (migration 004) preserves prior versions. **CommunitySummary supersession:** if A.source_pg_ids ⊆ B.source_pg_ids, A is marked superseded — retrieval always surfaces the most comprehensive non-superseded summary. **Gaps remaining:** cross-entity reconciliation (two summaries for overlapping entities may still diverge until supersession collapses them); during the REM backlog window, Tier 1 raw facts are available but NREM synthesis has not yet run.
 
 **The Lineage Test:** *Can I trace a decision back to the original source — the raw image, the specific video frame, or the precise document page — or just the text summary extracted from it?*
 
@@ -489,26 +489,30 @@ uv run --with aiohttp --with asyncpg --with neo4j --with httpx \
   python shared-memory/scripts/hive_mind_proxy.py 8888
 ```
 
-You will see two log lines confirming both are up:
+You will see log lines confirming all three are up:
 ```
 INFO  ### Hive-Mind Proxy on :8888 [aiohttp]
 INFO  Consolidation daemon started (pid XXXXX)
+INFO  REM daemon started (pid XXXXX)
 INFO  Listening for 'new_artifact' notifications...
+INFO:REMDaemon:REM daemon started (poll=120s, batch=5)
 ```
 
 **5. LM Studio** — start the application; it will pick up the MCP servers from `mcp.json` automatically.
 
-Step 4 is the only manual step required after databases and models are running. The proxy starts the daemon; the daemon registers its Postgres listener; both shut down cleanly when the proxy receives SIGINT or SIGTERM.
+Step 4 is the only manual step required after databases and models are running. The proxy starts both daemons; all three processes shut down cleanly when the proxy receives SIGINT or SIGTERM.
 
 **Verify the full stack is healthy:**
 ```bash
 curl http://localhost:8888/health
-# {"status":"ok","embedder":"ok","reranker":"ok","llm":"ok","daemon":"running","auth_required":true}
+# {"status":"ok","embedder":"ok","reranker":"ok","llm":"ok","daemon":"running","rem_daemon":"running","auth_required":true}
 ```
 
-HTTP 200 means the save/search path (embedder + reranker) is operational. HTTP 503 means at least one critical backend is down — do not attempt saves until resolved. The `llm` and `daemon` fields are informational; their degradation affects consolidation only. `auth_required: true` confirms token authentication is enforced.
+HTTP 200 means the save/search path (embedder + reranker) is operational. HTTP 503 means at least one critical backend is down — do not attempt saves until resolved. `daemon` and `rem_daemon` are informational; their degradation affects consolidation/enrichment only. `auth_required: true` confirms token authentication is enforced.
 
-**Daemon watchdog:** the gateway automatically restarts the consolidation daemon if it crashes, with exponential backoff and a circuit breaker (5 crashes / 10 min). If the circuit breaker trips, restart the gateway.
+**Daemon watchdogs:** the gateway automatically restarts both the NREM consolidation daemon and the REM daemon if either crashes, with independent exponential backoff and circuit breakers (5 crashes / 10 min each). If a circuit breaker trips, restart the gateway.
+
+**Daemon tokens (architecture note):** The REM and consolidation daemons are registered agents in `AGENT_TOKENS` (`rem_daemon` and `consolidation`). The gateway injects their `AGENT_TOKEN` into the subprocess environment so their outbound calls (embeddings, LLM) are authenticated through the proxy like any other agent. The daemon token is used **only for authentication** — it identifies the caller as a trusted internal process. It does **not** affect source attribution: `Fact.source` always reflects the original saving agent (e.g. `"claude"`, `"gemini"`). The daemon enriches facts on behalf of their authors; it does not claim ownership. Add tokens to `.env` → `AGENT_TOKENS` before starting the gateway; the proxy reads them at startup and passes the correct one to each subprocess.
 
 > **Network exposure:** The gateway binds to `127.0.0.1:8888` by default — localhost only. Set `PROXY_BIND=0.0.0.0` in `.env` to opt into all-interfaces binding, but only over an encrypted overlay network (Tailscale, WireGuard, or TLS). Bearer tokens are plaintext over HTTP. See [SECURITY.md](SECURITY.md) for details.
 
@@ -1469,6 +1473,7 @@ This framework is actively evolving toward a workstation where any number of AI 
 | **Provenance layer — Phase A** | PROV-O-inspired ontology: 6 new node labels (`Decision`, `Human`, `AIAgent`, `Project`, `Activity`, `Milestone`) and 8 provenance relationships (`WAS_ATTRIBUTED_TO`, `WAS_ASSISTED_BY`, `WAS_GENERATED_BY`, `PROJECT_OF`, `ACTED_ON_BEHALF_OF`, `SUPERSEDES`, `INFORMED_BY`, `HAD_OUTCOME`). Coordinator ingress validates `type:decision` saves (rejects missing `decided_by` / `project` / `rationale` before the row touches the outbox WAL). Outbox dispatches decision rows to a dedicated `_apply_decision_outbox_row` that materialises the full PROV-O subgraph in a single atomic Neo4j session. Plain `Fact` saves unchanged. | ✅ Done |
 | **Provenance layer — Phase B** | `save_decision` subcommand in `memory_bridge.py` (named flags — `--title`, `--decided-by`, `--project`, `--rationale` required; `--assisted-by`, `--alternatives`, `--confidence`, `--entities` optional) and `save_decision` MCP tool in `vector-skill.py`. `build_decision_metadata()` pure helper. `--version` flag added to `memory_bridge.py`. | ✅ Done |
 | **Three-test fixes (v0.3.1)** | Retrieval visibility: search results carry `tier`, `score_normalized` (sigmoid), `matched_entities`, structured `graph_context` list. Consolidation history: `summary_history JSONB` column on `community_summaries` (migration 004) — prior summary appended before each `DO UPDATE`, capped at 20. Lineage: `source_ref` optional metadata key flows from coordinator to Neo4j `Fact.source_ref` property. 14 new tests added. `schema.md` "appends new rows" inaccuracy corrected. | ✅ Done |
+| **REM/NREM + supersession (v0.4.0)** | `rem_loop.py` new daemon — LLM summary + typed entity relationships on oldest-first Fact nodes; single AUTOCOMMIT Postgres connection per cycle; `rem_processed=true` SET last (partial failure leaves fact retryable). NREM gated on `rem_processed`. CommunitySummary supersession: `superseded` column (migration 006) + `SUPERSEDES` Neo4j edges. 4 new ontology relationships (PRODUCES_INSIGHT, UNDER_CONDITIONS, CONSIDERED, REJECTED). Source normalisation backfill (migration 006). `AUDIT_LOG_PATH` opt-in JSON-lines outbox audit log. 17 new tests; 130 total. | ✅ Done |
 
 ### In Progress / Planned
 

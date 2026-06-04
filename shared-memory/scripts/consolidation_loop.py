@@ -27,6 +27,20 @@ IDLE_THRESHOLD_SEC = 60  # 1 minute for testing, change to 900 for 15 mins
 MAX_DEFERRAL_SEC = IDLE_THRESHOLD_SEC * 3
 DENSITY_THRESHOLD = ONT.density_threshold
 
+# AGENT_TOKEN authenticates daemon outbound calls through the proxy.
+# It identifies the daemon as a trusted internal caller — it does NOT affect
+# the source field on any saved artifact.  Fact.source always reflects the
+# original saving agent.  Injected by hive_mind_proxy.py via subprocess env.
+_AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "").strip() or None
+
+
+def _auth_headers() -> dict:
+    """Bearer token header for calls routed through the Hive-Mind proxy."""
+    if _AGENT_TOKEN:
+        return {"Authorization": f"Bearer {_AGENT_TOKEN}"}
+    return {}
+
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ConsolidationDaemon")
 
@@ -129,7 +143,11 @@ class ConsolidationDaemon:
         """Standardized 1024-dim BGE-M3 embedding call."""
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
-                resp = await client.post(RETRIEVER_URL, json={"input": text, "model": "bge-m3"})
+                resp = await client.post(
+                    RETRIEVER_URL,
+                    headers=_auth_headers(),
+                    json={"input": text, "model": "bge-m3"},
+                )
                 resp.raise_for_status()
                 return resp.json()["data"][0]["embedding"]
         except Exception as e:
@@ -167,11 +185,15 @@ class ConsolidationDaemon:
 
         try:
             async with httpx.AsyncClient(timeout=300.0) as client:
-                resp = await client.post(REASONER_URL, json={
-                    "model": "local-model",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.1
-                })
+                resp = await client.post(
+                    REASONER_URL,
+                    headers=_auth_headers(),
+                    json={
+                        "model": "local-model",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.1,
+                    },
+                )
                 if resp.status_code != 200:
                     logger.error(f"Summarization failed with status {resp.status_code}: {resp.text}")
                     return None
@@ -200,6 +222,7 @@ class ConsolidationDaemon:
                     f" WITH DISTINCT e"
                     f" MATCH (e)<-[:{ONT.entity_link_alias}|{ONT.entity_link}]-(neighbor:{ONT.fact})"
                     f" WHERE coalesce(neighbor.consolidated, false) = false"
+                    f"   AND coalesce(neighbor.rem_processed, false) = true"
                     f" WITH e, collect(neighbor) as unflagged_facts"
                     f" WHERE size(unflagged_facts) >= $threshold"
                     f" RETURN e.name as entity,"
@@ -209,7 +232,12 @@ class ConsolidationDaemon:
                 clusters = await result.data()
 
             if not clusters:
-                logger.info("No high-density clusters found to consolidate.")
+                logger.info(
+                    "No rem_processed clusters found (density_threshold=%d). "
+                    "NREM waits for REM enrichment — expected on fresh install or upgrade. "
+                    "REM processes %d facts every ~120s; check 'rem_daemon' in /health.",
+                    DENSITY_THRESHOLD, 5,
+                )
                 return
 
             conn = await loop.run_in_executor(
@@ -299,7 +327,35 @@ class ConsolidationDaemon:
                                 return cur.fetchone()[0]
                         summary_pg_id = await loop.run_in_executor(None, _write_summary)
 
-                        logger.info(f"Saved summary (ID: {summary_pg_id}) to Postgres. Syncing to Graph...")
+                        # Supersession: mark any active community_summary whose
+                        # source_pg_ids is a strict subset of the new summary's
+                        # source_pg_ids.  The new summary subsumes their content.
+                        new_src_set = set(pg_ids)
+                        def _check_supersession():
+                            superseded = []
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    "SELECT id, source_pg_ids FROM community_summaries"
+                                    " WHERE NOT superseded AND id != %s"
+                                    "   AND source_pg_ids IS NOT NULL",
+                                    (summary_pg_id,)
+                                )
+                                for old_id, old_src in cur.fetchall():
+                                    if old_src and set(old_src) <= new_src_set:
+                                        cur.execute(
+                                            "UPDATE community_summaries SET superseded = true"
+                                            " WHERE id = %s",
+                                            (old_id,)
+                                        )
+                                        superseded.append(old_id)
+                            return superseded
+                        superseded_ids = await loop.run_in_executor(None, _check_supersession)
+
+                        logger.info(
+                            f"Saved summary (ID: {summary_pg_id}) to Postgres."
+                            + (f" Superseded: {superseded_ids}." if superseded_ids else "")
+                            + " Syncing to Graph..."
+                        )
 
                         # NOTE: CROSS-DB ATOMICITY RISK — see ADR.md
                         async with self.driver.session() as session:
@@ -316,6 +372,15 @@ class ConsolidationDaemon:
                                 f" UNWIND facts as f"
                                 f" MERGE (f)-[:{ONT.summarized_by}]->(s)",
                                 fact_ids=pg_ids, summary_pg_id=summary_pg_id, entity=entity)
+                            # SUPERSEDES edges for any Postgres-superseded summaries
+                            if superseded_ids:
+                                await session.run(
+                                    f"MATCH (new:{ONT.community_summary} {{pg_id: $new_id}})"
+                                    f" UNWIND $old_ids AS old_pg_id"
+                                    f" MATCH (old:{ONT.community_summary} {{pg_id: old_pg_id}})"
+                                    f" MERGE (new)-[:{ONT.supersedes}]->(old)",
+                                    new_id=summary_pg_id, old_ids=superseded_ids
+                                )
 
                         await loop.run_in_executor(None, conn.commit)
                         logger.info(f"Successfully consolidated {len(pg_ids)} facts for '{entity}'.")

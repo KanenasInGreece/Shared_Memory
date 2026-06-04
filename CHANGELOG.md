@@ -9,6 +9,86 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.4.0] — 2026-06-04
+
+### Added
+
+- **REM/NREM two-phase sleep cycle** (`shared-memory/scripts/rem_loop.py` new, `consolidation_loop.py` modified, `hive_mind_proxy.py` modified): Replaces single-stage consolidation with a two-pass sleep architecture modelled on biological memory consolidation.
+
+  **REM daemon (`rem_loop.py`)** — new background process, auto-started by `hive_mind_proxy.py` alongside the consolidation daemon. On each idle scan (120 s poll, batch of 5):
+  - Fetches oldest non-REM Fact nodes from Neo4j (pg_id ASC — clears the historical backlog first).
+  - Gates on outbox `status='applied'` — only enriches facts confirmed written to Neo4j.
+  - Batch-fetches full Postgres content in one query (a single AUTOCOMMIT connection per cycle, replacing per-operation connection churn).
+  - Builds a closed typed-node registry from the graph (`Human`, `AIAgent`, `Project`, `Decision`, `Entity` nodes) — once a name is typed, its label never changes across the batch.
+  - Single LLM round-trip per fact: three-part prompt (full text + closed entity set + ontology vocabulary) → produces a paragraph summary (≤5 sentences) and typed entity→relationship assignments.
+  - Writes to Neo4j in one session: entity MERGE edges first, Decision extras second, then `SET f.content = summary, f.rem_processed = true` last — so a partial failure never marks a fact processed.
+  - For Decision facts: additionally extracts `CONSIDERED`, `REJECTED`, `UNDER_CONDITIONS`, `PRODUCES_INSIGHT` edges on the Decision node.
+  - Verifies Fact node consistency (full-string, not prefix) before touching the outbox.
+  - Optionally writes outbox row to `AUDIT_LOG_PATH` (JSON-lines) before marking `rem_reviewed`.
+  - Sends `pg_notify('new_artifact', pg_id)` to wake NREM after each enriched fact.
+
+  **NREM (modified `consolidation_loop.py`)** — cluster query now requires `AND coalesce(neighbor.rem_processed, false) = true`. Raw (non-REM-enriched) facts are never consolidated directly. Threshold unchanged (5+ rem_processed unconsolidated facts per entity hub).
+
+  **CommunitySummary supersession** — after every NREM consolidation, any existing active `community_summary` row whose `source_pg_ids` is a strict subset of the new summary's `source_pg_ids` is marked `superseded = true` in Postgres and linked with a `(new)-[:SUPERSEDES]->(old)` edge in Neo4j. Tier 3 search in `coordinator.py` filters `WHERE NOT superseded` — stale summaries are never surfaced.
+
+  **`hive_mind_proxy.py`** — adds `_start_rem_daemon()`, `_watchdog_rem_daemon()` (same circuit-breaker logic as the consolidation watchdog). `/health` now reports `rem_daemon` status. Drain sequence stops both daemons cleanly.
+
+- **Ontology additions** (`ontology.yaml`, `ontology.py`): Four new REM-enrichment relationship types used for decision capture in the knowledge graph:
+  - `PRODUCES_INSIGHT`: `(Fact/Decision)-[:PRODUCES_INSIGHT]->(Entity)` — insight or knowledge this node generates
+  - `UNDER_CONDITIONS`: `(Decision)-[:UNDER_CONDITIONS]->(Entity)` — constraints or conditions that bound the decision
+  - `CONSIDERED`: `(Decision)-[:CONSIDERED]->(Entity)` — alternatives evaluated
+  - `REJECTED`: `(Decision)-[:REJECTED]->(Entity)` — alternatives explicitly ruled out
+
+- **Migration 006** (`shared-memory/migrations/006_rem_supersession.sql`):
+  - `superseded BOOLEAN NOT NULL DEFAULT false` added to `community_summaries`; partial index `WHERE NOT superseded` keeps retrieval scans fast as superseded history accumulates.
+  - Source normalisation backfill — historical pre-auth source variants normalised to canonical agent names: `claude_code`, `claude-code`, `claude_session`, `claude_code_fix`, `claude_code_session`, `claude_code_verification`, `claude-sonnet-4-6`, `design_session`, `architectural_hardening`, `architectural_fix` → `"claude"`; `workstation-assistant` + null-source rows → `"lm_studio"`; `design_session_cloe` left unchanged.
+
+- **17 new tests** (`tests/test_rem_loop.py`): `_safe_label`, `_build_entity_registry`, `_resolve_rel` pure helpers; LLM mock output shape (plain fact vs decision); oldest-first ordering assertion; `rem_processed=true` SET last invariant; full-string consistency check; NREM `rem_processed` guard assertion; Tier 3 supersession filter assertion. **Total: 130 tests.**
+
+### Changed
+
+- **NREM cluster query** (`consolidation_loop.py`): Added `AND coalesce(neighbor.rem_processed, false) = true` to the density query — only REM-enriched facts participate in NREM synthesis.
+- **Tier 3 search** (`coordinator.py`): `community_summaries` query now filters `WHERE NOT superseded`.
+- **Outbox status lifecycle**: New terminal status `rem_reviewed` — REM writes this after verifying Fact consistency. Rows at `rem_reviewed` are safe to prune (handled by future `pruning_loop.py`).
+- **`AUDIT_LOG_PATH` env var**: Set to a writable path to enable JSON-lines outbox audit log before `rem_reviewed` marking. Default: disabled.
+
+### Fixed (post-release review — same day)
+
+- **A2 — Search hard-crash without migration 006** (`coordinator.py`): `WHERE NOT superseded` referenced the new column unconditionally. Operators who restarted the gateway after a `git pull` without running `apply.py` got HTTP 500 on every vector-backed search. Fixed by wrapping the Tier 3 query in try/except and falling back to the unsupervised query with a migration warning.
+
+- **A3 — CommunitySummary / ReasoningTrace in REM `_KNOWN_LABELS`** (`rem_loop.py`): Those node types are keyed by `pg_id`, not `name`. Including them in the set used to build `MERGE (e:{label} {name: n})` patterns could create structurally incompatible phantom nodes. Removed `ONT.community_summary`, `ONT.reasoning_trace`, `ONT.reasoning_step` from `_KNOWN_LABELS`. Practical risk was low because the closed-set query does not fetch those labels; removed as defence-in-depth.
+
+- **A1 — NREM silence after upgrade invisible to operators** (`consolidation_loop.py`): After upgrading from v0.3.x, all existing facts have `rem_processed=NULL` — NREM correctly waits for REM enrichment but logged nothing. Added an INFO log explaining the expected silence window and pointing operators to `/health` → `rem_daemon`.
+
+- **A4 — Deferred REM batch logged at DEBUG only** (`rem_loop.py`): When the outbox gate deferred all batch candidates, the reason was invisible at the default log level. Changed to INFO so operators see "N fact(s) deferred (outbox not yet applied)".
+
+### Added (post-release)
+
+- **Write quiesce for remote agents** (`rem_loop.py`): REM now skips its enrichment cycle if any fact was saved within `WRITE_QUIESCE_SEC` seconds (default 30, configurable via env var). Prevents REM's `pg_notify` calls from resetting NREM's idle timer during active write sessions from remote agents (e.g. chromebook-antigravity). See README §REM daemon and `.env.example`.
+
+- **Skill sync script** (`shared-memory/scripts/sync_skills.sh`): executable shell script that copies canonical sources to all agent install paths. Run after every code change: `bash shared-memory/scripts/sync_skills.sh`.
+
+### Upgrade path (from v0.3.x)
+
+**Expected NREM silence after upgrade:** all existing facts have `rem_processed=NULL`.
+NREM waits for REM to enrich each cluster before synthesising. At batch_size=5 and poll=120s,
+a graph with ~80 facts clears the backlog in ~30 minutes. Monitor with:
+```bash
+# Check how many facts still need REM processing
+curl http://localhost:8888/health  # rem_daemon: running
+```
+
+Users upgrading from any v0.3.x release must apply migration 006 before restarting the gateway:
+
+```bash
+# From the repo root
+PG_PASSWORD=<your_password> uv run --with psycopg2-binary python shared-memory/migrations/apply.py
+```
+
+Migration 006 adds the `superseded` column — the coordinator will fail to serve searches correctly without it. The source normalisation in the same migration is idempotent (safe to re-run). After migrating, restart the gateway; `rem_loop.py` will start automatically.
+
+---
+
 ## [0.3.6] — 2026-06-01
 
 ### Fixed
