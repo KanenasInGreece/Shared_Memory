@@ -1202,7 +1202,7 @@ caller: POST /memory/save {content, metadata, agent_id, scope, visibility}
        ↓ 401 if token missing or unrecognised
   metadata["source"] ← overwritten with verified agent name (server-side)
        ↓
-embed(content) via :8888 — retry with exponential backoff (4 attempts)
+embed(content) → embedder :8070 directly (coordinator runs inside the gateway) — retry ×4, linear backoff
        ↓ 503 if all retries fail — hard mandate: no save without a vector
 acquire per-entity asyncio.Lock for each name in metadata["entities"]
        ↓ serializes concurrent writes to the same entity cluster
@@ -1214,14 +1214,17 @@ BEGIN TRANSACTION
   SELECT pg_notify('new_artifact', {"pg_id": id})
 COMMIT  ← 200 OK returned to caller here (Postgres-ack)
        ↓ async outbox worker applies Neo4j write (MERGE Fact + Entity + MENTIONS)
-daemon receives NOTIFY → adds pg_id to pending_pg_ids → idle timer starts
+NOTIFY 'new_artifact' → NREM resets its idle timer; REM enriches the fact first,
+                        then it becomes eligible for consolidation (rem_processed, §13)
 ```
 
 > **Hard Mandate — Embedding Integrity:** Saves return 503 if the embedding service is unreachable after all retries. An artifact without a vector is invisible to semantic search — this failure must surface, never be swallowed.
 
-> **Per-entity write serialization:** Concurrent saves targeting the same entity are serialized via `asyncio.Lock[entity_name]`. This prevents duplicate `Entity` hub creation under agent-swarm concurrency and ensures the consolidation daemon sees a consistent cluster. (Phase 4 replaces this with Postgres advisory locks for multi-process deployment.)
+> **Why `:8070` here, not `:8888`?** Agents must always embed through the gateway (`:8888`) so every vector shares one space (§7). The coordinator is the process *behind* `:8888` — if it called `:8888` it would hit its own auth middleware (401) and loop on itself. It therefore calls the embedder (`:8070`) directly. The single-embedding-space guarantee is intact: `:8070` is the very BGE-M3 the gateway routes embedding traffic to.
 
-> **Cross-DB atomicity:** The outbox row is written in the same Postgres transaction as the fact. If the process crashes after commit, the outbox row survives and the Phase 2 worker replays the Neo4j write on restart. The ADR-001 dangling-Fact window is eliminated in Phase 2.
+> **Per-entity write serialization:** Concurrent saves targeting the same entity are serialized via `asyncio.Lock[entity_name]`, acquired in sorted order to avoid deadlock between concurrent saves. This prevents duplicate `Entity` hub creation under agent-swarm concurrency and ensures the sleep cycle sees a consistent cluster. (A future multi-process deployment would replace this in-process lock with Postgres advisory locks.)
+
+> **Cross-DB atomicity:** The outbox row is written in the same Postgres transaction as the fact. If the process crashes after commit, the outbox row survives and the outbox worker replays the Neo4j write on restart — the ADR-001 dangling-`Fact` window is eliminated.
 
 > **Audit logging:** Every event in the save path — coordinator unreachable, malformed metadata, missing entities, Neo4j sync failures, and successful saves — is optionally logged based on `MEMORY_LOG_LEVEL`. See [§14: Audit Logging](#14-audit-logging).
 
