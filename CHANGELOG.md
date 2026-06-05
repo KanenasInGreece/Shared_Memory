@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Base-schema migration** (`shared-memory/migrations/000_base_schema.sql`): creates the `vector` extension and the two base tables (`technical_docs`, `community_summaries`) with their embedding indexes — the original pre-001 schema. With it, `apply.py` (which globs every `*.sql` in order) now takes a brand-new empty `agent_data` database to the latest schema in **one command**, instead of requiring a manual `CREATE TABLE` step first. Idempotent (`IF NOT EXISTS`), so it is a no-op on existing installs and the same command serves new and upgrading users.
+
 ### Docs
 
 - **Documentation fact-check pass** (`/doc-audit`): reviewed every README chapter and standalone doc against current v0.4.0 code. Corrections:
@@ -17,6 +21,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - Auth-introduction version aligned to **v0.3.5** (Phase 2C landed in 0.3.5, hardened through 0.3.6) across README §18/§19 and `SKILL.md`, matching `CHANGELOG`, `SECURITY.md`, and `system-prompt.md`.
   - README §19 schema-migrations row extended to cover migrations 004–006.
   - `SECURITY.md` audit-cadence pointer advanced past the completed v0.4.0 review.
+  - README §6 "Database Schema" rewritten around the migration runner: a **one-command** new-install path (`apply.py` now creates base + all migrations), a separate **"Upgrading from an earlier schema"** section for installs that started on the original scheme, and an explicit note that Neo4j constraints are a one-time manual step (not auto-created). Previously §6 told new users to run only the base `CREATE TABLE` and never mentioned `apply.py`, leaving them on a pre-001 schema the coordinator cannot use.
+  - README §3 architecture diagram updated to the current topology: both **REM and NREM** daemons (was a single "Consolidation Daemon"), current agent set (Claude/Grok/Codex/Antigravity CLI/LM Studio), and gateway auth + `127.0.0.1` bind. Added a **"Topology enforcement"** table listing every step that enforces the topology in code (single embedding path, localhost bind, caller auth, no direct DB access, read-only graph guard, outbox atomicity, hard embedding mandate, authenticated daemons).
+  - `.env.example` trimmed to what a user actually sets — secrets, auth tokens, and the logging knobs that change what is recorded — with optional network overrides (`PROXY_BIND`, `COORDINATOR_URL`) commented. Removed internal/derived/test/hardcoded entries (`AGENT_ID`, `MOCK_LLM`, `WRITE_QUIESCE_SEC`, `PG_CONN`, and the never-read port vars) so the sample reflects only real, user-facing configuration.
 - **`.env.example` reconciled with the code** (`/doc-audit` follow-up): now lists exactly the parameters the scripts actually read, each set to its default value with a comment naming the README chapter that explains it.
   - Added the code-read vars that were missing/under-documented: `COORDINATOR_URL`, `AGENT_ID`, `MOCK_LLM`.
   - Removed vars the code never reads (they implied configurability that does not exist): `PROXY_PORT`, `EMBEDDER_PORT`, `RERANKER_PORT`, `NEO4J_BOLT_PORT`, `PG_PORT`, `OPENAI_BASE_URL`. The corresponding endpoints (`NEO4J_URI`, `EMBED_URL`, `RERANK_URL`, gateway argv port) are hardcoded in source and are now captured in a clearly-labelled "service endpoints — reference only" block.

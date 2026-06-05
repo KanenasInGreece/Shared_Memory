@@ -213,49 +213,43 @@ This is the problem the Shared Memory Framework is designed to address. The solu
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                              AGENT LAYER                                 │
-│                                                                          │
-│  Claude Code   Grok    Gemini CLI   LM Studio (MCP)    Any HTTP          │
-│  (skill)       (skill) (skill)      vector-skill.py    client            │
-│  memory_bridge.py ←→ memory_bridge.py ←→ memory_bridge.py               │
-└─────────────┬──────────────────────┬─────────────────────┬──────────────┘
-              │                      │                     │
-              └──────────────────────▼─────────────────────┘
-                                     │ HTTP (all memory ops)
-                         ┌───────────▼────────────────────────┐
-                         │  Hive-Mind Gateway + Coordinator   │
-                         │  hive_mind_proxy.py  :8888         │
-                         │                                    │
-                         │  /memory/save   → coordinator.py  │
-                         │  /memory/search → coordinator.py  │
-                         │  /memory/graph  → coordinator.py  │
-                         │  /v1/embeddings → :8070 (BGE-M3)  │
-                         │  /v1/reranking  → :8071            │
-                         │  default        → :5000 (LLM)     │
-                         └────────┬──────────────────────────┘
-                                  │ spawns
-                         ┌────────▼───────────────┐
-                         │  Consolidation Daemon  │
-                         │  consolidation_loop.py │
-                         │  LISTEN new_artifact   │
-                         └────────┬───────────────┘
-                                  │ writes
-              ┌───────────────────▼───────────────────────────┐
-              │                MEMORY LAYER                    │
-              │                                                │
-              │  ┌──────────────────────┐  ┌───────────────┐  │
-              │  │  PostgreSQL+pgvector │  │    Neo4j      │  │
-              │  │                      │  │               │  │
-              │  │ technical_docs       │  │ Fact nodes    │  │
-              │  │  (Tier 1 — Episodic) │  │ Entity hubs   │  │
-              │  │                      │  │ MENTIONS edges│  │
-              │  │ community_summaries  │  │ CommunitySumm │  │
-              │  │  (Tier 3 — Semantic) │  │ SUMMARIZED_BY │  │
-              │  │                      │  └───────────────┘  │
-              │  │ neo4j_outbox         │                      │
-              │  │  (coordinator WAL)   │                      │
-              │  └──────────────────────┘                      │
-              └────────────────────────────────────────────────┘
+│                              AGENT LAYER                                    │
+│                                                                            │
+│  Claude Code · Grok · Codex CLI · Antigravity CLI    LM Studio    Any      │
+│  (skills — memory_bridge.py)                         (MCP —       HTTP     │
+│                                                vector-skill.py)   client    │
+└────────────────────────────────┬───────────────────────────────────────────┘
+                                 │ HTTP — every memory op (agents never touch the DBs)
+                       ┌─────────▼───────────────────────────────────┐
+                       │  Hive-Mind Gateway + Coordinator            │
+                       │  hive_mind_proxy.py — binds 127.0.0.1:8888  │
+                       │  Bearer-token auth · DEFAULT DENY           │
+                       │                                             │
+                       │  /memory/save|search|graph → coordinator.py │
+                       │  /v1/embeddings → :8070 (BGE-M3, 1024-dim)  │
+                       │  /v1/reranking  → :8071 (BGE-Reranker)      │
+                       │  default        → :5000 (reasoning LLM)     │
+                       └─────┬───────────────────────────────┬───────┘
+                  spawns +   │ watchdogs        coordinator   │ owns all DB I/O
+                       ┌─────▼──────────────────┐             │
+                       │  Sleep-cycle daemons   │             │
+                       │  REM  — rem_loop.py     │             │
+                       │  NREM — consolidation_  │             │
+                       │         loop.py         │             │
+                       │  (LISTEN new_artifact)  │             │
+                       └─────┬──────────────────┘             │
+                             │ writes                          │ reads / writes
+              ┌──────────────▼──────────────────────────────────▼─┐
+              │                  MEMORY LAYER                      │
+              │  ┌──────────────────────┐   ┌───────────────┐     │
+              │  │  PostgreSQL+pgvector │   │     Neo4j     │     │
+              │  │ technical_docs       │   │ Fact nodes    │     │
+              │  │  (Tier 1 — Episodic) │   │ Entity hubs   │     │
+              │  │ community_summaries  │   │ MENTIONS      │     │
+              │  │  (Tier 3 — Semantic) │   │ CommunitySumm │     │
+              │  │ neo4j_outbox (WAL)   │   │ SUMMARIZED_BY │     │
+              │  └──────────────────────┘   └───────────────┘     │
+              └───────────────────────────────────────────────────┘
 ```
 
 | Tier | Store | Role | Biological Analogy |
@@ -264,7 +258,22 @@ This is the problem the Shared Memory Framework is designed to address. The solu
 | **2 — Structural** | Neo4j `Fact` nodes (keyed by `pg_id`) | Relationships, provenance, `consolidated` flag, Entity hubs | Hippocampus — relational context cosine similarity cannot express |
 | **3 — Semantic** | `community_summaries` (Postgres + pgvector) | Consolidated thematic narratives; queried first on retrieval | Neocortex — slow, abstract, statistical regularities across episodes |
 
-**Retrieval always queries Tier 3 first** (thematic orientation), then Tier 1 (surgical precision), then expands through Neo4j (relational context). Artifacts saved by one agent become retrievable by all others once the consolidation daemon runs.
+**Retrieval always queries Tier 3 first** (thematic orientation), then Tier 1 (surgical precision), then expands through Neo4j (relational context). Artifacts saved by one agent become retrievable by all others once the sleep cycle runs (§13).
+
+### Topology enforcement
+
+The topology above is not a convention agents are trusted to follow — each property is enforced in code. These are the steps that keep one shared brain coherent under concurrent multi-agent load:
+
+| Property | How it is enforced | Where |
+|---|---|---|
+| **One shared embedding space (1024-dim)** | Agents call only `:8888`; the coordinator alone calls `:8070`/`:8071`. No agent can introduce a foreign vector space. | gateway routing + `EMBED_URL`/`RERANK_URL` in `coordinator.py` |
+| **Localhost-only by default** | Gateway binds `127.0.0.1`; `PROXY_BIND=0.0.0.0` is opt-in and documented as overlay-network-only. | `hive_mind_proxy.py` (§9) |
+| **Caller authentication** | Every route except `/health` requires a registered `Authorization: Bearer` token (DEFAULT DENY); the server overwrites `source` with the verified agent name, so identity cannot be spoofed. | `auth_middleware` in `coordinator.py` (§10) |
+| **No direct DB access** | Agents hold no database credentials; all Postgres/Neo4j I/O flows through the coordinator's `asyncpg` pool and per-entity `asyncio.Lock`s. | `coordinator.py` (§11–§12) |
+| **Read-only graph queries** | `/memory/graph` rejects `CREATE`/`DELETE`/`SET`/`MERGE`/`CALL`/`DROP`/`LOAD CSV`; the Neo4j session is opened read-only as a second layer. | `coordinator.py` (§11) |
+| **Cross-DB atomicity** | Every save writes a `neo4j_outbox` row in the same Postgres transaction; the worker applies Neo4j asynchronously — no orphaned `Fact` nodes. | outbox worker, `coordinator.py` (§12) |
+| **Hard embedding mandate** | A save returns `503` after 4 failed embed retries rather than storing a vectorless, unsearchable row. | `coordinator.py` (§12) |
+| **Authenticated daemons** | REM and NREM run as registered agents (`rem_daemon`, `consolidation`); the gateway injects their tokens so their own embedding/LLM calls authenticate like any agent. | `hive_mind_proxy.py` (§9) |
 
 ---
 
@@ -338,48 +347,45 @@ Credentials are read from environment variables — copy `.env.example` to `.env
 
 ## 6. Database Schema
 
-Run these once against the Postgres instance to create the vector extension and both tables.
+The Postgres schema is managed by versioned migrations in `shared-memory/migrations/`, applied by `apply.py`. The runner executes every migration in order, and every migration is idempotent (`IF NOT EXISTS` throughout) — so it is always safe to re-run.
 
-```sql
--- Connect: psql postgresql://postgres:${PG_PASSWORD}@localhost:5432/agent_data
+### New install — one command
 
-CREATE EXTENSION IF NOT EXISTS vector;
+With the databases up (§5) and `PG_PASSWORD` in `.env`, run:
 
--- Tier 1: episodic facts from all agents
-CREATE TABLE IF NOT EXISTS technical_docs (
-    id            SERIAL PRIMARY KEY,
-    content       TEXT NOT NULL,
-    metadata      JSONB,
-    embedding     vector(1024),
-    content_hash  TEXT UNIQUE
-);
-CREATE INDEX IF NOT EXISTS technical_docs_embedding_idx
-    ON technical_docs USING ivfflat (embedding vector_cosine_ops);
-
--- Tier 3: consolidated thematic narratives
-CREATE TABLE IF NOT EXISTS community_summaries (
-    id             SERIAL PRIMARY KEY,
-    content        TEXT NOT NULL,
-    metadata       JSONB,
-    embedding      vector(1024),
-    source_pg_ids  integer[]       -- IDs of technical_docs rows that contributed to this summary
-);
-CREATE INDEX IF NOT EXISTS community_summaries_embedding_idx
-    ON community_summaries USING ivfflat (embedding vector_cosine_ops);
+```bash
+uv run --with psycopg2-binary python shared-memory/migrations/apply.py
 ```
 
-### Neo4j constraints
+That is the only schema command a new user runs. It takes an empty `agent_data` database all the way to the latest schema in one step:
+
+- `000` creates the `vector` extension and the two base tables (`technical_docs`, `community_summaries`).
+- `001` adds the multi-agent columns (`agent_id`, `scope`, `visibility`) and the `neo4j_outbox` table.
+- `002`–`006` add concurrency indexes, `source_pg_ids`, `summary_history`, and the `superseded` flag, plus one-time data back-fills.
+
+The resulting tables — `technical_docs` (Tier 1), `community_summaries` (Tier 3), and `neo4j_outbox` (coordinator WAL) — are documented column-by-column, with all Neo4j labels and relationship types, in [`shared-memory/Documentation/schema.md`](shared-memory/Documentation/schema.md).
+
+### Neo4j constraints — one-time
+
+Neo4j constraints are **not** created automatically. Run these once in Neo4j Browser or cypher-shell (also idempotent):
 
 ```cypher
-// Run in Neo4j Browser or cypher-shell
-CREATE CONSTRAINT fact_pg_id IF NOT EXISTS FOR (f:Fact) REQUIRE f.pg_id IS UNIQUE;
-CREATE CONSTRAINT entity_name IF NOT EXISTS FOR (e:Entity) REQUIRE e.name IS UNIQUE;
+CREATE CONSTRAINT fact_pg_id    IF NOT EXISTS FOR (f:Fact)             REQUIRE f.pg_id IS UNIQUE;
+CREATE CONSTRAINT entity_name   IF NOT EXISTS FOR (e:Entity)           REQUIRE e.name  IS UNIQUE;
 CREATE CONSTRAINT summary_pg_id IF NOT EXISTS FOR (s:CommunitySummary) REQUIRE s.pg_id IS UNIQUE;
 ```
 
-> **Key schema rule:** Every fact saved must include `"entities": ["Name1", "Name2"]` in its metadata. The saver creates `Entity` nodes and `MENTIONS` edges for each name. Without them the fact is stored and retrievable by vector search, but the consolidation daemon will never cluster it into Tier 3. The graph layer is the prerequisite for the semantic layer.
+### Upgrading from an earlier schema
 
-Full schema with all Neo4j labels and relationship types: [`shared-memory/Documentation/schema.md`](shared-memory/Documentation/schema.md)
+If you started on an older schema — before the coordinator, before REM/NREM, or before supersession — run the **same one command**:
+
+```bash
+uv run --with psycopg2-binary python shared-memory/migrations/apply.py
+```
+
+Because every migration is additive and `IF NOT EXISTS`, and `apply.py` re-runs the full set each time, this brings any existing database up to the latest schema **without dropping data**: missing columns and tables are added, and the one-time data migrations run (003/005 back-fill `source_pg_ids`; 006 normalises historical `source` values). Existing rows are preserved — pre-coordinator rows default to `agent_id='legacy'`, `scope`/`visibility='global'`. Re-running later is a no-op. Migration `000` is a no-op on a database that already has the tables, so new and upgrading users run the identical command.
+
+> **Key schema rule:** Every fact saved must include `"entities": ["Name1", "Name2"]` in its metadata. The saver creates `Entity` nodes and `MENTIONS` edges for each name. Without them the fact is stored and retrievable by vector search, but consolidation will never cluster it into Tier 3. The graph layer is the prerequisite for the semantic layer.
 
 ### Ontology configuration
 
