@@ -1287,9 +1287,9 @@ Both are **off by default**.
 |---|---|
 | `0` | Nothing (default) |
 | `1` | **Warnings** — save succeeded but `entities` missing; fact is stored but ineligible for consolidation |
-| `2` | Warnings + **errors** — gateway down (save aborted), malformed metadata JSON, non-dict metadata, Neo4j sync failure |
-| `3` | All above + **successful saves** — records `pg_id`, `source`, and entity count on every completed save |
-| `4` | All above + **full content copy** — includes the complete `content` field in each entry; warns if content exceeds 10 KB |
+| `2` | Warnings + **errors** — backend unreachable (`coordinator_down` from the CLI, `gateway_down` from the MCP), token rejected (`auth_failed`), malformed metadata JSON (`bad_metadata`), non-dict metadata (`bad_metadata_type`), missing `source` (`missing_source`), coordinator returned an error (`save_failed`), Neo4j sync failure (`neo4j_sync_failed`) |
+| `3` | All above + **successful saves** (`save_success`) — records `pg_id`, `source`, and entity count on every completed save |
+| `4` | All above + **full content copy** — adds the complete `content` field to each entry; adds a `content_size_warn` note if content exceeds 10 KB |
 
 ### Per-tool log files
 
@@ -1297,8 +1297,8 @@ Each entry point writes to its own file. Concurrent writes from CLI agents (both
 
 | Tool | Log file |
 |---|---|
-| CLI tools / Gemini CLI | `{MEMORY_LOG_PATH}/memory_bridge.log` |
-| LM Studio MCP | `{MEMORY_LOG_PATH}/vector_skill.log` |
+| CLI agents (Claude · Grok · Codex · Antigravity CLI) — all via `memory_bridge.py` | `{MEMORY_LOG_PATH}/memory_bridge.log` |
+| LM Studio MCP (`vector-skill.py`) | `{MEMORY_LOG_PATH}/vector_skill.log` |
 
 ### Log format
 
@@ -1310,14 +1310,17 @@ Each line is a self-contained JSON object:
 {"ts": "2026-05-24T14:41:03.552109", "tool": "vector_skill",   "event": "gateway_down", "content_preview": "Architectural dec..."}
 ```
 
-`event` is one of: `gateway_down`, `bad_metadata`, `bad_metadata_type`, `neo4j_sync_failed`, `no_entities`, `save_success`.
+The two tools emit slightly different `event` sets — notably they name the unreachable-backend case differently (`coordinator_down` from the CLI, `gateway_down` from the MCP):
 
-### Daily merge by the consolidation daemon
+- **`memory_bridge`** (CLI agents): `no_entities`, `bad_metadata`, `bad_metadata_type`, `auth_failed`, `coordinator_down`, `save_failed`, `save_success`
+- **`vector_skill`** (LM Studio MCP): `no_entities`, `bad_metadata`, `bad_metadata_type`, `missing_source`, `gateway_down`, `neo4j_sync_failed`, `save_success`
 
-The consolidation daemon runs `merge_logs()` once per calendar day on the first 1-second poll of a new day. It uses the logrotate pattern:
+### Daily merge of the per-tool logs (NREM consolidation daemon)
 
-1. Rename `memory_bridge.log` → `memory_bridge.log.rotating` and `vector_skill.log` → `vector_skill.log.rotating`. Writing tools create fresh files on next open.
-2. Parse all entries from both rotating files, sort by timestamp, group by calendar date.
+The **NREM consolidation daemon** (`consolidation_loop.py`) runs `merge_logs()` once per calendar day — on the first tick of its 1-second `LISTEN` poll after the date rolls over. Only the two per-tool *save* logs are merged; the REM outbox audit log (`AUDIT_LOG_PATH`, below) is separate and is never rotated or merged. The merge uses the logrotate pattern:
+
+1. Rename `memory_bridge.log` → `memory_bridge.log.rotating` and `vector_skill.log` → `vector_skill.log.rotating` (an empty per-tool log is just deleted). Writing tools create fresh files on next open.
+2. Parse all entries from both rotating files, group by calendar date, and sort each day's entries by timestamp.
 3. For each date, merge with any existing archive and write `shared_memory_YYYY-MM-DD.log.gz` (atomic `os.replace`).
 4. Delete the `.rotating` files.
 
