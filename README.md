@@ -1260,14 +1260,20 @@ The `consolidated` flag is not permanent. If future ingestion introduces unflagg
 
 ## 14. Audit Logging
 
-The save path in both `memory_bridge.py` and `vector-skill.py` writes structured JSON log entries to per-tool files. Logging is **off by default** — enable it by setting `MEMORY_LOG_LEVEL` in `.env`.
+There are two independent, opt-in logs:
+
+1. **Per-save logging** — the save path in both `memory_bridge.py` and `vector-skill.py` writes structured JSON entries to per-tool files, gated by `MEMORY_LOG_LEVEL`. Covered first below.
+2. **REM outbox audit log** — the REM daemon (`rem_loop.py`, §13 Phase 1) appends each applied outbox row to a single JSON-lines file, gated by `AUDIT_LOG_PATH`. Covered at the end of this section.
+
+Both are **off by default**.
 
 ### Configuration
 
 | Variable | Default | Description |
 |---|---|---|
-| `MEMORY_LOG_LEVEL` | `0` (off) | Controls which events are logged |
-| `MEMORY_LOG_PATH` | `~/.shared-memory/logs` | Directory where log files are written |
+| `MEMORY_LOG_LEVEL` | `0` (off) | Per-save logging: controls which events are logged |
+| `MEMORY_LOG_PATH` | `~/.shared-memory/logs` | Per-save logging: directory where log files are written |
+| `AUDIT_LOG_PATH` | unset (off) | REM outbox audit log: file path; empty/unset disables it |
 
 ### Log levels
 
@@ -1320,6 +1326,27 @@ The `shared_memory_` prefix distinguishes merged archives from agent memory file
 ```
 
 If the daemon is not running, per-tool logs accumulate; entries from multiple days are correctly split into separate dated archives on the next merge run.
+
+### REM outbox audit log (`AUDIT_LOG_PATH`)
+
+Distinct from the per-save logs above. The per-save logs record what each *agent* did on the save path and are gated by `MEMORY_LOG_LEVEL`. The REM outbox audit log records what the **REM daemon** did on the *write* path — a forensic trail of exactly which Neo4j writes were applied and when.
+
+Set `AUDIT_LOG_PATH` to a writable file path to enable it (unset or empty disables it — the default). During REM enrichment (§13 Phase 1), immediately before each processed outbox row is marked `rem_reviewed`, the daemon appends that row to the file as one JSON line. Unlike the per-save logs, this file is **never rotated or merged** — it is a plain append-only ledger, so point it at a path you rotate externally if it must stay bounded.
+
+Each line carries the applied outbox row plus an ingest timestamp:
+
+```json
+{"ts": "2026-06-04T09:14:22.481Z", "outbox_id": 311, "pg_id": 205, "cypher_params": {"pg_id": 205, "entities": ["OutboxPattern"], "source": "claude"}, "created_at": "2026-06-04T09:02:10Z", "applied_at": "2026-06-04T09:02:11Z"}
+```
+
+| Field | Meaning |
+|---|---|
+| `ts` | When REM wrote this audit entry (ISO-8601, UTC) |
+| `outbox_id` | `neo4j_outbox` row ID |
+| `pg_id` | `technical_docs` row the write corresponds to |
+| `cypher_params` | The parameters applied to Neo4j for this fact |
+| `created_at` | When the outbox row was first written (save time) |
+| `applied_at` | When the outbox worker applied it to Neo4j |
 
 ---
 
