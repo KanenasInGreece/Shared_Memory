@@ -33,7 +33,7 @@ A unified semantic and relational memory layer built from first principles to su
 11. [Agent Access: CLI and MCP](#11-agent-access-cli-and-mcp)
     - [11a. Complete Cycle: End-to-End Workflow with Cross-Agent Examples](#11a-complete-cycle-end-to-end-workflow-with-cross-agent-examples)
 12. [The Save Path — From Artifact to Memory](#12-the-save-path--from-artifact-to-memory)
-13. [The Sleep Cycle — Consolidation](#13-the-sleep-cycle--consolidation)
+13. [The Sleep Cycle — REM and NREM Consolidation](#13-the-sleep-cycle--rem-and-nrem-consolidation)
 14. [Audit Logging](#14-audit-logging)
 15. [Retrieval: Three-Tier Lookup](#15-retrieval-three-tier-lookup)
 16. [LM Studio MCP Configuration](#16-lm-studio-mcp-configuration)
@@ -1209,32 +1209,52 @@ daemon receives NOTIFY → adds pg_id to pending_pg_ids → idle timer starts
 
 ---
 
-## 13. The Sleep Cycle — Consolidation
+## 13. The Sleep Cycle — REM and NREM Consolidation
 
-The consolidation daemon is the neocortical layer of the architecture. It does not poll — polling would compete with inference workloads that need full GPU headroom. It waits for a Postgres `NOTIFY`, then applies a dual gate before acting: an idle timer and a graph density check.
+Since v0.4.0 the sleep cycle is **two-phase**, modelled on the biological division between REM and slow-wave (NREM) sleep. Two daemons run, both auto-started by the gateway:
 
-### Trigger logic
+- **REM** (`rem_loop.py`) — *enrichment*. Operates on individual `Fact` nodes: rewrites each into an LLM summary and attaches typed entity relationships. This is the first LLM-based entity-extraction pass; on save, entities are agent-supplied only.
+- **NREM** (`consolidation_loop.py`) — *consolidation*. Operates on Entity hub *communities*: synthesises high-density clusters of REM-enriched facts into thematic `community_summaries`. This is the neocortical layer.
 
-- Each `pg_notify` adds the artifact's `pg_id` to `pending_pg_ids` and resets a 15-minute idle timer.
-- After 15 minutes with no new notifications (idle threshold), consolidation runs.
-- A 45-minute hard backstop fires during continuous ingestion even if notifications never stop — preventing indefinite deferral.
+A fact must pass through REM before NREM will ever consolidate it. The phases are gated, not parallel.
 
-### Per-community consolidation
+### Phase 1 — REM (enrichment), `rem_loop.py`
 
-The daemon uses the queued `pg_id`s as entry points into Neo4j, not as the consolidation targets themselves. From each entry point it traverses to Entity hubs and counts unconsolidated Fact neighbors. Communities with fewer than 5 unconsolidated Facts wait — sparse neighborhoods are not ready for synthesis.
+Unlike NREM, REM **polls** — every 120 seconds, a batch of 5 facts (the per-fact LLM call is the latency bottleneck). Backlog enrichment has to drain steadily regardless of `NOTIFY` traffic, so it cannot be purely event-driven.
+
+Per cycle:
+
+1. Fetch the oldest non-REM `Fact` nodes (`pg_id ASC` — clears the historical backlog first).
+2. **Gate on outbox `status='applied'`** — only enrich facts whose Neo4j write is confirmed.
+3. Batch-fetch full content from Postgres in one query, over a single AUTOCOMMIT connection per cycle (replacing per-operation connection churn).
+4. Build a closed typed-node registry from the graph (`Human`, `AIAgent`, `Project`, `Decision`, `Entity`) so a name's label never changes mid-batch.
+5. One LLM round-trip per fact: a ≤5-sentence summary **plus** typed entity→relationship assignments. For `Decision` facts it additionally extracts `CONSIDERED`, `REJECTED`, `UNDER_CONDITIONS`, and `PRODUCES_INSIGHT` edges.
+6. Write to Neo4j in one session — entity `MERGE` edges first, Decision extras second, then `SET f.content = summary, f.rem_processed = true` **last**, so a partial failure never marks a fact processed.
+7. Notify NREM (`pg_notify('new_artifact', pg_id)`) so the entity cluster is re-evaluated, then mark the outbox row `rem_reviewed`.
+
+### Phase 2 — NREM (consolidation), `consolidation_loop.py`
+
+NREM **does not poll** — polling would compete with inference workloads that need full GPU headroom. It waits for a Postgres `NOTIFY`, then applies a dual gate: an idle timer and a graph density check.
+
+- Each `pg_notify` adds the artifact's `pg_id` to `pending_pg_ids` and resets a 15-minute idle timer. Consolidation runs after 15 minutes of quiet; a 45-minute hard backstop prevents indefinite deferral during continuous ingestion.
+- The queued `pg_id`s are entry points into Neo4j, not the consolidation targets. From each, NREM traverses to Entity hubs and counts unconsolidated Fact neighbours — **but only those with `rem_processed = true`**. Raw, un-enriched facts are never consolidated directly. Communities with fewer than 5 qualifying facts wait.
 
 For each community that meets the threshold:
 
 1. Fetch the most recent `CommunitySummary` for that Entity from Postgres (if any).
-2. Call the LLM via `:8888 → :5000` to integrate new facts into the existing narrative — **cumulative**, not a new isolated snapshot. This prevents content drift from parallel summary fragments about the same entity.
+2. Call the LLM via `:8888 → :5000` to integrate the new facts into the existing narrative — **cumulative**, not a new isolated snapshot. This prevents content drift from parallel summary fragments about the same entity.
 3. Re-embed the new narrative via BGE-M3 through `:8888`.
-4. Write to `community_summaries`; create/update `CommunitySummary` node in Neo4j; link source Facts via `SUMMARIZED_BY`; set `Fact.consolidated = true`.
+4. Write to `community_summaries`; create/update the `CommunitySummary` node in Neo4j; link source Facts via `SUMMARIZED_BY`; set `Fact.consolidated = true`.
 
 > **Why centroid averaging is not used:** The obvious compression approach — averaging related embeddings into a centroid — collapses the angular distinctions that cosine similarity depends on (Vangara & Gopinath, 2026, *"The Geometry of Consolidation"*). The LLM instead generates new language representing the theme of the cluster, which is then re-embedded from scratch. This produces a new semantic point that did not exist before — not a mathematical blend. Retrievable volume grows O(log n) with LLM-based consolidation versus O(n) without it.
 
+### Supersession
+
+After each NREM pass, any active summary whose `source_pg_ids` is a strict subset of the new summary's is marked `superseded = true` in Postgres and linked `(new)-[:SUPERSEDES]->(old)` in Neo4j. Tier 3 retrieval filters `WHERE NOT superseded`, so a stale, narrower summary is never surfaced once a more comprehensive one absorbs its source facts. Supersession is cross-entity — an "Outbox" summary can supersede a "Neo4j" summary if it absorbed all the same source facts.
+
 ### Re-consolidation
 
-The `consolidated` flag is not permanent. If future ingestion introduces unflagged Facts with sufficient neighborhood density that pull previously-consolidated Facts back into a candidate community, the entire cluster becomes eligible again.
+The `consolidated` flag is not permanent. If future ingestion introduces unflagged Facts with sufficient neighbourhood density that pull previously-consolidated Facts back into a candidate community, the entire cluster becomes eligible again.
 
 ---
 

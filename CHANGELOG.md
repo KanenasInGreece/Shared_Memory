@@ -12,6 +12,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Documentation fact-check pass** (`/doc-audit`): reviewed every README chapter and standalone doc against current v0.4.0 code. Corrections:
   - README `--version` example output `0.3.6` → `0.4.0` (§10a, §11) to match `memory_bridge.py` `VERSION`.
   - README §11 coordinator API table `/health` response now lists `rem_daemon` (the gateway has emitted it since v0.4.0).
+  - README §13 "The Sleep Cycle" rewritten for the v0.4.0 two-phase **REM/NREM** architecture (it still described the pre-0.4.0 single-stage daemon): REM enrichment (`rem_loop.py` — 120 s poll, batch 5, oldest-first, `applied`-gated, `rem_processed` set last), NREM `rem_processed` gate, and CommunitySummary supersession. Heading + TOC anchor updated.
   - Auth-introduction version aligned to **v0.3.5** (Phase 2C landed in 0.3.5, hardened through 0.3.6) across README §18/§19 and `SKILL.md`, matching `CHANGELOG`, `SECURITY.md`, and `system-prompt.md`.
   - README §19 schema-migrations row extended to cover migrations 004–006.
   - `SECURITY.md` audit-cadence pointer advanced past the completed v0.4.0 review.
