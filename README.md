@@ -133,7 +133,7 @@ Vishakha Gupta's *AI Memory & Cognition: The Architect's Playbook* (ApertureData
 
 ### What we are building toward
 
-Beyond storing facts, the framework is evolving to answer questions that no other tool on your workstation can answer today:
+Beyond storing facts, the framework is evolving to answer questions about how your work happened — who decided what, with which tool, in which context, and whether it held up:
 
 > *"Who decided on a consolidator on project shared\_memory, when, and was that a good decision?"*
 
@@ -186,8 +186,8 @@ If you adopt a "save everything" policy (logs, test output, status checks, raw s
 # What was abandoned and why
 "What embedding models were considered before BGE-M3?"
 → MiniLM-384: rejected — too few dimensions for cross-agent coherence.
-   BGE-base-768: evaluated — acceptable, not best-in-class for multilingual.
-   BGE-M3-1024: selected — highest multilingual retrieval quality in class.
+   BGE-base-768: evaluated — acceptable, weaker multilingual coverage.
+   BGE-M3-1024: selected — strong multilingual retrieval at 1024 dimensions.
 
 # Was a past decision successful? (Phase C — retrospectives)
 "Was the outbox-as-WAL approach a good decision for the shared_memory project?"
