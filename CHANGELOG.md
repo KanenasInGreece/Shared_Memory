@@ -17,6 +17,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - Auth-introduction version aligned to **v0.3.5** (Phase 2C landed in 0.3.5, hardened through 0.3.6) across README §18/§19 and `SKILL.md`, matching `CHANGELOG`, `SECURITY.md`, and `system-prompt.md`.
   - README §19 schema-migrations row extended to cover migrations 004–006.
   - `SECURITY.md` audit-cadence pointer advanced past the completed v0.4.0 review.
+- **`.env.example` reconciled with the code** (`/doc-audit` follow-up): now lists exactly the parameters the scripts actually read, each set to its default value with a comment naming the README chapter that explains it.
+  - Added the code-read vars that were missing/under-documented: `COORDINATOR_URL`, `AGENT_ID`, `MOCK_LLM`.
+  - Removed vars the code never reads (they implied configurability that does not exist): `PROXY_PORT`, `EMBEDDER_PORT`, `RERANKER_PORT`, `NEO4J_BOLT_PORT`, `PG_PORT`, `OPENAI_BASE_URL`. The corresponding endpoints (`NEO4J_URI`, `EMBED_URL`, `RERANK_URL`, gateway argv port) are hardcoded in source and are now captured in a clearly-labelled "service endpoints — reference only" block.
+  - Optional tuning vars (`PROXY_BIND`, `WRITE_QUIESCE_SEC`, `MEMORY_LOG_LEVEL`, `MEMORY_LOG_PATH`, `AUDIT_LOG_PATH`, `COORDINATOR_URL`) now show their real defaults inline.
 - **New `/doc-audit` workflow** (`.claude/commands/doc-audit.md`): repeatable chapter-by-chapter doc fact-check wired to this repo's source-of-truth files and release guardrails.
 
 ---
