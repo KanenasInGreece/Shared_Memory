@@ -124,7 +124,7 @@ MATCH (s:CommunitySummary {pg_id: <suspect_id>}) DETACH DELETE s;
 
 Seven findings from a rigorous code review. All are resolved in v0.3.4 unless marked otherwise.
 
-**Audit cadence:** Security reviews run at every **x.y.5 release** and on demand via `/security-review`. The review covers four vectors: Concurrency & State, Database & Persistence Integrity, Dependency & Supply Chain, and Edge-Case Resilience. Next scheduled: v0.4.0 (or v0.3.10 if reached first).
+**Audit cadence:** Security reviews run at every **x.y.5 release** and on demand via `/security-review`. The review covers four vectors: Concurrency & State, Database & Persistence Integrity, Dependency & Supply Chain, and Edge-Case Resilience. The v0.4.0 audit is complete (see below); next scheduled: v0.4.5 (or v0.5.0 if reached first).
 
 ---
 
