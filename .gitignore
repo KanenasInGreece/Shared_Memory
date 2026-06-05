@@ -14,4 +14,4 @@ shared-memory-skill/*.skill
 CLAUDE.md
 Local_Documentation/
 research/
-.claude/settings.local.json
+.claude/
