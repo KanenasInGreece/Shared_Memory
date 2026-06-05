@@ -9,11 +9,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **README "Quick Start" chapter**: a single front-to-back setup path for first-time users — resources (lean minimum 16 GB RAM / ~8 GB VRAM / ~30 GB disk), prerequisites, an 8-step sequence (code + OS limits → databases → schema → models → tokens/.env → gateway → install skill → use it), and a troubleshooting table (401 / 503 / search-500 / inotify + SELinux, plus "tell your agent to use the skill"). It only *points* to the detailed chapters (§4–§11) — no instructions are duplicated. Reasoning-LLM guidance names what we run (Qwen3-27B) and links the GraphRAG-cost article for the model trade-off. Carries a maintainer rule: any setup-affecting change must update Quick Start in the same change.
 - **Base-schema migration** (`shared-memory/migrations/000_base_schema.sql`): creates the `vector` extension and the two base tables (`technical_docs`, `community_summaries`) with their embedding indexes — the original pre-001 schema. With it, `apply.py` (which globs every `*.sql` in order) now takes a brand-new empty `agent_data` database to the latest schema in **one command**, instead of requiring a manual `CREATE TABLE` step first. Idempotent (`IF NOT EXISTS`), so it is a no-op on existing installs and the same command serves new and upgrading users.
 
 ### Docs
 
-- **Documentation fact-check pass** (`/doc-audit`): reviewed every README chapter and standalone doc against current v0.4.0 code. Corrections:
+- **Documentation fact-check pass**: reviewed every README chapter and standalone doc against current v0.4.0 code. Corrections:
   - README `--version` example output `0.3.6` → `0.4.0` (§10a, §11) to match `memory_bridge.py` `VERSION`.
   - README §11 coordinator API table `/health` response now lists `rem_daemon` (the gateway has emitted it since v0.4.0).
   - README §13 "The Sleep Cycle" rewritten for the v0.4.0 two-phase **REM/NREM** architecture (it still described the pre-0.4.0 single-stage daemon): REM enrichment (`rem_loop.py` — 120 s poll, batch 5, oldest-first, `applied`-gated, `rem_processed` set last), NREM `rem_processed` gate, and CommunitySummary supersession. Heading + TOC anchor updated.
@@ -32,11 +33,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - README §18 "Open Problems" reviewed: the **Stored Prompt Injection** "Implemented" note now reflects that *both* LLM stages are hardened — the v0.4.0 REM enrichment pass (`rem_loop.py`), not just NREM consolidation — with Tier 1 retrieval still correctly flagged unprotected. The **Agent Authentication** entry, which was resolved in v0.3.5 but still sat in Open Problems with duplicated setup steps, is reframed as **RESOLVED** and points to §10 / SECURITY.md / §19 instead of repeating the rollout procedure.
   - README §19 roadmap reconciled with shipped code: **Phase C (retrospective layer)** was listed as planned but is implemented (`POST /memory/retrospective`, `save_retrospective`, dated `HAD_OUTCOME` edges) — moved to Completed. **Phase D** and **Phase 2C (auth)** were marked ✅ but sat in the Planned table — moved to Completed so every done item is in one place and Planned holds only genuinely-pending work (Phase E next). Agent-integration row updated to name Antigravity CLI (`agy`, Gemini now legacy); schema-migrations row now lists migration `000`.
   - `.env.example` trimmed to what a user actually sets — secrets, auth tokens, and the logging knobs that change what is recorded — with optional network overrides (`PROXY_BIND`, `COORDINATOR_URL`) commented. Removed internal/derived/test/hardcoded entries (`AGENT_ID`, `MOCK_LLM`, `WRITE_QUIESCE_SEC`, `PG_CONN`, and the never-read port vars) so the sample reflects only real, user-facing configuration.
-- **`.env.example` reconciled with the code** (`/doc-audit` follow-up): now lists exactly the parameters the scripts actually read, each set to its default value with a comment naming the README chapter that explains it.
+- **`.env.example` reconciled with the code**: now lists exactly the parameters the scripts actually read, each set to its default value with a comment naming the README chapter that explains it.
   - Added the code-read vars that were missing/under-documented: `COORDINATOR_URL`, `AGENT_ID`, `MOCK_LLM`.
   - Removed vars the code never reads (they implied configurability that does not exist): `PROXY_PORT`, `EMBEDDER_PORT`, `RERANKER_PORT`, `NEO4J_BOLT_PORT`, `PG_PORT`, `OPENAI_BASE_URL`. The corresponding endpoints (`NEO4J_URI`, `EMBED_URL`, `RERANK_URL`, gateway argv port) are hardcoded in source and are now captured in a clearly-labelled "service endpoints — reference only" block.
   - Optional tuning vars (`PROXY_BIND`, `WRITE_QUIESCE_SEC`, `MEMORY_LOG_LEVEL`, `MEMORY_LOG_PATH`, `AUDIT_LOG_PATH`, `COORDINATOR_URL`) now show their real defaults inline.
-- **New `/doc-audit` workflow** (`.claude/commands/doc-audit.md`): repeatable chapter-by-chapter doc fact-check wired to this repo's source-of-truth files and release guardrails.
 
 ---
 

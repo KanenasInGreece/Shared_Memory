@@ -19,6 +19,8 @@ A unified semantic and relational memory layer built from first principles to su
 
 ## Table of Contents
 
+**▶ [Quick Start — set it up from scratch](#quick-start)** — new here? Start here.
+
 1. [The Vision: One Brain, Many Agents](#1-the-vision-one-brain-many-agents)
 2. [The Problem: Why RAG Systems Forget](#2-the-problem-why-rag-systems-forget)
 3. [Architecture Overview: Three Tiers](#3-architecture-overview-three-tiers)
@@ -41,6 +43,53 @@ A unified semantic and relational memory layer built from first principles to su
 18. [Open Problems](#18-open-problems)
 19. [Development Roadmap — Multi-Agent Safe Workstation](#19-development-roadmap--multi-agent-safe-workstation)
 20. [References](#20-references)
+
+---
+
+## Quick Start
+
+The rest of this README explains *why* each piece exists. This chapter is the *order to do things in* — a complete first-time setup that points to the chapter with the detail for each step, so nothing is repeated. Do the steps in sequence.
+
+**What you are standing up:** a local GraphRAG memory shared by every AI tool on your machine — CLI agents and LM Studio alike. They talk only to one gateway on `127.0.0.1:8888`; the gateway owns Postgres (vectors + facts) and Neo4j (the graph), and runs the REM/NREM sleep cycle that turns saved facts into shared knowledge.
+
+### Resources & prerequisites
+
+**Hardware — lean minimum:** **16 GB RAM · ~8 GB VRAM · ~30 GB free disk.** Postgres + Neo4j take ~6 GB RAM between them; BGE-M3 and the reranker are small; your **reasoning LLM dominates VRAM**.
+
+**Software:** Docker + Docker Compose · [`uv`](https://docs.astral.sh/uv/) (recommended — every command here uses it; or Python 3.11+ with `pip`) · a GGUF inference runtime to serve the models (llama.cpp's `llama-server`, and/or LM Studio) · at least one consumer that talks to the memory: a **CLI agent** (Claude Code, Antigravity CLI, Grok, or Codex CLI) and/or **LM Studio** — which serves a model and provides a chat interface, reaching the memory through MCP rather than as an agent.
+
+**Reasoning LLM (your choice, on `:5000`):** any OpenAI-compatible local endpoint works. We run **Qwen3-27B**; on the 8 GB lean tier a 7–8B model (e.g. Qwen3-8B) is the practical pick. That quality-vs-cost decision *is* the whole subject of [**GraphRAG's Hidden Cost**](https://www.linkedin.com/pulse/graphrags-hidden-cost-youre-always-paying-question-when-motsenigos-w81pc/) — worth reading before you commit to a model, because this framework is GraphRAG.
+
+### Steps
+
+1. **Get the code, set DB passwords, raise OS limits.**
+   Clone the repo and `cp .env.example .env` ([§10](#10-agent-integration-first-time-setup)); fill `NEO4J_PASSWORD` and `PG_PASSWORD` (needed before the databases start). Raise inotify limits and — on Fedora/RHEL — keep the SELinux `:z` mounts ([§4](#4-os-prerequisites--fedora--linux), [§5](#5-infrastructure-setup-docker-compose)).
+
+2. **Start the databases.** `docker compose -f postgres_neo4j_limits.yaml up -d` ([§5](#5-infrastructure-setup-docker-compose)).
+
+3. **Create the schema — one command.** `uv run --with psycopg2-binary python shared-memory/migrations/apply.py` brings an empty DB to the latest schema; then run the one-time Neo4j constraints ([§6](#6-database-schema)). *(Upgrading an older install? Same command — see §6.)*
+
+4. **Start the models.** BGE-M3 on `:8070` and BGE-Reranker on `:8071` via `llama-server` ([§7](#7-inference-backends-llamacpp)); your reasoning LLM on `:5000` (LM Studio or any OpenAI-compatible server).
+
+5. **Generate tokens and finish your `.env`.** `uv run python shared-memory/scripts/generate_tokens.py` ([§10 token setup](#10-agent-integration-first-time-setup)). Put `AGENT_TOKENS=…` in the **gateway `.env` at the repo root** (alongside the passwords from step 1); put each agent's own `AGENT_TOKEN=…` in that agent's skill `.env`. One distinct token per agent — never shared. `.env.example` is the annotated template.
+
+6. **Start the gateway.** `uv run --with aiohttp --with asyncpg --with neo4j --with httpx python shared-memory/scripts/hive_mind_proxy.py 8888` — this also launches the REM and NREM daemons ([§9](#9-starting-the-full-stack)). Verify: `curl http://localhost:8888/health` should report `"status":"ok"` and `"auth_required":true`.
+
+7. **Install the skill into your agent.** Symlink/copy the skill into the agent's skills directory ([§10](#10-agent-integration-first-time-setup); remote/laptop clients → [§10a](#10a-remote-clients-ssh-tunnel-access)). Shortcut: just tell your agent — *"clone this repo and install the shared-memory skill per README §10."*
+
+8. **Use it.** Activate the skill in your agent — `/shared-memory` (Claude Code, Grok), `$shared-memory` (Codex), `/activate shared-memory` (Antigravity) — and tell the agent to **use the shared-memory skill to recall context before a task and store decisions after** ([§11](#11-agent-access-cli-and-mcp), [§11a](#11a-complete-cycle-end-to-end-workflow-with-cross-agent-examples)). Quick shell smoke test: `memory_bridge.py search "test" 3` ([§10 smoke-test](#10-agent-integration-first-time-setup)).
+
+### Troubleshooting — the first four you'll hit
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| **401 Unauthorized** | `AGENT_TOKEN` missing, or it doesn't match an entry in the gateway's `AGENT_TOKENS` | Re-check both `.env`s (§10). Restart the gateway after editing `AGENT_TOKENS`; restart LM Studio **fully** after changing its token. |
+| **503 on save/search** | Embedder/reranker on `:8070`/`:8071` not running, or the gateway can't reach them | Start the models (§7), then `curl :8888/health` to see which backend is down. |
+| **Search returns HTTP 500** | Migrations not applied — the coordinator hits a missing column | Run `apply.py` (§6). Safe to re-run; it's idempotent. |
+| **Silent DB failures / file-watcher errors (Fedora)** | inotify limits too low, or a volume mount missing `:z` so Neo4j/Postgres can't read the host dir | Raise inotify limits (§4); add `:z` to the mounts (§5). |
+| *Bonus:* **agent "doesn't know" earlier facts** | the skill was never invoked for that turn | Activate the skill and explicitly ask the agent to **search shared memory first** (step 8). |
+
+> **Maintainers:** this chapter is the single source of setup truth. Any change that affects setup — a new env var, a different model, a schema/migration, a port, a new daemon — **must update Quick Start** in the same change.
 
 ---
 
