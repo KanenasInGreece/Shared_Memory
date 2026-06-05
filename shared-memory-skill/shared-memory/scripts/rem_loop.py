@@ -26,7 +26,7 @@ Postgres connections:
 Configuration env vars (beyond PG_CONN / NEO4J_PASSWORD):
   AUDIT_LOG_PATH  — if set, each reviewed outbox row is appended as JSON-lines before
                     being marked rem_reviewed.  Default: disabled (empty = no log).
-                    See README §REM Audit Log for format details.
+                    See README §14 "REM outbox audit log" for format details.
   MOCK_LLM=1      — bypass LLM calls for testing; returns deterministic stub output.
 """
 
