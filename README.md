@@ -33,7 +33,7 @@ A unified semantic and relational memory layer built from first principles to su
 11. [Agent Access: CLI and MCP](#11-agent-access-cli-and-mcp)
     - [11a. Complete Cycle: End-to-End Workflow with Cross-Agent Examples](#11a-complete-cycle-end-to-end-workflow-with-cross-agent-examples)
 12. [The Save Path — From Artifact to Memory](#12-the-save-path--from-artifact-to-memory)
-13. [The Sleep Cycle — Consolidation](#13-the-sleep-cycle--consolidation)
+13. [The Sleep Cycle — REM and NREM Consolidation](#13-the-sleep-cycle--rem-and-nrem-consolidation)
 14. [Audit Logging](#14-audit-logging)
 15. [Retrieval: Three-Tier Lookup](#15-retrieval-three-tier-lookup)
 16. [LM Studio MCP Configuration](#16-lm-studio-mcp-configuration)
@@ -213,49 +213,43 @@ This is the problem the Shared Memory Framework is designed to address. The solu
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                              AGENT LAYER                                 │
-│                                                                          │
-│  Claude Code   Grok    Gemini CLI   LM Studio (MCP)    Any HTTP          │
-│  (skill)       (skill) (skill)      vector-skill.py    client            │
-│  memory_bridge.py ←→ memory_bridge.py ←→ memory_bridge.py               │
-└─────────────┬──────────────────────┬─────────────────────┬──────────────┘
-              │                      │                     │
-              └──────────────────────▼─────────────────────┘
-                                     │ HTTP (all memory ops)
-                         ┌───────────▼────────────────────────┐
-                         │  Hive-Mind Gateway + Coordinator   │
-                         │  hive_mind_proxy.py  :8888         │
-                         │                                    │
-                         │  /memory/save   → coordinator.py  │
-                         │  /memory/search → coordinator.py  │
-                         │  /memory/graph  → coordinator.py  │
-                         │  /v1/embeddings → :8070 (BGE-M3)  │
-                         │  /v1/reranking  → :8071            │
-                         │  default        → :5000 (LLM)     │
-                         └────────┬──────────────────────────┘
-                                  │ spawns
-                         ┌────────▼───────────────┐
-                         │  Consolidation Daemon  │
-                         │  consolidation_loop.py │
-                         │  LISTEN new_artifact   │
-                         └────────┬───────────────┘
-                                  │ writes
-              ┌───────────────────▼───────────────────────────┐
-              │                MEMORY LAYER                    │
-              │                                                │
-              │  ┌──────────────────────┐  ┌───────────────┐  │
-              │  │  PostgreSQL+pgvector │  │    Neo4j      │  │
-              │  │                      │  │               │  │
-              │  │ technical_docs       │  │ Fact nodes    │  │
-              │  │  (Tier 1 — Episodic) │  │ Entity hubs   │  │
-              │  │                      │  │ MENTIONS edges│  │
-              │  │ community_summaries  │  │ CommunitySumm │  │
-              │  │  (Tier 3 — Semantic) │  │ SUMMARIZED_BY │  │
-              │  │                      │  └───────────────┘  │
-              │  │ neo4j_outbox         │                      │
-              │  │  (coordinator WAL)   │                      │
-              │  └──────────────────────┘                      │
-              └────────────────────────────────────────────────┘
+│                              AGENT LAYER                                    │
+│                                                                            │
+│  Claude Code · Grok · Codex CLI · Antigravity CLI    LM Studio    Any      │
+│  (skills — memory_bridge.py)                         (MCP —       HTTP     │
+│                                                vector-skill.py)   client    │
+└────────────────────────────────┬───────────────────────────────────────────┘
+                                 │ HTTP — every memory op (agents never touch the DBs)
+                       ┌─────────▼───────────────────────────────────┐
+                       │  Hive-Mind Gateway + Coordinator            │
+                       │  hive_mind_proxy.py — binds 127.0.0.1:8888  │
+                       │  Bearer-token auth · DEFAULT DENY           │
+                       │                                             │
+                       │  /memory/save|search|graph → coordinator.py │
+                       │  /v1/embeddings → :8070 (BGE-M3, 1024-dim)  │
+                       │  /v1/reranking  → :8071 (BGE-Reranker)      │
+                       │  default        → :5000 (reasoning LLM)     │
+                       └─────┬───────────────────────────────┬───────┘
+                  spawns +   │ watchdogs        coordinator   │ owns all DB I/O
+                       ┌─────▼──────────────────┐             │
+                       │  Sleep-cycle daemons   │             │
+                       │  REM  — rem_loop.py     │             │
+                       │  NREM — consolidation_  │             │
+                       │         loop.py         │             │
+                       │  (LISTEN new_artifact)  │             │
+                       └─────┬──────────────────┘             │
+                             │ writes                          │ reads / writes
+              ┌──────────────▼──────────────────────────────────▼─┐
+              │                  MEMORY LAYER                      │
+              │  ┌──────────────────────┐   ┌───────────────┐     │
+              │  │  PostgreSQL+pgvector │   │     Neo4j     │     │
+              │  │ technical_docs       │   │ Fact nodes    │     │
+              │  │  (Tier 1 — Episodic) │   │ Entity hubs   │     │
+              │  │ community_summaries  │   │ MENTIONS      │     │
+              │  │  (Tier 3 — Semantic) │   │ CommunitySumm │     │
+              │  │ neo4j_outbox (WAL)   │   │ SUMMARIZED_BY │     │
+              │  └──────────────────────┘   └───────────────┘     │
+              └───────────────────────────────────────────────────┘
 ```
 
 | Tier | Store | Role | Biological Analogy |
@@ -264,7 +258,22 @@ This is the problem the Shared Memory Framework is designed to address. The solu
 | **2 — Structural** | Neo4j `Fact` nodes (keyed by `pg_id`) | Relationships, provenance, `consolidated` flag, Entity hubs | Hippocampus — relational context cosine similarity cannot express |
 | **3 — Semantic** | `community_summaries` (Postgres + pgvector) | Consolidated thematic narratives; queried first on retrieval | Neocortex — slow, abstract, statistical regularities across episodes |
 
-**Retrieval always queries Tier 3 first** (thematic orientation), then Tier 1 (surgical precision), then expands through Neo4j (relational context). Artifacts saved by one agent become retrievable by all others once the consolidation daemon runs.
+**Retrieval always queries Tier 3 first** (thematic orientation), then Tier 1 (surgical precision), then expands through Neo4j (relational context). Artifacts saved by one agent become retrievable by all others once the sleep cycle runs (§13).
+
+### Topology enforcement
+
+The topology above is not a convention agents are trusted to follow — each property is enforced in code. These are the steps that keep one shared brain coherent under concurrent multi-agent load:
+
+| Property | How it is enforced | Where |
+|---|---|---|
+| **One shared embedding space (1024-dim)** | Agents call only `:8888`; the coordinator alone calls `:8070`/`:8071`. No agent can introduce a foreign vector space. | gateway routing + `EMBED_URL`/`RERANK_URL` in `coordinator.py` |
+| **Localhost-only by default** | Gateway binds `127.0.0.1`; `PROXY_BIND=0.0.0.0` is opt-in and documented as overlay-network-only. | `hive_mind_proxy.py` (§9) |
+| **Caller authentication** | Every route except `/health` requires a registered `Authorization: Bearer` token (DEFAULT DENY); the server overwrites `source` with the verified agent name, so identity cannot be spoofed. | `auth_middleware` in `coordinator.py` (§10) |
+| **No direct DB access** | Agents hold no database credentials; all Postgres/Neo4j I/O flows through the coordinator's `asyncpg` pool and per-entity `asyncio.Lock`s. | `coordinator.py` (§11–§12) |
+| **Read-only graph queries** | `/memory/graph` rejects `CREATE`/`DELETE`/`SET`/`MERGE`/`CALL`/`DROP`/`LOAD CSV`; the Neo4j session is opened read-only as a second layer. | `coordinator.py` (§11) |
+| **Cross-DB atomicity** | Every save writes a `neo4j_outbox` row in the same Postgres transaction; the worker applies Neo4j asynchronously — no orphaned `Fact` nodes. | outbox worker, `coordinator.py` (§12) |
+| **Hard embedding mandate** | A save returns `503` after 4 failed embed retries rather than storing a vectorless, unsearchable row. | `coordinator.py` (§12) |
+| **Authenticated daemons** | REM and NREM run as registered agents (`rem_daemon`, `consolidation`); the gateway injects their tokens so their own embedding/LLM calls authenticate like any agent. | `hive_mind_proxy.py` (§9) |
 
 ---
 
@@ -338,48 +347,45 @@ Credentials are read from environment variables — copy `.env.example` to `.env
 
 ## 6. Database Schema
 
-Run these once against the Postgres instance to create the vector extension and both tables.
+The Postgres schema is managed by versioned migrations in `shared-memory/migrations/`, applied by `apply.py`. The runner executes every migration in order, and every migration is idempotent (`IF NOT EXISTS` throughout) — so it is always safe to re-run.
 
-```sql
--- Connect: psql postgresql://postgres:${PG_PASSWORD}@localhost:5432/agent_data
+### New install — one command
 
-CREATE EXTENSION IF NOT EXISTS vector;
+With the databases up (§5) and `PG_PASSWORD` in `.env`, run:
 
--- Tier 1: episodic facts from all agents
-CREATE TABLE IF NOT EXISTS technical_docs (
-    id            SERIAL PRIMARY KEY,
-    content       TEXT NOT NULL,
-    metadata      JSONB,
-    embedding     vector(1024),
-    content_hash  TEXT UNIQUE
-);
-CREATE INDEX IF NOT EXISTS technical_docs_embedding_idx
-    ON technical_docs USING ivfflat (embedding vector_cosine_ops);
-
--- Tier 3: consolidated thematic narratives
-CREATE TABLE IF NOT EXISTS community_summaries (
-    id             SERIAL PRIMARY KEY,
-    content        TEXT NOT NULL,
-    metadata       JSONB,
-    embedding      vector(1024),
-    source_pg_ids  integer[]       -- IDs of technical_docs rows that contributed to this summary
-);
-CREATE INDEX IF NOT EXISTS community_summaries_embedding_idx
-    ON community_summaries USING ivfflat (embedding vector_cosine_ops);
+```bash
+uv run --with psycopg2-binary python shared-memory/migrations/apply.py
 ```
 
-### Neo4j constraints
+That is the only schema command a new user runs. It takes an empty `agent_data` database all the way to the latest schema in one step:
+
+- `000` creates the `vector` extension and the two base tables (`technical_docs`, `community_summaries`).
+- `001` adds the multi-agent columns (`agent_id`, `scope`, `visibility`) and the `neo4j_outbox` table.
+- `002`–`006` add concurrency indexes, `source_pg_ids`, `summary_history`, and the `superseded` flag, plus one-time data back-fills.
+
+The resulting tables — `technical_docs` (Tier 1), `community_summaries` (Tier 3), and `neo4j_outbox` (coordinator WAL) — are documented column-by-column, with all Neo4j labels and relationship types, in [`shared-memory/Documentation/schema.md`](shared-memory/Documentation/schema.md).
+
+### Neo4j constraints — one-time
+
+Neo4j constraints are **not** created automatically. Run these once in Neo4j Browser or cypher-shell (also idempotent):
 
 ```cypher
-// Run in Neo4j Browser or cypher-shell
-CREATE CONSTRAINT fact_pg_id IF NOT EXISTS FOR (f:Fact) REQUIRE f.pg_id IS UNIQUE;
-CREATE CONSTRAINT entity_name IF NOT EXISTS FOR (e:Entity) REQUIRE e.name IS UNIQUE;
+CREATE CONSTRAINT fact_pg_id    IF NOT EXISTS FOR (f:Fact)             REQUIRE f.pg_id IS UNIQUE;
+CREATE CONSTRAINT entity_name   IF NOT EXISTS FOR (e:Entity)           REQUIRE e.name  IS UNIQUE;
 CREATE CONSTRAINT summary_pg_id IF NOT EXISTS FOR (s:CommunitySummary) REQUIRE s.pg_id IS UNIQUE;
 ```
 
-> **Key schema rule:** Every fact saved must include `"entities": ["Name1", "Name2"]` in its metadata. The saver creates `Entity` nodes and `MENTIONS` edges for each name. Without them the fact is stored and retrievable by vector search, but the consolidation daemon will never cluster it into Tier 3. The graph layer is the prerequisite for the semantic layer.
+### Upgrading from an earlier schema
 
-Full schema with all Neo4j labels and relationship types: [`shared-memory/Documentation/schema.md`](shared-memory/Documentation/schema.md)
+If you started on an older schema — before the coordinator, before REM/NREM, or before supersession — run the **same one command**:
+
+```bash
+uv run --with psycopg2-binary python shared-memory/migrations/apply.py
+```
+
+Because every migration is additive and `IF NOT EXISTS`, and `apply.py` re-runs the full set each time, this brings any existing database up to the latest schema **without dropping data**: missing columns and tables are added, and the one-time data migrations run (003/005 back-fill `source_pg_ids`; 006 normalises historical `source` values). Existing rows are preserved — pre-coordinator rows default to `agent_id='legacy'`, `scope`/`visibility='global'`. Re-running later is a no-op. Migration `000` is a no-op on a database that already has the tables, so new and upgrading users run the identical command.
+
+> **Key schema rule:** Every fact saved must include `"entities": ["Name1", "Name2"]` in its metadata. The saver creates `Entity` nodes and `MENTIONS` edges for each name. Without them the fact is stored and retrievable by vector search, but consolidation will never cluster it into Tier 3. The graph layer is the prerequisite for the semantic layer.
 
 ### Ontology configuration
 
@@ -581,7 +587,7 @@ echo 'AGENT_TOKENS=claude:tok_abc123...,gemini:tok_def456...,lm_studio:tok_ghi78
 # Step 3a — Claude Code: add AGENT_TOKEN to the skill .env
 echo 'AGENT_TOKEN=tok_abc123...' >> ~/.claude/skills/shared-memory/.env
 
-# Step 3b — Gemini CLI / Antigravity: add to the skill .env
+# Step 3b — Antigravity CLI (or legacy Gemini CLI): add to the skill .env
 echo 'AGENT_TOKEN=tok_def456...' >> ~/.gemini/skills/shared-memory/.env
 
 # Step 3c — LM Studio: add to mcp.json env block (see §16)
@@ -596,13 +602,13 @@ echo 'AGENT_TOKEN=tok_def456...' >> ~/.gemini/skills/shared-memory/.env
 INFO  coordinator auth enabled — 6 agent(s): antigravity, claude, codex, gemini, grok, lm_studio
 ```
 
-**Token search order** — `memory_bridge.py` finds `AGENT_TOKEN` via two paths tried in order (first match wins):
-1. `python-dotenv`'s `find_dotenv()` — searches parent directories from the script's location
-2. `~/.{agent}/skills/shared-memory/.env` — found via parent-dir walk from the `scripts/` directory
+**Token search order** — `memory_bridge.py` loads `AGENT_TOKEN` from up to two `.env` locations (first definition of each variable wins):
+1. the nearest `.env` found by walking up from the `scripts/` directory (`python-dotenv`'s `find_dotenv()`) — normally the skill-root `~/.{agent}/skills/shared-memory/.env`, which is exactly where Step 3 places the token
+2. a `scripts/`-adjacent `.env` (`~/.{agent}/skills/shared-memory/scripts/.env`), if you placed one there
 
-Both paths require `memory_bridge.py` to be invoked by absolute path so `__file__` resolves to the skill directory. See the skill's path note for the correct invocation form.
+Both require `memory_bridge.py` to be invoked by absolute path so `__file__` resolves to the skill directory. See the skill's path note for the correct invocation form.
 
-If `python-dotenv` is not installed (e.g. bare `uv run --with httpx python ...`), a built-in plain-Python parser reads the same paths directly — auth works regardless.
+If `python-dotenv` is not installed (e.g. bare `uv run --with httpx python ...`), a built-in plain-Python parser reads the skill-root and `scripts/`-adjacent `.env` files directly — auth works regardless.
 
 Each token maps to a verified agent identity. Never share tokens across agents on a multi-agent machine.
 
@@ -831,7 +837,7 @@ printf 'AGENT_TOKEN=tok_<your-token>\nCOORDINATOR_URL=http://localhost:8888\n' \
 ```bash
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version
-# → {"version": "0.3.6", "tool": "shared-memory-framework"}
+# → {"version": "0.4.0", "tool": "shared-memory-framework"}
 
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py search "test" 3
@@ -864,7 +870,7 @@ All three paths route through the coordinator on port 8888. The coordinator owns
 ```bash
 # Check the framework version
 python shared-memory/scripts/memory_bridge.py --version
-# → {"version": "0.3.6", "tool": "shared-memory-framework"}
+# → {"version": "0.4.0", "tool": "shared-memory-framework"}
 
 # Search — semantic + rerank + Neo4j expansion
 uv run --with httpx --with python-dotenv \
@@ -917,7 +923,7 @@ The coordinator exposes four endpoints on port 8888. All routes (except `/health
 | `POST` | `/memory/graph` | `{cypher, params?}` | `{status, records[]}` |
 | `POST` | `/memory/retrospective` | `{pg_id, rating, notes, date?, agent_id?}` | `{status, target_pg_id}` |
 | `GET` | `/memory/status/{pg_id}` | — | `{pg_id, neo4j, retries, applied_at}` |
-| `GET` | `/health` | — | `{status, embedder, reranker, llm, daemon, auth_required}` |
+| `GET` | `/health` | — | `{status, embedder, reranker, llm, daemon, rem_daemon, auth_required}` |
 
 > **`/memory/graph` is read-only enforced.** Queries containing `CREATE`, `DELETE`, `DETACH DELETE`, `SET`, `MERGE`, `CALL`, `LOAD CSV`, or `DROP` are rejected with HTTP 400 before reaching Neo4j.
 
@@ -935,7 +941,7 @@ $shared-memory          # Codex CLI (explicit); also auto-matched via SKILL.md d
 
 ## 11a. Complete Cycle: End-to-End Workflow with Cross-Agent Examples
 
-This section shows the full memory lifecycle: one agent saves knowledge, the consolidation daemon synthesises it, a different agent retrieves it later, then a retrospective closes the loop.
+This section shows the full memory lifecycle: one agent saves knowledge, the two-phase sleep cycle (REM enrichment → NREM consolidation, §13) synthesises it, a different agent retrieves it later, then a retrospective closes the loop.
 
 ### Step 1 — Claude Code saves a decision
 
@@ -967,16 +973,16 @@ Response:
 
 `pg_id=42` is the Postgres row ID. Note it — you'll use it to attach a retrospective later. `neo4j: "pending"` means the outbox worker will apply the Neo4j write asynchronously (typically within seconds).
 
-### Step 2 — Plain fact saved by Gemini CLI
+### Step 2 — Plain fact saved by Antigravity CLI
 
-Later the same day, Gemini CLI is debugging the proxy restart sequence and discovers something worth preserving:
+Later the same day, Antigravity CLI (`agy`) is debugging the proxy restart sequence and discovers something worth preserving:
 
 ```bash
-# Gemini CLI session — invoked via /activate shared-memory
+# Antigravity CLI (agy) session — invoked via /activate shared-memory
 uv run --with httpx --with python-dotenv \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py save \
   "On gateway restart, any neo4j_outbox rows with status='in_progress' are reset to 'pending' by coordinator.start(). This prevents double-processing when a crash left rows claimed but not applied." \
-  '{"source":"gemini_cli","entities":["OutboxPattern","coordinator","SharedMemory"],"source_ref":"coordinator.py#start()"}'
+  '{"source":"antigravity","entities":["OutboxPattern","coordinator","SharedMemory"],"source_ref":"coordinator.py#start()"}'
 ```
 
 Response:
@@ -991,15 +997,27 @@ Response:
 
 Note `"source_ref":"coordinator.py#start()"` — this propagates to the Neo4j `Fact` node, preserving the back-link to the exact code location.
 
-### Step 3 — Consolidation runs (automatic, no action needed)
+### Step 3 — The sleep cycle runs (automatic, no action needed)
 
-After 15 minutes of idle time on the `new_artifact` Postgres channel, the consolidation daemon fires. It finds that the `OutboxPattern` entity now has ≥ 5 unconsolidated `Fact` nodes. It calls the LLM to synthesise a cumulative narrative and writes the result to `community_summaries`.
+This is where the two-phase sleep cycle (§13) turns the raw saves into shared, consolidated knowledge — with no action from any agent.
 
-You can watch it happen in the gateway log:
+**REM enrichment — within ~2 minutes.** The REM daemon polls every 120 s, takes the new `OutboxPattern` facts oldest-first (only those whose Neo4j write is `applied`), and makes one LLM call per fact to rewrite it into a concise summary and attach typed entity relationships. It sets `rem_processed = true` on each fact and re-notifies NREM.
+
 ```
-INFO  consolidation: community OutboxPattern — 6 facts → synthesising
-INFO  consolidation: pg_id=88 written to community_summaries
+INFO:REMDaemon:REM cycle: 2 fact(s) to process (pg_ids=[42, 47])
+INFO:REMDaemon:REM: pg_id=42 done (decision=True, rels=4, outbox_marked=True)
+INFO:REMDaemon:REM: pg_id=47 done (decision=False, rels=3, outbox_marked=True)
 ```
+
+**NREM consolidation — after the idle window.** The NREM daemon waits for 15 minutes of quiet on the `new_artifact` channel (45-minute hard backstop), then counts unconsolidated Fact neighbours on the `OutboxPattern` hub — **only the `rem_processed` ones**. Once that reaches the density threshold (5) it integrates the new facts into the existing summary cumulatively, re-embeds the narrative via BGE-M3, and writes it to `community_summaries`. An older summary whose source facts are now subsumed is marked `superseded`.
+
+```
+INFO:ConsolidationDaemon:Idle threshold reached. Starting consolidation.
+INFO:ConsolidationDaemon:Generated summary for 'OutboxPattern'. Vectorizing...
+INFO:ConsolidationDaemon:Successfully consolidated 6 facts for 'OutboxPattern'.
+```
+
+> **REM gates NREM.** A fact REM has not enriched yet is fully searchable as a Tier-1 hit but does not count toward consolidation — so a freshly-saved fact appears in search immediately, while the thematic Tier-3 summary follows once REM enriches it and the cluster crosses the threshold.
 
 ### Step 4 — A different agent searches and finds both pieces
 
@@ -1052,9 +1070,9 @@ Condensed response:
 ```
 
 Grok gets:
-- **Tier-3** — the consolidated narrative synthesised from everything Claude Code and Gemini CLI saved (the first result always orients the agent)
+- **Tier-3** — the consolidated narrative synthesised from everything Claude Code and Antigravity CLI saved (the first result always orients the agent)
 - **Tier-1 fact** — the original decision Claude Code saved, with full provenance (who, which AI, which project)
-- **Tier-1 fact** — Gemini CLI's finding about restart recovery, with a `source_ref` link back to the code
+- **Tier-1 fact** — Antigravity CLI's finding about restart recovery, with a `source_ref` link back to the code
 
 Neither piece of knowledge was created by Grok. Neither existed in Grok's context window before this search. The shared brain made both available.
 
@@ -1102,7 +1120,7 @@ uv run --with httpx --with python-dotenv \
   --pg-id 42 \
   --rating "high" \
   --notes "Held up under multi-agent concurrent load. Outbox replay on crash worked correctly. Neo4j lag < 200 ms typical. No orphaned Fact nodes after 4 weeks." \
-  --source "gemini_cli"
+  --source "antigravity"
 ```
 
 Response:
@@ -1184,7 +1202,7 @@ caller: POST /memory/save {content, metadata, agent_id, scope, visibility}
        ↓ 401 if token missing or unrecognised
   metadata["source"] ← overwritten with verified agent name (server-side)
        ↓
-embed(content) via :8888 — retry with exponential backoff (4 attempts)
+embed(content) → embedder :8070 directly (coordinator runs inside the gateway) — retry ×4, linear backoff
        ↓ 503 if all retries fail — hard mandate: no save without a vector
 acquire per-entity asyncio.Lock for each name in metadata["entities"]
        ↓ serializes concurrent writes to the same entity cluster
@@ -1196,58 +1214,87 @@ BEGIN TRANSACTION
   SELECT pg_notify('new_artifact', {"pg_id": id})
 COMMIT  ← 200 OK returned to caller here (Postgres-ack)
        ↓ async outbox worker applies Neo4j write (MERGE Fact + Entity + MENTIONS)
-daemon receives NOTIFY → adds pg_id to pending_pg_ids → idle timer starts
+NOTIFY 'new_artifact' → NREM resets its idle timer; REM enriches the fact first,
+                        then it becomes eligible for consolidation (rem_processed, §13)
 ```
 
 > **Hard Mandate — Embedding Integrity:** Saves return 503 if the embedding service is unreachable after all retries. An artifact without a vector is invisible to semantic search — this failure must surface, never be swallowed.
 
-> **Per-entity write serialization:** Concurrent saves targeting the same entity are serialized via `asyncio.Lock[entity_name]`. This prevents duplicate `Entity` hub creation under agent-swarm concurrency and ensures the consolidation daemon sees a consistent cluster. (Phase 4 replaces this with Postgres advisory locks for multi-process deployment.)
+> **Why `:8070` here, not `:8888`?** Agents must always embed through the gateway (`:8888`) so every vector shares one space (§7). The coordinator is the process *behind* `:8888` — if it called `:8888` it would hit its own auth middleware (401) and loop on itself. It therefore calls the embedder (`:8070`) directly. The single-embedding-space guarantee is intact: `:8070` is the very BGE-M3 the gateway routes embedding traffic to.
 
-> **Cross-DB atomicity:** The outbox row is written in the same Postgres transaction as the fact. If the process crashes after commit, the outbox row survives and the Phase 2 worker replays the Neo4j write on restart. The ADR-001 dangling-Fact window is eliminated in Phase 2.
+> **Per-entity write serialization:** Concurrent saves targeting the same entity are serialized via `asyncio.Lock[entity_name]`, acquired in sorted order to avoid deadlock between concurrent saves. This prevents duplicate `Entity` hub creation under agent-swarm concurrency and ensures the sleep cycle sees a consistent cluster. (A future multi-process deployment would replace this in-process lock with Postgres advisory locks.)
+
+> **Cross-DB atomicity:** The outbox row is written in the same Postgres transaction as the fact. If the process crashes after commit, the outbox row survives and the outbox worker replays the Neo4j write on restart — the ADR-001 dangling-`Fact` window is eliminated.
 
 > **Audit logging:** Every event in the save path — coordinator unreachable, malformed metadata, missing entities, Neo4j sync failures, and successful saves — is optionally logged based on `MEMORY_LOG_LEVEL`. See [§14: Audit Logging](#14-audit-logging).
 
 ---
 
-## 13. The Sleep Cycle — Consolidation
+## 13. The Sleep Cycle — REM and NREM Consolidation
 
-The consolidation daemon is the neocortical layer of the architecture. It does not poll — polling would compete with inference workloads that need full GPU headroom. It waits for a Postgres `NOTIFY`, then applies a dual gate before acting: an idle timer and a graph density check.
+Since v0.4.0 the sleep cycle is **two-phase**, modelled on the biological division between REM and slow-wave (NREM) sleep. Two daemons run, both auto-started by the gateway:
 
-### Trigger logic
+- **REM** (`rem_loop.py`) — *enrichment*. Operates on individual `Fact` nodes: rewrites each into an LLM summary and attaches typed entity relationships. This is the first LLM-based entity-extraction pass; on save, entities are agent-supplied only.
+- **NREM** (`consolidation_loop.py`) — *consolidation*. Operates on Entity hub *communities*: synthesises high-density clusters of REM-enriched facts into thematic `community_summaries`. This is the neocortical layer.
 
-- Each `pg_notify` adds the artifact's `pg_id` to `pending_pg_ids` and resets a 15-minute idle timer.
-- After 15 minutes with no new notifications (idle threshold), consolidation runs.
-- A 45-minute hard backstop fires during continuous ingestion even if notifications never stop — preventing indefinite deferral.
+A fact must pass through REM before NREM will ever consolidate it. The phases are gated, not parallel.
 
-### Per-community consolidation
+### Phase 1 — REM (enrichment), `rem_loop.py`
 
-The daemon uses the queued `pg_id`s as entry points into Neo4j, not as the consolidation targets themselves. From each entry point it traverses to Entity hubs and counts unconsolidated Fact neighbors. Communities with fewer than 5 unconsolidated Facts wait — sparse neighborhoods are not ready for synthesis.
+Unlike NREM, REM **polls** — every 120 seconds, a batch of 5 facts (the per-fact LLM call is the latency bottleneck). Backlog enrichment has to drain steadily regardless of `NOTIFY` traffic, so it cannot be purely event-driven.
+
+Per cycle:
+
+1. Fetch the oldest non-REM `Fact` nodes (`pg_id ASC` — clears the historical backlog first).
+2. **Gate on outbox `status='applied'`** — only enrich facts whose Neo4j write is confirmed.
+3. Batch-fetch full content from Postgres in one query, over a single AUTOCOMMIT connection per cycle (replacing per-operation connection churn).
+4. Build a closed typed-node registry from the graph (`Human`, `AIAgent`, `Project`, `Decision`, `Entity`) so a name's label never changes mid-batch.
+5. One LLM round-trip per fact: a ≤5-sentence summary **plus** typed entity→relationship assignments. For `Decision` facts it additionally extracts `CONSIDERED`, `REJECTED`, `UNDER_CONDITIONS`, and `PRODUCES_INSIGHT` edges.
+6. Write to Neo4j in one session — entity `MERGE` edges first, Decision extras second, then `SET f.content = summary, f.rem_processed = true` **last**, so a partial failure never marks a fact processed.
+7. Notify NREM (`pg_notify('new_artifact', pg_id)`) so the entity cluster is re-evaluated, then mark the outbox row `rem_reviewed`.
+
+### Phase 2 — NREM (consolidation), `consolidation_loop.py`
+
+NREM **does not poll** — polling would compete with inference workloads that need full GPU headroom. It waits for a Postgres `NOTIFY`, then applies a dual gate: an idle timer and a graph density check.
+
+- Each `pg_notify` adds the artifact's `pg_id` to `pending_pg_ids` and resets a 15-minute idle timer. Consolidation runs after 15 minutes of quiet; a 45-minute hard backstop prevents indefinite deferral during continuous ingestion.
+- The queued `pg_id`s are entry points into Neo4j, not the consolidation targets. From each, NREM traverses to Entity hubs and counts unconsolidated Fact neighbours — **but only those with `rem_processed = true`**. Raw, un-enriched facts are never consolidated directly. Communities with fewer than 5 qualifying facts wait.
 
 For each community that meets the threshold:
 
 1. Fetch the most recent `CommunitySummary` for that Entity from Postgres (if any).
-2. Call the LLM via `:8888 → :5000` to integrate new facts into the existing narrative — **cumulative**, not a new isolated snapshot. This prevents content drift from parallel summary fragments about the same entity.
+2. Call the LLM via `:8888 → :5000` to integrate the new facts into the existing narrative — **cumulative**, not a new isolated snapshot. This prevents content drift from parallel summary fragments about the same entity.
 3. Re-embed the new narrative via BGE-M3 through `:8888`.
-4. Write to `community_summaries`; create/update `CommunitySummary` node in Neo4j; link source Facts via `SUMMARIZED_BY`; set `Fact.consolidated = true`.
+4. Write to `community_summaries`; create/update the `CommunitySummary` node in Neo4j; link source Facts via `SUMMARIZED_BY`; set `Fact.consolidated = true`.
 
 > **Why centroid averaging is not used:** The obvious compression approach — averaging related embeddings into a centroid — collapses the angular distinctions that cosine similarity depends on (Vangara & Gopinath, 2026, *"The Geometry of Consolidation"*). The LLM instead generates new language representing the theme of the cluster, which is then re-embedded from scratch. This produces a new semantic point that did not exist before — not a mathematical blend. Retrievable volume grows O(log n) with LLM-based consolidation versus O(n) without it.
 
+### Supersession
+
+After each NREM pass, any active summary whose `source_pg_ids` is a strict subset of the new summary's is marked `superseded = true` in Postgres and linked `(new)-[:SUPERSEDES]->(old)` in Neo4j. Tier 3 retrieval filters `WHERE NOT superseded`, so a stale, narrower summary is never surfaced once a more comprehensive one absorbs its source facts. Supersession is cross-entity — an "Outbox" summary can supersede a "Neo4j" summary if it absorbed all the same source facts.
+
 ### Re-consolidation
 
-The `consolidated` flag is not permanent. If future ingestion introduces unflagged Facts with sufficient neighborhood density that pull previously-consolidated Facts back into a candidate community, the entire cluster becomes eligible again.
+The `consolidated` flag is not permanent. If future ingestion introduces unflagged Facts with sufficient neighbourhood density that pull previously-consolidated Facts back into a candidate community, the entire cluster becomes eligible again.
 
 ---
 
 ## 14. Audit Logging
 
-The save path in both `memory_bridge.py` and `vector-skill.py` writes structured JSON log entries to per-tool files. Logging is **off by default** — enable it by setting `MEMORY_LOG_LEVEL` in `.env`.
+There are two independent, opt-in logs:
+
+1. **Per-save logging** — the save path in both `memory_bridge.py` and `vector-skill.py` writes structured JSON entries to per-tool files, gated by `MEMORY_LOG_LEVEL`. Covered first below.
+2. **REM outbox audit log** — the REM daemon (`rem_loop.py`, §13 Phase 1) appends each applied outbox row to a single JSON-lines file, gated by `AUDIT_LOG_PATH`. Covered at the end of this section.
+
+Both are **off by default**.
 
 ### Configuration
 
 | Variable | Default | Description |
 |---|---|---|
-| `MEMORY_LOG_LEVEL` | `0` (off) | Controls which events are logged |
-| `MEMORY_LOG_PATH` | `~/.shared-memory/logs` | Directory where log files are written |
+| `MEMORY_LOG_LEVEL` | `0` (off) | Per-save logging: controls which events are logged |
+| `MEMORY_LOG_PATH` | `~/.shared-memory/logs` | Per-save logging: directory where log files are written |
+| `AUDIT_LOG_PATH` | unset (off) | REM outbox audit log: file path; empty/unset disables it |
 
 ### Log levels
 
@@ -1255,9 +1302,9 @@ The save path in both `memory_bridge.py` and `vector-skill.py` writes structured
 |---|---|
 | `0` | Nothing (default) |
 | `1` | **Warnings** — save succeeded but `entities` missing; fact is stored but ineligible for consolidation |
-| `2` | Warnings + **errors** — gateway down (save aborted), malformed metadata JSON, non-dict metadata, Neo4j sync failure |
-| `3` | All above + **successful saves** — records `pg_id`, `source`, and entity count on every completed save |
-| `4` | All above + **full content copy** — includes the complete `content` field in each entry; warns if content exceeds 10 KB |
+| `2` | Warnings + **errors** — backend unreachable (`coordinator_down` from the CLI, `gateway_down` from the MCP), token rejected (`auth_failed`), malformed metadata JSON (`bad_metadata`), non-dict metadata (`bad_metadata_type`), missing `source` (`missing_source`), coordinator returned an error (`save_failed`), Neo4j sync failure (`neo4j_sync_failed`) |
+| `3` | All above + **successful saves** (`save_success`) — records `pg_id`, `source`, and entity count on every completed save |
+| `4` | All above + **full content copy** — adds the complete `content` field to each entry; adds a `content_size_warn` note if content exceeds 10 KB |
 
 ### Per-tool log files
 
@@ -1265,8 +1312,8 @@ Each entry point writes to its own file. Concurrent writes from CLI agents (both
 
 | Tool | Log file |
 |---|---|
-| CLI tools / Gemini CLI | `{MEMORY_LOG_PATH}/memory_bridge.log` |
-| LM Studio MCP | `{MEMORY_LOG_PATH}/vector_skill.log` |
+| CLI agents (Claude · Grok · Codex · Antigravity CLI) — all via `memory_bridge.py` | `{MEMORY_LOG_PATH}/memory_bridge.log` |
+| LM Studio MCP (`vector-skill.py`) | `{MEMORY_LOG_PATH}/vector_skill.log` |
 
 ### Log format
 
@@ -1278,14 +1325,17 @@ Each line is a self-contained JSON object:
 {"ts": "2026-05-24T14:41:03.552109", "tool": "vector_skill",   "event": "gateway_down", "content_preview": "Architectural dec..."}
 ```
 
-`event` is one of: `gateway_down`, `bad_metadata`, `bad_metadata_type`, `neo4j_sync_failed`, `no_entities`, `save_success`.
+The two tools emit slightly different `event` sets — notably they name the unreachable-backend case differently (`coordinator_down` from the CLI, `gateway_down` from the MCP):
 
-### Daily merge by the consolidation daemon
+- **`memory_bridge`** (CLI agents): `no_entities`, `bad_metadata`, `bad_metadata_type`, `auth_failed`, `coordinator_down`, `save_failed`, `save_success`
+- **`vector_skill`** (LM Studio MCP): `no_entities`, `bad_metadata`, `bad_metadata_type`, `missing_source`, `gateway_down`, `neo4j_sync_failed`, `save_success`
 
-The consolidation daemon runs `merge_logs()` once per calendar day on the first 1-second poll of a new day. It uses the logrotate pattern:
+### Daily merge of the per-tool logs (NREM consolidation daemon)
 
-1. Rename `memory_bridge.log` → `memory_bridge.log.rotating` and `vector_skill.log` → `vector_skill.log.rotating`. Writing tools create fresh files on next open.
-2. Parse all entries from both rotating files, sort by timestamp, group by calendar date.
+The **NREM consolidation daemon** (`consolidation_loop.py`) runs `merge_logs()` once per calendar day — on the first tick of its 1-second `LISTEN` poll after the date rolls over. Only the two per-tool *save* logs are merged; the REM outbox audit log (`AUDIT_LOG_PATH`, below) is separate and is never rotated or merged. The merge uses the logrotate pattern:
+
+1. Rename `memory_bridge.log` → `memory_bridge.log.rotating` and `vector_skill.log` → `vector_skill.log.rotating` (an empty per-tool log is just deleted). Writing tools create fresh files on next open.
+2. Parse all entries from both rotating files, group by calendar date, and sort each day's entries by timestamp.
 3. For each date, merge with any existing archive and write `shared_memory_YYYY-MM-DD.log.gz` (atomic `os.replace`).
 4. Delete the `.rotating` files.
 
@@ -1300,6 +1350,27 @@ The `shared_memory_` prefix distinguishes merged archives from agent memory file
 ```
 
 If the daemon is not running, per-tool logs accumulate; entries from multiple days are correctly split into separate dated archives on the next merge run.
+
+### REM outbox audit log (`AUDIT_LOG_PATH`)
+
+Distinct from the per-save logs above. The per-save logs record what each *agent* did on the save path and are gated by `MEMORY_LOG_LEVEL`. The REM outbox audit log records what the **REM daemon** did on the *write* path — a forensic trail of exactly which Neo4j writes were applied and when.
+
+Set `AUDIT_LOG_PATH` to a writable file path to enable it (unset or empty disables it — the default). During REM enrichment (§13 Phase 1), immediately before each processed outbox row is marked `rem_reviewed`, the daemon appends that row to the file as one JSON line. Unlike the per-save logs, this file is **never rotated or merged** — it is a plain append-only ledger, so point it at a path you rotate externally if it must stay bounded.
+
+Each line carries the applied outbox row plus an ingest timestamp:
+
+```json
+{"ts": "2026-06-04T09:14:22.481Z", "outbox_id": 311, "pg_id": 205, "cypher_params": {"pg_id": 205, "entities": ["OutboxPattern"], "source": "claude"}, "created_at": "2026-06-04T09:02:10Z", "applied_at": "2026-06-04T09:02:11Z"}
+```
+
+| Field | Meaning |
+|---|---|
+| `ts` | When REM wrote this audit entry (ISO-8601, UTC) |
+| `outbox_id` | `neo4j_outbox` row ID |
+| `pg_id` | `technical_docs` row the write corresponds to |
+| `cypher_params` | The parameters applied to Neo4j for this fact |
+| `created_at` | When the outbox row was first written (save time) |
+| `applied_at` | When the outbox worker applied it to Neo4j |
 
 ---
 
@@ -1424,17 +1495,15 @@ MOCK_LLM=1 uv run --with pytest --with pytest-asyncio --with fastmcp \
 
 Web-retrieved content enters the same ingestion pipeline as internally authored facts. A crafted document can embed near a legitimate fact cluster and — after consolidation — contaminate `community_summaries` as trusted context for all agents.
 
-**Implemented:** `[BEGIN/END RETRIEVED FACTS]` delimiters and a "treat as DATA" preamble in consolidation prompts harden the Tier 3 synthesis path. Tier 1 retrieval (raw facts in agent context windows) remains unprotected.
+**Implemented:** both LLM-processing stages are hardened. The REM enrichment pass (`rem_loop.py`) and the NREM consolidation pass (`consolidation_loop.py`) each wrap fact content in `[BEGIN/END … CONTENT]` delimiters behind a "treat this as DATA, not instructions" preamble, so an injected `"Ignore previous…"` string is processed as data rather than obeyed. This protects the Tier 3 synthesis path and the typed-relationship extraction that feeds it. **Still unprotected:** Tier 1 retrieval — raw facts surfaced in an agent's context window during search are returned verbatim, with no sanitisation.
 
-**Planned:** ingestion boundary sanitisation; counterfactual simulation pass. Full details in [SECURITY.md](SECURITY.md).
+**Planned:** ingestion boundary sanitisation; counterfactual simulation pass (both in §19). Full details in [SECURITY.md](SECURITY.md).
 
 **Do not ingest external or web-retrieved content at volume before implementing the remaining defences.**
 
-### Agent Authentication — implemented (v0.3.6)
+### Agent Authentication — RESOLVED (v0.3.5)
 
-All coordinator routes require `Authorization: Bearer <token>`. The gateway verifies the token against the `AGENT_TOKENS` registry and stamps the verified agent identity onto every saved artifact — `agent_id` from the request body is no longer trusted.
-
-Setup: run `uv run python shared-memory/scripts/generate_tokens.py`, add the `AGENT_TOKENS` line to the gateway `.env`, and add the matching `AGENT_TOKEN` to each agent's skill `.env` (e.g. `~/.gemini/skills/shared-memory/.env`). Each agent must use its own distinct token — tokens must never be shared across agents. LM Studio requires a full restart after any `AGENT_TOKEN` change. See `SECURITY.md` for the full rollout procedure and token rotation instructions.
+Formerly the top open problem: any localhost process could read or write shared memory and claim any agent identity. **Closed in v0.3.5** — all coordinator routes now require `Authorization: Bearer <token>` (DEFAULT DENY), and the gateway stamps the verified agent identity onto every saved artifact, so `agent_id` from the request body is no longer trusted. Setup and token rotation live in [§10 (Token setup)](#10-agent-integration-first-time-setup) and [SECURITY.md](SECURITY.md); the milestone is tracked under Completed in §19. Retained here as the record of a closed problem.
 
 ### Entity Resolution
 
@@ -1468,21 +1537,21 @@ This framework is actively evolving toward a workstation where any number of AI 
 | **Concurrency hardening** | FOR UPDATE SKIP LOCKED, atomic retry increment, single UNWIND batch query, acquired-lock tracking, ON CONFLICT upsert for community_summaries, embedding refresh on re-save, LISTEN reconnect, event-loop non-blocking poll | ✅ Done |
 | **Security baseline** | Read-only Cypher guard, localhost-only bind (PROXY_BIND opt-in), opaque error responses, bounded limit, ONT label validation at startup, prompt injection delimiters | ✅ Done |
 | **Configurable ontology — Path A** | All Neo4j labels and relationship types in `ontology.yaml`; ONT singleton with validation; falls back to hardcoded defaults; density threshold configurable | ✅ Done |
-| **Agent integration** | Claude Code, Grok, Gemini CLI, LM Studio (MCP), Codex CLI — all 5 agents live, SKILL.md carries YAML frontmatter for implicit Codex invocation, `AGENTS.md` project context file added | ✅ Done |
-| **Schema migrations** | Migration runner; 001 (multi-agent schema: agent_id, scope, visibility, neo4j_outbox); 002 (concurrency hardening: unique index on community_summaries, covering index on outbox); 003 (source provenance: `source_pg_ids integer[]` on community_summaries, back-fill from metadata) | ✅ Done |
+| **Agent integration** | Claude Code, Grok, Codex CLI, Antigravity CLI (`agy` — current, replacing Gemini CLI, which stays supported as legacy), LM Studio (MCP) — all live; SKILL.md carries YAML frontmatter for implicit Codex invocation; `AGENTS.md` project context file added | ✅ Done |
+| **Schema migrations** | Migration runner; 000 (base schema: `vector` extension + `technical_docs`/`community_summaries` base tables — makes `apply.py` a one-command install); 001 (multi-agent schema: agent_id, scope, visibility, neo4j_outbox); 002 (concurrency hardening: unique index on community_summaries, covering index on outbox); 003 (source provenance: `source_pg_ids integer[]` on community_summaries, back-fill from metadata); 004 (`summary_history JSONB`); 005 (corrected `source_pg_ids` back-fill + applies 004); 006 (REM supersession: `superseded` column + partial index, source normalisation back-fill) | ✅ Done |
 | **Provenance layer — Phase A** | PROV-O-inspired ontology: 6 new node labels (`Decision`, `Human`, `AIAgent`, `Project`, `Activity`, `Milestone`) and 8 provenance relationships (`WAS_ATTRIBUTED_TO`, `WAS_ASSISTED_BY`, `WAS_GENERATED_BY`, `PROJECT_OF`, `ACTED_ON_BEHALF_OF`, `SUPERSEDES`, `INFORMED_BY`, `HAD_OUTCOME`). Coordinator ingress validates `type:decision` saves (rejects missing `decided_by` / `project` / `rationale` before the row touches the outbox WAL). Outbox dispatches decision rows to a dedicated `_apply_decision_outbox_row` that materialises the full PROV-O subgraph in a single atomic Neo4j session. Plain `Fact` saves unchanged. | ✅ Done |
 | **Provenance layer — Phase B** | `save_decision` subcommand in `memory_bridge.py` (named flags — `--title`, `--decided-by`, `--project`, `--rationale` required; `--assisted-by`, `--alternatives`, `--confidence`, `--entities` optional) and `save_decision` MCP tool in `vector-skill.py`. `build_decision_metadata()` pure helper. `--version` flag added to `memory_bridge.py`. | ✅ Done |
 | **Three-test fixes (v0.3.1)** | Retrieval visibility: search results carry `tier`, `score_normalized` (sigmoid), `matched_entities`, structured `graph_context` list. Consolidation history: `summary_history JSONB` column on `community_summaries` (migration 004) — prior summary appended before each `DO UPDATE`, capped at 20. Lineage: `source_ref` optional metadata key flows from coordinator to Neo4j `Fact.source_ref` property. 14 new tests added. `schema.md` "appends new rows" inaccuracy corrected. | ✅ Done |
 | **REM/NREM + supersession (v0.4.0)** | `rem_loop.py` new daemon — LLM summary + typed entity relationships on oldest-first Fact nodes; single AUTOCOMMIT Postgres connection per cycle; `rem_processed=true` SET last (partial failure leaves fact retryable). NREM gated on `rem_processed`. CommunitySummary supersession: `superseded` column (migration 006) + `SUPERSEDES` Neo4j edges. 4 new ontology relationships (PRODUCES_INSIGHT, UNDER_CONDITIONS, CONSIDERED, REJECTED). Source normalisation backfill (migration 006). `AUDIT_LOG_PATH` opt-in JSON-lines outbox audit log. 17 new tests; 130 total. | ✅ Done |
+| **Provenance layer — Phase C** | Retrospective layer — closes the Why-To loop. `POST /memory/retrospective` (`coordinator.py`) writes a dated `HAD_OUTCOME` edge (an edge property, not a node — lineage without node explosion); `save_retrospective` in `memory_bridge.py` + MCP tool in `vector-skill.py`; multiple retrospectives per decision allowed; retrospectives never create a `technical_docs` row, so they do not pollute semantic search. | ✅ Done (v0.3.3) |
+| **Provenance layer — Phase D** | Four named query shortcuts in `memory_bridge.py query <template>`: `who-decided`, `agent-decisions`, `retrospectives`, `why-to-check`. Filter values sanitised before Cypher interpolation; raw `graph` subcommand preserved for custom traversals; SKILL.md Task 3 documents both paths. 7 new tests. | ✅ Done (v0.3.3) |
+| **Agent authentication (Phase 2C)** | `AGENT_TOKENS` registry; `Authorization: Bearer <token>` DEFAULT DENY middleware; server-side `source` overwrite (identity cannot be spoofed); duplicate-token guard; trailing-slash normalisation; 22 new tests. | ✅ Done (v0.3.5, hardened through v0.3.6) |
 
 ### In Progress / Planned
 
 | Phase | Milestone | Notes |
 |---|---|---|
-| **Provenance layer — Phase C** | Retrospective layer: `HAD_OUTCOME` edge written as a dated edge property (not a node) so lineage is preserved without node explosion; Why-To loop — agents query past retrospectives before executing new work in the same area | Phase B is the prerequisite. |
-| **Provenance layer — Phase D** ✅ | Four named query shortcuts in `memory_bridge.py query <template>`: `who-decided`, `agent-decisions`, `retrospectives`, `why-to-check`. Filter values sanitised before Cypher interpolation. Raw `graph` subcommand preserved for custom traversals. SKILL.md Task 3 restructured to document both paths. 7 new tests — 91 total. | v0.3.3. |
-| **Provenance layer — Phase E** | Separate `pruning_loop.py` on a slow cron; enforces the information foraging heuristic (save if retrieval utility + decision impact > storage cost); `type:decision` and `decision_impact`-flagged rows are unconditionally shielded; plain facts compete on retrieval frequency × age | Decoupled from the consolidation daemon — different cadence. |
-| **Agent authentication (Phase 2C)** ✅ | `AGENT_TOKENS` env var; `Authorization: Bearer <token>` DEFAULT DENY middleware; server-side source overwrite; duplicate-token guard; trailing-slash normalisation; 22 new tests | v0.3.6. |
+| **Provenance layer — Phase E** | Separate `pruning_loop.py` on a slow cron; enforces the information foraging heuristic (save if retrieval utility + decision impact > storage cost); `type:decision` and `decision_impact`-flagged rows are unconditionally shielded; plain facts compete on retrieval frequency × age | Next up. Decoupled from the consolidation daemon — different cadence. |
 | **Ontology as graph (Path B)** | Bootstrap `(:Class)` nodes + `SCO` relationships from `ontology.yaml` into Neo4j on startup; replace `ONT.*` string constants with startup-cached dict read from graph; enables live ontology inspection and Neosemantics (n10s) forward compatibility | Path A is the prerequisite ✅. Does not replace `ontology.yaml` — yaml stays the human-editable source; graph is a materialised copy. |
 | **Entity type enrichment** | Apply Neo4j multi-label to distinguish entity kinds — `:Entity:Person`, `:Entity:System`, `:Entity:Tool`, `:Entity:Decision` etc. — without breaking existing queries | Path A + Path B are the prerequisites. Enables richer graph traversal and type-aware consolidation clustering. |
 | **Entity resolution** | Detect and merge synonymous Entity nodes (`"hive_mind_proxy"` ≡ `"Hive-Mind Gateway"`); maintain a canonical name + alias set; re-link Fact nodes on merge | The entity contract (explicit caller-supplied names) makes this tractable. Implementation is a background reconciliation job, not a save-path change. |
