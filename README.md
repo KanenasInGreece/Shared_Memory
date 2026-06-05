@@ -587,7 +587,7 @@ echo 'AGENT_TOKENS=claude:tok_abc123...,gemini:tok_def456...,lm_studio:tok_ghi78
 # Step 3a — Claude Code: add AGENT_TOKEN to the skill .env
 echo 'AGENT_TOKEN=tok_abc123...' >> ~/.claude/skills/shared-memory/.env
 
-# Step 3b — Gemini CLI / Antigravity: add to the skill .env
+# Step 3b — Antigravity CLI (or legacy Gemini CLI): add to the skill .env
 echo 'AGENT_TOKEN=tok_def456...' >> ~/.gemini/skills/shared-memory/.env
 
 # Step 3c — LM Studio: add to mcp.json env block (see §16)
@@ -602,13 +602,13 @@ echo 'AGENT_TOKEN=tok_def456...' >> ~/.gemini/skills/shared-memory/.env
 INFO  coordinator auth enabled — 6 agent(s): antigravity, claude, codex, gemini, grok, lm_studio
 ```
 
-**Token search order** — `memory_bridge.py` finds `AGENT_TOKEN` via two paths tried in order (first match wins):
-1. `python-dotenv`'s `find_dotenv()` — searches parent directories from the script's location
-2. `~/.{agent}/skills/shared-memory/.env` — found via parent-dir walk from the `scripts/` directory
+**Token search order** — `memory_bridge.py` loads `AGENT_TOKEN` from up to two `.env` locations (first definition of each variable wins):
+1. the nearest `.env` found by walking up from the `scripts/` directory (`python-dotenv`'s `find_dotenv()`) — normally the skill-root `~/.{agent}/skills/shared-memory/.env`, which is exactly where Step 3 places the token
+2. a `scripts/`-adjacent `.env` (`~/.{agent}/skills/shared-memory/scripts/.env`), if you placed one there
 
-Both paths require `memory_bridge.py` to be invoked by absolute path so `__file__` resolves to the skill directory. See the skill's path note for the correct invocation form.
+Both require `memory_bridge.py` to be invoked by absolute path so `__file__` resolves to the skill directory. See the skill's path note for the correct invocation form.
 
-If `python-dotenv` is not installed (e.g. bare `uv run --with httpx python ...`), a built-in plain-Python parser reads the same paths directly — auth works regardless.
+If `python-dotenv` is not installed (e.g. bare `uv run --with httpx python ...`), a built-in plain-Python parser reads the skill-root and `scripts/`-adjacent `.env` files directly — auth works regardless.
 
 Each token maps to a verified agent identity. Never share tokens across agents on a multi-agent machine.
 
@@ -973,16 +973,16 @@ Response:
 
 `pg_id=42` is the Postgres row ID. Note it — you'll use it to attach a retrospective later. `neo4j: "pending"` means the outbox worker will apply the Neo4j write asynchronously (typically within seconds).
 
-### Step 2 — Plain fact saved by Gemini CLI
+### Step 2 — Plain fact saved by Antigravity CLI
 
-Later the same day, Gemini CLI is debugging the proxy restart sequence and discovers something worth preserving:
+Later the same day, Antigravity CLI (`agy`) is debugging the proxy restart sequence and discovers something worth preserving:
 
 ```bash
-# Gemini CLI session — invoked via /activate shared-memory
+# Antigravity CLI (agy) session — invoked via /activate shared-memory
 uv run --with httpx --with python-dotenv \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py save \
   "On gateway restart, any neo4j_outbox rows with status='in_progress' are reset to 'pending' by coordinator.start(). This prevents double-processing when a crash left rows claimed but not applied." \
-  '{"source":"gemini_cli","entities":["OutboxPattern","coordinator","SharedMemory"],"source_ref":"coordinator.py#start()"}'
+  '{"source":"antigravity","entities":["OutboxPattern","coordinator","SharedMemory"],"source_ref":"coordinator.py#start()"}'
 ```
 
 Response:
@@ -1070,9 +1070,9 @@ Condensed response:
 ```
 
 Grok gets:
-- **Tier-3** — the consolidated narrative synthesised from everything Claude Code and Gemini CLI saved (the first result always orients the agent)
+- **Tier-3** — the consolidated narrative synthesised from everything Claude Code and Antigravity CLI saved (the first result always orients the agent)
 - **Tier-1 fact** — the original decision Claude Code saved, with full provenance (who, which AI, which project)
-- **Tier-1 fact** — Gemini CLI's finding about restart recovery, with a `source_ref` link back to the code
+- **Tier-1 fact** — Antigravity CLI's finding about restart recovery, with a `source_ref` link back to the code
 
 Neither piece of knowledge was created by Grok. Neither existed in Grok's context window before this search. The shared brain made both available.
 
@@ -1120,7 +1120,7 @@ uv run --with httpx --with python-dotenv \
   --pg-id 42 \
   --rating "high" \
   --notes "Held up under multi-agent concurrent load. Outbox replay on crash worked correctly. Neo4j lag < 200 ms typical. No orphaned Fact nodes after 4 weeks." \
-  --source "gemini_cli"
+  --source "antigravity"
 ```
 
 Response:

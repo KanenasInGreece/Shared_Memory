@@ -48,7 +48,7 @@ To opt into all-interfaces binding (e.g. inside a Docker or VM network), set `PR
 **Setup:**
 1. Run `uv run python shared-memory/scripts/generate_tokens.py` to generate tokens
 2. Add `AGENT_TOKENS=claude:tok_...,gemini:tok_...,...` to the gateway `.env`
-3. Add `AGENT_TOKEN=<your-token>` to each agent's skill `.env` (or `~/.config/shared-memory/client.env`)
+3. Add `AGENT_TOKEN=<your-token>` to each agent's own skill `.env` — a distinct token per agent, never a shared file
 4. Restart the gateway; LM Studio requires a full application restart
 
 **Backward compatible:** `AGENT_TOKENS` unset → auth disabled (no-op for existing installs).
@@ -240,7 +240,9 @@ The three-tier dotenv fallback used Python `or` chaining: `find_dotenv() or path
 
 Agents running `uv run --with httpx python scripts/memory_bridge.py` without `--with python-dotenv` hit `except ImportError: pass` silently — no `.env` was parsed, `AGENT_TOKEN` stayed unset, and every call got 401. Grok's standard invocation pattern triggered this: it ran without `python-dotenv` and fell back to reading local filesystem files to answer queries, bypassing shared memory entirely.
 
-**Fix:** Added a plain-Python fallback in the `except ImportError` block that manually parses the skill-root `.env` (one directory above `scripts/`, covering `~/.grok/skills/shared-memory/.env` etc.) and `~/.config/shared-memory/client.env`. Auth tokens load with no external dependencies.
+**Fix:** Added a plain-Python fallback in the `except ImportError` block that manually parses the skill-root `.env` (one directory above `scripts/`, covering `~/.grok/skills/shared-memory/.env` etc.) and the `scripts/`-adjacent `.env`. Auth tokens load with no external dependencies.
+
+> **Later change:** the original `~/.config/shared-memory/client.env` shared-fallback tier (present in the v0.3.5 fix) was **removed**. A single shared token file could attach the wrong agent identity to a save — defeating the server-side source verification — so each agent now reads only its own skill `.env` and the `scripts/`-adjacent `.env`.
 
 ---
 
