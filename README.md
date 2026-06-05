@@ -941,7 +941,7 @@ $shared-memory          # Codex CLI (explicit); also auto-matched via SKILL.md d
 
 ## 11a. Complete Cycle: End-to-End Workflow with Cross-Agent Examples
 
-This section shows the full memory lifecycle: one agent saves knowledge, the consolidation daemon synthesises it, a different agent retrieves it later, then a retrospective closes the loop.
+This section shows the full memory lifecycle: one agent saves knowledge, the two-phase sleep cycle (REM enrichment → NREM consolidation, §13) synthesises it, a different agent retrieves it later, then a retrospective closes the loop.
 
 ### Step 1 — Claude Code saves a decision
 
@@ -997,15 +997,27 @@ Response:
 
 Note `"source_ref":"coordinator.py#start()"` — this propagates to the Neo4j `Fact` node, preserving the back-link to the exact code location.
 
-### Step 3 — Consolidation runs (automatic, no action needed)
+### Step 3 — The sleep cycle runs (automatic, no action needed)
 
-After 15 minutes of idle time on the `new_artifact` Postgres channel, the consolidation daemon fires. It finds that the `OutboxPattern` entity now has ≥ 5 unconsolidated `Fact` nodes. It calls the LLM to synthesise a cumulative narrative and writes the result to `community_summaries`.
+This is where the two-phase sleep cycle (§13) turns the raw saves into shared, consolidated knowledge — with no action from any agent.
 
-You can watch it happen in the gateway log:
+**REM enrichment — within ~2 minutes.** The REM daemon polls every 120 s, takes the new `OutboxPattern` facts oldest-first (only those whose Neo4j write is `applied`), and makes one LLM call per fact to rewrite it into a concise summary and attach typed entity relationships. It sets `rem_processed = true` on each fact and re-notifies NREM.
+
 ```
-INFO  consolidation: community OutboxPattern — 6 facts → synthesising
-INFO  consolidation: pg_id=88 written to community_summaries
+INFO:REMDaemon:REM cycle: 2 fact(s) to process (pg_ids=[42, 47])
+INFO:REMDaemon:REM: pg_id=42 done (decision=True, rels=4, outbox_marked=True)
+INFO:REMDaemon:REM: pg_id=47 done (decision=False, rels=3, outbox_marked=True)
 ```
+
+**NREM consolidation — after the idle window.** The NREM daemon waits for 15 minutes of quiet on the `new_artifact` channel (45-minute hard backstop), then counts unconsolidated Fact neighbours on the `OutboxPattern` hub — **only the `rem_processed` ones**. Once that reaches the density threshold (5) it integrates the new facts into the existing summary cumulatively, re-embeds the narrative via BGE-M3, and writes it to `community_summaries`. An older summary whose source facts are now subsumed is marked `superseded`.
+
+```
+INFO:ConsolidationDaemon:Idle threshold reached. Starting consolidation.
+INFO:ConsolidationDaemon:Generated summary for 'OutboxPattern'. Vectorizing...
+INFO:ConsolidationDaemon:Successfully consolidated 6 facts for 'OutboxPattern'.
+```
+
+> **REM gates NREM.** A fact REM has not enriched yet is fully searchable as a Tier-1 hit but does not count toward consolidation — so a freshly-saved fact appears in search immediately, while the thematic Tier-3 summary follows once REM enriches it and the cluster crosses the threshold.
 
 ### Step 4 — A different agent searches and finds both pieces
 
