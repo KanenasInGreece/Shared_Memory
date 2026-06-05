@@ -56,7 +56,7 @@ The rest of this README explains *why* each piece exists. This chapter is the *o
 
 **Hardware — lean minimum:** **16 GB RAM · ~8 GB VRAM · ~30 GB free disk.** Postgres + Neo4j take ~6 GB RAM between them; BGE-M3 and the reranker are small; your **reasoning LLM dominates VRAM**.
 
-**Software:** Docker + Docker Compose · [`uv`](https://docs.astral.sh/uv/) (recommended — every command here uses it; or Python 3.11+ with `pip`) · a GGUF inference runtime to serve the models (llama.cpp's `llama-server`, and/or LM Studio) · at least one consumer that talks to the memory: a **CLI agent** (Claude Code, Antigravity CLI, Grok, or Codex CLI) and/or **LM Studio** — which serves a model and provides a chat interface, reaching the memory through MCP rather than as an agent.
+**Software:** Docker + Docker Compose · [`uv`](https://docs.astral.sh/uv/) (recommended — every command here uses it; or Python 3.11+ with `pip`) · a server for your reasoning LLM on `:5000` (LM Studio, or any OpenAI-compatible endpoint) — the embedder and reranker run as Docker containers from the compose file, so they need no separate install · at least one consumer that talks to the memory: a **CLI agent** (Claude Code, Antigravity CLI, Grok, or Codex CLI) and/or **LM Studio** — which serves a model and provides a chat interface, reaching the memory through MCP rather than as an agent.
 
 **Reasoning LLM (your choice, on `:5000`):** any OpenAI-compatible local endpoint works. We run **Qwen3-27B**; on the 8 GB lean tier a 7–8B model (e.g. Qwen3-8B) is the practical pick. That quality-vs-cost decision *is* the whole subject of [**GraphRAG's Hidden Cost**](https://www.linkedin.com/pulse/graphrags-hidden-cost-youre-always-paying-question-when-motsenigos-w81pc/) — worth reading before you commit to a model, because this framework is GraphRAG.
 
@@ -65,11 +65,11 @@ The rest of this README explains *why* each piece exists. This chapter is the *o
 1. **Get the code, set DB passwords, raise OS limits.**
    Clone the repo and `cp .env.example .env` ([§10](#10-agent-integration-first-time-setup)); fill `NEO4J_PASSWORD` and `PG_PASSWORD` (needed before the databases start). Raise inotify limits and — on Fedora/RHEL — keep the SELinux `:z` mounts ([§4](#4-os-prerequisites--fedora--linux), [§5](#5-infrastructure-setup-docker-compose)).
 
-2. **Start the databases.** `docker compose -f postgres_neo4j_limits.yaml up -d` ([§5](#5-infrastructure-setup-docker-compose)).
+2. **Start the stack (databases + inference).** First put your BGE-M3 and reranker GGUF files in the folder the compose mounts ([§5](#5-infrastructure-setup-docker-compose)). Then `docker compose -f postgres_neo4j_limits.yaml up -d` brings up Postgres, Neo4j, the embedder (`:8070`) and the reranker (`:8071`); `docker compose … ps` should show all four `healthy`.
 
 3. **Create the schema — one command.** `uv run --with psycopg2-binary python shared-memory/migrations/apply.py` brings an empty DB to the latest schema; then run the one-time Neo4j constraints ([§6](#6-database-schema)). *(Upgrading an older install? Same command — see §6.)*
 
-4. **Start the models.** BGE-M3 on `:8070` and BGE-Reranker on `:8071` via `llama-server` ([§7](#7-inference-backends-llamacpp)); your reasoning LLM on `:5000` (LM Studio or any OpenAI-compatible server).
+4. **Start the reasoning LLM.** The embedder and reranker already came up with the compose stack (step 2); you only need your reasoning LLM on `:5000` — LM Studio or any OpenAI-compatible server ([§7](#7-inference-backends-llamacpp)).
 
 5. **Generate tokens and finish your `.env`.** `uv run python shared-memory/scripts/generate_tokens.py` ([§10 token setup](#10-agent-integration-first-time-setup)). Put `AGENT_TOKENS=…` in the **gateway `.env` at the repo root** (alongside the passwords from step 1); put each agent's own `AGENT_TOKEN=…` in that agent's skill `.env`. One distinct token per agent — never shared. `.env.example` is the annotated template.
 
@@ -84,7 +84,7 @@ The rest of this README explains *why* each piece exists. This chapter is the *o
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | **401 Unauthorized** | `AGENT_TOKEN` missing, or it doesn't match an entry in the gateway's `AGENT_TOKENS` | Re-check both `.env`s (§10). Restart the gateway after editing `AGENT_TOKENS`; restart LM Studio **fully** after changing its token. |
-| **503 on save/search** | Embedder/reranker on `:8070`/`:8071` not running, or the gateway can't reach them | Start the models (§7), then `curl :8888/health` to see which backend is down. |
+| **503 on save/search** | Embedder/reranker (`:8070`/`:8071`) down or `unhealthy` | Run `docker compose ps` **first** — the inference services have healthchecks; an `unhealthy` one (usually a wrong model path, §5) is the cause. Then `curl :8888/health`. |
 | **Search returns HTTP 500** | Migrations not applied — the coordinator hits a missing column | Run `apply.py` (§6). Safe to re-run; it's idempotent. |
 | **Silent DB failures / file-watcher errors (Fedora)** | inotify limits too low, or a volume mount missing `:z` so Neo4j/Postgres can't read the host dir | Raise inotify limits (§4); add `:z` to the mounts (§5). |
 | *Bonus:* **agent "doesn't know" earlier facts** | the skill was never invoked for that turn | Activate the skill and explicitly ask the agent to **search shared memory first** (step 8). |
@@ -350,7 +350,7 @@ A stock Fedora workstation defaults to 128 instances and 65536 watches — adequ
 
 ## 5. Infrastructure Setup: Docker Compose
 
-Neo4j and Postgres are the two persistent stores. Both run in Docker. See `postgres_neo4j_limits.yaml` for the full compose file; the key structure is:
+`postgres_neo4j_limits.yaml` defines the whole local stack as **four** services — the two persistent stores (**neo4j**, **postgres**) and the two inference backends (**retriever-api**, the BGE-M3 embedder on `:8070`, and **reranker-api**, BGE-Reranker-v2-m3 on `:8071`, both llama.cpp `server` containers). One `docker compose up -d` brings up all four. The key structure:
 
 ```yaml
 services:
@@ -380,6 +380,37 @@ services:
       - POSTGRES_PASSWORD=${PG_PASSWORD}
       - POSTGRES_DB=agent_data
     restart: always
+
+  # --- Inference layer (llama.cpp server containers) ---
+  retriever-api:                 # BGE-M3 embedder
+    image: ghcr.io/ggml-org/llama.cpp:server
+    ports: ["8070:8070"]
+    volumes:
+      - /path/to/your/LLM_Models:/models:ro,z   # host models folder → /models in-container
+    command: >
+      -m /models/gpustack/bge-m3-GGUF/bge-m3-Q8_0.gguf
+      --embedding --host 0.0.0.0 --port 8070 -c 8192 -b 8192 -ub 8192
+    healthcheck:                 # surfaces as healthy/unhealthy in `docker compose ps`
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8070/health"]
+      interval: 30s
+      retries: 3
+      start_period: 60s
+    restart: always
+
+  reranker-api:                  # BGE-Reranker-v2-m3
+    image: ghcr.io/ggml-org/llama.cpp:server
+    ports: ["8071:8071"]
+    volumes:
+      - /path/to/your/LLM_Models:/models:ro,z
+    command: >
+      -m /models/gpustack/bge-reranker-v2-m3-GGUF/bge-reranker-v2-m3-Q8_0.gguf
+      --rerank --host 0.0.0.0 --port 8071 -c 8192 -b 8192 -ub 8192
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8071/health"]
+      interval: 30s
+      retries: 3
+      start_period: 60s
+    restart: always
 ```
 
 ```bash
@@ -391,6 +422,10 @@ docker compose -f postgres_neo4j_limits.yaml ps
 ```
 
 Credentials are read from environment variables — copy `.env.example` to `.env` and fill in `NEO4J_PASSWORD` and `PG_PASSWORD` before starting.
+
+> **Place the models where the compose expects them.** The two inference containers mount a host models directory read-only (`/path/to/your/LLM_Models:/models:ro,z`) and load each GGUF by path (`-m /models/gpustack/bge-m3-GGUF/bge-m3-Q8_0.gguf`, and the reranker equivalent). Put your GGUF files under that host folder at those sub-paths — or edit the mount and `-m` paths to match where you keep them. A wrong path lets the container start but then fail its healthcheck.
+
+> **Healthchecks are the first troubleshooting step.** Both inference services declare a Docker `healthcheck` against `/health`. Run `docker compose -f postgres_neo4j_limits.yaml ps` and read the **STATUS** column — `healthy`, `starting`, or `unhealthy`. An `unhealthy` embedder or reranker (almost always a wrong model path or too little RAM) is why saves and searches return 503 — check this before debugging the gateway.
 
 ---
 
@@ -476,14 +511,16 @@ Set `SMEM_ONTOLOGY_PATH=/path/to/your/ontology.yaml` to load from a non-default 
 
 ## 7. Inference Backends (llama.cpp)
 
-Two models serve the embedding and reranking paths. Both are hosted via `llama-server` on separate ports. A third port (5000) hosts the reasoning LLM — typically LM Studio's inference server, but any OpenAI-compatible endpoint works.
+Two models serve the embedding and reranking paths. In the default setup they run as the **`retriever-api`** (BGE-M3, `:8070`) and **`reranker-api`** (BGE-Reranker-v2-m3, `:8071`) services in the compose file — so `docker compose up -d` (§5) already started them; see §5 for where to place the GGUF files. A third port (`5000`) hosts the reasoning LLM (LM Studio or any OpenAI-compatible endpoint) — this one is **not** in the compose file, so start it yourself.
+
+To run the embedder and reranker outside Docker instead, launch `llama-server` directly (point `-m` at your GGUF files):
 
 ```bash
 # BGE-M3 — embedding model, port 8070
-llama-server --model /path/to/bge-m3-Q8_0.gguf --port 8070 --embedding --pooling mean
+llama-server -m /path/to/bge-m3-Q8_0.gguf --port 8070 --embedding -c 8192 -b 8192 -ub 8192
 
 # BGE-Reranker-v2-m3 — reranking model, port 8071
-llama-server --model /path/to/bge-reranker-v2-m3.gguf --port 8071 --reranking
+llama-server -m /path/to/bge-reranker-v2-m3-Q8_0.gguf --port 8071 --rerank -c 8192 -b 8192 -ub 8192
 ```
 
 > **Never call ports 8070 or 8071 directly.** All agents must go through the Hive-Mind Gateway on port 8888. The gateway is what enforces the shared embedding space — if any agent bypasses it, the 1024-dim consistency guarantee is broken in operational practice.
@@ -529,16 +566,16 @@ The v6 async rewrite replaced the entire implementation with `aiohttp.web` + `ai
 
 The startup sequence is order-dependent. The gateway must be up before any embedding or save operation. Starting the gateway also starts the consolidation daemon — you do not need to manage them separately.
 
-**1. Start databases**
+**1. Start databases + inference** — one compose brings up Postgres, Neo4j, the BGE-M3 embedder (`:8070`) and the BGE-Reranker (`:8071`):
 ```bash
 docker compose -f postgres_neo4j_limits.yaml up -d
+docker compose -f postgres_neo4j_limits.yaml ps    # all four should reach 'healthy'
 ```
+First run? Make sure the GGUF models are in the mounted folder before this — see §5.
 
-**2. Start BGE-M3 and BGE-Reranker-v2-m3** (llama-server, ports 8070 and 8071)
+**2. Start the reasoning LLM** (LM Studio or any OpenAI-compatible server on port 5000 — this one is *not* in the compose file)
 
-**3. Start the reasoning LLM** (LM Studio or any OpenAI-compatible server on port 5000)
-
-**4. Start the Hive-Mind Gateway** — this also starts the consolidation daemon automatically
+**3. Start the Hive-Mind Gateway** — this also starts the REM and NREM daemons automatically
 ```bash
 uv run --with aiohttp --with asyncpg --with neo4j --with httpx \
   python shared-memory/scripts/hive_mind_proxy.py 8888
@@ -553,9 +590,9 @@ INFO  Listening for 'new_artifact' notifications...
 INFO:REMDaemon:REM daemon started (poll=120s, batch=5)
 ```
 
-**5. LM Studio** — start the application; it will pick up the MCP servers from `mcp.json` automatically.
+**4. LM Studio** — start the application; it will pick up the MCP servers from `mcp.json` automatically.
 
-Step 4 is the only manual step required after databases and models are running. The proxy starts both daemons; all three processes shut down cleanly when the proxy receives SIGINT or SIGTERM.
+The gateway is the only repo script you start by hand — databases and both inference backends come up with `docker compose up -d`. The proxy starts both daemons; all processes shut down cleanly when the proxy receives SIGINT or SIGTERM.
 
 **Verify the full stack is healthy:**
 ```bash
@@ -563,7 +600,7 @@ curl http://localhost:8888/health
 # {"status":"ok","embedder":"ok","reranker":"ok","llm":"ok","daemon":"running","rem_daemon":"running","auth_required":true}
 ```
 
-HTTP 200 means the save/search path (embedder + reranker) is operational. HTTP 503 means at least one critical backend is down — do not attempt saves until resolved. `daemon` and `rem_daemon` are informational; their degradation affects consolidation/enrichment only. `auth_required: true` confirms token authentication is enforced.
+HTTP 200 means the save/search path (embedder + reranker) is operational. HTTP 503 means at least one critical backend is down — do not attempt saves until resolved (run `docker compose ps`; an `unhealthy` embedder or reranker is the usual cause). `daemon` and `rem_daemon` are informational; their degradation affects consolidation/enrichment only. `auth_required: true` confirms token authentication is enforced.
 
 **Daemon watchdogs:** the gateway automatically restarts both the NREM consolidation daemon and the REM daemon if either crashes, with independent exponential backoff and circuit breakers (5 crashes / 10 min each). If a circuit breaker trips, restart the gateway.
 

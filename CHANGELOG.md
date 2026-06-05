@@ -14,6 +14,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Docs
 
+- **README now documents the full Docker stack (inference layer included).** `postgres_neo4j_limits.yaml` runs **four** services — Postgres, Neo4j, and the BGE-M3 embedder (`retriever-api`, `:8070`) + BGE-Reranker (`reranker-api`, `:8071`) as llama.cpp `server` containers — but §5 showed only the two databases and §7/§9 described the embedder/reranker as separately-run `llama-server` processes.
+  - §5 now shows the two inference services (with their model volume mount and Docker `healthcheck`) and adds two notes: **place the GGUF models in the host folder the compose mounts** (`/path/to/your/LLM_Models:/models`, at the `-m` sub-paths) and **use `docker compose ps` healthchecks as the first troubleshooting step** for 503s.
+  - §7 reframed: the embedder/reranker run as the compose services (started by `docker compose up -d`); the manual `llama-server` form is the non-Docker alternative, with flags corrected to match the compose (`--rerank`, `-c/-b/-ub 8192`).
+  - §9 startup reconciled: one `docker compose up -d` brings up databases **and** inference; the separate "start BGE-M3 / reranker" step is gone; the gateway is the only script started by hand. Health line points to `docker compose ps`.
+  - Quick Start: step 2 starts the stack incl. inference and notes the model-folder placement; step 4 is now just the reasoning LLM; the 503 row points to `docker compose ps` healthchecks first.
 - **Documentation fact-check pass**: reviewed every README chapter and standalone doc against current v0.4.0 code. Corrections:
   - README `--version` example output `0.3.6` → `0.4.0` (§10a, §11) to match `memory_bridge.py` `VERSION`.
   - README §11 coordinator API table `/health` response now lists `rem_daemon` (the gateway has emitted it since v0.4.0).
