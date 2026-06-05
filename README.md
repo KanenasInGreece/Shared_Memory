@@ -58,7 +58,7 @@ The rest of this README explains *why* each piece exists. This chapter is the *o
 
 **Software:** Docker + Docker Compose · [`uv`](https://docs.astral.sh/uv/) (recommended — every command here uses it; or Python 3.11+ with `pip`) · a server for your reasoning LLM on `:5000` (LM Studio, or any OpenAI-compatible endpoint) — the embedder and reranker run as Docker containers from the compose file, so they need no separate install · at least one consumer that talks to the memory: a **CLI agent** (Claude Code, Antigravity CLI, Grok, or Codex CLI) and/or **LM Studio** — which serves a model and provides a chat interface, reaching the memory through MCP rather than as an agent.
 
-**Reasoning LLM (your choice, on `:5000`):** any OpenAI-compatible local endpoint works. We run **Qwen3-27B**; on the 8 GB lean tier a 7–8B model (e.g. Qwen3-8B) is the practical pick. That quality-vs-cost decision *is* the whole subject of [**GraphRAG's Hidden Cost**](https://www.linkedin.com/pulse/graphrags-hidden-cost-youre-always-paying-question-when-motsenigos-w81pc/) — worth reading before you commit to a model, because this framework is GraphRAG.
+**Reasoning LLM (your choice, on `:5000`):** any OpenAI-compatible local endpoint works. We run **Qwen3-27B**; on the 8 GB lean tier a 7–8B model (e.g. Qwen3-8B) is the practical pick. That choice of model may affect the way quality of your graph -- my experience withthis is reflected in  [**GraphRAG's Hidden Cost**](https://www.linkedin.com/pulse/graphrags-hidden-cost-youre-always-paying-question-when-motsenigos-w81pc/).
 
 ### Steps
 
@@ -73,7 +73,7 @@ The rest of this README explains *why* each piece exists. This chapter is the *o
 
 5. **Generate tokens and finish your `.env`.** `uv run python shared-memory/scripts/generate_tokens.py` ([§10 token setup](#10-agent-integration-first-time-setup)). Put `AGENT_TOKENS=…` in the **gateway `.env` at the repo root** (alongside the passwords from step 1); put each agent's own `AGENT_TOKEN=…` in that agent's skill `.env`. One distinct token per agent — never shared. `.env.example` is the annotated template.
 
-6. **Start the gateway.** `uv run --with aiohttp --with asyncpg --with neo4j --with httpx python shared-memory/scripts/hive_mind_proxy.py 8888` — this also launches the REM and NREM daemons ([§9](#9-starting-the-full-stack)). Verify: `curl http://localhost:8888/health` should report `"status":"ok"` and `"auth_required":true`.
+6. **Start the gateway.** `uv run --with aiohttp --with asyncpg --with neo4j --with httpx python shared-memory/scripts/hive_mind_proxy.py 8888` — this also launches the REM and NREM daemons ([§9](#9-starting-the-full-stack)). Verify: `curl http://localhost:8888/health` should report `"status":"ok"` and `"auth_required":true`.  
 
 7. **Install the skill into your agent.** Symlink/copy the skill into the agent's skills directory ([§10](#10-agent-integration-first-time-setup); remote/laptop clients → [§10a](#10a-remote-clients-ssh-tunnel-access)). Shortcut: just tell your agent — *"clone this repo and install the shared-memory skill per README §10."*
 
@@ -95,9 +95,9 @@ The rest of this README explains *why* each piece exists. This chapter is the *o
 
 ## 1. The Vision: One Brain, Many Agents
 
-Every AI workstation today runs several tools in parallel — a terminal agent, a desktop chat model, a coding assistant. Each of them works hard in a session, reasons through a problem, discovers something useful. Then the session ends, and all of that is gone. The next tool starts cold, the next session starts from zero. They do not talk to each other. They cannot.
+An AI workstation today may be running several tools in parallel — a coding agent, a desktop chat model, a local assistant(agent). Each of them  reasons through a problem, discovers something useful, but then the session ends, and all of that is gone. It is not the artifact produced, it is the knowledge gained, the decision process, which we are capturing with this shared memory framework -- The important lessons learned should inform the work you do with other tools, it should be captured as part of the value created and shared so that your whole ecosystem may benefit.
 
-This framework is built around one idea: those tools should share a brain. When Gemini CLI figures out why the proxy was failing, any other agent should already know the next time it is asked about the proxy. When LM Studio runs a consolidation on a set of architectural facts, those summaries should be there for any agent that searches next.
+The shared memory framework is built around this idea: your tools should capture and share the knowledge gained from each project they work on. When Gemini CLI figures out why the proxy was failing, any other agent should already know the next time it is asked about the proxy. When LM Studio runs a consolidation on a set of architectural facts, those summaries should be there for any agent that searches next.
 
 **The consumers, and how they connect:**
 
