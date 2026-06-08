@@ -47,6 +47,51 @@ from ontology import ONT
 
 log = logging.getLogger("coordinator")
 
+# ── Version contract ────────────────────────────────────────────────────────────
+# FRAMEWORK_VERSION is the informational build/semver — it changes every release.
+# API_VERSION is the wire contract between memory_bridge.py (the thin client that
+# ships with the skill) and this coordinator. Bump it ONLY when the request or
+# response shape, auth scheme, or routes change in a way that breaks older clients.
+# Client and server build-versions are allowed to drift; their API_VERSION must agree.
+FRAMEWORK_VERSION = "0.4.1"
+API_VERSION = 1
+CLIENT_VERSION_HEADER = "X-SM-Api-Version"
+
+# Throttle: remember (agent, version) pairs already logged so a misversioned
+# client does not flood the gateway log on every request.
+_seen_version_skews: set[tuple[str, int]] = set()
+
+
+def _check_client_version(request: web.Request) -> None:
+    """Log a one-time warning when a client's API_VERSION differs from ours.
+
+    Best-effort and never raises — a missing/garbled header is simply ignored,
+    so old clients that don't send the header are unaffected.
+    """
+    raw = request.headers.get(CLIENT_VERSION_HEADER)
+    if raw is None:
+        return
+    try:
+        client_api = int(raw)
+    except (TypeError, ValueError):
+        return
+    if client_api == API_VERSION:
+        return
+    # Attribute the skew to an agent when the bearer token resolves one.
+    token = request.headers.get("Authorization", "").split(maxsplit=1)
+    agent = _AGENT_TOKENS.get(token[1]) if len(token) == 2 else None
+    agent = agent or "unknown"
+    key = (agent, client_api)
+    if key in _seen_version_skews:
+        return
+    _seen_version_skews.add(key)
+    upgrade = "client (re-sync the skill)" if client_api < API_VERSION else "gateway (git pull + restart)"
+    log.warning(
+        "API version skew: agent %r speaks v%d, gateway speaks v%d — upgrade the %s.",
+        agent, client_api, API_VERSION, upgrade,
+    )
+
+
 # ── Agent authentication ───────────────────────────────────────────────────────
 
 _UNPROTECTED_PATHS = {"/health"}
@@ -89,6 +134,7 @@ _AGENT_TOKENS: dict[str, str] = _load_agent_tokens()
 @web.middleware
 async def auth_middleware(request: web.Request, handler):
     """DEFAULT DENY — every route requires a valid Bearer token unless explicitly allowlisted."""
+    _check_client_version(request)  # logs API skew to the gateway log; never raises
     if not _AGENT_TOKENS:
         return await handler(request)
     if request.path.rstrip("/") in _UNPROTECTED_PATHS or request.path in _UNPROTECTED_PATHS:

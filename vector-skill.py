@@ -32,11 +32,24 @@ mcp = FastMCP("Local_RAG_Orchestrator")
 RETRIEVER_URL = "http://localhost:8888/v1/embeddings"
 RERANKER_URL = "http://localhost:8888/v1/reranking"
 
+# Wire contract this MCP server speaks on its /memory/* gateway calls. Keep in
+# step with API_VERSION in coordinator.py / memory_bridge.py — the gateway logs
+# a warning (coordinator._check_client_version) if they disagree.
+API_VERSION = 1
+CLIENT_VERSION_HEADER = "X-SM-Api-Version"
+
 
 def _auth_headers() -> dict:
-    """Return Authorization header dict if AGENT_TOKEN is set, else empty dict."""
+    """Headers for every coordinator request.
+
+    Advertises this server's API_VERSION so the gateway can log version skew,
+    and adds the Bearer token when AGENT_TOKEN is set.
+    """
+    headers = {CLIENT_VERSION_HEADER: str(API_VERSION)}
     token = os.environ.get("AGENT_TOKEN", "").strip()
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 _CONTENT_SIZE_WARN_BYTES = 10 * 1024
 

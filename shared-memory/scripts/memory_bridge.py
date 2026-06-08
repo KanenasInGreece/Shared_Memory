@@ -28,6 +28,10 @@ from datetime import datetime
 import httpx
 
 VERSION = "0.4.1"
+# Wire contract this client was built against. Must match the gateway's
+# api_version (reported by GET /health). Bump only on breaking protocol changes.
+API_VERSION = 1
+CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Two-source dotenv search — both sources tried; first definition wins.
 # Always invoke memory_bridge.py by absolute path so __file__ resolves
@@ -66,10 +70,18 @@ COORDINATOR_BASE = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
 AGENT_ID         = os.environ.get("AGENT_ID", "memory_bridge")
 
 
-def _auth_headers() -> dict:
-    """Return Authorization header dict if AGENT_TOKEN is set, else empty dict."""
+def _request_headers() -> dict:
+    """Headers attached to every coordinator request.
+
+    Always advertises this client's API_VERSION so the gateway can log skew
+    (see coordinator._check_client_version). Adds the Bearer token when
+    AGENT_TOKEN is set.
+    """
+    headers = {CLIENT_VERSION_HEADER: str(API_VERSION)}
     token = os.environ.get("AGENT_TOKEN", "").strip()
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
 
@@ -113,6 +125,60 @@ def _coordinator_unavailable(exc: Exception) -> dict:
     }
 
 
+async def check_gateway_compat() -> dict:
+    """GET /health and compare the wire contract. Pure diagnostic; never raises.
+
+    Returns a dict with a ``compat`` field of "ok" | "incompatible" | "unknown",
+    plus a human-readable ``warning`` when the client and gateway disagree on
+    API_VERSION. Used by the ``doctor`` command and to enrich error messages.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            h = (await client.get(f"{COORDINATOR_BASE}/health")).json()
+    except Exception as exc:
+        return {"reachable": False, "error": str(exc), "compat": "unknown"}
+
+    srv = h.get("api_version")
+    diag = {
+        "reachable": True,
+        "gateway_status":     h.get("status"),
+        "gateway_version":    h.get("version"),
+        "client_version":     VERSION,
+        "server_api_version": srv,
+        "client_api_version": API_VERSION,
+    }
+    if srv is None:
+        diag["compat"]  = "unknown"
+        diag["warning"] = (
+            "Gateway does not report api_version — it predates the version "
+            "contract. Upgrade the gateway (git pull + restart)."
+        )
+    elif srv != API_VERSION:
+        lag = "client (re-sync the skill)" if srv < API_VERSION else "gateway (git pull + restart)"
+        diag["compat"]  = "incompatible"
+        diag["warning"] = (
+            f"API contract skew: client speaks v{API_VERSION}, gateway speaks v{srv}. "
+            f"Upgrade the {lag}."
+        )
+    else:
+        diag["compat"] = "ok"
+    return diag
+
+
+async def _warn_on_skew(result: dict) -> dict:
+    """When a request failed, probe /health and append a version-skew hint.
+
+    Only runs on the failure path, so the happy path pays no extra round trip.
+    """
+    if not isinstance(result, dict) or result.get("status") != "error":
+        return result
+    diag = await check_gateway_compat()
+    if diag.get("compat") in ("incompatible", "unknown") and diag.get("warning"):
+        print(f"[WARN] shared-memory: {diag['warning']}", file=sys.stderr)
+        result["version_warning"] = diag["warning"]
+    return result
+
+
 async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
     if isinstance(metadata_json, str):
         try:
@@ -132,7 +198,7 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
             r = await client.post(
                 f"{COORDINATOR_BASE}/memory/save",
                 json={"content": content, "metadata": metadata, "agent_id": AGENT_ID},
-                headers=_auth_headers(),
+                headers=_request_headers(),
             )
             if r.status_code == 401:
                 _append_log("memory_bridge", 2, "auth_failed",
@@ -142,7 +208,7 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
             result = r.json()
     except Exception as exc:
         _append_log("memory_bridge", 2, "coordinator_down", {"content_preview": content[:100]}, content)
-        return _coordinator_unavailable(exc)
+        return await _warn_on_skew(_coordinator_unavailable(exc))
 
     if result.get("status") == "success":
         pg_id    = result.get("pg_id")
@@ -164,7 +230,7 @@ async def search_and_rerank(query: str, limit: int = 5) -> list | dict:
             r = await client.post(
                 f"{COORDINATOR_BASE}/memory/search",
                 json={"query": query, "limit": limit, "agent_id": AGENT_ID},
-                headers=_auth_headers(),
+                headers=_request_headers(),
             )
             if r.status_code == 401:
                 _append_log("memory_bridge", 2, "auth_failed",
@@ -173,7 +239,7 @@ async def search_and_rerank(query: str, limit: int = 5) -> list | dict:
                         "message": "Coordinator rejected token. Set AGENT_TOKEN in this agent's .env."}
             result = r.json()
     except Exception as exc:
-        return _coordinator_unavailable(exc)
+        return await _warn_on_skew(_coordinator_unavailable(exc))
 
     return result.get("results", result)
 
@@ -183,7 +249,7 @@ def query_graph(cypher: str, params: dict = None) -> list | dict:
         r = httpx.post(
             f"{COORDINATOR_BASE}/memory/graph",
             json={"cypher": cypher, "params": params or {}},
-            headers=_auth_headers(),
+            headers=_request_headers(),
             timeout=30.0,
         )
         if r.status_code == 401:
@@ -275,7 +341,7 @@ async def save_retrospective_artifact(
             r = await client.post(
                 f"{COORDINATOR_BASE}/memory/retrospective",
                 json=payload,
-                headers=_auth_headers(),
+                headers=_request_headers(),
             )
             if r.status_code == 401:
                 _append_log("memory_bridge", 2, "auth_failed",
@@ -377,15 +443,24 @@ def _build_query(template: str, args) -> str:
 async def main() -> None:
     if len(sys.argv) < 2:
         print(json.dumps({
-            "error": "Usage: python memory_bridge.py [--version|graph|query|search|save|save_decision|save_retrospective] ..."
+            "error": "Usage: python memory_bridge.py [--version|doctor|graph|query|search|save|save_decision|save_retrospective] ..."
         }))
         sys.exit(1)
 
     action = sys.argv[1]
 
     if action in ("--version", "version", "-v"):
-        print(json.dumps({"version": VERSION, "tool": "shared-memory-framework"}))
+        print(json.dumps({
+            "version": VERSION,
+            "api_version": API_VERSION,
+            "tool": "shared-memory-framework",
+        }))
         return
+    elif action in ("doctor", "health"):
+        diag = await check_gateway_compat()
+        print(json.dumps(diag, indent=2))
+        # Non-zero exit on an actionable problem so scripts can gate on it.
+        sys.exit(0 if diag.get("compat") == "ok" else 1)
     elif action == "graph":
         if len(sys.argv) < 3:
             print(json.dumps({"error": "Usage: memory_bridge.py graph <cypher>"}))
