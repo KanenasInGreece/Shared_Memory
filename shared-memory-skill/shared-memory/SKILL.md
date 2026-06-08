@@ -66,6 +66,8 @@ Commit findings, decisions, and technical facts to long-term shared memory.
 
 **`entities` is required for Tier 3 consolidation.** Supply 1–4 named concepts the fact is about. Facts saved without `entities` are stored and searchable but never synthesised into community summaries.
 
+**`project` / `domain` scopes consolidation (recommended).** NREM keys community summaries on **(entity, domain)** — facts that share an entity but carry different `project`/`domain` tags are never fused into one summary. Untagged facts collapse to domain `general` (the prior single-summary-per-entity behaviour). Tag saves whose entities span unrelated topics (e.g. `"project":"homelab"` vs `"project":"shared-memory"`) to keep summaries coherent.
+
 **`source_ref` (optional):** supply a sub-document citation string to preserve lineage back to the original asset. Passed through unchanged by the coordinator; stored on the `Fact` Neo4j node as `source_ref`. Examples: `"design-doc.pdf#p12"`, `"meeting-2026-05-15.mp4@00:04:32"`, `"CLAUDE.md#L45-50"`.
 
 **What happens on save:**
