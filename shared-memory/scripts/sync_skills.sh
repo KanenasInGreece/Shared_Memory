@@ -23,6 +23,7 @@ SCRIPTS=(
   memory_bridge.py
   rem_loop.py
   consolidation_loop.py
+  gpu_load.py
   hive_mind_proxy.py
   ontology.py
   coordinator.py

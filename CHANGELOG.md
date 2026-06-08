@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`sync_skills.sh` now propagates `gpu_load.py`.** The GPU-aware-dreaming module added in 0.4.1 is imported by `rem_loop.py` and `consolidation_loop.py`, but it was missing from the sync `SCRIPTS` manifest and the `shared-memory-skill/` package — so a daemon launched from a synced/packaged location would `ImportError`. Added `gpu_load.py` to the manifest (and therefore the package). Live daemons run from `shared-memory/scripts/` and were unaffected.
+
 ## [0.4.1] — 2026-06-08
 
 ### Added

@@ -11,6 +11,7 @@ import select
 from datetime import datetime
 from neo4j import AsyncGraphDatabase
 from ontology import ONT
+from gpu_load import inference_gpu_busy
 
 # Configuration — set via environment variables or .env file
 NEO4J_URI = "bolt://localhost:7687"
@@ -500,18 +501,27 @@ class ConsolidationDaemon:
                     seconds_since_activity = (now - self.last_activity).total_seconds()
 
                     should_consolidate = False
+                    forced = False
                     if self.pending_pg_ids:
                         if seconds_since_activity >= IDLE_THRESHOLD_SEC:
-                            logger.info("Idle threshold reached. Starting consolidation.")
                             should_consolidate = True
                         elif self.first_notification_time:
                             seconds_since_first = (now - self.first_notification_time).total_seconds()
                             if seconds_since_first >= MAX_DEFERRAL_SEC:
-                                logger.info(f"Hard backstop reached ({seconds_since_first:.1f}s). Forcing consolidation.")
                                 should_consolidate = True
+                                forced = True
 
                     if should_consolidate:
-                        await self.run_consolidation_cycle()
+                        # Yield to active user inference on the GPU — but never let the
+                        # hard backstop be starved by continuous activity.
+                        if not forced and await inference_gpu_busy():
+                            logger.warning("NREM: inference GPU busy — deferring consolidation; will re-check next cycle.")
+                        else:
+                            if forced:
+                                logger.info(f"Hard backstop reached ({seconds_since_first:.1f}s). Forcing consolidation (ignoring GPU activity).")
+                            else:
+                                logger.info("Idle threshold reached. Starting consolidation.")
+                            await self.run_consolidation_cycle()
                 else:
                     # Socket readable — drain notification queue
                     try:
