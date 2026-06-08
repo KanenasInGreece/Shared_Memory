@@ -472,8 +472,12 @@ async def test_search_response_fact_carries_tier_and_normalized_score():
     """Fact results must include tier='fact', score_normalized in (0,1), matched_entities list."""
     c, mock_conn, mock_session = _coordinator_with_mocks()
 
-    # Tier 3: top community summary
-    mock_conn.fetchrow = AsyncMock(return_value={"content": "Global context summary"})
+    # Tier 3: top community summary (now carries metadata + source_pg_ids)
+    mock_conn.fetchrow = AsyncMock(return_value={
+        "content": "Global context summary",
+        "metadata": {"entity": "Neo4j", "domain": "general"},
+        "source_pg_ids": [10, 11, 12],
+    })
     # Tier 1: one candidate
     mock_conn.fetch = AsyncMock(return_value=[
         {"id": 1, "content": "fact about Neo4j outbox", "metadata": {"entities": ["Neo4j"], "source": "claude-code"}},
@@ -520,7 +524,11 @@ async def test_search_response_community_summary_has_tier_field():
     """The community summary prepended to results must carry tier='community_summary'."""
     c, mock_conn, mock_session = _coordinator_with_mocks()
 
-    mock_conn.fetchrow = AsyncMock(return_value={"content": "A community narrative"})
+    mock_conn.fetchrow = AsyncMock(return_value={
+        "content": "A community narrative",
+        "metadata": {"entity": "Anything", "domain": "general"},
+        "source_pg_ids": [1, 2, 3],
+    })
     # Provide one candidate so the early-return path is not taken
     mock_conn.fetch = AsyncMock(return_value=[
         {"id": 1, "content": "fact content", "metadata": {"entities": [], "source": "claude-code"}},
@@ -546,6 +554,45 @@ async def test_search_response_community_summary_has_tier_field():
     assert resp.status == 200
     results = json.loads(resp.text)["results"]
     assert results[0]["tier"] == "community_summary"
+
+
+@pytest.mark.asyncio
+async def test_search_community_summary_surfaces_traceback_pointers():
+    """The Tier-3 community summary result must surface source_pg_ids and metadata
+    so agents can trace the narrative back to its source facts (issue d)."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+
+    mock_conn.fetchrow = AsyncMock(return_value={
+        "content": "Synthesised narrative about the outbox pattern",
+        "metadata": {"entity": "OutboxPattern", "domain": "shared-memory"},
+        "source_pg_ids": [42, 43, 44],
+    })
+    mock_conn.fetch = AsyncMock(return_value=[
+        {"id": 1, "content": "fact", "metadata": {"entities": [], "source": "claude-code"}},
+    ])
+    mock_session.run = AsyncMock(return_value=_AsyncIter())
+
+    mock_reranker = MagicMock()
+    mock_reranker.raise_for_status = MagicMock()
+    mock_reranker.json = MagicMock(return_value={"results": [{"index": 0, "relevance_score": 1.0}]})
+
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        with patch("httpx.AsyncClient") as mock_cls:
+            mock_http = AsyncMock()
+            mock_http.post = AsyncMock(return_value=mock_reranker)
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_http)
+            mock_cls.return_value.__aexit__  = AsyncMock(return_value=None)
+
+            req = _make_request({"query": "outbox pattern", "limit": 5})
+            resp = await c.handle_search(req)
+
+    assert resp.status == 200
+    cs = json.loads(resp.text)["results"][0]
+    assert cs["tier"] == "community_summary"
+    # Trace-back pointers are now present (previously dropped — metadata was None)
+    assert cs["source_pg_ids"] == [42, 43, 44]
+    assert cs["metadata"]["entity"] == "OutboxPattern"
+    assert cs["metadata"]["domain"] == "shared-memory"
 
 
 # ── Auth source overwrite — Phase 2C ─────────────────────────────────────────
