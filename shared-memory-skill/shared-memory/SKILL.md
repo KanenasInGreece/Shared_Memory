@@ -387,6 +387,8 @@ The proxy binds to `127.0.0.1:8888` by default (localhost only). Set `PROXY_BIND
 
 **Write quiesce:** REM skips its cycle if any fact was saved within `WRITE_QUIESCE_SEC` seconds (default 30). This prevents REM's `pg_notify` calls from resetting NREM's idle timer during active write sessions from any agent including remote ones. Set `WRITE_QUIESCE_SEC=0` in `.env` to disable.
 
+**GPU-aware dreaming (nvtop):** beyond the time-guard, REM and NREM also yield while the GPU running the LLM is busy, so dreaming never competes with active user inference. Cross-vendor via `nvtop --snapshot` (Nvidia/AMD/Intel). **nvtop is a prerequisite**, but the check fails open — without it the daemons fall back to the `WRITE_QUIESCE_SEC` guard only. Deferrals log at WARNING; the NREM hard backstop always fires regardless. Tunables: `SLOT_AWARE` (default on), `GPU_BUSY_PERCENT` (50), `INFERENCE_PROC_MATCH`, `GPU_INDICES`, `NVTOP_BIN`. Install nvtop on the **infrastructure host** where the daemons run — remote clients need nothing, and inference they trigger through the gateway is still detected because it runs on the host GPU.
+
 **After upgrade from v0.3.x:** NREM will be silent until REM has enriched at least 5 facts per entity cluster (`rem_processed=true`). At default settings (batch=5, poll=120s) a graph with ~80 facts clears the backlog in ~30 minutes. This is intentional — NREM synthesis quality depends on REM enrichment.
 
 **Check gateway health before saving:**
@@ -405,7 +407,7 @@ After changing `AGENT_TOKEN` in `mcp.json`, restart LM Studio completely.
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.4.0", "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.4.1", "tool": "shared-memory-framework"}`
 - **Schema:** Neo4j labels, relationship types, Postgres tables — [schema.md](Documentation/schema.md)
 - **Embedding mandate:** All calls route through the gateway (:8888). Never call port 8070 (BGE-M3) or 8071 (BGE-Reranker) directly — the gateway enforces 1024-dim consistency across all agents.
 - **Ontology:** All Neo4j labels and relationship types are configurable in `ontology.yaml` at the repo root.

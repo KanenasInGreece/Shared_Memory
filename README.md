@@ -60,6 +60,8 @@ The rest of this README explains *why* each piece exists. This chapter is the *o
 
 **Reasoning LLM (your choice, on `:5000`):** any OpenAI-compatible local endpoint works. We run **Qwen3-27B**; on the 8 GB lean tier a 7–8B model (e.g. Qwen3-8B) is the practical pick. That choice of model may affect the quality of your graph -- my experience with this is reflected in [**GraphRAG's Hidden Cost**](https://www.linkedin.com/pulse/graphrags-hidden-cost-youre-always-paying-question-when-motsenigos-w81pc/).
 
+**Optional — [`nvtop`](https://github.com/Syllo/nvtop) for GPU-aware dreaming:** if installed, REM/NREM yield while the GPU running your LLM is busy, so consolidation never competes with active inference. It works across Nvidia/AMD/Intel via one `nvtop --snapshot` call. Without it the daemons still run, falling back to the time-based `WRITE_QUIESCE_SEC` guard ([§13](#13-the-sleep-cycle--rem-and-nrem-consolidation)).
+
 ### Steps
 
 1. **Get the code, set DB passwords, raise OS limits.**
@@ -856,6 +858,8 @@ A remote client is any machine that runs an AI CLI tool (Antigravity CLI, Claude
 - SSH access to the machine running the gateway
 - A distinct token registered in the gateway's `AGENT_TOKENS`
 
+> **Not required remotely:** Docker, the databases, the BGE models, and `nvtop`. GPU-aware dreaming ([§13](#13-the-sleep-cycle--rem-and-nrem-consolidation)) runs entirely on the infrastructure host — `nvtop` belongs there, not on the remote client. Inference you trigger remotely still executes on the host GPU, so it is detected correctly.
+
 ### Step 1 — Register a token for this remote agent
 
 On the **host machine**, add a new named entry to `AGENT_TOKENS` in the gateway `.env`. Use a descriptive name that identifies both the tool and the machine (e.g. `laptop-agy`, `chromebook-agy`):
@@ -923,7 +927,7 @@ printf 'AGENT_TOKEN=tok_<your-token>\nCOORDINATOR_URL=http://localhost:8888\n' \
 ```bash
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version
-# → {"version": "0.4.0", "tool": "shared-memory-framework"}
+# → {"version": "0.4.1", "tool": "shared-memory-framework"}
 
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py search "test" 3
@@ -956,7 +960,7 @@ All three paths route through the coordinator on port 8888. The coordinator owns
 ```bash
 # Check the framework version
 python shared-memory/scripts/memory_bridge.py --version
-# → {"version": "0.4.0", "tool": "shared-memory-framework"}
+# → {"version": "0.4.1", "tool": "shared-memory-framework"}
 
 # Search — semantic + rerank + Neo4j expansion
 uv run --with httpx --with python-dotenv \
@@ -1345,15 +1349,24 @@ NREM **does not poll** — polling would compete with inference workloads that n
 
 - Each `pg_notify` adds the artifact's `pg_id` to `pending_pg_ids` and resets a 15-minute idle timer. Consolidation runs after 15 minutes of quiet; a 45-minute hard backstop prevents indefinite deferral during continuous ingestion.
 - The queued `pg_id`s are entry points into Neo4j, not the consolidation targets. From each, NREM traverses to Entity hubs and counts unconsolidated Fact neighbours — **but only those with `rem_processed = true`**. Raw, un-enriched facts are never consolidated directly. Communities with fewer than 5 qualifying facts wait.
+- **Domain-scoped (migration 007):** within each Entity hub, facts are partitioned by `domain = COALESCE(metadata->>'project', metadata->>'domain', scope, 'general')`, and the density threshold is re-applied **per (entity, domain)**. Facts that share an entity but belong to unrelated domains are never fused into one narrative. Summaries are keyed on `(entity, domain)`; untagged facts collapse to `general`, reproducing the prior single-summary-per-entity behaviour until agents tag their saves.
 
 For each community that meets the threshold:
 
-1. Fetch the most recent `CommunitySummary` for that Entity from Postgres (if any).
+1. Fetch the most recent `CommunitySummary` for that `(Entity, domain)` pair from Postgres (if any).
 2. Call the LLM via `:8888 → :5000` to integrate the new facts into the existing narrative — **cumulative**, not a new isolated snapshot. This prevents content drift from parallel summary fragments about the same entity.
 3. Re-embed the new narrative via BGE-M3 through `:8888`.
 4. Write to `community_summaries`; create/update the `CommunitySummary` node in Neo4j; link source Facts via `SUMMARIZED_BY`; set `Fact.consolidated = true`.
 
 > **Why centroid averaging is not used:** The obvious compression approach — averaging related embeddings into a centroid — collapses the angular distinctions that cosine similarity depends on (Vangara & Gopinath, 2026, *"The Geometry of Consolidation"*). The LLM instead generates new language representing the theme of the cluster, which is then re-embedded from scratch. This produces a new semantic point that did not exist before — not a mathematical blend. Retrievable volume grows O(log n) with LLM-based consolidation versus O(n) without it.
+
+### Yielding to active inference (GPU-aware)
+
+Both daemons drive the LLM at `:8888 → :5000`, the same endpoint a user's chat uses. Beyond the time-based `WRITE_QUIESCE_SEC` guard (REM yields if a fact was saved in the last 30 s), each phase also checks whether the **GPU running the LLM is busy** before starting a cycle, and defers if so — logged at **WARNING**.
+
+Detection is cross-architecture via `nvtop --snapshot` (one JSON path for Nvidia/AMD/Intel — no per-vendor `nvidia-smi`/`rocm-smi`/sysfs parsing, which breaks unevenly; Intel Arc exposes no `gpu_busy_percent`). Only the GPU hosting the inference process is gated (`INFERENCE_PROC_MATCH`, default `lmstudio|llmworker|llama`). **nvtop is a prerequisite but the probe fails open:** if it is absent or errors, the check is skipped (logged once) and only the time-guard applies. NREM's 45-minute hard backstop always fires regardless of GPU state, so consolidation is never starved. Tunables: `SLOT_AWARE` (default on), `GPU_BUSY_PERCENT` (default 50), `INFERENCE_PROC_MATCH`, `GPU_INDICES`, `NVTOP_BIN`, `NVTOP_TIMEOUT_SEC`.
+
+**Remote clients:** REM and NREM run on the **infrastructure host** (the gateway spawns them), so `nvtop --snapshot` always samples the GPU that actually serves inference — including generation that [remote clients](#10a-remote-clients-ssh-tunnel-access) trigger through the gateway, since that load lands on the host's `:5000`/GPU. **Install nvtop on the infrastructure host only**; remote client machines need nothing for this. (The probe assumes the LLM is co-located with the daemons, as in the standard topology; if your `:5000` is on a different machine, set `SLOT_AWARE=0`.)
 
 ### Supersession
 
