@@ -27,7 +27,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 # Two-source dotenv search — both sources tried; first definition wins.
 # Always invoke memory_bridge.py by absolute path so __file__ resolves

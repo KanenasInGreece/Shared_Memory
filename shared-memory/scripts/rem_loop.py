@@ -46,6 +46,7 @@ from neo4j import AsyncGraphDatabase
 
 sys.path.insert(0, os.path.dirname(__file__))
 from ontology import ONT
+from gpu_load import inference_gpu_busy
 
 
 # ── Environment ───────────────────────────────────────────────────────────────
@@ -739,6 +740,11 @@ class REMDaemon:
                     "REM: write activity in last %ds — yielding to active writes",
                     WRITE_QUIESCE_SEC,
                 )
+                return 0
+
+            # Yield to active user inference — don't compete with the LLM on the GPU.
+            if await inference_gpu_busy():
+                logger.warning("REM: inference GPU busy — deferring enrichment cycle")
                 return 0
 
             pg_ids = await self._filter_applied_in_outbox(candidates, conn, loop)

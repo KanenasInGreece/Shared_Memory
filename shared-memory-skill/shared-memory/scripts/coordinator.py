@@ -700,7 +700,7 @@ class MemoryCoordinator:
                 # unsupervised query so search continues to work (with a warning).
                 try:
                     summary = await conn.fetchrow(
-                        "SELECT content FROM community_summaries"
+                        "SELECT content, metadata, source_pg_ids FROM community_summaries"
                         " WHERE NOT superseded"
                         " ORDER BY embedding <=> $1::vector LIMIT 1",
                         str(q_vec),
@@ -712,7 +712,7 @@ class MemoryCoordinator:
                         "python shared-memory/migrations/apply.py"
                     )
                     summary = await conn.fetchrow(
-                        "SELECT content FROM community_summaries"
+                        "SELECT content, metadata, source_pg_ids FROM community_summaries"
                         " ORDER BY embedding <=> $1::vector LIMIT 1",
                         str(q_vec),
                     )
@@ -756,13 +756,17 @@ class MemoryCoordinator:
         # Neo4j relational expansion
         final: list[dict] = []
         if summary:
+            # Surface the summary's provenance so an agent can trace a Tier-3
+            # narrative back to the exact Tier-1 facts it was synthesised from
+            # (source_pg_ids) — drill down via /memory/graph or status/{pg_id}.
             final.append({
                 "tier": "community_summary",
                 "content": summary["content"],
                 "score": None,
                 "score_normalized": None,
                 "matched_entities": [],
-                "metadata": None,
+                "metadata": summary["metadata"],
+                "source_pg_ids": summary["source_pg_ids"],
                 "graph_context": [],
             })
 
