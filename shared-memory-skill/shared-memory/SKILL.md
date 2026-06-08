@@ -46,6 +46,8 @@ Search the shared memory with semantic similarity, reranking, and Neo4j relation
 
 Returns: Tier 3 community summary (global context) + Tier 1 semantic hits + Neo4j relational expansion.
 
+The Tier-3 community summary now carries `source_pg_ids` (and its `metadata`) — the exact Tier-1 facts it was synthesised from. Trace a narrative back to its sources by running `graph`/`status` on those ids.
+
 If all results score below −3.0, an entity-graph fallback runs automatically and appears as a supplementary section in the output.
 
 ### 2. Artifact Persistence (Save)
