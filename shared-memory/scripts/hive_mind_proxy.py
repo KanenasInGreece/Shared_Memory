@@ -468,10 +468,15 @@ async def handle_health(request: web.Request) -> web.Response:
     proxy: AsyncHiveMindProxy = request.app["proxy"]
     checks: dict[str, str] = {}
 
+    # The embedder and reranker are llama.cpp containers that expose /health.
+    # The reasoning LLM (:5000) is "LM Studio or any OpenAI-compatible endpoint";
+    # those do NOT standardise /health — LM Studio logs an error for the unknown
+    # route on every probe. Use /v1/models, which every OpenAI-compatible server
+    # (LM Studio included) serves, as the LLM liveness check instead.
     for name, url in [
         ("embedder", "http://localhost:8070/health"),
         ("reranker",  "http://localhost:8071/health"),
-        ("llm",       "http://localhost:5000/health"),
+        ("llm",       "http://localhost:5000/v1/models"),
     ]:
         try:
             timeout = ClientTimeout(total=2.0)
