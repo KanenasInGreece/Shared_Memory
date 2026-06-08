@@ -52,6 +52,22 @@ The rest of this README explains *why* each piece exists. This chapter is the *o
 
 **What you are standing up:** a local GraphRAG memory shared by every AI tool on your machine — CLI agents and LM Studio alike. They talk only to one gateway on `127.0.0.1:8888`; the gateway owns Postgres (vectors + facts) and Neo4j (the graph), and runs the REM/NREM sleep cycle that turns saved facts into shared knowledge.
 
+### Two surfaces: usage vs. operations
+
+The framework has two distinct surfaces with separate lifecycles. Conflating them is the most common setup mistake.
+
+| | **Usage** (skill / client) | **Operations** (gateway / daemons) |
+|---|---|---|
+| What it is | `memory_bridge.py` + `SKILL.md` | gateway, coordinator, REM/NREM daemons, `migrations/` |
+| Runs on | **every** agent, every host (incl. remote laptops) | the **one** gateway host |
+| Talks to DB/GPU? | No — HTTP to `:8888` only | Yes — owns Postgres, Neo4j, GPU |
+| Distributed by | `sync_skills.sh` (thin client only) | this repo, via `git` |
+| Upgraded by | re-sync the skill | `git pull` → `migrations/apply.py` → restart gateway |
+
+**Installing the skill is not installing the framework.** The skill is a thin HTTP client; the daemons never run from a skill directory, and a remote agent (no DB, no GPU) cannot run or upgrade them. Daemon and **schema** changes reach a hive through `git` on the gateway host — never through a skill download, so updating a skill never triggers a migration. The operations runbook lives in [`shared-memory/Documentation/server-setup.md`](shared-memory/Documentation/server-setup.md). Steps 1–6 below are operations (gateway host); steps 7–8 are usage (any agent).
+
+**Version contract:** client and gateway are decoupled and may drift, so compatibility is enforced by an `api_version` exchanged on `GET /health` — not by copying daemon code into skills. Run `memory_bridge.py doctor` to check it; on skew it names which side to upgrade.
+
 ### Resources & prerequisites
 
 **Hardware — lean minimum:** **16 GB RAM · ~8 GB VRAM · ~30 GB free disk.** Postgres + Neo4j take ~6 GB RAM between them; BGE-M3 and the reranker are small; your **reasoning LLM dominates VRAM**.
@@ -77,7 +93,7 @@ The rest of this README explains *why* each piece exists. This chapter is the *o
 
 6. **Start the gateway.** `uv run --with aiohttp --with asyncpg --with neo4j --with httpx python shared-memory/scripts/hive_mind_proxy.py 8888` — this also launches the REM and NREM daemons ([§9](#9-starting-the-full-stack)). Verify: `curl http://localhost:8888/health` should report `"status":"ok"` and `"auth_required":true`.
 
-7. **Install the skill into your agent.** Symlink/copy the skill into the agent's skills directory ([§10](#10-agent-integration-first-time-setup); remote/laptop clients → [§10a](#10a-remote-clients-ssh-tunnel-access)). Shortcut: just tell your agent — *"clone this repo and install the shared-memory skill per README §10."*
+7. **Install the skill into your agent.** The skill is a **thin client** — only `memory_bridge.py` ships with it (the daemons stay on the gateway host from step 6). Symlink/copy `SKILL.md` + `memory_bridge.py` into the agent's skills directory ([§10](#10-agent-integration-first-time-setup); remote/laptop clients → [§10a](#10a-remote-clients-ssh-tunnel-access)). Shortcut: just tell your agent — *"clone this repo and install the shared-memory skill per README §10."*
 
 8. **Use it.** Activate the skill in your agent — `/shared-memory` (Claude Code, Grok), `$shared-memory` (Codex), `/activate shared-memory` (Antigravity) — and tell the agent to **use the shared-memory skill to recall context before a task and store decisions after** ([§11](#11-agent-access-cli-and-mcp), [§11a](#11a-complete-cycle-end-to-end-workflow-with-cross-agent-examples)). Quick shell smoke test: `memory_bridge.py search "test" 3` ([§10 smoke-test](#10-agent-integration-first-time-setup)).
 
@@ -616,6 +632,8 @@ HTTP 200 means the save/search path (embedder + reranker) is operational. HTTP 5
 
 This section covers where to place files and how to register each agent. For runtime usage (commands and examples) see [§11: Agent Access: CLI and MCP](#11-agent-access-cli-and-mcp).
 
+> **The skill is a thin client.** The only script it needs is `memory_bridge.py` (an HTTP client to the gateway on `:8888`). The daemons run on the gateway host from this repo (§9) — **never install a daemon into a skill dir**. Each per-agent block below symlinks `memory_bridge.py` alone; standing up the gateway/daemons is a separate, gateway-host task ([server-setup.md](shared-memory/Documentation/server-setup.md)). After installing, run `memory_bridge.py doctor` to confirm the client and gateway agree on `api_version`.
+
 ### Clone the repository and set up the environment
 
 ```bash
@@ -716,10 +734,11 @@ uv run --with httpx --with python-dotenv \
 Claude Code loads skills from `~/.claude/skills/`. Create the skill directory with a symlink so scripts always stay in sync with the repo:
 
 ```bash
-mkdir -p ~/.claude/skills/shared-memory
+mkdir -p ~/.claude/skills/shared-memory/scripts
 
-# Symlink scripts — always in sync with the repo
-ln -s /path/to/Shared_Memory/shared-memory/scripts ~/.claude/skills/shared-memory/scripts
+# Symlink the CLIENT SCRIPT ONLY — the skill is a thin client. The daemons are
+# server-side and run from the repo on the gateway host (see server-setup.md).
+ln -s /path/to/Shared_Memory/shared-memory/scripts/memory_bridge.py ~/.claude/skills/shared-memory/scripts/memory_bridge.py
 
 # Copy SKILL.md (or symlink it too)
 cp shared-memory-skill/shared-memory/SKILL.md ~/.claude/skills/shared-memory/SKILL.md
@@ -736,10 +755,10 @@ Invoke in any Claude Code session:
 Grok loads skills from `~/.grok/skills/`. Same symlink pattern:
 
 ```bash
-mkdir -p ~/.grok/skills/shared-memory
+mkdir -p ~/.grok/skills/shared-memory/scripts
 
-# Symlink scripts — always in sync with the repo
-ln -s /path/to/Shared_Memory/shared-memory/scripts ~/.grok/skills/shared-memory/scripts
+# Symlink the client script only (thin client — daemons stay on the gateway host)
+ln -s /path/to/Shared_Memory/shared-memory/scripts/memory_bridge.py ~/.grok/skills/shared-memory/scripts/memory_bridge.py
 
 # Copy SKILL.md
 cp shared-memory-skill/shared-memory/SKILL.md ~/.grok/skills/shared-memory/SKILL.md
@@ -756,10 +775,10 @@ Invoke in any Grok session:
 Codex CLI loads skills from `~/.codex/skills/` (global) or `.agents/skills/` (project-level). Install globally so the skill is available in every project:
 
 ```bash
-mkdir -p ~/.codex/skills/shared-memory
+mkdir -p ~/.codex/skills/shared-memory/scripts
 
-# Symlink scripts — always in sync with the repo
-ln -s /path/to/Shared_Memory/shared-memory/scripts ~/.codex/skills/shared-memory/scripts
+# Symlink the client script only (thin client — daemons stay on the gateway host)
+ln -s /path/to/Shared_Memory/shared-memory/scripts/memory_bridge.py ~/.codex/skills/shared-memory/scripts/memory_bridge.py
 
 # Copy SKILL.md
 cp shared-memory/SKILL.md ~/.codex/skills/shared-memory/SKILL.md
@@ -927,7 +946,7 @@ printf 'AGENT_TOKEN=tok_<your-token>\nCOORDINATOR_URL=http://localhost:8888\n' \
 ```bash
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version
-# → {"version": "0.4.1", "tool": "shared-memory-framework"}
+# → {"version": "0.4.1", "api_version": 1, "tool": "shared-memory-framework"}
 
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py search "test" 3
@@ -937,7 +956,7 @@ A valid response (even empty results) confirms the tunnel, token, and `.env` are
 
 ### Updating the skill
 
-When a new version is released, re-run the two `curl` commands from Step 3 to pull the latest `memory_bridge.py` and `SKILL.md`. No other files are needed on the remote machine.
+When a new version is released, re-run the two `curl` commands from Step 3 to pull the latest `memory_bridge.py` and `SKILL.md`. No other files are needed on the remote machine. Then run `memory_bridge.py doctor` — if it reports `compat: incompatible`, the gateway and this client disagree on `api_version`; upgrade whichever side it names (the gateway upgrades via `git pull` + restart on its host, not from here).
 
 ---
 
@@ -960,7 +979,7 @@ All three paths route through the coordinator on port 8888. The coordinator owns
 ```bash
 # Check the framework version
 python shared-memory/scripts/memory_bridge.py --version
-# → {"version": "0.4.1", "tool": "shared-memory-framework"}
+# → {"version": "0.4.1", "api_version": 1, "tool": "shared-memory-framework"}
 
 # Search — semantic + rerank + Neo4j expansion
 uv run --with httpx --with python-dotenv \

@@ -26,7 +26,14 @@ def _load_env() -> None:
 
 _load_env()
 
-from coordinator import MemoryCoordinator, attach as attach_coordinator, auth_middleware, _AGENT_TOKENS
+from coordinator import (
+    MemoryCoordinator,
+    attach as attach_coordinator,
+    auth_middleware,
+    _AGENT_TOKENS,
+    FRAMEWORK_VERSION,
+    API_VERSION,
+)
 
 # Unified Hive-Mind Async Proxy v7
 # Routes /v1/embeddings -> 8070 (BGE-M3)
@@ -477,6 +484,11 @@ async def handle_health(request: web.Request) -> web.Response:
 
     checks["daemon"]     = "running" if _daemon_healthy else "stopped"
     checks["rem_daemon"] = "running" if _rem_healthy    else "stopped"
+
+    # Version contract — clients compare api_version against their own to detect
+    # skew. Cheap string fields; no backend probe. version is informational only.
+    checks["version"]     = FRAMEWORK_VERSION
+    checks["api_version"] = API_VERSION
 
     # Embedder and reranker are the critical path — every save and search
     # depends on them.  LLM and daemon degradation is reported but does not

@@ -32,9 +32,10 @@ uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bri
 uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py save_decision --title "..." --decided-by "..." --project "..." --rationale "..."
 uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py save_retrospective --pg-id N --rating high --notes "..."
 uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py graph "MATCH (n:Entity) RETURN n LIMIT 10"
+uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py doctor   # check client↔gateway api_version compatibility
 ```
 
-After any script or SKILL.md change, run `bash shared-memory/scripts/sync_skills.sh` to propagate to every agent skill dir.
+The skill is a **thin client** — only `memory_bridge.py` ships with it. After a client or SKILL.md change, run `bash shared-memory/scripts/sync_skills.sh` (add `--prune` to clear daemons older installs left in skill dirs). The daemons are **server-side**: changes to them or to `migrations/` deploy on the gateway host via `git pull` + `migrations/apply.py` + restart — never via a skill sync. See `shared-memory/Documentation/server-setup.md`.
 
 ## Architecture
 
@@ -49,6 +50,8 @@ After any script or SKILL.md change, run `bash shared-memory/scripts/sync_skills
 | LM Studio | MCP (FastMCP) | `vector-skill.py` → `rag-orchestrator` in `mcp.json` |
 
 `vector-skill.py` (MCP) is for LM Studio only; CLI agents use `memory_bridge.py`, a thin HTTP client that delegates all storage to the coordinator (needs only `httpx` + `python-dotenv`).
+
+**Client ↔ gateway version contract.** `memory_bridge.py` (and `vector-skill.py`'s `/memory/*` calls) send the `X-SM-Api-Version` header; the gateway reports `api_version` on `GET /health` and logs any skew. `API_VERSION` lives in both `coordinator.py` and `memory_bridge.py` — bump them together on a breaking protocol change. Never copy daemons into a skill dir to "match versions"; the contract, not file parity, governs compatibility. (ADR-014)
 
 **No separate graph MCP (e.g. neo4j-agent-memory).** Direct-bolt Neo4j servers bypass the coordinator's per-entity locks, outbox atomicity, and SHA-256 dedup — producing orphaned nodes invisible to search. `rag-orchestrator` already expands Neo4j on every search.
 
@@ -68,7 +71,7 @@ Async aiohttp on `:8888`; **all routes require `Authorization: Bearer <token>` w
 - `/memory/save|search|graph`, `/memory/decision`, `/memory/retrospective`, `GET /memory/status/{pg_id}` → `coordinator.py`
 - `/v1/embeddings` → BGE-M3 `:8070` · `/v1/reranking` → reranker `:8071` · everything else → reasoning LLM `:5000`
 
-Startup launches the coordinator (asyncpg pool, per-entity locks, outbox worker) plus the REM and NREM daemons; the gateway auto-restarts both on crash (circuit breaker after 5 crashes / 10 min — restart the gateway to reset). `GET /health` reports backend + daemon liveness and `auth_required`.
+Startup launches the coordinator (asyncpg pool, per-entity locks, outbox worker) plus the REM and NREM daemons; the gateway auto-restarts both on crash (circuit breaker after 5 crashes / 10 min — restart the gateway to reset). `GET /health` reports backend + daemon liveness, `auth_required`, and the gateway `version` / `api_version`.
 
 ### Sleep cycle — REM (`rem_loop.py`) + NREM (`consolidation_loop.py`)
 

@@ -19,6 +19,13 @@ This skill bridges the Shared Memory Framework — a three-tier semantic and rel
 | Gemini CLI *(legacy)* | `/activate shared-memory` | `~/.gemini/skills/shared-memory/` |
 | LM Studio | MCP `rag-orchestrator` | `vector-skill.py` via `mcp.json` |
 
+> **This skill is the usage surface — a thin client.** It runs one script,
+> `memory_bridge.py`, over HTTP to the gateway on `:8888`. It does not run or
+> manage the gateway, the daemons, or schema migrations — that **operations
+> surface** lives on the gateway host in the framework repo
+> ([Documentation/server-setup.md](Documentation/server-setup.md)). Installing
+> this skill is not installing the framework.
+
 ---
 
 > **AI instruction — use absolute paths for every CLI command.** Skill runners execute commands from the user's project directory, not the skill directory, so a bare `scripts/memory_bridge.py` fails with "No such file or directory." Commands below use the Gemini CLI path as the canonical example — **substitute `~/.gemini` with the correct prefix for this agent:**
@@ -306,28 +313,19 @@ Args: {"pg_id": 43, "rating": "high", "notes": "No deadlocks in 30-day test.", "
 
 ---
 
-## Authentication Setup (v0.4.0)
+## Authentication (client side)
 
-All coordinator routes require `Authorization: Bearer <token>`. One-time setup:
+All coordinator routes require `Authorization: Bearer <token>`. This agent reads its
+token from `AGENT_TOKEN` in its own skill `.env` (e.g. `~/.claude/skills/shared-memory/.env`):
 
 ```bash
-# 1. Generate tokens (run from repo root)
-uv run python shared-memory/scripts/generate_tokens.py
-# Prints AGENT_TOKENS line (for gateway) and per-agent AGENT_TOKEN lines
-
-# 2. Add AGENT_TOKENS to the gateway .env
-echo "AGENT_TOKENS=claude:tok_abc...,gemini:tok_def...,lm_studio:tok_ghi..." >> .env
-
-# 3a. Claude Code — add AGENT_TOKEN to the skill .env
 echo "AGENT_TOKEN=tok_abc..." >> ~/.claude/skills/shared-memory/.env
-
-# 3b. Gemini CLI / Antigravity — add AGENT_TOKEN to the skill .env
-echo "AGENT_TOKEN=tok_def..." >> ~/.gemini/skills/shared-memory/.env
-
-# 3c. LM Studio — add to mcp.json env block for rag-orchestrator, then restart LM Studio
-
-# 4. Restart the gateway (CLI agents pick up AGENT_TOKEN on next invocation)
 ```
+
+Tokens are **minted on the gateway host** (`generate_tokens.py`) and added to the
+gateway's `AGENT_TOKENS` — that is an operations task, see
+[Documentation/server-setup.md](Documentation/server-setup.md#first-time-install).
+Each agent uses its own distinct token; never share tokens across agents.
 
 The dotenv search order for CLI agents (first match wins):
 1. `find_dotenv()` — searches parent directories from the script's location (requires absolute-path invocation — see path note above)
@@ -356,58 +354,39 @@ Check that `AGENT_TOKEN` in the agent's `.env` matches one of the `name:token` p
 
 ## Infrastructure
 
-### Gateway + Coordinator + REM & NREM Daemons
-All start from a single command. Must be running before any save, search, or embed operation.
+This skill is a **thin client**. The only script it runs is `memory_bridge.py`, which
+talks to the gateway on `:8888` over HTTP. The gateway, the coordinator, and the
+REM/NREM daemons are the **operations surface** — they run on the one gateway host
+from the framework repo, never from a skill directory. A remote agent needs nothing
+but `python` + `httpx` and its token.
 
-```
-uv run --with aiohttp --with asyncpg --with neo4j --with httpx \
-  python scripts/hive_mind_proxy.py 8888
-```
+Standing up or upgrading the gateway, the daemons, schema migrations, and token
+minting all live in **[Documentation/server-setup.md](Documentation/server-setup.md)**.
 
-Confirm startup:
-```
-INFO  coordinator ready (pool 2–10, outbox worker running)
-INFO  coordinator auth enabled — N agent(s): antigravity, claude, gemini, ...
-INFO  ### Hive-Mind Proxy on :8888 [aiohttp]
-INFO  Consolidation daemon started (pid XXXXX)
-INFO  REM daemon started (pid XXXXX)
-INFO  Listening for 'new_artifact' notifications...
-INFO:REMDaemon:REM daemon started (poll=120s, batch=5)
-```
-
-The proxy binds to `127.0.0.1:8888` by default (localhost only). Set `PROXY_BIND=0.0.0.0` in `.env` to opt into all-interfaces binding — only safe over an encrypted overlay network (Tailscale, WireGuard) or behind TLS.
-
-**Two-phase sleep cycle (v0.4.0):**
-- **REM** (`rem_loop.py`) — idle daemon; enriches each Fact with a full LLM summary and typed entity relationships. Oldest facts processed first. Sets `rem_processed=true` on the Fact node after enriching. Sends `pg_notify` to wake NREM.
-- **NREM** (`consolidation_loop.py`) — synthesises community summaries from `rem_processed=true` facts once 5+ are available per entity hub. Superseded summaries are marked `superseded=true` and filtered from all searches.
-
-**Daemon watchdogs:** The gateway auto-restarts both daemons on unexpected crashes with exponential backoff. A circuit breaker stops retrying after 5 crashes in 10 minutes — restart the gateway to reset.
-
-**Audit log (optional):** Set `AUDIT_LOG_PATH=~/shared_memory.log` to enable JSON-lines logging of outbox rows before REM marks them reviewed.
-
-**Write quiesce:** REM skips its cycle if any fact was saved within `WRITE_QUIESCE_SEC` seconds (default 30). This prevents REM's `pg_notify` calls from resetting NREM's idle timer during active write sessions from any agent including remote ones. Set `WRITE_QUIESCE_SEC=0` in `.env` to disable.
-
-**GPU-aware dreaming (nvtop):** beyond the time-guard, REM and NREM also yield while the GPU running the LLM is busy, so dreaming never competes with active user inference. Cross-vendor via `nvtop --snapshot` (Nvidia/AMD/Intel). **nvtop is a prerequisite**, but the check fails open — without it the daemons fall back to the `WRITE_QUIESCE_SEC` guard only. Deferrals log at WARNING; the NREM hard backstop always fires regardless. Tunables: `SLOT_AWARE` (default on), `GPU_BUSY_PERCENT` (50), `INFERENCE_PROC_MATCH`, `GPU_INDICES`, `NVTOP_BIN`. Install nvtop on the **infrastructure host** where the daemons run — remote clients need nothing, and inference they trigger through the gateway is still detected because it runs on the host GPU.
-
-**After upgrade from v0.3.x:** NREM will be silent until REM has enriched at least 5 facts per entity cluster (`rem_processed=true`). At default settings (batch=5, poll=120s) a graph with ~80 facts clears the backlog in ~30 minutes. This is intentional — NREM synthesis quality depends on REM enrichment.
-
-**Check gateway health before saving:**
-```
+**Before saving, confirm the gateway is up and compatible:**
+```bash
+# Liveness:
 curl http://localhost:8888/health
+# → {"status":"ok","api_version":1,"version":"0.4.1","daemon":"running","rem_daemon":"running",...}
+
+# Liveness + API contract check (this client vs the gateway):
+python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
+# → compat: ok | incompatible | unknown — names which side to upgrade on skew
 ```
-Returns `{"status":"ok","auth_required":true,"daemon":"running","rem_daemon":"running",...}` when embedder and reranker are both reachable. HTTP 503 means the save/search path is degraded.
+
+`status: ok` means embedder and reranker are reachable; HTTP 503 means the
+save/search path is degraded. `doctor` additionally compares `api_version` —
+exit 0 when compatible, exit 1 (with a fix hint) otherwise.
 
 ### MCP Server (LM Studio only)
-```
-uv run --with fastmcp --with httpx --with psycopg2-binary --with neo4j \
-  python /path/to/vector-skill.py
-```
-
-After changing `AGENT_TOKEN` in `mcp.json`, restart LM Studio completely.
+LM Studio uses the MCP interface (`vector-skill.py` via `mcp.json`), not this CLI skill.
+After changing `AGENT_TOKEN` in `mcp.json`, restart LM Studio completely. The gateway
+must be running — see [Documentation/server-setup.md](Documentation/server-setup.md).
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.4.1", "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.4.1", "api_version": 1, "tool": "shared-memory-framework"}`
+- **Operations runbook:** gateway/daemon install + upgrade — [server-setup.md](Documentation/server-setup.md)
 - **Schema:** Neo4j labels, relationship types, Postgres tables — [schema.md](Documentation/schema.md)
 - **Embedding mandate:** All calls route through the gateway (:8888). Never call port 8070 (BGE-M3) or 8071 (BGE-Reranker) directly — the gateway enforces 1024-dim consistency across all agents.
 - **Ontology:** All Neo4j labels and relationship types are configurable in `ontology.yaml` at the repo root.

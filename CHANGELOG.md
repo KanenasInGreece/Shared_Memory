@@ -7,9 +7,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Client ↔ gateway version contract.** The gateway now reports `version` (informational build) and `api_version` (the wire contract) on `GET /health`, and the client (`memory_bridge.py`) sends its `API_VERSION` on every request via the `X-SM-Api-Version` header. Skew surfaces two ways: (1) **caller-facing** — a new `memory_bridge.py doctor` command (and an automatic hint appended to failed save/search output) prints `compat: ok | incompatible | unknown` and names which side to upgrade; (2) **gateway-log** — `coordinator.py` logs a one-time warning when a client's API version differs from the server's. `API_VERSION` starts at `1` and lives in both `coordinator.py` and `memory_bridge.py`; bump it only on a breaking protocol change. Fully backward compatible — old clients omit the header (server ignores), old gateways omit the fields (client reports `unknown`). `--version` now also prints `api_version`.
+- **`Documentation/server-setup.md` — operations runbook.** A first-run guide for standing up and maintaining the **gateway host**: prerequisites, install sequence (clone → `.env` → compose → migrations → tokens → gateway → verify), the daemon roster, the upgrade procedure (`git pull` → `apply.py` → restart), the version contract, and health/observability. This is the home for everything that is *operations*, kept out of the client `SKILL.md`.
+
+### Changed
+
+- **Skill is now a strict thin client; daemons are operations-only.** The skill package ships **only `memory_bridge.py`** — the agent never executes a daemon from its skill directory. The gateway, coordinator, and REM/NREM daemons run on the one gateway host from this repo and are reached over HTTP on `:8888`; a remote agent (no DB, no GPU) cannot run them. Concretely: `sync_skills.sh` `SCRIPTS` manifest trimmed to the client set (with a new `--prune` pass that removes daemon scripts older installs left in skill dirs); the six daemon scripts were `git rm`'d from the tracked `shared-memory-skill/` package; README install snippets now symlink `memory_bridge.py` alone (not the whole `scripts/` dir); `SKILL.md` slimmed to client concerns with a pointer to `server-setup.md`; README gained a "Two surfaces: usage vs. operations" section. Rationale: daemon and **schema** changes reach a hive through `git`, never through a skill download, so updating a skill never triggers a migration, and version compatibility is enforced by the `api_version` contract above rather than by copying backend code into clients.
+
 ### Fixed
 
-- **`sync_skills.sh` now propagates `gpu_load.py`.** The GPU-aware-dreaming module added in 0.4.1 is imported by `rem_loop.py` and `consolidation_loop.py`, but it was missing from the sync `SCRIPTS` manifest and the `shared-memory-skill/` package — so a daemon launched from a synced/packaged location would `ImportError`. Added `gpu_load.py` to the manifest (and therefore the package). Live daemons run from `shared-memory/scripts/` and were unaffected.
+- ~~**`sync_skills.sh` now propagates `gpu_load.py`.**~~ *(Superseded by the thin-client change above — daemons, including `gpu_load.py`, are no longer shipped with the skill at all. The manifest is now client-only.)* The GPU-aware-dreaming module added in 0.4.1 is imported by `rem_loop.py` and `consolidation_loop.py`, but it was missing from the sync `SCRIPTS` manifest and the `shared-memory-skill/` package — so a daemon launched from a synced/packaged location would `ImportError`. Live daemons run from `shared-memory/scripts/` and were unaffected.
 
 ## [0.4.1] — 2026-06-08
 
