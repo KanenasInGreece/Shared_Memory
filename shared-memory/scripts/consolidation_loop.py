@@ -44,6 +44,37 @@ def _auth_headers() -> dict:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ConsolidationDaemon")
 
+# Domain assigned to any fact that carries no project/domain/scope tag.
+# Untagged facts collapse to this single bucket, reproducing the historic
+# one-summary-per-entity behaviour until agents start tagging their saves.
+DEFAULT_DOMAIN = "general"
+
+
+def eligible_domain_clusters(contents, pg_ids, domain_map, threshold):
+    """Partition one entity's facts by domain, keeping only domains that meet
+    the density threshold.
+
+    NREM keys community summaries on (entity, domain) so that facts from
+    unrelated domains sharing an entity are never fused into one narrative.
+    ``domain_map`` maps pg_id → domain (derived from Postgres metadata); a
+    missing or empty domain falls back to DEFAULT_DOMAIN.
+
+    Returns a list of (domain, contents, pg_ids) tuples — one per qualifying
+    domain. Pure function (no I/O) so the partition rule is unit-testable.
+    """
+    by_domain: dict = {}
+    for content, pid in zip(contents, pg_ids):
+        dom = domain_map.get(pid) or DEFAULT_DOMAIN
+        bucket = by_domain.setdefault(dom, ([], []))
+        bucket[0].append(content)
+        bucket[1].append(pid)
+    return [
+        (dom, c, p)
+        for dom, (c, p) in by_domain.items()
+        if len(p) >= threshold
+    ]
+
+
 _LOG_TOOLS = ["memory_bridge", "vector_skill"]
 
 def merge_logs(log_dir: str) -> None:
@@ -244,29 +275,57 @@ class ConsolidationDaemon:
                 None, lambda: psycopg2.connect(PG_CONN, connect_timeout=5)
             )
             try:
-                for cluster in clusters:
-                    entity = cluster['entity']
-                    contents = cluster['contents']
-                    pg_ids = cluster['pg_ids']
+                # Domain map for every fact across all clusters (single batch).
+                # Domain = COALESCE(project, domain, scope, 'general') from the
+                # authoritative Postgres metadata — the Neo4j Fact node does not
+                # carry a domain.
+                all_ids = sorted({pid for c in clusters for pid in c['pg_ids']})
+                def _fetch_domains(ids=all_ids):
+                    if not ids:
+                        return {}
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT id, COALESCE(metadata->>'project',"
+                            " metadata->>'domain', scope, 'general')"
+                            " FROM technical_docs WHERE id = ANY(%s)",
+                            (ids,),
+                        )
+                        return {r[0]: r[1] for r in cur.fetchall()}
+                domain_map = await loop.run_in_executor(None, _fetch_domains)
 
-                    # 1. Fetch previous summary (Postgres)
+                # Split each entity cluster into per-domain work items. Density is
+                # re-gated per (entity, domain): an entity-level cluster that meets
+                # the threshold may yield zero summaries if its facts are spread
+                # thinly across domains — which is the intended anti-clutter rule.
+                work_items = []  # (entity, domain, contents, pg_ids)
+                for cluster in clusters:
+                    for dom, c, p in eligible_domain_clusters(
+                        cluster['contents'], cluster['pg_ids'],
+                        domain_map, DENSITY_THRESHOLD,
+                    ):
+                        work_items.append((cluster['entity'], dom, c, p))
+
+                for entity, domain, contents, pg_ids in work_items:
+
+                    # 1. Fetch previous summary for this (entity, domain) pair
                     previous_summary = None
                     try:
-                        def _fetch_prev(ent=entity):
+                        def _fetch_prev(ent=entity, dom=domain):
                             with conn.cursor() as cur:
                                 cur.execute("""
                                     SELECT content FROM community_summaries
                                     WHERE metadata->>'entity' = %s
+                                      AND COALESCE(metadata->>'domain', %s) = %s
                                     ORDER BY id DESC LIMIT 1
-                                """, (ent,))
+                                """, (ent, DEFAULT_DOMAIN, dom))
                                 row = cur.fetchone()
                                 return row[0] if row else None
                         previous_summary = await loop.run_in_executor(None, _fetch_prev)
                     except Exception as e:
-                        logger.warning(f"Failed to fetch previous summary for {entity}: {str(e)}")
+                        logger.warning(f"Failed to fetch previous summary for {entity}/{domain}: {str(e)}")
 
                     # 2. Summarize (Long-running LLM call - No DB sessions held)
-                    logger.info(f"Distilling cluster for '{entity}' ({len(contents)} facts)...")
+                    logger.info(f"Distilling cluster for '{entity}' [domain={domain}] ({len(contents)} facts)...")
                     summary = await self.generate_summary(entity, contents, previous_summary)
                     if not summary:
                         logger.error(f"Failed to generate summary for {entity}. Re-queueing IDs.")
@@ -285,6 +344,7 @@ class ConsolidationDaemon:
                     metadata = {
                         "type": "community_summary",
                         "entity": entity,
+                        "domain": domain,
                         "source_pg_ids": pg_ids,
                         "timestamp": datetime.now().isoformat()
                     }
@@ -295,14 +355,15 @@ class ConsolidationDaemon:
                         def _write_summary():
                             with conn.cursor() as cur:
                                 # ON CONFLICT prevents duplicate rows when two consolidation
-                                # cycles run concurrently for the same entity (e.g. proxy
-                                # restart overlap). The unique index is on metadata->>'entity'.
+                                # cycles run concurrently for the same (entity, domain) pair
+                                # (e.g. proxy restart overlap). The unique index is on
+                                # (metadata->>'entity', metadata->>'domain') — migration 007.
                                 # Before overwriting, append the current content to summary_history
                                 # (capped at 20 entries) so drift can be audited over time.
                                 cur.execute("""
                                     INSERT INTO community_summaries (content, metadata, embedding, source_pg_ids)
                                     VALUES (%s, %s, %s, %s)
-                                    ON CONFLICT ((metadata->>'entity')) DO UPDATE
+                                    ON CONFLICT ((metadata->>'entity'), (metadata->>'domain')) DO UPDATE
                                         SET content         = EXCLUDED.content,
                                             embedding       = EXCLUDED.embedding,
                                             metadata        = EXCLUDED.metadata,
@@ -367,11 +428,13 @@ class ConsolidationDaemon:
                                 f" MERGE (s:{ONT.community_summary} {{pg_id: $summary_pg_id}})"
                                 f" ON CREATE SET s.created_at = datetime()"
                                 f" SET s.entity = $entity,"
+                                f"     s.domain = $domain,"
                                 f"     s.updated_at = datetime()"
                                 f" WITH s, facts"
                                 f" UNWIND facts as f"
                                 f" MERGE (f)-[:{ONT.summarized_by}]->(s)",
-                                fact_ids=pg_ids, summary_pg_id=summary_pg_id, entity=entity)
+                                fact_ids=pg_ids, summary_pg_id=summary_pg_id,
+                                entity=entity, domain=domain)
                             # SUPERSEDES edges for any Postgres-superseded summaries
                             if superseded_ids:
                                 await session.run(
@@ -383,7 +446,7 @@ class ConsolidationDaemon:
                                 )
 
                         await loop.run_in_executor(None, conn.commit)
-                        logger.info(f"Successfully consolidated {len(pg_ids)} facts for '{entity}'.")
+                        logger.info(f"Successfully consolidated {len(pg_ids)} facts for '{entity}' [domain={domain}].")
                     except Exception as e:
                         await loop.run_in_executor(None, conn.rollback)
                         logger.error(f"Database write error for {entity}: {str(e)}")
