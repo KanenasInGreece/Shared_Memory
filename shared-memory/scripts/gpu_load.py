@@ -1,10 +1,19 @@
-"""Cross-architecture GPU / inference-load probe for REM & NREM dreaming.
+"""Cross-architecture GPU-load probe for REM & NREM dreaming.
 
 The sleep-cycle daemons (rem_loop.py, consolidation_loop.py) drive the LLM at
-:5000 to enrich and synthesise memory. When a user is actively generating with
-that same LLM, dreaming should yield so it does not compete for the GPU.
+:5000 to enrich and synthesise memory. When the GPU is already busy — a user
+chatting with the local LLM, or any other GPU workload — dreaming should yield
+so it does not compete for the hardware.
 
-Detecting "GPU busy" portably is the hard part: driver-specific paths
+We deliberately make **no assumption about what is driving the GPU**. The only
+contract is that :5000 serves an OpenAI-compatible completions endpoint; the
+server platform (LM Studio, vLLM, llama-server, Ollama, TGI, a bare script, …)
+is irrelevant. So the gate is purely "is the GPU busy", not "is a process whose
+name we recognise busy" — the latter both coupled us to specific platforms and
+ignored direct chats and unrelated GPU apps, which are exactly what we want to
+yield to.
+
+Detecting GPU utilisation portably is the hard part: driver-specific paths
 (`nvidia-smi`, `rocm-smi`, i915/xe sysfs `gpu_busy_percent`) each break on some
 hardware — e.g. Intel Arc exposes no `gpu_busy_percent`. We therefore shell out
 to **nvtop --snapshot**, which already abstracts Nvidia (NVML), AMD and Intel
@@ -16,7 +25,7 @@ the daemons still honour their WRITE_QUIESCE_SEC time-guard, and NREM's hard
 backstop always fires regardless of GPU state.
 
 Runs wherever REM/NREM run — the infrastructure host — so it measures the GPU
-that actually serves inference, including requests that remote clients route
+that actually serves inference, including generation that remote clients route
 through the gateway. nvtop is an infrastructure-host prerequisite, not a
 remote-client one.
 """
@@ -24,7 +33,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import shutil
 
 log = logging.getLogger("gpu_load")
@@ -34,13 +42,10 @@ log = logging.getLogger("gpu_load")
 # tests that monkeypatch env — see the right values. Documented env vars:
 #   SLOT_AWARE=0           disable GPU-aware dreaming entirely
 #   NVTOP_BIN=nvtop        path/name of the nvtop binary
-#   GPU_BUSY_PERCENT=50    a selected GPU at/above this util (%) counts as busy
-#   INFERENCE_PROC_MATCH   regex matched against GPU process cmdlines to find the
-#                          inference server (default lmstudio|llmworker|llama)
-#   GPU_INDICES=0,1        explicit GPU positions, overriding process auto-detect
+#   GPU_BUSY_PERCENT=50    a gated GPU at/above this util (%) counts as busy
+#   GPU_INDICES=0,1        gate only these GPU positions; default is every GPU
 #   NVTOP_TIMEOUT_SEC=5.0  snapshot subprocess timeout
 DEFAULT_GPU_BUSY_PERCENT = 50
-DEFAULT_INFERENCE_PROC_MATCH = r"lmstudio|llmworker|llama"
 
 _warned = False  # rate-limit the "nvtop unavailable" warning to once per process
 
@@ -55,35 +60,28 @@ def _pct(value) -> int:
         return 0
 
 
-def parse_busy(snapshot, proc_match=None, threshold=DEFAULT_GPU_BUSY_PERCENT, gpu_indices=None) -> bool:
+def parse_busy(snapshot, threshold=DEFAULT_GPU_BUSY_PERCENT, gpu_indices=None) -> bool:
     """Pure decision function over a parsed `nvtop -s` snapshot (list of GPU dicts).
 
     GPU selection:
       * if ``gpu_indices`` is given, gate on those GPU positions;
-      * else gate on GPUs whose process list contains a cmdline matching
-        ``proc_match`` (the inference server);
-      * if neither selects a GPU, the LLM is idle/absent → not busy.
+      * otherwise gate on **every** GPU in the snapshot.
 
-    Returns True iff a selected GPU's ``gpu_util`` is >= ``threshold``.
+    Returns True iff a gated GPU's ``gpu_util`` is >= ``threshold``. The signal is
+    platform-agnostic: any GPU consumer (the local LLM, a direct chat, an
+    unrelated app) counts — we yield to all of them, not just recognised servers.
     """
     if not isinstance(snapshot, list):
         return False
-    rx = re.compile(proc_match, re.IGNORECASE) if proc_match else None
-    selected = []
     if gpu_indices:
-        for i in gpu_indices:
-            if 0 <= i < len(snapshot):
-                selected.append(snapshot[i])
-    elif rx:
-        for gpu in snapshot:
-            procs = gpu.get("processes") or []
-            if any(rx.search(p.get("cmdline", "") or "") for p in procs):
-                selected.append(gpu)
+        selected = [snapshot[i] for i in gpu_indices if 0 <= i < len(snapshot)]
+    else:
+        selected = snapshot
     return any(_pct(g.get("gpu_util")) >= threshold for g in selected)
 
 
 async def inference_gpu_busy() -> bool:
-    """Async probe: True if the inference GPU is busy at/above GPU_BUSY_PERCENT.
+    """Async probe: True if a gated GPU is busy at/above GPU_BUSY_PERCENT.
 
     Fail-open: returns False when SLOT_AWARE is disabled or nvtop is unavailable.
     """
@@ -117,15 +115,14 @@ async def inference_gpu_busy() -> bool:
         return False
 
     threshold = int(os.environ.get("GPU_BUSY_PERCENT", str(DEFAULT_GPU_BUSY_PERCENT)))
-    proc_match = os.environ.get("INFERENCE_PROC_MATCH", DEFAULT_INFERENCE_PROC_MATCH)
     gpu_indices_env = os.environ.get("GPU_INDICES", "").strip()
     indices = (
         [int(x) for x in gpu_indices_env.split(",") if x.strip().isdigit()]
         if gpu_indices_env else None
     )
-    busy = parse_busy(snapshot, proc_match, threshold, indices)
+    busy = parse_busy(snapshot, threshold, indices)
     if busy:
         # Detail at debug; the deferral itself is logged at WARNING by the caller
         # (REM/NREM) so the warning names which dreaming cycle was deferred.
-        log.debug("Inference GPU busy (>=%d%%).", threshold)
+        log.debug("GPU busy (>=%d%%).", threshold)
     return busy
