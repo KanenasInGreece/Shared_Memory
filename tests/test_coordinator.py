@@ -428,8 +428,8 @@ async def test_save_propagates_source_ref_to_outbox_cypher_params():
         None,
     )
     assert outbox_call is not None, "outbox INSERT not found in execute() calls"
-    # args: (sql, pg_id, cypher_params_json) — cypher_params is args[2]
-    params = json.loads(outbox_call.args[2])
+    # args: (sql, pg_id, cypher_params) — cypher_params is args[2], bound as a dict
+    params = outbox_call.args[2]   # bound as a dict; asyncpg jsonb codec serialises it
     assert params["source_ref"] == "design-doc.pdf#p12"
 
 
@@ -453,7 +453,7 @@ async def test_save_without_source_ref_stores_none_in_outbox():
         None,
     )
     assert outbox_call is not None
-    params = json.loads(outbox_call.args[2])
+    params = outbox_call.args[2]   # bound as a dict; asyncpg jsonb codec serialises it
     assert params["source_ref"] is None
 
 
@@ -622,5 +622,76 @@ async def test_handle_save_source_overwritten_by_authenticated_agent():
         None,
     )
     assert outbox_call is not None
-    params = json.loads(outbox_call.args[2])
+    params = outbox_call.args[2]   # bound as a dict; asyncpg jsonb codec serialises it
     assert params["source"] == "claude"
+
+
+# ── JSONB double-encoding regression (v0.4.2) ────────────────────────────────
+#
+# The asyncpg pool registers a jsonb codec with encoder=json.dumps, so jsonb
+# params must be bound as Python objects, never pre-serialised strings. A manual
+# json.dumps() here double-encodes the value into a string scalar
+# (jsonb_typeof='string'), which makes metadata->>'key' return NULL. These tests
+# pin the contract: handle_save / handle_retrospective bind dicts, and a client
+# that sends metadata as a JSON string is coerced back to an object.
+
+def _outbox_params(mock_conn):
+    call = next(
+        (c for c in mock_conn.execute.call_args_list if "neo4j_outbox" in c.args[0]),
+        None,
+    )
+    assert call is not None, "outbox INSERT not found"
+    return call.args[2]
+
+
+@pytest.mark.asyncio
+async def test_save_binds_metadata_as_object_not_stringified():
+    """Regression: the technical_docs INSERT and the outbox INSERT must bind
+    dicts, not JSON strings — otherwise the codec double-encodes them."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "fact for encoding check",
+            "metadata": {"source": "claude-code", "entities": ["SharedMemory"]},
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 200
+
+    # technical_docs INSERT: (sql, content, metadata, embedding, hash, ...)
+    metadata_arg = mock_conn.fetchrow.await_args.args[2]
+    assert isinstance(metadata_arg, dict), (
+        f"metadata must bind as a dict, got {type(metadata_arg).__name__} "
+        "(a str would be double-encoded by the jsonb codec)"
+    )
+    assert isinstance(_outbox_params(mock_conn), dict)
+
+
+@pytest.mark.asyncio
+async def test_save_coerces_stringified_metadata_to_object():
+    """A client that sends metadata as a JSON string must still be stored as a
+    queryable object, not a jsonb string scalar."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "fact with stringified metadata",
+            "metadata": json.dumps({"source": "grok", "entities": ["X"]}),
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 200
+    metadata_arg = mock_conn.fetchrow.await_args.args[2]
+    assert isinstance(metadata_arg, dict)
+    assert metadata_arg["source"] == "grok"
+    assert metadata_arg["entities"] == ["X"]
+
+
+@pytest.mark.asyncio
+async def test_retrospective_binds_cypher_params_as_object():
+    """Regression: the retrospective outbox payload must bind as a dict."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+    req = _make_request({"pg_id": 240, "rating": "High", "notes": "held up well"})
+    resp = await c.handle_retrospective(req)
+    assert resp.status == 200
+    params = _outbox_params(mock_conn)
+    assert isinstance(params, dict)
+    assert params["type"] == "retrospective"
+    assert params["retrospective"]["rating"] == "High"

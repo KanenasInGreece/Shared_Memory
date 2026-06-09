@@ -53,7 +53,7 @@ log = logging.getLogger("coordinator")
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.4.1"
+FRAMEWORK_VERSION = "0.4.2"
 API_VERSION = 1
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
@@ -195,6 +195,27 @@ def _matched_entities(query: str, metadata: dict | None) -> list[str]:
         return []
     q = query.lower()
     return [e for e in metadata.get("entities", []) if isinstance(e, str) and e.lower() in q]
+
+
+def _coerce_jsonb_obj(value):
+    """Return a value ready to bind to a JSONB parameter — a Python object, never
+    a pre-serialised JSON string.
+
+    The asyncpg pool registers a jsonb codec with ``encoder=json.dumps`` (see
+    ``_init_connection``), so every jsonb parameter is serialised exactly once at
+    the driver layer. Passing an already-stringified value double-encodes it: the
+    row stores a JSON *string scalar* (``jsonb_typeof = 'string'``) instead of an
+    object, so ``metadata->>'key'`` silently returns NULL and SQL audits of the
+    column find nothing (migration 008 repairs rows written before this guard).
+    Some clients also send ``metadata`` as a JSON string; parse it back so it
+    stores as a queryable object. Non-JSON strings and non-strings pass through.
+    """
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (ValueError, TypeError):
+            return value
+    return value
 
 
 # ── Coordinator ───────────────────────────────────────────────────────────────
@@ -500,7 +521,7 @@ class MemoryCoordinator:
             )
 
         content    = body.get("content", "")
-        metadata   = body.get("metadata", {})
+        metadata   = _coerce_jsonb_obj(body.get("metadata", {}))
         agent_id   = body.get("agent_id", "unknown")
         scope      = body.get("scope", "global")
         visibility = body.get("visibility", "global")
@@ -588,7 +609,7 @@ class MemoryCoordinator:
                                 embedding = EXCLUDED.embedding
                         RETURNING id
                         """,
-                        content, json.dumps(metadata), str(embedding),
+                        content, metadata, str(embedding),
                         content_hash, agent_id, scope, visibility,
                     )
                     pg_id = row["id"]
@@ -601,7 +622,7 @@ class MemoryCoordinator:
                         VALUES ($1, $2::jsonb)
                         """,
                         pg_id,
-                        json.dumps({
+                        {
                             "content_snippet": content[:200],
                             "source": metadata.get("source", "coordinator"),
                             "entities": entities,
@@ -609,7 +630,7 @@ class MemoryCoordinator:
                             "type": metadata.get("type", "fact"),
                             "decision": metadata.get("decision", {}),
                             "source_ref": metadata.get("source_ref") or None,
-                        }),
+                        },
                     )
 
                     # Wake the consolidation daemon
@@ -677,12 +698,12 @@ class MemoryCoordinator:
                 await conn.execute(
                     "INSERT INTO neo4j_outbox (pg_id, cypher_params) VALUES ($1, $2::jsonb)",
                     pg_id,
-                    json.dumps({
+                    {
                         "type": "retrospective",
                         "target_pg_id": pg_id,
                         "retrospective": {"rating": rating, "date": date, "notes": notes},
                         "source": agent_id,
-                    }),
+                    },
                 )
 
         return web.json_response({"status": "success", "target_pg_id": pg_id})

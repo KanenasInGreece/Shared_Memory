@@ -7,6 +7,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-06-09
+
 ### Added
 
 - **Client ↔ gateway version contract.** The gateway now reports `version` (informational build) and `api_version` (the wire contract) on `GET /health`, and the client (`memory_bridge.py`) sends its `API_VERSION` on every request via the `X-SM-Api-Version` header. Skew surfaces two ways: (1) **caller-facing** — a new `memory_bridge.py doctor` command (and an automatic hint appended to failed save/search output) prints `compat: ok | incompatible | unknown` and names which side to upgrade; (2) **gateway-log** — `coordinator.py` logs a one-time warning when a client's API version differs from the server's. `API_VERSION` starts at `1` and lives in both `coordinator.py` and `memory_bridge.py`; bump it only on a breaking protocol change. Fully backward compatible — old clients omit the header (server ignores), old gateways omit the fields (client reports `unknown`). `--version` now also prints `api_version`.
@@ -20,6 +22,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **JSONB columns were double-encoded as string scalars — `metadata->>'key'` silently returned NULL.** `coordinator.py` called `json.dumps()` on `metadata` and on the `neo4j_outbox` `cypher_params` before binding them to a `$N::jsonb` parameter, but the asyncpg pool already registers a jsonb codec with `encoder=json.dumps` (`_init_connection`). Every jsonb value was therefore serialised **twice** and stored as a JSON *string scalar* (`jsonb_typeof = 'string'`) instead of an object — so `metadata->>'type'`, `->>'project'`, `->>'entities'` etc. all returned `NULL`, and any SQL audit of metadata silently found nothing, even though the read path still worked (the codec decoder unwraps one layer). Rows saved through the psycopg2 MCP path (no codec) were stored correctly, so the corruption was partial — **133 of 170** `technical_docs` rows and **191** `neo4j_outbox` rows. The semantic pipeline (embed → outbox → Neo4j → consolidation) was unaffected because those paths `json.loads()` the value, which is why Decision/Fact nodes and consolidation looked healthy while SQL introspection lied. **Fix:** the manual `json.dumps()` calls are removed (the codec serialises once), and a defensive `_coerce_jsonb_obj()` guard parses any client-supplied stringified `metadata` back into an object on ingress. **Migration `008_fix_double_encoded_jsonb.sql`** normalises historical rows via `(col #>> '{}')::jsonb` (idempotent; only touches object/array-shaped string scalars). Three regression tests in `tests/test_coordinator.py` pin that `handle_save`/`handle_retrospective` bind dicts, not pre-serialised strings.
 - ~~**`sync_skills.sh` now propagates `gpu_load.py`.**~~ *(Superseded by the thin-client change above — daemons, including `gpu_load.py`, are no longer shipped with the skill at all. The manifest is now client-only.)* The GPU-aware-dreaming module added in 0.4.1 is imported by `rem_loop.py` and `consolidation_loop.py`, but it was missing from the sync `SCRIPTS` manifest and the `shared-memory-skill/` package — so a daemon launched from a synced/packaged location would `ImportError`. Live daemons run from `shared-memory/scripts/` and were unaffected.
 
 ## [0.4.1] — 2026-06-08
