@@ -240,10 +240,12 @@ class REMDaemon:
         """
         async with self.driver.session() as session:
             result = await session.run(
-                f"MATCH (f:{ONT.fact})"
-                f" WHERE coalesce(f.rem_processed, false) = false"
-                f" RETURN f.pg_id AS pg_id"
-                f" ORDER BY f.pg_id ASC"
+                f"MATCH (n)"
+                f" WHERE (n:{ONT.fact} OR n:{ONT.decision})"
+                f"   AND coalesce(n.rem_processed, false) = false"
+                f"   AND n.pg_id IS NOT NULL"
+                f" RETURN n.pg_id AS pg_id"
+                f" ORDER BY n.pg_id ASC"
                 f" LIMIT $limit",
                 limit=BATCH_SIZE,
             )
@@ -479,17 +481,23 @@ class REMDaemon:
         relationships: list[dict],
         registry: dict[str, dict],
         decision_extras: dict[str, list[str]] | None,
+        is_decision: bool = False,
     ) -> None:
         """Write all REM output to Neo4j in a single driver session.
 
         Write order (critical for correctness):
-          1. Entity MERGE edges on the Fact node
+          1. Entity MERGE edges on the anchor node (Fact, or Decision when is_decision)
           2. Decision extras on the Decision node (if applicable)
-          3. SET f.content = summary, f.rem_processed = true  ← LAST
+          3. mark rem_processed = true  ← LAST
 
-        rem_processed is set last so that if any MERGE above raises, the fact
-        is NOT marked processed and will be retried in the next REM cycle.
+        The anchor is the node REM is enriching: a Fact for a plain artifact, a
+        Decision when the pg_id is a decision (which has no Fact node). Step 3
+        marks the anchor processed last so that if any MERGE above raises, the
+        node is NOT marked processed and will be retried next cycle. For a Fact
+        the summary is written to f.content; for a Decision the rationale is left
+        intact and the summary is kept non-destructively in d.rem_summary.
         """
+        anchor = ONT.decision if is_decision else ONT.fact
         # Resolve and group Fact relationships by (label, rel_type)
         groups: dict[tuple[str, str], list[str]] = defaultdict(list)
         for rel in relationships:
@@ -501,13 +509,13 @@ class REMDaemon:
             groups[(label, rel_type)].append(name)
 
         async with self.driver.session() as session:
-            # Step 1 — entity edges on Fact node
+            # Step 1 — entity edges on the anchor node (Fact, or Decision)
             for (label, rel_type), names in groups.items():
                 await session.run(
-                    f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
+                    f"MATCH (a:{anchor} {{pg_id: $pg_id}})"
                     f" UNWIND $names AS n"
                     f" MERGE (e:{label} {{name: n}})"
-                    f" MERGE (f)-[:{rel_type}]->(e)",
+                    f" MERGE (a)-[:{rel_type}]->(e)",
                     pg_id=pg_id, names=names,
                 )
 
@@ -525,12 +533,21 @@ class REMDaemon:
                         pg_id=pg_id, names=names,
                     )
 
-            # Step 3 — mark processed LAST (after all edges succeed)
-            await session.run(
-                f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
-                f" SET f.content = $summary, f.rem_processed = true",
-                pg_id=pg_id, summary=summary[:2000],
-            )
+            # Step 3 — mark processed LAST (after all edges succeed).
+            # Fact: overwrite content with the REM summary. Decision: keep the
+            # rationale intact, store the summary in rem_summary instead.
+            if is_decision:
+                await session.run(
+                    f"MATCH (d:{ONT.decision} {{pg_id: $pg_id}})"
+                    f" SET d.rem_summary = $summary, d.rem_processed = true",
+                    pg_id=pg_id, summary=summary[:2000],
+                )
+            else:
+                await session.run(
+                    f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
+                    f" SET f.content = $summary, f.rem_processed = true",
+                    pg_id=pg_id, summary=summary[:2000],
+                )
 
     # ── LLM call ──────────────────────────────────────────────────────────────
 
@@ -669,26 +686,32 @@ class REMDaemon:
 
         # Single Neo4j session: edges first, rem_processed=true last.
         try:
-            await self._write_neo4j_rem(pg_id, summary, relationships, registry, decision_extras)
+            await self._write_neo4j_rem(
+                pg_id, summary, relationships, registry, decision_extras,
+                is_decision=is_decision,
+            )
         except Exception as exc:
             logger.error("REM: pg_id=%d Neo4j write failed: %s", pg_id, exc)
             return False
 
         # Verify consistency — full string comparison (not prefix) against the
-        # value actually written (capped at 2000 chars).
-        try:
-            consistent = await self._fact_is_consistent(pg_id, summary)
-        except Exception as exc:
-            logger.warning("REM: pg_id=%d consistency check error: %s", pg_id, exc)
-            consistent = False
+        # value actually written (capped at 2000 chars). Only facts have their
+        # content rewritten by REM; a decision is enrichment-only (rationale is
+        # left intact), so the Fact-content check does not apply to decisions.
+        if not is_decision:
+            try:
+                consistent = await self._fact_is_consistent(pg_id, summary)
+            except Exception as exc:
+                logger.warning("REM: pg_id=%d consistency check error: %s", pg_id, exc)
+                consistent = False
 
-        if not consistent:
-            logger.error(
-                "REM: discrepancy — pg_id=%d Fact content mismatch after write; "
-                "outbox row left as applied for manual inspection",
-                pg_id,
-            )
-            return False
+            if not consistent:
+                logger.error(
+                    "REM: discrepancy — pg_id=%d Fact content mismatch after write; "
+                    "outbox row left as applied for manual inspection",
+                    pg_id,
+                )
+                return False
 
         # Audit log (optional) → then mark rem_reviewed.
         outbox_marked = False
