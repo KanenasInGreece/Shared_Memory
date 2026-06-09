@@ -28,6 +28,11 @@ IDLE_THRESHOLD_SEC = 60  # 1 minute for testing, change to 900 for 15 mins
 MAX_DEFERRAL_SEC = IDLE_THRESHOLD_SEC * 3
 DENSITY_THRESHOLD = ONT.density_threshold
 
+# Sampling temperature for the NREM summarisation LLM. Default 0.6 suits Gemma-class
+# models (see rem_loop REM_TEMPERATURE); set NREM_TEMPERATURE=0.1 (or DREAM_TEMPERATURE
+# for both daemons) in .env for Qwen-class models. Overrides the LM Studio preset.
+NREM_TEMPERATURE = float(os.environ.get("NREM_TEMPERATURE", os.environ.get("DREAM_TEMPERATURE", "0.6")))
+
 # AGENT_TOKEN authenticates daemon outbound calls through the proxy.
 # It identifies the daemon as a trusted internal caller — it does NOT affect
 # the source field on any saved artifact.  Fact.source always reflects the
@@ -223,7 +228,7 @@ class ConsolidationDaemon:
                     json={
                         "model": "local-model",
                         "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.1,
+                        "temperature": NREM_TEMPERATURE,
                     },
                 )
                 if resp.status_code != 200:
