@@ -695,3 +695,54 @@ async def test_retrospective_binds_cypher_params_as_object():
     assert isinstance(params, dict)
     assert params["type"] == "retrospective"
     assert params["retrospective"]["rating"] == "High"
+
+
+# ── GET /memory/telemetry rollup ──────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_handle_telemetry_rolls_up_postgres_and_neo4j():
+    """handle_telemetry returns a combined Postgres + Neo4j operational snapshot."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+    mock_conn.fetch = AsyncMock(return_value=[
+        {"status": "applied", "n": 10}, {"status": "rem_reviewed", "n": 3},
+    ])
+    mock_conn.fetchval = AsyncMock(return_value=171)
+    mock_conn.fetchrow = AsyncMock(return_value={"total": 2, "superseded": 0, "insight": 0})
+
+    def _result(rows):
+        r = MagicMock(); r.data = AsyncMock(return_value=rows); return r
+    mock_session.run = AsyncMock(side_effect=[
+        _result([{"rem": True, "con": True, "n": 96}, {"rem": False, "con": False, "n": 1}]),
+        _result([{"rem": True, "n": 4}, {"rem": False, "n": 71}]),
+    ])
+
+    resp = await c.handle_telemetry(_make_request({}))
+    assert resp.status == 200
+    t = json.loads(resp.text)["telemetry"]
+    assert t["postgres"]["technical_docs"] == 171
+    assert t["postgres"]["outbox"] == {"applied": 10, "rem_reviewed": 3}
+    assert t["postgres"]["community_summaries"]["insight"] == 0
+    assert t["neo4j"]["facts_total"] == 97
+    assert t["neo4j"]["facts_rem_pending"] == 1
+    assert t["neo4j"]["facts_unconsolidated"] == 0   # only rem=True & con=False counts; here 96 are consolidated
+    assert t["neo4j"]["decisions_total"] == 75
+    assert t["neo4j"]["decisions_rem_pending"] == 71
+
+
+@pytest.mark.asyncio
+async def test_handle_telemetry_survives_partial_backend_failure():
+    """A Postgres error must not sink the Neo4j section (and vice versa)."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+    mock_conn.fetch = AsyncMock(side_effect=Exception("pg down"))
+
+    def _result(rows):
+        r = MagicMock(); r.data = AsyncMock(return_value=rows); return r
+    mock_session.run = AsyncMock(side_effect=[
+        _result([{"rem": True, "con": False, "n": 5}]),
+        _result([{"rem": False, "n": 2}]),
+    ])
+
+    resp = await c.handle_telemetry(_make_request({}))
+    t = json.loads(resp.text)["telemetry"]
+    assert "error" in t["postgres"]
+    assert t["neo4j"]["facts_total"] == 5

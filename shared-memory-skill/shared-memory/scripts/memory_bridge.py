@@ -27,7 +27,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 API_VERSION = 1
@@ -264,6 +264,49 @@ def query_graph(cypher: str, params: dict = None) -> list | dict:
     return result.get("records", result)
 
 
+def get_telemetry() -> dict:
+    """Fetch the gateway's operational telemetry snapshot (GET /memory/telemetry)."""
+    try:
+        r = httpx.get(
+            f"{COORDINATOR_BASE}/memory/telemetry",
+            headers=_request_headers(),
+            timeout=15.0,
+        )
+        if r.status_code == 401:
+            return {"status": "error",
+                    "message": "Coordinator rejected token. Set AGENT_TOKEN in this agent's .env."}
+        return r.json()
+    except Exception as exc:
+        return _coordinator_unavailable(exc)
+
+
+def format_status(payload: dict) -> str:
+    """Render the telemetry snapshot as a compact human-readable report."""
+    if payload.get("status") != "success":
+        return json.dumps(payload, indent=2)
+    t  = payload["telemetry"]
+    pg = t.get("postgres", {})
+    nj = t.get("neo4j", {})
+    lines = [f"Shared-memory status  @ {t.get('timestamp','?')}"]
+    if "error" in pg:
+        lines.append(f"  postgres: ERROR {pg['error']}")
+    else:
+        cs = pg.get("community_summaries", {})
+        lines.append(f"  technical_docs:      {pg.get('technical_docs','?')}")
+        lines.append(f"  outbox:              {pg.get('outbox', {})}")
+        lines.append(f"  community_summaries: {cs.get('total','?')} "
+                     f"(superseded {cs.get('superseded',0)}, insight {cs.get('insight',0)})")
+    if "error" in nj:
+        lines.append(f"  neo4j: ERROR {nj['error']}")
+    else:
+        lines.append(f"  facts:     {nj.get('facts_total','?')} total | "
+                     f"REM pending {nj.get('facts_rem_pending','?')} | "
+                     f"unconsolidated {nj.get('facts_unconsolidated','?')}")
+        lines.append(f"  decisions: {nj.get('decisions_total','?')} total | "
+                     f"REM pending {nj.get('decisions_rem_pending','?')}")
+    return "\n".join(lines)
+
+
 # ── Decision shortcut ─────────────────────────────────────────────────────────
 
 def build_decision_metadata(
@@ -443,7 +486,7 @@ def _build_query(template: str, args) -> str:
 async def main() -> None:
     if len(sys.argv) < 2:
         print(json.dumps({
-            "error": "Usage: python memory_bridge.py [--version|doctor|graph|query|search|save|save_decision|save_retrospective] ..."
+            "error": "Usage: python memory_bridge.py [--version|doctor|status|graph|query|search|save|save_decision|save_retrospective] ..."
         }))
         sys.exit(1)
 
@@ -455,6 +498,14 @@ async def main() -> None:
             "api_version": API_VERSION,
             "tool": "shared-memory-framework",
         }))
+        return
+    elif action == "status":
+        payload = get_telemetry()
+        # --json for machine-readable; default is the compact human report.
+        if "--json" in sys.argv:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(format_status(payload))
         return
     elif action in ("doctor", "health"):
         diag = await check_gateway_compat()

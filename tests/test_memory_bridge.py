@@ -108,7 +108,7 @@ def _health(payload):
 
 @pytest.mark.asyncio
 async def test_compat_ok_when_versions_match():
-    payload = {"status": "ok", "version": "0.4.2", "api_version": memory_bridge.API_VERSION}
+    payload = {"status": "ok", "version": "0.4.3", "api_version": memory_bridge.API_VERSION}
     with patch("httpx.AsyncClient.get", return_value=_health(payload)):
         diag = await memory_bridge.check_gateway_compat()
     assert diag["compat"] == "ok"
@@ -161,3 +161,34 @@ async def test_search_and_rerank_returns_error_on_401():
     assert isinstance(result, dict)
     assert result["status"] == "error"
     assert "token" in result["message"].lower() or "AGENT_TOKEN" in result["message"]
+
+
+# ── status / telemetry rendering ──────────────────────────────────────────────
+
+def test_format_status_renders_sections():
+    """format_status turns a telemetry payload into a compact readable report."""
+    payload = {
+        "status": "success",
+        "telemetry": {
+            "timestamp": "2026-06-09T20:00:00+00:00",
+            "postgres": {
+                "technical_docs": 171,
+                "outbox": {"applied": 10, "rem_reviewed": 3},
+                "community_summaries": {"total": 2, "superseded": 0, "insight": 0},
+            },
+            "neo4j": {
+                "facts_total": 97, "facts_rem_pending": 1, "facts_unconsolidated": 20,
+                "decisions_total": 75, "decisions_rem_pending": 71,
+            },
+        },
+    }
+    out = memory_bridge.format_status(payload)
+    assert "technical_docs:      171" in out
+    assert "applied" in out and "rem_reviewed" in out
+    assert "decisions: 75 total" in out
+    assert "REM pending 71" in out
+
+
+def test_format_status_passes_through_errors():
+    err = {"status": "error", "message": "Coordinator rejected token."}
+    assert "rejected token" in memory_bridge.format_status(err)
