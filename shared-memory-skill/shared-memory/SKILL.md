@@ -367,7 +367,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness:
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":1,"version":"0.4.2","daemon":"running","rem_daemon":"running",...}
+# → {"status":"ok","api_version":1,"version":"0.4.3","daemon":"running","rem_daemon":"running",...}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -378,6 +378,22 @@ python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
 save/search path is degraded. `doctor` additionally compares `api_version` —
 exit 0 when compatible, exit 1 (with a fix hint) otherwise.
 
+**Operational telemetry — one-shot snapshot of the memory system's state:**
+```bash
+python ~/.claude/skills/shared-memory/scripts/memory_bridge.py status
+# Shared-memory status  @ 2026-06-09T20:00:00+00:00
+#   technical_docs:      171
+#   outbox:              {'applied': 131, 'rem_reviewed': 62, 'failed': 1}
+#   community_summaries: 2 (superseded 0, insight 0)
+#   facts:     97 total | REM pending 1 | unconsolidated 20
+#   decisions: 75 total | REM pending 71
+# add --json for machine-readable output
+```
+`status` rolls up the outbox health and the REM/NREM dream-cycle backlog
+(`GET /memory/telemetry`). Use it to see whether REM/NREM have work pending or
+the system is caught up. The coordinator owns the DB connections, so the client
+needs nothing but its token.
+
 ### MCP Server (LM Studio only)
 LM Studio uses the MCP interface (`vector-skill.py` via `mcp.json`), not this CLI skill.
 After changing `AGENT_TOKEN` in `mcp.json`, restart LM Studio completely. The gateway
@@ -385,7 +401,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.4.2", "api_version": 1, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.4.3", "api_version": 1, "tool": "shared-memory-framework"}`
 - **Operations runbook:** gateway/daemon install + upgrade — [server-setup.md](Documentation/server-setup.md)
 - **Schema:** Neo4j labels, relationship types, Postgres tables — [schema.md](Documentation/schema.md)
 - **Embedding mandate:** All calls route through the gateway (:8888). Never call port 8070 (BGE-M3) or 8071 (BGE-Reranker) directly — the gateway enforces 1024-dim consistency across all agents.

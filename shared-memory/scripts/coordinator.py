@@ -53,7 +53,7 @@ log = logging.getLogger("coordinator")
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.4.2"
+FRAMEWORK_VERSION = "0.4.3"
 API_VERSION = 1
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
@@ -938,6 +938,68 @@ class MemoryCoordinator:
             "applied_at": row["applied_at"].isoformat() if row["applied_at"] else None,
         })
 
+    # ── GET /memory/telemetry ─────────────────────────────────────────────────
+
+    async def handle_telemetry(self, request: web.Request) -> web.Response:
+        """Operational telemetry snapshot — pull-based rollup of the state that
+        matters day to day: outbox health, the REM/NREM dream-cycle backlog, and
+        summary counts. Each section is computed independently so a partial
+        backend failure still returns whatever the other can.
+        """
+        from datetime import datetime, timezone
+        snap: dict = {"timestamp": datetime.now(timezone.utc).isoformat()}
+
+        # Postgres — outbox status, doc + summary counts
+        try:
+            async with self._pool.acquire() as conn:
+                outbox = await conn.fetch(
+                    "SELECT status, count(*) AS n FROM neo4j_outbox GROUP BY status"
+                )
+                docs = await conn.fetchval("SELECT count(*) FROM technical_docs")
+                summ = await conn.fetchrow(
+                    "SELECT count(*) AS total,"
+                    " count(*) FILTER (WHERE superseded) AS superseded,"
+                    " count(*) FILTER (WHERE metadata->>'kind'='insight') AS insight"
+                    " FROM community_summaries"
+                )
+            snap["postgres"] = {
+                "technical_docs": docs,
+                "outbox": {r["status"]: r["n"] for r in outbox},
+                "community_summaries": {
+                    "total": summ["total"],
+                    "superseded": summ["superseded"],
+                    "insight": summ["insight"],
+                },
+            }
+        except Exception as exc:
+            snap["postgres"] = {"error": str(exc)}
+
+        # Neo4j — REM/NREM backlog for facts and decisions
+        try:
+            async with self._neo4j.session() as session:
+                fres = await session.run(
+                    f"MATCH (f:{ONT.fact}) WHERE f.pg_id IS NOT NULL"
+                    f" RETURN coalesce(f.rem_processed,false) AS rem,"
+                    f"        coalesce(f.consolidated,false) AS con, count(*) AS n"
+                )
+                facts = await fres.data()
+                dres = await session.run(
+                    f"MATCH (d:{ONT.decision})"
+                    f" RETURN coalesce(d.rem_processed,false) AS rem, count(*) AS n"
+                )
+                decisions = await dres.data()
+            snap["neo4j"] = {
+                "facts_total":          sum(r["n"] for r in facts),
+                "facts_rem_pending":    sum(r["n"] for r in facts if not r["rem"]),
+                "facts_unconsolidated": sum(r["n"] for r in facts if r["rem"] and not r["con"]),
+                "decisions_total":      sum(r["n"] for r in decisions),
+                "decisions_rem_pending": sum(r["n"] for r in decisions if not r["rem"]),
+            }
+        except Exception as exc:
+            snap["neo4j"] = {"error": str(exc)}
+
+        return web.json_response({"status": "success", "telemetry": snap})
+
 
 # ── Registration ──────────────────────────────────────────────────────────────
 
@@ -953,3 +1015,4 @@ def attach(app: web.Application, coordinator: MemoryCoordinator) -> None:
     app.router.add_post("/memory/search",         coordinator.handle_search)
     app.router.add_post("/memory/graph",          coordinator.handle_graph)
     app.router.add_get( "/memory/status/{pg_id}", coordinator.handle_status)
+    app.router.add_get( "/memory/telemetry",       coordinator.handle_telemetry)
