@@ -89,7 +89,13 @@ def _auth_headers() -> dict:
 
 POLL_INTERVAL      = 120   # seconds between REM scans
 BATCH_SIZE         = 5     # facts per cycle (LLM calls are the latency bottleneck)
-ENTITY_SET_LIMIT   = 500   # closed-set cap; warning logged when hit
+# Closed-set cap for the REM grounding prompt. Every typed node (up to this cap)
+# is listed in each REM prompt so the LLM matches existing entity names exactly
+# instead of minting near-duplicates. Raising it improves grounding but enlarges
+# every prompt — keep LM Studio context >= ~16K if you push it high. Env-tunable
+# as the typed-node graph grows; the real fix for unbounded growth is per-domain
+# scoping / embedding-retrieval of relevant entities (roadmap).
+ENTITY_SET_LIMIT   = int(os.environ.get("ENTITY_SET_LIMIT", "1500"))
 WRITE_QUIESCE_SEC  = int(os.environ.get("WRITE_QUIESCE_SEC", "30"))  # yield to active writes
 
 # Sampling temperature for the REM enrichment LLM. Default 0.6 suits Gemma-class
