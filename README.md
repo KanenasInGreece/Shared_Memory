@@ -981,6 +981,9 @@ All three paths route through the coordinator on port 8888. The coordinator owns
 python shared-memory/scripts/memory_bridge.py --version
 # → {"version": "0.4.3", "api_version": 1, "tool": "shared-memory-framework"}
 
+# Operational telemetry — outbox health + REM/NREM backlog snapshot (add --json for raw)
+python shared-memory/scripts/memory_bridge.py status
+
 # Search — semantic + rerank + Neo4j expansion
 uv run --with httpx --with python-dotenv \
   python shared-memory/scripts/memory_bridge.py search "bgem3 interference problem" 5
@@ -1023,7 +1026,7 @@ uv run --with httpx --with python-dotenv \
 
 ### Coordinator HTTP API
 
-The coordinator exposes four endpoints on port 8888. All routes (except `/health`) require `Authorization: Bearer <token>`.
+The coordinator exposes six memory endpoints on port 8888. All routes (except `/health`) require `Authorization: Bearer <token>`.
 
 | Method | Path | Body | Response |
 |---|---|---|---|
@@ -1032,6 +1035,7 @@ The coordinator exposes four endpoints on port 8888. All routes (except `/health
 | `POST` | `/memory/graph` | `{cypher, params?}` | `{status, records[]}` |
 | `POST` | `/memory/retrospective` | `{pg_id, rating, notes, date?, agent_id?}` | `{status, target_pg_id}` |
 | `GET` | `/memory/status/{pg_id}` | — | `{pg_id, neo4j, retries, applied_at}` |
+| `GET` | `/memory/telemetry` | — | `{status, telemetry: {postgres, neo4j}}` — outbox + dream-cycle backlog rollup (v0.4.3) |
 | `GET` | `/health` | — | `{status, embedder, reranker, llm, daemon, rem_daemon, auth_required}` |
 
 > **`/memory/graph` is read-only enforced.** Queries containing `CREATE`, `DELETE`, `DETACH DELETE`, `SET`, `MERGE`, `CALL`, `LOAD CSV`, or `DROP` are rejected with HTTP 400 before reaching Neo4j.
@@ -1343,7 +1347,7 @@ NOTIFY 'new_artifact' → NREM resets its idle timer; REM enriches the fact firs
 
 Since v0.4.0 the sleep cycle is **two-phase**, modelled on the biological division between REM and slow-wave (NREM) sleep. Two daemons run, both auto-started by the gateway:
 
-- **REM** (`rem_loop.py`) — *enrichment*. Operates on individual `Fact` nodes: rewrites each into an LLM summary and attaches typed entity relationships. This is the first LLM-based entity-extraction pass; on save, entities are agent-supplied only.
+- **REM** (`rem_loop.py`) — *enrichment*. Operates on individual `Fact` **and `Decision`** nodes: rewrites each `Fact` into an LLM summary and attaches typed entity relationships; for a `Decision` it extracts the reasoning layer — `CONSIDERED`/`REJECTED` alternatives and `PRODUCES_INSIGHT`/`UNDER_CONDITIONS` from the rationale — onto the node (v0.4.3). This is the first LLM-based entity-extraction pass; on save, entities are agent-supplied only.
 - **NREM** (`consolidation_loop.py`) — *consolidation*. Operates on Entity hub *communities*: synthesises high-density clusters of REM-enriched facts into thematic `community_summaries`. This is the neocortical layer.
 
 A fact must pass through REM before NREM will ever consolidate it. The phases are gated, not parallel.
@@ -1354,12 +1358,12 @@ Unlike NREM, REM **polls** — every 120 seconds, a batch of 5 facts (the per-fa
 
 Per cycle:
 
-1. Fetch the oldest non-REM `Fact` nodes (`pg_id ASC` — clears the historical backlog first).
+1. Fetch the oldest non-REM `Fact` **or `Decision`** nodes (`pg_id ASC` — clears the historical backlog first).
 2. **Gate on outbox `status='applied'`** — only enrich facts whose Neo4j write is confirmed.
 3. Batch-fetch full content from Postgres in one query, over a single AUTOCOMMIT connection per cycle (replacing per-operation connection churn).
 4. Build a closed typed-node registry from the graph (`Human`, `AIAgent`, `Project`, `Decision`, `Entity`) so a name's label never changes mid-batch.
 5. One LLM round-trip per fact: a ≤5-sentence summary **plus** typed entity→relationship assignments. For `Decision` facts it additionally extracts `CONSIDERED`, `REJECTED`, `UNDER_CONDITIONS`, and `PRODUCES_INSIGHT` edges.
-6. Write to Neo4j in one session — entity `MERGE` edges first, Decision extras second, then `SET f.content = summary, f.rem_processed = true` **last**, so a partial failure never marks a fact processed.
+6. Write to Neo4j in one session — entity `MERGE` edges on the node first (a `Fact`, or the `Decision`), Decision extras second, then the processed-mark **last**: a `Fact` gets `SET f.content = summary, f.rem_processed = true`; a `Decision` gets `SET d.rem_summary = summary, d.rem_processed = true` (its rationale is never overwritten). Marking last means a partial failure never leaves a node processed.
 7. Notify NREM (`pg_notify('new_artifact', pg_id)`) so the entity cluster is re-evaluated, then mark the outbox row `rem_reviewed`.
 
 ### Phase 2 — NREM (consolidation), `consolidation_loop.py`
@@ -1637,7 +1641,7 @@ The daemon trusts the LLM to synthesise accurately. There is no quantitative sig
 
 ### Observability
 
-Per-save audit logging (§14) records gateway failures, missing entities, and Neo4j sync errors. What it does not provide is a system-level signal for whether consolidation is improving retrieval quality over time.
+Per-save audit logging (§14) records gateway failures, missing entities, and Neo4j sync errors, and `GET /memory/telemetry` — via `memory_bridge.py status` (v0.4.3) — gives a system-level operational snapshot (outbox health and the REM/NREM backlog). What is still missing is a **quality** signal: whether consolidation is improving retrieval over time.
 
 ---
 
@@ -1664,12 +1668,16 @@ This framework is actively evolving toward a workstation where any number of AI 
 | **Provenance layer — Phase C** | Retrospective layer — closes the Why-To loop. `POST /memory/retrospective` (`coordinator.py`) writes a dated `HAD_OUTCOME` edge (an edge property, not a node — lineage without node explosion); `save_retrospective` in `memory_bridge.py` + MCP tool in `vector-skill.py`; multiple retrospectives per decision allowed; retrospectives never create a `technical_docs` row, so they do not pollute semantic search. | ✅ Done (v0.3.3) |
 | **Provenance layer — Phase D** | Four named query shortcuts in `memory_bridge.py query <template>`: `who-decided`, `agent-decisions`, `retrospectives`, `why-to-check`. Filter values sanitised before Cypher interpolation; raw `graph` subcommand preserved for custom traversals; SKILL.md Task 3 documents both paths. 7 new tests. | ✅ Done (v0.3.3) |
 | **Agent authentication (Phase 2C)** | `AGENT_TOKENS` registry; `Authorization: Bearer <token>` DEFAULT DENY middleware; server-side `source` overwrite (identity cannot be spoofed); duplicate-token guard; trailing-slash normalisation; 22 new tests. | ✅ Done (v0.3.5, hardened through v0.3.6) |
+| **GPU-aware dreaming (v0.4.1)** | REM/NREM yield when the GPU is busy — platform-agnostic `nvtop --snapshot` probe (no per-vendor parsing), fail-open, `SLOT_AWARE`/`GPU_BUSY_PERCENT`/`GPU_INDICES` tunables; NREM 45-min hard backstop preserved. `/health` probes the LLM via `/v1/models` (the route OpenAI-compatible servers actually serve). | ✅ Done |
+| **JSONB integrity + thin-client split (v0.4.2)** | Fixed JSONB double-encoding — `metadata`/`cypher_params` were `json.dumps()`'d against an asyncpg codec that dumps again, storing string scalars so `metadata->>` returned NULL (migration 008 repairs them). Strict thin-client/operations split: the skill ships only `memory_bridge.py`; daemons + schema deploy on the gateway host. Client↔gateway `api_version` contract + `doctor`. MCP `save_artifact` routed through the gateway (outbox atomicity, `metadata.model` preserves the loaded model name). | ✅ Done |
+| **Decision enrichment + telemetry (v0.4.3)** | REM now enriches `:Decision` nodes — activates the previously-orphaned reasoning layer (`CONSIDERED`/`REJECTED`/`PRODUCES_INSIGHT`/`UNDER_CONDITIONS`), marking decisions with a non-destructive `rem_summary`. Operational telemetry: `GET /memory/telemetry` + `memory_bridge.py status` (outbox + REM/NREM backlog rollup). Structured logging enabled by default in deployment. | ✅ Done |
 
 ### In Progress / Planned
 
 | Phase | Milestone | Notes |
 |---|---|---|
-| **Provenance layer — Phase E** | Separate `pruning_loop.py` on a slow cron; enforces the information foraging heuristic (save if retrieval utility + decision impact > storage cost); `type:decision` and `decision_impact`-flagged rows are unconditionally shielded; plain facts compete on retrieval frequency × age | Next up. Decoupled from the consolidation daemon — different cadence. |
+| **Insight consolidation (Phase 3a)** | NREM folds *clusters* of ≥2 decisions converging on a shared grounded `Fact` (non-mega-hub entity, `INSIGHT_THRESHOLD=2`) into elevated `community_summaries` tagged `metadata.kind="insight"` (`source_pg_ids`=decisions, aggregate retrospective `outcome_rating`); adds a `consolidated` flag on decisions and elevates insights in `handle_search`. Reuses the existing summary write + supersession. | **Design complete** (decision 245); next build. A *decision-cluster* trigger, not fact-density — a lone decision is never round-tripped. |
+| **Provenance layer — Phase E** | Separate `pruning_loop.py` on a slow cron; enforces the information foraging heuristic (save if retrieval utility + decision impact > storage cost); `type:decision` and `decision_impact`-flagged rows are unconditionally shielded; plain facts compete on retrieval frequency × age | Queued. Decoupled from the consolidation daemon — different cadence. |
 | **Ontology as graph (Path B)** | Bootstrap `(:Class)` nodes + `SCO` relationships from `ontology.yaml` into Neo4j on startup; replace `ONT.*` string constants with startup-cached dict read from graph; enables live ontology inspection and Neosemantics (n10s) forward compatibility | Path A is the prerequisite ✅. Does not replace `ontology.yaml` — yaml stays the human-editable source; graph is a materialised copy. |
 | **Entity type enrichment** | Apply Neo4j multi-label to distinguish entity kinds — `:Entity:Person`, `:Entity:System`, `:Entity:Tool`, `:Entity:Decision` etc. — without breaking existing queries | Path A + Path B are the prerequisites. Enables richer graph traversal and type-aware consolidation clustering. |
 | **Entity resolution** | Detect and merge synonymous Entity nodes (`"hive_mind_proxy"` ≡ `"Hive-Mind Gateway"`); maintain a canonical name + alias set; re-link Fact nodes on merge | The entity contract (explicit caller-supplied names) makes this tractable. Implementation is a background reconciliation job, not a save-path change. |
