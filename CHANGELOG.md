@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **REM/NREM sampling temperature is now env-configurable** (was hardcoded `0.1`). `rem_loop.py` reads `REM_TEMPERATURE`, `consolidation_loop.py` reads `NREM_TEMPERATURE`, both falling back to `DREAM_TEMPERATURE` then a default of **0.6**. The request value overrides the LM Studio preset, so this is the only place the dreaming temperature can be set. Rationale: the old `0.1` was tuned for Qwen-class models; different local models want very different temperatures — Gemma-class degrade at low temp (≈0.6), Mistral-3 *Instruct* wants `<0.1`, Mistral-3 *Reasoning* wants `1.0`. One knob now serves all without code edits. `tests/test_rem_loop.py` asserts the payload uses the configured value, not a literal.
+
 ## [0.4.3] — 2026-06-09
 
 ### Added

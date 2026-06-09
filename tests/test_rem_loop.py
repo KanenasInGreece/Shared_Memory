@@ -331,3 +331,30 @@ def test_search_tier3_query_excludes_superseded():
     assert "superseded" in source, (
         "Tier 3 search must filter WHERE NOT superseded"
     )
+
+
+# ── configurable REM temperature (v0.4.4) ─────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_llm_process_uses_configured_temperature(monkeypatch):
+    """REM must send REM_TEMPERATURE (default 0.6, Gemma-friendly), not a hardcoded 0.1."""
+    daemon, _ = _make_daemon()
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+
+    captured = {}
+    class _Resp:
+        status_code = 200
+        def json(self):
+            return {"choices": [{"message": {"content": '{"summary":"s","relationships":[]}'}}]}
+    async def _fake_post(self, url, **kwargs):
+        captured.update(kwargs.get("json", {}))
+        return _Resp()
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
+
+    await daemon._llm_process("some content", False, [])
+
+    from rem_loop import REM_TEMPERATURE
+    assert "temperature" in captured
+    assert captured["temperature"] == REM_TEMPERATURE
+    assert captured["temperature"] != 0.1   # no longer the Qwen-tuned constant
+    assert isinstance(REM_TEMPERATURE, float)

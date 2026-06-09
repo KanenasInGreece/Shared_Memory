@@ -92,6 +92,12 @@ BATCH_SIZE         = 5     # facts per cycle (LLM calls are the latency bottlene
 ENTITY_SET_LIMIT   = 500   # closed-set cap; warning logged when hit
 WRITE_QUIESCE_SEC  = int(os.environ.get("WRITE_QUIESCE_SEC", "30"))  # yield to active writes
 
+# Sampling temperature for the REM enrichment LLM. Default 0.6 suits Gemma-class
+# models, which degrade at very low temperatures; set REM_TEMPERATURE=0.1 in .env
+# for Qwen-class models that prefer near-greedy decoding. DREAM_TEMPERATURE sets
+# both daemons at once. The request value overrides the LM Studio preset.
+REM_TEMPERATURE = float(os.environ.get("REM_TEMPERATURE", os.environ.get("DREAM_TEMPERATURE", "0.6")))
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("REMDaemon")
@@ -621,7 +627,7 @@ class REMDaemon:
                     json={
                         "model": "local-model",
                         "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.1,
+                        "temperature": REM_TEMPERATURE,
                     },
                 )
                 if resp.status_code != 200:
