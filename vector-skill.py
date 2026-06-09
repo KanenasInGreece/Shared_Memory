@@ -6,7 +6,6 @@ import os
 import sys
 import logging
 import asyncio
-import hashlib
 from datetime import datetime
 from fastmcp import FastMCP
 from neo4j import GraphDatabase
@@ -293,95 +292,82 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5) -> str:
 @mcp.tool()
 async def save_artifact(content: str, metadata_json: str = "{}") -> str:
     """
-    Stores artifact in both Postgres and Neo4j.
-    Hard Mandate: Aborts if embedding service is down.
-    Idempotent: Reuses existing ID if content is identical.
+    Stores an artifact in shared memory via the Hive-Mind Gateway.
+
+    Routes through the Memory Coordinator (POST /memory/save) — no direct DB
+    writes here — so the save gets the full server-side path: BGE-M3 embedding
+    (hard mandate; the coordinator returns 503 if the embedder is down), SHA-256
+    idempotent upsert into Postgres, and a neo4j_outbox row written in the SAME
+    transaction and applied asynchronously by the outbox worker. That closes the
+    ADR-001 dangling-Fact gap the old direct Postgres+Neo4j write left open: the
+    two stores can no longer diverge on a crash between them.
+
+    Idempotent: identical content reuses the existing row.
     """
+    # Validate metadata client-side first so the model gets a clear MCP error
+    # before any network call. The coordinator is the authority and re-checks.
+    if isinstance(metadata_json, str):
+        try:
+            m_data = json.loads(metadata_json)
+        except (json.JSONDecodeError, ValueError) as e:
+            _append_log("vector_skill", 2, "bad_metadata", {"error": str(e), "content_preview": content[:100]}, content)
+            return f"Error: Invalid metadata JSON: {e}"
+    else:
+        m_data = metadata_json
+
+    if not isinstance(m_data, dict):
+        _append_log("vector_skill", 2, "bad_metadata_type", {"got": type(m_data).__name__, "content_preview": content[:100]}, content)
+        return f"Error: Metadata must be a JSON object, got {type(m_data).__name__}"
+
+    if not m_data.get("source"):
+        _append_log("vector_skill", 2, "missing_source", {"content_preview": content[:100]}, content)
+        return (
+            "Error: metadata.source is required — set it to the loaded model name "
+            "(e.g. 'qwen3-27b', 'llama3-70b'). "
+            "Facts without provenance are rejected to protect memory integrity."
+        )
+
+    m_data["timestamp"] = datetime.now().isoformat()
+    # Auth-enabled gateways overwrite metadata.source with the verified agent
+    # identity (e.g. "lm_studio"). Preserve the loaded model name so the
+    # specific model behind the save is not lost when several share one token.
+    m_data.setdefault("model", m_data["source"])
+    entities = m_data.get("entities", [])
+
+    coordinator_url = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
+    agent_id = os.environ.get("AGENT_ID", "lm_studio")
+
     try:
-        embedding = await get_embedding(content)
-        if not embedding:
-            _append_log("vector_skill", 2, "gateway_down", {"content_preview": content[:100]}, content)
-            return "Error: Hive-Mind Gateway (8888) is DOWN. Save aborted to protect memory integrity. Start hive_mind_proxy.py first."
-
-        if isinstance(metadata_json, str):
-            try:
-                m_data = json.loads(metadata_json)
-            except (json.JSONDecodeError, ValueError) as e:
-                _append_log("vector_skill", 2, "bad_metadata", {"error": str(e), "content_preview": content[:100]}, content)
-                return f"Error: Invalid metadata JSON: {e}"
-        else:
-            m_data = metadata_json
-
-        if not isinstance(m_data, dict):
-            _append_log("vector_skill", 2, "bad_metadata_type", {"got": type(m_data).__name__, "content_preview": content[:100]}, content)
-            return f"Error: Metadata must be a JSON object, got {type(m_data).__name__}"
-
-        if not m_data.get("source"):
-            _append_log("vector_skill", 2, "missing_source", {"content_preview": content[:100]}, content)
-            return (
-                "Error: metadata.source is required — set it to the loaded model name "
-                "(e.g. 'qwen3-27b', 'llama3-70b'). "
-                "Facts without provenance are rejected to protect memory integrity."
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                f"{coordinator_url}/memory/save",
+                json={"content": content, "metadata": m_data, "agent_id": agent_id},
+                headers=_auth_headers(),
             )
+            if r.status_code == 401:
+                return "Error: Coordinator rejected token. Set AGENT_TOKEN in mcp.json env block."
+            result = r.json()
+    except Exception as exc:
+        _append_log("vector_skill", 2, "gateway_down", {"content_preview": content[:100]}, content)
+        return (
+            f"Error: Hive-Mind Gateway unreachable at {coordinator_url} — is "
+            f"hive_mind_proxy.py running? Save aborted to protect memory integrity. ({exc})"
+        )
 
-        m_data["timestamp"] = datetime.now().isoformat()
-        entities = m_data.get("entities", [])
+    if result.get("status") != "success":
+        # Coordinator rejected the save — e.g. missing source (400) or the
+        # embedder unreachable after retries (503). Surface its message verbatim.
+        _append_log("vector_skill", 2, "save_rejected", {"message": result.get("message", result)}, content)
+        return f"Error: {result.get('message', result)}"
 
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
+    pg_id = result.get("pg_id")
+    if not entities:
+        _append_log("vector_skill", 1, "no_entities", {"pg_id": pg_id, "source": m_data.get("source")}, content)
+    _append_log("vector_skill", 3, "save_success", {"pg_id": pg_id, "source": m_data.get("source"), "entity_count": len(entities)}, content)
 
-        # 1. Postgres Save (Idempotent Upsert)
-        daemon_up = True
-        conn = get_pg_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO technical_docs (content, metadata, embedding, content_hash)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (content_hash)
-                    DO UPDATE SET metadata = EXCLUDED.metadata
-                    RETURNING id
-                """, (content, json.dumps(m_data), embedding, content_hash))
-                pg_id = cur.fetchone()[0]
-                cur.execute("SELECT count(*) FROM pg_stat_activity WHERE application_name = 'consolidation_daemon'")
-                daemon_up = cur.fetchone()[0] > 0
-                cur.execute("SELECT pg_notify('new_artifact', %s)", (json.dumps({"pg_id": pg_id}),))
-            conn.commit()
-        finally:
-            release_pg_conn(conn)
-
-        # 2. Neo4j Sync (agent-memory schema)
-        try:
-            driver = get_neo4j()
-            with driver.session() as session:
-                session.run(
-                    f"MERGE (f:{ONT.fact} {{pg_id: $pg_id}})"
-                    " SET f.content = $content,"
-                    "     f.created_at = datetime(),"
-                    "     f.source = $source",
-                    pg_id=pg_id, content=content[:200], source=m_data.get("source", "mcp_sync"))
-
-                for entity_name in entities:
-                    session.run(
-                        f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
-                        f" MERGE (e:{ONT.entity} {{name: $name}})"
-                        f" MERGE (f)-[:{ONT.entity_link}]->(e)",
-                        pg_id=pg_id, name=entity_name)
-
-            sync_msg = f"Successfully linked to Graph (Neo4j){f' with {len(entities)} entities' if entities else ''}."
-        except Exception as ne:
-            sync_msg = f"Postgres saved (ID: {pg_id}), but Graph sync failed: {str(ne)}"
-            _append_log("vector_skill", 2, "neo4j_sync_failed", {"pg_id": pg_id, "error": str(ne)}, content)
-
-        if not entities:
-            _append_log("vector_skill", 1, "no_entities", {"pg_id": pg_id, "source": m_data.get("source")}, content)
-        _append_log("vector_skill", 3, "save_success", {"pg_id": pg_id, "source": m_data.get("source"), "entity_count": len(entities)}, content)
-
-        entities_warning = "" if entities else "\nWARNING: No 'entities' in metadata — fact stored but ineligible for Tier 3 consolidation."
-        daemon_warning = "" if daemon_up else "\nWARNING: Consolidation daemon not running — NOTIFY dropped. Start consolidation_loop.py."
-        return f"Success: {sync_msg}{entities_warning}{daemon_warning}"
-    except Exception as e:
-        logger.error(f"Save failed: {str(e)}")
-        return f"Error saving artifact: {str(e)}"
+    # The coordinator's message already carries the no-entities Tier-3 warning.
+    neo4j_status = result.get("neo4j", "pending")
+    return f"Success (pg_id={pg_id}, neo4j={neo4j_status}): {result.get('message', '')}".rstrip()
 
 @mcp.tool()
 async def archive_reasoning_trace(session_id: str, task: str, steps: list) -> str:

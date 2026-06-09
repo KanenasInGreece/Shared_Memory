@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **MCP `save_artifact` now routes through the gateway — no more direct DB writes.** The LM Studio MCP tool (`vector-skill.py`) previously wrote Postgres and Neo4j itself (own psycopg2 INSERT + `MERGE`), the one save path that bypassed the coordinator's outbox. A crash between the two writes could leave Neo4j out of sync with Postgres — exactly the ADR-001 dangling-Fact risk the outbox pattern exists to prevent. `save_artifact` now `POST`s to `/memory/save` like `save_decision`/`save_retrospective`, so it gets the same server-side path: hard-mandate BGE-M3 embedding (503 if the embedder is down), SHA-256 idempotent upsert, and a `neo4j_outbox` row written in the **same transaction** and applied asynchronously by the outbox worker. The loaded model name (which auth would otherwise overwrite on `metadata.source` with the verified agent identity) is preserved in a new `metadata.model` field. Client-side metadata validation (JSON parse, dict check, `source` required) is kept for clear MCP errors before the call. `tests/test_vector_skill.py` updated: the save_artifact tests now assert gateway routing (object-bound metadata, model preserved, gateway-down + coordinator-error surfacing) instead of direct DB mocks.
+
 ## [0.4.2] — 2026-06-09
 
 ### Added
