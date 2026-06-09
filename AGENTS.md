@@ -10,7 +10,7 @@ This repo's shared memory skill is installed at `~/.codex/skills/shared-memory/`
 
 ## What This Repository Is
 
-The **Shared Memory Framework** — a three-tier semantic memory shared by every local AI tool through one gateway (Postgres + pgvector + Neo4j). All credentials are read from `.env`; no secrets are hardcoded. Current version **v0.4.1**: two-phase REM/NREM sleep cycle, per-agent token auth, summary supersession, domain-scoped consolidation, Tier-3 trace-back pointers, and GPU-aware dreaming.
+The **Shared Memory Framework** — a three-tier semantic memory shared by every local AI tool through one gateway (Postgres + pgvector + Neo4j). All credentials are read from `.env`; no secrets are hardcoded. Current version **v0.4.2**: two-phase REM/NREM sleep cycle, per-agent token auth, summary supersession, domain-scoped consolidation, Tier-3 trace-back pointers, and GPU-aware dreaming.
 
 ## Commands
 

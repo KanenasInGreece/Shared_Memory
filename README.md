@@ -946,7 +946,7 @@ printf 'AGENT_TOKEN=tok_<your-token>\nCOORDINATOR_URL=http://localhost:8888\n' \
 ```bash
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version
-# → {"version": "0.4.1", "api_version": 1, "tool": "shared-memory-framework"}
+# → {"version": "0.4.2", "api_version": 1, "tool": "shared-memory-framework"}
 
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py search "test" 3
@@ -979,7 +979,7 @@ All three paths route through the coordinator on port 8888. The coordinator owns
 ```bash
 # Check the framework version
 python shared-memory/scripts/memory_bridge.py --version
-# → {"version": "0.4.1", "api_version": 1, "tool": "shared-memory-framework"}
+# → {"version": "0.4.2", "api_version": 1, "tool": "shared-memory-framework"}
 
 # Search — semantic + rerank + Neo4j expansion
 uv run --with httpx --with python-dotenv \
