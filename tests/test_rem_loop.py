@@ -192,6 +192,59 @@ async def test_write_neo4j_rem_sets_rem_processed_last():
     assert any("MERGE" in c for c in earlier_cyphers)
 
 
+@pytest.mark.asyncio
+async def test_fetch_non_rem_batch_selects_facts_and_decisions():
+    """Selection must consider both :Fact and :Decision so decisions get enriched."""
+    daemon, mock_session = _make_daemon()
+    mock_result = MagicMock()
+    mock_result.data = AsyncMock(return_value=[{"pg_id": 7}])
+    mock_session.run = AsyncMock(return_value=mock_result)
+
+    from rem_loop import ONT
+    await daemon._fetch_non_rem_batch()
+
+    cypher = mock_session.run.call_args.args[0]
+    assert ONT.fact in cypher and ONT.decision in cypher
+    assert "OR" in cypher
+    assert "ORDER BY" in cypher and "ASC" in cypher
+
+
+@pytest.mark.asyncio
+async def test_write_neo4j_rem_decision_anchors_on_decision_and_keeps_rationale():
+    """For a decision: anchor edges + the rem_processed mark on the :Decision
+    node, write the CONSIDERED/PRODUCES_INSIGHT extras, and never overwrite the
+    rationale (summary goes to d.rem_summary, not d.content)."""
+    daemon, mock_session = _make_daemon()
+    mock_session.run = AsyncMock()
+
+    from rem_loop import ONT
+    registry = {"BGE-M3": {"label": ONT.entity, "default_rel": ONT.entity_link}}
+    relationships = [{"name": "BGE-M3", "rel_type": ONT.entity_link}]
+    decision_extras = {
+        ONT.considered:       ["synchronous writes"],
+        ONT.rejected:         ["no consolidation"],
+        ONT.under_conditions: [],                       # empty → skipped
+        ONT.produces_insight: ["outbox decouples write latency"],
+    }
+
+    await daemon._write_neo4j_rem(
+        42, "rem summary", relationships, registry, decision_extras, is_decision=True,
+    )
+
+    cyphers = [c.args[0] for c in mock_session.run.call_args_list]
+    # Step 1 — entity edges anchored on the Decision node, never on a Fact
+    assert any(f"(a:{ONT.decision}" in c and "MERGE (a)-[" in c for c in cyphers)
+    assert not any(f"MATCH (f:{ONT.fact}" in c for c in cyphers)
+    # Step 2 — decision extras written (non-empty ones only)
+    assert any(ONT.considered in c for c in cyphers)
+    assert any(ONT.produces_insight in c for c in cyphers)
+    # Step 3 (last) — mark on Decision; rationale/content untouched
+    last = cyphers[-1]
+    assert f"MATCH (d:{ONT.decision}" in last
+    assert "rem_processed" in last and "rem_summary" in last
+    assert "d.content" not in last and "d.rationale" not in last
+
+
 # ── _fact_is_consistent full string comparison ────────────────────────────────
 
 @pytest.mark.asyncio
