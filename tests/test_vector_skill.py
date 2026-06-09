@@ -35,38 +35,69 @@ async def test_mcp_get_embedding_success():
 
 @pytest.mark.asyncio
 async def test_mcp_save_artifact_success():
-    with patch("vector_skill.get_embedding", return_value=MOCK_EMBEDDING), \
-         patch("vector_skill.get_pg_conn") as mock_pg_conn, \
-         patch("vector_skill.release_pg_conn") as mock_pg_release, \
-         patch("vector_skill.get_neo4j") as mock_neo4j:
-        
-        # Postgres mock
-        mock_cur = mock_pg_conn.return_value.cursor.return_value.__enter__.return_value
-        mock_cur.fetchone.return_value = [MOCK_PG_ID]
-        
-        # Neo4j mock
-        mock_session = mock_neo4j.return_value.session.return_value.__enter__.return_value
-        
+    """save_artifact routes through the coordinator (POST /memory/save) — no direct
+    Postgres/Neo4j writes — and returns the pg_id from the gateway response."""
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json = lambda: {
+        "status": "success", "pg_id": MOCK_PG_ID, "neo4j": "pending",
+        "message": f"Artifact stored with ID {MOCK_PG_ID}.",
+    }
+
+    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
         result = await vector_skill.save_artifact(
-            MOCK_CONTENT, '{"source":"test_agent","entities":["TestEntity"]}'
+            MOCK_CONTENT, '{"source":"qwen3-27b","entities":["TestEntity"]}'
         )
 
-        assert "Success" in result
-        assert "linked to Graph" in result
-        mock_cur.execute.assert_called()
-        # Verify idempotency clause present in one of the execute calls
-        all_sql = [call.args[0] for call in mock_cur.execute.call_args_list]
-        assert any("ON CONFLICT (content_hash)" in sql for sql in all_sql)
-        assert any("pg_notify" in sql for sql in all_sql)
-        mock_session.run.assert_called()
-        mock_pg_release.assert_called()
+    assert "Success" in result
+    assert f"pg_id={MOCK_PG_ID}" in result
+    # Routed to the gateway save endpoint with metadata as an OBJECT (the codec
+    # serialises once — a stringified metadata here would double-encode).
+    call = mock_post.call_args
+    assert call.args[0].endswith("/memory/save")
+    payload = call.kwargs["json"]
+    assert isinstance(payload["metadata"], dict)
+    assert payload["metadata"]["entities"] == ["TestEntity"]
+    # Loaded model name preserved even though auth may overwrite source.
+    assert payload["metadata"]["model"] == "qwen3-27b"
+
 
 @pytest.mark.asyncio
-async def test_mcp_save_artifact_abort_on_no_vector():
-    with patch("vector_skill.get_embedding", return_value=None):
-        result = await vector_skill.save_artifact(MOCK_CONTENT)
-        assert "Error" in result
-        assert "DOWN" in result
+async def test_mcp_save_artifact_gateway_down():
+    """save_artifact returns a readable error when the gateway is unreachable."""
+    with patch("httpx.AsyncClient.post", side_effect=Exception("connection refused")):
+        result = await vector_skill.save_artifact(
+            MOCK_CONTENT, '{"source":"qwen3-27b"}'
+        )
+    assert "Error" in result
+    assert "hive_mind_proxy.py" in result
+
+
+@pytest.mark.asyncio
+async def test_mcp_save_artifact_surfaces_coordinator_error():
+    """A 503 (embedder down) or other coordinator rejection is surfaced verbatim."""
+    mock_response = MagicMock()
+    mock_response.status_code = 503
+    mock_response.json = lambda: {
+        "status": "error",
+        "message": "Embedding service unreachable after 4 attempts.",
+    }
+    with patch("httpx.AsyncClient.post", return_value=mock_response):
+        result = await vector_skill.save_artifact(
+            MOCK_CONTENT, '{"source":"qwen3-27b"}'
+        )
+    assert "Error" in result
+    assert "Embedding service unreachable" in result
+
+
+@pytest.mark.asyncio
+async def test_mcp_save_artifact_missing_source_rejected_client_side():
+    """source is required — rejected before any network call."""
+    with patch("httpx.AsyncClient.post") as mock_post:
+        result = await vector_skill.save_artifact(MOCK_CONTENT, '{"entities":["X"]}')
+    assert "Error" in result
+    assert "source is required" in result
+    mock_post.assert_not_called()
 
 @pytest.mark.asyncio
 async def test_mcp_hybrid_search_expanded_success():
