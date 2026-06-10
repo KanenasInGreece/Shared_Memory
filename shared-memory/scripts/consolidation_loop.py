@@ -188,21 +188,33 @@ def fetch_unreconciled(conn):
         return cur.fetchall()
 
 
-def close_ledger_rows(conn, pg_ids):
+def close_ledger_rows(conn, pg_ids, context="consolidation"):
     """Final ledger transition: delete 'consolidated' rows once the Neo4j
     marking has succeeded. Row absence = both stores conclusively synced.
-    Returns the number of rows closed."""
+
+    Every deletion is logged to the gateway log unconditionally — the row is
+    the only record of the dream lifecycle, so its destruction must always
+    leave a trace. RETURNING captures what was actually deleted (the request
+    list and the affected rows can differ). Returns the number of rows closed.
+    """
     if not pg_ids:
         return 0
     with conn.cursor() as cur:
         cur.execute(
             "DELETE FROM neo4j_outbox"
-            " WHERE status = 'consolidated' AND pg_id = ANY(%s)",
+            " WHERE status = 'consolidated' AND pg_id = ANY(%s)"
+            " RETURNING id, pg_id",
             (list(pg_ids),),
         )
-        closed = cur.rowcount
+        deleted = cur.fetchall()
     conn.commit()
-    return closed
+    if deleted:
+        logger.info(
+            "Ledger close [%s]: deleted %d outbox row(s): %s",
+            context, len(deleted),
+            ", ".join(f"outbox_id={oid}→pg_id={pid}" for oid, pid in sorted(deleted)),
+        )
+    return len(deleted)
 
 
 _LOG_TOOLS = ["memory_bridge", "vector_skill"]
@@ -451,13 +463,14 @@ class ConsolidationDaemon:
 
                 stuck = await loop.run_in_executor(None, lambda: fetch_unreconciled(conn))
                 for summary_id, entity, domain, src_ids in stuck:
-                    logger.warning(
+                    logger.info(
                         "Ledger sweep: re-applying graph marking for summary %d ('%s'/%s) — "
-                        "previous Neo4j sync was not confirmed.", summary_id, entity, domain,
+                        "unconfirmed Neo4j sync or pre-ledger backfilled row.",
+                        summary_id, entity, domain,
                     )
                     await self._mark_consolidated_in_graph(src_ids, summary_id, entity, domain)
                     closed = await loop.run_in_executor(
-                        None, lambda ids=src_ids: close_ledger_rows(conn, ids)
+                        None, lambda ids=src_ids: close_ledger_rows(conn, ids, context="reconciliation")
                     )
                     logger.info("Ledger sweep: reconciled summary %d, closed %d rows.", summary_id, closed)
 

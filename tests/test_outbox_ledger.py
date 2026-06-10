@@ -128,17 +128,40 @@ def test_unreconciled_returns_covering_summary_tuples():
 # ── close_ledger_rows ─────────────────────────────────────────────────────────
 
 def test_close_deletes_only_consolidated_status():
-    conn = StubConn(script=[{"rowcount": 5, "rows": []}])
+    rows = [(101, 1), (102, 2), (103, 3), (104, 4), (105, 5)]
+    conn = StubConn(script=[{"rowcount": 5, "rows": rows}])
     assert close_ledger_rows(conn, [1, 2, 3, 4, 5]) == 5
     assert conn.commits == 1
     sql, params = conn.executed[0]
     assert sql.startswith("DELETE FROM neo4j_outbox")
     assert "status = 'consolidated'" in sql
+    assert "RETURNING id, pg_id" in sql
     assert params == ([1, 2, 3, 4, 5],)
 
 
-def test_close_with_no_ids_is_a_noop():
+def test_close_always_logs_deletions_to_gateway_log(caplog):
+    # The row is the only record of the dream lifecycle — its destruction
+    # must always leave a trace in the gateway log, with the actual rows
+    # deleted (not the requested list).
+    import logging
+    rows = [(101, 1), (103, 3)]
+    conn = StubConn(script=[{"rowcount": 2, "rows": rows}])
+    with caplog.at_level(logging.INFO, logger="ConsolidationDaemon"):
+        assert close_ledger_rows(conn, [1, 2, 3], context="reconciliation") == 2
+    record = next(r for r in caplog.records if "Ledger close" in r.getMessage())
+    msg = record.getMessage()
+    assert "[reconciliation]" in msg
+    # Each deletion is a traceable pair: outbox row id ↔ consolidated fact pg_id.
+    assert "outbox_id=101→pg_id=1" in msg
+    assert "outbox_id=103→pg_id=3" in msg
+    assert "pg_id=2" not in msg  # 2 was requested but not present — not logged
+
+
+def test_close_with_no_ids_is_a_noop(caplog):
+    import logging
     conn = StubConn()
-    assert close_ledger_rows(conn, []) == 0
+    with caplog.at_level(logging.INFO, logger="ConsolidationDaemon"):
+        assert close_ledger_rows(conn, []) == 0
     assert conn.executed == []
     assert conn.commits == 0
+    assert not any("Ledger close" in r.getMessage() for r in caplog.records)
