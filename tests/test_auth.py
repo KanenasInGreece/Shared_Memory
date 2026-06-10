@@ -20,10 +20,10 @@ import pytest
 
 # ── Dynamic import ────────────────────────────────────────────────────────────
 
-def load_coordinator(agent_tokens: str = ""):
-    """Import coordinator.py with AGENT_TOKENS pre-set in the environment.
+def load_coordinator(agent_tokens: str = "", agent_roles: str = ""):
+    """Import coordinator.py with AGENT_TOKENS / AGENT_ROLES pre-set in the env.
 
-    Each call produces a fresh module so token state is isolated per test.
+    Each call produces a fresh module so token/role state is isolated per test.
     """
     scripts_dir = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts")
@@ -31,11 +31,16 @@ def load_coordinator(agent_tokens: str = ""):
     if scripts_dir not in sys.path:
         sys.path.insert(0, scripts_dir)
 
-    # Set env BEFORE loading so _load_agent_tokens() picks it up at module level
+    # Set env BEFORE loading so _load_agent_tokens()/_load_agent_roles() pick it
+    # up at module level
     if agent_tokens:
         os.environ["AGENT_TOKENS"] = agent_tokens
     else:
         os.environ.pop("AGENT_TOKENS", None)
+    if agent_roles:
+        os.environ["AGENT_ROLES"] = agent_roles
+    else:
+        os.environ.pop("AGENT_ROLES", None)
 
     path = os.path.join(scripts_dir, "coordinator.py")
     spec = importlib.util.spec_from_file_location("coordinator_auth_test", path)
@@ -88,9 +93,10 @@ def test_load_agent_tokens_duplicate_token_logs_warning_first_wins(caplog):
 
 # ── auth_middleware — helpers ─────────────────────────────────────────────────
 
-def _make_request(path: str, auth_header: str | None = None) -> MagicMock:
+def _make_request(path: str, auth_header: str | None = None, method: str = "POST") -> MagicMock:
     req = MagicMock()
     req.path = path
+    req.method = method
     headers = {}
     if auth_header is not None:
         headers["Authorization"] = auth_header
@@ -199,5 +205,105 @@ async def test_auth_middleware_handles_extra_spaces_in_header():
     authenticates correctly.  This is the key advantage over raw [7:] slicing."""
     mod = load_coordinator("claude:tok_abc")
     req = _make_request("/memory/save", auth_header="Bearer  tok_abc")
+    resp = await mod.auth_middleware(req, _noop_handler)
+    assert resp.status == 200
+
+
+# ── _load_agent_roles ─────────────────────────────────────────────────────────
+
+def test_load_agent_roles_empty_env():
+    mod = load_coordinator("claude:tok_abc")
+    assert mod._AGENT_ROLES == {}
+
+
+def test_load_agent_roles_read_pair():
+    mod = load_coordinator("monitor:tok_m", agent_roles="monitor:read")
+    assert mod._AGENT_ROLES == {"monitor": "read"}
+
+
+def test_load_agent_roles_skips_malformed_entry(caplog):
+    with caplog.at_level(logging.WARNING, logger="coordinator"):
+        mod = load_coordinator("monitor:tok_m", agent_roles="monitor:read,bad_entry")
+    assert mod._AGENT_ROLES == {"monitor": "read"}
+    assert "malformed" in caplog.text
+
+
+def test_load_agent_roles_unknown_role_ignored(caplog):
+    with caplog.at_level(logging.WARNING, logger="coordinator"):
+        mod = load_coordinator("monitor:tok_m", agent_roles="monitor:writ")
+    # Unknown role is dropped — the agent keeps full access (fail-known, logged)
+    assert mod._AGENT_ROLES == {}
+    assert "unknown role" in caplog.text
+
+
+# ── auth_middleware — read-only role enforcement ──────────────────────────────
+
+@pytest.mark.asyncio
+async def test_read_role_allows_telemetry():
+    mod = load_coordinator("monitor:tok_m", agent_roles="monitor:read")
+    req = _make_request("/memory/telemetry", auth_header="Bearer tok_m", method="GET")
+    resp = await mod.auth_middleware(req, _noop_handler)
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_read_role_allows_graph():
+    mod = load_coordinator("monitor:tok_m", agent_roles="monitor:read")
+    req = _make_request("/memory/graph", auth_header="Bearer tok_m", method="POST")
+    resp = await mod.auth_middleware(req, _noop_handler)
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_read_role_denies_save():
+    from aiohttp.web_exceptions import HTTPForbidden
+    mod = load_coordinator("monitor:tok_m", agent_roles="monitor:read")
+    req = _make_request("/memory/save", auth_header="Bearer tok_m", method="POST")
+    with pytest.raises(HTTPForbidden):
+        await mod.auth_middleware(req, _noop_handler)
+
+
+@pytest.mark.asyncio
+async def test_read_role_denies_search():
+    from aiohttp.web_exceptions import HTTPForbidden
+    mod = load_coordinator("monitor:tok_m", agent_roles="monitor:read")
+    req = _make_request("/memory/search", auth_header="Bearer tok_m", method="POST")
+    with pytest.raises(HTTPForbidden):
+        await mod.auth_middleware(req, _noop_handler)
+
+
+@pytest.mark.asyncio
+async def test_read_role_denies_proxy_passthrough():
+    """A read token cannot reach the LLM/embeddings proxy catch-all either."""
+    from aiohttp.web_exceptions import HTTPForbidden
+    mod = load_coordinator("monitor:tok_m", agent_roles="monitor:read")
+    req = _make_request("/v1/embeddings", auth_header="Bearer tok_m", method="POST")
+    with pytest.raises(HTTPForbidden):
+        await mod.auth_middleware(req, _noop_handler)
+
+
+@pytest.mark.asyncio
+async def test_read_role_denies_telemetry_wrong_method():
+    """Allowlist is method-specific: POST /memory/telemetry is not GET."""
+    from aiohttp.web_exceptions import HTTPForbidden
+    mod = load_coordinator("monitor:tok_m", agent_roles="monitor:read")
+    req = _make_request("/memory/telemetry", auth_header="Bearer tok_m", method="POST")
+    with pytest.raises(HTTPForbidden):
+        await mod.auth_middleware(req, _noop_handler)
+
+
+@pytest.mark.asyncio
+async def test_read_role_health_still_unauthenticated():
+    mod = load_coordinator("monitor:tok_m", agent_roles="monitor:read")
+    req = _make_request("/health", method="GET")
+    resp = await mod.auth_middleware(req, _noop_handler)
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_full_role_agent_can_still_save():
+    """An agent absent from AGENT_ROLES keeps full read/write access."""
+    mod = load_coordinator("claude:tok_abc,monitor:tok_m", agent_roles="monitor:read")
+    req = _make_request("/memory/save", auth_header="Bearer tok_abc", method="POST")
     resp = await mod.auth_middleware(req, _noop_handler)
     assert resp.status == 200

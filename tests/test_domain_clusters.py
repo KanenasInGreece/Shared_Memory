@@ -64,3 +64,38 @@ def test_content_pgid_alignment_preserved_per_domain():
                   eligible_domain_clusters(contents, pg_ids, domain_map, threshold=2))
     assert result["d1"] == [(10, "alpha"), (30, "gamma")]
     assert result["d2"] == [(20, "beta"), (40, "delta")]
+
+
+# ── _count_domain_cycles — telemetry NREM cycle gauge (coordinator) ───────────
+# Mirrors eligible_domain_clusters' gating but returns a count, used by
+# GET /memory/telemetry so a read-only client needs no DB join of its own.
+from coordinator import _count_domain_cycles
+
+
+def test_count_cycles_single_domain_meets_threshold():
+    assert _count_domain_cycles([1, 2, 3], {1: "x", 2: "x", 3: "x"}, threshold=3) == 1
+
+
+def test_count_cycles_below_threshold_is_zero():
+    assert _count_domain_cycles([1, 2], {1: "x", 2: "x"}, threshold=3) == 0
+
+
+def test_count_cycles_counts_each_qualifying_domain():
+    # x has 3 (qualifies), y has 3 (qualifies), z has 2 (does not) → 2 cycles
+    pg_ids = [1, 2, 3, 4, 5, 6, 7, 8]
+    domain_map = {1: "x", 2: "x", 3: "x", 4: "y", 5: "y", 6: "y", 7: "z", 8: "z"}
+    assert _count_domain_cycles(pg_ids, domain_map, threshold=3) == 2
+
+
+def test_count_cycles_thinly_spread_yields_zero():
+    # 4 ids split 2/2 — neither domain meets threshold 3
+    assert _count_domain_cycles([1, 2, 3, 4], {1: "x", 2: "x", 3: "y", 4: "y"}, threshold=3) == 0
+
+
+def test_count_cycles_untagged_collapse_to_default():
+    # No domain tags → all collapse to one bucket
+    assert _count_domain_cycles([1, 2], {}, threshold=2) == 1
+
+
+def test_count_cycles_empty_domain_falls_back_to_default():
+    assert _count_domain_cycles([1, 2], {1: "", 2: None}, threshold=2) == 1

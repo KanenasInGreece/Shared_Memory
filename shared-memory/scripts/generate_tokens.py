@@ -12,14 +12,27 @@ Run once from the repo root:
 """
 import secrets
 
-AGENTS = ["claude", "gemini", "grok", "codex", "lm_studio", "antigravity"]
+AGENTS = ["claude", "gemini", "grok", "codex", "lm_studio", "antigravity", "monitor"]
+
+# Read-only identities: registered like any agent, but confined by AGENT_ROLES
+# to GET /health, GET /memory/telemetry, and POST /memory/graph (read-only
+# Cypher). "monitor" is the shared-memory-monitor dashboard — a read-only ops
+# client that must not borrow a write-capable agent token.
+READ_ONLY_AGENTS = ["monitor"]
+
 tokens = {a: f"tok_{secrets.token_urlsafe(24)}" for a in AGENTS}
 
 print("=== Gateway .env — add this line ===")
 print("AGENT_TOKENS=" + ",".join(f"{a}:{t}" for a, t in tokens.items()))
 print()
+print("=== Gateway .env — optional read-only roles ===")
+print("AGENT_ROLES=" + ",".join(f"{a}:read" for a in READ_ONLY_AGENTS))
+print("# read-role agents may reach only GET /health, GET /memory/telemetry,")
+print("# and POST /memory/graph (read-only Cypher). All other routes → 403.")
+print()
 print("=== Per-agent .env — copy the matching AGENT_TOKEN line ===")
 for a, t in tokens.items():
-    print(f"  {a:15}  AGENT_TOKEN={t}")
+    suffix = "  (read-only)" if a in READ_ONLY_AGENTS else ""
+    print(f"  {a:15}  AGENT_TOKEN={t}{suffix}")
 print()
 print("Each agent must use its own distinct token — never share tokens across agents.")

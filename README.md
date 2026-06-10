@@ -720,6 +720,17 @@ Each token maps to a verified agent identity. Never share tokens across agents o
 
 **Backward compatible:** If `AGENT_TOKENS` is unset, the coordinator accepts all requests (existing installs are unaffected until you add the variable).
 
+**Read-only roles (`AGENT_ROLES`).** A registered token can be confined to read-only access by adding it to `AGENT_ROLES` in the gateway `.env`:
+
+```bash
+# Gateway .env — comma-separated name:role pairs; role is "read" or "full".
+AGENT_ROLES=monitor:read
+```
+
+A `read` token may reach only `GET /health`, `GET /memory/telemetry`, and `POST /memory/graph` (which already enforces a read-only Cypher guard). Every other route — `save`, `retrospective`, `search`, and the embeddings/LLM proxy passthrough — returns **403**. Roles only ever *narrow* access; a token must still be a valid `AGENT_TOKENS` entry. `AGENT_ROLES` unset (or `name:full`) preserves full read/write — the backward-compatible default. `generate_tokens.py` mints a `monitor` identity and emits the matching `AGENT_ROLES=monitor:read` line.
+
+This exists so read-only ops clients — e.g. the companion **Shared Memory Monitor** dashboard — hold their own dedicated, non-write-capable identity instead of borrowing an agent's full-access token. A leaked monitor token cannot save or poison memory.
+
 ### Smoke-test the bridge
 
 After the full stack is running and tokens are configured, verify the bridge works from any shell:
@@ -1035,7 +1046,7 @@ The coordinator exposes six memory endpoints on port 8888. All routes (except `/
 | `POST` | `/memory/graph` | `{cypher, params?}` | `{status, records[]}` |
 | `POST` | `/memory/retrospective` | `{pg_id, rating, notes, date?, agent_id?}` | `{status, target_pg_id}` |
 | `GET` | `/memory/status/{pg_id}` | — | `{pg_id, neo4j, retries, applied_at}` |
-| `GET` | `/memory/telemetry` | — | `{status, telemetry: {postgres, neo4j}}` — outbox + dream-cycle backlog rollup (v0.4.3) |
+| `GET` | `/memory/telemetry` | — | `{status, telemetry: {postgres, neo4j, nrem, breakdown}}` — outbox + dream-cycle backlog rollup, NREM consolidation-cycle counts, and metadata distributions. The coordinator owns both backends and does the joins, so a read-only client can render a full dashboard from this one call with no direct DB access. (v0.4.3; `nrem`/`breakdown` added [Unreleased]) |
 | `GET` | `/health` | — | `{status, embedder, reranker, llm, daemon, rem_daemon, auth_required}` |
 
 > **`/memory/graph` is read-only enforced.** Queries containing `CREATE`, `DELETE`, `DETACH DELETE`, `SET`, `MERGE`, `CALL`, `LOAD CSV`, or `DROP` are rejected with HTTP 400 before reaching Neo4j.
