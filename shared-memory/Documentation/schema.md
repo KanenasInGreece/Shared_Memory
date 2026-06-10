@@ -73,21 +73,23 @@ Written exclusively by the consolidation daemon. Each row is an LLM-synthesised 
 
 ---
 
-### `neo4j_outbox` — Coordinator outbox (cross-DB atomicity)
+### `neo4j_outbox` — Coordinator outbox + dream-cycle ledger
 
-Written by the coordinator on every save, in the same Postgres transaction as `technical_docs`. Applied asynchronously to Neo4j by the outbox worker. Survives crashes and Neo4j outages — pending rows are replayed on restart.
+Written by the coordinator on every save, in the same Postgres transaction as `technical_docs`. Applied asynchronously to Neo4j by the outbox worker. Survives crashes and Neo4j outages — pending rows are replayed on restart. For **fact rows** the table doubles as the dream-cycle ledger: a row's presence means "this artifact has not finished dreaming", and its deletion is the conclusive record that both stores are synced.
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | `BIGSERIAL PRIMARY KEY` | Monotonic outbox entry ID |
 | `pg_id` | `BIGINT NOT NULL` | References the `technical_docs.id` row this write belongs to |
 | `cypher_params` | `JSONB NOT NULL` | Parameters passed to the Neo4j Cypher write (content snippet, source, entities, etc.) |
-| `status` | `TEXT NOT NULL DEFAULT 'pending'` | `pending` → `in_progress` → `applied` → `rem_reviewed` or `failed`. `in_progress` means a coordinator instance has claimed the row for Neo4j apply. `applied` means Neo4j write succeeded. `rem_reviewed` means REM has enriched the fact and verified Neo4j consistency — the row is safe to prune (handled by future `pruning_loop.py`). Rows stuck in `in_progress` after a crash are reset to `pending` on coordinator startup. |
+| `status` | `TEXT NOT NULL DEFAULT 'pending'` | Fact lifecycle: `pending` → `in_progress` → `applied` → `rem_reviewed` → `consolidated` → **row deleted**; `failed` is the dead-letter state. `in_progress` means a coordinator instance has claimed the row for Neo4j apply. `applied` means the Neo4j write succeeded. `rem_reviewed` means REM has enriched the fact and verified Neo4j consistency — the durable NREM backlog. `consolidated` is set by NREM **in the same transaction** as the `community_summaries` INSERT the fact was folded into; the row is **deleted** only after the Neo4j consolidation marking succeeds. Rows stuck in `in_progress` after a crash are reset to `pending` on coordinator startup; rows stuck at `consolidated` (crash between the stores) are reconciled by the next ledger sweep, which re-applies the idempotent graph marking and closes them. |
 | `retries` | `INT NOT NULL DEFAULT 0` | Incremented on each failed application attempt |
 | `created_at` | `TIMESTAMPTZ DEFAULT now()` | When the outbox row was written |
 | `applied_at` | `TIMESTAMPTZ` | Set when status transitions to `applied` |
 
 **Index:** partial btree on `status WHERE status = 'pending'` — keeps the worker scan O(backlog), not O(table).
+
+**Decision and retrospective rows are exempt from the ledger tail** (`consolidated`/deletion): their lifecycle ends at `applied`/`rem_reviewed` until the decision-NREM design (insight consolidation, reversal cascade) is ratified. Note that a retrospective row shares its **target decision's** `pg_id`; because REM's outbox mark targets the latest `applied` row for a `pg_id`, retro rows can sit at `rem_reviewed` — they are identified by `cypher_params->>'type'`, never by status.
 
 **Consistency note:** after a save returns success (Postgres committed), the corresponding Neo4j `Fact` node may not yet exist — the outbox worker applies it asynchronously. `graph` queries immediately after a save use `?consistency=neo4j` to block until the outbox row is applied.
 
