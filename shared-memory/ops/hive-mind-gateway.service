@@ -1,0 +1,20 @@
+[Unit]
+Description=Shared Memory Hive-Mind Gateway (coordinator + consolidation + REM daemons)
+Documentation=https://github.com/YOUR_GITHUB_USER/shared-memory
+# Best-effort ordering; the daemons retry their own upstreams, so these are not hard deps.
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Repo root — the .env beside it is loaded automatically by hive_mind_proxy.py.
+WorkingDirectory=/path/to/your/shared-memory-GitHub
+ExecStart=/usr/bin/uv run --with aiohttp --with asyncpg --with neo4j --with httpx python shared-memory/scripts/hive_mind_proxy.py 8888
+# The proxy traps SIGTERM and drains the daemons cleanly — let it.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
