@@ -105,6 +105,106 @@ def sweep_due(now, last_sweep_time, last_activity, has_pending,
     return (now - last_sweep_time).total_seconds() >= sweep_interval
 
 
+# ── Outbox dream-cycle ledger — fact path only (decision pg_id 267) ───────────
+# A fact's neo4j_outbox row now lives through the full dream cycle:
+#
+#   pending → applied → rem_reviewed → consolidated → row DELETED
+#
+# 'consolidated' is set in the SAME Postgres transaction as the community-
+# summary INSERT (Postgres synced); the row is deleted only after the Neo4j
+# marking succeeds (both stores conclusively synced). A row's presence
+# therefore always means "this artifact has not finished dreaming" — a durable
+# NREM backlog that survives daemon restarts and lost NOTIFYs, and a
+# reconciliation point if a crash lands between the two stores.
+#
+# Decision and retrospective rows are deliberately UNTOUCHED by every function
+# below: their lifecycle is downstream of the decision-NREM design (reversal
+# cascade, insight supersession) which is not ratified yet — see pg_id 269.
+# Retrospective rows must be identified by cypher_params type, never by
+# status: REM's outbox mark targets the latest applied row for a pg_id, and a
+# retrospective shares its target decision's pg_id, so retro rows can sit at
+# 'rem_reviewed'.
+
+_FACT_ROW = "COALESCE(cypher_params->>'type', 'fact') NOT IN ('retrospective', 'decision')"
+
+
+def mark_covered_rows_consolidated(conn):
+    """Ledger backfill: advance applied/rem_reviewed fact rows to
+    'consolidated' when their pg_id already appears in an active community
+    summary's source_pg_ids. Normally the consolidation write does this
+    transactionally; this catches rows that predate the ledger (one-time
+    backfill after upgrade) and re-save duplicates stuck at 'applied'.
+
+    'pending' and 'failed' rows are never touched — the outbox worker still
+    owes them a Neo4j write or an investigation. Facts saved without entities
+    are NOT special-cased: REM extracts entities and creates MENTIONS edges,
+    so they can become Tier-3 eligible after enrichment; until then their
+    rows correctly remain backlog. Returns the number of rows advanced.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE neo4j_outbox AS o SET status = 'consolidated'"
+            " WHERE o.status IN ('applied', 'rem_reviewed')"
+            f"   AND {_FACT_ROW}"
+            "   AND EXISTS (SELECT 1 FROM community_summaries cs"
+            "               WHERE NOT cs.superseded"
+            "                 AND o.pg_id = ANY(cs.source_pg_ids))"
+        )
+        advanced = cur.rowcount
+    conn.commit()
+    return advanced
+
+
+def fetch_ledger_backlog(conn):
+    """pg_ids of facts that finished REM but not NREM — the durable
+    consolidation backlog. DISTINCT because re-saves can leave multiple rows
+    per pg_id."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT pg_id FROM neo4j_outbox"
+            " WHERE status = 'rem_reviewed'"
+            f"  AND {_FACT_ROW}"
+        )
+        return [r[0] for r in cur.fetchall()]
+
+
+def fetch_unreconciled(conn):
+    """Covering summaries for rows stuck at 'consolidated' — Postgres holds
+    the summary but the Neo4j marking was not confirmed (crash or graph error
+    after commit). Returns [(summary_id, entity, domain, source_pg_ids)] for
+    every active summary covering such a row; re-applying the marking is
+    idempotent, so no graph-side state check is needed first."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT cs.id, cs.metadata->>'entity',"
+            "       COALESCE(cs.metadata->>'domain', %s), cs.source_pg_ids"
+            "  FROM community_summaries cs"
+            "  JOIN neo4j_outbox o ON o.pg_id = ANY(cs.source_pg_ids)"
+            " WHERE NOT cs.superseded"
+            "   AND o.status = 'consolidated'"
+            f"  AND {_FACT_ROW.replace('cypher_params', 'o.cypher_params')}",
+            (DEFAULT_DOMAIN,),
+        )
+        return cur.fetchall()
+
+
+def close_ledger_rows(conn, pg_ids):
+    """Final ledger transition: delete 'consolidated' rows once the Neo4j
+    marking has succeeded. Row absence = both stores conclusively synced.
+    Returns the number of rows closed."""
+    if not pg_ids:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM neo4j_outbox"
+            " WHERE status = 'consolidated' AND pg_id = ANY(%s)",
+            (list(pg_ids),),
+        )
+        closed = cur.rowcount
+    conn.commit()
+    return closed
+
+
 _LOG_TOOLS = ["memory_bridge", "vector_skill"]
 
 def merge_logs(log_dir: str) -> None:
@@ -202,6 +302,10 @@ class ConsolidationDaemon:
         # datetime.min ⇒ the first idle tick after startup sweeps immediately,
         # draining clusters that became eligible while the daemon was down.
         self.last_sweep_time = datetime.min
+        # The unanchored graph sweep runs once per process start — it covers
+        # pre-coordinator facts that have no outbox rows. Every later sweep
+        # is driven by the durable outbox ledger instead.
+        self._startup_sweep_done = False
 
     def _requeue(self, pg_ids):
         """Re-queue failed work as event entry points. Starts the backstop
@@ -285,21 +389,7 @@ class ConsolidationDaemon:
         self.first_notification_time = None
 
         try:
-            async with self.driver.session() as session:
-                result = await session.run(
-                    f"MATCH (f:{ONT.fact}) WHERE f.pg_id IN $ids"
-                    f" MATCH (f)-[:{ONT.entity_link_alias}|{ONT.entity_link}]->(e:{ONT.entity})"
-                    f" WITH DISTINCT e"
-                    f" MATCH (e)<-[:{ONT.entity_link_alias}|{ONT.entity_link}]-(neighbor:{ONT.fact})"
-                    f" WHERE coalesce(neighbor.consolidated, false) = false"
-                    f"   AND coalesce(neighbor.rem_processed, false) = true"
-                    f" WITH e, collect(neighbor) as unflagged_facts"
-                    f" WHERE size(unflagged_facts) >= $threshold"
-                    f" RETURN e.name as entity,"
-                    f"        [fact IN unflagged_facts | fact.content] as contents,"
-                    f"        [fact IN unflagged_facts | fact.pg_id] as pg_ids",
-                    ids=ids_to_process, threshold=DENSITY_THRESHOLD)
-                clusters = await result.data()
+            clusters = await self._find_anchored_clusters(ids_to_process)
 
             if not clusters:
                 logger.info(
@@ -316,13 +406,97 @@ class ConsolidationDaemon:
             logger.error(f"Consolidation cycle failed: {str(e)}")
             self._requeue(ids_to_process)
 
+    async def _find_anchored_clusters(self, ids):
+        """Entity clusters reachable from the given fact pg_ids that meet the
+        density gate — shared by the event-driven cycle and the ledger sweep."""
+        async with self.driver.session() as session:
+            result = await session.run(
+                f"MATCH (f:{ONT.fact}) WHERE f.pg_id IN $ids"
+                f" MATCH (f)-[:{ONT.entity_link_alias}|{ONT.entity_link}]->(e:{ONT.entity})"
+                f" WITH DISTINCT e"
+                f" MATCH (e)<-[:{ONT.entity_link_alias}|{ONT.entity_link}]-(neighbor:{ONT.fact})"
+                f" WHERE coalesce(neighbor.consolidated, false) = false"
+                f"   AND coalesce(neighbor.rem_processed, false) = true"
+                f" WITH e, collect(neighbor) as unflagged_facts"
+                f" WHERE size(unflagged_facts) >= $threshold"
+                f" RETURN e.name as entity,"
+                f"        [fact IN unflagged_facts | fact.content] as contents,"
+                f"        [fact IN unflagged_facts | fact.pg_id] as pg_ids",
+                ids=ids, threshold=DENSITY_THRESHOLD)
+            return await result.data()
+
+    async def run_ledger_sweep(self):
+        """Recurring sweep driven by the durable outbox ledger (decision 267).
+
+        Three steps, all idle-gated by the caller:
+          1. Backfill — advance fact rows already covered by an active summary
+             to 'consolidated' (pre-ledger rows, re-save duplicates).
+          2. Reconcile — re-apply the Neo4j marking for rows stuck at
+             'consolidated' (crash between Postgres commit and graph sync),
+             then close them. Idempotent, so no graph-state check first.
+          3. Evaluate — if the rem_reviewed fact backlog meets the density
+             threshold, feed those pg_ids to the anchored cluster query.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            conn = await loop.run_in_executor(
+                None, lambda: psycopg2.connect(PG_CONN, connect_timeout=5)
+            )
+            try:
+                advanced = await loop.run_in_executor(
+                    None, lambda: mark_covered_rows_consolidated(conn)
+                )
+                if advanced:
+                    logger.info("Ledger sweep: backfilled %d already-covered rows to 'consolidated'.", advanced)
+
+                stuck = await loop.run_in_executor(None, lambda: fetch_unreconciled(conn))
+                for summary_id, entity, domain, src_ids in stuck:
+                    logger.warning(
+                        "Ledger sweep: re-applying graph marking for summary %d ('%s'/%s) — "
+                        "previous Neo4j sync was not confirmed.", summary_id, entity, domain,
+                    )
+                    await self._mark_consolidated_in_graph(src_ids, summary_id, entity, domain)
+                    closed = await loop.run_in_executor(
+                        None, lambda ids=src_ids: close_ledger_rows(conn, ids)
+                    )
+                    logger.info("Ledger sweep: reconciled summary %d, closed %d rows.", summary_id, closed)
+
+                backlog = await loop.run_in_executor(None, lambda: fetch_ledger_backlog(conn))
+            finally:
+                await loop.run_in_executor(None, conn.close)
+
+            if len(backlog) < DENSITY_THRESHOLD:
+                if backlog:
+                    logger.info(
+                        "Ledger sweep: %d facts awaiting NREM (< %d) — no cluster can be due.",
+                        len(backlog), DENSITY_THRESHOLD,
+                    )
+                return
+
+            clusters = await self._find_anchored_clusters(backlog)
+            if not clusters:
+                logger.info(
+                    "Ledger sweep: %d-fact backlog forms no eligible cluster yet "
+                    "(density_threshold=%d per entity+domain).",
+                    len(backlog), DENSITY_THRESHOLD,
+                )
+                return
+
+            logger.info("Ledger sweep: backlog of %d facts → %d eligible cluster(s).",
+                        len(backlog), len(clusters))
+            await self._consolidate_clusters(clusters)
+
+        except Exception as e:
+            # Nothing to re-queue — the ledger is durable; the next sweep retries.
+            logger.error(f"Ledger sweep failed: {str(e)}")
+
     async def run_global_sweep(self):
-        """Periodic global density sweep — same cluster rule as the event-driven
-        cycle but with no pending_pg_ids anchor. Drains clusters that crossed
-        the density threshold without a triggering save: REM flipped their
-        facts to rem_processed=true after the save notification was consumed,
-        or the notification was lost to a daemon restart. (Retrospective on
-        decision pg_id 214.)"""
+        """Unanchored global density sweep — same cluster rule as the
+        event-driven cycle but scanning every entity hub. Runs once per
+        process start: it is the only pass that reaches pre-coordinator facts
+        with no outbox rows. Recurring coverage is the outbox-anchored
+        run_ledger_sweep. (Retrospective on decision pg_id 214; ledger:
+        decision pg_id 267.)"""
         try:
             async with self.driver.session() as session:
                 result = await session.run(
@@ -424,7 +598,14 @@ class ConsolidationDaemon:
                     self._requeue(pg_ids)
                     continue
 
-                # 4. Atomic Multi-DB Update
+                # 4. Postgres write: summary + ledger flag, one transaction,
+                #    committed BEFORE the graph marking. A crash between the
+                #    stores now fails safe: facts stay consolidated=false in
+                #    Neo4j and the ledger rows sit at 'consolidated', so the
+                #    next sweep re-applies the marking from the authoritative
+                #    summary row (idempotent) instead of the old failure mode —
+                #    graph-marked facts with no committed summary, stranded
+                #    invisibly (the former ADR cross-DB atomicity risk).
                 metadata = {
                     "type": "community_summary",
                     "entity": entity,
@@ -475,7 +656,18 @@ class ConsolidationDaemon:
                                         )
                                 RETURNING id
                             """, (_summary, _meta_json, _embedding, _pg_ids))
-                            return cur.fetchone()[0]
+                            summary_id = cur.fetchone()[0]
+                            # Ledger transition (decision 267): these facts'
+                            # outbox rows advance to 'consolidated' atomically
+                            # with the summary they were folded into. Closed
+                            # (deleted) only after the Neo4j marking succeeds.
+                            cur.execute(
+                                "UPDATE neo4j_outbox SET status = 'consolidated'"
+                                " WHERE pg_id = ANY(%s)"
+                                "   AND status IN ('applied', 'rem_reviewed')",
+                                (_pg_ids,),
+                            )
+                            return summary_id
                     summary_pg_id = await loop.run_in_executor(None, _write_summary)
 
                     # Supersession: mark any active community_summary whose
@@ -502,47 +694,72 @@ class ConsolidationDaemon:
                         return superseded
                     superseded_ids = await loop.run_in_executor(None, _check_supersession)
 
+                    await loop.run_in_executor(None, conn.commit)
                     logger.info(
                         f"Saved summary (ID: {summary_pg_id}) to Postgres."
                         + (f" Superseded: {superseded_ids}." if superseded_ids else "")
                         + " Syncing to Graph..."
                     )
-
-                    # NOTE: CROSS-DB ATOMICITY RISK — see ADR.md
-                    async with self.driver.session() as session:
-                        await session.run(
-                            f"UNWIND $fact_ids as fid"
-                            f" MATCH (f:{ONT.fact} {{pg_id: fid}})"
-                            f" SET f.consolidated = true"
-                            f" WITH collect(f) as facts"
-                            f" MERGE (s:{ONT.community_summary} {{pg_id: $summary_pg_id}})"
-                            f" ON CREATE SET s.created_at = datetime()"
-                            f" SET s.entity = $entity,"
-                            f"     s.domain = $domain,"
-                            f"     s.updated_at = datetime()"
-                            f" WITH s, facts"
-                            f" UNWIND facts as f"
-                            f" MERGE (f)-[:{ONT.summarized_by}]->(s)",
-                            fact_ids=pg_ids, summary_pg_id=summary_pg_id,
-                            entity=entity, domain=domain)
-                        # SUPERSEDES edges for any Postgres-superseded summaries
-                        if superseded_ids:
-                            await session.run(
-                                f"MATCH (new:{ONT.community_summary} {{pg_id: $new_id}})"
-                                f" UNWIND $old_ids AS old_pg_id"
-                                f" MATCH (old:{ONT.community_summary} {{pg_id: old_pg_id}})"
-                                f" MERGE (new)-[:{ONT.supersedes}]->(old)",
-                                new_id=summary_pg_id, old_ids=superseded_ids
-                            )
-
-                    await loop.run_in_executor(None, conn.commit)
-                    logger.info(f"Successfully consolidated {len(pg_ids)} facts for '{entity}' [domain={domain}].")
                 except Exception as e:
                     await loop.run_in_executor(None, conn.rollback)
                     logger.error(f"Database write error for {entity}: {str(e)}")
                     self._requeue(pg_ids)
+                    continue
+
+                # 5. Graph sync + ledger close. Postgres is already committed;
+                #    a failure here leaves the ledger rows at 'consolidated'
+                #    and the next sweep's reconciliation re-applies this exact
+                #    marking — no re-queue, no duplicate synthesis.
+                try:
+                    await self._mark_consolidated_in_graph(
+                        pg_ids, summary_pg_id, entity, domain, superseded_ids
+                    )
+                    closed = await loop.run_in_executor(
+                        None, lambda ids=pg_ids: close_ledger_rows(conn, ids)
+                    )
+                    logger.info(
+                        f"Successfully consolidated {len(pg_ids)} facts for '{entity}'"
+                        f" [domain={domain}] ({closed} ledger rows closed)."
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Graph sync failed for {entity} [domain={domain}] — summary "
+                        f"{summary_pg_id} is committed; ledger reconciliation will retry: {str(e)}"
+                    )
         finally:
             await loop.run_in_executor(None, conn.close)
+
+    async def _mark_consolidated_in_graph(self, pg_ids, summary_pg_id, entity,
+                                          domain, superseded_ids=None):
+        """Neo4j side of a consolidation: flag the source Facts, upsert the
+        CommunitySummary node, link SUMMARIZED_BY (and SUPERSEDES) edges.
+        Fully idempotent — also used by ledger reconciliation to re-apply a
+        marking whose first attempt was not confirmed."""
+        async with self.driver.session() as session:
+            await session.run(
+                f"UNWIND $fact_ids as fid"
+                f" MATCH (f:{ONT.fact} {{pg_id: fid}})"
+                f" SET f.consolidated = true"
+                f" WITH collect(f) as facts"
+                f" MERGE (s:{ONT.community_summary} {{pg_id: $summary_pg_id}})"
+                f" ON CREATE SET s.created_at = datetime()"
+                f" SET s.entity = $entity,"
+                f"     s.domain = $domain,"
+                f"     s.updated_at = datetime()"
+                f" WITH s, facts"
+                f" UNWIND facts as f"
+                f" MERGE (f)-[:{ONT.summarized_by}]->(s)",
+                fact_ids=pg_ids, summary_pg_id=summary_pg_id,
+                entity=entity, domain=domain)
+            # SUPERSEDES edges for any Postgres-superseded summaries
+            if superseded_ids:
+                await session.run(
+                    f"MATCH (new:{ONT.community_summary} {{pg_id: $new_id}})"
+                    f" UNWIND $old_ids AS old_pg_id"
+                    f" MATCH (old:{ONT.community_summary} {{pg_id: old_pg_id}})"
+                    f" MERGE (new)-[:{ONT.supersedes}]->(old)",
+                    new_id=summary_pg_id, old_ids=superseded_ids
+                )
 
     async def _make_listen_conn(self):
         """Open a Postgres LISTEN connection and return (conn, cur)."""
@@ -612,10 +829,20 @@ class ConsolidationDaemon:
                         # Background hygiene — always yields to active inference;
                         # a deferred sweep simply retries on the next idle tick.
                         if await inference_gpu_busy():
-                            logger.info("NREM: inference GPU busy — deferring global sweep.")
+                            logger.info("NREM: inference GPU busy — deferring sweep.")
                         else:
-                            logger.info("Sweep interval reached. Starting global density sweep.")
-                            await self.run_global_sweep()
+                            if not self._startup_sweep_done:
+                                # Once per process start: the unanchored graph
+                                # sweep covers pre-coordinator facts that have
+                                # no outbox rows; the ledger sweep then does
+                                # the backfill/reconciliation pass.
+                                logger.info("Startup sweep: global graph pass + ledger pass.")
+                                await self.run_global_sweep()
+                                await self.run_ledger_sweep()
+                                self._startup_sweep_done = True
+                            else:
+                                logger.info("Sweep interval reached. Starting ledger sweep.")
+                                await self.run_ledger_sweep()
                             self.last_sweep_time = datetime.now()
                 else:
                     # Socket readable — drain notification queue
