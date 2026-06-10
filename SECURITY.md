@@ -53,6 +53,8 @@ To opt into all-interfaces binding (e.g. inside a Docker or VM network), set `PR
 
 **Backward compatible:** `AGENT_TOKENS` unset → auth disabled (no-op for existing installs).
 
+**Read-only roles (`AGENT_ROLES`).** A registered token can be confined to read-only access with `AGENT_ROLES=name:read` in the gateway `.env`. A `read` token may reach only `GET /health`, `GET /memory/telemetry`, and `POST /memory/graph` (read-only-Cypher-guarded); `save`, `retrospective`, `search`, and the proxy passthrough return **403**. Roles only narrow access — the token must still be registered in `AGENT_TOKENS`; unset/`name:full` keeps full read/write. This lets read-only ops clients (e.g. the companion Shared Memory Monitor) hold a dedicated, non-write-capable identity rather than borrowing a full-access agent token — so a leaked monitor token cannot write to memory, and agent-token rotation cannot break telemetry.
+
 **Token rotation** requires: edit gateway `.env`, restart gateway, update agent `.env` files (CLI agents take effect on next invocation; LM Studio requires full restart).
 
 ### Network transport — tokens require an encrypted channel

@@ -387,12 +387,16 @@ python ~/.claude/skills/shared-memory/scripts/memory_bridge.py status
 #   community_summaries: 2 (superseded 0, insight 0)
 #   facts:     97 total | REM pending 1 | unconsolidated 20
 #   decisions: 75 total | REM pending 71
+#   NREM cycles: 3 pending (facts 2, decisions 1)
 # add --json for machine-readable output
 ```
 `status` rolls up the outbox health and the REM/NREM dream-cycle backlog
 (`GET /memory/telemetry`). Use it to see whether REM/NREM have work pending or
 the system is caught up. The coordinator owns the DB connections, so the client
-needs nothing but its token.
+needs nothing but its token. The `--json` payload also carries `telemetry.nrem`
+(pending consolidation-cycle counts + thresholds) and `telemetry.breakdown`
+(record-type / agent / source / domain / summary-kind distributions) — enough to
+render a full dashboard without any direct Postgres or Neo4j access.
 
 ### MCP Server (LM Studio only)
 LM Studio uses the MCP interface (`vector-skill.py` via `mcp.json`), not this CLI skill.

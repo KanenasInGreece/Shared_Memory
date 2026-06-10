@@ -304,6 +304,12 @@ def format_status(payload: dict) -> str:
                      f"unconsolidated {nj.get('facts_unconsolidated','?')}")
         lines.append(f"  decisions: {nj.get('decisions_total','?')} total | "
                      f"REM pending {nj.get('decisions_rem_pending','?')}")
+    nr = t.get("nrem", {})
+    if nr and "error" not in nr:
+        lines.append(f"  NREM cycles: {nr.get('total_cycles','?')} pending "
+                     f"(facts {nr.get('fact_cycles',0)}, decisions {nr.get('decision_cycles',0)})")
+    elif "error" in nr:
+        lines.append(f"  nrem: ERROR {nr['error']}")
     return "\n".join(lines)
 
 

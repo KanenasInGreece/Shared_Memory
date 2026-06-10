@@ -131,6 +131,59 @@ def _load_agent_tokens() -> dict[str, str]:
 _AGENT_TOKENS: dict[str, str] = _load_agent_tokens()
 
 
+# ── Read-only roles (e.g. the telemetry monitor) ────────────────────────────────
+#
+# Routes a "read" role may reach. Everything else — saves, retrospectives,
+# search, and the LLM/embeddings proxy passthrough — returns 403 for a read
+# token. /health is unauthenticated for everyone (see _UNPROTECTED_PATHS).
+# /memory/graph is included because handle_graph already enforces a read-only
+# Cypher guard, so a read token cannot mutate Neo4j through it.
+_READ_ROLE_ROUTES: set[tuple[str, str]] = {
+    ("GET",  "/memory/telemetry"),
+    ("POST", "/memory/graph"),
+}
+
+
+def _load_agent_roles() -> dict[str, str]:
+    """Parse AGENT_ROLES into an agent_name→role mapping.
+
+    Format: AGENT_ROLES=monitor:read,dashboard:read
+    Roles only ever NARROW access — they never grant it (a token must still be a
+    valid AGENT_TOKENS entry). The value "read" restricts an agent to
+    _READ_ROLE_ROUTES; "full" (or absence from the map) keeps full read/write.
+    Unset AGENT_ROLES → every token is full-access (backward compatible).
+    """
+    raw = os.environ.get("AGENT_ROLES", "").strip()
+    if not raw:
+        return {}
+    result: dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if ":" not in pair:
+            log.warning("AGENT_ROLES: malformed entry %r (expected name:role)", pair)
+            continue
+        name, role = (p.strip() for p in pair.split(":", 1))
+        if role not in ("read", "full"):
+            log.warning(
+                "AGENT_ROLES: unknown role %r for %r — expected 'read' or 'full'; "
+                "ignoring (agent keeps full access)", role, name,
+            )
+            continue
+        result[name] = role
+    return result
+
+
+_AGENT_ROLES: dict[str, str] = _load_agent_roles()
+
+
+def _read_role_permits(request: web.Request) -> bool:
+    """True if a read-only role may reach this route (exact method+path allowlist)."""
+    path = request.path.rstrip("/") or "/"
+    return (request.method, path) in _READ_ROLE_ROUTES
+
+
 @web.middleware
 async def auth_middleware(request: web.Request, handler):
     """DEFAULT DENY — every route requires a valid Bearer token unless explicitly allowlisted."""
@@ -147,6 +200,12 @@ async def auth_middleware(request: web.Request, handler):
     if not agent_name:
         raise web.HTTPUnauthorized(reason="Unrecognised token")
     request["authenticated_agent"] = agent_name
+    # Read-only roles are confined to the telemetry/graph allowlist. A leaked
+    # monitor token therefore cannot save, supersede, or proxy LLM calls.
+    if _AGENT_ROLES.get(agent_name) == "read" and not _read_role_permits(request):
+        raise web.HTTPForbidden(
+            reason="Read-only token: this route requires a write-capable agent token",
+        )
     return await handler(request)
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -173,6 +232,29 @@ OUTBOX_POLL_INTERVAL = 2.0   # seconds between outbox drain cycles
 OUTBOX_BATCH_SIZE    = 20    # rows processed per cycle
 OUTBOX_MAX_RETRIES   = 5     # row marked 'failed' after this many Neo4j errors
 CONSISTENCY_TIMEOUT  = 15.0  # seconds to wait for ?consistency=neo4j
+
+# NREM dream-cycle backlog gauge (GET /memory/telemetry). A "cycle" is one
+# (entity, domain) cluster that meets the consolidation density threshold —
+# the unit NREM actually fires on, NOT the raw unconsolidated fact count. Fact
+# clusters reuse ONT.density_threshold (the same value consolidation_loop.py
+# gates on). Decision clusters track the Phase 3a insight-consolidation design
+# (≥2 rem_processed, unconsolidated decisions per (entity, domain)).
+DEFAULT_DOMAIN = "general"
+NREM_DECISION_THRESHOLD = 2
+
+
+def _count_domain_cycles(pg_ids: list[int], domain_map: dict[int, str], threshold: int) -> int:
+    """Partition pg_ids by domain and count buckets meeting the density threshold.
+
+    Pure function (no I/O) so the per-(entity, domain) gating rule is unit-testable.
+    Mirrors consolidation_loop.eligible_domain_clusters' partitioning, but returns
+    a count rather than the work items — telemetry needs the gauge, not the payload.
+    """
+    by_domain: dict[str, int] = {}
+    for pid in pg_ids:
+        dom = domain_map.get(pid) or DEFAULT_DOMAIN
+        by_domain[dom] = by_domain.get(dom, 0) + 1
+    return sum(1 for n in by_domain.values() if n >= threshold)
 
 # Cypher write-operation guard — reject queries containing mutating keywords.
 # Defence-in-depth: blocks obvious destructive ops while a deeper Neo4j RBAC
@@ -257,6 +339,11 @@ class MemoryCoordinator:
                 "coordinator auth enabled — %d agent(s): %s",
                 len(_AGENT_TOKENS), ", ".join(sorted(_AGENT_TOKENS.values())),
             )
+            if _AGENT_ROLES:
+                log.info(
+                    "coordinator read-only roles: %s",
+                    ", ".join(f"{n}={r}" for n, r in sorted(_AGENT_ROLES.items())),
+                )
             log.info("NOTE: MCP clients (LM Studio) must be fully restarted after .env changes")
         else:
             log.warning("AGENT_TOKENS not set — coordinator running unauthenticated")
@@ -942,9 +1029,15 @@ class MemoryCoordinator:
 
     async def handle_telemetry(self, request: web.Request) -> web.Response:
         """Operational telemetry snapshot — pull-based rollup of the state that
-        matters day to day: outbox health, the REM/NREM dream-cycle backlog, and
-        summary counts. Each section is computed independently so a partial
-        backend failure still returns whatever the other can.
+        matters day to day: outbox health, the REM/NREM dream-cycle backlog,
+        consolidation-cycle counts, and a metadata breakdown. Each section is
+        computed independently so a partial backend failure still returns
+        whatever the others can.
+
+        This endpoint is the single read-only source of truth for the pipeline:
+        a read-scoped client (e.g. the Shared Memory Monitor) can render the
+        whole live dashboard from here without any direct Postgres or Neo4j
+        credentials — the coordinator owns both backends and does the joins.
         """
         from datetime import datetime, timezone
         snap: dict = {"timestamp": datetime.now(timezone.utc).isoformat()}
@@ -998,7 +1091,130 @@ class MemoryCoordinator:
         except Exception as exc:
             snap["neo4j"] = {"error": str(exc)}
 
+        # NREM dream-cycle backlog — pending consolidation CYCLES, not raw facts.
+        # One cycle per (entity, domain) cluster meeting the density threshold.
+        # Needs both backends: Neo4j supplies the rem_processed/unconsolidated
+        # clusters; Postgres supplies the authoritative domain per pg_id (the
+        # Fact node has no domain). This is the join a read-only client cannot
+        # do itself — hence it lives here.
+        try:
+            snap["nrem"] = await self._nrem_cycle_counts()
+        except Exception as exc:
+            snap["nrem"] = {"error": str(exc)}
+
+        # Metadata breakdown — drill-down distributions a dashboard renders
+        # (record types, agents, sources, domains, summary kinds). Cheap GROUP
+        # BYs over technical_docs + community_summaries; surfaced here so the
+        # monitor needs no direct Postgres connection for its breakdown panels.
+        try:
+            snap["breakdown"] = await self._metadata_breakdown()
+        except Exception as exc:
+            snap["breakdown"] = {"error": str(exc)}
+
         return web.json_response({"status": "success", "telemetry": snap})
+
+    async def _nrem_cycle_counts(self) -> dict:
+        """Pending NREM consolidation cycles for facts and decisions.
+
+        Reproduces consolidation_loop's gating: entity clusters of
+        rem_processed, unconsolidated nodes, re-partitioned per (entity, domain)
+        and counted only where a bucket meets its density threshold.
+        """
+        # Neo4j: entity clusters of eligible facts (global, not just pending ids).
+        async with self._neo4j.session() as session:
+            fres = await session.run(
+                f"MATCH (f:{ONT.fact}) WHERE f.pg_id IS NOT NULL"
+                f" MATCH (f)-[:{ONT.entity_link_alias}|{ONT.entity_link}]->(e:{ONT.entity})"
+                f" WITH DISTINCT e"
+                f" MATCH (e)<-[:{ONT.entity_link_alias}|{ONT.entity_link}]-(n:{ONT.fact})"
+                f" WHERE coalesce(n.consolidated,false) = false"
+                f"   AND coalesce(n.rem_processed,false) = true"
+                f" WITH e, collect(n.pg_id) AS pg_ids"
+                f" WHERE size(pg_ids) >= $threshold"
+                f" RETURN e.name AS entity, pg_ids",
+                threshold=ONT.density_threshold,
+            )
+            fact_clusters = await fres.data()
+            dres = await session.run(
+                f"MATCH (d:{ONT.decision})"
+                f" WHERE coalesce(d.rem_processed,false) = true"
+                f"   AND coalesce(d.consolidated,false) = false"
+                f" RETURN collect(d.pg_id) AS pg_ids"
+            )
+            drows = await dres.data()
+        decision_ids = [int(x) for x in (drows[0]["pg_ids"] if drows else []) if x is not None]
+
+        # Postgres: authoritative domain per pg_id across all eligible nodes.
+        all_ids = sorted(
+            {int(pid) for c in fact_clusters for pid in (c["pg_ids"] or []) if pid is not None}
+            | set(decision_ids)
+        )
+        domain_map: dict[int, str] = {}
+        if all_ids:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT id, COALESCE(metadata->>'project', metadata->>'domain',"
+                    " scope, $2) AS domain FROM technical_docs WHERE id = ANY($1)",
+                    all_ids, DEFAULT_DOMAIN,
+                )
+            domain_map = {r["id"]: r["domain"] for r in rows}
+
+        fact_cycles = sum(
+            _count_domain_cycles(
+                [int(pid) for pid in (c["pg_ids"] or []) if pid is not None],
+                domain_map, ONT.density_threshold,
+            )
+            for c in fact_clusters
+        )
+        decision_cycles = _count_domain_cycles(
+            decision_ids, domain_map, NREM_DECISION_THRESHOLD
+        )
+        return {
+            "fact_cycles": fact_cycles,
+            "decision_cycles": decision_cycles,
+            "total_cycles": fact_cycles + decision_cycles,
+            "fact_threshold": ONT.density_threshold,
+            "decision_threshold": NREM_DECISION_THRESHOLD,
+        }
+
+    async def _metadata_breakdown(self) -> dict:
+        """Distribution counts a dashboard renders, sourced server-side so a
+        read-only client needs no direct Postgres access.
+        """
+        async with self._pool.acquire() as conn:
+            record_types = await conn.fetch(
+                "SELECT COALESCE(metadata->>'type','(untagged)') AS key,"
+                " count(*)::int AS count FROM technical_docs GROUP BY 1 ORDER BY count DESC"
+            )
+            agents = await conn.fetch(
+                "SELECT agent_id AS key, count(*)::int AS count"
+                " FROM technical_docs GROUP BY 1 ORDER BY count DESC LIMIT 12"
+            )
+            sources = await conn.fetch(
+                "SELECT COALESCE(metadata->>'source','(none)') AS key,"
+                " count(*)::int AS count FROM technical_docs GROUP BY 1 ORDER BY count DESC LIMIT 12"
+            )
+            domains = await conn.fetch(
+                "SELECT COALESCE(metadata->>'project', metadata->>'domain', scope, 'general') AS key,"
+                " count(*)::int AS count FROM technical_docs GROUP BY 1 ORDER BY count DESC LIMIT 12"
+            )
+            summaries = await conn.fetch(
+                "SELECT COALESCE(metadata->>'kind','community_summary') AS kind,"
+                " count(*) FILTER (WHERE superseded)::int AS superseded,"
+                " count(*) FILTER (WHERE NOT superseded)::int AS active"
+                " FROM community_summaries GROUP BY 1 ORDER BY active DESC"
+            )
+        kv = lambda rows: [{"key": r["key"], "count": r["count"]} for r in rows]
+        return {
+            "record_types": kv(record_types),
+            "agents": kv(agents),
+            "sources": kv(sources),
+            "domains": kv(domains),
+            "summaries": [
+                {"kind": r["kind"], "superseded": r["superseded"], "active": r["active"]}
+                for r in summaries
+            ],
+        }
 
 
 # ── Registration ──────────────────────────────────────────────────────────────
