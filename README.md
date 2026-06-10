@@ -1061,6 +1061,12 @@ $shared-memory          # Codex CLI (explicit); also auto-matched via SKILL.md d
 /activate shared-memory # Gemini CLI
 ```
 
+### Optional: Shared Memory Monitor (companion dashboard)
+
+[**Shared Memory Monitor**](https://github.com/KanenasInGreece/Shared_Memory_Monitor) is a separate, optional ops dashboard for this framework — REM/NREM dream-cycle backlog, outbox health, gateway/daemon status, metadata breakdown, and live log tailing, served at `http://127.0.0.1:8765/`. It is **not** part of the framework and ships nothing server-side; install it only if you want the visualisation.
+
+It is a pure **read-only client**: it authenticates with its own dedicated `monitor` token (`AGENT_ROLES=monitor:read` — see [§10](#read-only-roles-agent_roles)) and renders the entire dashboard from `GET /memory/telemetry` (`nrem` + `breakdown`) and read-only `POST /memory/graph`. With that token it **cannot** save, search, or reach the inference proxy, and needs **no Postgres or Neo4j credentials** — the coordinator does the joins. To enable it, mint a `monitor` token (`generate_tokens.py`), add `monitor:tok_…` to `AGENT_TOKENS` and `AGENT_ROLES=monitor:read` to the gateway `.env`, restart the gateway, and point the monitor's own `.env` at that token. See the monitor repo's README for setup.
+
 ---
 
 ## 11a. Complete Cycle: End-to-End Workflow with Cross-Agent Examples
