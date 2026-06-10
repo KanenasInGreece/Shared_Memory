@@ -28,6 +28,14 @@ IDLE_THRESHOLD_SEC = 60  # 1 minute for testing, change to 900 for 15 mins
 MAX_DEFERRAL_SEC = IDLE_THRESHOLD_SEC * 3
 DENSITY_THRESHOLD = ONT.density_threshold
 
+# Interval between global density sweeps. The event-driven path only evaluates
+# clusters touched by a fresh save, but eligibility can change without a save:
+# REM enrichment flips rem_processed=true after the save's notification was
+# already consumed, and notifications fired while the daemon was down are lost.
+# The sweep re-evaluates every entity hub so such clusters drain (retrospective
+# on decision pg_id 214). First sweep runs on the first idle tick after startup.
+SWEEP_INTERVAL_SEC = int(os.environ.get("NREM_SWEEP_INTERVAL_SEC", "3600"))
+
 # Sampling temperature for the NREM summarisation LLM. Default 0.6 suits Gemma-class
 # models (see rem_loop REM_TEMPERATURE); set NREM_TEMPERATURE=0.1 (or DREAM_TEMPERATURE
 # for both daemons) in .env for Qwen-class models. Overrides the LM Studio preset.
@@ -79,6 +87,22 @@ def eligible_domain_clusters(contents, pg_ids, domain_map, threshold):
         for dom, (c, p) in by_domain.items()
         if len(p) >= threshold
     ]
+
+
+def sweep_due(now, last_sweep_time, last_activity, has_pending,
+              idle_threshold=IDLE_THRESHOLD_SEC, sweep_interval=SWEEP_INTERVAL_SEC):
+    """Gate for the periodic global density sweep.
+
+    The sweep runs only when the daemon is otherwise quiet: no pending
+    event-driven entry points (those take priority), the idle threshold has
+    passed since the last notification, and the sweep interval has elapsed.
+    Pure function (no I/O) so the gating rule is unit-testable.
+    """
+    if has_pending:
+        return False
+    if (now - last_activity).total_seconds() < idle_threshold:
+        return False
+    return (now - last_sweep_time).total_seconds() >= sweep_interval
 
 
 _LOG_TOOLS = ["memory_bridge", "vector_skill"]
@@ -175,6 +199,17 @@ class ConsolidationDaemon:
         self.driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
         self.is_running = True
         self.last_log_merge_date = None
+        # datetime.min ⇒ the first idle tick after startup sweeps immediately,
+        # draining clusters that became eligible while the daemon was down.
+        self.last_sweep_time = datetime.min
+
+    def _requeue(self, pg_ids):
+        """Re-queue failed work as event entry points. Starts the backstop
+        clock if it is not already running — without this, re-queued work has
+        no hard backstop and sustained GPU activity can defer it forever."""
+        if pg_ids and not self.pending_pg_ids and self.first_notification_time is None:
+            self.first_notification_time = datetime.now()
+        self.pending_pg_ids.update(pg_ids)
 
     async def get_embedding(self, text):
         """Standardized 1024-dim BGE-M3 embedding call."""
@@ -249,8 +284,6 @@ class ConsolidationDaemon:
         self.pending_pg_ids.clear()
         self.first_notification_time = None
 
-        loop = asyncio.get_running_loop()
-        clusters = []
         try:
             async with self.driver.session() as session:
                 result = await session.run(
@@ -277,192 +310,239 @@ class ConsolidationDaemon:
                 )
                 return
 
-            conn = await loop.run_in_executor(
-                None, lambda: psycopg2.connect(PG_CONN, connect_timeout=5)
-            )
-            try:
-                # Domain map for every fact across all clusters (single batch).
-                # Domain = COALESCE(project, domain, scope, 'general') from the
-                # authoritative Postgres metadata — the Neo4j Fact node does not
-                # carry a domain.
-                all_ids = sorted({pid for c in clusters for pid in c['pg_ids']})
-                def _fetch_domains(ids=all_ids):
-                    if not ids:
-                        return {}
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "SELECT id, COALESCE(metadata->>'project',"
-                            " metadata->>'domain', scope, 'general')"
-                            " FROM technical_docs WHERE id = ANY(%s)",
-                            (ids,),
-                        )
-                        return {r[0]: r[1] for r in cur.fetchall()}
-                domain_map = await loop.run_in_executor(None, _fetch_domains)
-
-                # Split each entity cluster into per-domain work items. Density is
-                # re-gated per (entity, domain): an entity-level cluster that meets
-                # the threshold may yield zero summaries if its facts are spread
-                # thinly across domains — which is the intended anti-clutter rule.
-                work_items = []  # (entity, domain, contents, pg_ids)
-                for cluster in clusters:
-                    for dom, c, p in eligible_domain_clusters(
-                        cluster['contents'], cluster['pg_ids'],
-                        domain_map, DENSITY_THRESHOLD,
-                    ):
-                        work_items.append((cluster['entity'], dom, c, p))
-
-                for entity, domain, contents, pg_ids in work_items:
-
-                    # 1. Fetch previous summary for this (entity, domain) pair
-                    previous_summary = None
-                    try:
-                        def _fetch_prev(ent=entity, dom=domain):
-                            with conn.cursor() as cur:
-                                cur.execute("""
-                                    SELECT content FROM community_summaries
-                                    WHERE metadata->>'entity' = %s
-                                      AND COALESCE(metadata->>'domain', %s) = %s
-                                    ORDER BY id DESC LIMIT 1
-                                """, (ent, DEFAULT_DOMAIN, dom))
-                                row = cur.fetchone()
-                                return row[0] if row else None
-                        previous_summary = await loop.run_in_executor(None, _fetch_prev)
-                    except Exception as e:
-                        logger.warning(f"Failed to fetch previous summary for {entity}/{domain}: {str(e)}")
-
-                    # 2. Summarize (Long-running LLM call - No DB sessions held)
-                    logger.info(f"Distilling cluster for '{entity}' [domain={domain}] ({len(contents)} facts)...")
-                    summary = await self.generate_summary(entity, contents, previous_summary)
-                    if not summary:
-                        logger.error(f"Failed to generate summary for {entity}. Re-queueing IDs.")
-                        self.pending_pg_ids.update(pg_ids)
-                        continue
-
-                    # 3. Vectorize
-                    logger.info(f"Generated summary for '{entity}'. Vectorizing...")
-                    embedding = await self.get_embedding(summary)
-                    if not embedding:
-                        logger.error(f"Failed to vectorize summary for {entity}. Re-queueing IDs.")
-                        self.pending_pg_ids.update(pg_ids)
-                        continue
-
-                    # 4. Atomic Multi-DB Update
-                    metadata = {
-                        "type": "community_summary",
-                        "entity": entity,
-                        "domain": domain,
-                        "source_pg_ids": pg_ids,
-                        "timestamp": datetime.now().isoformat()
-                    }
-
-                    try:
-                        _meta_json = json.dumps(metadata)
-                        _summary, _embedding, _pg_ids = summary, embedding, pg_ids
-                        def _write_summary():
-                            with conn.cursor() as cur:
-                                # ON CONFLICT prevents duplicate rows when two consolidation
-                                # cycles run concurrently for the same (entity, domain) pair
-                                # (e.g. proxy restart overlap). The unique index is on
-                                # (metadata->>'entity', metadata->>'domain') — migration 007.
-                                # Before overwriting, append the current content to summary_history
-                                # (capped at 20 entries) so drift can be audited over time.
-                                cur.execute("""
-                                    INSERT INTO community_summaries (content, metadata, embedding, source_pg_ids)
-                                    VALUES (%s, %s, %s, %s)
-                                    ON CONFLICT ((metadata->>'entity'), (metadata->>'domain')) DO UPDATE
-                                        SET content         = EXCLUDED.content,
-                                            embedding       = EXCLUDED.embedding,
-                                            metadata        = EXCLUDED.metadata,
-                                            source_pg_ids   = EXCLUDED.source_pg_ids,
-                                            summary_history = (
-                                                SELECT jsonb_agg(entry)
-                                                FROM (
-                                                    SELECT entry FROM jsonb_array_elements(
-                                                        COALESCE(community_summaries.summary_history, '[]'::jsonb)
-                                                        || jsonb_build_array(jsonb_build_object(
-                                                            'content',        community_summaries.content,
-                                                            'source_pg_ids',  community_summaries.source_pg_ids,
-                                                            'timestamp',      community_summaries.metadata->>'timestamp'
-                                                        ))
-                                                    ) AS entry
-                                                    ORDER BY (entry->>'timestamp') DESC
-                                                    LIMIT 20
-                                                ) sub
-                                            )
-                                    RETURNING id
-                                """, (_summary, _meta_json, _embedding, _pg_ids))
-                                return cur.fetchone()[0]
-                        summary_pg_id = await loop.run_in_executor(None, _write_summary)
-
-                        # Supersession: mark any active community_summary whose
-                        # source_pg_ids is a strict subset of the new summary's
-                        # source_pg_ids.  The new summary subsumes their content.
-                        new_src_set = set(pg_ids)
-                        def _check_supersession():
-                            superseded = []
-                            with conn.cursor() as cur:
-                                cur.execute(
-                                    "SELECT id, source_pg_ids FROM community_summaries"
-                                    " WHERE NOT superseded AND id != %s"
-                                    "   AND source_pg_ids IS NOT NULL",
-                                    (summary_pg_id,)
-                                )
-                                for old_id, old_src in cur.fetchall():
-                                    if old_src and set(old_src) <= new_src_set:
-                                        cur.execute(
-                                            "UPDATE community_summaries SET superseded = true"
-                                            " WHERE id = %s",
-                                            (old_id,)
-                                        )
-                                        superseded.append(old_id)
-                            return superseded
-                        superseded_ids = await loop.run_in_executor(None, _check_supersession)
-
-                        logger.info(
-                            f"Saved summary (ID: {summary_pg_id}) to Postgres."
-                            + (f" Superseded: {superseded_ids}." if superseded_ids else "")
-                            + " Syncing to Graph..."
-                        )
-
-                        # NOTE: CROSS-DB ATOMICITY RISK — see ADR.md
-                        async with self.driver.session() as session:
-                            await session.run(
-                                f"UNWIND $fact_ids as fid"
-                                f" MATCH (f:{ONT.fact} {{pg_id: fid}})"
-                                f" SET f.consolidated = true"
-                                f" WITH collect(f) as facts"
-                                f" MERGE (s:{ONT.community_summary} {{pg_id: $summary_pg_id}})"
-                                f" ON CREATE SET s.created_at = datetime()"
-                                f" SET s.entity = $entity,"
-                                f"     s.domain = $domain,"
-                                f"     s.updated_at = datetime()"
-                                f" WITH s, facts"
-                                f" UNWIND facts as f"
-                                f" MERGE (f)-[:{ONT.summarized_by}]->(s)",
-                                fact_ids=pg_ids, summary_pg_id=summary_pg_id,
-                                entity=entity, domain=domain)
-                            # SUPERSEDES edges for any Postgres-superseded summaries
-                            if superseded_ids:
-                                await session.run(
-                                    f"MATCH (new:{ONT.community_summary} {{pg_id: $new_id}})"
-                                    f" UNWIND $old_ids AS old_pg_id"
-                                    f" MATCH (old:{ONT.community_summary} {{pg_id: old_pg_id}})"
-                                    f" MERGE (new)-[:{ONT.supersedes}]->(old)",
-                                    new_id=summary_pg_id, old_ids=superseded_ids
-                                )
-
-                        await loop.run_in_executor(None, conn.commit)
-                        logger.info(f"Successfully consolidated {len(pg_ids)} facts for '{entity}' [domain={domain}].")
-                    except Exception as e:
-                        await loop.run_in_executor(None, conn.rollback)
-                        logger.error(f"Database write error for {entity}: {str(e)}")
-                        self.pending_pg_ids.update(pg_ids)
-            finally:
-                await loop.run_in_executor(None, conn.close)
+            await self._consolidate_clusters(clusters)
 
         except Exception as e:
             logger.error(f"Consolidation cycle failed: {str(e)}")
-            self.pending_pg_ids.update(ids_to_process)
+            self._requeue(ids_to_process)
+
+    async def run_global_sweep(self):
+        """Periodic global density sweep — same cluster rule as the event-driven
+        cycle but with no pending_pg_ids anchor. Drains clusters that crossed
+        the density threshold without a triggering save: REM flipped their
+        facts to rem_processed=true after the save notification was consumed,
+        or the notification was lost to a daemon restart. (Retrospective on
+        decision pg_id 214.)"""
+        try:
+            async with self.driver.session() as session:
+                result = await session.run(
+                    f"MATCH (e:{ONT.entity})<-[:{ONT.entity_link_alias}|{ONT.entity_link}]-(neighbor:{ONT.fact})"
+                    f" WHERE coalesce(neighbor.consolidated, false) = false"
+                    f"   AND coalesce(neighbor.rem_processed, false) = true"
+                    f" WITH e, collect(neighbor) as unflagged_facts"
+                    f" WHERE size(unflagged_facts) >= $threshold"
+                    f" RETURN e.name as entity,"
+                    f"        [fact IN unflagged_facts | fact.content] as contents,"
+                    f"        [fact IN unflagged_facts | fact.pg_id] as pg_ids",
+                    threshold=DENSITY_THRESHOLD)
+                clusters = await result.data()
+
+            if not clusters:
+                logger.info("Global sweep: no eligible clusters (density_threshold=%d).", DENSITY_THRESHOLD)
+                return
+
+            logger.info(
+                "Global sweep: %d eligible entity cluster(s) found without a triggering save.",
+                len(clusters),
+            )
+            await self._consolidate_clusters(clusters)
+
+        except Exception as e:
+            # Nothing to re-queue — the next sweep re-evaluates the whole graph.
+            logger.error(f"Global sweep failed: {str(e)}")
+
+    async def _consolidate_clusters(self, clusters):
+        """Shared consolidation body: domain re-gating, LLM synthesis, and the
+        atomic Postgres + Neo4j write for a list of entity clusters."""
+        loop = asyncio.get_running_loop()
+        conn = await loop.run_in_executor(
+            None, lambda: psycopg2.connect(PG_CONN, connect_timeout=5)
+        )
+        try:
+            # Domain map for every fact across all clusters (single batch).
+            # Domain = COALESCE(project, domain, scope, 'general') from the
+            # authoritative Postgres metadata — the Neo4j Fact node does not
+            # carry a domain.
+            all_ids = sorted({pid for c in clusters for pid in c['pg_ids']})
+            def _fetch_domains(ids=all_ids):
+                if not ids:
+                    return {}
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, COALESCE(metadata->>'project',"
+                        " metadata->>'domain', scope, 'general')"
+                        " FROM technical_docs WHERE id = ANY(%s)",
+                        (ids,),
+                    )
+                    return {r[0]: r[1] for r in cur.fetchall()}
+            domain_map = await loop.run_in_executor(None, _fetch_domains)
+
+            # Split each entity cluster into per-domain work items. Density is
+            # re-gated per (entity, domain): an entity-level cluster that meets
+            # the threshold may yield zero summaries if its facts are spread
+            # thinly across domains — which is the intended anti-clutter rule.
+            work_items = []  # (entity, domain, contents, pg_ids)
+            for cluster in clusters:
+                for dom, c, p in eligible_domain_clusters(
+                    cluster['contents'], cluster['pg_ids'],
+                    domain_map, DENSITY_THRESHOLD,
+                ):
+                    work_items.append((cluster['entity'], dom, c, p))
+
+            for entity, domain, contents, pg_ids in work_items:
+
+                # 1. Fetch previous summary for this (entity, domain) pair
+                previous_summary = None
+                try:
+                    def _fetch_prev(ent=entity, dom=domain):
+                        with conn.cursor() as cur:
+                            cur.execute("""
+                                SELECT content FROM community_summaries
+                                WHERE metadata->>'entity' = %s
+                                  AND COALESCE(metadata->>'domain', %s) = %s
+                                ORDER BY id DESC LIMIT 1
+                            """, (ent, DEFAULT_DOMAIN, dom))
+                            row = cur.fetchone()
+                            return row[0] if row else None
+                    previous_summary = await loop.run_in_executor(None, _fetch_prev)
+                except Exception as e:
+                    logger.warning(f"Failed to fetch previous summary for {entity}/{domain}: {str(e)}")
+
+                # 2. Summarize (Long-running LLM call - No DB sessions held)
+                logger.info(f"Distilling cluster for '{entity}' [domain={domain}] ({len(contents)} facts)...")
+                summary = await self.generate_summary(entity, contents, previous_summary)
+                if not summary:
+                    logger.error(f"Failed to generate summary for {entity}. Re-queueing IDs.")
+                    self._requeue(pg_ids)
+                    continue
+
+                # 3. Vectorize
+                logger.info(f"Generated summary for '{entity}'. Vectorizing...")
+                embedding = await self.get_embedding(summary)
+                if not embedding:
+                    logger.error(f"Failed to vectorize summary for {entity}. Re-queueing IDs.")
+                    self._requeue(pg_ids)
+                    continue
+
+                # 4. Atomic Multi-DB Update
+                metadata = {
+                    "type": "community_summary",
+                    "entity": entity,
+                    "domain": domain,
+                    "source_pg_ids": pg_ids,
+                    "timestamp": datetime.now().isoformat()
+                }
+
+                try:
+                    _meta_json = json.dumps(metadata)
+                    _summary, _embedding, _pg_ids = summary, embedding, pg_ids
+                    def _write_summary():
+                        with conn.cursor() as cur:
+                            # Deliberately a direct INSERT, never a /memory/save:
+                            # a community summary must produce no neo4j_outbox row
+                            # and no new_artifact NOTIFY. Consolidation closes the
+                            # loop — its Neo4j sync happens inline below, and a
+                            # summary write must never re-wake this daemon.
+                            #
+                            # ON CONFLICT prevents duplicate rows when two consolidation
+                            # cycles run concurrently for the same (entity, domain) pair
+                            # (e.g. proxy restart overlap). The unique index is on
+                            # (metadata->>'entity', metadata->>'domain') — migration 007.
+                            # Before overwriting, append the current content to summary_history
+                            # (capped at 20 entries) so drift can be audited over time.
+                            cur.execute("""
+                                INSERT INTO community_summaries (content, metadata, embedding, source_pg_ids)
+                                VALUES (%s, %s, %s, %s)
+                                ON CONFLICT ((metadata->>'entity'), (metadata->>'domain')) DO UPDATE
+                                    SET content         = EXCLUDED.content,
+                                        embedding       = EXCLUDED.embedding,
+                                        metadata        = EXCLUDED.metadata,
+                                        source_pg_ids   = EXCLUDED.source_pg_ids,
+                                        summary_history = (
+                                            SELECT jsonb_agg(entry)
+                                            FROM (
+                                                SELECT entry FROM jsonb_array_elements(
+                                                    COALESCE(community_summaries.summary_history, '[]'::jsonb)
+                                                    || jsonb_build_array(jsonb_build_object(
+                                                        'content',        community_summaries.content,
+                                                        'source_pg_ids',  community_summaries.source_pg_ids,
+                                                        'timestamp',      community_summaries.metadata->>'timestamp'
+                                                    ))
+                                                ) AS entry
+                                                ORDER BY (entry->>'timestamp') DESC
+                                                LIMIT 20
+                                            ) sub
+                                        )
+                                RETURNING id
+                            """, (_summary, _meta_json, _embedding, _pg_ids))
+                            return cur.fetchone()[0]
+                    summary_pg_id = await loop.run_in_executor(None, _write_summary)
+
+                    # Supersession: mark any active community_summary whose
+                    # source_pg_ids is a strict subset of the new summary's
+                    # source_pg_ids.  The new summary subsumes their content.
+                    new_src_set = set(pg_ids)
+                    def _check_supersession():
+                        superseded = []
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT id, source_pg_ids FROM community_summaries"
+                                " WHERE NOT superseded AND id != %s"
+                                "   AND source_pg_ids IS NOT NULL",
+                                (summary_pg_id,)
+                            )
+                            for old_id, old_src in cur.fetchall():
+                                if old_src and set(old_src) <= new_src_set:
+                                    cur.execute(
+                                        "UPDATE community_summaries SET superseded = true"
+                                        " WHERE id = %s",
+                                        (old_id,)
+                                    )
+                                    superseded.append(old_id)
+                        return superseded
+                    superseded_ids = await loop.run_in_executor(None, _check_supersession)
+
+                    logger.info(
+                        f"Saved summary (ID: {summary_pg_id}) to Postgres."
+                        + (f" Superseded: {superseded_ids}." if superseded_ids else "")
+                        + " Syncing to Graph..."
+                    )
+
+                    # NOTE: CROSS-DB ATOMICITY RISK — see ADR.md
+                    async with self.driver.session() as session:
+                        await session.run(
+                            f"UNWIND $fact_ids as fid"
+                            f" MATCH (f:{ONT.fact} {{pg_id: fid}})"
+                            f" SET f.consolidated = true"
+                            f" WITH collect(f) as facts"
+                            f" MERGE (s:{ONT.community_summary} {{pg_id: $summary_pg_id}})"
+                            f" ON CREATE SET s.created_at = datetime()"
+                            f" SET s.entity = $entity,"
+                            f"     s.domain = $domain,"
+                            f"     s.updated_at = datetime()"
+                            f" WITH s, facts"
+                            f" UNWIND facts as f"
+                            f" MERGE (f)-[:{ONT.summarized_by}]->(s)",
+                            fact_ids=pg_ids, summary_pg_id=summary_pg_id,
+                            entity=entity, domain=domain)
+                        # SUPERSEDES edges for any Postgres-superseded summaries
+                        if superseded_ids:
+                            await session.run(
+                                f"MATCH (new:{ONT.community_summary} {{pg_id: $new_id}})"
+                                f" UNWIND $old_ids AS old_pg_id"
+                                f" MATCH (old:{ONT.community_summary} {{pg_id: old_pg_id}})"
+                                f" MERGE (new)-[:{ONT.supersedes}]->(old)",
+                                new_id=summary_pg_id, old_ids=superseded_ids
+                            )
+
+                    await loop.run_in_executor(None, conn.commit)
+                    logger.info(f"Successfully consolidated {len(pg_ids)} facts for '{entity}' [domain={domain}].")
+                except Exception as e:
+                    await loop.run_in_executor(None, conn.rollback)
+                    logger.error(f"Database write error for {entity}: {str(e)}")
+                    self._requeue(pg_ids)
+        finally:
+            await loop.run_in_executor(None, conn.close)
 
     async def _make_listen_conn(self):
         """Open a Postgres LISTEN connection and return (conn, cur)."""
@@ -527,6 +607,16 @@ class ConsolidationDaemon:
                             else:
                                 logger.info("Idle threshold reached. Starting consolidation.")
                             await self.run_consolidation_cycle()
+                    elif sweep_due(now, self.last_sweep_time, self.last_activity,
+                                   bool(self.pending_pg_ids)):
+                        # Background hygiene — always yields to active inference;
+                        # a deferred sweep simply retries on the next idle tick.
+                        if await inference_gpu_busy():
+                            logger.info("NREM: inference GPU busy — deferring global sweep.")
+                        else:
+                            logger.info("Sweep interval reached. Starting global density sweep.")
+                            await self.run_global_sweep()
+                            self.last_sweep_time = datetime.now()
                 else:
                     # Socket readable — drain notification queue
                     try:

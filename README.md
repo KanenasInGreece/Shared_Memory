@@ -1387,11 +1387,14 @@ Per cycle:
 
 ### Phase 2 — NREM (consolidation), `consolidation_loop.py`
 
-NREM **does not poll** — polling would compete with inference workloads that need full GPU headroom. It waits for a Postgres `NOTIFY`, then applies a dual gate: an idle timer and a graph density check.
+NREM **does not poll for work** — polling would compete with inference workloads that need full GPU headroom. It waits for a Postgres `NOTIFY`, then applies a dual gate: an idle timer and a graph density check. `new_artifact` notifications arrive from **two senders**: the coordinator at save time, and REM after it enriches a fact (Phase 1, step 7). The save-time notification is usually premature for the fact that triggered it — REM has not run yet, so the fact is not `rem_processed` and the density gate excludes it. It is REM's post-enrichment notification that makes the fact countable and re-opens its entity cluster for evaluation.
 
 - Each `pg_notify` adds the artifact's `pg_id` to `pending_pg_ids` and resets a 15-minute idle timer. Consolidation runs after 15 minutes of quiet; a 45-minute hard backstop prevents indefinite deferral during continuous ingestion.
 - The queued `pg_id`s are entry points into Neo4j, not the consolidation targets. From each, NREM traverses to Entity hubs and counts unconsolidated Fact neighbours — **but only those with `rem_processed = true`**. Raw, un-enriched facts are never consolidated directly. Communities with fewer than 5 qualifying facts wait.
 - **Domain-scoped (migration 007):** within each Entity hub, facts are partitioned by `domain = COALESCE(metadata->>'project', metadata->>'domain', scope, 'general')`, and the density threshold is re-applied **per (entity, domain)**. Facts that share an entity but belong to unrelated domains are never fused into one narrative. Summaries are keyed on `(entity, domain)`; untagged facts collapse to `general`, reproducing the prior single-summary-per-entity behaviour until agents tag their saves.
+- **Global density sweep:** `NOTIFY` is fire-and-forget — a notification sent while the daemon is down (restart, crash, host reboot) is lost, and a cluster can cross the density threshold with no save event at all (e.g. a domain re-tag). As a safety net, NREM re-evaluates **every** Entity hub — same density and domain gates, no entry-point anchor — on the first idle tick after startup and then every `NREM_SWEEP_INTERVAL_SEC` (default 3600). The sweep only runs when the daemon is idle with no pending notifications, and always yields to active GPU inference.
+
+A community-summary write **closes the loop**: it is a direct `INSERT` into `community_summaries` plus an inline Neo4j sync — it produces no `neo4j_outbox` row and no `new_artifact` NOTIFY, so consolidation can never re-trigger itself.
 
 For each community that meets the threshold:
 

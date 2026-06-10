@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **NREM stranded clusters: periodic global density sweep.** NREM was purely event-driven — only entities touched by a fresh `new_artifact` NOTIFY were ever density-evaluated, so a cluster that crossed `DENSITY_THRESHOLD` without a triggering save sat eligible forever (observed 2026-06-10: an entity at exactly 5 `rem_processed`, unconsolidated facts that never consolidated; retrospective on decision pg_id 214). REM does notify NREM after each enrichment, but `NOTIFY` is fire-and-forget: anything sent while the daemon was down (gateway restarts, the pre-systemd session-teardown kills) was lost, and `pending_pg_ids` is in-memory so a restart also dropped queued entry points. `consolidation_loop.py` now runs a **global density sweep** — the same cluster query, density gate, and per-`(entity, domain)` re-gate, just without the entry-point anchor — on the first idle tick after startup (draining anything stranded while down) and every `NREM_SWEEP_INTERVAL_SEC` thereafter (default 3600). The sweep runs only when idle with no pending event work and yields to active GPU inference. Also fixed en route: re-queued failed work (LLM/embed/DB errors) never armed the `MAX_DEFERRAL` backstop clock (`first_notification_time` stayed `None`), so sustained GPU activity could defer retries indefinitely — re-queueing now goes through a `_requeue()` helper that arms it. The shared consolidation body is extracted to `_consolidate_clusters()`; the community-summary write remains a direct INSERT producing **no outbox row and no NOTIFY** — consolidation closes the loop and can never re-wake itself. New gating rule is pure and unit-tested (`tests/test_global_sweep.py`, 9 cases).
+
 ## [0.4.4] — 2026-06-10
 
 ### Added
