@@ -573,5 +573,29 @@ async def check_memory_health() -> str:
 
     return json.dumps(stats, indent=2)
 
+@mcp.tool()
+async def memory_telemetry() -> str:
+    """Operational telemetry snapshot from the gateway (GET /memory/telemetry).
+
+    Pull-based rollup the coordinator computes over both backends: outbox health,
+    REM/NREM dream-cycle backlog, NREM consolidation-cycle counts (`nrem`), and
+    metadata distributions (`breakdown`). Use this to see whether the dream cycle
+    has work pending or is caught up — it is the same snapshot the CLI agents get
+    via `memory_bridge.py status`. Read-only; no direct database access needed.
+    """
+    coordinator_url = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{coordinator_url}/memory/telemetry", headers=_auth_headers()
+            )
+        if resp.status_code == 401:
+            return "Error: coordinator rejected token (check AGENT_TOKEN in mcp.json)."
+        if resp.status_code >= 400:
+            return f"Error: coordinator returned HTTP {resp.status_code}."
+        return json.dumps(resp.json(), indent=2)
+    except Exception as e:
+        return f"Error: gateway unreachable — {e}"
+
 if __name__ == "__main__":
     mcp.run()

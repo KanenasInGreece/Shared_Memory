@@ -957,7 +957,7 @@ printf 'AGENT_TOKEN=tok_<your-token>\nCOORDINATOR_URL=http://localhost:8888\n' \
 ```bash
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version
-# → {"version": "0.4.3", "api_version": 1, "tool": "shared-memory-framework"}
+# → {"version": "0.4.4", "api_version": 1, "tool": "shared-memory-framework"}
 
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py search "test" 3
@@ -990,7 +990,7 @@ All three paths route through the coordinator on port 8888. The coordinator owns
 ```bash
 # Check the framework version
 python shared-memory/scripts/memory_bridge.py --version
-# → {"version": "0.4.3", "api_version": 1, "tool": "shared-memory-framework"}
+# → {"version": "0.4.4", "api_version": 1, "tool": "shared-memory-framework"}
 
 # Operational telemetry — outbox health + REM/NREM backlog snapshot (add --json for raw)
 python shared-memory/scripts/memory_bridge.py status
@@ -1046,7 +1046,7 @@ The coordinator exposes six memory endpoints on port 8888. All routes (except `/
 | `POST` | `/memory/graph` | `{cypher, params?}` | `{status, records[]}` |
 | `POST` | `/memory/retrospective` | `{pg_id, rating, notes, date?, agent_id?}` | `{status, target_pg_id}` |
 | `GET` | `/memory/status/{pg_id}` | — | `{pg_id, neo4j, retries, applied_at}` |
-| `GET` | `/memory/telemetry` | — | `{status, telemetry: {postgres, neo4j, nrem, breakdown}}` — outbox + dream-cycle backlog rollup, NREM consolidation-cycle counts, and metadata distributions. The coordinator owns both backends and does the joins, so a read-only client can render a full dashboard from this one call with no direct DB access. (v0.4.3; `nrem`/`breakdown` added [Unreleased]) |
+| `GET` | `/memory/telemetry` | — | `{status, telemetry: {postgres, neo4j, nrem, breakdown}}` — outbox + dream-cycle backlog rollup, NREM consolidation-cycle counts, and metadata distributions. The coordinator owns both backends and does the joins, so a read-only client can render a full dashboard from this one call with no direct DB access. (v0.4.3; `nrem`/`breakdown` added v0.4.4) |
 | `GET` | `/health` | — | `{status, embedder, reranker, llm, daemon, rem_daemon, auth_required}` |
 
 > **`/memory/graph` is read-only enforced.** Queries containing `CREATE`, `DELETE`, `DETACH DELETE`, `SET`, `MERGE`, `CALL`, `LOAD CSV`, or `DROP` are rejected with HTTP 400 before reaching Neo4j.
