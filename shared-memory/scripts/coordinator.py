@@ -242,6 +242,28 @@ CONSISTENCY_TIMEOUT  = 15.0  # seconds to wait for ?consistency=neo4j
 DEFAULT_DOMAIN = "general"
 NREM_DECISION_THRESHOLD = 2
 
+# Canonical project names (decision pg_id 276): the project folder name is
+# canonical, and free-text drift ("shared_memory" vs "shared-memory") breaks
+# the insight gate's ≥2-distinct-projects rule. PROJECT_ALIASES maps legacy
+# spellings to the canonical name at ingress, e.g.
+#   PROJECT_ALIASES="shared_memory=shared-memory-GitHub,shared-memory=shared-memory-GitHub"
+# Empty (default) = no rewriting. One-time backfill of existing rows/nodes:
+# scripts/normalize_projects.py.
+def _parse_project_aliases(raw: str) -> dict[str, str]:
+    aliases = {}
+    for pair in raw.split(","):
+        old, sep, new = pair.partition("=")
+        if sep and old.strip() and new.strip():
+            aliases[old.strip()] = new.strip()
+    return aliases
+
+
+PROJECT_ALIASES = _parse_project_aliases(os.environ.get("PROJECT_ALIASES", ""))
+
+
+def _normalize_project(name):
+    return PROJECT_ALIASES.get(name, name) if isinstance(name, str) else name
+
 
 def _count_domain_cycles(pg_ids: list[int], domain_map: dict[int, str], threshold: int) -> int:
     """Partition pg_ids by domain and count buckets meeting the density threshold.
@@ -566,10 +588,16 @@ class MemoryCoordinator:
         MATCH only (no MERGE) so a missing Decision surfaces as a no-op rather than a phantom node.
         """
         retro = params.get("retrospective", {})
+        # Reversal (decision 276): the cascade is decision-level only — the
+        # graph node mirrors technical_docs.superseded so the insight gate's
+        # fresh-cluster query can exclude reversed decisions cheaply. Insights
+        # are never invalidated here; the re-fold supersedes them instead.
+        superseded_clause = " SET d.superseded = true" if retro.get("superseded") else ""
         async with self._neo4j.session() as session:
             await session.run(
                 f"MATCH (d:{ONT.decision} {{pg_id: $pg_id}})"
-                f" CREATE (d)-[:{ONT.had_outcome} {{rating: $rating, date: $date, notes: $notes}}]->(d)",
+                f" CREATE (d)-[:{ONT.had_outcome} {{rating: $rating, date: $date, notes: $notes}}]->(d)"
+                f"{superseded_clause}",
                 pg_id=pg_id,
                 rating=retro.get("rating", ""),
                 date=retro.get("date", ""),
@@ -618,6 +646,17 @@ class MemoryCoordinator:
         # dict when the key is absent, so the mutation would otherwise be discarded.
         if request.get("authenticated_agent"):
             metadata["source"] = request["authenticated_agent"]
+            body["metadata"] = metadata
+
+        # Project-name normalisation (decision 276): canonical = folder name.
+        # Applied before the row and its outbox params are written so the
+        # graph Project node and the Postgres metadata never drift again.
+        if isinstance(metadata, dict):
+            if metadata.get("project"):
+                metadata["project"] = _normalize_project(metadata["project"])
+            decision_blob = metadata.get("decision")
+            if isinstance(decision_blob, dict) and decision_blob.get("project"):
+                decision_blob["project"] = _normalize_project(decision_blob["project"])
             body["metadata"] = metadata
 
         if not content:
@@ -771,6 +810,15 @@ class MemoryCoordinator:
                 status=400,
             )
 
+        # Reversal vocabulary (decision 276): rating 'reversed' is the one
+        # structural rating — it marks the DECISION superseded in both stores
+        # (Tier-1 filter + fresh-cluster exclusion). All other ratings carry
+        # no enum semantics; their wording reaches insights via the re-fold.
+        is_reversal = rating.strip().lower() == "reversed"
+        retro_payload = {"rating": rating, "date": date, "notes": notes}
+        if is_reversal:
+            retro_payload["superseded"] = True
+
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
@@ -788,10 +836,25 @@ class MemoryCoordinator:
                     {
                         "type": "retrospective",
                         "target_pg_id": pg_id,
-                        "retrospective": {"rating": rating, "date": date, "notes": notes},
+                        "retrospective": retro_payload,
                         "source": agent_id,
                     },
                 )
+                if is_reversal:
+                    try:
+                        # Savepoint: a pre-migration-009 schema must not
+                        # poison the retrospective save itself.
+                        async with conn.transaction():
+                            await conn.execute(
+                                "UPDATE technical_docs SET superseded = true WHERE id = $1",
+                                pg_id,
+                            )
+                    except Exception:
+                        log.warning(
+                            "technical_docs.superseded column missing — run migration "
+                            "009; reversal of pg_id=%d recorded on the graph only.",
+                            pg_id,
+                        )
 
         return web.json_response({"status": "success", "target_pg_id": pg_id})
 
@@ -849,13 +912,29 @@ class MemoryCoordinator:
                 })
 
             async with self._pool.acquire() as conn:
-                # Tier 3 — top active (non-superseded) community summary.
-                # Guard: if migration 006 has not been applied, fall back to the
-                # unsupervised query so search continues to work (with a warning).
+                # Tier 3 — nearest active insight (cross-project principle,
+                # decision 276) surfaces ABOVE the nearest thematic summary.
+                # Disjoint queries, both filtered to non-superseded rows.
+                insight = None
+                try:
+                    insight = await conn.fetchrow(
+                        "SELECT content, metadata, source_pg_ids FROM community_summaries"
+                        " WHERE NOT superseded"
+                        "   AND metadata->>'kind' = 'insight'"
+                        " ORDER BY embedding <=> $1::vector LIMIT 1",
+                        str(q_vec),
+                    )
+                except Exception:
+                    insight = None  # pre-006 schema — thematic guard below warns
+
+                # Thematic summary. Guard: if migration 006 has not been
+                # applied, fall back to the unsupervised query so search
+                # continues to work (with a warning).
                 try:
                     summary = await conn.fetchrow(
                         "SELECT content, metadata, source_pg_ids FROM community_summaries"
                         " WHERE NOT superseded"
+                        "   AND COALESCE(metadata->>'kind', 'thematic') <> 'insight'"
                         " ORDER BY embedding <=> $1::vector LIMIT 1",
                         str(q_vec),
                     )
@@ -871,19 +950,31 @@ class MemoryCoordinator:
                         str(q_vec),
                     )
 
-                # Tier 1 — vector search, 20 candidates for reranker
+                # Tier 1 — vector search, 20 candidates for reranker.
+                # Reversed decisions (superseded=true, migration 009) are
+                # excluded; the fallback keeps pre-migration schemas working.
                 scope_sql = "AND scope = $3" if scope else ""
                 args: list = [str(q_vec), 20]
                 if scope:
                     args.append(scope)
-                candidates = await conn.fetch(
-                    f"""
-                    SELECT id, content, metadata FROM technical_docs
-                    WHERE 1=1 {scope_sql}
-                    ORDER BY embedding <=> $1::vector LIMIT $2
-                    """,
-                    *args,
-                )
+                try:
+                    candidates = await conn.fetch(
+                        f"""
+                        SELECT id, content, metadata FROM technical_docs
+                        WHERE NOT superseded {scope_sql}
+                        ORDER BY embedding <=> $1::vector LIMIT $2
+                        """,
+                        *args,
+                    )
+                except Exception:
+                    candidates = await conn.fetch(
+                        f"""
+                        SELECT id, content, metadata FROM technical_docs
+                        WHERE 1=1 {scope_sql}
+                        ORDER BY embedding <=> $1::vector LIMIT $2
+                        """,
+                        *args,
+                    )
 
             if not candidates:
                 return web.json_response({"status": "success", "results": []})
@@ -909,6 +1000,20 @@ class MemoryCoordinator:
 
         # Neo4j relational expansion
         final: list[dict] = []
+        if insight:
+            # Insights rank above thematic summaries: a cross-project
+            # principle validated by at least one retrospective outranks a
+            # single-domain narrative. source_pg_ids are DECISION ids here.
+            final.append({
+                "tier": "insight_summary",
+                "content": insight["content"],
+                "score": None,
+                "score_normalized": None,
+                "matched_entities": [],
+                "metadata": insight["metadata"],
+                "source_pg_ids": insight["source_pg_ids"],
+                "graph_context": [],
+            })
         if summary:
             # Surface the summary's provenance so an agent can trace a Tier-3
             # narrative back to the exact Tier-1 facts it was synthesised from

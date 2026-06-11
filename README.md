@@ -1398,7 +1398,26 @@ NREM **does not poll for work** — polling would compete with inference workloa
 
 A community-summary write **closes the loop**: it is a direct `INSERT` into `community_summaries` plus an inline Neo4j sync — it produces no *new* `neo4j_outbox` row and no `new_artifact` NOTIFY (it only advances, then deletes, the ledger rows of the facts it consumed), so consolidation can never re-trigger itself.
 
-> Decision and retrospective outbox rows are exempt from the ledger tail until the decision-NREM design (insight consolidation, reversal cascade) is ratified — they stop at `applied`/`rem_reviewed` exactly as before.
+### Phase 2b — Insight consolidation (decision clusters → `kind='insight'`)
+
+NREM has a second cluster path for **decisions**. A solitary decision is never round-tripped back to Postgres — it is already Tier-1-searchable via its own embedding. Value exists only in synthesis across **linked decisions**, so the unit of work is a decision *cluster* (`insight_threshold: 2` in `ontology.yaml`), and the output is an elevated `community_summaries` row with `metadata.kind = "insight"`.
+
+**The eligibility gate is pure graph state — no LLM, no rating taxonomy:**
+
+1. ≥ 2 unconsolidated, REM-enriched, non-reversed `:Decision` nodes converge on a shared `:Entity` that also carries at least one `:Fact` (insights stay grounded in verified knowledge);
+2. the shared entity is **not a mega-hub** (total degree ≤ `INSIGHT_HUB_DEGREE_CAP`, default 50 — clustering through a hub like the project itself links everything to everything);
+3. the decisions span **≥ 2 distinct projects** — cross-project recurrence is the signal that a principle generalises;
+4. at least one decision in the cluster has a `HAD_OUTCOME` edge — the **existence** of a retrospective, never its rating, is the trust gate. Two untested decisions agreeing is consensus, not verification.
+
+The fold prompt receives each decision's full Postgres content plus **every retrospective verbatim** (`HAD_OUTCOME` edge properties are the permanent outcome archive). Valence lives in the synthesised narrative — a positive outcome strengthens the principle, a negative or reversed one bounds it ("held when…, failed when…").
+
+**Insights are always-INSERT; supersession is the dedup.** Insight rows are exempt from the `(entity, domain)` upsert key (partial unique index, migration 009): a later retrospective on any source decision **re-folds the same `source_pg_ids`**, and the equal source set rides the covered-subset supersession rule — the new insight (now carrying the outcome wording) supersedes the old, and retrieval only ever surfaces the active one.
+
+**The trigger is the durable ledger, not NOTIFY.** Decisions have no `:Fact` node, so the event path is structurally deaf to them. Decision and retrospective outbox rows now complete the same lifecycle as facts: an open retrospective row means "this outcome has not been folded yet" and re-triggers the fold; the consumed rows flip to `consolidated` transactionally with the insight INSERT and are deleted (logged) after the graph marking. A retrospective row whose decision belongs to no insight and no qualifying cluster **stays open deliberately** — durable backlog, not a stuck outbox.
+
+**Reversal is the one structural rating:** `save_retrospective` with `rating="reversed"` marks the decision `superseded` in both stores — Tier-1 search excludes it and it never seeds a *fresh* cluster. Existing insights are never invalidated without replacement: the re-fold supersedes them with a narrative that records the reversal as boundary evidence.
+
+Retrieval elevation: `handle_search` returns the nearest active insight **above** the nearest thematic summary, tagged `tier: "insight_summary"` with decision ids in `source_pg_ids` (mirrored in the LM Studio MCP path).
 
 For each community that meets the threshold:
 
@@ -1527,8 +1546,8 @@ Each line carries the applied outbox row plus an ingest timestamp:
 Both the MCP tool (`hybrid_search_and_rerank` in `vector-skill.py`) and the CLI (`memory_bridge.py search`) implement the same retrieval chain:
 
 1. **Embed the query** via BGE-M3 through `:8888`.
-2. **Global context scan:** query `community_summaries` — top-1 thematic match. This orients the result set toward the most relevant synthesised narrative.
-3. **Semantic hit:** query `technical_docs` — top-20 candidates by cosine similarity.
+2. **Global context scan:** query `community_summaries` — the nearest active **insight** (`kind='insight'`, cross-project principle — surfaced first as `tier: "insight_summary"`) and the nearest thematic match. Insights outrank thematic narratives: a principle validated by at least one retrospective carries more weight than a single-domain synthesis.
+3. **Semantic hit:** query `technical_docs` — top-20 candidates by cosine similarity, excluding `superseded` rows (reversed decisions, migration 009).
 4. **Rerank:** BGE-Reranker-v2-m3 via `:8888` scores all 20 candidates against the original query and returns the top-N by cross-encoder relevance.
 5. **Relational expansion:** for each top-N hit, query Neo4j for related entities and facts — surfaces structural context that vector similarity cannot express.
 

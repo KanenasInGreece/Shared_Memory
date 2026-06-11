@@ -472,12 +472,13 @@ async def test_search_response_fact_carries_tier_and_normalized_score():
     """Fact results must include tier='fact', score_normalized in (0,1), matched_entities list."""
     c, mock_conn, mock_session = _coordinator_with_mocks()
 
-    # Tier 3: top community summary (now carries metadata + source_pg_ids)
-    mock_conn.fetchrow = AsyncMock(return_value={
+    # Tier 3: fetchrow is called twice — nearest insight (none here), then
+    # the top thematic community summary (metadata + source_pg_ids).
+    mock_conn.fetchrow = AsyncMock(side_effect=[None, {
         "content": "Global context summary",
         "metadata": {"entity": "Neo4j", "domain": "general"},
         "source_pg_ids": [10, 11, 12],
-    })
+    }])
     # Tier 1: one candidate
     mock_conn.fetch = AsyncMock(return_value=[
         {"id": 1, "content": "fact about Neo4j outbox", "metadata": {"entities": ["Neo4j"], "source": "claude-code"}},
@@ -524,11 +525,11 @@ async def test_search_response_community_summary_has_tier_field():
     """The community summary prepended to results must carry tier='community_summary'."""
     c, mock_conn, mock_session = _coordinator_with_mocks()
 
-    mock_conn.fetchrow = AsyncMock(return_value={
+    mock_conn.fetchrow = AsyncMock(side_effect=[None, {
         "content": "A community narrative",
         "metadata": {"entity": "Anything", "domain": "general"},
         "source_pg_ids": [1, 2, 3],
-    })
+    }])
     # Provide one candidate so the early-return path is not taken
     mock_conn.fetch = AsyncMock(return_value=[
         {"id": 1, "content": "fact content", "metadata": {"entities": [], "source": "claude-code"}},
@@ -562,11 +563,11 @@ async def test_search_community_summary_surfaces_traceback_pointers():
     so agents can trace the narrative back to its source facts (issue d)."""
     c, mock_conn, mock_session = _coordinator_with_mocks()
 
-    mock_conn.fetchrow = AsyncMock(return_value={
+    mock_conn.fetchrow = AsyncMock(side_effect=[None, {
         "content": "Synthesised narrative about the outbox pattern",
         "metadata": {"entity": "OutboxPattern", "domain": "shared-memory"},
         "source_pg_ids": [42, 43, 44],
-    })
+    }])
     mock_conn.fetch = AsyncMock(return_value=[
         {"id": 1, "content": "fact", "metadata": {"entities": [], "source": "claude-code"}},
     ])
@@ -746,3 +747,129 @@ async def test_handle_telemetry_survives_partial_backend_failure():
     t = json.loads(resp.text)["telemetry"]
     assert "error" in t["postgres"]
     assert t["neo4j"]["facts_total"] == 5
+
+
+# ── Phase 3a — insight elevation, reversal hook, project normalisation ───────
+
+@pytest.mark.asyncio
+async def test_search_insight_elevated_above_thematic_summary():
+    """When an active kind='insight' summary exists, it surfaces FIRST with
+    tier='insight_summary'; the thematic summary follows (decision 276)."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+
+    mock_conn.fetchrow = AsyncMock(side_effect=[
+        {  # nearest insight
+            "content": "Cross-project principle about outbox ledgers",
+            "metadata": {"kind": "insight", "entity": "OutboxPattern",
+                         "projects": ["shared-memory-GitHub", "tier3-cloe"]},
+            "source_pg_ids": [245, 267],
+        },
+        {  # nearest thematic summary
+            "content": "Thematic narrative",
+            "metadata": {"entity": "OutboxPattern", "domain": "general"},
+            "source_pg_ids": [1, 2, 3],
+        },
+    ])
+    mock_conn.fetch = AsyncMock(return_value=[
+        {"id": 1, "content": "fact", "metadata": {"entities": [], "source": "claude-code"}},
+    ])
+    mock_session.run = AsyncMock(return_value=_AsyncIter())
+
+    mock_reranker = MagicMock()
+    mock_reranker.raise_for_status = MagicMock()
+    mock_reranker.json = MagicMock(return_value={"results": [{"index": 0, "relevance_score": 1.0}]})
+
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        with patch("httpx.AsyncClient") as mock_cls:
+            mock_http = AsyncMock()
+            mock_http.post = AsyncMock(return_value=mock_reranker)
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_http)
+            mock_cls.return_value.__aexit__  = AsyncMock(return_value=None)
+
+            resp = await c.handle_search(_make_request({"query": "outbox", "limit": 5}))
+
+    results = json.loads(resp.text)["results"]
+    assert results[0]["tier"] == "insight_summary"
+    assert results[0]["source_pg_ids"] == [245, 267]   # decision ids
+    assert results[1]["tier"] == "community_summary"
+    assert results[2]["tier"] == "fact"
+
+
+@pytest.mark.asyncio
+async def test_retrospective_reversed_marks_decision_superseded():
+    """rating='reversed' is the one structural rating: technical_docs row gets
+    superseded=true and the outbox payload carries the graph-side flag."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+    mock_conn.fetchrow = AsyncMock(return_value={"id": 42})
+
+    req = _make_request({"pg_id": 42, "rating": "Reversed",
+                         "notes": "approach withdrawn", "agent_id": "claude_code"})
+    resp = await c.handle_retrospective(req)
+
+    assert resp.status == 200
+    executes = [c_.args for c_ in mock_conn.execute.call_args_list]
+    outbox_sql, _, params = executes[0]
+    assert "INSERT INTO neo4j_outbox" in outbox_sql
+    assert params["retrospective"]["superseded"] is True
+    update_sql = executes[1][0]
+    assert "SET superseded = true" in update_sql
+
+
+@pytest.mark.asyncio
+async def test_retrospective_normal_rating_has_no_reversal_side_effects():
+    c, mock_conn, _ = _coordinator_with_mocks()
+    mock_conn.fetchrow = AsyncMock(return_value={"id": 42})
+
+    resp = await c.handle_retrospective(_make_request(
+        {"pg_id": 42, "rating": "high", "notes": "held up", "agent_id": "claude_code"}
+    ))
+
+    assert resp.status == 200
+    executes = [c_.args for c_ in mock_conn.execute.call_args_list]
+    assert len(executes) == 1                      # outbox INSERT only
+    assert "superseded" not in executes[0][2]["retrospective"]
+
+
+@pytest.mark.asyncio
+async def test_apply_retrospective_with_superseded_sets_graph_flag():
+    """The outbox apply mirrors the reversal onto the Decision node so the
+    fresh-cluster gate can exclude it with pure graph state."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+
+    await c._apply_retrospective_outbox_row(7, 42, {
+        "type": "retrospective",
+        "retrospective": {"rating": "reversed", "date": "2026-06-11",
+                          "notes": "withdrawn", "superseded": True},
+    })
+
+    cypher = mock_session.run.call_args.args[0]
+    assert "SET d.superseded = true" in cypher
+    assert "HAD_OUTCOME" in cypher
+
+
+@pytest.mark.asyncio
+async def test_save_normalizes_project_aliases_at_ingress():
+    """PROJECT_ALIASES rewrites metadata.project and decision.project before
+    the row and outbox params are written (decision 276: canonical = folder name)."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+    mock_conn.fetchrow = AsyncMock(return_value={"id": 7})
+
+    with patch.dict(coordinator_mod.PROJECT_ALIASES,
+                    {"shared_memory": "shared-memory-GitHub"}, clear=True):
+        req = _make_request({
+            "content": "decision text",
+            "metadata": {
+                "source": "claude_code",
+                "project": "shared_memory",
+                "type": "decision",
+                "decision": {"decided_by": "X", "project": "shared_memory",
+                             "rationale": "because"},
+            },
+        })
+        with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+            resp = await c.handle_save(req)
+
+    assert resp.status == 200
+    saved_metadata = mock_conn.fetchrow.call_args.args[2]
+    assert saved_metadata["project"] == "shared-memory-GitHub"
+    assert saved_metadata["decision"]["project"] == "shared-memory-GitHub"

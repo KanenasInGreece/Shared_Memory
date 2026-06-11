@@ -157,6 +157,8 @@ uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/s
 **Required:** `--pg-id` (int, returned by `save_decision`), `--rating`, `--notes`
 **Optional:** `--date` (ISO string, default: today), `--source` (default: `$AGENT_ID`)
 
+**`--rating` is free text with one structural value:** `reversed` marks the decision superseded — it disappears from Tier-1 search and never seeds a new cross-project insight (existing insights are re-folded with the reversal recorded as a known limit). Use it only when the decision was actually withdrawn; otherwise rate freely (`high`, `good`, `mixed`, `low`, …) — the wording of `--notes` is what insight synthesis quotes, so write outcome evidence, not just a verdict.
+
 **Why-To loop query (raw Cypher; Phase D will add a named shortcut):**
 ```
 uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py graph \
@@ -235,6 +237,8 @@ Result shape:
 ```
 
 The first result is the **Tier-3 community summary** — the synthesised narrative across all related facts. The second is the **Tier-1 precision hit** — the original decision, with its full provenance chain in `graph_context`.
+
+When a cross-project insight exists, a `"tier": "insight_summary"` result precedes the community summary — a principle synthesised from ≥2 decisions across different projects, validated by at least one retrospective; its `source_pg_ids` are **decision** ids.
 
 ### D. Query the provenance graph
 

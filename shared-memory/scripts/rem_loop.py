@@ -408,9 +408,16 @@ class REMDaemon:
     ) -> None:
         """Mark the most-recent applied outbox row as rem_reviewed.
 
-        rem_reviewed = REM has enriched this fact and verified consistency.
-        Pruning_loop.py handles final deletion (with optional TTL).
+        rem_reviewed = REM has enriched this fact/decision and verified
+        consistency. The dream-cycle ledger (consolidation_loop) handles the
+        final 'consolidated' → DELETE transitions.
         No explicit commit needed — connection is in AUTOCOMMIT mode.
+
+        Retrospective rows are excluded by type: a retrospective shares its
+        target decision's pg_id with a HIGHER row id, so without the filter
+        REM's mark lands on the retro row instead of the decision row —
+        mis-stamping the re-fold trigger and leaving the decision row at
+        'applied' (fact pg_id 269 gotcha; ledger statuses must stay honest).
         """
         def _mark() -> None:
             with conn.cursor() as cur:
@@ -419,6 +426,7 @@ class REMDaemon:
                     " WHERE id = ("
                     "   SELECT id FROM neo4j_outbox"
                     "   WHERE pg_id = %s AND status = 'applied'"
+                    "     AND COALESCE(cypher_params->>'type', 'fact') != 'retrospective'"
                     "   ORDER BY id DESC LIMIT 1"
                     ")",
                     (pg_id,),

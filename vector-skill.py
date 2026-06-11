@@ -186,31 +186,59 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5) -> str:
         if not query_vector:
             return "Error: Embedding service down. Cannot perform high-precision search."
 
-        # 2. Global Context Search (Postgres community_summaries)
+        # 2. Global Context Search (Postgres community_summaries).
+        #    Insights (cross-project principles, decision 276) surface above
+        #    the nearest thematic summary — mirrors coordinator handle_search.
         global_context = ""
         conn = get_pg_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT content FROM community_summaries
-                    ORDER BY embedding <=> %s::vector LIMIT 1
-                """, (query_vector,))
+                try:
+                    cur.execute("""
+                        SELECT content FROM community_summaries
+                        WHERE NOT superseded AND metadata->>'kind' = 'insight'
+                        ORDER BY embedding <=> %s::vector LIMIT 1
+                    """, (query_vector,))
+                    i_row = cur.fetchone()
+                    if i_row:
+                        global_context += f"### Insight (cross-project principle)\n{i_row[0]}\n\n---\n\n"
+                    cur.execute("""
+                        SELECT content FROM community_summaries
+                        WHERE NOT superseded
+                          AND COALESCE(metadata->>'kind', 'thematic') <> 'insight'
+                        ORDER BY embedding <=> %s::vector LIMIT 1
+                    """, (query_vector,))
+                except Exception:
+                    conn.rollback()  # pre-migration schema — unfiltered fallback
+                    cur.execute("""
+                        SELECT content FROM community_summaries
+                        ORDER BY embedding <=> %s::vector LIMIT 1
+                    """, (query_vector,))
                 g_row = cur.fetchone()
                 if g_row:
-                    global_context = f"### Global Context Summary\n{g_row[0]}\n\n---\n\n"
+                    global_context += f"### Global Context Summary\n{g_row[0]}\n\n---\n\n"
         except Exception as e:
             logger.warning(f"Global context retrieval failed: {str(e)}")
         finally:
             release_pg_conn(conn)
 
-        # 3. Vector Search (Postgres technical_docs)
+        # 3. Vector Search (Postgres technical_docs) — reversed decisions
+        #    (superseded=true, migration 009) are excluded when the column exists.
         conn = get_pg_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT id, content, metadata FROM technical_docs
-                    ORDER BY embedding <=> %s::vector LIMIT 10
-                """, (query_vector,))
+                try:
+                    cur.execute("""
+                        SELECT id, content, metadata FROM technical_docs
+                        WHERE NOT superseded
+                        ORDER BY embedding <=> %s::vector LIMIT 10
+                    """, (query_vector,))
+                except Exception:
+                    conn.rollback()
+                    cur.execute("""
+                        SELECT id, content, metadata FROM technical_docs
+                        ORDER BY embedding <=> %s::vector LIMIT 10
+                    """, (query_vector,))
                 rows = cur.fetchall()
                 ids = [row[0] for row in rows]
                 candidates = [row[1] for row in rows]

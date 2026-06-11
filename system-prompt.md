@@ -71,7 +71,7 @@ Every save fires a Postgres `pg_notify`. The daemon synthesises community summar
 
 ## Cross-agent knowledge flow
 
-Facts and decisions saved by one agent (Claude Code, Gemini CLI, Grok) are retrievable by this model as soon as the search is run. The Tier-3 community summary — the first result in every search response — is a synthesised narrative across all agents' contributions. Read it first; it orients the result set.
+Facts and decisions saved by one agent (Claude Code, Gemini CLI, Grok) are retrievable by this model as soon as the search is run. The Tier-3 community summary — the first result in every search response — is a synthesised narrative across all agents' contributions. Read it first; it orients the result set. When an "Insight (cross-project principle)" section appears above it, that is a decision-validated principle spanning multiple projects — it outranks the thematic summary.
 
 ```
 hybrid_search_and_rerank("coordinator deadlock prevention", 5)
