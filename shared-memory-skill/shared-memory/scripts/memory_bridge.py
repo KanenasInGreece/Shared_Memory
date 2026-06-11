@@ -27,7 +27,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.4.6"
+VERSION = "0.4.8"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 API_VERSION = 1

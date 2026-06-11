@@ -61,7 +61,9 @@ def main() -> None:
     if len(sys.argv) > 1:
         targets = [MIGRATIONS_DIR / sys.argv[1]]
     else:
-        targets = sorted(MIGRATIONS_DIR.glob("*.sql"))
+        # Numbered migrations only — never schema_init.sql (the generated
+        # fresh-install snapshot, which shares this directory).
+        targets = sorted(MIGRATIONS_DIR.glob("[0-9]*.sql"))
 
     if not targets:
         print("No migration files found.")

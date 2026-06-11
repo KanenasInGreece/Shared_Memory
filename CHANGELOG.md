@@ -5,6 +5,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.4.8] — 2026-06-11
+
+### Added
+
+- **`neo4j_init.cypher` — the Neo4j counterpart to `schema_init.sql`.** All seven uniqueness constraints (`Fact`, `Entity`, `CommunitySummary`, `Decision`, `Human`, `AIAgent`, `Project`) in one idempotent file. Run once on a fresh Neo4j instance before the first gateway start — without these constraints, `MERGE` races can create duplicate nodes. Previously only three constraints were documented, and only in README prose.
+
+### Fixed
+
+- **`schema_init.sql` is now generated from the migration chain, not a live database — eliminating drift.** `generate_schema_init.py` spins up a throwaway database, applies every numbered migration to it (exactly what `apply.py` does on a fresh install), introspects the result, then drops it. The output is **equivalent to `apply.py` on an empty database by construction** and verified byte-identical (columns, types, nullability, defaults, indexes) via a two-scratch-DB diff. The previous version introspected the long-lived production database, which had drifted from the chain — it had silently dropped `content NOT NULL` on both tables and captured a manual `ivfflat→hnsw` index swap. Both are now correct: fresh installs get `content NOT NULL` and `ivfflat`, matching the chain.
+- **`apply.py` no longer re-runs `schema_init.sql`.** It globbed `*.sql`, which picked up the generated `schema_init.sql` now sharing the migrations directory; the glob is now `[0-9]*.sql` (numbered migrations only). Harmless before (idempotent), but conceptually wrong — `apply.py` runs migrations, not the fresh-install snapshot.
+- **`neo4j_init.cypher` no longer claims constraints are applied automatically.** The header referenced a `coordinator._ensure_neo4j_schema` mechanism that does not exist; an operator trusting it would skip the file and run Neo4j with zero constraints. The header now correctly states it is a one-time manual step.
+
+### Changed
+
+- **`generate_schema_init.py` discovers tables dynamically** (no hardcoded list — a migration that adds a table is captured automatically) and the generated header is deterministic (no embedded timestamp), so regeneration produces a diff only when the schema actually changed.
+
+---
+
 ## [0.4.7] — 2026-06-11
 
 ### Fixed
