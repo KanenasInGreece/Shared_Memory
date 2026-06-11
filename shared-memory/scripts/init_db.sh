@@ -38,6 +38,10 @@ ylw() { printf '\033[33m%s\033[0m\n' "$*"; }
 read_env() { grep -E "^$1=" "$ENV_FILE" | tail -1 | cut -d= -f2-; }
 NEO4J_PASSWORD="$(read_env NEO4J_PASSWORD)"
 [[ -n "$NEO4J_PASSWORD" ]] || { red "✗ NEO4J_PASSWORD not set in .env"; exit 1; }
+# Export so `docker exec -e NEO4J_PASSWORD` (no value) passes it through from
+# this process's environment — the password never appears on any argv (a
+# world-readable /proc/<pid>/cmdline), unlike `cypher-shell -p <password>`.
+export NEO4J_PASSWORD
 
 docker inspect "$PG_CONTAINER"    >/dev/null 2>&1 || { red "✗ container '$PG_CONTAINER' not found — is the compose stack up?"; exit 1; }
 docker inspect "$NEO4J_CONTAINER" >/dev/null 2>&1 || { red "✗ container '$NEO4J_CONTAINER' not found — is the compose stack up?"; exit 1; }
@@ -65,13 +69,13 @@ grn "✓ Postgres schema applied"
 # ── Wait for Neo4j ────────────────────────────────────────────────────────────
 echo "Waiting for Neo4j ($NEO4J_CONTAINER) ..."
 for ((i = 0; i < WAIT_TIMEOUT; i++)); do
-    if docker exec "$NEO4J_CONTAINER" cypher-shell -u neo4j -p "$NEO4J_PASSWORD" \
+    if docker exec -e NEO4J_PASSWORD "$NEO4J_CONTAINER" cypher-shell -u neo4j \
          "RETURN 1" >/dev/null 2>&1; then
         break
     fi
     sleep 1
 done
-docker exec "$NEO4J_CONTAINER" cypher-shell -u neo4j -p "$NEO4J_PASSWORD" "RETURN 1" >/dev/null 2>&1 \
+docker exec -e NEO4J_PASSWORD "$NEO4J_CONTAINER" cypher-shell -u neo4j "RETURN 1" >/dev/null 2>&1 \
     || { red "✗ Neo4j did not become ready within ${WAIT_TIMEOUT}s"; exit 1; }
 
 # ── Apply Neo4j constraints ───────────────────────────────────────────────────
@@ -82,7 +86,7 @@ docker exec "$NEO4J_CONTAINER" cypher-shell -u neo4j -p "$NEO4J_PASSWORD" "RETUR
 # still apply.
 echo "Applying neo4j_init.cypher → Neo4j ..."
 # set -e is active; guard with `if` so we can give a useful diagnostic on failure.
-if docker exec -i "$NEO4J_CONTAINER" cypher-shell -u neo4j -p "$NEO4J_PASSWORD" \
+if docker exec -e NEO4J_PASSWORD -i "$NEO4J_CONTAINER" cypher-shell -u neo4j \
        --fail-at-end < "$MIGRATIONS_DIR/neo4j_init.cypher"; then
     grn "✓ Neo4j constraints applied"
     echo
@@ -94,7 +98,7 @@ else
     ylw "  usually means the :Entity (or another) label already carries a conflicting"
     ylw "  index/constraint — e.g. a Neo4j shared with another memory system that"
     ylw "  keys Entity by id with a non-unique name index. Inspect with:"
-    ylw "    docker exec -it $NEO4J_CONTAINER cypher-shell -u neo4j -p '***' 'SHOW CONSTRAINTS'"
+    ylw "    docker exec -it $NEO4J_CONTAINER cypher-shell -u neo4j -p <password> 'SHOW CONSTRAINTS'"
     ylw "  Postgres was initialised successfully; resolve the Neo4j conflict by hand"
     ylw "  if this instance is meant to be a single-purpose framework store."
     exit 1

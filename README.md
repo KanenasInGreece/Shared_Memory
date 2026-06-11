@@ -64,7 +64,7 @@ The framework has two distinct surfaces with separate lifecycles. Conflating the
 | Distributed by | `sync_skills.sh` (thin client only) | this repo, via `git` |
 | Upgraded by | re-sync the skill | `git pull` → `migrations/apply.py` → restart gateway |
 
-**Installing the skill is not installing the framework.** The skill is a thin HTTP client; the daemons never run from a skill directory, and a remote agent (no DB, no GPU) cannot run or upgrade them. Daemon and **schema** changes reach a hive through `git` on the gateway host — never through a skill download, so updating a skill never triggers a migration. The operations runbook lives in [`shared-memory/Documentation/server-setup.md`](shared-memory/Documentation/server-setup.md). Steps 1–6 below are operations (gateway host); steps 7–8 are usage (any agent).
+**Installing the skill is not installing the framework.** The skill is a thin HTTP client; the daemons never run from a skill directory, and a remote agent (no DB, no GPU) cannot run or upgrade them. Daemon and **schema** changes reach a hive through `git` on the gateway host — never through a skill download, so updating a skill never triggers a migration. The operations runbook lives in [`shared-memory/Documentation/server-setup.md`](shared-memory/Documentation/server-setup.md). Steps 1–7 below are operations (gateway host); steps 8–9 are usage (any agent).
 
 **Version contract:** client and gateway are decoupled and may drift, so compatibility is enforced by an `api_version` exchanged on `GET /health` — not by copying daemon code into skills. Run `memory_bridge.py doctor` to check it; on skew it names which side to upgrade.
 
@@ -99,7 +99,7 @@ Each is idempotent and safe to re-run; each step links the manual equivalent.
 
 6. **Start the reasoning LLM.** The embedder and reranker already came up with the compose stack (step 3); you only need your reasoning LLM on `:5000` — LM Studio or any OpenAI-compatible server ([§7](#7-inference-backends-llamacpp)).
 
-7. **Start the gateway.** `uv run --with aiohttp --with asyncpg --with neo4j --with httpx python shared-memory/scripts/hive_mind_proxy.py 8888` — this also launches the REM and NREM daemons ([§9](#9-starting-the-full-stack)). Verify: `curl http://localhost:8888/health` should report `"status":"ok"`, `"auth_required":true`, and `"embedder":"ok"` before you save any artifacts.
+7. **Start the gateway.** `uv run --with aiohttp --with asyncpg --with neo4j --with httpx python shared-memory/scripts/hive_mind_proxy.py 8888` — this also launches the REM and NREM daemons ([§9](#9-starting-the-full-stack)). Verify: `curl http://localhost:8888/health` should report `"status":"ok"`, `"auth_required":true`, and `"embedder":"ok"` before you save any artifacts. For a gateway that survives logout and reboot, install the `systemd --user` unit in [`shared-memory/ops/`](shared-memory/ops/) rather than leaving it in a terminal — a session-launched gateway is killed on teardown.
 
 8. **Install the skill into your agent.** The skill is a **thin client** — only `memory_bridge.py` ships with it (the daemons stay on the gateway host from step 7). Symlink/copy `SKILL.md` + `memory_bridge.py` into the agent's skills directory ([§10](#10-agent-integration-first-time-setup); remote/laptop clients → [§10a](#10a-remote-clients-ssh-tunnel-access)). Shortcut: just tell your agent — *"clone this repo and install the shared-memory skill per README §10."*
 
@@ -637,6 +637,8 @@ INFO:REMDaemon:REM daemon started (poll=120s, batch=5)
 
 The gateway is the only repo script you start by hand — databases and both inference backends come up with `docker compose up -d`. The proxy starts both daemons; all processes shut down cleanly when the proxy receives SIGINT or SIGTERM.
 
+> **Run it supervised.** A gateway launched in a terminal (or a background `&` job) receives `SIGTERM` and exits when that login session ends — `nohup` does not help. For a gateway that survives logout and reboot, install the `systemd --user` unit in [`shared-memory/ops/`](shared-memory/ops/) and `loginctl enable-linger` your user; operate it with `systemctl --user restart hive-mind-gateway.service`. See [`shared-memory/ops/README.md`](shared-memory/ops/README.md).
+
 **Verify the full stack is healthy:**
 ```bash
 curl http://localhost:8888/health
@@ -692,6 +694,8 @@ source .venv/bin/activate
 ### Token setup — one-time, all agents
 
 The coordinator requires `Authorization: Bearer <token>` on all memory routes. Generate tokens once, then configure each agent's install.
+
+> **Shortcut:** `bash shared-memory/scripts/bootstrap_tokens.sh` does Steps 1–2 for you — it mints the tokens, appends `AGENT_TOKENS` (and read-only `AGENT_ROLES`) to the gateway `.env`, and prints each agent's `AGENT_TOKEN` to distribute (Step 3). It refuses to overwrite an existing registry; `--force` rotates. The manual steps below are the equivalent, done by hand.
 
 ```bash
 # Step 1 — generate tokens (run from repo root)
@@ -982,7 +986,7 @@ printf 'AGENT_TOKEN=tok_<your-token>\nCOORDINATOR_URL=http://localhost:8888\n' \
 ```bash
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version
-# → {"version": "0.4.10", "api_version": 1, "tool": "shared-memory-framework"}
+# → {"version": "0.4.11", "api_version": 1, "tool": "shared-memory-framework"}
 
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py search "test" 3
@@ -1015,7 +1019,7 @@ All three paths route through the coordinator on port 8888. The coordinator owns
 ```bash
 # Check the framework version
 python shared-memory/scripts/memory_bridge.py --version
-# → {"version": "0.4.10", "api_version": 1, "tool": "shared-memory-framework"}
+# → {"version": "0.4.11", "api_version": 1, "tool": "shared-memory-framework"}
 
 # Operational telemetry — outbox health + REM/NREM backlog snapshot (add --json for raw)
 python shared-memory/scripts/memory_bridge.py status
@@ -1730,7 +1734,7 @@ This framework is actively evolving toward a workstation where any number of AI 
 | **Security baseline** | Read-only Cypher guard, localhost-only bind (PROXY_BIND opt-in), opaque error responses, bounded limit, ONT label validation at startup, prompt injection delimiters | ✅ Done |
 | **Configurable ontology — Path A** | All Neo4j labels and relationship types in `ontology.yaml`; ONT singleton with validation; falls back to hardcoded defaults; density threshold configurable | ✅ Done |
 | **Agent integration** | Claude Code, Grok, Codex CLI, Antigravity CLI (`agy` — current, replacing Gemini CLI, which stays supported as legacy), LM Studio (MCP) — all live; SKILL.md carries YAML frontmatter for implicit Codex invocation; `AGENTS.md` project context file added | ✅ Done |
-| **Schema migrations** | Migration runner; 000 (base schema: `vector` extension + `technical_docs`/`community_summaries` base tables — makes `apply.py` a one-command install); 001 (multi-agent schema: agent_id, scope, visibility, neo4j_outbox); 002 (concurrency hardening: unique index on community_summaries, covering index on outbox); 003 (source provenance: `source_pg_ids integer[]` on community_summaries, back-fill from metadata); 004 (`summary_history JSONB`); 005 (corrected `source_pg_ids` back-fill + applies 004); 006 (REM supersession: `superseded` column + partial index, source normalisation back-fill) | ✅ Done |
+| **Schema migrations** | Migration runner (`apply.py`, numbered chain); 000 (base schema) through 006 (REM supersession); 007 (domain-scoped consolidation: `(entity, domain)` unique key); 008 (JSONB double-encoding repair); 009 (Phase 3a: `technical_docs.superseded` + partial insight index); 010 (embedding indexes → hnsw, idempotent guard). Fresh installs use `schema_init.sql` + `neo4j_init.cypher` (Neo4j constraints), generated from the chain by `generate_schema_init.py` and applied by `init_db.sh`. | ✅ Done |
 | **Provenance layer — Phase A** | PROV-O-inspired ontology: 6 new node labels (`Decision`, `Human`, `AIAgent`, `Project`, `Activity`, `Milestone`) and 8 provenance relationships (`WAS_ATTRIBUTED_TO`, `WAS_ASSISTED_BY`, `WAS_GENERATED_BY`, `PROJECT_OF`, `ACTED_ON_BEHALF_OF`, `SUPERSEDES`, `INFORMED_BY`, `HAD_OUTCOME`). Coordinator ingress validates `type:decision` saves (rejects missing `decided_by` / `project` / `rationale` before the row touches the outbox WAL). Outbox dispatches decision rows to a dedicated `_apply_decision_outbox_row` that materialises the full PROV-O subgraph in a single atomic Neo4j session. Plain `Fact` saves unchanged. | ✅ Done |
 | **Provenance layer — Phase B** | `save_decision` subcommand in `memory_bridge.py` (named flags — `--title`, `--decided-by`, `--project`, `--rationale` required; `--assisted-by`, `--alternatives`, `--confidence`, `--entities` optional) and `save_decision` MCP tool in `vector-skill.py`. `build_decision_metadata()` pure helper. `--version` flag added to `memory_bridge.py`. | ✅ Done |
 | **Three-test fixes (v0.3.1)** | Retrieval visibility: search results carry `tier`, `score_normalized` (sigmoid), `matched_entities`, structured `graph_context` list. Consolidation history: `summary_history JSONB` column on `community_summaries` (migration 004) — prior summary appended before each `DO UPDATE`, capped at 20. Lineage: `source_ref` optional metadata key flows from coordinator to Neo4j `Fact.source_ref` property. 14 new tests added. `schema.md` "appends new rows" inaccuracy corrected. | ✅ Done |
@@ -1741,13 +1745,17 @@ This framework is actively evolving toward a workstation where any number of AI 
 | **GPU-aware dreaming (v0.4.1)** | REM/NREM yield when the GPU is busy — platform-agnostic `nvtop --snapshot` probe (no per-vendor parsing), fail-open, `SLOT_AWARE`/`GPU_BUSY_PERCENT`/`GPU_INDICES` tunables; NREM 45-min hard backstop preserved. `/health` probes the LLM via `/v1/models` (the route OpenAI-compatible servers actually serve). | ✅ Done |
 | **JSONB integrity + thin-client split (v0.4.2)** | Fixed JSONB double-encoding — `metadata`/`cypher_params` were `json.dumps()`'d against an asyncpg codec that dumps again, storing string scalars so `metadata->>` returned NULL (migration 008 repairs them). Strict thin-client/operations split: the skill ships only `memory_bridge.py`; daemons + schema deploy on the gateway host. Client↔gateway `api_version` contract + `doctor`. MCP `save_artifact` routed through the gateway (outbox atomicity, `metadata.model` preserves the loaded model name). | ✅ Done |
 | **Decision enrichment + telemetry (v0.4.3)** | REM now enriches `:Decision` nodes — activates the previously-orphaned reasoning layer (`CONSIDERED`/`REJECTED`/`PRODUCES_INSIGHT`/`UNDER_CONDITIONS`), marking decisions with a non-destructive `rem_summary`. Operational telemetry: `GET /memory/telemetry` + `memory_bridge.py status` (outbox + REM/NREM backlog rollup). Structured logging enabled by default in deployment. | ✅ Done |
+| **Read-only roles + telemetry breakdown (v0.4.4)** | `AGENT_ROLES` read-only tokens (confined to `GET /health`, `GET /memory/telemetry`, read-only `POST /memory/graph`); dedicated `monitor` token. `/memory/telemetry` enriched with `nrem` consolidation-cycle counts and a metadata `breakdown` — a read-only client (the companion Shared Memory Monitor) renders a full dashboard with zero DB access. | ✅ Done |
+| **Insight consolidation — Phase 3a (v0.4.5)** | NREM's second path folds clusters of ≥2 REM-enriched, non-reversed `:Decision` nodes that share a grounded `:Entity` across ≥2 distinct projects — gated on the **existence** of a `HAD_OUTCOME` edge (never its rating) — into elevated `kind='insight'` `community_summaries`. Always-INSERT with supersession as dedup (migration 009 partial unique index, closing the resurrection trap); a durable decision+retrospective outbox ledger drives the fold. `rating="reversed"` marks a decision superseded in both stores. Retrieval surfaces the nearest insight above the thematic summary as `tier="insight_summary"`. Decision pg_id 276, ADR-015. | ✅ Done |
+| **Verified identity + project normalisation (v0.4.6)** | Auth stamps the verified token identity onto **both** `metadata.source` and the `technical_docs.agent_id` column (was collapsing to `memory_bridge`). `PROJECT_ALIASES` ingress normalisation + `normalize_projects.py` backfill (canonical project = folder name) so the insight gate's ≥2-distinct-projects rule is trustworthy. | ✅ Done |
+| **Fresh-install tooling + onboarding (v0.4.7–v0.4.10)** | Canonical-agent-identity doc fixes (`source` is token-stamped; model names belong in `assisted_by`); `schema_init.sql` generated from the migration chain via a scratch DB (`generate_schema_init.py`, equivalent to `apply.py` by construction); `neo4j_init.cypher` (7 uniqueness constraints); embedding indexes → hnsw (migration 010); guided install scripts (`preflight.sh`, `init_db.sh`, `bootstrap_tokens.sh`) + Quick Start rewritten around them. | ✅ Done |
 
 ### In Progress / Planned
 
 | Phase | Milestone | Notes |
 |---|---|---|
-| **Insight consolidation (Phase 3a)** | NREM folds *clusters* of ≥2 decisions converging on a shared grounded `Fact` (non-mega-hub entity, `INSIGHT_THRESHOLD=2`) into elevated `community_summaries` tagged `metadata.kind="insight"` (`source_pg_ids`=decisions, aggregate retrospective `outcome_rating`); adds a `consolidated` flag on decisions and elevates insights in `handle_search`. Reuses the existing summary write + supersession. | **Design complete** (decision 245); next build. A *decision-cluster* trigger, not fact-density — a lone decision is never round-tripped. |
-| **Provenance layer — Phase E** | Separate `pruning_loop.py` on a slow cron; enforces the information foraging heuristic (save if retrieval utility + decision impact > storage cost); `type:decision` and `decision_impact`-flagged rows are unconditionally shielded; plain facts compete on retrieval frequency × age | Queued. Decoupled from the consolidation daemon — different cadence. |
+| **Insight consolidation — Phase 3b** | Stronger insight triggers beyond the shared-entity gate: `INFORMED_BY` decision chains and shared-lesson clustering; promote retrospectives to first-class `:Retrospective` nodes. | Gated on entity-resolution dedup (below). Phase 3a shipped in v0.4.5 (see Completed). |
+| **Provenance layer — Phase E** | Separate `pruning_loop.py` on a slow cron; enforces the information foraging heuristic (save if retrieval utility + decision impact > storage cost); `type:decision` and `decision_impact`-flagged rows are unconditionally shielded; plain facts compete on retrieval frequency × age | Queued. Decoupled from the consolidation daemon — different cadence. Partially absorbed by the dream-cycle ledger purge. |
 | **Ontology as graph (Path B)** | Bootstrap `(:Class)` nodes + `SCO` relationships from `ontology.yaml` into Neo4j on startup; replace `ONT.*` string constants with startup-cached dict read from graph; enables live ontology inspection and Neosemantics (n10s) forward compatibility | Path A is the prerequisite ✅. Does not replace `ontology.yaml` — yaml stays the human-editable source; graph is a materialised copy. |
 | **Entity type enrichment** | Apply Neo4j multi-label to distinguish entity kinds — `:Entity:Person`, `:Entity:System`, `:Entity:Tool`, `:Entity:Decision` etc. — without breaking existing queries | Path A + Path B are the prerequisites. Enables richer graph traversal and type-aware consolidation clustering. |
 | **Entity resolution** | Detect and merge synonymous Entity nodes (`"hive_mind_proxy"` ≡ `"Hive-Mind Gateway"`); maintain a canonical name + alias set; re-link Fact nodes on merge | The entity contract (explicit caller-supplied names) makes this tractable. Implementation is a background reconciliation job, not a save-path change. |
