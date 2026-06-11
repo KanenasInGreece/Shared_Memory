@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS community_summaries (
 
 CREATE INDEX IF NOT EXISTS community_summaries_active_idx ON public.community_summaries USING btree (id) WHERE (NOT superseded);
 CREATE INDEX IF NOT EXISTS community_summaries_agent_id_idx ON public.community_summaries USING btree (agent_id);
-CREATE INDEX IF NOT EXISTS community_summaries_embedding_idx ON public.community_summaries USING ivfflat (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS community_summaries_embedding_idx ON public.community_summaries USING hnsw (embedding vector_cosine_ops);
 CREATE UNIQUE INDEX IF NOT EXISTS community_summaries_entity_domain_unique ON public.community_summaries USING btree (((metadata ->> 'entity'::text)), ((metadata ->> 'domain'::text))) WHERE (COALESCE((metadata ->> 'kind'::text), 'thematic'::text) <> 'insight'::text);
 CREATE INDEX IF NOT EXISTS community_summaries_scope_idx ON public.community_summaries USING btree (scope);
 CREATE INDEX IF NOT EXISTS community_summaries_visibility_idx ON public.community_summaries USING btree (visibility);
@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS technical_docs (
 
 CREATE INDEX IF NOT EXISTS technical_docs_agent_id_idx ON public.technical_docs USING btree (agent_id);
 CREATE UNIQUE INDEX IF NOT EXISTS technical_docs_content_hash_key ON public.technical_docs USING btree (content_hash);
-CREATE INDEX IF NOT EXISTS technical_docs_embedding_idx ON public.technical_docs USING ivfflat (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS technical_docs_embedding_idx ON public.technical_docs USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS technical_docs_scope_idx ON public.technical_docs USING btree (scope);
 CREATE INDEX IF NOT EXISTS technical_docs_visibility_idx ON public.technical_docs USING btree (visibility);
 

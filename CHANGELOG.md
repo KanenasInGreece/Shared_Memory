@@ -5,6 +5,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.4.9] — 2026-06-11
+
+### Added
+
+- **Migration 010 — embedding indexes switch from `ivfflat` to `hnsw`.** HNSW gives better recall and query latency for this workload (no list-count tuning, graceful with incremental inserts) at the cost of a slower build and more memory — an acceptable trade at this corpus size. Production already ran hnsw via a manual swap; this migration brings the chain (and therefore fresh installs via `schema_init.sql`) in line, so every install converges on the same index. **Idempotent and cheap to re-run:** because `apply.py` replays the whole chain on every invocation, the migration is wrapped in a `DO` block that rebuilds an index *only* when it is not already hnsw — a bare `DROP`/`CREATE` would rebuild the vector index (exclusive lock, expensive) on every run. Verified a no-op on production (index OIDs unchanged after apply) and idempotent on a chain applied twice. `schema_init.sql` regenerated — now byte-identical to the chain with hnsw.
+
+---
+
 ## [0.4.8] — 2026-06-11
 
 ### Added
