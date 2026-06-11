@@ -317,7 +317,7 @@ async def test_fold_insight_full_path(monkeypatch):
     daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
     conn = StubConn(script=_fold_script())
 
-    await daemon._fold_insight(conn, "OutboxPattern", [245, 267])
+    assert await daemon._fold_insight(conn, "OutboxPattern", [245, 267]) is True
 
     sqls = [s for s, _ in conn.executed]
     insert = next(s for s in sqls if s.startswith("INSERT INTO community_summaries"))
@@ -327,8 +327,9 @@ async def test_fold_insight_full_path(monkeypatch):
     assert meta["kind"] == "insight"
     assert meta["source_pg_ids"] == [245, 267]
     assert sorted(meta["projects"]) == ["shared-memory-GitHub", "tier3-cloe"]
-    # one commit for the insight tx, one inside close_ledger_rows_by_id
-    assert conn.commits == 2
+    # three commits: the read-tx close before the LLM call, the insight write
+    # tx, and the one inside close_ledger_rows_by_id.
+    assert conn.commits == 3
     # graph marking ran: consolidated flags + kind='insight' summary node
     mark_query = session.calls[-1][0]
     assert "SET d.consolidated = true" in mark_query or "SUPERSEDES" in mark_query
@@ -344,11 +345,12 @@ async def test_fold_insight_aborts_when_llm_fails(monkeypatch):
     daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
     conn = StubConn(script=_fold_script())
 
-    await daemon._fold_insight(conn, "OutboxPattern", [245, 267])
+    assert await daemon._fold_insight(conn, "OutboxPattern", [245, 267]) is False
 
     assert not any(s.startswith("INSERT INTO community_summaries")
                    for s, _ in conn.executed)
-    assert conn.commits == 0
+    # Only the read-transaction close ran before the LLM aborted the fold.
+    assert conn.commits == 1
 
 
 @pytest.mark.asyncio
@@ -359,7 +361,7 @@ async def test_fold_insight_skips_singleton_cluster(monkeypatch):
     daemon, _ = daemon_with_fake_graph()
     conn = StubConn(script=[{"rowcount": 1, "rows": [(245, "Decision A", "p1")]}])
 
-    await daemon._fold_insight(conn, "OutboxPattern", [245, 999])
+    assert await daemon._fold_insight(conn, "OutboxPattern", [245, 999]) is False
 
     assert len(conn.executed) == 1  # only the content fetch ran
     assert conn.commits == 0

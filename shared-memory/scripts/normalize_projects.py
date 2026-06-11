@@ -25,12 +25,32 @@ With no --map, the PROJECT_ALIASES environment variable is used.
 import argparse
 import os
 import sys
+from pathlib import Path
 
 import psycopg2
 from neo4j import GraphDatabase
 
 sys.path.insert(0, os.path.dirname(__file__))
 from ontology import ONT  # noqa: E402
+
+
+def _load_env() -> None:
+    """Populate credentials from the repo-root .env, matching migrations/
+    apply.py and hive_mind_proxy.py — this is a standalone CLI run in a fresh
+    shell where PG_PASSWORD/NEO4J_PASSWORD are otherwise unset (CLAUDE.md:
+    credentials are read from .env, never hardcoded)."""
+    env_path = Path(__file__).resolve().parent.parent.parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        os.environ.setdefault(key.strip(), val.strip())
+
+
+_load_env()
 
 _pg_pass = os.environ.get("PG_PASSWORD", "")
 PG_CONN = os.environ.get(

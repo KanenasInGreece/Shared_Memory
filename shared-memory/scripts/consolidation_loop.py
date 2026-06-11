@@ -1064,41 +1064,47 @@ class ConsolidationDaemon:
                 logger.info("Insight cycle: reconciled insight %d, closed %d rows.", summary_id, closed)
 
             # 1. Re-folds — active insights with un-dreamed retrospectives.
+            #    fetch_refold_insights self-guards on empty retro_ids.
             retro_ids = await loop.run_in_executor(None, lambda: fetch_open_retro_decision_ids(conn))
             refolds = await loop.run_in_executor(
                 None, lambda: fetch_refold_insights(conn, retro_ids)
-            ) if retro_ids else []
+            )
+            # Track only decisions actually FOLDED (not merely attempted): an
+            # aborted fold (LLM down, <2 rows) must not suppress a fresh cluster
+            # that shares its ids — that work should still be tried this pass.
             folded: set = set()
             for old_id, entity, src_ids, prev_content in refolds:
                 logger.info(
                     "Insight cycle: re-folding insight %d ('%s') — new retrospective(s) on %s.",
                     old_id, entity, sorted(set(src_ids) & set(retro_ids)),
                 )
-                await self._fold_insight(conn, entity, src_ids, previous_insight=prev_content)
-                folded.update(src_ids)
+                if await self._fold_insight(conn, entity, src_ids, previous_insight=prev_content):
+                    folded.update(src_ids)
 
             # 2. Fresh clusters from the graph gate.
             clusters = await self._find_fresh_insight_clusters()
             for c in clusters:
                 ids = [int(i) for i in c["decision_ids"] if i is not None]
                 if not ids or any(i in folded for i in ids):
-                    continue  # flags changed this pass; the next sweep re-evaluates
+                    continue  # already folded as a re-fold this pass
                 logger.info(
                     "Insight cycle: fresh cluster on '%s' — %d decisions across projects %s.",
                     c["entity"], len(ids), sorted(c.get("projects") or []),
                 )
-                await self._fold_insight(conn, c["entity"], ids, projects=c.get("projects"))
-                folded.update(ids)
+                if await self._fold_insight(conn, c["entity"], ids, projects=c.get("projects")):
+                    folded.update(ids)
         except Exception as e:
             logger.error(f"Insight cycle failed: {str(e)}")
         finally:
             await loop.run_in_executor(None, conn.close)
 
-    async def _fold_insight(self, conn, entity, decision_ids, previous_insight=None, projects=None):
+    async def _fold_insight(self, conn, entity, decision_ids, previous_insight=None):
         """One insight fold: authoritative decision content from Postgres +
         cumulative HAD_OUTCOME wording from the graph → LLM synthesis → embed
         → always-INSERT + ledger flip (one transaction) → supersession → graph
-        marking → close consumed rows."""
+        marking → close consumed rows. Returns True only when an insight was
+        actually written; False on any abort (so the caller does not suppress a
+        fresh cluster sharing these decision ids)."""
         loop = asyncio.get_running_loop()
         src_ids = sorted({int(i) for i in decision_ids})
 
@@ -1118,7 +1124,7 @@ class ConsolidationDaemon:
                 "Insight fold for '%s' skipped: only %d of %d source decisions found in Postgres.",
                 entity, len(rows), len(src_ids),
             )
-            return
+            return False
 
         outcomes = await self._fetch_outcome_edges(src_ids)
         by_decision: dict = {}
@@ -1138,10 +1144,17 @@ class ConsolidationDaemon:
             blocks.append(block)
 
         # Snapshot the consumable ledger rows BEFORE the LLM call: a
-        # retrospective arriving mid-fold stays open and re-triggers.
+        # retrospective arriving mid-fold stays open and re-triggers. Then
+        # COMMIT to end the read transaction — psycopg2 opens one on the first
+        # execute and would otherwise sit idle-in-transaction across the
+        # multi-minute LLM call, pinning xmin and blocking autovacuum on the
+        # high-churn outbox/technical_docs tables. The snapshot lives in Python;
+        # the later ledger flip re-checks status IN ('applied','rem_reviewed'),
+        # so closing the read transaction here is semantically free.
         row_ids = await loop.run_in_executor(
             None, lambda: fetch_insight_outbox_rows(conn, src_ids)
         )
+        await loop.run_in_executor(None, conn.commit)
 
         logger.info(
             "Folding insight for '%s' (%d decisions, %d retrospective edges)...",
@@ -1150,18 +1163,21 @@ class ConsolidationDaemon:
         insight = await self.generate_insight(entity, blocks, previous_insight)
         if not insight:
             logger.error(f"Failed to synthesise insight for '{entity}' — ledger rows stay open; next sweep retries.")
-            return
+            return False
         embedding = await self.get_embedding(insight)
         if not embedding:
             logger.error(f"Failed to vectorise insight for '{entity}' — ledger rows stay open; next sweep retries.")
-            return
+            return False
 
         metadata_json = json.dumps({
             "type": "community_summary",
             "kind": "insight",
             "entity": entity,
             "domain": INSIGHT_DOMAIN,
-            "projects": sorted(set(projects or []) or seen_projects),
+            # Projects come from the authoritative Postgres metadata (single
+            # source of truth) — not the graph Project names that seeded the
+            # cluster, which could drift before PROJECT_ALIASES normalisation.
+            "projects": sorted(seen_projects),
             "source_pg_ids": src_ids,
             "timestamp": datetime.now().isoformat(),
         })
@@ -1183,7 +1199,7 @@ class ConsolidationDaemon:
         except Exception as e:
             await loop.run_in_executor(None, conn.rollback)
             logger.error(f"Insight write error for '{entity}': {str(e)}")
-            return
+            return False
 
         # Graph sync + ledger close — same crash contract as the fact path:
         # Postgres is committed; a failure here leaves the consumed rows at
@@ -1202,6 +1218,7 @@ class ConsolidationDaemon:
                 f"Graph sync failed for insight {summary_id} ('{entity}') — committed; "
                 f"reconciliation will retry: {str(e)}"
             )
+        return True
 
     async def _mark_insight_in_graph(self, decision_ids, summary_pg_id, entity,
                                      superseded_ids=None):
