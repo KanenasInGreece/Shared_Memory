@@ -80,42 +80,30 @@ The framework has two distinct surfaces with separate lifecycles. Conflating the
 
 ### Steps
 
+A fresh gateway host goes from clone to running with three helper scripts in
+`shared-memory/scripts/` — `preflight.sh`, `init_db.sh`, `bootstrap_tokens.sh`.
+Each is idempotent and safe to re-run; each step links the manual equivalent.
+
 1. **Get the code, set DB passwords, raise OS limits.**
    Clone the repo and `cp .env.example .env` ([§10](#10-agent-integration-first-time-setup)); fill `NEO4J_PASSWORD` and `PG_PASSWORD` (needed before the databases start). Raise inotify limits and — on Fedora/RHEL — keep the SELinux `:z` mounts ([§4](#4-os-prerequisites--fedora--linux), [§5](#5-infrastructure-setup-docker-compose)).
 
-2. **Start the stack (databases + inference).** First put your BGE-M3 and reranker GGUF files in the folder the compose mounts ([§5](#5-infrastructure-setup-docker-compose)). Then `docker compose -f postgres_neo4j_limits.yaml up -d` brings up Postgres, Neo4j, the embedder (`:8070`) and the reranker (`:8071`); `docker compose … ps` should show all four `healthy`.
+2. **Check prerequisites.** `bash shared-memory/scripts/preflight.sh` verifies Docker + the daemon, `docker compose` v2, `uv`, and a populated `.env`, and warns on low RAM/disk. Resolve any ✗ before continuing.
 
-3. **Initialise both databases — two commands, both idempotent.**
+3. **Start the stack (databases + inference).** Put your BGE-M3 and reranker GGUF files in the folder the compose mounts ([§5](#5-infrastructure-setup-docker-compose)), then `docker compose -f postgres_neo4j_limits.yaml up -d` brings up Postgres, Neo4j, the embedder (`:8070`) and the reranker (`:8071`); `docker compose … ps` should show all four `healthy`.
 
-   **Postgres** (tables, indexes, vector extension):
-   ```bash
-   psql -U postgres agent_data < shared-memory/migrations/schema_init.sql
-   ```
-   Or via Python (no `psql` required):
-   ```bash
-   uv run --with psycopg2-binary python shared-memory/migrations/apply.py
-   ```
+4. **Initialise both databases — one command.** `bash shared-memory/scripts/init_db.sh` waits for both stores, then applies `schema_init.sql` to Postgres (tables, indexes, pgvector) and `neo4j_init.cypher` to Neo4j (uniqueness constraints), running the clients *inside* the containers — so no host `psql` or `cypher-shell` is needed. Idempotent. *(Manual commands and the `apply.py` upgrade path: [§6](#6-database-schema).)*
 
-   **Neo4j** (uniqueness constraints for all node labels):
-   ```bash
-   cypher-shell -u neo4j -p <your-neo4j-password> \
-     --file shared-memory/migrations/neo4j_init.cypher
-   ```
-   Or paste the file contents into Neo4j Browser and run each statement.
+   > **Embedding consistency guarantee:** every vector in this system — saved by any agent, re-embedded by the consolidation daemon — must come from the **same model through the same gateway** (`:8888`). The coordinate space must be shared: cosine distances between vectors from different models are meaningless. The default schema uses BGE-M3 at 1024 dimensions; if you substitute a different model, update the `vector(1024)` columns in `000_base_schema.sql`, regenerate `schema_init.sql` with `generate_schema_init.py`, and re-apply. The dimension itself does not matter — consistency does.
 
-   Both files live in `shared-memory/migrations/` and are always current. `schema_init.sql` is auto-regenerated after every migration via `generate_schema_init.py` — never edit it by hand. *(Upgrading an older install? Use `apply.py` for Postgres — it only runs pending migrations. Re-run `neo4j_init.cypher` freely; `IF NOT EXISTS` makes it a no-op on constraints that already exist.)*
+5. **Generate agent tokens.** `bash shared-memory/scripts/bootstrap_tokens.sh` mints one token per agent, appends `AGENT_TOKENS` to the gateway `.env`, and prints each agent's own `AGENT_TOKEN` to paste into its skill `.env` ([§10](#10-agent-integration-first-time-setup)). One distinct token per agent — never shared. (It refuses to overwrite an existing registry; `--force` rotates all tokens.)
 
-   > **Embedding consistency guarantee:** every vector in this system — saved by any agent, re-embedded by the consolidation daemon — must come from the **same model through the same gateway** (`:8888`). The coordinate space must be shared: cosine distances between vectors from different models are meaningless. The default schema uses BGE-M3 at 1024 dimensions; if you substitute a different model, update the `vector(1024)` column definitions in `schema_init.sql`, regenerate with `generate_schema_init.py`, and re-apply. The dimension itself does not matter — consistency does. Verify: `curl http://localhost:8888/health` → `"embedder": "ok"` before saving any artifacts.
+6. **Start the reasoning LLM.** The embedder and reranker already came up with the compose stack (step 3); you only need your reasoning LLM on `:5000` — LM Studio or any OpenAI-compatible server ([§7](#7-inference-backends-llamacpp)).
 
-4. **Start the reasoning LLM.** The embedder and reranker already came up with the compose stack (step 2); you only need your reasoning LLM on `:5000` — LM Studio or any OpenAI-compatible server ([§7](#7-inference-backends-llamacpp)).
+7. **Start the gateway.** `uv run --with aiohttp --with asyncpg --with neo4j --with httpx python shared-memory/scripts/hive_mind_proxy.py 8888` — this also launches the REM and NREM daemons ([§9](#9-starting-the-full-stack)). Verify: `curl http://localhost:8888/health` should report `"status":"ok"`, `"auth_required":true`, and `"embedder":"ok"` before you save any artifacts.
 
-5. **Generate tokens and finish your `.env`.** `uv run python shared-memory/scripts/generate_tokens.py` ([§10 token setup](#10-agent-integration-first-time-setup)). Put `AGENT_TOKENS=…` in the **gateway `.env` at the repo root** (alongside the passwords from step 1); put each agent's own `AGENT_TOKEN=…` in that agent's skill `.env`. One distinct token per agent — never shared. `.env.example` is the annotated template.
+8. **Install the skill into your agent.** The skill is a **thin client** — only `memory_bridge.py` ships with it (the daemons stay on the gateway host from step 7). Symlink/copy `SKILL.md` + `memory_bridge.py` into the agent's skills directory ([§10](#10-agent-integration-first-time-setup); remote/laptop clients → [§10a](#10a-remote-clients-ssh-tunnel-access)). Shortcut: just tell your agent — *"clone this repo and install the shared-memory skill per README §10."*
 
-6. **Start the gateway.** `uv run --with aiohttp --with asyncpg --with neo4j --with httpx python shared-memory/scripts/hive_mind_proxy.py 8888` — this also launches the REM and NREM daemons ([§9](#9-starting-the-full-stack)). Verify: `curl http://localhost:8888/health` should report `"status":"ok"` and `"auth_required":true`.
-
-7. **Install the skill into your agent.** The skill is a **thin client** — only `memory_bridge.py` ships with it (the daemons stay on the gateway host from step 6). Symlink/copy `SKILL.md` + `memory_bridge.py` into the agent's skills directory ([§10](#10-agent-integration-first-time-setup); remote/laptop clients → [§10a](#10a-remote-clients-ssh-tunnel-access)). Shortcut: just tell your agent — *"clone this repo and install the shared-memory skill per README §10."*
-
-8. **Use it.** Activate the skill in your agent — `/shared-memory` (Claude Code, Grok), `$shared-memory` (Codex), `/activate shared-memory` (Antigravity) — and tell the agent to **use the shared-memory skill to recall context before a task and store decisions after** ([§11](#11-agent-access-cli-and-mcp), [§11a](#11a-complete-cycle-end-to-end-workflow-with-cross-agent-examples)). Quick shell smoke test: `memory_bridge.py search "test" 3` ([§10 smoke-test](#10-agent-integration-first-time-setup)).
+9. **Use it.** Activate the skill in your agent — `/shared-memory` (Claude Code, Grok), `$shared-memory` (Codex), `/activate shared-memory` (Antigravity) — and tell the agent to **use the shared-memory skill to recall context before a task and store decisions after** ([§11](#11-agent-access-cli-and-mcp), [§11a](#11a-complete-cycle-end-to-end-workflow-with-cross-agent-examples)). Quick shell smoke test: `memory_bridge.py search "test" 3` ([§10 smoke-test](#10-agent-integration-first-time-setup)).
 
 ### Troubleshooting — the first four you'll hit
 
@@ -471,15 +459,26 @@ Credentials are read from environment variables — copy `.env.example` to `.env
 
 The Postgres schema is managed by versioned migrations in `shared-memory/migrations/`, applied by `apply.py`. The runner executes every migration in order, and every migration is idempotent (`IF NOT EXISTS` throughout) — so it is always safe to re-run.
 
-### New install — one command
+### New install
 
-With the databases up (§5) and `PG_PASSWORD` in `.env`, run:
+With the databases up (§5), the easiest path initialises **both** stores at once:
 
 ```bash
-uv run --with psycopg2-binary python shared-memory/migrations/apply.py
+bash shared-memory/scripts/init_db.sh
 ```
 
-That is the only schema command a new user runs. It takes an empty `agent_data` database all the way to the latest schema in one step:
+It applies the Postgres schema and the Neo4j constraints, running each client inside its container (no host `psql`/`cypher-shell` needed). If you'd rather run the steps by hand:
+
+```bash
+# Postgres — full schema in one shot (psql), or replay the migration chain (Python):
+psql -U postgres agent_data < shared-memory/migrations/schema_init.sql
+uv run --with psycopg2-binary python shared-memory/migrations/apply.py
+
+# Neo4j — uniqueness constraints (see the next subsection):
+cypher-shell -u neo4j -p <password> --file shared-memory/migrations/neo4j_init.cypher
+```
+
+`schema_init.sql` is auto-generated from the migration chain (`generate_schema_init.py`) and is equivalent to `apply.py` on an empty database — never hand-edit it. Both take an empty `agent_data` database all the way to the latest schema in one step:
 
 - `000` creates the `vector` extension and the two base tables (`technical_docs`, `community_summaries`).
 - `001` adds the multi-agent columns (`agent_id`, `scope`, `visibility`) and the `neo4j_outbox` table.
@@ -489,7 +488,7 @@ The resulting tables — `technical_docs` (Tier 1), `community_summaries` (Tier 
 
 ### Neo4j constraints
 
-Run `shared-memory/migrations/neo4j_init.cypher` once on a fresh Neo4j instance (the full command is in Quick Start step 3). The file is idempotent — re-running it on an existing instance is safe. It creates uniqueness constraints on every node label the framework writes:
+`init_db.sh` (above) applies these for you. To run them by hand, apply `shared-memory/migrations/neo4j_init.cypher` once on a fresh Neo4j instance. The file is idempotent — re-running it on an existing instance is safe. It creates uniqueness constraints on every node label the framework writes:
 
 | Constraint | Node | Property | Purpose |
 |---|---|---|---|
@@ -983,7 +982,7 @@ printf 'AGENT_TOKEN=tok_<your-token>\nCOORDINATOR_URL=http://localhost:8888\n' \
 ```bash
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version
-# → {"version": "0.4.9", "api_version": 1, "tool": "shared-memory-framework"}
+# → {"version": "0.4.10", "api_version": 1, "tool": "shared-memory-framework"}
 
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py search "test" 3
@@ -1016,7 +1015,7 @@ All three paths route through the coordinator on port 8888. The coordinator owns
 ```bash
 # Check the framework version
 python shared-memory/scripts/memory_bridge.py --version
-# → {"version": "0.4.9", "api_version": 1, "tool": "shared-memory-framework"}
+# → {"version": "0.4.10", "api_version": 1, "tool": "shared-memory-framework"}
 
 # Operational telemetry — outbox health + REM/NREM backlog snapshot (add --json for raw)
 python shared-memory/scripts/memory_bridge.py status
