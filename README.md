@@ -85,7 +85,27 @@ The framework has two distinct surfaces with separate lifecycles. Conflating the
 
 2. **Start the stack (databases + inference).** First put your BGE-M3 and reranker GGUF files in the folder the compose mounts ([§5](#5-infrastructure-setup-docker-compose)). Then `docker compose -f postgres_neo4j_limits.yaml up -d` brings up Postgres, Neo4j, the embedder (`:8070`) and the reranker (`:8071`); `docker compose … ps` should show all four `healthy`.
 
-3. **Create the schema — one command.** Fresh install: `psql -U postgres agent_data < shared-memory/migrations/schema_init.sql` creates the complete schema in one shot. Alternatively, `uv run --with psycopg2-binary python shared-memory/migrations/apply.py` does the same by replaying the migration chain (safe, idempotent). Then run the one-time Neo4j constraints ([§6](#6-database-schema)). *(Upgrading an older install? Use `apply.py` — it only runs pending migrations. `schema_init.sql` is auto-generated from the live DB after each migration via `generate_schema_init.py` and is always current — you never edit it by hand.)*
+3. **Initialise both databases — two commands, both idempotent.**
+
+   **Postgres** (tables, indexes, vector extension):
+   ```bash
+   psql -U postgres agent_data < shared-memory/migrations/schema_init.sql
+   ```
+   Or via Python (no `psql` required):
+   ```bash
+   uv run --with psycopg2-binary python shared-memory/migrations/apply.py
+   ```
+
+   **Neo4j** (uniqueness constraints for all node labels):
+   ```bash
+   cypher-shell -u neo4j -p <your-neo4j-password> \
+     --file shared-memory/migrations/neo4j_init.cypher
+   ```
+   Or paste the file contents into Neo4j Browser and run each statement.
+
+   Both files live in `shared-memory/migrations/` and are always current. `schema_init.sql` is auto-regenerated after every migration via `generate_schema_init.py` — never edit it by hand. *(Upgrading an older install? Use `apply.py` for Postgres — it only runs pending migrations. Re-run `neo4j_init.cypher` freely; `IF NOT EXISTS` makes it a no-op on constraints that already exist.)*
+
+   > **Embedding consistency guarantee:** every vector in this system — saved by any agent, re-embedded by the consolidation daemon — must come from the **same model through the same gateway** (`:8888`). The coordinate space must be shared: cosine distances between vectors from different models are meaningless. The default schema uses BGE-M3 at 1024 dimensions; if you substitute a different model, update the `vector(1024)` column definitions in `schema_init.sql`, regenerate with `generate_schema_init.py`, and re-apply. The dimension itself does not matter — consistency does. Verify: `curl http://localhost:8888/health` → `"embedder": "ok"` before saving any artifacts.
 
 4. **Start the reasoning LLM.** The embedder and reranker already came up with the compose stack (step 2); you only need your reasoning LLM on `:5000` — LM Studio or any OpenAI-compatible server ([§7](#7-inference-backends-llamacpp)).
 
@@ -467,15 +487,21 @@ That is the only schema command a new user runs. It takes an empty `agent_data` 
 
 The resulting tables — `technical_docs` (Tier 1), `community_summaries` (Tier 3), and `neo4j_outbox` (coordinator WAL) — are documented column-by-column, with all Neo4j labels and relationship types, in [`shared-memory/Documentation/schema.md`](shared-memory/Documentation/schema.md).
 
-### Neo4j constraints — one-time
+### Neo4j constraints
 
-Neo4j constraints are **not** created automatically. Run these once in Neo4j Browser or cypher-shell (also idempotent):
+Run `shared-memory/migrations/neo4j_init.cypher` once on a fresh Neo4j instance (the full command is in Quick Start step 3). The file is idempotent — re-running it on an existing instance is safe. It creates uniqueness constraints on every node label the framework writes:
 
-```cypher
-CREATE CONSTRAINT fact_pg_id    IF NOT EXISTS FOR (f:Fact)             REQUIRE f.pg_id IS UNIQUE;
-CREATE CONSTRAINT entity_name   IF NOT EXISTS FOR (e:Entity)           REQUIRE e.name  IS UNIQUE;
-CREATE CONSTRAINT summary_pg_id IF NOT EXISTS FOR (s:CommunitySummary) REQUIRE s.pg_id IS UNIQUE;
-```
+| Constraint | Node | Property | Purpose |
+|---|---|---|---|
+| `fact_pg_id` | `Fact` | `pg_id` | One Fact node per Postgres row |
+| `entity_name` | `Entity` | `name` | Consolidation anchor — no duplicate hubs |
+| `community_summary_pg` | `CommunitySummary` | `pg_id` | One summary node per summary row |
+| `decision_pg_id` | `Decision` | `pg_id` | One Decision node per Postgres row |
+| `human_name` | `Human` | `name` | PROV-O provenance — dedup by person name |
+| `ai_agent_name` | `AIAgent` | `name` | PROV-O provenance — dedup by tool name |
+| `project_name` | `Project` | `name` | PROV-O provenance — dedup by project name |
+
+If you customise label names in `ontology.yaml`, edit `neo4j_init.cypher` to match before running it.
 
 ### Upgrading from an earlier schema
 

@@ -9,6 +9,14 @@
 -- Regenerate after every new migration:
 --   uv run --with psycopg2-binary python shared-memory/migrations/generate_schema_init.py
 --
+-- EMBEDDING DIMENSION: vector columns default to 1024-dim for BGE-M3.
+-- If you use a different embedding model, change every vector(1024) below to
+-- match your model's output dimension, then run generate_schema_init.py to
+-- keep schema_init.sql in sync. The critical invariant is that ALL agents
+-- use the SAME model through the gateway — not the specific dimension.
+--
+-- Also run neo4j_init.cypher to initialise the Neo4j constraint set.
+--
 -- Usage:
 --   psql -U postgres agent_data < shared-memory/migrations/schema_init.sql
 
