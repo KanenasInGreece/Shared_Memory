@@ -5,6 +5,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.4.11] — 2026-06-12
+
+### Security
+
+- **`init_db.sh` no longer passes the Neo4j password on a command line.** `cypher-shell -p "$NEO4J_PASSWORD"` placed the password on the process argv (a world-readable `/proc/<pid>/cmdline`), exposing it to other local users on a shared host. It is now passed through the environment (`export NEO4J_PASSWORD` + `docker exec -e NEO4J_PASSWORD`, no value on any argv); `/proc/<pid>/environ` is owner-restricted. Verified on a throwaway Neo4j: env-var auth works and all 7 constraints still apply. (Surfaced by `/security-review`.)
+- **`bootstrap_tokens.sh --force` preserves the `.env` file mode.** The rewrite went through a temp file created with the default umask, which could widen a `chmod 600 .env` back to `644`. It now `chmod --reference`s the original before the `mv`.
+
+### Changed
+
+- **README currency pass (§1–§20).** Roadmap (§19) corrected: insight consolidation (Phase 3a) moved from *Planned* to *Completed* (it shipped in v0.4.5) and the Completed table extended through v0.4.4–v0.4.10; the schema-migrations row now lists 007–010 + `schema_init.sql`/`neo4j_init.cypher`/`generate_schema_init.py`. §9 and §10 gained pointers to the `systemd --user` unit and `bootstrap_tokens.sh` respectively. Quick Start step-range fixed and pointed at the supervised-gateway unit. Cross-checked versions, ports, service names, model (gemma-4-12b), and the test command against the code — all current.
+
+---
+
 ## [0.4.10] — 2026-06-12
 
 ### Added

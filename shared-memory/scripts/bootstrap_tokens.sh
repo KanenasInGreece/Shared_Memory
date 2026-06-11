@@ -43,8 +43,12 @@ roles_line="$(grep -E '^AGENT_ROLES='  <<<"$out" || true)"
 [[ -n "$tokens_line" ]] || { red "✗ generate_tokens.py produced no AGENT_TOKENS line"; exit 1; }
 
 # If forcing, strip any existing token/role lines before appending the new ones.
+# Preserve the original file mode — a fresh temp file would otherwise be created
+# with the default umask (often 0644), widening read access on a secrets file.
 if [[ "$force" -eq 1 ]]; then
-    grep -vE '^[[:space:]]*AGENT_(TOKENS|ROLES)=' "$ENV_FILE" > "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"
+    grep -vE '^[[:space:]]*AGENT_(TOKENS|ROLES)=' "$ENV_FILE" > "$ENV_FILE.tmp"
+    chmod --reference="$ENV_FILE" "$ENV_FILE.tmp" 2>/dev/null || true
+    mv "$ENV_FILE.tmp" "$ENV_FILE"
 fi
 
 {
