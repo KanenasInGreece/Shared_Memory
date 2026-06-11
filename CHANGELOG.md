@@ -5,6 +5,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.4.6] — 2026-06-11
+
+### Fixed
+
+- **Verified agent identity is now stamped on the `agent_id` column.** The auth middleware overwrote `metadata.source` with the server-verified token identity but left the `technical_docs.agent_id` column set to the client-supplied value — and `memory_bridge.py` defaults `AGENT_ID` to the script name `"memory_bridge"` when the env var is unset. Every authenticated save from an agent that didn't explicitly set `AGENT_ID` was therefore recorded under the placeholder `memory_bridge` (observed: 152 rows) instead of the real agent. `handle_save` (and `handle_retrospective`) now derive `agent_id` from `authenticated_agent` when present, mirroring the `source` overwrite — spoof-proof, and no per-agent `AGENT_ID` config required. Backward compatible: with auth disabled the client-supplied `agent_id` is still used. Existing rows backfilled from `metadata.source`. New tests in `tests/test_coordinator.py`.
+
+### Ops
+
+- **Project-name normalisation applied to live data (decision 276).** `PROJECT_ALIASES` set in the gateway `.env` (canonicalising future writes to the project folder name) and `normalize_projects.py` run against both stores: the `shared-memory`/`shared_memory`/`Shared Memory Framework` variants folded to `shared-memory-GitHub` and the `tier3*`/`openclaw*` variants to `tier3-cloe`, so the insight gate's ≥2-distinct-projects rule is trustworthy. Canonical distribution: shared-memory-GitHub, tier3-cloe, shared-memory-monitor.
+
 ## [0.4.5] — 2026-06-11
 
 ### Added

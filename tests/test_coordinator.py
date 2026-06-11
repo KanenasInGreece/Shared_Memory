@@ -627,6 +627,55 @@ async def test_handle_save_source_overwritten_by_authenticated_agent():
     assert params["source"] == "claude"
 
 
+@pytest.mark.asyncio
+async def test_handle_save_agent_id_stamped_from_verified_identity():
+    """The agent_id COLUMN must be the verified token identity, not the client's
+    script-name default ('memory_bridge'). Regression: authenticated saves were
+    all recorded under the placeholder because only source was overwritten."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request(
+            {
+                "content": "some content",
+                "metadata": {"source": "claude", "entities": ["Entity1"]},
+                "agent_id": "memory_bridge",   # client default
+            },
+            authenticated_agent="grok",
+        )
+        resp = await c.handle_save(req)
+
+    assert resp.status == 200
+    insert_call = next(
+        c_ for c_ in mock_conn.fetchrow.call_args_list
+        if "INSERT INTO technical_docs" in c_.args[0]
+    )
+    # agent_id is the 5th bound param (content, metadata, embedding, hash, agent_id, ...)
+    assert insert_call.args[5] == "grok"
+    assert "memory_bridge" not in insert_call.args
+
+
+@pytest.mark.asyncio
+async def test_handle_save_agent_id_falls_back_to_body_without_auth():
+    """Auth disabled (no authenticated_agent) → keep the client-supplied agent_id."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "some content",
+            "metadata": {"source": "claude", "entities": ["Entity1"]},
+            "agent_id": "claude_code",
+        })  # authenticated_agent defaults to None
+        resp = await c.handle_save(req)
+
+    assert resp.status == 200
+    insert_call = next(
+        c_ for c_ in mock_conn.fetchrow.call_args_list
+        if "INSERT INTO technical_docs" in c_.args[0]
+    )
+    assert insert_call.args[5] == "claude_code"
+
+
 # ── JSONB double-encoding regression (v0.4.2) ────────────────────────────────
 #
 # The asyncpg pool registers a jsonb codec with encoder=json.dumps, so jsonb
