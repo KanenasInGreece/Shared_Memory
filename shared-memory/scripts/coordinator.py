@@ -53,7 +53,7 @@ log = logging.getLogger("coordinator")
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.4.5"
+FRAMEWORK_VERSION = "0.4.6"
 API_VERSION = 1
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
@@ -644,8 +644,13 @@ class MemoryCoordinator:
         # Server-side identity enforcement — verified agent name overrides client claim.
         # body["metadata"] is explicitly reattached; dict.get() returns an independent
         # dict when the key is absent, so the mutation would otherwise be discarded.
+        # The agent_id COLUMN is stamped from the same verified identity — the client
+        # defaults it to the script name ("memory_bridge"), so trusting the body left
+        # every authenticated save recorded under that placeholder instead of the real
+        # token identity. Source and agent_id now agree and are both spoof-proof.
         if request.get("authenticated_agent"):
             metadata["source"] = request["authenticated_agent"]
+            agent_id = request["authenticated_agent"]
             body["metadata"] = metadata
 
         # Project-name normalisation (decision 276): canonical = folder name.
@@ -802,7 +807,8 @@ class MemoryCoordinator:
         rating   = body.get("rating", "")
         notes    = body.get("notes", "")
         date     = body.get("date") or datetime.now().date().isoformat()
-        agent_id = body.get("agent_id", "unknown")
+        # Verified token identity over the client's script-name default ("memory_bridge").
+        agent_id = request.get("authenticated_agent") or body.get("agent_id", "unknown")
 
         if not isinstance(pg_id, int) or not rating or not notes:
             return web.json_response(

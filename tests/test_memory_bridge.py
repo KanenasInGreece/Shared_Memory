@@ -108,7 +108,7 @@ def _health(payload):
 
 @pytest.mark.asyncio
 async def test_compat_ok_when_versions_match():
-    payload = {"status": "ok", "version": "0.4.5", "api_version": memory_bridge.API_VERSION}
+    payload = {"status": "ok", "version": "0.4.6", "api_version": memory_bridge.API_VERSION}
     with patch("httpx.AsyncClient.get", return_value=_health(payload)):
         diag = await memory_bridge.check_gateway_compat()
     assert diag["compat"] == "ok"
