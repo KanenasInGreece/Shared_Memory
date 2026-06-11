@@ -5,6 +5,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.4.7] — 2026-06-11
+
+### Fixed
+
+- **`SKILL.md` and `system-prompt.md` no longer instruct agents to set `source` to the loaded model name.** Since v0.4.6 the coordinator stamps `source` with the server-verified token identity, overriding any client-supplied value — the old instruction was misleading and the root cause of model names (e.g. `claude-sonnet-4-6`, `qwen3-27b`) appearing as agent identities in the monitor. Guidance now: `source` is owned by the gateway; the canonical identity is always the auth-token name (`claude`, `gemini`, `lm_studio`, etc.). Model names belong in `assisted_by` on decisions, which creates `:AIAgent` provenance nodes.
+
+### Ops
+
+- **`shared_mem` added to `PROJECT_ALIASES` (decision 276 follow-up).** Ten rows carrying the `shared_mem` label were missed by the v0.4.6 normalisation because the alias was absent from the map. Added `shared_mem=<canonical>` so both the ingress guard and future `normalize_projects.py` runs cover it. Two residual source-label noise rows also backfilled: `design_session_cloe → antigravity`, `test_sync → claude`. Final canonical agent_id distribution: `claude(109) · legacy(34) · gemini(34) · antigravity(18) · grok(14) · chromebook-antigravity(1)`.
+
+---
+
 ## [0.4.6] — 2026-06-11
 
 ### Fixed
