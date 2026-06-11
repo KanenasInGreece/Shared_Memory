@@ -64,7 +64,7 @@ The framework has two distinct surfaces with separate lifecycles. Conflating the
 | Distributed by | `sync_skills.sh` (thin client only) | this repo, via `git` |
 | Upgraded by | re-sync the skill | `git pull` → `migrations/apply.py` → restart gateway |
 
-**Installing the skill is not installing the framework.** The skill is a thin HTTP client; the daemons never run from a skill directory, and a remote agent (no DB, no GPU) cannot run or upgrade them. Daemon and **schema** changes reach a hive through `git` on the gateway host — never through a skill download, so updating a skill never triggers a migration. The operations runbook lives in [`shared-memory/Documentation/server-setup.md`](shared-memory/Documentation/server-setup.md). Steps 1–6 below are operations (gateway host); steps 7–8 are usage (any agent).
+**Installing the skill is not installing the framework.** The skill is a thin HTTP client; the daemons never run from a skill directory, and a remote agent (no DB, no GPU) cannot run or upgrade them. Daemon and **schema** changes reach a hive through `git` on the gateway host — never through a skill download, so updating a skill never triggers a migration. The operations runbook lives in [`shared-memory/Documentation/server-setup.md`](shared-memory/Documentation/server-setup.md). Steps 1–7 below are operations (gateway host); steps 8–9 are usage (any agent).
 
 **Version contract:** client and gateway are decoupled and may drift, so compatibility is enforced by an `api_version` exchanged on `GET /health` — not by copying daemon code into skills. Run `memory_bridge.py doctor` to check it; on skew it names which side to upgrade.
 
@@ -99,7 +99,7 @@ Each is idempotent and safe to re-run; each step links the manual equivalent.
 
 6. **Start the reasoning LLM.** The embedder and reranker already came up with the compose stack (step 3); you only need your reasoning LLM on `:5000` — LM Studio or any OpenAI-compatible server ([§7](#7-inference-backends-llamacpp)).
 
-7. **Start the gateway.** `uv run --with aiohttp --with asyncpg --with neo4j --with httpx python shared-memory/scripts/hive_mind_proxy.py 8888` — this also launches the REM and NREM daemons ([§9](#9-starting-the-full-stack)). Verify: `curl http://localhost:8888/health` should report `"status":"ok"`, `"auth_required":true`, and `"embedder":"ok"` before you save any artifacts.
+7. **Start the gateway.** `uv run --with aiohttp --with asyncpg --with neo4j --with httpx python shared-memory/scripts/hive_mind_proxy.py 8888` — this also launches the REM and NREM daemons ([§9](#9-starting-the-full-stack)). Verify: `curl http://localhost:8888/health` should report `"status":"ok"`, `"auth_required":true`, and `"embedder":"ok"` before you save any artifacts. For a gateway that survives logout and reboot, install the `systemd --user` unit in [`shared-memory/ops/`](shared-memory/ops/) rather than leaving it in a terminal — a session-launched gateway is killed on teardown.
 
 8. **Install the skill into your agent.** The skill is a **thin client** — only `memory_bridge.py` ships with it (the daemons stay on the gateway host from step 7). Symlink/copy `SKILL.md` + `memory_bridge.py` into the agent's skills directory ([§10](#10-agent-integration-first-time-setup); remote/laptop clients → [§10a](#10a-remote-clients-ssh-tunnel-access)). Shortcut: just tell your agent — *"clone this repo and install the shared-memory skill per README §10."*
 
