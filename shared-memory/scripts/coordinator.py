@@ -53,7 +53,7 @@ log = logging.getLogger("coordinator")
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.4.6"
+FRAMEWORK_VERSION = "0.4.7"
 API_VERSION = 1
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
