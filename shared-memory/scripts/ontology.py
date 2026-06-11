@@ -47,6 +47,7 @@ class OntologyConfig:
     rejected: str = "REJECTED"
     # Consolidation tuning
     density_threshold: int = 5
+    insight_threshold: int = 2
 
 
 def _load() -> OntologyConfig:
@@ -91,6 +92,7 @@ def _load() -> OntologyConfig:
             considered=rels.get("considered", "CONSIDERED"),
             rejected=rels.get("rejected", "REJECTED"),
             density_threshold=int(cons.get("density_threshold", 5)),
+            insight_threshold=int(cons.get("insight_threshold", 2)),
         )
     except FileNotFoundError:
         return OntologyConfig()

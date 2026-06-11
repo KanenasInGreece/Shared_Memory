@@ -157,6 +157,8 @@ uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/s
 **Required:** `--pg-id` (int, returned by `save_decision`), `--rating`, `--notes`
 **Optional:** `--date` (ISO string, default: today), `--source` (default: `$AGENT_ID`)
 
+**`--rating` is free text with one structural value:** `reversed` marks the decision superseded — it disappears from Tier-1 search and never seeds a new cross-project insight (existing insights are re-folded with the reversal recorded as a known limit). Use it only when the decision was actually withdrawn; otherwise rate freely (`high`, `good`, `mixed`, `low`, …) — the wording of `--notes` is what insight synthesis quotes, so write outcome evidence, not just a verdict.
+
 **Why-To loop query (raw Cypher; Phase D will add a named shortcut):**
 ```
 uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py graph \
@@ -235,6 +237,8 @@ Result shape:
 ```
 
 The first result is the **Tier-3 community summary** — the synthesised narrative across all related facts. The second is the **Tier-1 precision hit** — the original decision, with its full provenance chain in `graph_context`.
+
+When a cross-project insight exists, a `"tier": "insight_summary"` result precedes the community summary — a principle synthesised from ≥2 decisions across different projects, validated by at least one retrospective; its `source_pg_ids` are **decision** ids.
 
 ### D. Query the provenance graph
 
@@ -367,7 +371,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness:
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":1,"version":"0.4.4","daemon":"running","rem_daemon":"running",...}
+# → {"status":"ok","api_version":1,"version":"0.4.5","daemon":"running","rem_daemon":"running",...}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -405,7 +409,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.4.4", "api_version": 1, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.4.5", "api_version": 1, "tool": "shared-memory-framework"}`
 - **Operations runbook:** gateway/daemon install + upgrade — [server-setup.md](Documentation/server-setup.md)
 - **Schema:** Neo4j labels, relationship types, Postgres tables — [schema.md](Documentation/schema.md)
 - **Embedding mandate:** All calls route through the gateway (:8888). Never call port 8070 (BGE-M3) or 8071 (BGE-Reranker) directly — the gateway enforces 1024-dim consistency across all agents.

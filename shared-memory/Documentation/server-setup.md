@@ -68,7 +68,7 @@ uv run --with aiohttp --with asyncpg --with neo4j --with httpx \
 
 # 7. Verify.
 curl http://localhost:8888/health
-#    → {"status":"ok","api_version":1,"version":"0.4.4","daemon":"running",...}
+#    → {"status":"ok","api_version":1,"version":"0.4.5","daemon":"running",...}
 ```
 
 The proxy binds to `127.0.0.1:8888` by default. Set `PROXY_BIND=0.0.0.0` only over

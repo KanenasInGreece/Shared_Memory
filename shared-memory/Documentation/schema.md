@@ -18,6 +18,7 @@ Holds every artifact saved by any agent. This is the authoritative fact store.
 | `agent_id` | `TEXT NOT NULL DEFAULT 'legacy'` | Identity of the writing agent; `'legacy'` for pre-coordinator rows |
 | `scope` | `TEXT NOT NULL DEFAULT 'global'` | Namespace for access control; `'global'` = visible to all agents |
 | `visibility` | `TEXT NOT NULL DEFAULT 'global'` | Read policy: `'global'` \| `'scope'` \| `'private'` |
+| `superseded` | `BOOLEAN NOT NULL DEFAULT false` | Decision-level reversal flag (decision pg_id 276). Set when a retrospective with `rating="reversed"` lands on the row; mirrored as `superseded = true` on the graph `:Decision` node. Tier-1 search excludes superseded rows; reversed decisions never seed a fresh insight cluster (re-folds keep them as boundary evidence). Added by migration 009. |
 
 **Indexes:** `technical_docs_embedding_idx` — `ivfflat (embedding vector_cosine_ops)`; btree indexes on `agent_id`, `scope`, `visibility`
 
@@ -55,11 +56,15 @@ Written exclusively by the consolidation daemon. Each row is an LLM-synthesised 
 ```json
 {
   "type": "community_summary",
+  "kind": "thematic",
   "entity": "<Entity.name that anchors the cluster>",
+  "domain": "<COALESCE(project, domain, scope, 'general')>",
   "source_pg_ids": [<list of technical_docs.id values that were consolidated>],
   "timestamp": "<ISO-8601 datetime of this consolidation run>"
 }
 ```
+
+**Insight rows (`kind: "insight"`, decision pg_id 276):** the second consolidation path folds cross-project *decision* clusters. Same table, distinguished by metadata — `kind: "insight"`, `domain: "insight"`, a `projects` array, and `source_pg_ids` containing **decision** ids (disjoint from fact ids, so the two kinds can never supersede each other). Insight rows are **always-INSERT**: they are exempt from the `(entity, domain)` unique upsert (partial index, migration 009) and rely on supersession for dedup — a re-fold on the same source set writes a fresh row that supersedes the old one.
 
 > **Note:** `source_pg_ids` is stored both as the dedicated column above and inside `metadata` JSONB. The column is the authoritative query path; the JSONB key is retained for backwards compatibility with tooling that reads raw metadata.
 
@@ -67,9 +72,9 @@ Written exclusively by the consolidation daemon. Each row is an LLM-synthesised 
 
 **Retrieval role:** queried first on every search — top-1 cosine match is prepended to results as "Global Context Summary" to orient the response before the Tier 1 vector search runs.
 
-**Growth behaviour:** there is **one row per entity**, keyed by `metadata->>'entity'`. Each consolidation cycle replaces the existing row via `ON CONFLICT DO UPDATE` — the new LLM synthesis overwrites `content` and `embedding`, while the previous `content` is appended to `summary_history` (capped at 20 entries). The row ID (`id`) is stable across updates. Retrieval surfaces the embedding-closest `WHERE NOT superseded` match — always the latest non-superseded synthesis for a qualifying entity.
+**Growth behaviour (thematic rows):** one row per `(entity, domain)`, keyed by `metadata->>'entity'` + `metadata->>'domain'` (partial unique index `community_summaries_entity_domain_unique`, migrations 007 + 009 — insight rows exempt). Each consolidation cycle replaces the existing row via `ON CONFLICT DO UPDATE` — the new LLM synthesis overwrites `content` and `embedding`, while the previous `content` is appended to `summary_history` (capped at 20 entries). The row ID (`id`) is stable across updates. Insight rows instead accumulate as inserts and retire via supersession. Retrieval surfaces the embedding-closest `WHERE NOT superseded` match per kind — insight first, then thematic.
 
-**Supersession rule (v0.4.0):** if summary A's `source_pg_ids` is a strict subset of summary B's `source_pg_ids`, A is superseded by B. The consolidation daemon sets `A.superseded = true` in Postgres and writes `(B)-[:SUPERSEDES]->(A)` in Neo4j. Cross-entity supersession is supported — an "Outbox" summary can supersede a "Neo4j" summary if it absorbed all the same source facts.
+**Supersession rule:** if summary A's `source_pg_ids` is **covered by** (subset of, or equal to) summary B's `source_pg_ids`, A is superseded by B. The equal-set case is how an insight re-fold replaces its predecessor. The consolidation daemon sets `A.superseded = true` in Postgres and writes `(B)-[:SUPERSEDES]->(A)` in Neo4j. Cross-entity supersession is supported — an "Outbox" summary can supersede a "Neo4j" summary if it absorbed all the same source facts; insight and thematic rows never collide because their source id spaces (decisions vs facts) are disjoint.
 
 ---
 
@@ -82,7 +87,7 @@ Written by the coordinator on every save, in the same Postgres transaction as `t
 | `id` | `BIGSERIAL PRIMARY KEY` | Monotonic outbox entry ID |
 | `pg_id` | `BIGINT NOT NULL` | References the `technical_docs.id` row this write belongs to |
 | `cypher_params` | `JSONB NOT NULL` | Parameters passed to the Neo4j Cypher write (content snippet, source, entities, etc.) |
-| `status` | `TEXT NOT NULL DEFAULT 'pending'` | Fact lifecycle: `pending` → `in_progress` → `applied` → `rem_reviewed` → `consolidated` → **row deleted**; `failed` is the dead-letter state. `in_progress` means a coordinator instance has claimed the row for Neo4j apply. `applied` means the Neo4j write succeeded. `rem_reviewed` means REM has enriched the fact and verified Neo4j consistency — the durable NREM backlog. `consolidated` is set by NREM **in the same transaction** as the `community_summaries` INSERT the fact was folded into; the row is **deleted** only after the Neo4j consolidation marking succeeds. Rows stuck in `in_progress` after a crash are reset to `pending` on coordinator startup; rows stuck at `consolidated` (crash between the stores) are reconciled by the next ledger sweep, which re-applies the idempotent graph marking and closes them. |
+| `status` | `TEXT NOT NULL DEFAULT 'pending'` | Fact lifecycle: `pending` → `in_progress` → `applied` → `rem_reviewed` → `consolidated` → **row deleted**; `failed` is the dead-letter state. `in_progress` means a coordinator instance has claimed the row for Neo4j apply. `applied` means the Neo4j write succeeded. `rem_reviewed` means REM has enriched the fact and verified Neo4j consistency — the durable NREM backlog. `consolidated` is set by NREM **in the same transaction** as the `community_summaries` INSERT the fact was folded into; the row is **deleted** only after the Neo4j consolidation marking succeeds. Rows stuck in `in_progress` after a crash are reset to `pending` on coordinator startup; rows stuck at `consolidated` (crash between the stores) are reconciled by the next ledger sweep, which re-applies the idempotent graph marking and closes them. **Decision and retrospective rows** follow the same lifecycle through the *insight* path (decision pg_id 276): a fold flips the cluster's decision rows plus the consumed retrospective rows to `consolidated` transactionally with the `kind='insight'` INSERT and deletes them (by row id) after the graph marking. Identify retrospective rows by `cypher_params->>'type'`, never by status. |
 | `retries` | `INT NOT NULL DEFAULT 0` | Incremented on each failed application attempt |
 | `created_at` | `TIMESTAMPTZ DEFAULT now()` | When the outbox row was written |
 | `applied_at` | `TIMESTAMPTZ` | Set when status transitions to `applied` |
@@ -105,7 +110,7 @@ Written by the coordinator on every save, in the same Postgres transaction as `t
 |---|---|---|
 | `Fact` | Outbox worker (on every save) | Primary node — one per `technical_docs` row, keyed by `pg_id` |
 | `Entity` | Outbox worker | Named entity extracted from `metadata["entities"]`; anchors consolidation clusters |
-| `CommunitySummary` | Consolidation daemon | Synthesised thematic narrative — one per Entity hub |
+| `CommunitySummary` | Consolidation daemon | Synthesised narrative, keyed by `pg_id`. Thematic: one per `(entity, domain)` hub. Insight (`kind: "insight"` property, decision pg_id 276): cross-project decision synthesis, accumulates + supersedes. |
 | `ReasoningTrace` | Agent (via `archive_reasoning_trace`) | Root of a reasoning session |
 | `ReasoningStep` | Agent (via `archive_reasoning_trace`) | Individual step within a trace |
 
@@ -115,7 +120,7 @@ Written by the outbox worker when `metadata["type"] == "decision"`.
 
 | Label | Purpose |
 |---|---|
-| `Decision` | An architectural or design decision — keyed by `pg_id`, links to all PROV-O edges |
+| `Decision` | An architectural or design decision — keyed by `pg_id`, links to all PROV-O edges. Lifecycle flags: `rem_processed` (REM enrichment done), `consolidated` (folded into an insight), `superseded` (reversed via `rating="reversed"`). |
 | `Human` | A person who owns or makes a decision (`decided_by` field) |
 | `AIAgent` | An AI tool that assisted in the decision (`assisted_by` list) |
 | `Project` | Project scope — root node for decisions and milestones |
@@ -128,7 +133,7 @@ Written by the outbox worker when `metadata["type"] == "decision"`.
 |---|---|---|
 | `MENTIONS` | `(:Fact)-[:MENTIONS]->(:Entity)` | Outbox worker — from `metadata["entities"]`; required for consolidation clustering |
 | `REPORTS_ON` | `(:Fact)-[:REPORTS_ON]->(:Entity)` | Legacy alias; accepted by consolidation query. Use `MENTIONS` for new saves. |
-| `SUMMARIZED_BY` | `(:Fact)-[:SUMMARIZED_BY]->(:CommunitySummary)` | Consolidation daemon after synthesis |
+| `SUMMARIZED_BY` | `(:Fact\|:Decision)-[:SUMMARIZED_BY]->(:CommunitySummary)` | Consolidation daemon after synthesis (Decision source = insight fold) |
 | `NEXT_STEP` | `(:ReasoningStep)-[:NEXT_STEP]->(:ReasoningStep)` | Agent — links consecutive steps in a trace |
 
 ### Provenance relationships (Phase A — PROV-O inspired)
@@ -178,6 +183,10 @@ CREATE (d)-[:HAD_OUTCOME {rating: $rating, date: $date, notes: $notes}]->(d)
 ```
 
 Self-loop pattern — each call creates a new dated edge; multiple retrospectives per Decision are allowed. `date` defaults to today (ISO) if omitted.
+
+**Two roles, one record (decision pg_id 276):** the `HAD_OUTCOME` edge is the **permanent outcome archive** — insight folds read every edge's wording verbatim, including on cumulative re-folds. The outbox row is only the **trigger**: while it is open (`applied`/`rem_reviewed`), the retrospective has not been folded into an insight yet; the fold consumes it (flips to `consolidated`, then deletes after the graph marking). A retro row on a decision in no insight and no qualifying cluster stays open deliberately.
+
+**`rating` semantics:** free text, with one structural value — `"reversed"` marks the target decision `superseded` in `technical_docs` and on the `:Decision` node (excluded from Tier-1 search and from fresh insight clusters). Every other rating carries no enum meaning; its wording reaches Tier 3 through the insight narrative.
 
 ### Provenance query examples
 

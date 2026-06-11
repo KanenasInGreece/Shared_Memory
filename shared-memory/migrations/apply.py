@@ -20,13 +20,6 @@ except ImportError:
 
 MIGRATIONS_DIR = Path(__file__).parent
 
-_pg_pass = os.environ.get("PG_PASSWORD", "")
-PG_CONN = os.environ.get(
-    "PG_CONN",
-    f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data",
-)
-
-
 def _load_env() -> None:
     env_path = MIGRATIONS_DIR.parent.parent / ".env"
     if not env_path.exists():
@@ -39,9 +32,20 @@ def _load_env() -> None:
         os.environ.setdefault(key.strip(), val.strip())
 
 
+def _pg_conn() -> str:
+    """Build the DSN AFTER _load_env() has populated the environment. Computing
+    it at module import (before _load_env runs in main) froze an empty password
+    into the DSN and broke auth when PG_PASSWORD lived only in .env."""
+    pg_pass = os.environ.get("PG_PASSWORD", "")
+    return os.environ.get(
+        "PG_CONN",
+        f"postgresql://postgres:{pg_pass}@localhost:5432/agent_data",
+    )
+
+
 def apply(sql_file: Path) -> None:
     sql = sql_file.read_text()
-    conn = psycopg2.connect(PG_CONN)
+    conn = psycopg2.connect(_pg_conn())
     try:
         with conn:
             with conn.cursor() as cur:

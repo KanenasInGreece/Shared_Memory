@@ -358,3 +358,32 @@ async def test_llm_process_uses_configured_temperature(monkeypatch):
     assert captured["temperature"] == REM_TEMPERATURE
     assert captured["temperature"] != 0.1   # no longer the Qwen-tuned constant
     assert isinstance(REM_TEMPERATURE, float)
+
+
+@pytest.mark.asyncio
+async def test_mark_outbox_rem_reviewed_excludes_retro_rows():
+    """A retrospective shares its target decision's pg_id with a HIGHER row
+    id — without the type filter the mark lands on the retro row and the
+    decision row stays 'applied' (fact pg_id 269 gotcha; ledger statuses
+    must stay honest for the insight triggers)."""
+    daemon, _ = _make_daemon()
+
+    executed = []
+
+    class _Cur:
+        def execute(self, sql, params=None):
+            executed.append((" ".join(sql.split()), params))
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc):
+            return False
+
+    conn = MagicMock()
+    conn.cursor = MagicMock(return_value=_Cur())
+
+    await daemon._mark_outbox_rem_reviewed(42, conn, asyncio.get_running_loop())
+
+    sql, params = executed[0]
+    assert "!= 'retrospective'" in sql
+    assert "status = 'applied'" in sql
+    assert params == (42,)
