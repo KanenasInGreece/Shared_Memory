@@ -5,6 +5,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.4.10] — 2026-06-12
+
+### Added
+
+- **Guided install scripts in `shared-memory/scripts/` — a fresh gateway host goes clone → running with three idempotent commands.**
+  - `preflight.sh` — read-only prerequisite doctor: checks Docker + daemon, `docker compose` v2, `uv`, and a populated `.env`; warns on low RAM/disk and missing `nvtop`. Exits non-zero on any hard failure.
+  - `init_db.sh` — initialises **both** stores: applies `schema_init.sql` to Postgres and `neo4j_init.cypher` to Neo4j, running each client *inside* its compose container (`postgres-vector` / `neo4j-memory`), so the host needs neither `psql` nor `cypher-shell`. Waits for readiness; idempotent. Neo4j constraints apply with `--fail-at-end` and, on a Neo4j shared with another system (a label already keyed differently), report the conflict instead of half-applying.
+  - `bootstrap_tokens.sh` — mints one token per agent via `generate_tokens.py`, appends `AGENT_TOKENS` (+ read-only `AGENT_ROLES`) to the gateway `.env`, and prints each agent's own `AGENT_TOKEN` to distribute. Refuses to overwrite an existing registry (which would invalidate every agent's token); `--force` rotates all tokens.
+
+### Changed
+
+- **Quick Start rewritten around the scripts.** Step 2 runs `preflight.sh`, step 4 collapses the two manual schema commands into `init_db.sh`, step 5 uses `bootstrap_tokens.sh` — each step still links its manual equivalent. §6 updated to present `init_db.sh` as the easy path with the by-hand commands as alternatives; the stale "Quick Start step 3" cross-reference for Neo4j is fixed.
+- The install scripts read `.env` values key-by-key rather than `source`-ing the file — `.env` values may contain spaces (e.g. `PROJECT_ALIASES`) that bash `source` mis-parses.
+
+---
+
 ## [0.4.9] — 2026-06-11
 
 ### Added
