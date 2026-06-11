@@ -74,7 +74,7 @@ The framework has two distinct surfaces with separate lifecycles. Conflating the
 
 **Software:** Docker + Docker Compose · [`uv`](https://docs.astral.sh/uv/) (recommended — every command here uses it; or Python 3.11+ with `pip`) · a server for your reasoning LLM on `:5000` (LM Studio, or any OpenAI-compatible endpoint) — the embedder and reranker run as Docker containers from the compose file, so they need no separate install · at least one consumer that talks to the memory: a **CLI agent** (Claude Code, Antigravity CLI, Grok, or Codex CLI) and/or **LM Studio** — which serves a model and provides a chat interface, reaching the memory through MCP rather than as an agent.
 
-**Reasoning LLM (your choice, on `:5000`):** any OpenAI-compatible local endpoint works. We run **Qwen3-27B**; on the 8 GB lean tier a 7–8B model (e.g. Qwen3-8B) is the practical pick. That choice of model may affect the quality of your graph -- my experience with this is reflected in [**GraphRAG's Hidden Cost**](https://www.linkedin.com/pulse/graphrags-hidden-cost-youre-always-paying-question-when-motsenigos-w81pc/).
+**Reasoning LLM (your choice, on `:5000`):** any OpenAI-compatible local endpoint works. We run **google/gemma-4-12b** — tested and quality-validated for REM enrichment and NREM consolidation, and meaningfully faster and less resource-demanding than the larger models we benchmarked previously. Load it **text-only** (no multimodal projector); set `DREAM_TEMPERATURE=0.6` (Gemma degrades at lower temperatures). On the 8 GB lean tier a 7–8B model is the practical pick. That choice of model may affect the quality of your graph — my experience with this is reflected in [**GraphRAG's Hidden Cost**](https://www.linkedin.com/pulse/graphrags-hidden-cost-youre-always-paying-question-when-motsenigos-w81pc/).
 
 **Optional — [`nvtop`](https://github.com/Syllo/nvtop) for GPU-aware dreaming:** if installed, REM/NREM yield while the GPU running your LLM is busy, so consolidation never competes with active inference. It works across Nvidia/AMD/Intel via one `nvtop --snapshot` call. Without it the daemons still run, falling back to the time-based `WRITE_QUIESCE_SEC` guard ([§13](#13-the-sleep-cycle--rem-and-nrem-consolidation)).
 
@@ -85,7 +85,7 @@ The framework has two distinct surfaces with separate lifecycles. Conflating the
 
 2. **Start the stack (databases + inference).** First put your BGE-M3 and reranker GGUF files in the folder the compose mounts ([§5](#5-infrastructure-setup-docker-compose)). Then `docker compose -f postgres_neo4j_limits.yaml up -d` brings up Postgres, Neo4j, the embedder (`:8070`) and the reranker (`:8071`); `docker compose … ps` should show all four `healthy`.
 
-3. **Create the schema — one command.** `uv run --with psycopg2-binary python shared-memory/migrations/apply.py` brings an empty DB to the latest schema; then run the one-time Neo4j constraints ([§6](#6-database-schema)). *(Upgrading an older install? Same command — see §6.)*
+3. **Create the schema — one command.** Fresh install: `psql -U postgres agent_data < shared-memory/migrations/schema_init.sql` creates the complete schema in one shot. Alternatively, `uv run --with psycopg2-binary python shared-memory/migrations/apply.py` does the same by replaying the migration chain (safe, idempotent). Then run the one-time Neo4j constraints ([§6](#6-database-schema)). *(Upgrading an older install? Use `apply.py` — it skips already-applied steps.)*
 
 4. **Start the reasoning LLM.** The embedder and reranker already came up with the compose stack (step 2); you only need your reasoning LLM on `:5000` — LM Studio or any OpenAI-compatible server ([§7](#7-inference-backends-llamacpp)).
 
@@ -1244,7 +1244,7 @@ Four weeks later, the outbox has been running in production. Any agent can recor
 # LM Studio records the retrospective via MCP tool:
 # save_retrospective(pg_id=42, rating="high",
 #   notes="Held up under multi-agent concurrent load. Outbox replay on crash worked correctly. Neo4j lag < 200 ms typical. No orphaned Fact nodes after 4 weeks.",
-#   source="qwen3-27b")
+#   source="lm_studio")
 
 # Or from the CLI (any agent):
 uv run --with httpx --with python-dotenv \
@@ -1285,7 +1285,7 @@ LM Studio uses the MCP tools from `rag-orchestrator`. The model calls them autom
 Tool: save_artifact
 Args: {
   "content": "The consolidation daemon uses AsyncGraphDatabase (neo4j async driver) so the event loop is never blocked during Neo4j I/O. psycopg2 calls use run_in_executor for the same reason.",
-  "metadata": "{\"source\":\"qwen3-27b\",\"entities\":[\"consolidation_loop\",\"AsyncGraphDatabase\",\"SharedMemory\"]}"
+  "metadata": "{\"source\":\"lm_studio\",\"entities\":[\"consolidation_loop\",\"AsyncGraphDatabase\",\"SharedMemory\"]}"
 }
 ```
 
@@ -1305,8 +1305,8 @@ Args: {
   "decided_by": "Xenofon",
   "project": "shared-memory",
   "rationale": "Sync GraphDatabase inside async def blocked the event loop for every Neo4j round-trip, causing LISTEN/NOTIFY drops under write bursts.",
-  "source": "qwen3-27b",
-  "assisted_by": "qwen3-27b",
+  "source": "lm_studio",
+  "assisted_by": "gemma-4-12b",
   "entities": "AsyncGraphDatabase,consolidation_loop,SharedMemory"
 }
 ```
@@ -1318,7 +1318,7 @@ Args: {
   "pg_id": 42,
   "rating": "high",
   "notes": "No NOTIFY drops observed after migration to async. Event loop latency stable under 6-agent concurrent write test.",
-  "source": "qwen3-27b"
+  "source": "lm_studio"
 }
 ```
 
