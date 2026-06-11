@@ -1,36 +1,35 @@
 #!/usr/bin/env python3
-"""Generate schema_init.sql from the live database schema.
+"""Generate schema_init.sql from the migration chain (via a scratch database).
 
-Run this after apply.py whenever a new migration is added. The output
-replaces schema_init.sql with a fresh, idempotent CREATE TABLE / INDEX file
-that exactly matches the current database state — so new installs stay in
-sync with the migration chain without hand-editing two files.
+Run this after adding a new migration. The generator spins up a throwaway
+database, applies every numbered migration to it (exactly what apply.py does
+on a fresh install), introspects the result, then drops the scratch database
+and writes schema_init.sql. The output is therefore *equivalent to apply.py
+on an empty database by construction* — it can never drift from the migration
+chain the way introspecting a long-lived production database would.
 
 Usage:
     uv run --with psycopg2-binary python shared-memory/migrations/generate_schema_init.py
     uv run --with psycopg2-binary python shared-memory/migrations/generate_schema_init.py --dry-run
 
 Reads PG_PASSWORD / PG_CONN from .env at the repo root (same as apply.py).
-Writes shared-memory/migrations/schema_init.sql.
+Requires privileges to CREATE DATABASE / DROP DATABASE (the postgres role has
+them by default). Writes shared-memory/migrations/schema_init.sql.
 """
 
 import os
 import sys
 import textwrap
-from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 
 try:
     import psycopg2
-    import psycopg2.extras
 except ImportError:
     sys.exit("psycopg2 not available — run with: uv run --with psycopg2-binary python ...")
 
 MIGRATIONS_DIR = Path(__file__).parent
 SCHEMA_FILE = MIGRATIONS_DIR / "schema_init.sql"
-
-# Tables to include, in creation order (dependencies first).
-TABLES = ["technical_docs", "community_summaries", "neo4j_outbox"]
 
 
 def _load_env() -> None:
@@ -53,15 +52,50 @@ def _pg_conn() -> str:
     )
 
 
+def _dsns() -> tuple[str, str, str]:
+    """Return (maintenance_dsn, scratch_dsn, scratch_name).
+
+    Maintenance points at the `postgres` database (for CREATE/DROP DATABASE);
+    scratch is a per-process database we build, introspect, then drop.
+    """
+    u = urlparse(_pg_conn())
+    scratch_name = f"smf_schemagen_{os.getpid()}"
+    maint = urlunparse(u._replace(path="/postgres"))
+    scratch = urlunparse(u._replace(path=f"/{scratch_name}"))
+    return maint, scratch, scratch_name
+
+
+# ── Migration replay (mirrors apply.py) ───────────────────────────────────────
+
+def _numbered_migrations() -> list[Path]:
+    """The NNN_*.sql files only — never schema_init.sql or this script."""
+    return sorted(MIGRATIONS_DIR.glob("[0-9]*.sql"))
+
+
+def _apply_migrations(conn) -> None:
+    for path in _numbered_migrations():
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(path.read_text())
+
+
+# ── Introspection ─────────────────────────────────────────────────────────────
+
+def fetch_tables(cur) -> list[str]:
+    """All base tables in public — discovered, not hardcoded, so a migration
+    that adds a table is captured automatically."""
+    cur.execute("""
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+        ORDER BY table_name
+    """)
+    return [row[0] for row in cur.fetchall()]
+
+
 def fetch_columns(cur, table: str) -> list[dict]:
     cur.execute("""
-        SELECT
-            column_name,
-            data_type,
-            udt_name,
-            character_maximum_length,
-            is_nullable,
-            column_default
+        SELECT column_name, data_type, udt_name, is_nullable, column_default
         FROM information_schema.columns
         WHERE table_schema = 'public' AND table_name = %s
         ORDER BY ordinal_position
@@ -71,9 +105,7 @@ def fetch_columns(cur, table: str) -> list[dict]:
 
 def fetch_indexes(cur, table: str) -> list[dict]:
     cur.execute("""
-        SELECT
-            indexname,
-            indexdef
+        SELECT indexname, indexdef
         FROM pg_indexes
         WHERE schemaname = 'public' AND tablename = %s
         ORDER BY indexname
@@ -81,18 +113,17 @@ def fetch_indexes(cur, table: str) -> list[dict]:
     return [{"name": row[0], "def": row[1]} for row in cur.fetchall()]
 
 
-def fetch_constraints(cur, table: str) -> list[dict]:
+def fetch_pk_columns(cur, table: str) -> set[str]:
     cur.execute("""
-        SELECT
-            conname,
-            contype,
-            pg_get_constraintdef(oid) AS condef
+        SELECT pg_get_constraintdef(oid) AS condef
         FROM pg_constraint
-        WHERE conrelid = %s::regclass
-          AND contype IN ('p', 'u')          -- primary key + unique only
-        ORDER BY conname
+        WHERE conrelid = %s::regclass AND contype = 'p'
     """, (table,))
-    return [{"name": row[0], "type": row[1], "def": row[2]} for row in cur.fetchall()]
+    row = cur.fetchone()
+    if not row:
+        return set()
+    inner = row[0].replace("PRIMARY KEY (", "").rstrip(")")
+    return {s.strip() for s in inner.split(",")}
 
 
 def fetch_extensions(cur) -> list[str]:
@@ -100,13 +131,27 @@ def fetch_extensions(cur) -> list[str]:
     return [row[0] for row in cur.fetchall()]
 
 
-def col_type(col: dict) -> str:
-    """Reconstruct the SQL type string from information_schema columns."""
+def fetch_vector_dims(cur, table: str, column: str) -> int | None:
+    """pgvector stores the dimension directly in atttypmod (unlike varchar)."""
+    cur.execute("""
+        SELECT atttypmod
+        FROM pg_attribute
+        WHERE attrelid = %s::regclass AND attname = %s
+    """, (table, column))
+    row = cur.fetchone()
+    return row[0] if row and row[0] > 0 else None
+
+
+# ── Rendering ──────────────────────────────────────────────────────────────────
+
+def col_type(cur, table: str, col: dict) -> str:
     dt = col["data_type"]
     udt = col["udt_name"]
     if dt == "USER-DEFINED":
-        # e.g. vector(1024) — stored as udt_name='vector'; dimensions in atttypmod
-        return udt  # will be augmented below with dimensions
+        if udt == "vector":
+            dims = fetch_vector_dims(cur, table, col["column_name"])
+            return f"vector({dims})" if dims else "vector"
+        return udt
     if dt == "integer":
         return "INTEGER"
     if dt == "bigint":
@@ -118,96 +163,46 @@ def col_type(col: dict) -> str:
     if dt == "jsonb":
         return "JSONB"
     if dt == "ARRAY":
-        # e.g. integer[]
-        element = udt.lstrip("_")
-        return f"{element.upper()}[]"
+        return f"{udt.lstrip('_').upper()}[]"
     if dt == "timestamp with time zone":
         return "TIMESTAMPTZ"
     return dt.upper()
 
 
-def fetch_vector_dims(cur, table: str, column: str) -> int | None:
-    """Read the vector dimension from pg_attribute.atttypmod."""
-    cur.execute("""
-        SELECT atttypmod
-        FROM pg_attribute
-        WHERE attrelid = %s::regclass AND attname = %s
-    """, (table, column))
-    row = cur.fetchone()
-    if row and row[0] > 0:
-        return row[0]
-    return None
-
-
 def render_column(cur, table: str, col: dict, pk_cols: set[str]) -> str:
     name = col["column_name"]
-    ctype = col_type(col)
-
-    # Augment vector type with dimensions
-    if ctype == "vector":
-        dims = fetch_vector_dims(cur, table, name)
-        if dims:
-            ctype = f"vector({dims})"
-
-    # Reconstruct SERIAL from sequences
+    ctype = col_type(cur, table, col)
     default = col["column_default"] or ""
+
+    # Collapse SERIAL/BIGSERIAL back from the sequence default.
     if "nextval" in default:
-        if ctype in ("INTEGER", "int4"):
-            ctype = "SERIAL"
-        elif ctype in ("BIGINT", "int8"):
-            ctype = "BIGSERIAL"
+        ctype = "BIGSERIAL" if ctype == "BIGINT" else "SERIAL"
         default = ""
 
     parts = [f"    {name:<16} {ctype}"]
     if name in pk_cols:
         parts.append("PRIMARY KEY")
-    elif col["is_nullable"] == "NO" and not default:
+    elif col["is_nullable"] == "NO":
         parts.append("NOT NULL")
-    elif col["is_nullable"] == "NO" and default:
-        parts.append("NOT NULL")
-
     if default and "nextval" not in default:
         parts.append(f"DEFAULT {default}")
-
-    # UNIQUE inline only for content_hash (single-column unique with no partial predicate)
-    # All other unique constraints come out as separate indexes.
-
     return " ".join(parts)
 
 
 def render_table(cur, table: str) -> str:
     cols = fetch_columns(cur, table)
-    constraints = fetch_constraints(cur, table)
-    pk_cols = set()
-    for c in constraints:
-        if c["type"] == "p":
-            # extract column names from PRIMARY KEY (col1, col2, ...)
-            inner = c["def"].replace("PRIMARY KEY (", "").rstrip(")")
-            pk_cols = {s.strip() for s in inner.split(",")}
-
+    pk_cols = fetch_pk_columns(cur, table)
     col_lines = [render_column(cur, table, col, pk_cols) for col in cols]
-
-    lines = [f"CREATE TABLE IF NOT EXISTS {table} ("]
-    lines += [line + "," for line in col_lines[:-1]]
-    lines += [col_lines[-1]]
-    lines += [");"]
-    return "\n".join(lines)
+    body = ",\n".join(col_lines)
+    return f"CREATE TABLE IF NOT EXISTS {table} (\n{body}\n);"
 
 
 def render_indexes(cur, table: str) -> list[str]:
-    """
-    Emit indexes. Skip the primary key index (handled inline).
-    Rewrite as IF NOT EXISTS so the output is idempotent.
-    """
-    idxs = fetch_indexes(cur, table)
     out = []
-    for idx in idxs:
-        name = idx["name"]
-        defn = idx["def"]
-        # Skip auto-generated primary key index
-        if name == f"{table}_pkey":
+    for idx in fetch_indexes(cur, table):
+        if idx["name"] == f"{table}_pkey":   # PK index is implied by the column def
             continue
-        # INSERT IF NOT EXISTS
+        defn = idx["def"]
         defn = defn.replace("CREATE UNIQUE INDEX ", "CREATE UNIQUE INDEX IF NOT EXISTS ")
         defn = defn.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
         out.append(defn + ";")
@@ -216,39 +211,43 @@ def render_indexes(cur, table: str) -> list[str]:
 
 def generate(conn) -> str:
     cur = conn.cursor()
-
-    # Version header
-    version_line = f"-- schema_init.sql — full schema (auto-generated {datetime.now(timezone.utc).strftime('%Y-%m-%d')})"
-
     sections = [
-        textwrap.dedent(f"""\
-        {version_line}
+        textwrap.dedent("""\
+        -- schema_init.sql — full schema for a fresh install.
         --
-        -- USE THIS for new installs: creates the complete schema in one shot without
-        -- replaying the incremental migration chain. Equivalent to running apply.py
-        -- on an empty database. Idempotent (IF NOT EXISTS throughout).
+        -- AUTO-GENERATED from the migration chain — do NOT edit by hand. The
+        -- generator applies every NNN_*.sql migration to a throwaway database and
+        -- introspects the result, so this file is equivalent to running apply.py
+        -- on an empty database by construction.
+        --
+        -- USE THIS for new installs: creates the complete schema in one shot.
+        -- Idempotent (IF NOT EXISTS throughout).
         --
         -- Upgrading an existing install? Use apply.py — it only runs pending migrations.
         --
         -- Regenerate after every new migration:
         --   uv run --with psycopg2-binary python shared-memory/migrations/generate_schema_init.py
         --
+        -- EMBEDDING DIMENSION: vector columns default to 1024-dim for BGE-M3. To use
+        -- a different model, change vector(1024) in 000_base_schema.sql, then
+        -- regenerate. The invariant is that ALL agents share ONE model via the
+        -- gateway — not the specific dimension.
+        --
+        -- Also run neo4j_init.cypher to initialise the Neo4j constraint set.
+        --
         -- Usage:
         --   psql -U postgres agent_data < shared-memory/migrations/schema_init.sql
         """),
+        "BEGIN;\n",
     ]
 
-    sections.append("BEGIN;\n")
-
-    # Extensions
     exts = fetch_extensions(cur)
     if exts:
         sections.append("-- ─── Extensions ────────────────────────────────────────────────────────────")
         for ext in exts:
             sections.append(f"CREATE EXTENSION IF NOT EXISTS {ext};\n")
 
-    # Tables + their indexes
-    for table in TABLES:
+    for table in fetch_tables(cur):
         sections.append(f"-- ─── {table} {'─' * max(1, 75 - len(table))}")
         sections.append(render_table(cur, table))
         idx_lines = render_indexes(cur, table)
@@ -264,12 +263,35 @@ def generate(conn) -> str:
 def main() -> None:
     _load_env()
     dry_run = "--dry-run" in sys.argv
+    maint_dsn, scratch_dsn, scratch_name = _dsns()
 
-    conn = psycopg2.connect(_pg_conn())
+    # 1. Create a clean scratch database.
+    maint = psycopg2.connect(maint_dsn)
+    maint.autocommit = True
     try:
-        ddl = generate(conn)
+        with maint.cursor() as cur:
+            cur.execute(f'DROP DATABASE IF EXISTS "{scratch_name}"')
+            cur.execute(f'CREATE DATABASE "{scratch_name}"')
     finally:
-        conn.close()
+        maint.close()
+
+    try:
+        # 2. Apply the migration chain, then introspect.
+        scratch = psycopg2.connect(scratch_dsn)
+        try:
+            _apply_migrations(scratch)
+            ddl = generate(scratch)
+        finally:
+            scratch.close()
+    finally:
+        # 3. Always drop the scratch database.
+        maint = psycopg2.connect(maint_dsn)
+        maint.autocommit = True
+        try:
+            with maint.cursor() as cur:
+                cur.execute(f'DROP DATABASE IF EXISTS "{scratch_name}"')
+        finally:
+            maint.close()
 
     if dry_run:
         print(ddl)

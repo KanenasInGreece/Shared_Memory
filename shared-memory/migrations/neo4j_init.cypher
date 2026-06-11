@@ -1,16 +1,17 @@
 // neo4j_init.cypher — Neo4j schema for the Shared Memory Framework
 //
-// These constraints are now applied AUTOMATICALLY on every gateway start
-// (coordinator._ensure_neo4j_schema). Run this file manually only to
-// reinitialise a Neo4j instance before the gateway is started for the
-// first time, or to verify the schema on an existing instance.
+// Run this ONCE on a fresh Neo4j instance, before the first gateway start.
+// Neo4j constraints are NOT created automatically — without them, MERGE races
+// can create duplicate Entity / Fact / Decision nodes. This is the Neo4j
+// counterpart to schema_init.sql for Postgres.
 //
 // Usage (cypher-shell):
 //   cypher-shell -u neo4j -p <password> < shared-memory/migrations/neo4j_init.cypher
 // Usage (Neo4j Browser):
 //   Paste and run each statement individually.
 //
-// All statements are idempotent (IF NOT EXISTS). Safe to re-run.
+// All statements are idempotent (IF NOT EXISTS) — safe to re-run on an
+// existing instance to verify or repair the constraint set.
 
 // ── Core nodes ────────────────────────────────────────────────────────────────
 
