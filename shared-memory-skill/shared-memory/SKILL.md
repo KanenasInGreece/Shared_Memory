@@ -64,14 +64,14 @@ Commit findings, decisions, and technical facts to long-term shared memory.
   ```json
   { "content": "<fact>", "metadata": "{\"source\":\"qwen3-27b\",\"entities\":[\"EntityA\",\"EntityB\"]}" }
   ```
-  Set `source` to the **loaded model name** (e.g. `"qwen3-27b"`, `"llama3-70b"`) — not a generic label.
+  The gateway stamps `source` with the authenticated token identity (`lm_studio`); any client value is overridden. For decisions, pass the loaded model name in `assisted_by` to record which model assisted.
 - **CLI (other agents):**
   ```
   uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py save "<content>" \
     '{"source":"<agent_name>","entities":["EntityA","EntityB"]}'
   ```
 
-**`source` is required** — saves without it are rejected with HTTP 400. Use the agent or model name that generated the fact (e.g. `"claude_code"`, `"grok"`, `"qwen3-27b"`).
+**`source`** — the gateway stamps this with the authenticated token identity (`claude`, `gemini`, `lm_studio`, etc.); any client-supplied value is overridden. Pass any non-empty string to satisfy the schema — `entities` and `project` matter more. For non-authenticated (legacy) installs, pass the agent name explicitly.
 
 **`entities` is required for Tier 3 consolidation.** Supply 1–4 named concepts the fact is about. Facts saved without `entities` are stored and searchable but never synthesised into community summaries.
 
