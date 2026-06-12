@@ -91,8 +91,9 @@ Written by the coordinator on every save, in the same Postgres transaction as `t
 | `retries` | `INT NOT NULL DEFAULT 0` | Incremented on each failed application attempt |
 | `created_at` | `TIMESTAMPTZ DEFAULT now()` | When the outbox row was written |
 | `applied_at` | `TIMESTAMPTZ` | Set when status transitions to `applied` |
+| `next_attempt_at` | `TIMESTAMPTZ` | (migration 011) Earliest time a failed row may be retried — set to `now() + exponential·jitter` on each failure so a Neo4j outage backs off instead of re-hammering every drain cycle. `NULL` = eligible immediately (never failed). |
 
-**Index:** partial btree on `status WHERE status = 'pending'` — keeps the worker scan O(backlog), not O(table).
+**Index:** partial btree on `status WHERE status = 'pending'` — keeps the worker scan O(backlog), not O(table). The drain claim also gates on `next_attempt_at IS NULL OR next_attempt_at <= now()`, a cheap filter on the small pending set.
 
 **Decision and retrospective rows are exempt from the ledger tail** (`consolidated`/deletion): their lifecycle ends at `applied`/`rem_reviewed` until the decision-NREM design (insight consolidation, reversal cascade) is ratified. Note that a retrospective row shares its **target decision's** `pg_id`; because REM's outbox mark targets the latest `applied` row for a `pg_id`, retro rows can sit at `rem_reviewed` — they are identified by `cypher_params->>'type'`, never by status.
 

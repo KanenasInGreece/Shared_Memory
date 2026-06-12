@@ -67,6 +67,10 @@ _load_env()
 NEO4J_URI    = "bolt://localhost:7687"
 NEO4J_USER   = "neo4j"
 NEO4J_PASS   = os.environ.get("NEO4J_PASSWORD", "")
+# Bound the driver pool — this daemon shares Neo4j with live gateway traffic;
+# an unbounded default pool can queue indefinitely under contention.
+NEO4J_MAX_POOL        = int(os.environ.get("NEO4J_MAX_POOL", "50"))
+NEO4J_ACQUIRE_TIMEOUT = float(os.environ.get("NEO4J_ACQUIRE_TIMEOUT", "30"))
 _pg_pass     = os.environ.get("PG_PASSWORD", "")
 PG_CONN      = os.environ.get(
     "PG_CONN", f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
@@ -225,7 +229,11 @@ def _resolve_rel(name: str, suggested_rel: str, registry: dict[str, dict]) -> tu
 
 class REMDaemon:
     def __init__(self) -> None:
-        self.driver     = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+        self.driver     = AsyncGraphDatabase.driver(
+            NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS),
+            max_connection_pool_size=NEO4J_MAX_POOL,
+            connection_acquisition_timeout=NEO4J_ACQUIRE_TIMEOUT,
+        )
         self.is_running = True
 
     # ── Postgres connection factory ───────────────────────────────────────────
