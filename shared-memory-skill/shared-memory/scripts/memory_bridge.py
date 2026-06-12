@@ -27,7 +27,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.4.11"
+VERSION = "0.4.12"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 API_VERSION = 1
@@ -105,7 +105,17 @@ def _append_log(tool: str, min_level: int, event: str, data: dict, content: str 
                     f"content is {len(content.encode())} bytes"
                     " — reduce log level to avoid large logs"
                 )
-        with open(os.path.join(log_dir, f"{tool}.log"), "a") as f:
+        # Create 0600 if absent and tighten an existing world-readable file —
+        # logs may carry agent activity; keep them owner-only. (merge_logs rotates
+        # these per-tool logs daily; the gateway-side logs use log_hygiene.)
+        log_path = os.path.join(log_dir, f"{tool}.log")
+        if not os.path.exists(log_path):
+            os.close(os.open(log_path, os.O_CREAT | os.O_WRONLY, 0o600))
+        try:
+            os.chmod(log_path, 0o600)
+        except OSError:
+            pass
+        with open(log_path, "a") as f:
             f.write(json.dumps(entry) + "\n")
     except OSError as e:
         print(f"[WARN] shared-memory: audit log unavailable ({e})", file=sys.stderr)
