@@ -5,7 +5,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.4.12] — 2026-06-12
+
+Concurrent-load hardening + a pluggable auth/audit seam (the foundation for the
+planned PoP auth and full agent-auditing work), plus log hygiene: owner-only
+perms, off-event-loop audit writes, and logrotate-managed rotation.
 
 ### Added — log hygiene (perms, off-loop writes, logrotate)
 

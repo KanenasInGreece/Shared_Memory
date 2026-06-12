@@ -986,7 +986,7 @@ printf 'AGENT_TOKEN=tok_<your-token>\nCOORDINATOR_URL=http://localhost:8888\n' \
 ```bash
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version
-# → {"version": "0.4.11", "api_version": 1, "tool": "shared-memory-framework"}
+# → {"version": "0.4.12", "api_version": 1, "tool": "shared-memory-framework"}
 
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py search "test" 3
@@ -1019,7 +1019,7 @@ All three paths route through the coordinator on port 8888. The coordinator owns
 ```bash
 # Check the framework version
 python shared-memory/scripts/memory_bridge.py --version
-# → {"version": "0.4.11", "api_version": 1, "tool": "shared-memory-framework"}
+# → {"version": "0.4.12", "api_version": 1, "tool": "shared-memory-framework"}
 
 # Operational telemetry — outbox health + REM/NREM backlog snapshot (add --json for raw)
 python shared-memory/scripts/memory_bridge.py status
@@ -1778,7 +1778,7 @@ This framework is actively evolving toward a workstation where any number of AI 
 | **Insight consolidation — Phase 3a (v0.4.5)** | NREM's second path folds clusters of ≥2 REM-enriched, non-reversed `:Decision` nodes that share a grounded `:Entity` across ≥2 distinct projects — gated on the **existence** of a `HAD_OUTCOME` edge (never its rating) — into elevated `kind='insight'` `community_summaries`. Always-INSERT with supersession as dedup (migration 009 partial unique index, closing the resurrection trap); a durable decision+retrospective outbox ledger drives the fold. `rating="reversed"` marks a decision superseded in both stores. Retrieval surfaces the nearest insight above the thematic summary as `tier="insight_summary"`. Decision pg_id 276, ADR-015. | ✅ Done |
 | **Verified identity + project normalisation (v0.4.6)** | Auth stamps the verified token identity onto **both** `metadata.source` and the `technical_docs.agent_id` column (was collapsing to `memory_bridge`). `PROJECT_ALIASES` ingress normalisation + `normalize_projects.py` backfill (canonical project = folder name) so the insight gate's ≥2-distinct-projects rule is trustworthy. | ✅ Done |
 | **Fresh-install tooling + onboarding (v0.4.7–v0.4.10)** | Canonical-agent-identity doc fixes (`source` is token-stamped; model names belong in `assisted_by`); `schema_init.sql` generated from the migration chain via a scratch DB (`generate_schema_init.py`, equivalent to `apply.py` by construction); `neo4j_init.cypher` (7 uniqueness constraints); embedding indexes → hnsw (migration 010); guided install scripts (`preflight.sh`, `init_db.sh`, `bootstrap_tokens.sh`) + Quick Start rewritten around them. | ✅ Done |
-| **Concurrent-load hardening + auth/audit seam** | The gateway sheds load instead of hanging under concurrent ingress, ahead of the auth + auditing work below (both amplify per-request load). Bounded asyncpg pool with `POOL_ACQUIRE_TIMEOUT` (saturation → `503 + Retry-After`); `BoundedKeyedLocks` replacing the leaking per-entity lock map; bounded Neo4j driver pools (gateway + both daemons); outbox exponential backoff + jitter (migration 011 `next_attempt_at`) with dead-letter age in `/memory/telemetry`. Auth refactored into a pluggable `resolve_identity()` seam (`_IDENTITY_RESOLVERS` — bearer today, PoP later); thin opt-in per-request audit log (`GATEWAY_AUDIT_LOG_PATH`, JSON-lines, off the DB hot path); optional in-flight load-shed valve; `auth_scheme` on `/health`. 14 new tests; 251 total. | ✅ Done (Unreleased) |
+| **Concurrent-load hardening + auth/audit seam** | The gateway sheds load instead of hanging under concurrent ingress, ahead of the auth + auditing work below (both amplify per-request load). Bounded asyncpg pool with `POOL_ACQUIRE_TIMEOUT` (saturation → `503 + Retry-After`); `BoundedKeyedLocks` replacing the leaking per-entity lock map; bounded Neo4j driver pools (gateway + both daemons); outbox exponential backoff + jitter (migration 011 `next_attempt_at`) with dead-letter age in `/memory/telemetry`. Auth refactored into a pluggable `resolve_identity()` seam (`_IDENTITY_RESOLVERS` — bearer today, PoP later); thin opt-in per-request audit log (`GATEWAY_AUDIT_LOG_PATH`, JSON-lines, off the DB hot path); optional in-flight load-shed valve; `auth_scheme` on `/health`. 14 new tests; 251 total. | ✅ Done (v0.4.12) |
 
 ### In Progress / Planned
 
