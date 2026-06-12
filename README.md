@@ -1477,12 +1477,13 @@ The `consolidated` flag is not permanent. If future ingestion introduces unflagg
 
 ## 14. Audit Logging
 
-There are two independent, opt-in logs:
+There are three independent, opt-in logs:
 
 1. **Per-save logging** — the save path in both `memory_bridge.py` and `vector-skill.py` writes structured JSON entries to per-tool files, gated by `MEMORY_LOG_LEVEL`. Covered first below.
 2. **REM outbox audit log** — the REM daemon (`rem_loop.py`, §13 Phase 1) appends each applied outbox row to a single JSON-lines file, gated by `AUDIT_LOG_PATH`. Covered at the end of this section.
+3. **Gateway per-request audit log** — the auth middleware appends one JSON line per authenticated request (`ts, agent, role, method, path, status, latency_ms, request_id`), gated by `GATEWAY_AUDIT_LOG_PATH`. The observability tier of agent auditing; the write is **off the event loop** (see *Permissions & rotation* below).
 
-Both are **off by default**.
+All are **off by default**.
 
 ### Configuration
 
@@ -1491,6 +1492,7 @@ Both are **off by default**.
 | `MEMORY_LOG_LEVEL` | `0` (off) | Per-save logging: controls which events are logged |
 | `MEMORY_LOG_PATH` | `~/.shared-memory/logs` | Per-save logging: directory where log files are written |
 | `AUDIT_LOG_PATH` | unset (off) | REM outbox audit log: file path; empty/unset disables it |
+| `GATEWAY_AUDIT_LOG_PATH` | unset (off) | Gateway per-request audit log: file path; empty/unset disables it |
 
 ### Log levels
 
@@ -1551,7 +1553,7 @@ If the daemon is not running, per-tool logs accumulate; entries from multiple da
 
 Distinct from the per-save logs above. The per-save logs record what each *agent* did on the save path and are gated by `MEMORY_LOG_LEVEL`. The REM outbox audit log records what the **REM daemon** did on the *write* path — a forensic trail of exactly which Neo4j writes were applied and when.
 
-Set `AUDIT_LOG_PATH` to a writable file path to enable it (unset or empty disables it — the default). During REM enrichment (§13 Phase 1), immediately before each processed outbox row is marked `rem_reviewed`, the daemon appends that row to the file as one JSON line. Unlike the per-save logs, this file is **never rotated or merged** — it is a plain append-only ledger, so point it at a path you rotate externally if it must stay bounded.
+Set `AUDIT_LOG_PATH` to a writable file path to enable it (unset or empty disables it — the default). During REM enrichment (§13 Phase 1), immediately before each processed outbox row is marked `rem_reviewed`, the daemon appends that row to the file as one JSON line. It is a plain append-only ledger; name it `*-audit.jsonl` in the log dir and the **logrotate timer** (see *Permissions & rotation* below) keeps it bounded — no external rotation to wire up by hand.
 
 Each line carries the applied outbox row plus an ingest timestamp:
 
@@ -1567,6 +1569,33 @@ Each line carries the applied outbox row plus an ingest timestamp:
 | `cypher_params` | The parameters applied to Neo4j for this fact |
 | `created_at` | When the outbox row was first written (save time) |
 | `applied_at` | When the outbox worker applied it to Neo4j |
+
+### Gateway per-request audit log (`GATEWAY_AUDIT_LOG_PATH`)
+
+Set `GATEWAY_AUDIT_LOG_PATH` to a writable file path to record one JSON line per **authenticated** request at the auth-middleware seam:
+
+```json
+{"ts":"2026-06-12T11:47:35.808Z","agent":"claude","role":"full","method":"POST","path":"/memory/search","status":200,"latency_ms":5153.6,"request_id":"a9d8779ab446"}
+```
+
+Metadata only — no request bodies, tokens, or content; `path` excludes query strings. It captures agent `/memory/*` calls **and** daemon inference calls (REM/NREM hit `/v1/*` through the gateway with their tokens). It does **not** capture coordinator save-path embeddings (those call the inference backends directly, bypassing the gateway) or auth failures (rejected before an identity is resolved). The write is **off the event loop**: the line is enqueued and a background task appends it via a thread executor (`scripts/log_hygiene.py` → `AsyncLineWriter`), so a slow disk never adds latency to the request path.
+
+### Permissions & rotation
+
+Framework-written log files are created **owner-only (0600)** in a **0700** directory — they can carry agent-activity metadata, so they are never world-readable. Server-side writers (gateway audit, REM audit) go through `scripts/log_hygiene.py`, which enforces these perms on every write; the per-tool client logs set 0600 inline.
+
+Rotation and gzip of the audit logs (`*-audit.jsonl`) are handled by **system `logrotate(8)`**, driven by a `systemd --user` timer (no root) so it matches the gateway's `--user` deployment. The writers open-append-close per line, so logrotate `create` mode is clean — no `copytruncate`, no lost lines. Install (per-user):
+
+```bash
+mkdir -p ~/.config/shared-memory ~/.config/systemd/user
+sed "s#__SM_LOG_DIR__#$HOME/.shared-memory/logs#g" \
+  shared-memory/ops/shared-memory.logrotate > ~/.config/shared-memory/logrotate.conf
+cp shared-memory/ops/shared-memory-logrotate.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now shared-memory-logrotate.timer
+```
+
+Policy (in `ops/shared-memory.logrotate`): `daily`, `maxsize 50M`, `rotate 14`, `compress` + `delaycompress`, `create 0600`. The per-tool *save* logs are not covered here — they are rotated in-process by the NREM daily merge (above). The REM and gateway audit logs no longer need external rotation set up by hand; the timer manages them.
 
 ---
 

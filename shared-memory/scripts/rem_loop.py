@@ -47,6 +47,7 @@ from neo4j import AsyncGraphDatabase
 sys.path.insert(0, os.path.dirname(__file__))
 from ontology import ONT
 from gpu_load import inference_gpu_busy
+from log_hygiene import append_secure
 
 
 # ── Environment ───────────────────────────────────────────────────────────────
@@ -495,10 +496,8 @@ class REMDaemon:
         if not AUDIT_LOG_PATH:
             return
         entry = json.dumps({"ts": datetime.now(timezone.utc).isoformat(), **outbox_row})
-        def _append() -> None:
-            with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as fh:
-                fh.write(entry + "\n")
-        await loop.run_in_executor(None, _append)
+        # append_secure enforces 0600 perms (+0700 dir); rotation is logrotate's job.
+        await loop.run_in_executor(None, append_secure, AUDIT_LOG_PATH, entry)
 
     # ── Neo4j write ───────────────────────────────────────────────────────────
 

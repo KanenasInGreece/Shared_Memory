@@ -205,6 +205,8 @@ async def test_middleware_audits_dispatched_request(tmp_path):
     req = _make_request("/memory/search", auth_header="Bearer tok_abc")
     resp = await mod.auth_middleware(req, _ok_handler)
     assert resp.status == 200
+    # The audit write is now off the event loop (AsyncLineWriter) — drain it.
+    await mod._audit_writer.flush()
     rec = json.loads(logf.read_text().strip())
     assert rec["agent"] == "claude" and rec["status"] == 200 and rec["method"] == "POST"
     assert mod._inflight == 0

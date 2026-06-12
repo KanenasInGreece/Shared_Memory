@@ -1,0 +1,36 @@
+# Shared Memory Framework — rotation for the gateway/REM audit logs.
+#
+# Rotation + gzip are handled here by system logrotate(8); the framework's
+# Python writers only enforce 0600 perms and append (see scripts/log_hygiene.py).
+# The writers open-append-close per line, so logrotate `create` mode is clean:
+# after a rotation the next write reopens the freshly-created file — no
+# copytruncate, no lost lines.
+#
+# Covers ONLY *-audit.jsonl (gateway-audit.jsonl, rem-audit.jsonl, and any
+# future *-audit.jsonl). It deliberately does NOT touch the per-tool client
+# logs ({tool}.log) or the daily shared_memory_YYYY-MM-DD.log.gz archives —
+# those are rotated in-process by consolidation_loop.merge_logs().
+#
+# logrotate does NOT expand `~` or environment variables, so the absolute log
+# dir is substituted at install time. Default: $HOME/.shared-memory/logs
+#
+# Install (per-user, no root — matches the systemd --user gateway deployment):
+#   mkdir -p ~/.config/shared-memory ~/.config/systemd/user
+#   sed "s#__SM_LOG_DIR__#$HOME/.shared-memory/logs#g" \
+#     shared-memory/ops/shared-memory.logrotate > ~/.config/shared-memory/logrotate.conf
+#   cp shared-memory/ops/shared-memory-logrotate.service \
+#      shared-memory/ops/shared-memory-logrotate.timer  ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now shared-memory-logrotate.timer
+#   # one-off check: logrotate -d ~/.config/shared-memory/logrotate.conf   (dry-run)
+
+__SM_LOG_DIR__/*-audit.jsonl {
+    daily
+    maxsize 50M
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0600
+}

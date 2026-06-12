@@ -46,6 +46,7 @@ import httpx
 from aiohttp import web
 from neo4j import AsyncGraphDatabase
 
+from log_hygiene import AsyncLineWriter
 from ontology import ONT
 
 log = logging.getLogger("coordinator")
@@ -255,8 +256,12 @@ def _audit(agent: str, method: str, path: str, status: int,
     connection budget) and a logging failure never surfaces into the request.
     No-op unless GATEWAY_AUDIT_LOG_PATH is set. The identity is the verified agent
     name — when PoP lands the same rows become non-repudiable with no schema change.
+
+    The write goes through _audit_writer (an AsyncLineWriter): the line is enqueued
+    O(1) and a background task does the disk append in an executor, so the write
+    never blocks the event loop. Rotation/gzip is handled by logrotate(8).
     """
-    if not GATEWAY_AUDIT_LOG_PATH:
+    if _audit_writer is None:
         return
     try:
         line = json.dumps({
@@ -269,8 +274,7 @@ def _audit(agent: str, method: str, path: str, status: int,
             "latency_ms": round(latency_ms, 1),
             "request_id": request_id,
         }, separators=(",", ":"))
-        with open(GATEWAY_AUDIT_LOG_PATH, "a") as fh:
-            fh.write(line + "\n")
+        _audit_writer.write(line)
     except Exception as exc:  # never break a request because auditing failed
         log.warning("audit write failed: %s", exc)
 
@@ -395,6 +399,10 @@ GATEWAY_INFLIGHT_MAX = _env_int("GATEWAY_INFLIGHT_MAX", 0)
 # request_id}. Unset = disabled. Identity is the verified agent name — when PoP
 # auth lands, the same rows become non-repudiable with no schema change.
 GATEWAY_AUDIT_LOG_PATH = os.environ.get("GATEWAY_AUDIT_LOG_PATH", "").strip()
+
+# Off-event-loop writer for the audit log (None = auditing disabled). Created at
+# import; its drain task starts lazily on the first write within a running loop.
+_audit_writer = AsyncLineWriter(GATEWAY_AUDIT_LOG_PATH) if GATEWAY_AUDIT_LOG_PATH else None
 
 # NREM dream-cycle backlog gauge (GET /memory/telemetry). A "cycle" is one
 # (entity, domain) cluster that meets the consolidation density threshold —
@@ -602,6 +610,11 @@ class MemoryCoordinator:
             try:
                 await self._outbox_task
             except asyncio.CancelledError:
+                pass
+        if _audit_writer is not None:
+            try:
+                await _audit_writer.aclose()   # flush queued audit lines, stop drain
+            except Exception:
                 pass
         if self._pool:
             await self._pool.close()
