@@ -31,6 +31,7 @@ from coordinator import (
     attach as attach_coordinator,
     auth_middleware,
     _AGENT_TOKENS,
+    AUTH_SCHEME,
     FRAMEWORK_VERSION,
     API_VERSION,
 )
@@ -501,6 +502,9 @@ async def handle_health(request: web.Request) -> web.Response:
     critical_ok = checks["embedder"] == "ok" and checks["reranker"] == "ok"
     checks["status"] = "ok" if critical_ok else "degraded"
     checks["auth_required"] = bool(_AGENT_TOKENS)
+    # Advertise the active auth scheme so clients can detect when the gateway
+    # moves from bearer tokens to PoP (asymmetric-key proof-of-possession).
+    checks["auth_scheme"] = AUTH_SCHEME
 
     return web.json_response(checks, status=200 if critical_ok else 503)
 

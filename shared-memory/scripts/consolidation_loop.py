@@ -17,6 +17,10 @@ from gpu_load import inference_gpu_busy
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_USER = "neo4j"
 NEO4J_PASS = os.environ.get("NEO4J_PASSWORD", "")
+# Bound the driver pool — this daemon shares Neo4j with live gateway traffic;
+# an unbounded default pool can queue indefinitely under contention.
+NEO4J_MAX_POOL = int(os.environ.get("NEO4J_MAX_POOL", "50"))
+NEO4J_ACQUIRE_TIMEOUT = float(os.environ.get("NEO4J_ACQUIRE_TIMEOUT", "30"))
 _pg_pass = os.environ.get("PG_PASSWORD", "")
 PG_CONN = os.environ.get(
     "PG_CONN",
@@ -476,7 +480,11 @@ class ConsolidationDaemon:
         self.pending_pg_ids = set()
         self.last_activity = datetime.now()
         self.first_notification_time = None
-        self.driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+        self.driver = AsyncGraphDatabase.driver(
+            NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS),
+            max_connection_pool_size=NEO4J_MAX_POOL,
+            connection_acquisition_timeout=NEO4J_ACQUIRE_TIMEOUT,
+        )
         self.is_running = True
         self.last_log_merge_date = None
         # datetime.min ⇒ the first idle tick after startup sweeps immediately,

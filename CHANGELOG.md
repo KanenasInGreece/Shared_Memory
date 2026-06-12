@@ -5,6 +5,69 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Changed — concurrent-load hardening
+
+The gateway now sheds load gracefully under concurrent ingress instead of
+hanging, ahead of the planned auth (asymmetric-key + PoP) and agent-auditing
+work, which both amplify per-request load.
+
+- **Bounded Postgres pool with acquire timeout.** `_pool.acquire()` calls now go
+  through `_acquire()`, which bounds the wait by `POOL_ACQUIRE_TIMEOUT` (default
+  5 s). A saturated pool surfaces as `503 + Retry-After` via the auth middleware
+  rather than blocking a caller indefinitely. `POOL_MIN`/`POOL_MAX` are now
+  env-configurable (default 2/20); pool sizing is documented as a system budget
+  against Postgres `max_connections` (coordinator + REM + NREM + LISTEN).
+- **Bounded per-entity lock registry.** The unbounded `dict[str, asyncio.Lock]`
+  (one permanent lock per unique entity, a slow leak) is replaced by
+  `BoundedKeyedLocks` — LRU eviction of *idle* locks past `LOCKS_MAX_SIZE`
+  (default 4096), never evicting a held or awaited lock. This is the bounded-map
+  pattern the future PoP nonce/replay cache reuses.
+- **Neo4j driver pools bounded** in the gateway and both daemons
+  (`NEO4J_MAX_POOL`, `NEO4J_ACQUIRE_TIMEOUT`) — they share Neo4j, so an unbounded
+  default pool could queue indefinitely under contention.
+- **Outbox retry backoff (migration 011).** Failed `neo4j_outbox` rows get a
+  `next_attempt_at` set to `now() + base·2^retries` (capped, jittered), and the
+  drain query skips rows not yet due. A Neo4j outage now backs off instead of
+  re-hammering up to `OUTBOX_BATCH_SIZE` rows every 2 s. `/memory/telemetry`
+  reports the oldest dead-letter (`outbox_failed_oldest_age_seconds`).
+
+### Added — auth/audit seam (foundation for PoP + agent auditing)
+
+- **Pluggable identity resolution.** Auth is now a `resolve_identity()` registry
+  (`_IDENTITY_RESOLVERS`); bearer-token resolution is the only entry today. The
+  PoP overhaul appends a resolver here without touching the middleware, handlers,
+  or audit hook — they only ever see the resolved agent *name*.
+- **Thin per-request audit log.** Opt-in `GATEWAY_AUDIT_LOG_PATH` writes one
+  JSON line per authenticated request (`ts, agent, role, method, path, status,
+  latency_ms, request_id`) at the auth seam, OFF the DB hot path. The
+  observability tier of agent auditing; the verified-identity rows become
+  non-repudiable once PoP lands, with no schema change.
+- **Outer load-shed valve.** Optional `GATEWAY_INFLIGHT_MAX` caps total
+  concurrent in-flight requests (including ones parked on a slow embedding/LLM
+  that hold no DB connection) — returns `503 + Retry-After` when exceeded.
+- **`/health` advertises `auth_scheme`** (`bearer`) so clients can detect when
+  the gateway moves to PoP.
+
+### Tests & migration
+
+- 14 new tests in `tests/test_hardening.py` (bounded-lock eviction, outbox
+  backoff schedule, pluggable identity resolution, audit hook, in-flight
+  load-shed, pool-saturation → 503) — **251 total, all green**.
+- Migration **011** (`next_attempt_at`) applied; `schema_init.sql` regenerated
+  from the chain (the only diff is the new column).
+
+### Roadmap
+
+- §19 adds the next two phases this work sets up: **Agent authentication —
+  Proof-of-Possession** (asymmetric-key + PoP, plugging into the new identity
+  seam) and **Agent auditing — full non-repudiable record** (DB-backed, built on
+  PoP identity, surfaced to the monitor). The current cycle's hardening + thin
+  audit log is the foundation both build on.
+
+---
+
 ## [0.4.11] — 2026-06-12
 
 ### Security

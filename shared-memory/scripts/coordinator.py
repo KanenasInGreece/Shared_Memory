@@ -34,8 +34,11 @@ import json
 import logging
 import math
 import os
+import random
 import re
-from datetime import datetime
+import uuid
+from collections import OrderedDict
+from datetime import datetime, timezone
 from typing import Any
 
 import asyncpg
@@ -46,6 +49,31 @@ from neo4j import AsyncGraphDatabase
 from ontology import ONT
 
 log = logging.getLogger("coordinator")
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an int from the environment, falling back to default on unset/invalid."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("%s: invalid int %r — using default %d", name, raw, default)
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float from the environment, falling back to default on unset/invalid."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning("%s: invalid float %r — using default %s", name, raw, default)
+        return default
+
 
 # ── Version contract ────────────────────────────────────────────────────────────
 # FRAMEWORK_VERSION is the informational build/semver — it changes every release.
@@ -184,21 +212,89 @@ def _read_role_permits(request: web.Request) -> bool:
     return (request.method, path) in _READ_ROLE_ROUTES
 
 
+# ── Pluggable identity resolution ───────────────────────────────────────────────
+#
+# resolve_identity() walks an ordered list of resolvers and returns the first
+# verified agent name. Today only Bearer-token resolution is wired; the planned
+# PoP (asymmetric-key + proof-of-possession) overhaul appends a second resolver
+# here and bumps API_VERSION. Everything downstream — the role check, the audit
+# hook, and every handler — only ever sees the resolved *name*, so none of it
+# changes when the scheme does. (This is the seam PoP plugs into.)
+AUTH_SCHEME = "bearer"
+
+
+def _resolve_bearer(request: web.Request) -> str | None:
+    """Map ``Authorization: Bearer <token>`` to a verified agent name, or None."""
+    parts = request.headers.get("Authorization", "").split(maxsplit=1)
+    if len(parts) != 2 or parts[0] != "Bearer":
+        return None
+    return _AGENT_TOKENS.get(parts[1])
+
+
+_IDENTITY_RESOLVERS = [_resolve_bearer]
+
+
+def resolve_identity(request: web.Request) -> str | None:
+    """First resolver to recognise the request wins; None if none authenticate."""
+    for resolver in _IDENTITY_RESOLVERS:
+        name = resolver(request)
+        if name:
+            return name
+    return None
+
+
+# ── Governance: outer in-flight load-shed valve ─────────────────────────────────
+_inflight = 0
+
+
+# ── Thin per-request audit hook ─────────────────────────────────────────────────
+def _audit(agent: str, method: str, path: str, status: int,
+           latency_ms: float, request_id: str) -> None:
+    """Append one JSON line recording a completed request. Best-effort and OFF the
+    DB hot path: it never touches Postgres (so audit volume can't steal the pool's
+    connection budget) and a logging failure never surfaces into the request.
+    No-op unless GATEWAY_AUDIT_LOG_PATH is set. The identity is the verified agent
+    name — when PoP lands the same rows become non-repudiable with no schema change.
+    """
+    if not GATEWAY_AUDIT_LOG_PATH:
+        return
+    try:
+        line = json.dumps({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent": agent,
+            "role": _AGENT_ROLES.get(agent, "full"),
+            "method": method,
+            "path": path,
+            "status": status,
+            "latency_ms": round(latency_ms, 1),
+            "request_id": request_id,
+        }, separators=(",", ":"))
+        with open(GATEWAY_AUDIT_LOG_PATH, "a") as fh:
+            fh.write(line + "\n")
+    except Exception as exc:  # never break a request because auditing failed
+        log.warning("audit write failed: %s", exc)
+
+
 @web.middleware
 async def auth_middleware(request: web.Request, handler):
-    """DEFAULT DENY — every route requires a valid Bearer token unless explicitly allowlisted."""
+    """DEFAULT DENY, and the single identity → govern → audit choke point.
+
+    Order: resolve a verified identity (pluggable — bearer today, PoP later) →
+    enforce read-only role → shed if over the in-flight cap → dispatch → audit
+    the outcome. A DB pool that stays saturated past POOL_ACQUIRE_TIMEOUT surfaces
+    as asyncio.TimeoutError from a handler's _acquire(); it is mapped here to
+    503 + Retry-After so the gateway sheds load instead of hanging a caller.
+    """
+    global _inflight
     _check_client_version(request)  # logs API skew to the gateway log; never raises
     if not _AGENT_TOKENS:
         return await handler(request)
     if request.path.rstrip("/") in _UNPROTECTED_PATHS or request.path in _UNPROTECTED_PATHS:
         return await handler(request)
-    raw_header = request.headers.get("Authorization", "")
-    parts = raw_header.split(maxsplit=1)
-    if len(parts) != 2 or parts[0] != "Bearer":
-        raise web.HTTPUnauthorized(reason="Authorization: Bearer <token> required")
-    agent_name = _AGENT_TOKENS.get(parts[1])
+
+    agent_name = resolve_identity(request)
     if not agent_name:
-        raise web.HTTPUnauthorized(reason="Unrecognised token")
+        raise web.HTTPUnauthorized(reason="Authorization: a valid Bearer token is required")
     request["authenticated_agent"] = agent_name
     # Read-only roles are confined to the telemetry/graph allowlist. A leaked
     # monitor token therefore cannot save, supersede, or proxy LLM calls.
@@ -206,7 +302,36 @@ async def auth_middleware(request: web.Request, handler):
         raise web.HTTPForbidden(
             reason="Read-only token: this route requires a write-capable agent token",
         )
-    return await handler(request)
+
+    # Outer load-shed valve (disabled when GATEWAY_INFLIGHT_MAX == 0). Caps total
+    # concurrent requests — including ones parked on a slow embedding/LLM call
+    # that hold no DB connection — which the pool timeout alone cannot bound.
+    if GATEWAY_INFLIGHT_MAX and _inflight >= GATEWAY_INFLIGHT_MAX:
+        raise web.HTTPServiceUnavailable(
+            reason="gateway at capacity", headers={"Retry-After": "1"},
+        )
+
+    started    = asyncio.get_running_loop().time()
+    request_id = uuid.uuid4().hex[:12]
+    status     = 500
+    _inflight += 1
+    try:
+        resp = await handler(request)
+        status = resp.status
+        return resp
+    except asyncio.TimeoutError:
+        # DB pool stayed saturated past POOL_ACQUIRE_TIMEOUT — shed, don't hang.
+        status = 503
+        raise web.HTTPServiceUnavailable(
+            reason="database pool saturated", headers={"Retry-After": "1"},
+        )
+    except web.HTTPException as exc:
+        status = exc.status
+        raise
+    finally:
+        _inflight -= 1
+        latency_ms = (asyncio.get_running_loop().time() - started) * 1000
+        _audit(agent_name, request.method, request.path, status, latency_ms, request_id)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -217,6 +342,12 @@ PG_DSN   = os.environ.get(
 NEO4J_URI  = "bolt://localhost:7687"
 NEO4J_AUTH = ("neo4j", os.environ.get("NEO4J_PASSWORD", ""))
 
+# Bound the Neo4j driver pool so a burst of concurrent searches (or daemon
+# traffic sharing this driver) cannot queue indefinitely. acquisition_timeout
+# fails fast instead of blocking forever when the pool is saturated.
+NEO4J_MAX_POOL        = _env_int("NEO4J_MAX_POOL", 50)
+NEO4J_ACQUIRE_TIMEOUT = _env_float("NEO4J_ACQUIRE_TIMEOUT", 30.0)
+
 # Both inference backends are called directly so the coordinator does not
 # route through its own auth middleware (which would require a valid token
 # for an internal call).  External agents still go through :8888 and must
@@ -226,12 +357,44 @@ RERANK_URL = "http://localhost:8071/v1/reranking"
 
 EMBED_RETRIES = 4
 EMBED_BACKOFF = 0.5      # seconds × attempt number  (0.5 s, 1 s, 1.5 s, 2 s)
-POOL_MIN, POOL_MAX = 2, 10
+
+# Pool sizing is a SYSTEM budget, not just a coordinator knob: Postgres
+# max_connections must cover this pool + REM (1 conn) + NREM (per-op) + the
+# LISTEN connection + headroom. POOL_ACQUIRE_TIMEOUT bounds how long a request
+# waits for a free connection — on expiry the request sheds (503 + Retry-After)
+# via auth_middleware instead of hanging the gateway under concurrent load.
+POOL_MIN = _env_int("POOL_MIN", 2)
+POOL_MAX = _env_int("POOL_MAX", 20)
+POOL_ACQUIRE_TIMEOUT = _env_float("POOL_ACQUIRE_TIMEOUT", 5.0)
 
 OUTBOX_POLL_INTERVAL = 2.0   # seconds between outbox drain cycles
 OUTBOX_BATCH_SIZE    = 20    # rows processed per cycle
 OUTBOX_MAX_RETRIES   = 5     # row marked 'failed' after this many Neo4j errors
 CONSISTENCY_TIMEOUT  = 15.0  # seconds to wait for ?consistency=neo4j
+
+# Per-row exponential backoff for failed outbox rows. Without it, a down Neo4j
+# turns the 2 s drain cycle into a retry storm (BATCH_SIZE rows × every poll).
+# A failed row's next_attempt_at is pushed out by base·2^retries (capped),
+# jittered, so a Neo4j outage backs off instead of hammering.
+OUTBOX_BACKOFF_BASE = _env_float("OUTBOX_BACKOFF_BASE", 2.0)   # seconds
+OUTBOX_BACKOFF_MAX  = _env_float("OUTBOX_BACKOFF_MAX", 300.0)  # seconds (cap)
+
+# Per-entity write-lock registry size. Locks are kept only for keys in active
+# use; idle locks are evicted LRU once the registry exceeds this bound, so the
+# map cannot grow unbounded with unique entity names over months of operation.
+LOCKS_MAX_SIZE = _env_int("LOCKS_MAX_SIZE", 4096)
+
+# Outer load-shed valve: cap concurrent in-flight requests at the auth seam.
+# 0 = disabled (default). Complements POOL_ACQUIRE_TIMEOUT — the semaphore caps
+# total requests (incl. those parked on embeddings/LLM that hold no DB conn);
+# the pool timeout protects the DB connection budget specifically.
+GATEWAY_INFLIGHT_MAX = _env_int("GATEWAY_INFLIGHT_MAX", 0)
+
+# Thin per-request observability audit log (JSON-lines, append-only, OFF the DB
+# hot path). Records {ts, agent, role, method, path, status, latency_ms,
+# request_id}. Unset = disabled. Identity is the verified agent name — when PoP
+# auth lands, the same rows become non-repudiable with no schema change.
+GATEWAY_AUDIT_LOG_PATH = os.environ.get("GATEWAY_AUDIT_LOG_PATH", "").strip()
 
 # NREM dream-cycle backlog gauge (GET /memory/telemetry). A "cycle" is one
 # (entity, domain) cluster that meets the consolidation density threshold —
@@ -322,6 +485,65 @@ def _coerce_jsonb_obj(value):
     return value
 
 
+def _outbox_backoff_delay(retries: int) -> float:
+    """Seconds to defer the next attempt of a failed outbox row.
+
+    Exponential in the retry count, capped at OUTBOX_BACKOFF_MAX, then jittered
+    ±50% so concurrent failures don't re-converge on the same instant. Pure (no
+    I/O) so the schedule is unit-testable.
+    """
+    base = min(OUTBOX_BACKOFF_MAX, OUTBOX_BACKOFF_BASE * (2 ** retries))
+    return base * (0.5 + random.random())
+
+
+class BoundedKeyedLocks:
+    """Per-key ``asyncio.Lock`` registry with a bounded number of entries.
+
+    The unbounded ``dict[str, Lock]`` it replaces grew one permanent lock per
+    unique entity name, leaking for the life of the process. Here, idle locks
+    are evicted LRU once the registry passes ``max_size``.
+
+    Safety: a lock is only evicted when it is provably unreferenced — not held
+    (``locked()`` is False) and with no waiters. A just-requested key is moved to
+    MRU before any eviction runs, so a caller that does ``lk = await get(k)``
+    immediately followed by ``await lk.acquire()`` cannot have its lock evicted
+    out from under it (it is the most-recently-used entry, never the LRU victim).
+    Eviction is best-effort: if every over-budget candidate is still in use the
+    map may briefly exceed the bound rather than ever drop a live lock — memory
+    over correctness. This is the same pattern a future PoP nonce/replay cache
+    reuses with a TTL victim test instead of the lock-state test.
+    """
+
+    def __init__(self, max_size: int) -> None:
+        self._max = max(1, max_size)
+        self._locks: "OrderedDict[str, asyncio.Lock]" = OrderedDict()
+        self._mu = asyncio.Lock()
+
+    async def get(self, key: str) -> asyncio.Lock:
+        async with self._mu:
+            lk = self._locks.get(key)
+            if lk is None:
+                lk = asyncio.Lock()
+            self._locks[key] = lk
+            self._locks.move_to_end(key)          # mark MRU — never this call's victim
+            if len(self._locks) > self._max:
+                self._evict_idle()
+            return lk
+
+    def _evict_idle(self) -> None:
+        # Oldest-first; drop only locks nobody is holding or waiting on.
+        for k in list(self._locks.keys()):
+            if len(self._locks) <= self._max:
+                break
+            lk = self._locks[k]
+            waiters = getattr(lk, "_waiters", None)
+            if not lk.locked() and not waiters:
+                del self._locks[k]
+
+    def __len__(self) -> int:                      # for tests / introspection
+        return len(self._locks)
+
+
 # ── Coordinator ───────────────────────────────────────────────────────────────
 
 class MemoryCoordinator:
@@ -335,8 +557,7 @@ class MemoryCoordinator:
     def __init__(self) -> None:
         self._pool: asyncpg.Pool | None = None
         self._neo4j: Any = None
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._locks_mu = asyncio.Lock()
+        self._locks = BoundedKeyedLocks(LOCKS_MAX_SIZE)
         self._outbox_task: asyncio.Task | None = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -346,14 +567,18 @@ class MemoryCoordinator:
             PG_DSN, min_size=POOL_MIN, max_size=POOL_MAX,
             init=self._init_connection,
         )
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             result = await conn.execute(
                 "UPDATE neo4j_outbox SET status='pending' WHERE status='in_progress'"
             )
             recovered = int(result.split()[-1])
             if recovered:
                 log.warning("outbox startup: recovered %d in_progress row(s) → pending", recovered)
-        self._neo4j = AsyncGraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
+        self._neo4j = AsyncGraphDatabase.driver(
+            NEO4J_URI, auth=NEO4J_AUTH,
+            max_connection_pool_size=NEO4J_MAX_POOL,
+            connection_acquisition_timeout=NEO4J_ACQUIRE_TIMEOUT,
+        )
         self._outbox_task = asyncio.create_task(self._outbox_worker(), name="outbox-worker")
         log.info("coordinator ready (pool %d–%d, outbox worker running)", POOL_MIN, POOL_MAX)
         if _AGENT_TOKENS:
@@ -397,11 +622,19 @@ class MemoryCoordinator:
             format="text",
         )
 
+    def _acquire(self):
+        """Acquire a pooled connection, bounded by POOL_ACQUIRE_TIMEOUT.
+
+        asyncpg raises ``asyncio.TimeoutError`` when the pool stays saturated
+        past the timeout. Request handlers let it propagate to auth_middleware,
+        which maps it to 503 + Retry-After — the gateway sheds load instead of
+        blocking a caller on the pool forever. Background tasks (outbox worker)
+        catch it in their own loop and retry on the next cycle.
+        """
+        return self._pool.acquire(timeout=POOL_ACQUIRE_TIMEOUT)
+
     async def _lock_for(self, entity: str) -> asyncio.Lock:
-        async with self._locks_mu:
-            if entity not in self._locks:
-                self._locks[entity] = asyncio.Lock()
-            return self._locks[entity]
+        return await self._locks.get(entity)
 
     async def _embed(self, text: str, client: httpx.AsyncClient) -> list[float]:
         """Embed text via the gateway with exponential-backoff retry."""
@@ -441,7 +674,7 @@ class MemoryCoordinator:
         # Atomically claim rows by flipping status to 'in_progress' before releasing
         # the lock. A concurrent coordinator instance SKIP LOCKs these rows and moves on.
         # Any rows stuck in 'in_progress' after a crash are reset to 'pending' by start().
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             async with conn.transaction():
                 rows = await conn.fetch(
                     """
@@ -449,6 +682,7 @@ class MemoryCoordinator:
                     WHERE id IN (
                         SELECT id FROM neo4j_outbox
                         WHERE status = 'pending' AND retries < $1
+                          AND (next_attempt_at IS NULL OR next_attempt_at <= now())
                         ORDER BY id
                         LIMIT $2
                         FOR UPDATE SKIP LOCKED
@@ -499,7 +733,7 @@ class MemoryCoordinator:
                     entities=params.get("entities", []),
                     **( {"source_ref": source_ref} if source_ref else {} ),
                 )
-            async with self._pool.acquire() as conn:
+            async with self._acquire() as conn:
                 await conn.execute(
                     "UPDATE neo4j_outbox SET status='applied', applied_at=now() WHERE id=$1",
                     outbox_id,
@@ -510,7 +744,7 @@ class MemoryCoordinator:
                 "outbox: neo4j write failed pg_id=%d attempt %d/%d: %s",
                 pg_id, retries + 1, OUTBOX_MAX_RETRIES, exc,
             )
-            async with self._pool.acquire() as conn:
+            async with self._acquire() as conn:
                 if retries + 1 >= OUTBOX_MAX_RETRIES:
                     # Atomic: bump retries AND flip status in one statement
                     await conn.execute(
@@ -522,9 +756,15 @@ class MemoryCoordinator:
                         pg_id, retries + 1,
                     )
                 else:
+                    # Exponential backoff with jitter so a Neo4j outage backs off
+                    # rather than re-hammering BATCH_SIZE rows every poll cycle.
+                    delay = _outbox_backoff_delay(retries)
                     await conn.execute(
-                        "UPDATE neo4j_outbox SET retries=retries+1, status='pending' WHERE id=$1",
-                        outbox_id,
+                        "UPDATE neo4j_outbox"
+                        " SET retries=retries+1, status='pending',"
+                        "     next_attempt_at = now() + make_interval(secs => $2)"
+                        " WHERE id=$1",
+                        outbox_id, delay,
                     )
 
     async def _apply_decision_outbox_row(
@@ -572,7 +812,7 @@ class MemoryCoordinator:
                 assisted_by=decision.get("assisted_by", []),
                 entities=params.get("entities", []),
             )
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute(
                 "UPDATE neo4j_outbox SET status='applied', applied_at=now() WHERE id=$1",
                 outbox_id,
@@ -603,7 +843,7 @@ class MemoryCoordinator:
                 date=retro.get("date", ""),
                 notes=retro.get("notes", ""),
             )
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute(
                 "UPDATE neo4j_outbox SET status='applied', applied_at=now() WHERE id=$1",
                 outbox_id,
@@ -615,7 +855,7 @@ class MemoryCoordinator:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + CONSISTENCY_TIMEOUT
         while loop.time() < deadline:
-            async with self._pool.acquire() as conn:
+            async with self._acquire() as conn:
                 row = await conn.fetchrow(
                     "SELECT status FROM neo4j_outbox WHERE pg_id=$1 ORDER BY id DESC LIMIT 1",
                     pg_id,
@@ -718,15 +958,17 @@ class MemoryCoordinator:
             return web.json_response({"status": "error", "message": str(exc)}, status=503)
 
         # Acquire per-entity write locks (sorted to prevent deadlocks across concurrent saves).
-        # Track only the locks we actually acquired: if acquire() is cancelled mid-list,
-        # the finally block releases only what we hold — avoiding RuntimeError on unacquired locks.
-        entity_locks = [await self._lock_for(e) for e in sorted(set(entities))]
+        # Get-and-acquire each in the sorted loop: merging the fetch with the acquire keeps
+        # the lock at MRU and taken immediately, so the bounded registry can never evict a
+        # lock this save is about to hold. Track only locks actually acquired: if acquire()
+        # is cancelled mid-list, the finally releases only what we hold.
         acquired: list[asyncio.Lock] = []
         try:
-            for lk in entity_locks:
+            for e in sorted(set(entities)):
+                lk = await self._lock_for(e)
                 await lk.acquire()
                 acquired.append(lk)
-            async with self._pool.acquire() as conn:
+            async with self._acquire() as conn:
                 async with conn.transaction():
                     row = await conn.fetchrow(
                         """
@@ -825,7 +1067,7 @@ class MemoryCoordinator:
         if is_reversal:
             retro_payload["superseded"] = True
 
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
                     "SELECT id FROM technical_docs WHERE id=$1 FOR SHARE",
@@ -891,7 +1133,7 @@ class MemoryCoordinator:
 
             if q_vec is None:
                 # Keyword fallback when the embedding service is unavailable
-                async with self._pool.acquire() as conn:
+                async with self._acquire() as conn:
                     rows = await conn.fetch(
                         """
                         SELECT id, content, metadata FROM technical_docs
@@ -917,7 +1159,7 @@ class MemoryCoordinator:
                     ],
                 })
 
-            async with self._pool.acquire() as conn:
+            async with self._acquire() as conn:
                 # Tier 3 — nearest active insight (cross-project principle,
                 # decision 276) surfaces ABOVE the nearest thematic summary.
                 # Disjoint queries, both filtered to non-superseded rows.
@@ -1117,7 +1359,7 @@ class MemoryCoordinator:
                 {"status": "error", "message": "pg_id must be an integer"}, status=400
             )
 
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             row = await conn.fetchrow(
                 """
                 SELECT status, retries, applied_at FROM neo4j_outbox
@@ -1155,9 +1397,16 @@ class MemoryCoordinator:
 
         # Postgres — outbox status, doc + summary counts
         try:
-            async with self._pool.acquire() as conn:
+            async with self._acquire() as conn:
                 outbox = await conn.fetch(
                     "SELECT status, count(*) AS n FROM neo4j_outbox GROUP BY status"
+                )
+                # Dead-letter age: how long the oldest permanently-failed row has
+                # been stuck. A non-null, growing value means Neo4j writes are
+                # being abandoned — the signal a dashboard alerts on.
+                failed_age = await conn.fetchval(
+                    "SELECT EXTRACT(EPOCH FROM now() - min(created_at))::int"
+                    " FROM neo4j_outbox WHERE status='failed'"
                 )
                 docs = await conn.fetchval("SELECT count(*) FROM technical_docs")
                 summ = await conn.fetchrow(
@@ -1169,6 +1418,7 @@ class MemoryCoordinator:
             snap["postgres"] = {
                 "technical_docs": docs,
                 "outbox": {r["status"]: r["n"] for r in outbox},
+                "outbox_failed_oldest_age_seconds": failed_age,
                 "community_summaries": {
                     "total": summ["total"],
                     "superseded": summ["superseded"],
@@ -1262,7 +1512,7 @@ class MemoryCoordinator:
         )
         domain_map: dict[int, str] = {}
         if all_ids:
-            async with self._pool.acquire() as conn:
+            async with self._acquire() as conn:
                 rows = await conn.fetch(
                     "SELECT id, COALESCE(metadata->>'project', metadata->>'domain',"
                     " scope, $2) AS domain FROM technical_docs WHERE id = ANY($1)",
@@ -1292,7 +1542,7 @@ class MemoryCoordinator:
         """Distribution counts a dashboard renders, sourced server-side so a
         read-only client needs no direct Postgres access.
         """
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             record_types = await conn.fetch(
                 "SELECT COALESCE(metadata->>'type','(untagged)') AS key,"
                 " count(*)::int AS count FROM technical_docs GROUP BY 1 ORDER BY count DESC"
