@@ -1,0 +1,9 @@
+[Unit]
+Description=Shared Memory Framework — rotate gateway/REM audit logs
+Documentation=https://github.com/KanenasInGreece/Shared_Memory
+
+[Service]
+Type=oneshot
+# Per-user logrotate with a user-owned state file — no root, no /etc/logrotate.d.
+# %h is the user's home; the config is generated from ops/shared-memory.logrotate.
+ExecStart=/usr/bin/logrotate --state %h/.shared-memory/logrotate.state %h/.config/shared-memory/logrotate.conf

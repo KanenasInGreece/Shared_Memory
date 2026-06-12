@@ -7,6 +7,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — log hygiene (perms, off-loop writes, logrotate)
+
+Framework log files are now owner-only and rotated by default.
+
+- **New `scripts/log_hygiene.py`** (server-side): `secure_path`/`append_secure`
+  enforce **0600** files in a **0700** dir on every write (tightening any
+  existing world-readable file), and `AsyncLineWriter` moves the gateway audit
+  write **off the event loop** — the line is enqueued (O(1), drop-oldest if the
+  bounded queue fills) and a background task appends it via a thread executor, so
+  a slow disk can't add latency to the request path. Sync fallback when no loop
+  is running (non-async callers / tests).
+- **Wired up:** `coordinator._audit` → `AsyncLineWriter` (flushed on `stop()`);
+  `rem_loop._write_audit_log` → `append_secure`; `memory_bridge._append_log` and
+  `consolidation_loop.merge_logs` set 0600 on the files/archives they create.
+- **Rotation via system `logrotate(8)`** (not in-process): `ops/shared-memory.logrotate`
+  (covers `*-audit.jsonl` — `daily`, `maxsize 50M`, `rotate 14`, `compress`,
+  `create 0600`) driven by a `systemd --user` timer
+  (`ops/shared-memory-logrotate.{service,timer}`, no root). Open-append-close
+  writers make `create` mode clean — no `copytruncate`, no lost lines. The
+  per-tool save logs remain rotated in-process by the NREM daily merge.
+- 6 new tests in `tests/test_log_hygiene.py` (**257 total**).
+
 ### Changed — concurrent-load hardening
 
 The gateway now sheds load gracefully under concurrent ingress instead of
@@ -54,7 +76,8 @@ work, which both amplify per-request load.
 
 - 14 new tests in `tests/test_hardening.py` (bounded-lock eviction, outbox
   backoff schedule, pluggable identity resolution, audit hook, in-flight
-  load-shed, pool-saturation → 503) — **251 total, all green**.
+  load-shed, pool-saturation → 503) — all green (**257 total** including the
+  log-hygiene suite below).
 - Migration **011** (`next_attempt_at`) applied; `schema_init.sql` regenerated
   from the chain (the only diff is the new column).
 

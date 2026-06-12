@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily rotation of Shared Memory audit logs
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

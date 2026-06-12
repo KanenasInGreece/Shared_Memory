@@ -461,6 +461,10 @@ def merge_logs(log_dir: str) -> None:
                 for entry in merged:
                     f.write(json.dumps(entry) + "\n")
             os.replace(tmp_path, out_path)
+            try:
+                os.chmod(out_path, 0o600)   # owner-only: merged logs carry agent activity
+            except OSError:
+                pass
             logger.info(f"merge_logs: {len(merged)} entries → {os.path.basename(out_path)}")
         except Exception as e:
             logger.error(f"merge_logs: failed writing {out_path}: {e}")
