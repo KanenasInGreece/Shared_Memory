@@ -32,6 +32,28 @@ IDLE_THRESHOLD_SEC = 60  # 1 minute for testing, change to 900 for 15 mins
 MAX_DEFERRAL_SEC = IDLE_THRESHOLD_SEC * 3
 DENSITY_THRESHOLD = ONT.density_threshold
 
+# Backup fence: a single well-known Postgres advisory lock shared with the gateway
+# (coordinator.BACKUP_ADVISORY_LOCK_KEY) and the REM daemon. The gateway holds it
+# EXCLUSIVE during a backup dump; each NREM write-cycle takes it SHARED and skips if
+# it can't — so consolidation never writes mid-dump. MUST match the coordinator's key.
+BACKUP_ADVISORY_LOCK_KEY = int(os.environ.get("BACKUP_ADVISORY_LOCK_KEY", "8765309"))
+
+
+def _try_backup_shared_lock():
+    """Open a dedicated autocommit conn and take the SHARED backup advisory lock.
+    Returns the conn (caller MUST close it to release) if acquired, or None if the
+    gateway holds the EXCLUSIVE lock (a backup is dumping) so the caller skips the
+    cycle. Session-scoped — auto-releases on conn close or process death.
+    """
+    conn = psycopg2.connect(PG_CONN, connect_timeout=5)
+    conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock_shared(%s)", (BACKUP_ADVISORY_LOCK_KEY,))
+        if not cur.fetchone()[0]:
+            conn.close()
+            return None
+    return conn
+
 # Interval between global density sweeps. The event-driven path only evaluates
 # clusters touched by a fresh save, but eligibility can change without a save:
 # REM enrichment flips rem_processed=true after the save's notification was
@@ -1321,11 +1343,21 @@ class ConsolidationDaemon:
                         if not forced and await inference_gpu_busy():
                             logger.warning("NREM: inference GPU busy — deferring consolidation; will re-check next cycle.")
                         else:
-                            if forced:
-                                logger.info(f"Hard backstop reached ({seconds_since_first:.1f}s). Forcing consolidation (ignoring GPU activity).")
+                            # Backup fence: SHARED advisory lock held across the cycle.
+                            # If the gateway holds it EXCLUSIVE (backup dumping), defer —
+                            # pending_pg_ids stay intact (cleared only inside the cycle).
+                            gate = await loop.run_in_executor(None, _try_backup_shared_lock)
+                            if gate is None:
+                                logger.info("NREM: backup in progress — deferring consolidation; pending entries kept.")
                             else:
-                                logger.info("Idle threshold reached. Starting consolidation.")
-                            await self.run_consolidation_cycle()
+                                try:
+                                    if forced:
+                                        logger.info(f"Hard backstop reached ({seconds_since_first:.1f}s). Forcing consolidation (ignoring GPU activity).")
+                                    else:
+                                        logger.info("Idle threshold reached. Starting consolidation.")
+                                    await self.run_consolidation_cycle()
+                                finally:
+                                    await loop.run_in_executor(None, gate.close)
                     elif sweep_due(now, self.last_sweep_time, self.last_activity,
                                    bool(self.pending_pg_ids)):
                         # Background hygiene — always yields to active inference;
@@ -1333,23 +1365,33 @@ class ConsolidationDaemon:
                         if await inference_gpu_busy():
                             logger.info("NREM: inference GPU busy — deferring sweep.")
                         else:
-                            if not self._startup_sweep_done:
-                                # Once per process start: the unanchored graph
-                                # sweep covers pre-coordinator facts that have
-                                # no outbox rows; the ledger sweep then does
-                                # the backfill/reconciliation pass.
-                                logger.info("Startup sweep: global graph pass + ledger pass.")
-                                await self.run_global_sweep()
-                                await self.run_ledger_sweep()
-                                self._startup_sweep_done = True
+                            # Backup fence: SHARED advisory lock held across the sweep.
+                            # Deferred if the gateway holds it EXCLUSIVE — last_sweep_time
+                            # is not advanced, so the sweep stays due and retries.
+                            gate = await loop.run_in_executor(None, _try_backup_shared_lock)
+                            if gate is None:
+                                logger.info("NREM: backup in progress — deferring sweep.")
                             else:
-                                logger.info("Sweep interval reached. Starting ledger sweep.")
-                                await self.run_ledger_sweep()
-                            # Insight pass rides every sweep — it is ledger-
-                            # driven (decision/retro rows + graph gate), so it
-                            # needs no fact backlog to be due.
-                            await self.run_insight_cycle()
-                            self.last_sweep_time = datetime.now()
+                                try:
+                                    if not self._startup_sweep_done:
+                                        # Once per process start: the unanchored graph
+                                        # sweep covers pre-coordinator facts that have
+                                        # no outbox rows; the ledger sweep then does
+                                        # the backfill/reconciliation pass.
+                                        logger.info("Startup sweep: global graph pass + ledger pass.")
+                                        await self.run_global_sweep()
+                                        await self.run_ledger_sweep()
+                                        self._startup_sweep_done = True
+                                    else:
+                                        logger.info("Sweep interval reached. Starting ledger sweep.")
+                                        await self.run_ledger_sweep()
+                                    # Insight pass rides every sweep — it is ledger-
+                                    # driven (decision/retro rows + graph gate), so it
+                                    # needs no fact backlog to be due.
+                                    await self.run_insight_cycle()
+                                    self.last_sweep_time = datetime.now()
+                                finally:
+                                    await loop.run_in_executor(None, gate.close)
                 else:
                     # Socket readable — drain notification queue
                     try:

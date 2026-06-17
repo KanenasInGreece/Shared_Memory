@@ -42,7 +42,8 @@ A unified semantic and relational memory layer built from first principles to su
 17. [Testing](#17-testing)
 18. [Open Problems](#18-open-problems)
 19. [Development Roadmap — Multi-Agent Safe Workstation](#19-development-roadmap--multi-agent-safe-workstation)
-20. [References](#20-references)
+20. [Backups & Disaster Recovery](#20-backups--disaster-recovery)
+21. [References](#21-references)
 
 ---
 
@@ -104,6 +105,8 @@ Each is idempotent and safe to re-run; each step links the manual equivalent.
 8. **Install the skill into your agent.** The skill is a **thin client** — only `memory_bridge.py` ships with it (the daemons stay on the gateway host from step 7). Symlink/copy `SKILL.md` + `memory_bridge.py` into the agent's skills directory ([§10](#10-agent-integration-first-time-setup); remote/laptop clients → [§10a](#10a-remote-clients-ssh-tunnel-access)). Shortcut: just tell your agent — *"clone this repo and install the shared-memory skill per README §10."*
 
 9. **Use it.** Activate the skill in your agent — `/shared-memory` (Claude Code, Grok), `$shared-memory` (Codex), `/activate shared-memory` (Antigravity) — and tell the agent to **use the shared-memory skill to recall context before a task and store decisions after** ([§11](#11-agent-access-cli-and-mcp), [§11a](#11a-complete-cycle-end-to-end-workflow-with-cross-agent-examples)). Quick shell smoke test: `memory_bridge.py search "test" 3` ([§10 smoke-test](#10-agent-integration-first-time-setup)).
+
+> **Day-2 — back it up.** Once it's running, schedule `ops/backup.sh` (quiesced, captures **both** Postgres and Neo4j) via cron or the shipped `systemd --user` timer. **Rebuilding a host?** Do steps 3–4 to bring the databases up **empty**, then `ops/restore.sh` instead of starting fresh. Both need an admin token (`AGENT_ROLES=…,backup:admin`). Full detail: [§20](#20-backups--disaster-recovery).
 
 ### Troubleshooting — the first four you'll hit
 
@@ -1798,7 +1801,86 @@ This framework is actively evolving toward a workstation where any number of AI 
 
 ---
 
-## 20. References
+## 20. Backups & Disaster Recovery
+
+Both stores must be backed up. Postgres is the source of truth, **but Neo4j holds
+non-derivable state** — the `HAD_OUTCOME` retrospective edges live only in the
+graph — so a Postgres-only backup cannot rebuild a full system. `ops/backup.sh`
+captures both as one set; `ops/restore.sh` rebuilds a host from it. The framework
+ships the **mechanism**; the **policy** (schedule, retention, destination,
+encryption) is yours, set in the private `.env`.
+
+### What it does
+
+- **Postgres** — `pg_dump -Fc` (online, MVCC-consistent).
+- **Neo4j** — APOC `apoc.export.cypher.all` to the import dir (online; requires
+  `NEO4J_apoc_export_file_enabled=true`, already set in the compose file).
+- **Consistency** — before dumping, the script asks the gateway to **quiesce**:
+  client writes shed (`503 + Retry-After`) and the REM/NREM daemons are fenced by
+  a Postgres advisory lock, then the outbox drains so the two stores are caught
+  up. Reads keep flowing. A `trap` resumes the gateway on any exit, and the
+  gateway's own TTL auto-resumes if the script dies — writes can never wedge.
+- Each set is three files in `BACKUP_DIR`: `*.pgdump`, `*.cypher.gz`, and a
+  `*.manifest.json` (written last; carries sha256 + counts, so its presence marks
+  a complete set).
+
+### Setup
+
+Mint an admin-role token so the script can quiesce the gateway. The admin token is
+**confined to `/admin/*`** — it cannot read or write memory.
+
+```bash
+# Add the token + role to .env, then restart the gateway:
+#   AGENT_TOKENS=...,backup:tok_xxx
+#   AGENT_ROLES=monitor:read,backup:admin
+# Then set the backup knobs in .env (see .env.example): BACKUP_ADMIN_TOKEN,
+# BACKUP_DIR, BACKUP_RETENTION_DAYS, BACKUP_QUIESCE_MAX_SECONDS, ...
+```
+
+### Run
+
+```bash
+bash shared-memory/ops/backup.sh              # full quiesced backup
+bash shared-memory/ops/backup.sh --dry-run    # sizes / free space / retention — no writes, no quiesce
+bash shared-memory/ops/backup.sh --verify     # sha256 + gzip + pg_restore --list on the latest set
+```
+
+Schedule it however you like — **cron**:
+
+```cron
+30 3 * * *  cd /path/to/shared-memory-GitHub && bash shared-memory/ops/backup.sh >> ~/.shared-memory/logs/backup.log 2>&1
+```
+
+…or the shipped **`systemd --user` timer** (`ops/shared-memory-backup.{service,timer}`,
+mirrors the logrotate timer — see `ops/README.md`). Pick one; both are documented.
+
+### Restore (ground-up)
+
+Bring the Postgres + Neo4j containers up **empty**, **stop the gateway** so nothing
+writes, then:
+
+```bash
+bash shared-memory/ops/restore.sh             # restore the latest set
+bash shared-memory/ops/restore.sh NAME        # a specific set
+bash shared-memory/ops/restore.sh --force     # overwrite a non-empty store
+```
+
+`restore.sh` verifies the set's sha256 + integrity **before touching anything**,
+refuses to clobber a non-empty store without `--force`, restores Postgres (source
+of truth) before Neo4j, and reports post-restore counts against the manifest.
+
+`backup.sh` auto-detects Neo4j's import directory (`server.directories.import`), so
+no path configuration is needed across deployments.
+
+> **Existing deployments:** the Neo4j export needs `NEO4J_apoc_export_file_enabled=true`.
+> If your Neo4j container predates this flag, recreate it (`docker compose up -d
+> neo4j` — your data is safe in the mounted volume), **then restart the gateway**
+> (`systemctl --user restart hive-mind-gateway.service`) so it reconnects to the
+> new Neo4j container with a fresh driver.
+
+---
+
+## 21. References
 
 - **AI Memory & Cognition: The Architect's Playbook** (Vishakha Gupta, ApertureData, May 2026) — Proposes the KMC Blueprint (Knowledge · Memory · Context) and the three diagnostic tests used in the [§1 Vision](#1-the-vision-one-brain-many-agents) section: Retrieval, Consolidation, and Lineage. [aperturedata.io/resources/ai-memory-cognition-the-architects-playbook](https://www.aperturedata.io/resources/ai-memory-cognition-the-architects-playbook)
 - **The Geometry of Forgetting** (Barman et al., 2026) — *Exposing the Dimensionality Illusion*. arXiv:2604.06222

@@ -5,6 +5,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Added — cross-store backup & restore (quiesced)
+
+Consistent, scriptable backup of **both** stores and a ground-up restore. Both are
+required because Neo4j holds non-derivable state (the `HAD_OUTCOME` retrospective
+edges); the framework ships the mechanism, while policy (schedule/retention/
+destination/encryption) stays admin-owned in the private `.env`.
+
+- **New `ops/backup.sh`** — `pg_dump -Fc` + Neo4j APOC `apoc.export.cypher.all`
+  (online, no container stop). `flock` single-instance, dump-to-`.tmp` + atomic
+  `mv`, a `*.manifest.json` (sha256 + counts) written last. `--dry-run` reports
+  sizes/free-space/retention with no writes; `--verify` checks sha256 + gzip
+  integrity + `pg_restore --list`. Retention prunes only its own prefix.
+- **New `ops/restore.sh`** — verifies a set's sha256/integrity before touching
+  anything, refuses to clobber a non-empty store without `--force`, restores
+  Postgres (source of truth) before Neo4j, reports counts vs the manifest.
+- **New `ops/shared-memory-backup.{service,timer}`** — optional `systemd --user`
+  timer; cron is documented as the alternative.
+- **Quiesce seam** — new authenticated `POST /admin/backup` (`quiesce`/`resume`)
+  gated by a new **`admin`** `AGENT_ROLES` value (confined to `/admin/*`; cannot
+  read/write memory). While quiesced, client **write** routes shed
+  `503 + Retry-After` at the existing auth chokepoint; reads keep flowing.
+  `/health` exposes `backup_in_progress`. A TTL auto-resumes if the backup script
+  dies, so writes can never wedge.
+- **Daemon fence** — REM/NREM each take a **shared** Postgres advisory lock per
+  cycle and skip if the gateway holds it **exclusive**, so consolidation/enrichment
+  never writes mid-dump. Auto-releases on session death (crash-safe).
+- **Config** — `postgres_neo4j_limits.yaml` sets `NEO4J_apoc_export_file_enabled=true`
+  (existing Neo4j containers must be recreated to pick it up). New `BACKUP_*`
+  knobs documented in `.env.example`.
+
+---
+
 ## [0.4.12] — 2026-06-12
 
 Concurrent-load hardening + a pluggable auth/audit seam (the foundation for the

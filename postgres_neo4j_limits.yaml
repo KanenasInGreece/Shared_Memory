@@ -17,6 +17,9 @@ services:
       # APOC Security Procedures
       - NEO4J_dbms_security_procedures_unrestricted=apoc.*
       - NEO4J_dbms_security_procedures_allowlist=apoc.*
+      # Allow APOC to write the backup export into the mounted /import dir
+      # (ops/backup.sh → apoc.export.cypher.all). Online, no container stop.
+      - NEO4J_apoc_export_file_enabled=true
       # Corrected Neo4j 5 Memory Mapping (Note the double underscores __)
       - NEO4J_server_memory_heap_initial__size=1G
       - NEO4J_server_memory_heap_max__size=2G
