@@ -103,6 +103,22 @@ BATCH_SIZE         = 5     # facts per cycle (LLM calls are the latency bottlene
 ENTITY_SET_LIMIT   = int(os.environ.get("ENTITY_SET_LIMIT", "1500"))
 WRITE_QUIESCE_SEC  = int(os.environ.get("WRITE_QUIESCE_SEC", "30"))  # yield to active writes
 
+# Backup fence: a single well-known Postgres advisory lock shared with the gateway
+# (coordinator.BACKUP_ADVISORY_LOCK_KEY) and the NREM daemon. The gateway holds it
+# EXCLUSIVE during a backup dump; each REM cycle takes it SHARED and skips if it
+# can't — so enrichment never writes mid-dump. MUST match the coordinator's key.
+BACKUP_ADVISORY_LOCK_KEY = int(os.environ.get("BACKUP_ADVISORY_LOCK_KEY", "8765309"))
+
+
+def _take_shared_backup_lock(conn) -> bool:
+    """Non-blocking SHARED acquire of the backup advisory lock on an existing
+    autocommit conn. Returns True if taken (no backup running), False if the
+    gateway holds it EXCLUSIVE. Session-scoped — auto-releases when conn closes.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock_shared(%s)", (BACKUP_ADVISORY_LOCK_KEY,))
+        return bool(cur.fetchone()[0])
+
 # Sampling temperature for the REM enrichment LLM. Default 0.6 suits Gemma-class
 # models, which degrade at very low temperatures; set REM_TEMPERATURE=0.1 in .env
 # for Qwen-class models that prefer near-greedy decoding. DREAM_TEMPERATURE sets
@@ -784,6 +800,12 @@ class REMDaemon:
         # Single AUTOCOMMIT connection shared across all Postgres helpers in this cycle.
         conn = await loop.run_in_executor(None, self._open_pg_conn)
         try:
+            # Backup fence: skip this cycle if a backup holds the EXCLUSIVE advisory
+            # lock. The SHARED lock auto-releases when conn closes in the finally.
+            if not await loop.run_in_executor(None, lambda: _take_shared_backup_lock(conn)):
+                logger.info("REM: backup in progress — deferring enrichment cycle.")
+                return 0
+
             # Yield to active write sessions — don't enrich during a save burst.
             if await self._recent_write_happened(conn, loop):
                 logger.debug(

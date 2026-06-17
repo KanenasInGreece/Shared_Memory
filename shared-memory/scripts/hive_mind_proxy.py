@@ -30,6 +30,7 @@ from coordinator import (
     MemoryCoordinator,
     attach as attach_coordinator,
     auth_middleware,
+    backup_quiesce_active,
     _AGENT_TOKENS,
     AUTH_SCHEME,
     FRAMEWORK_VERSION,
@@ -505,6 +506,9 @@ async def handle_health(request: web.Request) -> web.Response:
     # Advertise the active auth scheme so clients can detect when the gateway
     # moves from bearer tokens to PoP (asymmetric-key proof-of-possession).
     checks["auth_scheme"] = AUTH_SCHEME
+    # True while a backup quiesce is active — the monitor surfaces this as
+    # "backup ongoing", and a client seeing it knows write 503s are expected.
+    checks["backup_in_progress"] = backup_quiesce_active()
 
     return web.json_response(checks, status=200 if critical_ok else 503)
 

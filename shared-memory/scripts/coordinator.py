@@ -172,6 +172,20 @@ _READ_ROLE_ROUTES: set[tuple[str, str]] = {
     ("POST", "/memory/graph"),
 }
 
+# Client WRITE routes — shed (503 + Retry-After) while a backup quiesce is active.
+# Reads (search/graph/telemetry/status) and /health always flow.
+_WRITE_ROUTES: set[tuple[str, str]] = {
+    ("POST", "/memory/save"),
+    ("POST", "/memory/retrospective"),
+}
+
+# Admin-only routes — reachable ONLY by an "admin"-role token, which in turn can
+# reach nothing else (least privilege: a leaked backup token can only pause/resume
+# backups). Backup quiesce/resume is the first such route.
+_ADMIN_ROUTES: set[tuple[str, str]] = {
+    ("POST", "/admin/backup"),
+}
+
 
 def _load_agent_roles() -> dict[str, str]:
     """Parse AGENT_ROLES into an agent_name→role mapping.
@@ -194,10 +208,10 @@ def _load_agent_roles() -> dict[str, str]:
             log.warning("AGENT_ROLES: malformed entry %r (expected name:role)", pair)
             continue
         name, role = (p.strip() for p in pair.split(":", 1))
-        if role not in ("read", "full"):
+        if role not in ("read", "full", "admin"):
             log.warning(
-                "AGENT_ROLES: unknown role %r for %r — expected 'read' or 'full'; "
-                "ignoring (agent keeps full access)", role, name,
+                "AGENT_ROLES: unknown role %r for %r — expected 'read', 'full', or "
+                "'admin'; ignoring (agent keeps full access)", role, name,
             )
             continue
         result[name] = role
@@ -246,6 +260,35 @@ def resolve_identity(request: web.Request) -> str | None:
 
 # ── Governance: outer in-flight load-shed valve ─────────────────────────────────
 _inflight = 0
+
+# ── Backup quiesce: client-write shed + daemon advisory-lock gate ───────────────
+# While a backup runs, client WRITE routes shed (503 + Retry-After) so the dump
+# sees a quiet database; reads always flow. Set/cleared via POST /admin/backup by
+# an admin-role token. _backup_quiesce mirrors the state for the auth chokepoint
+# and is surfaced on /health as backup_in_progress. The REM/NREM daemons are fenced
+# separately through a Postgres advisory lock (MemoryCoordinator._begin_quiesce):
+# the gateway holds it EXCLUSIVE for the dump, each daemon takes it SHARED per cycle
+# and skips when it can't — so a dump never races a daemon write.
+_backup_quiesce: bool = False
+
+# Single well-known advisory-lock key shared by the gateway (exclusive) and the
+# REM/NREM daemons (shared). MUST match BACKUP_ADVISORY_LOCK_KEY in rem_loop.py and
+# consolidation_loop.py. Postgres drops session advisory locks on disconnect, so a
+# crashed gateway or daemon never wedges the others.
+BACKUP_ADVISORY_LOCK_KEY    = _env_int("BACKUP_ADVISORY_LOCK_KEY", 8765309)
+# Seconds the gateway waits for in-flight daemon cycles to release their shared lock
+# before reporting drain_timeout. Bounds the quiesce handshake.
+BACKUP_DAEMON_DRAIN_TIMEOUT = _env_float("BACKUP_DAEMON_DRAIN_TIMEOUT", 45.0)
+# TTL safety net: auto-resume if a backup script dies without calling resume, so a
+# crashed backup can never wedge writes. The script passes its own max_seconds.
+BACKUP_QUIESCE_MAX_SECONDS  = _env_float("BACKUP_QUIESCE_MAX_SECONDS", 900.0)
+# Retry-After (seconds) handed to a write shed while quiesced.
+BACKUP_RETRY_AFTER          = _env_int("BACKUP_RETRY_AFTER", 30)
+
+
+def backup_quiesce_active() -> bool:
+    """True while a backup quiesce is in effect (read by /health and the chokepoint)."""
+    return _backup_quiesce
 
 
 # ── Thin per-request audit hook ─────────────────────────────────────────────────
@@ -300,12 +343,29 @@ async def auth_middleware(request: web.Request, handler):
     if not agent_name:
         raise web.HTTPUnauthorized(reason="Authorization: a valid Bearer token is required")
     request["authenticated_agent"] = agent_name
-    # Read-only roles are confined to the telemetry/graph allowlist. A leaked
-    # monitor token therefore cannot save, supersede, or proxy LLM calls.
-    if _AGENT_ROLES.get(agent_name) == "read" and not _read_role_permits(request):
+    # Role + governance gate. Read-only roles are confined to the telemetry/graph
+    # allowlist; admin-role tokens are confined to /admin/* (and no other role may
+    # reach an admin route); and while a backup quiesce is active the write routes
+    # shed 503 + Retry-After so the dump sees a quiet DB. Reads always flow — so a
+    # leaked monitor token cannot save/supersede/proxy, and a leaked backup token
+    # can only pause/resume backups.
+    role  = _AGENT_ROLES.get(agent_name, "full")
+    route = (request.method, request.path.rstrip("/") or "/")
+    if role == "read" and not _read_role_permits(request):
         raise web.HTTPForbidden(
             reason="Read-only token: this route requires a write-capable agent token",
         )
+    if route in _ADMIN_ROUTES:
+        if role != "admin":
+            raise web.HTTPForbidden(reason="This route requires an admin-role token")
+    else:
+        if role == "admin":
+            raise web.HTTPForbidden(reason="Admin token is confined to /admin/* routes")
+        if _backup_quiesce and route in _WRITE_ROUTES:
+            raise web.HTTPServiceUnavailable(
+                reason="backup in progress — writes are briefly paused",
+                headers={"Retry-After": str(BACKUP_RETRY_AFTER)},
+            )
 
     # Outer load-shed valve (disabled when GATEWAY_INFLIGHT_MAX == 0). Caps total
     # concurrent requests — including ones parked on a slow embedding/LLM call
@@ -567,6 +627,10 @@ class MemoryCoordinator:
         self._neo4j: Any = None
         self._locks = BoundedKeyedLocks(LOCKS_MAX_SIZE)
         self._outbox_task: asyncio.Task | None = None
+        # Backup quiesce: dedicated connection holding the EXCLUSIVE advisory lock
+        # (None = not held), plus the TTL auto-resume task.
+        self._quiesce_conn: Any = None
+        self._quiesce_timer: asyncio.Task | None = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -611,6 +675,7 @@ class MemoryCoordinator:
                 await self._outbox_task
             except asyncio.CancelledError:
                 pass
+        await self._end_quiesce()   # release the backup advisory lock if held
         if _audit_writer is not None:
             try:
                 await _audit_writer.aclose()   # flush queued audit lines, stop drain
@@ -1591,6 +1656,131 @@ class MemoryCoordinator:
         }
 
 
+    # ── POST /admin/backup (quiesce / resume) ─────────────────────────────────
+
+    async def handle_backup(self, request: web.Request) -> web.Response:
+        """Admin control for the backup quiesce. Body: {"state","max_seconds"}.
+
+        state=quiesce → shed client writes immediately and acquire the EXCLUSIVE
+        backup advisory lock, which blocks only until in-flight daemon cycles
+        release their shared lock — so a 200 means "all writers drained, safe to
+        dump". A daemon cycle that outlasts BACKUP_DAEMON_DRAIN_TIMEOUT yields 202
+        (drain_timeout): client writes are still shed, but a daemon may write
+        during the dump, so the caller decides whether to proceed.
+        state=resume → release the lock, clear the flag, cancel the TTL.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        state = (body.get("state") or "").strip().lower()
+        if state == "quiesce":
+            try:
+                max_s = float(body.get("max_seconds") or BACKUP_QUIESCE_MAX_SECONDS)
+            except (TypeError, ValueError):
+                max_s = BACKUP_QUIESCE_MAX_SECONDS
+            drained = await self._begin_quiesce(max_s)
+            return web.json_response(
+                {
+                    "status": "success",
+                    "quiesced": True,
+                    "daemons": "drained" if drained else "drain_timeout",
+                    "ttl_seconds": max_s,
+                },
+                status=200 if drained else 202,
+            )
+        if state == "resume":
+            await self._end_quiesce()
+            return web.json_response({"status": "success", "quiesced": False})
+        return web.json_response(
+            {"status": "error", "message": "state must be 'quiesce' or 'resume'"},
+            status=400,
+        )
+
+    async def _begin_quiesce(self, max_seconds: float) -> bool:
+        """Shed client writes now; acquire the exclusive backup advisory lock to
+        fence the REM/NREM daemons. Returns True once the lock is held (daemons
+        drained), False if an in-flight cycle outlasts the drain timeout. Idempotent:
+        a second call while quiesced only refreshes the TTL.
+        """
+        global _backup_quiesce
+        _backup_quiesce = True
+        # (Re)arm the TTL auto-resume so a dead backup script can't wedge writes.
+        if self._quiesce_timer and not self._quiesce_timer.done():
+            self._quiesce_timer.cancel()
+        self._quiesce_timer = asyncio.create_task(self._quiesce_ttl(max_seconds))
+        # Already holding the exclusive lock → nothing more to do (TTL refreshed).
+        if self._quiesce_conn is not None:
+            return True
+        # Dedicated connection (outside the pool) so the lock auto-releases if this
+        # process dies — Postgres drops session advisory locks on disconnect.
+        try:
+            conn = await asyncpg.connect(PG_DSN)
+        except Exception as exc:
+            log.warning("backup quiesce: could not open advisory-lock connection: %s", exc)
+            return False
+        try:
+            await conn.execute(
+                "SET lock_timeout = '%dms'" % int(BACKUP_DAEMON_DRAIN_TIMEOUT * 1000)
+            )
+            await conn.execute("SELECT pg_advisory_lock($1)", BACKUP_ADVISORY_LOCK_KEY)
+        except Exception as exc:
+            # Daemons did not drain in time (lock_timeout). Leave client writes shed
+            # but report drain_timeout; drop the connection so no half-held lock lingers.
+            log.warning(
+                "backup quiesce: daemons did not drain within %.0fs (%s)",
+                BACKUP_DAEMON_DRAIN_TIMEOUT, exc,
+            )
+            try:
+                await conn.close()
+            except Exception:
+                pass
+            return False
+        self._quiesce_conn = conn
+        log.info(
+            "backup quiesce: client writes shed + daemons fenced "
+            "(exclusive advisory lock %d held)", BACKUP_ADVISORY_LOCK_KEY,
+        )
+        return True
+
+    async def _end_quiesce(self) -> None:
+        """Release the advisory lock, clear the flag, cancel the TTL. Safe to call
+        when not quiesced (idempotent).
+        """
+        global _backup_quiesce
+        _backup_quiesce = False
+        if self._quiesce_timer and not self._quiesce_timer.done():
+            self._quiesce_timer.cancel()
+        self._quiesce_timer = None
+        if self._quiesce_conn is not None:
+            try:
+                await self._quiesce_conn.execute(
+                    "SELECT pg_advisory_unlock($1)", BACKUP_ADVISORY_LOCK_KEY
+                )
+            except Exception:
+                pass
+            try:
+                await self._quiesce_conn.close()
+            except Exception:
+                pass
+            self._quiesce_conn = None
+            log.info("backup quiesce: released — writes and daemons resumed")
+
+    async def _quiesce_ttl(self, max_seconds: float) -> None:
+        """Auto-resume backstop: if no resume arrives within max_seconds, release."""
+        try:
+            await asyncio.sleep(max_seconds)
+        except asyncio.CancelledError:
+            return
+        log.warning(
+            "backup quiesce: TTL of %.0fs expired without resume — auto-resuming",
+            max_seconds,
+        )
+        # Detach self first so _end_quiesce won't cancel this running task mid-cleanup.
+        self._quiesce_timer = None
+        await self._end_quiesce()
+
+
 # ── Registration ──────────────────────────────────────────────────────────────
 
 def attach(app: web.Application, coordinator: MemoryCoordinator) -> None:
@@ -1606,3 +1796,4 @@ def attach(app: web.Application, coordinator: MemoryCoordinator) -> None:
     app.router.add_post("/memory/graph",          coordinator.handle_graph)
     app.router.add_get( "/memory/status/{pg_id}", coordinator.handle_status)
     app.router.add_get( "/memory/telemetry",       coordinator.handle_telemetry)
+    app.router.add_post("/admin/backup",           coordinator.handle_backup)

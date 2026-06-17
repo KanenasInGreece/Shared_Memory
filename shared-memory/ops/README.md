@@ -43,3 +43,38 @@ journalctl --user -u hive-mind-gateway.service -f
 
 `Restart=on-failure` brings it back after a genuine crash; the `enable-linger`
 step is what makes it survive logout and reboot.
+
+## `backup.sh` / `restore.sh` (+ `shared-memory-backup.{service,timer}`)
+
+Consistent backup of **both** stores (Postgres + Neo4j — the latter holds the
+non-derivable `HAD_OUTCOME` retrospective edges) and a ground-up restore. The
+scripts ship the mechanism; **policy (schedule/retention/destination/encryption)
+is yours**, set in the private `.env`. Full reference: [README §20 — Backups &
+Disaster Recovery](../../README.md#20-backups--disaster-recovery).
+
+Before dumping, `backup.sh` quiesces the gateway over `POST /admin/backup`
+(needs a `backup:admin` token — see `.env.example`): client writes shed
+(`503 + Retry-After`), the REM/NREM daemons are fenced by a Postgres advisory
+lock, and the outbox drains. A `trap` resumes on any exit; the gateway's TTL
+auto-resumes if the script dies.
+
+```bash
+bash shared-memory/ops/backup.sh             # full quiesced backup
+bash shared-memory/ops/backup.sh --dry-run   # sizes / space / retention, no writes
+bash shared-memory/ops/backup.sh --verify    # integrity-check the latest set
+bash shared-memory/ops/restore.sh --force    # ground-up restore (see README §20)
+```
+
+### Schedule — cron or the timer (pick one)
+
+```bash
+# Option A — systemd --user timer (mirrors the gateway/logrotate units):
+cp shared-memory/ops/shared-memory-backup.{service,timer} ~/.config/systemd/user/
+# edit WorkingDirectory in the .service to your repo root, then:
+systemctl --user daemon-reload
+systemctl --user enable --now shared-memory-backup.timer
+systemctl --user list-timers shared-memory-backup.timer
+
+# Option B — cron:
+#   30 3 * * *  cd /path/to/shared-memory-GitHub && bash shared-memory/ops/backup.sh >> ~/.shared-memory/logs/backup.log 2>&1
+```
