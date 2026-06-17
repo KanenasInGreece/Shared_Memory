@@ -99,12 +99,16 @@ command -v "$DOCKER"   >/dev/null || die "'$DOCKER' not found"
 command -v python3     >/dev/null || die "python3 not found (needed for JSON parsing)"
 command -v sha256sum   >/dev/null || die "sha256sum not found"
 
-# Pull one scalar out of a JSON object on stdin (dotted path, ints only). Empty on miss.
+# Pull one scalar out of a JSON object on stdin (dotted path). Empty on any
+# miss/parse error — robust to an empty or non-JSON response (no stack trace).
 json_get() { python3 -c 'import sys,json
-d=json.load(sys.stdin)
-for k in sys.argv[1].split("."):
-    d=d.get(k,{}) if isinstance(d,dict) else {}
-print(d if isinstance(d,(int,float,str)) else "")' "$1" 2>/dev/null; }
+try:
+    d=json.load(sys.stdin)
+    for k in sys.argv[1].split("."):
+        d=d.get(k,{}) if isinstance(d,dict) else {}
+    print(d if isinstance(d,(int,float,str)) else "")
+except Exception:
+    print("")' "$1" 2>/dev/null; }
 
 dcurl() { curl -s --max-time 15 "$@"; }
 
