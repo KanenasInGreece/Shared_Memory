@@ -80,10 +80,13 @@ command -v python3   >/dev/null || die "python3 not found"
 command -v sha256sum >/dev/null || die "sha256sum not found"
 
 json_get() { python3 -c 'import sys,json
-d=json.load(sys.stdin)
-for k in sys.argv[1].split("."):
-    d=d.get(k,{}) if isinstance(d,dict) else {}
-print(d if isinstance(d,(int,float,str)) else "")' "$1" 2>/dev/null; }
+try:
+    d=json.load(sys.stdin)
+    for k in sys.argv[1].split("."):
+        d=d.get(k,{}) if isinstance(d,dict) else {}
+    print(d if isinstance(d,(int,float,str)) else "")
+except Exception:
+    print("")' "$1" 2>/dev/null; }
 
 neo4j_q() {
   $DOCKER exec -e NEO4J_PASSWORD="$NEO4J_PASSWORD" "$NEO4J_CONTAINER" \
