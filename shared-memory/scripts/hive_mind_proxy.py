@@ -516,6 +516,14 @@ async def handle_health(request: web.Request) -> web.Response:
 # --------------------------------------------------------------------------- #
 # Startup / shutdown
 # --------------------------------------------------------------------------- #
+def _default_uds_path() -> str:
+    """Per-user runtime socket by default (0700 dir → only this user reaches it,
+    which is exactly right for a single-user box). For a multi-user gateway set
+    GATEWAY_UDS_PATH to a shared location and widen GATEWAY_UDS_MODE."""
+    base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    return os.path.join(base, "shared-memory-gw.sock")
+
+
 async def main() -> None:
     PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8888
 
@@ -543,6 +551,27 @@ async def main() -> None:
     bind_host = os.environ.get("PROXY_BIND", "127.0.0.1")
     site = web.TCPSite(runner, bind_host, PORT)
     await site.start()
+
+    # AF_UNIX listener for kernel-attested person identity (SO_PEERCRED). Local
+    # agents and SSH-forwarded Unix sockets connect here so the gateway reads the
+    # operator's OS account straight from the kernel — see coordinator._peer_identity.
+    # The TCP listener stays up for back-compat (no principal on that path). Disable
+    # by setting GATEWAY_UDS_PATH="".
+    uds_site = None
+    uds_path = os.environ.get("GATEWAY_UDS_PATH")
+    if uds_path is None:
+        uds_path = _default_uds_path()
+    if uds_path:
+        try:
+            if os.path.exists(uds_path):
+                os.unlink(uds_path)          # clear a stale socket from a prior run
+            uds_site = web.UnixSite(runner, uds_path)
+            await uds_site.start()
+            os.chmod(uds_path, int(os.environ.get("GATEWAY_UDS_MODE", "0600"), 8))
+            log.info("### Hive-Mind Proxy on unix:%s [SO_PEERCRED principal]", uds_path)
+        except (OSError, ValueError) as exc:
+            log.warning("UDS listener disabled (%s): %s", uds_path, exc)
+            uds_site = None
 
     log.info("### Hive-Mind Proxy on :%d [aiohttp]", PORT)
     log.info("### /v1/embeddings->8070 | /v1/reranking->8071 | default->5000")
@@ -574,6 +603,8 @@ async def main() -> None:
     # 5. coordinator/proxy cleanup last
     log.info("Stopping listener...")
     await site.stop()
+    if uds_site is not None:
+        await uds_site.stop()
     log.info("Draining in-flight requests...")
     await runner.cleanup()
     if _daemon_proc and _daemon_proc.returncode is None:

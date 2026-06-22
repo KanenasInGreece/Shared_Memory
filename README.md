@@ -1484,7 +1484,7 @@ There are three independent, opt-in logs:
 
 1. **Per-save logging** — the save path in both `memory_bridge.py` and `vector-skill.py` writes structured JSON entries to per-tool files, gated by `MEMORY_LOG_LEVEL`. Covered first below.
 2. **REM outbox audit log** — the REM daemon (`rem_loop.py`, §13 Phase 1) appends each applied outbox row to a single JSON-lines file, gated by `AUDIT_LOG_PATH`. Covered at the end of this section.
-3. **Gateway per-request audit log** — the auth middleware appends one JSON line per authenticated request (`ts, agent, role, method, path, status, latency_ms, request_id`), gated by `GATEWAY_AUDIT_LOG_PATH`. The observability tier of agent auditing; the write is **off the event loop** (see *Permissions & rotation* below).
+3. **Gateway per-request audit log** — the auth middleware appends one JSON line per authenticated request (`ts, agent, role, method, path, status, latency_ms, request_id`, plus `principal` + `connected_from` for the person axis when the client connects over the Unix socket), gated by `GATEWAY_AUDIT_LOG_PATH`. The observability tier of agent auditing; the write is **off the event loop** (see *Permissions & rotation* below). Pair it with the database for a full audit picture — see *Gateway per-request audit log* below.
 
 All are **off by default**.
 
@@ -1578,10 +1578,25 @@ Each line carries the applied outbox row plus an ingest timestamp:
 Set `GATEWAY_AUDIT_LOG_PATH` to a writable file path to record one JSON line per **authenticated** request at the auth-middleware seam:
 
 ```json
-{"ts":"2026-06-12T11:47:35.808Z","agent":"claude","role":"full","method":"POST","path":"/memory/search","status":200,"latency_ms":5153.6,"request_id":"a9d8779ab446"}
+{"ts":"2026-06-22T11:36:29.385Z","agent":"claude","role":"full","method":"POST","path":"/memory/save","status":200,"latency_ms":1083.6,"request_id":"a7b3b9ef2bf2","principal":"xenofon","connected_from":{"uid":1000,"gid":1000,"pid":901177,"login_uid":1000,"login_user":"xenofon","session":"19"}}
 ```
 
 Metadata only — no request bodies, tokens, or content; `path` excludes query strings. It captures agent `/memory/*` calls **and** daemon inference calls (REM/NREM hit `/v1/*` through the gateway with their tokens). It does **not** capture coordinator save-path embeddings (those call the inference backends directly, bypassing the gateway) or auth failures (rejected before an identity is resolved). The write is **off the event loop**: the line is enqueued and a background task appends it via a thread executor (`scripts/log_hygiene.py` → `AsyncLineWriter`), so a slow disk never adds latency to the request path.
+
+**Two identity axes per line.** `agent` is the *tool* (token-verified — `"agent":"claude"` is a server guarantee, not a client claim). `principal` is the *person* — **the OS login account behind the connection, obtained from the kernel via `SO_PEERCRED`** when the client connects over the gateway's Unix socket (`GATEWAY_UDS_PATH`); it is never read from the request and never inferred from the agent, so the operator can neither forge nor repudiate it. `connected_from` is the companion connection fingerprint (`uid/gid/pid` plus the immutable audit `login_uid`/`login_user` and the `session` id — feed `session` to `loginctl show-session <id>` to resolve the remote host of an SSH client). Requests that arrive over plain TCP carry **no** `principal`/`connected_from` (no kernel credential) — recorded as honestly absent, never guessed. Set `GATEWAY_REQUIRE_PRINCIPAL=1` to reject write routes that lack a kernel-attested principal once every writer is on the socket.
+
+> **Audit trail = log + database, together.** The two answer different halves and you need both for a full picture. The **audit log** is the request trail — *who* (agent × person) called *which route*, *when*, *from where*, with what status/latency — but it deliberately carries **no `project` and no record-type** (those live in the request body, not the per-request hook), and its `request_id` is **not** persisted on the stored row, so there is no log→DB join key. The **database** (`technical_docs.metadata`) carries the content axes — `source` (agent), `principal` (person), `type` (`decision`/`fact`), `decision.project`, and the content itself. So a forensic question like *"every decision saved by user `xenofon` on project `shared-memory-GitHub`"* is answered from the DB, not the log:
+>
+> ```sql
+> SELECT id, metadata->>'source', metadata->>'principal',
+>        metadata->'decision'->>'project', metadata->'decision'->>'title'
+> FROM technical_docs
+> WHERE metadata->>'type'='decision'
+>   AND metadata->>'principal'   = 'xenofon'
+>   AND metadata->'decision'->>'project' = 'shared-memory-GitHub';
+> ```
+>
+> The log then corroborates *when and from which session/host* each of those saves happened (match on `agent` + `principal` + timestamp). Neither source alone is sufficient: the log knows the connection but not the project; the DB knows the project but not the connection. (`principal`/`connected_from` are stored in the existing `metadata` JSONB — no schema change — and are queryable in Postgres; they are not yet copied onto the Neo4j nodes, so filter by person in Postgres.)
 
 ### Permissions & rotation
 

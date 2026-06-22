@@ -34,8 +34,11 @@ import json
 import logging
 import math
 import os
+import pwd
 import random
 import re
+import socket
+import struct
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -186,6 +189,14 @@ _ADMIN_ROUTES: set[tuple[str, str]] = {
     ("POST", "/admin/backup"),
 }
 
+# When set, write routes require a kernel-attested principal — i.e. the client must
+# connect over the AF_UNIX listener (SO_PEERCRED), not TCP. OFF by default so the TCP
+# path keeps working during rollout; turn ON once every writer is on the UDS to
+# guarantee every stored fact carries a non-repudiable person identity.
+GATEWAY_REQUIRE_PRINCIPAL = os.environ.get(
+    "GATEWAY_REQUIRE_PRINCIPAL", ""
+).strip().lower() in ("1", "true", "yes", "on")
+
 
 def _load_agent_roles() -> dict[str, str]:
     """Parse AGENT_ROLES into an agent_name→role mapping.
@@ -258,6 +269,107 @@ def resolve_identity(request: web.Request) -> str | None:
     return None
 
 
+# ── Person axis: the principal (OS account), kernel-attested ─────────────────────
+#
+# Identity has two orthogonal axes: the AGENT (which tool — resolved above) and the
+# PRINCIPAL (which human is accountable). The principal is NEVER carried in the
+# request and is NEVER inferred from the agent: it is the OS login account behind
+# the connection, read from the kernel via SO_PEERCRED on the AF_UNIX listener.
+# Local users are their logged-in account; remote users reach the gateway over SSH
+# (which already authenticated them by public key), and the agent process inherits
+# that login UID. The peer cannot lie about it — it is the kernel's word, not a
+# client claim, so the connecting party can neither forge nor repudiate it.
+#
+# Alongside the username we capture the *connection fingerprint* (pid, the immutable
+# audit loginuid, and the audit session id). loginuid is set once by PAM at login
+# and cannot be changed thereafter (kernel audit subsystem), so it survives fork and
+# setuid — a non-repudiable handle on the login session. The session id resolves the
+# remote host on demand via `loginctl show-session <id>` (RemoteHost) — i.e. final
+# resolution to the person is deliberately left to the OS records, not duplicated
+# here. On a TCP transport there is no peer credential, so the principal is honestly
+# None (unknown); the gateway never guesses. (Pre-PoP person-identity foundation —
+# decision pg_id 347.)
+_LOGINUID_UNSET = 0xFFFFFFFF  # /proc/<pid>/loginuid when no login session is attached
+
+
+def _proc_login_context(pid: int) -> dict[str, Any]:
+    """Best-effort, world-readable login fingerprint for a pid: the immutable audit
+    loginuid (+ its username) and the audit session id. Empty dict if unreadable
+    (e.g. hidepid, or the process already exited). Never raises."""
+    ctx: dict[str, Any] = {}
+    try:
+        with open(f"/proc/{pid}/loginuid") as fh:
+            luid = int(fh.read().strip())
+        if 0 <= luid < _LOGINUID_UNSET:
+            ctx["login_uid"] = luid
+            try:
+                ctx["login_user"] = pwd.getpwuid(luid).pw_name
+            except KeyError:
+                pass
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(f"/proc/{pid}/sessionid") as fh:
+            sid = fh.read().strip()
+        if sid and sid != str(_LOGINUID_UNSET):
+            ctx["session"] = sid
+    except OSError:
+        pass
+    return ctx
+
+
+def _peer_identity(request: web.Request) -> dict[str, Any] | None:
+    """Kernel-attested identity of the connecting peer via SO_PEERCRED, or None on a
+    non-UDS transport. Server-derived; the client cannot assert or override any field.
+
+    Returns {user, uid, gid, pid, [login_uid, login_user, session]} — the username is
+    the queryable principal; the rest is the connection fingerprint that lets the
+    audit resolve back to the human against the OS's own records."""
+    transport = request.transport
+    if transport is None:
+        return None
+    sock = transport.get_extra_info("socket")
+    if sock is None or sock.family != socket.AF_UNIX:
+        return None  # TCP/loopback: no kernel peer credential — principal is unknown
+    try:
+        # struct ucred = { pid_t pid; uid_t uid; gid_t gid; } — three native ints.
+        raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        pid, uid, gid = struct.unpack("3i", raw)
+    except (OSError, struct.error):
+        return None
+    ident: dict[str, Any] = {"uid": uid, "gid": gid, "pid": pid}
+    try:
+        ident["user"] = pwd.getpwuid(uid).pw_name
+    except KeyError:
+        ident["user"] = str(uid)  # uid with no passwd entry — record the number
+    ident.update(_proc_login_context(pid))
+    return ident
+
+
+# Fields the server owns on the person axis. The client may never set these: they are
+# stripped from any client payload and re-stamped from the kernel-attested principal.
+_PRINCIPAL_KEYS = ("uid", "gid", "pid", "login_uid", "login_user", "session")
+
+
+def _apply_principal(target: dict[str, Any], principal: dict[str, Any] | None) -> dict[str, Any]:
+    """Stamp the operator identity DETERMINISTICALLY onto a payload dict.
+
+    Whatever the client put in `principal` / `connected_from` is STRIPPED first, then
+    the kernel-attested values (from auth_middleware via SO_PEERCRED) are written. An
+    agent told to "save as someone else" therefore cannot move these — at most it can
+    write a separate narrative claim (e.g. decision.decided_by). When `principal` is
+    None (TCP transport, no kernel credential) the fields are simply absent — honestly
+    unknown, never guessed. The same enforcement applies to every write path."""
+    if not isinstance(target, dict):
+        return target
+    target.pop("principal", None)
+    target.pop("connected_from", None)
+    if principal:
+        target["principal"]      = principal.get("user")
+        target["connected_from"] = {k: principal[k] for k in _PRINCIPAL_KEYS if k in principal}
+    return target
+
+
 # ── Governance: outer in-flight load-shed valve ─────────────────────────────────
 _inflight = 0
 
@@ -293,7 +405,8 @@ def backup_quiesce_active() -> bool:
 
 # ── Thin per-request audit hook ─────────────────────────────────────────────────
 def _audit(agent: str, method: str, path: str, status: int,
-           latency_ms: float, request_id: str) -> None:
+           latency_ms: float, request_id: str,
+           principal: dict[str, Any] | None = None) -> None:
     """Append one JSON line recording a completed request. Best-effort and OFF the
     DB hot path: it never touches Postgres (so audit volume can't steal the pool's
     connection budget) and a logging failure never surfaces into the request.
@@ -307,7 +420,7 @@ def _audit(agent: str, method: str, path: str, status: int,
     if _audit_writer is None:
         return
     try:
-        line = json.dumps({
+        record = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "agent": agent,
             "role": _AGENT_ROLES.get(agent, "full"),
@@ -316,7 +429,18 @@ def _audit(agent: str, method: str, path: str, status: int,
             "status": status,
             "latency_ms": round(latency_ms, 1),
             "request_id": request_id,
-        }, separators=(",", ":"))
+        }
+        # Person axis: the kernel-attested OS account + connection fingerprint. None
+        # on the TCP transport. Server-derived (SO_PEERCRED) — never a client claim,
+        # so the operator can neither forge nor repudiate it.
+        if principal:
+            record["principal"]      = principal.get("user")
+            record["connected_from"] = {
+                k: principal[k] for k in
+                ("uid", "gid", "pid", "login_uid", "login_user", "session")
+                if k in principal
+            }
+        line = json.dumps(record, separators=(",", ":"))
         _audit_writer.write(line)
     except Exception as exc:  # never break a request because auditing failed
         log.warning("audit write failed: %s", exc)
@@ -343,6 +467,11 @@ async def auth_middleware(request: web.Request, handler):
     if not agent_name:
         raise web.HTTPUnauthorized(reason="Authorization: a valid Bearer token is required")
     request["authenticated_agent"] = agent_name
+    # Person axis: stamp the kernel-attested principal (OS account + connection
+    # fingerprint) from SO_PEERCRED. None on the TCP transport — never inferred from
+    # the agent. Every handler and the audit hook read it from here, spoof-proof.
+    principal = _peer_identity(request)
+    request["principal"] = principal
     # Role + governance gate. Read-only roles are confined to the telemetry/graph
     # allowlist; admin-role tokens are confined to /admin/* (and no other role may
     # reach an admin route); and while a backup quiesce is active the write routes
@@ -365,6 +494,11 @@ async def auth_middleware(request: web.Request, handler):
             raise web.HTTPServiceUnavailable(
                 reason="backup in progress — writes are briefly paused",
                 headers={"Retry-After": str(BACKUP_RETRY_AFTER)},
+            )
+        if GATEWAY_REQUIRE_PRINCIPAL and route in _WRITE_ROUTES and principal is None:
+            raise web.HTTPForbidden(
+                reason="writes require a kernel-attested principal — connect over the "
+                       "gateway Unix socket (GATEWAY_UDS_PATH), not TCP",
             )
 
     # Outer load-shed valve (disabled when GATEWAY_INFLIGHT_MAX == 0). Caps total
@@ -395,7 +529,8 @@ async def auth_middleware(request: web.Request, handler):
     finally:
         _inflight -= 1
         latency_ms = (asyncio.get_running_loop().time() - started) * 1000
-        _audit(agent_name, request.method, request.path, status, latency_ms, request_id)
+        _audit(agent_name, request.method, request.path, status, latency_ms,
+               request_id, request.get("principal"))
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -971,6 +1106,14 @@ class MemoryCoordinator:
             agent_id = request["authenticated_agent"]
             body["metadata"] = metadata
 
+        # Person-axis enforcement — DETERMINISTIC, never agent-supplied. The operator
+        # identity + connection fingerprint are stamped from the kernel-attested
+        # principal (auth_middleware → SO_PEERCRED); any client claim is stripped. See
+        # _apply_principal / decision 347.
+        if isinstance(metadata, dict):
+            _apply_principal(metadata, request.get("principal"))
+            body["metadata"] = metadata
+
         # Project-name normalisation (decision 276): canonical = folder name.
         # Applied before the row and its outbox params are written so the
         # graph Project node and the Postgres metadata never drift again.
@@ -1144,6 +1287,9 @@ class MemoryCoordinator:
         retro_payload = {"rating": rating, "date": date, "notes": notes}
         if is_reversal:
             retro_payload["superseded"] = True
+        # Person-axis enforcement (see handle_save): the operator who recorded this
+        # outcome is stamped from the kernel-attested principal, never from the body.
+        _apply_principal(retro_payload, request.get("principal"))
 
         async with self._acquire() as conn:
             async with conn.transaction():

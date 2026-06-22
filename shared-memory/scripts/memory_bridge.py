@@ -70,6 +70,34 @@ COORDINATOR_BASE = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
 AGENT_ID         = os.environ.get("AGENT_ID", "memory_bridge")
 
 
+def _uds_path() -> str | None:
+    """The gateway Unix socket to connect over, so the gateway can read this client's
+    OS account via SO_PEERCRED (the person axis). Explicit COORDINATOR_UDS wins;
+    otherwise auto-detect the per-user default if it exists. Empty string disables it
+    (force TCP). Connecting over the UDS is what lets the gateway stamp the principal;
+    over TCP there is no kernel credential and the save is recorded with no principal."""
+    p = os.environ.get("COORDINATOR_UDS")
+    if p is None:
+        base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+        cand = os.path.join(base, "shared-memory-gw.sock")
+        p = cand if os.path.exists(cand) else ""
+    return p or None
+
+
+def _async_client(timeout: float) -> "httpx.AsyncClient":
+    uds = _uds_path()
+    if uds:
+        return httpx.AsyncClient(timeout=timeout, transport=httpx.AsyncHTTPTransport(uds=uds))
+    return httpx.AsyncClient(timeout=timeout)
+
+
+def _sync_client(timeout: float) -> "httpx.Client":
+    uds = _uds_path()
+    if uds:
+        return httpx.Client(timeout=timeout, transport=httpx.HTTPTransport(uds=uds))
+    return httpx.Client(timeout=timeout)
+
+
 def _request_headers() -> dict:
     """Headers attached to every coordinator request.
 
@@ -143,7 +171,7 @@ async def check_gateway_compat() -> dict:
     API_VERSION. Used by the ``doctor`` command and to enrich error messages.
     """
     try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
+        async with _async_client(3.0) as client:
             h = (await client.get(f"{COORDINATOR_BASE}/health")).json()
     except Exception as exc:
         return {"reachable": False, "error": str(exc), "compat": "unknown"}
@@ -204,7 +232,7 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
         return {"status": "error", "message": f"Metadata must be a JSON object, got {type(metadata).__name__}"}
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with _async_client(60.0) as client:
             r = await client.post(
                 f"{COORDINATOR_BASE}/memory/save",
                 json={"content": content, "metadata": metadata, "agent_id": AGENT_ID},
@@ -236,7 +264,7 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
 
 async def search_and_rerank(query: str, limit: int = 5) -> list | dict:
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with _async_client(30.0) as client:
             r = await client.post(
                 f"{COORDINATOR_BASE}/memory/search",
                 json={"query": query, "limit": limit, "agent_id": AGENT_ID},
@@ -256,12 +284,12 @@ async def search_and_rerank(query: str, limit: int = 5) -> list | dict:
 
 def query_graph(cypher: str, params: dict = None) -> list | dict:
     try:
-        r = httpx.post(
-            f"{COORDINATOR_BASE}/memory/graph",
-            json={"cypher": cypher, "params": params or {}},
-            headers=_request_headers(),
-            timeout=30.0,
-        )
+        with _sync_client(30.0) as client:
+            r = client.post(
+                f"{COORDINATOR_BASE}/memory/graph",
+                json={"cypher": cypher, "params": params or {}},
+                headers=_request_headers(),
+            )
         if r.status_code == 401:
             _append_log("memory_bridge", 2, "auth_failed",
                         {"hint": "Check AGENT_TOKEN in .env matches an entry in gateway AGENT_TOKENS"})
@@ -277,11 +305,11 @@ def query_graph(cypher: str, params: dict = None) -> list | dict:
 def get_telemetry() -> dict:
     """Fetch the gateway's operational telemetry snapshot (GET /memory/telemetry)."""
     try:
-        r = httpx.get(
-            f"{COORDINATOR_BASE}/memory/telemetry",
-            headers=_request_headers(),
-            timeout=15.0,
-        )
+        with _sync_client(15.0) as client:
+            r = client.get(
+                f"{COORDINATOR_BASE}/memory/telemetry",
+                headers=_request_headers(),
+            )
         if r.status_code == 401:
             return {"status": "error",
                     "message": "Coordinator rejected token. Set AGENT_TOKEN in this agent's .env."}
@@ -396,7 +424,7 @@ async def save_retrospective_artifact(
 ) -> dict:
     payload = build_retrospective_payload(pg_id, rating, notes, date, source)
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with _async_client(60.0) as client:
             r = await client.post(
                 f"{COORDINATOR_BASE}/memory/retrospective",
                 json=payload,
