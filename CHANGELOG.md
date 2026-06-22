@@ -7,6 +7,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — person identity (operator) via OS login, server-enforced
+
+A second identity axis alongside the token-verified **agent**: the **principal** — the
+human operator — obtained from the **OS login account behind the connection**, read from
+the kernel via `SO_PEERCRED`. Pre-PoP foundation; the cryptographic person-key/delegation
+tier remains a later "only if".
+
+- **`AF_UNIX` listener** on the gateway alongside TCP `:8888` (`GATEWAY_UDS_PATH`, default
+  `$XDG_RUNTIME_DIR/shared-memory-gw.sock`, mode `GATEWAY_UDS_MODE`=`0600`). Local agents and
+  SSH-forwarded Unix sockets connect here so the gateway can read the operator's OS account
+  from the kernel. SSH already authenticates remote users (and encrypts), so identity +
+  confidentiality come from the existing transport.
+- **`principal` + `connected_from`** stamped server-side on every write and audit line.
+  `principal` is the OS username; `connected_from` is the kernel-attested fingerprint
+  (`uid/gid/pid`, immutable `login_uid`/`login_user`, audit `session` — resolve the remote
+  host via `loginctl show-session`). **Enforced in code, never agent-supplied:** any
+  client-sent `principal`/`connected_from` is stripped and re-stamped (`_apply_principal`)
+  on both `handle_save` and `handle_retrospective`, so an agent told to "save as someone
+  else" cannot move it (`decided_by` stays a separate narrative claim). Over plain TCP there
+  is no kernel credential, so the fields are honestly absent — never guessed.
+- **`GATEWAY_REQUIRE_PRINCIPAL`** (off by default) rejects write routes that lack a
+  kernel-attested principal — turn on once every writer is on the socket.
+- **`memory_bridge.py`** auto-detects and prefers the Unix socket (httpx `uds=` transport;
+  `COORDINATOR_UDS` to override) so local saves are stamped; falls back to TCP.
+- **No schema change** — `principal`/`connected_from` ride the existing `metadata` JSONB and
+  the audit JSONL. README §14 documents the audit trail as **log + database together**: the
+  log is the per-request *who/from-where* trail (no project/record-type, no log→DB join key),
+  the DB answers *which decisions on which project by which user*.
+- Tests: new `tests/test_person_identity.py` (SO_PEERCRED over a real socketpair, TCP→absent,
+  strip-and-stamp, require-principal gate).
+
 ### Added — cross-store backup & restore (quiesced)
 
 Consistent, scriptable backup of **both** stores and a ground-up restore. Both are

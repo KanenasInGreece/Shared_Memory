@@ -40,17 +40,21 @@ MemoryCoordinator = coordinator_mod.MemoryCoordinator
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _make_request(body: dict, authenticated_agent: str | None = None) -> MagicMock:
+def _make_request(body: dict, authenticated_agent: str | None = None,
+                  principal: dict | None = None) -> MagicMock:
     """Minimal aiohttp Request mock with an async .json() method.
 
     authenticated_agent: simulates the value set by auth_middleware after token validation.
-    Defaults to None so existing tests run without auth overwrite.
+    principal: the kernel-attested person identity dict (auth_middleware sets this from
+        SO_PEERCRED). Key-specific so .get('principal') doesn't collide with
+        .get('authenticated_agent'). Defaults to None (e.g. TCP transport).
     """
+    state = {"authenticated_agent": authenticated_agent, "principal": principal}
     req = MagicMock()
     req.json = AsyncMock(return_value=body)
     req.rel_url.query.get = MagicMock(return_value=None)
-    req.get = MagicMock(return_value=authenticated_agent)
-    req.__getitem__ = MagicMock(return_value=authenticated_agent)
+    req.get = MagicMock(side_effect=lambda k, d=None: state.get(k, d))
+    req.__getitem__ = MagicMock(side_effect=lambda k: state.get(k))
     return req
 
 
