@@ -1125,7 +1125,7 @@ class ConsolidationDaemon:
                     "Insight cycle: fresh cluster on '%s' — %d decisions across projects %s.",
                     c["entity"], len(ids), sorted(c.get("projects") or []),
                 )
-                if await self._fold_insight(conn, c["entity"], ids, projects=c.get("projects")):
+                if await self._fold_insight(conn, c["entity"], ids):
                     folded.update(ids)
         except Exception as e:
             logger.error(f"Insight cycle failed: {str(e)}")
