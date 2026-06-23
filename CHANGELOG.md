@@ -7,6 +7,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — silent insight-fold crash (`insight = 0` since v0.4.5)
+
+Cross-project insight consolidation (Phase 3a) produced **zero** insights since it shipped
+in v0.4.5: `run_insight_cycle`'s fresh-cluster path called `_fold_insight(..., projects=…)`,
+but `_fold_insight` has no `projects` parameter (it derives projects from the Postgres rows
+itself), so every fresh fold raised `TypeError`. The cycle's `try/except` swallowed it, so the
+failure surfaced only as an hourly ERROR log line — no `/health` or telemetry signal — and went
+unnoticed for ~12 days while ~30 eligible clusters sat unfolded.
+
+- **Fix:** drop the stray `projects=` kwarg at the call site (`consolidation_loop.py`).
+- **Regression test:** `run_insight_cycle`'s fresh-cluster call site is now exercised with an
+  `autospec`'d `_fold_insight`, so an incompatible kwarg fails the suite — the isolated
+  `_fold_insight` unit tests could not catch a call-site signature mismatch. (#77)
+- **Verified live:** `insight 0 → 1` and draining the backlog after deploy.
+
 ### Added — person identity (operator) via OS login, server-enforced
 
 A second identity axis alongside the token-verified **agent**: the **principal** — the
