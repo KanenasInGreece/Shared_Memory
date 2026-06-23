@@ -362,6 +362,45 @@ async def test_fold_insight_skips_singleton_cluster(monkeypatch):
     conn = StubConn(script=[{"rowcount": 1, "rows": [(245, "Decision A", "p1")]}])
 
     assert await daemon._fold_insight(conn, "OutboxPattern", [245, 999]) is False
-
     assert len(conn.executed) == 1  # only the content fetch ran
     assert conn.commits == 0
+
+
+# ── run_insight_cycle wiring (regression for the fresh-cluster call site) ──────
+
+@pytest.mark.asyncio
+async def test_run_insight_cycle_calls_fold_with_compatible_signature(monkeypatch):
+    """Regression — the fresh-cluster path in run_insight_cycle must call
+    _fold_insight with arguments its signature accepts.
+
+    A real bug (fixed 2026-06-23) passed projects=c.get("projects") to
+    _fold_insight(), which has no such parameter, raising a TypeError that
+    the cycle's try/except swallowed — so EVERY fresh fold crashed silently
+    and insight stayed at 0 for ~12 days. The isolated _fold_insight tests
+    above could not catch it because run_insight_cycle is the only place that
+    call site is wired. create_autospec enforces the real signature, so
+    reintroducing an unexpected kwarg makes the call raise (swallowed),
+    dropping await_count to 0 and failing this test."""
+    import consolidation_loop as cl
+    from unittest.mock import create_autospec
+
+    class _Conn(StubConn):
+        def close(self):
+            pass
+
+    monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: _Conn())
+    monkeypatch.setattr(cl, "fetch_unreconciled_insights", lambda conn: [])
+    monkeypatch.setattr(cl, "fetch_open_retro_decision_ids", lambda conn: [])
+    monkeypatch.setattr(cl, "fetch_refold_insights", lambda conn, ids: [])
+
+    daemon, _ = daemon_with_fake_graph()
+    daemon._find_fresh_insight_clusters = AsyncMock(return_value=[
+        {"entity": "OutboxPattern", "decision_ids": [245, 267],
+         "projects": ["shared-memory-GitHub", "tier3-cloe"]},
+    ])
+    daemon._fold_insight = create_autospec(daemon._fold_insight, return_value=True)
+
+    await daemon.run_insight_cycle()
+
+    assert daemon._fold_insight.await_count == 1
+    assert "projects" not in daemon._fold_insight.await_args.kwargs
