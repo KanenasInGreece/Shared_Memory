@@ -7,6 +7,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — consolidation quality/coverage signal, Phase 1 liveness (ADR-018)
+
+The dream cycle is now observable. The `insight = 0` outage above ran ~12 days because a fold
+outcome was **logged, not stated** — nothing survived a cycle except a journal line. Phase 1
+makes a fold outcome queryable state, so a silent crash can never hide again.
+
+- **New `consolidation_runs` ledger** (migration `012`): one row per cycle (`insight` /
+  `fact_consolidation`) with outcome (`completed` / `crashed` / `deferred`), fold counts, error,
+  and timing. Self-pruning at daemon startup (`CONSOLIDATION_RUNS_RETENTION_DAYS`).
+- **Instrumented seams** (`consolidation_loop.py`): `run_insight_cycle` and the shared
+  `_consolidate_clusters` body (covering the event cycle, ledger sweep, and global sweep) record
+  every outcome and **also leave a corroborating log line** — the table write is failsafe, so the
+  outcome survives even if Postgres is unreachable. GPU/backup deferrals are recorded (throttled)
+  so a stall is attributable; orphaned in-flight rows are reaped on restart (mirrors ADR-010).
+- **`/health.consolidation`** `{stalled, last_outcome, last_success_age_seconds}` — a cached
+  snapshot the coordinator refreshes in the background (~60 s) so `/health` stays DB-free.
+- **`/memory/telemetry` `consolidation` section** — per-cycle-type last outcome, success age,
+  in-flight, consecutive failures, last error, and the derived `stalled` verdict. Additive; the
+  Monitor (read-only over these two endpoints) reshapes against the published contract.
+- **Stall rule:** eligible backlog present AND no successful fold within
+  `CONSOLIDATION_STALL_THRESHOLD_SEC` (default 2.5× the NREM sweep interval) AND nothing in-flight
+  — so a merely-slow LLM fold reads as in-flight, not stalled.
+- **Coverage census (PR-2):** the insight cycle records, *before folding* (so a crash still leaves
+  it), `eligible_clusters` (uncovered insight opportunities) and `eligible_oldest_age_seconds` —
+  the **K-th-oldest member's outbox write-time**, i.e. how long the most-neglected *actionable*
+  cluster has gone unfolded. No new write-timestamp was needed: the self-cleaning `neo4j_outbox`
+  is a complete write-time index over exactly the un-consolidated working set (ADR-018 open-Q1).
+  NULL-safe for facts predating the outbox. Surfaced per cycle-type in the telemetry
+  `consolidation` section. Server-side only; no `api_version` bump. 9 new tests
+  (`tests/test_consolidation_signal.py`), suite 300 green.
+
 ### Fixed — silent insight-fold crash (`insight = 0` since v0.4.5)
 
 Cross-project insight consolidation (Phase 3a) produced **zero** insights since it shipped

@@ -1476,6 +1476,21 @@ After each NREM pass, any active summary whose `source_pg_ids` is a strict subse
 
 The `consolidated` flag is not permanent. If future ingestion introduces unflagged Facts with sufficient neighbourhood density that pull previously-consolidated Facts back into a candidate community, the entire cluster becomes eligible again.
 
+### Observability — the consolidation signal (ADR-018)
+
+The dream cycle is **observable**, so a silent fold failure cannot hide. (Cross-project insight consolidation once produced zero insights for ~12 days because a fold crashed on a stray kwarg and the failure surfaced *only* as an hourly log line — no health or telemetry signal.) Every consolidation/insight cycle now writes one row to the `consolidation_runs` ledger (`migration 012`, self-pruning) **and** leaves a corroborating journal line — the table write is failsafe, so the outcome survives even when Postgres is unreachable.
+
+The coordinator rolls this up onto two read-only surfaces (the Monitor consumes both; no DB access needed):
+
+- **`GET /health`** carries a cached `consolidation` block (refreshed in the background so `/health` stays DB-free):
+  ```json
+  "consolidation": { "stalled": false, "last_outcome": "completed", "last_success_age_seconds": 312, "fresh": true }
+  ```
+  `stalled` is **true** only when an eligible backlog exists, no fold has succeeded within `CONSOLIDATION_STALL_THRESHOLD_SEC` (default 2.5× the NREM sweep interval), and nothing is in-flight — so a merely-slow LLM fold reads as in-flight, not stalled. The backlog is measured by the cycle's own gate census, not the looser density count, so a dense cluster the strict insight gate rejects is **not** flagged.
+- **`GET /memory/telemetry`** carries a fuller `consolidation` section: per cycle type (`insight`, `fact_consolidation`) the last outcome, success age, in-flight flag, consecutive failures, last error, plus **coverage** — `eligible_clusters` (uncovered insight opportunities) and `eligible_oldest_age_seconds` (how long the most-neglected actionable cluster has waited, anchored on the K-th-oldest member's `neo4j_outbox.created_at` — the self-cleaning outbox doubles as a write-time index over exactly the un-consolidated working set).
+
+GPU/backup **deferrals** are recorded too, so a stall is attributable (starved vs. crashing); orphaned in-flight rows are reaped on daemon restart. Tunables: `CONSOLIDATION_STALL_THRESHOLD_SEC`, `CONSOLIDATION_HEALTH_REFRESH_SEC`, `CONSOLIDATION_ORPHAN_TIMEOUT_SEC`, `CONSOLIDATION_RUNS_RETENTION_DAYS` (see `.env.example`).
+
 ---
 
 ## 14. Audit Logging
