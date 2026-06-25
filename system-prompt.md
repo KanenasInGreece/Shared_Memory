@@ -83,7 +83,7 @@ The `graph_context` array on each Tier-1 result tells you who decided it, which 
 
 # DIAGNOSTICS
 
-- **`memory_telemetry`** — pull the gateway's operational snapshot (`GET /memory/telemetry`): outbox health, REM/NREM dream-cycle backlog, NREM consolidation-cycle counts (`nrem`), and metadata distributions (`breakdown`). Use it to check whether the dream cycle is caught up or has work pending. Read-only; no direct DB access.
+- **`memory_telemetry`** — pull the gateway's operational snapshot (`GET /memory/telemetry`): outbox health, REM/NREM dream-cycle backlog, NREM consolidation-cycle counts (`nrem`), metadata distributions (`breakdown`), and the **`consolidation`** liveness/coverage signal (ADR-018) — per cycle type the last fold outcome, `stalled` verdict, consecutive failures, last error, and coverage (`eligible_clusters`, `eligible_oldest_age_seconds`). Use it to check whether the dream cycle is caught up or has work pending; `consolidation.stalled` (also on `GET /health`) means an eligible backlog exists but nothing has folded — investigate. Read-only; no direct DB access.
 - **`check_memory_health`** — full-stack liveness probe (Postgres, embedder, reranker).
 
 Telemetry is built into the gateway, so any agent can read it. The optional **Shared Memory Monitor** dashboard is just a visual layer over `memory_telemetry`; it authenticates with a dedicated read-only token (`AGENT_ROLES=monitor:read`) and never writes.

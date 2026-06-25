@@ -348,6 +348,34 @@ def format_status(payload: dict) -> str:
                      f"(facts {nr.get('fact_cycles',0)}, decisions {nr.get('decision_cycles',0)})")
     elif "error" in nr:
         lines.append(f"  nrem: ERROR {nr['error']}")
+    # Consolidation liveness/coverage signal (ADR-018). stalled = eligible backlog
+    # but no fold succeeded within the threshold and nothing in-flight.
+    cn = t.get("consolidation", {})
+    if cn and "error" not in cn:
+        age = cn.get("last_success_age_seconds")
+        age_s = f"{age}s ago" if age is not None else "—"
+        flag = "STALLED ⚠" if cn.get("stalled") else "ok"
+        lines.append(f"  consolidation: {flag} | last {cn.get('last_outcome') or '—'} "
+                     f"| last success {age_s}")
+        for ct in ("insight", "fact_consolidation"):
+            c = cn.get(ct)
+            if not isinstance(c, dict):
+                continue
+            parts = [c.get("last_outcome") or "—"]
+            if c.get("stalled"):
+                parts.append("STALLED")
+            if c.get("consecutive_failures"):
+                parts.append(f"{c['consecutive_failures']} fails")
+            if c.get("last_error"):
+                parts.append(f"err {c['last_error'].get('class','?')}")
+            if c.get("eligible_clusters") is not None:
+                cov = f"eligible {c['eligible_clusters']}"
+                if c.get("eligible_oldest_age_seconds") is not None:
+                    cov += f" (oldest {c['eligible_oldest_age_seconds']}s)"
+                parts.append(cov)
+            lines.append(f"    {ct}: " + ", ".join(parts))
+    elif "error" in cn:
+        lines.append(f"  consolidation: ERROR {cn['error']}")
     return "\n".join(lines)
 
 

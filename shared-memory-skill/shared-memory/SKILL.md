@@ -392,14 +392,21 @@ python ~/.claude/skills/shared-memory/scripts/memory_bridge.py status
 #   facts:     97 total | REM pending 1 | unconsolidated 20
 #   decisions: 75 total | REM pending 71
 #   NREM cycles: 3 pending (facts 2, decisions 1)
+#   consolidation: ok | last completed | last success 312s ago
+#     insight: completed, eligible 0
 # add --json for machine-readable output
 ```
 `status` rolls up the outbox health and the REM/NREM dream-cycle backlog
 (`GET /memory/telemetry`). Use it to see whether REM/NREM have work pending or
 the system is caught up. The coordinator owns the DB connections, so the client
 needs nothing but its token. The `--json` payload also carries `telemetry.nrem`
-(pending consolidation-cycle counts + thresholds) and `telemetry.breakdown`
-(record-type / agent / source / domain / summary-kind distributions) — enough to
+(pending consolidation-cycle counts + thresholds), `telemetry.breakdown`
+(record-type / agent / source / domain / summary-kind distributions), and
+`telemetry.consolidation` — the dream-cycle liveness/coverage signal (ADR-018):
+per cycle type the last fold outcome, a `stalled` verdict, consecutive failures,
+last error, and coverage (`eligible_clusters`, `eligible_oldest_age_seconds`).
+A `consolidation: STALLED ⚠` line (also `consolidation.stalled` on `GET /health`)
+means an eligible backlog exists but nothing has folded — investigate. Enough to
 render a full dashboard without any direct Postgres or Neo4j access.
 
 ### MCP Server (LM Studio only)
