@@ -2,6 +2,7 @@ import sys
 import os
 import json
 import gzip
+import contextlib
 import psycopg2
 import psycopg2.extensions
 import httpx
@@ -66,6 +67,193 @@ SWEEP_INTERVAL_SEC = int(os.environ.get("NREM_SWEEP_INTERVAL_SEC", "3600"))
 # models (see rem_loop REM_TEMPERATURE); set NREM_TEMPERATURE=0.1 (or DREAM_TEMPERATURE
 # for both daemons) in .env for Qwen-class models. Overrides the LM Studio preset.
 NREM_TEMPERATURE = float(os.environ.get("NREM_TEMPERATURE", os.environ.get("DREAM_TEMPERATURE", "0.6")))
+
+# ── Consolidation run ledger (ADR-018) ──────────────────────────────────────
+# One consolidation_runs row per cycle so a silent fold crash becomes queryable
+# state (it previously surfaced only as a log line). Every recorded outcome ALSO
+# leaves a journal line: the table write is failsafe (can no-op if Postgres is
+# unreachable), so the log is the independent second record — DB + logs
+# corroborate, the same trace-on-every-lifecycle-event rule close_ledger_rows
+# follows. Rows past the retention window are pruned at daemon startup.
+CONSOLIDATION_RUNS_RETENTION_DAYS = int(os.environ.get("CONSOLIDATION_RUNS_RETENTION_DAYS", "30"))
+# Throttle 'deferred' rows: at most one per cycle_type within this window, so a
+# GPU-busy episode spanning many poll ticks records one deferral, not dozens.
+_DEFER_THROTTLE_SEC = 60
+
+
+def _crun_start(cycle_type):
+    """Insert an in-flight consolidation_runs row, return its id (own short
+    conn — instrumentation must never share or block the cycle's own conn).
+    Failsafe: any DB error returns None and the cycle proceeds uninstrumented."""
+    try:
+        c = psycopg2.connect(PG_CONN, connect_timeout=5)
+        try:
+            with c.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO consolidation_runs (cycle_type, started_at)"
+                    " VALUES (%s, now()) RETURNING id", (cycle_type,))
+                rid = cur.fetchone()[0]
+            c.commit()
+            return rid
+        finally:
+            c.close()
+    except Exception as e:
+        logger.warning("consolidation_runs: could not open run row (%s) — uninstrumented this cycle", e)
+        return None
+
+
+def _crun_finish(run_id, outcome, attempted=0, succeeded=0, failed=0,
+                 error_class=None, error_msg=None, extra=None,
+                 eligible_clusters=None, eligible_oldest_age=None):
+    """Stamp finished_at + outcome + fold counts (+ coverage census, PR-2) on a
+    run row. Failsafe — a DB error is logged but never raised (the caller already
+    emitted the corroborating journal line, so the outcome is not lost)."""
+    if run_id is None:
+        return
+    try:
+        c = psycopg2.connect(PG_CONN, connect_timeout=5)
+        try:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE consolidation_runs SET finished_at=now(), outcome=%s,"
+                    " folds_attempted=%s, folds_succeeded=%s, folds_failed=%s,"
+                    " error_class=%s, error_msg=%s,"
+                    " eligible_clusters=COALESCE(%s, eligible_clusters),"
+                    " eligible_oldest_age_seconds=COALESCE(%s, eligible_oldest_age_seconds),"
+                    " extra=COALESCE(%s::jsonb, extra) WHERE id=%s",
+                    (outcome, attempted, succeeded, failed, error_class,
+                     (error_msg or None) and str(error_msg)[:500],
+                     eligible_clusters, eligible_oldest_age,
+                     json.dumps(extra) if extra else None, run_id))
+            c.commit()
+        finally:
+            c.close()
+    except Exception as e:
+        logger.warning("consolidation_runs: could not finalize run %s (%s)", run_id, e)
+
+
+def _crun_record_deferred(cycle_type, reason):
+    """Record a throttled 'deferred' run row when a DUE cycle is skipped (GPU
+    busy / backup quiesce) — makes a later stall attributable. The skip itself is
+    already logged by the caller (the existing 'deferring' line), so this is the
+    DB half only. Failsafe."""
+    try:
+        c = psycopg2.connect(PG_CONN, connect_timeout=5)
+        try:
+            with c.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO consolidation_runs"
+                    " (cycle_type, started_at, finished_at, outcome, extra)"
+                    " SELECT %s, now(), now(), 'deferred', %s::jsonb"
+                    " WHERE NOT EXISTS ("
+                    "   SELECT 1 FROM consolidation_runs WHERE cycle_type=%s"
+                    "     AND started_at > now() - make_interval(secs => %s))",
+                    (cycle_type, json.dumps({"reason": reason}), cycle_type, _DEFER_THROTTLE_SEC))
+            c.commit()
+        finally:
+            c.close()
+    except Exception as e:
+        logger.warning("consolidation_runs: could not record deferral (%s)", e)
+
+
+def _crun_recover_and_prune():
+    """Daemon startup: a prior process's in-flight rows (finished_at IS NULL) are
+    dead — mark them 'crashed' so they cannot masquerade as in-flight (mirrors
+    ADR-010 outbox startup recovery). Then prune rows past the retention window.
+    Failsafe — observability bookkeeping must never stop the daemon booting."""
+    try:
+        c = psycopg2.connect(PG_CONN, connect_timeout=5)
+        try:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE consolidation_runs SET finished_at=now(), outcome='crashed',"
+                    " error_class='OrphanedRun',"
+                    " error_msg='daemon restarted while cycle was in-flight'"
+                    " WHERE finished_at IS NULL RETURNING id")
+                orphans = [r[0] for r in cur.fetchall()]
+                cur.execute(
+                    "DELETE FROM consolidation_runs"
+                    " WHERE finished_at < now() - make_interval(days => %s)",
+                    (CONSOLIDATION_RUNS_RETENTION_DAYS,))
+            c.commit()
+            if orphans:
+                logger.warning(
+                    "consolidation_runs: marked %d orphaned in-flight row(s) crashed: %s",
+                    len(orphans), orphans)
+        finally:
+            c.close()
+    except Exception as e:
+        logger.warning("consolidation_runs: startup recovery/prune failed (%s)", e)
+
+
+def _fetch_outbox_created_at(pg_ids):
+    """pg_id → neo4j_outbox.created_at: the durable write-time index over the
+    un-consolidated working set (ADR-018). The outbox is self-cleaning, so a
+    surviving row exists for exactly the not-yet-consolidated members; a missing
+    entry (pre-outbox row) is NULL-safe at the caller. Failsafe → {} on error."""
+    ids = [int(i) for i in pg_ids if i is not None]
+    if not ids:
+        return {}
+    try:
+        c = psycopg2.connect(PG_CONN, connect_timeout=5)
+        try:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_id, min(created_at) FROM neo4j_outbox"
+                    " WHERE pg_id = ANY(%s) GROUP BY pg_id", (ids,))
+                return {r[0]: r[1] for r in cur.fetchall()}
+        finally:
+            c.close()
+    except Exception as e:
+        logger.warning("consolidation_runs: outbox timestamp fetch failed (%s)", e)
+        return {}
+
+
+def _kth_oldest_age_seconds(cluster_id_lists, ts_map, k):
+    """Coverage-debt gauge (ADR-018 open-Q1, K-th anchor): max over clusters of
+    (now − the K-th-oldest member's outbox write-time) = the eligibility-onset
+    age of the most-neglected actionable cluster. The K-th member is the one
+    that tipped the cluster over the threshold, so this is 'how long has an
+    actionable cluster gone unfolded' — fairer than min(member). NULL-safe: a
+    cluster with <k timestamped members degrades to its oldest available; None
+    if no cluster yields any timestamp."""
+    from datetime import timezone
+    now = datetime.now(timezone.utc)
+    oldest = None
+    for ids in cluster_id_lists:
+        ts = sorted(t for t in (ts_map.get(int(i)) for i in ids if i is not None) if t is not None)
+        if not ts:
+            continue
+        anchor = ts[k - 1] if len(ts) >= k else ts[-1]
+        age = (now - anchor).total_seconds()
+        if oldest is None or age > oldest:
+            oldest = age
+    return int(oldest) if oldest is not None else None
+
+
+class _CycleRec:
+    """Mutable fold tally + coverage census threaded through a recorded cycle."""
+    __slots__ = ("attempted", "succeeded", "failed",
+                 "eligible_clusters", "eligible_oldest_age")
+
+    def __init__(self):
+        self.attempted = self.succeeded = self.failed = 0
+        # Coverage census (PR-2) — captured after the gate, before folding, so a
+        # crash mid-fold still records what was eligible. None until set.
+        self.eligible_clusters = None
+        self.eligible_oldest_age = None
+
+    def fold(self, ok):
+        self.attempted += 1
+        if ok:
+            self.succeeded += 1
+        else:
+            self.failed += 1
+
+    def add(self, attempted, succeeded):
+        self.attempted += attempted
+        self.succeeded += succeeded
+        self.failed += max(0, attempted - succeeded)
 
 # AGENT_TOKEN authenticates daemon outbound calls through the proxy.
 # It identifies the daemon as a trusted internal caller — it does NOT affect
@@ -529,6 +717,40 @@ class ConsolidationDaemon:
             self.first_notification_time = datetime.now()
         self.pending_pg_ids.update(pg_ids)
 
+    @contextlib.asynccontextmanager
+    async def _record_cycle(self, cycle_type):
+        """Wrap a consolidation/insight cycle as one consolidation_runs row and
+        ALWAYS leave a corroborating journal line at exit (ADR-018). Yields a
+        _CycleRec the body bumps per fold. On exception: record 'crashed', log an
+        ERROR, then re-raise so the caller's existing handler still logs/requeues.
+        On clean exit: record 'completed' and log an INFO summary. The log is
+        emitted independent of the table write, so the outcome survives even if
+        the consolidation_runs write itself fails."""
+        loop = asyncio.get_running_loop()
+        rec = _CycleRec()
+        run_id = await loop.run_in_executor(None, lambda: _crun_start(cycle_type))
+        try:
+            yield rec
+        except Exception as e:
+            logger.error(
+                "Consolidation run [%s] CRASHED after %d/%d folds: %s: %s (run_id=%s)",
+                cycle_type, rec.succeeded, rec.attempted,
+                type(e).__name__, str(e)[:200], run_id)
+            await loop.run_in_executor(None, lambda: _crun_finish(
+                run_id, "crashed", rec.attempted, rec.succeeded, rec.failed,
+                type(e).__name__, str(e),
+                eligible_clusters=rec.eligible_clusters,
+                eligible_oldest_age=rec.eligible_oldest_age))
+            raise
+        else:
+            logger.info(
+                "Consolidation run [%s] completed: folds %d/%d (run_id=%s)",
+                cycle_type, rec.succeeded, rec.attempted, run_id)
+            await loop.run_in_executor(None, lambda: _crun_finish(
+                run_id, "completed", rec.attempted, rec.succeeded, rec.failed,
+                eligible_clusters=rec.eligible_clusters,
+                eligible_oldest_age=rec.eligible_oldest_age))
+
     async def get_embedding(self, text):
         """Standardized 1024-dim BGE-M3 embedding call."""
         try:
@@ -794,8 +1016,13 @@ class ConsolidationDaemon:
 
     async def _consolidate_clusters(self, clusters):
         """Shared consolidation body: domain re-gating, LLM synthesis, and the
-        atomic Postgres + Neo4j write for a list of entity clusters."""
+        atomic Postgres + Neo4j write for a list of entity clusters. Recorded as
+        one 'fact_consolidation' consolidation_runs row (ADR-018) — the single
+        instrumentation point for all three fact schedulers (event cycle, ledger
+        sweep, global sweep) that call it; every outcome also leaves a log line."""
         loop = asyncio.get_running_loop()
+        rec = _CycleRec()
+        run_id = await loop.run_in_executor(None, lambda: _crun_start("fact_consolidation"))
         conn = await loop.run_in_executor(
             None, lambda: psycopg2.connect(PG_CONN, connect_timeout=5)
         )
@@ -854,6 +1081,7 @@ class ConsolidationDaemon:
                 summary = await self.generate_summary(entity, contents, previous_summary)
                 if not summary:
                     logger.error(f"Failed to generate summary for {entity}. Re-queueing IDs.")
+                    rec.fold(False)
                     self._requeue(pg_ids)
                     continue
 
@@ -862,6 +1090,7 @@ class ConsolidationDaemon:
                 embedding = await self.get_embedding(summary)
                 if not embedding:
                     logger.error(f"Failed to vectorize summary for {entity}. Re-queueing IDs.")
+                    rec.fold(False)
                     self._requeue(pg_ids)
                     continue
 
@@ -952,6 +1181,10 @@ class ConsolidationDaemon:
                     )
 
                     await loop.run_in_executor(None, conn.commit)
+                    # The summary is durable here — a graph-sync failure below is
+                    # recovered by reconciliation, so this counts as a successful
+                    # fold for liveness regardless of what step 5 does.
+                    rec.fold(True)
                     logger.info(
                         f"Saved summary (ID: {summary_pg_id}) to Postgres."
                         + (f" Superseded: {superseded_ids}." if superseded_ids else "")
@@ -960,6 +1193,7 @@ class ConsolidationDaemon:
                 except Exception as e:
                     await loop.run_in_executor(None, conn.rollback)
                     logger.error(f"Database write error for {entity}: {str(e)}")
+                    rec.fold(False)
                     self._requeue(pg_ids)
                     continue
 
@@ -983,6 +1217,22 @@ class ConsolidationDaemon:
                         f"Graph sync failed for {entity} [domain={domain}] — summary "
                         f"{summary_pg_id} is committed; ledger reconciliation will retry: {str(e)}"
                     )
+        except Exception as e:
+            # Cycle-level crash (e.g. domain fetch / cluster iteration) — record
+            # 'crashed' + log, then re-raise to the caller's existing handler.
+            logger.error(
+                "Consolidation run [fact_consolidation] CRASHED after %d/%d folds: %s: %s (run_id=%s)",
+                rec.succeeded, rec.attempted, type(e).__name__, str(e)[:200], run_id)
+            await loop.run_in_executor(None, lambda: _crun_finish(
+                run_id, "crashed", rec.attempted, rec.succeeded, rec.failed,
+                type(e).__name__, str(e)))
+            raise
+        else:
+            logger.info(
+                "Consolidation run [fact_consolidation] completed: folds %d/%d (run_id=%s)",
+                rec.succeeded, rec.attempted, run_id)
+            await loop.run_in_executor(None, lambda: _crun_finish(
+                run_id, "completed", rec.attempted, rec.succeeded, rec.failed))
         finally:
             await loop.run_in_executor(None, conn.close)
 
@@ -1078,55 +1328,74 @@ class ConsolidationDaemon:
             logger.error(f"Insight cycle: Postgres unavailable: {str(e)}")
             return
         try:
-            # 0. Reconcile — re-apply unconfirmed graph markings, close rows.
-            try:
-                stuck = await loop.run_in_executor(None, lambda: fetch_unreconciled_insights(conn))
-            except Exception as e:
-                # Pre-migration schema (no kind metadata is fine; missing
-                # superseded column is not) — nothing to reconcile either way.
-                logger.warning(f"Insight cycle: reconciliation query failed: {str(e)}")
-                stuck = []
-            for summary_id, entity, src_ids in stuck:
-                logger.info(
-                    "Insight cycle: re-applying graph marking for insight %d ('%s').",
-                    summary_id, entity,
-                )
-                await self._mark_insight_in_graph(src_ids, summary_id, entity)
-                closed = await loop.run_in_executor(
-                    None, lambda ids=src_ids: close_ledger_rows(conn, ids, context="insight-reconciliation")
-                )
-                logger.info("Insight cycle: reconciled insight %d, closed %d rows.", summary_id, closed)
+            async with self._record_cycle("insight") as rec:
+                # 0. Reconcile — re-apply unconfirmed graph markings, close rows.
+                try:
+                    stuck = await loop.run_in_executor(None, lambda: fetch_unreconciled_insights(conn))
+                except Exception as e:
+                    # Pre-migration schema (no kind metadata is fine; missing
+                    # superseded column is not) — nothing to reconcile either way.
+                    logger.warning(f"Insight cycle: reconciliation query failed: {str(e)}")
+                    stuck = []
+                for summary_id, entity, src_ids in stuck:
+                    logger.info(
+                        "Insight cycle: re-applying graph marking for insight %d ('%s').",
+                        summary_id, entity,
+                    )
+                    await self._mark_insight_in_graph(src_ids, summary_id, entity)
+                    closed = await loop.run_in_executor(
+                        None, lambda ids=src_ids: close_ledger_rows(conn, ids, context="insight-reconciliation")
+                    )
+                    logger.info("Insight cycle: reconciled insight %d, closed %d rows.", summary_id, closed)
 
-            # 1. Re-folds — active insights with un-dreamed retrospectives.
-            #    fetch_refold_insights self-guards on empty retro_ids.
-            retro_ids = await loop.run_in_executor(None, lambda: fetch_open_retro_decision_ids(conn))
-            refolds = await loop.run_in_executor(
-                None, lambda: fetch_refold_insights(conn, retro_ids)
-            )
-            # Track only decisions actually FOLDED (not merely attempted): an
-            # aborted fold (LLM down, <2 rows) must not suppress a fresh cluster
-            # that shares its ids — that work should still be tried this pass.
-            folded: set = set()
-            for old_id, entity, src_ids, prev_content in refolds:
-                logger.info(
-                    "Insight cycle: re-folding insight %d ('%s') — new retrospective(s) on %s.",
-                    old_id, entity, sorted(set(src_ids) & set(retro_ids)),
+                # 1. Re-folds — active insights with un-dreamed retrospectives.
+                #    fetch_refold_insights self-guards on empty retro_ids.
+                retro_ids = await loop.run_in_executor(None, lambda: fetch_open_retro_decision_ids(conn))
+                refolds = await loop.run_in_executor(
+                    None, lambda: fetch_refold_insights(conn, retro_ids)
                 )
-                if await self._fold_insight(conn, entity, src_ids, previous_insight=prev_content):
-                    folded.update(src_ids)
+                # Track only decisions actually FOLDED (not merely attempted): an
+                # aborted fold (LLM down, <2 rows) must not suppress a fresh cluster
+                # that shares its ids — that work should still be tried this pass.
+                folded: set = set()
+                for old_id, entity, src_ids, prev_content in refolds:
+                    logger.info(
+                        "Insight cycle: re-folding insight %d ('%s') — new retrospective(s) on %s.",
+                        old_id, entity, sorted(set(src_ids) & set(retro_ids)),
+                    )
+                    ok = await self._fold_insight(conn, entity, src_ids, previous_insight=prev_content)
+                    rec.fold(ok)
+                    if ok:
+                        folded.update(src_ids)
 
-            # 2. Fresh clusters from the graph gate.
-            clusters = await self._find_fresh_insight_clusters()
-            for c in clusters:
-                ids = [int(i) for i in c["decision_ids"] if i is not None]
-                if not ids or any(i in folded for i in ids):
-                    continue  # already folded as a re-fold this pass
-                logger.info(
-                    "Insight cycle: fresh cluster on '%s' — %d decisions across projects %s.",
-                    c["entity"], len(ids), sorted(c.get("projects") or []),
-                )
-                if await self._fold_insight(conn, c["entity"], ids):
-                    folded.update(ids)
+                # 2. Fresh clusters from the graph gate.
+                clusters = await self._find_fresh_insight_clusters()
+                # Coverage census (PR-2) — captured BEFORE folding so a crash
+                # mid-fold still records what was eligible. eligible_clusters =
+                # uncovered insight opportunities; oldest age = the K-th-oldest
+                # member's outbox write-time (eligibility onset) of the most
+                # neglected cluster.
+                cluster_id_lists = [
+                    [int(i) for i in c["decision_ids"] if i is not None] for c in clusters
+                ]
+                all_member_ids = [i for ids in cluster_id_lists for i in ids]
+                ts_map = await loop.run_in_executor(
+                    None, lambda: _fetch_outbox_created_at(all_member_ids))
+                rec.eligible_clusters = len(clusters)
+                rec.eligible_oldest_age = _kth_oldest_age_seconds(
+                    cluster_id_lists, ts_map, INSIGHT_THRESHOLD)
+                for c in clusters:
+                    ids = [int(i) for i in c["decision_ids"] if i is not None]
+                    if not ids or any(i in folded for i in ids):
+                        continue  # already folded as a re-fold this pass
+                    logger.info(
+                        "Insight cycle: fresh cluster on '%s' — %d decisions across projects %s.",
+                        c["entity"], len(ids), sorted(c.get("projects") or []),
+                    )
+                    ok = await self._fold_insight(conn, c["entity"], ids)
+                    rec.fold(ok)
+                    if ok:
+                        folded.update(ids)
         except Exception as e:
             logger.error(f"Insight cycle failed: {str(e)}")
         finally:
@@ -1301,6 +1570,10 @@ class ConsolidationDaemon:
     async def listen_for_events(self):
         """Asynchronous LISTEN on Postgres with non-blocking poll and hard backstop."""
         loop = asyncio.get_running_loop()
+        # ADR-018: a prior process may have died mid-fold, leaving an in-flight
+        # consolidation_runs row. Mark such orphans 'crashed' (so they cannot
+        # masquerade as in-flight) and prune old rows before we start recording.
+        await loop.run_in_executor(None, _crun_recover_and_prune)
         conn, cur = await self._make_listen_conn()
         logger.info("Listening for 'new_artifact' notifications...")
         try:
@@ -1342,6 +1615,7 @@ class ConsolidationDaemon:
                         # hard backstop be starved by continuous activity.
                         if not forced and await inference_gpu_busy():
                             logger.warning("NREM: inference GPU busy — deferring consolidation; will re-check next cycle.")
+                            await loop.run_in_executor(None, lambda: _crun_record_deferred("fact_consolidation", "gpu_busy"))
                         else:
                             # Backup fence: SHARED advisory lock held across the cycle.
                             # If the gateway holds it EXCLUSIVE (backup dumping), defer —
@@ -1349,6 +1623,7 @@ class ConsolidationDaemon:
                             gate = await loop.run_in_executor(None, _try_backup_shared_lock)
                             if gate is None:
                                 logger.info("NREM: backup in progress — deferring consolidation; pending entries kept.")
+                                await loop.run_in_executor(None, lambda: _crun_record_deferred("fact_consolidation", "backup_in_progress"))
                             else:
                                 try:
                                     if forced:
@@ -1364,6 +1639,7 @@ class ConsolidationDaemon:
                         # a deferred sweep simply retries on the next idle tick.
                         if await inference_gpu_busy():
                             logger.info("NREM: inference GPU busy — deferring sweep.")
+                            await loop.run_in_executor(None, lambda: _crun_record_deferred("insight", "gpu_busy"))
                         else:
                             # Backup fence: SHARED advisory lock held across the sweep.
                             # Deferred if the gateway holds it EXCLUSIVE — last_sweep_time
@@ -1371,6 +1647,7 @@ class ConsolidationDaemon:
                             gate = await loop.run_in_executor(None, _try_backup_shared_lock)
                             if gate is None:
                                 logger.info("NREM: backup in progress — deferring sweep.")
+                                await loop.run_in_executor(None, lambda: _crun_record_deferred("insight", "backup_in_progress"))
                             else:
                                 try:
                                     if not self._startup_sweep_done:

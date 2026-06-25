@@ -99,6 +99,28 @@ Written by the coordinator on every save, in the same Postgres transaction as `t
 
 **Consistency note:** after a save returns success (Postgres committed), the corresponding Neo4j `Fact` node may not yet exist — the outbox worker applies it asynchronously. `graph` queries immediately after a save use `?consistency=neo4j` to block until the outbox row is applied.
 
+### `consolidation_runs` — dream-cycle liveness/coverage ledger (ADR-018, migration 012)
+
+One row per consolidation/insight **cycle** so a fold outcome is queryable state, not just a journal line. The daemon (`consolidation_loop.py`) is the sole writer; the coordinator rolls it up into the `/memory/telemetry` `consolidation` section and a cached `/health.consolidation` snapshot.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `BIGSERIAL PRIMARY KEY` | |
+| `cycle_type` | `TEXT NOT NULL` | `insight` \| `fact_consolidation` |
+| `started_at` / `finished_at` | `TIMESTAMPTZ` | `finished_at IS NULL` ⇒ in-flight (not stalled). A prior process's in-flight rows are marked `crashed` on daemon startup (orphan reap, mirrors ADR-010). |
+| `outcome` | `TEXT` | `completed` \| `crashed` \| `deferred` (deferred = a due cycle skipped for GPU-busy / backup quiesce, reason in `extra`, throttled to one per cycle_type per minute). |
+| `folds_attempted` / `folds_succeeded` / `folds_failed` | `INTEGER NOT NULL DEFAULT 0` | A row with `folds_succeeded > 0` is the success that resets `last_success_age` in the stall rule. |
+| `eligible_clusters` | `INTEGER` | Coverage census captured **at gate-time, before folding** (PR-2) — uncovered insight opportunities. |
+| `eligible_oldest_age_seconds` | `INTEGER` | Age of the most-neglected actionable cluster — the **K-th-oldest (K=`INSIGHT_THRESHOLD`) member's `neo4j_outbox.created_at`** (eligibility onset). NULL-safe for facts predating the outbox. |
+| `error_class` / `error_msg` | `TEXT` | Populated on `crashed` (msg truncated to 500 chars). |
+| `extra` | `JSONB` | Defer reason; reserved for family C (per-fold quality: `max_cosine`, fold shape). |
+
+**Indexes:** `consolidation_runs_type_started_idx` on `(cycle_type, started_at DESC)` (latest / latest-success per type); partial `consolidation_runs_inflight_idx` on `(started_at DESC) WHERE finished_at IS NULL` (in-flight probe).
+
+**Self-pruning:** the daemon deletes rows older than `CONSOLIDATION_RUNS_RETENTION_DAYS` (default 30) at startup. Writes are ~hourly (one per sweep), so volume is trivial.
+
+**Stall rule (coordinator):** `stalled = eligible backlog present AND no successful fold within CONSOLIDATION_STALL_THRESHOLD_SEC (default 2.5× the NREM sweep interval) AND nothing in-flight`. A slow LLM fold reads as in-flight, not stalled.
+
 ---
 
 ## Neo4j (Relational Memory)

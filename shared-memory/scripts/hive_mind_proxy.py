@@ -510,6 +510,17 @@ async def handle_health(request: web.Request) -> web.Response:
     # "backup ongoing", and a client seeing it knows write 503s are expected.
     checks["backup_in_progress"] = backup_quiesce_active()
 
+    # Dream-cycle liveness (ADR-018) — cached snapshot from the coordinator
+    # (refreshed ~60 s in the background) so /health stays DB-free. stalled=true
+    # means an eligible backlog exists but nothing has folded within the stall
+    # window and no fold is in-flight — an actionable alert, not a probe miss.
+    coordinator = request.app.get("coordinator")
+    if coordinator is not None:
+        try:
+            checks["consolidation"] = coordinator.consolidation_health()
+        except Exception:
+            checks["consolidation"] = {"fresh": False}
+
     return web.json_response(checks, status=200 if critical_ok else 503)
 
 
@@ -537,6 +548,7 @@ async def main() -> None:
     # The streaming path (request.content) bypasses this — see handle_proxy.
     app = web.Application(client_max_size=50 * 1024 * 1024, middlewares=[auth_middleware])
     app["proxy"] = proxy  # shared with health handler
+    app["coordinator"] = coordinator  # health reads the cached consolidation snapshot
 
     # Coordinator routes and health endpoint before the catch-all proxy route.
     attach_coordinator(app, coordinator)

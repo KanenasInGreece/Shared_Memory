@@ -608,6 +608,41 @@ _audit_writer = AsyncLineWriter(GATEWAY_AUDIT_LOG_PATH) if GATEWAY_AUDIT_LOG_PAT
 DEFAULT_DOMAIN = "general"
 NREM_DECISION_THRESHOLD = 2
 
+# ── Consolidation health signal (ADR-018) ───────────────────────────────────
+# The coordinator rolls up the daemon's consolidation_runs ledger into a cached
+# snapshot that /health and /memory/telemetry read. /health is polled frequently
+# and must stay DB-free, so a background task refreshes the snapshot rather than
+# querying per probe. STALL threshold defaults to 2.5× the NREM sweep interval
+# (the insight cycle rides every sweep) so a single deferred/failed sweep never
+# trips it; two consecutive failures do.
+_NREM_SWEEP_INTERVAL_SEC = int(os.environ.get("NREM_SWEEP_INTERVAL_SEC", "3600"))
+CONSOLIDATION_STALL_THRESHOLD_SEC = int(os.environ.get(
+    "CONSOLIDATION_STALL_THRESHOLD_SEC", str(int(2.5 * _NREM_SWEEP_INTERVAL_SEC))))
+CONSOLIDATION_HEALTH_REFRESH_SEC = int(os.environ.get("CONSOLIDATION_HEALTH_REFRESH_SEC", "60"))
+# An in-flight run row older than this is treated as a dead-mid-fold orphan, not
+# a live fold — so a crashed daemon cannot peg in_flight=true forever (the daemon
+# also reaps these on restart; this is the read-side backstop).
+CONSOLIDATION_ORPHAN_TIMEOUT_SEC = int(os.environ.get("CONSOLIDATION_ORPHAN_TIMEOUT_SEC", "1800"))
+
+
+def _consolidation_backlog(eligible_clusters, nrem_count) -> int:
+    """Backlog for the stall verdict = the cycle's OWN gate census
+    (eligible_clusters, the strict insight gate) when the daemon has recorded
+    one; else the looser nrem density count as a fresh-deploy fallback. Using
+    nrem alone falsely flags a stall when nrem sees a dense cluster the insight
+    gate rejects (≥2 projects / HAD_OUTCOME / non-mega-hub). Pure → testable."""
+    return eligible_clusters if eligible_clusters is not None else nrem_count
+
+
+def _consolidation_stall_verdict(last_success_age, in_flight, has_backlog, threshold) -> bool:
+    """Pure stall rule (ADR-018): a cycle is stalled when an eligible backlog
+    exists, no successful fold landed within the threshold (or none ever), and
+    nothing is currently in-flight. Extracted so the verdict is unit-testable
+    without a database."""
+    if not has_backlog or in_flight:
+        return False
+    return last_success_age is None or last_success_age > threshold
+
 # Canonical project names (decision pg_id 276): the project folder name is
 # canonical, and free-text drift ("shared_memory" vs "shared-memory") breaks
 # the insight gate's ≥2-distinct-projects rule. PROJECT_ALIASES maps legacy
@@ -766,6 +801,12 @@ class MemoryCoordinator:
         # (None = not held), plus the TTL auto-resume task.
         self._quiesce_conn: Any = None
         self._quiesce_timer: asyncio.Task | None = None
+        # ADR-018 consolidation health: cached snapshot refreshed by a background
+        # task so /health stays DB-free. Defaults read as "unknown" until the
+        # first refresh lands (stalled is never asserted on no data).
+        self._consolidation_health: dict = {"stalled": False, "last_outcome": None,
+                                             "last_success_age_seconds": None, "fresh": False}
+        self._consolidation_health_task: asyncio.Task | None = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -787,6 +828,8 @@ class MemoryCoordinator:
             connection_acquisition_timeout=NEO4J_ACQUIRE_TIMEOUT,
         )
         self._outbox_task = asyncio.create_task(self._outbox_worker(), name="outbox-worker")
+        self._consolidation_health_task = asyncio.create_task(
+            self._consolidation_health_refresher(), name="consolidation-health")
         log.info("coordinator ready (pool %d–%d, outbox worker running)", POOL_MIN, POOL_MAX)
         if _AGENT_TOKENS:
             log.info(
@@ -804,12 +847,13 @@ class MemoryCoordinator:
             log.warning("Run: uv run python shared-memory/scripts/generate_tokens.py to bootstrap")
 
     async def stop(self) -> None:
-        if self._outbox_task:
-            self._outbox_task.cancel()
-            try:
-                await self._outbox_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._outbox_task, self._consolidation_health_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         await self._end_quiesce()   # release the backup advisory lock if held
         if _audit_writer is not None:
             try:
@@ -1696,7 +1740,130 @@ class MemoryCoordinator:
         except Exception as exc:
             snap["breakdown"] = {"error": str(exc)}
 
+        # Consolidation signal (ADR-018) — the dream-cycle liveness rollup from
+        # the daemon's consolidation_runs ledger: per-cycle-type last outcome,
+        # success age, in-flight, last error, plus the derived stall verdict.
+        # Computed fresh here (telemetry is auth-scoped and already heavier); the
+        # cheaper /health subset reads the cached snapshot instead.
+        try:
+            snap["consolidation"] = await self._consolidation_telemetry()
+        except Exception as exc:
+            snap["consolidation"] = {"error": str(exc)}
+
         return web.json_response({"status": "success", "telemetry": snap})
+
+    # ── Consolidation health (ADR-018) ────────────────────────────────────────
+
+    async def _compute_consolidation_health(self) -> dict:
+        """Roll up consolidation_runs into per-cycle-type liveness + the stall
+        verdict. One windowed query (last-success per partition) plus the live
+        backlog from _nrem_cycle_counts. stalled = backlog present AND no
+        successful fold within STALL_THRESHOLD AND nothing in-flight."""
+        query = """
+            WITH ranked AS (
+              SELECT cycle_type, started_at, finished_at, outcome, error_class, error_msg,
+                     eligible_clusters, eligible_oldest_age_seconds,
+                     max(finished_at) FILTER (WHERE folds_succeeded > 0)
+                         OVER (PARTITION BY cycle_type) AS last_success
+              FROM consolidation_runs
+            )
+            SELECT cycle_type,
+              max(last_success) AS last_success,
+              (array_agg(outcome ORDER BY started_at DESC))[1] AS last_outcome,
+              EXTRACT(EPOCH FROM now() - max(last_success))::int AS last_success_age,
+              count(*) FILTER (WHERE finished_at IS NULL
+                  AND started_at > now() - make_interval(secs => $1)) AS inflight,
+              count(*) FILTER (WHERE outcome = 'crashed'
+                  AND (last_success IS NULL OR started_at > last_success)) AS consec_fail,
+              (array_agg(error_class ORDER BY started_at DESC)
+                  FILTER (WHERE outcome = 'crashed'))[1] AS last_error_class,
+              (array_agg(error_msg ORDER BY started_at DESC)
+                  FILTER (WHERE outcome = 'crashed'))[1] AS last_error_msg,
+              (array_agg(eligible_clusters ORDER BY started_at DESC)
+                  FILTER (WHERE eligible_clusters IS NOT NULL))[1] AS eligible_clusters,
+              (array_agg(eligible_oldest_age_seconds ORDER BY started_at DESC)
+                  FILTER (WHERE eligible_oldest_age_seconds IS NOT NULL))[1] AS eligible_oldest_age
+            FROM ranked GROUP BY cycle_type
+        """
+        async with self._acquire() as conn:
+            rows = await conn.fetch(query, CONSOLIDATION_ORPHAN_TIMEOUT_SEC)
+        by_type = {r["cycle_type"]: r for r in rows}
+        try:
+            nrem = await self._nrem_cycle_counts()
+        except Exception:
+            nrem = {}
+        backlog = {"insight": nrem.get("decision_cycles", 0) or 0,
+                   "fact_consolidation": nrem.get("fact_cycles", 0) or 0}
+
+        out: dict = {"stall_threshold_seconds": CONSOLIDATION_STALL_THRESHOLD_SEC}
+        any_stalled = False
+        for ct in ("insight", "fact_consolidation"):
+            r = by_type.get(ct)
+            age = r["last_success_age"] if r else None
+            in_flight = bool(r["inflight"]) if r else False
+            elig = r["eligible_clusters"] if r else None
+            # Backlog must match the gate the cycle ACTUALLY folds on (see
+            # _consolidation_backlog): the recorded eligible_clusters, not nrem.
+            backlog_count = _consolidation_backlog(elig, backlog.get(ct, 0))
+            has_backlog = backlog_count > 0
+            stalled = _consolidation_stall_verdict(
+                age, in_flight, has_backlog, CONSOLIDATION_STALL_THRESHOLD_SEC)
+            any_stalled = any_stalled or stalled
+            err = None
+            if r and r["last_error_class"]:
+                err = {"class": r["last_error_class"], "msg": r["last_error_msg"]}
+            out[ct] = {
+                "last_outcome": r["last_outcome"] if r else None,
+                "last_success_age_seconds": age,
+                "in_flight": in_flight,
+                "consecutive_failures": int(r["consec_fail"]) if r else 0,
+                "backlog": backlog_count,
+                "stalled": stalled,
+                "last_error": err,
+                # Coverage census (PR-2): latest gate snapshot the daemon recorded.
+                "eligible_clusters": elig,
+                "eligible_oldest_age_seconds": (r["eligible_oldest_age"] if r else None),
+            }
+        # Top-level signal keys mirror the insight cycle (the fragile one the
+        # signal exists for); stalled is OR across cycle types.
+        ins = out["insight"]
+        out["stalled"] = any_stalled
+        out["last_outcome"] = ins["last_outcome"]
+        out["last_success_age_seconds"] = ins["last_success_age_seconds"]
+        return out
+
+    async def _consolidation_telemetry(self) -> dict:
+        """Full consolidation section for /memory/telemetry (computed fresh)."""
+        return await self._compute_consolidation_health()
+
+    def consolidation_health(self) -> dict:
+        """Cached compact snapshot for /health (DB-free, refreshed in background).
+        Returns {stalled, last_outcome, last_success_age_seconds, fresh}."""
+        return dict(self._consolidation_health)
+
+    async def _consolidation_health_refresher(self) -> None:
+        """Background loop: recompute the cached /health snapshot every
+        CONSOLIDATION_HEALTH_REFRESH_SEC so /health never touches the DB."""
+        while True:
+            try:
+                full = await self._compute_consolidation_health()
+                self._consolidation_health = {
+                    "stalled": full["stalled"],
+                    "last_outcome": full["last_outcome"],
+                    "last_success_age_seconds": full["last_success_age_seconds"],
+                    "fresh": True,
+                }
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Never let the snapshot assert a stall on a compute failure —
+                # mark it stale so a reader can tell it is not current.
+                log.warning("consolidation health refresh failed: %s", exc)
+                self._consolidation_health = {**self._consolidation_health, "fresh": False}
+            try:
+                await asyncio.sleep(CONSOLIDATION_HEALTH_REFRESH_SEC)
+            except asyncio.CancelledError:
+                raise
 
     async def _nrem_cycle_counts(self) -> dict:
         """Pending NREM consolidation cycles for facts and decisions.

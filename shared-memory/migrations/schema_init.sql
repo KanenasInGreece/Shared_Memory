@@ -49,6 +49,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS community_summaries_entity_domain_unique ON pu
 CREATE INDEX IF NOT EXISTS community_summaries_scope_idx ON public.community_summaries USING btree (scope);
 CREATE INDEX IF NOT EXISTS community_summaries_visibility_idx ON public.community_summaries USING btree (visibility);
 
+-- ─── consolidation_runs ─────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS consolidation_runs (
+    id               BIGSERIAL PRIMARY KEY,
+    cycle_type       TEXT NOT NULL,
+    started_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at      TIMESTAMPTZ,
+    outcome          TEXT,
+    folds_attempted  INTEGER NOT NULL DEFAULT 0,
+    folds_succeeded  INTEGER NOT NULL DEFAULT 0,
+    folds_failed     INTEGER NOT NULL DEFAULT 0,
+    eligible_clusters INTEGER,
+    eligible_oldest_age_seconds INTEGER,
+    error_class      TEXT,
+    error_msg        TEXT,
+    extra            JSONB
+);
+
+CREATE INDEX IF NOT EXISTS consolidation_runs_inflight_idx ON public.consolidation_runs USING btree (started_at DESC) WHERE (finished_at IS NULL);
+CREATE INDEX IF NOT EXISTS consolidation_runs_type_started_idx ON public.consolidation_runs USING btree (cycle_type, started_at DESC);
+
 -- ─── neo4j_outbox ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS neo4j_outbox (
     id               BIGSERIAL PRIMARY KEY,
