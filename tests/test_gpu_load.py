@@ -109,3 +109,53 @@ async def test_missing_nvtop_fails_open(monkeypatch):
     monkeypatch.setenv("NVTOP_BIN", "definitely-not-a-real-binary-xyz")
     gpu_load._warned = False  # reset rate-limit so the branch is exercised
     assert await inference_gpu_busy() is False
+
+
+# ── gpu_probe_available + inference_busy_state: tri-state for telemetry ───────
+# The read-only "busy" surface MUST distinguish "cannot tell" from "idle" so the
+# monitor never renders a false "idle" when nvtop is absent or gating is off.
+
+from gpu_load import gpu_probe_available, inference_busy_state
+
+
+def test_probe_unavailable_when_slot_aware_off(monkeypatch):
+    monkeypatch.setenv("SLOT_AWARE", "0")
+    assert gpu_probe_available() is False
+
+
+def test_probe_unavailable_when_nvtop_missing(monkeypatch):
+    monkeypatch.setenv("SLOT_AWARE", "1")
+    monkeypatch.setenv("NVTOP_BIN", "definitely-not-a-real-binary-xyz")
+    assert gpu_probe_available() is False
+
+
+@pytest.mark.asyncio
+async def test_state_unknown_when_nvtop_missing(monkeypatch):
+    # The whole point: nvtop absent => "unknown", NEVER "idle". A fail-open False
+    # from inference_gpu_busy() must not be reported to the monitor as idle.
+    monkeypatch.setenv("SLOT_AWARE", "1")
+    monkeypatch.setenv("NVTOP_BIN", "definitely-not-a-real-binary-xyz")
+    assert await inference_busy_state() == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_state_unknown_when_slot_aware_off(monkeypatch):
+    monkeypatch.setenv("SLOT_AWARE", "0")
+    assert await inference_busy_state() == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_state_busy_and_idle_when_probe_available(monkeypatch):
+    # Probe available → delegate to the boolean gate, mapping True→busy, False→idle.
+    monkeypatch.setattr(gpu_load, "gpu_probe_available", lambda: True)
+
+    async def _busy():
+        return True
+
+    async def _idle():
+        return False
+
+    monkeypatch.setattr(gpu_load, "inference_gpu_busy", _busy)
+    assert await inference_busy_state() == "busy"
+    monkeypatch.setattr(gpu_load, "inference_gpu_busy", _idle)
+    assert await inference_busy_state() == "idle"

@@ -7,6 +7,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.13] — 2026-06-26
+
 ### Added — consolidation quality/coverage signal, Phase 1 liveness (ADR-018)
 
 The dream cycle is now observable. The `insight = 0` outage above ran ~12 days because a fold
@@ -37,6 +39,28 @@ makes a fold outcome queryable state, so a silent crash can never hide again.
   NULL-safe for facts predating the outbox. Surfaced per cycle-type in the telemetry
   `consolidation` section. Server-side only; no `api_version` bump. 9 new tests
   (`tests/test_consolidation_signal.py`), suite 300 green.
+
+### Added — inference/GPU-busy signal on `/health` + `/memory/telemetry`
+
+The Monitor could not truthfully show the LLM as **"Busy"** (or explain *why* consolidation was
+deferring): `/health.llm` is only a reachability probe of `:5000`, and the real GPU-busy signal —
+the `nvtop` check the REM/NREM daemons already gate on — was computed for the defer decision and
+thrown away. This surfaces it on the two read-only endpoints the Monitor may use.
+
+- **`inference_busy` (tri-state `"busy" | "idle" | "unknown"`)** on `/health` (top-level) and
+  `/memory/telemetry`, from a new `gpu_load.inference_busy_state()`. **`"unknown"` when nvtop is
+  absent or `SLOT_AWARE=0`** — a fail-open `False` from the gate is *never* reported as `"idle"`,
+  so the Monitor cannot show a false idle. Distinct from `/health.llm`, which stays pure
+  reachability. `nvtop` measures raw GPU utilisation, so this also reflects a user chatting
+  directly with `:5000` (which bypasses the gateway).
+- **Cached, not per-request:** the coordinator probes the GPU in the existing background
+  consolidation-health refresher, so `/health` reads a cached value and never shells out to nvtop.
+- **`last_deferred_reason`** (`"gpu_busy" | "backup_in_progress"`) added per cycle-type and
+  top-level in the telemetry `consolidation` section — read from the deferral reason the daemon
+  **already** records in `consolidation_runs.extra`. The Monitor can now show
+  "deferred — inference GPU busy". `status` CLI renders both.
+- Server-side only; **no schema change, no `api_version` bump.** 8 new tests
+  (`tests/test_gpu_load.py`, `tests/test_consolidation_signal.py`), suite 309 green.
 
 ### Fixed — silent insight-fold crash (`insight = 0` since v0.4.5)
 

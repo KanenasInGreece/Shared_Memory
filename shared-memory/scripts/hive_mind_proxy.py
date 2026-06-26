@@ -517,9 +517,18 @@ async def handle_health(request: web.Request) -> web.Response:
     coordinator = request.app.get("coordinator")
     if coordinator is not None:
         try:
-            checks["consolidation"] = coordinator.consolidation_health()
+            consolidation = coordinator.consolidation_health()
+            checks["consolidation"] = consolidation
+            # Top-level inference/GPU-busy signal for the monitor's LLM tile.
+            # Tri-state ("busy"|"idle"|"unknown") from the cached snapshot the
+            # coordinator probes in the background — /health never shells out to
+            # nvtop. "unknown" (nvtop absent / SLOT_AWARE off) is reported verbatim
+            # so the monitor shows "unknown", never a false "idle". Distinct from
+            # checks["llm"], which stays a pure reachability probe of :5000.
+            checks["inference_busy"] = consolidation.get("inference_busy", "unknown")
         except Exception:
             checks["consolidation"] = {"fresh": False}
+            checks["inference_busy"] = "unknown"
 
     return web.json_response(checks, status=200 if critical_ok else 503)
 
