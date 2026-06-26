@@ -54,6 +54,18 @@ from ontology import ONT
 
 log = logging.getLogger("coordinator")
 
+try:
+    from gpu_load import inference_busy_state
+except Exception as _gpu_exc:  # pragma: no cover - import-time safety only
+    # The busy signal is observability, never load-bearing: if gpu_load can't be
+    # imported the gateway must still serve. Fall back to "unknown" so the monitor
+    # never renders a false "idle" (it cannot tell, and says so).
+    log.warning("gpu_load.inference_busy_state unavailable (%s) — "
+                "inference_busy will report 'unknown'", _gpu_exc)
+
+    async def inference_busy_state() -> str:  # type: ignore[misc]
+        return "unknown"
+
 
 def _env_int(name: str, default: int) -> int:
     """Read an int from the environment, falling back to default on unset/invalid."""
@@ -85,7 +97,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.4.12"
+FRAMEWORK_VERSION = "0.4.13"
 API_VERSION = 1
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
@@ -805,7 +817,8 @@ class MemoryCoordinator:
         # task so /health stays DB-free. Defaults read as "unknown" until the
         # first refresh lands (stalled is never asserted on no data).
         self._consolidation_health: dict = {"stalled": False, "last_outcome": None,
-                                             "last_success_age_seconds": None, "fresh": False}
+                                             "last_success_age_seconds": None,
+                                             "inference_busy": "unknown", "fresh": False}
         self._consolidation_health_task: asyncio.Task | None = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -1750,6 +1763,12 @@ class MemoryCoordinator:
         except Exception as exc:
             snap["consolidation"] = {"error": str(exc)}
 
+        # Inference/GPU-busy signal (tri-state: "busy"|"idle"|"unknown"). Read the
+        # cached value the consolidation refresher already probed so telemetry never
+        # shells out to nvtop itself. "unknown" (nvtop absent) is surfaced verbatim
+        # so the monitor never shows a false "idle".
+        snap["inference_busy"] = self._consolidation_health.get("inference_busy", "unknown")
+
         return web.json_response({"status": "success", "telemetry": snap})
 
     # ── Consolidation health (ADR-018) ────────────────────────────────────────
@@ -1762,7 +1781,7 @@ class MemoryCoordinator:
         query = """
             WITH ranked AS (
               SELECT cycle_type, started_at, finished_at, outcome, error_class, error_msg,
-                     eligible_clusters, eligible_oldest_age_seconds,
+                     eligible_clusters, eligible_oldest_age_seconds, extra,
                      max(finished_at) FILTER (WHERE folds_succeeded > 0)
                          OVER (PARTITION BY cycle_type) AS last_success
               FROM consolidation_runs
@@ -1782,7 +1801,12 @@ class MemoryCoordinator:
               (array_agg(eligible_clusters ORDER BY started_at DESC)
                   FILTER (WHERE eligible_clusters IS NOT NULL))[1] AS eligible_clusters,
               (array_agg(eligible_oldest_age_seconds ORDER BY started_at DESC)
-                  FILTER (WHERE eligible_oldest_age_seconds IS NOT NULL))[1] AS eligible_oldest_age
+                  FILTER (WHERE eligible_oldest_age_seconds IS NOT NULL))[1] AS eligible_oldest_age,
+              -- Reason of the most-recent deferral (e.g. 'gpu_busy' | 'backup_drain'),
+              -- written to consolidation_runs.extra by the daemon. Lets the monitor
+              -- show "deferred — inference GPU busy" instead of a bare "deferred".
+              (array_agg(extra->>'reason' ORDER BY started_at DESC)
+                  FILTER (WHERE outcome = 'deferred' AND extra ? 'reason'))[1] AS last_deferred_reason
             FROM ranked GROUP BY cycle_type
         """
         async with self._acquire() as conn:
@@ -1823,6 +1847,9 @@ class MemoryCoordinator:
                 # Coverage census (PR-2): latest gate snapshot the daemon recorded.
                 "eligible_clusters": elig,
                 "eligible_oldest_age_seconds": (r["eligible_oldest_age"] if r else None),
+                # Why the most-recent deferral happened (None if never deferred);
+                # only meaningful when last_outcome == "deferred".
+                "last_deferred_reason": (r["last_deferred_reason"] if r else None),
             }
         # Top-level signal keys mirror the insight cycle (the fragile one the
         # signal exists for); stalled is OR across cycle types.
@@ -1830,6 +1857,7 @@ class MemoryCoordinator:
         out["stalled"] = any_stalled
         out["last_outcome"] = ins["last_outcome"]
         out["last_success_age_seconds"] = ins["last_success_age_seconds"]
+        out["last_deferred_reason"] = ins["last_deferred_reason"]
         return out
 
     async def _consolidation_telemetry(self) -> dict:
@@ -1838,7 +1866,8 @@ class MemoryCoordinator:
 
     def consolidation_health(self) -> dict:
         """Cached compact snapshot for /health (DB-free, refreshed in background).
-        Returns {stalled, last_outcome, last_success_age_seconds, fresh}."""
+        Returns {stalled, last_outcome, last_success_age_seconds, inference_busy,
+        fresh}. inference_busy is tri-state ("busy"|"idle"|"unknown")."""
         return dict(self._consolidation_health)
 
     async def _consolidation_health_refresher(self) -> None:
@@ -1847,17 +1876,24 @@ class MemoryCoordinator:
         while True:
             try:
                 full = await self._compute_consolidation_health()
+                # Probe the GPU here (background, ~CONSOLIDATION_HEALTH_REFRESH_SEC)
+                # so /health reads a cached value and never shells out to nvtop per
+                # request. Tri-state: "unknown" when nvtop is absent — surfaced as-is
+                # so the monitor never shows a false "idle".
+                inference_busy = await inference_busy_state()
                 self._consolidation_health = {
                     "stalled": full["stalled"],
                     "last_outcome": full["last_outcome"],
                     "last_success_age_seconds": full["last_success_age_seconds"],
+                    "inference_busy": inference_busy,
                     "fresh": True,
                 }
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 # Never let the snapshot assert a stall on a compute failure —
-                # mark it stale so a reader can tell it is not current.
+                # mark it stale so a reader can tell it is not current. Keep the
+                # prior inference_busy rather than inventing "idle" on failure.
                 log.warning("consolidation health refresh failed: %s", exc)
                 self._consolidation_health = {**self._consolidation_health, "fresh": False}
             try:

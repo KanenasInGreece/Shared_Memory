@@ -8,6 +8,7 @@ is a pure, DB-free rule.
 
 All Postgres I/O is stubbed — no live infrastructure required.
 """
+import asyncio
 import os
 import sys
 from unittest.mock import MagicMock
@@ -193,3 +194,67 @@ def test_orphan_recovery_marks_crashed_and_prunes(monkeypatch):
     assert "finished_at IS NULL" in sqls          # only reap in-flight rows
     assert "DELETE FROM consolidation_runs" in sqls  # retention prune
     assert conn.committed and conn.closed
+
+
+# ── inference_busy in the cached /health snapshot (nvtop surfacing) ───────────
+# The refresher probes the GPU in the background so /health reads a cached value
+# and never shells out to nvtop. The "never a false idle" guarantee is enforced
+# here: the default is "unknown", a probe says "busy"/"idle", and a refresh
+# failure keeps the prior value rather than inventing "idle".
+
+
+def _stop_after_one_iteration(monkeypatch):
+    """Make the refresher's trailing sleep raise CancelledError so a single
+    iteration runs, then the loop exits (matches its `except CancelledError`)."""
+    async def _sleep(*_a, **_k):
+        raise asyncio.CancelledError
+    monkeypatch.setattr(co.asyncio, "sleep", _sleep)
+
+
+def test_cached_snapshot_defaults_inference_busy_unknown():
+    c = co.MemoryCoordinator()
+    # Before any probe, the surface must read "unknown" — never a false "idle".
+    assert c.consolidation_health()["inference_busy"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_refresher_stores_inference_busy(monkeypatch):
+    c = co.MemoryCoordinator()
+
+    async def _compute():
+        return {"stalled": False, "last_outcome": "completed",
+                "last_success_age_seconds": 5}
+
+    async def _state():
+        return "busy"
+
+    monkeypatch.setattr(c, "_compute_consolidation_health", _compute)
+    monkeypatch.setattr(co, "inference_busy_state", _state)
+    _stop_after_one_iteration(monkeypatch)
+
+    with pytest.raises(asyncio.CancelledError):
+        await c._consolidation_health_refresher()
+
+    snap = c.consolidation_health()
+    assert snap["inference_busy"] == "busy"
+    assert snap["fresh"] is True
+
+
+@pytest.mark.asyncio
+async def test_refresh_failure_keeps_inference_busy_not_idle(monkeypatch):
+    c = co.MemoryCoordinator()
+    c._consolidation_health = {**c._consolidation_health, "inference_busy": "busy"}
+
+    async def _boom():
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(c, "_compute_consolidation_health", _boom)
+    _stop_after_one_iteration(monkeypatch)
+
+    with pytest.raises(asyncio.CancelledError):
+        await c._consolidation_health_refresher()
+
+    snap = c.consolidation_health()
+    # A compute failure must NOT flip the busy signal to "idle"; keep prior + stale.
+    assert snap["inference_busy"] == "busy"
+    assert snap["fresh"] is False

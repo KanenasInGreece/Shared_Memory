@@ -27,7 +27,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.4.12"
+VERSION = "0.4.13"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 API_VERSION = 1
@@ -348,6 +348,11 @@ def format_status(payload: dict) -> str:
                      f"(facts {nr.get('fact_cycles',0)}, decisions {nr.get('decision_cycles',0)})")
     elif "error" in nr:
         lines.append(f"  nrem: ERROR {nr['error']}")
+    # Inference/GPU-busy signal (tri-state). "unknown" = nvtop absent / SLOT_AWARE
+    # off — shown verbatim so the LLM is never reported falsely idle.
+    ib = t.get("inference_busy")
+    if ib is not None:
+        lines.append(f"  inference (LLM/GPU): {ib}")
     # Consolidation liveness/coverage signal (ADR-018). stalled = eligible backlog
     # but no fold succeeded within the threshold and nothing in-flight.
     cn = t.get("consolidation", {})
@@ -362,6 +367,8 @@ def format_status(payload: dict) -> str:
             if not isinstance(c, dict):
                 continue
             parts = [c.get("last_outcome") or "—"]
+            if c.get("last_outcome") == "deferred" and c.get("last_deferred_reason"):
+                parts[0] = f"deferred ({c['last_deferred_reason']})"
             if c.get("stalled"):
                 parts.append("STALLED")
             if c.get("consecutive_failures"):

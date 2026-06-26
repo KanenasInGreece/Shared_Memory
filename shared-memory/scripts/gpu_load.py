@@ -126,3 +126,29 @@ async def inference_gpu_busy() -> bool:
         # (REM/NREM) so the warning names which dreaming cycle was deferred.
         log.debug("GPU busy (>=%d%%).", threshold)
     return busy
+
+
+def gpu_probe_available() -> bool:
+    """True iff the nvtop GPU probe can actually answer (SLOT_AWARE on AND nvtop on
+    PATH). When False, a "not busy" result means "cannot tell", not "idle" — callers
+    surfacing a busy/idle state to telemetry must treat that case as unknown."""
+    if os.environ.get("SLOT_AWARE", "1") == "0":
+        return False
+    return shutil.which(os.environ.get("NVTOP_BIN", "nvtop")) is not None
+
+
+async def inference_busy_state() -> str:
+    """Tri-state view of the inference GPU for /health + /memory/telemetry:
+
+      "busy"    — a gated GPU is at/above GPU_BUSY_PERCENT (same gate REM/NREM
+                  defer on, so the monitor can show the LLM "Busy" truthfully)
+      "idle"    — the probe ran and no gated GPU is busy
+      "unknown" — the probe is unavailable (SLOT_AWARE=0 or nvtop absent), so the
+                  fail-open False from inference_gpu_busy() must NOT read as "idle"
+
+    This is the read-only surface for the busy signal; inference_gpu_busy() remains
+    the boolean the daemons gate on. nvtop sees raw GPU utilisation, so this also
+    reflects a user chatting directly with :5000 (which bypasses the gateway)."""
+    if not gpu_probe_available():
+        return "unknown"
+    return "busy" if await inference_gpu_busy() else "idle"

@@ -371,7 +371,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness:
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":1,"version":"0.4.12","daemon":"running","rem_daemon":"running",...}
+# → {"status":"ok","api_version":1,"version":"0.4.13","daemon":"running","rem_daemon":"running",...}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -392,8 +392,9 @@ python ~/.claude/skills/shared-memory/scripts/memory_bridge.py status
 #   facts:     97 total | REM pending 1 | unconsolidated 20
 #   decisions: 75 total | REM pending 71
 #   NREM cycles: 3 pending (facts 2, decisions 1)
+#   inference (LLM/GPU): busy
 #   consolidation: ok | last completed | last success 312s ago
-#     insight: completed, eligible 0
+#     insight: deferred (gpu_busy), eligible 0
 # add --json for machine-readable output
 ```
 `status` rolls up the outbox health and the REM/NREM dream-cycle backlog
@@ -401,10 +402,15 @@ python ~/.claude/skills/shared-memory/scripts/memory_bridge.py status
 the system is caught up. The coordinator owns the DB connections, so the client
 needs nothing but its token. The `--json` payload also carries `telemetry.nrem`
 (pending consolidation-cycle counts + thresholds), `telemetry.breakdown`
-(record-type / agent / source / domain / summary-kind distributions), and
+(record-type / agent / source / domain / summary-kind distributions),
+`telemetry.inference_busy` — the inference/GPU-busy signal (tri-state
+`"busy"|"idle"|"unknown"`, also top-level on `GET /health`; `"unknown"` means
+nvtop is absent or `SLOT_AWARE=0`, never reported as a false `"idle"`; distinct
+from `health.llm`, which is pure `:5000` reachability), and
 `telemetry.consolidation` — the dream-cycle liveness/coverage signal (ADR-018):
 per cycle type the last fold outcome, a `stalled` verdict, consecutive failures,
-last error, and coverage (`eligible_clusters`, `eligible_oldest_age_seconds`).
+last error, `last_deferred_reason` (`"gpu_busy"|"backup_in_progress"`), and
+coverage (`eligible_clusters`, `eligible_oldest_age_seconds`).
 A `consolidation: STALLED ⚠` line (also `consolidation.stalled` on `GET /health`)
 means an eligible backlog exists but nothing has folded — investigate. Enough to
 render a full dashboard without any direct Postgres or Neo4j access.
@@ -416,7 +422,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.4.12", "api_version": 1, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.4.13", "api_version": 1, "tool": "shared-memory-framework"}`
 - **Operations runbook:** gateway/daemon install + upgrade — [server-setup.md](Documentation/server-setup.md)
 - **Schema:** Neo4j labels, relationship types, Postgres tables — [schema.md](Documentation/schema.md)
 - **Embedding mandate:** All calls route through the gateway (:8888). Never call port 8070 (BGE-M3) or 8071 (BGE-Reranker) directly — the gateway enforces 1024-dim consistency across all agents.

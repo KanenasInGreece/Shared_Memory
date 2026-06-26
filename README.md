@@ -150,7 +150,7 @@ Vishakha Gupta's *AI Memory & Cognition: The Architect's Playbook* (ApertureData
 
 **The Retrieval Test:** *Can the agent explain why it retrieved a specific memory? Not just what was retrieved, but which specific context, session, and principal metadata informed the decision.*
 
-> **Grade: Passes (v0.4.12).** Search results carry `tier` (fact | community_summary | insight_summary), `score_normalized` (sigmoid of the raw reranker logit → [0, 1]), `matched_entities` (intersection of the query string against the saved entity list), and `graph_context` as a structured list of `{rel_type, name, label}` triples. Agent source attribution is server-verified via token authentication — `"source": "gemini"` is a server guarantee, not a client claim. An agent can reason: *"I returned a Tier-3 community synthesis — normalized score 0.91, matching entity OutboxPattern — alongside two Tier-1 precision hits, both saved by the verified Gemini CLI identity."* Since **v0.4.12**, retrieval events are also auditable: the opt-in gateway per-request audit log (`GATEWAY_AUDIT_LOG_PATH`, §14) records one off-event-loop line per authenticated request — agent, route, status, latency, timestamp, `request_id` — covering every `/memory/search`. **Gaps remaining:** that audit log is opt-in (off by default) and not yet non-repudiable (closes with the planned PoP auth); cross-encoder span attribution is not exposed (the reranker scores full documents, not spans).
+> **Grade: Passes (v0.4.13).** Search results carry `tier` (fact | community_summary | insight_summary), `score_normalized` (sigmoid of the raw reranker logit → [0, 1]), `matched_entities` (intersection of the query string against the saved entity list), and `graph_context` as a structured list of `{rel_type, name, label}` triples. Agent source attribution is server-verified via token authentication — `"source": "gemini"` is a server guarantee, not a client claim. An agent can reason: *"I returned a Tier-3 community synthesis — normalized score 0.91, matching entity OutboxPattern — alongside two Tier-1 precision hits, both saved by the verified Gemini CLI identity."* Since **v0.4.12**, retrieval events are also auditable: the opt-in gateway per-request audit log (`GATEWAY_AUDIT_LOG_PATH`, §14) records one off-event-loop line per authenticated request — agent, route, status, latency, timestamp, `request_id` — covering every `/memory/search`. **Gaps remaining:** that audit log is opt-in (off by default) and not yet non-repudiable (closes with the planned PoP auth); cross-encoder span attribution is not exposed (the reranker scores full documents, not spans).
 
 **The Consolidation Test:** *When the agent learns something new, does the system update a coherent knowledge base, or does it just accumulate versions? After six months, do you have one "truth" or three conflicting ones?*
 
@@ -158,7 +158,7 @@ Vishakha Gupta's *AI Memory & Cognition: The Architect's Playbook* (ApertureData
 
 **The Lineage Test:** *Can I trace a decision back to the original source — the raw image, the specific video frame, or the precise document page — or just the text summary extracted from it?*
 
-> **Grade: Strong Partial (v0.4.12).** Decisions trace fully to human (`WAS_ATTRIBUTED_TO`), AI agent (`WAS_ASSISTED_BY`), and project (`PROJECT_OF`); `HAD_OUTCOME` dated edges close the forward trace decision → outcome → rating + notes (the Why-To loop, with multiple retrospectives per decision). Community summaries link back to their source facts via `source_pg_ids`, and `kind='insight'` summaries to their source **decisions** the same way. The optional `source_ref` key (e.g. `"design-doc.pdf#p12"`, `"meeting.mp4@00:04:32"`) propagates to `Fact.source_ref` in Neo4j. Agent source attribution is server-verified, and since **v0.4.12** every authenticated read (`/memory/search`, `/memory/graph`, `/memory/status`) is recorded in the opt-in gateway audit log with agent + timestamp. **Gaps remaining:** `source_ref` is supplied by agents, not enforced; there is no back-edge from a raw `Fact` to the `Decision` it informed (`INFORMED_BY`, Phase 3b); the audit log is not yet non-repudiable (closes with PoP auth).
+> **Grade: Strong Partial (v0.4.13).** Decisions trace fully to human (`WAS_ATTRIBUTED_TO`), AI agent (`WAS_ASSISTED_BY`), and project (`PROJECT_OF`); `HAD_OUTCOME` dated edges close the forward trace decision → outcome → rating + notes (the Why-To loop, with multiple retrospectives per decision). Community summaries link back to their source facts via `source_pg_ids`, and `kind='insight'` summaries to their source **decisions** the same way. The optional `source_ref` key (e.g. `"design-doc.pdf#p12"`, `"meeting.mp4@00:04:32"`) propagates to `Fact.source_ref` in Neo4j. Agent source attribution is server-verified, and since **v0.4.12** every authenticated read (`/memory/search`, `/memory/graph`, `/memory/status`) is recorded in the opt-in gateway audit log with agent + timestamp. **Gaps remaining:** `source_ref` is supplied by agents, not enforced; there is no back-edge from a raw `Fact` to the `Decision` it informed (`INFORMED_BY`, Phase 3b); the audit log is not yet non-repudiable (closes with PoP auth).
 
 ### What we are building toward
 
@@ -989,7 +989,7 @@ printf 'AGENT_TOKEN=tok_<your-token>\nCOORDINATOR_URL=http://localhost:8888\n' \
 ```bash
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version
-# → {"version": "0.4.12", "api_version": 1, "tool": "shared-memory-framework"}
+# → {"version": "0.4.13", "api_version": 1, "tool": "shared-memory-framework"}
 
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py search "test" 3
@@ -1022,7 +1022,7 @@ All three paths route through the coordinator on port 8888. The coordinator owns
 ```bash
 # Check the framework version
 python shared-memory/scripts/memory_bridge.py --version
-# → {"version": "0.4.12", "api_version": 1, "tool": "shared-memory-framework"}
+# → {"version": "0.4.13", "api_version": 1, "tool": "shared-memory-framework"}
 
 # Operational telemetry — outbox health + REM/NREM backlog snapshot (add --json for raw)
 python shared-memory/scripts/memory_bridge.py status
