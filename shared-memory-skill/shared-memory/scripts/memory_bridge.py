@@ -27,7 +27,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.4.13"
+VERSION = "0.5.0"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 API_VERSION = 1
@@ -262,6 +262,47 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
     return result
 
 
+async def supersede_fact(pg_id: int, by: int | None = None) -> dict:
+    """Retract an existing fact without saving a replacement (decision 381/384).
+    With `by`, point it at an existing successor fact."""
+    payload: dict = {"pg_id": pg_id}
+    if by is not None:
+        payload["by"] = by
+    try:
+        async with _async_client(30.0) as client:
+            r = await client.post(
+                f"{COORDINATOR_BASE}/memory/supersede",
+                json=payload,
+                headers=_request_headers(),
+            )
+            if r.status_code == 401:
+                return {"status": "error",
+                        "message": "Coordinator rejected token. Set AGENT_TOKEN in this agent's .env."}
+            result = r.json()
+    except Exception as exc:
+        return await _warn_on_skew(_coordinator_unavailable(exc))
+    return result
+
+
+async def review_hold(summary_id: int, pg_id: int) -> dict:
+    """Mark a summary's flagged stale source as reviewed-and-held (decision 384, 8e):
+    stop surfacing the supersession of `pg_id` for summary `summary_id`."""
+    try:
+        async with _async_client(30.0) as client:
+            r = await client.post(
+                f"{COORDINATOR_BASE}/memory/review_hold",
+                json={"summary_id": summary_id, "pg_id": pg_id},
+                headers=_request_headers(),
+            )
+            if r.status_code == 401:
+                return {"status": "error",
+                        "message": "Coordinator rejected token. Set AGENT_TOKEN in this agent's .env."}
+            result = r.json()
+    except Exception as exc:
+        return await _warn_on_skew(_coordinator_unavailable(exc))
+    return result
+
+
 async def search_and_rerank(query: str, limit: int = 5) -> list | dict:
     try:
         async with _async_client(30.0) as client:
@@ -330,7 +371,9 @@ def format_status(payload: dict) -> str:
         lines.append(f"  postgres: ERROR {pg['error']}")
     else:
         cs = pg.get("community_summaries", {})
-        lines.append(f"  technical_docs:      {pg.get('technical_docs','?')}")
+        _sup = pg.get('technical_docs_superseded', 0)
+        lines.append(f"  technical_docs:      {pg.get('technical_docs','?')}"
+                     + (f" (superseded {_sup})" if _sup else ""))
         lines.append(f"  outbox:              {pg.get('outbox', {})}")
         lines.append(f"  community_summaries: {cs.get('total','?')} "
                      f"(superseded {cs.get('superseded',0)}, insight {cs.get('insight',0)})")
@@ -603,11 +646,52 @@ async def main() -> None:
         limit = int(sys.argv[3]) if len(sys.argv) > 3 else 5
         print(json.dumps(await search_and_rerank(sys.argv[2], limit), indent=2))
     elif action == "save":
-        if len(sys.argv) < 3:
-            print(json.dumps({"error": "Usage: memory_bridge.py save <content> [metadata_json]"}))
-            sys.exit(1)
-        metadata = sys.argv[3] if len(sys.argv) > 3 else "{}"
-        print(json.dumps(await save_artifact(sys.argv[2], metadata), indent=2))
+        p = argparse.ArgumentParser(
+            prog="memory_bridge.py save",
+            description="Save a fact, optionally superseding an existing one.",
+        )
+        p.add_argument("content", help="Fact content")
+        p.add_argument("metadata", nargs="?", default="{}", help="Metadata JSON (optional)")
+        p.add_argument("--supersedes", type=int, default=None,
+                       help="pg_id of an existing fact this save supersedes "
+                            "(soft-retire: old fact kept, flagged, hidden from search)")
+        sargs = p.parse_args(sys.argv[2:])
+        metadata = sargs.metadata
+        if sargs.supersedes is not None:
+            try:
+                mobj = json.loads(metadata) if isinstance(metadata, str) else metadata
+            except (json.JSONDecodeError, ValueError) as e:
+                print(json.dumps({"status": "error", "message": f"Invalid metadata JSON: {e}"}))
+                sys.exit(1)
+            if not isinstance(mobj, dict):
+                mobj = {}
+            mobj["supersedes"] = sargs.supersedes
+            metadata = json.dumps(mobj)
+        print(json.dumps(await save_artifact(sargs.content, metadata), indent=2))
+    elif action == "supersede":
+        p = argparse.ArgumentParser(
+            prog="memory_bridge.py supersede",
+            description="Retract an existing fact (no replacement). Soft: kept, "
+                        "flagged, hidden from search.",
+        )
+        p.add_argument("--pg-id", type=int, required=True,
+                       help="pg_id of the fact to retract")
+        p.add_argument("--by", type=int, default=None,
+                       help="pg_id of an existing successor fact (optional)")
+        sargs = p.parse_args(sys.argv[2:])
+        print(json.dumps(await supersede_fact(sargs.pg_id, sargs.by), indent=2))
+    elif action == "review-hold":
+        p = argparse.ArgumentParser(
+            prog="memory_bridge.py review-hold",
+            description="Mark a summary's flagged stale source as reviewed-and-held "
+                        "(stops re-surfacing it).",
+        )
+        p.add_argument("--summary-id", type=int, required=True,
+                       help="community_summaries.id of the flagged summary")
+        p.add_argument("--pg-id", type=int, required=True,
+                       help="pg_id of the superseded source fact to acknowledge")
+        sargs = p.parse_args(sys.argv[2:])
+        print(json.dumps(await review_hold(sargs.summary_id, sargs.pg_id), indent=2))
     elif action == "query":
         if len(sys.argv) < 3:
             print(json.dumps({

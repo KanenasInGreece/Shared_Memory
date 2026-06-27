@@ -83,7 +83,8 @@ def test_backfill_excludes_decision_and_retrospective_rows():
     conn = StubConn(script=[{"rowcount": 0, "rows": []}])
     mark_covered_rows_consolidated(conn)
     sql, _ = conn.executed[0]
-    assert "NOT IN ('retrospective', 'decision')" in sql
+    # 'supersede' rows joined the type exclusion (fact-supersession mirror, decision 381)
+    assert "NOT IN ('retrospective', 'decision', 'supersede')" in sql
 
 
 def test_backfill_requires_active_covering_summary():
@@ -100,8 +101,11 @@ def test_backlog_returns_distinct_rem_reviewed_fact_ids():
     conn = StubConn(script=[{"rowcount": 2, "rows": [(11,), (42,)]}])
     assert fetch_ledger_backlog(conn) == [11, 42]
     sql, _ = conn.executed[0]
-    assert "SELECT DISTINCT pg_id" in sql
+    assert "SELECT DISTINCT o.pg_id" in sql
     assert "status = 'rem_reviewed'" in sql
+    # superseded facts excluded from the working-set census (decision 389)
+    assert "LEFT JOIN technical_docs" in sql
+    assert "COALESCE(t.superseded, false) = false" in sql
 
 
 def test_backlog_excludes_decision_and_retro_rows_by_type():
@@ -111,7 +115,7 @@ def test_backlog_excludes_decision_and_retro_rows_by_type():
     conn = StubConn(script=[{"rowcount": 0, "rows": []}])
     fetch_ledger_backlog(conn)
     sql, _ = conn.executed[0]
-    assert "NOT IN ('retrospective', 'decision')" in sql
+    assert "NOT IN ('retrospective', 'decision', 'supersede')" in sql
 
 
 # ── fetch_unreconciled ────────────────────────────────────────────────────────

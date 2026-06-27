@@ -761,7 +761,10 @@ async def test_handle_telemetry_rolls_up_postgres_and_neo4j():
         {"status": "applied", "n": 10}, {"status": "rem_reviewed", "n": 3},
     ])
     mock_conn.fetchval = AsyncMock(return_value=171)
-    mock_conn.fetchrow = AsyncMock(return_value={"total": 2, "superseded": 0, "insight": 0})
+    mock_conn.fetchrow = AsyncMock(side_effect=[
+        {"total": 171, "superseded": 4},                  # technical_docs rollup
+        {"total": 2, "superseded": 0, "insight": 0},      # community_summaries rollup
+    ])
 
     def _result(rows):
         r = MagicMock(); r.data = AsyncMock(return_value=rows); return r
@@ -774,6 +777,7 @@ async def test_handle_telemetry_rolls_up_postgres_and_neo4j():
     assert resp.status == 200
     t = json.loads(resp.text)["telemetry"]
     assert t["postgres"]["technical_docs"] == 171
+    assert t["postgres"]["technical_docs_superseded"] == 4
     assert t["postgres"]["outbox"] == {"applied": 10, "rem_reviewed": 3}
     assert t["postgres"]["community_summaries"]["insight"] == 0
     assert t["neo4j"]["facts_total"] == 97

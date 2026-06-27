@@ -280,6 +280,7 @@ class REMDaemon:
                 f"MATCH (n)"
                 f" WHERE (n:{ONT.fact} OR n:{ONT.decision})"
                 f"   AND coalesce(n.rem_processed, false) = false"
+                f"   AND coalesce(n.superseded, false) = false"
                 f"   AND n.pg_id IS NOT NULL"
                 f" RETURN n.pg_id AS pg_id"
                 f" ORDER BY n.pg_id ASC"

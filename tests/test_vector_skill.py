@@ -226,3 +226,61 @@ async def test_mcp_check_memory_health():
         assert result["components"]["postgres"]["docs"] == 100
         assert result["components"]["retriever"]["status"] == "OK"
         mock_pg_release.assert_called()
+
+
+# ── supersede / review_hold MCP tools (fact supersession, decision 381/384) ──
+
+@pytest.mark.asyncio
+async def test_mcp_supersede_bare_retract():
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json = lambda: {
+        "status": "success", "superseded": 7, "superseded_by": None,
+        "purged_outbox": 1, "message": "Fact 7 superseded (retracted, no replacement).",
+    }
+    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
+        result = await vector_skill.supersede(7)
+    assert "superseded" in result.lower()
+    call = mock_post.call_args
+    assert call.args[0].endswith("/memory/supersede")
+    assert call.kwargs["json"] == {"pg_id": 7}          # no `by` when omitted
+
+
+@pytest.mark.asyncio
+async def test_mcp_supersede_with_successor():
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json = lambda: {
+        "status": "success", "superseded": 7, "superseded_by": 9,
+        "purged_outbox": 0, "message": "Fact 7 superseded by 9.",
+    }
+    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
+        result = await vector_skill.supersede(7, by=9)
+    assert "9" in result
+    assert mock_post.call_args.kwargs["json"] == {"pg_id": 7, "by": 9}
+
+
+@pytest.mark.asyncio
+async def test_mcp_supersede_surfaces_coordinator_error():
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json = lambda: {"status": "error", "message": "fact 7 is already superseded"}
+    with patch("httpx.AsyncClient.post", return_value=mock_response):
+        result = await vector_skill.supersede(7)
+    assert "Error" in result and "already superseded" in result
+
+
+@pytest.mark.asyncio
+async def test_mcp_review_hold():
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json = lambda: {
+        "status": "success", "summary_id": 3, "reviewed": {"old": 5, "by": 6},
+        "message": "Summary 3: supersession of 5 marked reviewed-and-held.",
+    }
+    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
+        result = await vector_skill.review_hold(3, 5)
+    assert "reviewed-and-held" in result
+    call = mock_post.call_args
+    assert call.args[0].endswith("/memory/review_hold")
+    assert call.kwargs["json"] == {"summary_id": 3, "pg_id": 5}
