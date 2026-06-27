@@ -18,9 +18,10 @@ Holds every artifact saved by any agent. This is the authoritative fact store.
 | `agent_id` | `TEXT NOT NULL DEFAULT 'legacy'` | Identity of the writing agent; `'legacy'` for pre-coordinator rows |
 | `scope` | `TEXT NOT NULL DEFAULT 'global'` | Namespace for access control; `'global'` = visible to all agents |
 | `visibility` | `TEXT NOT NULL DEFAULT 'global'` | Read policy: `'global'` \| `'scope'` \| `'private'` |
-| `superseded` | `BOOLEAN NOT NULL DEFAULT false` | Decision-level reversal flag (decision pg_id 276). Set when a retrospective with `rating="reversed"` lands on the row; mirrored as `superseded = true` on the graph `:Decision` node. Tier-1 search excludes superseded rows; reversed decisions never seed a fresh insight cluster (re-folds keep them as boundary evidence). Added by migration 009. |
+| `superseded` | `BOOLEAN NOT NULL DEFAULT false` | Soft-supersede flag. Set when (a) a retrospective with `rating="reversed"` lands on a decision row (pg_id 276), or (b) a **fact** is superseded by a correction (`save --supersedes`) or retracted (`POST /memory/supersede`) — decision 381. Mirrored as `superseded = true` on the graph `:Fact`/`:Decision` node. Tier-1 search, REM/NREM selection, and the working-set census all exclude superseded rows; the row is kept (provenance, compare/contrast). Added by migration 009. |
+| `superseded_by` | `INTEGER REFERENCES technical_docs(id) ON DELETE SET NULL` | The successor fact when this row was superseded by a correction; `NULL` for a live row, a bare retract, or a reversed decision. Powers the retrieval-time `stale_sources: [{old, superseded_by}]` annotation (decision 384) as a cheap join — no Neo4j hop. Added by migration 013. |
 
-**Indexes:** `technical_docs_embedding_idx` — `ivfflat (embedding vector_cosine_ops)`; btree indexes on `agent_id`, `scope`, `visibility`
+**Indexes:** `technical_docs_embedding_idx` — `ivfflat (embedding vector_cosine_ops)`; btree indexes on `agent_id`, `scope`, `visibility`; partial `technical_docs_superseded_by_idx` on `superseded_by WHERE superseded_by IS NOT NULL`
 
 **`source_ref` convention (optional metadata key):** agents may include `"source_ref"` in metadata to record the sub-document origin of a fact. The coordinator passes it through unchanged; the outbox worker stores it as a property on the `Fact` Neo4j node. No schema enforcement — supply it when the source is a specific document location.
 
@@ -67,6 +68,8 @@ Written exclusively by the consolidation daemon. Each row is an LLM-synthesised 
 **Insight rows (`kind: "insight"`, decision pg_id 276):** the second consolidation path folds cross-project *decision* clusters. Same table, distinguished by metadata — `kind: "insight"`, `domain: "insight"`, a `projects` array, and `source_pg_ids` containing **decision** ids (disjoint from fact ids, so the two kinds can never supersede each other). Insight rows are **always-INSERT**: they are exempt from the `(entity, domain)` unique upsert (partial index, migration 009) and rely on supersession for dedup — a re-fold on the same source set writes a fresh row that supersedes the old one.
 
 > **Note:** `source_pg_ids` is stored both as the dedicated column above and inside `metadata` JSONB. The column is the authoritative query path; the JSONB key is retained for backwards compatibility with tooling that reads raw metadata.
+
+> **`metadata.reviewed_supersessions`** (optional, decision 384 §8e): `[{old, by}, …]` — supersessions of this summary's source facts that a consumer reviewed and judged immaterial via `POST /memory/review_hold`. Retrieval suppresses `stale_sources` entries whose `old` appears here, so a held summary stops re-flagging until a *different* source is superseded.
 
 **Indexes:** `community_summaries_embedding_idx` — `ivfflat (embedding vector_cosine_ops)`; btree indexes on `agent_id`, `scope`, `visibility`
 
@@ -174,6 +177,7 @@ Written by the outbox worker for `type:decision` saves.
 | `INFORMED_BY` | `(:Decision)-[:INFORMED_BY]->(:Decision)` | Prior decision used as input |
 | `HAD_OUTCOME` | `(:Decision)-[:HAD_OUTCOME {rating,date,notes}]->()` | Retrospective — dated edge property, not a node |
 | `SUPERSEDES` | `(:CommunitySummary)-[:SUPERSEDES]->(:CommunitySummary)` | Also written between CommunitySummary nodes when supersession rule fires (v0.4.0) |
+| `SUPERSEDES` | `(:Fact)-[:SUPERSEDES]->(:Fact)` | A correction supersedes an older fact (decision 381); the old `:Fact` also gets `superseded = true` so REM/NREM skip it |
 
 ### REM-enrichment relationships (v0.4.0 — written by `rem_loop.py`)
 

@@ -69,6 +69,13 @@ The gateway requires `Authorization: Bearer <token>` on all memory routes. `AGEN
 
 Every save fires a Postgres `pg_notify`. The daemon synthesises community summaries after a 15-min idle window. If `WARNING: Consolidation daemon not running` appears in a save response, restart the gateway — notifications are not re-delivered.
 
+## Superseded sources — act on `stale_sources`
+
+A search result for a summary or insight may carry `stale_sources: [{old, superseded_by}]` — it was synthesised from a fact that has since been **superseded** (corrected/retracted), so that part of the narrative may be stale. Fetch the successor (`superseded_by`) and compare before relying on it; a null successor means the source was retracted with no replacement. Superseded facts are explicit (never inferred from similarity), kept for provenance, and excluded from search and consolidation.
+
+- **`supersede`** — retract a wrong/outdated fact: `supersede(pg_id=<id>, by=<successor_pg_id or 0>)`. To save a correction that supersedes an old fact in one call, pass `"supersedes": <old_pg_id>` in `save_artifact`'s `metadata_json` instead.
+- **`review_hold`** — `review_hold(summary_id=<id>, pg_id=<superseded_source>)` when a `stale_sources` warning is immaterial, so it stops re-surfacing.
+
 ## Cross-agent knowledge flow
 
 Facts and decisions saved by one agent (Claude Code, Gemini CLI, Grok) are retrievable by this model as soon as the search is run. The Tier-3 community summary — the first result in every search response — is a synthesised narrative across all agents' contributions. Read it first; it orients the result set. When an "Insight (cross-project principle)" section appears above it, that is a decision-validated principle spanning multiple projects — it outranks the thematic summary.

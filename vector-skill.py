@@ -193,30 +193,60 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5) -> str:
         conn = get_pg_conn()
         try:
             with conn.cursor() as cur:
+                def _stale_warning(src_ids, metadata):
+                    # decision 384: warn when a returned summary was synthesised
+                    # from a now-superseded fact (minus reviewed-and-held, 8e).
+                    if not src_ids:
+                        return ""
+                    try:
+                        cur.execute(
+                            "SELECT id, superseded_by FROM technical_docs"
+                            " WHERE id = ANY(%s) AND superseded",
+                            (list(src_ids),),
+                        )
+                        stale = cur.fetchall()
+                    except Exception:
+                        conn.rollback()  # pre-013 schema — no superseded_by column
+                        return ""
+                    md = metadata if isinstance(metadata, dict) else {}
+                    acked = {e.get("old") for e in (md.get("reviewed_supersessions") or [])
+                             if isinstance(e, dict)}
+                    pairs = [f"{old}->{by if by is not None else 'retracted'}"
+                             for old, by in stale if old not in acked]
+                    if not pairs:
+                        return ""
+                    return ("\n[⚠ STALE SOURCES: built on superseded fact(s) "
+                            + ", ".join(pairs)
+                            + " — verify the successor before relying on this]\n")
                 try:
                     cur.execute("""
-                        SELECT content FROM community_summaries
+                        SELECT content, source_pg_ids, metadata FROM community_summaries
                         WHERE NOT superseded AND metadata->>'kind' = 'insight'
                         ORDER BY embedding <=> %s::vector LIMIT 1
                     """, (query_vector,))
                     i_row = cur.fetchone()
                     if i_row:
-                        global_context += f"### Insight (cross-project principle)\n{i_row[0]}\n\n---\n\n"
+                        global_context += (f"### Insight (cross-project principle)\n{i_row[0]}"
+                                           f"{_stale_warning(i_row[1], i_row[2])}\n\n---\n\n")
                     cur.execute("""
-                        SELECT content FROM community_summaries
+                        SELECT content, source_pg_ids, metadata FROM community_summaries
                         WHERE NOT superseded
                           AND COALESCE(metadata->>'kind', 'thematic') <> 'insight'
                         ORDER BY embedding <=> %s::vector LIMIT 1
                     """, (query_vector,))
+                    g_row = cur.fetchone()
+                    if g_row:
+                        global_context += (f"### Global Context Summary\n{g_row[0]}"
+                                           f"{_stale_warning(g_row[1], g_row[2])}\n\n---\n\n")
                 except Exception:
-                    conn.rollback()  # pre-migration schema — unfiltered fallback
+                    conn.rollback()  # pre-migration schema — unfiltered, content-only fallback
                     cur.execute("""
                         SELECT content FROM community_summaries
                         ORDER BY embedding <=> %s::vector LIMIT 1
                     """, (query_vector,))
-                g_row = cur.fetchone()
-                if g_row:
-                    global_context += f"### Global Context Summary\n{g_row[0]}\n\n---\n\n"
+                    g_row = cur.fetchone()
+                    if g_row:
+                        global_context += f"### Global Context Summary\n{g_row[0]}\n\n---\n\n"
         except Exception as e:
             logger.warning(f"Global context retrieval failed: {str(e)}")
         finally:
@@ -331,6 +361,11 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
     two stores can no longer diverge on a crash between them.
 
     Idempotent: identical content reuses the existing row.
+
+    Supersede-on-save: include "supersedes": <old_pg_id> in metadata_json to save
+    this as a CORRECTION that retires an older fact in one call (the old fact is
+    kept but flagged + hidden from search). To retract a fact WITHOUT a
+    replacement, use the `supersede` tool instead.
     """
     # Validate metadata client-side first so the model gets a clear MCP error
     # before any network call. The coordinator is the authority and re-checks.
@@ -557,6 +592,79 @@ async def save_retrospective(
     if result.get("status") == "success":
         return f"Retrospective recorded on Decision pg_id={result['target_pg_id']}."
 
+    return f"Error: {result.get('message', result)}"
+
+
+@mcp.tool()
+async def supersede(pg_id: int, by: int = 0) -> str:
+    """
+    Retract / supersede an existing fact (decision 381/384). Soft — the old fact
+    is KEPT (provenance) but flagged, hidden from search, and excluded from
+    consolidation. Supersession is EXPLICIT; never infer it from similarity.
+
+    Use when a stored fact is wrong or outdated and you are NOT saving a
+    replacement in the same call. To save a correction that supersedes an old
+    fact in one step, instead call save_artifact with "supersedes": <old_pg_id>
+    in its metadata_json.
+
+    Required: pg_id (the fact to retract).
+    Optional: by (pg_id of an existing successor fact to point at; omit / 0 = none).
+    """
+    coordinator_url = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
+    payload = {"pg_id": pg_id}
+    if by and by > 0:
+        payload["by"] = by
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                f"{coordinator_url}/memory/supersede",
+                json=payload,
+                headers=_auth_headers(),
+            )
+            if r.status_code == 401:
+                return "Error: Coordinator rejected token. Set AGENT_TOKEN in mcp.json env block."
+            result = r.json()
+    except Exception as exc:
+        return (
+            f"Error: Memory coordinator unreachable at {coordinator_url} — "
+            f"is hive_mind_proxy.py running? ({exc})"
+        )
+    if result.get("status") == "success":
+        return result.get("message", f"Fact {pg_id} superseded.")
+    return f"Error: {result.get('message', result)}"
+
+
+@mcp.tool()
+async def review_hold(summary_id: int, pg_id: int) -> str:
+    """
+    Mark a summary's flagged stale source as reviewed-and-held (decision 384).
+
+    When a search result carries a stale_sources warning (a summary/insight was
+    synthesised from a since-superseded fact) and you judge the change immaterial,
+    call this so the warning stops re-surfacing for that summary. A later
+    supersession of a DIFFERENT source still surfaces.
+
+    Required: summary_id (the community_summaries id), pg_id (the superseded
+    source fact to acknowledge).
+    """
+    coordinator_url = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                f"{coordinator_url}/memory/review_hold",
+                json={"summary_id": summary_id, "pg_id": pg_id},
+                headers=_auth_headers(),
+            )
+            if r.status_code == 401:
+                return "Error: Coordinator rejected token. Set AGENT_TOKEN in mcp.json env block."
+            result = r.json()
+    except Exception as exc:
+        return (
+            f"Error: Memory coordinator unreachable at {coordinator_url} — "
+            f"is hive_mind_proxy.py running? ({exc})"
+        )
+    if result.get("status") == "success":
+        return result.get("message", f"Summary {summary_id}: supersession of {pg_id} held.")
     return f"Error: {result.get('message', result)}"
 
 

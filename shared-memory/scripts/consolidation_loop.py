@@ -339,7 +339,7 @@ def sweep_due(now, last_sweep_time, last_activity, has_pending,
 # a pg_id, and a retrospective shares its target decision's pg_id, so legacy
 # retro rows can sit at 'rem_reviewed'.
 
-_FACT_ROW = "COALESCE(cypher_params->>'type', 'fact') NOT IN ('retrospective', 'decision')"
+_FACT_ROW = "COALESCE(cypher_params->>'type', 'fact') NOT IN ('retrospective', 'decision', 'supersede')"
 _DREAM_ROW = "COALESCE(cypher_params->>'type', 'fact') IN ('decision', 'retrospective')"
 _RETRO_ROW = "COALESCE(cypher_params->>'type', 'fact') = 'retrospective'"
 
@@ -374,12 +374,20 @@ def mark_covered_rows_consolidated(conn):
 def fetch_ledger_backlog(conn):
     """pg_ids of facts that finished REM but not NREM — the durable
     consolidation backlog. DISTINCT because re-saves can leave multiple rows
-    per pg_id."""
+    per pg_id.
+
+    Superseded facts are excluded (decision 389): their row rides along until
+    the successor consolidates, but they are excluded from REM/NREM folding, so
+    counting them as backlog would never drain on its own — inflating coverage
+    age and risking a false ADR-018 stall verdict. The LEFT JOIN keeps rows
+    whose pg_id has no technical_docs row (defensive) as non-superseded."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT DISTINCT pg_id FROM neo4j_outbox"
-            " WHERE status = 'rem_reviewed'"
-            f"  AND {_FACT_ROW}"
+            "SELECT DISTINCT o.pg_id FROM neo4j_outbox o"
+            "  LEFT JOIN technical_docs t ON t.id = o.pg_id"
+            " WHERE o.status = 'rem_reviewed'"
+            "   AND COALESCE(t.superseded, false) = false"
+            f"  AND {_FACT_ROW.replace('cypher_params', 'o.cypher_params')}"
         )
         return [r[0] for r in cur.fetchall()]
 
@@ -423,12 +431,47 @@ def close_ledger_rows(conn, pg_ids, context="consolidation"):
             (list(pg_ids),),
         )
         deleted = cur.fetchall()
+
+        # Supersession GC (decision 381/384): a fact superseded before it could
+        # be REM/NREM-processed never advances its own row — it RIDES ALONG with
+        # its successor. When the superseding fact's row is closed here, purge the
+        # whole superseded ancestry (transitive via technical_docs.superseded_by)
+        # in the SAME pass, logged identically — the corrected knowledge is now
+        # consolidated, so the retired ancestors leave the working set together.
+        # Recursive walk handles chains A→B→C: closing head C purges {B, A}.
+        purged_preds = []
+        if deleted:
+            consolidated_ids = [pid for _oid, pid in deleted]
+            cur.execute(
+                "WITH RECURSIVE preds AS ("
+                "  SELECT id FROM technical_docs WHERE superseded_by = ANY(%s)"
+                "  UNION"
+                "  SELECT t.id FROM technical_docs t"
+                "    JOIN preds p ON t.superseded_by = p.id"
+                ")"
+                " DELETE FROM neo4j_outbox"
+                " WHERE pg_id IN (SELECT id FROM preds)"
+                # Only the predecessor's dream-cycle FACT row is GC'd here; a
+                # type='supersede' mirror row self-deletes on apply and must not
+                # be yanked before it marks the old node + writes the edge.
+                f"   AND {_FACT_ROW}"
+                " RETURNING id, pg_id",
+                (consolidated_ids,),
+            )
+            purged_preds = cur.fetchall()
     conn.commit()
     if deleted:
         logger.info(
             "Ledger close [%s]: deleted %d outbox row(s): %s",
             context, len(deleted),
             ", ".join(f"outbox_id={oid}→pg_id={pid}" for oid, pid in sorted(deleted)),
+        )
+    if purged_preds:
+        logger.info(
+            "Ledger close [%s]: purged %d superseded-predecessor outbox row(s) "
+            "alongside their consolidated successor: %s",
+            context, len(purged_preds),
+            ", ".join(f"outbox_id={oid}→pg_id={pid}" for oid, pid in sorted(purged_preds)),
         )
     return len(deleted)
 
@@ -905,6 +948,7 @@ class ConsolidationDaemon:
                 f" MATCH (e)<-[:{ONT.entity_link_alias}|{ONT.entity_link}]-(neighbor:{ONT.fact})"
                 f" WHERE coalesce(neighbor.consolidated, false) = false"
                 f"   AND coalesce(neighbor.rem_processed, false) = true"
+                f"   AND coalesce(neighbor.superseded, false) = false"
                 f" WITH e, collect(neighbor) as unflagged_facts"
                 f" WHERE size(unflagged_facts) >= $threshold"
                 f" RETURN e.name as entity,"

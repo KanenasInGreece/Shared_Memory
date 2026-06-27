@@ -97,7 +97,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.4.13"
+FRAMEWORK_VERSION = "0.5.0"
 API_VERSION = 1
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
@@ -192,6 +192,8 @@ _READ_ROLE_ROUTES: set[tuple[str, str]] = {
 _WRITE_ROUTES: set[tuple[str, str]] = {
     ("POST", "/memory/save"),
     ("POST", "/memory/retrospective"),
+    ("POST", "/memory/supersede"),
+    ("POST", "/memory/review_hold"),
 }
 
 # Admin-only routes — reachable ONLY by an "admin"-role token, which in turn can
@@ -985,6 +987,10 @@ class MemoryCoordinator:
                 await self._apply_retrospective_outbox_row(outbox_id, pg_id, params)
                 return
 
+            if params.get("type") == "supersede":
+                await self._apply_supersede_outbox_row(outbox_id, params)
+                return
+
             # Standard Fact + Entity MERGE — all writes in one round-trip so they
             # succeed or fail atomically. MERGE is idempotent — safe to retry.
             source_ref = params.get("source_ref") or None
@@ -1003,6 +1009,25 @@ class MemoryCoordinator:
                     entities=params.get("entities", []),
                     **( {"source_ref": source_ref} if source_ref else {} ),
                 )
+                # Fact supersession mirror (decision 381/384), piggybacked on this
+                # fact's row: flag the old Fact node so REM/NREM exclude it, and
+                # link (new)-[:SUPERSEDES]->(old) — same relationship + direction
+                # community-summary supersession uses. MATCH-only on old so a
+                # missing node (pre-coordinator fact) is a no-op, never a phantom.
+                supersedes = params.get("supersedes")
+                if supersedes is not None:
+                    # MERGE (not MATCH) on old: the outbox worker may apply the new
+                    # fact's row before the old fact's own row, so the old node may
+                    # not exist yet. MERGE marks it (stub if needed); the old fact's
+                    # later row-apply only SETs content, never clearing superseded.
+                    await session.run(
+                        f"MERGE (old:{ONT.fact} {{pg_id: $old_id}})"
+                        f" SET old.superseded = true"
+                        f" WITH old"
+                        f" MATCH (new:{ONT.fact} {{pg_id: $new_id}})"
+                        f" MERGE (new)-[:{ONT.supersedes}]->(old)",
+                        old_id=supersedes, new_id=pg_id,
+                    )
             async with self._acquire() as conn:
                 await conn.execute(
                     "UPDATE neo4j_outbox SET status='applied', applied_at=now() WHERE id=$1",
@@ -1120,6 +1145,37 @@ class MemoryCoordinator:
             )
         log.debug("outbox: applied retrospective pg_id=%d (outbox_id=%d)", pg_id, outbox_id)
 
+    async def _apply_supersede_outbox_row(self, outbox_id: int, params: dict) -> None:
+        """Standalone supersession mirror for the /memory/supersede route (bare
+        retract, or point an existing fact at an existing successor — no new fact
+        to piggyback on). MERGE old so it is marked even if its own row has not
+        applied; optional (new)-[:SUPERSEDES]->(old) edge to an existing successor.
+        One-shot: the row is DELETED on success — it carries no dream lifecycle and
+        must never count as working-set backlog."""
+        old_id = params.get("old_pg_id")
+        new_id = params.get("new_pg_id")
+        async with self._neo4j.session() as session:
+            if new_id is not None:
+                await session.run(
+                    f"MERGE (old:{ONT.fact} {{pg_id: $old_id}})"
+                    f" SET old.superseded = true"
+                    f" WITH old"
+                    f" MERGE (new:{ONT.fact} {{pg_id: $new_id}})"
+                    f" MERGE (new)-[:{ONT.supersedes}]->(old)",
+                    old_id=old_id, new_id=new_id,
+                )
+            else:
+                await session.run(
+                    f"MERGE (old:{ONT.fact} {{pg_id: $old_id}}) SET old.superseded = true",
+                    old_id=old_id,
+                )
+        async with self._acquire() as conn:
+            await conn.execute("DELETE FROM neo4j_outbox WHERE id=$1", outbox_id)
+        log.debug(
+            "outbox: applied supersede old=%s new=%s (outbox_id=%d, row deleted)",
+            old_id, new_id, outbox_id,
+        )
+
     async def _wait_for_outbox(self, pg_id: int) -> bool:
         """Poll until the outbox row for pg_id is applied, or CONSISTENCY_TIMEOUT expires."""
         loop = asyncio.get_running_loop()
@@ -1225,6 +1281,37 @@ class MemoryCoordinator:
                     status=400,
                 )
 
+        # Fact supersession (decision 381, refined by 384): an optional
+        # `supersedes` pointer marks an existing fact superseded by THIS save.
+        # Validated at ingress — target must exist and not already be superseded —
+        # before the embed/WAL work. Propagation to dependent summaries/decisions
+        # is LAZY (resolved at retrieval, decision 384), so nothing else fires here
+        # beyond flagging the old row; the Neo4j mirror + REM/NREM exclusion follow.
+        supersedes = metadata.get("supersedes")
+        if supersedes is not None:
+            if isinstance(supersedes, bool) or not isinstance(supersedes, int):
+                return web.json_response(
+                    {"status": "error",
+                     "message": "metadata.supersedes must be an integer pg_id"},
+                    status=400,
+                )
+            async with self._acquire() as conn:
+                target = await conn.fetchrow(
+                    "SELECT superseded FROM technical_docs WHERE id = $1", supersedes
+                )
+            if target is None:
+                return web.json_response(
+                    {"status": "error",
+                     "message": f"supersedes target {supersedes} not found"},
+                    status=400,
+                )
+            if target["superseded"]:
+                return web.json_response(
+                    {"status": "error",
+                     "message": f"supersedes target {supersedes} is already superseded"},
+                    status=400,
+                )
+
         entities     = metadata.get("entities", [])
         content_hash = hashlib.sha256(content.encode()).hexdigest()
 
@@ -1281,8 +1368,30 @@ class MemoryCoordinator:
                             "type": metadata.get("type", "fact"),
                             "decision": metadata.get("decision", {}),
                             "source_ref": metadata.get("source_ref") or None,
+                            # Piggyback the supersession mirror onto THIS fact's row
+                            # (no separate outbox row to pollute the census): when it
+                            # applies, the worker also marks the old Fact node
+                            # superseded and writes (new)-[:SUPERSEDES]->(old).
+                            "supersedes": (
+                                supersedes if (supersedes is not None
+                                               and supersedes != pg_id) else None
+                            ),
                         },
                     )
+
+                    # Flag the superseded predecessor in the SAME transaction as
+                    # its replacement (atomic: the correction and the retirement
+                    # commit together). superseded_by powers the read-time
+                    # stale_sources annotation (decision 384) as a pure Postgres
+                    # join. The id != pg_id guard covers the degenerate case where
+                    # identical content hash-collides onto the target row itself.
+                    if supersedes is not None and supersedes != pg_id:
+                        await conn.execute(
+                            "UPDATE technical_docs"
+                            " SET superseded = true, superseded_by = $2"
+                            " WHERE id = $1 AND id != $2",
+                            supersedes, pg_id,
+                        )
 
                     # Wake the consolidation daemon
                     await conn.execute(
@@ -1306,11 +1415,185 @@ class MemoryCoordinator:
             if entities
             else " WARNING: no 'entities' in metadata — fact ineligible for Tier 3 consolidation."
         )
+        superseded_pg_id = (
+            supersedes if (supersedes is not None and supersedes != pg_id) else None
+        )
+        sup_msg = (
+            f" Superseded fact {superseded_pg_id}." if superseded_pg_id is not None else ""
+        )
         return web.json_response({
             "status": "success",
             "pg_id": pg_id,
             "neo4j": neo4j_status,
-            "message": f"Artifact stored with ID {pg_id}.{warn}",
+            "superseded": superseded_pg_id,
+            "message": f"Artifact stored with ID {pg_id}.{sup_msg}{warn}",
+        })
+
+    # ── POST /memory/supersede ────────────────────────────────────────────────
+
+    async def handle_supersede(self, request: web.Request) -> web.Response:
+        """Retract an existing fact WITHOUT saving a replacement (decision 381/384):
+        `supersede {pg_id, by?}`. With `by`, point the retracted fact at an existing
+        successor. Soft: the row is kept + flagged (search excludes it; provenance
+        intact). The Neo4j mirror runs via a one-shot 'supersede' outbox row.
+
+        GC (decision 389): a superseded fact rides along with its successor and is
+        purged when that successor consolidates. A bare retract (no `by`) — or a
+        `by` whose successor has no live outbox row to ride with — has no future
+        purger, so its outbox row is purged here and logged."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {"status": "error", "message": "request body must be JSON"}, status=400
+            )
+        pg_id = body.get("pg_id")
+        by    = body.get("by")
+        if isinstance(pg_id, bool) or not isinstance(pg_id, int):
+            return web.json_response(
+                {"status": "error", "message": "pg_id (int) is required"}, status=400
+            )
+        if by is not None and (isinstance(by, bool) or not isinstance(by, int)):
+            return web.json_response(
+                {"status": "error", "message": "by must be an integer pg_id"}, status=400
+            )
+        if by is not None and by == pg_id:
+            return web.json_response(
+                {"status": "error", "message": "a fact cannot supersede itself"}, status=400
+            )
+
+        async with self._acquire() as conn:
+            target = await conn.fetchrow(
+                "SELECT superseded FROM technical_docs WHERE id = $1", pg_id
+            )
+            if target is None:
+                return web.json_response(
+                    {"status": "error", "message": f"fact {pg_id} not found"}, status=400
+                )
+            if target["superseded"]:
+                return web.json_response(
+                    {"status": "error", "message": f"fact {pg_id} is already superseded"},
+                    status=400,
+                )
+            if by is not None:
+                succ = await conn.fetchval(
+                    "SELECT 1 FROM technical_docs WHERE id = $1", by
+                )
+                if succ is None:
+                    return web.json_response(
+                        {"status": "error", "message": f"successor {by} not found"},
+                        status=400,
+                    )
+
+            purged = 0
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE technical_docs SET superseded = true, superseded_by = $2"
+                    " WHERE id = $1",
+                    pg_id, by,
+                )
+                await conn.execute(
+                    "INSERT INTO neo4j_outbox (pg_id, cypher_params) VALUES ($1, $2::jsonb)",
+                    pg_id,
+                    {"type": "supersede", "old_pg_id": pg_id, "new_pg_id": by},
+                )
+                # Ride-along only if a live successor fact row exists to purge us
+                # later; otherwise purge this fact's own dream-cycle row now.
+                ride = False
+                if by is not None:
+                    ride = await conn.fetchval(
+                        "SELECT 1 FROM neo4j_outbox WHERE pg_id = $1"
+                        " AND COALESCE(cypher_params->>'type','fact') = 'fact' LIMIT 1",
+                        by,
+                    ) is not None
+                if not ride:
+                    rows = await conn.fetch(
+                        "DELETE FROM neo4j_outbox WHERE pg_id = $1"
+                        " AND COALESCE(cypher_params->>'type','fact') = 'fact'"
+                        " RETURNING id",
+                        pg_id,
+                    )
+                    purged = len(rows)
+            if purged:
+                log.info(
+                    "Supersede: purged %d outbox row(s) for retracted fact %d "
+                    "(no live successor to ride with).", purged, pg_id,
+                )
+
+        return web.json_response({
+            "status": "success",
+            "superseded": pg_id,
+            "superseded_by": by,
+            "purged_outbox": purged,
+            "message": (
+                f"Fact {pg_id} superseded"
+                + (f" by {by}." if by is not None else " (retracted, no replacement).")
+            ),
+        })
+
+    # ── POST /memory/review_hold ──────────────────────────────────────────────
+
+    async def handle_review_hold(self, request: web.Request) -> web.Response:
+        """Mark a summary's supersession as reviewed-and-held (decision 384, 8e):
+        the consumer judged a flagged stale source immaterial, so stop surfacing it.
+        Records {old, by} in community_summaries.metadata.reviewed_supersessions
+        (dedup by old). A later supersession of a DIFFERENT source still surfaces;
+        a re-fold (8c) makes a new summary with fresh metadata, so acks never leak."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {"status": "error", "message": "request body must be JSON"}, status=400
+            )
+        summary_id = body.get("summary_id")
+        pg_id      = body.get("pg_id")
+        if isinstance(summary_id, bool) or not isinstance(summary_id, int) \
+           or isinstance(pg_id, bool) or not isinstance(pg_id, int):
+            return web.json_response(
+                {"status": "error",
+                 "message": "summary_id (int) and pg_id (int) are required"},
+                status=400,
+            )
+        async with self._acquire() as conn:
+            srow = await conn.fetchrow(
+                "SELECT source_pg_ids, metadata FROM community_summaries WHERE id = $1",
+                summary_id,
+            )
+            if srow is None:
+                return web.json_response(
+                    {"status": "error", "message": f"summary {summary_id} not found"},
+                    status=400,
+                )
+            if pg_id not in list(srow["source_pg_ids"] or []):
+                return web.json_response(
+                    {"status": "error",
+                     "message": f"fact {pg_id} is not a source of summary {summary_id}"},
+                    status=400,
+                )
+            by = await conn.fetchval(
+                "SELECT superseded_by FROM technical_docs WHERE id = $1 AND superseded",
+                pg_id,
+            )
+            meta = _coerce_jsonb_obj(srow["metadata"]) or {}
+            acks = meta.get("reviewed_supersessions")
+            if not isinstance(acks, list):
+                acks = []
+            if not any(isinstance(e, dict) and e.get("old") == pg_id for e in acks):
+                acks.append({"old": pg_id, "by": by})
+            # jsonb_set touches ONLY the reviewed_supersessions key in-place, so a
+            # concurrent NREM re-fold rewriting other metadata keys isn't clobbered.
+            await conn.execute(
+                "UPDATE community_summaries"
+                " SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb),"
+                "                          '{reviewed_supersessions}', $2::jsonb)"
+                " WHERE id = $1",
+                summary_id, acks,
+            )
+        return web.json_response({
+            "status": "success",
+            "summary_id": summary_id,
+            "reviewed": {"old": pg_id, "by": by},
+            "message": f"Summary {summary_id}: supersession of {pg_id} marked reviewed-and-held.",
         })
 
     # ── POST /memory/retrospective ────────────────────────────────────────────
@@ -1527,13 +1810,53 @@ class MemoryCoordinator:
                     for i in range(min(limit, len(candidates)))
                 ]
 
+        # Retrieval-time supersession check (decision 384) — the PRIMARY mechanism.
+        # A summary/insight outlives its sources, so flag any returned narrative
+        # whose provenance touches a superseded fact (or a reversed decision —
+        # decisions set `superseded` too, with a NULL successor). Cheap PG join via
+        # the superseded_by pointer (migration 013); no LLM, no Neo4j hop. The
+        # consumer judges materiality on the spot (8b) and may trigger an on-demand
+        # re-fold / retrospective (8c) — propagation is never eager.
+        prov_ids: set[int] = set()
+        if insight:
+            prov_ids.update(insight.get("source_pg_ids") or [])
+        if summary:
+            prov_ids.update(summary.get("source_pg_ids") or [])
+        stale_map: dict[int, int | None] = {}
+        if prov_ids:
+            try:
+                async with self._acquire() as conn:
+                    srows = await conn.fetch(
+                        "SELECT id, superseded_by FROM technical_docs"
+                        " WHERE id = ANY($1) AND superseded",
+                        list(prov_ids),
+                    )
+                stale_map = {r["id"]: r["superseded_by"] for r in srows}
+            except Exception:
+                stale_map = {}  # column missing (pre-013) — degrade to no annotation
+
+        def _stale_sources(source_pg_ids, meta) -> list[dict]:
+            # 8e: suppress supersessions already reviewed-and-held for this summary
+            # (metadata.reviewed_supersessions = [{old, by}, ...]). A later, distinct
+            # supersession of a different source is a new pair, so still surfaces.
+            m = _coerce_jsonb_obj(meta) if not isinstance(meta, dict) else meta
+            acked = {
+                e["old"] for e in (m or {}).get("reviewed_supersessions", [])
+                if isinstance(e, dict) and "old" in e
+            }
+            return [
+                {"old": pid, "superseded_by": stale_map[pid]}
+                for pid in (source_pg_ids or [])
+                if pid in stale_map and pid not in acked
+            ]
+
         # Neo4j relational expansion
         final: list[dict] = []
         if insight:
             # Insights rank above thematic summaries: a cross-project
             # principle validated by at least one retrospective outranks a
             # single-domain narrative. source_pg_ids are DECISION ids here.
-            final.append({
+            ins_result = {
                 "tier": "insight_summary",
                 "content": insight["content"],
                 "score": None,
@@ -1542,12 +1865,16 @@ class MemoryCoordinator:
                 "metadata": insight["metadata"],
                 "source_pg_ids": insight["source_pg_ids"],
                 "graph_context": [],
-            })
+            }
+            stale = _stale_sources(insight["source_pg_ids"], insight["metadata"])
+            if stale:
+                ins_result["stale_sources"] = stale
+            final.append(ins_result)
         if summary:
             # Surface the summary's provenance so an agent can trace a Tier-3
             # narrative back to the exact Tier-1 facts it was synthesised from
             # (source_pg_ids) — drill down via /memory/graph or status/{pg_id}.
-            final.append({
+            sum_result = {
                 "tier": "community_summary",
                 "content": summary["content"],
                 "score": None,
@@ -1556,7 +1883,11 @@ class MemoryCoordinator:
                 "metadata": summary["metadata"],
                 "source_pg_ids": summary["source_pg_ids"],
                 "graph_context": [],
-            })
+            }
+            stale = _stale_sources(summary["source_pg_ids"], summary["metadata"])
+            if stale:
+                sum_result["stale_sources"] = stale
+            final.append(sum_result)
 
         async with self._neo4j.session() as session:
             for hit in ranked:
@@ -1689,7 +2020,12 @@ class MemoryCoordinator:
                     "SELECT EXTRACT(EPOCH FROM now() - min(created_at))::int"
                     " FROM neo4j_outbox WHERE status='failed'"
                 )
-                docs = await conn.fetchval("SELECT count(*) FROM technical_docs")
+                docrow = await conn.fetchrow(
+                    "SELECT count(*) AS total,"
+                    " count(*) FILTER (WHERE superseded) AS superseded"
+                    " FROM technical_docs"
+                )
+                docs = docrow["total"]
                 summ = await conn.fetchrow(
                     "SELECT count(*) AS total,"
                     " count(*) FILTER (WHERE superseded) AS superseded,"
@@ -1698,6 +2034,7 @@ class MemoryCoordinator:
                 )
             snap["postgres"] = {
                 "technical_docs": docs,
+                "technical_docs_superseded": docrow["superseded"],
                 "outbox": {r["status"]: r["n"] for r in outbox},
                 "outbox_failed_oldest_age_seconds": failed_age,
                 "community_summaries": {
@@ -1917,6 +2254,7 @@ class MemoryCoordinator:
                 f" MATCH (e)<-[:{ONT.entity_link_alias}|{ONT.entity_link}]-(n:{ONT.fact})"
                 f" WHERE coalesce(n.consolidated,false) = false"
                 f"   AND coalesce(n.rem_processed,false) = true"
+                f"   AND coalesce(n.superseded,false) = false"
                 f" WITH e, collect(n.pg_id) AS pg_ids"
                 f" WHERE size(pg_ids) >= $threshold"
                 f" RETURN e.name AS entity, pg_ids",
@@ -1927,6 +2265,7 @@ class MemoryCoordinator:
                 f"MATCH (d:{ONT.decision})"
                 f" WHERE coalesce(d.rem_processed,false) = true"
                 f"   AND coalesce(d.consolidated,false) = false"
+                f"   AND coalesce(d.superseded,false) = false"
                 f" RETURN collect(d.pg_id) AS pg_ids"
             )
             drows = await dres.data()
@@ -2141,6 +2480,8 @@ def attach(app: web.Application, coordinator: MemoryCoordinator) -> None:
     """
     app.router.add_post("/memory/save",           coordinator.handle_save)
     app.router.add_post("/memory/retrospective",  coordinator.handle_retrospective)
+    app.router.add_post("/memory/supersede",      coordinator.handle_supersede)
+    app.router.add_post("/memory/review_hold",     coordinator.handle_review_hold)
     app.router.add_post("/memory/search",         coordinator.handle_search)
     app.router.add_post("/memory/graph",          coordinator.handle_graph)
     app.router.add_get( "/memory/status/{pg_id}", coordinator.handle_status)

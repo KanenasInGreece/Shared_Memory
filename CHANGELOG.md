@@ -7,6 +7,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-06-27
+
+### Added — fact supersession (decisions 381, 384, 389)
+
+Plain facts now have the soft-supersede lifecycle that `reversed` decisions and community
+summaries already had. A wrong/outdated fact is **kept** (provenance, compare/contrast) but
+flagged, hidden from search, and excluded from consolidation.
+
+- **`save --supersedes <pg_id>`** — save a correction that supersedes an older fact in one call.
+  The old row gets `superseded = true` + a `superseded_by` pointer (migration `013`); the Neo4j
+  mirror (`old.superseded = true` + `(new)-[:SUPERSEDES]->(old)`) is **piggybacked** on the new
+  fact's outbox row (no extra row).
+- **`POST /memory/supersede {pg_id, by?}`** / **`supersede --pg-id [--by]`** — retract a fact with
+  no replacement, or point it at an existing successor.
+- **Lazy resolution (decision 384):** dependent summaries/insights are **not** re-folded on
+  supersede. Search annotates any returned summary/insight whose provenance touches a superseded
+  fact with **`stale_sources: [{old, superseded_by}]`** — a cheap Postgres join, no LLM. The
+  consumer judges materiality at the point of use; **`review-hold --summary-id --pg-id`** records a
+  reviewed-and-held supersession so it stops re-flagging.
+- **Outbox GC (decision 389):** a fact superseded before it finished dreaming **rides along** with
+  its successor and is purged transitively when the successor consolidates (`close_ledger_rows`,
+  recursive over `superseded_by`, logged). A bare retract with no successor is purged immediately.
+- **Census safety:** superseded facts are excluded from REM selection, the NREM density gate, the
+  ledger backlog, and the telemetry/stall census — a riding-along predecessor cannot false-trip the
+  ADR-018 stall verdict. `status` now shows `technical_docs: N (superseded M)`.
+- Supersession is **explicit, never automatic** — embedding similarity is not a correctness signal.
+  Additive and back-compatible: `api_version` unchanged.
+
 ## [0.4.13] — 2026-06-26
 
 ### Added — consolidation quality/coverage signal, Phase 1 liveness (ADR-018)
