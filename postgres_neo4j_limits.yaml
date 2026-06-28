@@ -7,16 +7,23 @@ services:
       - "7474:7474"
       - "7687:7687"
     volumes:
-      - /your/data/path/neo4j/data:/data:z
-      - /your/data/path/neo4j/logs:/logs:z
-      - /your/data/path/neo4j/import:/import:z
-      - /your/data/path/neo4j/plugins:/plugins:z
+      # Host data dirs come from the framework env (shared-memory/.env); the
+      # first-install script (scripts/install_framework.sh) sets NEO4J_HOST_DIR.
+      - ${NEO4J_HOST_DIR:?set NEO4J_HOST_DIR in shared-memory/.env}/data:/data:z
+      - ${NEO4J_HOST_DIR}/logs:/logs:z
+      - ${NEO4J_HOST_DIR}/import:/import:z
+      - ${NEO4J_HOST_DIR}/plugins:/plugins:z
     environment:
       - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD}
-      - NEO4J_PLUGINS=["apoc"]
-      # APOC Security Procedures
-      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
-      - NEO4J_dbms_security_procedures_allowlist=apoc.*
+      # graph-data-science (GDS) added for ADR-017 alias-component grouping
+      # (gds.wcc) and the deferred graph-quality pass (gds.nodeSimilarity,
+      # embeddings, stable componentIds for growth deltas). GDS Community tier
+      # is free and runs on neo4j:5-community; the official plugin auto-matches
+      # the server version. Restart the container to load it.
+      - NEO4J_PLUGINS=["apoc","graph-data-science"]
+      # APOC + GDS Security Procedures
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*,gds.*
+      - NEO4J_dbms_security_procedures_allowlist=apoc.*,gds.*
       # Allow APOC to write the backup export into the mounted /import dir
       # (ops/backup.sh → apoc.export.cypher.all). Online, no container stop.
       - NEO4J_apoc_export_file_enabled=true
@@ -38,7 +45,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - /your/data/path/postgres/data:/var/lib/postgresql/data:z
+      - ${PG_DATA_DIR:?set PG_DATA_DIR in shared-memory/.env}:/var/lib/postgresql/data:z
     command: >
       postgres
       -c shared_buffers=1GB
@@ -61,7 +68,7 @@ services:
     container_name: llama-retriever
     ports: ["8070:8070"]
     volumes:
-      - /path/to/your/LLM_Models:/models:ro,z
+      - ${LLM_MODELS_DIR:-./models}:/models:ro,z
     command: >
       -m /models/gpustack/bge-m3-GGUF/bge-m3-Q8_0.gguf
       --embedding --host 0.0.0.0 --port 8070 --threads 4  -c 8192 -b 8192 -ub 8192
@@ -79,7 +86,7 @@ services:
     container_name: llama-reranker
     ports: ["8071:8071"]
     volumes:
-      - /path/to/your/LLM_Models:/models:ro,z
+      - ${LLM_MODELS_DIR:-./models}:/models:ro,z
     command: >
       -m /models/gpustack/bge-reranker-v2-m3-GGUF/bge-reranker-v2-m3-Q8_0.gguf
       --rerank --host 0.0.0.0 --port 8071 --threads 4  -c 8192 -b 8192 -ub 8192

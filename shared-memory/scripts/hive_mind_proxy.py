@@ -14,8 +14,13 @@ from aiohttp.client_exceptions import (
 # Load .env BEFORE importing coordinator — coordinator reads env vars at module
 # level, so credentials must be in os.environ by the time that import runs.
 def _load_env() -> None:
-    env_path = Path(__file__).parent.parent.parent / ".env"
-    if not env_path.exists():
+    # Framework env now lives in the framework folder (shared-memory/.env);
+    # the repo-root path is kept as a fallback so pre-0.6 installs don't break.
+    # __file__ = shared-memory/scripts/hive_mind_proxy.py → parent.parent = shared-memory/
+    here = Path(__file__).resolve()
+    candidates = [here.parent.parent / ".env", here.parent.parent.parent / ".env"]
+    env_path = next((p for p in candidates if p.exists()), None)
+    if env_path is None:
         return
     for line in env_path.read_text().splitlines():
         line = line.strip()

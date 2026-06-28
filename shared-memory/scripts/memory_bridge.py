@@ -27,7 +27,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 API_VERSION = 1
@@ -385,6 +385,17 @@ def format_status(payload: dict) -> str:
                      f"unconsolidated {nj.get('facts_unconsolidated','?')}")
         lines.append(f"  decisions: {nj.get('decisions_total','?')} total | "
                      f"REM pending {nj.get('decisions_rem_pending','?')}")
+    # Entity-graph shape (ADR-017). singletons = mentioned by one fact only
+    # (fragmentation proxy); aliases climb from 0 once the alias layer ships.
+    eg = t.get("entity_graph", {})
+    if eg and "error" not in eg:
+        _tot = eg.get("entities_total", 0) or 0
+        _cov = eg.get("alias_covered_entities", 0) or 0
+        _pct = f" ({_cov * 100 // _tot}% covered)" if _tot and _cov else ""
+        lines.append(f"  entities:  {_tot} total | singletons {eg.get('singleton_entities',0)} "
+                     f"| orphans {eg.get('orphan_entities',0)} | aliases {eg.get('alias_edges',0)}{_pct}")
+    elif "error" in eg:
+        lines.append(f"  entities: ERROR {eg['error']}")
     nr = t.get("nrem", {})
     if nr and "error" not in nr:
         lines.append(f"  NREM cycles: {nr.get('total_cycles','?')} pending "

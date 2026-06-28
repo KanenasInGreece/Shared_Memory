@@ -939,19 +939,48 @@ class ConsolidationDaemon:
 
     async def _find_anchored_clusters(self, ids):
         """Entity clusters reachable from the given fact pg_ids that meet the
-        density gate — shared by the event-driven cycle and the ledger sweep."""
+        density gate — shared by the event-driven cycle and the ledger sweep.
+
+        ADR-017: clusters are keyed on the ALIAS COMPONENT, not the bare entity.
+        Entities sharing an `alias_component` (stamped by REM via gds.wcc over the
+        soft ALIASES edges) fold as ONE cluster, so fragmented surface forms
+        (coordinator/Coordinator) clear the density threshold together instead of
+        each falling short. The canonical (cluster key) is the lexicographically
+        smallest member name — deterministic, so the (entity,domain) summary key is
+        stable across cycles; `aliases` carries every surface form for the summary's
+        JSON record + lexical match. No-op-safe: with no ALIASES edges every entity
+        has a null alias_component → it is its own component (keyed by elementId) →
+        identical to the prior exact-name behaviour.
+        """
+        rels = f"{ONT.entity_link_alias}|{ONT.entity_link}"
         async with self.driver.session() as session:
             result = await session.run(
                 f"MATCH (f:{ONT.fact}) WHERE f.pg_id IN $ids"
-                f" MATCH (f)-[:{ONT.entity_link_alias}|{ONT.entity_link}]->(e:{ONT.entity})"
-                f" WITH DISTINCT e"
-                f" MATCH (e)<-[:{ONT.entity_link_alias}|{ONT.entity_link}]-(neighbor:{ONT.fact})"
+                f" MATCH (f)-[:{rels}]->(e0:{ONT.entity})"
+                f" WITH DISTINCT e0"
+                # CALL (e0) variable-scope form (Neo4j 5.23+; our GDS 2.13 dep
+                # already implies a recent 5.x). Aggregate sibs first, then branch —
+                # collect() can't sit beside non-grouped e0 inside a CASE.
+                f" CALL (e0) {{"
+                f"   OPTIONAL MATCH (sib:{ONT.entity})"
+                f"     WHERE e0.alias_component IS NOT NULL"
+                f"       AND sib.alias_component = e0.alias_component"
+                f"   WITH e0, collect(sib) AS sibs"
+                f"   RETURN CASE WHEN e0.alias_component IS NULL"
+                f"               THEN [e0] ELSE sibs END AS members"
+                f" }}"
+                f" WITH coalesce(e0.alias_component, elementId(e0)) AS comp, members"
+                f" WITH comp, head(collect(members)) AS members"   # dedup anchors → 1 row/component
+                f" UNWIND members AS m"
+                f" MATCH (m)<-[:{rels}]-(neighbor:{ONT.fact})"
                 f" WHERE coalesce(neighbor.consolidated, false) = false"
                 f"   AND coalesce(neighbor.rem_processed, false) = true"
                 f"   AND coalesce(neighbor.superseded, false) = false"
-                f" WITH e, collect(neighbor) as unflagged_facts"
+                f" WITH comp, members, collect(DISTINCT neighbor) as unflagged_facts"
                 f" WHERE size(unflagged_facts) >= $threshold"
-                f" RETURN e.name as entity,"
+                f" RETURN reduce(c = null, nm IN [x IN members | x.name] |"
+                f"          CASE WHEN c IS NULL OR nm < c THEN nm ELSE c END) as entity,"
+                f"        [x IN members | x.name] as aliases,"
                 f"        [fact IN unflagged_facts | fact.content] as contents,"
                 f"        [fact IN unflagged_facts | fact.pg_id] as pg_ids",
                 ids=ids, threshold=DENSITY_THRESHOLD)
@@ -1093,15 +1122,19 @@ class ConsolidationDaemon:
             # re-gated per (entity, domain): an entity-level cluster that meets
             # the threshold may yield zero summaries if its facts are spread
             # thinly across domains — which is the intended anti-clutter rule.
-            work_items = []  # (entity, domain, contents, pg_ids)
+            work_items = []  # (entity, domain, contents, pg_ids, aliases)
             for cluster in clusters:
+                # Alias surface forms are component-level (ADR-017) — same for every
+                # domain split of this cluster. Default to [entity] for clusters from
+                # before the alias layer (no 'aliases' key).
+                aliases = cluster.get('aliases') or [cluster['entity']]
                 for dom, c, p in eligible_domain_clusters(
                     cluster['contents'], cluster['pg_ids'],
                     domain_map, DENSITY_THRESHOLD,
                 ):
-                    work_items.append((cluster['entity'], dom, c, p))
+                    work_items.append((cluster['entity'], dom, c, p, aliases))
 
-            for entity, domain, contents, pg_ids in work_items:
+            for entity, domain, contents, pg_ids, aliases in work_items:
 
                 # 1. Fetch previous summary for this (entity, domain) pair
                 previous_summary = None
@@ -1151,6 +1184,10 @@ class ConsolidationDaemon:
                     "kind": "thematic",
                     "entity": entity,
                     "domain": domain,
+                    # All alias surface forms folded into this summary (ADR-017).
+                    # Self-describing + lexically matchable on any variant; [entity]
+                    # when the cluster is a lone entity (no alias component).
+                    "aliases": aliases,
                     "source_pg_ids": pg_ids,
                     "timestamp": datetime.now().isoformat()
                 }

@@ -29,6 +29,7 @@ class OntologyConfig:
     # Relationship types — core
     entity_link: str = "MENTIONS"
     entity_link_alias: str = "REPORTS_ON"
+    aliases: str = "ALIASES"
     summarized_by: str = "SUMMARIZED_BY"
     reasoning_next: str = "NEXT_STEP"
     # Relationship types — provenance (Phase A)
@@ -48,6 +49,7 @@ class OntologyConfig:
     # Consolidation tuning
     density_threshold: int = 5
     insight_threshold: int = 2
+    alias_max_hops: int = 2
 
 
 def _load() -> OntologyConfig:
@@ -77,6 +79,7 @@ def _load() -> OntologyConfig:
             milestone=labels.get("milestone", "Milestone"),
             entity_link=rels.get("entity_link", "MENTIONS"),
             entity_link_alias=rels.get("entity_link_alias", "REPORTS_ON"),
+            aliases=rels.get("aliases", "ALIASES"),
             summarized_by=rels.get("summarized_by", "SUMMARIZED_BY"),
             reasoning_next=rels.get("reasoning_next", "NEXT_STEP"),
             was_attributed_to=rels.get("was_attributed_to", "WAS_ATTRIBUTED_TO"),
@@ -93,6 +96,7 @@ def _load() -> OntologyConfig:
             rejected=rels.get("rejected", "REJECTED"),
             density_threshold=int(cons.get("density_threshold", 5)),
             insight_threshold=int(cons.get("insight_threshold", 2)),
+            alias_max_hops=int(cons.get("alias_max_hops", 2)),
         )
     except FileNotFoundError:
         return OntologyConfig()

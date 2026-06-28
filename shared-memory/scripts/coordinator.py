@@ -97,7 +97,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.5.0"
+FRAMEWORK_VERSION = "0.6.0"
 API_VERSION = 1
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
@@ -1899,17 +1899,26 @@ class MemoryCoordinator:
                     result = await session.run(
                         f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
                         " OPTIONAL MATCH (f)-[r]-(related)"
-                        " RETURN labels(related) as labels, related.name as name,"
-                        "        type(r) as rel_type LIMIT 5",
+                        # ADR-017: also pull each related Entity's alias siblings so
+                        # search surfaces every surface form of a concept. One query,
+                        # no-op-safe (empty when no ALIASES edges exist).
+                        f" OPTIONAL MATCH (related)-[:{ONT.aliases}]-(al:{ONT.entity})"
+                        " WITH r, related, labels(related) AS labels,"
+                        "      collect(DISTINCT al.name) AS aliases LIMIT 5"
+                        " RETURN labels, related.name as name,"
+                        "        type(r) as rel_type, aliases",
                         pg_id=pg_id,
                     )
                     async for rec in result:
                         if rec["name"]:
-                            ctx.append({
+                            entry = {
                                 "rel_type": rec["rel_type"],
                                 "name": rec["name"],
                                 "label": rec["labels"][0] if rec["labels"] else None,
-                            })
+                            }
+                            if rec["aliases"]:
+                                entry["aliases"] = rec["aliases"]
+                            ctx.append(entry)
                 except Exception:
                     pass
                 final.append({
@@ -2090,6 +2099,15 @@ class MemoryCoordinator:
         except Exception as exc:
             snap["breakdown"] = {"error": str(exc)}
 
+        # Entity-graph shape (ADR-017) — the live, cheap counterpart to the
+        # offline ER calibration harness (entity_resolution_eval.py). Surfaces
+        # fragmentation and, once the alias layer ships, alias coverage. The O(n²)
+        # cosine over-merge analysis stays OUT of the hot path; only aggregates here.
+        try:
+            snap["entity_graph"] = await self._entity_graph()
+        except Exception as exc:
+            snap["entity_graph"] = {"error": str(exc)}
+
         # Consolidation signal (ADR-018) — the dream-cycle liveness rollup from
         # the daemon's consolidation_runs ledger: per-cycle-type last outcome,
         # success age, in-flight, last error, plus the derived stall verdict.
@@ -2245,19 +2263,37 @@ class MemoryCoordinator:
         rem_processed, unconsolidated nodes, re-partitioned per (entity, domain)
         and counted only where a bucket meets its density threshold.
         """
-        # Neo4j: entity clusters of eligible facts (global, not just pending ids).
+        # Neo4j: clusters of eligible facts (global, not just pending ids).
+        # ADR-017: grouped by ALIAS COMPONENT, identical to the gate
+        # consolidation_loop._find_anchored_clusters actually folds on — so this
+        # census (which drives the ADR-018 stall/coverage signal) never disagrees
+        # with what NREM does. No-op-safe: null alias_component → per-entity, as before.
+        rels = f"{ONT.entity_link_alias}|{ONT.entity_link}"
         async with self._neo4j.session() as session:
             fres = await session.run(
                 f"MATCH (f:{ONT.fact}) WHERE f.pg_id IS NOT NULL"
-                f" MATCH (f)-[:{ONT.entity_link_alias}|{ONT.entity_link}]->(e:{ONT.entity})"
-                f" WITH DISTINCT e"
-                f" MATCH (e)<-[:{ONT.entity_link_alias}|{ONT.entity_link}]-(n:{ONT.fact})"
+                f" MATCH (f)-[:{rels}]->(e0:{ONT.entity})"
+                f" WITH DISTINCT e0"
+                f" CALL (e0) {{"
+                f"   OPTIONAL MATCH (sib:{ONT.entity})"
+                f"     WHERE e0.alias_component IS NOT NULL"
+                f"       AND sib.alias_component = e0.alias_component"
+                f"   WITH e0, collect(sib) AS sibs"
+                f"   RETURN CASE WHEN e0.alias_component IS NULL"
+                f"               THEN [e0] ELSE sibs END AS members"
+                f" }}"
+                f" WITH coalesce(e0.alias_component, elementId(e0)) AS comp, members"
+                f" WITH comp, head(collect(members)) AS members"
+                f" UNWIND members AS m"
+                f" MATCH (m)<-[:{rels}]-(n:{ONT.fact})"
                 f" WHERE coalesce(n.consolidated,false) = false"
                 f"   AND coalesce(n.rem_processed,false) = true"
                 f"   AND coalesce(n.superseded,false) = false"
-                f" WITH e, collect(n.pg_id) AS pg_ids"
+                f" WITH comp, members, collect(DISTINCT n.pg_id) AS pg_ids"
                 f" WHERE size(pg_ids) >= $threshold"
-                f" RETURN e.name AS entity, pg_ids",
+                f" RETURN reduce(c = null, nm IN [x IN members | x.name] |"
+                f"          CASE WHEN c IS NULL OR nm < c THEN nm ELSE c END) AS entity,"
+                f"        pg_ids",
                 threshold=ONT.density_threshold,
             )
             fact_clusters = await fres.data()
@@ -2341,6 +2377,57 @@ class MemoryCoordinator:
                 {"kind": r["kind"], "superseded": r["superseded"], "active": r["active"]}
                 for r in summaries
             ],
+        }
+
+    # Anticipated ADR-017 alias edge type. Kept as a literal (a valid Cypher
+    # identifier) until ADR-017 lands and formalises it in ontology.yaml; MATCHing
+    # a relationship type that doesn't exist yet returns 0, not an error — so this
+    # honestly reads 0 alias edges today rather than failing.
+    _ALIAS_REL = "ALIASES"
+
+    async def _entity_graph(self) -> dict:
+        """Entity-graph shape metrics for the ADR-017 alias work — all cheap Neo4j
+        aggregates, no embeddings, no pairwise scan:
+
+          entities_total   — distinct Entity nodes
+          orphan_entities  — mentioned by no non-superseded fact/decision (dead refs)
+          singleton_entities — mentioned by exactly one (fragmentation/noise proxy)
+          alias_edges / alias_covered_entities — populate once ADR-017 ships alias
+              edges; 0 until then (an honest gap, the metric to watch climb)
+          top_hubs         — highest-degree entities, the consolidation backbone
+
+        The over-merge RISK behind these (which singletons are really the same
+        concept) is the offline harness's job; this just sizes the problem live.
+        """
+        async with self._neo4j.session() as session:
+            deg = await (await session.run(
+                f"MATCH (e:{ONT.entity}) "
+                f"OPTIONAL MATCH (n)-[:{ONT.entity_link}]->(e) "
+                f"  WHERE n.pg_id IS NOT NULL AND coalesce(n.superseded,false) = false "
+                f"WITH e, count(n) AS deg "
+                f"RETURN count(e) AS total, "
+                f"  sum(CASE WHEN deg = 0 THEN 1 ELSE 0 END) AS orphans, "
+                f"  sum(CASE WHEN deg = 1 THEN 1 ELSE 0 END) AS singletons"
+            )).single()
+            aliases = await (await session.run(
+                f"MATCH ()-[r:{self._ALIAS_REL}]-() RETURN count(DISTINCT r) AS edges"
+            )).single()
+            covered = await (await session.run(
+                f"MATCH (e:{ONT.entity})-[:{self._ALIAS_REL}]-() RETURN count(DISTINCT e) AS c"
+            )).single()
+            hubs = await (await session.run(
+                f"MATCH (e:{ONT.entity})<-[:{ONT.entity_link}]-(n) "
+                f"  WHERE n.pg_id IS NOT NULL AND coalesce(n.superseded,false) = false "
+                f"RETURN e.name AS name, count(n) AS degree "
+                f"ORDER BY degree DESC LIMIT 8"
+            )).data()
+        return {
+            "entities_total": deg["total"] or 0,
+            "orphan_entities": deg["orphans"] or 0,
+            "singleton_entities": deg["singletons"] or 0,
+            "alias_edges": aliases["edges"] or 0,
+            "alias_covered_entities": covered["c"] or 0,
+            "top_hubs": [{"name": h["name"], "degree": h["degree"]} for h in hubs],
         }
 
 
