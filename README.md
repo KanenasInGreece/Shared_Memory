@@ -381,6 +381,8 @@ A stock Fedora workstation defaults to 128 instances and 65536 watches — adequ
 
 `postgres_neo4j_limits.yaml` defines the whole local stack as **four** services — the two persistent stores (**neo4j**, **postgres**) and the two inference backends (**retriever-api**, the BGE-M3 embedder on `:8070`, and **reranker-api**, BGE-Reranker-v2-m3 on `:8071`, both llama.cpp `server` containers). One `docker compose up -d` brings up all four. The key structure:
 
+> **Required setup (v0.6.0).** The compose file is `${VAR}`-parametrized — host paths and DB passwords come from the **framework env** at **`shared-memory/.env`** (gitignored; copy from `shared-memory/.env.example`). Run **`bash shared-memory/scripts/install_framework.sh`** once to be prompted for the paths/passwords, write that `.env`, and create the data dirs; then bring the stack up with `docker compose -f postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d`. The **Neo4j GDS plugin is required** (`graph-data-science`, free Community tier) and the stack needs **Neo4j 5.23+** — both satisfied by the pinned `neo4j:5-community` image. The client token lives separately in each agent's skill `.env` (see `shared-memory-skill/shared-memory/.env.example`).
+
 ```yaml
 services:
   neo4j:
@@ -392,7 +394,7 @@ services:
       - /your/databases/neo4j/data:/data:z
     environment:
       - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD}
-      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_PLUGINS=["apoc","graph-data-science"]   # GDS REQUIRED (v0.6.0) — powers alias grouping
       # Neo4j 5 uses double underscores (__) for nested config keys
       - NEO4J_server_memory_heap_max__size=2G
       - NEO4J_server_memory_pagecache_size=2G

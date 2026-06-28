@@ -7,6 +7,50 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-06-28
+
+Entity-resolution **alias layer** — soft `ALIASES` edges between synonymous entities (`coordinator` ↔
+`Coordinator`), never a hard node merge, so a wrong link is always reversible — plus the
+infrastructure it needs. This release lands the **consumption + telemetry** half (consumers traverse
+alias components; everything is **no-op-safe** — identical to the exact-name graph until alias edges
+exist). The automated **REM alias *writer*** (cosine-block + lexical-Jaccard + LLM verdict → `ALIASES`
+edge) lands in **0.6.1**; until then aliases are created/calibrated with the offline harness below.
+
+### Added — alias components (decision 455)
+
+- **`ALIASES` Entity↔Entity edge** + `alias_max_hops` in `ontology.yaml` / `ontology.py`. Soft, audited,
+  reversible — it never merges nodes.
+- **`alias_graph.py`** — `gds.wcc` stamps `Entity.alias_component` (stable connected-component id). Grouping
+  key everywhere is `coalesce(e.alias_component, elementId(e))`, so a lone entity is its own component.
+- **NREM groups by alias component** (`consolidation_loop._find_anchored_clusters`): every surface form of a
+  concept folds as ONE cluster, keyed on a deterministic canonical (lexicographic-min); all forms are
+  recorded in the summary's **`metadata.aliases`** JSON. Fixes the fragmentation where synonym variants
+  each fell below the consolidation threshold and no cross-cutting summary was ever synthesised.
+- **Search surfaces aliases** — `graph_context` entries carry an `aliases` list (single query, no extra round-trip).
+- **`/memory/telemetry` `entity_graph`** section (+ `status` line): `entities_total`, `singleton_entities`,
+  `orphan_entities`, `alias_edges`, `alias_covered_entities`, `top_hubs`. The consolidation-coverage census
+  (`_nrem_cycle_counts`, which drives the dream-cycle stall signal) is grouped by the same alias-component
+  gate the daemon folds on, so the two never disagree.
+- **`entity_resolution_eval.py`** — offline ER calibration harness (cosine vs lexical-Jaccard over-merge report);
+  the instrument that proved raw cosine over-merges (cosine = blocking key, never the verdict).
+
+### Added — framework env architecture (decision 456)
+
+- **Framework env** now lives in the framework folder (`shared-memory/.env`, gitignored) with a committed
+  `shared-memory/.env.example`; **client env** lives in the skill folder (`shared-memory-skill/shared-memory/.env.example`).
+  Every live `.env` is gitignored; only sanitized examples are committed.
+- **`postgres_neo4j_limits.yaml` is `${VAR}`-parametrized** (data paths + passwords from the framework env) and now
+  loads **GDS** (`NEO4J_PLUGINS=["apoc","graph-data-science"]`).
+- **`install_framework.sh`** — first-install script: prompts for paths/passwords, writes the gitignored `.env`,
+  creates data dirs.
+- Gateway env loader is backward-compatible (prefers `shared-memory/.env`, falls back to repo-root `.env`).
+
+### Requirements
+
+- **Neo4j GDS plugin** (free Community tier; validated on 2.13.10) is now required — `gds.wcc` powers alias grouping.
+- **Neo4j 5.23+** (the `CALL (var) {}` variable-scope subquery form; already implied by GDS 2.13). The compose
+  pins `neo4j:5-community` (latest 5.x).
+
 ## [0.5.0] — 2026-06-27
 
 ### Added — fact supersession (decisions 381, 384, 389)

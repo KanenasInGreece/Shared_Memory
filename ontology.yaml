@@ -22,6 +22,7 @@ labels:
 relationships:
   entity_link: MENTIONS          # primary Fact→Entity relationship written on save
   entity_link_alias: REPORTS_ON  # legacy alias accepted by consolidation clustering
+  aliases: ALIASES               # Entity↔Entity soft synonym edge (ADR-017 "A"); REM-written, LLM-gated, never merges nodes
   summarized_by: SUMMARIZED_BY   # Fact→CommunitySummary, written by consolidation daemon
   reasoning_next: NEXT_STEP      # links consecutive ReasoningStep nodes
   # Provenance relationships (Phase A — PROV-O inspired)
@@ -42,3 +43,4 @@ relationships:
 consolidation:
   density_threshold: 5           # min unconsolidated Facts per Entity hub to trigger synthesis
   insight_threshold: 2           # min unconsolidated Decisions on a shared grounded Entity to fold an insight
+  alias_max_hops: 2              # bound on ALIASES component traversal (class(e) = (e)-[:ALIASES*0..H]-(m)); caps alias-chain drift

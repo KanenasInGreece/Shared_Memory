@@ -415,6 +415,7 @@ python ~/.claude/skills/shared-memory/scripts/memory_bridge.py status
 #   community_summaries: 2 (superseded 0, insight 0)
 #   facts:     97 total | REM pending 1 | unconsolidated 20
 #   decisions: 75 total | REM pending 71
+#   entities:  142 total | singletons 38 | orphans 12 | aliases 0
 #   NREM cycles: 3 pending (facts 2, decisions 1)
 #   inference (LLM/GPU): busy
 #   consolidation: ok | last completed | last success 312s ago
@@ -427,11 +428,15 @@ the system is caught up. The coordinator owns the DB connections, so the client
 needs nothing but its token. The `--json` payload also carries `telemetry.nrem`
 (pending consolidation-cycle counts + thresholds), `telemetry.breakdown`
 (record-type / agent / source / domain / summary-kind distributions),
+`telemetry.entity_graph` — entity-graph shape for the alias layer
+(`entities_total`, `singleton_entities`, `orphan_entities`, `alias_edges`,
+`alias_covered_entities`, `top_hubs`; `alias_*` stay 0 until the REM alias-writer
+lands in v0.6.1, then climb as an alias-coverage signal),
 `telemetry.inference_busy` — the inference/GPU-busy signal (tri-state
 `"busy"|"idle"|"unknown"`, also top-level on `GET /health`; `"unknown"` means
 nvtop is absent or `SLOT_AWARE=0`, never reported as a false `"idle"`; distinct
 from `health.llm`, which is pure `:5000` reachability), and
-`telemetry.consolidation` — the dream-cycle liveness/coverage signal (ADR-018):
+`telemetry.consolidation` — the dream-cycle liveness/coverage signal:
 per cycle type the last fold outcome, a `stalled` verdict, consecutive failures,
 last error, `last_deferred_reason` (`"gpu_busy"|"backup_in_progress"`), and
 coverage (`eligible_clusters`, `eligible_oldest_age_seconds`).
