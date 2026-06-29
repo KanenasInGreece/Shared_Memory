@@ -243,3 +243,37 @@ KNOWN_RELATIONSHIPS: frozenset[str] = frozenset({
     ONT.depends_on, ONT.part_of, ONT.implements, ONT.produces, ONT.consumes,
     ONT.runs_on, ONT.configures, ONT.describes, ONT.validates,
 })
+
+
+# ── Domain-range map for typed Entity→Entity relationships (Stage 1.2) ─────────
+# Which typed relationship is legal between which entity sub-types — the gate REM
+# enforces in Stage 1.3 (an unknown/over-broad typed edge falls back to MENTIONS).
+# `rel -> {source_label: frozenset(allowed target labels)}`. MENTIONS is the
+# unconstrained fallback and is intentionally absent here. Cross-checked with a
+# companion advisor/researcher agent's domain-range map; key guardrail: artifacts
+# reach the abstract Concept hub ONLY via IMPLEMENTS / DESCRIBES (never DEPENDS_ON),
+# which prevented the modularity collapse that over-broad concept edges cause.
+_C, _S, _M, _K, _D = ONT.component, ONT.system, ONT.model, ONT.concept, ONT.document
+_A, _DEC = ONT.activity, ONT.decision  # Process reuses Activity
+
+DOMAIN_RANGE: dict[str, dict[str, frozenset[str]]] = {
+    ONT.depends_on: {_C: frozenset({_C, _S, _M}), _S: frozenset({_S, _C, _M}),
+                     _A: frozenset({_C, _S, _M})},
+    ONT.part_of:    {_C: frozenset({_C, _S}), _S: frozenset({_S})},
+    ONT.implements: {_C: frozenset({_K}), _S: frozenset({_K})},
+    ONT.produces:   {_C: frozenset({_D, _M}), _S: frozenset({_D, _M}),
+                     _A: frozenset({_D, _M})},
+    ONT.consumes:   {_C: frozenset({_C, _S, _M}), _S: frozenset({_C, _S, _M}),
+                     _A: frozenset({_C, _S, _M})},
+    ONT.runs_on:    {_C: frozenset({_S}), _S: frozenset({_S}), _M: frozenset({_S})},
+    ONT.configures: {_C: frozenset({_C, _S}), _D: frozenset({_C, _S})},
+    ONT.describes:  {_D: frozenset({_C, _S, _K, _DEC})},
+    ONT.validates:  {_C: frozenset({_C, _S, _M}), _A: frozenset({_C, _S, _M})},
+}
+
+
+def is_allowed_relation(rel: str, src_label: str, tgt_label: str) -> bool:
+    """True if a typed Entity→Entity `rel` is permitted from `src_label` to
+    `tgt_label` per the domain-range map. Pure. MENTIONS (and any rel not in the
+    map) returns False here — callers use MENTIONS as the explicit fallback."""
+    return tgt_label in DOMAIN_RANGE.get(rel, {}).get(src_label, frozenset())

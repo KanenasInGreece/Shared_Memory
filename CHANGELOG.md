@@ -71,6 +71,15 @@ materialised as real edges.
   linked by `SUPERSEDES`). First run materialised 128 edges (109 `REFERENCES`, 19 `INFORMED_BY`). REM applies
   the same resolver incrementally in a later step.
 
+### Added — typed-relationship domain-range map, Stage 1.2
+
+- **`ontology.DOMAIN_RANGE` + `is_allowed_relation()`** — which typed `Entity→Entity` relationship is legal
+  between which entity sub-types (the rulebook REM will enforce next; an over-broad or unknown typed edge
+  falls back to `MENTIONS`). Pure gate logic, inert until wired in. Cross-checked with a companion
+  advisor/researcher agent's domain-range gate. Key guardrail: artifacts reach the abstract `Concept` hub only
+  via `IMPLEMENTS`/`DESCRIBES`, never `DEPENDS_ON` — avoiding the modularity collapse over-broad concept edges
+  cause. `DESCRIBES`/`CONFIGURES`/`VALIDATES` targets narrowed to high-signal pairings.
+
 ## [0.6.0] — 2026-06-28
 
 Entity-resolution **alias layer** — soft `ALIASES` edges between synonymous entities (`coordinator` ↔
