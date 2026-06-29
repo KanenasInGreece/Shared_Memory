@@ -85,12 +85,12 @@ A fresh gateway host goes from clone to running with three helper scripts in
 `shared-memory/scripts/` — `preflight.sh`, `init_db.sh`, `bootstrap_tokens.sh`.
 Each is idempotent and safe to re-run; each step links the manual equivalent.
 
-1. **Get the code, set DB passwords, raise OS limits.**
-   Clone the repo and `cp .env.example .env` ([§10](#10-agent-integration-first-time-setup)); fill `NEO4J_PASSWORD` and `PG_PASSWORD` (needed before the databases start). Raise inotify limits and — on Fedora/RHEL — keep the SELinux `:z` mounts ([§4](#4-os-prerequisites--fedora--linux), [§5](#5-infrastructure-setup-docker-compose)).
+1. **Get the code, set DB passwords and host paths, raise OS limits.**
+   Clone the repo; run `bash shared-memory/scripts/install_framework.sh` ([§5](#5-infrastructure-setup-docker-compose)) — it prompts for paths and passwords and writes `shared-memory/.env`. Or copy `shared-memory/.env.example` → `shared-memory/.env` and fill values by hand. Raise inotify limits and — on Fedora/RHEL — keep the SELinux `:z` mounts ([§4](#4-os-prerequisites--fedora--linux), [§5](#5-infrastructure-setup-docker-compose)).
 
 2. **Check prerequisites.** `bash shared-memory/scripts/preflight.sh` verifies Docker + the daemon, `docker compose` v2, `uv`, and a populated `.env`, and warns on low RAM/disk. Resolve any ✗ before continuing.
 
-3. **Start the stack (databases + inference).** Put your BGE-M3 and reranker GGUF files in the folder the compose mounts ([§5](#5-infrastructure-setup-docker-compose)), then `docker compose -f postgres_neo4j_limits.yaml up -d` brings up Postgres, Neo4j, the embedder (`:8070`) and the reranker (`:8071`); `docker compose … ps` should show all four `healthy`.
+3. **Start the stack (databases + inference).** Put your BGE-M3 and reranker GGUF files in the folder the compose mounts ([§5](#5-infrastructure-setup-docker-compose)), then `docker compose -f postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d` brings up Postgres, Neo4j, the embedder (`:8070`) and the reranker (`:8071`); `docker compose … ps` should show all four `healthy`.
 
 4. **Initialise both databases — one command.** `bash shared-memory/scripts/init_db.sh` waits for both stores, then applies `schema_init.sql` to Postgres (tables, indexes, pgvector) and `neo4j_init.cypher` to Neo4j (uniqueness constraints), running the clients *inside* the containers — so no host `psql` or `cypher-shell` is needed. Idempotent. *(Manual commands and the `apply.py` upgrade path: [§6](#6-database-schema).)*
 
@@ -150,11 +150,11 @@ Vishakha Gupta's *AI Memory & Cognition: The Architect's Playbook* (ApertureData
 
 **The Retrieval Test:** *Can the agent explain why it retrieved a specific memory? Not just what was retrieved, but which specific context, session, and principal metadata informed the decision.*
 
-> **Grade: Passes (v0.5.0).** Search results carry `tier` (fact | community_summary | insight_summary), `score_normalized` (sigmoid of the raw reranker logit → [0, 1]), `matched_entities` (intersection of the query string against the saved entity list), and `graph_context` as a structured list of `{rel_type, name, label}` triples. Agent source attribution is server-verified via token authentication — `"source": "gemini"` is a server guarantee, not a client claim. An agent can reason: *"I returned a Tier-3 community synthesis — normalized score 0.91, matching entity OutboxPattern — alongside two Tier-1 precision hits, both saved by the verified Gemini CLI identity."* Since **v0.4.12**, retrieval events are also auditable: the opt-in gateway per-request audit log (`GATEWAY_AUDIT_LOG_PATH`, §14) records one off-event-loop line per authenticated request — agent, route, status, latency, timestamp, `request_id` — covering every `/memory/search`. **Gaps remaining:** that audit log is opt-in (off by default) and not yet non-repudiable (closes with the planned PoP auth); cross-encoder span attribution is not exposed (the reranker scores full documents, not spans).
+> **Grade: Passes (v0.6.0).** Search results carry `tier` (fact | community_summary | insight_summary), `score_normalized` (sigmoid of the raw reranker logit → [0, 1]), `matched_entities` (intersection of the query string against the saved entity list), and `graph_context` as a structured list of `{rel_type, name, label}` triples — **each entry now carries an `aliases` list** of synonymous entity names in the same alias component (v0.6.0). Agent source attribution is server-verified via token authentication — `"source": "gemini"` is a server guarantee, not a client claim. An agent can reason: *"I returned a Tier-3 community synthesis — normalized score 0.91, matching entity OutboxPattern — alongside two Tier-1 precision hits, both saved by the verified Gemini CLI identity."* Since **v0.4.12**, retrieval events are also auditable: the opt-in gateway per-request audit log (`GATEWAY_AUDIT_LOG_PATH`, §14) records one off-event-loop line per authenticated request — agent, route, status, latency, timestamp, `request_id` — covering every `/memory/search`. **Gaps remaining:** that audit log is opt-in (off by default) and not yet non-repudiable (closes with the planned PoP auth); cross-encoder span attribution is not exposed (the reranker scores full documents, not spans).
 
 **The Consolidation Test:** *When the agent learns something new, does the system update a coherent knowledge base, or does it just accumulate versions? After six months, do you have one "truth" or three conflicting ones?*
 
-> **Grade: Passes (v0.4.5).** Two-phase REM/NREM sleep cycle. **REM** (idle daemon): enriches each Fact with a full LLM summary and typed entity relationships before it can enter NREM — the first LLM-based entity-extraction pass over the agent-supplied entities. **NREM** (consolidation daemon): synthesises community summaries only from `rem_processed=true` facts, keyed on **(entity, domain)** (migration 007) so facts that share an entity but belong to different projects are never fused; density ≥ 5 per hub. `summary_history JSONB` (migration 004) preserves prior versions; if A.source_pg_ids ⊆ B.source_pg_ids, A is superseded so retrieval surfaces the most comprehensive non-superseded summary. **Insight consolidation (Phase 3a, v0.4.5):** a second NREM path folds ≥2 REM-enriched, non-reversed `:Decision` nodes that share a grounded entity across ≥2 distinct projects — gated on the *existence* of a `HAD_OUTCOME` edge, never its rating — into elevated `kind='insight'` summaries (always-INSERT with supersession as dedup, migration 009). A retrospective rated `reversed` marks its decision superseded in both stores and re-folds the affected insight. **Gaps remaining:** cross-entity reconciliation still leans on supersession rather than a true merge — synonymous entities (`hive_mind_proxy` ≡ `Hive-Mind Gateway`) are not yet deduplicated (entity resolution, Phase 3b); during the REM backlog window Tier-1 facts are searchable but NREM synthesis has not yet run.
+> **Grade: Passes (v0.6.0).** Two-phase REM/NREM sleep cycle. **REM** (idle daemon): enriches each Fact with a full LLM summary and typed entity relationships before it can enter NREM — the first LLM-based entity-extraction pass over the agent-supplied entities. **NREM** (consolidation daemon): synthesises community summaries only from `rem_processed=true` facts, keyed on **(entity, domain)** (migration 007) so facts that share an entity but belong to different projects are never fused; density ≥ 5 per hub. `summary_history JSONB` (migration 004) preserves prior versions; if A.source_pg_ids ⊆ B.source_pg_ids, A is superseded so retrieval surfaces the most comprehensive non-superseded summary. **Since v0.6.0:** entities connected via `ALIASES` edges share an `alias_component` (computed by `gds.wcc`), and NREM groups by component so synonym variants fold as one cluster — fragmented synonyms no longer each fall below the threshold independently. **Insight consolidation (Phase 3a, v0.4.5):** a second NREM path folds ≥2 REM-enriched, non-reversed `:Decision` nodes that share a grounded entity across ≥2 distinct projects — gated on the *existence* of a `HAD_OUTCOME` edge, never its rating — into elevated `kind='insight'` summaries (always-INSERT with supersession as dedup, migration 009). A retrospective rated `reversed` marks its decision superseded in both stores and re-folds the affected insight. **Gaps remaining:** the automated REM alias writer (cosine-block + LLM verdict → `ALIASES` edge) lands in v0.6.1; until then aliases are created with the offline `entity_resolution_eval.py` harness; during the REM backlog window Tier-1 facts are searchable but NREM synthesis has not yet run.
 
 **The Lineage Test:** *Can I trace a decision back to the original source — the raw image, the specific video frame, or the precise document page — or just the text summary extracted from it?*
 
@@ -379,7 +379,7 @@ A stock Fedora workstation defaults to 128 instances and 65536 watches — adequ
 
 ## 5. Infrastructure Setup: Docker Compose
 
-`postgres_neo4j_limits.yaml` defines the whole local stack as **four** services — the two persistent stores (**neo4j**, **postgres**) and the two inference backends (**retriever-api**, the BGE-M3 embedder on `:8070`, and **reranker-api**, BGE-Reranker-v2-m3 on `:8071`, both llama.cpp `server` containers). One `docker compose up -d` brings up all four. The key structure:
+`postgres_neo4j_limits.yaml` defines the whole local stack as **four** services — the two persistent stores (**neo4j**, **postgres**) and the two inference backends (**retriever-api**, the BGE-M3 embedder on `:8070`, and **reranker-api**, BGE-Reranker-v2-m3 on `:8071`, both llama.cpp `server` containers). One `docker compose -f postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d` brings up all four. The key structure:
 
 > **Required setup (v0.6.0).** The compose file is `${VAR}`-parametrized — host paths and DB passwords come from the **framework env** at **`shared-memory/.env`** (gitignored; copy from `shared-memory/.env.example`). Run **`bash shared-memory/scripts/install_framework.sh`** once to be prompted for the paths/passwords, write that `.env`, and create the data dirs; then bring the stack up with `docker compose -f postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d`. The **Neo4j GDS plugin is required** (`graph-data-science`, free Community tier) and the stack needs **Neo4j 5.23+** — both satisfied by the pinned `neo4j:5-community` image. The client token lives separately in each agent's skill `.env` (see `shared-memory-skill/shared-memory/.env.example`).
 
@@ -446,13 +446,13 @@ services:
 
 ```bash
 # Start both services
-docker compose -f postgres_neo4j_limits.yaml up -d
+docker compose -f postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d
 
 # Verify
-docker compose -f postgres_neo4j_limits.yaml ps
+docker compose -f postgres_neo4j_limits.yaml --env-file shared-memory/.env ps
 ```
 
-Credentials are read from environment variables — copy `.env.example` to `.env` and fill in `NEO4J_PASSWORD` and `PG_PASSWORD` before starting.
+Credentials are read from environment variables — copy `shared-memory/.env.example` to `shared-memory/.env` and fill in `NEO4J_PASSWORD`, `PG_PASSWORD`, and host data paths before starting (or run `bash shared-memory/scripts/install_framework.sh` for guided setup).
 
 > **Place the models where the compose expects them.** The two inference containers mount a host models directory read-only (`/path/to/your/LLM_Models:/models:ro,z`) and load each GGUF by path (`-m /models/gpustack/bge-m3-GGUF/bge-m3-Q8_0.gguf`, and the reranker equivalent). Put your GGUF files under that host folder at those sub-paths — or edit the mount and `-m` paths to match where you keep them. A wrong path lets the container start but then fail its healthcheck.
 
@@ -559,7 +559,7 @@ Set `SMEM_ONTOLOGY_PATH=/path/to/your/ontology.yaml` to load from a non-default 
 
 ## 7. Inference Backends (llama.cpp)
 
-Two models serve the embedding and reranking paths. In the default setup they run as the **`retriever-api`** (BGE-M3, `:8070`) and **`reranker-api`** (BGE-Reranker-v2-m3, `:8071`) services in the compose file — so `docker compose up -d` (§5) already started them; see §5 for where to place the GGUF files. A third port (`5000`) hosts the reasoning LLM (LM Studio or any OpenAI-compatible endpoint) — this one is **not** in the compose file, so start it yourself.
+Two models serve the embedding and reranking paths. In the default setup they run as the **`retriever-api`** (BGE-M3, `:8070`) and **`reranker-api`** (BGE-Reranker-v2-m3, `:8071`) services in the compose file — so `docker compose … --env-file shared-memory/.env up -d` (§5) already started them; see §5 for where to place the GGUF files. A third port (`5000`) hosts the reasoning LLM (LM Studio or any OpenAI-compatible endpoint) — this one is **not** in the compose file, so start it yourself.
 
 To run the embedder and reranker outside Docker instead, launch `llama-server` directly (point `-m` at your GGUF files):
 
@@ -616,8 +616,8 @@ The startup sequence is order-dependent. The gateway must be up before any embed
 
 **1. Start databases + inference** — one compose brings up Postgres, Neo4j, the BGE-M3 embedder (`:8070`) and the BGE-Reranker (`:8071`):
 ```bash
-docker compose -f postgres_neo4j_limits.yaml up -d
-docker compose -f postgres_neo4j_limits.yaml ps    # all four should reach 'healthy'
+docker compose -f postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d
+docker compose -f postgres_neo4j_limits.yaml --env-file shared-memory/.env ps    # all four should reach 'healthy'
 ```
 First run? Make sure the GGUF models are in the mounted folder before this — see §5.
 
@@ -640,7 +640,7 @@ INFO:REMDaemon:REM daemon started (poll=120s, batch=5)
 
 **4. LM Studio** — start the application; it will pick up the MCP servers from `mcp.json` automatically.
 
-The gateway is the only repo script you start by hand — databases and both inference backends come up with `docker compose up -d`. The proxy starts both daemons; all processes shut down cleanly when the proxy receives SIGINT or SIGTERM.
+The gateway is the only repo script you start by hand — databases and both inference backends come up with `docker compose … --env-file shared-memory/.env up -d`. The proxy starts both daemons; all processes shut down cleanly when the proxy receives SIGINT or SIGTERM.
 
 > **Run it supervised.** A gateway launched in a terminal (or a background `&` job) receives `SIGTERM` and exits when that login session ends — `nohup` does not help. For a gateway that survives logout and reboot, install the `systemd --user` unit in [`shared-memory/ops/`](shared-memory/ops/) and `loginctl enable-linger` your user; operate it with `systemctl --user restart hive-mind-gateway.service`. See [`shared-memory/ops/README.md`](shared-memory/ops/README.md).
 
@@ -671,8 +671,8 @@ This section covers where to place files and how to register each agent. For run
 ```bash
 git clone https://github.com/KanenasInGreece/Shared_Memory.git
 cd Shared_Memory
-cp .env.example .env
-# Edit .env — fill in NEO4J_PASSWORD and PG_PASSWORD
+bash shared-memory/scripts/install_framework.sh   # guided: writes shared-memory/.env + creates data dirs
+# OR manually: cp shared-memory/.env.example shared-memory/.env  (then fill passwords, host paths)
 ```
 
 Create a virtual environment and install dependencies:
@@ -991,7 +991,7 @@ printf 'AGENT_TOKEN=tok_<your-token>\nCOORDINATOR_URL=http://localhost:8888\n' \
 ```bash
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version
-# → {"version": "0.5.0", "api_version": 1, "tool": "shared-memory-framework"}
+# → {"version": "0.6.0", "api_version": 1, "tool": "shared-memory-framework"}
 
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py search "test" 3
@@ -1024,7 +1024,7 @@ All three paths route through the coordinator on port 8888. The coordinator owns
 ```bash
 # Check the framework version
 python shared-memory/scripts/memory_bridge.py --version
-# → {"version": "0.5.0", "api_version": 1, "tool": "shared-memory-framework"}
+# → {"version": "0.6.0", "api_version": 1, "tool": "shared-memory-framework"}
 
 # Operational telemetry — outbox health + REM/NREM backlog snapshot (add --json for raw)
 python shared-memory/scripts/memory_bridge.py status
@@ -1426,6 +1426,7 @@ NREM **does not poll for work** — polling would compete with inference workloa
 - Each `pg_notify` adds the artifact's `pg_id` to `pending_pg_ids` and resets a 15-minute idle timer. Consolidation runs after 15 minutes of quiet; a 45-minute hard backstop prevents indefinite deferral during continuous ingestion.
 - The queued `pg_id`s are entry points into Neo4j, not the consolidation targets. From each, NREM traverses to Entity hubs and counts unconsolidated Fact neighbours — **but only those with `rem_processed = true`**. Raw, un-enriched facts are never consolidated directly. Communities with fewer than 5 qualifying facts wait.
 - **Domain-scoped (migration 007):** within each Entity hub, facts are partitioned by `domain = COALESCE(metadata->>'project', metadata->>'domain', scope, 'general')`, and the density threshold is re-applied **per (entity, domain)**. Facts that share an entity but belong to unrelated domains are never fused into one narrative. Summaries are keyed on `(entity, domain)`; untagged facts collapse to `general`, reproducing the prior single-summary-per-entity behaviour until agents tag their saves.
+- **Alias-component grouping (v0.6.0):** `alias_graph.py` runs `gds.wcc` to stamp each `Entity` node with a stable `alias_component` id — all entities connected (directly or transitively) by `ALIASES` edges share the same component id. NREM groups by this component (`coalesce(e.alias_component, elementId(e))`) instead of by exact name, so synonym variants (`coordinator` / `Coordinator` / `hive_mind_proxy`) fold as **one cluster** keyed on the lexicographic-min canonical name. The summary's `metadata.aliases` records all surface forms. Until `ALIASES` edges exist, every entity is its own component — behaviour is identical to prior versions.
 - **Outbox dream-cycle ledger:** `NOTIFY` is fire-and-forget — a notification sent while the daemon is down (restart, crash, host reboot) is lost. The durable record is the `neo4j_outbox` table: a fact's row now lives through `pending → applied → rem_reviewed → consolidated → deleted`. `consolidated` is set **in the same transaction** as the community-summary INSERT the fact was folded into; the row is deleted only after the Neo4j marking succeeds — a row's presence always means "this artifact has not finished dreaming", and its absence is the conclusive record that **both stores are synced**. The set of `rem_reviewed` fact rows is therefore the NREM backlog, restart-proof.
 - **Ledger sweep:** on each `NREM_SWEEP_INTERVAL_SEC` tick (default 3600 s; idle-gated, yields to GPU inference), NREM backfills already-covered rows, **reconciles** any rows stuck at `consolidated` (a crash between the Postgres commit and the Neo4j marking — the sweep re-applies the idempotent marking and closes the rows), and, when the `rem_reviewed` backlog reaches the density threshold, feeds those `pg_id`s to the same anchored cluster query the event path uses. Once per process start, an **unanchored global graph sweep** also runs — the only pass that reaches pre-coordinator facts that have no outbox rows.
 - **Fail-safe write order:** the Postgres transaction (summary + supersession + ledger flag) commits **before** the graph marking. A crash between the stores leaves facts unmarked in Neo4j and ledger rows at `consolidated` — repairable state the next sweep heals — instead of the old failure mode (graph-marked facts with no committed summary, stranded invisibly).
@@ -1642,7 +1643,7 @@ Both the MCP tool (`hybrid_search_and_rerank` in `vector-skill.py`) and the CLI 
 2. **Global context scan:** query `community_summaries` — the nearest active **insight** (`kind='insight'`, cross-project principle — surfaced first as `tier: "insight_summary"`) and the nearest thematic match. Insights outrank thematic narratives: a principle validated by at least one retrospective carries more weight than a single-domain synthesis.
 3. **Semantic hit:** query `technical_docs` — top-20 candidates by cosine similarity, excluding `superseded` rows (reversed decisions, migration 009; **superseded/retracted facts**, migration 013).
 4. **Rerank:** BGE-Reranker-v2-m3 via `:8888` scores all 20 candidates against the original query and returns the top-N by cross-encoder relevance.
-5. **Relational expansion:** for each top-N hit, query Neo4j for related entities and facts — surfaces structural context that vector similarity cannot express.
+5. **Relational expansion:** for each top-N hit, query Neo4j for related entities and facts — surfaces structural context that vector similarity cannot express. Since v0.6.0, each `graph_context` entry carries an `aliases` list — synonymous entity names sharing the same alias component.
 
 A returned summary/insight that was synthesised from a now-superseded fact is annotated with `stale_sources: [{old, superseded_by}]` (a cheap `superseded_by` join — **fact supersession**, decisions 381/384). Propagation is lazy: the narrative isn't re-folded on supersede, it's flagged at retrieval and judged at the point of use (`review-hold` to acknowledge an immaterial one). Save a correction with `--supersedes <pg_id>`, or retract with `memory_bridge.py supersede --pg-id <id>`; the old fact is kept (provenance) but hidden from search and consolidation.
 
@@ -1767,9 +1768,13 @@ Web-retrieved content enters the same ingestion pipeline as internally authored 
 
 Formerly the top open problem: any localhost process could read or write shared memory and claim any agent identity. **Closed in v0.3.5** — all coordinator routes now require `Authorization: Bearer <token>` (DEFAULT DENY), and the gateway stamps the verified agent identity onto every saved artifact, so `agent_id` from the request body is no longer trusted. Setup and token rotation live in [§10 (Token setup)](#10-agent-integration-first-time-setup) and [SECURITY.md](SECURITY.md); the milestone is tracked under Completed in §19. Retained here as the record of a closed problem.
 
-### Entity Resolution
+### Entity Resolution (partially addressed — alias layer in progress)
 
-The consolidation daemon clusters facts by entity names supplied by callers. Two callers using different names for the same concept (`"hive_mind_proxy"` vs `"Hive-Mind Gateway"`) produce separate clusters and separate community summaries. As the agent population grows, entity resolution — merging synonymous nodes — becomes a real structural problem. Not implemented.
+The consolidation daemon clusters facts by entity names supplied by callers. Two callers using different names for the same concept (`"hive_mind_proxy"` vs `"Hive-Mind Gateway"`) historically produced separate clusters and separate community summaries.
+
+**v0.6.0 landed the alias layer's consumption half:** `ALIASES` Entity↔Entity soft edges connect synonymous nodes without merging them (reversible by design). `alias_graph.py` runs `gds.wcc` to compute `alias_component` ids; NREM groups by alias component so synonym variants now fold as one cluster. Search surfaces aliases in `graph_context`. The offline harness `entity_resolution_eval.py` calibrates candidate pairs using cosine + lexical-Jaccard.
+
+**Pending (v0.6.1):** the **automated REM alias writer** — cosine-based blocking key + LLM verdict → `ALIASES` edge — is the remaining piece. Until it lands, aliases are created manually with the offline harness. A wrong alias edge is always reversible; no hard node merge ever happens.
 
 ### Consolidation Quality
 
@@ -1816,6 +1821,11 @@ This framework is actively evolving toward a workstation where any number of AI 
 | **Verified identity + project normalisation (v0.4.6)** | Auth stamps the verified token identity onto **both** `metadata.source` and the `technical_docs.agent_id` column (was collapsing to `memory_bridge`). `PROJECT_ALIASES` ingress normalisation + `normalize_projects.py` backfill (canonical project = folder name) so the insight gate's ≥2-distinct-projects rule is trustworthy. | ✅ Done |
 | **Fresh-install tooling + onboarding (v0.4.7–v0.4.10)** | Canonical-agent-identity doc fixes (`source` is token-stamped; model names belong in `assisted_by`); `schema_init.sql` generated from the migration chain via a scratch DB (`generate_schema_init.py`, equivalent to `apply.py` by construction); `neo4j_init.cypher` (7 uniqueness constraints); embedding indexes → hnsw (migration 010); guided install scripts (`preflight.sh`, `init_db.sh`, `bootstrap_tokens.sh`) + Quick Start rewritten around them. | ✅ Done |
 | **Concurrent-load hardening + auth/audit seam** | The gateway sheds load instead of hanging under concurrent ingress, ahead of the auth + auditing work below (both amplify per-request load). Bounded asyncpg pool with `POOL_ACQUIRE_TIMEOUT` (saturation → `503 + Retry-After`); `BoundedKeyedLocks` replacing the leaking per-entity lock map; bounded Neo4j driver pools (gateway + both daemons); outbox exponential backoff + jitter (migration 011 `next_attempt_at`) with dead-letter age in `/memory/telemetry`. Auth refactored into a pluggable `resolve_identity()` seam (`_IDENTITY_RESOLVERS` — bearer today, PoP later); thin opt-in per-request audit log (`GATEWAY_AUDIT_LOG_PATH`, JSON-lines, off the DB hot path); optional in-flight load-shed valve; `auth_scheme` on `/health`. 14 new tests; 251 total. | ✅ Done (v0.4.12) |
+| **Person identity — OS-kernel attested principal** | `AF_UNIX` listener (`GATEWAY_UDS_PATH`); `SO_PEERCRED` stamps `principal` (OS username) + `connected_from` (uid/gid/pid, audit `login_uid`/`login_user`/`session`) server-side on writes and audit lines — never agent-supplied, stripped and re-stamped by `_apply_principal`. `memory_bridge.py` auto-prefers the Unix socket. `GATEWAY_REQUIRE_PRINCIPAL` opt-in to enforce on write routes. Pre-PoP foundation. | ✅ Done (v0.4.13) |
+| **Consolidation observability — ADR-018** | `consolidation_runs` ledger (migration 012, self-pruning) records every fold outcome plus a corroborating journal line (survives Postgres unavailability). `/health.consolidation` cached snapshot (`stalled`, `last_outcome`, `last_success_age_seconds`). `/memory/telemetry` full per-cycle-type breakdown: outcome, success age, in-flight, consecutive failures, last error, `last_deferred_reason`, and **coverage** (`eligible_clusters`, `eligible_oldest_age_seconds` — outbox as write-time index). `inference_busy` tri-state (`"busy"|"idle"|"unknown"` — `"unknown"` when nvtop absent, never false-idle) on both endpoints. Stall rule: eligible backlog + no success within `CONSOLIDATION_STALL_THRESHOLD_SEC` + not in-flight. Fixed the silent insight-fold crash (`projects=` kwarg) that hid Phase 3a output for ~12 days. | ✅ Done (v0.4.13) |
+| **Cross-store backup & restore (quiesced)** | `ops/backup.sh` + `ops/restore.sh`: online `pg_dump -Fc` + Neo4j APOC `apoc.export.cypher.all`, consistency via gateway quiesce (`POST /admin/backup`; new `admin` AGENT_ROLES tier confined to `/admin/*`), sha256 manifest, `--dry-run` / `--verify`. Daemon fence via Postgres advisory lock. `ops/shared-memory-backup.{service,timer}` for systemd scheduling. Both stores required — Neo4j holds non-derivable `HAD_OUTCOME` retrospective edges. | ✅ Done (v0.4.13) |
+| **Fact supersession** | Plain facts now carry the same soft-supersede lifecycle as decisions: `save --supersedes <pg_id>` corrects and hides an old fact (provenance preserved); `supersede --pg-id [--by]` bare-retracts. Search annotates returned summaries/insights synthesised from superseded sources via `stale_sources: [{old, superseded_by}]` (lazy Postgres join, no re-fold); `review-hold` acknowledges an immaterial flag. Outbox GC rides superseded facts alongside their successors. Supersession is explicit-only — embedding similarity is not a correctness signal. (Migration 013.) | ✅ Done (v0.5.0) |
+| **Entity alias layer + framework env architecture** | `ALIASES` Entity↔Entity soft edges (never a hard merge; always reversible). `alias_graph.py` runs `gds.wcc` to stamp `Entity.alias_component`; NREM groups by alias component so synonym variants fold as one cluster keyed on lexicographic-min canonical name. Search surfaces aliases in `graph_context`. `/memory/telemetry` carries `entity_graph` section (`alias_edges`, `alias_covered_entities`, `top_hubs`, …). Offline calibration harness `entity_resolution_eval.py`. Framework env moved to `shared-memory/.env`; `${VAR}`-parametrized compose; `install_framework.sh` first-install script. **Neo4j GDS plugin required.** Automated REM alias writer (v0.6.1) pending. | ✅ Done (v0.6.0) |
 
 ### In Progress / Planned
 
@@ -1827,7 +1837,7 @@ This framework is actively evolving toward a workstation where any number of AI 
 | **Provenance layer — Phase E** | Separate `pruning_loop.py` on a slow cron; enforces the information foraging heuristic (save if retrieval utility + decision impact > storage cost); `type:decision` and `decision_impact`-flagged rows are unconditionally shielded; plain facts compete on retrieval frequency × age | Queued. Decoupled from the consolidation daemon — different cadence. Partially absorbed by the dream-cycle ledger purge. |
 | **Ontology as graph (Path B)** | Bootstrap `(:Class)` nodes + `SCO` relationships from `ontology.yaml` into Neo4j on startup; replace `ONT.*` string constants with startup-cached dict read from graph; enables live ontology inspection and Neosemantics (n10s) forward compatibility | Path A is the prerequisite ✅. Does not replace `ontology.yaml` — yaml stays the human-editable source; graph is a materialised copy. |
 | **Entity type enrichment** | Apply Neo4j multi-label to distinguish entity kinds — `:Entity:Person`, `:Entity:System`, `:Entity:Tool`, `:Entity:Decision` etc. — without breaking existing queries | Path A + Path B are the prerequisites. Enables richer graph traversal and type-aware consolidation clustering. |
-| **Entity resolution** | Detect and merge synonymous Entity nodes (`"hive_mind_proxy"` ≡ `"Hive-Mind Gateway"`); maintain a canonical name + alias set; re-link Fact nodes on merge | The entity contract (explicit caller-supplied names) makes this tractable. Implementation is a background reconciliation job, not a save-path change. |
+| **Entity resolution — automated alias writer (v0.6.1)** | REM alias writer: cosine-based blocking key + lexical-Jaccard + LLM verdict → creates `ALIASES` edges automatically. The consumption + telemetry half (NREM alias-component grouping, search aliases, entity_graph telemetry) shipped in v0.6.0. Never a hard node merge — alias edges are soft and reversible. | Alias layer (consumption side) in v0.6.0; automated writer is the remaining piece. Gated on: Phase 3b insight triggers (`INFORMED_BY` chains, retrospective-as-node) depend on this landing first. |
 | **Horizontal agent expansion** | Packaging guides and integration templates for additional agent types (VS Code extensions, Claude Desktop, any MCP-capable tool, REST-only agents) | The coordinator's HTTP API is already agent-agnostic. New agents require packaging only — no backend changes. |
 | **Ingestion boundary sanitisation** | Trust-tier tagging for web-retrieved content; strip instructional patterns; quarantine external facts before Tier 3 promotion | Security prerequisite for ingesting external content at volume. |
 | **Counterfactual simulation pass** | Before committing a consolidated narrative, verify every claim traces to a source Fact node; reject narratives that introduce unsourced claims | Completes the stored-injection defence. |
