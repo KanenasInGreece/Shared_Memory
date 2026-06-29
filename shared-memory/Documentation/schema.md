@@ -190,7 +190,8 @@ Written by the outbox worker for `type:decision` saves.
 | `WAS_GENERATED_BY` | `(:Decision)-[:WAS_GENERATED_BY]->(:Activity)` | Which session produced it (reserved) |
 | `ACTED_ON_BEHALF_OF` | `(:AIAgent)-[:ACTED_ON_BEHALF_OF]->(:Human)` | Delegation chain (reserved) |
 | `SUPERSEDES` | `(:Decision)-[:SUPERSEDES]->(:Decision)` | Replaces a prior decision |
-| `INFORMED_BY` | `(:Decision)-[:INFORMED_BY]->(:Decision)` | Prior decision used as input |
+| `INFORMED_BY` | `(:Decision)-[:INFORMED_BY]->(:Decision)` | Prior decision used as input. Populated by reference resolution (Stage 1.2b) from textual cross-references in content, plus any explicit links. |
+| `REFERENCES` | `(:Fact\|:Decision)-[:REFERENCES]->(:Fact\|:Decision)` | A record cross-reference resolved from content (Stage 1.2b): a context-gated pg-id mention (e.g. "refines decision 381") that resolves to a real record. `Decision→Decision` is promoted to `INFORMED_BY`; everything else is `REFERENCES`. Carries `resolved_from='content'` + `cue`. Never auto-`SUPERSEDES` (explicit-only). |
 | `HAD_OUTCOME` | `(:Decision)-[:HAD_OUTCOME {rating,date,notes}]->()` | Retrospective — dated edge property, not a node |
 | `SUPERSEDES` | `(:CommunitySummary)-[:SUPERSEDES]->(:CommunitySummary)` | Also written between CommunitySummary nodes when supersession rule fires (v0.4.0) |
 | `SUPERSEDES` | `(:Fact)-[:SUPERSEDES]->(:Fact)` | A correction supersedes an older fact (decision 381); the old `:Fact` also gets `superseded = true` so REM/NREM skip it |

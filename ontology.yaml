@@ -42,6 +42,7 @@ relationships:
   supersedes: SUPERSEDES                   # Decision→Decision: replaces a prior decision
   informed_by: INFORMED_BY                 # Decision→Decision: prior knowledge used
   had_outcome: HAD_OUTCOME                 # Decision→Decision/Milestone: retrospective edge
+  references: REFERENCES                    # Fact/Decision→Fact/Decision: cross-reference resolved from content (Stage 1.2b)
   # REM-enrichment relationships (written by rem_loop.py during idle processing)
   produces_insight: PRODUCES_INSIGHT       # Fact/Decision→Entity: insight or knowledge this node generates
   under_conditions: UNDER_CONDITIONS       # Decision→Entity: constraints or conditions that bound the decision
