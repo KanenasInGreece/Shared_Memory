@@ -50,7 +50,7 @@ from aiohttp import web
 from neo4j import AsyncGraphDatabase
 
 from log_hygiene import AsyncLineWriter
-from ontology import ONT
+from ontology import ONT, sanitize_entity_names, sanitize_entity_name
 
 log = logging.getLogger("coordinator")
 
@@ -975,6 +975,24 @@ class MemoryCoordinator:
                 params = json.loads(params)
             await self._apply_outbox_row(row["id"], row["pg_id"], params, row["retries"])
 
+    @staticmethod
+    def _gate_graph_entities(pg_id: int, raw: object) -> list[str]:
+        """Outbox→graph entity-name gate (Phase 1 inbound hygiene).
+
+        Sanitises names at the point they are projected from the Postgres outbox
+        into Neo4j — keeping Tier-1 (the stored fact) pristine while ensuring only
+        meaningful names become graph hubs. Rejected names are logged as a quality
+        signal (leaked pg-ids, booleans, placeholders, schema vocabulary).
+        """
+        clean = sanitize_entity_names(raw)
+        if isinstance(raw, (list, tuple)):
+            dropped = [r for r in raw
+                       if isinstance(r, str) and sanitize_entity_name(r) is None]
+            if dropped:
+                log.info("outbox->graph gate rejected %d name(s) for pg_id=%s: %s",
+                         len(dropped), pg_id, dropped)
+        return clean
+
     async def _apply_outbox_row(
         self, outbox_id: int, pg_id: int, params: dict, retries: int
     ) -> None:
@@ -1006,7 +1024,7 @@ class MemoryCoordinator:
                     pg_id=pg_id,
                     content=params.get("content_snippet", "")[:200],
                     source=params.get("source", "coordinator"),
-                    entities=params.get("entities", []),
+                    entities=self._gate_graph_entities(pg_id, params.get("entities", [])),
                     **( {"source_ref": source_ref} if source_ref else {} ),
                 )
                 # Fact supersession mirror (decision 381/384), piggybacked on this
@@ -1105,7 +1123,7 @@ class MemoryCoordinator:
                 decided_by=decision.get("decided_by", "unknown"),
                 project=decision.get("project", "unknown"),
                 assisted_by=decision.get("assisted_by", []),
-                entities=params.get("entities", []),
+                entities=self._gate_graph_entities(pg_id, params.get("entities", [])),
             )
         async with self._acquire() as conn:
             await conn.execute(
