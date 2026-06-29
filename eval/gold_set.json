@@ -1,0 +1,83 @@
+{
+  "_meta": {
+    "purpose": "Stage 1.3 REM typing eval — ground truth for entity sub-type + typed-relationship assignment.",
+    "ground_truth": "human judgment (curated from real corpus entities). Ensemble agreement is a FILTER not truth; disagreements get human adjudication (decision 475). Minority classes Model/Document are smaller — macro-F1 noise expected.",
+    "fallback_label": "OTHER = no confident sub-type (maps to untyped :Entity / MENTIONS).",
+    "rel_none": "NONE = no valid typed relationship (maps to MENTIONS fallback)."
+  },
+  "entities": [
+    {"name": "coordinator", "type": "Component", "context": "the coordinator acquires per-entity locks before each write"},
+    {"name": "rem_loop", "type": "Component", "context": "rem_loop.py enriches the oldest un-enriched facts during idle time"},
+    {"name": "consolidation_loop", "type": "Component", "context": "the consolidation daemon folds dense clusters into summaries"},
+    {"name": "hive_mind_proxy", "type": "Component", "context": "hive_mind_proxy.py is the gateway entrypoint that starts the daemons"},
+    {"name": "memory_bridge", "type": "Component", "context": "memory_bridge.py is the thin CLI client to the gateway"},
+    {"name": "AuthMiddleware", "type": "Component", "context": "AuthMiddleware validates the bearer token on each request"},
+    {"name": "vector-skill", "type": "Component", "context": "vector-skill.py is the LM Studio MCP server"},
+    {"name": "reference_resolver", "type": "Component", "context": "reference_resolver extracts pg-id cross-references from content"},
+
+    {"name": "Neo4j", "type": "System", "context": "Neo4j stores the structural graph of facts and entities"},
+    {"name": "Postgres", "type": "System", "context": "Postgres with pgvector holds the Tier-1 episodic facts"},
+    {"name": "LanceDB", "type": "System", "context": "LanceDB is the vector store on the companion agent's stack"},
+    {"name": "HiveMindGateway", "type": "System", "context": "the Hive-Mind Gateway routes embedding calls on port 8888"},
+    {"name": "SharedMemory", "type": "System", "context": "the Shared Memory framework shares context across all local agents"},
+    {"name": "SharedMemoryMonitor", "type": "System", "context": "the monitor renders the dashboard from telemetry alone"},
+    {"name": "retriever-api", "type": "System", "context": "the BGE-M3 embedder runs as the retriever-api service on 8070"},
+    {"name": "CloeVM", "type": "System", "context": "the companion advisor agent runs on a separate Proxmox VM"},
+
+    {"name": "Gemma4", "type": "Model", "context": "Gemma 4 12B is the REM/NREM reasoning model"},
+    {"name": "BGE-M3", "type": "Model", "context": "BGE-M3 produces 1024-dim embeddings"},
+    {"name": "Qwen3", "type": "Model", "context": "Qwen3 was the prior reasoning model before Gemma"},
+    {"name": "BGE-Reranker", "type": "Model", "context": "the BGE reranker scores candidate documents at query time"},
+    {"name": "nomic-embed", "type": "Model", "context": "nomic-embed is a 768-dim embedding model"},
+    {"name": "llama-8b", "type": "Model", "context": "a fast llama-8b serves as the second-opinion judge"},
+
+    {"name": "OutboxPattern", "type": "Concept", "context": "the outbox pattern gives cross-DB atomicity between Postgres and Neo4j"},
+    {"name": "NREM", "type": "Concept", "context": "NREM consolidation synthesises community summaries from clusters"},
+    {"name": "EntityResolution", "type": "Concept", "context": "entity resolution links synonymous entities without merging nodes"},
+    {"name": "FactSupersession", "type": "Concept", "context": "fact supersession soft-hides corrected facts while keeping provenance"},
+    {"name": "ConfidenceRouting", "type": "Concept", "context": "confidence routing selects which retrieval tier answers a query"},
+    {"name": "RoleEquivalence", "type": "Concept", "context": "role equivalence validates a new edge by neighbourhood consistency"},
+    {"name": "DomainScoping", "type": "Concept", "context": "domain-scoped consolidation keys summaries on entity plus domain"},
+    {"name": "ConsolidationQuality", "type": "Concept", "context": "consolidation quality is defined as grounded novelty"},
+
+    {"name": "README", "type": "Document", "context": "the README is the primary architecture reference"},
+    {"name": "SKILL.md", "type": "Document", "context": "SKILL.md is the agent skill contract with usage examples"},
+    {"name": "schema.md", "type": "Document", "context": "schema.md documents the full Postgres and Neo4j schema"},
+    {"name": "CHANGELOG", "type": "Document", "context": "the changelog records notable changes per version"},
+    {"name": "server-setup.md", "type": "Document", "context": "server-setup documents the gateway-host install steps"},
+    {"name": "research-note", "type": "Document", "context": "a dated research note distilled from web and book sources"},
+    {"name": "DistilledResearch", "type": "Document", "context": "a distilled research artifact stored for later retrieval"},
+    {"name": "design-doc", "type": "Document", "context": "a design document specifying a feature before build"},
+
+    {"name": "Xenofon", "type": "OTHER", "context": "Xenofon owns the architectural decisions"},
+    {"name": "shared-memory-GitHub", "type": "OTHER", "context": "the project scope for these decisions"}
+  ],
+  "relationships": [
+    {"src": "coordinator", "src_type": "Component", "tgt": "Postgres", "tgt_type": "System", "rel": "DEPENDS_ON", "context": "the coordinator uses an asyncpg pool to Postgres"},
+    {"src": "coordinator", "src_type": "Component", "tgt": "OutboxPattern", "tgt_type": "Concept", "rel": "IMPLEMENTS", "context": "the coordinator implements the outbox pattern"},
+    {"src": "rem_loop", "src_type": "Component", "tgt": "SharedMemory", "tgt_type": "System", "rel": "PART_OF", "context": "rem_loop is part of the shared memory framework"},
+    {"src": "consolidation_loop", "src_type": "Component", "tgt": "Neo4j", "tgt_type": "System", "rel": "DEPENDS_ON", "context": "the consolidation daemon reads clusters from Neo4j"},
+    {"src": "consolidation_loop", "src_type": "Component", "tgt": "NREM", "tgt_type": "Concept", "rel": "IMPLEMENTS", "context": "consolidation_loop implements the NREM cycle"},
+    {"src": "AuthMiddleware", "src_type": "Component", "tgt": "HiveMindGateway", "tgt_type": "System", "rel": "PART_OF", "context": "AuthMiddleware is part of the gateway"},
+    {"src": "vector-skill", "src_type": "Component", "tgt": "BGE-M3", "tgt_type": "Model", "rel": "CONSUMES", "context": "vector-skill consumes BGE-M3 embeddings"},
+    {"src": "memory_bridge", "src_type": "Component", "tgt": "HiveMindGateway", "tgt_type": "System", "rel": "CONSUMES", "context": "memory_bridge calls the gateway over HTTP"},
+    {"src": "HiveMindGateway", "src_type": "System", "tgt": "Gemma4", "tgt_type": "Model", "rel": "DEPENDS_ON", "context": "the gateway routes completions to the Gemma model"},
+    {"src": "BGE-M3", "src_type": "Model", "tgt": "retriever-api", "tgt_type": "System", "rel": "RUNS_ON", "context": "BGE-M3 runs on the retriever-api service"},
+    {"src": "Gemma4", "src_type": "Model", "tgt": "CloeVM", "tgt_type": "System", "rel": "RUNS_ON", "context": "Gemma runs on the VM"},
+    {"src": "README", "src_type": "Document", "tgt": "coordinator", "tgt_type": "Component", "rel": "DESCRIBES", "context": "the README describes the coordinator architecture"},
+    {"src": "schema.md", "src_type": "Document", "tgt": "Neo4j", "tgt_type": "System", "rel": "DESCRIBES", "context": "schema.md describes the Neo4j labels and relationships"},
+    {"src": "schema.md", "src_type": "Document", "tgt": "EntityResolution", "tgt_type": "Concept", "rel": "DESCRIBES", "context": "the doc describes the entity resolution approach"},
+    {"src": "ontology.yaml", "src_type": "Document", "tgt": "Neo4j", "tgt_type": "System", "rel": "CONFIGURES", "context": "ontology.yaml configures the Neo4j label names"},
+    {"src": "consolidation_loop", "src_type": "Component", "tgt": "design-doc", "tgt_type": "Document", "rel": "PRODUCES", "context": "the build process produced a design document"},
+    {"src": "SecurityAudit", "src_type": "Activity", "tgt": "coordinator", "tgt_type": "Component", "rel": "VALIDATES", "context": "the security audit validates the coordinator"},
+    {"src": "consolidation_loop", "src_type": "Component", "tgt": "community_summaries", "tgt_type": "System", "rel": "PRODUCES", "context": "the daemon produces community summary rows"},
+
+    {"src": "Xenofon", "src_type": "OTHER", "tgt": "coordinator", "tgt_type": "Component", "rel": "NONE", "context": "Xenofon designed the coordinator"},
+    {"src": "OutboxPattern", "src_type": "Concept", "tgt": "Neo4j", "tgt_type": "System", "rel": "NONE", "context": "the outbox pattern relates to Neo4j writes"},
+    {"src": "coordinator", "src_type": "Component", "tgt": "README", "tgt_type": "Document", "rel": "NONE", "context": "the coordinator is mentioned in the README"},
+    {"src": "Neo4j", "src_type": "System", "tgt": "OutboxPattern", "tgt_type": "Concept", "rel": "NONE", "context": "Neo4j is written via the outbox pattern"},
+    {"src": "BGE-M3", "src_type": "Model", "tgt": "coordinator", "tgt_type": "Component", "rel": "NONE", "context": "BGE-M3 is called by the coordinator"},
+    {"src": "rem_loop", "src_type": "Component", "tgt": "coordinator", "tgt_type": "Component", "rel": "DEPENDS_ON", "context": "rem_loop relies on the coordinator's outbox state"},
+    {"src": "memory_bridge", "src_type": "Component", "tgt": "SharedMemory", "tgt_type": "System", "rel": "PART_OF", "context": "memory_bridge is part of the shared memory toolset"}
+  ]
+}
