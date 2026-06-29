@@ -7,6 +7,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — inbound entity-name hygiene gate (decision 470)
+
+A deterministic "garbage-in" gate (ported from Cloe tier3 `ingest.py`, adapted to the single-`Entity`-label
+ontology) that stops meaningless names from becoming graph hubs.
+
+- **`ontology.sanitize_entity_name()` / `sanitize_entity_names()`** — pure, deterministic. Rejects numeric-only
+  names (leaked pg-ids), single characters, booleans/placeholders, and schema vocabulary (relationship/label
+  names). **Casing is preserved** (`Neo4j` stays `Neo4j`) — case-variant unification is the alias layer's job.
+  `MIN_ENTITY_NAME_LEN` is env-tunable (default 2).
+- **Gate 1 — outbox→graph** (`coordinator._gate_graph_entities`, applied at the fact + decision MERGE): gates the
+  graph **projection** only. Tier-1 Postgres facts stay pristine (the agent's original record is the source of
+  truth). Rejected names are logged as a quality signal.
+- **Gate 2 — REM** (`rem_loop._write_neo4j_rem`): sanitises LLM-extracted fact relationships + decision extras,
+  which are minted during enrichment and never passed Gate 1.
+- **`cleanup_entity_noise.py`** — one-time cleanup (dry-run default) that removes pre-gate noise using the gate's
+  **own** definition, so prevention and cleanup can never drift. First run removed 27 noise hubs, headlined by
+  `:Entity{name:"Decision"}` at **degree 83** (a fake super-hub on 49 Decisions + 34 Facts that would corrupt
+  NREM density clustering) plus leaked pg-ids `254`–`259`; 153 Decisions + 234 Facts untouched.
+
 ## [0.6.0] — 2026-06-28
 
 Entity-resolution **alias layer** — soft `ALIASES` edges between synonymous entities (`coordinator` ↔
