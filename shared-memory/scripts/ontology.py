@@ -114,3 +114,68 @@ def _validate(cfg: OntologyConfig) -> OntologyConfig:
 
 
 ONT = _validate(_load())
+
+
+# ── Entity-name hygiene (inbound quality gate) ────────────────────────────────
+# A deterministic "garbage-in" gate applied where names enter the graph
+# (outbox→Neo4j projection and REM enrichment). It keeps graph hubs meaningful:
+# leaked pg-ids ("254"), booleans, placeholders and schema vocabulary must never
+# become Entity nodes. It is NOT a casing pass — proper-noun forms ("Neo4j",
+# "LanceDB") are canonical and case-variant unification is the alias layer's job.
+
+# Minimum entity-name length after stripping. Env-tunable. Default 2 keeps useful
+# short abbreviations ("uv", "VM", "ER") while dropping single-character noise.
+MIN_ENTITY_NAME_LEN: int = int(os.environ.get("MIN_ENTITY_NAME_LEN", "2"))
+
+# Lowercased tokens that must never become Entity nodes.
+_ENTITY_NOISE_NAMES: frozenset[str] = frozenset({
+    # content-free placeholders / booleans
+    "true", "false", "null", "none", "nil", "n/a", "na", "tbd", "todo",
+    "yes", "no", "unknown", "undefined", "nan",
+    # ontology vocabulary (relationship + label names) — schema leakage, not entities
+    "mentions", "aliases", "considered", "rejected", "produces_insight",
+    "under_conditions", "informed_by", "had_outcome", "supersedes",
+    "was_attributed_to", "was_assisted_by", "was_generated_by", "project_of",
+    "reports_on", "acted_on_behalf_of", "summarized_by", "next_step",
+    "fact", "entity", "decision", "human", "aiagent", "project",
+    "activity", "milestone", "communitysummary", "reasoningtrace", "reasoningstep",
+})
+
+_NUMERIC_NAME_RE = re.compile(r"^[0-9]+$")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def sanitize_entity_name(raw: object) -> str | None:
+    """Normalise and validate one entity name. Returns the cleaned name, or None
+    if it must be rejected. Pure and deterministic — no I/O.
+
+    Rejection rules: non-string / empty after strip; numeric-only (leaked pg-ids,
+    counts); shorter than MIN_ENTITY_NAME_LEN; lowercased form in the noise set.
+    Internal whitespace is collapsed to a single space; casing is preserved.
+    """
+    if not isinstance(raw, str):
+        return None
+    name = _WHITESPACE_RE.sub(" ", raw.strip())
+    if not name:
+        return None
+    if _NUMERIC_NAME_RE.match(name):
+        return None
+    if len(name) < MIN_ENTITY_NAME_LEN:
+        return None
+    if name.lower() in _ENTITY_NOISE_NAMES:
+        return None
+    return name
+
+
+def sanitize_entity_names(raw_names: object) -> list[str]:
+    """Sanitise a list of names: drop rejects, de-duplicate, preserve order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    if not isinstance(raw_names, (list, tuple, set)):
+        return out
+    for r in raw_names:
+        n = sanitize_entity_name(r)
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out

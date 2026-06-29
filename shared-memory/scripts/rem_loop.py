@@ -45,7 +45,7 @@ import psycopg2.extensions
 from neo4j import AsyncGraphDatabase
 
 sys.path.insert(0, os.path.dirname(__file__))
-from ontology import ONT
+from ontology import ONT, sanitize_entity_name, sanitize_entity_names
 from gpu_load import inference_gpu_busy
 from log_hygiene import append_secure
 
@@ -543,15 +543,26 @@ class REMDaemon:
         intact and the summary is kept non-destructively in d.rem_summary.
         """
         anchor = ONT.decision if is_decision else ONT.fact
-        # Resolve and group Fact relationships by (label, rel_type)
+        # Resolve and group Fact relationships by (label, rel_type).
+        # REM gate (Phase 1 inbound hygiene): the LLM mints these names freshly,
+        # so they never passed the outbox->graph gate — sanitise here too. Leaked
+        # pg-ids, booleans and schema vocabulary are dropped before they can
+        # become Entity hubs.
         groups: dict[tuple[str, str], list[str]] = defaultdict(list)
+        dropped_names: list[str] = []
         for rel in relationships:
-            name      = (rel.get("name") or "").strip()
-            suggested = rel.get("rel_type", ONT.entity_link)
+            raw_name  = rel.get("name")
+            name      = sanitize_entity_name(raw_name)
             if not name:
+                if isinstance(raw_name, str) and raw_name.strip():
+                    dropped_names.append(raw_name.strip())
                 continue
+            suggested = rel.get("rel_type", ONT.entity_link)
             label, rel_type = _resolve_rel(name, suggested, registry)
             groups[(label, rel_type)].append(name)
+        if dropped_names:
+            logger.info("REM gate rejected %d LLM-extracted name(s) for pg_id=%s: %s",
+                        len(dropped_names), pg_id, dropped_names)
 
         async with self.driver.session() as session:
             # Step 1 — entity edges on the anchor node (Fact, or Decision)
@@ -567,7 +578,7 @@ class REMDaemon:
             # Step 2 — Decision extras on Decision node (same session)
             if decision_extras:
                 for rel_type in _DECISION_EXTRA_RELS:
-                    names = [n.strip() for n in decision_extras.get(rel_type, []) if n.strip()]
+                    names = sanitize_entity_names(decision_extras.get(rel_type, []))
                     if not names:
                         continue
                     await session.run(
