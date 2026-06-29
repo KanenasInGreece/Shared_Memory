@@ -52,6 +52,25 @@ accumulated decisions and entities, cross-checked against a companion advisor/re
   compliance telemetry and the inbound gates track it immediately. **Schema-defs only** — REM begins
   assigning the new vocab in a later step; nothing in the write path changes yet.
 
+### Added — reference resolution (record→record edges), Stage 1.2b
+
+Agents reference other records in free text ("refines decision 381", "addendum to pg_id 257"). Those are
+real cross-references that previously leaked as noise entity nodes or stayed invisible in prose. They are now
+materialised as real edges.
+
+- **`reference_resolver.py`** — context-gated regex (a number counts only after a record-reference cue) +
+  id-validation against `technical_docs`. **Deterministic and high-confidence** (in the existing corpus 145/146
+  such references resolved to a real record). New `REFERENCES` relationship (`Fact|Decision → Fact|Decision`);
+  `Decision→Decision` is promoted to the previously-dormant `INFORMED_BY`.
+- **Configurable relationship-type judge** (framework env): `REFERENCE_JUDGE_MODE=deterministic` (default) `| llm`,
+  with `REFERENCE_JUDGE_URL` (any OpenAI-compatible endpoint — local, or a separate node to offload it) and
+  `REFERENCE_JUDGE_MODEL`. The judge is **gated** — consulted only for the ambiguous `Decision→Decision` case,
+  output strictly validated (exactly one allowed token), deterministic fallback otherwise. It can never widen
+  the relation set or emit `SUPERSEDES` (explicit-only).
+- **`resolve_references.py`** — one-time backfill (dry-run default, idempotent `MERGE`, skips pairs already
+  linked by `SUPERSEDES`). First run materialised 128 edges (109 `REFERENCES`, 19 `INFORMED_BY`). REM applies
+  the same resolver incrementally in a later step.
+
 ## [0.6.0] — 2026-06-28
 
 Entity-resolution **alias layer** — soft `ALIASES` edges between synonymous entities (`coordinator` ↔

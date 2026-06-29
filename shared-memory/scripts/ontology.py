@@ -49,6 +49,7 @@ class OntologyConfig:
     supersedes: str = "SUPERSEDES"
     informed_by: str = "INFORMED_BY"
     had_outcome: str = "HAD_OUTCOME"
+    references: str = "REFERENCES"   # record→record cross-reference resolved from content (Stage 1.2b)
     # REM-enrichment relationships (written by rem_loop.py)
     produces_insight: str = "PRODUCES_INSIGHT"
     under_conditions: str = "UNDER_CONDITIONS"
@@ -115,6 +116,7 @@ def _load() -> OntologyConfig:
             supersedes=rels.get("supersedes", "SUPERSEDES"),
             informed_by=rels.get("informed_by", "INFORMED_BY"),
             had_outcome=rels.get("had_outcome", "HAD_OUTCOME"),
+            references=rels.get("references", "REFERENCES"),
             produces_insight=rels.get("produces_insight", "PRODUCES_INSIGHT"),
             under_conditions=rels.get("under_conditions", "UNDER_CONDITIONS"),
             considered=rels.get("considered", "CONSIDERED"),
@@ -235,8 +237,8 @@ KNOWN_RELATIONSHIPS: frozenset[str] = frozenset({
     ONT.entity_link, ONT.entity_link_alias, ONT.aliases, ONT.summarized_by,
     ONT.reasoning_next, ONT.was_attributed_to, ONT.was_assisted_by,
     ONT.was_generated_by, ONT.project_of, ONT.acted_on_behalf_of,
-    ONT.supersedes, ONT.informed_by, ONT.had_outcome, ONT.produces_insight,
-    ONT.under_conditions, ONT.considered, ONT.rejected,
+    ONT.supersedes, ONT.informed_by, ONT.had_outcome, ONT.references,
+    ONT.produces_insight, ONT.under_conditions, ONT.considered, ONT.rejected,
     # typed Entity→Entity domain relationships (decision 472)
     ONT.depends_on, ONT.part_of, ONT.implements, ONT.produces, ONT.consumes,
     ONT.runs_on, ONT.configures, ONT.describes, ONT.validates,
