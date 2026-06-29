@@ -51,7 +51,7 @@ The skill is a **thin client** — only `memory_bridge.py` ships with it. After 
 
 `vector-skill.py` (MCP) is for LM Studio only; CLI agents use `memory_bridge.py`, a thin HTTP client that delegates all storage to the coordinator (needs only `httpx` + `python-dotenv`).
 
-**Client ↔ gateway version contract.** `memory_bridge.py` (and `vector-skill.py`'s `/memory/*` calls) send the `X-SM-Api-Version` header; the gateway reports `api_version` on `GET /health` and logs any skew. `API_VERSION` lives in both `coordinator.py` and `memory_bridge.py` — bump them together on a breaking protocol change. Never copy daemons into a skill dir to "match versions"; the contract, not file parity, governs compatibility. (ADR-014)
+**Client ↔ gateway version contract.** `memory_bridge.py` (and `vector-skill.py`'s `/memory/*` calls) send the `X-SM-Api-Version` header; the gateway reports `api_version` on `GET /health` and logs any skew. `API_VERSION` lives in both `coordinator.py` and `memory_bridge.py` — bump them together on a breaking protocol change. Never copy daemons into a skill dir to "match versions"; the contract, not file parity, governs compatibility.
 
 **No separate graph MCP (e.g. neo4j-agent-memory).** Direct-bolt Neo4j servers bypass the coordinator's per-entity locks, outbox atomicity, and SHA-256 dedup — producing orphaned nodes invisible to search. `rag-orchestrator` already expands Neo4j on every search.
 
@@ -87,7 +87,7 @@ Startup launches the coordinator (asyncpg pool, per-entity locks, outbox worker)
 - **Per-agent auth** — each agent's `.env` holds its own `AGENT_TOKEN` matching one entry in the gateway's `AGENT_TOKENS`; tokens are never shared.
 - **Hard embedding mandate** — saves abort (503) if the gateway/embedder is unreachable; an unvectored row is invisible to search.
 - **SHA-256 idempotency** — `ON CONFLICT (content_hash) DO UPDATE`. Safe to re-save identical content.
-- **Outbox atomicity** — every save writes a `neo4j_outbox` row in the same Postgres transaction; the worker applies Neo4j asynchronously (eliminates ADR-001 dangling-Fact risk).
+- **Outbox atomicity** — every save writes a `neo4j_outbox` row in the same Postgres transaction; the worker applies Neo4j asynchronously (eliminates the dangling-Fact risk).
 - **`entities` required for consolidation; `project`/`domain` scopes it.**
 - **Health check before saves** — `GET :8888/health` → `status: ok` when embedder and reranker are up; 503 means saves will fail.
 
