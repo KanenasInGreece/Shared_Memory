@@ -26,6 +26,14 @@ class OntologyConfig:
     project: str = "Project"
     activity: str = "Activity"
     milestone: str = "Milestone"
+    # Node labels — entity type sub-labels (Path A multi-label under :Entity; decision 472).
+    # Stage 1 defines them; REM populates them (1.3) + one-time backfill (1.4). Person/
+    # Agent/Process reuse the provenance labels above (Human/AIAgent/Activity).
+    component: str = "Component"   # software unit we build (module/class/script/daemon)
+    system: str = "System"        # service / datastore / framework / infra we run
+    model: str = "Model"          # AI/ML model
+    concept: str = "Concept"      # pattern / technique / principle / signal
+    document: str = "Document"    # spec / ADR / doc / research artifact
     # Relationship types — core
     entity_link: str = "MENTIONS"
     entity_link_alias: str = "REPORTS_ON"
@@ -46,6 +54,18 @@ class OntologyConfig:
     under_conditions: str = "UNDER_CONDITIONS"
     considered: str = "CONSIDERED"
     rejected: str = "REJECTED"
+    # Relationship types — typed Entity→Entity domain (decision 472). REM picks one
+    # (1.3) gated by the domain-range map; MENTIONS stays as fallback until per-edge
+    # confidence retires it in v0.6.1.
+    depends_on: str = "DEPENDS_ON"   # needs / requires (build/config dependency)
+    part_of: str = "PART_OF"         # composition / belongs-to
+    implements: str = "IMPLEMENTS"   # realises a concept / pattern
+    produces: str = "PRODUCES"       # creates output / data / artifact
+    consumes: str = "CONSUMES"       # uses another's output / data (runtime I/O)
+    runs_on: str = "RUNS_ON"         # executes on / deployed on
+    configures: str = "CONFIGURES"   # controls / parametrises / governs
+    describes: str = "DESCRIBES"     # documents / specifies (Document→X)
+    validates: str = "VALIDATES"     # quality-gate / test / telemetry validates X
     # Consolidation tuning
     density_threshold: int = 5
     insight_threshold: int = 2
@@ -77,6 +97,11 @@ def _load() -> OntologyConfig:
             project=labels.get("project", "Project"),
             activity=labels.get("activity", "Activity"),
             milestone=labels.get("milestone", "Milestone"),
+            component=labels.get("component", "Component"),
+            system=labels.get("system", "System"),
+            model=labels.get("model", "Model"),
+            concept=labels.get("concept", "Concept"),
+            document=labels.get("document", "Document"),
             entity_link=rels.get("entity_link", "MENTIONS"),
             entity_link_alias=rels.get("entity_link_alias", "REPORTS_ON"),
             aliases=rels.get("aliases", "ALIASES"),
@@ -94,6 +119,15 @@ def _load() -> OntologyConfig:
             under_conditions=rels.get("under_conditions", "UNDER_CONDITIONS"),
             considered=rels.get("considered", "CONSIDERED"),
             rejected=rels.get("rejected", "REJECTED"),
+            depends_on=rels.get("depends_on", "DEPENDS_ON"),
+            part_of=rels.get("part_of", "PART_OF"),
+            implements=rels.get("implements", "IMPLEMENTS"),
+            produces=rels.get("produces", "PRODUCES"),
+            consumes=rels.get("consumes", "CONSUMES"),
+            runs_on=rels.get("runs_on", "RUNS_ON"),
+            configures=rels.get("configures", "CONFIGURES"),
+            describes=rels.get("describes", "DESCRIBES"),
+            validates=rels.get("validates", "VALIDATES"),
             density_threshold=int(cons.get("density_threshold", 5)),
             insight_threshold=int(cons.get("insight_threshold", 2)),
             alias_max_hops=int(cons.get("alias_max_hops", 2)),
@@ -139,6 +173,10 @@ _ENTITY_NOISE_NAMES: frozenset[str] = frozenset({
     "reports_on", "acted_on_behalf_of", "summarized_by", "next_step",
     "fact", "entity", "decision", "human", "aiagent", "project",
     "activity", "milestone", "communitysummary", "reasoningtrace", "reasoningstep",
+    # entity type sub-labels + typed relationships (decision 472) — schema vocabulary
+    "component", "system", "model", "concept", "document",
+    "depends_on", "part_of", "implements", "produces", "consumes",
+    "runs_on", "configures", "describes", "validates",
 })
 
 _NUMERIC_NAME_RE = re.compile(r"^[0-9]+$")
@@ -179,3 +217,27 @@ def sanitize_entity_names(raw_names: object) -> list[str]:
             seen.add(n)
             out.append(n)
     return out
+
+
+# ── Ontology vocabulary (compliance reference) ────────────────────────────────
+# Every node label / relationship type the schema defines. Anything in the live
+# graph outside these sets is legacy or foreign drift — surfaced by compliance
+# telemetry and reusable by cleanup tooling. Derived from ONT so the vocabulary
+# can never disagree with the identifiers the daemons actually write.
+KNOWN_LABELS: frozenset[str] = frozenset({
+    ONT.fact, ONT.entity, ONT.community_summary, ONT.reasoning_trace,
+    ONT.reasoning_step, ONT.decision, ONT.human, ONT.ai_agent,
+    ONT.project, ONT.activity, ONT.milestone,
+    # entity type sub-labels (decision 472)
+    ONT.component, ONT.system, ONT.model, ONT.concept, ONT.document,
+})
+KNOWN_RELATIONSHIPS: frozenset[str] = frozenset({
+    ONT.entity_link, ONT.entity_link_alias, ONT.aliases, ONT.summarized_by,
+    ONT.reasoning_next, ONT.was_attributed_to, ONT.was_assisted_by,
+    ONT.was_generated_by, ONT.project_of, ONT.acted_on_behalf_of,
+    ONT.supersedes, ONT.informed_by, ONT.had_outcome, ONT.produces_insight,
+    ONT.under_conditions, ONT.considered, ONT.rejected,
+    # typed Entity→Entity domain relationships (decision 472)
+    ONT.depends_on, ONT.part_of, ONT.implements, ONT.produces, ONT.consumes,
+    ONT.runs_on, ONT.configures, ONT.describes, ONT.validates,
+})
