@@ -140,7 +140,7 @@ One row per consolidation/insight **cycle** so a fold outcome is queryable state
 | `ReasoningTrace` | Agent (via `archive_reasoning_trace`) | Root of a reasoning session |
 | `ReasoningStep` | Agent (via `archive_reasoning_trace`) | Individual step within a trace |
 
-### Entity type sub-labels (decision 472 — Path A multi-label)
+### Entity type sub-labels (Path A multi-label)
 
 Type specialisations applied **on top of** `:Entity` (e.g. `:Entity:Component`), so all existing
 `:Entity` queries keep working. **Staged rollout:** defined in `ontology.yaml` now; REM assigns them during

@@ -7,10 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Added — inbound entity-name hygiene gate (decision 470)
+### Added — inbound entity-name hygiene gate
 
-A deterministic "garbage-in" gate (ported from Cloe tier3 `ingest.py`, adapted to the single-`Entity`-label
-ontology) that stops meaningless names from becoming graph hubs.
+A deterministic "garbage-in" gate (adapted from a companion advisor/researcher agent's ingestion gate to the
+single-`Entity`-label ontology) that stops meaningless names from becoming graph hubs.
 
 - **`ontology.sanitize_entity_name()` / `sanitize_entity_names()`** — pure, deterministic. Rejects numeric-only
   names (leaked pg-ids), single characters, booleans/placeholders, and schema vocabulary (relationship/label
@@ -36,11 +36,11 @@ ontology) that stops meaningless names from becoming graph hubs.
   (`_compliance_split`) is pure and unit-tested; the rule reads `KNOWN_LABELS`/`KNOWN_RELATIONSHIPS` so it
   can never drift from what the daemons write.
 
-### Changed — ontology enrichment, Stage 1.1 (decision 472)
+### Changed — ontology enrichment, Stage 1.1
 
-Path A (first-class multi-label, no n10s) data-driven enrichment of the thin domain layer (previously a
-single untyped `:Entity` + one `MENTIONS` edge). Vocabulary derived by mining 153 decisions + 1737 entities,
-cross-checked with Cloe's Oratotis schema.
+Path A (first-class multi-label, no external ontology plugin) data-driven enrichment of the thin domain layer
+(previously a single untyped `:Entity` + one `MENTIONS` edge). Vocabulary derived by mining the project's own
+accumulated decisions and entities, cross-checked against a companion advisor/researcher agent's domain ontology.
 
 - **5 new entity sub-labels** in `ontology.yaml` / `ONT` (under `:Entity`, multi-label): `Component`,
   `System`, `Model`, `Concept`, `Document`. (Person/Agent/Process reuse the provenance labels
