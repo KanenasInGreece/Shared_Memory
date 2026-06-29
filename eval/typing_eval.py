@@ -183,16 +183,25 @@ def _longest(hits):
     return max(hits, key=len)  # prefer the most specific token if several appear
 
 
-def call_llm(prompt, url, model, temp):
+def call_llm(prompt, url, model, temp, timeout=300.0, retries=2):
+    """Call an OpenAI-compatible endpoint. Long timeout + retry because the local
+    model is shared with REM/NREM — a call can queue behind a dream cycle for
+    minutes during backlog (observed 90s+ under load)."""
     import httpx
-    resp = httpx.post(
-        f"{url.rstrip('/')}/chat/completions",
-        json={"model": model, "temperature": temp, "max_tokens": 12,
-              "messages": [{"role": "user", "content": prompt}]},
-        timeout=60.0,
-    )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            resp = httpx.post(
+                f"{url.rstrip('/')}/chat/completions",
+                json={"model": model, "temperature": temp, "max_tokens": 12,
+                      "messages": [{"role": "user", "content": prompt}]},
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+        except Exception as exc:  # noqa: BLE001 — retry transient GPU-contention timeouts
+            last = exc
+    raise last
 
 
 def predict_entity(e, url, model, temp, mock):
