@@ -140,6 +140,21 @@ One row per consolidation/insight **cycle** so a fold outcome is queryable state
 | `ReasoningTrace` | Agent (via `archive_reasoning_trace`) | Root of a reasoning session |
 | `ReasoningStep` | Agent (via `archive_reasoning_trace`) | Individual step within a trace |
 
+### Entity type sub-labels (decision 472 — Path A multi-label)
+
+Type specialisations applied **on top of** `:Entity` (e.g. `:Entity:Component`), so all existing
+`:Entity` queries keep working. **Staged rollout:** defined in `ontology.yaml` now; REM assigns them during
+enrichment (Stage 1.3) and a one-time backfill types the existing corpus (Stage 1.4). Person / Agent /
+Process reuse the provenance labels `Human` / `AIAgent` / `Activity` rather than minting parallel types.
+
+| Sub-label | Captures |
+|---|---|
+| `Component` | software unit we build (module / class / script / daemon) |
+| `System` | service / datastore / framework / infrastructure we run |
+| `Model` | AI/ML model |
+| `Concept` | pattern / technique / principle / signal |
+| `Document` | spec / ADR / doc / research artifact |
+
 ### Provenance labels (Phase A — PROV-O inspired)
 
 Written by the outbox worker when `metadata["type"] == "decision"`.

@@ -50,7 +50,10 @@ from aiohttp import web
 from neo4j import AsyncGraphDatabase
 
 from log_hygiene import AsyncLineWriter
-from ontology import ONT, sanitize_entity_names, sanitize_entity_name
+from ontology import (
+    ONT, sanitize_entity_names, sanitize_entity_name,
+    KNOWN_LABELS, KNOWN_RELATIONSHIPS,
+)
 
 log = logging.getLogger("coordinator")
 
@@ -2126,6 +2129,15 @@ class MemoryCoordinator:
         except Exception as exc:
             snap["entity_graph"] = {"error": str(exc)}
 
+        # Schema compliance — node labels / relationship types in the live graph
+        # outside the ontology vocabulary (legacy or foreign drift the inbound
+        # gates now prevent but cannot retroactively remove). Predicate
+        # distribution is the supporting census.
+        try:
+            snap["compliance"] = await self._graph_compliance()
+        except Exception as exc:
+            snap["compliance"] = {"error": str(exc)}
+
         # Consolidation signal (ADR-018) — the dream-cycle liveness rollup from
         # the daemon's consolidation_runs ledger: per-cycle-type last outcome,
         # success age, in-flight, last error, plus the derived stall verdict.
@@ -2446,6 +2458,47 @@ class MemoryCoordinator:
             "alias_edges": aliases["edges"] or 0,
             "alias_covered_entities": covered["c"] or 0,
             "top_hubs": [{"name": h["name"], "degree": h["degree"]} for h in hubs],
+        }
+
+    @staticmethod
+    def _compliance_split(counts: dict[str, int], known: frozenset[str]) -> tuple[str, list[dict]]:
+        """Partition a {name: count} distribution against the ontology vocabulary.
+
+        Returns (status, invalid) where status is "ok" when every name is known
+        and "non-compliant" otherwise; invalid lists the offending names with
+        counts, highest first. Pure — unit-testable without a graph.
+        """
+        invalid = [{"name": n, "count": c} for n, c in counts.items() if n not in known]
+        invalid.sort(key=lambda d: (-d["count"], d["name"]))
+        return ("ok" if not invalid else "non-compliant"), invalid
+
+    async def _graph_compliance(self) -> dict:
+        """Schema-compliance telemetry: which node labels and relationship types
+        in the live graph fall outside the ontology vocabulary. Two cheap Neo4j
+        aggregates; the valid/invalid split is computed in-process so the rule
+        (KNOWN_LABELS / KNOWN_RELATIONSHIPS) can never drift from what the daemons
+        write. Surfaces legacy/foreign drift (e.g. a DockerContainer node or a
+        REQUIRES edge from a pre-gate experiment) that entity-shape metrics miss.
+        """
+        async with self._neo4j.session() as session:
+            preds = await (await session.run(
+                "MATCH ()-[r]->() RETURN type(r) AS name, count(*) AS c"
+            )).data()
+            labels = await (await session.run(
+                "MATCH (n) UNWIND labels(n) AS l RETURN l AS name, count(*) AS c"
+            )).data()
+        pred_dist = {r["name"]: r["c"] for r in preds}
+        label_dist = {r["name"]: r["c"] for r in labels}
+        rel_status, invalid_rels = self._compliance_split(pred_dist, KNOWN_RELATIONSHIPS)
+        lbl_status, invalid_lbls = self._compliance_split(label_dist, KNOWN_LABELS)
+        return {
+            "predicate_distribution": dict(
+                sorted(pred_dist.items(), key=lambda kv: (-kv[1], kv[0]))
+            ),
+            "label_compliance": lbl_status,
+            "invalid_labels": invalid_lbls,
+            "relationship_compliance": rel_status,
+            "invalid_relationships": invalid_rels,
         }
 
 

@@ -26,6 +26,32 @@ ontology) that stops meaningless names from becoming graph hubs.
   `:Entity{name:"Decision"}` at **degree 83** (a fake super-hub on 49 Decisions + 34 Facts that would corrupt
   NREM density clustering) plus leaked pg-ids `254`–`259`; 153 Decisions + 234 Facts untouched.
 
+### Added — schema-compliance telemetry
+
+- **`/memory/telemetry` `compliance` section** (`coordinator._graph_compliance`): `predicate_distribution`
+  (full relationship-type census), `label_compliance` + `invalid_labels[]`, `relationship_compliance` +
+  `invalid_relationships[]` — node labels / relationship types in the live graph that fall outside the
+  ontology vocabulary. Surfaces legacy/foreign drift the inbound gates now prevent but cannot retroactively
+  remove (e.g. `DockerContainer` nodes, `WRITES_TO` edges from pre-gate experiments). Split logic
+  (`_compliance_split`) is pure and unit-tested; the rule reads `KNOWN_LABELS`/`KNOWN_RELATIONSHIPS` so it
+  can never drift from what the daemons write.
+
+### Changed — ontology enrichment, Stage 1.1 (decision 472)
+
+Path A (first-class multi-label, no n10s) data-driven enrichment of the thin domain layer (previously a
+single untyped `:Entity` + one `MENTIONS` edge). Vocabulary derived by mining 153 decisions + 1737 entities,
+cross-checked with Cloe's Oratotis schema.
+
+- **5 new entity sub-labels** in `ontology.yaml` / `ONT` (under `:Entity`, multi-label): `Component`,
+  `System`, `Model`, `Concept`, `Document`. (Person/Agent/Process reuse the provenance labels
+  `Human`/`AIAgent`/`Activity`.)
+- **9 typed Entity→Entity relationships**: `DEPENDS_ON`, `PART_OF`, `IMPLEMENTS`, `PRODUCES`, `CONSUMES`,
+  `RUNS_ON`, `CONFIGURES`, `DESCRIBES`, `VALIDATES`. `MENTIONS` stays as the fallback (retires in 0.6.1
+  once per-edge confidence can show whether a typed pick fits).
+- `KNOWN_LABELS`/`KNOWN_RELATIONSHIPS` and the entity-name noise filter extended to the new vocabulary, so
+  compliance telemetry and the inbound gates track it immediately. **Schema-defs only** — REM begins
+  assigning the new vocab in a later step; nothing in the write path changes yet.
+
 ## [0.6.0] — 2026-06-28
 
 Entity-resolution **alias layer** — soft `ALIASES` edges between synonymous entities (`coordinator` ↔

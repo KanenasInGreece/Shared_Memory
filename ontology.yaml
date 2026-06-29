@@ -18,6 +18,14 @@ labels:
   project: Project                     # project scope — root for decisions and milestones
   activity: Activity                   # a work session or task context
   milestone: Milestone                 # a significant achievement marker
+  # Entity type sub-labels (Path A multi-label under :Entity; decision 472).
+  # Staged rollout: defined now; REM assigns them (Stage 1.3) + one-time backfill
+  # (1.4). Person/Agent/Process reuse Human/AIAgent/Activity above.
+  component: Component                  # software unit we build (module/class/script/daemon)
+  system: System                       # service / datastore / framework / infra we run
+  model: Model                         # AI/ML model
+  concept: Concept                     # pattern / technique / principle / signal
+  document: Document                   # spec / ADR / doc / research artifact
 
 relationships:
   entity_link: MENTIONS          # primary Fact→Entity relationship written on save
@@ -39,6 +47,18 @@ relationships:
   under_conditions: UNDER_CONDITIONS       # Decision→Entity: constraints or conditions that bound the decision
   considered: CONSIDERED                   # Decision→Entity: alternatives that were evaluated
   rejected: REJECTED                       # Decision→Entity: alternatives explicitly ruled out
+  # Typed Entity→Entity domain relationships (decision 472). REM picks one (Stage 1.3)
+  # gated by the domain-range map; MENTIONS stays as fallback until per-edge confidence
+  # retires it in v0.6.1 (strict ontology).
+  depends_on: DEPENDS_ON                   # Entity→Entity: needs / requires (build/config dependency)
+  part_of: PART_OF                         # Entity→Entity: composition / belongs-to
+  implements: IMPLEMENTS                   # Entity→Entity: realises a concept / pattern
+  produces: PRODUCES                       # Entity→Entity: creates output / data / artifact
+  consumes: CONSUMES                       # Entity→Entity: uses another's output / data (runtime I/O)
+  runs_on: RUNS_ON                         # Entity→Entity: executes on / deployed on
+  configures: CONFIGURES                   # Entity→Entity: controls / parametrises / governs
+  describes: DESCRIBES                     # Entity→Entity: documents / specifies (Document→X)
+  validates: VALIDATES                     # Entity→Entity: quality-gate / test / telemetry validates X
 
 consolidation:
   density_threshold: 5           # min unconsolidated Facts per Entity hub to trigger synthesis
