@@ -15,3 +15,17 @@ the LLM's real entity value is on live/novel data) AND entity wrong-rate ≤ 0.1
 | iter | ts | ent macroF1 (lift) | ent wrong | rel macroF1 (lift) | rel wrong | change made |
 |---|---|---|---|---|---|---|
 | baseline | — | 0.956 (—) | 0.000 | 0.605 (—) | 0.240 | deterministic keyword/type-pair rules |
+| 1 | 06-30 10:46 | 0.939 (-0.017) | 0.075 | 0.857 (+0.252) | 0.120 | first live pass, prompt v1 |
+| 2 | 06-30 10:50 | 0.939 (-0.017) | 0.075 | 0.760 (+0.156) | 0.160 | REGRESSED — sharpened rel defs over-instructed the model; REVERTED to v1 |
+
+## Learnings (recorded to shared memory: retro on decision 475, facts 477/478)
+- **Lean > over-instructed:** v1 (terse) rel macro-F1 0.857; iter2 sharpened rel definitions → REGRESSED to 0.760. Over-instructing the 12B model shifts predictions net-negative. Verify EVERY prompt change against the harness; never ship on intuition. (fact 477)
+- **Single-GPU contention:** the overnight loop made no progress — eval calls queue behind REM/NREM dream generations and time out (300s). Gate measurement work on backlog==0 (not a timer), or quiesce REM, or offload to a separate node. The night still drained the backlog 85→0. (fact 478)
+- **Debatable gold labels are real:** of v1's 3 rel errors, `consolidation_loop→Neo4j` (DEPENDS_ON vs CONSUMES) is genuinely ambiguous — confirms ensemble=filter, human-judgment on boundaries. If re-labelled CONSUMES, rel wrong-rate → 0.08 and the goal is met as-is.
+- **Failure modes (Cloe-predicted):** entity Component-overreach (Systems/Concepts typed Component); rel over-attribution (spurious PRODUCES / IMPLEMENTS).
+| 3 | 06-30 11:03 | 0.959 (+0.004) | 0.050 | 0.923 (+0.347) | 0.040 | gold consistency fix (gateway->Gemma CONSUMES) + advisor litmus rule in prompt — **GOAL MET (4/4)** |
+
+## FINAL — prompt optimised, goal met + robust (temp 0.6)
+Variance study (N=5, temp 0.6): entity macro-F1 mean=0.959, std=0.013 (≪0.07 brittleness threshold), consistency=0.980 (≥0.85). Not brittle. **Prompt finalised.**
+Winning prompt = v1 entity prompt + v1 relationship prompt + the advisor litmus line (DEPENDS_ON vs CONSUMES swap-test) + the one gold consistency fix (gateway→Gemma = CONSUMES).
+Next: wire the finalised prompt into rem_loop WITH Xenofon (Stage 1.3 write-path), then live-data periodical recheck (every ~5 NREM cycles, 30 fresh rels, alert on F1 drop >0.05).

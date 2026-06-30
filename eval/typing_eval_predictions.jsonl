@@ -1,0 +1,65 @@
+{"kind": "entity", "name": "coordinator", "gold": "Component", "pred": "Component"}
+{"kind": "entity", "name": "rem_loop", "gold": "Component", "pred": "Component"}
+{"kind": "entity", "name": "consolidation_loop", "gold": "Component", "pred": "Component"}
+{"kind": "entity", "name": "hive_mind_proxy", "gold": "Component", "pred": "Component"}
+{"kind": "entity", "name": "memory_bridge", "gold": "Component", "pred": "Component"}
+{"kind": "entity", "name": "AuthMiddleware", "gold": "Component", "pred": "Component"}
+{"kind": "entity", "name": "vector-skill", "gold": "Component", "pred": "Component"}
+{"kind": "entity", "name": "reference_resolver", "gold": "Component", "pred": "Component"}
+{"kind": "entity", "name": "Neo4j", "gold": "System", "pred": "System"}
+{"kind": "entity", "name": "Postgres", "gold": "System", "pred": "System"}
+{"kind": "entity", "name": "LanceDB", "gold": "System", "pred": "System"}
+{"kind": "entity", "name": "HiveMindGateway", "gold": "System", "pred": "System"}
+{"kind": "entity", "name": "SharedMemory", "gold": "System", "pred": "System"}
+{"kind": "entity", "name": "SharedMemoryMonitor", "gold": "System", "pred": "Component"}
+{"kind": "entity", "name": "retriever-api", "gold": "System", "pred": "System"}
+{"kind": "entity", "name": "CloeVM", "gold": "System", "pred": "System"}
+{"kind": "entity", "name": "Gemma4", "gold": "Model", "pred": "Model"}
+{"kind": "entity", "name": "BGE-M3", "gold": "Model", "pred": "Model"}
+{"kind": "entity", "name": "Qwen3", "gold": "Model", "pred": "Model"}
+{"kind": "entity", "name": "BGE-Reranker", "gold": "Model", "pred": "Model"}
+{"kind": "entity", "name": "nomic-embed", "gold": "Model", "pred": "Model"}
+{"kind": "entity", "name": "llama-8b", "gold": "Model", "pred": "Model"}
+{"kind": "entity", "name": "OutboxPattern", "gold": "Concept", "pred": "Concept"}
+{"kind": "entity", "name": "NREM", "gold": "Concept", "pred": "Component"}
+{"kind": "entity", "name": "EntityResolution", "gold": "Concept", "pred": "Concept"}
+{"kind": "entity", "name": "FactSupersession", "gold": "Concept", "pred": "Concept"}
+{"kind": "entity", "name": "ConfidenceRouting", "gold": "Concept", "pred": "Concept"}
+{"kind": "entity", "name": "RoleEquivalence", "gold": "Concept", "pred": "Concept"}
+{"kind": "entity", "name": "DomainScoping", "gold": "Concept", "pred": "Concept"}
+{"kind": "entity", "name": "ConsolidationQuality", "gold": "Concept", "pred": "Concept"}
+{"kind": "entity", "name": "README", "gold": "Document", "pred": "Document"}
+{"kind": "entity", "name": "SKILL.md", "gold": "Document", "pred": "Document"}
+{"kind": "entity", "name": "schema.md", "gold": "Document", "pred": "Document"}
+{"kind": "entity", "name": "CHANGELOG", "gold": "Document", "pred": "Document"}
+{"kind": "entity", "name": "server-setup.md", "gold": "Document", "pred": "Document"}
+{"kind": "entity", "name": "research-note", "gold": "Document", "pred": "Document"}
+{"kind": "entity", "name": "DistilledResearch", "gold": "Document", "pred": "Document"}
+{"kind": "entity", "name": "design-doc", "gold": "Document", "pred": "Document"}
+{"kind": "entity", "name": "Xenofon", "gold": "OTHER", "pred": "OTHER"}
+{"kind": "entity", "name": "shared-memory-GitHub", "gold": "OTHER", "pred": "OTHER"}
+{"kind": "rel", "src": "coordinator", "tgt": "Postgres", "gold": "DEPENDS_ON", "pred": "DEPENDS_ON"}
+{"kind": "rel", "src": "coordinator", "tgt": "OutboxPattern", "gold": "IMPLEMENTS", "pred": "IMPLEMENTS"}
+{"kind": "rel", "src": "rem_loop", "tgt": "SharedMemory", "gold": "PART_OF", "pred": "PART_OF"}
+{"kind": "rel", "src": "consolidation_loop", "tgt": "Neo4j", "gold": "DEPENDS_ON", "pred": "DEPENDS_ON"}
+{"kind": "rel", "src": "consolidation_loop", "tgt": "NREM", "gold": "IMPLEMENTS", "pred": "IMPLEMENTS"}
+{"kind": "rel", "src": "AuthMiddleware", "tgt": "HiveMindGateway", "gold": "PART_OF", "pred": "PART_OF"}
+{"kind": "rel", "src": "vector-skill", "tgt": "BGE-M3", "gold": "CONSUMES", "pred": "CONSUMES"}
+{"kind": "rel", "src": "memory_bridge", "tgt": "HiveMindGateway", "gold": "CONSUMES", "pred": "DEPENDS_ON"}
+{"kind": "rel", "src": "HiveMindGateway", "tgt": "Gemma4", "gold": "CONSUMES", "pred": "CONSUMES"}
+{"kind": "rel", "src": "BGE-M3", "tgt": "retriever-api", "gold": "RUNS_ON", "pred": "RUNS_ON"}
+{"kind": "rel", "src": "Gemma4", "tgt": "CloeVM", "gold": "RUNS_ON", "pred": "RUNS_ON"}
+{"kind": "rel", "src": "README", "tgt": "coordinator", "gold": "DESCRIBES", "pred": "DESCRIBES"}
+{"kind": "rel", "src": "schema.md", "tgt": "Neo4j", "gold": "DESCRIBES", "pred": "DESCRIBES"}
+{"kind": "rel", "src": "schema.md", "tgt": "EntityResolution", "gold": "DESCRIBES", "pred": "DESCRIBES"}
+{"kind": "rel", "src": "ontology.yaml", "tgt": "Neo4j", "gold": "CONFIGURES", "pred": "CONFIGURES"}
+{"kind": "rel", "src": "consolidation_loop", "tgt": "design-doc", "gold": "PRODUCES", "pred": "PRODUCES"}
+{"kind": "rel", "src": "SecurityAudit", "tgt": "coordinator", "gold": "VALIDATES", "pred": "VALIDATES"}
+{"kind": "rel", "src": "consolidation_loop", "tgt": "community_summaries", "gold": "PRODUCES", "pred": "NONE"}
+{"kind": "rel", "src": "Xenofon", "tgt": "coordinator", "gold": "NONE", "pred": "NONE"}
+{"kind": "rel", "src": "OutboxPattern", "tgt": "Neo4j", "gold": "NONE", "pred": "NONE"}
+{"kind": "rel", "src": "coordinator", "tgt": "README", "gold": "NONE", "pred": "NONE"}
+{"kind": "rel", "src": "Neo4j", "tgt": "OutboxPattern", "gold": "NONE", "pred": "NONE"}
+{"kind": "rel", "src": "BGE-M3", "tgt": "coordinator", "gold": "NONE", "pred": "NONE"}
+{"kind": "rel", "src": "rem_loop", "tgt": "coordinator", "gold": "DEPENDS_ON", "pred": "DEPENDS_ON"}
+{"kind": "rel", "src": "memory_bridge", "tgt": "SharedMemory", "gold": "PART_OF", "pred": "PART_OF"}
