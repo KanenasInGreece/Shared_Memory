@@ -559,7 +559,7 @@ Set `SMEM_ONTOLOGY_PATH=/path/to/your/ontology.yaml` to load from a non-default 
 
 ## 7. Inference Backends (llama.cpp)
 
-Two models serve the embedding and reranking paths. In the default setup they run as the **`retriever-api`** (BGE-M3, `:8070`) and **`reranker-api`** (BGE-Reranker-v2-m3, `:8071`) services in the compose file — so `docker compose … --env-file shared-memory/.env up -d` (§5) already started them; see §5 for where to place the GGUF files. A third port (`5000`) hosts the reasoning LLM (LM Studio or any OpenAI-compatible endpoint) — this one is **not** in the compose file, so start it yourself.
+Two models serve the embedding and reranking paths. In the default setup they run as the **`retriever-api`** (BGE-M3, `:8070`) and **`reranker-api`** (BGE-Reranker-v2-m3, `:8071`) services in the compose file — so `docker compose … --env-file shared-memory/.env up -d` (§5) already started them; see §5 for where to place the GGUF files. A third port (`5000`) hosts the reasoning LLM — any OpenAI-compatible server (e.g. llama.cpp's `llama-server`, or LM Studio) — this one is **not** in the compose file, so start it yourself. You can run **one** reasoning backend or a **pool** of several (one per GPU, or remote) that the gateway load-balances; see §8 "The reasoning-LLM pool".
 
 To run the embedder and reranker outside Docker instead, launch `llama-server` directly (point `-m` at your GGUF files):
 
@@ -591,9 +591,21 @@ The gateway solves all three. Every tool points at `http://localhost:8888/v1`. T
 |---|---|
 | `/v1/embeddings` | Port 8070 (BGE-M3, 1024-dim) |
 | `/v1/reranking` | Port 8071 (BGE-Reranker-v2-m3) |
-| All other requests | Port 5000 (reasoning LLM) |
+| All other requests | The reasoning-LLM pool (one or more backends; default `:5000`) |
 
 One endpoint. All agents. Same vector space.
+
+### The reasoning-LLM pool — one endpoint, one-or-many models
+
+The reasoning LLM behind `/v1/chat/completions` can be a **single** OpenAI-compatible server (the default, `:5000`) **or a pool of several** — for example one per GPU, or a remote host. Clients never know the difference: they only ever call the gateway, and the **gateway owns all routing and parallelisation**. The pool is configured only in the framework environment (`LLM_BACKENDS="url@weight,…"`), never exposed to clients.
+
+- **Weighted least-in-flight** dispatch sends each request to the free-est capable backend (`score = in-flight / weight`), so concurrent work — REM enriching while NREM consolidates — fans out across backends instead of queueing on one. A capacity `weight` lets a faster/larger card take proportionally more load.
+- **Forward-and-absorb:** the gateway forwards into each backend's own single-slot queue rather than holding a queue itself, so it stays stateless under multi-minute generations.
+- **Fault tolerance:** a backend that fails repeatedly is put in a short cooldown and skipped; the rest of the pool keeps serving, so a single card always keeps the system running.
+- **Same model on every backend** (different context sizes are fine) — mixed models would return inconsistent output formats.
+- Unset `LLM_BACKENDS` → a single backend, behaviour identical to a classic single-server setup.
+
+`GET /health` reports the pool (`llm`, and per-backend `llm_pool` with weight, in-flight, requests routed, failures, and cooldown) so the realised load split is observable.
 
 ### From ThreadingHTTPServer to async aiohttp — why streaming required a rewrite
 
