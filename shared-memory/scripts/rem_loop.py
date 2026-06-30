@@ -96,7 +96,22 @@ def _auth_headers() -> dict:
         return {"Authorization": f"Bearer {_AGENT_TOKEN}"}
     return {}
 
-POLL_INTERVAL      = 120   # seconds between REM scans
+# Adaptive scan cadence (ADR-021) — replaces the fixed 120s POLL_INTERVAL magic
+# number. Fast when there is work to drain, exponential backoff to a cap when idle,
+# so REM is responsive under load and near-silent when caught up. Internal tuning
+# constants, not user knobs (no env clutter); only the bounds remain.
+MIN_POLL_SEC  = 15    # never faster (don't hammer Neo4j/Postgres)
+BASE_POLL_SEC = 30    # cadence while there is work
+MAX_POLL_SEC  = 300   # never slower than 5 min (liveness)
+
+
+def adaptive_poll_sleep(idle_streak: int) -> float:
+    """Seconds before the next REM scan given the consecutive-idle streak
+    (0 = just did work → BASE; each further idle cycle doubles, capped at MAX)."""
+    if idle_streak <= 0:
+        return BASE_POLL_SEC
+    return max(MIN_POLL_SEC,
+               min(MAX_POLL_SEC, BASE_POLL_SEC * (2 ** min(idle_streak - 1, 8))))
 BATCH_SIZE         = 5     # facts per cycle (LLM calls are the latency bottleneck)
 # Closed-set cap for the REM grounding prompt. Every typed node (up to this cap)
 # is listed in each REM prompt so the LLM matches existing entity names exactly
@@ -899,8 +914,8 @@ class REMDaemon:
             deferred = len(candidates) - len(pg_ids)
             if deferred:
                 logger.info(
-                    "REM: %d fact(s) deferred (outbox not yet applied — retry in %ds)",
-                    deferred, POLL_INTERVAL,
+                    "REM: %d fact(s) deferred (outbox not yet applied — retry next scan ~%ds)",
+                    deferred, BASE_POLL_SEC,
                 )
             if not pg_ids:
                 return 0
@@ -931,17 +946,23 @@ class REMDaemon:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def run(self) -> None:
-        logger.info("REM daemon started (poll=%ds, batch=%d)", POLL_INTERVAL, BATCH_SIZE)
+        logger.info("REM daemon started (adaptive poll %d-%ds, batch=%d)",
+                    BASE_POLL_SEC, MAX_POLL_SEC, BATCH_SIZE)
         if AUDIT_LOG_PATH:
             logger.info("REM audit log: %s", AUDIT_LOG_PATH)
+        idle_streak = 0
         while self.is_running:
+            count = 0
             try:
                 count = await self.run_cycle()
                 if count == 0:
                     logger.debug("REM: idle — no facts ready for processing")
             except Exception as exc:
                 logger.error("REM cycle error: %s", exc, exc_info=True)
-            await asyncio.sleep(POLL_INTERVAL)
+            # Adaptive cadence: work drained → stay responsive at BASE; idle →
+            # exponential backoff to MAX so an idle system polls near-silently.
+            idle_streak = 0 if count > 0 else idle_streak + 1
+            await asyncio.sleep(adaptive_poll_sleep(idle_streak))
 
     async def stop(self) -> None:
         self.is_running = False

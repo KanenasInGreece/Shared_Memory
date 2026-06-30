@@ -411,3 +411,16 @@ async def test_mark_outbox_rem_reviewed_excludes_retro_rows():
     assert "!= 'retrospective'" in sql
     assert "status = 'applied'" in sql
     assert params == (42,)
+
+
+def test_adaptive_poll_sleep_backoff():
+    """Adaptive cadence: BASE when working, exponential backoff to MAX when idle."""
+    rem = load_rem_loop()
+    assert rem.adaptive_poll_sleep(0) == rem.BASE_POLL_SEC          # just did work
+    assert rem.adaptive_poll_sleep(1) == rem.BASE_POLL_SEC          # first idle = BASE
+    assert rem.adaptive_poll_sleep(2) == rem.BASE_POLL_SEC * 2      # doubling
+    assert rem.adaptive_poll_sleep(3) == rem.BASE_POLL_SEC * 4
+    # deep idle is capped at MAX, never below MIN
+    assert rem.adaptive_poll_sleep(50) == rem.MAX_POLL_SEC
+    assert rem.adaptive_poll_sleep(99) <= rem.MAX_POLL_SEC
+    assert rem.adaptive_poll_sleep(99) >= rem.MIN_POLL_SEC
