@@ -15,3 +15,4 @@ the LLM's real entity value is on live/novel data) AND entity wrong-rate ≤ 0.1
 | iter | ts | ent macroF1 (lift) | ent wrong | rel macroF1 (lift) | rel wrong | change made |
 |---|---|---|---|---|---|---|
 | baseline | — | 0.956 (—) | 0.000 | 0.605 (—) | 0.240 | deterministic keyword/type-pair rules |
+| 1 | 06-30 10:46 | 0.939 (-0.017) | 0.075 | 0.857 (+0.252) | 0.120 | first live pass, prompt v1 |
