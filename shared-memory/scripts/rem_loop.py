@@ -45,7 +45,9 @@ import psycopg2.extensions
 from neo4j import AsyncGraphDatabase
 
 sys.path.insert(0, os.path.dirname(__file__))
-from ontology import ONT, sanitize_entity_name, sanitize_entity_names
+from ontology import (
+    ONT, sanitize_entity_name, sanitize_entity_names, is_allowed_relation,
+)
 from gpu_load import inference_gpu_busy
 from log_hygiene import append_secure
 
@@ -161,6 +163,13 @@ _LABEL_ALLOWED_RELS: dict[str, frozenset[str]] = {
     ONT.decision: frozenset({ONT.informed_by,         ONT.entity_link}),
     ONT.entity:   frozenset({ONT.entity_link,         ONT.entity_link_alias}),
 }
+
+# Entity type sub-labels (Stage 1.3) — REM applies one to each generic Entity as a
+# second label (:Entity:Component). Validated against this set before interpolation
+# (Cypher-injection guard); anything else (incl. "OTHER") leaves the entity untyped.
+_ENTITY_SUBLABELS: frozenset[str] = frozenset({
+    ONT.component, ONT.system, ONT.model, ONT.concept, ONT.document,
+})
 
 # Decision-specific extras written to the Decision node (not the Fact node).
 _DECISION_EXTRA_RELS: tuple[str, ...] = (
@@ -527,6 +536,7 @@ class REMDaemon:
         registry: dict[str, dict],
         decision_extras: dict[str, list[str]] | None,
         is_decision: bool = False,
+        entity_types: dict[str, str] | None = None,
     ) -> None:
         """Write all REM output to Neo4j in a single driver session.
 
@@ -574,6 +584,23 @@ class REMDaemon:
                     f" MERGE (a)-[:{rel_type}]->(e)",
                     pg_id=pg_id, names=names,
                 )
+
+            # Step 1b — entity sub-typing (Stage 1.3): apply each LLM-assigned
+            # sub-label as a SECOND label on the generic :Entity node
+            # (:Entity:Component). Only :Entity nodes match (Human/Project etc. are
+            # untouched), and the sub-label is validated against _ENTITY_SUBLABELS
+            # before interpolation (Cypher-injection guard). Batched per sub-label.
+            if entity_types:
+                by_sublabel: dict[str, list[str]] = defaultdict(list)
+                for name, sub in entity_types.items():
+                    if sub in _ENTITY_SUBLABELS:
+                        by_sublabel[sub].append(name)
+                for sub, names in by_sublabel.items():
+                    await session.run(
+                        f"MATCH (e:{ONT.entity}) WHERE e.name IN $names"
+                        f" SET e:{sub}",
+                        names=names,
+                    )
 
             # Step 2 — Decision extras on Decision node (same session)
             if decision_extras:
@@ -659,13 +686,20 @@ class REMDaemon:
             "or was decided, why it matters, the system/component involved, any constraints, "
             "and the expected outcome or insight produced.\n"
             "2. List every entity referenced in the content. For each: supply the exact name "
-            "(from known typed nodes if it matches) and the most appropriate relationship type.\n"
+            "(from known typed nodes if it matches), the most appropriate relationship type, "
+            "and classify the entity's TYPE as exactly one of:\n"
+            "   Component (a software unit we build: module/class/script/daemon),\n"
+            "   System (a service/datastore/framework/infrastructure we run),\n"
+            "   Model (an AI/ML model),\n"
+            "   Concept (a pattern/technique/principle),\n"
+            "   Document (a spec/ADR/README/research artifact),\n"
+            "   OTHER (a person, a project, or none of the above).\n"
             + ("3. For this Decision: extract considered/rejected alternatives, bounding "
                "conditions, and insights produced.\n" if is_decision else "")
             + "\nRespond with ONLY a JSON object (no prose, no markdown fences):\n"
             '{\n'
             '  "summary": "<paragraph>",\n'
-            '  "relationships": [{"name": "<entity name>", "rel_type": "<REL_TYPE>"}, ...]'
+            '  "relationships": [{"name": "<entity name>", "rel_type": "<REL_TYPE>", "type": "<Component|System|Model|Concept|Document|OTHER>"}, ...]'
             + decision_extras_spec
             + "\n}"
         )
@@ -735,6 +769,18 @@ class REMDaemon:
             logger.warning("REM: pg_id=%d empty summary — skipping", pg_id)
             return False
 
+        # Stage 1.3 entity sub-typing: collect {sanitized name -> sub-label} for the
+        # entities the LLM typed as one of the 5 ontology sub-labels (OTHER/invalid
+        # leaves the entity untyped). Applied as a second label (:Entity:Component).
+        entity_types: dict[str, str] = {}
+        for rel in relationships:
+            if not isinstance(rel, dict):
+                continue
+            nm = sanitize_entity_name(rel.get("name"))
+            ty = (rel.get("type") or "").strip()
+            if nm and ty in _ENTITY_SUBLABELS:
+                entity_types[nm] = ty
+
         decision_extras: dict[str, list[str]] | None = None
         if is_decision:
             decision_extras = {
@@ -748,7 +794,7 @@ class REMDaemon:
         try:
             await self._write_neo4j_rem(
                 pg_id, summary, relationships, registry, decision_extras,
-                is_decision=is_decision,
+                is_decision=is_decision, entity_types=entity_types,
             )
         except Exception as exc:
             logger.error("REM: pg_id=%d Neo4j write failed: %s", pg_id, exc)

@@ -193,6 +193,30 @@ async def test_write_neo4j_rem_sets_rem_processed_last():
 
 
 @pytest.mark.asyncio
+async def test_write_neo4j_rem_applies_entity_sublabels():
+    """Stage 1.3: LLM-assigned sub-types become a SECOND label on :Entity
+    (:Entity:Component), validated against the sub-label set before interpolation
+    (Cypher-injection guard); rem_processed still SET last."""
+    daemon, mock_session = _make_daemon()
+    mock_session.run = AsyncMock()
+
+    from rem_loop import ONT
+    relationships = [{"name": "coordinator", "rel_type": ONT.entity_link},
+                     {"name": "Neo4j", "rel_type": ONT.entity_link}]
+    # includes an invalid sub-type that must be rejected, not interpolated
+    entity_types = {"coordinator": ONT.component, "Neo4j": ONT.system, "x": "Bogus"}
+
+    await daemon._write_neo4j_rem(7, "summary", relationships, {}, None,
+                                  entity_types=entity_types)
+
+    cyphers = [c.args[0] for c in mock_session.run.call_args_list]
+    assert any(f"SET e:{ONT.component}" in c for c in cyphers)
+    assert any(f"SET e:{ONT.system}" in c for c in cyphers)
+    assert not any("Bogus" in c for c in cyphers), "invalid sub-label must not interpolate"
+    assert "rem_processed" in cyphers[-1], "rem_processed must still be set last"
+
+
+@pytest.mark.asyncio
 async def test_fetch_non_rem_batch_selects_facts_and_decisions():
     """Selection must consider both :Fact and :Decision so decisions get enriched."""
     daemon, mock_session = _make_daemon()
