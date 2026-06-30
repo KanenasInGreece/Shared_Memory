@@ -71,6 +71,16 @@ materialised as real edges.
   linked by `SUPERSEDES`). First run materialised 128 edges (109 `REFERENCES`, 19 `INFORMED_BY`). REM applies
   the same resolver incrementally in a later step.
 
+### Added — REM entity sub-typing wired live, Stage 1.3
+
+- **REM now assigns each entity a sub-type** during enrichment and writes it as a second label
+  (`:Entity:Component` / `:System` / `:Model` / `:Concept` / `:Document`). The prompt was tuned data-driven
+  against a gold set (eval harness): entity typing macro-F1 **0.959**, robust at the production temperature
+  (variance std 0.013). The sub-label is validated against the ontology set before interpolation
+  (Cypher-injection guard); `OTHER`/invalid leaves the entity untyped; only `:Entity` nodes are touched
+  (provenance nodes untouched). Live validation enriched a real fact and correctly typed all 6 of its
+  entities. Typed `Entity→Entity` relationship extraction (`DEPENDS_ON`/`CONSUMES`/…) is the next step.
+
 ### Added — typed-relationship domain-range map, Stage 1.2
 
 - **`ontology.DOMAIN_RANGE` + `is_allowed_relation()`** — which typed `Entity→Entity` relationship is legal
