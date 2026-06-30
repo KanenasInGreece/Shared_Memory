@@ -46,6 +46,30 @@ def adaptive_ceiling(prompt_chars: int, units: int = 0) -> float:
     return max(CEILING_FLOOR_S, prompt_chars / 100.0, units * 15.0)
 
 
+def record_grounding(grounding_n: int, referenced: int, matched: int,
+                     minted: int, *, pg_id: int | None = None) -> dict:
+    """Record REM grounding effectiveness for the chunk-strategy decision (Task 15,
+    measure-first). mint_rate = minted/referenced: how often the LLM coined a NEW
+    entity instead of matching one in the grounding set. A high rate with a big
+    grounding set means the set is not helping (safe to shrink); a low rate means
+    the grounding is doing real entity-linking work (shrinking it risks duplicates,
+    undermining entity resolution). Never raises."""
+    rate = round(minted / referenced, 3) if referenced else None
+    rec = {
+        "ts": round(time.time(), 3), "kind": "rem_grounding", "pg_id": pg_id,
+        "grounding_n": grounding_n, "referenced": referenced,
+        "matched": matched, "minted": minted, "mint_rate": rate,
+    }
+    try:
+        logger.info("rem-grounding pg_id=%s grounding_n=%d referenced=%d matched=%d minted=%d mint_rate=%s",
+                    pg_id, grounding_n, referenced, matched, minted, rate)
+        if DREAM_METRICS_PATH:
+            append_secure(DREAM_METRICS_PATH, json.dumps(rec))
+    except Exception as exc:
+        logger.warning("dream grounding record failed: %s", exc)
+    return rec
+
+
 def record_llm_call(
     phase: str,
     resp_json: dict | None,

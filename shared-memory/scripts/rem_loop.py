@@ -51,7 +51,7 @@ from ontology import (
 )
 from gpu_load import inference_gpu_busy
 from log_hygiene import append_secure
-from dream_telemetry import record_llm_call, adaptive_ceiling
+from dream_telemetry import record_llm_call, adaptive_ceiling, record_grounding
 
 
 # ── Environment ───────────────────────────────────────────────────────────────
@@ -808,6 +808,15 @@ class REMDaemon:
             ty = (rel.get("type") or "").strip()
             if nm and ty in _ENTITY_SUBLABELS:
                 entity_types[nm] = ty
+
+        # Grounding telemetry (Task 15, measure-first): how many referenced entities
+        # matched the grounding set vs were newly minted — the mint_rate gates the
+        # grounding-reduction-vs-batching decision. Observability only.
+        _ref = {(r.get("name") or "").strip() for r in relationships if isinstance(r, dict)}
+        _ref.discard("")
+        _matched = _ref & set(registry.keys())
+        record_grounding(len(registry), len(_ref), len(_matched),
+                         len(_ref) - len(_matched), pg_id=pg_id)
 
         decision_extras: dict[str, list[str]] | None = None
         if is_decision:

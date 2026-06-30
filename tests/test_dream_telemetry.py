@@ -69,6 +69,16 @@ def test_adaptive_ceiling_floor_and_scaling(monkeypatch):
     assert dt.adaptive_ceiling(4400, 79) == 1185.0
 
 
+def test_record_grounding_mint_rate(monkeypatch):
+    dt = _fresh(monkeypatch)
+    rec = dt.record_grounding(grounding_n=1500, referenced=10, matched=7, minted=3, pg_id=42)
+    assert rec["kind"] == "rem_grounding"
+    assert rec["mint_rate"] == 0.3
+    assert rec["grounding_n"] == 1500 and rec["pg_id"] == 42
+    # no references → mint_rate None, never divides by zero
+    assert dt.record_grounding(1500, 0, 0, 0)["mint_rate"] is None
+
+
 def test_writes_jsonl_when_path_set(monkeypatch, tmp_path):
     metrics = tmp_path / "dream-metrics.jsonl"
     dt = _fresh(monkeypatch, str(metrics))
