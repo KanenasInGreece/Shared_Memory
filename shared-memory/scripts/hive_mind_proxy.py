@@ -1,4 +1,5 @@
 import asyncio
+import time
 import logging
 import os
 import shutil
@@ -76,7 +77,92 @@ ROUTING_MAP = {
     "/v1/embeddings": "http://localhost:8070",
     "/v1/reranking":  "http://localhost:8071",
 }
-DEFAULT_TARGET = "http://localhost:5000"
+DEFAULT_TARGET = "http://localhost:5000"   # primary reasoning LLM (main)
+
+# Reasoning-LLM backend POOL. The gateway owns LLM routing + parallelisation:
+# clients have ONE way in (/v1/chat/completions) and never know how many models
+# back it, where they live (local or REMOTE host), or which GPU. Configure the
+# pool ONLY here, in the framework env — never exposed to clients.
+#   LLM_BACKENDS="http://localhost:5000@3,http://localhost:4000@1,http://remote:1234@2"
+# Each entry is "url" or "url@weight" (capacity weight, default 1 — give a faster/
+# larger card a higher weight). Unset → single backend (DEFAULT_TARGET); identical
+# to before. Algorithm (advisor-agent-validated for this exact stack): WEIGHTED
+# LEAST-IN-FLIGHT (score = inflight/weight) → fan out concurrent long jobs to the
+# free-est capable card. NOT least-response-time (long completions make latency
+# meaningless), NOT a gateway queue (forward-and-absorb into llama.cpp's own slot
+# queue keeps the gateway stateless). A backend that fails twice in a window is put
+# in cooldown; requests retry on the next-best backend — one card always serves.
+def _parse_backend(entry: str) -> tuple[str, float]:
+    url, _, w = entry.strip().partition("@")
+    try:
+        weight = float(w) if w else 1.0
+    except ValueError:
+        weight = 1.0
+    return url.rstrip("/"), max(weight, 0.1)
+
+
+_raw_backends = [_parse_backend(e) for e in os.environ.get("LLM_BACKENDS", "").split(",") if e.strip()]
+if not _raw_backends:
+    _raw_backends = [(DEFAULT_TARGET, 1.0)]
+LLM_BACKENDS: list[str] = [u for u, _ in _raw_backends]
+LLM_WEIGHTS: dict[str, float] = {u: w for u, w in _raw_backends}
+
+# Failure/cooldown (advisor spec): N fails within a window → cooldown; re-probed
+# (a normal request) after it elapses. A success clears the fail streak.
+LLM_FAIL_THRESHOLD = int(os.environ.get("LLM_FAIL_THRESHOLD", "2"))
+LLM_FAIL_WINDOW = float(os.environ.get("LLM_FAIL_WINDOW", "60"))
+LLM_COOLDOWN = float(os.environ.get("LLM_COOLDOWN", "300"))
+# Per-request retries across backends on a connect failure (transparent to client).
+LLM_MAX_TRIES = int(os.environ.get("LLM_MAX_TRIES", "2")) + 1
+
+# Reservation flag: when set (and >1 backend), the LAST backend is RESERVED — held
+# out of the general parallelise pool and dedicated to quality/judge work (the
+# framework addresses it with the X-SM-LLM-Role: judge header). Unset (default):
+# every backend joins the parallelise pool. Framework-owned env; clients never see
+# it. The judge CONSUMER lands with the v0.6.1 quality work — the routing seam is
+# in place now so a second LLM is ready to relay the judge load.
+LLM_RESERVE_JUDGE = os.environ.get("LLM_RESERVE_JUDGE", "0").strip().lower() in ("1", "true", "yes")
+_reserved = bool(LLM_RESERVE_JUDGE and len(LLM_BACKENDS) > 1)
+LLM_POOL: list[str] = LLM_BACKENDS[:-1] if _reserved else list(LLM_BACKENDS)   # general parallelise pool
+LLM_JUDGE_BACKEND: str = LLM_BACKENDS[-1] if _reserved else DEFAULT_TARGET      # judge/quality target
+
+_llm_inflight: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
+_llm_unhealthy_until: dict[str, float] = {b: 0.0 for b in LLM_BACKENDS}
+_llm_fail_times: dict[str, list] = {b: [] for b in LLM_BACKENDS}
+
+
+def _llm_mark_fail(backend: str) -> None:
+    """Record a backend failure; trip the cooldown if it fails too often."""
+    now = time.monotonic()
+    fails = [t for t in _llm_fail_times.get(backend, []) if now - t < LLM_FAIL_WINDOW]
+    fails.append(now)
+    _llm_fail_times[backend] = fails
+    if len(fails) >= LLM_FAIL_THRESHOLD:
+        _llm_unhealthy_until[backend] = now + LLM_COOLDOWN
+        _llm_fail_times[backend] = []
+        log.warning("LLM backend %s in cooldown for %.0fs (%d fails)", backend, LLM_COOLDOWN, LLM_FAIL_THRESHOLD)
+
+
+def _llm_mark_ok(backend: str) -> None:
+    _llm_fail_times[backend] = []
+
+
+def _ordered_llm_backends(role: str = "") -> list[str]:
+    """Backends to try, best-first, by WEIGHTED least-in-flight (inflight/weight).
+    role=='judge' → the reserved judge backend only. Healthy (out-of-cooldown)
+    backends first; cooldown ones appended as last-resort so service never stops."""
+    if role == "judge":
+        return [LLM_JUDGE_BACKEND]
+    now = time.monotonic()
+    healthy = [b for b in LLM_POOL if _llm_unhealthy_until.get(b, 0.0) <= now]
+    cooling = [b for b in LLM_POOL if b not in healthy]
+    key = lambda b: _llm_inflight.get(b, 0) / LLM_WEIGHTS.get(b, 1.0)
+    return sorted(healthy, key=key) + sorted(cooling, key=key)
+
+
+def _select_llm_backend(role: str = "") -> str:
+    """The single best backend (weighted least-in-flight). Clients never choose."""
+    return _ordered_llm_backends(role)[0]
 
 # --------------------------------------------------------------------------- #
 # RFC 7230 §6.1 — hop-by-hop headers must never be forwarded by a proxy.
@@ -145,12 +231,21 @@ class AsyncHiveMindProxy:
         }
 
     async def handle_proxy(self, request: web.Request) -> web.StreamResponse:
-        # Route on path only (exact prefix); forward rel_url to preserve query string.
-        target_base = DEFAULT_TARGET
+        # Route on path: embeddings/reranking have fixed targets; everything else
+        # is a reasoning-LLM request, dispatched through the backend POOL so the
+        # gateway owns parallelisation. The optional X-SM-LLM-Role header is set
+        # ONLY by framework components (e.g. the v0.6.1 judge) — never by clients.
+        llm_backend: str | None = None
+        target_base: str | None = None
         for prefix, target in ROUTING_MAP.items():
             if request.path.startswith(prefix):
                 target_base = target
                 break
+        if target_base is None:
+            role = request.headers.get("X-SM-LLM-Role", "").strip().lower()
+            llm_backend = _select_llm_backend(role)
+            _llm_inflight[llm_backend] = _llm_inflight.get(llm_backend, 0) + 1
+            target_base = llm_backend
 
         target_url = f"{target_base}{request.rel_url}"
         log.debug("→ %s %s", request.method, target_url)
@@ -210,6 +305,8 @@ class AsyncHiveMindProxy:
                     # Nothing more can be sent; log and return.
                     log.warning("Client disconnected mid-stream: %s — %s", target_url, e)
 
+                if llm_backend is not None:
+                    _llm_mark_ok(llm_backend)   # connected + served — clear fail streak
                 return proxy_resp
 
         except asyncio.CancelledError:
@@ -222,6 +319,8 @@ class AsyncHiveMindProxy:
             # Upstream is down, unreachable, or refused the connection.
             # 503: the proxy is fine; the backend is not.
             log.error("Upstream unreachable %s: %s", target_url, ce)
+            if llm_backend is not None:
+                _llm_mark_fail(llm_backend)
             if proxy_resp and proxy_resp.prepared:
                 return proxy_resp
             return web.json_response({"error": f"Backend unreachable: {ce}"}, status=503)
@@ -229,6 +328,8 @@ class AsyncHiveMindProxy:
         except asyncio.TimeoutError:
             # Connect timeout to upstream — correct status is 504, not 500.
             log.warning("Upstream connect timeout: %s", target_url)
+            if llm_backend is not None:
+                _llm_mark_fail(llm_backend)
             if proxy_resp and proxy_resp.prepared:
                 return proxy_resp
             return web.json_response({"error": "Upstream connect timeout"}, status=504)
@@ -238,6 +339,12 @@ class AsyncHiveMindProxy:
             if proxy_resp and proxy_resp.prepared:
                 return proxy_resp
             return web.json_response({"error": f"Proxy error: {e}"}, status=500)
+
+        finally:
+            # Release the in-flight slot so least-busy selection stays accurate,
+            # whatever the outcome (success, disconnect, error, cancellation).
+            if llm_backend is not None:
+                _llm_inflight[llm_backend] = max(0, _llm_inflight.get(llm_backend, 0) - 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -483,7 +590,6 @@ async def handle_health(request: web.Request) -> web.Response:
     for name, url in [
         ("embedder", "http://localhost:8070/health"),
         ("reranker",  "http://localhost:8071/health"),
-        ("llm",       "http://localhost:5000/v1/models"),
     ]:
         try:
             timeout = ClientTimeout(total=2.0)
@@ -493,6 +599,24 @@ async def handle_health(request: web.Request) -> web.Response:
             checks[name] = "timeout"
         except Exception:
             checks[name] = "down"
+
+    # Reasoning-LLM backend pool — probe each; "llm" is ok if ANY is up (the pool
+    # tolerates a down backend). Per-backend statuses are reported for observability;
+    # a reserved judge backend is flagged. A single-backend deployment just shows one.
+    backend_status: dict[str, str] = {}
+    for b in LLM_BACKENDS:
+        try:
+            async with proxy.session.get(f"{b}/v1/models", timeout=ClientTimeout(total=2.0)) as r:
+                backend_status[b] = "ok" if r.status < 400 else f"http_{r.status}"
+        except asyncio.TimeoutError:
+            backend_status[b] = "timeout"
+        except Exception:
+            backend_status[b] = "down"
+    checks["llm"] = "ok" if any(s == "ok" for s in backend_status.values()) else "down"
+    if len(LLM_BACKENDS) > 1 or LLM_RESERVE_JUDGE:
+        checks["llm_backends"] = backend_status
+        if _reserved:
+            checks["llm_judge_reserved"] = LLM_JUDGE_BACKEND
 
     checks["daemon"]     = "running" if _daemon_healthy else "stopped"
     checks["rem_daemon"] = "running" if _rem_healthy    else "stopped"
