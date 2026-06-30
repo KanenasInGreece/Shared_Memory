@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +51,7 @@ from ontology import (
 )
 from gpu_load import inference_gpu_busy
 from log_hygiene import append_secure
+from dream_telemetry import record_llm_call
 
 
 # ── Environment ───────────────────────────────────────────────────────────────
@@ -704,6 +706,7 @@ class REMDaemon:
             + "\n}"
         )
 
+        _start = time.monotonic()
         try:
             async with httpx.AsyncClient(timeout=REM_LLM_TIMEOUT) as client:
                 resp = await client.post(
@@ -718,11 +721,18 @@ class REMDaemon:
                         "temperature": REM_TEMPERATURE,
                     },
                 )
+                _backend = resp.headers.get("X-SM-LLM-Backend")
                 if resp.status_code != 200:
+                    record_llm_call("REM", None, backend=_backend,
+                                    wall_s=time.monotonic() - _start, ceiling_s=REM_LLM_TIMEOUT,
+                                    ok=False, note=f"http_{resp.status_code}")
                     logger.error("LLM returned %d: %s", resp.status_code, resp.text[:200])
                     return None
+                resp_json = resp.json()
+                record_llm_call("REM", resp_json, backend=_backend,
+                                wall_s=time.monotonic() - _start, ceiling_s=REM_LLM_TIMEOUT)
                 try:
-                    raw = resp.json()["choices"][0]["message"]["content"].strip()
+                    raw = resp_json["choices"][0]["message"]["content"].strip()
                 except (KeyError, IndexError) as exc:
                     logger.error(
                         "LLM response schema unexpected (%s) — possible gateway error: %s",

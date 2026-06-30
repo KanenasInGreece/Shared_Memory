@@ -9,10 +9,12 @@ import httpx
 import asyncio
 import logging
 import select
+import time
 from datetime import datetime
 from neo4j import AsyncGraphDatabase
 from ontology import ONT
 from gpu_load import inference_gpu_busy
+from dream_telemetry import record_llm_call
 
 # Configuration — set via environment variables or .env file
 NEO4J_URI = "bolt://localhost:7687"
@@ -272,6 +274,26 @@ def _auth_headers() -> dict:
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ConsolidationDaemon")
+
+
+async def _post_nrem(client: httpx.AsyncClient, payload: dict) -> httpx.Response:
+    """POST an NREM completion through the gateway and record per-call telemetry
+    (timings + serving backend) for the adaptive-timer work. Telemetry is
+    best-effort and never alters the call path — NREM stays agnostic to routing."""
+    _start = time.monotonic()
+    resp = await client.post(REASONER_URL, headers=_auth_headers(), json=payload)
+    ok = resp.status_code == 200
+    rj = None
+    if ok:
+        try:
+            rj = resp.json()
+        except Exception:
+            rj = None
+    record_llm_call("NREM", rj, backend=resp.headers.get("X-SM-LLM-Backend"),
+                    wall_s=time.monotonic() - _start, ceiling_s=NREM_LLM_TIMEOUT,
+                    ok=ok, note=None if ok else f"http_{resp.status_code}")
+    return resp
+
 
 # Domain assigned to any fact that carries no project/domain/scope tag.
 # Untagged facts collapse to this single bucket, reproducing the historic
@@ -843,18 +865,14 @@ class ConsolidationDaemon:
 
         try:
             async with httpx.AsyncClient(timeout=NREM_LLM_TIMEOUT) as client:
-                resp = await client.post(
-                    REASONER_URL,
-                    headers=_auth_headers(),
-                    json={
-                        "model": "local-model",
-                        "messages": [
-                            {"role": "system", "content": "You are a technical knowledge curator. Write your response directly — no reasoning steps, no thinking tokens, no internal deliberation before the answer."},
-                            {"role": "user", "content": prompt},
-                        ],
-                        "temperature": NREM_TEMPERATURE,
-                    },
-                )
+                resp = await _post_nrem(client, {
+                    "model": "local-model",
+                    "messages": [
+                        {"role": "system", "content": "You are a technical knowledge curator. Write your response directly — no reasoning steps, no thinking tokens, no internal deliberation before the answer."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": NREM_TEMPERATURE,
+                })
                 if resp.status_code != 200:
                     logger.error(f"Summarization failed with status {resp.status_code}: {resp.text}")
                     return None
@@ -899,18 +917,14 @@ class ConsolidationDaemon:
 
         try:
             async with httpx.AsyncClient(timeout=NREM_LLM_TIMEOUT) as client:
-                resp = await client.post(
-                    REASONER_URL,
-                    headers=_auth_headers(),
-                    json={
-                        "model": "local-model",
-                        "messages": [
-                            {"role": "system", "content": "You are a technical knowledge curator. Write your response directly — no reasoning steps, no thinking tokens, no internal deliberation before the answer."},
-                            {"role": "user", "content": prompt},
-                        ],
-                        "temperature": NREM_TEMPERATURE,
-                    },
-                )
+                resp = await _post_nrem(client, {
+                    "model": "local-model",
+                    "messages": [
+                        {"role": "system", "content": "You are a technical knowledge curator. Write your response directly — no reasoning steps, no thinking tokens, no internal deliberation before the answer."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": NREM_TEMPERATURE,
+                })
                 if resp.status_code != 200:
                     logger.error(f"Insight synthesis failed with status {resp.status_code}: {resp.text}")
                     return None

@@ -288,6 +288,10 @@ class AsyncHiveMindProxy:
                     status=upstream.status,
                     headers=self._filter_headers(upstream.headers),
                 )
+                # Stamp the serving backend so daemons can attribute per-backend
+                # telemetry (obs tok/s) without learning routing — observability only.
+                if llm_backend is not None:
+                    proxy_resp.headers["X-SM-LLM-Backend"] = llm_backend
                 await proxy_resp.prepare(request)
 
                 # write_eof() lives inside the same try as the chunk loop so that
