@@ -115,20 +115,23 @@ LLM_COOLDOWN = float(os.environ.get("LLM_COOLDOWN", "300"))
 # Per-request retries across backends on a connect failure (transparent to client).
 LLM_MAX_TRIES = int(os.environ.get("LLM_MAX_TRIES", "2")) + 1
 
-# Reservation flag: when set (and >1 backend), the LAST backend is RESERVED — held
-# out of the general parallelise pool and dedicated to quality/judge work (the
-# framework addresses it with the X-SM-LLM-Role: judge header). Unset (default):
-# every backend joins the parallelise pool. Framework-owned env; clients never see
-# it. The judge CONSUMER lands with the v0.6.1 quality work — the routing seam is
-# in place now so a second LLM is ready to relay the judge load.
-LLM_RESERVE_JUDGE = os.environ.get("LLM_RESERVE_JUDGE", "0").strip().lower() in ("1", "true", "yes")
-_reserved = bool(LLM_RESERVE_JUDGE and len(LLM_BACKENDS) > 1)
-LLM_POOL: list[str] = LLM_BACKENDS[:-1] if _reserved else list(LLM_BACKENDS)   # general parallelise pool
-LLM_JUDGE_BACKEND: str = LLM_BACKENDS[-1] if _reserved else DEFAULT_TARGET      # judge/quality target
+# The whole pool parallelises. Judge/quality routing (v0.6.1) is GATEWAY-controlled
+# at runtime — NOT a user/env setting. The framework's judge will signal its role
+# (X-SM-LLM-Role: judge) and the gateway decides allocation; for now every role
+# shares the weighted pool, so the judge simply gets the free-est backend. Any
+# future dedicate-a-backend policy lives here, in the gateway, never in env.
+LLM_POOL: list[str] = list(LLM_BACKENDS)
 
 _llm_inflight: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
 _llm_unhealthy_until: dict[str, float] = {b: 0.0 for b in LLM_BACKENDS}
 _llm_fail_times: dict[str, list] = {b: [] for b in LLM_BACKENDS}
+# Runtime reservation (gateway-controlled, NEVER env/user). A backend in this set
+# is held OUT of the general parallelise pool so a quality task can use it
+# exclusively, then released — e.g. the periodical golden-set recheck (v0.6.1)
+# reserves a card, runs its eval on it, releases it: no restart, no degradation,
+# the rest of the pool keeps serving REM/NREM. Control endpoint + consumer land
+# with the v0.6.1 quality work; the state + pool-exclusion seam is here now.
+_llm_reserved: set[str] = set()
 
 
 def _llm_mark_fail(backend: str) -> None:
@@ -149,13 +152,14 @@ def _llm_mark_ok(backend: str) -> None:
 
 def _ordered_llm_backends(role: str = "") -> list[str]:
     """Backends to try, best-first, by WEIGHTED least-in-flight (inflight/weight).
-    role=='judge' → the reserved judge backend only. Healthy (out-of-cooldown)
-    backends first; cooldown ones appended as last-resort so service never stops."""
-    if role == "judge":
-        return [LLM_JUDGE_BACKEND]
+    The general pool excludes any backend the gateway has reserved at runtime;
+    healthy (out-of-cooldown) backends come first, cooldown ones last so service
+    never stops. `role` is a gateway-internal signal (e.g. a future quality/judge
+    task addressing its reserved backend) — clients never set or see routing."""
     now = time.monotonic()
-    healthy = [b for b in LLM_POOL if _llm_unhealthy_until.get(b, 0.0) <= now]
-    cooling = [b for b in LLM_POOL if b not in healthy]
+    pool = [b for b in LLM_POOL if b not in _llm_reserved] or LLM_POOL
+    healthy = [b for b in pool if _llm_unhealthy_until.get(b, 0.0) <= now]
+    cooling = [b for b in pool if b not in healthy]
     key = lambda b: _llm_inflight.get(b, 0) / LLM_WEIGHTS.get(b, 1.0)
     return sorted(healthy, key=key) + sorted(cooling, key=key)
 
@@ -613,10 +617,10 @@ async def handle_health(request: web.Request) -> web.Response:
         except Exception:
             backend_status[b] = "down"
     checks["llm"] = "ok" if any(s == "ok" for s in backend_status.values()) else "down"
-    if len(LLM_BACKENDS) > 1 or LLM_RESERVE_JUDGE:
+    if len(LLM_BACKENDS) > 1:
         checks["llm_backends"] = backend_status
-        if _reserved:
-            checks["llm_judge_reserved"] = LLM_JUDGE_BACKEND
+        if _llm_reserved:
+            checks["llm_reserved"] = sorted(_llm_reserved)
 
     checks["daemon"]     = "running" if _daemon_healthy else "stopped"
     checks["rem_daemon"] = "running" if _rem_healthy    else "stopped"
