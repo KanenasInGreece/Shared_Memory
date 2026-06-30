@@ -125,6 +125,11 @@ LLM_POOL: list[str] = list(LLM_BACKENDS)
 _llm_inflight: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
 _llm_unhealthy_until: dict[str, float] = {b: 0.0 for b in LLM_BACKENDS}
 _llm_fail_times: dict[str, list] = {b: [] for b in LLM_BACKENDS}
+# Parallelisation telemetry (instrument-first): cumulative requests routed +
+# fails per backend, so the realised distribution can be checked against the
+# weights (is A770@3 / B580@1 actually happening?) and cooldowns observed.
+_llm_routed: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
+_llm_fail_total: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
 # Runtime reservation (gateway-controlled, NEVER env/user). A backend in this set
 # is held OUT of the general parallelise pool so a quality task can use it
 # exclusively, then released — e.g. the periodical golden-set recheck (v0.6.1)
@@ -137,6 +142,7 @@ _llm_reserved: set[str] = set()
 def _llm_mark_fail(backend: str) -> None:
     """Record a backend failure; trip the cooldown if it fails too often."""
     now = time.monotonic()
+    _llm_fail_total[backend] = _llm_fail_total.get(backend, 0) + 1
     fails = [t for t in _llm_fail_times.get(backend, []) if now - t < LLM_FAIL_WINDOW]
     fails.append(now)
     _llm_fail_times[backend] = fails
@@ -249,6 +255,7 @@ class AsyncHiveMindProxy:
             role = request.headers.get("X-SM-LLM-Role", "").strip().lower()
             llm_backend = _select_llm_backend(role)
             _llm_inflight[llm_backend] = _llm_inflight.get(llm_backend, 0) + 1
+            _llm_routed[llm_backend] = _llm_routed.get(llm_backend, 0) + 1
             target_base = llm_backend
 
         target_url = f"{target_base}{request.rel_url}"
@@ -621,6 +628,22 @@ async def handle_health(request: web.Request) -> web.Response:
         checks["llm_backends"] = backend_status
         if _llm_reserved:
             checks["llm_reserved"] = sorted(_llm_reserved)
+        # Parallelisation telemetry: per-backend weight, current in-flight, cumulative
+        # routed (check the realised split against weights), total fails, cooldown.
+        now = time.monotonic()
+        total_routed = sum(_llm_routed.values()) or 1
+        checks["llm_pool"] = {
+            b: {
+                "weight": LLM_WEIGHTS.get(b, 1.0),
+                "inflight": _llm_inflight.get(b, 0),
+                "routed": _llm_routed.get(b, 0),
+                "routed_pct": round(100 * _llm_routed.get(b, 0) / total_routed, 1),
+                "fails": _llm_fail_total.get(b, 0),
+                "cooldown": round(max(0.0, _llm_unhealthy_until.get(b, 0.0) - now), 1),
+                "reserved": b in _llm_reserved,
+            }
+            for b in LLM_BACKENDS
+        }
 
     checks["daemon"]     = "running" if _daemon_healthy else "stopped"
     checks["rem_daemon"] = "running" if _rem_healthy    else "stopped"
