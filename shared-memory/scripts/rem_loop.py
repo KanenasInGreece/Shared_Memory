@@ -765,7 +765,10 @@ class REMDaemon:
                     return None
                 return json.loads(raw[start:end])
         except json.JSONDecodeError as exc:
-            logger.error("LLM JSON parse error: %s", exc)
+            # Log the offending payload (truncated) so the malformed-JSON root cause
+            # is diagnosable — intermittent Gemma JSON slips block enrichment (ADR-022
+            # follow-up: json-repair salvage + max-retry dead-letter).
+            logger.error("LLM JSON parse error: %s | payload=%.500s", exc, raw[start:end])
             return None
         except Exception as exc:
             logger.error("LLM error: %s", exc)
