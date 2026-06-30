@@ -51,7 +51,7 @@ from ontology import (
 )
 from gpu_load import inference_gpu_busy
 from log_hygiene import append_secure
-from dream_telemetry import record_llm_call
+from dream_telemetry import record_llm_call, adaptive_ceiling
 
 
 # ── Environment ───────────────────────────────────────────────────────────────
@@ -105,7 +105,9 @@ BATCH_SIZE         = 5     # facts per cycle (LLM calls are the latency bottlene
 # as the typed-node graph grows; the real fix for unbounded growth is per-domain
 # scoping / embedding-retrieval of relevant entities (roadmap).
 ENTITY_SET_LIMIT   = int(os.environ.get("ENTITY_SET_LIMIT", "1500"))
-REM_LLM_TIMEOUT    = float(os.environ.get("REM_LLM_TIMEOUT", "600"))
+# REM_LLM_TIMEOUT removed (ADR-021): the per-call timeout is now adaptive —
+# adaptive_ceiling(len(prompt)) — so a big grounding prompt is never killed for
+# being big. Only the floor (LLM_CEILING_FLOOR, default 600s) remains tunable.
 WRITE_QUIESCE_SEC  = int(os.environ.get("WRITE_QUIESCE_SEC", "30"))  # yield to active writes
 
 # Backup fence: a single well-known Postgres advisory lock shared with the gateway
@@ -706,9 +708,10 @@ class REMDaemon:
             + "\n}"
         )
 
+        _ceiling = adaptive_ceiling(len(prompt))   # scales with the grounding prompt
         _start = time.monotonic()
         try:
-            async with httpx.AsyncClient(timeout=REM_LLM_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=_ceiling) as client:
                 resp = await client.post(
                     REASONER_URL,
                     headers=_auth_headers(),
@@ -724,13 +727,13 @@ class REMDaemon:
                 _backend = resp.headers.get("X-SM-LLM-Backend")
                 if resp.status_code != 200:
                     record_llm_call("REM", None, backend=_backend,
-                                    wall_s=time.monotonic() - _start, ceiling_s=REM_LLM_TIMEOUT,
+                                    wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
                                     ok=False, note=f"http_{resp.status_code}")
                     logger.error("LLM returned %d: %s", resp.status_code, resp.text[:200])
                     return None
                 resp_json = resp.json()
                 record_llm_call("REM", resp_json, backend=_backend,
-                                wall_s=time.monotonic() - _start, ceiling_s=REM_LLM_TIMEOUT)
+                                wall_s=time.monotonic() - _start, ceiling_s=_ceiling)
                 try:
                     raw = resp_json["choices"][0]["message"]["content"].strip()
                 except (KeyError, IndexError) as exc:

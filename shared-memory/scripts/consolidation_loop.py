@@ -14,7 +14,7 @@ from datetime import datetime
 from neo4j import AsyncGraphDatabase
 from ontology import ONT
 from gpu_load import inference_gpu_busy
-from dream_telemetry import record_llm_call
+from dream_telemetry import record_llm_call, adaptive_ceiling
 
 # Configuration — set via environment variables or .env file
 NEO4J_URI = "bolt://localhost:7687"
@@ -69,7 +69,8 @@ SWEEP_INTERVAL_SEC = int(os.environ.get("NREM_SWEEP_INTERVAL_SEC", "3600"))
 # models (see rem_loop REM_TEMPERATURE); set NREM_TEMPERATURE=0.1 (or DREAM_TEMPERATURE
 # for both daemons) in .env for Qwen-class models. Overrides the LM Studio preset.
 NREM_TEMPERATURE = float(os.environ.get("NREM_TEMPERATURE", os.environ.get("DREAM_TEMPERATURE", "0.6")))
-NREM_LLM_TIMEOUT = float(os.environ.get("NREM_LLM_TIMEOUT", "600"))
+# NREM_LLM_TIMEOUT removed (ADR-021): per-call timeout is now adaptive —
+# adaptive_ceiling(len(prompt), units=cluster_size). Floor: LLM_CEILING_FLOOR (600s).
 
 # ── Consolidation run ledger (ADR-018) ──────────────────────────────────────
 # One consolidation_runs row per cycle so a silent fold crash becomes queryable
@@ -276,7 +277,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ConsolidationDaemon")
 
 
-async def _post_nrem(client: httpx.AsyncClient, payload: dict) -> httpx.Response:
+async def _post_nrem(client: httpx.AsyncClient, payload: dict,
+                     ceiling_s: float | None = None) -> httpx.Response:
     """POST an NREM completion through the gateway and record per-call telemetry
     (timings + serving backend) for the adaptive-timer work. Telemetry is
     best-effort and never alters the call path — NREM stays agnostic to routing."""
@@ -290,7 +292,7 @@ async def _post_nrem(client: httpx.AsyncClient, payload: dict) -> httpx.Response
         except Exception:
             rj = None
     record_llm_call("NREM", rj, backend=resp.headers.get("X-SM-LLM-Backend"),
-                    wall_s=time.monotonic() - _start, ceiling_s=NREM_LLM_TIMEOUT,
+                    wall_s=time.monotonic() - _start, ceiling_s=ceiling_s,
                     ok=ok, note=None if ok else f"http_{resp.status_code}")
     return resp
 
@@ -863,8 +865,9 @@ class ConsolidationDaemon:
                 f"Focus on technical decisions and outcomes."
             )
 
+        _ceiling = adaptive_ceiling(len(prompt), units=len(facts))
         try:
-            async with httpx.AsyncClient(timeout=NREM_LLM_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=_ceiling) as client:
                 resp = await _post_nrem(client, {
                     "model": "local-model",
                     "messages": [
@@ -872,7 +875,7 @@ class ConsolidationDaemon:
                         {"role": "user", "content": prompt},
                     ],
                     "temperature": NREM_TEMPERATURE,
-                })
+                }, ceiling_s=_ceiling)
                 if resp.status_code != 200:
                     logger.error(f"Summarization failed with status {resp.status_code}: {resp.text}")
                     return None
@@ -915,8 +918,9 @@ class ConsolidationDaemon:
             f"### INSIGHT:"
         )
 
+        _ceiling = adaptive_ceiling(len(prompt), units=len(decision_blocks))
         try:
-            async with httpx.AsyncClient(timeout=NREM_LLM_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=_ceiling) as client:
                 resp = await _post_nrem(client, {
                     "model": "local-model",
                     "messages": [
@@ -924,7 +928,7 @@ class ConsolidationDaemon:
                         {"role": "user", "content": prompt},
                     ],
                     "temperature": NREM_TEMPERATURE,
-                })
+                }, ceiling_s=_ceiling)
                 if resp.status_code != 200:
                     logger.error(f"Insight synthesis failed with status {resp.status_code}: {resp.text}")
                     return None
