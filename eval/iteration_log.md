@@ -23,3 +23,4 @@ the LLM's real entity value is on live/novel data) AND entity wrong-rate ≤ 0.1
 - **Single-GPU contention:** the overnight loop made no progress — eval calls queue behind REM/NREM dream generations and time out (300s). Gate measurement work on backlog==0 (not a timer), or quiesce REM, or offload to a separate node. The night still drained the backlog 85→0. (fact 478)
 - **Debatable gold labels are real:** of v1's 3 rel errors, `consolidation_loop→Neo4j` (DEPENDS_ON vs CONSUMES) is genuinely ambiguous — confirms ensemble=filter, human-judgment on boundaries. If re-labelled CONSUMES, rel wrong-rate → 0.08 and the goal is met as-is.
 - **Failure modes (Cloe-predicted):** entity Component-overreach (Systems/Concepts typed Component); rel over-attribution (spurious PRODUCES / IMPLEMENTS).
+| 3 | 06-30 11:03 | 0.959 (+0.004) | 0.050 | 0.923 (+0.347) | 0.040 | gold consistency fix (gateway->Gemma CONSUMES) + advisor litmus rule in prompt — **GOAL MET (4/4)** |

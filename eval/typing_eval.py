@@ -54,6 +54,7 @@ Source ({src_type}): "{src}"
 Target ({tgt_type}): "{tgt}"
 Context: "{context}"
 Allowed: DEPENDS_ON, PART_OF, IMPLEMENTS, PRODUCES, CONSUMES, RUNS_ON, CONFIGURES, DESCRIBES, VALIDATES, NONE
+DEPENDS_ON vs CONSUMES: if swapping the target for an equivalent would change the DATA the source gets (a model/embedder/API), use CONSUMES; if not (a database/lock/library/component), use DEPENDS_ON.
 Answer:"""
 
 

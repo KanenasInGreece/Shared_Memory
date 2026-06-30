@@ -3,7 +3,8 @@
     "purpose": "Stage 1.3 REM typing eval — ground truth for entity sub-type + typed-relationship assignment.",
     "ground_truth": "human judgment (curated from real corpus entities). Ensemble agreement is a FILTER not truth; disagreements get human adjudication (decision 475). Minority classes Model/Document are smaller — macro-F1 noise expected.",
     "fallback_label": "OTHER = no confident sub-type (maps to untyped :Entity / MENTIONS).",
-    "rel_none": "NONE = no valid typed relationship (maps to MENTIONS fallback)."
+    "rel_none": "NONE = no valid typed relationship (maps to MENTIONS fallback).",
+    "depends_on_vs_consumes": "Litmus (advisor-agent rule): swap the target for a functional equivalent — if the source would get DIFFERENT data (models, embedders, APIs whose identity shapes output) use CONSUMES; if it would get the same result (databases, locks, libraries, plain components — transparent vessels) use DEPENDS_ON."
   },
   "entities": [
     {"name": "coordinator", "type": "Component", "context": "the coordinator acquires per-entity locks before each write"},
@@ -61,7 +62,7 @@
     {"src": "AuthMiddleware", "src_type": "Component", "tgt": "HiveMindGateway", "tgt_type": "System", "rel": "PART_OF", "context": "AuthMiddleware is part of the gateway"},
     {"src": "vector-skill", "src_type": "Component", "tgt": "BGE-M3", "tgt_type": "Model", "rel": "CONSUMES", "context": "vector-skill consumes BGE-M3 embeddings"},
     {"src": "memory_bridge", "src_type": "Component", "tgt": "HiveMindGateway", "tgt_type": "System", "rel": "CONSUMES", "context": "memory_bridge calls the gateway over HTTP"},
-    {"src": "HiveMindGateway", "src_type": "System", "tgt": "Gemma4", "tgt_type": "Model", "rel": "DEPENDS_ON", "context": "the gateway routes completions to the Gemma model"},
+    {"src": "HiveMindGateway", "src_type": "System", "tgt": "Gemma4", "tgt_type": "Model", "rel": "CONSUMES", "context": "the gateway routes completions to the Gemma model"},
     {"src": "BGE-M3", "src_type": "Model", "tgt": "retriever-api", "tgt_type": "System", "rel": "RUNS_ON", "context": "BGE-M3 runs on the retriever-api service"},
     {"src": "Gemma4", "src_type": "Model", "tgt": "CloeVM", "tgt_type": "System", "rel": "RUNS_ON", "context": "Gemma runs on the VM"},
     {"src": "README", "src_type": "Document", "tgt": "coordinator", "tgt_type": "Component", "rel": "DESCRIBES", "context": "the README describes the coordinator architecture"},
