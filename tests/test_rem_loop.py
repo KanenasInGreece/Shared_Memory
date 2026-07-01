@@ -424,3 +424,30 @@ def test_adaptive_poll_sleep_backoff():
     assert rem.adaptive_poll_sleep(50) == rem.MAX_POLL_SEC
     assert rem.adaptive_poll_sleep(99) <= rem.MAX_POLL_SEC
     assert rem.adaptive_poll_sleep(99) >= rem.MIN_POLL_SEC
+
+
+def test_parse_llm_json_clean():
+    rem = load_rem_loop()
+    obj = rem._parse_llm_json('{"summary": "ok", "relationships": [{"name": "X", "rel_type": "MENTIONS"}]}')
+    assert obj["summary"] == "ok" and len(obj["relationships"]) == 1
+
+
+def test_parse_llm_json_salvages_missing_comma():
+    """Mirrors the real Gemma-4 failure: missing comma between array items."""
+    rem = load_rem_loop()
+    bad = '{"summary": "ok", "relationships": [{"name": "X", "rel_type": "MENTIONS"} {"name": "Y", "rel_type": "MENTIONS"}]}'
+    obj = rem._parse_llm_json(bad)
+    assert isinstance(obj, dict) and obj.get("summary") == "ok"
+    assert len(obj.get("relationships", [])) == 2
+
+
+def test_parse_llm_json_salvages_unescaped_newline():
+    rem = load_rem_loop()
+    bad = '{"summary": "line one\nline two in the same string", "relationships": []}'
+    obj = rem._parse_llm_json(bad)
+    assert isinstance(obj, dict) and "line one" in obj["summary"]
+
+
+def test_parse_llm_json_hopeless_returns_none():
+    rem = load_rem_loop()
+    assert rem._parse_llm_json("not json at all !!!") is None

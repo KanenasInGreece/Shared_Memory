@@ -152,6 +152,32 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("REMDaemon")
 
 
+def _parse_llm_json(candidate: str):
+    """Parse the LLM's JSON, salvaging Gemma-4's common slips (unescaped quotes /
+    newlines inside long summary strings) with json_repair when strict parsing
+    fails (decision 491). Returns the dict, or None if even repair can't produce
+    usable JSON. json_repair is imported lazily so the module stays importable
+    without the dependency; the salvage path only runs when json.loads already
+    failed, so it can never regress a currently-valid parse. A salvage is logged
+    (WARNING 'salvaged via json_repair') so the salvage rate is measurable."""
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        try:
+            import json_repair
+            obj = json_repair.loads(candidate)
+        except Exception as exc2:
+            logger.error("REM JSON parse+repair failed: %s / %s | payload=%.400s",
+                         exc, exc2, candidate)
+            return None
+        if isinstance(obj, dict) and obj:
+            logger.warning("REM JSON salvaged via json_repair (orig: %s)", exc)
+            return obj
+        logger.error("REM JSON unrepairable (empty after repair): %s | payload=%.400s",
+                     exc, candidate)
+        return None
+
+
 # ── Ontology-derived constants ────────────────────────────────────────────────
 
 # Labels safe to interpolate into Cypher MERGE patterns via `MERGE (e:{label} {name: n})`.
@@ -763,13 +789,8 @@ class REMDaemon:
                 if start == -1 or end == 0:
                     logger.error("LLM returned no JSON object: %s", raw[:300])
                     return None
-                return json.loads(raw[start:end])
-        except json.JSONDecodeError as exc:
-            # Log the offending payload (truncated) so the malformed-JSON root cause
-            # is diagnosable — intermittent Gemma JSON slips block enrichment (ADR-022
-            # follow-up: json-repair salvage + max-retry dead-letter).
-            logger.error("LLM JSON parse error: %s | payload=%.500s", exc, raw[start:end])
-            return None
+                # Strict parse first; salvage Gemma-4 JSON slips via json_repair (decision 491).
+                return _parse_llm_json(raw[start:end])
         except Exception as exc:
             logger.error("LLM error: %s", exc)
             return None
