@@ -100,7 +100,7 @@ Each is idempotent and safe to re-run; each step links the manual equivalent.
 
 6. **Start the reasoning LLM.** The embedder and reranker already came up with the compose stack (step 3); you only need your reasoning LLM on `:5000` — LM Studio or any OpenAI-compatible server ([§7](#7-inference-backends-llamacpp)).
 
-7. **Start the gateway.** `uv run --with aiohttp --with asyncpg --with neo4j --with httpx python shared-memory/scripts/hive_mind_proxy.py 8888` — this also launches the REM and NREM daemons ([§9](#9-starting-the-full-stack)). Verify: `curl http://localhost:8888/health` should report `"status":"ok"`, `"auth_required":true`, and `"embedder":"ok"` before you save any artifacts. For a gateway that survives logout and reboot, install the `systemd --user` unit in [`shared-memory/ops/`](shared-memory/ops/) rather than leaving it in a terminal — a session-launched gateway is killed on teardown.
+7. **Start the gateway.** `uv run --with aiohttp --with asyncpg --with neo4j --with httpx --with json-repair python shared-memory/scripts/hive_mind_proxy.py 8888` — this also launches the REM and NREM daemons ([§9](#9-starting-the-full-stack)). Verify: `curl http://localhost:8888/health` should report `"status":"ok"`, `"auth_required":true`, and `"embedder":"ok"` before you save any artifacts. For a gateway that survives logout and reboot, install the `systemd --user` unit in [`shared-memory/ops/`](shared-memory/ops/) rather than leaving it in a terminal — a session-launched gateway is killed on teardown.
 
 8. **Install the skill into your agent.** The skill is a **thin client** — only `memory_bridge.py` ships with it (the daemons stay on the gateway host from step 7). Symlink/copy `SKILL.md` + `memory_bridge.py` into the agent's skills directory ([§10](#10-agent-integration-first-time-setup); remote/laptop clients → [§10a](#10a-remote-clients-ssh-tunnel-access)). Shortcut: just tell your agent — *"clone this repo and install the shared-memory skill per README §10."*
 
@@ -637,7 +637,7 @@ First run? Make sure the GGUF models are in the mounted folder before this — s
 
 **3. Start the Hive-Mind Gateway** — this also starts the REM and NREM daemons automatically
 ```bash
-uv run --with aiohttp --with asyncpg --with neo4j --with httpx \
+uv run --with aiohttp --with asyncpg --with neo4j --with httpx --with json-repair \
   python shared-memory/scripts/hive_mind_proxy.py 8888
 ```
 

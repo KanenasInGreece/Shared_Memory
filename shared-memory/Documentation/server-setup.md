@@ -63,7 +63,7 @@ uv run python shared-memory/scripts/generate_tokens.py
 #    → give each agent its own AGENT_TOKEN in its skill .env (never share tokens)
 
 # 6. Start the gateway (also spawns the REM + NREM daemons).
-uv run --with aiohttp --with asyncpg --with neo4j --with httpx \
+uv run --with aiohttp --with asyncpg --with neo4j --with httpx --with json-repair \
   python shared-memory/scripts/hive_mind_proxy.py 8888
 
 # 7. Verify.
