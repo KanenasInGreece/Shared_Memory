@@ -2467,6 +2467,13 @@ class MemoryCoordinator:
             covered = await (await session.run(
                 f"MATCH (e:{ONT.entity})-[:{self._ALIAS_REL}]-() RETURN count(DISTINCT e) AS c"
             )).single()
+            # Alias-component distribution (gds.wcc stamps Entity.alias_component;
+            # singletons get their own id, so a group is a component of size > 1).
+            comp = await (await session.run(
+                f"MATCH (e:{ONT.entity}) WHERE e.alias_component IS NOT NULL "
+                f"WITH e.alias_component AS c, count(*) AS sz WHERE sz > 1 "
+                f"RETURN count(*) AS groups, coalesce(max(sz), 0) AS largest"
+            )).single()
             hubs = await (await session.run(
                 f"MATCH (e:{ONT.entity})<-[:{ONT.entity_link}]-(n) "
                 f"  WHERE n.pg_id IS NOT NULL AND coalesce(n.superseded,false) = false "
@@ -2480,6 +2487,8 @@ class MemoryCoordinator:
             "singleton_entities": deg["singletons"] or 0,
             "alias_edges": aliases["edges"] or 0,
             "alias_covered_entities": covered["c"] or 0,
+            "alias_components": comp["groups"] or 0,
+            "largest_alias_component": comp["largest"] or 0,
             "top_hubs": [{"name": h["name"], "degree": h["degree"]} for h in hubs],
         }
 

@@ -359,17 +359,43 @@ def run_sweep(threshold: float = COSINE_THRESHOLD, k: int = ANN_K,
             "components_stamped": stamped}
 
 
+def adjudication_stats() -> dict:
+    """Summary of the alias_adjudications ledger — the precision-review surface
+    (verdict/method split + mean confidence). True precision is a spot-check
+    against these rows; this sizes the ledger."""
+    conn = psycopg2.connect(PG_CONN, connect_timeout=5)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT method, verdict, count(*), round(avg(confidence)::numeric, 3) "
+                        "FROM alias_adjudications GROUP BY method, verdict ORDER BY method, verdict")
+            by = [{"method": m, "verdict": v, "count": c, "mean_confidence": float(a) if a is not None else None}
+                  for m, v, c, a in cur.fetchall()]
+            cur.execute("SELECT count(*) FROM alias_adjudications WHERE verdict='alias'")
+            aliases = cur.fetchone()[0]
+            cur.execute("SELECT count(*) FROM alias_adjudications")
+            total = cur.fetchone()[0]
+    finally:
+        conn.close()
+    return {"total_adjudications": total, "alias": aliases,
+            "distinct": total - aliases, "breakdown": by}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Alias-writer sweep (ADR-017 A).")
     ap.add_argument("--dry-run", action="store_true",
                     help="generate candidates only — no LLM, no writes")
     ap.add_argument("--apply", action="store_true",
                     help="run LLM adjudication and WRITE ALIASES edges")
+    ap.add_argument("--stats", action="store_true",
+                    help="print the adjudication-ledger summary (precision-review surface)")
     ap.add_argument("--json", action="store_true", help="machine-readable candidate dump")
     ap.add_argument("--threshold", type=float, default=COSINE_THRESHOLD)
     ap.add_argument("--limit", type=int, default=None,
                     help="cap LLM-adjudicated candidates (safe incremental rollout)")
     args = ap.parse_args()
+    if args.stats:
+        print(json.dumps(adjudication_stats(), indent=2))
+        return
     if args.apply:
         print(json.dumps(run_sweep(threshold=args.threshold, limit=args.limit), indent=2))
         return
