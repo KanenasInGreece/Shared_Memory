@@ -451,3 +451,51 @@ def test_parse_llm_json_salvages_unescaped_newline():
 def test_parse_llm_json_hopeless_returns_none():
     rem = load_rem_loop()
     assert rem._parse_llm_json("not json at all !!!") is None
+
+
+def test_build_batch_prompt_numbered_and_strict():
+    rem = load_rem_loop()
+    items = [{"pg_id": 1, "content": "fact one"}, {"pg_id": 2, "content": "fact two"}]
+    p = rem.REMDaemon._build_batch_prompt(None, items, [{"labels": ["Entity"], "name": "Neo4j"}])
+    assert "[FACT 0]" in p and "[FACT 1]" in p
+    assert "EXACTLY 2 lines" in p and '"idx"' in p
+    assert "Neo4j" in p          # shared grounding included
+
+
+def test_parse_jsonl_batch_maps_by_idx_and_skips_null():
+    rem = load_rem_loop()
+    idx_to_pg = {0: 101, 1: 102, 2: 103}
+    raw = (
+        '{"idx": 0, "summary": "s0", "relationships": []}\n'
+        '{"idx": 1, "summary": "s1", "relationships": [{"name":"X","rel_type":"MENTIONS","type":"System"}]}\n'
+        '{"idx": 2, "summary": null, "relationships": []}\n'   # null-summary sentinel → skipped
+    )
+    out = rem.REMDaemon._parse_jsonl_batch(None, raw, idx_to_pg)
+    assert set(out.keys()) == {101, 102}          # 103 skipped
+    assert out[101]["summary"] == "s0" and len(out[102]["relationships"]) == 1
+
+
+def test_parse_jsonl_batch_salvages_and_isolates_failures():
+    rem = load_rem_loop()
+    idx_to_pg = {0: 201, 1: 202}
+    raw = (
+        '{"idx": 0, "summary": "ok" "relationships": []}\n'    # missing comma → json_repair salvages
+        'garbage line, not json at all\n'                       # idx 1 missing → retry next cycle
+    )
+    out = rem.REMDaemon._parse_jsonl_batch(None, raw, idx_to_pg)
+    assert 201 in out and 202 not in out           # partial success, isolated
+
+
+def test_parse_jsonl_batch_rejects_out_of_range_idx():
+    rem = load_rem_loop()
+    out = rem.REMDaemon._parse_jsonl_batch(None, '{"idx": 9, "summary": "x"}', {0: 1})
+    assert out == {}
+
+
+def test_llm_process_batch_mock(monkeypatch):
+    import asyncio
+    monkeypatch.setenv("MOCK_LLM", "1")
+    rem = load_rem_loop()
+    items = [{"pg_id": 1, "content": "a"}, {"pg_id": 2, "content": "b"}]
+    out = asyncio.run(rem.REMDaemon._llm_process_batch(None, items, []))
+    assert set(out.keys()) == {1, 2} and out[1]["summary"]
