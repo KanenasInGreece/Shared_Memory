@@ -13,7 +13,7 @@ import time
 from datetime import datetime
 from neo4j import AsyncGraphDatabase
 from ontology import ONT
-from gpu_load import inference_gpu_busy
+from pool_status import pool_has_free_slot
 from dream_telemetry import record_llm_call, adaptive_ceiling
 
 # Configuration — set via environment variables or .env file
@@ -1722,9 +1722,9 @@ class ConsolidationDaemon:
                     if should_consolidate:
                         # Yield to active user inference on the GPU — but never let the
                         # hard backstop be starved by continuous activity.
-                        if not forced and await inference_gpu_busy():
-                            logger.warning("NREM: inference GPU busy — deferring consolidation; will re-check next cycle.")
-                            await loop.run_in_executor(None, lambda: _crun_record_deferred("fact_consolidation", "gpu_busy"))
+                        if not forced and not await pool_has_free_slot():
+                            logger.warning("NREM: LLM pool has no free slot — deferring consolidation; will re-check next cycle.")
+                            await loop.run_in_executor(None, lambda: _crun_record_deferred("fact_consolidation", "pool_busy"))
                         else:
                             # Backup fence: SHARED advisory lock held across the cycle.
                             # If the gateway holds it EXCLUSIVE (backup dumping), defer —
@@ -1746,9 +1746,9 @@ class ConsolidationDaemon:
                                    bool(self.pending_pg_ids)):
                         # Background hygiene — always yields to active inference;
                         # a deferred sweep simply retries on the next idle tick.
-                        if await inference_gpu_busy():
-                            logger.info("NREM: inference GPU busy — deferring sweep.")
-                            await loop.run_in_executor(None, lambda: _crun_record_deferred("insight", "gpu_busy"))
+                        if not await pool_has_free_slot():
+                            logger.info("NREM: LLM pool has no free slot — deferring sweep.")
+                            await loop.run_in_executor(None, lambda: _crun_record_deferred("insight", "pool_busy"))
                         else:
                             # Backup fence: SHARED advisory lock held across the sweep.
                             # Deferred if the gateway holds it EXCLUSIVE — last_sweep_time

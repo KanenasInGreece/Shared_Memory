@@ -49,7 +49,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from ontology import (
     ONT, sanitize_entity_name, sanitize_entity_names, is_allowed_relation,
 )
-from gpu_load import inference_gpu_busy
+from pool_status import pool_has_free_slot
 from log_hygiene import append_secure
 from dream_telemetry import record_llm_call, adaptive_ceiling, record_grounding
 
@@ -1055,9 +1055,11 @@ class REMDaemon:
                 )
                 return 0
 
-            # Yield to active user inference — don't compete with the LLM on the GPU.
-            if await inference_gpu_busy():
-                logger.warning("REM: inference GPU busy — deferring enrichment cycle")
+            # Yield only if the whole LLM pool is busy — the gateway routes to a
+            # free card (incl. one the user isn't LLM-loading). NOT a global GPU
+            # gate, which self-defers to our own dream work + ignores a free card.
+            if not await pool_has_free_slot():
+                logger.warning("REM: LLM pool has no free slot — deferring enrichment cycle")
                 return 0
 
             pg_ids = await self._filter_applied_in_outbox(candidates, conn, loop)

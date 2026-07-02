@@ -930,3 +930,31 @@ async def test_save_normalizes_project_aliases_at_ingress():
     saved_metadata = mock_conn.fetchrow.call_args.args[2]
     assert saved_metadata["project"] == "shared-memory-GitHub"
     assert saved_metadata["decision"]["project"] == "shared-memory-GitHub"
+
+
+def test_embed_truncates_oversized_input():
+    """BGE-M3 8192-ctx guard: embedding input over EMBED_MAX_CHARS is truncated."""
+    import asyncio
+    coord = load_coordinator()
+    captured = {}
+    class FakeResp:
+        def raise_for_status(self): pass
+        def json(self): return {"data": [{"embedding": [0.1, 0.2]}]}
+    class FakeClient:
+        async def post(self, url, json=None): captured["len"] = len(json["input"]); return FakeResp()
+    long = "x" * (coord.EMBED_MAX_CHARS + 5000)
+    out = asyncio.run(coord.MemoryCoordinator._embed(None, long, FakeClient()))
+    assert captured["len"] == coord.EMBED_MAX_CHARS and out == [0.1, 0.2]
+
+
+def test_embed_passes_short_input_untruncated():
+    import asyncio
+    coord = load_coordinator()
+    captured = {}
+    class FakeResp:
+        def raise_for_status(self): pass
+        def json(self): return {"data": [{"embedding": [0.0]}]}
+    class FakeClient:
+        async def post(self, url, json=None): captured["len"] = len(json["input"]); return FakeResp()
+    asyncio.run(coord.MemoryCoordinator._embed(None, "short text", FakeClient()))
+    assert captured["len"] == len("short text")

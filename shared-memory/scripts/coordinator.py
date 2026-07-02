@@ -141,7 +141,9 @@ def _check_client_version(request: web.Request) -> None:
 
 # ── Agent authentication ───────────────────────────────────────────────────────
 
-_UNPROTECTED_PATHS = {"/health"}
+# /pool/status is read-only, DB-free in-memory LLM capacity — the REM/NREM daemons
+# poll it (tokenless) to gate dreaming, same trust level as /health.
+_UNPROTECTED_PATHS = {"/health", "/pool/status"}
 
 
 def _load_agent_tokens() -> dict[str, str]:
@@ -573,6 +575,14 @@ RERANK_URL = "http://localhost:8071/v1/reranking"
 
 EMBED_RETRIES = 4
 EMBED_BACKOFF = 0.5      # seconds × attempt number  (0.5 s, 1 s, 1.5 s, 2 s)
+# BGE-M3 runs with -c 8192 (context tokens). An input over that fails to embed —
+# which would abort a save or drop a community summary from search. Truncate the
+# EMBEDDING input to a conservative char budget (~<=8000 tokens at ~3 chars/token,
+# safely under 8192); the FULL text is always kept in Tier 1 (technical_docs), so
+# search still returns it — only the vector is computed from the prefix. Prompted
+# by an advisor hitting a smaller BGE-M3 limit; guards us as summaries grow with
+# the larger-context work. Env-tunable if the embedder's -c changes.
+EMBED_MAX_CHARS = int(os.environ.get("EMBED_MAX_CHARS", "24000"))
 
 # Pool sizing is a SYSTEM budget, not just a coordinator knob: Postgres
 # max_connections must cover this pool + REM (1 conn) + NREM (per-op) + the
@@ -913,6 +923,10 @@ class MemoryCoordinator:
 
     async def _embed(self, text: str, client: httpx.AsyncClient) -> list[float]:
         """Embed text via the gateway with exponential-backoff retry."""
+        if len(text) > EMBED_MAX_CHARS:
+            log.warning("embed input %d chars > %d — truncating to fit BGE-M3 8192-ctx "
+                        "(full text kept in Tier 1)", len(text), EMBED_MAX_CHARS)
+            text = text[:EMBED_MAX_CHARS]
         for attempt in range(1, EMBED_RETRIES + 1):
             try:
                 r = await client.post(EMBED_URL, json={"input": text, "model": "bge-m3"})

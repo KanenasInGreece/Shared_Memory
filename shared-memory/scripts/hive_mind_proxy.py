@@ -655,6 +655,32 @@ async def _watchdog_daemon(stop_event: asyncio.Event) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Pool status — cheap, in-memory LLM capacity signal for the dreaming daemons
+# --------------------------------------------------------------------------- #
+async def handle_pool_status(request: web.Request) -> web.Response:
+    """GET /pool/status — in-memory LLM pool availability, no upstream probes.
+    A backend is available iff zero in-flight, not in cooldown, not reserved.
+    Because ALL LLM traffic (dream cycles AND user chats) flows through the
+    gateway, in-flight IS the LLM-usage signal — so REM/NREM gate on this instead
+    of a global nvtop check (which self-defers to our own dream work and ignores a
+    free card). Desktop/display GPU use is intentionally not considered."""
+    now = time.monotonic()
+    backends, free = {}, 0
+    for b in LLM_POOL:
+        avail = (_llm_inflight.get(b, 0) == 0
+                 and _llm_unhealthy_until.get(b, 0.0) <= now
+                 and b not in _llm_reserved)
+        backends[b] = {
+            "inflight": _llm_inflight.get(b, 0),
+            "cooldown": round(max(0.0, _llm_unhealthy_until.get(b, 0.0) - now), 1),
+            "reserved": b in _llm_reserved,
+            "available": avail,
+        }
+        free += 1 if avail else 0
+    return web.json_response({"free_slots": free, "backends": backends})
+
+
+# --------------------------------------------------------------------------- #
 # Health endpoint
 # --------------------------------------------------------------------------- #
 async def handle_health(request: web.Request) -> web.Response:
@@ -806,6 +832,7 @@ async def main() -> None:
     # Coordinator routes and health endpoint before the catch-all proxy route.
     attach_coordinator(app, coordinator)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/pool/status", handle_pool_status)
     app.router.add_route("*", "/{tail:.*}", proxy.handle_proxy)
 
     runner = web.AppRunner(app)
