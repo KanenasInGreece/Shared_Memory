@@ -1,5 +1,7 @@
 import asyncio
 import time
+import hashlib
+import json
 import logging
 import os
 import shutil
@@ -138,6 +140,37 @@ _llm_fail_total: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
 # with the v0.6.1 quality work; the state + pool-exclusion seam is here now.
 _llm_reserved: set[str] = set()
 
+# Cache-affinity dispatch (advisor-reviewed). llama.cpp's KV prefix-cache makes a
+# repeated large prompt prefix ~8x cheaper (measured 22251->5 prompt tokens,
+# 274s->35s) IF the request lands on the SAME backend that already holds that
+# prefix. REM's grounding prefix is byte-stable (ORDER BY name), so all REM calls
+# share one affinity key and pin to one warm card; NREM's varied prompts flow
+# elsewhere. Allocation-free: the card is chosen by least-in-flight on first sight,
+# then remembered by prefix hash. A prefix reused >=PROTECT_HITS times (i.e. REM's
+# grounding, not a one-shot NREM cluster) marks its card protected, so a non-affine
+# request won't evict that warm cache (--parallel 1 has a single KV slot).
+AFFINITY_PREFIX_CHARS = int(os.environ.get("LLM_AFFINITY_PREFIX_CHARS", "6144"))
+AFFINITY_TTL          = float(os.environ.get("LLM_AFFINITY_TTL", "600"))
+AFFINITY_MAX_INFLIGHT = int(os.environ.get("LLM_AFFINITY_MAX_INFLIGHT", "4"))
+AFFINITY_PROTECT_HITS = 2
+_llm_affinity: dict[str, list] = {}   # key -> [backend, last_ts, hits]
+_llm_affinity_hits = 0
+_llm_affinity_misses = 0
+
+
+def _affinity_key(body: bytes) -> str | None:
+    """sha1 of the leading AFFINITY_PREFIX_CHARS of the concatenated message
+    content — identifies requests sharing a large prompt prefix (the KV-cache
+    unit). None if the body is not a parseable chat payload."""
+    try:
+        msgs = (json.loads(body) or {}).get("messages") or []
+        text = "".join(str(m.get("content", "")) for m in msgs)
+        if not text:
+            return None
+        return hashlib.sha1(text[:AFFINITY_PREFIX_CHARS].encode("utf-8", "ignore")).hexdigest()
+    except Exception:
+        return None
+
 
 def _llm_mark_fail(backend: str) -> None:
     """Record a backend failure; trip the cooldown if it fails too often."""
@@ -170,9 +203,39 @@ def _ordered_llm_backends(role: str = "") -> list[str]:
     return sorted(healthy, key=key) + sorted(cooling, key=key)
 
 
-def _select_llm_backend(role: str = "") -> str:
-    """The single best backend (weighted least-in-flight). Clients never choose."""
-    return _ordered_llm_backends(role)[0]
+def _select_llm_backend(role: str = "", affinity_key: str | None = None) -> str:
+    """Pick a backend: cache-affinity first (keep a warm KV prefix on its card),
+    else least-in-flight while PROTECTING cards that hold a frequently-reused
+    prefix from eviction. Allocation-free (no precomputed weights). Clients never
+    choose. Records/refreshes the affinity map as a side effect."""
+    global _llm_affinity_hits, _llm_affinity_misses
+    now = time.monotonic()
+    for k in [k for k, v in _llm_affinity.items() if now - v[1] > AFFINITY_TTL]:
+        _llm_affinity.pop(k, None)
+
+    def _usable(b: str) -> bool:
+        return (b in LLM_POOL and b not in _llm_reserved
+                and _llm_unhealthy_until.get(b, 0.0) <= now)
+
+    # 1) affinity hit — same prefix already warm on a usable, non-saturated card
+    ent = _llm_affinity.get(affinity_key) if affinity_key else None
+    if ent and _usable(ent[0]) and _llm_inflight.get(ent[0], 0) < AFFINITY_MAX_INFLIGHT:
+        ent[1] = now
+        ent[2] += 1
+        _llm_affinity_hits += 1
+        return ent[0]
+
+    # 2) miss — least-in-flight, protecting cards holding a reused (hits>=N) hot prefix
+    protected = {v[0] for v in _llm_affinity.values()
+                 if now - v[1] <= AFFINITY_TTL and v[2] >= AFFINITY_PROTECT_HITS}
+    usable = [b for b in LLM_POOL if _usable(b)]
+    cold = ([b for b in usable if b not in protected] or usable
+            or [b for b in LLM_POOL if b not in _llm_reserved] or list(LLM_POOL))
+    chosen = min(cold, key=lambda b: _llm_inflight.get(b, 0))
+    if affinity_key:
+        _llm_affinity[affinity_key] = [chosen, now, (ent[2] + 1 if ent else 1)]
+        _llm_affinity_misses += 1
+    return chosen
 
 # --------------------------------------------------------------------------- #
 # RFC 7230 §6.1 — hop-by-hop headers must never be forwarded by a proxy.
@@ -247,13 +310,19 @@ class AsyncHiveMindProxy:
         # ONLY by framework components (e.g. the v0.6.1 judge) — never by clients.
         llm_backend: str | None = None
         target_base: str | None = None
+        llm_body: bytes | None = None
         for prefix, target in ROUTING_MAP.items():
             if request.path.startswith(prefix):
                 target_base = target
                 break
         if target_base is None:
+            # Reasoning-LLM request → buffer the body so we can compute the
+            # cache-affinity key (bounded chat payload; buffering cost negligible),
+            # then dispatch cache-affinity-first. The key is computed as late as
+            # possible, just before selection, so nothing mutates the prompt after.
+            llm_body = await request.read() if request.can_read_body else b""
             role = request.headers.get("X-SM-LLM-Role", "").strip().lower()
-            llm_backend = _select_llm_backend(role)
+            llm_backend = _select_llm_backend(role, _affinity_key(llm_body))
             _llm_inflight[llm_backend] = _llm_inflight.get(llm_backend, 0) + 1
             _llm_routed[llm_backend] = _llm_routed.get(llm_backend, 0) + 1
             target_base = llm_backend
@@ -269,7 +338,10 @@ class AsyncHiveMindProxy:
         # NOTE: this bypasses the client_max_size check that request.read() would
         # enforce. Acceptable for this trusted localhost deployment; revisit if the
         # proxy is ever exposed to untrusted clients.
-        upstream_data = request.content if request.can_read_body else None
+        # LLM requests forward the buffered body (already read for affinity hashing);
+        # embeddings/reranking keep streaming so large batches stay memory-flat.
+        upstream_data = llm_body if llm_body is not None else (
+            request.content if request.can_read_body else None)
 
         # Initialized to None so exception handlers can check object state directly
         # (.prepared attribute) rather than relying on a parallel boolean flag.
@@ -647,6 +719,18 @@ async def handle_health(request: web.Request) -> web.Response:
                 "reserved": b in _llm_reserved,
             }
             for b in LLM_BACKENDS
+        }
+        # Cache-affinity telemetry: hit rate + which backend holds each hot prefix
+        # (so the KV-cache win is observable). hits/(hits+misses) should climb as
+        # REM's stable grounding prefix keeps landing on its warm card.
+        _aff_total = _llm_affinity_hits + _llm_affinity_misses
+        checks["llm_affinity"] = {
+            "hits": _llm_affinity_hits,
+            "misses": _llm_affinity_misses,
+            "hit_rate": round(_llm_affinity_hits / _aff_total, 3) if _aff_total else None,
+            "hot_prefixes": {k[:8]: {"backend": v[0], "hits": v[2]}
+                             for k, v in _llm_affinity.items()
+                             if now - v[1] <= AFFINITY_TTL},
         }
 
     checks["daemon"]     = "running" if _daemon_healthy else "stopped"
