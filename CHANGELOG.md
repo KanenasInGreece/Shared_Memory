@@ -7,6 +7,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — entity-resolution alias writer (ADR-017 "A")
+
+The writer that populates the soft `ALIASES` synonym layer whose read/consume side shipped in 0.6.0 — it
+never merges nodes, so every surface form stays addressable.
+
+- **`alias_writer.py`** — a standalone periodic sweep (heavy embedding kept off the gateway event loop) that
+  proposes and writes `ALIASES` edges in two tiers, calibrated to the graph's measured fact-density:
+  **normalized-exact** name matches (case/format variants) are auto-accepted; the **name-cosine recall net**
+  (a blocking key, ≥ 0.82) surfaces non-lexical synonyms which an **LLM adjudicates** (default *no-merge*, with
+  a confidence + rationale). Edges are soft and revocable; `gds.wcc` refreshes alias components afterward.
+- **Candidate-generation store (`entity_embeddings`, pgvector + HNSW)** — entity names are embedded **once** and
+  found via an indexed ANN query, so a sweep costs *O(new)* embeddings rather than re-embedding the whole set.
+- **`alias_adjudications`** — a per-pair verdict ledger doubling as an audit trail and a don't-re-ask idempotency
+  cache. `alias_writer --stats` summarises it (the precision-review surface).
+- **Entity-graph telemetry** — `alias_edges` / `alias_covered_entities` now climb from zero, plus
+  `alias_components` / `largest_alias_component`. **Orphan counting corrected**: `orphan_entities` now means
+  truly dangling (degree-0), not "no live-fact `MENTIONS`" (which mislabels legitimate REM typed-edge targets); a
+  new `unmentioned_entities` reports that class honestly.
+- **`/health.config`** — an always-present, non-secret echo of the effective env-resolved LLM/tuning config
+  (backends + weights, pool tuning, affinity knobs, `embed_max_chars`), so the live setup is inspectable without
+  reading `.env` on the host.
+
 ### Added — inbound entity-name hygiene gate
 
 A deterministic "garbage-in" gate (adapted from a companion advisor/researcher agent's ingestion gate to the

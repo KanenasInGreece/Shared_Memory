@@ -126,6 +126,38 @@ One row per consolidation/insight **cycle** so a fold outcome is queryable state
 
 ---
 
+### `entity_embeddings` — alias candidate-generation store (ADR-017, migration 014)
+
+Entity **names** embedded once (BGE-M3, 1024-dim, via the gateway) so the alias writer finds cosine-near
+candidates with an indexed ANN query instead of re-embedding the whole entity set each sweep. Vectors stay in
+Postgres (Neo4j remains the structure tier); reuses the `technical_docs` HNSW pattern.
+
+| Column | Type | Notes |
+|---|---|---|
+| `name` | `TEXT PRIMARY KEY` | Entity identity (the coordinator MERGEs entities by name) |
+| `embedding` | `vector(1024)` | BGE-M3 name embedding (the gateway 1024-dim contract) |
+| `updated_at` | `TIMESTAMPTZ` | Last upsert |
+
+**Indexes:** `entity_embeddings_embedding_idx` — `hnsw (embedding vector_cosine_ops)`.
+
+### `alias_adjudications` — alias verdict ledger (ADR-017, migration 014)
+
+Per-pair `alias` / `distinct` verdicts from the writer — both the audit trail (method / confidence / signals /
+rationale, revocable) and the idempotency cache: a sweep skips pairs already judged, so the LLM is never re-asked.
+
+| Column | Type | Notes |
+|---|---|---|
+| `name_a`, `name_b` | `TEXT` | Canonical order `name_a < name_b`; `UNIQUE(name_a, name_b)` |
+| `verdict` | `TEXT` | `alias` \| `distinct` |
+| `method` | `TEXT` | `normalized_exact` (auto-accept) \| `llm` |
+| `confidence` | `REAL` | 0..1 (llm) or 1.0 (normalized-exact) |
+| `cosine`, `lexical_jaccard`, `shared_facts`, `domain_disjoint` | `REAL`/`INT`/`BOOLEAN` | Signals recorded at adjudication |
+| `rationale` | `TEXT` | Short LLM justification (audit) |
+
+**Indexes:** `alias_adjudications_verdict_idx` on `(verdict)`.
+
+---
+
 ## Neo4j (Relational Memory)
 
 > Configurable via `ontology.yaml`. Label and relationship keys map directly to the `labels:` and `relationships:` sections.
