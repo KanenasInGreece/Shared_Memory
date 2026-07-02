@@ -100,7 +100,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.6.0"
+FRAMEWORK_VERSION = "0.6.1"
 API_VERSION = 1
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
@@ -2434,8 +2434,15 @@ class MemoryCoordinator:
         aggregates, no embeddings, no pairwise scan:
 
           entities_total   — distinct Entity nodes
-          orphan_entities  — mentioned by no non-superseded fact/decision (dead refs)
-          singleton_entities — mentioned by exactly one (fragmentation/noise proxy)
+          orphan_entities  — TRULY dangling: no relationship of ANY kind (degree 0).
+              NOT "no live-fact MENTIONS" — an entity reached only by typed edges
+              (UNDER_CONDITIONS / PRODUCES_INSIGHT / CONSIDERED / REJECTED / ALIASES)
+              from REM enrichment is legitimately connected, not an orphan. Counting
+              only MENTIONS overstated this ~500x on our graph (see below).
+          unmentioned_entities — has edges but no non-superseded fact/decision MENTIONS
+              (mostly REM-typed-edge targets). A coverage/fragmentation proxy, NOT
+              dead refs.
+          singleton_entities — mentioned by exactly one live fact (fragmentation proxy)
           alias_edges / alias_covered_entities — populate once ADR-017 ships alias
               edges; 0 until then (an honest gap, the metric to watch climb)
           top_hubs         — highest-degree entities, the consolidation backbone
@@ -2448,16 +2455,24 @@ class MemoryCoordinator:
                 f"MATCH (e:{ONT.entity}) "
                 f"OPTIONAL MATCH (n)-[:{ONT.entity_link}]->(e) "
                 f"  WHERE n.pg_id IS NOT NULL AND coalesce(n.superseded,false) = false "
-                f"WITH e, count(n) AS deg "
+                f"WITH e, count(n) AS mentions "
                 f"RETURN count(e) AS total, "
-                f"  sum(CASE WHEN deg = 0 THEN 1 ELSE 0 END) AS orphans, "
-                f"  sum(CASE WHEN deg = 1 THEN 1 ELSE 0 END) AS singletons"
+                f"  sum(CASE WHEN NOT (e)--() THEN 1 ELSE 0 END) AS orphans, "
+                f"  sum(CASE WHEN mentions = 0 AND (e)--() THEN 1 ELSE 0 END) AS unmentioned, "
+                f"  sum(CASE WHEN mentions = 1 THEN 1 ELSE 0 END) AS singletons"
             )).single()
             aliases = await (await session.run(
                 f"MATCH ()-[r:{self._ALIAS_REL}]-() RETURN count(DISTINCT r) AS edges"
             )).single()
             covered = await (await session.run(
                 f"MATCH (e:{ONT.entity})-[:{self._ALIAS_REL}]-() RETURN count(DISTINCT e) AS c"
+            )).single()
+            # Alias-component distribution (gds.wcc stamps Entity.alias_component;
+            # singletons get their own id, so a group is a component of size > 1).
+            comp = await (await session.run(
+                f"MATCH (e:{ONT.entity}) WHERE e.alias_component IS NOT NULL "
+                f"WITH e.alias_component AS c, count(*) AS sz WHERE sz > 1 "
+                f"RETURN count(*) AS groups, coalesce(max(sz), 0) AS largest"
             )).single()
             hubs = await (await session.run(
                 f"MATCH (e:{ONT.entity})<-[:{ONT.entity_link}]-(n) "
@@ -2468,9 +2483,12 @@ class MemoryCoordinator:
         return {
             "entities_total": deg["total"] or 0,
             "orphan_entities": deg["orphans"] or 0,
+            "unmentioned_entities": deg["unmentioned"] or 0,
             "singleton_entities": deg["singletons"] or 0,
             "alias_edges": aliases["edges"] or 0,
             "alias_covered_entities": covered["c"] or 0,
+            "alias_components": comp["groups"] or 0,
+            "largest_alias_component": comp["largest"] or 0,
             "top_hubs": [{"name": h["name"], "degree": h["degree"]} for h in hubs],
         }
 

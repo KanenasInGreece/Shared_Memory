@@ -28,6 +28,25 @@ BEGIN;
 -- ─── Extensions ────────────────────────────────────────────────────────────
 CREATE EXTENSION IF NOT EXISTS vector;
 
+-- ─── alias_adjudications ────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS alias_adjudications (
+    id               BIGSERIAL PRIMARY KEY,
+    name_a           TEXT NOT NULL,
+    name_b           TEXT NOT NULL,
+    verdict          TEXT NOT NULL,
+    method           TEXT NOT NULL,
+    confidence       REAL,
+    cosine           REAL,
+    lexical_jaccard  REAL,
+    shared_facts     INTEGER,
+    domain_disjoint  BOOLEAN,
+    rationale        TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS alias_adjudications_name_a_name_b_key ON public.alias_adjudications USING btree (name_a, name_b);
+CREATE INDEX IF NOT EXISTS alias_adjudications_verdict_idx ON public.alias_adjudications USING btree (verdict);
+
 -- ─── community_summaries ────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS community_summaries (
     id               SERIAL PRIMARY KEY,
@@ -69,6 +88,15 @@ CREATE TABLE IF NOT EXISTS consolidation_runs (
 CREATE INDEX IF NOT EXISTS consolidation_runs_inflight_idx ON public.consolidation_runs USING btree (started_at DESC) WHERE (finished_at IS NULL);
 CREATE INDEX IF NOT EXISTS consolidation_runs_type_started_idx ON public.consolidation_runs USING btree (cycle_type, started_at DESC);
 
+-- ─── entity_embeddings ──────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS entity_embeddings (
+    name             TEXT PRIMARY KEY,
+    embedding        vector(1024) NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS entity_embeddings_embedding_idx ON public.entity_embeddings USING hnsw (embedding vector_cosine_ops);
+
 -- ─── neo4j_outbox ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS neo4j_outbox (
     id               BIGSERIAL PRIMARY KEY,
@@ -94,13 +122,15 @@ CREATE TABLE IF NOT EXISTS technical_docs (
     agent_id         TEXT NOT NULL DEFAULT 'legacy'::text,
     scope            TEXT NOT NULL DEFAULT 'global'::text,
     visibility       TEXT NOT NULL DEFAULT 'global'::text,
-    superseded       BOOLEAN NOT NULL DEFAULT false
+    superseded       BOOLEAN NOT NULL DEFAULT false,
+    superseded_by    INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS technical_docs_agent_id_idx ON public.technical_docs USING btree (agent_id);
 CREATE UNIQUE INDEX IF NOT EXISTS technical_docs_content_hash_key ON public.technical_docs USING btree (content_hash);
 CREATE INDEX IF NOT EXISTS technical_docs_embedding_idx ON public.technical_docs USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS technical_docs_scope_idx ON public.technical_docs USING btree (scope);
+CREATE INDEX IF NOT EXISTS technical_docs_superseded_by_idx ON public.technical_docs USING btree (superseded_by) WHERE (superseded_by IS NOT NULL);
 CREATE INDEX IF NOT EXISTS technical_docs_visibility_idx ON public.technical_docs USING btree (visibility);
 
 COMMIT;

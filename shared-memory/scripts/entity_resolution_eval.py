@@ -175,11 +175,26 @@ def evaluate(thresholds: list[float]) -> dict:
     dom_map = fetch_domains(all_pg_ids)
     domains = [real_domains(n["pg_ids"] or [], dom_map) for n in nodes]
     names = [n["name"] for n in nodes]
+    # Fact-set per entity — the basis for the GRAPH shared-fact signal. On a
+    # sparse-fact graph this signal is absent for most candidates (an entity with
+    # 0 facts can share none), so the alias proposer must NOT lean on it as the
+    # primary weight. This density profile is what proves that on OUR data.
+    factsets = [set(n["pg_ids"] or []) for n in nodes]
+    nfacts = [len(s) for s in factsets]
+    density = {
+        "orphan":         sum(1 for k in nfacts if k == 0),   # 0 facts → no graph signal
+        "single_fact":    sum(1 for k in nfacts if k == 1),
+        "multi_fact":     sum(1 for k in nfacts if k >= 2),
+        "distinct_facts": len(set().union(*factsets)) if factsets else 0,
+    }
 
     vecs = embed(names)
     sim = vecs @ vecs.T
 
-    stats = {t: {"candidates": 0, "domain_conflicts": 0, "judgeable": 0} for t in thresholds}
+    # share_fact = candidate pairs that share >=1 fact (graph signal is present);
+    # its fraction of candidates is the realizability test for graph-Jaccard.
+    stats = {t: {"candidates": 0, "domain_conflicts": 0, "judgeable": 0, "share_fact": 0}
+             for t in thresholds}
     divergent: list[dict] = []
     overmerges: list[dict] = []
     divergence_count = 0
@@ -192,9 +207,12 @@ def evaluate(thresholds: list[float]) -> dict:
             judgeable = bool(di) and bool(dj)            # both have a real domain
             conflict = judgeable and di.isdisjoint(dj)   # ...and they share none
 
+            shares_fact = bool(factsets[i] and factsets[j] and (factsets[i] & factsets[j]))
             for t in thresholds:
                 if cos >= t:
                     stats[t]["candidates"] += 1
+                    if shares_fact:
+                        stats[t]["share_fact"] += 1
                     if judgeable:
                         stats[t]["judgeable"] += 1
                         if conflict:
@@ -218,11 +236,14 @@ def evaluate(thresholds: list[float]) -> dict:
     for t in thresholds:
         s = stats[t]
         ratio = (s["domain_conflicts"] / s["judgeable"] * 100) if s["judgeable"] else None
-        table.append({"threshold": t, **s, "conflict_ratio_pct": ratio})
+        share_pct = (s["share_fact"] / s["candidates"] * 100) if s["candidates"] else None
+        table.append({"threshold": t, **s, "conflict_ratio_pct": ratio,
+                      "share_fact_pct": share_pct})
 
     return {
         "entities_total": len(nodes),
         "entities_domain_judgeable": judgeable_entities,
+        "density": density,
         "thresholds": table,
         "divergence": {
             "cosine_floor": DIVERGENCE_COSINE, "jaccard_ceiling": DIVERGENCE_JACCARD,
@@ -241,14 +262,28 @@ def print_markdown(d: dict) -> None:
           f"(domain-judgeable: {d['entities_domain_judgeable']})")
     print(f"Conflict proxy: {d['conflict_proxy']}\n")
 
-    print("### 1. Cosine threshold → over-merge risk")
-    print("| Threshold | Candidate pairs | Domain-judgeable | Cross-domain (false-merge) | Conflict ratio |")
-    print("| :-- | --: | --: | --: | --: |")
+    den = d.get("density")
+    if den:
+        n = d["entities_total"] or 1
+        print("### 0. Fact-density (graph-signal realizability)")
+        print(f"- orphan (0 facts, no graph signal): **{den['orphan']}** ({100*den['orphan']/n:.1f}%)")
+        print(f"- exactly 1 fact: {den['single_fact']} ({100*den['single_fact']/n:.1f}%)  "
+              f"| >=2 facts: {den['multi_fact']} ({100*den['multi_fact']/n:.1f}%)")
+        print(f"- distinct facts referenced: {den['distinct_facts']}")
+        print("*A graph shared-fact (nodeSimilarity) signal is only available for candidate "
+              "pairs where BOTH entities touch facts; the `share_fact` column below is that "
+              "fraction — if low, graph-Jaccard cannot be the primary alias signal.*\n")
+
+    print("### 1. Cosine threshold → over-merge risk & graph-signal coverage")
+    print("| Threshold | Candidate pairs | Share ≥1 fact | Domain-judgeable | Cross-domain (false-merge) | Conflict ratio |")
+    print("| :-- | --: | --: | --: | --: | --: |")
     for r in d["thresholds"]:
         cr = "n/a" if r["conflict_ratio_pct"] is None else f"{r['conflict_ratio_pct']:.1f}%"
-        print(f"| **{r['threshold']:.2f}** | {r['candidates']} | {r['judgeable']} "
+        sf = "n/a" if r.get("share_fact_pct") is None else f"{r['share_fact']} ({r['share_fact_pct']:.0f}%)"
+        print(f"| **{r['threshold']:.2f}** | {r['candidates']} | {sf} | {r['judgeable']} "
               f"| {r['domain_conflicts']} | {cr} |")
     print("\n*Candidate pairs = entity pairs a raw-cosine merge at that threshold would link.*")
+    print("*Share ≥1 fact = candidates with a graph shared-fact signal present (low ⇒ graph is a sparse confirmer, not a primary weight).*")
     print("*Cross-domain = those pairs whose mentioning-fact domains are disjoint = likely over-merge.*\n")
 
     dv = d["divergence"]

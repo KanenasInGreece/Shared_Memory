@@ -767,6 +767,28 @@ async def handle_health(request: web.Request) -> web.Response:
     checks["version"]     = FRAMEWORK_VERSION
     checks["api_version"] = API_VERSION
 
+    # Effective NON-SECRET configuration the running gateway resolved from the
+    # environment — so the live LLM/tuning setup is inspectable via /health
+    # without reading .env on the host (and works for a single backend too, where
+    # llm_pool above is omitted). Secrets (AGENT_TOKENS, PG/NEO4J passwords) are
+    # NEVER echoed here.
+    checks["config"] = {
+        "llm_backends": [{"url": b, "weight": LLM_WEIGHTS.get(b, 1.0)}
+                         for b in LLM_BACKENDS],
+        "llm_pool_tuning": {
+            "fail_threshold": LLM_FAIL_THRESHOLD,
+            "fail_window_s": LLM_FAIL_WINDOW,
+            "cooldown_s": LLM_COOLDOWN,
+            "max_tries": LLM_MAX_TRIES,
+        },
+        "llm_affinity": {
+            "prefix_chars": AFFINITY_PREFIX_CHARS,
+            "ttl_s": AFFINITY_TTL,
+            "max_inflight": AFFINITY_MAX_INFLIGHT,
+        },
+        "embed_max_chars": int(os.environ.get("EMBED_MAX_CHARS", "24000")),
+    }
+
     # Embedder and reranker are the critical path — every save and search
     # depends on them.  LLM and daemon degradation is reported but does not
     # fail the health check so agents can still read/write memory.
