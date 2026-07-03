@@ -267,7 +267,11 @@ def adjudicate_batch(candidates: list[dict]) -> dict[int, dict]:
             continue
         obj = _parse_llm_json(line[s:e])
         if isinstance(obj, dict) and "idx" in obj and "verdict" in obj:
-            out[int(obj["idx"])] = obj
+            try:                                    # tolerate a salvaged idx like "4,"
+                idx = int(str(obj["idx"]).strip().rstrip(","))
+            except (ValueError, TypeError):
+                continue                            # unparseable idx → leave for next sweep
+            out[idx] = obj
     return out
 
 
