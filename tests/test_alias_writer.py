@@ -88,3 +88,13 @@ def test_adjudicate_batch_handles_llm_failure(monkeypatch):
         raise RuntimeError("timeout")
     monkeypatch.setattr(alias_writer.httpx, "post", boom)
     assert alias_writer.adjudicate_batch(_batch()) == {}
+
+
+def test_adjudicate_batch_tolerates_salvaged_idx(monkeypatch):
+    # A Gemma-4 slip salvaged to `"idx": 4,` must not crash the whole sweep.
+    monkeypatch.setattr(alias_writer.httpx, "post",
+                        lambda *a, **k: _FakeResp('{"idx": 0, "verdict": "alias"}\n'
+                                                  '{"idx": "1,", "verdict": "distinct"}'))
+    out = alias_writer.adjudicate_batch(_batch())
+    assert out[0]["verdict"] == "alias"
+    assert out[1]["verdict"] == "distinct"

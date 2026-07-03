@@ -7,6 +7,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`alias_writer`** — a salvaged LLM `idx` such as `"4,"` (a Gemma-4 JSON slip) no longer crashes the sweep;
+  the malformed entry is skipped and left for the next sweep.
+
+## [0.6.1] — 2026-07-02
+
 ### Added — entity-resolution alias writer (ADR-017 "A")
 
 The writer that populates the soft `ALIASES` synonym layer whose read/consume side shipped in 0.6.0 — it
