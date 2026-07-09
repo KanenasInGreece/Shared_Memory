@@ -53,6 +53,8 @@ The rest of this README explains *why* each piece exists. This chapter is the *o
 
 **What you are standing up:** a local GraphRAG memory shared by every AI tool on your machine — CLI agents and LM Studio alike. They talk only to one gateway on `127.0.0.1:8888`; the gateway owns Postgres (vectors + facts) and Neo4j (the graph), and runs the REM/NREM sleep cycle that turns saved facts into shared knowledge.
 
+> **Prefer to have an agent do this?** Open your coding agent (Claude Code, Codex CLI, Antigravity/Gemini, Grok, …) at the repo root and say: *"Read `AGENTS.md` and set up the framework."* Part 1 of [`AGENTS.md`](AGENTS.md) has the agent interview you for the required choices (data folders, model files, your reasoning-LLM address and port, which agents get tokens), then drive the same steps 1–9 below — writing your `.env` from the template, minting tokens, and verifying health. The same file carries the day-2 **start / stop / status / upgrade / backup** runbooks, so "stop the framework" or "upgrade the framework" also work as agent requests. The steps below remain the manual, self-explanatory path.
+
 ### Two surfaces: usage vs. operations
 
 The framework has two distinct surfaces with separate lifecycles. Conflating them is the most common setup mistake.
@@ -849,7 +851,7 @@ $shared-memory
 
 Codex CLI also supports **implicit invocation**: if the description in SKILL.md's frontmatter matches the task, the skill is loaded automatically without an explicit `$` call.
 
-> **AGENTS.md:** Codex CLI reads `AGENTS.md` at the project root before each session (their equivalent of `CLAUDE.md`). This repo provides `AGENTS.md` alongside `AGENT.md` — both contain the same architectural guidance.
+> **AGENTS.md:** Codex CLI reads `AGENTS.md` at the project root before each session (their equivalent of `CLAUDE.md`). In this repo `AGENTS.md` is the **canonical agent file** — it carries both the agent-driven setup/operations playbook (Part 1) and the developer context (Part 2); `AGENT.md` is a thin pointer to it for agents that look for that name.
 
 ### Antigravity CLI (and Gemini CLI)
 

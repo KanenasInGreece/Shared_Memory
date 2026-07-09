@@ -5,7 +5,8 @@ Usage:
     uv run --with psycopg2-binary python shared-memory/migrations/apply.py 001_multiagent_schema.sql
     uv run --with psycopg2-binary python shared-memory/migrations/apply.py  # runs all pending
 
-Reads PG_PASSWORD / PG_CONN from the environment (or .env at repo root).
+Reads PG_PASSWORD / PG_CONN from the environment (or shared-memory/.env, with
+the repo-root .env as pre-0.6 fallback — same order as the gateway).
 """
 
 import os
@@ -21,8 +22,11 @@ except ImportError:
 MIGRATIONS_DIR = Path(__file__).parent
 
 def _load_env() -> None:
-    env_path = MIGRATIONS_DIR.parent.parent / ".env"
-    if not env_path.exists():
+    # Framework env lives at shared-memory/.env; the repo-root path is the
+    # pre-0.6 fallback — same resolution order as the gateway (hive_mind_proxy).
+    candidates = [MIGRATIONS_DIR.parent / ".env", MIGRATIONS_DIR.parent.parent / ".env"]
+    env_path = next((p for p in candidates if p.exists()), None)
+    if env_path is None:
         return
     for line in env_path.read_text().splitlines():
         line = line.strip()

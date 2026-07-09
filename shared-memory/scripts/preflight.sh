@@ -14,7 +14,10 @@ set -uo pipefail   # not -e: we run every check and summarise, never abort early
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-ENV_FILE="$REPO_ROOT/.env"
+# Framework env lives at shared-memory/.env; the repo-root path is the pre-0.6
+# fallback — same resolution order as the gateway (hive_mind_proxy.py).
+ENV_FILE="$REPO_ROOT/shared-memory/.env"
+[[ -f "$ENV_FILE" ]] || ENV_FILE="$REPO_ROOT/.env"
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 grn()   { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -62,7 +65,7 @@ if [[ -f "$ENV_FILE" ]]; then
     [[ -n "$(read_env PG_PASSWORD)"    ]] && ok "PG_PASSWORD set"    || bad "PG_PASSWORD empty in .env"
     [[ -n "$(read_env NEO4J_PASSWORD)" ]] && ok "NEO4J_PASSWORD set" || bad "NEO4J_PASSWORD empty in .env"
 else
-    bad ".env not found — run: cp .env.example .env  (then set PG_PASSWORD + NEO4J_PASSWORD)"
+    bad ".env not found — run: bash shared-memory/scripts/install_framework.sh  (or copy shared-memory/.env.example → shared-memory/.env and fill it in)"
 fi
 
 # ── Soft requirements (warnings only) ─────────────────────────────────────────

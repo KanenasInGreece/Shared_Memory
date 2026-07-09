@@ -16,7 +16,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-ENV_FILE="$REPO_ROOT/.env"
+# Framework env lives at shared-memory/.env; the repo-root path is the pre-0.6
+# fallback — same resolution order as the gateway (hive_mind_proxy.py). Tokens
+# MUST land in the file the gateway actually reads, or auth stays silently off.
+ENV_FILE="$REPO_ROOT/shared-memory/.env"
+[[ -f "$ENV_FILE" ]] || ENV_FILE="$REPO_ROOT/.env"
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 grn() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -25,7 +29,7 @@ ylw() { printf '\033[33m%s\033[0m\n' "$*"; }
 force=0
 [[ "${1:-}" == "--force" ]] && force=1
 
-[[ -f "$ENV_FILE" ]] || { red "✗ .env not found at $ENV_FILE — run: cp .env.example .env"; exit 1; }
+[[ -f "$ENV_FILE" ]] || { red "✗ .env not found at $ENV_FILE — run: bash shared-memory/scripts/install_framework.sh"; exit 1; }
 
 # Guard: never silently overwrite a live token registry.
 if grep -qE '^[[:space:]]*AGENT_TOKENS=.+' "$ENV_FILE" && [[ "$force" -eq 0 ]]; then

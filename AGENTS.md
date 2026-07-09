@@ -1,26 +1,204 @@
 # AGENTS.md
 
-This file is the **Codex CLI project context file** (equivalent to `CLAUDE.md` for Claude Code). Codex CLI reads it automatically before each session. Other agents should refer to `AGENT.md`.
+**The canonical agent file for this repository.** Codex CLI reads it automatically before each session; Claude Code, Grok, Antigravity/Gemini CLI and others are pointed here by `AGENT.md`. It serves **two missions** — pick the one that matches what your user asked for:
 
-Guidance for AI coding agents (Claude Code, Codex CLI, Grok, Antigravity/Gemini CLI, LM Studio, and others) working in this repository.
+- **Operate the framework** — the user wants this repo *installed, configured, started, stopped, or upgraded* on their machine. Follow **Part 1**. You will interview the user, write their `.env`, bring up the stack, mint tokens, and verify health.
+- **Develop in this repository** — the user is changing the framework's code or docs. Follow **Part 2** (commands, architecture, invariants).
 
-## Skill invocation (Codex CLI)
+`README.md` remains the authoritative deep reference; every step below links the section with the full detail. Setup-affecting changes must keep README Quick Start, this file, and `CHANGELOG.md` in sync.
 
-This repo's shared memory skill is installed at `~/.codex/skills/shared-memory/`. Invoke it explicitly with `$shared-memory`, or let Codex pick it up implicitly — the SKILL.md description matches memory-related tasks automatically.
+---
 
-## What This Repository Is
+# Part 1 — Operate the framework
 
-The **Shared Memory Framework** — a three-tier semantic memory shared by every local AI tool through one gateway (Postgres + pgvector + Neo4j). All credentials are read from `.env`; no secrets are hardcoded. Current version **v0.6.0**: two-phase REM/NREM sleep cycle, per-agent token auth, summary supersession, domain-scoped consolidation, Tier-3 trace-back pointers, GPU-aware dreaming, REM decision-graph enrichment (alternatives/insights/conditions), **cross-project insight consolidation** (NREM folds linked decisions across ≥2 projects into elevated `kind='insight'` Tier-3 summaries, gated on retrospective existence), operational telemetry (`memory_bridge.py status`) with NREM consolidation-cycle counts + metadata breakdown, **consolidation observability** (`consolidation_runs` ledger, `/health.consolidation`, stall verdict, `inference_busy` tri-state), read-only agent roles, **fact supersession** (`save --supersedes <pg_id>`, retract, `stale_sources` lazy propagation), **person identity** via OS kernel (`SO_PEERCRED` — `principal`/`connected_from` stamped server-side), **cross-store backup & restore** (quiesced `ops/backup.sh`/`restore.sh`), and **entity alias layer** (`ALIASES` edges, `gds.wcc` alias-component grouping in NREM + search, `entity_graph` telemetry; Neo4j GDS plugin required; automated REM alias writer lands in v0.6.1).
+Everything in this part runs on the **gateway host** — the one machine that owns the databases and daemons. Installing the *skill* into an agent is a separate, much smaller step (Phase 8).
+
+## Ground rules for the operating agent
+
+1. **Secrets never enter the conversation or git.** Generate passwords yourself (`openssl rand -base64 24` or Python `secrets`) instead of asking the user to type them into chat. Write them only to the gitignored `shared-memory/.env` (`chmod 600`). Confirm with `git check-ignore shared-memory/.env` before moving on. Never commit `.env`, tokens, or anything under a user's home config.
+2. **Ask before destructive actions.** Token rotation (`bootstrap_tokens.sh --force`) invalidates every existing agent token; `ops/restore.sh` overwrites both databases; removing data dirs loses memory permanently. Get explicit confirmation each time.
+3. **Verify each phase before the next.** Every phase ends with a check command. Do not continue past a failing check — the Quick Start troubleshooting table (README) maps the first failures you'll hit.
+4. **The helper scripts are idempotent** — `preflight.sh`, `init_db.sh`, `bootstrap_tokens.sh`, `migrations/apply.py` are all safe to re-run. Prefer them over hand-rolled equivalents.
+5. **Never call the embedder (`:8070`) or reranker (`:8071`) directly** — all traffic goes through the gateway on `:8888`. Never copy daemon files into a skill directory.
+
+## First-time setup
+
+### Phase 0 — Interview the user
+
+Collect these answers before touching anything. Defaults in brackets are safe to offer.
+
+| # | Ask the user | Fills |
+|---|---|---|
+| 1 | Where should database data live on disk? [`~/databases/neo4j`, `~/databases/postgres`] | `NEO4J_HOST_DIR`, `PG_DATA_DIR` |
+| 2 | Use the **bundled embedder + reranker containers** (recommended; CPU-only, started by compose), or an existing endpoint? If bundled: which folder holds your GGUF model files? | `LLM_MODELS_DIR` |
+| 3 | Where is your **reasoning LLM** served? Any OpenAI-compatible endpoint works (LM Studio, llama.cpp server, etc.) [`http://localhost:5000`]. More than one backend? List them all. | default `:5000` route, or `LLM_BACKENDS` |
+| 4 | Which model family is it? Gemma → `DREAM_TEMPERATURE=0.6`; Mistral-3 Instruct / Qwen → `0.1`; Mistral-3 Reasoning → `1.0` | `DREAM_TEMPERATURE` |
+| 5 | Which **agents** will use the memory? (Claude Code / Codex CLI / Grok / Antigravity–Gemini / LM Studio / a read-only monitor) | token minting + Phase 8 targets |
+| 6 | DB passwords: shall I generate strong random ones? (recommended) | `NEO4J_PASSWORD`, `PG_PASSWORD` |
+| 7 | *(optional)* Tavily API key for LM Studio web search? Backups from day one? | `TAVILY_API_KEY`, §Backup runbook |
+
+For question 2, the compose file expects this layout under `LLM_MODELS_DIR` (edit the two `command:` paths in `postgres_neo4j_limits.yaml` if the user's files differ):
+
+```
+$LLM_MODELS_DIR/gpustack/bge-m3-GGUF/bge-m3-Q8_0.gguf
+$LLM_MODELS_DIR/gpustack/bge-reranker-v2-m3-GGUF/bge-reranker-v2-m3-Q8_0.gguf
+```
+
+Verify both files exist before Phase 4. If the user substitutes a different embedding model, the vector dimension must match the schema — see the embedding-consistency note in README Quick Start step 4.
+
+### Phase 1 — Write the framework `.env`
+
+`bash shared-memory/scripts/install_framework.sh` does this interactively for a human. As an agent, write the file directly instead: copy `shared-memory/.env.example` → `shared-memory/.env`, replace the values for `NEO4J_HOST_DIR`, `PG_DATA_DIR`, `LLM_MODELS_DIR`, `NEO4J_PASSWORD`, `PG_PASSWORD` (leave every other line as shipped — the commented defaults are correct), then:
+
+```bash
+chmod 600 shared-memory/.env
+git check-ignore shared-memory/.env          # MUST print the path
+mkdir -p "$NEO4J_HOST_DIR"/{data,logs,import,plugins} "$PG_DATA_DIR"
+```
+
+Uncomment/set `DREAM_TEMPERATURE` (Q4) and, for multiple LLM backends, `LLM_BACKENDS` (Q3). All framework and helper tooling reads `shared-memory/.env` first, with a repo-root `.env` honoured as a pre-0.6 fallback.
+
+### Phase 2 — Preflight
+
+```bash
+bash shared-memory/scripts/preflight.sh
+```
+
+Verifies Docker + compose v2, `uv`, and a populated `.env`; warns on low RAM/disk (lean minimum: 16 GB RAM, ~8 GB VRAM, ~30 GB disk). Resolve every ✗ before continuing.
+
+### Phase 3 — OS limits (Linux)
+
+Raise inotify limits per README §4 (needs sudo — give the user the commands to run if you cannot). On Fedora/RHEL with SELinux, keep the `:z` suffixes on the compose volume mounts.
+
+### Phase 4 — Databases + inference containers
+
+```bash
+docker compose -f postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d
+docker compose -f postgres_neo4j_limits.yaml --env-file shared-memory/.env ps   # all four healthy
+```
+
+Postgres (`:5432`), Neo4j (`:7474/:7687`), embedder (`:8070`), reranker (`:8071`). An `unhealthy` inference container is almost always a wrong model path (Phase 0 Q2).
+
+### Phase 5 — Initialise both schemas
+
+```bash
+bash shared-memory/scripts/init_db.sh
+```
+
+Applies `schema_init.sql` (Postgres) and `neo4j_init.cypher` (Neo4j constraints) *inside* the containers — no host `psql`/`cypher-shell` needed. Idempotent.
+
+### Phase 6 — Mint agent tokens
+
+```bash
+bash shared-memory/scripts/bootstrap_tokens.sh
+```
+
+Appends `AGENT_TOKENS` (and a read-only `AGENT_ROLES` line for `monitor`) to the framework `.env`, and prints one `AGENT_TOKEN` per agent. Save the per-agent lines — Phase 8 distributes them. One distinct token per agent, never shared. The script refuses to overwrite an existing registry; `--force` rotates **all** tokens (destructive — rule 2).
+
+### Phase 7 — Start the gateway and verify
+
+Smoke-test in the foreground first:
+
+```bash
+uv run --with aiohttp --with asyncpg --with neo4j --with httpx --with json-repair \
+  python shared-memory/scripts/hive_mind_proxy.py 8888
+curl -s http://localhost:8888/health
+```
+
+Expect `"status":"ok"`, `"auth_required":true`, `"embedder":"ok"`, `"daemon":"running"`, `"rem_daemon":"running"`. (`"llm":"down"` only blocks dreaming, not saves/search — check the reasoning LLM from Q3.)
+
+Then make it survive logout/reboot with the shipped `systemd --user` unit — a terminal-launched gateway dies with its session:
+
+```bash
+cp shared-memory/ops/hive-mind-gateway.service ~/.config/systemd/user/
+# edit WorkingDirectory in the unit to this repo's absolute path
+loginctl enable-linger "$USER"
+systemctl --user daemon-reload
+systemctl --user enable --now hive-mind-gateway.service
+curl -s http://localhost:8888/health
+```
+
+### Phase 8 — Install the skill into each agent
+
+For every agent from Q5, follow README §10 (§10a for remote/laptop clients): create the agent's skill dir, symlink/copy `memory_bridge.py` + `SKILL.md`, and write that agent's own `AGENT_TOKEN` into the skill `.env` (template: `shared-memory-skill/shared-memory/.env.example`). LM Studio instead registers `vector-skill.py` through `mcp.json` (fill the `YOUR_*` placeholders) and needs a full restart after token changes.
+
+Final end-to-end check, as an agent (uses the skill path, exercises auth + embedding + storage):
+
+```bash
+uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py doctor
+uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py save "install smoke test" '{"source":"<agent>","entities":["SetupTest"]}'
+uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py search "install smoke test" 3
+```
+
+## Runbooks
+
+### Start (e.g. after reboot)
+
+The compose services carry `restart: always` and the systemd unit auto-starts under linger, so a healthy install largely self-starts. Verify, and repair only what's down:
+
+```bash
+docker compose -f postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d   # no-op if running
+systemctl --user start hive-mind-gateway.service                                   # or restart
+curl -s http://localhost:8888/health                                               # status: ok
+```
+
+The reasoning LLM (Q3) is managed by the user's own server (LM Studio etc.) — confirm it's serving before expecting dreaming to run. If a model lives on a partition that isn't mounted at boot, mount it **before** starting containers that bind-mount it (a missing bind source gets created as an empty root-owned dir, which can divert the mount).
+
+### Stop (reclaim resources / maintenance)
+
+```bash
+systemctl --user stop hive-mind-gateway.service        # gateway + REM/NREM daemons
+docker compose -f postgres_neo4j_limits.yaml --env-file shared-memory/.env stop   # DBs + inference
+```
+
+Stopping only the inference containers (`docker stop llama-retriever llama-reranker`) degrades saves/search (embedding mandate → 503) — stop the gateway too, or don't stop the embedder. Facts already saved are never lost by a stop; dreaming resumes where it left off.
+
+### Status / health
+
+```bash
+curl -s http://localhost:8888/health          # gateway, daemons, backends, consolidation liveness
+docker compose -f postgres_neo4j_limits.yaml --env-file shared-memory/.env ps
+systemctl --user status hive-mind-gateway.service
+journalctl --user -u hive-mind-gateway.service -n 50   # daemon logs
+uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py status   # telemetry
+```
+
+`status: degraded` on `/health` names the down backend. `consolidation.stalled: true` means the dream cycle hasn't completed within its threshold — check the reasoning LLM first.
+
+### Upgrade (gateway host)
+
+```bash
+git pull
+uv run --with psycopg2-binary python shared-memory/migrations/apply.py   # BEFORE restart
+systemctl --user restart hive-mind-gateway.service
+curl -s http://localhost:8888/health                                     # api_version, status ok
+bash shared-memory/scripts/sync_skills.sh                                # refresh installed skills
+```
+
+Clients and gateway may drift; `memory_bridge.py doctor` names which side to upgrade on `api_version` skew.
+
+### Backup / restore
+
+Day-2 duty: schedule `shared-memory/ops/backup.sh` (quiesced; captures Postgres **and** Neo4j together) via the shipped systemd timer. It needs an admin-role token (`AGENT_ROLES=…,backup:admin` — confined to `/admin/*`, cannot read or write memory). Rebuild = Phases 4–5 to bring the stores up empty, then `ops/restore.sh`. Full detail: README §20 and `shared-memory/ops/README.md`.
+
+---
+
+# Part 2 — Develop in this repository
+
+## What this is
+
+The **Shared Memory Framework** — a three-tier semantic memory shared by every local AI tool through one gateway (Postgres + pgvector + Neo4j). All credentials come from `.env`; nothing is hardcoded. Current version: see `CHANGELOG.md` (v0.6.x line: REM/NREM sleep cycle, per-agent token auth, fact + summary supersession, domain-scoped and cross-project insight consolidation, consolidation observability, read-only roles, person identity via `SO_PEERCRED`, quiesced cross-store backup/restore, entity alias layer with automated REM alias writer, gateway-owned LLM backend pool).
 
 ## Commands
 
 ```bash
 # Run all tests from repo root (fully mocked — no live infra; MOCK_LLM=1 bypasses LLM)
 uv run --with pytest --with pytest-asyncio --with fastmcp --with psycopg2-binary \
-  --with httpx --with neo4j --with asyncpg --with aiohttp pytest tests/ -v
+  --with httpx --with neo4j --with asyncpg --with aiohttp --with json-repair --with numpy \
+  pytest tests/ -v
 
 # Start the gateway — also launches coordinator + REM + NREM daemons; loads .env automatically
-uv run --with aiohttp --with asyncpg --with neo4j --with httpx --with psycopg2-binary \
+uv run --with aiohttp --with asyncpg --with neo4j --with httpx --with json-repair \
   python shared-memory/scripts/hive_mind_proxy.py 8888
 
 # Apply schema migrations (idempotent; run after clone or when migrations/ gains files)
@@ -28,11 +206,11 @@ uv run --with psycopg2-binary python shared-memory/migrations/apply.py
 
 # CLI memory bridge (thin HTTP client; gateway must be running)
 uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py search "<query>" 5
-uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py save "<content>" '{"source":"codex-cli","entities":["Entity1"],"project":"<domain>"}'
+uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py save "<content>" '{"source":"<agent>","entities":["Entity1"],"project":"<domain>"}'
 uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py save_decision --title "..." --decided-by "..." --project "..." --rationale "..."
 uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py save_retrospective --pg-id N --rating high --notes "..."
 uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py graph "MATCH (n:Entity) RETURN n LIMIT 10"
-uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py doctor   # check client↔gateway api_version compatibility
+uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py doctor   # client↔gateway api_version check
 ```
 
 The skill is a **thin client** — only `memory_bridge.py` ships with it. After a client or SKILL.md change, run `bash shared-memory/scripts/sync_skills.sh` (add `--prune` to clear daemons older installs left in skill dirs). The daemons are **server-side**: changes to them or to `migrations/` deploy on the gateway host via `git pull` + `migrations/apply.py` + restart — never via a skill sync. See `shared-memory/Documentation/server-setup.md`.
@@ -69,14 +247,14 @@ Retrieval queries **Tier 3 first**, then Tier 1 (vector + rerank), then Neo4j ex
 
 Async aiohttp on `:8888`; **all routes require `Authorization: Bearer <token>` when `AGENT_TOKENS` is set**.
 - `/memory/save|search|graph`, `/memory/decision`, `/memory/retrospective`, `GET /memory/status/{pg_id}` → `coordinator.py`
-- `/v1/embeddings` → BGE-M3 `:8070` · `/v1/reranking` → reranker `:8071` · everything else → reasoning LLM `:5000`
+- `/v1/embeddings` → BGE-M3 `:8070` · `/v1/reranking` → reranker `:8071` · everything else → the reasoning-LLM backend pool (default single backend `:5000`; `LLM_BACKENDS` for more)
 
 Startup launches the coordinator (asyncpg pool, per-entity locks, outbox worker) plus the REM and NREM daemons; the gateway auto-restarts both on crash (circuit breaker after 5 crashes / 10 min — restart the gateway to reset). `GET /health` reports backend + daemon liveness, `auth_required`, and the gateway `version` / `api_version`.
 
 ### Sleep cycle — REM (`rem_loop.py`) + NREM (`consolidation_loop.py`)
 
-- **REM** polls every 120 s, enriches the oldest un-enriched `Fact`s (LLM summary + typed entity relationships), sets `rem_processed=true`, and notifies NREM. A fact must pass REM before NREM can consolidate it.
-- **NREM** waits on `LISTEN/NOTIFY` with a 15-min idle timer (45-min hard backstop). It consolidates Entity-hub clusters of ≥5 `rem_processed` facts, **partitioned per `(entity, domain)`** where `domain = COALESCE(metadata->>'project', metadata->>'domain', scope, 'general')`. Since v0.6.0, entities in the same `alias_component` (connected via `ALIASES` edges, grouped by `gds.wcc`) fold as one cluster — synonym variants no longer fall below the threshold independently. It writes cumulative `community_summaries` and supersedes any summary whose `source_pg_ids` is a strict subset.
+- **REM** polls adaptively, enriches the oldest un-enriched `Fact`s (LLM summary + typed entity relationships), sets `rem_processed=true`, and notifies NREM. A fact must pass REM before NREM can consolidate it.
+- **NREM** waits on `LISTEN/NOTIFY` with a 15-min idle timer (45-min hard backstop). It consolidates Entity-hub clusters of ≥5 `rem_processed` facts, **partitioned per `(entity, domain)`** where `domain = COALESCE(metadata->>'project', metadata->>'domain', scope, 'general')`. Entities in the same `alias_component` (connected via `ALIASES` edges, grouped by `gds.wcc`) fold as one cluster — synonym variants no longer fall below the threshold independently. It writes cumulative `community_summaries` and supersedes any summary whose `source_pg_ids` is a strict subset.
 - Both phases yield to active writes (`WRITE_QUIESCE_SEC`, default 30 s) **and** to a busy inference GPU (via `nvtop --snapshot`, cross-vendor; nvtop is a prerequisite but fails open). Deferrals log at **WARNING**; NREM's hard backstop is never blocked.
 
 **Facts saved without `metadata.entities` are stored and searchable but never consolidated.** Tag `project`/`domain` so consolidation stays domain-coherent.
@@ -93,11 +271,11 @@ Startup launches the coordinator (asyncpg pool, per-entity locks, outbox worker)
 
 ## Configuration
 
-**Framework env (gateway host):** run `bash shared-memory/scripts/install_framework.sh` — it writes `shared-memory/.env` with DB passwords and host data-dir paths (used by docker-compose). Or copy `shared-memory/.env.example` → `shared-memory/.env` and fill values by hand. The gateway also reads the root `.env` as a backward-compat fallback. **Client env:** each agent stores only `AGENT_TOKEN` in `~/<agent>/skills/shared-memory/.env` (see `shared-memory-skill/shared-memory/.env.example`). For `mcp.json`, replace all `YOUR_*` placeholders and the absolute path to `vector-skill.py`. Optional: install `nvtop` on the **infrastructure host** (where REM/NREM run) for GPU-aware dreaming — not on remote clients. **Neo4j GDS plugin** (free Community tier, `graph-data-science`) is required for alias-component grouping.
+**Framework env (gateway host):** `shared-memory/.env`, written in Part 1 Phase 1 (or by `install_framework.sh`); the repo-root `.env` is honoured as a pre-0.6 fallback by the gateway **and** by `preflight.sh` / `init_db.sh` / `bootstrap_tokens.sh` / `migrations/apply.py`. **Client env:** each agent stores only `AGENT_TOKEN` in `~/<agent>/skills/shared-memory/.env` (see `shared-memory-skill/shared-memory/.env.example`). For `mcp.json`, replace all `YOUR_*` placeholders and the absolute path to `vector-skill.py`. Optional: install `nvtop` on the **infrastructure host** (where REM/NREM run) for GPU-aware dreaming — not on remote clients. **Neo4j GDS plugin** (free Community tier, `graph-data-science`) is required for alias-component grouping.
 
 ## Documentation
 
-`README.md` — primary reference (architecture, Quick Start, save path, sleep cycle, retrieval chain). `CHANGELOG.md` — version history. `shared-memory/Documentation/schema.md` — full Postgres + Neo4j schema.
+`README.md` — primary reference (architecture, Quick Start, save path, sleep cycle, retrieval chain). `CHANGELOG.md` — version history. `shared-memory/Documentation/schema.md` — full Postgres + Neo4j schema. `shared-memory/Documentation/server-setup.md` — operations runbook detail.
 
 ## Licensing
 
