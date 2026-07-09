@@ -7,7 +7,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-07-09
+
 ### Added
+
+- **`visibility` is now enforced on the read path** — the `visibility` column (`global | scope | private`) was
+  stamped on save since 0.1 but never consulted at retrieval, so a `private` or `scope` row was returned to any
+  caller. `handle_search` now composes a read-authorization predicate (`_visibility_filter`) into **every** read —
+  Tier-1 vector search, the keyword fallback, and the Tier-3 insight/summary reads — gated by the server-verified
+  `authenticated_agent`. A row is visible when `visibility='global'` (all callers), `'private'` and owned by the
+  viewer's `agent_id`, or `'scope'` and the viewer asserts the matching `scope`; an anonymous caller (no verified
+  identity) sees `'global'` only (fail closed). Tier-3 is gated too, so a private fact filtered from Tier-1 cannot
+  leak through its community summary. **No migration and no client change:** the columns/indexes already exist
+  (migration 001) and every existing row defaults to `'global'`, so nothing currently stored is hidden — behavior
+  changes only for rows an operator explicitly marks. Wire contract unchanged (`api_version` stays 1); result
+  *semantics* narrow. This is the gap between "one shared global brain" and per-agent/per-project private memory
+  on a shared host. 8 new tests in `tests/test_visibility.py`.
+
+### Added — prior (rolled up from Unreleased)
 
 - **Agent-operable quickstart (`AGENTS.md` Part 1)** — `AGENTS.md` is now the **canonical agent file**, carrying an
   interview-driven setup playbook a coding agent can execute for a new user: collect data dirs, model files,
