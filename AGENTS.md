@@ -1,6 +1,6 @@
 # AGENTS.md
 
-**The canonical agent file for this repository.** Codex CLI reads it automatically before each session; Claude Code, Grok, Antigravity/Gemini CLI and others are pointed here by `AGENT.md`. It serves **two missions** — pick the one that matches what your user asked for:
+**The canonical agent file for this repository.** Codex CLI reads it automatically before each session; Claude Code, Grok, Antigravity CLI and others are pointed here by `AGENT.md`. It serves **two missions** — pick the one that matches what your user asked for:
 
 - **Operate the framework** — the user wants this repo *installed, configured, started, stopped, or upgraded* on their machine. Follow **Part 1**. You will interview the user, write their `.env`, bring up the stack, mint tokens, and verify health.
 - **Develop in this repository** — the user is changing the framework's code or docs. Follow **Part 2** (commands, architecture, invariants).
@@ -33,7 +33,7 @@ Collect these answers before touching anything. Defaults in brackets are safe to
 | 2 | Use the **bundled embedder + reranker containers** (recommended; CPU-only, started by compose), or an existing endpoint? If bundled: which folder holds your GGUF model files? | `LLM_MODELS_DIR` |
 | 3 | Where is your **reasoning LLM** served? Any OpenAI-compatible endpoint works (LM Studio, llama.cpp server, etc.) [`http://localhost:5000`]. More than one backend? List them all. | default `:5000` route, or `LLM_BACKENDS` |
 | 4 | Which model family is it? Gemma → `DREAM_TEMPERATURE=0.6`; Mistral-3 Instruct / Qwen → `0.1`; Mistral-3 Reasoning → `1.0` | `DREAM_TEMPERATURE` |
-| 5 | Which **agents** will use the memory? (Claude Code / Codex CLI / Grok / Antigravity–Gemini / LM Studio / a read-only monitor) | token minting + Phase 8 targets |
+| 5 | Which **agents** will use the memory? (Claude Code / Codex CLI / Grok / Antigravity CLI / LM Studio / a read-only monitor) | token minting + Phase 8 targets |
 | 6 | DB passwords: shall I generate strong random ones? (recommended) | `NEO4J_PASSWORD`, `PG_PASSWORD` |
 | 7 | *(optional)* Tavily API key for LM Studio web search? Backups from day one? | `TAVILY_API_KEY`, §Backup runbook |
 
@@ -120,7 +120,7 @@ curl -s http://localhost:8888/health
 
 ### Phase 8 — Install the skill into each agent
 
-For every agent from Q5, follow README §10 (§10a for remote/laptop clients): create the agent's skill dir, symlink/copy `memory_bridge.py` + `SKILL.md`, and write that agent's own `AGENT_TOKEN` into the skill `.env` (template: `shared-memory-skill/shared-memory/.env.example`). LM Studio instead registers `vector-skill.py` through `mcp.json` (fill the `YOUR_*` placeholders) and needs a full restart after token changes.
+For every agent from Q5, follow README §10 (§10a for remote/laptop clients): create the agent's skill dir (Antigravity CLI uses the legacy `~/.gemini/skills/` path), symlink/copy `memory_bridge.py` + `SKILL.md`, and write that agent's own `AGENT_TOKEN` into the skill `.env` (template: `shared-memory-skill/shared-memory/.env.example`). LM Studio instead registers `vector-skill.py` through `mcp.json` (fill the `YOUR_*` placeholders) and needs a full restart after token changes.
 
 Final end-to-end check, as an agent (uses the skill path, exercises auth + embedding + storage):
 
@@ -224,7 +224,7 @@ The skill is a **thin client** — only `memory_bridge.py` ships with it. After 
 | Claude Code | CLI skill (`/shared-memory`) | `~/.claude/skills/shared-memory/scripts/memory_bridge.py` |
 | Codex CLI | CLI skill (`$shared-memory`) | `~/.codex/skills/shared-memory/scripts/memory_bridge.py` |
 | Grok | CLI skill (`/shared-memory`) | `~/.grok/skills/shared-memory/scripts/memory_bridge.py` |
-| Antigravity / Gemini CLI | CLI skill (`/activate shared-memory`) | `~/.gemini/skills/shared-memory/scripts/memory_bridge.py` |
+| Antigravity CLI (successor to Gemini CLI) | CLI skill (`/activate shared-memory`) | `~/.gemini/skills/shared-memory/scripts/memory_bridge.py` |
 | LM Studio | MCP (FastMCP) | `vector-skill.py` → `rag-orchestrator` in `mcp.json` |
 
 `vector-skill.py` (MCP) is for LM Studio only; CLI agents use `memory_bridge.py`, a thin HTTP client that delegates all storage to the coordinator (needs only `httpx` + `python-dotenv`).

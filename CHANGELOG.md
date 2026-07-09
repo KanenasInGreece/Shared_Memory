@@ -17,6 +17,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   operator ground rules (secrets hygiene, destructive-action confirmation). `AGENT.md` becomes a thin pointer —
   the two files previously carried duplicate guidance that drifted. README Quick Start links the agent-driven path.
 
+### Changed
+
+- **Gemini CLI retired from the agent roster** — Antigravity CLI (`agy`) fully replaced it; Gemini CLI is no
+  longer available as a CLI agent. All live docs (README, AGENTS.md, both SKILL.md copies, system-prompt.md)
+  now list Antigravity CLI only; the `~/.gemini/skills/` install path keeps its legacy name, so existing
+  installs and the `gemini` token identity continue to work unchanged.
+
 ### Fixed
 
 - **Helper scripts read the wrong `.env` on fresh installs** — `preflight.sh`, `init_db.sh`, `bootstrap_tokens.sh`,

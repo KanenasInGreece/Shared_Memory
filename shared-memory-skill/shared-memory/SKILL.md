@@ -16,7 +16,6 @@ This skill bridges the Shared Memory Framework — a three-tier semantic and rel
 | Grok | `/shared-memory` | `~/.grok/skills/shared-memory/` |
 | Codex CLI | `$shared-memory` | `~/.codex/skills/shared-memory/` |
 | Antigravity CLI (`agy`) | `/activate shared-memory` | `~/.gemini/skills/shared-memory/` |
-| Gemini CLI *(legacy)* | `/activate shared-memory` | `~/.gemini/skills/shared-memory/` |
 | LM Studio | MCP `rag-orchestrator` | `vector-skill.py` via `mcp.json` |
 
 > **This skill is the usage surface — a thin client.** It runs one script,
@@ -28,7 +27,7 @@ This skill bridges the Shared Memory Framework — a three-tier semantic and rel
 
 ---
 
-> **AI instruction — use absolute paths for every CLI command.** Skill runners execute commands from the user's project directory, not the skill directory, so a bare `scripts/memory_bridge.py` fails with "No such file or directory." Commands below use the Gemini CLI path as the canonical example — **substitute `~/.gemini` with the correct prefix for this agent:**
+> **AI instruction — use absolute paths for every CLI command.** Skill runners execute commands from the user's project directory, not the skill directory, so a bare `scripts/memory_bridge.py` fails with "No such file or directory." Commands below use the Antigravity CLI path (`~/.gemini` — the legacy directory name it inherited from Gemini CLI) as the canonical example — **substitute `~/.gemini` with the correct prefix for this agent:**
 >
 > | Agent | Replace `~/.gemini` with |
 > |---|---|
@@ -158,7 +157,7 @@ uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/s
 
 After a decision has been acted on, close the Why-To loop with `save_retrospective`. Each call appends a new dated `HAD_OUTCOME` edge on the Decision node — multiple retrospectives per decision are allowed.
 
-**CLI (Claude Code, Gemini CLI, Codex CLI):**
+**CLI (Claude Code, Antigravity CLI, Codex CLI):**
 ```
 uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py save_retrospective \
   --pg-id 42 \
@@ -218,7 +217,7 @@ Note the `pg_id` — you'll attach a retrospective to it.
 
 ### C. Search from a different agent
 
-From Gemini CLI (or any other agent), with no prior context about this decision:
+From Antigravity CLI (or any other agent), with no prior context about this decision:
 
 ```bash
 uv run --with httpx \
@@ -285,7 +284,7 @@ uv run --with httpx \
   --pg-id 43 \
   --rating "high" \
   --notes "No deadlocks observed across 30-day multi-agent test. 6-agent concurrent writes at 50 req/s — zero lock contention errors. Sorted acquisition order held." \
-  --source "gemini_cli"
+  --source "antigravity"
 # → {"status":"success","target_pg_id":43}
 ```
 
