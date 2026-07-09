@@ -19,7 +19,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 MIGRATIONS_DIR="$SCRIPT_DIR/../migrations"
-ENV_FILE="$REPO_ROOT/.env"
+# Framework env lives at shared-memory/.env; the repo-root path is the pre-0.6
+# fallback — same resolution order as the gateway (hive_mind_proxy.py).
+ENV_FILE="$REPO_ROOT/shared-memory/.env"
+[[ -f "$ENV_FILE" ]] || ENV_FILE="$REPO_ROOT/.env"
 
 PG_CONTAINER="${PG_CONTAINER:-postgres-vector}"
 NEO4J_CONTAINER="${NEO4J_CONTAINER:-neo4j-memory}"

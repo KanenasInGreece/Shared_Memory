@@ -7,8 +7,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Agent-operable quickstart (`AGENTS.md` Part 1)** — `AGENTS.md` is now the **canonical agent file**, carrying an
+  interview-driven setup playbook a coding agent can execute for a new user: collect data dirs, model files,
+  reasoning-LLM endpoint(s) and agent list; write `shared-memory/.env` from the template (agent-generated passwords,
+  never typed into chat); then preflight → compose → `init_db.sh` → `bootstrap_tokens.sh` → gateway → skill install,
+  each phase gated on a verification command. Also ships day-2 runbooks (start/stop/status/upgrade/backup) and
+  operator ground rules (secrets hygiene, destructive-action confirmation). `AGENT.md` becomes a thin pointer —
+  the two files previously carried duplicate guidance that drifted. README Quick Start links the agent-driven path.
+
+### Changed
+
+- **Gemini CLI retired from the agent roster** — Antigravity CLI (`agy`) fully replaced it; Gemini CLI is no
+  longer available as a CLI agent. All live docs (README, AGENTS.md, both SKILL.md copies, system-prompt.md)
+  now list Antigravity CLI only; the `~/.gemini/skills/` install path keeps its legacy name, so existing
+  installs and the `gemini` token identity continue to work unchanged.
+
 ### Fixed
 
+- **Helper scripts read the wrong `.env` on fresh installs** — `preflight.sh`, `init_db.sh`, `bootstrap_tokens.sh`,
+  and `migrations/apply.py` looked only at the repo-root `.env`, while `install_framework.sh` writes (and the gateway
+  prefers) `shared-memory/.env`. Worst case: `bootstrap_tokens.sh` appended `AGENT_TOKENS` to a root `.env` the
+  gateway never reads — leaving auth **silently disabled**. All four now resolve `shared-memory/.env` first with the
+  repo-root path as the pre-0.6 fallback, matching `hive_mind_proxy.py`.
 - **`alias_writer`** — a salvaged LLM `idx` such as `"4,"` (a Gemma-4 JSON slip) no longer crashes the sweep;
   the malformed entry is skipped and left for the next sweep.
 

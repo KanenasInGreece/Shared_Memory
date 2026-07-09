@@ -8,7 +8,7 @@ A unified semantic and relational memory layer built from first principles to su
 ![Claude Code](https://img.shields.io/badge/Claude_Code-Skill-blue)
 ![Codex CLI](https://img.shields.io/badge/Codex_CLI-Skill-blue)
 ![Grok](https://img.shields.io/badge/Grok-Skill-blue)
-![Gemini CLI](https://img.shields.io/badge/Gemini_CLI-Skill-blue)
+![Antigravity CLI](https://img.shields.io/badge/Antigravity_CLI-Skill-blue)
 ![LM Studio](https://img.shields.io/badge/LM_Studio-MCP-blue)
 ![Neo4j](https://img.shields.io/badge/Neo4j-Graph-green)
 ![Postgres](https://img.shields.io/badge/Postgres%2Bpgvector-Vector-green)
@@ -52,6 +52,8 @@ A unified semantic and relational memory layer built from first principles to su
 The rest of this README explains *why* each piece exists. This chapter is the *order to do things in* — a complete first-time setup that points to the chapter with the detail for each step, so nothing is repeated. Do the steps in sequence.
 
 **What you are standing up:** a local GraphRAG memory shared by every AI tool on your machine — CLI agents and LM Studio alike. They talk only to one gateway on `127.0.0.1:8888`; the gateway owns Postgres (vectors + facts) and Neo4j (the graph), and runs the REM/NREM sleep cycle that turns saved facts into shared knowledge.
+
+> **Prefer to have an agent do this?** Open your coding agent (Claude Code, Codex CLI, Antigravity CLI, Grok, …) at the repo root and say: *"Read `AGENTS.md` and set up the framework."* Part 1 of [`AGENTS.md`](AGENTS.md) has the agent interview you for the required choices (data folders, model files, your reasoning-LLM address and port, which agents get tokens), then drive the same steps 1–9 below — writing your `.env` from the template, minting tokens, and verifying health. The same file carries the day-2 **start / stop / status / upgrade / backup** runbooks, so "stop the framework" or "upgrade the framework" also work as agent requests. The steps below remain the manual, self-explanatory path.
 
 ### Two surfaces: usage vs. operations
 
@@ -126,7 +128,7 @@ Each is idempotent and safe to re-run; each step links the manual equivalent.
 
 An AI workstation today may be running several tools in parallel — a coding agent, a desktop chat model, a local assistant (agent). Each of them reasons through a problem, discovers something useful, but then the session ends, and all of that is gone. It is not the artifact produced, it is the knowledge gained, the decision process, which we are capturing with this shared memory framework -- The important lessons learned should inform the work you do with other tools, it should be captured as part of the value created and shared so that your whole ecosystem may benefit.
 
-The shared memory framework is built around this idea: your tools should capture and share the knowledge gained from each project they work on. When Gemini CLI figures out why the proxy was failing, any other agent should already know the next time it is asked about the proxy. When LM Studio runs a consolidation on a set of architectural facts, those summaries should be there for any agent that searches next.
+The shared memory framework is built around this idea: your tools should capture and share the knowledge gained from each project they work on. When Antigravity CLI figures out why the proxy was failing, any other agent should already know the next time it is asked about the proxy. When LM Studio runs a consolidation on a set of architectural facts, those summaries should be there for any agent that searches next.
 
 **The consumers, and how they connect:**
 
@@ -136,7 +138,7 @@ The shared memory framework is built around this idea: your tools should capture
 
 - **Grok** — uses `memory_bridge.py` packaged as a Grok skill (`/shared-memory`). Install the skill directory under `~/.grok/skills/`.
 
-- **Gemini CLI** — uses `memory_bridge.py` packaged as a Gemini skill (`/activate shared-memory`). Install the skill directory under `~/.gemini/skills/`.
+- **Antigravity CLI** (`agy`) — uses `memory_bridge.py` packaged as a skill (`/activate shared-memory`). Install the skill directory under `~/.gemini/skills/` (the legacy path inherited from Gemini CLI, which Antigravity replaced).
 
 - **LM Studio** — uses an MCP server (`vector-skill.py`), registered in `mcp.json`. The model calls `save_artifact` and `hybrid_search_and_rerank` as tools against the same backend.
 
@@ -150,7 +152,7 @@ Vishakha Gupta's *AI Memory & Cognition: The Architect's Playbook* (ApertureData
 
 **The Retrieval Test:** *Can the agent explain why it retrieved a specific memory? Not just what was retrieved, but which specific context, session, and principal metadata informed the decision.*
 
-> **Grade: Passes (v0.6.0).** Search results carry `tier` (fact | community_summary | insight_summary), `score_normalized` (sigmoid of the raw reranker logit → [0, 1]), `matched_entities` (intersection of the query string against the saved entity list), and `graph_context` as a structured list of `{rel_type, name, label}` triples — **each entry now carries an `aliases` list** of synonymous entity names in the same alias component (v0.6.0). Agent source attribution is server-verified via token authentication — `"source": "gemini"` is a server guarantee, not a client claim. An agent can reason: *"I returned a Tier-3 community synthesis — normalized score 0.91, matching entity OutboxPattern — alongside two Tier-1 precision hits, both saved by the verified Gemini CLI identity."* Since **v0.4.12**, retrieval events are also auditable: the opt-in gateway per-request audit log (`GATEWAY_AUDIT_LOG_PATH`, §14) records one off-event-loop line per authenticated request — agent, route, status, latency, timestamp, `request_id` — covering every `/memory/search`. **Gaps remaining:** that audit log is opt-in (off by default) and not yet non-repudiable (closes with the planned PoP auth); cross-encoder span attribution is not exposed (the reranker scores full documents, not spans).
+> **Grade: Passes (v0.6.0).** Search results carry `tier` (fact | community_summary | insight_summary), `score_normalized` (sigmoid of the raw reranker logit → [0, 1]), `matched_entities` (intersection of the query string against the saved entity list), and `graph_context` as a structured list of `{rel_type, name, label}` triples — **each entry now carries an `aliases` list** of synonymous entity names in the same alias component (v0.6.0). Agent source attribution is server-verified via token authentication — `"source": "gemini"` is a server guarantee, not a client claim. An agent can reason: *"I returned a Tier-3 community synthesis — normalized score 0.91, matching entity OutboxPattern — alongside two Tier-1 precision hits, both saved by a server-verified agent identity."* Since **v0.4.12**, retrieval events are also auditable: the opt-in gateway per-request audit log (`GATEWAY_AUDIT_LOG_PATH`, §14) records one off-event-loop line per authenticated request — agent, route, status, latency, timestamp, `request_id` — covering every `/memory/search`. **Gaps remaining:** that audit log is opt-in (off by default) and not yet non-repudiable (closes with the planned PoP auth); cross-encoder span attribution is not exposed (the reranker scores full documents, not spans).
 
 **The Consolidation Test:** *When the agent learns something new, does the system update a coherent knowledge base, or does it just accumulate versions? After six months, do you have one "truth" or three conflicting ones?*
 
@@ -269,7 +271,7 @@ volumes:
 
 ### The binding element: 1024-dimensional BGE-M3
 
-What makes the three tools a unified memory system rather than three separate stores is the embedding model. Every vector in the system — saved by Gemini CLI, saved by LM Studio, saved by any CLI agent, re-embedded by the consolidation daemon — was generated by the same BGE-M3 instance through the same gateway. The coordinate system is shared. Cosine similarity between a vector one agent saved last Tuesday and a query another agent is making right now is a genuine semantic comparison.
+What makes the three tools a unified memory system rather than three separate stores is the embedding model. Every vector in the system — saved by Antigravity CLI, saved by LM Studio, saved by any CLI agent, re-embedded by the consolidation daemon — was generated by the same BGE-M3 instance through the same gateway. The coordinate system is shared. Cosine similarity between a vector one agent saved last Tuesday and a query another agent is making right now is a genuine semantic comparison.
 
 ---
 
@@ -739,7 +741,7 @@ echo 'AGENT_TOKENS=claude:tok_abc123...,gemini:tok_def456...,lm_studio:tok_ghi78
 # Step 3a — Claude Code: add AGENT_TOKEN to the skill .env
 echo 'AGENT_TOKEN=tok_abc123...' >> ~/.claude/skills/shared-memory/.env
 
-# Step 3b — Antigravity CLI (or legacy Gemini CLI): add to the skill .env
+# Step 3b — Antigravity CLI: add to the skill .env
 echo 'AGENT_TOKEN=tok_def456...' >> ~/.gemini/skills/shared-memory/.env
 
 # Step 3c — LM Studio: add to mcp.json env block (see §16)
@@ -849,11 +851,11 @@ $shared-memory
 
 Codex CLI also supports **implicit invocation**: if the description in SKILL.md's frontmatter matches the task, the skill is loaded automatically without an explicit `$` call.
 
-> **AGENTS.md:** Codex CLI reads `AGENTS.md` at the project root before each session (their equivalent of `CLAUDE.md`). This repo provides `AGENTS.md` alongside `AGENT.md` — both contain the same architectural guidance.
+> **AGENTS.md:** Codex CLI reads `AGENTS.md` at the project root before each session (their equivalent of `CLAUDE.md`). In this repo `AGENTS.md` is the **canonical agent file** — it carries both the agent-driven setup/operations playbook (Part 1) and the developer context (Part 2); `AGENT.md` is a thin pointer to it for agents that look for that name.
 
-### Antigravity CLI (and Gemini CLI)
+### Antigravity CLI
 
-**Antigravity CLI** (`agy`) is the current CLI for this skill, replacing Gemini CLI. Both tools load skills from `~/.gemini/skills/` — the same install directory works for both.
+**Antigravity CLI** (`agy`) replaced Gemini CLI, which is no longer available as a CLI agent. It loads skills from `~/.gemini/skills/` — the install directory keeps its legacy name, so existing installs carry over unchanged.
 
 ```bash
 mkdir -p ~/.gemini/skills
@@ -1025,7 +1027,6 @@ When a new version is released, re-run the two `curl` commands from Step 3 to pu
 | **Codex CLI** | CLI (skill `$shared-memory`) | `~/.codex/skills/shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
 | **Grok** | CLI (skill `/shared-memory`) | `~/.grok/skills/shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
 | **Antigravity CLI** (`agy`) | CLI (skill `/activate shared-memory`) | `~/.gemini/skills/shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
-| **Gemini CLI** *(legacy)* | CLI (skill `/activate shared-memory`) | `~/.gemini/skills/shared-memory/scripts/memory_bridge.py` | via coordinator → `pg_notify` |
 | **LM Studio** | MCP (FastMCP) | `vector-skill.py` → `rag-orchestrator` in `mcp.json` | via coordinator → `pg_notify` |
 | **Any HTTP client** | REST | `POST http://localhost:8888/memory/save\|search\|graph` | via coordinator → `pg_notify` |
 
@@ -1104,7 +1105,7 @@ The coordinator exposes six memory endpoints on port 8888. All routes (except `/
 ```
 /shared-memory          # Claude Code and Grok
 $shared-memory          # Codex CLI (explicit); also auto-matched via SKILL.md description
-/activate shared-memory # Gemini CLI
+/activate shared-memory # Antigravity CLI
 ```
 
 ### Optional: Shared Memory Monitor (companion dashboard)
@@ -1817,7 +1818,7 @@ This framework is actively evolving toward a workstation where any number of AI 
 | **Security baseline** | Read-only Cypher guard, localhost-only bind (PROXY_BIND opt-in), opaque error responses, bounded limit, ONT label validation at startup, prompt injection delimiters | ✅ Done |
 | **Configurable ontology — Path A** | All Neo4j labels and relationship types in `ontology.yaml`; ONT singleton with validation; falls back to hardcoded defaults; density threshold configurable | ✅ Done |
 | **Ontology enrichment — Path A (Stage 1)** | Data-driven typing of the thin domain layer (derived from the project's own accumulated decisions and entities, and cross-checked against a separate advisor/researcher agent's domain ontology): 5 entity sub-labels (`Component`/`System`/`Model`/`Concept`/`Document`, multi-label under `:Entity`; Person/Agent/Process reuse `Human`/`AIAgent`/`Activity`) + 9 typed Entity→Entity relationships (`DEPENDS_ON`/`PART_OF`/`IMPLEMENTS`/`PRODUCES`/`CONSUMES`/`RUNS_ON`/`CONFIGURES`/`DESCRIBES`/`VALIDATES`). Plus `/memory/telemetry` `compliance` section (predicate distribution + label/relationship compliance vs the ontology vocabulary). Staged: **1.1 schema defs + compliance (done)**; 1.2 domain-range map; 1.3 REM assigns types + typed rels; 1.4 one-time local-LLM backfill classification; `MENTIONS` retires in 0.6.1 via per-edge confidence. | 🔶 In progress (1.1) |
-| **Agent integration** | Claude Code, Grok, Codex CLI, Antigravity CLI (`agy` — current, replacing Gemini CLI, which stays supported as legacy), LM Studio (MCP) — all live; SKILL.md carries YAML frontmatter for implicit Codex invocation; `AGENTS.md` project context file added | ✅ Done |
+| **Agent integration** | Claude Code, Grok, Codex CLI, Antigravity CLI (`agy` — replaced the retired Gemini CLI; same `~/.gemini/skills/` install dir), LM Studio (MCP) — all live; SKILL.md carries YAML frontmatter for implicit Codex invocation; `AGENTS.md` is the canonical agent file (agent-driven setup/operations playbook + developer context; `AGENT.md` is a thin pointer to it) | ✅ Done |
 | **Schema migrations** | Migration runner (`apply.py`, numbered chain); 000 (base schema) through 006 (REM supersession); 007 (domain-scoped consolidation: `(entity, domain)` unique key); 008 (JSONB double-encoding repair); 009 (Phase 3a: `technical_docs.superseded` + partial insight index); 010 (embedding indexes → hnsw, idempotent guard). Fresh installs use `schema_init.sql` + `neo4j_init.cypher` (Neo4j constraints), generated from the chain by `generate_schema_init.py` and applied by `init_db.sh`. | ✅ Done |
 | **Provenance layer — Phase A** | PROV-O-inspired ontology: 6 new node labels (`Decision`, `Human`, `AIAgent`, `Project`, `Activity`, `Milestone`) and 8 provenance relationships (`WAS_ATTRIBUTED_TO`, `WAS_ASSISTED_BY`, `WAS_GENERATED_BY`, `PROJECT_OF`, `ACTED_ON_BEHALF_OF`, `SUPERSEDES`, `INFORMED_BY`, `HAD_OUTCOME`). Coordinator ingress validates `type:decision` saves (rejects missing `decided_by` / `project` / `rationale` before the row touches the outbox WAL). Outbox dispatches decision rows to a dedicated `_apply_decision_outbox_row` that materialises the full PROV-O subgraph in a single atomic Neo4j session. Plain `Fact` saves unchanged. | ✅ Done |
 | **Provenance layer — Phase B** | `save_decision` subcommand in `memory_bridge.py` (named flags — `--title`, `--decided-by`, `--project`, `--rationale` required; `--assisted-by`, `--alternatives`, `--confidence`, `--entities` optional) and `save_decision` MCP tool in `vector-skill.py`. `build_decision_metadata()` pure helper. `--version` flag added to `memory_bridge.py`. | ✅ Done |
