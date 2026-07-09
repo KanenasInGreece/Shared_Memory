@@ -17,7 +17,7 @@ Holds every artifact saved by any agent. This is the authoritative fact store.
 | `content_hash` | `TEXT UNIQUE` | SHA-256 of `content`; `ON CONFLICT DO UPDATE` makes saves idempotent |
 | `agent_id` | `TEXT NOT NULL DEFAULT 'legacy'` | Identity of the writing agent; `'legacy'` for pre-coordinator rows |
 | `scope` | `TEXT NOT NULL DEFAULT 'global'` | Namespace for access control; `'global'` = visible to all agents |
-| `visibility` | `TEXT NOT NULL DEFAULT 'global'` | Read policy: `'global'` \| `'scope'` \| `'private'` |
+| `visibility` | `TEXT NOT NULL DEFAULT 'global'` | Read policy, **enforced on every `/memory/search` read** (v0.6.2): `'global'` = all callers; `'private'` = only the owning `agent_id`; `'scope'` = only a caller asserting the matching `scope`. Anonymous callers (no verified identity) see `'global'` only — fail closed. Gates Tier-1 and Tier-3 alike, so a private fact's community summary never leaks. |
 | `superseded` | `BOOLEAN NOT NULL DEFAULT false` | Soft-supersede flag. Set when (a) a retrospective with `rating="reversed"` lands on a decision row (pg_id 276), or (b) a **fact** is superseded by a correction (`save --supersedes`) or retracted (`POST /memory/supersede`) — decision 381. Mirrored as `superseded = true` on the graph `:Fact`/`:Decision` node. Tier-1 search, REM/NREM selection, and the working-set census all exclude superseded rows; the row is kept (provenance, compare/contrast). Added by migration 009. |
 | `superseded_by` | `INTEGER REFERENCES technical_docs(id) ON DELETE SET NULL` | The successor fact when this row was superseded by a correction; `NULL` for a live row, a bare retract, or a reversed decision. Powers the retrieval-time `stale_sources: [{old, superseded_by}]` annotation (decision 384) as a cheap join — no Neo4j hop. Added by migration 013. |
 
@@ -51,7 +51,7 @@ Written exclusively by the consolidation daemon. Each row is an LLM-synthesised 
 | `superseded` | `BOOLEAN NOT NULL DEFAULT false` | Set to `true` when another summary's `source_pg_ids` is a strict superset of this row's `source_pg_ids` — the newer summary subsumes this one. Retrieval (`coordinator.py`) always filters `WHERE NOT superseded`. Partial index `community_summaries_active_idx` keeps this scan fast. Added by migration 006. |
 | `agent_id` | `TEXT NOT NULL DEFAULT 'legacy'` | Agent that triggered consolidation; `'legacy'` for pre-coordinator rows |
 | `scope` | `TEXT NOT NULL DEFAULT 'global'` | Inherited from the source `Fact` cluster's scope |
-| `visibility` | `TEXT NOT NULL DEFAULT 'global'` | Read policy, same semantics as `technical_docs.visibility` |
+| `visibility` | `TEXT NOT NULL DEFAULT 'global'` | Read policy, same semantics as `technical_docs.visibility` — enforced on Tier-3 reads (v0.6.2) so a scoped/private source fact's synthesis inherits the same gate. |
 
 **`metadata` structure (written by `consolidation_loop.py`):**
 ```json

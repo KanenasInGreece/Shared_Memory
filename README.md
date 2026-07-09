@@ -5,6 +5,8 @@ Every insight one agent gains is available to every other — across sessions, a
 
 A unified semantic and relational memory layer built from first principles to survive the interference problem and scale safely to concurrent multi-agent workloads.
 
+Most agent-memory systems are libraries bound to a single agent framework. This one is a shared substrate: independent tools — Claude Code, Codex CLI, Grok, Antigravity CLI, and LM Studio — each connect to one gateway under their own server-verified identity, and read and write the same Postgres + Neo4j store. The architectural choice is to sit *between* heterogeneous tools rather than inside one of them; adding a tool is a packaging step, not a backend change ([§1](#1-the-vision-one-brain-many-agents)).
+
 ![Claude Code](https://img.shields.io/badge/Claude_Code-Skill-blue)
 ![Codex CLI](https://img.shields.io/badge/Codex_CLI-Skill-blue)
 ![Grok](https://img.shields.io/badge/Grok-Skill-blue)
@@ -1941,6 +1943,7 @@ no path configuration is needed across deployments.
 ## 21. References
 
 - **AI Memory & Cognition: The Architect's Playbook** (Vishakha Gupta, ApertureData, May 2026) — Proposes the KMC Blueprint (Knowledge · Memory · Context) and the three diagnostic tests used in the [§1 Vision](#1-the-vision-one-brain-many-agents) section: Retrieval, Consolidation, and Lineage. [aperturedata.io/resources/ai-memory-cognition-the-architects-playbook](https://www.aperturedata.io/resources/ai-memory-cognition-the-architects-playbook)
+- **Governed Shared Memory for Multi-Agent LLM Systems** (2026) — motivates per-agent visibility, write authority, and provenance as first-class concerns once several agents share one store, rather than assuming single-agent, largely unconstrained, append-only access. arXiv:2606.24535
 - **The Geometry of Forgetting** (Barman et al., 2026) — *Exposing the Dimensionality Illusion*. arXiv:2604.06222
 - **The Geometry of Consolidation** (Vangara & Gopinath, 2026) — NeurIPS 2026 submission. Proves centroid averaging collapses retrieval identity.
 - **Active Dreaming Memory (ADM)** (Dudekula Kasim Vali, 2025) — Biologically-Inspired Episodic Consolidation. engrXiv preprint, DOI: 10.31224/5919

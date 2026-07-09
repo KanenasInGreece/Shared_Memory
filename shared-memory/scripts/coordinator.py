@@ -100,7 +100,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.6.1"
+FRAMEWORK_VERSION = "0.6.2"
 API_VERSION = 1
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
@@ -727,6 +727,34 @@ def _matched_entities(query: str, metadata: dict | None) -> list[str]:
         return []
     q = query.lower()
     return [e for e in metadata.get("entities", []) if isinstance(e, str) and e.lower() in q]
+
+
+def _visibility_filter(viewer: str | None, viewer_scope: str | None,
+                       start: int) -> tuple[str, list]:
+    """Build the read-authorization predicate for the `visibility` column.
+
+    A row is visible when its ``visibility`` is:
+      - ``'global'``  → to everyone;
+      - ``'private'`` → only to the owning ``agent_id`` (the viewer);
+      - ``'scope'``   → only when the viewer asserts the matching ``scope``.
+
+    The viewer is the server-verified ``authenticated_agent`` (spoof-proof); an
+    anonymous caller (no verified identity) sees only ``'global'`` — fail closed.
+    A caller that asserts no scope cannot match ``'scope'`` rows. Returns the SQL
+    fragment and its parameters; ``start`` is the next free asyncpg positional
+    index (``$N``). Every read in ``handle_search`` composes this, so a private
+    fact is filtered from Tier-1 AND its Tier-3 synthesis never leaks (the
+    community summary inherits the source cluster's scope/visibility).
+    """
+    if not viewer:
+        return "visibility = 'global'", []
+    clauses = ["visibility = 'global'",
+               f"(visibility = 'private' AND agent_id = ${start})"]
+    params: list = [viewer]
+    if viewer_scope:
+        clauses.append(f"(visibility = 'scope' AND scope = ${start + 1})")
+        params.append(viewer_scope)
+    return "(" + " OR ".join(clauses) + ")", params
 
 
 def _coerce_jsonb_obj(value):
@@ -1718,6 +1746,9 @@ class MemoryCoordinator:
         query = body.get("query", "")
         limit = min(max(1, int(body.get("limit", 5))), 100)
         scope = body.get("scope")  # None = no scope filter
+        # Read authorization — the server-verified identity gates which rows this
+        # caller may see (visibility column). None = anonymous → 'global' only.
+        viewer = request.get("authenticated_agent")
 
         if not query:
             return web.json_response(
@@ -1732,14 +1763,16 @@ class MemoryCoordinator:
 
             if q_vec is None:
                 # Keyword fallback when the embedding service is unavailable
+                vis_sql, vis_params = _visibility_filter(viewer, scope, 3)
                 async with self._acquire() as conn:
                     rows = await conn.fetch(
-                        """
+                        f"""
                         SELECT id, content, metadata FROM technical_docs
-                        WHERE content ILIKE $1 OR metadata::text ILIKE $1
+                        WHERE (content ILIKE $1 OR metadata::text ILIKE $1)
+                          AND {vis_sql}
                         LIMIT $2
                         """,
-                        f"%{query}%", limit,
+                        f"%{query}%", limit, *vis_params,
                     )
                 return web.json_response({
                     "status": "success",
@@ -1762,14 +1795,19 @@ class MemoryCoordinator:
                 # Tier 3 — nearest active insight (cross-project principle,
                 # decision 276) surfaces ABOVE the nearest thematic summary.
                 # Disjoint queries, both filtered to non-superseded rows.
+                # Same read-authorization predicate gates Tier-3: a private/scoped
+                # fact's synthesized narrative must not leak where the fact itself
+                # is filtered. Params start at $2 ($1 is the query vector).
+                vis_t3, vis_t3_params = _visibility_filter(viewer, scope, 2)
                 insight = None
                 try:
                     insight = await conn.fetchrow(
                         "SELECT content, metadata, source_pg_ids FROM community_summaries"
                         " WHERE NOT superseded"
                         "   AND metadata->>'kind' = 'insight'"
+                        f"   AND {vis_t3}"
                         " ORDER BY embedding <=> $1::vector LIMIT 1",
-                        str(q_vec),
+                        str(q_vec), *vis_t3_params,
                     )
                 except Exception:
                     insight = None  # pre-006 schema — thematic guard below warns
@@ -1782,8 +1820,9 @@ class MemoryCoordinator:
                         "SELECT content, metadata, source_pg_ids FROM community_summaries"
                         " WHERE NOT superseded"
                         "   AND COALESCE(metadata->>'kind', 'thematic') <> 'insight'"
+                        f"   AND {vis_t3}"
                         " ORDER BY embedding <=> $1::vector LIMIT 1",
-                        str(q_vec),
+                        str(q_vec), *vis_t3_params,
                     )
                 except Exception:
                     log.warning(
@@ -1793,22 +1832,26 @@ class MemoryCoordinator:
                     )
                     summary = await conn.fetchrow(
                         "SELECT content, metadata, source_pg_ids FROM community_summaries"
+                        f" WHERE {vis_t3}"
                         " ORDER BY embedding <=> $1::vector LIMIT 1",
-                        str(q_vec),
+                        str(q_vec), *vis_t3_params,
                     )
 
                 # Tier 1 — vector search, 20 candidates for reranker.
                 # Reversed decisions (superseded=true, migration 009) are
                 # excluded; the fallback keeps pre-migration schemas working.
-                scope_sql = "AND scope = $3" if scope else ""
                 args: list = [str(q_vec), 20]
+                scope_sql = ""
                 if scope:
                     args.append(scope)
+                    scope_sql = f"AND scope = ${len(args)}"
+                vis_sql, vis_params = _visibility_filter(viewer, scope, len(args) + 1)
+                args.extend(vis_params)
                 try:
                     candidates = await conn.fetch(
                         f"""
                         SELECT id, content, metadata FROM technical_docs
-                        WHERE NOT superseded {scope_sql}
+                        WHERE NOT superseded AND {vis_sql} {scope_sql}
                         ORDER BY embedding <=> $1::vector LIMIT $2
                         """,
                         *args,
@@ -1817,7 +1860,7 @@ class MemoryCoordinator:
                     candidates = await conn.fetch(
                         f"""
                         SELECT id, content, metadata FROM technical_docs
-                        WHERE 1=1 {scope_sql}
+                        WHERE {vis_sql} {scope_sql}
                         ORDER BY embedding <=> $1::vector LIMIT $2
                         """,
                         *args,
