@@ -50,6 +50,7 @@ class OntologyConfig:
     informed_by: str = "INFORMED_BY"
     had_outcome: str = "HAD_OUTCOME"
     references: str = "REFERENCES"   # record→record cross-reference resolved from content (Stage 1.2b)
+    grounded_in: str = "GROUNDED_IN" # Decision/Retrospective→Fact: fact(s) grounding this record (decision 550) — SPINE
     # REM-enrichment relationships (written by rem_loop.py)
     produces_insight: str = "PRODUCES_INSIGHT"
     under_conditions: str = "UNDER_CONDITIONS"
@@ -74,68 +75,49 @@ class OntologyConfig:
 
 
 def _load() -> OntologyConfig:
+    """Build the ontology config. The SPINE (framework identity — Fact / Decision /
+    CommunitySummary / Insight, provenance, alias, grounding, and every relation the
+    consolidation dream cycle depends on) is HARDCODED via the dataclass defaults and
+    is NEVER read from the config file (decision 550). Only the DOMAIN layer — entity
+    sub-labels + typed Entity→Entity relationships — plus framework consolidation
+    tuning is read from ontology.yaml. Spine keys present in the file are ignored: the
+    file cannot rename or redefine the framework, only extend the domain vocabulary."""
+    cfg = OntologyConfig()  # all spine + domain defaults; spine is fixed from here on
     path = os.environ.get(
         "SMEM_ONTOLOGY_PATH",
         os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "ontology.yaml"))
     )
     if not _yaml_available:
-        return OntologyConfig()
+        return cfg
     try:
         with open(path) as f:
-            cfg = yaml.safe_load(f) or {}
-        labels = cfg.get("labels", {})
-        rels = cfg.get("relationships", {})
-        cons = cfg.get("consolidation", {})
-        return OntologyConfig(
-            fact=labels.get("fact", "Fact"),
-            entity=labels.get("entity", "Entity"),
-            community_summary=labels.get("community_summary", "CommunitySummary"),
-            reasoning_trace=labels.get("reasoning_trace", "ReasoningTrace"),
-            reasoning_step=labels.get("reasoning_step", "ReasoningStep"),
-            decision=labels.get("decision", "Decision"),
-            human=labels.get("human", "Human"),
-            ai_agent=labels.get("ai_agent", "AIAgent"),
-            project=labels.get("project", "Project"),
-            activity=labels.get("activity", "Activity"),
-            milestone=labels.get("milestone", "Milestone"),
-            component=labels.get("component", "Component"),
-            system=labels.get("system", "System"),
-            model=labels.get("model", "Model"),
-            concept=labels.get("concept", "Concept"),
-            document=labels.get("document", "Document"),
-            entity_link=rels.get("entity_link", "MENTIONS"),
-            entity_link_alias=rels.get("entity_link_alias", "REPORTS_ON"),
-            aliases=rels.get("aliases", "ALIASES"),
-            summarized_by=rels.get("summarized_by", "SUMMARIZED_BY"),
-            reasoning_next=rels.get("reasoning_next", "NEXT_STEP"),
-            was_attributed_to=rels.get("was_attributed_to", "WAS_ATTRIBUTED_TO"),
-            was_assisted_by=rels.get("was_assisted_by", "WAS_ASSISTED_BY"),
-            was_generated_by=rels.get("was_generated_by", "WAS_GENERATED_BY"),
-            project_of=rels.get("project_of", "PROJECT_OF"),
-            acted_on_behalf_of=rels.get("acted_on_behalf_of", "ACTED_ON_BEHALF_OF"),
-            supersedes=rels.get("supersedes", "SUPERSEDES"),
-            informed_by=rels.get("informed_by", "INFORMED_BY"),
-            had_outcome=rels.get("had_outcome", "HAD_OUTCOME"),
-            references=rels.get("references", "REFERENCES"),
-            produces_insight=rels.get("produces_insight", "PRODUCES_INSIGHT"),
-            under_conditions=rels.get("under_conditions", "UNDER_CONDITIONS"),
-            considered=rels.get("considered", "CONSIDERED"),
-            rejected=rels.get("rejected", "REJECTED"),
-            depends_on=rels.get("depends_on", "DEPENDS_ON"),
-            part_of=rels.get("part_of", "PART_OF"),
-            implements=rels.get("implements", "IMPLEMENTS"),
-            produces=rels.get("produces", "PRODUCES"),
-            consumes=rels.get("consumes", "CONSUMES"),
-            runs_on=rels.get("runs_on", "RUNS_ON"),
-            configures=rels.get("configures", "CONFIGURES"),
-            describes=rels.get("describes", "DESCRIBES"),
-            validates=rels.get("validates", "VALIDATES"),
-            density_threshold=int(cons.get("density_threshold", 5)),
-            insight_threshold=int(cons.get("insight_threshold", 2)),
-            alias_max_hops=int(cons.get("alias_max_hops", 2)),
-        )
+            data = yaml.safe_load(f) or {}
     except FileNotFoundError:
-        return OntologyConfig()
+        return cfg
+    labels = data.get("labels", {})
+    rels = data.get("relationships", {})
+    cons = data.get("consolidation", {})
+    # DOMAIN entity sub-labels (configurable)
+    cfg.component = labels.get("component", cfg.component)
+    cfg.system = labels.get("system", cfg.system)
+    cfg.model = labels.get("model", cfg.model)
+    cfg.concept = labels.get("concept", cfg.concept)
+    cfg.document = labels.get("document", cfg.document)
+    # DOMAIN typed Entity→Entity relationships (configurable)
+    cfg.depends_on = rels.get("depends_on", cfg.depends_on)
+    cfg.part_of = rels.get("part_of", cfg.part_of)
+    cfg.implements = rels.get("implements", cfg.implements)
+    cfg.produces = rels.get("produces", cfg.produces)
+    cfg.consumes = rels.get("consumes", cfg.consumes)
+    cfg.runs_on = rels.get("runs_on", cfg.runs_on)
+    cfg.configures = rels.get("configures", cfg.configures)
+    cfg.describes = rels.get("describes", cfg.describes)
+    cfg.validates = rels.get("validates", cfg.validates)
+    # Framework consolidation tuning (operator-tunable mechanism params, NOT domain vocab)
+    cfg.density_threshold = int(cons.get("density_threshold", cfg.density_threshold))
+    cfg.insight_threshold = int(cons.get("insight_threshold", cfg.insight_threshold))
+    cfg.alias_max_hops = int(cons.get("alias_max_hops", cfg.alias_max_hops))
+    return cfg
 
 
 def _validate(cfg: OntologyConfig) -> OntologyConfig:
@@ -170,7 +152,7 @@ _ENTITY_NOISE_NAMES: frozenset[str] = frozenset({
     "yes", "no", "unknown", "undefined", "nan",
     # ontology vocabulary (relationship + label names) — schema leakage, not entities
     "mentions", "aliases", "considered", "rejected", "produces_insight",
-    "under_conditions", "informed_by", "had_outcome", "supersedes",
+    "under_conditions", "informed_by", "had_outcome", "grounded_in", "supersedes",
     "was_attributed_to", "was_assisted_by", "was_generated_by", "project_of",
     "reports_on", "acted_on_behalf_of", "summarized_by", "next_step",
     "fact", "entity", "decision", "human", "aiagent", "project",
@@ -221,28 +203,80 @@ def sanitize_entity_names(raw_names: object) -> list[str]:
     return out
 
 
-# ── Ontology vocabulary (compliance reference) ────────────────────────────────
-# Every node label / relationship type the schema defines. Anything in the live
-# graph outside these sets is legacy or foreign drift — surfaced by compliance
-# telemetry and reusable by cleanup tooling. Derived from ONT so the vocabulary
-# can never disagree with the identifiers the daemons actually write.
-KNOWN_LABELS: frozenset[str] = frozenset({
+# ── Fact epistemic kind (soft, DERIVED from source_ref) ───────────────────────
+# fact_kind is a soft tag — NOT a spine sub-label — giving a stored fact its
+# evidential weight for the high-signal grounding story (decision 552 + the
+# fact-overload discussion). It is DERIVED from source_ref, never elicited
+# separately. A plain stored fact is an observation; its source upgrades it.
+DISCUSSION_CONTEXT: str = "discussion_context"  # reserved source_ref for conversation-derived facts
+
+_CODE_SUFFIXES: tuple[str, ...] = (
+    ".py", ".js", ".ts", ".tsx", ".go", ".rs", ".java", ".c", ".cc", ".cpp",
+    ".h", ".sh", ".sql", ".yaml", ".yml", ".toml",
+)
+
+
+def fact_kind_from_source_ref(source_ref: object) -> str:
+    """Derive a fact's soft epistemic kind from its source_ref. Pure, deterministic.
+
+      none / empty          → 'observation'  (a plain stored fact)
+      'discussion_context'  → 'discussion'   (from a conversation)
+      http(s):// URL        → 'researched'   (external source)
+      points into a test    → 'tested'       (empirically verified)
+      a source-code file    → 'measured'     (measured from code)
+      any other cited doc   → 'researched'
+    """
+    if not isinstance(source_ref, str) or not source_ref.strip():
+        return "observation"
+    low = source_ref.strip().lower()
+    if low == DISCUSSION_CONTEXT:
+        return "discussion"
+    if low.startswith(("http://", "https://")):
+        return "researched"
+    # strip a sub-document locator (file#L10, video@00:04) before keyword/suffix checks
+    base = low.split("#", 1)[0].split("@", 1)[0].strip()
+    if "test" in base:
+        return "tested"
+    if base.endswith(_CODE_SUFFIXES):
+        return "measured"
+    return "researched"
+
+
+# ── Spine vs Domain split (decision 550) ──────────────────────────────────────
+# SPINE = the framework identity / unique selling point — code-pinned, never read
+# from ontology.yaml: the high-signal ADR capture (Fact/Decision/CommunitySummary/
+# Insight + provenance), alias-not-merge, fact-grounding, and every relation the
+# summarising dream cycle (NREM) depends on. DOMAIN = the configurable vocabulary
+# (entity sub-labels + typed Entity→Entity relations) loaded from the file; it
+# describes what records are ABOUT and is applied only at first-write and REM.
+# The boundary contract test asserts consolidation touches only SPINE identifiers.
+SPINE_LABELS: frozenset[str] = frozenset({
     ONT.fact, ONT.entity, ONT.community_summary, ONT.reasoning_trace,
     ONT.reasoning_step, ONT.decision, ONT.human, ONT.ai_agent,
     ONT.project, ONT.activity, ONT.milestone,
-    # entity type sub-labels (decision 472)
+})
+DOMAIN_LABELS: frozenset[str] = frozenset({
     ONT.component, ONT.system, ONT.model, ONT.concept, ONT.document,
 })
-KNOWN_RELATIONSHIPS: frozenset[str] = frozenset({
+SPINE_RELATIONSHIPS: frozenset[str] = frozenset({
     ONT.entity_link, ONT.entity_link_alias, ONT.aliases, ONT.summarized_by,
     ONT.reasoning_next, ONT.was_attributed_to, ONT.was_assisted_by,
     ONT.was_generated_by, ONT.project_of, ONT.acted_on_behalf_of,
     ONT.supersedes, ONT.informed_by, ONT.had_outcome, ONT.references,
     ONT.produces_insight, ONT.under_conditions, ONT.considered, ONT.rejected,
-    # typed Entity→Entity domain relationships (decision 472)
+    ONT.grounded_in,
+})
+DOMAIN_RELATIONSHIPS: frozenset[str] = frozenset({
     ONT.depends_on, ONT.part_of, ONT.implements, ONT.produces, ONT.consumes,
     ONT.runs_on, ONT.configures, ONT.describes, ONT.validates,
 })
+
+# ── Ontology vocabulary (compliance reference) ────────────────────────────────
+# Every node label / relationship type the schema defines = spine ∪ domain.
+# Anything in the live graph outside these sets is legacy or foreign drift —
+# surfaced by compliance telemetry and reusable by cleanup tooling.
+KNOWN_LABELS: frozenset[str] = SPINE_LABELS | DOMAIN_LABELS
+KNOWN_RELATIONSHIPS: frozenset[str] = SPINE_RELATIONSHIPS | DOMAIN_RELATIONSHIPS
 
 
 # ── Domain-range map for typed Entity→Entity relationships (Stage 1.2) ─────────
