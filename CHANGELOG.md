@@ -7,6 +7,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Spine vs configurable domain ontology (decision 550)** — the framework identity (the "spine": `Fact` / `Decision` /
+  `CommunitySummary` / `Insight`, the provenance layer, alias-not-merge, fact-grounding, and the summarising dream
+  cycle) is now **code-pinned in `ontology.py`** (`SPINE_LABELS` / `SPINE_RELATIONSHIPS` / `DOMAIN_LABELS` /
+  `DOMAIN_RELATIONSHIPS`) and no longer read from `ontology.yaml`. The file now configures **only** the DOMAIN
+  vocabulary (entity sub-types + typed `Entity→Entity` relations), with the full spine listed as a reference comment.
+  Spine keys placed in the file are ignored — it cannot rename or redefine the framework. NREM/consolidation depends
+  only on the spine (verified), so changing the domain never requires a framework rewrite.
+- **Deterministic decision fact-grounding (`GROUNDED_IN`)** — a decision's `metadata.grounded_in` (a list of `Fact`
+  pg_ids) is materialised at first write as `(:Decision)-[:GROUNDED_IN]->(:Fact)` edges, so a decision's first write
+  now yields **≥2 nodes** (the Decision + its grounding fact(s)). `confidence` and `alternatives` are written as
+  Decision **properties**, not entity nodes — the alias-pressure measurement showed `alternatives` are ~65% free
+  phrases that would flood the graph and never alias.
+- **`fact_kind`** — a soft epistemic tag stamped on every `:Fact` node, **derived from `source_ref`** (never elicited
+  separately): `observation` (no source) · `discussion` (the reserved `discussion_context` sentinel) · `tested`
+  (test file) · `measured` (source-code file) · `researched` (any other file or `http(s)://` URL). Pure helper
+  `fact_kind_from_source_ref` in `ontology.py` + `tests/test_fact_kind.py`.
+
 ## [0.6.2] — 2026-07-09
 
 ### Added

@@ -7,6 +7,8 @@ A unified semantic and relational memory layer built from first principles to su
 
 Most agent-memory systems are libraries bound to a single agent framework. This one is a shared substrate: independent tools — Claude Code, Codex CLI, Grok, Antigravity CLI, and LM Studio — each connect to one gateway under their own server-verified identity, and read and write the same Postgres + Neo4j store. The architectural choice is to sit *between* heterogeneous tools rather than inside one of them; adding a tool is a packaging step, not a backend change ([§1](#1-the-vision-one-brain-many-agents)).
 
+Underneath, it is a **general, grounded-fact memory** — on anything that fits a model's context window it sits at parity with a flat file or plain vector-RAG, and we say so plainly. Its proposition is what sits on top: a deliberately **frozen, high-signal spine** — decisions captured as first-class records (rationale, rejected alternatives, confidence, and the facts they are grounded in), alias-not-merge entity resolution, and a **summarising dream cycle** that consolidates idle-time clusters into thematic summaries and cross-project insights no single record contained. You configure only the *domain vocabulary*; the spine is a given. Whether it beats the commodity floor on long-horizon questions is what we are measuring next — no claim beyond parity until we have ([§1](#1-the-vision-one-brain-many-agents)).
+
 ![Claude Code](https://img.shields.io/badge/Claude_Code-Skill-blue)
 ![Codex CLI](https://img.shields.io/badge/Codex_CLI-Skill-blue)
 ![Grok](https://img.shields.io/badge/Grok-Skill-blue)
@@ -173,6 +175,22 @@ Beyond storing facts, the framework is evolving to answer questions about how yo
 Target answer shape: *"Xenofon, using Claude Code, decided that project shared\_memory should have a consolidator — to simulate dreaming — on 2026-05-20. He was using Postgres with pgvector as an outbox to achieve non-blocking Neo4j writes, giving optional consistency guarantees on Neo4j and hard guarantees on Postgres. Retrospective as of 2026-05-28: good — held up under multi-agent load."*
 
 This requires not just storing knowledge, but storing **who decided what, with which tool, in which context, and whether it held up**. It requires a provenance layer with first-class nodes for people, AI agents, projects, and decisions — not just facts.
+
+### General memory, a high-signal spine, and a configurable domain
+
+It is worth being precise about what this framework *is*, what it uniquely proposes, and where you are free to shape it.
+
+**General use — grounded facts.** At its base it is a general, domain-agnostic memory: you store *facts*, and each fact carries a `source_ref` that grounds it in where it came from — a code file, a URL, a conversation, a test, a measurement. A discussion decomposes into grounded facts; so does a research session or a test run. On its own this is table stakes: on anything that already fits inside a model's context window, a grounded-fact store performs on par with a flat markdown file or a plain vector-RAG pipeline, and we say so plainly. Parity on the commodity floor is the honest starting point, not the pitch.
+
+**The spine — what we propose adds value (the USP).** On top of that base sits an opinionated, deliberately frozen core — the part we are actually building and measuring:
+
+- **High-signal decision capture (ADRs):** a decision is a first-class node carrying its rationale, the alternatives it rejected, the confidence held at the time, and the facts it is grounded in.
+- **Alias-not-merge entity resolution:** entity variants are *linked*, never collapsed, so nothing is silently lost.
+- **The summarising dream cycle:** when the system is idle it consolidates dense fact clusters into thematic summaries, and folds decisions-with-outcomes into cross-project insights that no single record contained.
+
+This spine is frozen on purpose — it *is* the product. What a flat file cannot do, and a vector index does not attempt, is hold *why* a choice was made and then dream a larger insight out of a week of them. Whether the spine measurably beats the commodity floor on long-horizon, cross-project questions is the next thing we are measuring; we make no claim beyond parity until we have.
+
+**The flexibility — your domain vocabulary.** The one thing you configure is the *domain ontology*: the entity sub-types and the typed relationships that describe what your facts and decisions are *about*. You grow these in `ontology.yaml` as you learn, and they are applied at the write and enrichment stages. The spine — and especially the dream cycle — never depends on your vocabulary, so extending it never destabilises consolidation. Configure the domain; the spine is a given.
 
 ### The signal we are saving
 

@@ -52,7 +52,7 @@ from neo4j import AsyncGraphDatabase
 from log_hygiene import AsyncLineWriter
 from ontology import (
     ONT, sanitize_entity_names, sanitize_entity_name,
-    KNOWN_LABELS, KNOWN_RELATIONSHIPS,
+    KNOWN_LABELS, KNOWN_RELATIONSHIPS, fact_kind_from_source_ref,
 )
 
 log = logging.getLogger("coordinator")
@@ -1057,10 +1057,12 @@ class MemoryCoordinator:
             # Standard Fact + Entity MERGE — all writes in one round-trip so they
             # succeed or fail atomically. MERGE is idempotent — safe to retry.
             source_ref = params.get("source_ref") or None
+            fact_kind = params.get("fact_kind") or "observation"
             async with self._neo4j.session() as session:
                 await session.run(
                     f"MERGE (f:{ONT.fact} {{pg_id: $pg_id}})"
-                    f" SET f.content = $content, f.source = $source"
+                    f" SET f.content = $content, f.source = $source,"
+                    f"     f.fact_kind = $fact_kind"
                     + (" SET f.source_ref = $source_ref" if source_ref else "")
                     + f" WITH f"
                     f" UNWIND $entities AS ename"
@@ -1069,6 +1071,7 @@ class MemoryCoordinator:
                     pg_id=pg_id,
                     content=params.get("content_snippet", "")[:200],
                     source=params.get("source", "coordinator"),
+                    fact_kind=fact_kind,
                     entities=self._gate_graph_entities(pg_id, params.get("entities", [])),
                     **( {"source_ref": source_ref} if source_ref else {} ),
                 )
@@ -1140,10 +1143,17 @@ class MemoryCoordinator:
         async with self._neo4j.session() as session:
             await session.run(
                 f"MERGE (d:{ONT.decision} {{pg_id: $pg_id}})"
-                f"  SET d.title     = $title,"
-                f"      d.rationale = $rationale,"
-                f"      d.date      = $date,"
-                f"      d.source    = $source"
+                f"  SET d.title       = $title,"
+                f"      d.rationale   = $rationale,"
+                f"      d.date        = $date,"
+                f"      d.source      = $source,"
+                # confidence + alternatives are SPINE ADR fields, materialised
+                # deterministically as PROPERTIES (not entity nodes): the alias-
+                # pressure measurement (fact 551) showed alternatives are 65% free
+                # phrases, so minting them as :Entity would flood the graph — REM
+                # still extracts clean CONSIDERED entities from the text.
+                f"      d.confidence  = $confidence,"
+                f"      d.alternatives = $alternatives"
                 f" WITH d"
                 f" MERGE (h:{ONT.human} {{name: $decided_by}})"
                 f" MERGE (d)-[:{ONT.was_attributed_to}]->(h)"
@@ -1159,16 +1169,27 @@ class MemoryCoordinator:
                 f" FOREACH (ename IN $entities |"
                 f"   MERGE (e:{ONT.entity} {{name: ename}})"
                 f"   MERGE (d)-[:{ONT.entity_link}]->(e)"
+                f" )"
+                # Fact-grounding: deterministic GROUNDED_IN edge per pg_id (decision
+                # 550). MERGE the Fact so a not-yet-applied grounding fact becomes a
+                # stub that its own row fills later — same pattern as SUPERSEDES.
+                f" WITH d"
+                f" FOREACH (fid IN $grounded_in |"
+                f"   MERGE (gf:{ONT.fact} {{pg_id: fid}})"
+                f"   MERGE (d)-[:{ONT.grounded_in}]->(gf)"
                 f" )",
                 pg_id=pg_id,
                 title=decision.get("title", params.get("content_snippet", "")[:100]),
                 rationale=decision.get("rationale", ""),
                 date=decision.get("date", ""),
                 source=params.get("source", "coordinator"),
+                confidence=decision.get("confidence") or "",
+                alternatives=[a for a in (decision.get("alternatives") or []) if isinstance(a, str)],
                 decided_by=decision.get("decided_by", "unknown"),
                 project=decision.get("project", "unknown"),
                 assisted_by=decision.get("assisted_by", []),
                 entities=self._gate_graph_entities(pg_id, params.get("entities", [])),
+                grounded_in=params.get("grounded_in", []),
             )
         async with self._acquire() as conn:
             await conn.execute(
@@ -1431,6 +1452,22 @@ class MemoryCoordinator:
                             "type": metadata.get("type", "fact"),
                             "decision": metadata.get("decision", {}),
                             "source_ref": metadata.get("source_ref") or None,
+                            # fact_kind: soft epistemic tag, DERIVED from source_ref
+                            # (decision 553), stamped as a :Fact property at first
+                            # write. observation | discussion | tested | measured |
+                            # researched. Deterministic, never elicited separately.
+                            "fact_kind": fact_kind_from_source_ref(
+                                metadata.get("source_ref")
+                            ),
+                            # Fact-grounding (decision 550): pg_ids of the Fact(s) this
+                            # record rests on. Deterministic 1-1 → GROUNDED_IN edges at
+                            # first write (id match, no alias pressure). Facts-only
+                            # source_ref stays the fact's own origin; grounded_in points
+                            # a Decision/record at its evidence facts.
+                            "grounded_in": [
+                                g for g in (metadata.get("grounded_in") or [])
+                                if isinstance(g, int) and not isinstance(g, bool)
+                            ],
                             # Piggyback the supersession mirror onto THIS fact's row
                             # (no separate outbox row to pollute the census): when it
                             # applies, the worker also marks the old Fact node
