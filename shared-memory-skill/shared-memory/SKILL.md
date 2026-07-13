@@ -80,11 +80,11 @@ Commit findings, decisions, and technical facts to long-term shared memory.
 
 **`source_ref`:** a citation string for where the fact came from — stored on the `Fact` node and used to **auto-derive `fact_kind`** (`observation` = none · `discussion` = the reserved sentinel `"discussion_context"` · `tested` = a test path · `measured` = a code file · `researched` = any other file/URL). Examples: `"design-doc.pdf#p12"`, `"CLAUDE.md#L45-50"`, `"discussion_context"`.
 
-**Elicit the spine fields before you save — this is what makes the memory high-signal (decisions 553/559).** Saving is *not* a silent pass-through. Before a `save` of a significant fact or any `save_decision`, ask the operator — one short batched prompt — for the fields that carry the signal, propose defaults they only confirm, and stamp `"elicited": true` in metadata so coverage telemetry counts the ask:
-- **Fact →** `source_ref` (default `"discussion_context"` for a conversation-derived fact).
-- **Decision →** `grounded_in` (pg_ids of the facts it rests on — **always include at least the conversation fact**; propose 2–3 recent facts to confirm), `alternatives` (auto-fill any options you already generated), `confidence` (`high`/`medium`/`low`).
-- **Null is allowed only as an explicit answer.** If the operator says "no source"/"no alternatives", that null is deliberate — record it (stamp `elicited: true`) and move on. Never *skip* the ask.
-- Trigger on decisions and significant facts, never on retrieval/summarising turns. Keep it to one confirmation — don't nag on trivial facts.
+**Involve the operator before you save — this is what makes the memory high-signal (decisions 553/559).** Saving is *not* a silent pass-through, and the two record types get different weight:
+- **Decision saves — the operator gets a say.** Before any `save_decision`, ask (one short batched prompt) for the fields that carry the signal, proposing defaults they confirm or adjust: `grounded_in` (pg_ids of the facts it rests on — **always include at least the conversation fact**; propose 2–3 recent facts), `alternatives` (auto-fill options you already generated), `confidence` (`high`/`medium`/`low`).
+- **Fact saves — a mention is enough.** State what you are about to store and the `source_ref` you inferred (it sets `fact_kind`); the operator can OK it or adjust — no full questionnaire. Default `source_ref` to `"discussion_context"` for a conversation-derived fact.
+- **Null is allowed only as an explicit answer.** "No source" / "no alternatives" is a deliberate choice — record it and move on; never *skip* involving the operator.
+- Stamp `"elicited": true` when the operator was involved (had a say, or OK'd the mention) so coverage telemetry counts it. Trigger on decisions and significant facts, never on retrieval/summarising turns.
 
 **What happens on save:**
 1. Sends request to Memory Coordinator (gateway :8888)
