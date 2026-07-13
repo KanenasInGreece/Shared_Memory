@@ -78,7 +78,13 @@ Commit findings, decisions, and technical facts to long-term shared memory.
 
 **`project` / `domain` scopes consolidation (recommended).** NREM keys community summaries on **(entity, domain)** — facts that share an entity but carry different `project`/`domain` tags are never fused into one summary. Untagged facts collapse to domain `general` (the prior single-summary-per-entity behaviour). Tag saves whose entities span unrelated topics (e.g. `"project":"homelab"` vs `"project":"shared-memory"`) to keep summaries coherent.
 
-**`source_ref` (optional):** supply a sub-document citation string to preserve lineage back to the original asset. Passed through unchanged by the coordinator; stored on the `Fact` Neo4j node as `source_ref`. Examples: `"design-doc.pdf#p12"`, `"meeting-2026-05-15.mp4@00:04:32"`, `"CLAUDE.md#L45-50"`.
+**`source_ref`:** a citation string for where the fact came from — stored on the `Fact` node and used to **auto-derive `fact_kind`** (`observation` = none · `discussion` = the reserved sentinel `"discussion_context"` · `tested` = a test path · `measured` = a code file · `researched` = any other file/URL). Examples: `"design-doc.pdf#p12"`, `"CLAUDE.md#L45-50"`, `"discussion_context"`.
+
+**Involve the operator before you save — this is what makes the memory high-signal (decisions 553/559).** Saving is *not* a silent pass-through, and the two record types get different weight:
+- **Decision saves — the operator gets a say.** Before any `save_decision`, ask (one short batched prompt) for the fields that carry the signal, proposing defaults they confirm or adjust: `grounded_in` (pg_ids of the facts it rests on — **always include at least the conversation fact**; propose 2–3 recent facts), `alternatives` (auto-fill options you already generated), `confidence` (`high`/`medium`/`low`). Phrase the `rationale` as a **Y-statement** — *"In the context of X, we chose Y over Z, accepting W"* — which captures the choice, the rejected alternatives, and the accepted trade-off in one line (our compact stand-in for anticipated consequences; the real consequences arrive later as a retrospective — decision 562).
+- **Fact saves — a mention is enough.** State what you are about to store and the `source_ref` you inferred (it sets `fact_kind`); the operator can OK it or adjust — no full questionnaire. Default `source_ref` to `"discussion_context"` for a conversation-derived fact.
+- **Null is allowed only as an explicit answer.** "No source" / "no alternatives" is a deliberate choice — record it and move on; never *skip* involving the operator.
+- Stamp `"elicited": true` when the operator was involved (had a say, or OK'd the mention) so coverage telemetry counts it. Trigger on decisions and significant facts, never on retrieval/summarising turns.
 
 **What happens on save:**
 1. Sends request to Memory Coordinator (gateway :8888)

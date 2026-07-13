@@ -452,6 +452,8 @@ def build_decision_metadata(
     alternatives: str = "",
     confidence: str = "",
     entities: str = "",
+    grounded_in: str = "",
+    elicited: bool = False,
 ) -> tuple:
     """Build (content, metadata) for a decision save.
 
@@ -479,6 +481,16 @@ def build_decision_metadata(
         "entities": [e.strip() for e in entities.split(",") if e.strip()],
         "decision": decision,
     }
+    # grounded_in: pg_ids of the facts this decision rests on — materialised at
+    # first write as (:Decision)-[:GROUNDED_IN]->(:Fact). Always include at least
+    # the conversation fact (grounding floor, decision 552).
+    gi = [int(x) for x in grounded_in.split(",") if x.strip().isdigit()]
+    if gi:
+        metadata["grounded_in"] = gi
+    # elicited: the spine fields were asked of the operator (decision 559). An
+    # elicited null is a deliberate choice; coverage telemetry counts the ask.
+    if elicited:
+        metadata["elicited"] = True
     return content, metadata
 
 
@@ -751,6 +763,12 @@ async def main() -> None:
                        help="Confidence level (e.g. high, medium, low)")
         p.add_argument("--entities",    default="",
                        help="Comma-separated Neo4j entities to link")
+        p.add_argument("--grounded-in", default="",
+                       help="Comma-separated pg_ids of the facts this decision rests on "
+                            "(include at least the conversation fact — grounding floor)")
+        p.add_argument("--elicited",    action="store_true",
+                       help="The spine fields were elicited from the operator (an elicited "
+                            "null is deliberate; coverage telemetry counts the ask)")
         args = p.parse_args(sys.argv[2:])
         content, metadata = build_decision_metadata(
             title=args.title,
@@ -762,6 +780,8 @@ async def main() -> None:
             alternatives=args.alternatives,
             confidence=args.confidence,
             entities=args.entities,
+            grounded_in=args.grounded_in,
+            elicited=args.elicited,
         )
         print(json.dumps(await save_artifact(content, metadata), indent=2))
     elif action == "save_retrospective":
