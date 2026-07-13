@@ -9,31 +9,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **`created_at` on `technical_docs`** (migration 015) — server-stamped creation timestamp for **reranker recency**
-  (`id` stays for stable order/tie-break; id-gaps aren't uniform in time). Backfilled from `neo4j_outbox.created_at`
-  where recoverable; `NULL` = unknown creation time (consolidated/legacy). Additive; index `technical_docs_created_at_idx`.
-- **Spine-coverage telemetry** — `/memory/telemetry.spine`: required-field completeness + **elicited rate** + emergent
-  captured-but-unprojected fields + alias-adjudication volume (decision 559). Plus a client **elicitation protocol**
-  (`SKILL.md` two-tier — decisions get the operator's say, facts a mention; smart-defaults; explicit-null = approved;
-  Y-statement rationale) and `save_decision --grounded-in / --elicited`. The framework's ADR realisation was
-  cross-checked against the ADR canon (decision 562: retrospectives are our *consequences*; Y-statement holds the
-  anticipated trade-off).
-- **Spine vs configurable domain ontology (decision 550)** — the framework identity (the "spine": `Fact` / `Decision` /
-  `CommunitySummary` / `Insight`, the provenance layer, alias-not-merge, fact-grounding, and the summarising dream
-  cycle) is now **code-pinned in `ontology.py`** (`SPINE_LABELS` / `SPINE_RELATIONSHIPS` / `DOMAIN_LABELS` /
-  `DOMAIN_RELATIONSHIPS`) and no longer read from `ontology.yaml`. The file now configures **only** the DOMAIN
-  vocabulary (entity sub-types + typed `Entity→Entity` relations), with the full spine listed as a reference comment.
-  Spine keys placed in the file are ignored — it cannot rename or redefine the framework. NREM/consolidation depends
-  only on the spine (verified), so changing the domain never requires a framework rewrite.
-- **Deterministic decision fact-grounding (`GROUNDED_IN`)** — a decision's `metadata.grounded_in` (a list of `Fact`
-  pg_ids) is materialised at first write as `(:Decision)-[:GROUNDED_IN]->(:Fact)` edges, so a decision's first write
-  now yields **≥2 nodes** (the Decision + its grounding fact(s)). `confidence` and `alternatives` are written as
-  Decision **properties**, not entity nodes — the alias-pressure measurement showed `alternatives` are ~65% free
-  phrases that would flood the graph and never alias.
-- **`fact_kind`** — a soft epistemic tag stamped on every `:Fact` node, **derived from `source_ref`** (never elicited
-  separately): `observation` (no source) · `discussion` (the reserved `discussion_context` sentinel) · `tested`
-  (test file) · `measured` (source-code file) · `researched` (any other file or `http(s)://` URL). Pure helper
-  `fact_kind_from_source_ref` in `ontology.py` + `tests/test_fact_kind.py`.
+- **`created_at` on `technical_docs`** (migration 015) — a server-stamped creation timestamp for recency-aware
+  reranking (the row `id` gives creation *order*, but not elapsed time). Backfilled from the write-ahead log where
+  recoverable; `NULL` where the original time is unknown (older/consolidated rows). Additive; indexed.
+- **Capture-quality telemetry + write-time elicitation.** A section on `/memory/telemetry` reports how completely
+  each record carries its high-value fields (a fact's source; a decision's rejected alternatives, its confidence,
+  and the facts it rests on), how often those fields were actively asked of the operator, which metadata keys are
+  in use but not yet mapped to the graph, and entity-resolution volume. A companion skill has agents *ask* for
+  those fields at save time — the operator has a say on decisions and a quick confirm on facts — phrasing the
+  rationale as an [ADR](https://adr.github.io/) Y-statement. `save_decision` gains `--grounded-in` and `--elicited`.
+- **A fixed decision-capture core, and a configurable domain vocabulary.** How the framework handles decisions —
+  the facts they are grounded in, alias-linked entities (variants are *linked*, never merged), and idle-time
+  consolidation into higher-level insights — is now pinned in code and no longer read from `ontology.yaml`; the
+  config file carries only *your* domain vocabulary (the entity types and relationships specific to your work), so
+  changing it never disturbs how decisions consolidate. A decision's first write now records the facts it rests on
+  as `GROUNDED_IN` graph edges, and its confidence and rejected alternatives as node properties (instead of
+  flooding the graph with free-text nodes). Each fact also carries a lightweight kind — observation / discussion /
+  tested / measured / researched — derived from where it came from.
 
 ## [0.6.2] — 2026-07-09
 
