@@ -7,6 +7,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.3] — 2026-07-13
+
 ### Added
 
 - **`created_at` on `technical_docs`** (migration 015) — a server-stamped creation timestamp for recency-aware
@@ -26,6 +28,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   as `GROUNDED_IN` graph edges, and its confidence and rejected alternatives as node properties (instead of
   flooding the graph with free-text nodes). Each fact also carries a lightweight kind — observation / discussion /
   tested / measured / researched — derived from where it came from.
+- **Latency + lineage instrumentation.** Every record and pipeline stage now carries a server-stamped timestamp —
+  `created_at`/`updated_at` on records, `applied_at`/`rem_reviewed_at`/`consolidated_at` on the write-ahead log, and
+  a `run_id` linking each summary to the consolidation cycle that produced it (migrations 016–018). A new per-record
+  **lineage** endpoint — `GET /memory/status/{pg_id}` (client: `memory_bridge.py lineage <pg_id>`) — answers *"what
+  happened to this record?"*: its state, its live position in the dream cycle (each stage timestamped), and what it
+  consolidated into — which summary or insight, how long that took end-to-end, in which cycle, and that cycle's
+  duration. All joined gateway-side; the read-only Monitor role can reach it.
 
 ## [0.6.2] — 2026-07-09
 
