@@ -238,7 +238,7 @@ def _kth_oldest_age_seconds(cluster_id_lists, ts_map, k):
 class _CycleRec:
     """Mutable fold tally + coverage census threaded through a recorded cycle."""
     __slots__ = ("attempted", "succeeded", "failed",
-                 "eligible_clusters", "eligible_oldest_age")
+                 "eligible_clusters", "eligible_oldest_age", "run_id")
 
     def __init__(self):
         self.attempted = self.succeeded = self.failed = 0
@@ -246,6 +246,9 @@ class _CycleRec:
         # crash mid-fold still records what was eligible. None until set.
         self.eligible_clusters = None
         self.eligible_oldest_age = None
+        # consolidation_runs.id of THIS cycle — stamped onto each summary it writes
+        # (community_summaries.run_id) for fact→summary→cycle lineage (Stage 2b).
+        self.run_id = None
 
     def fold(self, ok):
         self.attempted += 1
@@ -570,7 +573,7 @@ def fetch_insight_outbox_rows(conn, pg_ids):
         return [r[0] for r in cur.fetchall()]
 
 
-def write_insight_summary(conn, content, metadata_json, embedding, src_ids, outbox_row_ids):
+def write_insight_summary(conn, content, metadata_json, embedding, src_ids, outbox_row_ids, run_id=None):
     """Insight Postgres write: always-INSERT plus the transactional ledger
     flip of the consumed rows. Deliberately NO ON CONFLICT — migration 009
     exempts kind='insight' from the (entity, domain) unique index; a
@@ -580,10 +583,10 @@ def write_insight_summary(conn, content, metadata_json, embedding, src_ids, outb
     supersession pass)."""
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO community_summaries (content, metadata, embedding, source_pg_ids)"
-            " VALUES (%s, %s, %s, %s)"
+            "INSERT INTO community_summaries (content, metadata, embedding, source_pg_ids, run_id)"
+            " VALUES (%s, %s, %s, %s, %s)"
             " RETURNING id",
-            (content, metadata_json, embedding, src_ids),
+            (content, metadata_json, embedding, src_ids, run_id),
         )
         summary_id = cur.fetchone()[0]
         if outbox_row_ids:
@@ -797,6 +800,7 @@ class ConsolidationDaemon:
         loop = asyncio.get_running_loop()
         rec = _CycleRec()
         run_id = await loop.run_in_executor(None, lambda: _crun_start(cycle_type))
+        rec.run_id = run_id
         try:
             yield rec
         except Exception as e:
@@ -1241,8 +1245,8 @@ class ConsolidationDaemon:
                             # Before overwriting, append the current content to summary_history
                             # (capped at 20 entries) so drift can be audited over time.
                             cur.execute("""
-                                INSERT INTO community_summaries (content, metadata, embedding, source_pg_ids)
-                                VALUES (%s, %s, %s, %s)
+                                INSERT INTO community_summaries (content, metadata, embedding, source_pg_ids, run_id)
+                                VALUES (%s, %s, %s, %s, %s)
                                 ON CONFLICT ((metadata->>'entity'), (metadata->>'domain'))
                                     WHERE COALESCE(metadata->>'kind', 'thematic') <> 'insight'
                                     DO UPDATE
@@ -1251,6 +1255,7 @@ class ConsolidationDaemon:
                                         metadata        = EXCLUDED.metadata,
                                         source_pg_ids   = EXCLUDED.source_pg_ids,
                                         updated_at      = now(),
+                                        run_id          = EXCLUDED.run_id,
                                         summary_history = (
                                             SELECT jsonb_agg(entry)
                                             FROM (
@@ -1267,7 +1272,7 @@ class ConsolidationDaemon:
                                             ) sub
                                         )
                                 RETURNING id
-                            """, (_summary, _meta_json, _embedding, _pg_ids))
+                            """, (_summary, _meta_json, _embedding, _pg_ids, run_id))
                             summary_id = cur.fetchone()[0]
                             # Ledger transition (decision 267): these facts'
                             # outbox rows advance to 'consolidated' atomically
@@ -1473,7 +1478,7 @@ class ConsolidationDaemon:
                         "Insight cycle: re-folding insight %d ('%s') — new retrospective(s) on %s.",
                         old_id, entity, sorted(set(src_ids) & set(retro_ids)),
                     )
-                    ok = await self._fold_insight(conn, entity, src_ids, previous_insight=prev_content)
+                    ok = await self._fold_insight(conn, entity, src_ids, previous_insight=prev_content, run_id=rec.run_id)
                     rec.fold(ok)
                     if ok:
                         folded.update(src_ids)
@@ -1502,7 +1507,7 @@ class ConsolidationDaemon:
                         "Insight cycle: fresh cluster on '%s' — %d decisions across projects %s.",
                         c["entity"], len(ids), sorted(c.get("projects") or []),
                     )
-                    ok = await self._fold_insight(conn, c["entity"], ids)
+                    ok = await self._fold_insight(conn, c["entity"], ids, run_id=rec.run_id)
                     rec.fold(ok)
                     if ok:
                         folded.update(ids)
@@ -1511,7 +1516,7 @@ class ConsolidationDaemon:
         finally:
             await loop.run_in_executor(None, conn.close)
 
-    async def _fold_insight(self, conn, entity, decision_ids, previous_insight=None):
+    async def _fold_insight(self, conn, entity, decision_ids, previous_insight=None, run_id=None):
         """One insight fold: authoritative decision content from Postgres +
         cumulative HAD_OUTCOME wording from the graph → LLM synthesis → embed
         → always-INSERT + ledger flip (one transaction) → supersession → graph
@@ -1598,7 +1603,7 @@ class ConsolidationDaemon:
         try:
             def _write():
                 sid = write_insight_summary(
-                    conn, insight, metadata_json, embedding, src_ids, row_ids
+                    conn, insight, metadata_json, embedding, src_ids, row_ids, run_id=run_id
                 )
                 sup = supersede_covered_summaries(conn, sid, src_ids)
                 return sid, sup

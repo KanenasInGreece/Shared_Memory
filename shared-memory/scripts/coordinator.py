@@ -2113,10 +2113,12 @@ class MemoryCoordinator:
                 " FROM neo4j_outbox WHERE pg_id = $1 ORDER BY id DESC LIMIT 1", pg_id,
             )
             summ = await conn.fetch(
-                "SELECT id, COALESCE(metadata->>'kind','thematic') AS kind,"
-                "       metadata->>'entity' AS entity, created_at"
-                " FROM community_summaries"
-                " WHERE $1 = ANY(source_pg_ids) AND NOT superseded ORDER BY id", pg_id,
+                "SELECT cs.id, COALESCE(cs.metadata->>'kind','thematic') AS kind,"
+                "       cs.metadata->>'entity' AS entity, cs.created_at, cs.run_id,"
+                "       cr.started_at AS cycle_started, cr.finished_at AS cycle_finished"
+                " FROM community_summaries cs"
+                " LEFT JOIN consolidation_runs cr ON cr.id = cs.run_id"
+                " WHERE $1 = ANY(cs.source_pg_ids) AND NOT cs.superseded ORDER BY cs.id", pg_id,
             )
 
         if rec is None and ob is None:
@@ -2130,12 +2132,19 @@ class MemoryCoordinator:
             latency = None
             if rec and rec["created_at"] and s["created_at"]:
                 latency = round((s["created_at"] - rec["created_at"]).total_seconds(), 3)
+            cycle_dur = None
+            if s["cycle_started"] and s["cycle_finished"]:
+                cycle_dur = round((s["cycle_finished"] - s["cycle_started"]).total_seconds(), 3)
             consolidated_into.append({
                 "summary_pg_id": s["id"],
                 "form": "insight" if s["kind"] == "insight" else "thematic_summary",
                 "entity": s["entity"],
                 "summary_created_at": _iso(s["created_at"]),
                 "fact_to_summary_seconds": latency,
+                # which consolidation cycle produced/last-refreshed this summary + how
+                # long that cycle ran (fact → summary → cycle join, Stage 2b)
+                "run_id": s["run_id"],
+                "cycle_duration_seconds": cycle_dur,
             })
 
         gi = rec["grounded_in"] if rec else None

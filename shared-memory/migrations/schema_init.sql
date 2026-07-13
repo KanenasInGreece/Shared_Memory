@@ -60,7 +60,8 @@ CREATE TABLE IF NOT EXISTS community_summaries (
     summary_history  JSONB NOT NULL DEFAULT '[]'::jsonb,
     superseded       BOOLEAN NOT NULL DEFAULT false,
     created_at       TIMESTAMPTZ DEFAULT now(),
-    updated_at       TIMESTAMPTZ DEFAULT now()
+    updated_at       TIMESTAMPTZ DEFAULT now(),
+    run_id           BIGINT
 );
 
 CREATE INDEX IF NOT EXISTS community_summaries_active_idx ON public.community_summaries USING btree (id) WHERE (NOT superseded);
