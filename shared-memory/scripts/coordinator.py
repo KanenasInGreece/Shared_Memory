@@ -2242,6 +2242,15 @@ class MemoryCoordinator:
         except Exception as exc:
             snap["consolidation"] = {"error": str(exc)}
 
+        # Spine coverage (decision 559) — required-field completeness + the elicited
+        # rate + emergent (captured-but-unprojected) fields + alias-adjudication
+        # volume. The data behind the first-write-quality push; the monitor samples
+        # this over time for the trend.
+        try:
+            snap["spine"] = await self._spine_telemetry()
+        except Exception as exc:
+            snap["spine"] = {"error": str(exc)}
+
         # Inference/GPU-busy signal (tri-state: "busy"|"idle"|"unknown"). Read the
         # cached value the consolidation refresher already probed so telemetry never
         # shells out to nvtop itself. "unknown" (nvtop absent) is surfaced verbatim
@@ -2249,6 +2258,74 @@ class MemoryCoordinator:
         snap["inference_busy"] = self._consolidation_health.get("inference_busy", "unknown")
 
         return web.json_response({"status": "success", "telemetry": snap})
+
+    # ── Spine coverage (decision 559) ─────────────────────────────────────────
+
+    async def _spine_telemetry(self) -> dict:
+        """Spine-coverage telemetry — the data behind the first-write-quality push.
+        Three families as cheap Postgres aggregates (the monitor samples over time
+        for the trend): (A) required-field completeness + the elicited rate — an
+        elicited null is a deliberate choice, so completeness is read *among
+        elicited saves*; (B) emergent = metadata keys captured but NOT first-write
+        projected (promotion candidates); (C) alias-adjudication volume (does the
+        deterministic projection keep the graph clean). No hot-path counters."""
+        PROJECTED = {"source", "type", "entities", "decision", "source_ref",
+                     "supersedes", "grounded_in", "fact_kind", "elicited"}
+
+        def pct(a: int, b: int) -> float:
+            return round(100.0 * a / b, 1) if b else 0.0
+
+        async with self._acquire() as conn:
+            drow = await conn.fetchrow(
+                "SELECT count(*) AS n,"
+                " count(*) FILTER (WHERE metadata ? 'grounded_in') AS grounded,"
+                " count(*) FILTER (WHERE metadata->'decision' ? 'alternatives') AS alts,"
+                " count(*) FILTER (WHERE metadata->'decision' ? 'confidence') AS conf,"
+                " count(*) FILTER (WHERE (metadata->>'elicited')='true') AS elicited"
+                " FROM technical_docs"
+                " WHERE metadata->>'type'='decision' AND NOT superseded"
+            )
+            frow = await conn.fetchrow(
+                "SELECT count(*) AS n,"
+                " count(*) FILTER (WHERE metadata ? 'source_ref') AS sref,"
+                " count(*) FILTER (WHERE (metadata->>'elicited')='true') AS elicited"
+                " FROM technical_docs"
+                " WHERE (metadata->>'type' IS NULL OR metadata->>'type' <> 'decision')"
+                "   AND NOT superseded"
+            )
+            keys = await conn.fetch(
+                "SELECT k, count(*) AS n FROM technical_docs, jsonb_object_keys(metadata) k"
+                " WHERE NOT superseded GROUP BY k ORDER BY n DESC"
+            )
+            try:
+                alias_total = await conn.fetchval("SELECT count(*) FROM alias_adjudications")
+                asplit = await conn.fetch(
+                    "SELECT verdict, count(*) AS n FROM alias_adjudications GROUP BY verdict"
+                )
+                alias = {"adjudications": alias_total,
+                         "by_verdict": {r["verdict"]: r["n"] for r in asplit}}
+            except Exception as exc:
+                alias = {"error": str(exc)}
+
+        dn, fn = drow["n"], frow["n"]
+        emergent = [{"key": r["k"], "n": r["n"]}
+                    for r in keys if r["k"] not in PROJECTED][:12]
+        return {
+            "decisions": {
+                "total": dn,
+                "grounded_in_pct": pct(drow["grounded"], dn),
+                "alternatives_pct": pct(drow["alts"], dn),
+                "confidence_pct": pct(drow["conf"], dn),
+                "elicited_pct": pct(drow["elicited"], dn),
+            },
+            "facts": {
+                "total": fn,
+                "source_ref_pct": pct(frow["sref"], fn),
+                "elicited_pct": pct(frow["elicited"], fn),
+            },
+            "emergent_unprojected_fields": emergent,
+            "alias": alias,
+        }
 
     # ── Consolidation health (ADR-018) ────────────────────────────────────────
 
