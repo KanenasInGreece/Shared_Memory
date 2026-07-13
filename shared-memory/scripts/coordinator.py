@@ -252,9 +252,14 @@ _AGENT_ROLES: dict[str, str] = _load_agent_roles()
 
 
 def _read_role_permits(request: web.Request) -> bool:
-    """True if a read-only role may reach this route (exact method+path allowlist)."""
+    """True if a read-only role may reach this route (method+path allowlist)."""
     path = request.path.rstrip("/") or "/"
-    return (request.method, path) in _READ_ROLE_ROUTES
+    if (request.method, path) in _READ_ROLE_ROUTES:
+        return True
+    # Per-record lineage — GET /memory/status/{pg_id} — is read-only (no mutation),
+    # so a read-role client (e.g. the Monitor drilling into a record) may reach it.
+    # It carries a path param, so it is matched by prefix rather than a fixed entry.
+    return request.method == "GET" and path.startswith("/memory/status/")
 
 
 # ── Pluggable identity resolution ───────────────────────────────────────────────

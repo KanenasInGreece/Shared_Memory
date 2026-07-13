@@ -125,6 +125,12 @@ Query the knowledge graph for structural and provenance context.
   ```
   Read-only enforced: `CREATE`, `DELETE`, `DETACH DELETE`, `SET`, `MERGE`, `CALL`, `LOAD CSV`, `DROP` are blocked.
 
+**Record lineage** — *"what happened to pg_id N?"*:
+```
+uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py lineage <pg_id>
+```
+Returns record state (type / created_at / superseded / grounded_in), its live dream-cycle stamps (applied → rem_reviewed → consolidated), and what it consolidated **into** — which summary/insight (the form), the fact→summary latency, the producing cycle, and that cycle's duration. All joined gateway-side.
+
 ### 4. Decision Provenance (Save a Decision)
 Record architectural or design decisions with full PROV-O provenance — who decided, which AI assisted, which project, and why.
 - **Trigger:** When a significant architectural, design, or process decision is made.
