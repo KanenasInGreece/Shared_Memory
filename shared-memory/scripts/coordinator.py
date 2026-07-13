@@ -2088,6 +2088,13 @@ class MemoryCoordinator:
     # ── GET /memory/status/{pg_id} ────────────────────────────────────────────
 
     async def handle_status(self, request: web.Request) -> web.Response:
+        """Full record lineage — "what happened to pg_id N?". The coordinator owns both
+        backends and does the joins (ADR-014); the thin client only calls the gateway.
+        Returns record state (type / created_at / superseded / grounded_in), the
+        in-flight dream-cycle stamps, and what it consolidated INTO — which summary or
+        insight (the FORM, via the source_pg_ids reverse lookup) and the coarse
+        fact→summary latency when both timestamps exist. Backwards-compatible: the old
+        `neo4j`/`retries`/`applied_at` fields are retained."""
         try:
             pg_id = int(request.match_info["pg_id"])
         except ValueError:
@@ -2096,22 +2103,64 @@ class MemoryCoordinator:
             )
 
         async with self._acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT status, retries, applied_at FROM neo4j_outbox
-                WHERE pg_id = $1 ORDER BY id DESC LIMIT 1
-                """,
-                pg_id,
+            rec = await conn.fetchrow(
+                "SELECT metadata->>'type' AS type, created_at, superseded, superseded_by,"
+                "       metadata->'grounded_in' AS grounded_in"
+                " FROM technical_docs WHERE id = $1", pg_id,
+            )
+            ob = await conn.fetchrow(
+                "SELECT status, retries, applied_at, rem_reviewed_at, consolidated_at"
+                " FROM neo4j_outbox WHERE pg_id = $1 ORDER BY id DESC LIMIT 1", pg_id,
+            )
+            summ = await conn.fetch(
+                "SELECT id, COALESCE(metadata->>'kind','thematic') AS kind,"
+                "       metadata->>'entity' AS entity, created_at"
+                " FROM community_summaries"
+                " WHERE $1 = ANY(source_pg_ids) AND NOT superseded ORDER BY id", pg_id,
             )
 
-        if not row:
-            return web.json_response({"pg_id": pg_id, "neo4j": "unknown"})
+        if rec is None and ob is None:
+            return web.json_response({"pg_id": pg_id, "exists": False, "neo4j": "unknown"})
+
+        def _iso(t):
+            return t.isoformat() if t else None
+
+        consolidated_into = []
+        for s in summ:
+            latency = None
+            if rec and rec["created_at"] and s["created_at"]:
+                latency = round((s["created_at"] - rec["created_at"]).total_seconds(), 3)
+            consolidated_into.append({
+                "summary_pg_id": s["id"],
+                "form": "insight" if s["kind"] == "insight" else "thematic_summary",
+                "entity": s["entity"],
+                "summary_created_at": _iso(s["created_at"]),
+                "fact_to_summary_seconds": latency,
+            })
+
+        gi = rec["grounded_in"] if rec else None
+        if isinstance(gi, str):
+            try:
+                gi = json.loads(gi)
+            except Exception:
+                gi = None
 
         return web.json_response({
             "pg_id": pg_id,
-            "neo4j": row["status"],
-            "retries": row["retries"],
-            "applied_at": row["applied_at"].isoformat() if row["applied_at"] else None,
+            "exists": rec is not None,
+            "type": rec["type"] if rec else None,
+            "created_at": _iso(rec["created_at"]) if rec else None,
+            "superseded": rec["superseded"] if rec else None,
+            "superseded_by": rec["superseded_by"] if rec else None,
+            "grounded_in": gi if isinstance(gi, list) else None,
+            # in-flight dream-cycle stamps — None once the outbox row is deleted
+            "neo4j": ob["status"] if ob else "unknown",
+            "retries": ob["retries"] if ob else None,
+            "applied_at": _iso(ob["applied_at"]) if ob else None,
+            "rem_reviewed_at": _iso(ob["rem_reviewed_at"]) if ob else None,
+            "consolidated_at": _iso(ob["consolidated_at"]) if ob else None,
+            # what it became (durable — from the source_pg_ids reverse lookup)
+            "consolidated_into": consolidated_into,
         })
 
     # ── GET /memory/telemetry ─────────────────────────────────────────────────
