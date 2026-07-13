@@ -384,7 +384,7 @@ def mark_covered_rows_consolidated(conn):
     """
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE neo4j_outbox AS o SET status = 'consolidated'"
+            "UPDATE neo4j_outbox AS o SET status = 'consolidated', consolidated_at = now()"
             " WHERE o.status IN ('applied', 'rem_reviewed')"
             f"   AND {_FACT_ROW}"
             "   AND EXISTS (SELECT 1 FROM community_summaries cs"
@@ -588,7 +588,7 @@ def write_insight_summary(conn, content, metadata_json, embedding, src_ids, outb
         summary_id = cur.fetchone()[0]
         if outbox_row_ids:
             cur.execute(
-                "UPDATE neo4j_outbox SET status = 'consolidated'"
+                "UPDATE neo4j_outbox SET status = 'consolidated', consolidated_at = now()"
                 " WHERE id = ANY(%s)"
                 "   AND status IN ('applied', 'rem_reviewed')",
                 (list(outbox_row_ids),),
@@ -1274,7 +1274,7 @@ class ConsolidationDaemon:
                             # with the summary they were folded into. Closed
                             # (deleted) only after the Neo4j marking succeeds.
                             cur.execute(
-                                "UPDATE neo4j_outbox SET status = 'consolidated'"
+                                "UPDATE neo4j_outbox SET status = 'consolidated', consolidated_at = now()"
                                 " WHERE pg_id = ANY(%s)"
                                 "   AND status IN ('applied', 'rem_reviewed')",
                                 (_pg_ids,),

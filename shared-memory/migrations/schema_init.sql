@@ -109,7 +109,9 @@ CREATE TABLE IF NOT EXISTS neo4j_outbox (
     retries          INTEGER NOT NULL DEFAULT 0,
     created_at       TIMESTAMPTZ DEFAULT now(),
     applied_at       TIMESTAMPTZ,
-    next_attempt_at  TIMESTAMPTZ
+    next_attempt_at  TIMESTAMPTZ,
+    rem_reviewed_at  TIMESTAMPTZ,
+    consolidated_at  TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS neo4j_outbox_pending_id_idx ON public.neo4j_outbox USING btree (id) WHERE (status = 'pending'::text);
