@@ -652,6 +652,24 @@ async def main() -> None:
         else:
             print(format_status(payload))
         return
+    elif action == "lineage":
+        # "What happened to pg_id N?" — record state + in-flight dream-cycle stamps +
+        # what it consolidated into (which summary/insight, the form, fact→summary
+        # latency). All joins done gateway-side (ADR-014); this only calls the endpoint.
+        if len(sys.argv) < 3 or not sys.argv[2].lstrip("-").isdigit():
+            print(json.dumps({"error": "Usage: memory_bridge.py lineage <pg_id>"}))
+            sys.exit(1)
+        pid = int(sys.argv[2])
+        try:
+            async with _async_client(30.0) as client:
+                r = await client.get(
+                    f"{COORDINATOR_BASE}/memory/status/{pid}",
+                    headers=_request_headers(),
+                )
+                print(json.dumps(r.json(), indent=2))
+        except httpx.ConnectError as exc:
+            print(json.dumps(_coordinator_unavailable(exc)))
+        return
     elif action in ("doctor", "health"):
         diag = await check_gateway_compat()
         print(json.dumps(diag, indent=2))

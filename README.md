@@ -1127,6 +1127,22 @@ $shared-memory          # Codex CLI (explicit); also auto-matched via SKILL.md d
 /activate shared-memory # Antigravity CLI
 ```
 
+### What the telemetry and lineage expose
+
+Everything below is served by the gateway — the coordinator does the joins across both stores, so any client or dashboard reads it over HTTP with no direct database access.
+
+**Operational telemetry — `GET /memory/telemetry`** (a read-only token is enough). One snapshot the coordinator assembles from both backends:
+
+- **Outbox health** — pending / applied / failed graph writes, and how long the oldest failure has been stuck.
+- **Dream-cycle backlog** — how many facts and decisions are waiting for enrichment and consolidation, and how many consolidation *cycles* are due.
+- **Consolidation liveness** — per-cycle counts, last outcome, and a "stalled" verdict if folding has stopped while work is due.
+- **Capture quality** — how completely records carry their high-value fields (a fact's source; a decision's rejected alternatives, its confidence, and the facts it rests on), how often those fields were actually asked of the operator, and which metadata keys are in use but not yet mapped to the graph. This is the signal for whether the memory is staying high-value over time.
+- **Distributions** — record types, agents, sources, domains; entity-graph shape and alias coverage; and any labels or relationships outside the schema (drift).
+
+**Per-record lineage — `GET /memory/status/{pg_id}`** (client: `memory_bridge.py lineage <pg_id>`). *"What happened to this record?"* — its type and creation time, whether it has been superseded, its live position in the dream cycle (written → applied to the graph → enriched → consolidated, each with a timestamp), and **what it became**: which thematic summary or cross-project insight it folded into, how long that took end-to-end, in which consolidation cycle, and how long that cycle ran.
+
+**Timing and latency** — because every stage now carries a server-stamped timestamp, these come out for free: the write→graph apply lag, the record→summary end-to-end latency, the per-cycle dream duration, and the enrichment-vs-consolidation split (live while a record is in flight; the durable per-cycle figure is kept on the consolidation ledger). Raw material for finding where the pipeline spends its time.
+
 ### Optional: Shared Memory Monitor (companion dashboard)
 
 **Telemetry is built into the framework.** The coordinator emits a full operational snapshot at `GET /memory/telemetry` — outbox health, the REM/NREM dream-cycle backlog, NREM consolidation-cycle counts (`nrem`), and metadata distributions (`breakdown`) — and any agent can read it directly via `memory_bridge.py status` (see [§11 CLI usage](#cli-usage)). This works with or without any dashboard installed; the telemetry is part of the gateway, not an add-on.
