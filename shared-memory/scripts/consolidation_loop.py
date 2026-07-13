@@ -1250,6 +1250,7 @@ class ConsolidationDaemon:
                                         embedding       = EXCLUDED.embedding,
                                         metadata        = EXCLUDED.metadata,
                                         source_pg_ids   = EXCLUDED.source_pg_ids,
+                                        updated_at      = now(),
                                         summary_history = (
                                             SELECT jsonb_agg(entry)
                                             FROM (
