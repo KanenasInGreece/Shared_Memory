@@ -58,7 +58,9 @@ CREATE TABLE IF NOT EXISTS community_summaries (
     visibility       TEXT NOT NULL DEFAULT 'global'::text,
     source_pg_ids    INT4[],
     summary_history  JSONB NOT NULL DEFAULT '[]'::jsonb,
-    superseded       BOOLEAN NOT NULL DEFAULT false
+    superseded       BOOLEAN NOT NULL DEFAULT false,
+    created_at       TIMESTAMPTZ DEFAULT now(),
+    updated_at       TIMESTAMPTZ DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS community_summaries_active_idx ON public.community_summaries USING btree (id) WHERE (NOT superseded);
@@ -66,6 +68,7 @@ CREATE INDEX IF NOT EXISTS community_summaries_agent_id_idx ON public.community_
 CREATE INDEX IF NOT EXISTS community_summaries_embedding_idx ON public.community_summaries USING hnsw (embedding vector_cosine_ops);
 CREATE UNIQUE INDEX IF NOT EXISTS community_summaries_entity_domain_unique ON public.community_summaries USING btree (((metadata ->> 'entity'::text)), ((metadata ->> 'domain'::text))) WHERE (COALESCE((metadata ->> 'kind'::text), 'thematic'::text) <> 'insight'::text);
 CREATE INDEX IF NOT EXISTS community_summaries_scope_idx ON public.community_summaries USING btree (scope);
+CREATE INDEX IF NOT EXISTS community_summaries_updated_at_idx ON public.community_summaries USING btree (updated_at);
 CREATE INDEX IF NOT EXISTS community_summaries_visibility_idx ON public.community_summaries USING btree (visibility);
 
 -- ─── consolidation_runs ─────────────────────────────────────────────────────────
@@ -106,7 +109,9 @@ CREATE TABLE IF NOT EXISTS neo4j_outbox (
     retries          INTEGER NOT NULL DEFAULT 0,
     created_at       TIMESTAMPTZ DEFAULT now(),
     applied_at       TIMESTAMPTZ,
-    next_attempt_at  TIMESTAMPTZ
+    next_attempt_at  TIMESTAMPTZ,
+    rem_reviewed_at  TIMESTAMPTZ,
+    consolidated_at  TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS neo4j_outbox_pending_id_idx ON public.neo4j_outbox USING btree (id) WHERE (status = 'pending'::text);

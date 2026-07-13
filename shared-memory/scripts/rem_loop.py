@@ -503,7 +503,7 @@ class REMDaemon:
         def _mark() -> None:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE neo4j_outbox SET status = 'rem_reviewed'"
+                    "UPDATE neo4j_outbox SET status = 'rem_reviewed', rem_reviewed_at = now()"
                     " WHERE id = ("
                     "   SELECT id FROM neo4j_outbox"
                     "   WHERE pg_id = %s AND status = 'applied'"
