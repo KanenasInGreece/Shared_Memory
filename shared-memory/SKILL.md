@@ -78,7 +78,13 @@ Commit findings, decisions, and technical facts to long-term shared memory.
 
 **`project` / `domain` scopes consolidation (recommended).** NREM keys community summaries on **(entity, domain)** — facts that share an entity but carry different `project`/`domain` tags are never fused into one summary. Untagged facts collapse to domain `general` (the prior single-summary-per-entity behaviour). Tag saves whose entities span unrelated topics (e.g. `"project":"homelab"` vs `"project":"shared-memory"`) to keep summaries coherent.
 
-**`source_ref` (optional):** supply a sub-document citation string to preserve lineage back to the original asset. Passed through unchanged by the coordinator; stored on the `Fact` Neo4j node as `source_ref`. Examples: `"design-doc.pdf#p12"`, `"meeting-2026-05-15.mp4@00:04:32"`, `"CLAUDE.md#L45-50"`.
+**`source_ref`:** a citation string for where the fact came from — stored on the `Fact` node and used to **auto-derive `fact_kind`** (`observation` = none · `discussion` = the reserved sentinel `"discussion_context"` · `tested` = a test path · `measured` = a code file · `researched` = any other file/URL). Examples: `"design-doc.pdf#p12"`, `"CLAUDE.md#L45-50"`, `"discussion_context"`.
+
+**Elicit the spine fields before you save — this is what makes the memory high-signal (decisions 553/559).** Saving is *not* a silent pass-through. Before a `save` of a significant fact or any `save_decision`, ask the operator — one short batched prompt — for the fields that carry the signal, propose defaults they only confirm, and stamp `"elicited": true` in metadata so coverage telemetry counts the ask:
+- **Fact →** `source_ref` (default `"discussion_context"` for a conversation-derived fact).
+- **Decision →** `grounded_in` (pg_ids of the facts it rests on — **always include at least the conversation fact**; propose 2–3 recent facts to confirm), `alternatives` (auto-fill any options you already generated), `confidence` (`high`/`medium`/`low`).
+- **Null is allowed only as an explicit answer.** If the operator says "no source"/"no alternatives", that null is deliberate — record it (stamp `elicited: true`) and move on. Never *skip* the ask.
+- Trigger on decisions and significant facts, never on retrieval/summarising turns. Keep it to one confirmation — don't nag on trivial facts.
 
 **What happens on save:**
 1. Sends request to Memory Coordinator (gateway :8888)
