@@ -9,6 +9,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`created_at` on `technical_docs`** (migration 015) — server-stamped creation timestamp for **reranker recency**
+  (`id` stays for stable order/tie-break; id-gaps aren't uniform in time). Backfilled from `neo4j_outbox.created_at`
+  where recoverable; `NULL` = unknown creation time (consolidated/legacy). Additive; index `technical_docs_created_at_idx`.
+- **Spine-coverage telemetry** — `/memory/telemetry.spine`: required-field completeness + **elicited rate** + emergent
+  captured-but-unprojected fields + alias-adjudication volume (decision 559). Plus a client **elicitation protocol**
+  (`SKILL.md` two-tier — decisions get the operator's say, facts a mention; smart-defaults; explicit-null = approved;
+  Y-statement rationale) and `save_decision --grounded-in / --elicited`. The framework's ADR realisation was
+  cross-checked against the ADR canon (decision 562: retrospectives are our *consequences*; Y-statement holds the
+  anticipated trade-off).
 - **Spine vs configurable domain ontology (decision 550)** — the framework identity (the "spine": `Fact` / `Decision` /
   `CommunitySummary` / `Insight`, the provenance layer, alias-not-merge, fact-grounding, and the summarising dream
   cycle) is now **code-pinned in `ontology.py`** (`SPINE_LABELS` / `SPINE_RELATIONSHIPS` / `DOMAIN_LABELS` /

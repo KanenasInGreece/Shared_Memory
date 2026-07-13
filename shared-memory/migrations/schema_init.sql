@@ -123,11 +123,13 @@ CREATE TABLE IF NOT EXISTS technical_docs (
     scope            TEXT NOT NULL DEFAULT 'global'::text,
     visibility       TEXT NOT NULL DEFAULT 'global'::text,
     superseded       BOOLEAN NOT NULL DEFAULT false,
-    superseded_by    INTEGER
+    superseded_by    INTEGER,
+    created_at       TIMESTAMPTZ DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS technical_docs_agent_id_idx ON public.technical_docs USING btree (agent_id);
 CREATE UNIQUE INDEX IF NOT EXISTS technical_docs_content_hash_key ON public.technical_docs USING btree (content_hash);
+CREATE INDEX IF NOT EXISTS technical_docs_created_at_idx ON public.technical_docs USING btree (created_at);
 CREATE INDEX IF NOT EXISTS technical_docs_embedding_idx ON public.technical_docs USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS technical_docs_scope_idx ON public.technical_docs USING btree (scope);
 CREATE INDEX IF NOT EXISTS technical_docs_superseded_by_idx ON public.technical_docs USING btree (superseded_by) WHERE (superseded_by IS NOT NULL);
