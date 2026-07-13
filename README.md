@@ -1,7 +1,8 @@
 # Shared Memory Framework
 
-**A local, private, shared brain for every AI agent on your workstation.**
-Every insight one agent gains is available to every other — across sessions, across tools, across models. Knowledge stays yours.
+Work through a problem with Claude Code today. Open Gemini or Codex next week and it already knows what you decided, why, and what you ruled out — no re-explaining, no lost context. Every AI tool on your machine reads and writes **one shared memory**, so what one agent learns, the others recall. Local, private, yours.
+
+That's the pain it removes. What makes it more than a shared notepad is *what* it remembers: not the code (Git has that) but the **decisions** behind it — the rationale, the alternatives you rejected, the confidence you held, the facts they rested on — and, while your machine is idle, it **dreams**, consolidating a week of those into insights no single note held.
 
 A unified semantic and relational memory layer built from first principles to survive the interference problem and scale safely to concurrent multi-agent workloads.
 
