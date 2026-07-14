@@ -34,7 +34,7 @@ RERANKER_URL = "http://localhost:8888/v1/reranking"
 # Wire contract this MCP server speaks on its /memory/* gateway calls. Keep in
 # step with API_VERSION in coordinator.py / memory_bridge.py — the gateway logs
 # a warning (coordinator._check_client_version) if they disagree.
-API_VERSION = 1
+API_VERSION = 2
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 
@@ -554,12 +554,17 @@ async def save_retrospective(
     date: str = "",
 ) -> str:
     """
-    Record an outcome on an existing Decision node (HAD_OUTCOME edge).
+    Record an outcome for an existing Decision as a full retrospective record
+    (own searchable record + Retrospective node behind the decision's
+    HAD_OUTCOME trigger edge).
 
     Use this after a decision has been acted on to close the Why-To loop.
-    Each call appends a new dated edge — multiple retrospectives per decision are allowed.
+    Multiple retrospectives per decision are allowed — the newest is the
+    decision's current verdict.
 
     Required: pg_id (returned by save_decision), rating, notes, source.
+    rating is a closed outcome-state enum: validated | mixed | refined |
+    pending | reversed ('reversed' supersedes the decision; nuance goes in notes).
     Optional: date (ISO string, default: today).
     """
     coordinator_url = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
@@ -590,7 +595,9 @@ async def save_retrospective(
         )
 
     if result.get("status") == "success":
-        return f"Retrospective recorded on Decision pg_id={result['target_pg_id']}."
+        own = result.get("pg_id")
+        own_note = f" (record pg_id={own})" if own else ""
+        return f"Retrospective recorded on Decision pg_id={result['target_pg_id']}{own_note}."
 
     return f"Error: {result.get('message', result)}"
 

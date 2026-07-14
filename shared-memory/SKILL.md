@@ -115,7 +115,7 @@ Query the knowledge graph for structural and provenance context.
   ```
   uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query why-to-check --title "outbox"
   uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query who-decided --project shared_memory
-  uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query retrospectives --rating good
+  uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query retrospectives --rating validated
   uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query agent-decisions --assisted-by claude
   ```
 
@@ -167,23 +167,26 @@ uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/s
 
 ### Task 5 — Save a Retrospective (record a decision outcome)
 
-After a decision has been acted on, close the Why-To loop with `save_retrospective`. Each call appends a new dated `HAD_OUTCOME` edge on the Decision node — multiple retrospectives per decision are allowed.
+After a decision has been acted on, close the Why-To loop with `save_retrospective`. A retrospective is a **full record**: it gets its own `pg_id`, is semantically searchable, and appears in the graph as a `Retrospective` node behind the decision's `HAD_OUTCOME` trigger edge. Multiple retrospectives per decision are allowed — the **newest is treated as the decision's current verdict** by synthesis and retrieval.
+
+**Retrospective saves — the operator gets a say.** Before any `save_retrospective`, ask (one short batched prompt), proposing defaults to confirm or adjust: the **target decision** (if the operator described it rather than giving a pg_id, `search` for it and confirm the match before saving), the **rating** (propose one of the five states below from what the conversation showed), and `grounded_in` — the pg_ids of the facts that **measured** this outcome, each with a role exactly as in `save_decision` (`"601,602:considered"`; a test-grounded decision deserves a test-grounded retrospective, and a bare id falls to the fact-kind default role). Pass `--elicited` when you asked. Set `--source-ref` to where the evidence lives (test file → the record's kind becomes `tested`).
 
 **CLI (Claude Code, Antigravity CLI, Codex CLI):**
 ```
 uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py save_retrospective \
   --pg-id 42 \
-  --rating "high" \
+  --rating "validated" \
   --notes "Outbox-as-WAL held under concurrent load; no orphaned rows in 30-day prod run." \
+  --grounded-in "601" --source-ref "tests/test_outbox_ledger.py" --elicited \
   --source claude_code
 ```
 
-**MCP tool (LM Studio):** `save_retrospective(pg_id=42, rating="high", notes="...", source="qwen3")`
+**MCP tool (LM Studio):** `save_retrospective(pg_id=42, rating="validated", notes="...", source="qwen3")`
 
 **Required:** `--pg-id` (int, returned by `save_decision`), `--rating`, `--notes`
-**Optional:** `--date` (ISO string, default: today), `--source` (default: `$AGENT_ID`)
+**Optional:** `--date` (ISO, default today), `--source` (default `$AGENT_ID`), `--grounded-in` (pg_ids+roles of the outcome evidence), `--entities`, `--source-ref`, `--elicited`
 
-**`--rating` is free text with one structural value:** `reversed` marks the decision superseded — it disappears from Tier-1 search and never seeds a new cross-project insight (existing insights are re-folded with the reversal recorded as a known limit). Use it only when the decision was actually withdrawn; otherwise rate freely (`high`, `good`, `mixed`, `low`, …) — the wording of `--notes` is what insight synthesis quotes, so write outcome evidence, not just a verdict.
+**`--rating` is a closed outcome-state enum:** `validated` (held up), `mixed` (partly), `refined` (the decision evolved), `pending` (not yet judged), `reversed` (withdrawn — supersedes the decision: it disappears from Tier-1 search and never seeds a new cross-project insight; existing insights re-fold with the reversal as a known limit). States, not grades — the nuance and the measured delta belong in `--notes`, which is what insight synthesis quotes.
 
 **Why-To loop query (raw Cypher; Phase D will add a named shortcut):**
 ```
@@ -294,10 +297,11 @@ After 3 weeks running multi-agent concurrent writes:
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py save_retrospective \
   --pg-id 43 \
-  --rating "high" \
+  --rating "validated" \
   --notes "No deadlocks observed across 30-day multi-agent test. 6-agent concurrent writes at 50 req/s — zero lock contention errors. Sorted acquisition order held." \
+  --grounded-in "88" --source-ref "tests/test_hardening.py" --elicited \
   --source "antigravity"
-# → {"status":"success","target_pg_id":43}
+# → {"status":"success","pg_id":91,"target_pg_id":43,...}   # 91 = the retro's OWN record id
 ```
 
 Now the Why-To check is informative for any future agent:
@@ -306,7 +310,7 @@ Now the Why-To check is informative for any future agent:
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query why-to-check --title "lock"
 # → [{d.title: "Sort entity locks by name...",
-#     o.rating: "high",
+#     o.rating: "validated",
 #     o.notes: "No deadlocks observed...",
 #     o.date: "2026-06-19"}]
 ```
@@ -336,9 +340,9 @@ Args: {
   "entities": "coordinator,OutboxPattern,SharedMemory"
 }
 
-# Save a retrospective
+# Save a retrospective (rating: validated|mixed|refined|pending|reversed)
 Tool: save_retrospective
-Args: {"pg_id": 43, "rating": "high", "notes": "No deadlocks in 30-day test.", "source": "qwen3-27b"}
+Args: {"pg_id": 43, "rating": "validated", "notes": "No deadlocks in 30-day test.", "source": "qwen3-27b"}
 
 # Supersede / retract a fact (soft — kept, flagged, hidden from search)
 Tool: supersede

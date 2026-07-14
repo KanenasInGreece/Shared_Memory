@@ -30,7 +30,12 @@ import httpx
 VERSION = "0.6.4"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
-API_VERSION = 1
+API_VERSION = 2
+
+# Retrospective outcome-state ratings — MUST mirror ontology.RETRO_RATINGS on
+# the gateway (the thin client never imports server modules). Outcome STATES,
+# not valence: 'reversed' drives the supersession cascade; nuance goes in notes.
+RETRO_RATINGS = ("validated", "mixed", "refined", "pending", "reversed")
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Two-source dotenv search — both sources tried; first definition wins.
@@ -520,18 +525,51 @@ def build_retrospective_payload(
     notes: str,
     date: str = "",
     source: str = None,
+    grounded_in: str = "",
+    entities: str = "",
+    source_ref: str = "",
+    elicited: bool = False,
 ) -> dict:
-    """Build the JSON payload for POST /memory/retrospective.
+    """Build the JSON payload for POST /memory/retrospective (API v2 —
+    retro-as-record: the gateway mints a full searchable record and returns
+    its own pg_id).
 
-    Pure function — no I/O, no side effects.
+    grounded_in uses the same "pgid[:role],pgid" grammar as save_decision —
+    the facts that MEASURED this outcome (test-grounded retrospectives,
+    decision 542). Pure function — no I/O, no side effects.
     """
-    return {
+    payload = {
         "pg_id": pg_id,
-        "rating": rating,
+        "rating": rating.strip().lower(),
         "notes": notes,
         "date": date or datetime.now().date().isoformat(),
         "agent_id": source or AGENT_ID,
     }
+    gi: list[int] = []
+    grounded_roles: dict[str, str] = {}
+    for tok in grounded_in.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        pid_str, _, role = tok.partition(":")
+        pid_str = pid_str.strip()
+        if not pid_str.isdigit():
+            continue
+        pid = int(pid_str)
+        gi.append(pid)
+        if role.strip():
+            grounded_roles[str(pid)] = role.strip().lower()
+    if gi:
+        payload["grounded_in"] = gi
+    if grounded_roles:
+        payload["grounded_roles"] = grounded_roles
+    if entities:
+        payload["entities"] = [e.strip() for e in entities.split(",") if e.strip()]
+    if source_ref:
+        payload["source_ref"] = source_ref
+    if elicited:
+        payload["elicited"] = True
+    return payload
 
 
 async def save_retrospective_artifact(
@@ -540,8 +578,19 @@ async def save_retrospective_artifact(
     notes: str,
     date: str = "",
     source: str = None,
+    grounded_in: str = "",
+    entities: str = "",
+    source_ref: str = "",
+    elicited: bool = False,
 ) -> dict:
-    payload = build_retrospective_payload(pg_id, rating, notes, date, source)
+    # Client-side enum check — a friendlier error than the gateway's 400, and
+    # the doc surface for what a rating IS.
+    if rating.strip().lower() not in RETRO_RATINGS:
+        return {"status": "error",
+                "message": (f"rating must be one of {list(RETRO_RATINGS)} — outcome "
+                            "states, not valence; put the nuance in --notes")}
+    payload = build_retrospective_payload(pg_id, rating, notes, date, source,
+                                          grounded_in, entities, source_ref, elicited)
     try:
         async with _async_client(60.0) as client:
             r = await client.post(
@@ -823,18 +872,33 @@ async def main() -> None:
     elif action == "save_retrospective":
         p = argparse.ArgumentParser(
             prog="memory_bridge.py save_retrospective",
-            description="Record an outcome for a past decision (HAD_OUTCOME edge).",
+            description="Record an outcome for a past decision as a full searchable "
+                        "record (Retrospective node behind the decision's HAD_OUTCOME "
+                        "trigger edge).",
         )
         p.add_argument("--pg-id",  required=True, type=int,
                        help="pg_id of the target Decision")
         p.add_argument("--rating", required=True,
-                       help="Outcome rating (e.g. high, medium, low)")
+                       help=f"Outcome state, one of {list(RETRO_RATINGS)} — 'reversed' "
+                            "supersedes the decision; nuance goes in --notes")
         p.add_argument("--notes",  required=True,
-                       help="What actually happened / lessons learned")
+                       help="What actually happened / lessons learned (becomes the "
+                            "record's searchable content)")
         p.add_argument("--date",   default="",
                        help="ISO date of outcome (default: today)")
         p.add_argument("--source", default=AGENT_ID,
                        help="Agent/model recording the outcome (default: $AGENT_ID)")
+        p.add_argument("--grounded-in", default="",
+                       help="Comma-separated pg_ids of the facts that MEASURED this "
+                            "outcome, optionally with a role: '601,602:considered'. A "
+                            "test-grounded decision deserves a test-grounded retrospective.")
+        p.add_argument("--entities",    default="",
+                       help="Comma-separated Neo4j entities to link")
+        p.add_argument("--source-ref",  default="",
+                       help="Where the outcome evidence lives (test file, URL, "
+                            "'discussion_context') — derives the record's fact_kind")
+        p.add_argument("--elicited",    action="store_true",
+                       help="The fields were elicited from the operator")
         args = p.parse_args(sys.argv[2:])
         print(json.dumps(
             await save_retrospective_artifact(
@@ -843,6 +907,10 @@ async def main() -> None:
                 notes=args.notes,
                 date=args.date,
                 source=args.source,
+                grounded_in=args.grounded_in,
+                entities=args.entities,
+                source_ref=args.source_ref,
+                elicited=args.elicited,
             ),
             indent=2,
         ))

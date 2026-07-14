@@ -241,7 +241,7 @@ If you adopt a "save everything" policy (logs, test output, status checks, raw s
 
 # Was a past decision successful? (Phase C — retrospectives)
 "Was the outbox-as-WAL approach a good decision for the shared_memory project?"
-→ Retrospective 2026-06-15 (rating: 8/10): held up under multi-agent load.
+→ Retrospective 2026-06-15 (rating: validated): held up under multi-agent load.
    Note: outbox replay on crash worked correctly; Neo4j lag < 200 ms typical.
    Suggested follow-up: add TTL pruning for applied rows > 30 days.
 
@@ -267,7 +267,7 @@ If you adopt a "save everything" policy (logs, test output, status checks, raw s
 
 # Retrospectives require save_retrospective (Phase C — now available)
 "Was the BGE-M3 selection the right call?"
-→ No retrospective saved yet. Use save_retrospective --pg-id <id> --rating high --notes "..."
+→ No retrospective saved yet. Use save_retrospective --pg-id <id> --rating validated --notes "..."
 ```
 
 The governing heuristic: **if you can get the answer in 3 seconds from `git log`, `grep`, or `cat`, don't save it here.** Memory is for context that evaporates without capture — the why behind a decision, the options that were weighed, the outcome after the fact.
@@ -1093,7 +1093,7 @@ uv run --with httpx --with python-dotenv \
 uv run --with httpx --with python-dotenv \
   python shared-memory/scripts/memory_bridge.py query agent-decisions --assisted-by claude
 uv run --with httpx --with python-dotenv \
-  python shared-memory/scripts/memory_bridge.py query retrospectives --rating good
+  python shared-memory/scripts/memory_bridge.py query retrospectives --rating validated
 
 # Raw Cypher — entity hub sizes (top referenced concepts)
 uv run --with httpx --with python-dotenv \
@@ -1110,7 +1110,7 @@ The coordinator exposes six memory endpoints on port 8888. All routes (except `/
 | `POST` | `/memory/save` | `{content, metadata, agent_id?, scope?, visibility?}` | `{status, pg_id, neo4j, message}` |
 | `POST` | `/memory/search` | `{query, limit?, scope?, agent_id?}` | `{status, results[]}` |
 | `POST` | `/memory/graph` | `{cypher, params?}` | `{status, records[]}` |
-| `POST` | `/memory/retrospective` | `{pg_id, rating, notes, date?, agent_id?}` | `{status, target_pg_id}` |
+| `POST` | `/memory/retrospective` | `{pg_id, rating, notes, date?, grounded_in?, grounded_roles?, entities?, source_ref?, elicited?, agent_id?}` — `rating` ∈ validated \| mixed \| refined \| pending \| reversed | `{status, pg_id, target_pg_id, message}` — `pg_id` is the retrospective's **own** record id (retro-as-record) |
 | `GET` | `/memory/status/{pg_id}` | — | `{pg_id, neo4j, retries, applied_at}` |
 | `GET` | `/memory/telemetry` | — | `{status, telemetry: {postgres, neo4j, nrem, breakdown}}` — outbox + dream-cycle backlog rollup, NREM consolidation-cycle counts, and metadata distributions. The coordinator owns both backends and does the joins, so a read-only client can render a full dashboard from this one call with no direct DB access. (v0.4.3; `nrem`/`breakdown` added v0.4.4) |
 | `GET` | `/health` | — | `{status, embedder, reranker, llm, daemon, rem_daemon, auth_required}` |
@@ -1324,7 +1324,7 @@ Four weeks later, the outbox has been running in production. Any agent can recor
 
 ```bash
 # LM Studio records the retrospective via MCP tool:
-# save_retrospective(pg_id=42, rating="high",
+# save_retrospective(pg_id=42, rating="validated",
 #   notes="Held up under multi-agent concurrent load. Outbox replay on crash worked correctly. Neo4j lag < 200 ms typical. No orphaned Fact nodes after 4 weeks.",
 #   source="lm_studio")
 
@@ -1332,15 +1332,18 @@ Four weeks later, the outbox has been running in production. Any agent can recor
 uv run --with httpx --with python-dotenv \
   python shared-memory/scripts/memory_bridge.py save_retrospective \
   --pg-id 42 \
-  --rating "high" \
+  --rating "validated" \
   --notes "Held up under multi-agent concurrent load. Outbox replay on crash worked correctly. Neo4j lag < 200 ms typical. No orphaned Fact nodes after 4 weeks." \
   --source "antigravity"
 ```
 
 Response:
 ```json
-{"status": "success", "target_pg_id": 42}
+{"status": "success", "pg_id": 91, "target_pg_id": 42,
+ "message": "Retrospective stored with ID 91 (rating=validated, target decision 42)."}
 ```
+
+The retrospective is a **record of its own** (`pg_id` 91): its notes are embedded and semantically searchable, it appears in the graph as a `Retrospective` node behind the decision's `HAD_OUTCOME` edge, and it can name the facts that *measured* the outcome (`--grounded-in "88:based_on" --source-ref tests/test_hardening.py`) — so a test-grounded decision gets a test-grounded retrospective, walkable end to end.
 
 Now the Why-To check returns something useful for any future agent:
 
@@ -1350,7 +1353,7 @@ uv run --with httpx --with python-dotenv \
   --title "outbox"
 
 # → [{d.title: "Use outbox-as-WAL for Neo4j writes",
-#     o.rating: "high",
+#     o.rating: "validated",
 #     o.notes:  "Held up under multi-agent concurrent load...",
 #     o.date:   "2026-06-26",
 #     decided_by: "Xenofon"}]
@@ -1398,7 +1401,7 @@ Args: {
 Tool: save_retrospective
 Args: {
   "pg_id": 42,
-  "rating": "high",
+  "rating": "validated",
   "notes": "No NOTIFY drops observed after migration to async. Event loop latency stable under 6-agent concurrent write test.",
   "source": "lm_studio"
 }

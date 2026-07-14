@@ -195,6 +195,7 @@ Written by the outbox worker when `metadata["type"] == "decision"`.
 | Label | Purpose |
 |---|---|
 | `Decision` | An architectural or design decision — keyed by `pg_id`, links to all PROV-O edges. Lifecycle flags: `rem_processed` (REM enrichment done), `consolidated` (folded into an insight), `superseded` (reversed via `rating="reversed"`). |
+| `Retrospective` | A recorded outcome for a decision (retro-as-record, v2) — keyed by `pg_id` like Fact/Decision. Carries `rating` (outcome-state enum: `validated`\|`mixed`\|`refined`\|`pending`\|`reversed`), `date`, `content` (notes snippet; full notes in Postgres), `source`, `fact_kind`, and `rem_processed`. Reached from its decision via the `HAD_OUTCOME` trigger edge; grounds in evidence facts via typed ROLE edges. Spine — never configurable. |
 | `Human` | A person who owns or makes a decision (`decided_by` field) |
 | `AIAgent` | An AI tool that assisted in the decision (`assisted_by` list) |
 | `Project` | Project scope — root node for decisions and milestones |
@@ -225,7 +226,7 @@ Written by the outbox worker for `type:decision` saves.
 | `SUPERSEDES` | `(:Decision)-[:SUPERSEDES]->(:Decision)` | Replaces a prior decision |
 | `INFORMED_BY` | `(:Decision)-[:INFORMED_BY]->(:Decision)` | Prior decision used as input. Populated by reference resolution (Stage 1.2b) from textual cross-references in content, plus any explicit links. |
 | `REFERENCES` | `(:Fact\|:Decision)-[:REFERENCES]->(:Fact\|:Decision)` | A record cross-reference resolved from content (Stage 1.2b): a context-gated pg-id mention (e.g. "refines decision 381") that resolves to a real record. `Decision→Decision` is promoted to `INFORMED_BY`; everything else is `REFERENCES`. Carries `resolved_from='content'` + `cue`. Never auto-`SUPERSEDES` (explicit-only). |
-| `HAD_OUTCOME` | `(:Decision)-[:HAD_OUTCOME {rating,date,notes}]->()` | Retrospective — dated edge property, not a node |
+| `HAD_OUTCOME` | `(:Decision)-[:HAD_OUTCOME {date}]->(:Retrospective)` | Retro-as-record (v2): the trigger edge to the retrospective RECORD (rating/date/content live on the node). Legacy pre-conversion shape: a self-loop `(:Decision)-[:HAD_OUTCOME {rating,date,notes}]->(:Decision)` with the payload as edge props — readers accept both during the transition |
 | `SUPERSEDES` | `(:CommunitySummary)-[:SUPERSEDES]->(:CommunitySummary)` | Also written between CommunitySummary nodes when supersession rule fires (v0.4.0) |
 | `SUPERSEDES` | `(:Fact)-[:SUPERSEDES]->(:Fact)` | A correction supersedes an older fact (decision 381); the old `:Fact` also gets `superseded = true` so REM/NREM skip it |
 
@@ -246,26 +247,34 @@ Written by the REM daemon during idle-time fact enrichment. These relationships 
 
 **Entity type registry:** REM builds a closed registry from all existing typed nodes (`Human`, `AIAgent`, `Project`, `Decision`, `Entity`) before each batch. Once a name is registered (e.g. "Xenofon → Human"), every occurrence in the batch uses the same label and a compatible relationship type. The LLM cannot reclassify existing nodes.
 
-### Retrospective write protocol
+### Retrospective write protocol (v2 — retro-as-record)
 
-To record an outcome on an existing Decision, `POST /memory/retrospective` with:
+A retrospective is a **full record**: its own `technical_docs` row (content = the notes, embedded and searchable), plus a `:Retrospective` node in the graph. `POST /memory/retrospective` with:
 
 ```json
-{"pg_id": 42, "rating": "high", "notes": "Held up in prod.", "agent_id": "claude_code"}
+{"pg_id": 42, "rating": "validated", "notes": "Held up in prod.",
+ "grounded_in": [601], "grounded_roles": {"601": "based_on"},
+ "source_ref": "tests/test_outbox_ledger.py", "elicited": true,
+ "agent_id": "claude_code"}
 ```
 
-The coordinator verifies the `pg_id` exists in `technical_docs`, then writes a `neo4j_outbox` row with `type=retrospective`. The outbox worker issues:
+The coordinator validates the rating against the outcome-state enum, verifies the target `pg_id` exists, embeds the notes (hard mandate), inserts the retro's own row (inheriting the target's `project`), and writes a `neo4j_outbox` row **under the retro's own pg_id** (`type=retrospective`, `v: 2`, `target_pg_id` = the decision). The outbox worker materialises:
 
 ```cypher
-MATCH (d:Decision {pg_id: $pg_id})
-CREATE (d)-[:HAD_OUTCOME {rating: $rating, date: $date, notes: $notes}]->(d)
+MERGE (r:Retrospective {pg_id: $pg_id})            // rating, date, content snippet,
+SET r.rating = ..., r.fact_kind = ...              // source, fact_kind on the node
+MATCH (d:Decision {pg_id: $target})
+MERGE (d)-[:HAD_OUTCOME {date: $date}]->(r)        // the TRIGGER edge
+// + MENTIONS edges for elicited entities, + typed grounding ROLE edges
+// (GROUNDED_IN/CONSIDERED/... with asserted_by) to the facts that MEASURED
+// the outcome — test-grounded retrospectives (decision 542), structural.
 ```
 
-Self-loop pattern — each call creates a new dated edge; multiple retrospectives per Decision are allowed. `date` defaults to today (ISO) if omitted.
+Multiple retrospectives per Decision are allowed; consumers treat the **newest as the decision's current verdict**. `date` defaults to today (ISO). Legacy pre-conversion rows (no `v`) still produce the old self-loop; the one-time migration converts existing self-loops to records.
 
-**Two roles, one record (decision pg_id 276):** the `HAD_OUTCOME` edge is the **permanent outcome archive** — insight folds read every edge's wording verbatim, including on cumulative re-folds. The outbox row is only the **trigger**: while it is open (`applied`/`rem_reviewed`), the retrospective has not been folded into an insight yet; the fold consumes it (flips to `consolidated`, then deletes after the graph marking). A retro row on a decision in no insight and no qualifying cluster stays open deliberately.
+**Lifecycle:** the retro's outbox row lives the ordinary record lifecycle (`applied` → `rem_reviewed` after REM enriches the node → `consolidated` when an insight fold consumes it → deleted after the graph marking). Insight triggers key retro rows on `COALESCE(cypher_params->>'target_pg_id', pg_id)` so legacy rows (decision's pg_id) and v2 rows (retro's own pg_id) behave identically. A retro row on a decision in no insight and no qualifying cluster stays open deliberately.
 
-**`rating` semantics:** free text, with one structural value — `"reversed"` marks the target decision `superseded` in `technical_docs` and on the `:Decision` node (excluded from Tier-1 search and from fresh insight clusters). Every other rating carries no enum meaning; its wording reaches Tier 3 through the insight narrative.
+**`rating` semantics:** a closed outcome-state enum — `validated` \| `mixed` \| `refined` \| `pending` \| `reversed`. `"reversed"` is structural: it marks the target decision `superseded` in `technical_docs` and on the `:Decision` node (excluded from Tier-1 search and from fresh insight clusters). States, not grades — the nuance belongs in the notes, which insight synthesis quotes. Legacy free-text ratings are preserved as `metadata.original_rating` by the migration.
 
 ### Provenance query examples
 
