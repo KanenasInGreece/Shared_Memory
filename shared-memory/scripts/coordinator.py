@@ -2430,12 +2430,17 @@ class MemoryCoordinator:
                 " GROUP BY rem_timing->>'model' ORDER BY n DESC"
             )
             # NREM whole-cycle compute window (kept alongside REM, decision 568).
+            # ONLY cycles that actually synthesised (folds_succeeded > 0): deferred and
+            # no-op sweeps open+close a row instantly (~0s) and otherwise swamp p50/p95
+            # to zero — the same meaningless-denominator trap that fact 567 warns about.
+            # Same gate as last_success in _compute_consolidation_health.
             cyc = await conn.fetchrow(
                 "SELECT count(*) AS n,"
                 "  percentile_cont(0.5)  WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (finished_at-started_at))) AS p50,"
                 "  percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (finished_at-started_at))) AS p95"
                 " FROM consolidation_runs"
                 " WHERE finished_at IS NOT NULL AND started_at IS NOT NULL"
+                "   AND folds_succeeded > 0"
                 "   AND finished_at >= now() - interval '7 days'"
             )
         out["rem_ms"] = {
@@ -2448,7 +2453,8 @@ class MemoryCoordinator:
             ],
         }
         out["nrem_cycle_seconds"] = (
-            {"window_days": 7, "n": cyc["n"], "p50": _r(cyc["p50"]), "p95": _r(cyc["p95"])}
+            {"window_days": 7, "n": cyc["n"], "p50": _r(cyc["p50"]), "p95": _r(cyc["p95"]),
+             "note": "synthesis cycles only (folds_succeeded>0); excludes deferred/no-op sweeps"}
             if cyc else {}
         )
         return out
