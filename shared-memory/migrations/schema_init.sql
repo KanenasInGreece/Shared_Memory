@@ -130,7 +130,8 @@ CREATE TABLE IF NOT EXISTS technical_docs (
     visibility       TEXT NOT NULL DEFAULT 'global'::text,
     superseded       BOOLEAN NOT NULL DEFAULT false,
     superseded_by    INTEGER,
-    created_at       TIMESTAMPTZ DEFAULT now()
+    created_at       TIMESTAMPTZ DEFAULT now(),
+    rem_timing       JSONB
 );
 
 CREATE INDEX IF NOT EXISTS technical_docs_agent_id_idx ON public.technical_docs USING btree (agent_id);
