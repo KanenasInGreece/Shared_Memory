@@ -12,7 +12,7 @@ import select
 import time
 from datetime import datetime
 from neo4j import AsyncGraphDatabase
-from ontology import ONT
+from ontology import ONT, fact_kind_from_source_ref
 from pool_status import pool_has_free_slot
 from dream_telemetry import record_llm_call, adaptive_ceiling
 
@@ -364,8 +364,15 @@ def sweep_due(now, last_sweep_time, last_activity, has_pending,
 # plus the consumed retrospective rows to 'consolidated' and closes them after
 # the graph marking. Retrospective rows must be identified by cypher_params
 # type, never by status: REM's outbox mark targets the latest applied row for
-# a pg_id, and a retrospective shares its target decision's pg_id, so legacy
-# retro rows can sit at 'rem_reviewed'.
+# a pg_id, and a LEGACY retrospective shares its target decision's pg_id, so
+# legacy retro rows can sit at 'rem_reviewed'.
+#
+# Retro-as-record transition (2026-07-14): a v2 retrospective row carries the
+# RETRO'S OWN pg_id (it is a full record) and names its decision in
+# cypher_params->>'target_pg_id'. Legacy rows also carry target_pg_id (equal to
+# their pg_id). Insight-path queries therefore key retro rows on
+# COALESCE(target_pg_id, pg_id) so both shapes trigger, are consumed, and are
+# reconciled identically.
 
 _FACT_ROW = "COALESCE(cypher_params->>'type', 'fact') NOT IN ('retrospective', 'decision', 'supersede')"
 _DREAM_ROW = "COALESCE(cypher_params->>'type', 'fact') IN ('decision', 'retrospective')"
@@ -521,13 +528,16 @@ INSIGHT_DOMAIN = "insight"
 def fetch_open_retro_decision_ids(conn):
     """Target decision pg_ids of un-dreamed retrospective rows. An open retro
     row is the durable re-fold trigger; its wording lives on the HAD_OUTCOME
-    edge (permanent archive), the row only signals 'not folded yet'. Rows at
-    'pending'/'failed' still owe the outbox worker a Neo4j write and are not
-    triggers. A retro row on a decision in no insight and no qualifying
-    cluster stays open deliberately — backlog, not a stuck outbox."""
+    edge (legacy) or the Retrospective record (v2), the row only signals 'not
+    folded yet'. Rows at 'pending'/'failed' still owe the outbox worker a Neo4j
+    write and are not triggers. A retro row on a decision in no insight and no
+    qualifying cluster stays open deliberately — backlog, not a stuck outbox.
+    COALESCE: a v2 row's pg_id is the retro's own id; target_pg_id names the
+    decision (legacy rows carry both, equal)."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT DISTINCT pg_id FROM neo4j_outbox"
+            "SELECT DISTINCT COALESCE((cypher_params->>'target_pg_id')::bigint, pg_id)"
+            " FROM neo4j_outbox"
             " WHERE status IN ('applied', 'rem_reviewed')"
             f"  AND {_RETRO_ROW}"
         )
@@ -554,6 +564,45 @@ def fetch_refold_insights(conn, retro_pg_ids):
         return cur.fetchall()
 
 
+def fetch_retro_records(conn, retro_ids):
+    """Authoritative content + grounding for v2 Retrospective records (the graph
+    node carries only a capped copy). Returns {retro_pg_id: {"content": str,
+    "grounded": [(fact_id, role, fact_kind)]}}. Grounding roles come from
+    metadata.grounded_roles (operator-elicited, Stage-2 write path); fact_kind is
+    derived from each grounding fact's source_ref — the same derivation the
+    write path uses — so the fold prompt can state the evidential weight."""
+    if not retro_ids:
+        return {}
+    out = {}
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, content, metadata->'grounded_in', metadata->'grounded_roles'"
+            "  FROM technical_docs WHERE id = ANY(%s)",
+            (list(retro_ids),),
+        )
+        rows = cur.fetchall()
+        all_gids = sorted({int(g) for _, _, gin, _ in rows if isinstance(gin, list)
+                           for g in gin if isinstance(g, (int, float))})
+        kinds = {}
+        if all_gids:
+            cur.execute(
+                "SELECT id, metadata->>'source_ref' FROM technical_docs WHERE id = ANY(%s)",
+                (all_gids,),
+            )
+            kinds = {rid: fact_kind_from_source_ref(sref) for rid, sref in cur.fetchall()}
+    for rid, content, gin, roles in rows:
+        grounded = []
+        if isinstance(gin, list):
+            roles = roles if isinstance(roles, dict) else {}
+            for g in gin:
+                if isinstance(g, (int, float)):
+                    gid = int(g)
+                    grounded.append((gid, roles.get(str(gid), "grounded_in"),
+                                     kinds.get(gid, "observation")))
+        out[rid] = {"content": content, "grounded": grounded}
+    return out
+
+
 def fetch_insight_outbox_rows(conn, pg_ids):
     """Snapshot the consumable ledger rows for one fold — decision and
     retrospective rows at applied/rem_reviewed — captured BY ROW ID before the
@@ -565,10 +614,11 @@ def fetch_insight_outbox_rows(conn, pg_ids):
     with conn.cursor() as cur:
         cur.execute(
             "SELECT id FROM neo4j_outbox"
-            " WHERE pg_id = ANY(%s)"
+            " WHERE (pg_id = ANY(%s)"
+            "        OR (cypher_params->>'target_pg_id')::bigint = ANY(%s))"
             "   AND status IN ('applied', 'rem_reviewed')"
             f"  AND {_DREAM_ROW}",
-            (list(pg_ids),),
+            (list(pg_ids), list(pg_ids)),
         )
         return [r[0] for r in cur.fetchall()]
 
@@ -661,7 +711,9 @@ def fetch_unreconciled_insights(conn):
         cur.execute(
             "SELECT DISTINCT cs.id, cs.metadata->>'entity', cs.source_pg_ids"
             "  FROM community_summaries cs"
-            "  JOIN neo4j_outbox o ON o.pg_id = ANY(cs.source_pg_ids)"
+            "  JOIN neo4j_outbox o"
+            "    ON (o.pg_id = ANY(cs.source_pg_ids)"
+            "        OR (o.cypher_params->>'target_pg_id')::bigint = ANY(cs.source_pg_ids))"
             " WHERE NOT cs.superseded"
             "   AND cs.metadata->>'kind' = 'insight'"
             "   AND o.status = 'consolidated'"
@@ -891,11 +943,14 @@ class ConsolidationDaemon:
     async def generate_insight(self, entity, decision_blocks, previous_insight=None):
         """Synthesise a cross-project principle from a decision cluster.
 
-        The blocks carry each decision's full content plus every HAD_OUTCOME
-        retrospective verbatim — the narrative is where outcome valence lives
-        (decision 276: no rating enum; the wording carries the meaning). A
-        decision reversed in one project but held in another must fold as
-        boundary evidence, not be dropped."""
+        The blocks carry each decision's full content plus its retrospective
+        history: the LATEST retro in full (its wording is the decision's current
+        verdict; v2 records add an EVIDENCE line naming the facts it is grounded
+        in and their epistemic kind), earlier retros compressed to rating+date
+        lines (retro-as-node session; refines decision 276 — ratings are now the
+        outcome-state enum, the notes still carry the nuance). A decision
+        reversed in one project but held in another must fold as boundary
+        evidence, not be dropped."""
         if os.getenv("MOCK_LLM") == "1":
             return (
                 f"Mocked Insight for {entity}: "
@@ -917,8 +972,12 @@ class ConsolidationDaemon:
             f"Synthesize the shared principle they demonstrate. Each [RETROSPECTIVE] line "
             f"is real-world outcome evidence — weave its meaning into the narrative: a "
             f"positive outcome strengthens the principle, a negative or reversed outcome "
-            f"bounds it ('holds when..., failed when...'). State the principle, the "
-            f"supporting evidence per project, and any known limits.\n\n"
+            f"bounds it ('holds when..., failed when...'). The line marked LATEST is the "
+            f"decision's current verdict; earlier compressed lines are history — weigh the "
+            f"latest most. A [RETROSPECTIVE EVIDENCE] line names the facts the verdict is "
+            f"based on and how they were established (tested/measured evidence outranks "
+            f"discussion). State the principle, the supporting evidence per project, and "
+            f"any known limits.\n\n"
             f"### INSIGHT:"
         )
 
@@ -1013,7 +1072,9 @@ class ConsolidationDaemon:
                 f" RETURN reduce(c = null, nm IN [x IN members | x.name] |"
                 f"          CASE WHEN c IS NULL OR nm < c THEN nm ELSE c END) as entity,"
                 f"        [x IN members | x.name] as aliases,"
-                f"        [fact IN unflagged_facts | fact.content] as contents,"
+                # rem_summary wins when present (long facts REM condensed); short
+                # facts carry their curated text verbatim (non-destructive REM).
+                f"        [fact IN unflagged_facts | coalesce(fact.rem_summary, fact.content)] as contents,"
                 f"        [fact IN unflagged_facts | fact.pg_id] as pg_ids",
                 ids=ids, threshold=DENSITY_THRESHOLD)
             return await result.data()
@@ -1100,7 +1161,9 @@ class ConsolidationDaemon:
                     f" WITH e, collect(neighbor) as unflagged_facts"
                     f" WHERE size(unflagged_facts) >= $threshold"
                     f" RETURN e.name as entity,"
-                    f"        [fact IN unflagged_facts | fact.content] as contents,"
+                    # Same non-destructive read as the anchored path: summary if
+                    # REM condensed a long fact, verbatim curated text otherwise.
+                    f"        [fact IN unflagged_facts | coalesce(fact.rem_summary, fact.content)] as contents,"
                     f"        [fact IN unflagged_facts | fact.pg_id] as pg_ids",
                     threshold=DENSITY_THRESHOLD)
                 clusters = await result.data()
@@ -1413,16 +1476,26 @@ class ConsolidationDaemon:
             return await result.data()
 
     async def _fetch_outcome_edges(self, pg_ids):
-        """All HAD_OUTCOME edge properties for the fold prompt. The edges are
-        the permanent retrospective content archive — the ledger row is only
-        the trigger and is purged on fold, so every cumulative re-fold must
-        read the wording from here."""
+        """All retrospective outcomes for the fold prompt, BOTH shapes
+        (retro-as-record transition): legacy self-loop edges carry
+        rating/date/notes as edge properties; a v2 HAD_OUTCOME edge points at a
+        :Retrospective node that carries them as node properties (notes = the
+        record content; rem_summary preferred when REM condensed it). For v2
+        rows retro_pg_id is returned so _fold_insight can pull the full
+        authoritative notes + grounding from Postgres. Legacy edges remain the
+        permanent archive for pre-migration retros — every cumulative re-fold
+        must read the wording from here."""
+        r = ONT.retrospective
         async with self.driver.session() as session:
             result = await session.run(
-                f"MATCH (d:{ONT.decision})-[o:{ONT.had_outcome}]->()"
+                f"MATCH (d:{ONT.decision})-[o:{ONT.had_outcome}]->(t)"
                 f" WHERE d.pg_id IN $ids"
-                f" RETURN d.pg_id AS pg_id, o.rating AS rating,"
-                f"        o.date AS date, o.notes AS notes"
+                f" RETURN d.pg_id AS pg_id,"
+                f"        CASE WHEN t:{r} THEN t.rating ELSE o.rating END AS rating,"
+                f"        CASE WHEN t:{r} THEN t.date   ELSE o.date   END AS date,"
+                f"        CASE WHEN t:{r} THEN coalesce(t.rem_summary, t.content)"
+                f"             ELSE o.notes END AS notes,"
+                f"        CASE WHEN t:{r} THEN t.pg_id  ELSE null     END AS retro_pg_id"
                 f" ORDER BY pg_id, date",
                 ids=pg_ids)
             return await result.data()
@@ -1549,16 +1622,41 @@ class ConsolidationDaemon:
         for o in outcomes:
             by_decision.setdefault(int(o["pg_id"]), []).append(o)
 
+        # v2 retro records: pull authoritative full notes + grounding from
+        # Postgres (the node carries only a capped copy). Legacy edge retros
+        # already carry their full wording in o['notes'].
+        retro_ids = [o["retro_pg_id"] for o in outcomes if o.get("retro_pg_id")]
+        retro_records = await loop.run_in_executor(
+            None, lambda: fetch_retro_records(conn, retro_ids)
+        ) if retro_ids else {}
+
+        # Latest-retrospective-as-current-verdict (retro-as-node session): the
+        # newest retro per decision enters in FULL (+ its evidence line); older
+        # ones are compressed to rating+date history so the prompt grows
+        # linearly, not with the whole outcome archive.
         blocks = []
         seen_projects = set()
         for pg_id, content, project in rows:
             seen_projects.add(project or "unknown")
             block = f"[DECISION pg_id={pg_id} project={project or 'unknown'}]\n{content}"
-            for o in by_decision.get(pg_id, []):
+            outs = by_decision.get(pg_id, [])   # date-ascending from the query
+            for o in outs[:-1]:
                 block += (
                     f"\n[RETROSPECTIVE rating={o['rating']} date={o['date']}]"
-                    f" {o['notes']}"
+                    f" (earlier outcome — superseded by the latest below)"
                 )
+            for o in outs[-1:]:
+                rec = retro_records.get(o.get("retro_pg_id")) if o.get("retro_pg_id") else None
+                notes = (rec or {}).get("content") or o["notes"]
+                block += (
+                    f"\n[RETROSPECTIVE rating={o['rating']} date={o['date']} LATEST]"
+                    f" {notes}"
+                )
+                grounded = (rec or {}).get("grounded") or []
+                if grounded:
+                    ev = ", ".join(f"fact {fid} ({kind}, {role})"
+                                   for fid, role, kind in grounded)
+                    block += f"\n[RETROSPECTIVE EVIDENCE] based on: {ev}"
             blocks.append(block)
 
         # Snapshot the consumable ledger rows BEFORE the LLM call: a

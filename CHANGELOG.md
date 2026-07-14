@@ -9,6 +9,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The background enrichment pass no longer overwrites a fact's text with its own summary.** Enrichment used to
+  replace every fact's graph-tier content with an LLM paraphrase — including short, deliberately curated facts,
+  where a paraphrase can only lose signal and inject style drift into every later synthesis. A fact's node now
+  carries the **original text verbatim** (up to the graph-tier cap); a summary is stored *alongside* it
+  (`rem_summary`) only when the source text exceeds the cap (`REM_SUMMARY_THRESHOLD`, default 2000 chars), and
+  consolidation reads the summary only where one exists. Decisions keep their rationale as before; the new
+  retrospective records keep their notes.
+- **Consolidation is transition-tolerant for the retrospective-as-record change.** Retrospectives are becoming
+  first-class records (own id, searchable, groundable in evidence) instead of edge annotations on a decision. The
+  readers now accept **both shapes**: the legacy self-loop edge and the new `Retrospective` node behind the same
+  `HAD_OUTCOME` trigger edge. When synthesising an insight, a decision's **latest retrospective is treated as its
+  current verdict** and enters in full — for new records with the authoritative notes plus an evidence line naming
+  the facts it is grounded in and how they were established — while earlier retrospectives compress to rating+date
+  history lines, so the prompt grows linearly instead of with the whole outcome archive.
+- **The enrichment daemon treats retrospectives as a third record kind** (alongside facts and decisions):
+  non-destructive, entity linking from the notes, no decision-only extras. New spine vocabulary: the
+  `Retrospective` node label and the retrospective **outcome-state rating enum**
+  (`validated / mixed / refined / pending / reversed`) — code-pinned, never configurable.
+
 - **The skill now actively elicits the grounding *role*, completing the v0.6.4 capture surface.** `save_decision`
   guidance proposes a role for each grounded fact — defaulting from the fact's kind (a `discussion` → soft
   `INFORMED_BY`, else `GROUNDED_IN`) — for the operator to confirm or override, and passes the confirmed role so it
