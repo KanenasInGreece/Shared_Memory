@@ -407,6 +407,48 @@ async def test_handle_retrospective_missing_fields_returns_400():
     assert body["status"] == "error"
 
 
+# ── Recency-aware retrieval (retro-as-record stage 4) ─────────────────────────
+
+def test_rerank_doc_text_prepends_date_for_outcome_records():
+    from datetime import datetime
+    ts = datetime(2026, 7, 14, 12, 0)
+    out = coordinator_mod._rerank_doc_text(
+        "held up well", {"type": "retrospective"}, ts)
+    assert out.startswith("[retrospective recorded 2026-07-14]")
+    out_d = coordinator_mod._rerank_doc_text(
+        "we chose X", {"type": "decision"}, ts)
+    assert out_d.startswith("[decision recorded 2026-07-14]")
+
+
+def test_rerank_doc_text_leaves_facts_untouched():
+    from datetime import datetime
+    assert coordinator_mod._rerank_doc_text(
+        "a plain fact", {"type": None, "source": "x"}, datetime(2026, 1, 1)
+    ) == "a plain fact"
+    assert coordinator_mod._rerank_doc_text(
+        "no date", {"type": "decision"}, None) == "no date"
+
+
+def test_order_retros_latest_first_same_decision_only():
+    """Several retros of the SAME decision reorder newest-first in the
+    positions they occupy; everything else keeps the reranker's order."""
+    results = [
+        {"tier": "fact", "metadata": {"type": None}, "created_at": "2026-01-01"},
+        {"tier": "fact", "metadata": {"type": "retrospective", "target_pg_id": 42},
+         "created_at": "2026-06-01", "content": "old verdict"},
+        {"tier": "fact", "metadata": {"type": "retrospective", "target_pg_id": 99},
+         "created_at": "2026-05-01", "content": "other decision"},
+        {"tier": "fact", "metadata": {"type": "retrospective", "target_pg_id": 42},
+         "created_at": "2026-07-14", "content": "new verdict"},
+    ]
+    out = coordinator_mod._order_retros_latest_first(results)
+    assert out[0] is results[0]                       # non-retro untouched
+    assert out[1]["content"] == "new verdict"         # newest takes the earlier slot
+    assert out[2] is results[2]                       # different decision untouched
+    assert out[3]["content"] == "old verdict"
+    assert coordinator_mod._order_retros_latest_first([]) == []
+
+
 # ── Pure function tests — Fix 1: retrieval visibility ─────────────────────────
 
 def test_sigmoid_midpoint():

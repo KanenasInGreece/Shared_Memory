@@ -738,6 +738,45 @@ def _matched_entities(query: str, metadata: dict | None) -> list[str]:
     return [e for e in metadata.get("entities", []) if isinstance(e, str) and e.lower() in q]
 
 
+def _rerank_doc_text(content: str, metadata: dict | None, created_at) -> str:
+    """The text the reranker scores. For decisions and retrospectives the
+    recording date is prepended so recency is VISIBLE to relevance scoring —
+    a decision's latest retrospective is its current verdict, and the reranker
+    cannot weigh what it cannot see. Facts are passed through untouched (their
+    truth is not time-ordered the way outcome records are). Pure."""
+    t = (metadata or {}).get("type") if isinstance(metadata, dict) else None
+    if t in ("decision", "retrospective") and created_at is not None:
+        try:
+            day = created_at.date().isoformat()
+        except AttributeError:
+            day = str(created_at)[:10]
+        return f"[{t} recorded {day}] {content}"
+    return content
+
+
+def _order_retros_latest_first(results: list[dict]) -> list[dict]:
+    """Within one result set, when SEVERAL retrospectives of the SAME decision
+    surface, present them newest-first in the positions they already occupy —
+    the newest retro is the decision's current verdict; everything else keeps
+    the reranker's order. Deterministic, no scoring change. Pure."""
+    groups: dict[int, list[int]] = {}
+    for i, r in enumerate(results):
+        meta = r.get("metadata") or {}
+        if isinstance(meta, dict) and meta.get("type") == "retrospective":
+            tgt = meta.get("target_pg_id")
+            if isinstance(tgt, int):
+                groups.setdefault(tgt, []).append(i)
+    out = list(results)
+    for positions in groups.values():
+        if len(positions) < 2:
+            continue
+        entries = sorted((out[i] for i in positions),
+                         key=lambda e: str(e.get("created_at") or ""), reverse=True)
+        for pos, entry in zip(positions, entries):
+            out[pos] = entry
+    return out
+
+
 def _visibility_filter(viewer: str | None, viewer_scope: str | None,
                        start: int) -> tuple[str, list]:
     """Build the read-authorization predicate for the `visibility` column.
@@ -2117,7 +2156,7 @@ class MemoryCoordinator:
                 try:
                     candidates = await conn.fetch(
                         f"""
-                        SELECT id, content, metadata FROM technical_docs
+                        SELECT id, content, metadata, created_at FROM technical_docs
                         WHERE NOT superseded AND {vis_sql} {scope_sql}
                         ORDER BY embedding <=> $1::vector LIMIT $2
                         """,
@@ -2126,7 +2165,7 @@ class MemoryCoordinator:
                 except Exception:
                     candidates = await conn.fetch(
                         f"""
-                        SELECT id, content, metadata FROM technical_docs
+                        SELECT id, content, metadata, created_at FROM technical_docs
                         WHERE {vis_sql} {scope_sql}
                         ORDER BY embedding <=> $1::vector LIMIT $2
                         """,
@@ -2138,13 +2177,22 @@ class MemoryCoordinator:
 
             ids      = [r["id"]       for r in candidates]
             contents = [r["content"]  for r in candidates]
-            metas    = [r["metadata"] for r in candidates]
+            metas    = [_coerce_jsonb_obj(r["metadata"]) for r in candidates]
+            # .get: tolerant of pre-migration schemas (and test stubs) where the
+            # created_at column is absent — recency simply degrades to off.
+            createds = [r.get("created_at") for r in candidates]
 
-            # Rerank — direct to port 8071 to avoid circular proxy call
+            # Rerank — direct to port 8071 to avoid circular proxy call.
+            # Decisions/retrospectives are scored WITH their recording date
+            # prepended (recency-aware: the newest retro is the current verdict).
+            rerank_docs = [
+                _rerank_doc_text(c, m, t)
+                for c, m, t in zip(contents, metas, createds)
+            ]
             try:
                 rr = await client.post(
                     RERANK_URL,
-                    json={"query": query, "documents": contents, "top_k": limit},
+                    json={"query": query, "documents": rerank_docs, "top_k": limit},
                     timeout=5.0,
                 )
                 rr.raise_for_status()
@@ -2268,14 +2316,19 @@ class MemoryCoordinator:
                     pass
                 final.append({
                     "tier": "fact",
+                    "pg_id": pg_id,
                     "content": contents[idx],
                     "score": raw_score,
                     "score_normalized": _sigmoid(raw_score),
                     "matched_entities": _matched_entities(query, metas[idx]),
                     "metadata": metas[idx],
+                    "created_at": (createds[idx].isoformat()
+                                   if createds[idx] is not None else None),
                     "graph_context": ctx,
                 })
 
+        # Latest-retro-as-verdict: same-decision retrospectives newest-first.
+        final = _order_retros_latest_first(final)
         return web.json_response({"status": "success", "results": final})
 
     # ── POST /memory/graph ────────────────────────────────────────────────────
