@@ -7,6 +7,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.4] — 2026-07-14
+
+### Changed
+
+- **A decision now links to each grounding fact by the *role* that fact played, not one flat edge.** Previously
+  every fact a decision rested on was attached by a single undifferentiated `GROUNDED_IN`, so a later synthesis
+  could not tell the decision's *evidence* from an alternative it *considered*, one it *rejected*, or a *constraint*
+  it accepted. First write now records the role — `GROUNDED_IN` (basis), `CONSIDERED`, `REJECTED`,
+  `UNDER_CONDITIONS`, or `INFORMED_BY` — chosen by the operator (`--grounded-in "42:considered,43,44:rejected"`) or,
+  when unspecified, defaulted from the fact's kind: a `discussion` grounds *softly* as `INFORMED_BY`, everything else
+  as hard basis. The default is **advisory**, never enforced — an explicit operator role always wins — and every
+  edge records **`asserted_by`** (`operator` vs `system_default`) so a summary can weight what the operator actually
+  asserted over what the system inferred, and nothing is silently rewritten.
+
+### Fixed
+
+- **Grounding a decision in another decision no longer creates an empty placeholder node.** The first-write grounding
+  edge used to `MERGE` a `Fact` by id unconditionally; when the grounded id belonged to a `Decision`, that produced a
+  hollow shadow `Fact` the real node never filled, and a summary hopping the edge reached nothing. Grounding now links
+  the **real** record across labels (fact *or* decision), so cross-record provenance is intact.
+
 ## [0.6.3] — 2026-07-13
 
 ### Added
