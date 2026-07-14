@@ -26,6 +26,12 @@ class OntologyConfig:
     project: str = "Project"
     activity: str = "Activity"
     milestone: str = "Milestone"
+    # Retrospective-as-record (retro-as-node session, 2026-07-14): a retrospective
+    # is a first-class SPINE record — own pg_id/technical_docs row, own node,
+    # keyed by pg_id like Fact/Decision (never by name). The Decision keeps a
+    # HAD_OUTCOME edge to it as the trigger; NREM hops to the node for rating/
+    # content/grounding. Never configurable from ontology.yaml.
+    retrospective: str = "Retrospective"
     # Node labels — entity type sub-labels (Path A multi-label under :Entity; decision 472).
     # Stage 1 defines them; REM populates them (1.3) + one-time backfill (1.4). Person/
     # Agent/Process reuse the provenance labels above (Human/AIAgent/Activity).
@@ -157,6 +163,7 @@ _ENTITY_NOISE_NAMES: frozenset[str] = frozenset({
     "reports_on", "acted_on_behalf_of", "summarized_by", "next_step",
     "fact", "entity", "decision", "human", "aiagent", "project",
     "activity", "milestone", "communitysummary", "reasoningtrace", "reasoningstep",
+    "retrospective",
     # entity type sub-labels + typed relationships (decision 472) — schema vocabulary
     "component", "system", "model", "concept", "document",
     "depends_on", "part_of", "implements", "produces", "consumes",
@@ -274,6 +281,18 @@ def default_grounding_role(fact_kind: object) -> str:
     return _FACT_KIND_DEFAULT_ROLE.get(fact_kind, ONT.grounded_in)
 
 
+# ── Retrospective outcome-state ratings (spine) ───────────────────────────────
+# The one machine-readable outcome field on a retrospective record (retro-as-node
+# session). Outcome STATES, not valence: 'reversed' keeps its structural semantics
+# (supersession cascade), 'pending' = not yet judged, 'refined' = the decision
+# evolved. Free-text nuance lives in the notes; legacy free-text ratings are
+# preserved in metadata.original_rating by the one-time migration. Code-pinned —
+# never read from ontology.yaml.
+RETRO_RATINGS: frozenset[str] = frozenset({
+    "validated", "mixed", "refined", "pending", "reversed",
+})
+
+
 # ── Spine vs Domain split (decision 550) ──────────────────────────────────────
 # SPINE = the framework identity / unique selling point — code-pinned, never read
 # from ontology.yaml: the high-signal ADR capture (Fact/Decision/CommunitySummary/
@@ -285,7 +304,7 @@ def default_grounding_role(fact_kind: object) -> str:
 SPINE_LABELS: frozenset[str] = frozenset({
     ONT.fact, ONT.entity, ONT.community_summary, ONT.reasoning_trace,
     ONT.reasoning_step, ONT.decision, ONT.human, ONT.ai_agent,
-    ONT.project, ONT.activity, ONT.milestone,
+    ONT.project, ONT.activity, ONT.milestone, ONT.retrospective,
 })
 DOMAIN_LABELS: frozenset[str] = frozenset({
     ONT.component, ONT.system, ONT.model, ONT.concept, ONT.document,

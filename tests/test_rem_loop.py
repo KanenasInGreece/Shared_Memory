@@ -131,7 +131,7 @@ def test_resolve_rel_unknown_name_always_entity_mentions():
 async def test_llm_process_mock_plain_fact():
     daemon, _ = _make_daemon()
     with patch.dict(os.environ, {"MOCK_LLM": "1"}):
-        result = await daemon._llm_process("some fact content", False, [])
+        result = await daemon._llm_process("some fact content", rem_mod.KIND_FACT, [])
     assert "summary" in result
     assert "relationships" in result
     assert isinstance(result["relationships"], list)
@@ -142,11 +142,22 @@ async def test_llm_process_mock_plain_fact():
 async def test_llm_process_mock_decision_includes_extras():
     daemon, _ = _make_daemon()
     with patch.dict(os.environ, {"MOCK_LLM": "1"}):
-        result = await daemon._llm_process("decision content", True, [])
+        result = await daemon._llm_process("decision content", rem_mod.KIND_DECISION, [])
     assert "considered" in result
     assert "rejected"   in result
     assert "under_conditions" in result
     assert "produces_insight" in result
+
+
+@pytest.mark.asyncio
+async def test_llm_process_mock_retrospective_no_extras():
+    """A retrospective anchor is enriched like a fact (summary + relationships) —
+    the decision-only extras must not appear."""
+    daemon, _ = _make_daemon()
+    with patch.dict(os.environ, {"MOCK_LLM": "1"}):
+        result = await daemon._llm_process("retro notes content", rem_mod.KIND_RETRO, [])
+    assert "summary" in result and "relationships" in result
+    assert "considered" not in result
 
 
 # ── _fetch_non_rem_batch ordering ─────────────────────────────────────────────
@@ -217,8 +228,9 @@ async def test_write_neo4j_rem_applies_entity_sublabels():
 
 
 @pytest.mark.asyncio
-async def test_fetch_non_rem_batch_selects_facts_and_decisions():
-    """Selection must consider both :Fact and :Decision so decisions get enriched."""
+async def test_fetch_non_rem_batch_selects_all_three_anchor_kinds():
+    """Selection must consider :Fact, :Decision AND :Retrospective (retro-as-node
+    session) so all three record types get enriched."""
     daemon, mock_session = _make_daemon()
     mock_result = MagicMock()
     mock_result.data = AsyncMock(return_value=[{"pg_id": 7}])
@@ -229,6 +241,7 @@ async def test_fetch_non_rem_batch_selects_facts_and_decisions():
 
     cypher = mock_session.run.call_args.args[0]
     assert ONT.fact in cypher and ONT.decision in cypher
+    assert ONT.retrospective in cypher
     assert "OR" in cypher
     assert "ORDER BY" in cypher and "ASC" in cypher
 
@@ -252,7 +265,8 @@ async def test_write_neo4j_rem_decision_anchors_on_decision_and_keeps_rationale(
     }
 
     await daemon._write_neo4j_rem(
-        42, "rem summary", relationships, registry, decision_extras, is_decision=True,
+        42, "rem summary", relationships, registry, decision_extras,
+        kind=rem_mod.KIND_DECISION,
     )
 
     cyphers = [c.args[0] for c in mock_session.run.call_args_list]
@@ -264,9 +278,68 @@ async def test_write_neo4j_rem_decision_anchors_on_decision_and_keeps_rationale(
     assert any(ONT.produces_insight in c for c in cyphers)
     # Step 3 (last) — mark on Decision; rationale/content untouched
     last = cyphers[-1]
-    assert f"MATCH (d:{ONT.decision}" in last
+    assert f"MATCH (a:{ONT.decision}" in last
     assert "rem_processed" in last and "rem_summary" in last
-    assert "d.content" not in last and "d.rationale" not in last
+    assert "a.content" not in last and "a.rationale" not in last
+
+
+# ── Non-destructive content policy (retro-as-node session) ────────────────────
+
+@pytest.mark.asyncio
+async def test_write_neo4j_rem_short_fact_keeps_verbatim_no_summary():
+    """A fact at or under REM_SUMMARY_THRESHOLD keeps its ORIGINAL text as
+    f.content and stores NO rem_summary — curated short facts stay verbatim."""
+    daemon, mock_session = _make_daemon()
+    mock_session.run = AsyncMock()
+
+    original = "short curated fact text"
+    await daemon._write_neo4j_rem(42, "an llm summary", [], {}, None,
+                                  original_content=original)
+
+    last = mock_session.run.call_args_list[-1]
+    assert "rem_summary" not in last.args[0]
+    assert "f.content = $orig" in last.args[0]
+    assert last.kwargs["orig"] == original
+    assert "rem_processed" in last.args[0]
+
+
+@pytest.mark.asyncio
+async def test_write_neo4j_rem_long_fact_verbatim_plus_summary():
+    """A fact over REM_SUMMARY_THRESHOLD keeps its original text (capped at
+    2000) in f.content AND stores the LLM summary in f.rem_summary."""
+    daemon, mock_session = _make_daemon()
+    mock_session.run = AsyncMock()
+
+    original = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 500)
+    await daemon._write_neo4j_rem(42, "condensed summary", [], {}, None,
+                                  original_content=original)
+
+    last = mock_session.run.call_args_list[-1]
+    assert "f.rem_summary = $summary" in last.args[0]
+    assert "f.content = $orig" in last.args[0]
+    assert last.kwargs["orig"] == original[:2000]
+    assert last.kwargs["summary"] == "condensed summary"
+
+
+@pytest.mark.asyncio
+async def test_write_neo4j_rem_retrospective_anchor_non_destructive():
+    """A Retrospective anchor gets entity edges + rem_summary, never a content
+    overwrite — the notes are the record."""
+    daemon, mock_session = _make_daemon()
+    mock_session.run = AsyncMock()
+
+    from rem_loop import ONT
+    relationships = [{"name": "OutboxPattern", "rel_type": ONT.entity_link}]
+    await daemon._write_neo4j_rem(99, "retro summary", relationships, {}, None,
+                                  kind=rem_mod.KIND_RETRO,
+                                  original_content="the retro notes")
+
+    cyphers = [c.args[0] for c in mock_session.run.call_args_list]
+    assert any(f"(a:{ONT.retrospective}" in c and "MERGE (a)-[" in c for c in cyphers)
+    last = cyphers[-1]
+    assert f"MATCH (a:{ONT.retrospective}" in last
+    assert "rem_summary" in last and "rem_processed" in last
+    assert ".content =" not in last
 
 
 # ── _fact_is_consistent full string comparison ────────────────────────────────
@@ -375,7 +448,7 @@ async def test_llm_process_uses_configured_temperature(monkeypatch):
         return _Resp()
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
 
-    await daemon._llm_process("some content", False, [])
+    await daemon._llm_process("some content", rem_mod.KIND_FACT, [])
 
     from rem_loop import REM_TEMPERATURE
     assert "temperature" in captured
@@ -411,6 +484,33 @@ async def test_mark_outbox_rem_reviewed_excludes_retro_rows():
     assert "!= 'retrospective'" in sql
     assert "status = 'applied'" in sql
     assert params == (42,)
+
+
+@pytest.mark.asyncio
+async def test_mark_outbox_rem_reviewed_retro_kind_targets_retro_row():
+    """For a Retrospective anchor (v2: row carries the retro's OWN pg_id) the
+    row to mark IS the retrospective-typed one — the filter inverts."""
+    daemon, _ = _make_daemon()
+
+    executed = []
+
+    class _Cur:
+        def execute(self, sql, params=None):
+            executed.append((" ".join(sql.split()), params))
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc):
+            return False
+
+    conn = MagicMock()
+    conn.cursor = MagicMock(return_value=_Cur())
+
+    await daemon._mark_outbox_rem_reviewed(
+        99, conn, asyncio.get_running_loop(), kind=rem_mod.KIND_RETRO)
+
+    sql, params = executed[0]
+    assert "= 'retrospective'" in sql and "!= 'retrospective'" not in sql
+    assert params == (99,)
 
 
 def test_adaptive_poll_sleep_backoff():

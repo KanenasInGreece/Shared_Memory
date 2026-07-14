@@ -25,6 +25,7 @@ from consolidation_loop import (
     fetch_insight_outbox_rows,
     fetch_open_retro_decision_ids,
     fetch_refold_insights,
+    fetch_retro_records,
     fetch_unreconciled_insights,
     supersede_covered_summaries,
     write_insight_summary,
@@ -118,7 +119,9 @@ def test_open_retro_ids_selects_retro_type_only():
     conn = StubConn(script=[{"rowcount": 2, "rows": [(245,), (267,)]}])
     assert fetch_open_retro_decision_ids(conn) == [245, 267]
     sql, _ = conn.executed[0]
-    assert "SELECT DISTINCT pg_id" in sql
+    # v2 rows carry the retro's OWN pg_id; the DECISION id lives in
+    # target_pg_id (legacy rows carry both, equal) — COALESCE keys on it.
+    assert "COALESCE((cypher_params->>'target_pg_id')::bigint, pg_id)" in sql
     assert "= 'retrospective'" in sql
 
 
@@ -159,12 +162,57 @@ def test_consumable_rows_snapshot_by_id_decision_and_retro_types():
     assert "SELECT id FROM neo4j_outbox" in sql
     assert "IN ('decision', 'retrospective')" in sql
     assert "status IN ('applied', 'rem_reviewed')" in sql
+    # v2 retro rows carry their own pg_id — they are consumed via target_pg_id.
+    assert "(cypher_params->>'target_pg_id')::bigint = ANY(%s)" in sql
 
 
 def test_consumable_rows_empty_pg_ids_runs_no_query():
     conn = StubConn()
     assert fetch_insight_outbox_rows(conn, []) == []
     assert conn.executed == []
+
+
+# ── fetch_retro_records (v2 authoritative content + grounding) ────────────────
+
+def test_fetch_retro_records_content_roles_and_kinds():
+    """Full notes come from Postgres; grounding roles from metadata; fact_kind
+    is derived from each grounding fact's source_ref (same derivation the
+    write path uses)."""
+    conn = StubConn(script=[
+        {"rowcount": 1, "rows": [
+            (900, "full retro notes", [573, 574], {"573": "based_on"}),
+        ]},
+        {"rowcount": 2, "rows": [
+            (573, "tests/test_typed_grounding.py"),
+            (574, "discussion_context"),
+        ]},
+    ])
+    out = fetch_retro_records(conn, [900])
+    assert out[900]["content"] == "full retro notes"
+    assert (573, "based_on", "tested") in out[900]["grounded"]
+    assert (574, "grounded_in", "discussion") in out[900]["grounded"]
+
+
+def test_fetch_retro_records_empty_ids_runs_no_query():
+    conn = StubConn()
+    assert fetch_retro_records(conn, []) == {}
+    assert conn.executed == []
+
+
+# ── _fetch_outcome_edges (dual-shape transition contract) ─────────────────────
+
+@pytest.mark.asyncio
+async def test_fetch_outcome_edges_reads_both_shapes():
+    """Legacy self-loop retros carry rating/date/notes as EDGE props; v2 edges
+    point at a :Retrospective node carrying them as NODE props. One query must
+    serve both during the transition, exposing retro_pg_id for v2 rows."""
+    daemon, session = daemon_with_fake_graph([FakeResult([])])
+    await daemon._fetch_outcome_edges([245])
+    query, _ = session.calls[0]
+    assert "CASE WHEN t:Retrospective" in query
+    assert "o.rating" in query and "t.rating" in query
+    assert "retro_pg_id" in query
+    assert "coalesce(t.rem_summary, t.content)" in query
 
 
 # ── write_insight_summary ─────────────────────────────────────────────────────
@@ -333,6 +381,55 @@ async def test_fold_insight_full_path(monkeypatch):
     # graph marking ran: consolidated flags + kind='insight' summary node
     mark_query = session.calls[-1][0]
     assert "SET d.consolidated = true" in mark_query or "SUPERSEDES" in mark_query
+
+
+@pytest.mark.asyncio
+async def test_fold_insight_v2_retro_latest_full_older_compressed(monkeypatch):
+    """Latest-retrospective-as-current-verdict: the newest retro enters in FULL
+    (v2: authoritative notes from Postgres + an EVIDENCE line naming grounding
+    facts with role and derived kind); older retros compress to rating+date
+    history lines."""
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    outcomes = [
+        {"pg_id": 245, "rating": "pending", "date": "2026-06-01",
+         "notes": "older note", "retro_pg_id": None},          # legacy edge
+        {"pg_id": 245, "rating": "validated", "date": "2026-07-14",
+         "notes": "node snippet", "retro_pg_id": 900},         # v2 record
+    ]
+    daemon, session = daemon_with_fake_graph([FakeResult(outcomes)])
+    daemon.generate_insight = AsyncMock(return_value="INSIGHT TEXT")
+    daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
+    conn = StubConn(script=[
+        # 1. decision content fetch
+        {"rowcount": 2, "rows": [
+            (245, "Decision A", "shared-memory-GitHub"),
+            (267, "Decision B", "tier3-cloe"),
+        ]},
+        # 2. fetch_retro_records — retro rows
+        {"rowcount": 1, "rows": [
+            (900, "full retro notes from postgres", [573], {"573": "based_on"}),
+        ]},
+        # 3. fetch_retro_records — grounding facts' source_ref
+        {"rowcount": 1, "rows": [(573, "tests/test_typed_grounding.py")]},
+        # 4. snapshot, 5. insert, 6. flip, 7. supersession, 8. close
+        {"rowcount": 2, "rows": [(101,), (102,)]},
+        {"rowcount": 1, "rows": [(77,)]},
+        {"rowcount": 2, "rows": []},
+        {"rowcount": 0, "rows": []},
+        {"rowcount": 2, "rows": [(101, 245), (102, 267)]},
+    ])
+
+    assert await daemon._fold_insight(conn, "OutboxPattern", [245, 267]) is True
+
+    blocks = daemon.generate_insight.call_args.args[1]
+    d245 = next(b for b in blocks if "pg_id=245" in b)
+    # Latest (v2): full authoritative notes + evidence, marked LATEST.
+    assert "LATEST] full retro notes from postgres" in d245
+    assert "[RETROSPECTIVE EVIDENCE] based on: fact 573 (tested, based_on)" in d245
+    assert "node snippet" not in d245           # capped node copy never used
+    # Older legacy retro: compressed to rating+date history.
+    assert "rating=pending date=2026-06-01] (earlier outcome" in d245
+    assert "older note" not in d245
 
 
 @pytest.mark.asyncio
