@@ -2314,6 +2314,14 @@ class MemoryCoordinator:
         except Exception as exc:
             snap["spine"] = {"error": str(exc)}
 
+        # Latency (decisions 568/570/571) — REM service/contention per model (durable,
+        # ungated, model/hardware) + the NREM whole-cycle compute window alongside it.
+        # Never fact→summary (gate-dominated, survivorship-biased — fact 567).
+        try:
+            snap["latency"] = await self._latency_telemetry()
+        except Exception as exc:
+            snap["latency"] = {"error": str(exc)}
+
         # Inference/GPU-busy signal (tri-state: "busy"|"idle"|"unknown"). Read the
         # cached value the consolidation refresher already probed so telemetry never
         # shells out to nvtop itself. "unknown" (nvtop absent) is surfaced verbatim
@@ -2389,6 +2397,61 @@ class MemoryCoordinator:
             "emergent_unprojected_fields": emergent,
             "alias": alias,
         }
+
+    # ── Latency rollup (decisions 568/570/571) ────────────────────────────────
+
+    async def _latency_telemetry(self) -> dict:
+        """Latency rollup for the monitor, from the DURABLE technical_docs.rem_timing
+        (survives outbox deletion — migration 019). REM is the anchor because it is
+        UNGATED: every saved fact passes through it (fact 567), so this is unbiased and
+        reflects model + hardware. Two REM percentile pairs, grouped by model so the
+        series is a model-evolution axis (decision 571):
+          service_ms   = pure inference = MODEL + HARDWARE, load-invariant.
+          contention_ms= queue behind a busy backend = CAPACITY (→ 0 as the pool grows).
+        The NREM whole-cycle COMPUTE window (consolidation_runs started_at→finished_at)
+        is kept ALONGSIDE (decision 568), never fact→summary — that end-to-end is
+        density-gate-dominated and survivorship-biased, an erroneous latency (fact 567).
+        p50/p95 via percentile_cont; each block independent so one failure spares the rest."""
+        def _r(v):
+            return round(float(v), 1) if v is not None else None
+
+        out: dict = {}
+        async with self._acquire() as conn:
+            # REM: per-model service/contention percentiles over the durable rows.
+            rem_rows = await conn.fetch(
+                "SELECT rem_timing->>'model' AS model, count(*) AS n,"
+                "  percentile_cont(0.5)  WITHIN GROUP (ORDER BY (rem_timing->>'service_ms')::float)    AS svc_p50,"
+                "  percentile_cont(0.95) WITHIN GROUP (ORDER BY (rem_timing->>'service_ms')::float)    AS svc_p95,"
+                "  percentile_cont(0.5)  WITHIN GROUP (ORDER BY (rem_timing->>'contention_ms')::float) AS con_p50,"
+                "  percentile_cont(0.95) WITHIN GROUP (ORDER BY (rem_timing->>'contention_ms')::float) AS con_p95,"
+                "  max((rem_timing->>'batch_size')::int) AS max_batch"
+                " FROM technical_docs"
+                " WHERE rem_timing IS NOT NULL AND (rem_timing->>'service_ms') IS NOT NULL"
+                " GROUP BY rem_timing->>'model' ORDER BY n DESC"
+            )
+            # NREM whole-cycle compute window (kept alongside REM, decision 568).
+            cyc = await conn.fetchrow(
+                "SELECT count(*) AS n,"
+                "  percentile_cont(0.5)  WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (finished_at-started_at))) AS p50,"
+                "  percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (finished_at-started_at))) AS p95"
+                " FROM consolidation_runs"
+                " WHERE finished_at IS NOT NULL AND started_at IS NOT NULL"
+                "   AND finished_at >= now() - interval '7 days'"
+            )
+        out["rem_ms"] = {
+            "note": "service_ms = model/hardware (anchor); contention_ms = capacity",
+            "by_model": [
+                {"model": r["model"], "n": r["n"], "max_batch_size": r["max_batch"],
+                 "service_ms":    {"p50": _r(r["svc_p50"]), "p95": _r(r["svc_p95"])},
+                 "contention_ms": {"p50": _r(r["con_p50"]), "p95": _r(r["con_p95"])}}
+                for r in rem_rows
+            ],
+        }
+        out["nrem_cycle_seconds"] = (
+            {"window_days": 7, "n": cyc["n"], "p50": _r(cyc["p50"]), "p95": _r(cyc["p95"])}
+            if cyc else {}
+        )
+        return out
 
     # ── Consolidation health (ADR-018) ────────────────────────────────────────
 

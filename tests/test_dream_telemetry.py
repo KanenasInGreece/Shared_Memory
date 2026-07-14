@@ -79,6 +79,45 @@ def test_record_grounding_mint_rate(monkeypatch):
     assert dt.record_grounding(1500, 0, 0, 0)["mint_rate"] is None
 
 
+def test_record_llm_call_captures_model(monkeypatch):
+    dt = _fresh(monkeypatch)
+    rec = dt.record_llm_call("REM", {**_RESP, "model": "gemma-4-12b"}, wall_s=10.0)
+    assert rec["model"] == "gemma-4-12b"
+    # absent model → None, never raises
+    assert dt.record_llm_call("REM", _RESP, wall_s=10.0)["model"] is None
+
+
+def test_call_timing_summary_splits_service_and_contention(monkeypatch):
+    dt = _fresh(monkeypatch)
+    # service = prompt_ms + predicted_ms = 5000 + 87000 = 92000ms; wall = 100s = 100000ms
+    # → contention = 100000 - 92000 = 8000ms (the one-backend busy-wait lands HERE)
+    resp = {**_RESP, "model": "gemma-4-12b"}
+    t = dt.call_timing_summary(resp, 100.0, backend="http://localhost:4000",
+                               batch_size=5, prompt_chars=22000)
+    assert t["service_ms"] == 92000.0
+    assert t["wall_ms"] == 100000.0
+    assert t["contention_ms"] == 8000.0
+    assert t["model"] == "gemma-4-12b"
+    assert t["backend"] == "http://localhost:4000"
+    assert t["batch_size"] == 5 and t["prompt_chars"] == 22000
+    assert t["poll_ms"] is None          # per-fact; filled by the caller
+
+
+def test_call_timing_summary_contention_never_negative(monkeypatch):
+    dt = _fresh(monkeypatch)
+    # wall < service (clock/measurement skew) → contention floored at 0, not negative
+    t = dt.call_timing_summary(_RESP, 10.0)   # wall 10s < service 92s
+    assert t["contention_ms"] == 0.0
+
+
+def test_call_timing_summary_missing_timings_yields_none(monkeypatch):
+    dt = _fresh(monkeypatch)
+    t = dt.call_timing_summary({"usage": {}}, None)
+    assert t["service_ms"] is None and t["wall_ms"] is None
+    assert t["contention_ms"] is None      # can't split without both
+    assert t["model"] is None
+
+
 def test_writes_jsonl_when_path_set(monkeypatch, tmp_path):
     metrics = tmp_path / "dream-metrics.jsonl"
     dt = _fresh(monkeypatch, str(metrics))

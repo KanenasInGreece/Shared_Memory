@@ -497,5 +497,6 @@ def test_llm_process_batch_mock(monkeypatch):
     monkeypatch.setenv("MOCK_LLM", "1")
     rem = load_rem_loop()
     items = [{"pg_id": 1, "content": "a"}, {"pg_id": 2, "content": "b"}]
-    out = asyncio.run(rem.REMDaemon._llm_process_batch(None, items, []))
+    out, timing = asyncio.run(rem.REMDaemon._llm_process_batch(None, items, []))
     assert set(out.keys()) == {1, 2} and out[1]["summary"]
+    assert timing is None          # MOCK_LLM path runs no real call → no timing
