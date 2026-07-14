@@ -482,11 +482,29 @@ def build_decision_metadata(
         "decision": decision,
     }
     # grounded_in: pg_ids of the facts this decision rests on — materialised at
-    # first write as (:Decision)-[:GROUNDED_IN]->(:Fact). Always include at least
-    # the conversation fact (grounding floor, decision 552).
-    gi = [int(x) for x in grounded_in.split(",") if x.strip().isdigit()]
+    # first write as typed (:Decision)-[:ROLE]->(:Fact|:Decision) edges. Always
+    # include at least the conversation fact (grounding floor, decision 552).
+    # Per-fact ROLE is optional: "534:considered,573,575:rejected" — a bare pg_id
+    # lets fact_kind pick the default role (decision 582). Roles: based_on,
+    # considered, rejected, under_conditions, informed_by.
+    gi: list[int] = []
+    grounded_roles: dict[str, str] = {}
+    for tok in grounded_in.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        pid_str, _, role = tok.partition(":")
+        pid_str = pid_str.strip()
+        if not pid_str.isdigit():
+            continue
+        pid = int(pid_str)
+        gi.append(pid)
+        if role.strip():
+            grounded_roles[str(pid)] = role.strip().lower()
     if gi:
         metadata["grounded_in"] = gi
+    if grounded_roles:
+        metadata["grounded_roles"] = grounded_roles
     # elicited: the spine fields were asked of the operator (decision 559). An
     # elicited null is a deliberate choice; coverage telemetry counts the ask.
     if elicited:
