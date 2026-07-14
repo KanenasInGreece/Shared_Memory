@@ -242,6 +242,38 @@ def fact_kind_from_source_ref(source_ref: object) -> str:
     return "researched"
 
 
+# ── Decision→fact grounding roles + advisory fact_kind gate (decision 582) ─────
+# A decision links to each grounding fact by a ROLE relation, not a flat GROUNDED_IN.
+# GROUNDING_ROLES maps the operator-facing role word (elicited via --grounded-in
+# "pgid:role") to the spine relation. Every one is already a SPINE relationship.
+GROUNDING_ROLES: dict[str, str] = {
+    "based_on":         ONT.grounded_in,   # positive evidence / basis
+    "grounded_in":      ONT.grounded_in,
+    "considered":       ONT.considered,
+    "rejected":         ONT.rejected,
+    "under_conditions": ONT.under_conditions,
+    "informed_by":      ONT.informed_by,   # soft input (not hard basis)
+}
+
+# Advisory gate (decision 582, OPTION A): fact_kind sets the DEFAULT grounding
+# relation when the operator names none — a discussion is soft (INFORMED_BY),
+# everything else defaults to hard basis (GROUNDED_IN). This is the minimal soft/
+# hard cut; it is NOT enforced — an explicit operator role always wins and is
+# recorded asserted_by=operator; nothing is silently rewritten. Hard enforcement
+# (option B) is deferred until mis-typing evidence justifies it. Deliberately small
+# (only discussion is soft) so it can be refined on the evidence option A gathers.
+_FACT_KIND_DEFAULT_ROLE: dict[str, str] = {
+    "discussion": ONT.informed_by,
+    # observation / tested / measured / researched → GROUNDED_IN (below)
+}
+
+
+def default_grounding_role(fact_kind: object) -> str:
+    """Default grounding relation for a fact of the given kind when the operator
+    named no explicit role (asserted_by=system_default). Pure, deterministic."""
+    return _FACT_KIND_DEFAULT_ROLE.get(fact_kind, ONT.grounded_in)
+
+
 # ── Spine vs Domain split (decision 550) ──────────────────────────────────────
 # SPINE = the framework identity / unique selling point — code-pinned, never read
 # from ontology.yaml: the high-signal ADR capture (Fact/Decision/CommunitySummary/

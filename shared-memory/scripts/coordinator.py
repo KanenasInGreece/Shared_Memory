@@ -53,6 +53,7 @@ from log_hygiene import AsyncLineWriter
 from ontology import (
     ONT, sanitize_entity_names, sanitize_entity_name,
     KNOWN_LABELS, KNOWN_RELATIONSHIPS, fact_kind_from_source_ref,
+    GROUNDING_ROLES, default_grounding_role,
 )
 
 log = logging.getLogger("coordinator")
@@ -1133,6 +1134,37 @@ class MemoryCoordinator:
                         outbox_id, delay,
                     )
 
+    async def _resolve_typed_grounding(
+        self, conn, grounded_ids: list, grounded_roles: dict
+    ) -> list:
+        """Resolve grounded pg_ids to typed edges (decision 582, OPTION A). For each
+        target, look up its node label (Fact vs Decision) and fact_kind from
+        technical_docs, then choose the ROLE: an explicit operator role
+        (asserted_by=operator) or the fact_kind default (asserted_by=system_default).
+        Advisory — no silent rewrite; an operator role always wins. Returns
+        [{pg_id, rel, asserted_by, label}] for the cross-type apoc writer."""
+        if not grounded_ids:
+            return []
+        rows = await conn.fetch(
+            "SELECT id, metadata->>'type' AS type, metadata->>'source_ref' AS source_ref"
+            " FROM technical_docs WHERE id = ANY($1)",
+            grounded_ids,
+        )
+        meta = {r["id"]: r for r in rows}
+        out: list[dict] = []
+        for pid in grounded_ids:
+            r = meta.get(pid)
+            label = ONT.decision if (r and r["type"] == "decision") else ONT.fact
+            requested = (grounded_roles.get(str(pid)) or "").strip().lower()
+            if requested in GROUNDING_ROLES:
+                rel, asserted_by = GROUNDING_ROLES[requested], "operator"
+            else:
+                fk = fact_kind_from_source_ref(r["source_ref"] if r else None)
+                rel, asserted_by = default_grounding_role(fk), "system_default"
+            out.append({"pg_id": pid, "rel": rel,
+                        "asserted_by": asserted_by, "label": label})
+        return out
+
     async def _apply_decision_outbox_row(
         self, outbox_id: int, pg_id: int, params: dict
     ) -> None:
@@ -1145,6 +1177,8 @@ class MemoryCoordinator:
         All writes in one session — atomic on transient failures (MERGE is idempotent).
         """
         decision = params.get("decision", {})
+        grounded = params.get("grounded") or []
+        grounded_in_flat = params.get("grounded_in", [])
         async with self._neo4j.session() as session:
             await session.run(
                 f"MERGE (d:{ONT.decision} {{pg_id: $pg_id}})"
@@ -1174,14 +1208,6 @@ class MemoryCoordinator:
                 f" FOREACH (ename IN $entities |"
                 f"   MERGE (e:{ONT.entity} {{name: ename}})"
                 f"   MERGE (d)-[:{ONT.entity_link}]->(e)"
-                f" )"
-                # Fact-grounding: deterministic GROUNDED_IN edge per pg_id (decision
-                # 550). MERGE the Fact so a not-yet-applied grounding fact becomes a
-                # stub that its own row fills later — same pattern as SUPERSEDES.
-                f" WITH d"
-                f" FOREACH (fid IN $grounded_in |"
-                f"   MERGE (gf:{ONT.fact} {{pg_id: fid}})"
-                f"   MERGE (d)-[:{ONT.grounded_in}]->(gf)"
                 f" )",
                 pg_id=pg_id,
                 title=decision.get("title", params.get("content_snippet", "")[:100]),
@@ -1194,8 +1220,30 @@ class MemoryCoordinator:
                 project=decision.get("project", "unknown"),
                 assisted_by=decision.get("assisted_by", []),
                 entities=self._gate_graph_entities(pg_id, params.get("entities", [])),
-                grounded_in=params.get("grounded_in", []),
             )
+            # Typed decision→fact grounding (decision 582): link the REAL target
+            # across labels (Fact OR Decision) — no shadow-Fact stub (bug 578) — and
+            # write the ROLE edge with asserted_by (operator | system_default). apoc
+            # supplies the dynamic label + relation type. Legacy flat GROUNDED_IN is
+            # the fallback for outbox rows queued before this shipped (no 'grounded').
+            if grounded:
+                await session.run(
+                    f"MATCH (d:{ONT.decision} {{pg_id: $pg_id}})"
+                    f" UNWIND $grounded AS g"
+                    f" CALL apoc.merge.node([g.label], {{pg_id: g.pg_id}}) YIELD node AS gf"
+                    f" CALL apoc.merge.relationship(d, g.rel, {{}},"
+                    f"      {{asserted_by: g.asserted_by}}, gf, {{asserted_by: g.asserted_by}}) YIELD rel"
+                    f" RETURN count(*) AS n",
+                    pg_id=pg_id, grounded=grounded,
+                )
+            elif grounded_in_flat:
+                await session.run(
+                    f"MATCH (d:{ONT.decision} {{pg_id: $pg_id}})"
+                    f" FOREACH (fid IN $grounded_in |"
+                    f"   MERGE (gf:{ONT.fact} {{pg_id: fid}})"
+                    f"   MERGE (d)-[:{ONT.grounded_in}]->(gf) )",
+                    pg_id=pg_id, grounded_in=grounded_in_flat,
+                )
         async with self._acquire() as conn:
             await conn.execute(
                 "UPDATE neo4j_outbox SET status='applied', applied_at=now() WHERE id=$1",
@@ -1441,6 +1489,20 @@ class MemoryCoordinator:
                     )
                     pg_id = row["id"]
 
+                    # Typed decision→fact grounding (decision 582): resolve each
+                    # grounded pg_id's node label + fact_kind from the durable store
+                    # and pick the ROLE relation (an operator role → asserted_by=
+                    # operator; else the fact_kind default → system_default). Advisory,
+                    # no silent rewrite. Drives the cross-type writer; the flat
+                    # grounded_in list is kept for telemetry/back-compat.
+                    grounded_ids = [
+                        g for g in (metadata.get("grounded_in") or [])
+                        if isinstance(g, int) and not isinstance(g, bool)
+                    ]
+                    grounded_typed = await self._resolve_typed_grounding(
+                        conn, grounded_ids, metadata.get("grounded_roles") or {}
+                    )
+
                     # Outbox row written atomically with the fact.
                     # The Phase 2 outbox worker drains this table.
                     await conn.execute(
@@ -1469,10 +1531,10 @@ class MemoryCoordinator:
                             # first write (id match, no alias pressure). Facts-only
                             # source_ref stays the fact's own origin; grounded_in points
                             # a Decision/record at its evidence facts.
-                            "grounded_in": [
-                                g for g in (metadata.get("grounded_in") or [])
-                                if isinstance(g, int) and not isinstance(g, bool)
-                            ],
+                            "grounded_in": grounded_ids,
+                            # Typed roles + asserted_by for the cross-type writer
+                            # (decision 582): [{pg_id, rel, asserted_by, label}].
+                            "grounded": grounded_typed,
                             # Piggyback the supersession mirror onto THIS fact's row
                             # (no separate outbox row to pollute the census): when it
                             # applies, the worker also marks the old Fact node
