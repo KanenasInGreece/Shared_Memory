@@ -9,6 +9,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **A retrospective is now a full record, not an annotation (API v2).** Recording a decision's outcome used to
+  write only an edge on the decision — the notes (the system's only *measured hindsight*) were invisible to
+  semantic search, nothing could cite the evidence behind a verdict, and the machinery could read only that an
+  outcome existed, never what it was. `save_retrospective` now mints a record with its own id: the notes are
+  embedded and searchable, the graph gains a `Retrospective` node behind the decision's `HAD_OUTCOME` trigger
+  edge (kept — the trigger semantics are unchanged), and the retrospective can be **grounded in the facts that
+  measured the outcome** with the same typed roles decisions use (`--grounded-in "601:based_on"`, `asserted_by`
+  recorded) — a test-grounded decision finally gets a test-grounded retrospective, structurally. The record
+  inherits its decision's project and derives its evidential kind from `--source-ref` (a test reference makes it
+  `tested`). New capture flags: `--grounded-in`, `--entities`, `--source-ref`, `--elicited`.
+- **The retrospective rating is now a closed outcome-state enum**: `validated` / `mixed` / `refined` / `pending` /
+  `reversed` — validated at the gateway and the client. The live graph had accumulated 15+ improvised free-text
+  ratings that nothing could threshold on; states (not grades) keep the structural verbs — `reversed` still
+  drives the supersession cascade — while the nuance and the measured delta stay in the notes, which is what
+  insight synthesis quotes. **API_VERSION bumped to 2** (the response now returns the retrospective's own `pg_id`).
 - **The background enrichment pass no longer overwrites a fact's text with its own summary.** Enrichment used to
   replace every fact's graph-tier content with an LLM paraphrase — including short, deliberately curated facts,
   where a paraphrase can only lose signal and inject style drift into every later synthesis. A fact's node now

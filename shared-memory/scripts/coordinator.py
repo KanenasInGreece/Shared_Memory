@@ -53,7 +53,7 @@ from log_hygiene import AsyncLineWriter
 from ontology import (
     ONT, sanitize_entity_names, sanitize_entity_name,
     KNOWN_LABELS, KNOWN_RELATIONSHIPS, fact_kind_from_source_ref,
-    GROUNDING_ROLES, default_grounding_role,
+    GROUNDING_ROLES, default_grounding_role, RETRO_RATINGS,
 )
 
 log = logging.getLogger("coordinator")
@@ -102,7 +102,10 @@ def _env_float(name: str, default: float) -> float:
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
 FRAMEWORK_VERSION = "0.6.4"
-API_VERSION = 1
+# v2 (retro-as-record): /memory/retrospective now creates a full record (own
+# pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
+# the response shape changed (returns the retro's own pg_id).
+API_VERSION = 2
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Throttle: remember (agent, version) pairs already logged so a misversioned
@@ -1165,6 +1168,28 @@ class MemoryCoordinator:
                         "asserted_by": asserted_by, "label": label})
         return out
 
+    @staticmethod
+    async def _write_typed_grounding(
+        session, anchor_label: str, pg_id: int, grounded: list
+    ) -> None:
+        """Write the typed grounding ROLE edges (decision 582) from an anchor
+        record (Decision or Retrospective) to its REAL targets across labels
+        (Fact OR Decision — no shadow-Fact stub, bug 578). apoc supplies the
+        dynamic label + relation type; every edge records asserted_by
+        (operator | system_default). Shared by the decision and retrospective
+        projections so the two writers can never drift."""
+        if not grounded:
+            return
+        await session.run(
+            f"MATCH (a:{anchor_label} {{pg_id: $pg_id}})"
+            f" UNWIND $grounded AS g"
+            f" CALL apoc.merge.node([g.label], {{pg_id: g.pg_id}}) YIELD node AS gf"
+            f" CALL apoc.merge.relationship(a, g.rel, {{}},"
+            f"      {{asserted_by: g.asserted_by}}, gf, {{asserted_by: g.asserted_by}}) YIELD rel"
+            f" RETURN count(*) AS n",
+            pg_id=pg_id, grounded=grounded,
+        )
+
     async def _apply_decision_outbox_row(
         self, outbox_id: int, pg_id: int, params: dict
     ) -> None:
@@ -1221,21 +1246,11 @@ class MemoryCoordinator:
                 assisted_by=decision.get("assisted_by", []),
                 entities=self._gate_graph_entities(pg_id, params.get("entities", [])),
             )
-            # Typed decision→fact grounding (decision 582): link the REAL target
-            # across labels (Fact OR Decision) — no shadow-Fact stub (bug 578) — and
-            # write the ROLE edge with asserted_by (operator | system_default). apoc
-            # supplies the dynamic label + relation type. Legacy flat GROUNDED_IN is
-            # the fallback for outbox rows queued before this shipped (no 'grounded').
+            # Typed decision→fact grounding (decision 582): shared writer — see
+            # _write_typed_grounding. Legacy flat GROUNDED_IN is the fallback for
+            # outbox rows queued before this shipped (no 'grounded').
             if grounded:
-                await session.run(
-                    f"MATCH (d:{ONT.decision} {{pg_id: $pg_id}})"
-                    f" UNWIND $grounded AS g"
-                    f" CALL apoc.merge.node([g.label], {{pg_id: g.pg_id}}) YIELD node AS gf"
-                    f" CALL apoc.merge.relationship(d, g.rel, {{}},"
-                    f"      {{asserted_by: g.asserted_by}}, gf, {{asserted_by: g.asserted_by}}) YIELD rel"
-                    f" RETURN count(*) AS n",
-                    pg_id=pg_id, grounded=grounded,
-                )
+                await self._write_typed_grounding(session, ONT.decision, pg_id, grounded)
             elif grounded_in_flat:
                 await session.run(
                     f"MATCH (d:{ONT.decision} {{pg_id: $pg_id}})"
@@ -1254,27 +1269,77 @@ class MemoryCoordinator:
     async def _apply_retrospective_outbox_row(
         self, outbox_id: int, pg_id: int, params: dict
     ) -> None:
-        """Materialise a HAD_OUTCOME self-loop on an existing Decision node in Neo4j.
+        """Materialise a retrospective in Neo4j — two shapes during the
+        retro-as-record transition:
 
-        Each call creates a new dated edge — multiple retrospectives per decision are allowed.
-        MATCH only (no MERGE) so a missing Decision surfaces as a no-op rather than a phantom node.
+        v2 (params['v'] == 2, retro-as-record): pg_id is the RETRO'S OWN id.
+        MERGE a :Retrospective node (rating/date/content-snippet/source/
+        fact_kind), link the target Decision via the HAD_OUTCOME trigger edge,
+        MENTIONS edges for elicited entities (gated), and the typed grounding
+        ROLE edges (shared writer). The target Decision is matched in its own
+        statement so a missing decision leaves the record intact (edge no-op).
+
+        Legacy (no 'v'): pg_id is the TARGET DECISION's id — a HAD_OUTCOME
+        self-loop carrying rating/date/notes as edge properties. Kept until the
+        pre-conversion outbox rows drain. MATCH only (no MERGE) so a missing
+        Decision surfaces as a no-op rather than a phantom node.
         """
         retro = params.get("retrospective", {})
         # Reversal (decision 276): the cascade is decision-level only — the
         # graph node mirrors technical_docs.superseded so the insight gate's
         # fresh-cluster query can exclude reversed decisions cheaply. Insights
         # are never invalidated here; the re-fold supersedes them instead.
-        superseded_clause = " SET d.superseded = true" if retro.get("superseded") else ""
+        reversal = bool(retro.get("superseded"))
         async with self._neo4j.session() as session:
-            await session.run(
-                f"MATCH (d:{ONT.decision} {{pg_id: $pg_id}})"
-                f" CREATE (d)-[:{ONT.had_outcome} {{rating: $rating, date: $date, notes: $notes}}]->(d)"
-                f"{superseded_clause}",
-                pg_id=pg_id,
-                rating=retro.get("rating", ""),
-                date=retro.get("date", ""),
-                notes=retro.get("notes", ""),
-            )
+            if params.get("v") == 2:
+                target_pg_id = params.get("target_pg_id")
+                source_ref = params.get("source_ref") or None
+                await session.run(
+                    f"MERGE (r:{ONT.retrospective} {{pg_id: $pg_id}})"
+                    f" SET r.rating = $rating, r.date = $date,"
+                    f"     r.content = $content, r.source = $source,"
+                    f"     r.fact_kind = $fact_kind"
+                    + (" SET r.source_ref = $source_ref" if source_ref else "")
+                    + f" WITH r"
+                    f" UNWIND $entities AS ename"
+                    f" MERGE (e:{ONT.entity} {{name: ename}})"
+                    f" MERGE (r)-[:{ONT.entity_link}]->(e)",
+                    pg_id=pg_id,
+                    rating=retro.get("rating", ""),
+                    date=retro.get("date", ""),
+                    content=params.get("content_snippet", "")[:200],
+                    source=params.get("source", "coordinator"),
+                    fact_kind=params.get("fact_kind") or "observation",
+                    entities=self._gate_graph_entities(pg_id, params.get("entities", [])),
+                    **({"source_ref": source_ref} if source_ref else {}),
+                )
+                # HAD_OUTCOME trigger edge from the target Decision (+ reversal
+                # mirror) — separate statement: a missing decision is a no-op
+                # for the edge but never loses the Retrospective record.
+                await session.run(
+                    f"MATCH (d:{ONT.decision} {{pg_id: $target}})"
+                    f" MATCH (r:{ONT.retrospective} {{pg_id: $pg_id}})"
+                    f" MERGE (d)-[:{ONT.had_outcome} {{date: $date}}]->(r)"
+                    + (" SET d.superseded = true" if reversal else ""),
+                    target=target_pg_id, pg_id=pg_id, date=retro.get("date", ""),
+                )
+                # Typed grounding ROLE edges (decision 582) — a retrospective
+                # grounds in the evidence that measured the outcome
+                # (test-grounded retrospectives, decision 542, now structural).
+                await self._write_typed_grounding(
+                    session, ONT.retrospective, pg_id, params.get("grounded") or []
+                )
+            else:
+                superseded_clause = " SET d.superseded = true" if reversal else ""
+                await session.run(
+                    f"MATCH (d:{ONT.decision} {{pg_id: $pg_id}})"
+                    f" CREATE (d)-[:{ONT.had_outcome} {{rating: $rating, date: $date, notes: $notes}}]->(d)"
+                    f"{superseded_clause}",
+                    pg_id=pg_id,
+                    rating=retro.get("rating", ""),
+                    date=retro.get("date", ""),
+                    notes=retro.get("notes", ""),
+                )
         async with self._acquire() as conn:
             await conn.execute(
                 "UPDATE neo4j_outbox SET status='applied', applied_at=now() WHERE id=$1",
@@ -1766,6 +1831,14 @@ class MemoryCoordinator:
     # ── POST /memory/retrospective ────────────────────────────────────────────
 
     async def handle_retrospective(self, request: web.Request) -> web.Response:
+        """Retro-as-record (API v2): a retrospective is a FULL record — own
+        pg_id + technical_docs row + embedding (searchable), materialised in
+        Neo4j as a :Retrospective node behind the target Decision's HAD_OUTCOME
+        trigger edge. The one machine-readable outcome field is the rating,
+        validated against the outcome-state enum (RETRO_RATINGS); the notes
+        carry the nuance. Optional grounding (grounded_in + roles) records the
+        evidence that measured the outcome — the test-grounded-retrospectives
+        rule (decision 542), now structural."""
         try:
             body = await request.json()
         except Exception:
@@ -1773,8 +1846,8 @@ class MemoryCoordinator:
                 {"status": "error", "message": "request body must be JSON"}, status=400
             )
 
-        pg_id    = body.get("pg_id")
-        rating   = body.get("rating", "")
+        pg_id    = body.get("pg_id")            # TARGET decision's id
+        rating   = (body.get("rating") or "").strip().lower()
         notes    = body.get("notes", "")
         date     = body.get("date") or datetime.now().date().isoformat()
         # Verified token identity over the client's script-name default ("memory_bridge").
@@ -1785,38 +1858,117 @@ class MemoryCoordinator:
                 {"status": "error", "message": "pg_id (int), rating, and notes are required"},
                 status=400,
             )
+        if rating not in RETRO_RATINGS:
+            return web.json_response(
+                {"status": "error",
+                 "message": (f"rating must be one of {sorted(RETRO_RATINGS)} "
+                             "(outcome states — nuance belongs in the notes)")},
+                status=400,
+            )
 
-        # Reversal vocabulary (decision 276): rating 'reversed' is the one
-        # structural rating — it marks the DECISION superseded in both stores
-        # (Tier-1 filter + fresh-cluster exclusion). All other ratings carry
-        # no enum semantics; their wording reaches insights via the re-fold.
-        is_reversal = rating.strip().lower() == "reversed"
-        retro_payload = {"rating": rating, "date": date, "notes": notes}
-        if is_reversal:
-            retro_payload["superseded"] = True
-        # Person-axis enforcement (see handle_save): the operator who recorded this
-        # outcome is stamped from the kernel-attested principal, never from the body.
-        _apply_principal(retro_payload, request.get("principal"))
+        # Reversal (decision 276): rating 'reversed' is the structural rating —
+        # it marks the DECISION superseded in both stores (Tier-1 filter +
+        # fresh-cluster exclusion).
+        is_reversal = rating == "reversed"
+        retro_payload = {"rating": rating, "date": date}
+
+        # The retro's own record metadata. Person-axis enforcement as in
+        # handle_save: principal is stamped from the kernel-attested identity.
+        source_ref = body.get("source_ref") or None
+        metadata = {
+            "type": "retrospective",
+            "source": agent_id,
+            "target_pg_id": pg_id,
+            "rating": rating,
+            "date": date,
+            "entities": [e for e in (body.get("entities") or [])
+                         if isinstance(e, str) and e.strip()],
+        }
+        if source_ref:
+            metadata["source_ref"] = source_ref
+        if body.get("elicited"):
+            metadata["elicited"] = True
+        grounded_ids = [
+            g for g in (body.get("grounded_in") or [])
+            if isinstance(g, int) and not isinstance(g, bool)
+        ]
+        if grounded_ids:
+            metadata["grounded_in"] = grounded_ids
+            roles = body.get("grounded_roles") or {}
+            if isinstance(roles, dict) and roles:
+                metadata["grounded_roles"] = roles
+        _apply_principal(metadata, request.get("principal"))
+
+        # Embedding — hard mandate, same as every record; no save without a vector.
+        content_hash = hashlib.sha256(notes.encode()).hexdigest()
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                embedding = await self._embed(notes, client)
+        except RuntimeError as exc:
+            return web.json_response({"status": "error", "message": str(exc)}, status=503)
 
         async with self._acquire() as conn:
             async with conn.transaction():
-                row = await conn.fetchrow(
-                    "SELECT id FROM technical_docs WHERE id=$1 FOR SHARE",
+                target = await conn.fetchrow(
+                    "SELECT id, metadata->>'type' AS type,"
+                    "       COALESCE(metadata->'decision'->>'project',"
+                    "                metadata->>'project') AS project"
+                    " FROM technical_docs WHERE id=$1 FOR SHARE",
                     pg_id,
                 )
-                if not row:
+                if not target:
                     return web.json_response(
                         {"status": "error", "message": f"No record found with pg_id={pg_id}"},
                         status=404,
                     )
+                # Inherit the target's project so domain-scoped reads see the
+                # retro beside its decision.
+                if target["project"]:
+                    metadata["project"] = target["project"]
+
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO technical_docs
+                        (content, metadata, embedding, content_hash,
+                         agent_id, scope, visibility)
+                    VALUES ($1, $2::jsonb, $3::vector, $4, $5, $6, $7)
+                    ON CONFLICT (content_hash) DO UPDATE
+                        SET metadata  = EXCLUDED.metadata,
+                            agent_id  = EXCLUDED.agent_id,
+                            embedding = EXCLUDED.embedding
+                    RETURNING id
+                    """,
+                    notes, metadata, str(embedding), content_hash,
+                    agent_id, body.get("scope", "global"),
+                    body.get("visibility", "global"),
+                )
+                retro_pg_id = row["id"]
+
+                grounded_typed = await self._resolve_typed_grounding(
+                    conn, grounded_ids, metadata.get("grounded_roles") or {}
+                )
+
+                # Outbox row under the RETRO'S OWN pg_id — ordinary record
+                # lifecycle (applied → rem_reviewed → consolidated → deleted
+                # after the insight fold). 'v': 2 selects the node projection;
+                # target_pg_id keys the insight triggers.
                 await conn.execute(
                     "INSERT INTO neo4j_outbox (pg_id, cypher_params) VALUES ($1, $2::jsonb)",
-                    pg_id,
+                    retro_pg_id,
                     {
+                        "v": 2,
                         "type": "retrospective",
                         "target_pg_id": pg_id,
-                        "retrospective": retro_payload,
+                        "retrospective": retro_payload
+                                          | ({"superseded": True} if is_reversal else {}),
+                        "content_snippet": notes[:200],
                         "source": agent_id,
+                        "agent_id": agent_id,
+                        "entities": metadata["entities"],
+                        "source_ref": source_ref,
+                        "fact_kind": fact_kind_from_source_ref(source_ref),
+                        "grounded_in": grounded_ids,
+                        "grounded": grounded_typed,
                     },
                 )
                 if is_reversal:
@@ -1834,8 +1986,19 @@ class MemoryCoordinator:
                             "009; reversal of pg_id=%d recorded on the graph only.",
                             pg_id,
                         )
+                # Wake the consolidation daemon — the retro is a record now.
+                await conn.execute(
+                    "SELECT pg_notify('new_artifact', $1)",
+                    json.dumps({"pg_id": retro_pg_id}),
+                )
 
-        return web.json_response({"status": "success", "target_pg_id": pg_id})
+        return web.json_response({
+            "status": "success",
+            "pg_id": retro_pg_id,
+            "target_pg_id": pg_id,
+            "message": f"Retrospective stored with ID {retro_pg_id} "
+                       f"(rating={rating}, target decision {pg_id}).",
+        })
 
     # ── POST /memory/search ───────────────────────────────────────────────────
 

@@ -343,6 +343,59 @@ async def test_apply_retrospective_outbox_row_creates_had_outcome():
 
 
 @pytest.mark.asyncio
+async def test_apply_retrospective_v2_creates_node_and_trigger_edge():
+    """v2 payload (retro-as-record): MERGE the :Retrospective node under the
+    retro's OWN pg_id, link the target Decision via HAD_OUTCOME, and write the
+    typed grounding ROLE edges via the shared writer."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+
+    params = {
+        "v": 2,
+        "type": "retrospective",
+        "target_pg_id": 42,
+        "retrospective": {"rating": "validated", "date": "2026-07-15"},
+        "content_snippet": "held up well",
+        "source": "claude",
+        "entities": ["OutboxPattern"],
+        "fact_kind": "tested",
+        "grounded": [{"pg_id": 601, "rel": "GROUNDED_IN",
+                      "asserted_by": "operator", "label": "Fact"}],
+    }
+
+    await c._apply_retrospective_outbox_row(outbox_id=11, pg_id=913, params=params)
+
+    cyphers = [call.args[0] for call in mock_session.run.await_args_list]
+    node_q = cyphers[0]
+    assert "MERGE (r:Retrospective {pg_id: $pg_id}" in node_q
+    assert "r.rating" in node_q and "r.fact_kind" in node_q
+    assert "MENTIONS" in node_q
+    edge_q = cyphers[1]
+    assert "MATCH (d:Decision {pg_id: $target}" in edge_q
+    assert "HAD_OUTCOME" in edge_q and "MERGE" in edge_q
+    assert not any("CREATE (d)-[:HAD_OUTCOME" in q for q in cyphers), \
+        "v2 must never write the legacy self-loop"
+    grounding_q = cyphers[2]
+    assert "apoc.merge.relationship" in grounding_q and "Retrospective" in grounding_q
+
+    kwargs = mock_session.run.await_args_list[1].kwargs
+    assert kwargs["target"] == 42 and kwargs["pg_id"] == 913
+
+
+@pytest.mark.asyncio
+async def test_apply_retrospective_v2_reversal_marks_decision_superseded():
+    c, _, mock_session = _coordinator_with_mocks()
+    params = {
+        "v": 2, "type": "retrospective", "target_pg_id": 42,
+        "retrospective": {"rating": "reversed", "date": "2026-07-15",
+                          "superseded": True},
+        "content_snippet": "withdrawn", "source": "claude", "entities": [],
+    }
+    await c._apply_retrospective_outbox_row(outbox_id=12, pg_id=914, params=params)
+    edge_q = mock_session.run.await_args_list[1].args[0]
+    assert "SET d.superseded = true" in edge_q
+
+
+@pytest.mark.asyncio
 async def test_handle_retrospective_missing_fields_returns_400():
     """handle_retrospective must return 400 when rating or notes are absent."""
     c, mock_conn, _ = _coordinator_with_mocks()
@@ -740,15 +793,66 @@ async def test_save_coerces_stringified_metadata_to_object():
 
 @pytest.mark.asyncio
 async def test_retrospective_binds_cypher_params_as_object():
-    """Regression: the retrospective outbox payload must bind as a dict."""
+    """Regression: the retrospective outbox payload must bind as a dict.
+    v2: the handler embeds the notes, mints the retro's own record, and queues
+    the outbox row under the retro's own pg_id with v=2 + target_pg_id."""
     c, mock_conn, _ = _coordinator_with_mocks()
-    req = _make_request({"pg_id": 240, "rating": "High", "notes": "held up well"})
-    resp = await c.handle_retrospective(req)
+    mock_conn.fetchrow = AsyncMock(side_effect=[
+        {"id": 240, "type": "decision", "project": "shared-memory-GitHub"},  # target
+        {"id": 911},                                                          # retro row
+    ])
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({"pg_id": 240, "rating": "Validated", "notes": "held up well"})
+        resp = await c.handle_retrospective(req)
     assert resp.status == 200
+    body = json.loads(resp.body)
+    assert body["pg_id"] == 911 and body["target_pg_id"] == 240
     params = _outbox_params(mock_conn)
     assert isinstance(params, dict)
     assert params["type"] == "retrospective"
-    assert params["retrospective"]["rating"] == "High"
+    assert params["v"] == 2
+    assert params["target_pg_id"] == 240
+    assert params["retrospective"]["rating"] == "validated"   # normalised
+
+
+@pytest.mark.asyncio
+async def test_retrospective_rejects_non_enum_rating():
+    """The rating is a closed outcome-state enum at the gateway — free-text
+    grades get a 400 that lists the vocabulary."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+    req = _make_request({"pg_id": 240, "rating": "high", "notes": "held up well"})
+    resp = await c.handle_retrospective(req)
+    assert resp.status == 400
+    body = json.loads(resp.body)
+    assert "validated" in body["message"] and "reversed" in body["message"]
+
+
+@pytest.mark.asyncio
+async def test_retrospective_v2_inherits_target_project_and_stores_record():
+    """The retro's technical_docs row inherits the target decision's project so
+    domain-scoped reads see the retro beside its decision."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+    mock_conn.fetchrow = AsyncMock(side_effect=[
+        {"id": 240, "type": "decision", "project": "tier3-cloe"},
+        {"id": 912},
+    ])
+    # _resolve_typed_grounding looks the grounded fact up in technical_docs
+    mock_conn.fetch = AsyncMock(return_value=[
+        {"id": 601, "type": None, "source_ref": "tests/test_outbox_ledger.py"},
+    ])
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({"pg_id": 240, "rating": "mixed", "notes": "partly held",
+                             "grounded_in": [601], "elicited": True})
+        resp = await c.handle_retrospective(req)
+    assert resp.status == 200
+    # technical_docs INSERT metadata (2nd fetchrow call): row content + metadata
+    meta = mock_conn.fetchrow.await_args_list[1].args[2]
+    assert meta["type"] == "retrospective"
+    assert meta["project"] == "tier3-cloe"
+    assert meta["target_pg_id"] == 240
+    assert meta["rating"] == "mixed"
+    assert meta["grounded_in"] == [601]
+    assert meta["elicited"] is True
 
 
 # ── GET /memory/telemetry rollup ──────────────────────────────────────────────
@@ -857,11 +961,15 @@ async def test_retrospective_reversed_marks_decision_superseded():
     """rating='reversed' is the one structural rating: technical_docs row gets
     superseded=true and the outbox payload carries the graph-side flag."""
     c, mock_conn, _ = _coordinator_with_mocks()
-    mock_conn.fetchrow = AsyncMock(return_value={"id": 42})
+    mock_conn.fetchrow = AsyncMock(side_effect=[
+        {"id": 42, "type": "decision", "project": "p1"},   # target FOR SHARE
+        {"id": 915},                                        # retro's own row
+    ])
 
-    req = _make_request({"pg_id": 42, "rating": "Reversed",
-                         "notes": "approach withdrawn", "agent_id": "claude_code"})
-    resp = await c.handle_retrospective(req)
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({"pg_id": 42, "rating": "Reversed",
+                             "notes": "approach withdrawn", "agent_id": "claude_code"})
+        resp = await c.handle_retrospective(req)
 
     assert resp.status == 200
     executes = [c_.args for c_ in mock_conn.execute.call_args_list]
@@ -875,15 +983,21 @@ async def test_retrospective_reversed_marks_decision_superseded():
 @pytest.mark.asyncio
 async def test_retrospective_normal_rating_has_no_reversal_side_effects():
     c, mock_conn, _ = _coordinator_with_mocks()
-    mock_conn.fetchrow = AsyncMock(return_value={"id": 42})
+    mock_conn.fetchrow = AsyncMock(side_effect=[
+        {"id": 42, "type": "decision", "project": "p1"},
+        {"id": 916},
+    ])
 
-    resp = await c.handle_retrospective(_make_request(
-        {"pg_id": 42, "rating": "high", "notes": "held up", "agent_id": "claude_code"}
-    ))
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        resp = await c.handle_retrospective(_make_request(
+            {"pg_id": 42, "rating": "validated", "notes": "held up",
+             "agent_id": "claude_code"}
+        ))
 
     assert resp.status == 200
     executes = [c_.args for c_ in mock_conn.execute.call_args_list]
-    assert len(executes) == 1                      # outbox INSERT only
+    # outbox INSERT + pg_notify wake — but NO superseded UPDATE
+    assert not any("SET superseded = true" in e[0] for e in executes)
     assert "superseded" not in executes[0][2]["retrospective"]
 
 
