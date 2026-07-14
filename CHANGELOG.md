@@ -16,6 +16,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   still held it, and the legacy self-loop deleted after each conversion. Migrated records arrive
   `rem_processed=true` — enriching historical retrospectives is a deliberate later choice, not a surprise
   backlog for the enrichment daemon.
+- **Retrieval is recency-aware for outcome records.** Decisions and retrospectives are scored by the reranker
+  **with their recording date prepended** to the text it sees — recency cannot be weighed if it is invisible —
+  and when several retrospectives of the *same* decision surface in one result set they are presented
+  newest-first: the newest retrospective is the decision's current verdict, older ones are history. Everything
+  else keeps pure relevance order; there is deliberately **no time-decay scoring** (uncalibratable at this
+  volume). Search results for Tier-1 records now expose `pg_id` and `created_at`.
 
 ### Changed
 
