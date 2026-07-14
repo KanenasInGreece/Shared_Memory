@@ -51,7 +51,9 @@ from ontology import (
 )
 from pool_status import pool_has_free_slot
 from log_hygiene import append_secure
-from dream_telemetry import record_llm_call, adaptive_ceiling, record_grounding
+from dream_telemetry import (
+    record_llm_call, adaptive_ceiling, record_grounding, call_timing_summary,
+)
 
 
 # ── Environment ───────────────────────────────────────────────────────────────
@@ -435,11 +437,13 @@ class REMDaemon:
         conn,
         loop: asyncio.AbstractEventLoop,
     ) -> dict[int, dict]:
-        """Fetch full content and metadata type for each pg_id in one query."""
+        """Fetch full content and metadata type for each pg_id in one query.
+        created_at is carried too so the caller can derive poll_ms (created_at → REM
+        pickup) for the durable rem_timing summary (decision 570)."""
         def _fetch() -> dict[int, dict]:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, content, metadata->>'type' AS doc_type"
+                    "SELECT id, content, metadata->>'type' AS doc_type, created_at"
                     " FROM technical_docs WHERE id = ANY(%s)",
                     (pg_ids,),
                 )
@@ -447,6 +451,7 @@ class REMDaemon:
                     row[0]: {
                         "content":     row[1],
                         "is_decision": row[2] == "decision",
+                        "created_at":  row[3],
                     }
                     for row in cur.fetchall()
                 }
@@ -513,6 +518,41 @@ class REMDaemon:
                     (pg_id,),
                 )
         await loop.run_in_executor(None, _mark)
+
+    async def _write_rem_timing(
+        self,
+        pg_id: int,
+        timing: dict,
+        conn,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """Persist the REM per-call timing summary onto the DURABLE technical_docs row
+        (decision 570) so it survives the outbox row's deletion on NREM consolidation.
+        Best-effort: a timing-write failure must never fail an already-enriched fact —
+        the enrichment (Neo4j + rem_reviewed) has already committed by the time we get
+        here, so we log and move on. No explicit commit needed (AUTOCOMMIT conn)."""
+        def _write() -> None:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE technical_docs SET rem_timing = %s::jsonb WHERE id = %s",
+                    (json.dumps(timing), pg_id),
+                )
+        try:
+            await loop.run_in_executor(None, _write)
+        except Exception as exc:
+            logger.warning("REM: pg_id=%d rem_timing persist failed: %s", pg_id, exc)
+
+    @staticmethod
+    def _poll_ms(pickup_wall: float, created_at) -> float | None:
+        """created_at → REM pickup, in ms (daemon cadence). created_at is a tz-aware
+        datetime from Postgres; None or a clock skew yields None rather than a negative."""
+        if created_at is None:
+            return None
+        try:
+            delta = (pickup_wall - created_at.timestamp()) * 1000.0
+        except Exception:
+            return None
+        return round(delta, 1) if delta >= 0 else None
 
     async def _recent_write_happened(
         self, conn, loop: asyncio.AbstractEventLoop
@@ -799,18 +839,21 @@ class REMDaemon:
 
     async def _llm_process_batch(
         self, items: list[dict], closed_set: list[dict],
-    ) -> dict[int, dict]:
+    ) -> tuple[dict[int, dict], dict | None]:
         """Enrich N regular facts in ONE LLM call, sharing the grounding prompt.
         (Decision 497 measured that the KV grounding cache is NOT reusable across
         cycles because REM mutates the graph — so amortise the 22K-token grounding
         WITHIN one call instead.) items = [{pg_id, content}]. Returns
-        {pg_id: result} for facts that parsed to a usable object; a missing/invalid
-        line is omitted → that fact retries next cycle. Decisions are NOT batched."""
+        ({pg_id: result}, call_timing): the results map (a missing/invalid line is
+        omitted → that fact retries next cycle; decisions are NOT batched) plus the
+        shared per-call timing summary (decision 570) — None when no LLM call ran or
+        it failed. The timing is per-CALL: every parsed fact in the batch shares the
+        same service_ms/contention_ms (per-fact cost = service_ms / batch_size)."""
         if not items:
-            return {}
+            return {}, None
         if os.getenv("MOCK_LLM") == "1":
-            return {it["pg_id"]: {"summary": f"REM batch summary (mock): {it['content'][:80]}",
-                                  "relationships": []} for it in items}
+            return ({it["pg_id"]: {"summary": f"REM batch summary (mock): {it['content'][:80]}",
+                                   "relationships": []} for it in items}, None)
 
         idx_to_pg = {i: it["pg_id"] for i, it in enumerate(items)}
         prompt = self._build_batch_prompt(items, closed_set)
@@ -832,16 +875,20 @@ class REMDaemon:
                                     wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
                                     ok=False, note=f"batch_http_{resp.status_code}")
                     logger.error("REM batch LLM returned %d: %s", resp.status_code, resp.text[:200])
-                    return {}
+                    return {}, None
                 resp_json = resp.json()
+                _wall_s = time.monotonic() - _start
                 record_llm_call("REM", resp_json, backend=_backend,
-                                wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
+                                wall_s=_wall_s, ceiling_s=_ceiling,
                                 note=f"batch={len(items)}")
+                call_timing = call_timing_summary(
+                    resp_json, _wall_s, backend=_backend,
+                    batch_size=len(items), prompt_chars=len(prompt))
                 raw = resp_json["choices"][0]["message"]["content"]
         except Exception as exc:
             logger.error("REM batch LLM error: %s", exc)
-            return {}
-        return self._parse_jsonl_batch(raw, idx_to_pg)
+            return {}, None
+        return self._parse_jsonl_batch(raw, idx_to_pg), call_timing
 
     def _build_batch_prompt(self, items: list[dict], closed_set: list[dict]) -> str:
         entity_lines = "\n".join(
@@ -1075,6 +1122,9 @@ class REMDaemon:
             logger.info("REM cycle: %d fact(s) to process (pg_ids=%s)", len(pg_ids), pg_ids)
 
             content_map = await self._batch_fetch_content(pg_ids, conn, loop)
+            # Wall clock at pickup — the reference for poll_ms (created_at → REM picks
+            # it up). Taken once the batch is in hand, just before enrichment work.
+            pickup_wall = time.time()
             closed_set  = await self._fetch_closed_entity_set()
             registry    = _build_entity_registry(closed_set)
 
@@ -1095,12 +1145,22 @@ class REMDaemon:
                     fact_items.append({"pg_id": pg_id, "content": row["content"]})
 
             if len(fact_items) > 1:
-                results = await self._llm_process_batch(fact_items, closed_set)
+                results, call_timing = await self._llm_process_batch(fact_items, closed_set)
                 for it in fact_items:
                     res = results.get(it["pg_id"])
                     if res and await self._apply_fact_result(
                             it["pg_id"], False, res, registry, conn, loop):
                         processed += 1
+                        # Durable REM timing (decision 570) — per-CALL metrics shared by
+                        # the batch, plus this fact's own poll_ms. Written after the
+                        # enrichment commits so a timing failure never loses a review.
+                        if call_timing:
+                            row = content_map.get(it["pg_id"]) or {}
+                            await self._write_rem_timing(
+                                it["pg_id"],
+                                {**call_timing,
+                                 "poll_ms": self._poll_ms(pickup_wall, row.get("created_at"))},
+                                conn, loop)
             elif fact_items:
                 it = fact_items[0]
                 if await self._process_fact(

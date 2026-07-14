@@ -70,6 +70,48 @@ def record_grounding(grounding_n: int, referenced: int, matched: int,
     return rec
 
 
+def call_timing_summary(
+    resp_json: dict | None,
+    wall_s: float | None,
+    *,
+    backend: str | None = None,
+    batch_size: int | None = None,
+    prompt_chars: int | None = None,
+) -> dict:
+    """Compact per-call REM timing for DURABLE persistence on the fact row (decisions
+    570/571) — distinct from record_llm_call, which streams to the JSONL metrics file.
+
+    Splits the one client-observed number into its honest parts:
+      service_ms    = llama.cpp prompt_ms + predicted_ms — pure inference = MODEL + HARDWARE,
+                      load-invariant (the anchor metric, decision 568).
+      wall_ms       = wall_s * 1000 — what the caller experienced (service + contention + net).
+      contention_ms = max(0, wall_ms - service_ms) — time queued behind a busy backend = the
+                      CAPACITY signal that falls toward 0 as the pool absorbs load. This is the
+                      one-backend example resolved: the second REM's busy-wait lands HERE, never
+                      folded into service_ms (fact 569).
+    model tags the model-evolution axis; batch_size/prompt_chars carry the workload context that
+    makes cross-model service_ms comparable. All best-effort — any missing input yields None, and
+    the caller persists whatever is present. Never raises."""
+    t = (resp_json or {}).get("timings") or {}
+    pm, dm = t.get("prompt_ms"), t.get("predicted_ms")
+    service_ms = (round(pm + dm, 1)
+                  if isinstance(pm, (int, float)) and isinstance(dm, (int, float)) else None)
+    wall_ms = round(wall_s * 1000.0, 1) if wall_s is not None else None
+    contention_ms = (round(max(0.0, wall_ms - service_ms), 1)
+                     if wall_ms is not None and service_ms is not None else None)
+    return {
+        "service_ms": service_ms,
+        "wall_ms": wall_ms,
+        "contention_ms": contention_ms,
+        "poll_ms": None,               # per-fact; filled by the caller from created_at
+        "model": (resp_json or {}).get("model"),
+        "backend": backend,
+        "batch_size": batch_size,
+        "prompt_chars": prompt_chars,
+        "ts": round(time.time(), 3),
+    }
+
+
 def record_llm_call(
     phase: str,
     resp_json: dict | None,
@@ -89,6 +131,7 @@ def record_llm_call(
         "ts": round(time.time(), 3),
         "phase": phase,
         "backend": backend,
+        "model": (resp_json or {}).get("model"),
         "prompt_n": t.get("prompt_n") if t.get("prompt_n") is not None else usage.get("prompt_tokens"),
         "predicted_n": t.get("predicted_n") if t.get("predicted_n") is not None else usage.get("completion_tokens"),
         "tok_s": round(tok_s, 2) if isinstance(tok_s, (int, float)) else None,
