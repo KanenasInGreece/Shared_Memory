@@ -7,6 +7,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **One-time migration for pre-existing retrospectives** (`migrate_retro_edges.py`, dry-run first): converts every
+  legacy outcome edge into a full retrospective record — notes embedded and searchable, the original recording
+  date **backdated into `created_at`** (so recency stays honest), free-text ratings mapped onto the outcome-state
+  enum with the original wording preserved (`original_rating`), recorder identity recovered where a queue row
+  still held it, and the legacy self-loop deleted after each conversion. Migrated records arrive
+  `rem_processed=true` — enriching historical retrospectives is a deliberate later choice, not a surprise
+  backlog for the enrichment daemon.
+
 ### Changed
 
 - **A retrospective is now a full record, not an annotation (API v2).** Recording a decision's outcome used to
