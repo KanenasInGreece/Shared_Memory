@@ -7,6 +7,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The skill now actively elicits the grounding *role*, completing the v0.6.4 capture surface.** `save_decision`
+  guidance proposes a role for each grounded fact — defaulting from the fact's kind (a `discussion` → soft
+  `INFORMED_BY`, else `GROUNDED_IN`) — for the operator to confirm or override, and passes the confirmed role so it
+  is recorded as **operator-asserted**. A bare id still falls to the system default. (Shipping the typed-grounding
+  code without this left the capability unreachable in practice — see the capture-surface release gate.)
+
 ## [0.6.4] — 2026-07-14
 
 ### Changed
