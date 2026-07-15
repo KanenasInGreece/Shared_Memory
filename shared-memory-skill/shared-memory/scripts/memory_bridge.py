@@ -656,32 +656,45 @@ def _build_query(template: str, args) -> str:
         )
         return "\n".join(lines)
 
-    elif template == "retrospectives":
+    # Retrospective payload lives on the RECORD node since the retro-as-record
+    # change; pre-conversion installs still carry it as edge properties. Both
+    # templates therefore read BOTH shapes: node fields when the target is a
+    # Retrospective, edge fields otherwise (same tolerance the consolidation
+    # daemon uses).
+    _RETRO_FIELDS = (
+        "WITH d, o, t,"
+        " CASE WHEN t:Retrospective THEN t.rating ELSE o.rating END AS rating,"
+        " CASE WHEN t:Retrospective THEN coalesce(t.rem_summary, t.content)"
+        "      ELSE o.notes END AS notes,"
+        " CASE WHEN t:Retrospective THEN t.date ELSE o.date END AS date"
+    )
+
+    if template == "retrospectives":
         rating = _safe(getattr(args, "rating", ""))
-        lines = ["MATCH (d:Decision)-[o:HAD_OUTCOME]->()"]
+        lines = ["MATCH (d:Decision)-[o:HAD_OUTCOME]->(t)", _RETRO_FIELDS]
         if rating:
-            lines.append(f"WHERE o.rating CONTAINS '{rating}'")
+            lines.append(f"WHERE rating CONTAINS '{rating}'")
         lines.append(
-            "RETURN d.title, d.pg_id, o.rating, o.notes, o.date ORDER BY o.date DESC"
+            "RETURN d.title, d.pg_id, rating, notes, date ORDER BY date DESC"
         )
         return "\n".join(lines)
 
     elif template == "why-to-check":
         title   = _safe(getattr(args, "title",   ""))
         project = _safe(getattr(args, "project", ""))
-        lines = ["MATCH (d:Decision)-[o:HAD_OUTCOME]->()"]
+        lines = ["MATCH (d:Decision)-[o:HAD_OUTCOME]->(t)"]
         if title:
             lines.append(f"WHERE d.title CONTAINS '{title}'")
         lines += [
             "OPTIONAL MATCH (d)-[:WAS_ATTRIBUTED_TO]->(h:Human)",
             "OPTIONAL MATCH (d)-[:PROJECT_OF]->(p:Project)",
+            _RETRO_FIELDS.replace("WITH d, o, t,", "WITH d, o, t, h, p,"),
         ]
         if project:
-            lines.append("WITH d, o, h, p")
             lines.append(f"WHERE p.name CONTAINS '{project}'")
         lines.append(
-            "RETURN d.title, d.pg_id, o.rating, o.notes, "
-            "o.date, h.name AS decided_by ORDER BY o.date DESC"
+            "RETURN d.title, d.pg_id, rating, notes, "
+            "date, h.name AS decided_by ORDER BY date DESC"
         )
         return "\n".join(lines)
 

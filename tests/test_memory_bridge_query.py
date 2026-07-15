@@ -51,6 +51,17 @@ def test_why_to_check_builds_cypher():
     assert "outbox" in cypher
 
 
+def test_retro_templates_read_both_shapes():
+    """Retro payload lives on the record node post-conversion, on the edge in
+    pre-conversion installs — the templates must read BOTH (the live regression:
+    edge-only reads returned null rating/notes after the migration)."""
+    for tpl in ("retrospectives", "why-to-check"):
+        cypher = mb._build_query(tpl, _ns(rating="validated", title="", project=""))
+        assert "t:Retrospective" in cypher
+        assert "o.rating" in cypher
+        assert "coalesce(t.rem_summary, t.content)" in cypher
+
+
 def test_filter_values_are_sanitised():
     # ';' and "'" are stripped — only the two structural CONTAINS delimiters remain.
     cypher = mb._build_query("retrospectives", _ns(rating="good'; DROP TABLE"))

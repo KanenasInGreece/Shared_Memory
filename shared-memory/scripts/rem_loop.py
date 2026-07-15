@@ -1032,6 +1032,13 @@ class REMDaemon:
         if not summary:
             logger.warning("REM: pg_id=%d empty summary — skipping", pg_id)
             return False
+        # Guard: for a Fact the original content is load-bearing (it becomes
+        # f.content verbatim). A call site that forgets it would blank the node
+        # and loop the fact through REM forever (consistency check fails every
+        # cycle) — refuse loudly instead.
+        if kind == KIND_FACT and not original_content:
+            logger.error("REM: pg_id=%d called without original_content — skipping", pg_id)
+            return False
 
         # Stage 1.3 entity sub-typing: collect {sanitized name -> sub-label} for the
         # entities the LLM typed as one of the 5 ontology sub-labels (OTHER/invalid

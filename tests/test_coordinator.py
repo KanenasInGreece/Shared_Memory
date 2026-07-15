@@ -895,6 +895,11 @@ async def test_retrospective_v2_inherits_target_project_and_stores_record():
     assert meta["rating"] == "mixed"
     assert meta["grounded_in"] == [601]
     assert meta["elicited"] is True
+    # Identity includes the target decision: same notes on another decision is
+    # a DIFFERENT record (and can never collide with a plain fact's hash).
+    import hashlib as _hl
+    assert mock_conn.fetchrow.await_args_list[1].args[4] == _hl.sha256(
+        b"retrospective:240:partly held").hexdigest()
 
 
 # ── GET /memory/telemetry rollup ──────────────────────────────────────────────

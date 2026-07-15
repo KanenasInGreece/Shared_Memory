@@ -195,7 +195,7 @@ Written by the outbox worker when `metadata["type"] == "decision"`.
 | Label | Purpose |
 |---|---|
 | `Decision` | An architectural or design decision — keyed by `pg_id`, links to all PROV-O edges. Lifecycle flags: `rem_processed` (REM enrichment done), `consolidated` (folded into an insight), `superseded` (reversed via `rating="reversed"`). |
-| `Retrospective` | A recorded outcome for a decision (retro-as-record, v2) — keyed by `pg_id` like Fact/Decision. Carries `rating` (outcome-state enum: `validated`\|`mixed`\|`refined`\|`pending`\|`reversed`), `date`, `content` (notes snippet; full notes in Postgres), `source`, `fact_kind`, and `rem_processed`. Reached from its decision via the `HAD_OUTCOME` trigger edge; grounds in evidence facts via typed ROLE edges. Spine — never configurable. |
+| `Retrospective` | A recorded outcome for a decision (retro-as-record, v2) — keyed by `pg_id` like Fact/Decision. Carries `rating` (outcome-state enum: `validated`\|`mixed`\|`refined`\|`pending`\|`reversed`), `date`, `content` (notes snippet; full notes in Postgres), `source`, `fact_kind`, and `rem_processed`. Reached from its decision via the `HAD_OUTCOME` trigger edge; grounds in evidence facts via typed ROLE edges. Framework-defined — never configurable via `ontology.yaml`. |
 | `Human` | A person who owns or makes a decision (`decided_by` field) |
 | `AIAgent` | An AI tool that assisted in the decision (`assisted_by` list) |
 | `Project` | Project scope — root node for decisions and milestones |
@@ -267,7 +267,7 @@ MATCH (d:Decision {pg_id: $target})
 MERGE (d)-[:HAD_OUTCOME {date: $date}]->(r)        // the TRIGGER edge
 // + MENTIONS edges for elicited entities, + typed grounding ROLE edges
 // (GROUNDED_IN/CONSIDERED/... with asserted_by) to the facts that MEASURED
-// the outcome — test-grounded retrospectives (decision 542), structural.
+// the outcome — a test-grounded decision gets a test-grounded retrospective.
 ```
 
 Multiple retrospectives per Decision are allowed; consumers treat the **newest as the decision's current verdict**. `date` defaults to today (ISO). Legacy pre-conversion rows (no `v`) still produce the old self-loop; the one-time migration converts existing self-loops to records.

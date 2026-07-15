@@ -12,7 +12,9 @@ import select
 import time
 from datetime import datetime
 from neo4j import AsyncGraphDatabase
-from ontology import ONT, fact_kind_from_source_ref
+from ontology import (
+    ONT, fact_kind_from_source_ref, GROUNDING_ROLES, default_grounding_role,
+)
 from pool_status import pool_has_free_slot
 from dream_telemetry import record_llm_call, adaptive_ceiling
 
@@ -597,8 +599,16 @@ def fetch_retro_records(conn, retro_ids):
             for g in gin:
                 if isinstance(g, (int, float)):
                     gid = int(g)
-                    grounded.append((gid, roles.get(str(gid), "grounded_in"),
-                                     kinds.get(gid, "observation")))
+                    kind = kinds.get(gid, "observation")
+                    # Report the RELATION the graph actually carries: an
+                    # operator role maps through GROUNDING_ROLES; a bare id
+                    # gets the same fact_kind default the write path used
+                    # (a discussion grounds softly as INFORMED_BY) — the
+                    # evidence line must never contradict the edge.
+                    requested = (roles.get(str(gid)) or "").strip().lower()
+                    rel = (GROUNDING_ROLES[requested] if requested in GROUNDING_ROLES
+                           else default_grounding_role(kind))
+                    grounded.append((gid, rel.lower(), kind))
         out[rid] = {"content": content, "grounded": grounded}
     return out
 

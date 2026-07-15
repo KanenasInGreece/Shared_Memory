@@ -175,9 +175,11 @@ def test_consumable_rows_empty_pg_ids_runs_no_query():
 # ── fetch_retro_records (v2 authoritative content + grounding) ────────────────
 
 def test_fetch_retro_records_content_roles_and_kinds():
-    """Full notes come from Postgres; grounding roles from metadata; fact_kind
-    is derived from each grounding fact's source_ref (same derivation the
-    write path uses)."""
+    """Full notes come from Postgres; the reported role is the RELATION the
+    graph actually carries — an operator role maps through GROUNDING_ROLES
+    (based_on → GROUNDED_IN), a bare id gets the same fact_kind default the
+    write path used (a discussion grounds softly as INFORMED_BY) — so the
+    evidence line can never contradict the edge."""
     conn = StubConn(script=[
         {"rowcount": 1, "rows": [
             (900, "full retro notes", [573, 574], {"573": "based_on"}),
@@ -189,8 +191,8 @@ def test_fetch_retro_records_content_roles_and_kinds():
     ])
     out = fetch_retro_records(conn, [900])
     assert out[900]["content"] == "full retro notes"
-    assert (573, "based_on", "tested") in out[900]["grounded"]
-    assert (574, "grounded_in", "discussion") in out[900]["grounded"]
+    assert (573, "grounded_in", "tested") in out[900]["grounded"]
+    assert (574, "informed_by", "discussion") in out[900]["grounded"]
 
 
 def test_fetch_retro_records_empty_ids_runs_no_query():
@@ -425,7 +427,7 @@ async def test_fold_insight_v2_retro_latest_full_older_compressed(monkeypatch):
     d245 = next(b for b in blocks if "pg_id=245" in b)
     # Latest (v2): full authoritative notes + evidence, marked LATEST.
     assert "LATEST] full retro notes from postgres" in d245
-    assert "[RETROSPECTIVE EVIDENCE] based on: fact 573 (tested, based_on)" in d245
+    assert "[RETROSPECTIVE EVIDENCE] based on: fact 573 (tested, grounded_in)" in d245
     assert "node snippet" not in d245           # capped node copy never used
     # Older legacy retro: compressed to rating+date history.
     assert "rating=pending date=2026-06-01] (earlier outcome" in d245
