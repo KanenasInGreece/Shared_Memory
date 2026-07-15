@@ -593,6 +593,13 @@ EMBED_BACKOFF = 0.5      # seconds × attempt number  (0.5 s, 1 s, 1.5 s, 2 s)
 # the larger-context work. Env-tunable if the embedder's -c changes.
 EMBED_MAX_CHARS = int(os.environ.get("EMBED_MAX_CHARS", "24000"))
 
+# Read-contract graph expansion cap: how many edges surface per anchored record
+# in search results. Env-tunable. Ordering (in the expansion Cypher) puts
+# provenance-bearing edges (r.asserted_by set) and typed relations ahead of bare
+# MENTIONS, so the highest-signal context survives the cap — context without
+# relation properties is noise disguised as fact.
+GRAPH_EXPANSION_LIMIT = _env_int("GRAPH_EXPANSION_LIMIT", 15)
+
 # Pool sizing is a SYSTEM budget, not just a coordinator knob: Postgres
 # max_connections must cover this pool + REM (1 conn) + NREM (per-op) + the
 # LISTEN connection + headroom. POOL_ACQUIRE_TIMEOUT bounds how long a request
@@ -824,6 +831,31 @@ def _coerce_jsonb_obj(value):
         except (ValueError, TypeError):
             return value
     return value
+
+
+def _json_safe(value):
+    """Coerce a Neo4j-driver value into JSON-serialisable primitives.
+
+    Edge/node property maps can carry temporal values (neo4j DateTime/Date/Time,
+    or plain datetime) — json.dumps raises TypeError on those. Primitives pass
+    through; lists/dicts recurse; temporals become ISO strings (neo4j exposes
+    ``iso_format()``, stdlib ``isoformat()``); anything else degrades to str().
+    Pure and defensive — surfacing edge properties must never fail a search.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    for attr in ("iso_format", "isoformat"):
+        fn = getattr(value, attr, None)
+        if callable(fn):
+            try:
+                return fn()
+            except Exception:
+                break
+    return str(value)
 
 
 def _outbox_backoff_delay(retries: int) -> float:
@@ -2072,6 +2104,79 @@ class MemoryCoordinator:
 
     # ── POST /memory/search ───────────────────────────────────────────────────
 
+    async def _expand_graph_context(self, session, pg_id: int,
+                                    anchor_labels: tuple[str, ...]) -> list[dict]:
+        """Read-contract graph expansion for one anchored record.
+
+        Anchors on any of ``anchor_labels`` (by ``pg_id``) and returns one entry
+        per edge, capped at GRAPH_EXPANSION_LIMIT with provenance-bearing edges
+        (``r.asserted_by`` set) and typed relations ordered ahead of bare
+        MENTIONS. Every edge surfaces its type, direction, and FULL property map
+        (asserted_by / confidence / role / method / support / created_at, …) —
+        a bare relation name cannot be weighed by the consumer.
+
+        Neighbor identity is never silently dropped: name-keyed nodes (Entity /
+        Human / AIAgent / Project) keep the legacy ``{rel_type, name, label,
+        aliases?}`` shape plus the new keys; pg_id-keyed nodes (Decision /
+        Retrospective / Fact / CommunitySummary) return ``{rel_type, direction,
+        properties, label, pg_id, snippet}`` where snippet is the first ~120
+        chars of the node's text-bearing property (content / title+rationale /
+        notes / rem_summary — null when the node carries none). Entity ALIASES
+        siblings are still folded in (ADR-017). Failures degrade to [] — graph
+        context enriches a search, it never fails one.
+        """
+        ctx: list[dict] = []
+        anchor_where = " OR ".join(f"n:{lbl}" for lbl in anchor_labels)
+        try:
+            result = await session.run(
+                f"MATCH (n {{pg_id: $pg_id}}) WHERE {anchor_where}"
+                " OPTIONAL MATCH (n)-[r]-(related)"
+                # ADR-017: also pull each related Entity's alias siblings so
+                # search surfaces every surface form of a concept. One query,
+                # no-op-safe (empty when no ALIASES edges exist).
+                f" OPTIONAL MATCH (related)-[:{ONT.aliases}]-(al:{ONT.entity})"
+                " WITH n, r, related, labels(related) AS labels,"
+                "      collect(DISTINCT al.name) AS aliases"
+                # Highest-signal edges survive the cap: provenance-bearing
+                # first, then any typed relation, bare MENTIONS last.
+                " ORDER BY CASE WHEN r.asserted_by IS NOT NULL THEN 0 ELSE 1 END,"
+                f"          CASE WHEN type(r) = '{ONT.entity_link}' THEN 1 ELSE 0 END"
+                " LIMIT $cap"
+                " RETURN labels, related.name AS name, related.pg_id AS pg_id,"
+                "        type(r) AS rel_type,"
+                "        CASE WHEN r IS NULL THEN null"
+                "             WHEN startNode(r) = n THEN 'out' ELSE 'in' END AS direction,"
+                "        properties(r) AS rel_props,"
+                "        left(coalesce(related.content, related.title,"
+                "                      related.rationale, related.notes,"
+                "                      related.rem_summary), 120) AS snippet,"
+                "        aliases",
+                pg_id=pg_id, cap=GRAPH_EXPANSION_LIMIT,
+            )
+            async for rec in result:
+                if not rec["rel_type"]:
+                    continue  # OPTIONAL MATCH row for an anchor with no edges
+                entry = {
+                    "rel_type": rec["rel_type"],
+                    "direction": rec["direction"],
+                    "properties": _json_safe(dict(rec["rel_props"] or {})),
+                    "label": rec["labels"][0] if rec["labels"] else None,
+                }
+                if rec["name"]:
+                    # Name-keyed neighbor — legacy shape preserved, new keys additive.
+                    entry["name"] = rec["name"]
+                    if rec["aliases"]:
+                        entry["aliases"] = rec["aliases"]
+                else:
+                    # pg_id-keyed neighbor (Decision/Retrospective/Fact/
+                    # CommunitySummary) — previously dropped by the name filter.
+                    entry["pg_id"] = rec["pg_id"]
+                    entry["snippet"] = rec["snippet"]
+                ctx.append(entry)
+        except Exception:
+            return []
+        return ctx
+
     async def handle_search(self, request: web.Request) -> web.Response:
         try:
             body = await request.json()
@@ -2139,7 +2244,7 @@ class MemoryCoordinator:
                 insight = None
                 try:
                     insight = await conn.fetchrow(
-                        "SELECT content, metadata, source_pg_ids FROM community_summaries"
+                        "SELECT id, content, metadata, source_pg_ids FROM community_summaries"
                         " WHERE NOT superseded"
                         "   AND metadata->>'kind' = 'insight'"
                         f"   AND {vis_t3}"
@@ -2154,7 +2259,7 @@ class MemoryCoordinator:
                 # continues to work (with a warning).
                 try:
                     summary = await conn.fetchrow(
-                        "SELECT content, metadata, source_pg_ids FROM community_summaries"
+                        "SELECT id, content, metadata, source_pg_ids FROM community_summaries"
                         " WHERE NOT superseded"
                         "   AND COALESCE(metadata->>'kind', 'thematic') <> 'insight'"
                         f"   AND {vis_t3}"
@@ -2168,7 +2273,7 @@ class MemoryCoordinator:
                         "python shared-memory/migrations/apply.py"
                     )
                     summary = await conn.fetchrow(
-                        "SELECT content, metadata, source_pg_ids FROM community_summaries"
+                        "SELECT id, content, metadata, source_pg_ids FROM community_summaries"
                         f" WHERE {vis_t3}"
                         " ORDER BY embedding <=> $1::vector LIMIT 1",
                         str(q_vec), *vis_t3_params,
@@ -2282,6 +2387,10 @@ class MemoryCoordinator:
             # single-domain narrative. source_pg_ids are DECISION ids here.
             ins_result = {
                 "tier": "insight_summary",
+                # .get: tolerant of pre-change callers/stubs without the id
+                # column — pg_id (community_summaries.id = the CommunitySummary
+                # node key) enables the summary→sources graph walk below.
+                "pg_id": insight.get("id"),
                 "content": insight["content"],
                 "score": None,
                 "score_normalized": None,
@@ -2300,6 +2409,7 @@ class MemoryCoordinator:
             # (source_pg_ids) — drill down via /memory/graph or status/{pg_id}.
             sum_result = {
                 "tier": "community_summary",
+                "pg_id": summary.get("id"),
                 "content": summary["content"],
                 "score": None,
                 "score_normalized": None,
@@ -2314,37 +2424,23 @@ class MemoryCoordinator:
             final.append(sum_result)
 
         async with self._neo4j.session() as session:
+            # Summary→sources walk: a Tier-3 narrative's graph context (its
+            # SUMMARIZED_BY source records + any typed edges) surfaces the same
+            # way a record's does. Degrades to [] on any Neo4j failure.
+            for res in final:
+                if res.get("pg_id") is not None:
+                    res["graph_context"] = await self._expand_graph_context(
+                        session, res["pg_id"], (ONT.community_summary,)
+                    )
             for hit in ranked:
                 idx   = hit["index"]
                 pg_id = ids[idx]
                 raw_score = hit["relevance_score"]
-                ctx: list[dict] = []
-                try:
-                    result = await session.run(
-                        f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
-                        " OPTIONAL MATCH (f)-[r]-(related)"
-                        # ADR-017: also pull each related Entity's alias siblings so
-                        # search surfaces every surface form of a concept. One query,
-                        # no-op-safe (empty when no ALIASES edges exist).
-                        f" OPTIONAL MATCH (related)-[:{ONT.aliases}]-(al:{ONT.entity})"
-                        " WITH r, related, labels(related) AS labels,"
-                        "      collect(DISTINCT al.name) AS aliases LIMIT 5"
-                        " RETURN labels, related.name as name,"
-                        "        type(r) as rel_type, aliases",
-                        pg_id=pg_id,
-                    )
-                    async for rec in result:
-                        if rec["name"]:
-                            entry = {
-                                "rel_type": rec["rel_type"],
-                                "name": rec["name"],
-                                "label": rec["labels"][0] if rec["labels"] else None,
-                            }
-                            if rec["aliases"]:
-                                entry["aliases"] = rec["aliases"]
-                            ctx.append(entry)
-                except Exception:
-                    pass
+                # Anchor on ALL record labels — Decision and Retrospective rows
+                # get graph context too, not just Facts (read contract).
+                ctx = await self._expand_graph_context(
+                    session, pg_id, (ONT.fact, ONT.decision, ONT.retrospective)
+                )
                 final.append({
                     "tier": "fact",
                     "pg_id": pg_id,
