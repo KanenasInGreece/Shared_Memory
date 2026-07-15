@@ -1938,98 +1938,129 @@ class MemoryCoordinator:
                 metadata["grounded_roles"] = roles
         _apply_principal(metadata, request.get("principal"))
 
+        # Cheap indexed existence pre-check BEFORE the GPU embedding — a typoed
+        # pg_id must not occupy the embedder just to 404. The FOR SHARE re-check
+        # inside the transaction below remains authoritative.
+        async with self._acquire() as conn:
+            exists = await conn.fetchval(
+                "SELECT 1 FROM technical_docs WHERE id=$1", pg_id
+            )
+        if not exists:
+            return web.json_response(
+                {"status": "error", "message": f"No record found with pg_id={pg_id}"},
+                status=404,
+            )
+
         # Embedding — hard mandate, same as every record; no save without a vector.
-        content_hash = hashlib.sha256(notes.encode()).hexdigest()
+        # Identity: a retrospective is (target decision, notes) — the target is part
+        # of the hash, so identical boilerplate notes on two DIFFERENT decisions stay
+        # two records (and can never hash-collide with a plain fact whose content
+        # equals the notes), while re-saving the same retro still dedupes.
+        content_hash = hashlib.sha256(
+            f"retrospective:{pg_id}:{notes}".encode()
+        ).hexdigest()
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 embedding = await self._embed(notes, client)
         except RuntimeError as exc:
             return web.json_response({"status": "error", "message": str(exc)}, status=503)
 
-        async with self._acquire() as conn:
-            async with conn.transaction():
-                target = await conn.fetchrow(
-                    "SELECT id, metadata->>'type' AS type,"
-                    "       COALESCE(metadata->'decision'->>'project',"
-                    "                metadata->>'project') AS project"
-                    " FROM technical_docs WHERE id=$1 FOR SHARE",
-                    pg_id,
-                )
-                if not target:
-                    return web.json_response(
-                        {"status": "error", "message": f"No record found with pg_id={pg_id}"},
-                        status=404,
+        # Per-entity write locks — same discipline as handle_save: entity MERGEs
+        # must be serialized (the locks are the only uniqueness guarantee for
+        # Entity nodes), and a retro's elicited entities reach the same projection.
+        acquired: list[asyncio.Lock] = []
+        try:
+            for e in sorted(set(metadata["entities"])):
+                lk = await self._lock_for(e)
+                await lk.acquire()
+                acquired.append(lk)
+            async with self._acquire() as conn:
+                async with conn.transaction():
+                    target = await conn.fetchrow(
+                        "SELECT id, metadata->>'type' AS type,"
+                        "       COALESCE(metadata->'decision'->>'project',"
+                        "                metadata->>'project') AS project"
+                        " FROM technical_docs WHERE id=$1 FOR SHARE",
+                        pg_id,
                     )
-                # Inherit the target's project so domain-scoped reads see the
-                # retro beside its decision.
-                if target["project"]:
-                    metadata["project"] = target["project"]
+                    if not target:
+                        return web.json_response(
+                            {"status": "error", "message": f"No record found with pg_id={pg_id}"},
+                            status=404,
+                        )
+                    # Inherit the target's project so domain-scoped reads see the
+                    # retro beside its decision.
+                    if target["project"]:
+                        metadata["project"] = target["project"]
 
-                row = await conn.fetchrow(
-                    """
-                    INSERT INTO technical_docs
-                        (content, metadata, embedding, content_hash,
-                         agent_id, scope, visibility)
-                    VALUES ($1, $2::jsonb, $3::vector, $4, $5, $6, $7)
-                    ON CONFLICT (content_hash) DO UPDATE
-                        SET metadata  = EXCLUDED.metadata,
-                            agent_id  = EXCLUDED.agent_id,
-                            embedding = EXCLUDED.embedding
-                    RETURNING id
-                    """,
-                    notes, metadata, str(embedding), content_hash,
-                    agent_id, body.get("scope", "global"),
-                    body.get("visibility", "global"),
-                )
-                retro_pg_id = row["id"]
+                    row = await conn.fetchrow(
+                        """
+                        INSERT INTO technical_docs
+                            (content, metadata, embedding, content_hash,
+                             agent_id, scope, visibility)
+                        VALUES ($1, $2::jsonb, $3::vector, $4, $5, $6, $7)
+                        ON CONFLICT (content_hash) DO UPDATE
+                            SET metadata  = EXCLUDED.metadata,
+                                agent_id  = EXCLUDED.agent_id,
+                                embedding = EXCLUDED.embedding
+                        RETURNING id
+                        """,
+                        notes, metadata, str(embedding), content_hash,
+                        agent_id, body.get("scope", "global"),
+                        body.get("visibility", "global"),
+                    )
+                    retro_pg_id = row["id"]
 
-                grounded_typed = await self._resolve_typed_grounding(
-                    conn, grounded_ids, metadata.get("grounded_roles") or {}
-                )
+                    grounded_typed = await self._resolve_typed_grounding(
+                        conn, grounded_ids, metadata.get("grounded_roles") or {}
+                    )
 
-                # Outbox row under the RETRO'S OWN pg_id — ordinary record
-                # lifecycle (applied → rem_reviewed → consolidated → deleted
-                # after the insight fold). 'v': 2 selects the node projection;
-                # target_pg_id keys the insight triggers.
-                await conn.execute(
-                    "INSERT INTO neo4j_outbox (pg_id, cypher_params) VALUES ($1, $2::jsonb)",
-                    retro_pg_id,
-                    {
-                        "v": 2,
-                        "type": "retrospective",
-                        "target_pg_id": pg_id,
-                        "retrospective": retro_payload
-                                          | ({"superseded": True} if is_reversal else {}),
-                        "content_snippet": notes[:200],
-                        "source": agent_id,
-                        "agent_id": agent_id,
-                        "entities": metadata["entities"],
-                        "source_ref": source_ref,
-                        "fact_kind": fact_kind_from_source_ref(source_ref),
-                        "grounded_in": grounded_ids,
-                        "grounded": grounded_typed,
-                    },
-                )
-                if is_reversal:
-                    try:
-                        # Savepoint: a pre-migration-009 schema must not
-                        # poison the retrospective save itself.
-                        async with conn.transaction():
-                            await conn.execute(
-                                "UPDATE technical_docs SET superseded = true WHERE id = $1",
+                    # Outbox row under the RETRO'S OWN pg_id — ordinary record
+                    # lifecycle (applied → rem_reviewed → consolidated → deleted
+                    # after the insight fold). 'v': 2 selects the node projection;
+                    # target_pg_id keys the insight triggers.
+                    await conn.execute(
+                        "INSERT INTO neo4j_outbox (pg_id, cypher_params) VALUES ($1, $2::jsonb)",
+                        retro_pg_id,
+                        {
+                            "v": 2,
+                            "type": "retrospective",
+                            "target_pg_id": pg_id,
+                            "retrospective": retro_payload
+                                              | ({"superseded": True} if is_reversal else {}),
+                            "content_snippet": notes[:200],
+                            "source": agent_id,
+                            "agent_id": agent_id,
+                            "entities": metadata["entities"],
+                            "source_ref": source_ref,
+                            "fact_kind": fact_kind_from_source_ref(source_ref),
+                            "grounded_in": grounded_ids,
+                            "grounded": grounded_typed,
+                        },
+                    )
+                    if is_reversal:
+                        try:
+                            # Savepoint: a pre-migration-009 schema must not
+                            # poison the retrospective save itself.
+                            async with conn.transaction():
+                                await conn.execute(
+                                    "UPDATE technical_docs SET superseded = true WHERE id = $1",
+                                    pg_id,
+                                )
+                        except Exception:
+                            log.warning(
+                                "technical_docs.superseded column missing — run migration "
+                                "009; reversal of pg_id=%d recorded on the graph only.",
                                 pg_id,
                             )
-                    except Exception:
-                        log.warning(
-                            "technical_docs.superseded column missing — run migration "
-                            "009; reversal of pg_id=%d recorded on the graph only.",
-                            pg_id,
-                        )
-                # Wake the consolidation daemon — the retro is a record now.
-                await conn.execute(
-                    "SELECT pg_notify('new_artifact', $1)",
-                    json.dumps({"pg_id": retro_pg_id}),
-                )
+                    # Wake the consolidation daemon — the retro is a record now.
+                    await conn.execute(
+                        "SELECT pg_notify('new_artifact', $1)",
+                        json.dumps({"pg_id": retro_pg_id}),
+                    )
+        finally:
+            for lk in acquired:
+                lk.release()
 
         return web.json_response({
             "status": "success",

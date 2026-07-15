@@ -208,7 +208,7 @@ uv run --with psycopg2-binary python shared-memory/migrations/apply.py
 uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py search "<query>" 5
 uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py save "<content>" '{"source":"<agent>","entities":["Entity1"],"project":"<domain>"}'
 uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py save_decision --title "..." --decided-by "..." --project "..." --rationale "..."
-uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py save_retrospective --pg-id N --rating high --notes "..."
+uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py save_retrospective --pg-id N --rating validated --notes "..."   # rating: validated|mixed|refined|pending|reversed
 uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py graph "MATCH (n:Entity) RETURN n LIMIT 10"
 uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py doctor   # client↔gateway api_version check
 ```

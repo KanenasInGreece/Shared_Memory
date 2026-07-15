@@ -227,7 +227,13 @@ def apply_plan(plan: list[dict], conn, driver) -> dict:
                     metadata["project"] = row[0]
 
             embedding = embed_one(client, notes)
-            content_hash = hashlib.sha256(notes.encode()).hexdigest()
+            # Identity matches the coordinator's v2 write path: (type, target
+            # decision, notes) — identical boilerplate notes on two different
+            # decisions stay two records, and a retro can never hash-collide
+            # with a plain fact whose content equals the notes.
+            content_hash = hashlib.sha256(
+                f"retrospective:{p['decision_id']}:{notes}".encode()
+            ).hexdigest()
             with conn.cursor() as cur:
                 cur.execute(
                     """

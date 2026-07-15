@@ -7,6 +7,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed (pre-release review of this batch)
+
+- **The `retrospectives` and `why-to-check` query shortcuts read the new record shape.** After the conversion
+  they still read rating/notes from the (now payload-free) trigger edge and returned nulls — the why-loop check
+  was silently empty. Both templates now read the retrospective *record* when present and fall back to edge
+  properties on installs that have not run the conversion yet.
+- **A retrospective's identity now includes its target decision.** The dedup hash was computed over the notes
+  alone, so identical boilerplate outcome notes on two different decisions would silently merge into one record
+  (repointing the first), and a retrospective could even collide with a plain fact of identical text. The hash is
+  now `(record type, target decision, notes)`; re-saving the same retrospective still dedupes. Same fix in the
+  migration script.
+- **The insight synthesis evidence line can no longer contradict the graph.** For groundings without an explicit
+  operator role it printed a fixed default instead of the relation the write path actually chose from the fact's
+  evidential kind (a discussion grounds softly as `INFORMED_BY`); it now reports the real relation in every case.
+- **Retrospective saves take the same per-entity write locks as fact saves** (entity node creation stays
+  serialized), and a non-existent target decision is rejected *before* the embedding is computed rather than
+  after (no wasted embedder work on a typoed id).
+- **The enrichment daemon refuses a fact write with no original content** instead of blanking the node and
+  retrying that record forever.
+- Doc sync: the agent quickstart, the LM Studio system prompt, and the example snippets now use the
+  outcome-state rating vocabulary (the old free-text examples would be rejected with a 400).
+
 ### Added
 
 - **One-time migration for pre-existing retrospectives** (`migrate_retro_edges.py`, dry-run first): converts every
@@ -55,9 +77,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the facts it is grounded in and how they were established — while earlier retrospectives compress to rating+date
   history lines, so the prompt grows linearly instead of with the whole outcome archive.
 - **The enrichment daemon treats retrospectives as a third record kind** (alongside facts and decisions):
-  non-destructive, entity linking from the notes, no decision-only extras. New spine vocabulary: the
+  non-destructive, entity linking from the notes, no decision-only extras. New framework vocabulary: the
   `Retrospective` node label and the retrospective **outcome-state rating enum**
-  (`validated / mixed / refined / pending / reversed`) — code-pinned, never configurable.
+  (`validated / mixed / refined / pending / reversed`) — framework-defined, never configurable.
 
 - **The skill now actively elicits the grounding *role*, completing the v0.6.4 capture surface.** `save_decision`
   guidance proposes a role for each grounded fact — defaulting from the fact's kind (a `discussion` → soft

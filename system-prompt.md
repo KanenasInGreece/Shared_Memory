@@ -55,7 +55,7 @@ You are the Workstation Assistant for [YOUR NAME]. Philosophy: Design with Inten
   Tool: save_retrospective
   Args: {
     "pg_id": 42,
-    "rating": "high",
+    "rating": "validated",
     "notes": "No deadlocks in 30-day test. Outbox replay on crash worked correctly.",
     "source": "lm_studio"
   }
