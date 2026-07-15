@@ -5,7 +5,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.6.5] — 2026-07-15
+
+Retrospectives become first-class records. A decision's outcome used to live only as an annotation
+on the decision itself — unsearchable, unweighable, impossible to ground in the tests that measured
+it. This release gives every retrospective its own record and graph node, a closed outcome-state
+rating vocabulary, evidence grounding with the same typed roles decisions use, recency-aware
+retrieval, and a one-time conversion of all pre-existing outcome annotations. Alongside it, the
+background enrichment pass stops paraphrasing over curated fact text. API version 2. A full code
+review and the x.y.5-cadence security review ran before this tag; the review's confirmed findings
+are fixed below.
 
 ### Fixed (pre-release review of this batch)
 
