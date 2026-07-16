@@ -116,17 +116,19 @@ def consumable(family: str, asserted_by: object, confidence: object,
     """May NREM/synthesis consume this edge? Operator-asserted always; machine-
     asserted only when the family is CALIBRATED and confidence clears the
     family threshold. A machine edge with no confidence is never consumable.
-    Legacy edges (asserted_by None/absent) use the fixed neutral prior, which
-    deliberately clears the entity threshold — legacy MENTIONS stay visible to
-    synthesis at neutral weight rather than vanishing (726 §4)."""
+    Legacy edges (asserted_by None/absent — the pre-provenance era) are ALWAYS
+    consumable at the fixed neutral prior: era-gating makes them a legitimate
+    distinct class (726 §4), and the confidence threshold is a gate on MACHINE
+    assertions, not a retroactive purge of the existing graph — excluding them
+    would silently sever every pre-rebuild cluster."""
     if asserted_by in (ASSERTED_OPERATOR, ASSERTED_SYSTEM_DEFAULT):
         return True
     if asserted_by in MACHINE_ASSERTED:
         if not calibrated or not isinstance(confidence, (int, float)):
             return False
         return float(confidence) >= CONSUME_THRESHOLD[family]
-    # legacy / unstamped edge → neutral prior against the family threshold
-    return LEGACY_MENTIONS_PRIOR >= CONSUME_THRESHOLD[family]
+    # legacy / unstamped edge → visible at neutral weight (LEGACY_MENTIONS_PRIOR)
+    return True
 
 
 # ── ledger helpers (relation_adjudications, migration 020) ────────────────────
