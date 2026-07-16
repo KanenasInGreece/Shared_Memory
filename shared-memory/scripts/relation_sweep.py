@@ -95,6 +95,7 @@ from ontology import (                        # noqa: E402
     ONT, DOMAIN_RANGE, KNOWN_RELATIONSHIPS, is_allowed_relation,
 )
 import relation_confidence as rc               # noqa: E402  (ledger + edge conventions)
+from dream_telemetry import adaptive_ceiling   # noqa: E402  (ADR-021 per-prompt timeout)
 
 # ── env knobs (alias_writer conventions) ──────────────────────────────────────
 MIN_COOCCUR = int(os.environ.get("RELSWEEP_MIN_COOCCUR", "2"))
@@ -339,13 +340,17 @@ def adjudicate_batch(candidates: list[dict],
     model = the gateway's X-SM-LLM-Backend response header when present."""
     if os.getenv("MOCK_LLM") == "1":
         return _mock_verdicts(candidates), "mock"
+    prompt = _build_prompt(candidates, snippets)
     try:
         resp = httpx.post(
-            REASONER_URL, headers=_auth_headers(), timeout=180.0,
+            # Adaptive per-prompt timeout (ADR-021, same instrument as REM):
+            # the dream model's long generations exceed any fixed timeout —
+            # the first live sweep run lost all 4 batches to a fixed 180s.
+            REASONER_URL, headers=_auth_headers(),
+            timeout=adaptive_ceiling(len(prompt), units=len(candidates)),
             json={"model": "local-model", "temperature": LLM_TEMPERATURE,
                   "messages": [{"role": "system", "content": _ADJUDICATOR_SYSTEM},
-                               {"role": "user",
-                                "content": _build_prompt(candidates, snippets)}]},
+                               {"role": "user", "content": prompt}]},
         )
         resp.raise_for_status()
         model = resp.headers.get("X-SM-LLM-Backend") or "local-model"
@@ -598,13 +603,15 @@ def adjudicate_evidential_batch(rows: list[dict],
     re-asked next run). Returns ({idx: verdict}, model)."""
     if os.getenv("MOCK_LLM") == "1":
         return _mock_evidential_verdicts(rows), "mock"
+    prompt = _build_evidential_prompt(rows, contents)
     try:
         resp = httpx.post(
-            REASONER_URL, headers=_auth_headers(), timeout=180.0,
+            # Adaptive per-prompt timeout (ADR-021) — see adjudicate_batch.
+            REASONER_URL, headers=_auth_headers(),
+            timeout=adaptive_ceiling(len(prompt), units=len(rows)),
             json={"model": "local-model", "temperature": LLM_TEMPERATURE,
                   "messages": [{"role": "system", "content": _EVIDENTIAL_SYSTEM},
-                               {"role": "user",
-                                "content": _build_evidential_prompt(rows, contents)}]},
+                               {"role": "user", "content": prompt}]},
         )
         resp.raise_for_status()
         model = resp.headers.get("X-SM-LLM-Backend") or "local-model"
