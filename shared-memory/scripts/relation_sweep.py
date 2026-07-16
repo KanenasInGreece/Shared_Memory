@@ -349,14 +349,22 @@ def _write_relation_edge(session, rel: str, src: str, tgt: str, props: dict) -> 
     """MERGE the directed typed edge with the universal provenance property map.
     `rel` is interpolated into Cypher, so membership in KNOWN_RELATIONSHIPS is a
     hard precondition (injection guard) — enforced here as the last line of
-    defense even though the caller checks first."""
+    defense even though the caller checks first.
+
+    Provenance discipline (726 §2, aligned with REM's writer): a NEWLY minted
+    edge is stamped in full (ON CREATE); an EXISTING edge is re-scored only
+    while still machine-asserted (ON MATCH guarded via CASE) — an edge the
+    operator promoted keeps asserted_by='operator' and its properties even if
+    this pair is ever re-adjudicated."""
     if rel not in KNOWN_RELATIONSHIPS:
         raise ValueError(f"relation {rel!r} not in KNOWN_RELATIONSHIPS — refusing to interpolate")
     session.run(
         f"MATCH (a:{ONT.entity} {{name: $src}}), (b:{ONT.entity} {{name: $tgt}}) "
         f"MERGE (a)-[r:{rel}]->(b) "
-        f"SET r += $props, r.created_at = coalesce(r.created_at, datetime())",
-        src=src, tgt=tgt, props=props,
+        f"ON CREATE SET r += $props, r.created_at = datetime() "
+        f"ON MATCH SET r += CASE WHEN r.asserted_by IN $machine"
+        f"                       THEN $props ELSE {{}} END",
+        src=src, tgt=tgt, props=props, machine=sorted(rc.MACHINE_ASSERTED),
     ).consume()
 
 
