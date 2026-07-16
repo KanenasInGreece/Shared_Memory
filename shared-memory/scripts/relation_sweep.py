@@ -61,6 +61,31 @@ import httpx
 import psycopg2
 from neo4j import GraphDatabase
 
+
+def _load_env() -> None:
+    """Standalone-script env bootstrap (same contract as the daemons):
+    shared-memory/.env first, repo-root .env as the pre-0.6 fallback —
+    setdefault semantics, so an already-exported variable always wins.
+    Must run BEFORE entity_resolution_eval is imported (it reads os.environ
+    at module load)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for env_path in (os.path.join(here, "..", ".env"),
+                     os.path.join(here, "..", "..", ".env")):
+        try:
+            with open(os.path.normpath(env_path)) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            os.environ.setdefault(key.strip(), val.strip())
+
+
+_load_env()
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from entity_resolution_eval import (          # noqa: E402  (shared harness helpers)
     fetch_domains, real_domains, PG_CONN,
