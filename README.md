@@ -1215,7 +1215,7 @@ Note `"source_ref":"coordinator.py#start()"` — this propagates to the Neo4j `F
 
 This is where the two-phase sleep cycle (§13) turns the raw saves into shared, consolidated knowledge — with no action from any agent.
 
-**REM enrichment — within ~2 minutes.** The REM daemon polls every 120 s, takes the new `OutboxPattern` facts oldest-first (only those whose Neo4j write is `applied`), and makes one LLM call per fact to rewrite it into a concise summary and attach typed entity relationships. It sets `rem_processed = true` on each fact and re-notifies NREM.
+**REM enrichment — within ~2 minutes.** The REM daemon polls adaptively, takes the new `OutboxPattern` facts oldest-first (only those whose Neo4j write is `applied`), assembles each record's **capture manifest** (what the save path already recorded — entities, evidential kind, existing edges and their asserters) and makes one LLM call per batch asking only for the **delta**: entities not yet captured, sub-types for untyped ones, and a summary only when the text exceeds the storage threshold. Every edge it mints carries `asserted_by`/`confidence`/`model`/`run_id` (v0.7.0). It sets `rem_processed = true` on each fact and re-notifies NREM.
 
 ```
 INFO:REMDaemon:REM cycle: 2 fact(s) to process (pg_ids=[42, 47])

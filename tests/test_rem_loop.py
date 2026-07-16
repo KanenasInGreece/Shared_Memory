@@ -129,20 +129,34 @@ def test_resolve_rel_unknown_name_always_entity_mentions():
 
 @pytest.mark.asyncio
 async def test_llm_process_mock_plain_fact():
+    """Short fact (<= REM_SUMMARY_THRESHOLD): the summary is prompt-gated OFF —
+    the mock (like the prompt) produces no summary at all. Returns (result, model)."""
     daemon, _ = _make_daemon()
     with patch.dict(os.environ, {"MOCK_LLM": "1"}):
-        result = await daemon._llm_process("some fact content", rem_mod.KIND_FACT, [])
-    assert "summary" in result
+        result, model = await daemon._llm_process("some fact content", rem_mod.KIND_FACT, [])
+    assert model == "mock"
+    assert "summary" not in result          # short record → no summary requested
     assert "relationships" in result
     assert isinstance(result["relationships"], list)
     assert "considered" not in result   # decision-only key
 
 
 @pytest.mark.asyncio
+async def test_llm_process_mock_long_fact_has_summary():
+    """A fact over REM_SUMMARY_THRESHOLD gets a summary — the only case one
+    is requested since the rebuild."""
+    daemon, _ = _make_daemon()
+    long_content = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
+    with patch.dict(os.environ, {"MOCK_LLM": "1"}):
+        result, _ = await daemon._llm_process(long_content, rem_mod.KIND_FACT, [])
+    assert result.get("summary")
+
+
+@pytest.mark.asyncio
 async def test_llm_process_mock_decision_includes_extras():
     daemon, _ = _make_daemon()
     with patch.dict(os.environ, {"MOCK_LLM": "1"}):
-        result = await daemon._llm_process("decision content", rem_mod.KIND_DECISION, [])
+        result, _ = await daemon._llm_process("decision content", rem_mod.KIND_DECISION, [])
     assert "considered" in result
     assert "rejected"   in result
     assert "under_conditions" in result
@@ -151,12 +165,12 @@ async def test_llm_process_mock_decision_includes_extras():
 
 @pytest.mark.asyncio
 async def test_llm_process_mock_retrospective_no_extras():
-    """A retrospective anchor is enriched like a fact (summary + relationships) —
+    """A retrospective anchor is enriched like a fact (delta relationships) —
     the decision-only extras must not appear."""
     daemon, _ = _make_daemon()
     with patch.dict(os.environ, {"MOCK_LLM": "1"}):
-        result = await daemon._llm_process("retro notes content", rem_mod.KIND_RETRO, [])
-    assert "summary" in result and "relationships" in result
+        result, _ = await daemon._llm_process("retro notes content", rem_mod.KIND_RETRO, [])
+    assert "relationships" in result
     assert "considered" not in result
 
 
@@ -180,6 +194,13 @@ async def test_fetch_non_rem_batch_orders_by_pg_id_asc():
 
 # ── _write_neo4j_rem — rem_processed set last ─────────────────────────────────
 
+def _edge(name, label, rel_type, props=None):
+    """Planned-edge helper matching the rebuild's _write_neo4j_rem input."""
+    return {"name": name, "label": label, "rel_type": rel_type,
+            "props": props or {"asserted_by": "rem", "confidence": 0.9,
+                               "model": "m", "run_id": "r"}}
+
+
 @pytest.mark.asyncio
 async def test_write_neo4j_rem_sets_rem_processed_last():
     """rem_processed=true must be SET in the final session.run() call,
@@ -188,10 +209,9 @@ async def test_write_neo4j_rem_sets_rem_processed_last():
     mock_session.run = AsyncMock()
 
     from rem_loop import ONT
-    registry = {"Xenofon": {"label": "Human", "default_rel": ONT.was_attributed_to}}
-    relationships = [{"name": "Xenofon", "rel_type": ONT.was_attributed_to}]
+    edges = [_edge("Xenofon", "Human", ONT.was_attributed_to)]
 
-    await daemon._write_neo4j_rem(42, "summary text", relationships, registry, None)
+    await daemon._write_neo4j_rem(42, "", edges, original_content="the original fact")
 
     calls = mock_session.run.call_args_list
     assert len(calls) >= 2, "Expected at least one entity MERGE + one SET call"
@@ -204,6 +224,48 @@ async def test_write_neo4j_rem_sets_rem_processed_last():
 
 
 @pytest.mark.asyncio
+async def test_write_neo4j_rem_stamps_provenance_on_create_only():
+    """726 §2: edge provenance is applied via ON CREATE SET — a newly minted
+    edge is stamped, an EXISTING edge (e.g. operator grounding) is never
+    overwritten. The props must travel as parameters, never bare SET."""
+    daemon, mock_session = _make_daemon()
+    mock_session.run = AsyncMock()
+
+    from rem_loop import ONT
+    props = {"asserted_by": "rem", "confidence": 0.83, "model": "m1", "run_id": "cycle-1"}
+    edges = [_edge("Neo4j", ONT.entity, ONT.entity_link, props)]
+
+    await daemon._write_neo4j_rem(42, "", edges, original_content="orig")
+
+    merge_call = mock_session.run.call_args_list[0]
+    cypher = merge_call.args[0]
+    assert "ON CREATE SET" in cypher, "provenance must be ON CREATE-only"
+    assert "r += row.props" in cypher
+    assert "r.created_at = datetime()" in cypher
+    # no unconditional SET on the relationship (would downgrade operator edges)
+    after_merge_rel = cypher.split("MERGE (a)-[r:")[1]
+    assert " SET r" not in after_merge_rel.replace("ON CREATE SET", "")
+    assert merge_call.kwargs["rows"] == [{"name": "Neo4j", "props": props}]
+
+
+@pytest.mark.asyncio
+async def test_write_neo4j_rem_refuses_unknown_label_or_rel():
+    """Injection guard: an edge whose label or rel_type is outside the known
+    sets is dropped, never interpolated into Cypher."""
+    daemon, mock_session = _make_daemon()
+    mock_session.run = AsyncMock()
+
+    edges = [_edge("X", "EvilLabel", "MENTIONS"),
+             _edge("Y", "Entity", "EVIL_REL")]
+    await daemon._write_neo4j_rem(42, "", edges, original_content="orig")
+
+    cyphers = [c.args[0] for c in mock_session.run.call_args_list]
+    assert not any("EvilLabel" in c or "EVIL_REL" in c for c in cyphers)
+    # only the final rem_processed SET should have run
+    assert len(cyphers) == 1 and "rem_processed" in cyphers[0]
+
+
+@pytest.mark.asyncio
 async def test_write_neo4j_rem_applies_entity_sublabels():
     """Stage 1.3: LLM-assigned sub-types become a SECOND label on :Entity
     (:Entity:Component), validated against the sub-label set before interpolation
@@ -212,13 +274,13 @@ async def test_write_neo4j_rem_applies_entity_sublabels():
     mock_session.run = AsyncMock()
 
     from rem_loop import ONT
-    relationships = [{"name": "coordinator", "rel_type": ONT.entity_link},
-                     {"name": "Neo4j", "rel_type": ONT.entity_link}]
+    edges = [_edge("coordinator", ONT.entity, ONT.entity_link),
+             _edge("Neo4j", ONT.entity, ONT.entity_link)]
     # includes an invalid sub-type that must be rejected, not interpolated
     entity_types = {"coordinator": ONT.component, "Neo4j": ONT.system, "x": "Bogus"}
 
-    await daemon._write_neo4j_rem(7, "summary", relationships, {}, None,
-                                  entity_types=entity_types)
+    await daemon._write_neo4j_rem(7, "", edges, entity_types=entity_types,
+                                  original_content="orig")
 
     cyphers = [c.args[0] for c in mock_session.run.call_args_list]
     assert any(f"SET e:{ONT.component}" in c for c in cyphers)
@@ -249,31 +311,29 @@ async def test_fetch_non_rem_batch_selects_all_three_anchor_kinds():
 @pytest.mark.asyncio
 async def test_write_neo4j_rem_decision_anchors_on_decision_and_keeps_rationale():
     """For a decision: anchor edges + the rem_processed mark on the :Decision
-    node, write the CONSIDERED/PRODUCES_INSIGHT extras, and never overwrite the
-    rationale (summary goes to d.rem_summary, not d.content)."""
+    node, extras edges (CONSIDERED/PRODUCES_INSIGHT — now unified planned
+    edges), and never overwrite the rationale (summary goes to d.rem_summary,
+    not d.content)."""
     daemon, mock_session = _make_daemon()
     mock_session.run = AsyncMock()
 
     from rem_loop import ONT
-    registry = {"BGE-M3": {"label": ONT.entity, "default_rel": ONT.entity_link}}
-    relationships = [{"name": "BGE-M3", "rel_type": ONT.entity_link}]
-    decision_extras = {
-        ONT.considered:       ["synchronous writes"],
-        ONT.rejected:         ["no consolidation"],
-        ONT.under_conditions: [],                       # empty → skipped
-        ONT.produces_insight: ["outbox decouples write latency"],
-    }
+    edges = [
+        _edge("BGE-M3", ONT.entity, ONT.entity_link),
+        _edge("OutboxPattern", ONT.entity, ONT.considered),
+        _edge("WritePathInsight", ONT.entity, ONT.produces_insight),
+    ]
 
     await daemon._write_neo4j_rem(
-        42, "rem summary", relationships, registry, decision_extras,
-        kind=rem_mod.KIND_DECISION,
+        42, "rem summary", edges, kind=rem_mod.KIND_DECISION,
+        original_content="the decision rationale",
     )
 
     cyphers = [c.args[0] for c in mock_session.run.call_args_list]
     # Step 1 — entity edges anchored on the Decision node, never on a Fact
     assert any(f"(a:{ONT.decision}" in c and "MERGE (a)-[" in c for c in cyphers)
     assert not any(f"MATCH (f:{ONT.fact}" in c for c in cyphers)
-    # Step 2 — decision extras written (non-empty ones only)
+    # Step 2 — decision extras written as ordinary provenance-stamped edges
     assert any(ONT.considered in c for c in cyphers)
     assert any(ONT.produces_insight in c for c in cyphers)
     # Step 3 (last) — mark on Decision; rationale/content untouched
@@ -281,6 +341,21 @@ async def test_write_neo4j_rem_decision_anchors_on_decision_and_keeps_rationale(
     assert f"MATCH (a:{ONT.decision}" in last
     assert "rem_processed" in last and "rem_summary" in last
     assert "a.content" not in last and "a.rationale" not in last
+
+
+@pytest.mark.asyncio
+async def test_write_neo4j_rem_decision_without_summary_marks_only():
+    """A short decision (no summary requested) must still be marked
+    rem_processed — without writing any rem_summary."""
+    daemon, mock_session = _make_daemon()
+    mock_session.run = AsyncMock()
+
+    await daemon._write_neo4j_rem(42, "", [], kind=rem_mod.KIND_DECISION,
+                                  original_content="short rationale")
+
+    last = mock_session.run.call_args_list[-1]
+    assert "rem_processed" in last.args[0]
+    assert "rem_summary" not in last.args[0]
 
 
 # ── Non-destructive content policy (retro-as-node session) ────────────────────
@@ -293,7 +368,7 @@ async def test_write_neo4j_rem_short_fact_keeps_verbatim_no_summary():
     mock_session.run = AsyncMock()
 
     original = "short curated fact text"
-    await daemon._write_neo4j_rem(42, "an llm summary", [], {}, None,
+    await daemon._write_neo4j_rem(42, "an llm summary", [],
                                   original_content=original)
 
     last = mock_session.run.call_args_list[-1]
@@ -311,7 +386,7 @@ async def test_write_neo4j_rem_long_fact_verbatim_plus_summary():
     mock_session.run = AsyncMock()
 
     original = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 500)
-    await daemon._write_neo4j_rem(42, "condensed summary", [], {}, None,
+    await daemon._write_neo4j_rem(42, "condensed summary", [],
                                   original_content=original)
 
     last = mock_session.run.call_args_list[-1]
@@ -329,8 +404,8 @@ async def test_write_neo4j_rem_retrospective_anchor_non_destructive():
     mock_session.run = AsyncMock()
 
     from rem_loop import ONT
-    relationships = [{"name": "OutboxPattern", "rel_type": ONT.entity_link}]
-    await daemon._write_neo4j_rem(99, "retro summary", relationships, {}, None,
+    edges = [_edge("OutboxPattern", ONT.entity, ONT.entity_link)]
+    await daemon._write_neo4j_rem(99, "retro summary", edges,
                                   kind=rem_mod.KIND_RETRO,
                                   original_content="the retro notes")
 
@@ -441,6 +516,7 @@ async def test_llm_process_uses_configured_temperature(monkeypatch):
     captured = {}
     class _Resp:
         status_code = 200
+        headers = {}
         def json(self):
             return {"choices": [{"message": {"content": '{"summary":"s","relationships":[]}'}}]}
     async def _fake_post(self, url, **kwargs):
@@ -448,7 +524,7 @@ async def test_llm_process_uses_configured_temperature(monkeypatch):
         return _Resp()
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
 
-    await daemon._llm_process("some content", rem_mod.KIND_FACT, [])
+    await daemon._llm_process("some content", rem_mod.KIND_FACT, [], {})
 
     from rem_loop import REM_TEMPERATURE
     assert "temperature" in captured
@@ -555,24 +631,53 @@ def test_parse_llm_json_hopeless_returns_none():
 
 def test_build_batch_prompt_numbered_and_strict():
     rem = load_rem_loop()
-    items = [{"pg_id": 1, "content": "fact one"}, {"pg_id": 2, "content": "fact two"}]
+    items = [{"pg_id": 1, "content": "fact one", "manifest": {}},
+             {"pg_id": 2, "content": "fact two", "manifest": {}}]
     p = rem.REMDaemon._build_batch_prompt(None, items, [{"labels": ["Entity"], "name": "Neo4j"}])
     assert "[FACT 0]" in p and "[FACT 1]" in p
+    assert "[MANIFEST 0]" in p and "[MANIFEST 1]" in p     # per-fact capture manifest
     assert "EXACTLY 2 lines" in p and '"idx"' in p
     assert "Neo4j" in p          # shared grounding included
+    # short facts → no summary requested at all
+    assert 'Do NOT include a "summary" field for any fact' in p
 
 
-def test_parse_jsonl_batch_maps_by_idx_and_skips_null():
+def test_build_batch_prompt_requests_summary_only_for_long_facts():
+    rem = load_rem_loop()
+    long = "y" * (rem.REM_SUMMARY_THRESHOLD + 1)
+    items = [{"pg_id": 1, "content": "short", "manifest": {}},
+             {"pg_id": 2, "content": long, "manifest": {}}]
+    p = rem.REMDaemon._build_batch_prompt(None, items, [])
+    assert "Facts [1] exceed the storage threshold" in p
+    assert "for THOSE lines only" in p
+
+
+def test_parse_jsonl_batch_maps_by_idx_empty_delta_ok():
+    """Alignment is idx-echo only: an empty relationships delta (no summary)
+    is a COMPLETE answer for a short fact — the null-summary sentinel is gone."""
     rem = load_rem_loop()
     idx_to_pg = {0: 101, 1: 102, 2: 103}
     raw = (
-        '{"idx": 0, "summary": "s0", "relationships": []}\n'
-        '{"idx": 1, "summary": "s1", "relationships": [{"name":"X","rel_type":"MENTIONS","type":"System"}]}\n'
-        '{"idx": 2, "summary": null, "relationships": []}\n'   # null-summary sentinel → skipped
+        '{"idx": 0, "relationships": []}\n'
+        '{"idx": 1, "relationships": [{"name":"X","rel_type":"MENTIONS","type":"System"}]}\n'
+        '{"idx": 2, "summary": "unsolicited", "relationships": []}\n'
     )
     out = rem.REMDaemon._parse_jsonl_batch(None, raw, idx_to_pg)
-    assert set(out.keys()) == {101, 102}          # 103 skipped
-    assert out[101]["summary"] == "s0" and len(out[102]["relationships"]) == 1
+    assert set(out.keys()) == {101, 102, 103}
+    assert out[101]["relationships"] == [] and len(out[102]["relationships"]) == 1
+
+
+def test_parse_jsonl_batch_drops_required_summary_missing():
+    """A fact over the threshold (idx in require_summary) whose line carries no
+    summary is dropped → retried solo next cycle; short facts are unaffected."""
+    rem = load_rem_loop()
+    idx_to_pg = {0: 101, 1: 102}
+    raw = (
+        '{"idx": 0, "relationships": []}\n'
+        '{"idx": 1, "summary": null, "relationships": []}\n'
+    )
+    out = rem.REMDaemon._parse_jsonl_batch(None, raw, idx_to_pg, require_summary={1})
+    assert set(out.keys()) == {101}
 
 
 def test_parse_jsonl_batch_salvages_and_isolates_failures():
@@ -596,7 +701,12 @@ def test_llm_process_batch_mock(monkeypatch):
     import asyncio
     monkeypatch.setenv("MOCK_LLM", "1")
     rem = load_rem_loop()
-    items = [{"pg_id": 1, "content": "a"}, {"pg_id": 2, "content": "b"}]
-    out, timing = asyncio.run(rem.REMDaemon._llm_process_batch(None, items, []))
-    assert set(out.keys()) == {1, 2} and out[1]["summary"]
+    long = "z" * (rem.REM_SUMMARY_THRESHOLD + 1)
+    items = [{"pg_id": 1, "content": "a", "manifest": {}},
+             {"pg_id": 2, "content": long, "manifest": {}}]
+    out, timing, model = asyncio.run(rem.REMDaemon._llm_process_batch(None, items, []))
+    assert set(out.keys()) == {1, 2}
+    assert "summary" not in out[1]        # short → not requested, not produced
+    assert out[2]["summary"]              # long → produced
     assert timing is None          # MOCK_LLM path runs no real call → no timing
+    assert model == "mock"

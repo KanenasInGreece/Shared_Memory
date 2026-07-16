@@ -399,7 +399,10 @@ async def test_fold_insight_v2_retro_latest_full_older_compressed(monkeypatch):
          "notes": "node snippet", "retro_pg_id": 900},         # v2 record
     ]
     daemon, session = daemon_with_fake_graph([FakeResult(outcomes)])
-    daemon.generate_insight = AsyncMock(return_value="INSIGHT TEXT")
+    # The stubbed insight must carry the preservation anchors (decision title
+    # word + latest rating) or the stage-5 preservation gate rightly blocks it.
+    daemon.generate_insight = AsyncMock(
+        return_value="INSIGHT TEXT: Decision A/B validated under load.")
     daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
     conn = StubConn(script=[
         # 1. decision content fetch

@@ -5,6 +5,78 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.7.0] — 2026-07-16
+
+The enrichment rebuild. The background enrichment pass used to see only a record's raw text —
+none of the provenance the save path had carefully captured — and the typed entity-to-entity
+relation layer defined in the ontology was wired to nothing, which is why entities connected
+only through the records that mentioned them. This release re-charters enrichment as
+**ontology-gated expressiveness with measured trust**: the first write captures what is required,
+enrichment adds what the ontology permits, and confidence, adjudication, and operator calibration
+are the guards that make that expressiveness safe. API version 3.
+
+### Added
+
+- **Universal machine-edge provenance.** Every edge the background passes mint now carries
+  `asserted_by` (who asserted it), `confidence`, `model`, `run_id`, and `created_at` — stamped on
+  creation only, so an edge the operator asserted or promoted is never overwritten. Pre-existing
+  edges are an era-gated legacy class, always consumed at a fixed neutral weight (no retroactive
+  re-scoring).
+- **Capture-manifest enrichment.** The enrichment daemon assembles what the save path already
+  knows about a record (its type, evidential kind, source reference, operator-named entities,
+  existing edges and their asserters, outcome rating) and asks the model **only for the delta** —
+  new entities, sub-types for untyped ones, a summary only when the text exceeds the storage
+  threshold. A record saved before rich capture existed simply has an empty manifest, so full
+  extraction remains the degenerate case — there is no legacy mode. Novel edges are scored by
+  self-consistency voting (up to three passes), shifted by the source record's evidential kind.
+- **Typed entity-to-entity relations via an evidence sweep** (`relation_sweep.py`). Candidate
+  pairs come from co-occurrence across records, aggregated per alias component; the ontology's
+  domain-range legality map — previously defined but unused — now gates every candidate in both
+  directions; a batched adjudication judges each pair against the actual shared-record evidence;
+  and every verdict (accept and reject) lands in a new `relation_adjudications` ledger with its
+  quantitative signals. The sweep's first run doubles as the backfill over the existing graph.
+- **A three-rung ladder for machine-proposed evidence links.** Enrichment may propose that a
+  decision was informed by another record — cheaply, and born *below* the consumption threshold;
+  a re-scoring pass (`relation_sweep.py --evidential`) re-judges survivors against both records'
+  content; operator review promotes an edge to operator-asserted (or refutes it, which removes
+  the machine edge and remembers the refusal). Basis-grounding (`GROUNDED_IN`) is never
+  machine-minted.
+- **Operator calibration as a first-class flow.** New gateway routes and client commands
+  (`review-edges`, `label-edges [--promote]`) present a stratified sample of machine verdicts for
+  labeling; the labels are the only calibration input. **Until a relation family has ~20 operator
+  labels, its machine edges are invisible to synthesis** — thresholds act only once measured
+  reliability exists, and per-band precision is reported so thresholds can be tuned per install.
+- **Calibration checked before any cluster is assessed.** Consolidation fetches the calibration
+  state at the start of each pass (failing closed if the ledger is unreachable) and traverses
+  machine-asserted edges only when their family is calibrated and their confidence clears the
+  family threshold; excluded edges are counted back to the review queue in the cycle telemetry.
+- **A preservation gate on synthesis.** Fold inputs are now differentiated by record type,
+  evidential kind, and date; decision folds carry each decision's typed grounding edges with
+  their asserter and confidence, machine-proposed lines explicitly tagged. After generation, a
+  deterministic check verifies every captured record survived into the narrative — decisions and
+  retrospectives are never droppable, plain facts tolerate small paraphrase slack. One corrective
+  retry names the dropped records; a second failure means the summary is **not written** and the
+  work requeues. A narrative that silently drops captured knowledge never reaches the semantic tier.
+- **The read surface honors everything capture writes.** Search graph expansion now anchors on
+  all record types (not just facts), returns each edge's direction and full property map
+  (asserter, confidence, role), surfaces record-keyed neighbors with a label, id, and snippet
+  instead of silently dropping them, ranks provenance-bearing edges above bare mentions within a
+  tunable cap, and walks a summary back to its sources with typed edges.
+
+### Changed
+
+- Enrichment no longer requests a summary for records below the storage threshold (previously it
+  generated one and discarded it), and decision-alternative extras are only linked to entities the
+  graph already knows — free phrases stay as record properties instead of becoming graph nodes.
+
+### Fixed
+
+- The consumption gate treats unstamped legacy edges as always consumable at neutral weight; an
+  earlier draft routed them through the machine threshold, which would have severed every
+  pre-rebuild mention edge from consolidation.
+
+---
+
 ## [0.6.5] — 2026-07-15
 
 Retrospectives become first-class records. A decision's outcome used to live only as an annotation

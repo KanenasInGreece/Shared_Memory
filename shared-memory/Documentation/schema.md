@@ -157,6 +157,38 @@ rationale, revocable) and the idempotency cache: a sweep skips pairs already jud
 
 **Indexes:** `alias_adjudications_verdict_idx` on `(verdict)`.
 
+### `relation_adjudications` — machine-relation verdict + calibration ledger (migration 020)
+
+One ledger for BOTH machine-minted relation families: `entity_relation` (typed
+Entity→Entity edges from the evidence sweep / REM, name-keyed endpoints) and
+`evidential` (record→record proposals such as `Decision INFORMED_BY Fact`,
+pg_id-keyed endpoints; `GROUNDED_IN` is never machine-minted so it never appears
+here). Every machine verdict lands here with its quantitative signals; operator
+labels recorded on these rows are the ONLY calibration input — per-family
+reliability curves are computed from them, and a family's confidence thresholds
+act only once it is calibrated (~20 labels). Also the audit trail and the
+don't-re-ask idempotency cache. One CURRENT row per directed edge per family:
+a re-score updates the row in place and preserves the prior rung inside
+`signals.prior_rungs` (the evidential ladder: `rem_k3` proposal → `llm_sweep`
+re-score → operator label/promotion).
+
+| Column | Type | Notes |
+|---|---|---|
+| `family` | `TEXT` | `entity_relation` \| `evidential` (CHECK-enforced endpoint encoding per family) |
+| `src_name`, `tgt_name` | `TEXT` | Entity endpoints (entity_relation family; directed) |
+| `src_pg_id`, `tgt_pg_id` | `BIGINT` | Record endpoints (evidential family; directed) |
+| `rel_type` | `TEXT` | The typed relation; rejects use the sentinel `NONE` (never interpolated into Cypher) |
+| `verdict` | `TEXT` | `accept` \| `reject` |
+| `method` | `TEXT` | `llm_sweep` \| `rem_k3` \| `operator` |
+| `confidence` | `REAL` | 0..1; evidential `rem_k3` rows are capped BELOW the consumption threshold (born-below rule) |
+| `support` | `TEXT` | `graph_evidence` (≥2 corroborating facts) \| `text_only` |
+| `signals` | `JSONB` | co-occurrence count, sub-labels, vote share, `prior_rungs` history, … |
+| `operator_label` | `TEXT` | `correct` \| `incorrect` — the calibration oracle (review-edges flow) |
+| `promoted_at` | `TIMESTAMPTZ` | Operator promotion → live edge `asserted_by='operator'` |
+| `model`, `run_id`, `rationale` | `TEXT` | Audit: adjudicating model, sweep/cycle correlation id, short justification |
+
+**Indexes:** partial UNIQUE per family on the directed edge; `(family, operator_label, created_at)` for review/calibration reads.
+
 ---
 
 ## Neo4j (Relational Memory)
@@ -242,6 +274,28 @@ Written by the REM daemon during idle-time fact enrichment. These relationships 
 | `REJECTED` | `(:Decision)-[:REJECTED]->(:Entity)` | Alternatives explicitly ruled out |
 
 **Typed decision grounding (v0.6.4):** the grounding edges that link a `Decision` to the *records it rests on* are role-typed — `GROUNDED_IN` (basis), `CONSIDERED`, `REJECTED`, `UNDER_CONDITIONS`, or `INFORMED_BY`, targeting `(:Fact\|:Decision)`. First write picks the relation from the operator-supplied role (`--grounded-in "42:considered"`) or, when omitted, from the grounded fact's `fact_kind` — a `discussion` defaults to `INFORMED_BY`, other kinds to `GROUNDED_IN` (advisory, never enforced). Each edge carries an **`asserted_by`** property (`operator` \| `system_default`). The target is matched by `pg_id` **across labels**, so grounding a decision in another decision links the real node rather than an empty placeholder.
+
+**Typed Entity→Entity relationships (REM rebuild):** the domain-layer relations
+(`DEPENDS_ON`, `PART_OF`, `IMPLEMENTS`, `PRODUCES`, `CONSUMES`, `RUNS_ON`,
+`CONFIGURES`, `DESCRIBES`, `VALIDATES`) are minted by the periodic **evidence
+sweep** (`relation_sweep.py`), never by the per-record save or enrichment path:
+candidate pairs come from co-occurrence across facts aggregated per alias
+component, are legality-gated by the ontology `DOMAIN_RANGE` map in both
+directions, LLM-adjudicated in batches against shared-fact evidence, and every
+verdict lands in `relation_adjudications`. `MENTIONS` remains the explicit
+neutral-weight fallback.
+
+**Universal machine-edge provenance (two-axis: who asserted × how evidenced):**
+every machine-minted edge carries `asserted_by` (`rem` = per-record enrichment,
+`rem_sweep` = evidence sweep), `confidence` (k-vote self-consistency for REM,
+adjudication score for the sweep), `model`, `run_id`, `created_at` — stamped
+`ON CREATE` only, so an existing edge (in particular an operator-asserted one)
+is never re-stamped; operator promotion via the review flow flips
+`asserted_by` to `operator`. Pre-rebuild edges carry no `asserted_by` and are
+consumed at a fixed neutral prior (era-gated legacy class — no LLM backfill).
+Consolidation consumes a machine edge only when its family is CALIBRATED and
+its confidence clears the family threshold; operator and legacy edges are
+always consumable.
 
 **`rem_processed` Fact property:** after REM enriches a Fact node, it sets `rem_processed = true`. NREM (`consolidation_loop.py`) requires this flag before including a Fact in a consolidation cluster — `WHERE coalesce(neighbor.rem_processed, false) = true`. A Fact whose Neo4j write is still pending in the outbox is never marked `rem_processed`.
 
