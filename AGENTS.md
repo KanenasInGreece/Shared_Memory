@@ -27,6 +27,21 @@ Everything in this part runs on the **gateway host** — the one machine that ow
 
 Collect these answers before touching anything. Defaults in brackets are safe to offer.
 
+**Interview conduct — these are commitments, not suggestions.** For every question you ask:
+- **Explain why it is needed** when the user asks (or looks unsure): what the answer configures, and
+  what happens if they take the default. Never push past "why do I need this?" with "it's required".
+- **"Under what conditions?" gets a real answer** — e.g. Q3's reasoning LLM matters only for the
+  background dreaming passes; saves and search work without it. Q7's Tavily key only affects
+  LM Studio web search. Say what each answer does and does not gate.
+- **Any question may be deferred.** Q1/Q2/Q6 block Phase 4 (the stores need paths and passwords);
+  everything else can be decided later: Q3/Q4 can be filled in after first start (dreaming simply
+  waits), Q5 agents can be added later (see the *Add an agent later* runbook), Q7 is optional from
+  day one. When the user defers, say exactly what will work in the meantime and what won't.
+- **"Can we pick this up after?" — yes, always.** Every phase is idempotent and ends with a check,
+  so setup resumes cleanly from wherever it stopped: re-run the phase checks top to bottom and
+  continue from the first failure. Offer to write a one-line note of where you stopped so the next
+  session (yours or another agent's) resumes without re-interviewing.
+
 | # | Ask the user | Fills |
 |---|---|---|
 | 1 | Where should database data live on disk? [`~/databases/neo4j`, `~/databases/postgres`] | `NEO4J_HOST_DIR`, `PG_DATA_DIR` |
@@ -130,7 +145,43 @@ uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridg
 uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py search "install smoke test" 3
 ```
 
+**Hand each installed agent its expectations** (tell the user to relay this, or write it where that
+agent will read it — Phase 8b): the memory is built around **facts** (durable results of work, with
+named entities), **decisions** grounded in those facts (what was chosen, why, what was rejected),
+and **retrospectives** recording whether a decision held up. Some fields are **elicited** — when the
+skill asks for a rating, a grounding role, or entities and the right value is unclear, the agent
+should ask its user rather than invent. The full field schemas and CLI wording live in the skill's
+`SKILL.md` — that file is the contract; this paragraph is only the shape.
+
+### Phase 8b — Offer a constitution line (per agent, optional)
+
+A skill tells an agent *how* to call the memory; it cannot make the agent *reach for it*. That
+standing behavior lives in each agent's own constitution file (`~/.claude/CLAUDE.md`,
+`~/.grok/AGENTS.md`, `~/.codex/AGENTS.md`, Antigravity's `~/.gemini/` equivalent, …). For every
+agent installed in Phase 8, **ask the user**: *"Would you like a short section in this agent's
+constitution describing the shared memory as its preferred depository of knowledge?"* If yes,
+append (adapting the file's tone; never overwrite existing content):
+
+> **Shared memory (gateway `:8888`) is the preferred depository of knowledge on this machine.**
+> Search it before starting any non-trivial task — prior facts, decisions, and retrospectives are
+> the context a seasoned collaborator would want on day one. Capture as you work: durable results
+> as facts; choices as decisions grounded in those facts (ask the user before recording a
+> decision); outcomes as retrospectives once evidence shows whether a decision held. When the
+> skill expects an elicited field you cannot infer, ask the user rather than invent. Field schemas:
+> the `shared-memory` skill's `SKILL.md`.
+
+Respect a "no" without re-asking; the skill remains fully usable without it.
+
 ## Runbooks
+
+### Add an agent later (no token rotation)
+
+`bootstrap_tokens.sh` refuses to touch an existing registry and `--force` rotates **everyone** —
+neither is what you want for one new agent. Instead: generate one token (`openssl rand -hex 32`),
+append `,<agent>:<token>` to the existing `AGENT_TOKENS=` line in `shared-memory/.env` (and to
+`AGENT_ROLES=` only if it needs a restricted role), restart the gateway
+(`systemctl --user restart hive-mind-gateway.service`), then run Phase 8 (+ 8b) for that agent
+alone. Verify with the agent's own `doctor`.
 
 ### Start (e.g. after reboot)
 
@@ -187,7 +238,7 @@ Day-2 duty: schedule `shared-memory/ops/backup.sh` (quiesced; captures Postgres 
 
 ## What this is
 
-The **Shared Memory Framework** — a three-tier semantic memory shared by every local AI tool through one gateway (Postgres + pgvector + Neo4j). All credentials come from `.env`; nothing is hardcoded. Current version: see `CHANGELOG.md` (v0.6.x line: REM/NREM sleep cycle, per-agent token auth, fact + summary supersession, domain-scoped and cross-project insight consolidation, consolidation observability, read-only roles, person identity via `SO_PEERCRED`, quiesced cross-store backup/restore, entity alias layer with automated REM alias writer, gateway-owned LLM backend pool).
+The **Shared Memory Framework** — a three-tier semantic memory shared by every local AI tool through one gateway (Postgres + pgvector + Neo4j). All credentials come from `.env`; nothing is hardcoded. Current version: see `CHANGELOG.md` (v0.7.x line: everything from v0.6.x — REM/NREM sleep cycle, per-agent token auth, supersession, domain-scoped + cross-project insight consolidation, read-only roles, quiesced backup/restore, entity alias layer, gateway LLM pool — plus the enrichment rebuild: universal machine-edge provenance, capture-manifest delta enrichment, the typed entity-relation evidence sweep with its adjudication ledger, operator calibration via `review-edges`/`label-edges`, calibration-gated consolidation, and preservation-gated synthesis).
 
 ## Commands
 
