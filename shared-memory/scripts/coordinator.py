@@ -105,7 +105,11 @@ FRAMEWORK_VERSION = "0.6.5"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
-API_VERSION = 2
+# v3 (relation calibration): new operator-facing routes /memory/relations/review
+# and /memory/relations/label (the review-edges / label-edges client commands
+# require them) — the operator is the calibration oracle for machine-minted
+# relation edges (decisions 726/727).
+API_VERSION = 3
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Throttle: remember (agent, version) pairs already logged so a misversioned
@@ -203,6 +207,12 @@ _WRITE_ROUTES: set[tuple[str, str]] = {
     ("POST", "/memory/retrospective"),
     ("POST", "/memory/supersede"),
     ("POST", "/memory/review_hold"),
+    # Operator labeling/promotion mutates the adjudication ledger + Neo4j edges,
+    # so it sheds during a backup quiesce like every other client write.
+    # /memory/relations/review is a pure read and deliberately absent here —
+    # but neither route is in _READ_ROLE_ROUTES, so a read-only token (monitor)
+    # gets 403 on both: labeling is operator-grade.
+    ("POST", "/memory/relations/label"),
 }
 
 # Admin-only routes — reachable ONLY by an "admin"-role token, which in turn can
@@ -599,6 +609,25 @@ EMBED_MAX_CHARS = int(os.environ.get("EMBED_MAX_CHARS", "24000"))
 # MENTIONS, so the highest-signal context survives the cap — context without
 # relation properties is noise disguised as fact.
 GRAPH_EXPANSION_LIMIT = _env_int("GRAPH_EXPANSION_LIMIT", 15)
+
+# ── Relation-adjudication review/label surface (migration 020; decisions 726/727)
+# These constants MUST mirror relation_confidence.py (the psycopg2 foundation the
+# sweep/REM daemons use). The coordinator reimplements the ledger queries
+# asyncpg-natively instead of importing that module: the gateway venv ships
+# WITHOUT psycopg2 (uv run --with asyncpg …), so a module-level import of
+# relation_confidence would break gateway startup. Same env knobs → same values.
+RELATION_FAMILIES: tuple[str, ...] = ("entity_relation", "evidential")
+# asserted_by values a machine minted — the ONLY values the guarded edge delete
+# may remove; an operator-asserted edge is never deleted by a label.
+RELATION_MACHINE_ASSERTED: tuple[str, ...] = ("rem", "rem_sweep")
+RELCONF_CONSUME_THRESHOLD: dict[str, float] = {
+    "entity_relation": _env_float("RELCONF_CONSUME_ENTITY", 0.60),
+    "evidential":      _env_float("RELCONF_CONSUME_EVIDENTIAL", 0.70),
+}
+RELCONF_MIN_LABELS = _env_int("RELCONF_MIN_LABELS", 20)
+RELATION_REVIEW_LIMIT_DEFAULT = 20
+RELATION_REVIEW_LIMIT_CAP    = 100
+RELATION_SNIPPET_CHARS       = 160   # evidential rows: LEFT(content, N) per endpoint
 
 # Pool sizing is a SYSTEM budget, not just a coordinator knob: Postgres
 # max_connections must cover this pool + REM (1 conn) + NREM (per-op) + the
@@ -2102,6 +2131,279 @@ class MemoryCoordinator:
                        f"(rating={rating}, target decision {pg_id}).",
         })
 
+    # ── POST /memory/relations/review + /memory/relations/label ──────────────
+    #
+    # The operator-facing rung of the evidential ladder (decisions 726/727): REM
+    # and the evidence sweep land every machine relation verdict in the
+    # relation_adjudications ledger; the operator labels a stratified sample here
+    # (the calibration oracle — per-family reliability is computed FROM these
+    # labels, and an uncalibrated family's machine edges are invisible to
+    # synthesis), and may PROMOTE a correct edge to asserted_by='operator',
+    # which bypasses confidence thresholds permanently.
+
+    async def _relation_calibration(self, conn, family: str) -> dict:
+        """Per-family calibration state from operator labels — asyncpg port of
+        relation_confidence.calibration_state (identical semantics: accept-verdict
+        rows only; precision per 0.1 confidence band)."""
+        rows = await conn.fetch(
+            """
+            SELECT width_bucket(COALESCE(confidence, 0.5), 0, 1, 10) AS band,
+                   count(*) FILTER (WHERE operator_label IS NOT NULL) AS labeled,
+                   count(*) FILTER (WHERE operator_label = 'correct') AS correct
+            FROM relation_adjudications
+            WHERE family = $1 AND verdict = 'accept'
+            GROUP BY band ORDER BY band
+            """,
+            family,
+        )
+        bands, total_labeled = [], 0
+        for r in rows:
+            total_labeled += r["labeled"]
+            bands.append({
+                "band": f"{(r['band'] - 1) / 10:.1f}-{r['band'] / 10:.1f}",
+                "labeled": r["labeled"],
+                "precision": round(r["correct"] / r["labeled"], 3) if r["labeled"] else None,
+            })
+        return {
+            "family": family,
+            "labels": total_labeled,
+            "calibrated": total_labeled >= RELCONF_MIN_LABELS,
+            "min_labels": RELCONF_MIN_LABELS,
+            "threshold": RELCONF_CONSUME_THRESHOLD[family],
+            "bands": bands,
+        }
+
+    async def handle_relations_review(self, request: web.Request) -> web.Response:
+        """Stratified unlabeled ledger sample for operator labeling — asyncpg port
+        of relation_confidence.fetch_review_sample (rows bucketed into confidence
+        deciles, drawn round-robin so labels cover the whole curve). Evidential
+        rows are enriched with content snippets of both endpoint records; the
+        response envelope carries the family's calibration state."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {"status": "error", "message": "request body must be JSON"}, status=400
+            )
+        family = body.get("family") or "entity_relation"
+        if family not in RELATION_FAMILIES:
+            return web.json_response(
+                {"status": "error",
+                 "message": f"family must be one of {list(RELATION_FAMILIES)}"},
+                status=400,
+            )
+        limit = body.get("limit", RELATION_REVIEW_LIMIT_DEFAULT)
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            return web.json_response(
+                {"status": "error", "message": "limit must be a positive integer"},
+                status=400,
+            )
+        limit = min(limit, RELATION_REVIEW_LIMIT_CAP)
+
+        async with self._acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, family, src_name, tgt_name, src_pg_id, tgt_pg_id, rel_type,
+                       verdict, method, confidence, support, signals, rationale, created_at
+                FROM (
+                    SELECT *, row_number() OVER (
+                        PARTITION BY width_bucket(COALESCE(confidence, 0.5), 0, 1, 10)
+                        ORDER BY created_at DESC) AS rn
+                    FROM relation_adjudications
+                    WHERE family = $1 AND operator_label IS NULL
+                ) t
+                ORDER BY rn, confidence DESC NULLS LAST
+                LIMIT $2
+                """,
+                family, limit,
+            )
+            rows = [dict(r) for r in rows]
+            if family == "evidential" and rows:
+                pg_ids = sorted({p for r in rows
+                                 for p in (r["src_pg_id"], r["tgt_pg_id"])
+                                 if p is not None})
+                snips = await conn.fetch(
+                    "SELECT id, LEFT(content, $2) AS snippet"
+                    " FROM technical_docs WHERE id = ANY($1)",
+                    pg_ids, RELATION_SNIPPET_CHARS,
+                )
+                snip_map = {s["id"]: s["snippet"] for s in snips}
+                for r in rows:
+                    r["src_snippet"] = snip_map.get(r["src_pg_id"])
+                    r["tgt_snippet"] = snip_map.get(r["tgt_pg_id"])
+            calibration = await self._relation_calibration(conn, family)
+
+        return web.json_response({
+            "status": "success",
+            "family": family,
+            "rows": _json_safe(rows),
+            "calibration": calibration,
+        })
+
+    def _relation_edge_match(self, row: dict) -> tuple[str, dict] | None:
+        """Cypher MATCH fragment + params addressing a ledger row's LIVE edge.
+        The rel_type is interpolated into Cypher, so membership in the schema's
+        KNOWN_RELATIONSHIPS is a hard precondition (injection guard) — None when
+        the rel is not schema vocabulary (e.g. the reject sentinel 'NONE'), which
+        callers treat as "no edge to touch". Entity family matches name-keyed
+        Entity endpoints; evidential family matches pg_id-keyed RECORD endpoints
+        across the record labels (Fact / Decision / Retrospective)."""
+        rel = row["rel_type"]
+        if rel not in KNOWN_RELATIONSHIPS:
+            return None
+        if row["family"] == "entity_relation":
+            return (
+                f"MATCH (a:{ONT.entity} {{name: $src}})-[r:{rel}]->"
+                f"(b:{ONT.entity} {{name: $tgt}})",
+                {"src": row["src_name"], "tgt": row["tgt_name"]},
+            )
+        rec_a = " OR ".join(f"a:{lbl}" for lbl in
+                            (ONT.fact, ONT.decision, ONT.retrospective))
+        rec_b = " OR ".join(f"b:{lbl}" for lbl in
+                            (ONT.fact, ONT.decision, ONT.retrospective))
+        return (
+            f"MATCH (a {{pg_id: $src}})-[r:{rel}]->(b {{pg_id: $tgt}})"
+            f" WHERE ({rec_a}) AND ({rec_b})",
+            {"src": row["src_pg_id"], "tgt": row["tgt_pg_id"]},
+        )
+
+    async def _promote_relation_edge(self, row: dict) -> int:
+        """Flip the live edge to asserted_by='operator' (operator promotion —
+        bypasses consumption thresholds permanently). Returns edges updated."""
+        m = self._relation_edge_match(row)
+        if m is None:
+            return 0
+        match, params = m
+        cypher = (match
+                  + " SET r.asserted_by = 'operator',"
+                  + "     r.promoted_at = coalesce(r.promoted_at, datetime())"
+                  + " RETURN count(r) AS n")
+        async with self._neo4j.session() as session:
+            result = await session.run(cypher, **params)
+            rec = await result.single()
+        return rec["n"] if rec else 0
+
+    async def _delete_machine_relation_edge(self, row: dict) -> int:
+        """Delete the live edge an operator labeled 'incorrect' — ONLY when the
+        edge is machine-asserted (asserted_by IN rem/rem_sweep). An operator-
+        asserted edge is never deleted here: the Cypher guard makes the delete a
+        no-op on it. The ledger row always stays (audit + don't-re-ask).
+        Returns edges deleted."""
+        m = self._relation_edge_match(row)
+        if m is None:
+            return 0
+        match, params = m
+        glue = " AND " if " WHERE " in match else " WHERE "
+        cypher = (match + glue + "r.asserted_by IN $machine"
+                  + " WITH r DELETE r RETURN count(*) AS n")
+        async with self._neo4j.session() as session:
+            result = await session.run(
+                cypher, machine=list(RELATION_MACHINE_ASSERTED), **params)
+            rec = await result.single()
+        return rec["n"] if rec else 0
+
+    async def handle_relations_label(self, request: web.Request) -> web.Response:
+        """Apply operator labels {row_id: 'correct'|'incorrect'} and optional
+        promotions. Labels land in relation_adjudications.operator_label (the
+        calibration substrate). Side effects on the LIVE graph:
+          - 'incorrect' on an accept-verdict row → guarded delete of the machine
+            edge (never an operator-asserted one); ledger row stays.
+          - promote (row must be labeled 'correct', now or already) → ledger
+            promoted_at=now() + live edge asserted_by='operator'.
+        Per-row outcomes are reported; a Neo4j failure degrades to an edge_error
+        on that row rather than failing the whole batch (the label is already
+        durable in the ledger)."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {"status": "error", "message": "request body must be JSON"}, status=400
+            )
+        raw_labels  = body.get("labels") or {}
+        raw_promote = body.get("promote") or []
+        if not isinstance(raw_labels, dict) or not isinstance(raw_promote, list):
+            return web.json_response(
+                {"status": "error",
+                 "message": "labels must be an object and promote a list"},
+                status=400,
+            )
+        labels: dict[int, str] = {}
+        try:
+            for rid, lab in raw_labels.items():
+                if lab not in ("correct", "incorrect"):
+                    return web.json_response(
+                        {"status": "error",
+                         "message": f"invalid operator label {lab!r} — "
+                                    "must be 'correct' or 'incorrect'"},
+                        status=400,
+                    )
+                labels[int(rid)] = lab
+            promote = [int(p) for p in raw_promote]
+        except (TypeError, ValueError):
+            return web.json_response(
+                {"status": "error", "message": "row ids must be integers"}, status=400
+            )
+        if not labels and not promote:
+            return web.json_response(
+                {"status": "error", "message": "labels and/or promote is required"},
+                status=400,
+            )
+
+        _ROW_SQL = ("SELECT id, family, src_name, tgt_name, src_pg_id, tgt_pg_id,"
+                    "       rel_type, verdict, operator_label, promoted_at"
+                    " FROM relation_adjudications WHERE id = $1")
+        outcomes: dict[str, dict] = {}
+        async with self._acquire() as conn:
+            for rid, lab in labels.items():
+                row = await conn.fetchrow(_ROW_SQL, rid)
+                if row is None:
+                    outcomes[str(rid)] = {"error": "ledger row not found"}
+                    continue
+                await conn.execute(
+                    "UPDATE relation_adjudications"
+                    " SET operator_label=$2, operator_labeled_at=now(), updated_at=now()"
+                    " WHERE id=$1",
+                    rid, lab,
+                )
+                out: dict[str, Any] = {"labeled": lab}
+                if lab == "incorrect" and row["verdict"] == "accept":
+                    # An accepted edge the operator refutes leaves the graph —
+                    # machine-asserted edges only; the ledger row stays.
+                    try:
+                        out["edge_deleted"] = await self._delete_machine_relation_edge(
+                            dict(row))
+                    except Exception as exc:
+                        log.error("relation label: edge delete failed for row %d: %s",
+                                  rid, exc, exc_info=True)
+                        out["edge_error"] = "edge delete failed — label recorded"
+                outcomes[str(rid)] = out
+
+            for rid in promote:
+                row = await conn.fetchrow(_ROW_SQL, rid)
+                out = outcomes.setdefault(str(rid), {})
+                if row is None:
+                    out["error"] = "ledger row not found"
+                    continue
+                effective = labels.get(rid) or row["operator_label"]
+                if effective != "correct":
+                    out["promoted"] = False
+                    out["error"] = ("promotion requires an operator label of "
+                                    "'correct' (in this call or already recorded)")
+                    continue
+                await conn.execute(
+                    "UPDATE relation_adjudications"
+                    " SET promoted_at=now(), updated_at=now() WHERE id=$1",
+                    rid,
+                )
+                out["promoted"] = True
+                try:
+                    out["edges_updated"] = await self._promote_relation_edge(dict(row))
+                except Exception as exc:
+                    log.error("relation promote: edge update failed for row %d: %s",
+                              rid, exc, exc_info=True)
+                    out["edge_error"] = "edge update failed — promotion recorded in ledger"
+        return web.json_response({"status": "success", "outcomes": outcomes})
+
     # ── POST /memory/search ───────────────────────────────────────────────────
 
     async def _expand_graph_context(self, session, pg_id: int,
@@ -3368,6 +3670,8 @@ def attach(app: web.Application, coordinator: MemoryCoordinator) -> None:
     app.router.add_post("/memory/review_hold",     coordinator.handle_review_hold)
     app.router.add_post("/memory/search",         coordinator.handle_search)
     app.router.add_post("/memory/graph",          coordinator.handle_graph)
+    app.router.add_post("/memory/relations/review", coordinator.handle_relations_review)
+    app.router.add_post("/memory/relations/label",  coordinator.handle_relations_label)
     app.router.add_get( "/memory/status/{pg_id}", coordinator.handle_status)
     app.router.add_get( "/memory/telemetry",       coordinator.handle_telemetry)
     app.router.add_post("/admin/backup",           coordinator.handle_backup)

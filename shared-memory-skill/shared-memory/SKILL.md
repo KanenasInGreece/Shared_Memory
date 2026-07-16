@@ -196,6 +196,22 @@ uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/s
    RETURN d.title, o.rating, o.notes, o.date ORDER BY o.date DESC LIMIT 1"
 ```
 
+### Task 6 — Review & calibrate machine-proposed relation edges
+
+REM and the evidence sweep mint typed graph edges **machine-asserted** with a confidence score; the operator's labels are the **only calibration oracle** — per-family reliability is computed from them, and until a family has ~20 labels it is **uncalibrated: its machine edges are invisible to synthesis**. Labeling is what unlocks them.
+- **Trigger:** a weekly stratified label pass per family — and **ALWAYS immediately after a first evidence-sweep run**, so calibration exists before any confidence threshold acts.
+- **Label honestly:** `correct` means the relation **as typed and as directed** is true of the two endpoints — the right pair with the wrong relation or wrong direction is `incorrect`.
+- Labeling an *accepted* edge `incorrect` deletes the machine edge from the graph (operator-asserted edges are never deleted); the ledger row stays as audit and so it is never re-asked.
+- **`--promote` = operator assertion** (`asserted_by=operator`): the edge bypasses confidence thresholds permanently — promote only edges you would defend yourself.
+- Two families calibrate separately: `entity_relation` (typed Entity→Entity) and `evidential` (record→record, e.g. a decision informed by a fact — rows show a content snippet of each record).
+
+```
+uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py review-edges entity_relation 20
+uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py label-edges "12=correct,13=incorrect" --promote 12
+```
+
+Each `review-edges` run ends with the family's calibration line — e.g. `family entity_relation: 7/20 labels — UNCALIBRATED, machine edges not consumed by synthesis` — so you always see what your labels have (not yet) unlocked.
+
 ## Complete Workflow: Save → Consolidate → Retrieve → Retrospective
 
 This section is a concrete runbook for the full memory cycle. Copy-paste each block directly.
