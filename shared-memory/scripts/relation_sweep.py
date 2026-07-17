@@ -99,6 +99,16 @@ from dream_telemetry import adaptive_ceiling   # noqa: E402  (ADR-021 per-prompt
 
 # ── env knobs (alias_writer conventions) ──────────────────────────────────────
 MIN_COOCCUR = int(os.environ.get("RELSWEEP_MIN_COOCCUR", "2"))
+# Pool-idle gate (mirrors REM's pool_has_free_slot deference): before each LLM
+# batch the sweep waits for a free backend slot, polling every
+# RELSWEEP_POOL_POLL_SEC up to RELSWEEP_POOL_WAIT_SEC, then STOPS the run
+# cleanly (unresolved candidates are re-asked next sweep). Firing into a busy
+# pool queues behind multi-minute dream generations, times the batch out
+# client-side, and leaves a ZOMBIE generation holding the slot server-side —
+# the first live run lost all its batches exactly this way.
+POOL_STATUS_URL = os.environ.get("POOL_STATUS_URL", "http://localhost:8888/pool/status")
+POOL_WAIT_SEC = float(os.environ.get("RELSWEEP_POOL_WAIT_SEC", "900"))
+POOL_POLL_SEC = float(os.environ.get("RELSWEEP_POOL_POLL_SEC", "15"))
 LLM_BATCH = int(os.environ.get("RELSWEEP_LLM_BATCH", "8"))
 _max_cand = os.environ.get("RELSWEEP_MAX_CANDIDATES", "").strip()
 MAX_CANDIDATES = int(_max_cand) if _max_cand else None
@@ -316,6 +326,29 @@ def _build_prompt(candidates: list[dict], snippets: dict[int, str]) -> str:
     )
 
 
+def wait_for_free_slot(max_wait: float = POOL_WAIT_SEC,
+                       poll: float = POOL_POLL_SEC) -> bool:
+    """Block until the gateway LLM pool has a free slot, or max_wait elapses.
+    Returns True when a slot is free. MOCK_LLM runs skip the wait entirely.
+    A status-endpoint error counts as free (fail-open, matching pool_status's
+    gateway-down semantics — the batch call itself will surface a real outage)."""
+    if os.getenv("MOCK_LLM") == "1":
+        return True
+    import time as _time
+    deadline = _time.monotonic() + max_wait
+    while True:
+        try:
+            r = httpx.get(POOL_STATUS_URL, headers=_auth_headers(), timeout=5.0)
+            r.raise_for_status()
+            if int(r.json().get("free_slots", 0)) > 0:
+                return True
+        except Exception:
+            return True   # fail-open: can't tell → let the batch call decide
+        if _time.monotonic() >= deadline:
+            return False
+        _time.sleep(poll)
+
+
 def _mock_verdicts(candidates: list[dict]) -> dict[int, dict]:
     """Deterministic MOCK_LLM stub: first legal relation, A→B preferred."""
     out = {}
@@ -488,6 +521,11 @@ def run_sweep(limit: int | None = None) -> dict:
     try:
         with driver.session() as session:
             for start in range(0, len(candidates), LLM_BATCH):
+                if not wait_for_free_slot():
+                    print(f"  [!] LLM pool busy for {POOL_WAIT_SEC:.0f}s — stopping; "
+                          f"{len(candidates) - start} candidate(s) left for the next sweep",
+                          file=sys.stderr)
+                    break
                 batch = candidates[start:start + LLM_BATCH]
                 pg_ids = sorted({p for c in batch for p in c["shared_pg_ids"]})
                 snippets = fetch_fact_snippets(conn, pg_ids)
@@ -716,6 +754,11 @@ def run_evidential_sweep(limit: int | None = None) -> dict:
             rows = rows[:limit]
         with driver.session() as session:
             for start in range(0, len(rows), LLM_BATCH):
+                if not wait_for_free_slot():
+                    print(f"  [!] LLM pool busy for {POOL_WAIT_SEC:.0f}s — stopping; "
+                          f"{len(rows) - start} proposal(s) left for the next pass",
+                          file=sys.stderr)
+                    break
                 batch = rows[start:start + LLM_BATCH]
                 pg_ids = sorted({p for r in batch
                                  for p in (r["src_pg_id"], r["tgt_pg_id"])
