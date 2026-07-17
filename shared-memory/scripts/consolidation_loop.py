@@ -1001,6 +1001,12 @@ class ConsolidationDaemon:
         self.pending_pg_ids = set()
         self.last_activity = datetime.now()
         self.first_notification_time = None
+        # Pool-busy sweep backoff: a due sweep that found no free LLM slot does
+        # not re-probe on every ~1s listen tick (that spams the log and a
+        # /pool/status GET per second during long dream generations) — it waits
+        # this many seconds before the next attempt. The DB deferral record is
+        # separately throttled by _DEFER_THROTTLE_SEC.
+        self._sweep_backoff_until: datetime | None = None
         self.driver = AsyncGraphDatabase.driver(
             NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS),
             max_connection_pool_size=NEO4J_MAX_POOL,
@@ -2380,12 +2386,17 @@ class ConsolidationDaemon:
                                     await self.run_consolidation_cycle()
                                 finally:
                                     await loop.run_in_executor(None, gate.close)
-                    elif sweep_due(now, self.last_sweep_time, self.last_activity,
+                    elif (self._sweep_backoff_until is None
+                          or now >= self._sweep_backoff_until) and \
+                         sweep_due(now, self.last_sweep_time, self.last_activity,
                                    bool(self.pending_pg_ids)):
                         # Background hygiene — always yields to active inference;
-                        # a deferred sweep simply retries on the next idle tick.
+                        # a deferred sweep retries after the pool-busy backoff.
                         if not await pool_has_free_slot():
-                            logger.info("NREM: LLM pool has no free slot — deferring sweep.")
+                            from datetime import timedelta as _td
+                            self._sweep_backoff_until = now + _td(seconds=60)
+                            logger.info("NREM: LLM pool has no free slot — deferring sweep "
+                                        "(next attempt in 60s).")
                             await loop.run_in_executor(None, lambda: _crun_record_deferred("insight", "pool_busy"))
                         else:
                             # Backup fence: SHARED advisory lock held across the sweep.
