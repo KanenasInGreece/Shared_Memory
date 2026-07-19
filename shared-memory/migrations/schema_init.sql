@@ -118,6 +118,34 @@ CREATE TABLE IF NOT EXISTS neo4j_outbox (
 CREATE INDEX IF NOT EXISTS neo4j_outbox_pending_id_idx ON public.neo4j_outbox USING btree (id) WHERE (status = 'pending'::text);
 CREATE INDEX IF NOT EXISTS neo4j_outbox_pending_idx ON public.neo4j_outbox USING btree (status) WHERE (status = 'pending'::text);
 
+-- ─── relation_adjudications ─────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS relation_adjudications (
+    id               BIGSERIAL PRIMARY KEY,
+    family           TEXT NOT NULL,
+    src_name         TEXT,
+    tgt_name         TEXT,
+    src_pg_id        BIGINT,
+    tgt_pg_id        BIGINT,
+    rel_type         TEXT NOT NULL,
+    verdict          TEXT NOT NULL,
+    method           TEXT NOT NULL,
+    confidence       REAL,
+    support          TEXT,
+    signals          JSONB,
+    rationale        TEXT,
+    model            TEXT,
+    run_id           TEXT,
+    operator_label   TEXT,
+    operator_labeled_at TIMESTAMPTZ,
+    promoted_at      TIMESTAMPTZ,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS relation_adjudications_entity_uniq ON public.relation_adjudications USING btree (family, src_name, tgt_name, rel_type) WHERE (family = 'entity_relation'::text);
+CREATE UNIQUE INDEX IF NOT EXISTS relation_adjudications_record_uniq ON public.relation_adjudications USING btree (family, src_pg_id, tgt_pg_id, rel_type) WHERE (family = 'evidential'::text);
+CREATE INDEX IF NOT EXISTS relation_adjudications_review_idx ON public.relation_adjudications USING btree (family, operator_label, created_at);
+
 -- ─── technical_docs ─────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS technical_docs (
     id               SERIAL PRIMARY KEY,
