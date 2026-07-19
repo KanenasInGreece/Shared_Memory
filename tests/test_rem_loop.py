@@ -1011,3 +1011,111 @@ def test_rem_and_nrem_priority_lock_keys_match():
     assert (cl.NREM_PRIORITY_ADVISORY_LOCK_KEY
             == rem_mod.NREM_PRIORITY_ADVISORY_LOCK_KEY)
     assert cl.NREM_PRIORITY_ADVISORY_LOCK_KEY != rem_mod.BACKUP_ADVISORY_LOCK_KEY
+
+
+# ── run_cycle composition harness ────────────────────────────────────────────
+# The fix-wave's defects were all in how independently-correct mechanisms
+# COMPOSED — which per-function unit tests cannot see. This drives the real
+# run_cycle with every I/O boundary stubbed so cycle-level behaviour is
+# testable.
+
+def _cycle_daemon(monkeypatch, pg_ids, kinds, *, queuing=None, attempts=None):
+    daemon, _ = _make_daemon()
+    attempts = attempts or {p: 0 for p in pg_ids}
+    content_map = {p: {"content": "c", "kind": kinds[p], "created_at": None}
+                   for p in pg_ids}
+
+    daemon._fetch_non_rem_batch = AsyncMock(return_value=(list(pg_ids), attempts))
+    daemon._open_pg_conn = lambda: MagicMock()
+    daemon._recent_write_happened = AsyncMock(return_value=False)
+    daemon._filter_applied_in_outbox = AsyncMock(return_value=list(pg_ids))
+    daemon._batch_fetch_content = AsyncMock(return_value=content_map)
+    daemon._fetch_existing_edges = AsyncMock(return_value={})
+    daemon._fetch_closed_entity_set = AsyncMock(return_value=[])
+    daemon._bump_rem_attempts = AsyncMock()
+
+    monkeypatch.setattr(rem_mod, "_take_shared_backup_lock", lambda c: True)
+    monkeypatch.setattr(rem_mod, "pool_has_free_slot", AsyncMock(return_value=True))
+    monkeypatch.setattr(rem_mod, "build_manifest", lambda row, edges: {})
+    monkeypatch.setattr(rem_mod, "_build_entity_registry", lambda cs: {})
+    monkeypatch.setattr(rem_mod, "_nrem_is_queuing", queuing or (lambda c: False))
+    return daemon
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_yields_to_nrem_between_solo_records(monkeypatch):
+    """F2 granularity: a cycle holding several solo records re-checks the
+    arbiter BETWEEN them. Checking only at cycle start let REM own the single
+    LLM slot for the whole cycle (~20 min per record) while NREM's queue
+    expired — the same starvation, on a longer clock."""
+    ids = [11, 12, 13]
+    kinds = {i: rem_mod.KIND_DECISION for i in ids}
+
+    # Probe 1 = the cycle-start gate, probe 2 = record 11's pre-check (both
+    # free), probe 3 = record 12's pre-check — NREM has queued by then.
+    probes = {"n": 0}
+    def _queuing(_conn):
+        probes["n"] += 1
+        return probes["n"] > 2
+    daemon = _cycle_daemon(monkeypatch, ids, kinds, queuing=_queuing)
+
+    seen = []
+    async def _fake(pg_id, *a, **k):
+        seen.append(pg_id)
+        return True
+    daemon._process_fact = _fake
+
+    processed, attempted = await daemon.run_cycle()
+
+    assert seen == [11], f"must stop at the next record boundary, processed {seen}"
+    assert processed == 1 and attempted == 1
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_processes_all_when_nrem_is_idle(monkeypatch):
+    """The arbiter must not throttle REM when nothing is queuing for the slot."""
+    ids = [11, 12, 13]
+    kinds = {i: rem_mod.KIND_DECISION for i in ids}
+    daemon = _cycle_daemon(monkeypatch, ids, kinds)
+
+    seen = []
+    async def _fake(pg_id, *a, **k):
+        seen.append(pg_id)
+        return True
+    daemon._process_fact = _fake
+
+    processed, attempted = await daemon.run_cycle()
+
+    assert seen == ids and processed == 3 and attempted == 3
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_batch_transport_failure_charges_nobody(monkeypatch):
+    """F1 at cycle level: a failed batch CALL leaves every record's attempt
+    counter untouched, so none of them is demoted out of the batched path."""
+    ids = [21, 22, 23]
+    kinds = {i: rem_mod.KIND_FACT for i in ids}
+    daemon = _cycle_daemon(monkeypatch, ids, kinds)
+    # results=None signals the call itself failed
+    daemon._llm_process_batch = AsyncMock(return_value=(None, None, "m"))
+
+    processed, attempted = await daemon.run_cycle()
+
+    assert processed == 0 and attempted == 3
+    daemon._bump_rem_attempts.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_batch_missing_line_charges_only_that_record(monkeypatch):
+    """The complement: when the call SUCCEEDS, a record whose line is missing
+    is chargeable — that is real evidence about that record."""
+    ids = [21, 22]
+    kinds = {i: rem_mod.KIND_FACT for i in ids}
+    daemon = _cycle_daemon(monkeypatch, ids, kinds)
+    daemon._llm_process_batch = AsyncMock(
+        return_value=({21: {"relationships": []}}, None, "m"))
+    daemon._apply_fact_result = AsyncMock(return_value=True)
+
+    await daemon.run_cycle()
+
+    daemon._bump_rem_attempts.assert_awaited_once_with([22])

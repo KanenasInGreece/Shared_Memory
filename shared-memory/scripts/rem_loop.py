@@ -1375,7 +1375,10 @@ class REMDaemon:
                         },
                     )
             except Exception as exc:
-                logger.error("LLM error: %s", exc)
+                # Name the type: httpx timeout/transport errors stringify to ""
+                # ("LLM error:" with nothing after it tells the next reader
+                # nothing about whether it timed out, reset, or refused).
+                logger.error("LLM error: %s: %s", type(exc).__name__, exc)
                 return None, model, LLM_FAIL_TRANSPORT
             _backend = resp.headers.get("X-SM-LLM-Backend")
             model = _backend or "local-model"
@@ -1529,7 +1532,7 @@ class REMDaemon:
                 truncated = _truncated(resp_json)
                 raw = resp_json["choices"][0]["message"]["content"]
         except Exception as exc:
-            logger.error("REM batch LLM error: %s", exc)
+            logger.error("REM batch LLM error: %s: %s", type(exc).__name__, exc)
             self._last_llm_failure = LLM_FAIL_TRANSPORT
             return None, None, model
         self._last_llm_failure = LLM_FAIL_TRUNCATED if truncated else None
@@ -2163,6 +2166,17 @@ class REMDaemon:
                     processed += 1
 
             for pg_id, kind in solo_ids:
+                # F2: yield at RECORD boundaries, not just cycle boundaries.
+                # A cycle can hold up to BATCH_SIZE solo records at ~20 minutes
+                # each, so a cycle-start-only check let REM own the slot for
+                # well over an hour while NREM's queue expired — the starvation
+                # the arbiter exists to prevent, just on a longer clock.
+                if await loop.run_in_executor(None, lambda: _nrem_is_queuing(conn)):
+                    logger.info(
+                        "REM: NREM is queuing for the LLM slot — yielding after "
+                        "%d/%d record(s); the rest retry next cycle.",
+                        processed, len(solo_ids))
+                    break
                 attempted += 1
                 if await self._process_fact(
                         pg_id, content_map[pg_id]["content"], kind, closed_set,
