@@ -1804,9 +1804,14 @@ class ConsolidationDaemon:
         )
         try:
             # Record map for every fact across all clusters (single batch).
-            # Domain = COALESCE(project, domain, scope, 'general') from the
+            # Domain = COALESCE(project, domain, 'general') from the
             # authoritative Postgres metadata — the Neo4j Fact node does not
-            # carry a domain. Stage 5 also pulls each record's TYPE, its
+            # carry a domain. `scope` is deliberately NOT in this chain: it is an
+            # ACCESS-CONTROL axis (it pairs with visibility='scope' on the read
+            # path), so including it keys a summary by who may SEE a record rather
+            # than what it is ABOUT. On a deployment that uses scopes, that
+            # silently partitions summaries along permission lines. Stage 5 also
+            # pulls each record's TYPE, its
             # evidential KIND (derived from source_ref, the same derivation the
             # write path uses) and capture date, so fold blocks differentiate
             # records instead of rendering bare [FACT] lines.
@@ -1817,7 +1822,7 @@ class ConsolidationDaemon:
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT id, COALESCE(metadata->>'project',"
-                        " metadata->>'domain', scope, 'general'),"
+                        " metadata->>'domain', 'general'),"
                         " COALESCE(metadata->>'type', 'fact'),"
                         " metadata->>'source_ref', created_at::date"
                         " FROM technical_docs WHERE id = ANY(%s)",

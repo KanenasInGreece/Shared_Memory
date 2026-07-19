@@ -3381,8 +3381,12 @@ class MemoryCoordinator:
         if all_ids:
             async with self._acquire() as conn:
                 rows = await conn.fetch(
+                    # `scope` is excluded on purpose — it is an access-control axis,
+                    # not a topical one; see consolidation_loop's domain-map note.
+                    # This must mirror that chain exactly or the eligibility count
+                    # reported here diverges from what the daemon actually folds.
                     "SELECT id, COALESCE(metadata->>'project', metadata->>'domain',"
-                    " scope, $2) AS domain FROM technical_docs WHERE id = ANY($1)",
+                    " $2) AS domain FROM technical_docs WHERE id = ANY($1)",
                     all_ids, DEFAULT_DOMAIN,
                 )
             domain_map = {r["id"]: r["domain"] for r in rows}
@@ -3423,7 +3427,7 @@ class MemoryCoordinator:
                 " count(*)::int AS count FROM technical_docs GROUP BY 1 ORDER BY count DESC LIMIT 12"
             )
             domains = await conn.fetch(
-                "SELECT COALESCE(metadata->>'project', metadata->>'domain', scope, 'general') AS key,"
+                "SELECT COALESCE(metadata->>'project', metadata->>'domain', 'general') AS key,"
                 " count(*)::int AS count FROM technical_docs GROUP BY 1 ORDER BY count DESC LIMIT 12"
             )
             summaries = await conn.fetch(

@@ -82,6 +82,57 @@ except ImportError:
 COORDINATOR_BASE = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
 AGENT_ID         = os.environ.get("AGENT_ID", "memory_bridge")
 
+# Markers that identify a project root, in priority order. `.git` first because a
+# repository root is the least ambiguous boundary; the agent-instruction files are
+# the fallback for project directories that are not repositories.
+PROJECT_ROOT_MARKERS = tuple(
+    m for m in os.environ.get(
+        "PROJECT_ROOT_MARKERS", ".git,CLAUDE.md,AGENTS.md,GEMINI.md"
+    ).split(",") if m.strip()
+)
+
+
+def derive_project(start: str | None = None) -> str:
+    """Derive the canonical project tag from the working directory.
+
+    The canonical project is the PROJECT FOLDER NAME, so that every session on a
+    project produces the same tag no matter which agent wrote the record. The
+    gateway cannot do this — it is a server and never sees a client's working
+    directory — but skill runners execute from the user's project directory, so
+    the client can, identically for every agent.
+
+    Walks up from `start` to the first directory holding a project-root marker and
+    returns its basename. Walking (rather than taking the bare basename of the cwd)
+    is the whole point: a save issued from `<project>/tests` must tag `<project>`,
+    not `tests`. Stops at the filesystem root and never ascends past $HOME, so a
+    save issued from a home directory or an unmarked scratch dir derives nothing
+    and returns "" — an empty tag is strictly better than a confidently wrong one.
+
+    `SHARED_MEMORY_PROJECT` overrides the walk entirely, for callers whose working
+    directory is not a meaningful project boundary (daemons, CI, cron).
+    """
+    override = os.environ.get("SHARED_MEMORY_PROJECT", "").strip()
+    if override:
+        return override
+
+    try:
+        cur = os.path.abspath(start or os.getcwd())
+    except OSError:          # cwd deleted out from under us
+        return ""
+    home = os.path.abspath(os.path.expanduser("~"))
+
+    while True:
+        # $HOME itself is a boundary, not a project: it commonly holds a CLAUDE.md
+        # and would otherwise tag every stray save with the account name.
+        if cur == home:
+            return ""
+        if any(os.path.exists(os.path.join(cur, m)) for m in PROJECT_ROOT_MARKERS):
+            return os.path.basename(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:    # filesystem root
+            return ""
+        cur = parent
+
 
 def _uds_path() -> str | None:
     """The gateway Unix socket to connect over, so the gateway can read this client's
@@ -243,6 +294,16 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
     if not isinstance(metadata, dict):
         _append_log("memory_bridge", 2, "bad_metadata_type", {"got": type(metadata).__name__, "content_preview": content[:100]}, content)
         return {"status": "error", "message": f"Metadata must be a JSON object, got {type(metadata).__name__}"}
+
+    # Derive the project tag when the caller supplied none. An explicit value always
+    # wins — this fills the gap, it does not override intent. Untagged facts are not
+    # merely untidy: the consolidation key falls back for them, so they fragment
+    # away from their own project's cluster and never reach a summary.
+    if not metadata.get("project"):
+        derived = derive_project()
+        if derived:
+            metadata["project"] = derived
+            _append_log("memory_bridge", 3, "project_derived", {"project": derived})
 
     try:
         async with _async_client(60.0) as client:
@@ -998,7 +1059,10 @@ async def main() -> None:
         )
         p.add_argument("--title",       required=True,  help="Short decision title")
         p.add_argument("--decided-by",  required=True,  help="Human who made the decision")
-        p.add_argument("--project",     required=True,  help="Project context")
+        # Not required: defaults to the project folder name (see derive_project).
+        # Still mandatory at the gateway, so a save from outside any project root
+        # fails loudly rather than recording a decision with no project.
+        p.add_argument("--project",     default="",     help="Project context (default: project folder name)")
         p.add_argument("--rationale",   required=True,  help="Why this decision was made")
         p.add_argument("--source",      default=AGENT_ID,
                        help="Agent/model saving this record (default: $AGENT_ID)")
@@ -1020,7 +1084,7 @@ async def main() -> None:
         content, metadata = build_decision_metadata(
             title=args.title,
             decided_by=args.decided_by,
-            project=args.project,
+            project=args.project or derive_project(),
             rationale=args.rationale,
             source=args.source,
             assisted_by=args.assisted_by,
