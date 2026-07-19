@@ -177,28 +177,64 @@ async def test_llm_process_mock_retrospective_no_extras():
 # ── _fetch_non_rem_batch ordering ─────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_fetch_non_rem_batch_orders_attempts_first_then_pg_id():
-    """Queue rotation: fresh records first (attempts ASC), oldest-first within
-    the same attempt count; dead-lettered records (>= REM_MAX_ATTEMPTS)
-    excluded. Returns (pg_ids, attempts_map) so run_cycle can demote."""
+async def test_fetch_non_rem_batch_orders_pickups_first_then_attempts_then_pg_id():
+    """Queue rotation is keyed on rem_PICKUPS first (819). Ordering on the
+    failure-only counter alone made the head deterministic, so the arbiter's
+    record-boundary yield always cut at the same place and the tail was
+    unreachable. Dead-lettering still keys on rem_ATTEMPTS alone, so a backend
+    outage can never retire a healthy record however often it is picked up.
+    Returns the selected LABEL too, for run_cycle's identity check."""
     daemon, mock_session = _make_daemon()
     mock_result = MagicMock()
     mock_result.data = AsyncMock(return_value=[
-        {"pg_id": 1, "rem_attempts": 0}, {"pg_id": 2, "rem_attempts": 1}])
+        {"pg_id": 1, "rem_attempts": 0, "labels": [rem_mod.ONT.fact]},
+        {"pg_id": 2, "rem_attempts": 1, "labels": [rem_mod.ONT.decision]}])
     mock_session.run = AsyncMock(return_value=mock_result)
 
-    pg_ids, attempts = await daemon._fetch_non_rem_batch()
+    pg_ids, attempts, labels = await daemon._fetch_non_rem_batch()
 
     assert pg_ids == [1, 2]
     assert attempts == {1: 0, 2: 1}
+    assert labels == {1: rem_mod.ONT.fact, 2: rem_mod.ONT.decision}
     fetch_call = mock_session.run.call_args_list[0]
     cypher = fetch_call.args[0]
-    assert "ORDER BY coalesce(n.rem_attempts, 0) ASC, n.pg_id ASC" in cypher
+    assert "ORDER BY coalesce(n.rem_pickups, 0) ASC" in cypher
+    assert "coalesce(n.rem_attempts, 0) ASC, n.pg_id ASC" in cypher
+    # the CAP is keyed on attempts alone — pickups must never gate selection
     assert "coalesce(n.rem_attempts, 0) < $max_attempts" in cypher
+    assert "rem_pickups, 0) < $max_attempts" not in cypher
+    assert "coalesce(n.rem_invalid, false) = false" in cypher
     assert fetch_call.kwargs["max_attempts"] == rem_mod.REM_MAX_ATTEMPTS
     # a second query counts the dead-lettered records for the cycle log
     dead_cypher = mock_session.run.call_args_list[1].args[0]
     assert ">= $max_attempts" in dead_cypher and "count(n)" in dead_cypher
+
+
+@pytest.mark.asyncio
+async def test_mark_node_invalid_is_label_qualified():
+    """The invalid node and the real record SHARE a pg_id, so an unqualified
+    MATCH would retire the healthy twin. Nothing is deleted."""
+    daemon, mock_session = _make_daemon()
+    mock_session.run = AsyncMock()
+
+    await daemon._mark_node_invalid(534, rem_mod.ONT.fact, "label_mismatch")
+
+    cypher = mock_session.run.call_args.args[0]
+    assert f"MATCH (n:{rem_mod.ONT.fact} {{pg_id: $pg_id}})" in cypher
+    assert "rem_invalid = true" in cypher and "rem_processed = true" in cypher
+    assert "DELETE" not in cypher.upper()
+
+
+@pytest.mark.asyncio
+async def test_mark_node_invalid_refuses_unlabelled_node():
+    """No label = no safe way to target the invalid node without risking its
+    twin. Refuse loudly rather than write an unqualified MATCH."""
+    daemon, mock_session = _make_daemon()
+    mock_session.run = AsyncMock()
+
+    await daemon._mark_node_invalid(534, "", "no_postgres_record")
+
+    mock_session.run.assert_not_awaited()
 
 
 # ── _write_neo4j_rem — rem_processed set last ─────────────────────────────────
@@ -1019,13 +1055,24 @@ def test_rem_and_nrem_priority_lock_keys_match():
 # run_cycle with every I/O boundary stubbed so cycle-level behaviour is
 # testable.
 
-def _cycle_daemon(monkeypatch, pg_ids, kinds, *, queuing=None, attempts=None):
+def _cycle_daemon(monkeypatch, pg_ids, kinds, *, queuing=None, attempts=None,
+                  labels=None, content_map=None):
     daemon, _ = _make_daemon()
     attempts = attempts or {p: 0 for p in pg_ids}
-    content_map = {p: {"content": "c", "kind": kinds[p], "created_at": None}
-                   for p in pg_ids}
+    if content_map is None:
+        content_map = {p: {"content": "c", "kind": kinds[p], "created_at": None}
+                       for p in pg_ids}
+    # Default: the selected label agrees with the Postgres kind (a healthy graph).
+    _k2l = {rem_mod.KIND_FACT:     rem_mod.ONT.fact,
+            rem_mod.KIND_DECISION: rem_mod.ONT.decision,
+            rem_mod.KIND_RETRO:    rem_mod.ONT.retrospective}
+    if labels is None:
+        labels = {p: _k2l[kinds[p]] for p in pg_ids}
 
-    daemon._fetch_non_rem_batch = AsyncMock(return_value=(list(pg_ids), attempts))
+    daemon._fetch_non_rem_batch = AsyncMock(
+        return_value=(list(pg_ids), attempts, labels))
+    daemon._bump_rem_pickups = AsyncMock()
+    daemon._mark_node_invalid = AsyncMock()
     daemon._open_pg_conn = lambda: MagicMock()
     daemon._recent_write_happened = AsyncMock(return_value=False)
     daemon._filter_applied_in_outbox = AsyncMock(return_value=list(pg_ids))
@@ -1069,6 +1116,114 @@ async def test_run_cycle_yields_to_nrem_between_solo_records(monkeypatch):
 
     assert seen == [11], f"must stop at the next record boundary, processed {seen}"
     assert processed == 1 and attempted == 1
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_retires_node_selected_under_the_wrong_label(monkeypatch):
+    """THE BLOCKER (820). A phantom :Fact node was MERGEd on a pg_id whose real
+    record is a decision. REM selects that node, but resolves the kind from
+    Postgres and marks the anchor THAT kind implies — the real :Decision — so
+    the node it actually selected is never marked and is re-selected every
+    cycle forever. Seven such nodes held three of five queue slots.
+
+    The cycle must notice the label disagrees, retire THAT node, and not hand
+    it to the LLM."""
+    ids = [534]
+    kinds = {534: rem_mod.KIND_DECISION}          # Postgres says decision …
+    daemon = _cycle_daemon(monkeypatch, ids, kinds,
+                           labels={534: rem_mod.ONT.fact})   # … graph says Fact
+    daemon._process_fact = AsyncMock(return_value=True)
+
+    processed, attempted = await daemon.run_cycle()
+
+    daemon._process_fact.assert_not_awaited()
+    daemon._mark_node_invalid.assert_awaited_once()
+    pg_id, label, reason = daemon._mark_node_invalid.await_args.args
+    assert pg_id == 534
+    assert label == rem_mod.ONT.fact, "must retire the SELECTED node, not its twin"
+    assert "label_mismatch" in reason
+    # A corrupt write is not evidence about the record: no attempt charged,
+    # so the phantom can never march the real record toward dead-letter.
+    daemon._bump_rem_attempts.assert_not_awaited()
+    assert processed == 0 and attempted == 0
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_retires_node_with_no_postgres_record(monkeypatch):
+    """Same class: a node whose pg_id has no technical_docs row can never be
+    processed. It used to be skipped with a warning — and so re-selected
+    forever, holding a slot no work could free."""
+    daemon = _cycle_daemon(monkeypatch, [999], {999: rem_mod.KIND_FACT},
+                           content_map={})
+    daemon._process_fact = AsyncMock(return_value=True)
+
+    processed, attempted = await daemon.run_cycle()
+
+    daemon._process_fact.assert_not_awaited()
+    _, _, reason = daemon._mark_node_invalid.await_args.args
+    assert reason == "no_postgres_record"
+    assert processed == 0 and attempted == 0
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_charges_a_pickup_before_the_llm_call(monkeypatch):
+    """ABANDONMENT accounting (819) — the case no existing test exercised.
+    The pickup must be durable BEFORE the expensive call, so a record that is
+    picked up and never finishes (crash, early return, killed cycle) still
+    rotates. A failure-only counter left it charged nothing, unrotated, and
+    permanently at the queue head."""
+    order = []
+    daemon = _cycle_daemon(monkeypatch, [11], {11: rem_mod.KIND_DECISION})
+    daemon._bump_rem_pickups = AsyncMock(side_effect=lambda ids: order.append(("pickup", tuple(ids))))
+
+    async def _abandon(pg_id, *a, **k):
+        order.append(("call", pg_id))
+        raise RuntimeError("cycle killed mid-generation")
+    daemon._process_fact = _abandon
+
+    with pytest.raises(RuntimeError):
+        await daemon.run_cycle()
+
+    assert order == [("pickup", (11,)), ("call", 11)], (
+        "the pickup must be written before the call, or abandonment is invisible")
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_does_not_charge_pickups_to_records_the_yield_never_reached(monkeypatch):
+    """The counterweight to the test above, and the line the fix must not
+    cross: a solo record the arbiter yield never reached was NOT picked up.
+    Rotating it would hide the very tail the counter exists to expose — and
+    charging a whole selected batch up front is how wave A′ finding F1 charged
+    five records for work never attempted."""
+    ids = [11, 12, 13]
+    probes = {"n": 0}
+    def _queuing(_conn):
+        probes["n"] += 1
+        return probes["n"] > 2          # free at cycle start + record 11, then queued
+    daemon = _cycle_daemon(monkeypatch, ids, {i: rem_mod.KIND_DECISION for i in ids},
+                           queuing=_queuing)
+    daemon._process_fact = AsyncMock(return_value=True)
+
+    await daemon.run_cycle()
+
+    bumped = [i for call in daemon._bump_rem_pickups.await_args_list for i in call.args[0]]
+    assert bumped == [11], f"only the reached record rotates, got {bumped}"
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_bulk_charges_pickups_for_a_batched_call(monkeypatch):
+    """Every member of a batched call really is handed to the LLM, so all of
+    them rotate. Safe precisely because pickups feed rotation only and never
+    the dead-letter cap — a batch-wide 503 still charges no ATTEMPT."""
+    ids = [21, 22, 23]
+    daemon = _cycle_daemon(monkeypatch, ids, {i: rem_mod.KIND_FACT for i in ids})
+    daemon._llm_process_batch = AsyncMock(return_value=(None, None, "m"))
+
+    await daemon.run_cycle()
+
+    bumped = [i for call in daemon._bump_rem_pickups.await_args_list for i in call.args[0]]
+    assert sorted(bumped) == ids
+    daemon._bump_rem_attempts.assert_not_awaited()
 
 
 @pytest.mark.asyncio

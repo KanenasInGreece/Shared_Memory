@@ -5,6 +5,54 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.7.3] — 2026-07-20
+
+Bug fix. The enrichment queue could stop draining entirely: the same records were selected
+every cycle, none finished, and none was ever counted as having failed — so the safeguard
+that retires a record after repeated failures could never engage. Two independent causes,
+both of which produced records that were neither successes nor failures. Every safety
+mechanism in this daemon keys on one or the other, so a record that was merely *never
+finished* was invisible to all of them.
+
+### Fixed
+
+- **A graph node that cannot correspond to its record is now retired instead of recirculating
+  forever.** Enrichment selects a *node* from the graph, but resolves everything after that
+  from the record id — it looks the id up in the relational store, takes the record's type
+  from there, and writes its result to the node that type implies. When those two disagree,
+  the daemon enriches and marks one node while the node it actually selected is left
+  untouched and selected again on the very next cycle. This happened wherever an earlier
+  release had linked a decision to another decision it was based on: the link was attached to
+  a newly created, empty node of the wrong type. Such nodes are unprocessable by construction
+  and were holding queue slots no amount of work could free. The daemon now carries the
+  selected node's type through the cycle, compares it against the record's real type, and
+  retires any node that disagrees — flagged, kept in the graph for inspection, never deleted,
+  and matched by type so its healthy counterpart can never be touched. A node whose id has no
+  record at all is retired the same way. This is self-healing: an existing install clears its
+  own residue on the next cycle, with no manual repair.
+- **The queue now rotates, so the tail is reachable.** One counter was doing two jobs that
+  need opposite rules — deciding who is processed next, and deciding who has failed too often
+  to keep trying. Because it only counted failures, a record that was picked up but not
+  finished counted for nothing, so selection order never changed; the same records were always
+  first, and the point at which enrichment yields the reasoning backend to consolidation
+  always fell in the same place. Everything behind that point was structurally unreachable.
+  Selection is now ordered by a second counter that records every pickup regardless of
+  outcome, written before the expensive call so an interrupted cycle still counts. Retirement
+  still keys on the failure counter alone, so an infrastructure outage cannot retire a healthy
+  record however many times it is picked up. Neither counter ever decreases.
+- **Linking a decision to the record it was based on no longer invents an empty node.** The
+  older linking path assumed any cited id referred to a fact and created one when it found no
+  match. It now resolves what the id actually refers to and links to that record, creating a
+  placeholder only when no record node exists yet.
+
+### Added
+
+- A record picked up many times but never blamed for a failure is now a distinguishable
+  state — the signature of work that is being abandoned rather than failing, which previously
+  looked identical to a healthy idle record.
+
+---
+
 ## [0.7.2] — 2026-07-19
 
 Bug fix. A review of the previous release against the running system found that its new
