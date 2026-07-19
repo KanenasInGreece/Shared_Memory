@@ -922,6 +922,8 @@ async def test_handle_telemetry_rolls_up_postgres_and_neo4j():
     mock_session.run = AsyncMock(side_effect=[
         _result([{"rem": True, "con": True, "n": 96}, {"rem": False, "con": False, "n": 1}]),
         _result([{"rem": True, "n": 4}, {"rem": False, "n": 71}]),
+        # rem_attempts distribution over pending records
+        _result([{"a": 0, "n": 60}, {"a": 2, "n": 9}, {"a": 5, "n": 3}]),
     ])
 
     resp = await c.handle_telemetry(_make_request({}))
@@ -936,6 +938,11 @@ async def test_handle_telemetry_rolls_up_postgres_and_neo4j():
     assert t["neo4j"]["facts_unconsolidated"] == 0   # only rem=True & con=False counts; here 96 are consolidated
     assert t["neo4j"]["decisions_total"] == 75
     assert t["neo4j"]["decisions_rem_pending"] == 71
+    # F5: records REM has given up on are visible, not just silently absent
+    # from its queue while still counted as "pending".
+    assert t["neo4j"]["rem_dead_lettered"] == 3
+    assert t["neo4j"]["rem_failing"] == 9
+    assert t["neo4j"]["rem_max_attempts"] == 5
 
 
 @pytest.mark.asyncio
@@ -949,6 +956,7 @@ async def test_handle_telemetry_survives_partial_backend_failure():
     mock_session.run = AsyncMock(side_effect=[
         _result([{"rem": True, "con": False, "n": 5}]),
         _result([{"rem": False, "n": 2}]),
+        _result([{"a": 0, "n": 2}]),
     ])
 
     resp = await c.handle_telemetry(_make_request({}))

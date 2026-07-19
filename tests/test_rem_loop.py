@@ -752,15 +752,26 @@ def _length_resp(content):
     return _Resp()
 
 
+def _ok_resp(content):
+    class _Resp:
+        status_code = 200
+        headers = {}
+        def json(self):
+            return {"choices": [{"finish_reason": "stop", "message": {"content": content}}]}
+    return _Resp()
+
+
 @pytest.mark.asyncio
 async def test_llm_process_solo_truncated_fails_unit_no_repair(monkeypatch):
     """A length-finish solo response returns None and NEVER reaches
-    _parse_llm_json/json_repair — a partial enrichment is not salvaged."""
+    _parse_llm_json/json_repair — a partial enrichment is not salvaged.
+    The bound is widened once first (F4), but a second length-finish still
+    fails the unit and classifies the failure as truncation."""
     daemon, _ = _make_daemon()
     monkeypatch.delenv("MOCK_LLM", raising=False)
-    captured = {}
+    bounds = []
     async def _fake_post(self, url, **kwargs):
-        captured.update(kwargs.get("json", {}))
+        bounds.append(kwargs.get("json", {})["max_tokens"])
         # plausibly-complete JSON body — the length-finish must still reject it
         return _length_resp('{"summary":"partial","relationships":[]}')
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
@@ -770,8 +781,77 @@ async def test_llm_process_solo_truncated_fails_unit_no_repair(monkeypatch):
 
     assert result is None
     parse.assert_not_called()
-    from rem_loop import REM_MAX_TOKENS_SOLO
-    assert captured["max_tokens"] == REM_MAX_TOKENS_SOLO
+    from rem_loop import REM_MAX_TOKENS_SOLO, REM_TRUNCATION_RETRY_FACTOR
+    assert bounds == [REM_MAX_TOKENS_SOLO,
+                      int(REM_MAX_TOKENS_SOLO * REM_TRUNCATION_RETRY_FACTOR)]
+    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRUNCATED
+
+
+@pytest.mark.asyncio
+async def test_llm_process_solo_truncation_retry_succeeds_at_wider_bound(monkeypatch):
+    """F4: a record that just needs more room succeeds on the widened retry
+    instead of marching toward a silent dead-letter."""
+    daemon, _ = _make_daemon()
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    bounds = []
+    async def _fake_post(self, url, **kwargs):
+        bounds.append(kwargs.get("json", {})["max_tokens"])
+        if len(bounds) == 1:
+            return _length_resp('{"summary":"cut","relationships":[]}')
+        return _ok_resp('{"summary":"complete","relationships":[]}')
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
+
+    result, _model = await daemon._llm_process("content", rem_mod.KIND_FACT, [], {}, pg_id=1)
+
+    assert result == {"summary": "complete", "relationships": []}
+    assert len(bounds) == 2 and bounds[1] > bounds[0]
+    assert daemon._last_llm_failure is None
+
+
+@pytest.mark.asyncio
+async def test_solo_transport_failure_does_not_charge_an_attempt(monkeypatch):
+    """F1: an HTTP failure is evidence about the backend, not the record —
+    it must never count toward the dead-letter cap."""
+    daemon, _ = _make_daemon()
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    async def _fake_post(self, url, **kwargs):
+        class R:
+            status_code = 503
+            text = "no free slot"
+            headers = {}
+        return R()
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
+
+    with patch.object(daemon, "_bump_rem_attempts", new=AsyncMock()) as bump:
+        ok = await daemon._process_fact(7, "content", rem_mod.KIND_FACT, [], {},
+                                        None, asyncio.get_running_loop())
+
+    assert ok is False
+    bump.assert_not_awaited()
+    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
+
+
+@pytest.mark.asyncio
+async def test_batch_transport_failure_charges_no_record(monkeypatch):
+    """F1 core: one pool 503 must not demote a whole batch to solo. The call
+    returns None (not {}) so run_cycle can tell 'call failed' from 'this line
+    was missing', and no record's attempt counter moves."""
+    daemon, _ = _make_daemon()
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    async def _fake_post(self, url, **kwargs):
+        class R:
+            status_code = 503
+            text = "no free slot"
+            headers = {}
+        return R()
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
+
+    items = [{"pg_id": i, "content": "c", "manifest": {}} for i in (1, 2, 3)]
+    results, timing, _model = await daemon._llm_process_batch(items, [])
+
+    assert results is None, "a failed CALL must be distinguishable from empty results"
+    assert timing is None
+    assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRANSPORT
 
 
 @pytest.mark.asyncio
@@ -874,3 +954,168 @@ async def test_revert_rem_mark_targets_kind_anchor_label():
     daemon2, session2 = _make_daemon()
     await daemon2._revert_rem_mark(8, KIND_RETRO)
     assert f"(n:{ONT.retrospective}" in session2.run.call_args.args[0]
+
+
+# ── F2: the REM/NREM slot arbiter ────────────────────────────────────────────
+
+class _ProbeConn:
+    """Minimal psycopg2-shaped conn whose advisory-lock probe returns `got`."""
+    def __init__(self, got, raises=False):
+        self._got, self._raises = got, raises
+        self.executed = []
+
+    def cursor(self):
+        outer = self
+
+        class _Cur:
+            def __enter__(self_inner): return self_inner
+            def __exit__(self_inner, *a): return False
+            def execute(self_inner, sql, params=None):
+                if outer._raises:
+                    raise RuntimeError("probe boom")
+                outer.executed.append(sql)
+            def fetchone(self_inner):
+                return (outer._got,)
+        return _Cur()
+
+
+def test_nrem_is_queuing_false_when_lock_is_free():
+    """Probe acquires the lock → nobody was queuing → REM proceeds, and the
+    probe must RELEASE what it took so it does not block NREM itself."""
+    conn = _ProbeConn(got=True)
+    assert rem_mod._nrem_is_queuing(conn) is False
+    assert any("pg_advisory_unlock" in s for s in conn.executed), \
+        "the probe must release the lock it acquired"
+
+
+def test_nrem_is_queuing_true_when_nrem_holds_it():
+    """Probe cannot acquire → NREM is queuing for the slot → REM yields."""
+    assert rem_mod._nrem_is_queuing(_ProbeConn(got=False)) is True
+
+
+def test_nrem_is_queuing_fails_open():
+    """A probe error must never block enrichment — the arbiter is an
+    optimisation, not a correctness gate."""
+    assert rem_mod._nrem_is_queuing(_ProbeConn(got=False, raises=True)) is False
+
+
+def test_rem_and_nrem_priority_lock_keys_match():
+    """The arbiter only works if both daemons name the SAME advisory lock."""
+    spec = importlib.util.spec_from_file_location(
+        "consolidation_loop_for_key",
+        os.path.join(os.path.dirname(__file__), "..", "shared-memory",
+                     "scripts", "consolidation_loop.py"))
+    cl = importlib.util.module_from_spec(spec)
+    sys.modules["consolidation_loop_for_key"] = cl
+    spec.loader.exec_module(cl)
+    assert (cl.NREM_PRIORITY_ADVISORY_LOCK_KEY
+            == rem_mod.NREM_PRIORITY_ADVISORY_LOCK_KEY)
+    assert cl.NREM_PRIORITY_ADVISORY_LOCK_KEY != rem_mod.BACKUP_ADVISORY_LOCK_KEY
+
+
+# ── run_cycle composition harness ────────────────────────────────────────────
+# The fix-wave's defects were all in how independently-correct mechanisms
+# COMPOSED — which per-function unit tests cannot see. This drives the real
+# run_cycle with every I/O boundary stubbed so cycle-level behaviour is
+# testable.
+
+def _cycle_daemon(monkeypatch, pg_ids, kinds, *, queuing=None, attempts=None):
+    daemon, _ = _make_daemon()
+    attempts = attempts or {p: 0 for p in pg_ids}
+    content_map = {p: {"content": "c", "kind": kinds[p], "created_at": None}
+                   for p in pg_ids}
+
+    daemon._fetch_non_rem_batch = AsyncMock(return_value=(list(pg_ids), attempts))
+    daemon._open_pg_conn = lambda: MagicMock()
+    daemon._recent_write_happened = AsyncMock(return_value=False)
+    daemon._filter_applied_in_outbox = AsyncMock(return_value=list(pg_ids))
+    daemon._batch_fetch_content = AsyncMock(return_value=content_map)
+    daemon._fetch_existing_edges = AsyncMock(return_value={})
+    daemon._fetch_closed_entity_set = AsyncMock(return_value=[])
+    daemon._bump_rem_attempts = AsyncMock()
+
+    monkeypatch.setattr(rem_mod, "_take_shared_backup_lock", lambda c: True)
+    monkeypatch.setattr(rem_mod, "pool_has_free_slot", AsyncMock(return_value=True))
+    monkeypatch.setattr(rem_mod, "build_manifest", lambda row, edges: {})
+    monkeypatch.setattr(rem_mod, "_build_entity_registry", lambda cs: {})
+    monkeypatch.setattr(rem_mod, "_nrem_is_queuing", queuing or (lambda c: False))
+    return daemon
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_yields_to_nrem_between_solo_records(monkeypatch):
+    """F2 granularity: a cycle holding several solo records re-checks the
+    arbiter BETWEEN them. Checking only at cycle start let REM own the single
+    LLM slot for the whole cycle (~20 min per record) while NREM's queue
+    expired — the same starvation, on a longer clock."""
+    ids = [11, 12, 13]
+    kinds = {i: rem_mod.KIND_DECISION for i in ids}
+
+    # Probe 1 = the cycle-start gate, probe 2 = record 11's pre-check (both
+    # free), probe 3 = record 12's pre-check — NREM has queued by then.
+    probes = {"n": 0}
+    def _queuing(_conn):
+        probes["n"] += 1
+        return probes["n"] > 2
+    daemon = _cycle_daemon(monkeypatch, ids, kinds, queuing=_queuing)
+
+    seen = []
+    async def _fake(pg_id, *a, **k):
+        seen.append(pg_id)
+        return True
+    daemon._process_fact = _fake
+
+    processed, attempted = await daemon.run_cycle()
+
+    assert seen == [11], f"must stop at the next record boundary, processed {seen}"
+    assert processed == 1 and attempted == 1
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_processes_all_when_nrem_is_idle(monkeypatch):
+    """The arbiter must not throttle REM when nothing is queuing for the slot."""
+    ids = [11, 12, 13]
+    kinds = {i: rem_mod.KIND_DECISION for i in ids}
+    daemon = _cycle_daemon(monkeypatch, ids, kinds)
+
+    seen = []
+    async def _fake(pg_id, *a, **k):
+        seen.append(pg_id)
+        return True
+    daemon._process_fact = _fake
+
+    processed, attempted = await daemon.run_cycle()
+
+    assert seen == ids and processed == 3 and attempted == 3
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_batch_transport_failure_charges_nobody(monkeypatch):
+    """F1 at cycle level: a failed batch CALL leaves every record's attempt
+    counter untouched, so none of them is demoted out of the batched path."""
+    ids = [21, 22, 23]
+    kinds = {i: rem_mod.KIND_FACT for i in ids}
+    daemon = _cycle_daemon(monkeypatch, ids, kinds)
+    # results=None signals the call itself failed
+    daemon._llm_process_batch = AsyncMock(return_value=(None, None, "m"))
+
+    processed, attempted = await daemon.run_cycle()
+
+    assert processed == 0 and attempted == 3
+    daemon._bump_rem_attempts.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_batch_missing_line_charges_only_that_record(monkeypatch):
+    """The complement: when the call SUCCEEDS, a record whose line is missing
+    is chargeable — that is real evidence about that record."""
+    ids = [21, 22]
+    kinds = {i: rem_mod.KIND_FACT for i in ids}
+    daemon = _cycle_daemon(monkeypatch, ids, kinds)
+    daemon._llm_process_batch = AsyncMock(
+        return_value=({21: {"relationships": []}}, None, "m"))
+    daemon._apply_fact_result = AsyncMock(return_value=True)
+
+    await daemon.run_cycle()
+
+    daemon._bump_rem_attempts.assert_awaited_once_with([22])
