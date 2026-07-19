@@ -2165,7 +2165,7 @@ class REMDaemon:
                         conn, loop, manifest=it["manifest"], run_id=run_id):
                     processed += 1
 
-            for pg_id, kind in solo_ids:
+            for solo_done, (pg_id, kind) in enumerate(solo_ids):
                 # F2: yield at RECORD boundaries, not just cycle boundaries.
                 # A cycle can hold up to BATCH_SIZE solo records at ~20 minutes
                 # each, so a cycle-start-only check let REM own the slot for
@@ -2174,8 +2174,8 @@ class REMDaemon:
                 if await loop.run_in_executor(None, lambda: _nrem_is_queuing(conn)):
                     logger.info(
                         "REM: NREM is queuing for the LLM slot — yielding after "
-                        "%d/%d record(s); the rest retry next cycle.",
-                        processed, len(solo_ids))
+                        "%d/%d solo record(s) handled; the rest retry next cycle.",
+                        solo_done, len(solo_ids))
                     break
                 attempted += 1
                 if await self._process_fact(
