@@ -497,13 +497,15 @@ def _thematic_conn_script(insert_id=90):
             (1, "general", "fact", "tests/test_x.py", d),
             (2, "general", "fact", None, d),
         ]},
-        # 2. previous summary fetch
+        # 2. fold dead-letter counts (own-conn SELECT; empty → no dead-lettering)
         {"rowcount": 0, "rows": []},
-        # 3. summary INSERT  4. outbox flip  5. supersession SELECT
+        # 3. previous summary fetch
+        {"rowcount": 0, "rows": []},
+        # 4. summary INSERT  5. outbox flip  6. supersession SELECT
         {"rowcount": 1, "rows": [(insert_id,)]},
         {"rowcount": 2, "rows": []},
         {"rowcount": 0, "rows": []},
-        # 6. close_ledger_rows DELETE  7. superseded-predecessor purge
+        # 7. close_ledger_rows DELETE  8. superseded-predecessor purge
         {"rowcount": 2, "rows": [(11, 1), (12, 2)]},
         {"rowcount": 0, "rows": []},
     ]
@@ -685,6 +687,7 @@ def test_cyclerec_extra_carries_all_stage5_fields():
         "machine_edges_consumed": 2,
         "preservation_retries": 1,
         "preservation_failures": 1,
+        "truncation_failures": 0,
         "calibration": {"entity_relation": True, "evidential": False},
         "preservation_failed": ["E/general"],
     }
@@ -713,3 +716,74 @@ def test_fetch_calibration_gate_reads_ledger(monkeypatch):
     assert gate[rc.FAMILY_EVIDENTIAL]["calibrated"] is False
     assert gate[rc.FAMILY_ENTITY]["threshold"] == rc.CONSUME_THRESHOLD[rc.FAMILY_ENTITY]
     assert conn.closed
+
+
+# ── Fix-wave: NREM truncation is a capacity failure, NOT a preservation miss ───
+# A length-finish draft can PASS the anchor check (the gate detects omission, not
+# truncation), so it must be discarded BEFORE the gate, counted separately, and
+# never persisted / never spend the corrective retry.
+
+@pytest.mark.asyncio
+async def test_generate_summary_truncated_sets_flag_and_bounds_tokens(monkeypatch):
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    captured = {}
+    async def fake_post(client, payload, ceiling_s=None):
+        captured.update(payload)
+        class R:
+            status_code = 200
+            def json(self):
+                return {"choices": [{"finish_reason": "length",
+                                     "message": {"content": "partial narrative"}}]}
+        return R()
+    monkeypatch.setattr(cl, "_post_nrem", fake_post)
+    daemon, _ = daemon_with_fake_graph()
+    daemon._last_llm_truncated = False
+
+    out = await daemon.generate_summary("TestEntity", ["fact one", "fact two"])
+    assert out is None
+    assert daemon._last_llm_truncated is True
+    assert captured["max_tokens"] == cl.NREM_MAX_TOKENS_SUMMARY
+
+
+@pytest.mark.asyncio
+async def test_thematic_truncated_summary_off_gate_not_written(monkeypatch):
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    daemon, _ = daemon_with_fake_graph()
+    conn = StubConn(script=_thematic_conn_script())
+    finish = {}
+    _wire_thematic(monkeypatch, daemon, conn, finish)
+
+    async def _truncated_summary(*a, **k):
+        daemon._last_llm_truncated = True
+        return ""     # falsy draft on a length-finish
+    daemon.generate_summary = _truncated_summary
+
+    await daemon._consolidate_clusters([_CLUSTER], gate=_gate())
+
+    assert not any(s.startswith("INSERT INTO community_summaries") for s, _ in conn.executed)
+    extra = finish["kwargs"]["extra"]
+    assert extra["truncation_failures"] == 1
+    assert extra["preservation_retries"] == 0     # gate never engaged
+    assert extra["preservation_failures"] == 0
+    assert finish["args"][2:5] == (1, 0, 1)       # attempted / succeeded / failed
+
+
+@pytest.mark.asyncio
+async def test_insight_truncated_off_gate_not_written(monkeypatch):
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    daemon, _ = daemon_with_fake_graph([FakeResult([]), FakeResult([])])
+    daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
+    conn = StubConn(script=_fold_script_two_decisions())
+    cyc = _CycleRec()
+
+    async def _truncated_insight(*a, **k):
+        daemon._last_llm_truncated = True
+        return ""
+    daemon.generate_insight = _truncated_insight
+
+    ok = await daemon._fold_insight(conn, "OutboxPattern", [245, 267], gate=_gate(), cyc=cyc)
+
+    assert ok is False
+    assert cyc.truncation_failures == 1
+    assert cyc.preservation_retries == 0 and cyc.preservation_failures == 0
+    assert not any(s.startswith("INSERT INTO community_summaries") for s, _ in conn.executed)

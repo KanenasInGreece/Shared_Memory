@@ -177,19 +177,28 @@ async def test_llm_process_mock_retrospective_no_extras():
 # ── _fetch_non_rem_batch ordering ─────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_fetch_non_rem_batch_orders_by_pg_id_asc():
-    """Query must include ORDER BY pg_id ASC to process oldest facts first."""
+async def test_fetch_non_rem_batch_orders_attempts_first_then_pg_id():
+    """Queue rotation: fresh records first (attempts ASC), oldest-first within
+    the same attempt count; dead-lettered records (>= REM_MAX_ATTEMPTS)
+    excluded. Returns (pg_ids, attempts_map) so run_cycle can demote."""
     daemon, mock_session = _make_daemon()
     mock_result = MagicMock()
-    mock_result.data = AsyncMock(return_value=[{"pg_id": 1}, {"pg_id": 2}])
+    mock_result.data = AsyncMock(return_value=[
+        {"pg_id": 1, "rem_attempts": 0}, {"pg_id": 2, "rem_attempts": 1}])
     mock_session.run = AsyncMock(return_value=mock_result)
 
-    result = await daemon._fetch_non_rem_batch()
+    pg_ids, attempts = await daemon._fetch_non_rem_batch()
 
-    assert result == [1, 2]
-    cypher_call = mock_session.run.call_args.args[0]
-    assert "ORDER BY" in cypher_call
-    assert "ASC"      in cypher_call
+    assert pg_ids == [1, 2]
+    assert attempts == {1: 0, 2: 1}
+    fetch_call = mock_session.run.call_args_list[0]
+    cypher = fetch_call.args[0]
+    assert "ORDER BY coalesce(n.rem_attempts, 0) ASC, n.pg_id ASC" in cypher
+    assert "coalesce(n.rem_attempts, 0) < $max_attempts" in cypher
+    assert fetch_call.kwargs["max_attempts"] == rem_mod.REM_MAX_ATTEMPTS
+    # a second query counts the dead-lettered records for the cycle log
+    dead_cypher = mock_session.run.call_args_list[1].args[0]
+    assert ">= $max_attempts" in dead_cypher and "count(n)" in dead_cypher
 
 
 # ── _write_neo4j_rem — rem_processed set last ─────────────────────────────────
@@ -301,7 +310,7 @@ async def test_fetch_non_rem_batch_selects_all_three_anchor_kinds():
     from rem_loop import ONT
     await daemon._fetch_non_rem_batch()
 
-    cypher = mock_session.run.call_args.args[0]
+    cypher = mock_session.run.call_args_list[0].args[0]
     assert ONT.fact in cypher and ONT.decision in cypher
     assert ONT.retrospective in cypher
     assert "OR" in cypher
@@ -710,3 +719,158 @@ def test_llm_process_batch_mock(monkeypatch):
     assert out[2]["summary"]              # long → produced
     assert timing is None          # MOCK_LLM path runs no real call → no timing
     assert model == "mock"
+
+
+# ── Fix-wave: truncation FAILS the unit (finish_reason='length') ──────────────
+# "a bound that processes but gives incomplete saves is worse than no bound at
+# all" — every max_tokens ships WITH length-detection; a truncated body is never
+# parsed/repaired, and each site's max_tokens is the per-site bound.
+
+def test_finish_reason_reads_choice_level():
+    from rem_loop import _finish_reason
+    assert _finish_reason({"choices": [{"finish_reason": "length", "message": {"content": ""}}]}) == "length"
+    assert _finish_reason({"choices": [{"finish_reason": "stop"}]}) == "stop"
+    assert _finish_reason({"choices": [{}]}) is None
+    assert _finish_reason({"choices": []}) is None
+    assert _finish_reason({}) is None
+
+
+def test_truncated_true_only_on_length():
+    from rem_loop import _truncated
+    assert _truncated({"choices": [{"finish_reason": "length"}]}) is True
+    assert _truncated({"choices": [{"finish_reason": "stop"}]}) is False
+    assert _truncated({"choices": [{}]}) is False
+    assert _truncated({}) is False
+
+
+def _length_resp(content):
+    class _Resp:
+        status_code = 200
+        headers = {}
+        def json(self):
+            return {"choices": [{"finish_reason": "length", "message": {"content": content}}]}
+    return _Resp()
+
+
+@pytest.mark.asyncio
+async def test_llm_process_solo_truncated_fails_unit_no_repair(monkeypatch):
+    """A length-finish solo response returns None and NEVER reaches
+    _parse_llm_json/json_repair — a partial enrichment is not salvaged."""
+    daemon, _ = _make_daemon()
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    captured = {}
+    async def _fake_post(self, url, **kwargs):
+        captured.update(kwargs.get("json", {}))
+        # plausibly-complete JSON body — the length-finish must still reject it
+        return _length_resp('{"summary":"partial","relationships":[]}')
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
+
+    with patch.object(rem_mod, "_parse_llm_json") as parse:
+        result, _model = await daemon._llm_process("content", rem_mod.KIND_FACT, [], {}, pg_id=1)
+
+    assert result is None
+    parse.assert_not_called()
+    from rem_loop import REM_MAX_TOKENS_SOLO
+    assert captured["max_tokens"] == REM_MAX_TOKENS_SOLO
+
+
+@pytest.mark.asyncio
+async def test_llm_process_batch_max_tokens_scales_per_fact_and_summary(monkeypatch):
+    """Batch bound = REM_MAX_TOKENS_PER_FACT×facts + REM_MAX_TOKENS_PER_SUMMARY×(facts needing a summary)."""
+    from rem_loop import (REM_MAX_TOKENS_PER_FACT, REM_MAX_TOKENS_PER_SUMMARY,
+                          REM_SUMMARY_THRESHOLD)
+    daemon, _ = _make_daemon()
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    items = [{"pg_id": 1, "content": "short", "manifest": {}},
+             {"pg_id": 2, "content": "x" * (REM_SUMMARY_THRESHOLD + 50), "manifest": {}}]
+    captured = {}
+    class _Resp:
+        status_code = 200
+        headers = {}
+        def json(self):
+            return {"choices": [{"finish_reason": "stop", "message": {"content":
+                '{"idx":0,"relationships":[]}\n{"idx":1,"relationships":[],"summary":"s"}'}}]}
+    async def _fake_post(self, url, **kwargs):
+        captured.update(kwargs.get("json", {}))
+        return _Resp()
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
+
+    await daemon._llm_process_batch(items, [])
+    assert captured["max_tokens"] == REM_MAX_TOKENS_PER_FACT * 2 + REM_MAX_TOKENS_PER_SUMMARY * 1
+
+
+def test_parse_jsonl_batch_truncated_drops_final_line_and_is_strict_only():
+    """truncated=True drops the final (under-the-knife) line AND parses the rest
+    strictly — json_repair NEVER runs, so a repairable-only line is skipped."""
+    daemon, _ = _make_daemon()
+    idx_to_pg = {0: 10, 1: 11, 2: 12}
+    raw = ('{"idx":0,"relationships":[]}\n'
+           '{"idx":1,"relationships":[],}\n'     # trailing comma: invalid strict, repairable
+           '{"idx":2,"relationships":[')          # incomplete final line
+    out = daemon._parse_jsonl_batch(raw, idx_to_pg, truncated=True)
+    assert 10 in out          # strict-valid line kept
+    assert 11 not in out      # repairable-only line NOT salvaged under truncation
+    assert 12 not in out      # final line dropped unconditionally
+
+
+def test_parse_jsonl_batch_untruncated_repairs_lines():
+    """Contrast: without truncation, json_repair salvages the same slip."""
+    daemon, _ = _make_daemon()
+    idx_to_pg = {0: 10, 1: 11}
+    raw = ('{"idx":0,"relationships":[]}\n'
+           '{"idx":1,"relationships":[],}')      # trailing comma → repaired
+    out = daemon._parse_jsonl_batch(raw, idx_to_pg, truncated=False)
+    assert 10 in out and 11 in out
+
+
+@pytest.mark.asyncio
+async def test_llm_verify_call_truncated_returns_none_and_bounds_tokens(monkeypatch):
+    """A truncated verification is a FAILED call (returns None → k degrades);
+    max_tokens = max(FLOOR, PER_VERIFY_EDGE × n_edges)."""
+    from rem_loop import REM_MAX_TOKENS_PER_VERIFY_EDGE, REM_VERIFY_MAX_TOKENS_FLOOR
+    daemon, _ = _make_daemon()
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    captured = {}
+    async def _fake_post(self, url, **kwargs):
+        captured.update(kwargs.get("json", {}))
+        return _length_resp('{"idx":0,"confirm":true}')
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
+
+    result = await daemon._llm_verify_call("prompt", pg_id=1, n_edges=5)
+    assert result is None
+    assert captured["max_tokens"] == max(REM_VERIFY_MAX_TOKENS_FLOOR,
+                                         REM_MAX_TOKENS_PER_VERIFY_EDGE * 5)
+
+
+def test_verify_max_tokens_respects_floor():
+    """Few edges → the FLOOR (64) wins over the per-edge product (20×1)."""
+    from rem_loop import REM_MAX_TOKENS_PER_VERIFY_EDGE, REM_VERIFY_MAX_TOKENS_FLOOR
+    assert max(REM_VERIFY_MAX_TOKENS_FLOOR, REM_MAX_TOKENS_PER_VERIFY_EDGE * 1) == REM_VERIFY_MAX_TOKENS_FLOOR
+
+
+# ── Fix-wave: F5 stranded-row revert ─────────────────────────────────────────
+# A post-write failure must revert rem_processed=false (+1 attempt) so the record
+# re-enters the queue under the attempt cap instead of stranding at 'applied'.
+
+@pytest.mark.asyncio
+async def test_revert_rem_mark_unstrands_row_and_counts_attempt():
+    from rem_loop import ONT, KIND_FACT
+    daemon, session = _make_daemon()
+    await daemon._revert_rem_mark(42, KIND_FACT)
+    session.run.assert_awaited_once()
+    query = session.run.call_args.args[0]
+    assert f"(n:{ONT.fact}" in query
+    assert "rem_processed = false" in query
+    assert "rem_attempts = coalesce(n.rem_attempts, 0) + 1" in query
+    assert session.run.call_args.kwargs["pg_id"] == 42
+
+
+@pytest.mark.asyncio
+async def test_revert_rem_mark_targets_kind_anchor_label():
+    from rem_loop import ONT, KIND_DECISION, KIND_RETRO
+    daemon, session = _make_daemon()
+    await daemon._revert_rem_mark(7, KIND_DECISION)
+    assert f"(n:{ONT.decision}" in session.run.call_args.args[0]
+    daemon2, session2 = _make_daemon()
+    await daemon2._revert_rem_mark(8, KIND_RETRO)
+    assert f"(n:{ONT.retrospective}" in session2.run.call_args.args[0]

@@ -326,7 +326,7 @@ def test_verify_novel_edges_degrades_on_call_failure(monkeypatch):
                 {"name": "B", "rel_type": "MENTIONS"}]
     calls = iter([None, {0: True, 1: False}])   # 1st call fails, 2nd confirms A only
 
-    async def _fake_call(prompt, pg_id):
+    async def _fake_call(prompt, pg_id, n_edges=1):
         return next(calls)
     daemon._llm_verify_call = _fake_call
 
@@ -339,7 +339,7 @@ def test_verify_novel_edges_all_calls_fail_degrades_to_one_vote(monkeypatch):
     monkeypatch.delenv("MOCK_LLM", raising=False)
     daemon, _ = _make_daemon()
 
-    async def _fake_call(prompt, pg_id):
+    async def _fake_call(prompt, pg_id, n_edges=1):
         return None
     daemon._llm_verify_call = _fake_call
 

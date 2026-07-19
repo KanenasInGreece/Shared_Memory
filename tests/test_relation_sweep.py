@@ -546,3 +546,51 @@ def test_run_evidential_sweep_mock_end_to_end(monkeypatch):
                 if "INSERT INTO relation_adjudications" in s]
     assert len(ledgered) == 1 and ledgered[0][7] == "llm_sweep"
     assert conn.commits >= 1
+
+
+# ── Fix-wave: a truncated verdict batch is salvaged STRICTLY (no ledger poison) ─
+
+def test_parse_verdict_lines_truncated_drops_final_and_strict_only():
+    """truncated=True drops the final (under-the-knife) line AND parses strictly —
+    a repairable-only line is skipped so no repair-salvaged verdict is minted."""
+    raw = ('{"idx":0,"rel":"DEPENDS_ON","direction":"ab","confidence":0.8,"rationale":"r"}\n'
+           '{"idx":1 "rel":"none"}\n'           # missing comma: invalid strict, repairable
+           '{"idx":2,"rel":"CONSU')             # incomplete final line
+    out = relation_sweep._parse_verdict_lines(raw, "rel", truncated=True)
+    assert 0 in out          # strict-valid kept
+    assert 1 not in out      # repairable-only NOT salvaged under truncation
+    assert 2 not in out      # final line dropped
+
+
+def test_parse_verdict_lines_untruncated_repairs_the_slip():
+    """Contrast: without truncation, json_repair salvages the same missing-comma slip."""
+    raw = ('{"idx":0,"rel":"DEPENDS_ON"}\n'
+           '{"idx":1 "rel":"none"}')            # missing comma → repaired
+    out = relation_sweep._parse_verdict_lines(raw, "rel", truncated=False)
+    assert 0 in out and 1 in out
+
+
+def test_adjudicate_batch_truncated_bounds_tokens_and_drops_final(monkeypatch):
+    """max_tokens == MAX_TOKENS_PER_VERDICT × batch; a length-finish batch drops
+    its final line and never repair-salvages a verdict onto the ledger."""
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    captured = {}
+    class _TruncResp:
+        headers = {"X-SM-LLM-Backend": "gemma"}
+        def __init__(self, content): self._c = content
+        def raise_for_status(self): pass
+        def json(self):
+            return {"choices": [{"finish_reason": "length",
+                                 "message": {"content": self._c}}]}
+    resp = ('{"idx":0,"rel":"DEPENDS_ON","direction":"ab","confidence":0.8,"rationale":"r"}\n'
+            '{"idx":1,"rel":"none","direction":"ab","confidence":0.5,"rationale":"r"}\n'
+            '{"idx":2,"rel":"CONSU')             # truncated final line
+    def _post(*a, **k):
+        captured.update(k.get("json", {}))
+        return _TruncResp(resp)
+    monkeypatch.setattr(relation_sweep.httpx, "post", _post)
+
+    verdicts, _model = relation_sweep.adjudicate_batch([_cand(), _cand(), _cand()], {})
+    assert captured["max_tokens"] == relation_sweep.MAX_TOKENS_PER_VERDICT * 3
+    assert 0 in verdicts and 1 in verdicts     # complete strict lines kept
+    assert 2 not in verdicts                    # truncated final line dropped

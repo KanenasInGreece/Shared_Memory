@@ -117,6 +117,11 @@ REASONER_URL = os.environ.get("REASONER_URL", "http://localhost:8888/v1/chat/com
 # daemons' 0.6 default rather than a near-greedy value.
 LLM_TEMPERATURE = float(os.environ.get(
     "RELSWEEP_LLM_TEMPERATURE", os.environ.get("DREAM_TEMPERATURE", "0.6")))
+# Output bound: one verdict line per candidate — max_tokens = this × batch.
+# OPERATOR CONSTRAINT: a truncated response FAILS the unit (see _truncated) —
+# ledger rows are permanent (the don't-re-ask cache), so a repair-salvaged
+# verdict from a length-finish must never be written.
+MAX_TOKENS_PER_VERDICT = int(os.environ.get("RELSWEEP_MAX_TOKENS_PER_VERDICT", "120"))
 
 EVIDENCE_SNIPPET_CHARS = 400   # per shared fact shown to the LLM
 EVIDENCE_FACTS_PER_PAIR = 3    # sample of shared facts per candidate
@@ -271,7 +276,8 @@ def fetch_fact_snippets(conn, pg_ids: list[int]) -> dict[int, str]:
 
 def _parse_llm_json(candidate: str):
     """Strict json first; salvage Gemma-4 slips with json_repair (decision 491).
-    Lazy import so a missing dep doesn't break the module."""
+    Lazy import so a missing dep doesn't break the module. NEVER called on a
+    truncated (finish_reason='length') response — see _parse_verdict_lines."""
     try:
         return json.loads(candidate)
     except json.JSONDecodeError:
@@ -280,6 +286,69 @@ def _parse_llm_json(candidate: str):
             return json_repair.loads(candidate)
         except Exception:
             return None
+
+
+# MUST-mirror: rem_loop.py and consolidation_loop.py carry their own copies of
+# _finish_reason/_truncated (single-file-per-venv convention) — keep in agreement.
+def _finish_reason(resp_json):
+    """choices[0].finish_reason of an OpenAI-compatible completion response
+    ('stop' | 'length' | ...); None when the shape is unexpected."""
+    try:
+        return (resp_json.get("choices") or [{}])[0].get("finish_reason")
+    except (AttributeError, IndexError, TypeError):
+        return None
+
+
+def _truncated(resp_json):
+    """True when generation hit the max_tokens bound (finish_reason='length').
+    FAIL-THE-UNIT semantics: only strictly-parsed complete lines are salvaged,
+    the final non-empty line is dropped, json_repair never runs — a permanent
+    ledger row must never come from a half-emitted verdict."""
+    return _finish_reason(resp_json) == "length"
+
+
+def _drop_final_nonempty_line(raw: str) -> str:
+    """Remove the FINAL non-empty line of a truncated JSONL response — it is
+    the line the max_tokens knife cut; even a strictly-parseable prefix of it
+    can be a silently incomplete verdict."""
+    lines = raw.splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip():
+            del lines[i]
+            break
+    return "\n".join(lines)
+
+
+def _parse_verdict_lines(raw: str, required_key: str,
+                         truncated: bool = False) -> dict[int, dict]:
+    """Shared JSONL verdict parser for both adjudicators. Normal path: strict
+    json first, json_repair salvage per line (Gemma quote-slips in COMPLETE
+    responses). Truncated path (finish_reason='length'): the final non-empty
+    line is unconditionally dropped and remaining lines are accepted ONLY under
+    strict json.loads — no repair anywhere; missing idx stay unresolved and are
+    re-asked next sweep."""
+    if truncated:
+        raw = _drop_final_nonempty_line(raw)
+    out: dict[int, dict] = {}
+    for line in raw.splitlines():
+        s, e = line.find("{"), line.rfind("}") + 1
+        if s == -1 or e == 0:
+            continue
+        candidate = line[s:e]
+        if truncated:
+            try:
+                obj = json.loads(candidate)     # strict only — never repair
+            except json.JSONDecodeError:
+                continue
+        else:
+            obj = _parse_llm_json(candidate)
+        if isinstance(obj, dict) and "idx" in obj and required_key in obj:
+            try:                                # tolerate a salvaged idx like "4,"
+                idx = int(str(obj["idx"]).strip().rstrip(","))
+            except (ValueError, TypeError):
+                continue
+            out[idx] = obj
+    return out
 
 
 _ADJUDICATOR_SYSTEM = (
@@ -370,10 +439,15 @@ def adjudicate_batch(candidates: list[dict],
     """LLM verdicts for one batch. Returns ({idx: verdict}, model). Signals +
     shared-fact evidence are HINTS; the legal-option list bounds the answer.
     Missing/failed idx are simply absent (caller leaves them for a later sweep).
-    model = the gateway's X-SM-LLM-Backend response header when present."""
+    model = the gateway's X-SM-LLM-Backend response header when present.
+
+    Bounded at MAX_TOKENS_PER_VERDICT × batch; a finish_reason='length'
+    response is salvaged strictly (final line dropped, no json_repair) — a
+    repair-salvaged verdict must never reach the permanent ledger."""
     if os.getenv("MOCK_LLM") == "1":
         return _mock_verdicts(candidates), "mock"
     prompt = _build_prompt(candidates, snippets)
+    max_tokens = MAX_TOKENS_PER_VERDICT * len(candidates)
     try:
         resp = httpx.post(
             # Adaptive per-prompt timeout (ADR-021, same instrument as REM):
@@ -382,28 +456,23 @@ def adjudicate_batch(candidates: list[dict],
             REASONER_URL, headers=_auth_headers(),
             timeout=adaptive_ceiling(len(prompt), units=len(candidates)),
             json={"model": "local-model", "temperature": LLM_TEMPERATURE,
+                  "max_tokens": max_tokens,
                   "messages": [{"role": "system", "content": _ADJUDICATOR_SYSTEM},
                                {"role": "user", "content": prompt}]},
         )
         resp.raise_for_status()
         model = resp.headers.get("X-SM-LLM-Backend") or "local-model"
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        rj = resp.json()
+        truncated = _truncated(rj)
+        raw = rj["choices"][0]["message"]["content"].strip()
     except Exception as exc:
         print(f"  [!] LLM batch failed: {exc}", file=sys.stderr)
         return {}, "local-model"
-    out: dict[int, dict] = {}
-    for line in raw.splitlines():
-        s, e = line.find("{"), line.rfind("}") + 1
-        if s == -1 or e == 0:
-            continue
-        obj = _parse_llm_json(line[s:e])
-        if isinstance(obj, dict) and "idx" in obj and "rel" in obj:
-            try:                                    # tolerate a salvaged idx like "4,"
-                idx = int(str(obj["idx"]).strip().rstrip(","))
-            except (ValueError, TypeError):
-                continue
-            out[idx] = obj
-    return out, model
+    if truncated:
+        print(f"  [!] LLM batch TRUNCATED at max_tokens={max_tokens} — strict "
+              f"salvage only (final line dropped, no repair); missing idx stay "
+              f"unresolved for the next sweep", file=sys.stderr)
+    return _parse_verdict_lines(raw, "rel", truncated=truncated), model
 
 
 # ── verdict handling + edge write ─────────────────────────────────────────────
@@ -636,40 +705,37 @@ def _mock_evidential_verdicts(rows: list[dict]) -> dict[int, dict]:
 
 def adjudicate_evidential_batch(rows: list[dict],
                                 contents: dict[int, str]) -> tuple[dict[int, dict], str]:
-    """LLM verdicts for one evidential batch — same transport/parsing discipline
-    as adjudicate_batch (JSONL + json_repair salvage; missing idx = unresolved,
-    re-asked next run). Returns ({idx: verdict}, model)."""
+    """LLM verdicts for one evidential batch — same transport/parsing/bounding
+    discipline as adjudicate_batch (JSONL; json_repair salvage ONLY on complete
+    responses; truncated → strict salvage, final line dropped; missing idx =
+    unresolved, re-asked next run). Returns ({idx: verdict}, model)."""
     if os.getenv("MOCK_LLM") == "1":
         return _mock_evidential_verdicts(rows), "mock"
     prompt = _build_evidential_prompt(rows, contents)
+    max_tokens = MAX_TOKENS_PER_VERDICT * len(rows)
     try:
         resp = httpx.post(
             # Adaptive per-prompt timeout (ADR-021) — see adjudicate_batch.
             REASONER_URL, headers=_auth_headers(),
             timeout=adaptive_ceiling(len(prompt), units=len(rows)),
             json={"model": "local-model", "temperature": LLM_TEMPERATURE,
+                  "max_tokens": max_tokens,
                   "messages": [{"role": "system", "content": _EVIDENTIAL_SYSTEM},
                                {"role": "user", "content": prompt}]},
         )
         resp.raise_for_status()
         model = resp.headers.get("X-SM-LLM-Backend") or "local-model"
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        rj = resp.json()
+        truncated = _truncated(rj)
+        raw = rj["choices"][0]["message"]["content"].strip()
     except Exception as exc:
         print(f"  [!] evidential LLM batch failed: {exc}", file=sys.stderr)
         return {}, "local-model"
-    out: dict[int, dict] = {}
-    for line in raw.splitlines():
-        s, e = line.find("{"), line.rfind("}") + 1
-        if s == -1 or e == 0:
-            continue
-        obj = _parse_llm_json(line[s:e])
-        if isinstance(obj, dict) and "idx" in obj and "verdict" in obj:
-            try:
-                idx = int(str(obj["idx"]).strip().rstrip(","))
-            except (ValueError, TypeError):
-                continue
-            out[idx] = obj
-    return out, model
+    if truncated:
+        print(f"  [!] evidential LLM batch TRUNCATED at max_tokens={max_tokens} — "
+              f"strict salvage only (final line dropped, no repair); missing idx "
+              f"stay unresolved for the next pass", file=sys.stderr)
+    return _parse_verdict_lines(raw, "verdict", truncated=truncated), model
 
 
 def _update_evidential_edge_confidence(session, rel: str, src_pg: int, tgt_pg: int,
