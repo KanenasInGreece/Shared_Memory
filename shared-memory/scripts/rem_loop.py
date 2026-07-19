@@ -127,7 +127,16 @@ _pg_pass     = os.environ.get("PG_PASSWORD", "")
 PG_CONN      = os.environ.get(
     "PG_CONN", f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
 )
+# The daemons' ONE way in is the hive-mind gateway — never a raw LLM. Pointing this
+# at a backend directly would bypass pooling, cache-affinity, wedge detection and
+# telemetry, so it is deliberately NOT an env knob: the shipped compose fixes the
+# topology. LLM choice belongs to the gateway (LLM_BACKENDS), never to a client.
 REASONER_URL   = "http://localhost:8888/v1/chat/completions"
+# Model id sent on every reasoning call. "local-model" suits llama.cpp / LM Studio,
+# which ignore the field — but a backend that VALIDATES model ids (vLLM or TGI with
+# named models, an OpenRouter/LiteLLM router, an OpenAI-compatible cloud endpoint, or
+# LM Studio with several models loaded) needs the real id. Configurable, never assumed.
+LLM_MODEL      = os.environ.get("LLM_MODEL", "local-model")
 AUDIT_LOG_PATH = os.environ.get("AUDIT_LOG_PATH", "").strip() or None
 
 # AGENT_TOKEN authenticates the daemon's outbound calls through the proxy.
@@ -1292,7 +1301,7 @@ class REMDaemon:
                     REASONER_URL,
                     headers=_auth_headers(),
                     json={
-                        "model": "local-model",
+                        "model": LLM_MODEL,
                         "messages": [
                             {"role": "system", "content": "You are a technical knowledge curator. Output only the requested JSON — no reasoning steps, no thinking tokens, no prose outside the JSON object."},
                             {"role": "user", "content": prompt},
@@ -1391,7 +1400,7 @@ class REMDaemon:
             async with httpx.AsyncClient(timeout=_ceiling) as client:
                 resp = await client.post(
                     REASONER_URL, headers=_auth_headers(),
-                    json={"model": "local-model",
+                    json={"model": LLM_MODEL,
                           "messages": [
                               {"role": "system", "content": "You are a technical knowledge curator. Output only JSONL — one JSON object per line, no prose, no markdown fences, no thinking."},
                               {"role": "user", "content": prompt}],
@@ -1551,7 +1560,7 @@ class REMDaemon:
             async with httpx.AsyncClient(timeout=_ceiling) as client:
                 resp = await client.post(
                     REASONER_URL, headers=_auth_headers(),
-                    json={"model": "local-model",
+                    json={"model": LLM_MODEL,
                           "messages": [
                               {"role": "system", "content": "You verify proposed knowledge-graph edges. Output only JSONL confirm lines — no prose, no markdown fences, no thinking."},
                               {"role": "user", "content": prompt}],

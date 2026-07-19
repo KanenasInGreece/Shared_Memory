@@ -62,7 +62,15 @@ PG_CONN = os.environ.get(
     f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
 )
 RETRIEVER_URL = "http://localhost:8888/v1/embeddings"
+# The daemons' ONE way in is the hive-mind gateway — never a raw LLM. Deliberately
+# NOT an env knob: the shipped compose fixes the topology, and pointing this at a
+# backend would bypass pooling, cache-affinity, wedge detection and telemetry.
+# LLM choice belongs to the gateway (LLM_BACKENDS), never to a client.
 REASONER_URL = "http://localhost:8888/v1/chat/completions"
+# Model id sent on every reasoning call — see the LLM_MODEL note in rem_loop.py.
+# Backends that validate model ids need the real one; "local-model" only suits
+# llama.cpp / LM Studio, which ignore the field.
+LLM_MODEL = os.environ.get("LLM_MODEL", "local-model")
 # Idle window before a pending event-driven consolidation fires. Ships at the
 # documented intent (15 min); the old hardcoded 60 was the testing value.
 IDLE_THRESHOLD_SEC = int(os.environ.get("NREM_IDLE_THRESHOLD_SEC", "900"))
@@ -1281,7 +1289,7 @@ class ConsolidationDaemon:
         try:
             async with httpx.AsyncClient(timeout=_ceiling) as client:
                 resp = await _post_nrem(client, {
-                    "model": "local-model",
+                    "model": LLM_MODEL,
                     "messages": [
                         {"role": "system", "content": "You are a technical knowledge curator. Write your response directly — no reasoning steps, no thinking tokens, no internal deliberation before the answer."},
                         {"role": "user", "content": prompt},
@@ -1375,7 +1383,7 @@ class ConsolidationDaemon:
         try:
             async with httpx.AsyncClient(timeout=_ceiling) as client:
                 resp = await _post_nrem(client, {
-                    "model": "local-model",
+                    "model": LLM_MODEL,
                     "messages": [
                         {"role": "system", "content": "You are a technical knowledge curator. Write your response directly — no reasoning steps, no thinking tokens, no internal deliberation before the answer."},
                         {"role": "user", "content": prompt},

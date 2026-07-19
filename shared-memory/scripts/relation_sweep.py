@@ -113,6 +113,8 @@ LLM_BATCH = int(os.environ.get("RELSWEEP_LLM_BATCH", "8"))
 _max_cand = os.environ.get("RELSWEEP_MAX_CANDIDATES", "").strip()
 MAX_CANDIDATES = int(_max_cand) if _max_cand else None
 REASONER_URL = os.environ.get("REASONER_URL", "http://localhost:8888/v1/chat/completions")
+# Model id sent on every reasoning call — see the LLM_MODEL note in rem_loop.py.
+LLM_MODEL = os.environ.get("LLM_MODEL", "local-model")
 # Gemma-4 (the dream reasoner) degrades at very low temperature — mirror the
 # daemons' 0.6 default rather than a near-greedy value.
 LLM_TEMPERATURE = float(os.environ.get(
@@ -455,7 +457,7 @@ def adjudicate_batch(candidates: list[dict],
             # the first live sweep run lost all 4 batches to a fixed 180s.
             REASONER_URL, headers=_auth_headers(),
             timeout=adaptive_ceiling(len(prompt), units=len(candidates)),
-            json={"model": "local-model", "temperature": LLM_TEMPERATURE,
+            json={"model": LLM_MODEL, "temperature": LLM_TEMPERATURE,
                   "max_tokens": max_tokens,
                   "messages": [{"role": "system", "content": _ADJUDICATOR_SYSTEM},
                                {"role": "user", "content": prompt}]},
@@ -718,7 +720,7 @@ def adjudicate_evidential_batch(rows: list[dict],
             # Adaptive per-prompt timeout (ADR-021) — see adjudicate_batch.
             REASONER_URL, headers=_auth_headers(),
             timeout=adaptive_ceiling(len(prompt), units=len(rows)),
-            json={"model": "local-model", "temperature": LLM_TEMPERATURE,
+            json={"model": LLM_MODEL, "temperature": LLM_TEMPERATURE,
                   "max_tokens": max_tokens,
                   "messages": [{"role": "system", "content": _EVIDENTIAL_SYSTEM},
                                {"role": "user", "content": prompt}]},

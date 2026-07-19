@@ -52,6 +52,8 @@ import alias_graph                             # noqa: E402  (refresh_components
 COSINE_THRESHOLD = float(os.environ.get("ALIAS_COSINE_THRESHOLD", "0.82"))
 ANN_K = int(os.environ.get("ALIAS_ANN_K", "25"))   # neighbours per entity (recall net)
 REASONER_URL = os.environ.get("REASONER_URL", "http://localhost:8888/v1/chat/completions")
+# Model id sent on every reasoning call — see the LLM_MODEL note in rem_loop.py.
+LLM_MODEL = os.environ.get("LLM_MODEL", "local-model")
 LLM_BATCH = int(os.environ.get("ALIAS_LLM_BATCH", "10"))
 # Gemma-4 (the dream reasoner) degrades at very low temperature — a documented
 # quirk — so this mirrors the daemons' 0.6 default rather than a near-greedy 0.2.
@@ -251,7 +253,7 @@ def adjudicate_batch(candidates: list[dict]) -> dict[int, dict]:
     try:
         resp = httpx.post(
             REASONER_URL, headers=_auth_headers(), timeout=180.0,
-            json={"model": "local-model", "temperature": LLM_TEMPERATURE,
+            json={"model": LLM_MODEL, "temperature": LLM_TEMPERATURE,
                   "messages": [{"role": "system", "content": _ADJUDICATOR_SYSTEM},
                                {"role": "user", "content": user}]},
         )
