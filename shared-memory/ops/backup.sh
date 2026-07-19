@@ -33,7 +33,13 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # ── CLI ──────────────────────────────────────────────────────────────────────
 MODE="backup"
 VERIFY_TARGET=""
-ENV_FILE="$REPO_ROOT/.env"
+# Framework env lives at shared-memory/.env (v0.6+); the repo-root path is the
+# pre-0.6 fallback — the same resolution init_db.sh and the maintenance scripts
+# use. backup.sh was the lone outlier: with only the repo-root path it silently
+# found NO env file, so BACKUP_DIR fell back to $HOME/.shared-memory (local disk,
+# not the configured destination) and BACKUP_ADMIN_TOKEN was empty (no quiesce).
+ENV_FILE="$REPO_ROOT/shared-memory/.env"
+[[ -f "$ENV_FILE" ]] || ENV_FILE="$REPO_ROOT/.env"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -dr|--dry-run) MODE="dry-run" ;;
@@ -86,7 +92,11 @@ NEO4J_IMPORT_DIR="${NEO4J_IMPORT_DIR:-/var/lib/neo4j/import}"
 BACKUP_DIR="${BACKUP_DIR:-$HOME/.shared-memory/backups}"
 BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
 BACKUP_LOCKFILE="${BACKUP_LOCKFILE:-$HOME/.shared-memory/backup.lock}"
-BACKUP_QUIESCE_MAX_SECONDS="${BACKUP_QUIESCE_MAX_SECONDS:-900}"
+# Both the drain wait AND the quiesce TTL: /admin/backup blocks up to this long
+# waiting for the dream daemons to drain, then returns 202 and holds the fence for
+# the same span. Keep it well above the dump duration but low enough that a nightly
+# run cannot stall — and the client MUST out-wait it (see qcurl below).
+BACKUP_QUIESCE_MAX_SECONDS="${BACKUP_QUIESCE_MAX_SECONDS:-120}"
 BACKUP_DRAIN_MAX_SECONDS="${BACKUP_DRAIN_MAX_SECONDS:-120}"
 BACKUP_DRAIN_POLL_SECONDS="${BACKUP_DRAIN_POLL_SECONDS:-2}"
 BACKUP_QUIESCE_REQUIRED="${BACKUP_QUIESCE_REQUIRED:-0}"
@@ -111,13 +121,19 @@ except Exception:
     print("")' "$1" 2>/dev/null; }
 
 dcurl() { curl -s --max-time 15 "$@"; }
+# The quiesce handshake BLOCKS for up to BACKUP_QUIESCE_MAX_SECONDS while the
+# gateway fences the dream daemons, so it needs its own, longer budget. With the
+# 15s dcurl the client always timed out first, so every backup silently ran
+# UNQUIESCED whenever a REM/NREM generation was in flight (which, with the ~22-30K
+# token grounding prompt, is most of the time).
+qcurl() { curl -s --max-time "$(( BACKUP_QUIESCE_MAX_SECONDS + 30 ))" "$@"; }
 
 # ── Quiesce handshake ────────────────────────────────────────────────────────
 QUIESCED=0
 quiesce() {
   [[ -z "$BACKUP_ADMIN_TOKEN" ]] && return 1
   local resp code body
-  resp="$(dcurl -w $'\n%{http_code}' -X POST "$GATEWAY_URL/admin/backup" \
+  resp="$(qcurl -w $'\n%{http_code}' -X POST "$GATEWAY_URL/admin/backup" \
     -H "Authorization: Bearer $BACKUP_ADMIN_TOKEN" -H 'Content-Type: application/json' \
     -d "{\"state\":\"quiesce\",\"max_seconds\":$BACKUP_QUIESCE_MAX_SECONDS}")" || return 1
   code="$(tail -n1 <<<"$resp")"; body="$(sed '$d' <<<"$resp")"
