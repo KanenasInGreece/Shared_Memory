@@ -350,9 +350,6 @@ class AsyncHiveMindProxy:
             llm_body = await request.read() if request.can_read_body else b""
             role = request.headers.get("X-SM-LLM-Role", "").strip().lower()
             llm_backend = _select_llm_backend(role, _affinity_key(llm_body))
-            _llm_inflight[llm_backend] = _llm_inflight.get(llm_backend, 0) + 1
-            _llm_inflight_started.setdefault(llm_backend, []).append(time.monotonic())
-            _llm_routed[llm_backend] = _llm_routed.get(llm_backend, 0) + 1
             target_base = llm_backend
 
         target_url = f"{target_base}{request.rel_url}"
@@ -376,6 +373,17 @@ class AsyncHiveMindProxy:
         proxy_resp: web.StreamResponse | None = None
 
         try:
+            # Reserve the in-flight slot INSIDE the try, so the finally below is
+            # GUARANTEED to release it. Reserving before the try left a window —
+            # target_url/_filter_headers construction, or a CancelledError from an
+            # early client disconnect — in which a slot leaked permanently. A leaked
+            # slot makes the pool read busy forever, which starves the idle-gated
+            # dream daemons (NREM defers on a never-idle pool) with no way back
+            # short of a gateway restart.
+            if llm_backend is not None:
+                _llm_inflight[llm_backend] = _llm_inflight.get(llm_backend, 0) + 1
+                _llm_inflight_started.setdefault(llm_backend, []).append(time.monotonic())
+                _llm_routed[llm_backend] = _llm_routed.get(llm_backend, 0) + 1
             async with self.session.request(
                 method=request.method,
                 url=target_url,
