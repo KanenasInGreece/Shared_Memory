@@ -4,7 +4,9 @@ Documentation=https://github.com/KanenasInGreece/Shared_Memory
 
 [Service]
 Type=oneshot
-# Set WorkingDirectory to your repo root so backup.sh finds the .env beside it
-# (creds + BACKUP_* knobs). The script self-locks (flock) against overlap.
+# Set WorkingDirectory to your repo root; backup.sh resolves shared-memory/.env
+# from there (creds + BACKUP_* knobs), falling back to a pre-0.6 repo-root .env.
+# Override with --env <path> if your env lives elsewhere.
+# The script self-locks (flock) against overlap.
 WorkingDirectory=/path/to/your/shared-memory-GitHub
 ExecStart=/usr/bin/env bash shared-memory/ops/backup.sh
