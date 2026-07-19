@@ -75,11 +75,21 @@ _rem_healthy:    bool = False  # True while the REM subprocess is alive
 # --------------------------------------------------------------------------- #
 # Routing
 # --------------------------------------------------------------------------- #
+# Embedding / reranking backends. Overridable because deployments differ — these
+# may run on other ports, in another container network, or on a REMOTE host — so
+# the ports this stack happens to use are a default, never an assumption. Clients
+# still only ever call the gateway (the 1024-dim mandate is unchanged); this is
+# where the gateway itself forwards to.
+EMBEDDER_URL = os.environ.get("EMBEDDER_URL", "http://localhost:8070").rstrip("/")
+RERANKER_URL = os.environ.get("RERANKER_URL", "http://localhost:8071").rstrip("/")
 ROUTING_MAP = {
-    "/v1/embeddings": "http://localhost:8070",
-    "/v1/reranking":  "http://localhost:8071",
+    "/v1/embeddings": EMBEDDER_URL,
+    "/v1/reranking":  RERANKER_URL,
 }
-DEFAULT_TARGET = "http://localhost:5000"   # primary reasoning LLM (main)
+# Fallback used ONLY when LLM_BACKENDS is unset. Deployments differ — LM Studio
+# defaults to :1234, llama.cpp servers commonly :8080 — so keep this overridable
+# instead of baking one port into the code. LLM_BACKENDS is the real knob.
+DEFAULT_TARGET = os.environ.get("LLM_DEFAULT_TARGET", "http://localhost:5000")
 
 # Reasoning-LLM backend POOL. The gateway owns LLM routing + parallelisation:
 # clients have ONE way in (/v1/chat/completions) and never know how many models
@@ -744,20 +754,20 @@ async def handle_health(request: web.Request) -> web.Response:
     HTTP 200: embedder + reranker both reachable (save/search path is healthy).
     HTTP 503: at least one critical backend is down.
 
-    LLM (:5000) is non-critical for saves and searches — its status is reported
+    The reasoning LLM is non-critical for saves and searches — its status is reported
     but does not affect the overall HTTP status code (it only affects consolidation).
     """
     proxy: AsyncHiveMindProxy = request.app["proxy"]
     checks: dict[str, str] = {}
 
     # The embedder and reranker are llama.cpp containers that expose /health.
-    # The reasoning LLM (:5000) is "LM Studio or any OpenAI-compatible endpoint";
+    # A reasoning backend is "LM Studio or any OpenAI-compatible endpoint";
     # those do NOT standardise /health — LM Studio logs an error for the unknown
     # route on every probe. Use /v1/models, which every OpenAI-compatible server
     # (LM Studio included) serves, as the LLM liveness check instead.
     for name, url in [
-        ("embedder", "http://localhost:8070/health"),
-        ("reranker",  "http://localhost:8071/health"),
+        ("embedder", f"{EMBEDDER_URL}/health"),
+        ("reranker",  f"{RERANKER_URL}/health"),
     ]:
         try:
             timeout = ClientTimeout(total=2.0)
@@ -888,7 +898,7 @@ async def handle_health(request: web.Request) -> web.Response:
             # coordinator probes in the background — /health never shells out to
             # nvtop. "unknown" (nvtop absent / SLOT_AWARE off) is reported verbatim
             # so the monitor shows "unknown", never a false "idle". Distinct from
-            # checks["llm"], which stays a pure reachability probe of :5000.
+            # checks["llm"], which is a reachability probe of the configured pool.
             checks["inference_busy"] = consolidation.get("inference_busy", "unknown")
         except Exception:
             checks["consolidation"] = {"fresh": False}
