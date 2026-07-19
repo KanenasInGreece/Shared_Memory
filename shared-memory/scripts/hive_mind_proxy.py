@@ -125,6 +125,33 @@ LLM_MAX_TRIES = int(os.environ.get("LLM_MAX_TRIES", "2")) + 1
 LLM_POOL: list[str] = list(LLM_BACKENDS)
 
 _llm_inflight: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
+# Wedge visibility (2026-07-17 backend-hang lesson): a connection count cannot
+# distinguish BUSY from STUCK — a GPU-driver hang held generations for hours
+# while every surface said "ok" (reachability) or just "inflight>0". Track when
+# each in-flight request STARTED so the pool can report the oldest age; past
+# LLM_WEDGE_SUSPECT_AGE the status endpoints add a lazy 2s probe of the
+# backend's own /health and flag `suspect_wedged` when it cannot answer.
+_llm_inflight_started: dict[str, list[float]] = {b: [] for b in LLM_BACKENDS}
+LLM_WEDGE_SUSPECT_AGE = float(os.environ.get("LLM_WEDGE_SUSPECT_AGE", "900"))
+
+
+def _oldest_inflight_age(backend: str, now: float) -> float | None:
+    starts = _llm_inflight_started.get(backend) or []
+    return round(now - min(starts), 1) if starts else None
+
+
+async def _probe_backend_alive(session, backend: str) -> bool:
+    """2s liveness probe of the backend's own health surface. llama.cpp serves
+    /health; OpenAI-compatible fallback is /v1/models. True = answered."""
+    for path in ("/health", "/v1/models"):
+        try:
+            async with session.get(f"{backend}{path}",
+                                   timeout=ClientTimeout(total=2.0)) as r:
+                if r.status < 500:
+                    return True
+        except Exception:
+            continue
+    return False
 _llm_unhealthy_until: dict[str, float] = {b: 0.0 for b in LLM_BACKENDS}
 _llm_fail_times: dict[str, list] = {b: [] for b in LLM_BACKENDS}
 # Parallelisation telemetry (instrument-first): cumulative requests routed +
@@ -324,6 +351,7 @@ class AsyncHiveMindProxy:
             role = request.headers.get("X-SM-LLM-Role", "").strip().lower()
             llm_backend = _select_llm_backend(role, _affinity_key(llm_body))
             _llm_inflight[llm_backend] = _llm_inflight.get(llm_backend, 0) + 1
+            _llm_inflight_started.setdefault(llm_backend, []).append(time.monotonic())
             _llm_routed[llm_backend] = _llm_routed.get(llm_backend, 0) + 1
             target_base = llm_backend
 
@@ -430,8 +458,15 @@ class AsyncHiveMindProxy:
         finally:
             # Release the in-flight slot so least-busy selection stays accurate,
             # whatever the outcome (success, disconnect, error, cancellation).
+            # NOTE the honesty gap this creates: on a client timeout the SERVER
+            # may keep generating (zombie) — inflight drops to 0 while the
+            # backend is still busy. The oldest-inflight age + suspect_wedged
+            # probe on the status surfaces exist to catch the sustained form.
             if llm_backend is not None:
                 _llm_inflight[llm_backend] = max(0, _llm_inflight.get(llm_backend, 0) - 1)
+                starts = _llm_inflight_started.get(llm_backend)
+                if starts:
+                    starts.remove(min(starts))
 
 
 # --------------------------------------------------------------------------- #
@@ -665,17 +700,29 @@ async def handle_pool_status(request: web.Request) -> web.Response:
     of a global nvtop check (which self-defers to our own dream work and ignores a
     free card). Desktop/display GPU use is intentionally not considered."""
     now = time.monotonic()
+    # Lazy/defensive: the session is needed only for the rare suspect-wedged
+    # probe; unit tests call this handler without a real request/app.
+    _app = getattr(request, "app", None)
+    _session = _app["proxy"].session if _app is not None and "proxy" in _app else None
     backends, free = {}, 0
     for b in LLM_POOL:
         avail = (_llm_inflight.get(b, 0) == 0
                  and _llm_unhealthy_until.get(b, 0.0) <= now
                  and b not in _llm_reserved)
-        backends[b] = {
+        age = _oldest_inflight_age(b, now)
+        entry = {
             "inflight": _llm_inflight.get(b, 0),
+            "oldest_inflight_age_s": age,
             "cooldown": round(max(0.0, _llm_unhealthy_until.get(b, 0.0) - now), 1),
             "reserved": b in _llm_reserved,
             "available": avail,
         }
+        # Lazy wedge check (the one exception to "no upstream probes"): only
+        # when a request has been in flight suspiciously long — busy-generating
+        # backends answer their own /health instantly; a driver-hung one can't.
+        if age is not None and age > LLM_WEDGE_SUSPECT_AGE and _session is not None:
+            entry["suspect_wedged"] = not await _probe_backend_alive(_session, b)
+        backends[b] = entry
         free += 1 if avail else 0
     return web.json_response({"free_slots": free, "backends": backends})
 
@@ -726,6 +773,23 @@ async def handle_health(request: web.Request) -> web.Response:
         except Exception:
             backend_status[b] = "down"
     checks["llm"] = "ok" if any(s == "ok" for s in backend_status.values()) else "down"
+    # Wedge visibility: reachability alone reported "ok" through a GPU-driver
+    # hang (the accept thread answers while the generation engine is dead).
+    # Surface the oldest in-flight age; past the suspect threshold, verify the
+    # backend can still answer its own health and flag it when it cannot.
+    _now_mono = time.monotonic()
+    _ages = {b: _oldest_inflight_age(b, _now_mono) for b in LLM_BACKENDS}
+    _max_age = max((a for a in _ages.values() if a is not None), default=None)
+    if _max_age is not None:
+        checks["llm_oldest_inflight_age_s"] = _max_age
+        if _max_age > LLM_WEDGE_SUSPECT_AGE:
+            _wedged = []
+            for b, a in _ages.items():
+                if a is not None and a > LLM_WEDGE_SUSPECT_AGE:
+                    if not await _probe_backend_alive(proxy.session, b):
+                        _wedged.append(b)
+            if _wedged:
+                checks["llm_suspect_wedged"] = _wedged
     if len(LLM_BACKENDS) > 1:
         checks["llm_backends"] = backend_status
         if _llm_reserved:

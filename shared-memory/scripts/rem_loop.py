@@ -213,9 +213,58 @@ def _take_shared_backup_lock(conn) -> bool:
 # both daemons at once. The request value overrides the LM Studio preset.
 REM_TEMPERATURE = float(os.environ.get("REM_TEMPERATURE", os.environ.get("DREAM_TEMPERATURE", "0.6")))
 
+# ── Output bounds + truncation detection ─────────────────────────────────────
+# Every LLM call sets max_tokens, and finish_reason='length' FAILS the unit.
+# OPERATOR CONSTRAINT: a bound that processes but gives incomplete saves /
+# truncated summaries is worse than no bound at all — truncated output is never
+# json_repair-salvaged, never persisted, never fed to downstream gates.
+REM_MAX_TOKENS_SOLO        = int(os.environ.get("REM_MAX_TOKENS_SOLO", "1500"))
+REM_MAX_TOKENS_PER_FACT    = int(os.environ.get("REM_MAX_TOKENS_PER_FACT", "400"))
+REM_MAX_TOKENS_PER_SUMMARY = int(os.environ.get("REM_MAX_TOKENS_PER_SUMMARY", "250"))
+REM_MAX_TOKENS_PER_VERIFY_EDGE = int(os.environ.get("REM_MAX_TOKENS_PER_VERIFY_EDGE", "20"))
+REM_VERIFY_MAX_TOKENS_FLOOR    = 64
+
+# Poison-record escape hatch: a record whose enrichment failed (LLM/parse/
+# truncation/write/consistency) this many times is DEAD-LETTERED — excluded
+# from the fetch until the operator resets n.rem_attempts (or the record is
+# fixed). Success clears the counter, so transient outages never accumulate.
+REM_MAX_ATTEMPTS = int(os.environ.get("REM_MAX_ATTEMPTS", "5"))
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("REMDaemon")
+
+
+# MUST-mirror: consolidation_loop.py and relation_sweep.py carry their own
+# copies of _finish_reason/_truncated (single-file-per-venv convention, like
+# _load_env/_auth_headers) — keep all three in agreement.
+def _finish_reason(resp_json) -> str | None:
+    """choices[0].finish_reason of an OpenAI-compatible completion response
+    ('stop' | 'length' | ...). llama.cpp always sets it and the gateway passes
+    it through; None when the shape is unexpected."""
+    try:
+        return (resp_json.get("choices") or [{}])[0].get("finish_reason")
+    except (AttributeError, IndexError, TypeError):
+        return None
+
+
+def _truncated(resp_json) -> bool:
+    """True when generation hit the max_tokens bound (finish_reason='length').
+    Semantics are FAIL-THE-UNIT: the response body must not be parsed,
+    repaired, persisted, or fed to any downstream gate."""
+    return _finish_reason(resp_json) == "length"
+
+
+def _drop_final_nonempty_line(raw: str) -> str:
+    """Remove the FINAL non-empty line of a truncated JSONL response — it is
+    the line the max_tokens knife cut, and even a strictly-parseable prefix of
+    it can be a silently incomplete record."""
+    lines = raw.splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip():
+            del lines[i]
+            break
+    return "\n".join(lines)
 
 
 def _parse_llm_json(candidate: str):
@@ -667,26 +716,102 @@ class REMDaemon:
 
     # ── Neo4j reads ───────────────────────────────────────────────────────────
 
-    async def _fetch_non_rem_batch(self) -> list[int]:
-        """Oldest non-REM Fact pg_ids (pg_id ASC — monotonic Postgres SERIAL).
+    async def _fetch_non_rem_batch(self) -> tuple[list[int], dict[int, int]]:
+        """Non-REM anchor pg_ids, attempts-first then oldest-first.
 
-        Oldest-first clears the historical backlog before new saves arrive
-        and ensures the entity registry is maximally populated for historical facts.
+        Ordering `coalesce(rem_attempts,0) ASC, pg_id ASC`: fresh records
+        first (oldest-first clears the historical backlog and keeps the entity
+        registry maximally populated), previously-FAILED records behind them —
+        so a poison record can never freeze the queue head. Records at
+        REM_MAX_ATTEMPTS or more are DEAD-LETTERED: excluded here, their count
+        logged once per cycle (telemetry surfacing is a later wave's job;
+        operator reset = `SET n.rem_attempts = 0`).
+
+        Returns (pg_ids, {pg_id: rem_attempts}) — the attempt map drives the
+        batch→solo demotion in run_cycle.
         """
+        base = (
+            f"MATCH (n)"
+            f" WHERE (n:{ONT.fact} OR n:{ONT.decision} OR n:{ONT.retrospective})"
+            f"   AND coalesce(n.rem_processed, false) = false"
+            f"   AND coalesce(n.superseded, false) = false"
+            f"   AND n.pg_id IS NOT NULL"
+        )
         async with self.driver.session() as session:
             result = await session.run(
-                f"MATCH (n)"
-                f" WHERE (n:{ONT.fact} OR n:{ONT.decision} OR n:{ONT.retrospective})"
-                f"   AND coalesce(n.rem_processed, false) = false"
-                f"   AND coalesce(n.superseded, false) = false"
-                f"   AND n.pg_id IS NOT NULL"
-                f" RETURN n.pg_id AS pg_id"
-                f" ORDER BY n.pg_id ASC"
+                base +
+                f"   AND coalesce(n.rem_attempts, 0) < $max_attempts"
+                f" RETURN n.pg_id AS pg_id,"
+                f"        coalesce(n.rem_attempts, 0) AS rem_attempts"
+                f" ORDER BY coalesce(n.rem_attempts, 0) ASC, n.pg_id ASC"
                 f" LIMIT $limit",
-                limit=BATCH_SIZE,
+                limit=BATCH_SIZE, max_attempts=REM_MAX_ATTEMPTS,
             )
             rows = await result.data()
-        return [r["pg_id"] for r in rows if r.get("pg_id") is not None]
+            dead_result = await session.run(
+                base +
+                f"   AND coalesce(n.rem_attempts, 0) >= $max_attempts"
+                f" RETURN count(n) AS dead",
+                max_attempts=REM_MAX_ATTEMPTS,
+            )
+            dead_rows = await dead_result.data()
+        dead = (dead_rows[0].get("dead") if dead_rows else 0) or 0
+        if dead:
+            logger.warning(
+                "REM: %d poison record(s) dead-lettered at rem_attempts >= %d — "
+                "excluded from the queue (operator reset: SET n.rem_attempts = 0)",
+                dead, REM_MAX_ATTEMPTS,
+            )
+        pg_ids: list[int] = []
+        attempts: dict[int, int] = {}
+        for r in rows:
+            if r.get("pg_id") is None:
+                continue
+            pg_ids.append(r["pg_id"])
+            attempts[r["pg_id"]] = int(r.get("rem_attempts") or 0)
+        return pg_ids, attempts
+
+    async def _bump_rem_attempts(self, pg_ids: list[int]) -> None:
+        """Durable failure counter (poison-record escape hatch): +1 on the
+        anchor's `rem_attempts` for EVERY failure class — LLM/HTTP failure,
+        parse failure, truncation, missing batch line, Neo4j write failure,
+        consistency failure. At REM_MAX_ATTEMPTS the fetch dead-letters the
+        record. Best-effort: the bump must never mask the original failure."""
+        if not pg_ids:
+            return
+        try:
+            async with self.driver.session() as session:
+                await session.run(
+                    f"MATCH (n)"
+                    f" WHERE (n:{ONT.fact} OR n:{ONT.decision} OR n:{ONT.retrospective})"
+                    f"   AND n.pg_id IN $pg_ids"
+                    f" SET n.rem_attempts = coalesce(n.rem_attempts, 0) + 1",
+                    pg_ids=list(pg_ids),
+                )
+        except Exception as exc:
+            logger.warning("REM: rem_attempts bump failed for %s: %s", pg_ids, exc)
+
+    async def _revert_rem_mark(self, pg_id: int, kind: str) -> None:
+        """F5 stranded rows: a post-write failure (consistency mismatch or
+        outbox-mark error) must not strand the record at rem_processed=true
+        while its outbox row sits at 'applied'. One SET reverts the mark AND
+        counts the attempt, so the record re-enters the queue under the
+        attempt cap instead of disappearing from both worklists."""
+        anchor = {KIND_DECISION: ONT.decision,
+                  KIND_RETRO:    ONT.retrospective}.get(kind, ONT.fact)
+        try:
+            async with self.driver.session() as session:
+                await session.run(
+                    f"MATCH (n:{anchor} {{pg_id: $pg_id}})"
+                    f" SET n.rem_processed = false,"
+                    f"     n.rem_attempts = coalesce(n.rem_attempts, 0) + 1",
+                    pg_id=pg_id,
+                )
+        except Exception as exc:
+            logger.error(
+                "REM: pg_id=%d revert of rem_processed failed (%s) — record may "
+                "be stranded until manual reset", pg_id, exc,
+            )
 
     async def _fetch_closed_entity_set(self) -> list[dict]:
         """All existing typed nodes — closed set for LLM ontology grounding.
@@ -1091,30 +1216,34 @@ class REMDaemon:
             # keeps notes; Fact content becomes the ORIGINAL text verbatim.
             # rem_summary is written only when a summary was produced (which,
             # since the rebuild, only happens above REM_SUMMARY_THRESHOLD).
+            # Success also clears rem_attempts (poison-record escape hatch):
+            # historical failures never linger once a record enriches cleanly.
             if kind in (KIND_DECISION, KIND_RETRO):
                 if summary:
                     await session.run(
                         f"MATCH (a:{anchor} {{pg_id: $pg_id}})"
-                        f" SET a.rem_summary = $summary, a.rem_processed = true",
+                        f" SET a.rem_summary = $summary, a.rem_processed = true,"
+                        f"     a.rem_attempts = 0",
                         pg_id=pg_id, summary=summary[:2000],
                     )
                 else:
                     await session.run(
                         f"MATCH (a:{anchor} {{pg_id: $pg_id}})"
-                        f" SET a.rem_processed = true",
+                        f" SET a.rem_processed = true, a.rem_attempts = 0",
                         pg_id=pg_id,
                     )
             elif len(original_content) > REM_SUMMARY_THRESHOLD and summary:
                 await session.run(
                     f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
                     f" SET f.content = $orig, f.rem_summary = $summary,"
-                    f"     f.rem_processed = true",
+                    f"     f.rem_processed = true, f.rem_attempts = 0",
                     pg_id=pg_id, orig=original_content[:2000], summary=summary[:2000],
                 )
             else:
                 await session.run(
                     f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
-                    f" SET f.content = $orig, f.rem_processed = true",
+                    f" SET f.content = $orig, f.rem_processed = true,"
+                    f"     f.rem_attempts = 0",
                     pg_id=pg_id, orig=original_content[:2000],
                 )
 
@@ -1126,6 +1255,7 @@ class REMDaemon:
         kind: str,
         closed_set: list[dict],
         manifest: dict | None = None,
+        pg_id: int | None = None,
     ) -> tuple[dict | None, str]:
         """Main enrichment round-trip for one record → (result, model).
 
@@ -1168,6 +1298,7 @@ class REMDaemon:
                             {"role": "user", "content": prompt},
                         ],
                         "temperature": REM_TEMPERATURE,
+                        "max_tokens": REM_MAX_TOKENS_SOLO,
                     },
                 )
                 _backend = resp.headers.get("X-SM-LLM-Backend")
@@ -1181,6 +1312,16 @@ class REMDaemon:
                 resp_json = resp.json()
                 record_llm_call("REM", resp_json, backend=_backend,
                                 wall_s=time.monotonic() - _start, ceiling_s=_ceiling)
+                if _truncated(resp_json):
+                    # Fail-the-unit: same path as an HTTP failure — the body is
+                    # never handed to _parse_llm_json/json_repair (an incomplete
+                    # enrichment must never be salvaged into a persistable dict).
+                    logger.warning(
+                        "REM: pg_id=%s solo enrichment TRUNCATED at max_tokens=%d "
+                        "(finish_reason=length) — failing the unit; no parse, no repair",
+                        pg_id, REM_MAX_TOKENS_SOLO,
+                    )
+                    return None, model
                 try:
                     raw = resp_json["choices"][0]["message"]["content"].strip()
                 except (KeyError, IndexError) as exc:
@@ -1239,6 +1380,10 @@ class REMDaemon:
             if len(it["content"]) > REM_SUMMARY_THRESHOLD
         }
         prompt = self._build_batch_prompt(items, closed_set)
+        # Budget scales with the ask: a relationships line per fact plus a
+        # summary allowance only for the facts one was requested from.
+        _max_tokens = (REM_MAX_TOKENS_PER_FACT * len(items)
+                       + REM_MAX_TOKENS_PER_SUMMARY * len(require_summary))
         _ceiling = adaptive_ceiling(len(prompt), units=len(items))
         _start = time.monotonic()
         model = "local-model"
@@ -1250,7 +1395,8 @@ class REMDaemon:
                           "messages": [
                               {"role": "system", "content": "You are a technical knowledge curator. Output only JSONL — one JSON object per line, no prose, no markdown fences, no thinking."},
                               {"role": "user", "content": prompt}],
-                          "temperature": REM_TEMPERATURE},
+                          "temperature": REM_TEMPERATURE,
+                          "max_tokens": _max_tokens},
                 )
                 _backend = resp.headers.get("X-SM-LLM-Backend")
                 model = _backend or "local-model"
@@ -1268,11 +1414,20 @@ class REMDaemon:
                 call_timing = call_timing_summary(
                     resp_json, _wall_s, backend=_backend,
                     batch_size=len(items), prompt_chars=len(prompt))
+                truncated = _truncated(resp_json)
                 raw = resp_json["choices"][0]["message"]["content"]
         except Exception as exc:
             logger.error("REM batch LLM error: %s", exc)
             return {}, None, model
-        return (self._parse_jsonl_batch(raw, idx_to_pg, require_summary),
+        if truncated:
+            logger.warning(
+                "REM batch: response TRUNCATED at max_tokens=%d (batch=%d) — "
+                "salvaging strictly-parsed complete lines only (no json_repair), "
+                "final line dropped; missing facts retry",
+                _max_tokens, len(items),
+            )
+        return (self._parse_jsonl_batch(raw, idx_to_pg, require_summary,
+                                        truncated=truncated),
                 call_timing, model)
 
     def _build_batch_prompt(self, items: list[dict], closed_set: list[dict]) -> str:
@@ -1332,6 +1487,7 @@ class REMDaemon:
         raw: str,
         idx_to_pg: dict[int, int],
         require_summary: set[int] = frozenset(),
+        truncated: bool = False,
     ) -> dict[int, dict]:
         """Parse JSONL line-by-line (json_repair per line), match by echoed idx,
         map to pg_id. Alignment is idx-echo only: an empty relationships list is
@@ -1339,13 +1495,28 @@ class REMDaemon:
         `require_summary` (facts over REM_SUMMARY_THRESHOLD) must carry a
         non-empty summary — those lines are dropped when it is missing so the
         fact retries next cycle. Malformed / missing lines are skipped likewise.
-        Only idx in the requested set are accepted."""
+        Only idx in the requested set are accepted.
+
+        `truncated` (finish_reason='length') switches to the FAIL-THE-UNIT
+        salvage: the FINAL non-empty line is unconditionally dropped (it is the
+        one under the knife) and the rest are accepted only under strict
+        json.loads — json_repair NEVER runs on a length-finish, because it can
+        turn a half-emitted record into a plausibly complete dict."""
+        if truncated:
+            raw = _drop_final_nonempty_line(raw)
         out: dict[int, dict] = {}
         for line in raw.splitlines():
             line = line.strip()
             if not line or "{" not in line:
                 continue
-            obj = _parse_llm_json(line[line.find("{"):line.rfind("}") + 1])
+            candidate = line[line.find("{"):line.rfind("}") + 1]
+            if truncated:
+                try:
+                    obj = json.loads(candidate)   # strict only — never repair
+                except json.JSONDecodeError:
+                    continue
+            else:
+                obj = _parse_llm_json(candidate)
             if not isinstance(obj, dict):
                 continue
             try:
@@ -1365,12 +1536,16 @@ class REMDaemon:
 
     # ── k=3 self-consistency verification (726 §3) ───────────────────────────
 
-    async def _llm_verify_call(self, prompt: str, pg_id: int) -> dict[int, bool] | None:
+    async def _llm_verify_call(self, prompt: str, pg_id: int,
+                               n_edges: int = 1) -> dict[int, bool] | None:
         """One cheap confirm/deny verification round-trip. Returns
         {idx: confirmed} or None when the call FAILED (HTTP error / exception /
-        nothing parseable) — a failed call does not count toward k (degrade,
-        never block). A succeeded call that omits an idx counts as a deny."""
+        truncation / nothing parseable) — a failed call does not count toward k
+        (degrade, never block). A succeeded call that omits an idx counts as a
+        deny. max_tokens scales with the edge count (~one confirm line each)."""
         _ceiling = adaptive_ceiling(len(prompt))
+        _max_tokens = max(REM_VERIFY_MAX_TOKENS_FLOOR,
+                          REM_MAX_TOKENS_PER_VERIFY_EDGE * max(n_edges, 1))
         _start = time.monotonic()
         try:
             async with httpx.AsyncClient(timeout=_ceiling) as client:
@@ -1380,7 +1555,8 @@ class REMDaemon:
                           "messages": [
                               {"role": "system", "content": "You verify proposed knowledge-graph edges. Output only JSONL confirm lines — no prose, no markdown fences, no thinking."},
                               {"role": "user", "content": prompt}],
-                          "temperature": REM_TEMPERATURE},
+                          "temperature": REM_TEMPERATURE,
+                          "max_tokens": _max_tokens},
                 )
                 _backend = resp.headers.get("X-SM-LLM-Backend")
                 if resp.status_code != 200:
@@ -1392,6 +1568,15 @@ class REMDaemon:
                 record_llm_call("REM", resp_json, backend=_backend,
                                 wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
                                 note="verify")
+                if _truncated(resp_json):
+                    # A truncated verification is a FAILED call (degrades k) —
+                    # a partial confirm list would silently deny the tail edges.
+                    logger.warning(
+                        "REM: pg_id=%d verification call truncated at "
+                        "max_tokens=%d — treated as failed (k degrades)",
+                        pg_id, _max_tokens,
+                    )
+                    return None
                 raw = resp_json["choices"][0]["message"]["content"]
         except Exception as exc:
             logger.warning("REM: pg_id=%d verification call failed: %s", pg_id, exc)
@@ -1430,7 +1615,8 @@ class REMDaemon:
             return votes, k
         prompt = _build_verify_prompt(content, proposed)
         for _ in range(VERIFY_CALLS):
-            confirms = await self._llm_verify_call(prompt, pg_id)
+            confirms = await self._llm_verify_call(prompt, pg_id,
+                                                   n_edges=len(proposed))
             if confirms is None:
                 continue
             k += 1
@@ -1456,10 +1642,14 @@ class REMDaemon:
         manifest: dict | None = None,
         run_id: str = "",
     ) -> bool:
-        """Full REM pipeline for one record. Returns True on success."""
-        result, model = await self._llm_process(content, kind, closed_set, manifest)
+        """Full REM pipeline for one record. Returns True on success.
+        Every failure class counts a durable rem_attempts on the anchor
+        (poison-record escape hatch)."""
+        result, model = await self._llm_process(content, kind, closed_set,
+                                                manifest, pg_id=pg_id)
         if not result:
             logger.warning("REM: pg_id=%d LLM failed — skipping", pg_id)
+            await self._bump_rem_attempts([pg_id])
             return False
         return await self._apply_fact_result(
             pg_id, kind, result, registry, conn, loop,
@@ -1495,15 +1685,18 @@ class REMDaemon:
         if want_summary and not summary:
             logger.warning("REM: pg_id=%d summary required (content > %d) but missing "
                            "— skipping", pg_id, REM_SUMMARY_THRESHOLD)
+            await self._bump_rem_attempts([pg_id])
             return False
         if not want_summary:
             summary = ""   # never store a summary that was not requested
         # Guard: for a Fact the original content is load-bearing (it becomes
         # f.content verbatim). A call site that forgets it would blank the node
         # and loop the fact through REM forever (consistency check fails every
-        # cycle) — refuse loudly instead.
+        # cycle) — refuse loudly instead (and count the attempt: after
+        # REM_MAX_ATTEMPTS the record dead-letters rather than looping forever).
         if kind == KIND_FACT and not original_content:
             logger.error("REM: pg_id=%d called without original_content — skipping", pg_id)
+            await self._bump_rem_attempts([pg_id])
             return False
 
         relationships = result.get("relationships") or []
@@ -1597,6 +1790,7 @@ class REMDaemon:
             )
         except Exception as exc:
             logger.error("REM: pg_id=%d Neo4j write failed: %s", pg_id, exc)
+            await self._bump_rem_attempts([pg_id])
             return False
 
         # Evidential ledger rows (727 rung 1, method=rem_k3) — on the cycle's
@@ -1636,15 +1830,20 @@ class REMDaemon:
                 consistent = False
 
             if not consistent:
+                # F5: without the revert this record would strand at
+                # rem_processed=true with its outbox row at 'applied' —
+                # invisible to both worklists. Revert + count the attempt so
+                # it re-enters the queue under the attempt cap.
                 logger.error(
                     "REM: discrepancy — pg_id=%d Fact content mismatch after write; "
-                    "outbox row left as applied for manual inspection",
+                    "reverting rem_processed (+1 attempt) so the record re-enters "
+                    "the queue under the attempt cap",
                     pg_id,
                 )
+                await self._revert_rem_mark(pg_id, kind)
                 return False
 
         # Audit log (optional) → then mark rem_reviewed.
-        outbox_marked = False
         try:
             if AUDIT_LOG_PATH:
                 row = await self._fetch_outbox_row(pg_id, conn, loop)
@@ -1653,16 +1852,23 @@ class REMDaemon:
             await self._mark_outbox_rem_reviewed(pg_id, conn, loop, kind=kind)
             outbox_marked = True
         except Exception as exc:
+            # F5: same stranding hazard as the consistency branch — revert the
+            # Neo4j mark (+1 attempt) and fail the unit, so the record retries
+            # (the enrichment write is idempotent MERGEs) instead of sitting at
+            # 'applied' forever.
             logger.error(
-                "REM: pg_id=%d outbox mark failed (%s) — row left as applied; "
-                "pruning_loop will not clean this row until it is manually resolved",
+                "REM: pg_id=%d outbox mark failed (%s) — reverting rem_processed "
+                "(+1 attempt); record re-enters the queue under the attempt cap",
                 pg_id, exc,
             )
+            await self._revert_rem_mark(pg_id, kind)
+            return False
 
-        # Notify NREM regardless of outbox mark outcome:
-        # rem_processed=true is already set on the Neo4j node, so this fact
-        # will not be re-processed by REM.  NREM re-evaluates the cluster;
-        # consolidated=false filter in NREM ensures no spurious work.
+        # Notify NREM (outbox mark succeeded if we got here):
+        # rem_processed=true is set on the Neo4j node, so this fact will not
+        # be re-processed by REM. NREM re-evaluates the cluster; the
+        # consolidated=false filter in NREM ensures no spurious work. A notify
+        # failure alone is tolerable — the ledger sweep re-evaluates durably.
         try:
             await self._notify_nrem(pg_id, conn, loop)
         except Exception as exc:
@@ -1677,11 +1883,15 @@ class REMDaemon:
 
     # ── Batch cycle ───────────────────────────────────────────────────────────
 
-    async def run_cycle(self) -> int:
-        """One full REM scan cycle. Returns number of facts successfully processed."""
-        candidates = await self._fetch_non_rem_batch()
+    async def run_cycle(self) -> tuple[int, int]:
+        """One full REM scan cycle. Returns (processed, attempted):
+        processed = records enriched successfully; attempted = records actually
+        handed to an LLM path this cycle. The caller needs BOTH to tell idle
+        (nothing to do → back off) from failure (work existed but failed → keep
+        BASE cadence; poison loops must not masquerade as idleness)."""
+        candidates, attempts_map = await self._fetch_non_rem_batch()
         if not candidates:
-            return 0
+            return 0, 0
 
         loop = asyncio.get_running_loop()
         # One uuid4 per REM cycle — correlates every edge and ledger row this
@@ -1695,7 +1905,7 @@ class REMDaemon:
             # lock. The SHARED lock auto-releases when conn closes in the finally.
             if not await loop.run_in_executor(None, lambda: _take_shared_backup_lock(conn)):
                 logger.info("REM: backup in progress — deferring enrichment cycle.")
-                return 0
+                return 0, 0
 
             # Yield to active write sessions — don't enrich during a save burst.
             if await self._recent_write_happened(conn, loop):
@@ -1703,14 +1913,14 @@ class REMDaemon:
                     "REM: write activity in last %ds — yielding to active writes",
                     WRITE_QUIESCE_SEC,
                 )
-                return 0
+                return 0, 0
 
             # Yield only if the whole LLM pool is busy — the gateway routes to a
             # free card (incl. one the user isn't LLM-loading). NOT a global GPU
             # gate, which self-defers to our own dream work + ignores a free card.
             if not await pool_has_free_slot():
                 logger.warning("REM: LLM pool has no free slot — deferring enrichment cycle")
-                return 0
+                return 0, 0
 
             pg_ids = await self._filter_applied_in_outbox(candidates, conn, loop)
             deferred = len(candidates) - len(pg_ids)
@@ -1720,7 +1930,7 @@ class REMDaemon:
                     deferred, BASE_POLL_SEC,
                 )
             if not pg_ids:
-                return 0
+                return 0, 0
 
             logger.info("REM cycle: %d fact(s) to process (pg_ids=%s)", len(pg_ids), pg_ids)
 
@@ -1747,26 +1957,42 @@ class REMDaemon:
             registry    = _build_entity_registry(closed_set)
 
             processed = 0
+            attempted = 0
             # Split: regular facts are BATCHED into one call (amortise the shared
             # grounding); decisions and retrospectives stay single-record (extra
             # fields / distinct anchors raise batched failure — advisor-reviewed).
-            # One fact → single path (no batch overhead).
+            # One fact → single path (no batch overhead). Batch→solo DEMOTION:
+            # a fact that already FAILED once (rem_attempts > 0) is routed solo —
+            # a clean single-record prompt isolates it from batch alignment, the
+            # dominant failure mode for a record that poisons a shared call.
             fact_items: list[dict] = []
-            solo_ids: list[tuple[int, str]] = []   # (pg_id, kind) — decisions + retros
+            solo_ids: list[tuple[int, str]] = []   # (pg_id, kind) — decisions/retros + demoted facts
             for pg_id in pg_ids:
                 row = content_map.get(pg_id)
                 if not row or not row.get("content"):
                     logger.warning("REM: pg_id=%d not in technical_docs — skipping", pg_id)
                     continue
-                if row["kind"] == KIND_FACT:
+                if row["kind"] == KIND_FACT and attempts_map.get(pg_id, 0) == 0:
                     fact_items.append({"pg_id": pg_id, "content": row["content"],
                                        "manifest": manifests.get(pg_id) or {}})
                 else:
+                    if row["kind"] == KIND_FACT:
+                        logger.info(
+                            "REM: pg_id=%d demoted batch→solo (rem_attempts=%d)",
+                            pg_id, attempts_map.get(pg_id, 0))
                     solo_ids.append((pg_id, row["kind"]))
 
             if len(fact_items) > 1:
+                attempted += len(fact_items)
                 results, call_timing, model = await self._llm_process_batch(
                     fact_items, closed_set)
+                # Missing/invalid batch lines are failures for THEIR records:
+                # count the attempt so a repeat offender is demoted solo next
+                # cycle and eventually dead-letters at REM_MAX_ATTEMPTS.
+                missing = [it["pg_id"] for it in fact_items
+                           if not results.get(it["pg_id"])]
+                if missing:
+                    await self._bump_rem_attempts(missing)
                 for it in fact_items:
                     res = results.get(it["pg_id"])
                     if res and await self._apply_fact_result(
@@ -1786,12 +2012,14 @@ class REMDaemon:
                                 conn, loop)
             elif fact_items:
                 it = fact_items[0]
+                attempted += 1
                 if await self._process_fact(
                         it["pg_id"], it["content"], KIND_FACT, closed_set, registry,
                         conn, loop, manifest=it["manifest"], run_id=run_id):
                     processed += 1
 
             for pg_id, kind in solo_ids:
+                attempted += 1
                 if await self._process_fact(
                         pg_id, content_map[pg_id]["content"], kind, closed_set,
                         registry, conn, loop,
@@ -1800,7 +2028,7 @@ class REMDaemon:
         finally:
             await loop.run_in_executor(None, conn.close)
 
-        return processed
+        return processed, attempted
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -1811,16 +2039,24 @@ class REMDaemon:
             logger.info("REM audit log: %s", AUDIT_LOG_PATH)
         idle_streak = 0
         while self.is_running:
-            count = 0
+            count, attempted = 0, 0
             try:
-                count = await self.run_cycle()
-                if count == 0:
+                count, attempted = await self.run_cycle()
+                if count == 0 and attempted == 0:
                     logger.debug("REM: idle — no facts ready for processing")
+                elif count == 0:
+                    logger.warning(
+                        "REM: %d candidate(s) attempted, ALL failed — keeping "
+                        "BASE cadence (failure is not idleness; the attempt cap "
+                        "dead-letters persistent offenders)", attempted)
             except Exception as exc:
                 logger.error("REM cycle error: %s", exc, exc_info=True)
             # Adaptive cadence: work drained → stay responsive at BASE; idle →
             # exponential backoff to MAX so an idle system polls near-silently.
-            idle_streak = 0 if count > 0 else idle_streak + 1
+            # FAILURE ≠ IDLE: a cycle that attempted candidates but processed
+            # none keeps the streak at 0 (BASE cadence) — backing off would
+            # mask a poison loop as a quiet system.
+            idle_streak = 0 if (count > 0 or attempted > 0) else idle_streak + 1
             await asyncio.sleep(adaptive_poll_sleep(idle_streak))
 
     async def stop(self) -> None:

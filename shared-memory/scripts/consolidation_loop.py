@@ -1,3 +1,31 @@
+"""
+NREM consolidation daemon — Tier-3 synthesis (community summaries + insights).
+
+Loop discipline (fix wave, 2026-07):
+
+* Every LLM call is bounded (NREM_MAX_TOKENS_SUMMARY / NREM_MAX_TOKENS_INSIGHT)
+  and finish_reason='length' FAILS the unit: a truncated draft is discarded
+  BEFORE the preservation gate ever sees it (the gate detects omission, not
+  truncation — a truncated draft can pass the anchor check) and never consumes
+  the one corrective retry. Truncations are counted separately
+  (extra.truncation_failures / extra.truncation_failed).
+
+* Fold dead-letter cap: before folding a cluster, the (entity/domain or
+  insight/entity) key is checked against the consolidation_runs ledger — if it
+  appears in preservation_failed / truncation_failed extras
+  NREM_FOLD_FAIL_CAP times (default 3) within the last NREM_FOLD_FAIL_WINDOW
+  days (default 7), the cluster is SKIPPED and the key recorded in
+  extra.fold_dead_letter. Operator reset = time passing beyond the window, or
+  manual consolidation_runs cleanup (delete/backdate the failing rows).
+
+* Forced-backstop fairness: the MAX_DEFERRAL backstop still fires, but it
+  never fires INTO a busy serial LLM slot — at forced time it waits up to
+  NREM_FORCED_SLOT_WAIT seconds (polling every 10s) for a free slot, then
+  defers with reason 'pool_busy_forced', leaving the backstop armed.
+
+* IDLE_THRESHOLD_SEC ships at its documented intent (900s, env-tunable via
+  NREM_IDLE_THRESHOLD_SEC); the shipped 60 was a testing value.
+"""
 import sys
 import os
 import re
@@ -35,9 +63,46 @@ PG_CONN = os.environ.get(
 )
 RETRIEVER_URL = "http://localhost:8888/v1/embeddings"
 REASONER_URL = "http://localhost:8888/v1/chat/completions"
-IDLE_THRESHOLD_SEC = 60  # 1 minute for testing, change to 900 for 15 mins
+# Idle window before a pending event-driven consolidation fires. Ships at the
+# documented intent (15 min); the old hardcoded 60 was the testing value.
+IDLE_THRESHOLD_SEC = int(os.environ.get("NREM_IDLE_THRESHOLD_SEC", "900"))
 MAX_DEFERRAL_SEC = IDLE_THRESHOLD_SEC * 3
 DENSITY_THRESHOLD = ONT.density_threshold
+
+# ── Output bounds + truncation detection ─────────────────────────────────────
+# OPERATOR CONSTRAINT: a bound that processes but gives incomplete saves /
+# truncated summaries is worse than no bound at all — a truncated draft is
+# never persisted, never repair-salvaged, never fed to the preservation gate.
+NREM_MAX_TOKENS_SUMMARY = int(os.environ.get("NREM_MAX_TOKENS_SUMMARY", "2048"))
+NREM_MAX_TOKENS_INSIGHT = int(os.environ.get("NREM_MAX_TOKENS_INSIGHT", "2048"))
+
+# Fold dead-letter cap (see module docstring): key occurrences in
+# preservation_failed/truncation_failed extras within the window → skip.
+NREM_FOLD_FAIL_WINDOW = int(os.environ.get("NREM_FOLD_FAIL_WINDOW", "7"))   # days
+NREM_FOLD_FAIL_CAP    = int(os.environ.get("NREM_FOLD_FAIL_CAP", "3"))
+
+# Forced-backstop fairness (F10): how long a due backstop may WAIT for a free
+# LLM slot before deferring with 'pool_busy_forced' (it never fires into a
+# busy serial slot), and the poll cadence while waiting.
+NREM_FORCED_SLOT_WAIT = float(os.environ.get("NREM_FORCED_SLOT_WAIT", "300"))
+NREM_FORCED_SLOT_POLL = 10.0
+
+
+# MUST-mirror: rem_loop.py and relation_sweep.py carry their own copies of
+# _finish_reason/_truncated (single-file-per-venv convention) — keep in agreement.
+def _finish_reason(resp_json):
+    """choices[0].finish_reason of an OpenAI-compatible completion response
+    ('stop' | 'length' | ...); None when the shape is unexpected."""
+    try:
+        return (resp_json.get("choices") or [{}])[0].get("finish_reason")
+    except (AttributeError, IndexError, TypeError):
+        return None
+
+
+def _truncated(resp_json):
+    """True when generation hit the max_tokens bound (finish_reason='length').
+    Semantics are FAIL-THE-UNIT — the draft is discarded, never gated/persisted."""
+    return _finish_reason(resp_json) == "length"
 
 # Backup fence: a single well-known Postgres advisory lock shared with the gateway
 # (coordinator.BACKUP_ADVISORY_LOCK_KEY) and the REM daemon. The gateway holds it
@@ -194,6 +259,35 @@ def _crun_recover_and_prune():
         logger.warning("consolidation_runs: startup recovery/prune failed (%s)", e)
 
 
+def fetch_fold_dead_letter_counts():
+    """Fold dead-letter gauge: {fold_key: n} — how many times each fold key
+    ('entity/domain' or 'insight/entity') appears in the preservation_failed
+    and truncation_failed extras of consolidation_runs rows started within the
+    last NREM_FOLD_FAIL_WINDOW days. At NREM_FOLD_FAIL_CAP the callers SKIP the
+    cluster (fold dead-letter) instead of burning an LLM fold on it every
+    cycle. Own short conn (instrumentation never shares the cycle's conn);
+    failsafe → {} on any DB error (fail open toward folding — a broken ledger
+    must not dead-letter healthy clusters)."""
+    try:
+        c = psycopg2.connect(PG_CONN, connect_timeout=5)
+        try:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT k, count(*) FROM consolidation_runs,"
+                    " LATERAL jsonb_array_elements_text("
+                    "   COALESCE(extra->'preservation_failed', '[]'::jsonb)"
+                    "   || COALESCE(extra->'truncation_failed', '[]'::jsonb)) AS k"
+                    " WHERE started_at > now() - make_interval(days => %s)"
+                    " GROUP BY k",
+                    (NREM_FOLD_FAIL_WINDOW,))
+                return {r[0]: int(r[1]) for r in cur.fetchall()}
+        finally:
+            c.close()
+    except Exception as e:
+        logger.warning("fold dead-letter: ledger fetch failed (%s) — no dead-lettering this pass", e)
+        return {}
+
+
 def _fetch_outbox_created_at(pg_ids):
     """pg_id → neo4j_outbox.created_at: the durable write-time index over the
     un-consolidated working set (ADR-018). The outbox is self-cleaning, so a
@@ -247,7 +341,11 @@ class _CycleRec:
                  # accounting shape — the original fields are untouched).
                  "edges_awaiting_calibration", "machine_edges_consumed",
                  "preservation_retries", "preservation_failures",
-                 "calibration", "preservation_failed")
+                 "calibration", "preservation_failed",
+                 # Truncation = capacity failure, counted SEPARATELY from
+                 # preservation failures; fold_dead_letter = keys skipped by
+                 # the fold-failure cap this cycle.
+                 "truncation_failures", "truncation_failed", "fold_dead_letter")
 
     def __init__(self):
         self.attempted = self.succeeded = self.failed = 0
@@ -269,6 +367,9 @@ class _CycleRec:
         self.preservation_failures = 0
         self.calibration = None
         self.preservation_failed = []
+        self.truncation_failures = 0
+        self.truncation_failed = []
+        self.fold_dead_letter = []
 
     def fold(self, ok):
         self.attempted += 1
@@ -289,7 +390,8 @@ class _CycleRec:
         if self.calibration is None and not (
             self.edges_awaiting_calibration or self.machine_edges_consumed
             or self.preservation_retries or self.preservation_failures
-            or self.preservation_failed
+            or self.preservation_failed or self.truncation_failures
+            or self.truncation_failed or self.fold_dead_letter
         ):
             return None
         out = {
@@ -297,11 +399,16 @@ class _CycleRec:
             "machine_edges_consumed": self.machine_edges_consumed,
             "preservation_retries": self.preservation_retries,
             "preservation_failures": self.preservation_failures,
+            "truncation_failures": self.truncation_failures,
         }
         if self.calibration is not None:
             out["calibration"] = self.calibration
         if self.preservation_failed:
             out["preservation_failed"] = self.preservation_failed
+        if self.truncation_failed:
+            out["truncation_failed"] = self.truncation_failed
+        if self.fold_dead_letter:
+            out["fold_dead_letter"] = self.fold_dead_letter
         return out
 
 # AGENT_TOKEN authenticates daemon outbound calls through the proxy.
@@ -1014,6 +1121,12 @@ class ConsolidationDaemon:
         )
         self.is_running = True
         self.last_log_merge_date = None
+        # Truncation signal from the last generate_summary/generate_insight
+        # call — the CALLER resets it before each call and reads it after a
+        # falsy return to tell a capacity failure (finish_reason=length) from
+        # an ordinary LLM failure. Kept on the daemon (not the return value)
+        # so mocked generators in tests keep their string|None contract.
+        self._last_llm_truncated = False
         # datetime.min ⇒ the first idle tick after startup sweeps immediately,
         # draining clusters that became eligible while the daemon was down.
         self.last_sweep_time = datetime.min
@@ -1174,11 +1287,26 @@ class ConsolidationDaemon:
                         {"role": "user", "content": prompt},
                     ],
                     "temperature": NREM_TEMPERATURE,
+                    "max_tokens": NREM_MAX_TOKENS_SUMMARY,
                 }, ceiling_s=_ceiling)
                 if resp.status_code != 200:
                     logger.error(f"Summarization failed with status {resp.status_code}: {resp.text}")
                     return None
-                return resp.json()["choices"][0]["message"]["content"]
+                rj = resp.json()
+                if _truncated(rj):
+                    # FAIL-THE-UNIT: a truncated draft can PASS the anchor
+                    # check (the preservation gate detects omission, not
+                    # truncation) — it must never reach the gate, never spend
+                    # the corrective retry, never be persisted. The flag lets
+                    # the caller count this separately as a capacity failure.
+                    self._last_llm_truncated = True
+                    logger.warning(
+                        "NREM: summary for '%s' TRUNCATED at max_tokens=%d "
+                        "(finish_reason=length) — draft discarded before the "
+                        "preservation gate (capacity failure)",
+                        entity, NREM_MAX_TOKENS_SUMMARY)
+                    return None
+                return rj["choices"][0]["message"]["content"]
         except Exception as e:
             logger.error(f"Summarization error for {entity}: {type(e).__name__}: {str(e)}")
             return None
@@ -1253,11 +1381,24 @@ class ConsolidationDaemon:
                         {"role": "user", "content": prompt},
                     ],
                     "temperature": NREM_TEMPERATURE,
+                    "max_tokens": NREM_MAX_TOKENS_INSIGHT,
                 }, ceiling_s=_ceiling)
                 if resp.status_code != 200:
                     logger.error(f"Insight synthesis failed with status {resp.status_code}: {resp.text}")
                     return None
-                return resp.json()["choices"][0]["message"]["content"]
+                rj = resp.json()
+                if _truncated(rj):
+                    # Same FAIL-THE-UNIT semantics as generate_summary: a
+                    # truncated insight never reaches the preservation gate,
+                    # never spends the corrective retry, never persists.
+                    self._last_llm_truncated = True
+                    logger.warning(
+                        "NREM: insight for '%s' TRUNCATED at max_tokens=%d "
+                        "(finish_reason=length) — draft discarded before the "
+                        "preservation gate (capacity failure)",
+                        entity, NREM_MAX_TOKENS_INSIGHT)
+                    return None
+                return rj["choices"][0]["message"]["content"]
         except Exception as e:
             logger.error(f"Insight synthesis error for {entity}: {type(e).__name__}: {str(e)}")
             return None
@@ -1612,9 +1753,28 @@ class ConsolidationDaemon:
                 ):
                     work_items.append((cluster['entity'], dom, c, p, aliases))
 
+            # Fold dead-letter cap (see module docstring): keys that failed the
+            # preservation/truncation gates NREM_FOLD_FAIL_CAP times within the
+            # window are skipped, not re-folded every cycle. Own-conn fetch,
+            # failsafe {} — a broken ledger never dead-letters healthy clusters.
+            dead_letter = await loop.run_in_executor(None, fetch_fold_dead_letter_counts)
+
             for entity, domain, contents, pg_ids, aliases in work_items:
 
-                # 1. Fetch previous summary for this (entity, domain) pair
+                fold_key = f"{entity}/{domain}"
+                if dead_letter.get(fold_key, 0) >= NREM_FOLD_FAIL_CAP:
+                    rec.fold_dead_letter.append(fold_key)
+                    logger.error(
+                        "NREM fold dead-letter: '%s' failed preservation/truncation "
+                        "%d time(s) within %dd (cap %d) — SKIPPING this cluster. "
+                        "Operator reset = window expiry or consolidation_runs cleanup.",
+                        fold_key, dead_letter[fold_key], NREM_FOLD_FAIL_WINDOW,
+                        NREM_FOLD_FAIL_CAP)
+                    continue
+
+                # 1. Fetch previous summary for this (entity, domain) pair.
+                #    A superseded narrative must never seed a fold (COALESCE is
+                #    belt-and-braces for pre-migration-006 rows).
                 previous_summary = None
                 try:
                     def _fetch_prev(ent=entity, dom=domain):
@@ -1623,6 +1783,7 @@ class ConsolidationDaemon:
                                 SELECT content FROM community_summaries
                                 WHERE metadata->>'entity' = %s
                                   AND COALESCE(metadata->>'domain', %s) = %s
+                                  AND NOT COALESCE(superseded, false)
                                 ORDER BY id DESC LIMIT 1
                             """, (ent, DEFAULT_DOMAIN, dom))
                             row = cur.fetchone()
@@ -1647,10 +1808,24 @@ class ConsolidationDaemon:
                     for content, r in zip(contents, recs)
                 ]
                 logger.info(f"Distilling cluster for '{entity}' [domain={domain}] ({len(contents)} facts)...")
+                self._last_llm_truncated = False
                 summary = await self.generate_summary(entity, contents, previous_summary,
                                                       records=recs)
                 if not summary:
-                    logger.error(f"Failed to generate summary for {entity}. Re-queueing IDs.")
+                    if self._last_llm_truncated:
+                        # Capacity failure — counted separately; the truncated
+                        # draft never reached the preservation gate and did NOT
+                        # consume the corrective retry. Requeue as today; the
+                        # fold-failure cap dead-letters repeat offenders.
+                        rec.truncation_failures += 1
+                        rec.truncation_failed.append(fold_key)
+                        logger.error(
+                            "Truncation failure for '%s' [domain=%s] — fold fails "
+                            "(no gate, no retry, nothing persisted). Re-queueing IDs. "
+                            "(truncation_failures=%d)",
+                            entity, domain, rec.truncation_failures)
+                    else:
+                        logger.error(f"Failed to generate summary for {entity}. Re-queueing IDs.")
                     rec.fold(False)
                     self._requeue(pg_ids)
                     continue
@@ -1668,9 +1843,15 @@ class ConsolidationDaemon:
                         "captured record(s) (%s) — one corrective retry. "
                         "(preservation_retries=%d)",
                         entity, domain, len(missing), missing, rec.preservation_retries)
+                    self._last_llm_truncated = False
                     summary = await self.generate_summary(
                         entity, contents, previous_summary, records=recs,
                         corrective=missing)
+                    if not summary and self._last_llm_truncated:
+                        # The corrective retry itself got truncated — a capacity
+                        # failure on top of the preservation miss; count both.
+                        rec.truncation_failures += 1
+                        rec.truncation_failed.append(fold_key)
                     ok, missing = (summary_preserves(summary, anchors)
                                    if summary else (False, missing))
                 if not ok:
@@ -1999,11 +2180,30 @@ class ConsolidationDaemon:
                 refolds = await loop.run_in_executor(
                     None, lambda: fetch_refold_insights(conn, retro_ids)
                 )
+                # Fold dead-letter cap (see module docstring) — checked at the
+                # call sites so _fold_insight's query order stays untouched.
+                dead_letter = await loop.run_in_executor(None, fetch_fold_dead_letter_counts)
+
+                def _dead_lettered(entity):
+                    key = f"insight/{entity}"
+                    if dead_letter.get(key, 0) >= NREM_FOLD_FAIL_CAP:
+                        rec.fold_dead_letter.append(key)
+                        logger.error(
+                            "NREM fold dead-letter: '%s' failed preservation/"
+                            "truncation %d time(s) within %dd (cap %d) — SKIPPING. "
+                            "Operator reset = window expiry or consolidation_runs cleanup.",
+                            key, dead_letter[key], NREM_FOLD_FAIL_WINDOW,
+                            NREM_FOLD_FAIL_CAP)
+                        return True
+                    return False
+
                 # Track only decisions actually FOLDED (not merely attempted): an
                 # aborted fold (LLM down, <2 rows) must not suppress a fresh cluster
                 # that shares its ids — that work should still be tried this pass.
                 folded: set = set()
                 for old_id, entity, src_ids, prev_content in refolds:
+                    if _dead_lettered(entity):
+                        continue
                     logger.info(
                         "Insight cycle: re-folding insight %d ('%s') — new retrospective(s) on %s.",
                         old_id, entity, sorted(set(src_ids) & set(retro_ids)),
@@ -2033,6 +2233,8 @@ class ConsolidationDaemon:
                     ids = [int(i) for i in c["decision_ids"] if i is not None]
                     if not ids or any(i in folded for i in ids):
                         continue  # already folded as a re-fold this pass
+                    if _dead_lettered(c["entity"]):
+                        continue
                     logger.info(
                         "Insight cycle: fresh cluster on '%s' — %d decisions across projects %s.",
                         c["entity"], len(ids), sorted(c.get("projects") or []),
@@ -2189,9 +2391,22 @@ class ConsolidationDaemon:
             "Folding insight for '%s' (%d decisions, %d retrospective edges)...",
             entity, len(rows), len(outcomes),
         )
+        self._last_llm_truncated = False
         insight = await self.generate_insight(entity, blocks, previous_insight)
         if not insight:
-            logger.error(f"Failed to synthesise insight for '{entity}' — ledger rows stay open; next sweep retries.")
+            if self._last_llm_truncated:
+                # Capacity failure — the truncated draft never reached the
+                # preservation gate and did not consume the corrective retry.
+                # Open ledger rows are the durable requeue; the fold-failure
+                # cap dead-letters repeat offenders.
+                cyc.truncation_failures += 1
+                cyc.truncation_failed.append(f"insight/{entity}")
+                logger.error(
+                    "Truncation failure for insight '%s' — fold fails (no gate, "
+                    "no retry, nothing persisted); ledger rows stay open. "
+                    "(truncation_failures=%d)", entity, cyc.truncation_failures)
+            else:
+                logger.error(f"Failed to synthesise insight for '{entity}' — ledger rows stay open; next sweep retries.")
             return False
 
         # PRESERVATION GATE (stage 5): every decision's title anchor and each
@@ -2206,8 +2421,13 @@ class ConsolidationDaemon:
                 "Preservation gate: insight for '%s' dropped %d captured anchor(s) "
                 "(%s) — one corrective retry. (preservation_retries=%d)",
                 entity, len(missing), missing, cyc.preservation_retries)
+            self._last_llm_truncated = False
             insight = await self.generate_insight(entity, blocks, previous_insight,
                                                   corrective=missing)
+            if not insight and self._last_llm_truncated:
+                # The corrective retry itself got truncated — count both.
+                cyc.truncation_failures += 1
+                cyc.truncation_failed.append(f"insight/{entity}")
             ok, missing = (summary_preserves(insight, anchors)
                            if insight else (False, missing))
         if not ok:
@@ -2307,6 +2527,21 @@ class ConsolidationDaemon:
                     new_id=summary_pg_id, old_ids=superseded_ids
                 )
 
+    async def _wait_for_forced_slot(self) -> bool:
+        """Forced-backstop fairness (F10): a due hard backstop may WAIT for a
+        free LLM slot — up to NREM_FORCED_SLOT_WAIT seconds, polling every
+        NREM_FORCED_SLOT_POLL — but it NEVER fires into a busy serial slot
+        (that queues a multi-minute fold behind a live generation and times it
+        out client-side while leaving a zombie generation server-side).
+        Returns True when a slot freed up, False when the wait expired."""
+        deadline = time.monotonic() + NREM_FORCED_SLOT_WAIT
+        while True:
+            if await pool_has_free_slot():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(NREM_FORCED_SLOT_POLL)
+
     async def _make_listen_conn(self):
         """Open a Postgres LISTEN connection and return (conn, cur)."""
         loop = asyncio.get_running_loop()
@@ -2364,11 +2599,27 @@ class ConsolidationDaemon:
                                 forced = True
 
                     if should_consolidate:
-                        # Yield to active user inference on the GPU — but never let the
-                        # hard backstop be starved by continuous activity.
-                        if not forced and not await pool_has_free_slot():
-                            logger.warning("NREM: LLM pool has no free slot — deferring consolidation; will re-check next cycle.")
-                            await loop.run_in_executor(None, lambda: _crun_record_deferred("fact_consolidation", "pool_busy"))
+                        # Yield to active user inference on the GPU. The hard
+                        # backstop is not starved — it may WAIT for a slot
+                        # (F10) — but consolidation NEVER fires into a busy
+                        # serial slot, forced or not.
+                        slot_free = await pool_has_free_slot()
+                        if not slot_free and forced:
+                            logger.warning(
+                                "NREM: hard backstop due but LLM pool busy — waiting up to "
+                                "%.0fs for a free slot (never firing into a busy slot).",
+                                NREM_FORCED_SLOT_WAIT)
+                            slot_free = await self._wait_for_forced_slot()
+                        if not slot_free:
+                            if forced:
+                                logger.warning(
+                                    "NREM: forced consolidation deferred — no free slot within "
+                                    "%.0fs (pool_busy_forced); backstop stays armed.",
+                                    NREM_FORCED_SLOT_WAIT)
+                                await loop.run_in_executor(None, lambda: _crun_record_deferred("fact_consolidation", "pool_busy_forced"))
+                            else:
+                                logger.warning("NREM: LLM pool has no free slot — deferring consolidation; will re-check next cycle.")
+                                await loop.run_in_executor(None, lambda: _crun_record_deferred("fact_consolidation", "pool_busy"))
                         else:
                             # Backup fence: SHARED advisory lock held across the cycle.
                             # If the gateway holds it EXCLUSIVE (backup dumping), defer —
