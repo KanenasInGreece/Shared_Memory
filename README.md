@@ -624,7 +624,8 @@ The reasoning LLM behind `/v1/chat/completions` can be a **single** OpenAI-compa
 - **Forward-and-absorb:** the gateway forwards into each backend's own single-slot queue rather than holding a queue itself, so it stays stateless under multi-minute generations.
 - **Fault tolerance:** a backend that fails repeatedly is put in a short cooldown and skipped; the rest of the pool keeps serving, so a single card always keeps the system running.
 - **Same model on every backend** (different context sizes are fine) — mixed models would return inconsistent output formats.
-- Unset `LLM_BACKENDS` → a single backend, behaviour identical to a classic single-server setup.
+- Unset `LLM_BACKENDS` → a single backend, behaviour identical to a classic single-server setup (its address is `LLM_DEFAULT_TARGET`, so a server on a different port needs no code change).
+- `LLM_MODEL` sets the model name sent on every reasoning call. The default suits servers that ignore that field; set the real id for anything that validates it — a named-model server, a routing proxy, a hosted OpenAI-compatible endpoint, or a desktop app with several models loaded.
 
 `GET /health` reports the pool (`llm`, and per-backend `llm_pool` with weight, in-flight, requests routed, failures, and cooldown) so the realised load split is observable.
 
