@@ -101,7 +101,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.7.3"
+FRAMEWORK_VERSION = "0.7.4"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -111,6 +111,66 @@ FRAMEWORK_VERSION = "0.7.3"
 # relation edges (decisions 726/727).
 API_VERSION = 3
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
+
+# ── Record references: a record id is only unique WITHIN ITS TABLE ────────────
+# `technical_docs` and `community_summaries` run INDEPENDENT id sequences, so the
+# same integer names two unrelated real records. Inside this process that has
+# always been safe by accident — every content path happens to be label-scoped or
+# table-scoped — but a BARE integer crossing the API boundary is genuinely
+# ambiguous: search returns the id under the same field name for both namespaces,
+# so an id lifted off a summary result and handed back to a lookup used to resolve
+# against technical_docs and return a confident, unrelated record.
+#
+# The fix is to make the record TYPE explicit on every reference (`fact:816`,
+# `summary:87`) rather than to renumber both tables onto one global sequence — an
+# irreversible migration to close something this closes additively. A bare integer
+# is still accepted, and still means technical_docs, for compatibility.
+REF_TYPES_DOCS      = ("fact", "decision", "retrospective")
+REF_TYPES_SUMMARIES = ("summary", "insight")
+REF_SEPARATOR       = ":"
+
+
+def make_ref(record_type: str, pg_id: int) -> str:
+    """The qualified, unambiguous form of a record reference."""
+    return f"{record_type}{REF_SEPARATOR}{pg_id}"
+
+
+def parse_ref(raw: str) -> tuple[str | None, int]:
+    """Parse a record reference into (record_type, pg_id).
+
+    A qualified ref (`fact:816`) returns its type; a bare integer returns
+    ``None``, meaning "unqualified — assume technical_docs", which is the
+    documented compatibility behaviour and the ONE place the old ambiguity
+    survives. Raises ValueError on anything else, so a malformed ref fails
+    loudly instead of being silently coerced to a number.
+    """
+    text = str(raw).strip()
+    if REF_SEPARATOR not in text:
+        return None, int(text)          # ValueError on non-numeric — deliberate
+    rtype, _, num = text.partition(REF_SEPARATOR)
+    rtype = rtype.strip().lower()
+    if rtype not in REF_TYPES_DOCS + REF_TYPES_SUMMARIES:
+        raise ValueError(
+            f"unknown record type {rtype!r} — expected one of "
+            f"{', '.join(REF_TYPES_DOCS + REF_TYPES_SUMMARIES)}"
+        )
+    return rtype, int(num)
+
+
+def summary_record_type(metadata: dict | None) -> str:
+    """The record type of a community_summaries row: insights are their own
+    namespace-mate, not a kind of thematic summary, and the two rank and read
+    differently — so they are distinguishable in a reference."""
+    kind = (metadata or {}).get("kind")
+    return "insight" if kind == "insight" else "summary"
+
+
+def doc_record_type(metadata: dict | None) -> str:
+    """The record type of a technical_docs row. Everything that is not an
+    explicit decision or retrospective is a fact — the same collapse the
+    enrichment daemon applies, so the two agree on what a record IS."""
+    t = (metadata or {}).get("type")
+    return t if t in REF_TYPES_DOCS else "fact"
 
 # Throttle: remember (agent, version) pairs already logged so a misversioned
 # client does not flood the gateway log on every request.
@@ -2708,6 +2768,11 @@ class MemoryCoordinator:
             # single-domain narrative. source_pg_ids are DECISION ids here.
             ins_result = {
                 "tier": "insight_summary",
+                # A DIFFERENT id namespace from the fact tier below — same field
+                # name, independent sequence. record_type/ref disambiguate it.
+                "record_type": summary_record_type(insight["metadata"]),
+                "ref": make_ref(summary_record_type(insight["metadata"]),
+                                insight.get("id")),
                 # .get: tolerant of pre-change callers/stubs without the id
                 # column — pg_id (community_summaries.id = the CommunitySummary
                 # node key) enables the summary→sources graph walk below.
@@ -2730,6 +2795,10 @@ class MemoryCoordinator:
             # (source_pg_ids) — drill down via /memory/graph or status/{pg_id}.
             sum_result = {
                 "tier": "community_summary",
+                # Same-name, different-namespace id — see the insight tier above.
+                "record_type": summary_record_type(summary["metadata"]),
+                "ref": make_ref(summary_record_type(summary["metadata"]),
+                                summary.get("id")),
                 "pg_id": summary.get("id"),
                 "content": summary["content"],
                 "score": None,
@@ -2762,9 +2831,16 @@ class MemoryCoordinator:
                 ctx = await self._expand_graph_context(
                     session, pg_id, (ONT.fact, ONT.decision, ONT.retrospective)
                 )
+                # `tier` says WHERE the hit came from; `record_type` says WHAT it
+                # is. They are not the same: the Tier-1 "fact" tier carries
+                # decisions and retrospectives too, and the id namespace is keyed
+                # on the record type, not the tier.
+                rtype = doc_record_type(metas[idx])
                 final.append({
                     "tier": "fact",
                     "pg_id": pg_id,
+                    "record_type": rtype,
+                    "ref": make_ref(rtype, pg_id),
                     "content": contents[idx],
                     "score": raw_score,
                     "score_normalized": _sigmoid(raw_score),
@@ -2826,12 +2902,24 @@ class MemoryCoordinator:
         insight (the FORM, via the source_pg_ids reverse lookup) and the coarse
         fact→summary latency when both timestamps exist. Backwards-compatible: the old
         `neo4j`/`retries`/`applied_at` fields are retained."""
+        # Accepts a qualified reference (`fact:816`, `summary:87`) or a bare
+        # integer. The bare form still means technical_docs — the compatibility
+        # concession, and the one place the namespace ambiguity survives.
         try:
-            pg_id = int(request.match_info["pg_id"])
-        except ValueError:
+            record_type, pg_id = parse_ref(request.match_info["pg_id"])
+        except ValueError as exc:
             return web.json_response(
-                {"status": "error", "message": "pg_id must be an integer"}, status=400
+                {"status": "error",
+                 "message": f"reference must be an integer or <type>:<id> ({exc})"},
+                status=400,
             )
+
+        # A summary id resolved against technical_docs is the exact wrong answer
+        # this qualification exists to prevent: the sequences are independent, so
+        # the lookup would succeed and return an unrelated record. Route it to
+        # the table it actually names.
+        if record_type in REF_TYPES_SUMMARIES:
+            return await self._status_of_summary(pg_id, record_type)
 
         async with self._acquire() as conn:
             rec = await conn.fetchrow(
@@ -2854,6 +2942,20 @@ class MemoryCoordinator:
 
         if rec is None and ob is None:
             return web.json_response({"pg_id": pg_id, "exists": False, "neo4j": "unknown"})
+
+        # A qualified ref that names the wrong type is a caller error worth
+        # surfacing: the id resolved, but not to the record the caller meant.
+        # Silently returning the row is how a mismatched reference becomes a
+        # confident wrong answer.
+        actual_type = doc_record_type({"type": rec["type"]} if rec else None)
+        if record_type and record_type != actual_type:
+            return web.json_response(
+                {"status": "error", "pg_id": pg_id,
+                 "message": (f"{make_ref(record_type, pg_id)} does not exist — id {pg_id} "
+                             f"in technical_docs is a {actual_type} "
+                             f"({make_ref(actual_type, pg_id)})")},
+                status=404,
+            )
 
         def _iso(t):
             return t.isoformat() if t else None
@@ -2887,6 +2989,10 @@ class MemoryCoordinator:
 
         return web.json_response({
             "pg_id": pg_id,
+            # The unambiguous form of the thing just returned — quote THIS back,
+            # not the bare id, and the reference can never resolve elsewhere.
+            "record_type": actual_type,
+            "ref": make_ref(actual_type, pg_id),
             "exists": rec is not None,
             "type": rec["type"] if rec else None,
             "created_at": _iso(rec["created_at"]) if rec else None,
@@ -2901,6 +3007,63 @@ class MemoryCoordinator:
             "consolidated_at": _iso(ob["consolidated_at"]) if ob else None,
             # what it became (durable — from the source_pg_ids reverse lookup)
             "consolidated_into": consolidated_into,
+        })
+
+    async def _status_of_summary(self, pg_id: int, record_type: str) -> web.Response:
+        """Status of a `community_summaries` row — the other id namespace.
+
+        Reached only from a QUALIFIED reference (`summary:87` / `insight:87`),
+        because a bare integer cannot say which table it means and must keep
+        resolving against technical_docs for compatibility. Returns the
+        narrative's own identity plus the Tier-1 records it was synthesised
+        from, so a summary can be traced to its sources with one call — those
+        `source_pg_ids` ARE technical_docs ids, and are handed back already
+        qualified so they cannot be mistaken for ids in this namespace."""
+        async with self._acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id, metadata, source_pg_ids, created_at, superseded, run_id"
+                "  FROM community_summaries WHERE id = $1", pg_id,
+            )
+            if row is None:
+                return web.json_response(
+                    {"pg_id": pg_id, "record_type": record_type,
+                     "ref": make_ref(record_type, pg_id), "exists": False},
+                    status=404,
+                )
+            meta   = _coerce_jsonb_obj(row["metadata"])
+            actual = summary_record_type(meta)
+            if record_type != actual:
+                return web.json_response(
+                    {"status": "error", "pg_id": pg_id,
+                     "message": (f"{make_ref(record_type, pg_id)} does not exist — id "
+                                 f"{pg_id} in community_summaries is a {actual} "
+                                 f"({make_ref(actual, pg_id)})")},
+                    status=404,
+                )
+            src_types = {}
+            if row["source_pg_ids"]:
+                for r in await conn.fetch(
+                    "SELECT id, metadata->>'type' AS type FROM technical_docs"
+                    "  WHERE id = ANY($1::bigint[])", list(row["source_pg_ids"]),
+                ):
+                    src_types[r["id"]] = doc_record_type({"type": r["type"]})
+        return web.json_response({
+            "pg_id": pg_id,
+            "record_type": actual,
+            "ref": make_ref(actual, pg_id),
+            "exists": True,
+            "entity": meta.get("entity"),
+            "domain": meta.get("domain"),
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            "superseded": row["superseded"],
+            "run_id": row["run_id"],
+            "source_pg_ids": list(row["source_pg_ids"] or []),
+            "sources": [
+                {"pg_id": sid,
+                 "record_type": src_types.get(sid),
+                 "ref": (make_ref(src_types[sid], sid) if sid in src_types else None)}
+                for sid in (row["source_pg_ids"] or [])
+            ],
         })
 
     # ── GET /memory/telemetry ─────────────────────────────────────────────────

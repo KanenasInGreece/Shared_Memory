@@ -5,6 +5,35 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.7.4] — 2026-07-20
+
+Correctness at the API boundary. A record id is unique only *within its table* — original
+records and synthesised narratives are stored separately and numbered independently — so the
+same integer names two unrelated real records. Inside the system this was always safe: every
+path that turns an id into content is scoped to one kind of record. But search returned the id
+under the same field name for both, so an id taken from a narrative and handed back to a
+lookup resolved against the wrong store and returned a confident, unrelated record.
+
+### Added
+
+- **Every record reference is now qualified with its type.** Search results carry
+  `record_type` and a `ref` (`fact:816`, `summary:87`) alongside the existing id, and the
+  lineage lookup accepts either form. Quote the `ref` and a reference cannot resolve to the
+  wrong record. Asking for a narrative by reference now returns its own identity and the
+  records it was synthesised from, each already qualified.
+- A reference naming the wrong type returns a not-found error **that names the right
+  reference**, instead of a plausible wrong record.
+
+### Notes
+
+- A bare id is still accepted and still means the original-records store, so existing callers
+  and scripts are unaffected. That remains the one place the ambiguity survives, and it is now
+  documented as such rather than being an unstated assumption.
+- Chosen over renumbering both stores onto a single global sequence, which would have required
+  an irreversible rewrite of every stored reference to close something this closes additively.
+
+---
+
 ## [0.7.3] — 2026-07-20
 
 Bug fix. The enrichment queue could stop draining entirely: the same records were selected

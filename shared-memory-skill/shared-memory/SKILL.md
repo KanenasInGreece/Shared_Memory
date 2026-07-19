@@ -52,7 +52,7 @@ Search the shared memory with semantic similarity, reranking, and Neo4j relation
 
 Returns: Tier 3 community summary (global context) + Tier 1 semantic hits + Neo4j relational expansion.
 
-The Tier-3 community summary now carries `source_pg_ids` (and its `metadata`) — the exact Tier-1 facts it was synthesised from. Trace a narrative back to its sources by running `graph`/`status` on those ids.
+The Tier-3 community summary now carries `source_pg_ids` (and its `metadata`) — the exact Tier-1 facts it was synthesised from. Those are **facts-table** ids: trace a narrative to its sources with `lineage` on them, or `lineage summary:<id>` to get them already qualified (see the record-reference note under Task 3).
 
 **`stale_sources` — act on it.** A returned summary or insight may carry `stale_sources: [{"old": X, "superseded_by": X′}]`, meaning it was synthesised from a fact that has since been **superseded** (corrected/retracted). The narrative may be stale. Fetch the successor (`status X′`) and compare before relying on that part. If the change is immaterial, run `review-hold` (below) so it stops re-flagging; if it matters, save the corrected understanding. A null `superseded_by` means the source was retracted (or a reversed decision) with no replacement.
 
@@ -125,11 +125,13 @@ Query the knowledge graph for structural and provenance context.
   ```
   Read-only enforced: `CREATE`, `DELETE`, `DETACH DELETE`, `SET`, `MERGE`, `CALL`, `LOAD CSV`, `DROP` are blocked.
 
-**Record lineage** — *"what happened to pg_id N?"*:
+**Record lineage** — *"what happened to this record?"*:
 ```
-uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py lineage <pg_id>
+uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py lineage <pg_id|type:id>
 ```
 Returns record state (type / created_at / superseded / grounded_in), its live dream-cycle stamps (applied → rem_reviewed → consolidated), and what it consolidated **into** — which summary/insight (the form), the fact→summary latency, the producing cycle, and that cycle's duration. All joined gateway-side.
+
+**⚠ An id is unique only within its table — quote the `ref`, not the bare number.** Facts, decisions and retrospectives share one table, so they can never collide with each other; **community summaries and insights are a SEPARATE sequence**, so the same integer names one of each. Every search result now carries `record_type` and a qualified `ref` (`fact:816`, `summary:87`) — pass **that** to `lineage` and it can never resolve to the wrong record. `lineage summary:87` returns the narrative's own identity plus its sources, already qualified. A bare id still works and still means the facts table, which is exactly why a bare id taken off a *summary* result is the one thing to avoid. A qualified ref naming the wrong type returns 404 with the right ref, rather than a plausible wrong record.
 
 ### 4. Decision Provenance (Save a Decision)
 Record architectural or design decisions with full PROV-O provenance — who decided, which AI assisted, which project, and why.

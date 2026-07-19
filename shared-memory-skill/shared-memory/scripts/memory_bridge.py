@@ -29,7 +29,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.7.2"
+VERSION = "0.7.4"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v3: review-edges / label-edges require the gateway's /memory/relations/* routes.
@@ -946,10 +946,26 @@ async def main() -> None:
         # "What happened to pg_id N?" — record state + in-flight dream-cycle stamps +
         # what it consolidated into (which summary/insight, the form, fact→summary
         # latency). All joins done gateway-side (ADR-014); this only calls the endpoint.
-        if len(sys.argv) < 3 or not sys.argv[2].lstrip("-").isdigit():
-            print(json.dumps({"error": "Usage: memory_bridge.py lineage <pg_id>"}))
+        # Accepts a bare id or a QUALIFIED reference (`fact:816`, `summary:87`).
+        # A record id is unique only within its table — technical_docs and
+        # community_summaries run independent sequences — so a bare id lifted
+        # off a summary search result would resolve against the wrong table and
+        # return a confident, unrelated record. Qualify it and it cannot.
+        if len(sys.argv) < 3:
+            print(json.dumps({"error": "Usage: memory_bridge.py lineage <pg_id|type:id>"}))
             sys.exit(1)
-        pid = int(sys.argv[2])
+        ref = sys.argv[2].strip()
+        head, _, tail = ref.partition(":")
+        valid = (tail.lstrip("-").isdigit()
+                 and head.lower() in ("fact", "decision", "retrospective",
+                                      "summary", "insight")) if tail else \
+                ref.lstrip("-").isdigit()
+        if not valid:
+            print(json.dumps({"error": (
+                "Usage: memory_bridge.py lineage <pg_id|type:id> — type is one of "
+                "fact, decision, retrospective, summary, insight")}))
+            sys.exit(1)
+        pid = ref
         try:
             async with _async_client(30.0) as client:
                 r = await client.get(
