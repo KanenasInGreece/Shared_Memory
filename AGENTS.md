@@ -1,17 +1,16 @@
 # AGENTS.md
 
-**The canonical agent file for this repository.** Codex CLI reads it automatically before each session; Claude Code, Grok, Antigravity CLI and others are pointed here by `AGENT.md`. It serves **two missions** — pick the one that matches what your user asked for:
+**The canonical agent file for this repository.** Codex CLI reads it automatically before each session; Claude Code, Grok, Antigravity CLI and others are pointed here by `AGENT.md`.
 
-- **Operate the framework** — the user wants this repo *installed, configured, started, stopped, or upgraded* on their machine. Follow **Part 1**. You will interview the user, write their `.env`, bring up the stack, mint tokens, and verify health.
-- **Develop in this repository** — the user is changing the framework's code or docs. Follow **Part 2** (commands, architecture, invariants).
+It has **one mission: operate the framework** — get this repo *installed, configured, started, stopped, upgraded, or backed up* on the user's machine. You will interview the user, write their `.env`, bring up the stack, mint tokens, and verify health. Quick start, maintenance, and updates: nothing else.
 
-`README.md` remains the authoritative deep reference; every step below links the section with the full detail. Setup-affecting changes must keep README Quick Start, this file, and `CHANGELOG.md` in sync.
+`README.md` is the authoritative deep reference for everything else — architecture, internals, and working on the framework's own code; every step below links the section with the full detail. Setup-affecting changes must keep README Quick Start, this file, and `CHANGELOG.md` in sync.
 
 ---
 
-# Part 1 — Operate the framework
+# Operating the framework
 
-Everything in this part runs on the **gateway host** — the one machine that owns the databases and daemons. Installing the *skill* into an agent is a separate, much smaller step (Phase 8).
+Everything here runs on the **gateway host** — the one machine that owns the databases and daemons. Installing the *skill* into an agent is a separate, much smaller step (Phase 8).
 
 ## Ground rules for the operating agent
 
@@ -71,7 +70,7 @@ git check-ignore shared-memory/.env          # MUST print the path
 mkdir -p "$NEO4J_HOST_DIR"/{data,logs,import,plugins} "$PG_DATA_DIR"
 ```
 
-Uncomment/set `DREAM_TEMPERATURE` (Q4) and, for multiple LLM backends, `LLM_BACKENDS` (Q3). All framework and helper tooling reads `shared-memory/.env` first, with a repo-root `.env` honoured as a pre-0.6 fallback.
+Uncomment/set `DREAM_TEMPERATURE` (Q4) and, for multiple LLM backends, `LLM_BACKENDS` (Q3). If the user's reasoning server **validates model names** (a named-model server, a routing proxy, a hosted OpenAI-compatible endpoint, or a desktop app with several models loaded), also set `LLM_MODEL` to the real id — the shipped default only suits servers that ignore the field. A single backend on a non-default port is `LLM_DEFAULT_TARGET`. All framework and helper tooling reads `shared-memory/.env` first, with a repo-root `.env` honoured as a pre-0.6 fallback.
 
 ### Phase 2 — Preflight
 
@@ -234,95 +233,9 @@ Day-2 duty: schedule `shared-memory/ops/backup.sh` (quiesced; captures Postgres 
 
 ---
 
-# Part 2 — Develop in this repository
-
-## What this is
-
-The **Shared Memory Framework** — a three-tier semantic memory shared by every local AI tool through one gateway (Postgres + pgvector + Neo4j). All credentials come from `.env`; nothing is hardcoded. Current version: see `CHANGELOG.md` (v0.7.x line: everything from v0.6.x — REM/NREM sleep cycle, per-agent token auth, supersession, domain-scoped + cross-project insight consolidation, read-only roles, quiesced backup/restore, entity alias layer, gateway LLM pool — plus the enrichment rebuild: universal machine-edge provenance, capture-manifest delta enrichment, the typed entity-relation evidence sweep with its adjudication ledger, operator calibration via `review-edges`/`label-edges`, calibration-gated consolidation, and preservation-gated synthesis).
-
-## Commands
-
-```bash
-# Run all tests from repo root (fully mocked — no live infra; MOCK_LLM=1 bypasses LLM)
-uv run --with pytest --with pytest-asyncio --with fastmcp --with psycopg2-binary \
-  --with httpx --with neo4j --with asyncpg --with aiohttp --with json-repair --with numpy \
-  pytest tests/ -v
-
-# Start the gateway — also launches coordinator + REM + NREM daemons; loads .env automatically
-uv run --with aiohttp --with asyncpg --with neo4j --with httpx --with json-repair \
-  python shared-memory/scripts/hive_mind_proxy.py 8888
-
-# Apply schema migrations (idempotent; run after clone or when migrations/ gains files)
-uv run --with psycopg2-binary python shared-memory/migrations/apply.py
-
-# CLI memory bridge (thin HTTP client; gateway must be running)
-uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py search "<query>" 5
-uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py save "<content>" '{"source":"<agent>","entities":["Entity1"],"project":"<domain>"}'
-uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py save_decision --title "..." --decided-by "..." --project "..." --rationale "..."
-uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py save_retrospective --pg-id N --rating validated --notes "..."   # rating: validated|mixed|refined|pending|reversed
-uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py graph "MATCH (n:Entity) RETURN n LIMIT 10"
-uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py doctor   # client↔gateway api_version check
-```
-
-The skill is a **thin client** — only `memory_bridge.py` ships with it. After a client or SKILL.md change, run `bash shared-memory/scripts/sync_skills.sh` (add `--prune` to clear daemons older installs left in skill dirs). The daemons are **server-side**: changes to them or to `migrations/` deploy on the gateway host via `git pull` + `migrations/apply.py` + restart — never via a skill sync. See `shared-memory/Documentation/server-setup.md`.
-
-## Architecture
-
-### Agent Access Split
-
-| Consumer | Interface | Entry point |
-|---|---|---|
-| Claude Code | CLI skill (`/shared-memory`) | `~/.claude/skills/shared-memory/scripts/memory_bridge.py` |
-| Codex CLI | CLI skill (`$shared-memory`) | `~/.codex/skills/shared-memory/scripts/memory_bridge.py` |
-| Grok | CLI skill (`/shared-memory`) | `~/.grok/skills/shared-memory/scripts/memory_bridge.py` |
-| Antigravity CLI (successor to Gemini CLI) | CLI skill (`/activate shared-memory`) | `~/.gemini/skills/shared-memory/scripts/memory_bridge.py` |
-| LM Studio | MCP (FastMCP) | `vector-skill.py` → `rag-orchestrator` in `mcp.json` |
-
-`vector-skill.py` (MCP) is for LM Studio only; CLI agents use `memory_bridge.py`, a thin HTTP client that delegates all storage to the coordinator (needs only `httpx` + `python-dotenv`).
-
-**Client ↔ gateway version contract.** `memory_bridge.py` (and `vector-skill.py`'s `/memory/*` calls) send the `X-SM-Api-Version` header; the gateway reports `api_version` on `GET /health` and logs any skew. `API_VERSION` lives in both `coordinator.py` and `memory_bridge.py` — bump them together on a breaking protocol change. Never copy daemons into a skill dir to "match versions"; the contract, not file parity, governs compatibility.
-
-**No separate graph MCP (e.g. neo4j-agent-memory).** Direct-bolt Neo4j servers bypass the coordinator's per-entity locks, outbox atomicity, and SHA-256 dedup — producing orphaned nodes invisible to search. `rag-orchestrator` already expands Neo4j on every search.
-
-### Three-Tier Storage
-
-| Tier | Store | Role |
-|---|---|---|
-| 1 — Episodic | Postgres `technical_docs` + pgvector | Original facts, full content |
-| 2 — Structural | Neo4j `Fact` (`pg_id`, `consolidated`, `rem_processed`) | Relationships, provenance |
-| 3 — Semantic | Postgres `community_summaries` (keyed on **entity + domain**) | LLM-synthesised narratives |
-
-Retrieval queries **Tier 3 first**, then Tier 1 (vector + rerank), then Neo4j expansion. Tier-3 results carry `source_pg_ids` so a narrative traces back to its source facts. Saves by one agent become retrievable by all once consolidation runs.
-
-### Hive-Mind Gateway + Coordinator (`hive_mind_proxy.py` + `coordinator.py`)
-
-Async aiohttp on `:8888`; **all routes require `Authorization: Bearer <token>` when `AGENT_TOKENS` is set**.
-- `/memory/save|search|graph`, `/memory/decision`, `/memory/retrospective`, `GET /memory/status/{pg_id}` → `coordinator.py`
-- `/v1/embeddings` → BGE-M3 `:8070` · `/v1/reranking` → reranker `:8071` · everything else → the reasoning-LLM backend pool (default single backend `:5000`; `LLM_BACKENDS` for more)
-
-Startup launches the coordinator (asyncpg pool, per-entity locks, outbox worker) plus the REM and NREM daemons; the gateway auto-restarts both on crash (circuit breaker after 5 crashes / 10 min — restart the gateway to reset). `GET /health` reports backend + daemon liveness, `auth_required`, and the gateway `version` / `api_version`.
-
-### Sleep cycle — REM (`rem_loop.py`) + NREM (`consolidation_loop.py`)
-
-- **REM** polls adaptively, enriches the oldest un-enriched `Fact`s (LLM summary + typed entity relationships), sets `rem_processed=true`, and notifies NREM. A fact must pass REM before NREM can consolidate it.
-- **NREM** waits on `LISTEN/NOTIFY` with a 15-min idle timer (45-min hard backstop). It consolidates Entity-hub clusters of ≥5 `rem_processed` facts, **partitioned per `(entity, domain)`** where `domain = COALESCE(metadata->>'project', metadata->>'domain', scope, 'general')`. Entities in the same `alias_component` (connected via `ALIASES` edges, grouped by `gds.wcc`) fold as one cluster — synonym variants no longer fall below the threshold independently. It writes cumulative `community_summaries` and supersedes any summary whose `source_pg_ids` is a strict subset.
-- Both phases yield to active writes (`WRITE_QUIESCE_SEC`, default 30 s) **and** to a busy inference GPU (via `nvtop --snapshot`, cross-vendor; nvtop is a prerequisite but fails open). Deferrals log at **WARNING**; NREM's hard backstop is never blocked.
-
-**Facts saved without `metadata.entities` are stored and searchable but never consolidated.** Tag `project`/`domain` so consolidation stays domain-coherent.
-
-## Key Invariants
-
-- **1024-dim via :8888 only** — never call 8070/8071 directly.
-- **Per-agent auth** — each agent's `.env` holds its own `AGENT_TOKEN` matching one entry in the gateway's `AGENT_TOKENS`; tokens are never shared.
-- **Hard embedding mandate** — saves abort (503) if the gateway/embedder is unreachable; an unvectored row is invisible to search.
-- **SHA-256 idempotency** — `ON CONFLICT (content_hash) DO UPDATE`. Safe to re-save identical content.
-- **Outbox atomicity** — every save writes a `neo4j_outbox` row in the same Postgres transaction; the worker applies Neo4j asynchronously (eliminates the dangling-Fact risk).
-- **`entities` required for consolidation; `project`/`domain` scopes it.**
-- **Health check before saves** — `GET :8888/health` → `status: ok` when embedder and reranker are up; 503 means saves will fail.
-
 ## Configuration
 
-**Framework env (gateway host):** `shared-memory/.env`, written in Part 1 Phase 1 (or by `install_framework.sh`); the repo-root `.env` is honoured as a pre-0.6 fallback by the gateway **and** by `preflight.sh` / `init_db.sh` / `bootstrap_tokens.sh` / `migrations/apply.py`. **Client env:** each agent stores only `AGENT_TOKEN` in `~/<agent>/skills/shared-memory/.env` (see `shared-memory-skill/shared-memory/.env.example`). For `mcp.json`, replace all `YOUR_*` placeholders and the absolute path to `vector-skill.py`. Optional: install `nvtop` on the **infrastructure host** (where REM/NREM run) for GPU-aware dreaming — not on remote clients. **Neo4j GDS plugin** (free Community tier, `graph-data-science`) is required for alias-component grouping.
+**Framework env (gateway host):** `shared-memory/.env`, written in Phase 1 (or by `install_framework.sh`); the repo-root `.env` is honoured as a pre-0.6 fallback by the gateway **and** by `preflight.sh` / `init_db.sh` / `bootstrap_tokens.sh` / `migrations/apply.py`. **Client env:** each agent stores only `AGENT_TOKEN` in `~/<agent>/skills/shared-memory/.env` (see `shared-memory-skill/shared-memory/.env.example`). For `mcp.json`, replace all `YOUR_*` placeholders and the absolute path to `vector-skill.py`. Optional: install `nvtop` on the **infrastructure host** (where REM/NREM run) for GPU-aware dreaming — not on remote clients. **Neo4j GDS plugin** (free Community tier, `graph-data-science`) is required for alias-component grouping.
 
 ## Documentation
 

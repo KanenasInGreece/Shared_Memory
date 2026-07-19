@@ -5,6 +5,64 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.7.1] — 2026-07-19
+
+Operational hardening, found by running the enrichment rebuild against real hardware for the
+first time. Three of these were silent: the backup had stopped reaching its configured
+destination weeks earlier, the consistency fence it relies on never actually engaged, and a
+leaked pool slot could stall consolidation indefinitely. The theme is failing safely and
+loudly instead of quietly producing something incomplete.
+
+### Fixed
+
+- **Backups were being written to local disk, unquiesced, since the environment refactor in
+  0.6.0.** The backup script resolved its configuration from the repository root, a location
+  that no longer holds the environment file. Finding nothing, it fell back to its own
+  defaults — a home-directory destination and no admin credential — so the configured
+  destination was ignored and the consistency fence was skipped outright. It now resolves the
+  framework environment file first, with the old path honoured as a fallback, matching every
+  other script in the project.
+- **The consistency fence could never complete.** Requesting the fence blocks while the
+  gateway quiets the background passes, but the request carried a fifteen-second client
+  timeout against a fifteen-minute server budget, so the client always abandoned it first and
+  every backup silently proceeded unfenced. The handshake now gets a budget that outlasts the
+  server, and the default fence window is short enough that a nightly run cannot stall.
+- **A leaked backend slot could starve consolidation permanently.** The pool's in-flight
+  counter was claimed just before the block whose cleanup releases it, so a failure in between
+  — or a client disconnecting early — leaked the slot for good. Because the background passes
+  only run when the pool looks idle, one leaked slot made it look busy forever, with no
+  recovery short of restarting the gateway. The slot is now claimed inside the protected block.
+- **Truncated model output is never salvaged into stored knowledge.** A bound that produces
+  incomplete saves is worse than no bound, so every bounded call now detects a
+  length-terminated response and fails that unit instead of parsing it: enrichment returns
+  nothing rather than a partial record, batched output drops its final interrupted line and
+  accepts only strictly valid ones, verification degrades its confidence instead of denying
+  unseen items, a truncated narrative never reaches the preservation gate that would have
+  wrongly passed it, and no repaired verdict can reach the permanent adjudication ledger.
+- **Records can no longer strand after a partial write.** A failure between marking a record
+  enriched and completing its bookkeeping now reverts the mark and counts an attempt, so the
+  record re-enters the queue under its retry cap instead of disappearing from every worklist.
+
+### Added
+
+- **Configurable reasoning model id.** The model name sent on every reasoning call was fixed
+  in code, which only works with servers that ignore the field. It can now be set, so backends
+  that validate model names — named-model servers, routing proxies, hosted OpenAI-compatible
+  endpoints — can be addressed.
+- **Configurable forwarding targets.** The embedding and reranking endpoints the gateway
+  forwards to, and the single-backend fallback, are now configuration with defaults rather
+  than literals in a code path. The framework no longer assumes the port layout of the machine
+  it was developed on. Clients are unaffected — they still reach everything through the gateway.
+
+### Notes
+
+- Embedding and reranking remain a **fixed part of the model contract**. The vector dimension
+  is defined in the schema, no dimension check guards it, and changing the embedding model once
+  data exists requires re-embedding rather than a configuration change. Only the reasoning
+  model is freely interchangeable today.
+
+---
+
 ## [0.7.0] — 2026-07-16
 
 The enrichment rebuild. The background enrichment pass used to see only a record's raw text —
