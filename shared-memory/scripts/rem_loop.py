@@ -216,6 +216,35 @@ def _take_shared_backup_lock(conn) -> bool:
         cur.execute("SELECT pg_try_advisory_lock_shared(%s)", (BACKUP_ADVISORY_LOCK_KEY,))
         return bool(cur.fetchone()[0])
 
+# ── NREM slot priority (F2): yield the LLM slot when NREM is queuing ──────────
+# REM and NREM contend for ONE serial LLM slot. REM re-arms far faster and its
+# solo units run ~1000s, so without an arbiter NREM defers indefinitely (it
+# went 4.6 days without a successful fold). NREM takes this advisory lock
+# EXCLUSIVE while it is queuing for the slot; REM checks it at cycle start and
+# yields its turn. Session-scoped, so a dead NREM can never wedge REM.
+# MUST match consolidation_loop.NREM_PRIORITY_ADVISORY_LOCK_KEY.
+NREM_PRIORITY_ADVISORY_LOCK_KEY = int(
+    os.environ.get("NREM_PRIORITY_ADVISORY_LOCK_KEY", "8765310"))
+
+
+def _nrem_is_queuing(conn) -> bool:
+    """True when NREM holds the priority lock (it is waiting for the slot), so
+    this REM cycle should yield. Probe by try-acquire + immediate release: if
+    we get it, nobody was queuing. Fail-open — a probe error never blocks
+    enrichment, it just means this cycle proceeds unarbitrated."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)",
+                        (NREM_PRIORITY_ADVISORY_LOCK_KEY,))
+            got = bool(cur.fetchone()[0])
+            if got:
+                cur.execute("SELECT pg_advisory_unlock(%s)",
+                            (NREM_PRIORITY_ADVISORY_LOCK_KEY,))
+            return not got
+    except Exception as exc:
+        logger.warning("REM: NREM-priority probe failed (%s) — proceeding", exc)
+        return False
+
 # Sampling temperature for the REM enrichment LLM. Default 0.6 suits Gemma-class
 # models, which degrade at very low temperatures; set REM_TEMPERATURE=0.1 in .env
 # for Qwen-class models that prefer near-greedy decoding. DREAM_TEMPERATURE sets
@@ -233,11 +262,34 @@ REM_MAX_TOKENS_PER_SUMMARY = int(os.environ.get("REM_MAX_TOKENS_PER_SUMMARY", "2
 REM_MAX_TOKENS_PER_VERIFY_EDGE = int(os.environ.get("REM_MAX_TOKENS_PER_VERIFY_EDGE", "20"))
 REM_VERIFY_MAX_TOKENS_FLOOR    = 64
 
-# Poison-record escape hatch: a record whose enrichment failed (LLM/parse/
-# truncation/write/consistency) this many times is DEAD-LETTERED — excluded
-# from the fetch until the operator resets n.rem_attempts (or the record is
-# fixed). Success clears the counter, so transient outages never accumulate.
+# On a truncated generation the bound is widened ONCE and the call retried
+# before the unit is failed. A FIXED bound plus the attempt cap below would
+# otherwise silently dead-letter any record that DETERMINISTICALLY needs more
+# output than the bound — permanent, invisible exclusion from the graph, which
+# is the very failure the truncation rule exists to prevent. Truncation still
+# fails the unit; it just gets one wider try first.
+REM_TRUNCATION_RETRY_FACTOR = float(os.environ.get("REM_TRUNCATION_RETRY_FACTOR", "2.0"))
+
+# Poison-record escape hatch: a record whose enrichment failed this many times
+# is DEAD-LETTERED — excluded from the fetch until the operator resets
+# n.rem_attempts (or the record is fixed). Success clears the counter.
+#
+# ONLY RECORD-CHARGEABLE failures count (see LLM_FAIL_* below): a failure that
+# says something about THIS record — its line was missing/unparseable from an
+# otherwise-good batch response, its required summary was absent, its Neo4j
+# write or consistency check failed. A TRANSPORT failure (HTTP non-200,
+# connection error, gateway/pool 503) says nothing about any record and must
+# never be charged: doing so let one 503 demote a whole batch to solo and
+# march five innocent records toward dead-letter (fix-wave A′ F1).
 REM_MAX_ATTEMPTS = int(os.environ.get("REM_MAX_ATTEMPTS", "5"))
+
+# LLM failure classes recorded on REMDaemon._last_llm_failure.
+LLM_FAIL_TRANSPORT = "transport"   # HTTP non-200 / connection / gateway-shape — NOT chargeable
+LLM_FAIL_TRUNCATED = "truncated"   # finish_reason=length even after the widened retry
+LLM_FAIL_PARSE     = "parse"       # response arrived but its content is unusable
+
+# Failure classes that may count toward a record's dead-letter cap.
+LLM_FAIL_CHARGEABLE = frozenset({LLM_FAIL_TRUNCATED, LLM_FAIL_PARSE})
 
 
 logging.basicConfig(level=logging.INFO)
@@ -708,6 +760,13 @@ class REMDaemon:
             connection_acquisition_timeout=NEO4J_ACQUIRE_TIMEOUT,
         )
         self.is_running = True
+        # Failure class of the most recent LLM call (LLM_FAIL_* or None on
+        # success). Set by _llm_process / _llm_process_batch, read by the
+        # callers to decide whether the failure is chargeable to the RECORD.
+        # Instance state rather than a return value: REM processes records
+        # serially within a cycle (same convention as NREM's
+        # _last_llm_truncated), so signatures stay stable.
+        self._last_llm_failure: str | None = None
 
     # ── Postgres connection factory ───────────────────────────────────────────
 
@@ -1293,69 +1352,106 @@ class REMDaemon:
         prompt = build_single_prompt(content, kind, closed_set, manifest or {})
 
         _ceiling = adaptive_ceiling(len(prompt))   # scales with the grounding prompt
-        _start = time.monotonic()
         model = "local-model"
-        try:
-            async with httpx.AsyncClient(timeout=_ceiling) as client:
-                resp = await client.post(
-                    REASONER_URL,
-                    headers=_auth_headers(),
-                    json={
-                        "model": LLM_MODEL,
-                        "messages": [
-                            {"role": "system", "content": "You are a technical knowledge curator. Output only the requested JSON — no reasoning steps, no thinking tokens, no prose outside the JSON object."},
-                            {"role": "user", "content": prompt},
-                        ],
-                        "temperature": REM_TEMPERATURE,
-                        "max_tokens": REM_MAX_TOKENS_SOLO,
-                    },
-                )
-                _backend = resp.headers.get("X-SM-LLM-Backend")
-                model = _backend or "local-model"
-                if resp.status_code != 200:
-                    record_llm_call("REM", None, backend=_backend,
-                                    wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
-                                    ok=False, note=f"http_{resp.status_code}")
-                    logger.error("LLM returned %d: %s", resp.status_code, resp.text[:200])
-                    return None, model
+
+        async def _attempt(max_tokens: int):
+            """One round-trip → (resp_json | None, model, failure).
+            failure is None when a complete (untruncated) body came back."""
+            nonlocal model
+            _start = time.monotonic()
+            try:
+                async with httpx.AsyncClient(timeout=_ceiling) as client:
+                    resp = await client.post(
+                        REASONER_URL,
+                        headers=_auth_headers(),
+                        json={
+                            "model": LLM_MODEL,
+                            "messages": [
+                                {"role": "system", "content": "You are a technical knowledge curator. Output only the requested JSON — no reasoning steps, no thinking tokens, no prose outside the JSON object."},
+                                {"role": "user", "content": prompt},
+                            ],
+                            "temperature": REM_TEMPERATURE,
+                            "max_tokens": max_tokens,
+                        },
+                    )
+            except Exception as exc:
+                logger.error("LLM error: %s", exc)
+                return None, model, LLM_FAIL_TRANSPORT
+            _backend = resp.headers.get("X-SM-LLM-Backend")
+            model = _backend or "local-model"
+            if resp.status_code != 200:
+                record_llm_call("REM", None, backend=_backend,
+                                wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
+                                ok=False, note=f"http_{resp.status_code}")
+                logger.error("LLM returned %d: %s", resp.status_code, resp.text[:200])
+                return None, model, LLM_FAIL_TRANSPORT
+            try:
                 resp_json = resp.json()
-                record_llm_call("REM", resp_json, backend=_backend,
-                                wall_s=time.monotonic() - _start, ceiling_s=_ceiling)
-                if _truncated(resp_json):
-                    # Fail-the-unit: same path as an HTTP failure — the body is
-                    # never handed to _parse_llm_json/json_repair (an incomplete
-                    # enrichment must never be salvaged into a persistable dict).
-                    logger.warning(
-                        "REM: pg_id=%s solo enrichment TRUNCATED at max_tokens=%d "
-                        "(finish_reason=length) — failing the unit; no parse, no repair",
-                        pg_id, REM_MAX_TOKENS_SOLO,
-                    )
-                    return None, model
-                try:
-                    raw = resp_json["choices"][0]["message"]["content"].strip()
-                except (KeyError, IndexError) as exc:
-                    logger.error(
-                        "LLM response schema unexpected (%s) — possible gateway error: %s",
-                        exc, resp.text[:200],
-                    )
-                    return None, model
-                # Extract JSON robustly even if the model wraps it in prose/fences.
-                start = raw.find("{")
-                end   = raw.rfind("}") + 1
-                if start == -1 or end == 0:
-                    logger.error("LLM returned no JSON object: %s", raw[:300])
-                    return None, model
-                # Strict parse first; salvage Gemma-4 JSON slips via json_repair (decision 491).
-                return _parse_llm_json(raw[start:end]), model
-        except Exception as exc:
-            logger.error("LLM error: %s", exc)
+            except Exception as exc:
+                logger.error("LLM response was not JSON (%s): %s", exc, resp.text[:200])
+                return None, model, LLM_FAIL_TRANSPORT
+            record_llm_call("REM", resp_json, backend=_backend,
+                            wall_s=time.monotonic() - _start, ceiling_s=_ceiling)
+            if _truncated(resp_json):
+                return None, model, LLM_FAIL_TRUNCATED
+            return resp_json, model, None
+
+        resp_json, model, failure = await _attempt(REM_MAX_TOKENS_SOLO)
+
+        # Widen ONCE and retry before failing a truncated unit (F4) — a fixed
+        # bound plus the attempt cap would otherwise dead-letter, silently and
+        # permanently, any record that simply needs more output than the
+        # default. Truncation still fails the unit if the wider try also cuts.
+        if failure == LLM_FAIL_TRUNCATED:
+            wider = int(REM_MAX_TOKENS_SOLO * REM_TRUNCATION_RETRY_FACTOR)
+            logger.warning(
+                "REM: pg_id=%s solo enrichment TRUNCATED at max_tokens=%d — "
+                "retrying ONCE at %d before failing the unit",
+                pg_id, REM_MAX_TOKENS_SOLO, wider,
+            )
+            resp_json, model, failure = await _attempt(wider)
+            if failure == LLM_FAIL_TRUNCATED:
+                logger.error(
+                    "REM: pg_id=%s solo enrichment TRUNCATED again at max_tokens=%d "
+                    "(finish_reason=length) — failing the unit; no parse, no repair. "
+                    "Raise REM_MAX_TOKENS_SOLO if this record is legitimately large.",
+                    pg_id, wider,
+                )
+
+        if failure is not None:
+            # Fail-the-unit: the body is never handed to _parse_llm_json /
+            # json_repair (an incomplete enrichment must never be salvaged
+            # into a persistable dict).
+            self._last_llm_failure = failure
             return None, model
+
+        try:
+            raw = resp_json["choices"][0]["message"]["content"].strip()
+        except (KeyError, IndexError) as exc:
+            logger.error(
+                "LLM response schema unexpected (%s) — possible gateway error",
+                exc,
+            )
+            # A malformed envelope is the GATEWAY's fault, not the record's.
+            self._last_llm_failure = LLM_FAIL_TRANSPORT
+            return None, model
+        # Extract JSON robustly even if the model wraps it in prose/fences.
+        start = raw.find("{")
+        end   = raw.rfind("}") + 1
+        if start == -1 or end == 0:
+            logger.error("LLM returned no JSON object: %s", raw[:300])
+            self._last_llm_failure = LLM_FAIL_PARSE
+            return None, model
+        # Strict parse first; salvage Gemma-4 JSON slips via json_repair (decision 491).
+        parsed = _parse_llm_json(raw[start:end])
+        self._last_llm_failure = None if parsed else LLM_FAIL_PARSE
+        return parsed, model
 
     # ── Batched LLM call (amortise the shared grounding across facts) ────────────
 
     async def _llm_process_batch(
         self, items: list[dict], closed_set: list[dict],
-    ) -> tuple[dict[int, dict], dict | None, str]:
+    ) -> tuple[dict[int, dict] | None, dict | None, str]:
         """Enrich N regular facts in ONE LLM call, sharing the grounding prompt.
         (Decision 497 measured that the KV grounding cache is NOT reusable across
         cycles because REM mutates the graph — so amortise the 22K-token grounding
@@ -1363,7 +1459,13 @@ class REMDaemon:
         ({pg_id: result}, call_timing, model): the results map (a missing/invalid
         line is omitted → that fact retries next cycle; decisions are NOT batched),
         the shared per-call timing summary (decision 570) — None when no LLM call
-        ran or it failed — and the backend model id for edge provenance. The
+        ran or it failed — and the backend model id for edge provenance.
+
+        The results map is **None** (not {}) when the CALL ITSELF failed —
+        transport error, HTTP non-200, unparseable envelope. The caller must
+        not charge an attempt to any record in that case: a pool 503 is not
+        evidence about five facts (F1). An empty dict means the call succeeded
+        but no line was usable, which IS chargeable per record. The
         timing is per-CALL: every parsed fact in the batch shares the same
         service_ms/contention_ms (per-fact cost = service_ms / batch_size).
 
@@ -1414,7 +1516,8 @@ class REMDaemon:
                                     wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
                                     ok=False, note=f"batch_http_{resp.status_code}")
                     logger.error("REM batch LLM returned %d: %s", resp.status_code, resp.text[:200])
-                    return {}, None, model
+                    self._last_llm_failure = LLM_FAIL_TRANSPORT
+                    return None, None, model
                 resp_json = resp.json()
                 _wall_s = time.monotonic() - _start
                 record_llm_call("REM", resp_json, backend=_backend,
@@ -1427,7 +1530,9 @@ class REMDaemon:
                 raw = resp_json["choices"][0]["message"]["content"]
         except Exception as exc:
             logger.error("REM batch LLM error: %s", exc)
-            return {}, None, model
+            self._last_llm_failure = LLM_FAIL_TRANSPORT
+            return None, None, model
+        self._last_llm_failure = LLM_FAIL_TRUNCATED if truncated else None
         if truncated:
             logger.warning(
                 "REM batch: response TRUNCATED at max_tokens=%d (batch=%d) — "
@@ -1652,13 +1757,22 @@ class REMDaemon:
         run_id: str = "",
     ) -> bool:
         """Full REM pipeline for one record. Returns True on success.
-        Every failure class counts a durable rem_attempts on the anchor
-        (poison-record escape hatch)."""
+        RECORD-CHARGEABLE failure classes count a durable rem_attempts on the
+        anchor (poison-record escape hatch); a TRANSPORT failure does not —
+        it says nothing about this record (F1)."""
+        self._last_llm_failure = None
         result, model = await self._llm_process(content, kind, closed_set,
                                                 manifest, pg_id=pg_id)
         if not result:
-            logger.warning("REM: pg_id=%d LLM failed — skipping", pg_id)
-            await self._bump_rem_attempts([pg_id])
+            failure = self._last_llm_failure or LLM_FAIL_TRANSPORT
+            chargeable = failure in LLM_FAIL_CHARGEABLE
+            logger.warning(
+                "REM: pg_id=%d LLM failed (%s) — skipping%s",
+                pg_id, failure,
+                "" if chargeable else " (transport failure — attempt NOT charged)",
+            )
+            if chargeable:
+                await self._bump_rem_attempts([pg_id])
             return False
         return await self._apply_fact_result(
             pg_id, kind, result, registry, conn, loop,
@@ -1924,6 +2038,13 @@ class REMDaemon:
                 )
                 return 0, 0
 
+            # Yield the turn when NREM is queuing for the slot (F2). Without
+            # this REM — which re-arms faster and runs multi-minute units —
+            # takes every slot and consolidation never folds at all.
+            if await loop.run_in_executor(None, lambda: _nrem_is_queuing(conn)):
+                logger.info("REM: NREM is queuing for the LLM slot — yielding this cycle.")
+                return 0, 0
+
             # Yield only if the whole LLM pool is busy — the gateway routes to a
             # free card (incl. one the user isn't LLM-loading). NOT a global GPU
             # gate, which self-defers to our own dream work + ignores a free card.
@@ -1993,15 +2114,29 @@ class REMDaemon:
 
             if len(fact_items) > 1:
                 attempted += len(fact_items)
+                self._last_llm_failure = None
                 results, call_timing, model = await self._llm_process_batch(
                     fact_items, closed_set)
-                # Missing/invalid batch lines are failures for THEIR records:
-                # count the attempt so a repeat offender is demoted solo next
-                # cycle and eventually dead-letters at REM_MAX_ATTEMPTS.
-                missing = [it["pg_id"] for it in fact_items
-                           if not results.get(it["pg_id"])]
-                if missing:
-                    await self._bump_rem_attempts(missing)
+                if results is None:
+                    # F1: the CALL failed (transport/HTTP/envelope). That is
+                    # evidence about the backend, not about these facts — no
+                    # attempt is charged, so a pool 503 can never demote the
+                    # batch to solo or march innocent records toward
+                    # dead-letter. They retry, still batched, next cycle.
+                    logger.warning(
+                        "REM batch: call failed (%s) — %d fact(s) retry next cycle; "
+                        "no attempt charged (not attributable to any record)",
+                        self._last_llm_failure or LLM_FAIL_TRANSPORT, len(fact_items),
+                    )
+                    results = {}
+                else:
+                    # The call succeeded: a missing/invalid line IS evidence
+                    # about ITS record. Count the attempt so a repeat offender
+                    # is demoted solo next cycle and eventually dead-letters.
+                    missing = [it["pg_id"] for it in fact_items
+                               if not results.get(it["pg_id"])]
+                    if missing:
+                        await self._bump_rem_attempts(missing)
                 for it in fact_items:
                     res = results.get(it["pg_id"])
                     if res and await self._apply_fact_result(

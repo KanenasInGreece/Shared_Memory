@@ -726,9 +726,9 @@ def test_fetch_calibration_gate_reads_ledger(monkeypatch):
 @pytest.mark.asyncio
 async def test_generate_summary_truncated_sets_flag_and_bounds_tokens(monkeypatch):
     monkeypatch.delenv("MOCK_LLM", raising=False)
-    captured = {}
+    bounds = []
     async def fake_post(client, payload, ceiling_s=None):
-        captured.update(payload)
+        bounds.append(payload["max_tokens"])
         class R:
             status_code = 200
             def json(self):
@@ -742,7 +742,34 @@ async def test_generate_summary_truncated_sets_flag_and_bounds_tokens(monkeypatc
     out = await daemon.generate_summary("TestEntity", ["fact one", "fact two"])
     assert out is None
     assert daemon._last_llm_truncated is True
-    assert captured["max_tokens"] == cl.NREM_MAX_TOKENS_SUMMARY
+    # F4: the default bound, then ONE widened retry, then fail the fold.
+    assert bounds == [cl.NREM_MAX_TOKENS_SUMMARY,
+                      int(cl.NREM_MAX_TOKENS_SUMMARY * cl.NREM_TRUNCATION_RETRY_FACTOR)]
+
+
+@pytest.mark.asyncio
+async def test_generate_summary_truncation_retry_succeeds_at_wider_bound(monkeypatch):
+    """F4: a cluster that simply needs a longer narrative is folded on the
+    widened retry rather than being silently dead-lettered by the fold cap."""
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    bounds = []
+    async def fake_post(client, payload, ceiling_s=None):
+        bounds.append(payload["max_tokens"])
+        cut = len(bounds) == 1
+        class R:
+            status_code = 200
+            def json(self):
+                return {"choices": [{"finish_reason": "length" if cut else "stop",
+                                     "message": {"content": "the full narrative"}}]}
+        return R()
+    monkeypatch.setattr(cl, "_post_nrem", fake_post)
+    daemon, _ = daemon_with_fake_graph()
+    daemon._last_llm_truncated = False
+
+    out = await daemon.generate_summary("TestEntity", ["fact one", "fact two"])
+    assert out == "the full narrative"
+    assert daemon._last_llm_truncated is False
+    assert len(bounds) == 2 and bounds[1] > bounds[0]
 
 
 @pytest.mark.asyncio
@@ -766,6 +793,39 @@ async def test_thematic_truncated_summary_off_gate_not_written(monkeypatch):
     assert extra["preservation_retries"] == 0     # gate never engaged
     assert extra["preservation_failures"] == 0
     assert finish["args"][2:5] == (1, 0, 1)       # attempted / succeeded / failed
+
+
+@pytest.mark.asyncio
+async def test_fold_key_counted_once_when_corrective_retry_truncates(monkeypatch):
+    """F3: the dead-letter gauge sums preservation_failed || truncation_failed,
+    so a single failed fold must appear in exactly ONE of them. Recording it in
+    both charged one cycle twice and killed the cluster in 2 cycles against a
+    cap of 3."""
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    daemon, _ = daemon_with_fake_graph()
+    conn = StubConn(script=_thematic_conn_script())
+    finish = {}
+    _wire_thematic(monkeypatch, daemon, conn, finish)
+
+    calls = {"n": 0}
+    async def _summary(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            daemon._last_llm_truncated = False
+            return "a narrative that drops the anchors"   # fails preservation
+        daemon._last_llm_truncated = True                 # corrective retry cut
+        return ""
+    daemon.generate_summary = _summary
+
+    await daemon._consolidate_clusters([_CLUSTER], gate=_gate())
+
+    extra = finish["kwargs"]["extra"]
+    # fetch_fold_dead_letter_counts sums these two arrays, so their combined
+    # length IS the number charged against NREM_FOLD_FAIL_CAP for this cycle.
+    both = extra.get("preservation_failed", []) + extra.get("truncation_failed", [])
+    assert len(both) == 1, (
+        f"one failed fold must contribute exactly one dead-letter count, got {both}")
+    assert extra.get("truncation_failed") and not extra.get("preservation_failed")
 
 
 @pytest.mark.asyncio

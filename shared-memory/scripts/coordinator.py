@@ -101,7 +101,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.7.1"
+FRAMEWORK_VERSION = "0.7.2"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -426,6 +426,10 @@ _backup_quiesce: bool = False
 # consolidation_loop.py. Postgres drops session advisory locks on disconnect, so a
 # crashed gateway or daemon never wedges the others.
 BACKUP_ADVISORY_LOCK_KEY    = _env_int("BACKUP_ADVISORY_LOCK_KEY", 8765309)
+# Read-only mirror of rem_loop.REM_MAX_ATTEMPTS — the gateway never enforces the
+# cap, it only needs the threshold to report how many records REM has given up
+# on. MUST match the daemon's default.
+REM_MAX_ATTEMPTS            = _env_int("REM_MAX_ATTEMPTS", 5)
 # Seconds the gateway waits for in-flight daemon cycles to release their shared lock
 # before reporting drain_timeout. Bounds the quiesce handshake.
 BACKUP_DAEMON_DRAIN_TIMEOUT = _env_float("BACKUP_DAEMON_DRAIN_TIMEOUT", 45.0)
@@ -2954,12 +2958,33 @@ class MemoryCoordinator:
                     f" RETURN coalesce(d.rem_processed,false) AS rem, count(*) AS n"
                 )
                 decisions = await dres.data()
+                # REM attempt/dead-letter gauge: a record at the attempt cap is
+                # excluded from REM's queue but still counts as rem_pending, so
+                # without this the backlog just sits there with no way to tell
+                # "waiting its turn" from "given up on and never retried again".
+                ares = await session.run(
+                    f"MATCH (n) WHERE (n:{ONT.fact} OR n:{ONT.decision}"
+                    f"                 OR n:{ONT.retrospective})"
+                    f"   AND coalesce(n.rem_processed,false) = false"
+                    f"   AND coalesce(n.superseded,false) = false"
+                    f"   AND n.pg_id IS NOT NULL"
+                    f" RETURN coalesce(n.rem_attempts,0) AS a, count(*) AS n"
+                )
+                attempts = await ares.data()
+            _cap = REM_MAX_ATTEMPTS
             snap["neo4j"] = {
                 "facts_total":          sum(r["n"] for r in facts),
                 "facts_rem_pending":    sum(r["n"] for r in facts if not r["rem"]),
                 "facts_unconsolidated": sum(r["n"] for r in facts if r["rem"] and not r["con"]),
                 "decisions_total":      sum(r["n"] for r in decisions),
                 "decisions_rem_pending": sum(r["n"] for r in decisions if not r["rem"]),
+                # Records REM has given up on: excluded from its queue until an
+                # operator resets n.rem_attempts. Non-zero means enrichment is
+                # silently losing records — investigate before it grows.
+                "rem_dead_lettered":    sum(r["n"] for r in attempts if r["a"] >= _cap),
+                # Pending records carrying at least one failed attempt.
+                "rem_failing":          sum(r["n"] for r in attempts if 0 < r["a"] < _cap),
+                "rem_max_attempts":     _cap,
             }
         except Exception as exc:
             snap["neo4j"] = {"error": str(exc)}

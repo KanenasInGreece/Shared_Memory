@@ -84,15 +84,32 @@ DENSITY_THRESHOLD = ONT.density_threshold
 NREM_MAX_TOKENS_SUMMARY = int(os.environ.get("NREM_MAX_TOKENS_SUMMARY", "2048"))
 NREM_MAX_TOKENS_INSIGHT = int(os.environ.get("NREM_MAX_TOKENS_INSIGHT", "2048"))
 
+# On a truncated draft the bound is widened ONCE and the call retried before
+# the fold is failed. A FIXED bound plus the fold dead-letter cap would
+# otherwise permanently and silently exclude any cluster that legitimately
+# needs a longer narrative than the default — the exact silent-loss failure
+# the truncation rule exists to prevent. Truncation still fails the fold; it
+# just gets one wider try first.
+NREM_TRUNCATION_RETRY_FACTOR = float(
+    os.environ.get("NREM_TRUNCATION_RETRY_FACTOR", "2.0"))
+
 # Fold dead-letter cap (see module docstring): key occurrences in
 # preservation_failed/truncation_failed extras within the window → skip.
 NREM_FOLD_FAIL_WINDOW = int(os.environ.get("NREM_FOLD_FAIL_WINDOW", "7"))   # days
 NREM_FOLD_FAIL_CAP    = int(os.environ.get("NREM_FOLD_FAIL_CAP", "3"))
 
-# Forced-backstop fairness (F10): how long a due backstop may WAIT for a free
-# LLM slot before deferring with 'pool_busy_forced' (it never fires into a
-# busy serial slot), and the poll cadence while waiting.
-NREM_FORCED_SLOT_WAIT = float(os.environ.get("NREM_FORCED_SLOT_WAIT", "300"))
+# Slot-queue fairness (F10 + F2): how long a due consolidation may WAIT for a
+# free LLM slot before deferring (it never fires into a busy serial slot), and
+# the poll cadence while waiting.
+#
+# The budget MUST exceed the longest expected REM unit or the arbiter never
+# actually wins: a solo REM enrichment on this class of hardware runs ~1000s
+# (the ~30K-token grounding prefill dominates), so a 300s queue expired every
+# time while REM was mid-generation and NREM went back to deferring — the
+# starvation this is meant to end. 1800s clears a solo unit with margin.
+# NREM holds the priority lock only while actually queuing, so a long budget
+# costs REM nothing except the turn it is being asked to yield.
+NREM_FORCED_SLOT_WAIT = float(os.environ.get("NREM_FORCED_SLOT_WAIT", "1800"))
 NREM_FORCED_SLOT_POLL = 10.0
 
 
@@ -133,6 +150,44 @@ def _try_backup_shared_lock():
             conn.close()
             return None
     return conn
+
+# ── NREM slot priority (F2): the arbiter between the two dream daemons ────────
+# REM and NREM contend for ONE serial LLM slot with no fairness mechanism —
+# both simply poll pool_has_free_slot() and take what they find. REM re-arms
+# far faster and (since it may run long solo units) holds the slot for many
+# minutes, so NREM could defer indefinitely: 2403 deferred vs 32 completed
+# cycles in 3 days, zero successful folds in 4.6 days.
+#
+# The fix is a well-known advisory lock meaning "NREM is queuing for the slot;
+# do not take it". NREM holds it EXCLUSIVE only while actively waiting, and
+# for a bounded window — so REM yields its turn but can never be starved in
+# the mirror image of the bug we are fixing. Session-scoped: Postgres drops it
+# on disconnect, so a daemon crash can never wedge REM permanently.
+# MUST match rem_loop.NREM_PRIORITY_ADVISORY_LOCK_KEY.
+NREM_PRIORITY_ADVISORY_LOCK_KEY = int(
+    os.environ.get("NREM_PRIORITY_ADVISORY_LOCK_KEY", "8765310"))
+
+
+def _take_nrem_priority_lock():
+    """Open a dedicated autocommit conn holding the EXCLUSIVE NREM-priority
+    advisory lock. Returns the conn (caller MUST close it to release) or None
+    if it could not be taken — in which case the caller simply proceeds
+    unprioritised rather than failing the cycle (fail-open: the arbiter is an
+    optimisation, never a correctness gate)."""
+    try:
+        conn = psycopg2.connect(PG_CONN, connect_timeout=5)
+        conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)",
+                        (NREM_PRIORITY_ADVISORY_LOCK_KEY,))
+            if not cur.fetchone()[0]:
+                conn.close()
+                return None
+        return conn
+    except Exception as e:
+        logger.warning("NREM priority lock: could not acquire (%s) — "
+                       "waiting unprioritised", e)
+        return None
 
 # Interval between global density sweeps. The event-driven path only evaluates
 # clusters touched by a fresh save, but eligibility can change without a save:
@@ -1286,35 +1341,48 @@ class ConsolidationDaemon:
             )
 
         _ceiling = adaptive_ceiling(len(prompt), units=len(facts))
+        # F4: try the default bound, then ONCE at a widened bound if the draft
+        # was cut. Without the second try a cluster that simply needs a longer
+        # narrative truncates every cycle and the fold dead-letter cap removes
+        # it from Tier 3 for good, silently.
+        bounds = [NREM_MAX_TOKENS_SUMMARY,
+                  int(NREM_MAX_TOKENS_SUMMARY * NREM_TRUNCATION_RETRY_FACTOR)]
         try:
             async with httpx.AsyncClient(timeout=_ceiling) as client:
-                resp = await _post_nrem(client, {
-                    "model": LLM_MODEL,
-                    "messages": [
-                        {"role": "system", "content": "You are a technical knowledge curator. Write your response directly — no reasoning steps, no thinking tokens, no internal deliberation before the answer."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": NREM_TEMPERATURE,
-                    "max_tokens": NREM_MAX_TOKENS_SUMMARY,
-                }, ceiling_s=_ceiling)
-                if resp.status_code != 200:
-                    logger.error(f"Summarization failed with status {resp.status_code}: {resp.text}")
-                    return None
-                rj = resp.json()
-                if _truncated(rj):
-                    # FAIL-THE-UNIT: a truncated draft can PASS the anchor
-                    # check (the preservation gate detects omission, not
-                    # truncation) — it must never reach the gate, never spend
-                    # the corrective retry, never be persisted. The flag lets
-                    # the caller count this separately as a capacity failure.
-                    self._last_llm_truncated = True
-                    logger.warning(
-                        "NREM: summary for '%s' TRUNCATED at max_tokens=%d "
-                        "(finish_reason=length) — draft discarded before the "
-                        "preservation gate (capacity failure)",
-                        entity, NREM_MAX_TOKENS_SUMMARY)
-                    return None
-                return rj["choices"][0]["message"]["content"]
+                for i, max_tokens in enumerate(bounds):
+                    resp = await _post_nrem(client, {
+                        "model": LLM_MODEL,
+                        "messages": [
+                            {"role": "system", "content": "You are a technical knowledge curator. Write your response directly — no reasoning steps, no thinking tokens, no internal deliberation before the answer."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": NREM_TEMPERATURE,
+                        "max_tokens": max_tokens,
+                    }, ceiling_s=_ceiling)
+                    if resp.status_code != 200:
+                        logger.error(f"Summarization failed with status {resp.status_code}: {resp.text}")
+                        return None
+                    rj = resp.json()
+                    if not _truncated(rj):
+                        return rj["choices"][0]["message"]["content"]
+                    if i == 0:
+                        logger.warning(
+                            "NREM: summary for '%s' TRUNCATED at max_tokens=%d — "
+                            "retrying ONCE at %d before failing the fold",
+                            entity, max_tokens, bounds[1])
+                # FAIL-THE-UNIT: a truncated draft can PASS the anchor check
+                # (the preservation gate detects omission, not truncation) — it
+                # must never reach the gate, never spend the corrective retry,
+                # never be persisted. The flag lets the caller count this
+                # separately as a capacity failure.
+                self._last_llm_truncated = True
+                logger.error(
+                    "NREM: summary for '%s' TRUNCATED again at max_tokens=%d "
+                    "(finish_reason=length) — draft discarded before the "
+                    "preservation gate (capacity failure). Raise "
+                    "NREM_MAX_TOKENS_SUMMARY if this cluster is legitimately large.",
+                    entity, bounds[-1])
+                return None
         except Exception as e:
             logger.error(f"Summarization error for {entity}: {type(e).__name__}: {str(e)}")
             return None
@@ -1380,33 +1448,43 @@ class ConsolidationDaemon:
         )
 
         _ceiling = adaptive_ceiling(len(prompt), units=len(decision_blocks))
+        # F4: widen the bound once before failing the fold — see generate_summary.
+        bounds = [NREM_MAX_TOKENS_INSIGHT,
+                  int(NREM_MAX_TOKENS_INSIGHT * NREM_TRUNCATION_RETRY_FACTOR)]
         try:
             async with httpx.AsyncClient(timeout=_ceiling) as client:
-                resp = await _post_nrem(client, {
-                    "model": LLM_MODEL,
-                    "messages": [
-                        {"role": "system", "content": "You are a technical knowledge curator. Write your response directly — no reasoning steps, no thinking tokens, no internal deliberation before the answer."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": NREM_TEMPERATURE,
-                    "max_tokens": NREM_MAX_TOKENS_INSIGHT,
-                }, ceiling_s=_ceiling)
-                if resp.status_code != 200:
-                    logger.error(f"Insight synthesis failed with status {resp.status_code}: {resp.text}")
-                    return None
-                rj = resp.json()
-                if _truncated(rj):
-                    # Same FAIL-THE-UNIT semantics as generate_summary: a
-                    # truncated insight never reaches the preservation gate,
-                    # never spends the corrective retry, never persists.
-                    self._last_llm_truncated = True
-                    logger.warning(
-                        "NREM: insight for '%s' TRUNCATED at max_tokens=%d "
-                        "(finish_reason=length) — draft discarded before the "
-                        "preservation gate (capacity failure)",
-                        entity, NREM_MAX_TOKENS_INSIGHT)
-                    return None
-                return rj["choices"][0]["message"]["content"]
+                for i, max_tokens in enumerate(bounds):
+                    resp = await _post_nrem(client, {
+                        "model": LLM_MODEL,
+                        "messages": [
+                            {"role": "system", "content": "You are a technical knowledge curator. Write your response directly — no reasoning steps, no thinking tokens, no internal deliberation before the answer."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": NREM_TEMPERATURE,
+                        "max_tokens": max_tokens,
+                    }, ceiling_s=_ceiling)
+                    if resp.status_code != 200:
+                        logger.error(f"Insight synthesis failed with status {resp.status_code}: {resp.text}")
+                        return None
+                    rj = resp.json()
+                    if not _truncated(rj):
+                        return rj["choices"][0]["message"]["content"]
+                    if i == 0:
+                        logger.warning(
+                            "NREM: insight for '%s' TRUNCATED at max_tokens=%d — "
+                            "retrying ONCE at %d before failing the fold",
+                            entity, max_tokens, bounds[1])
+                # Same FAIL-THE-UNIT semantics as generate_summary: a truncated
+                # insight never reaches the preservation gate, never spends the
+                # corrective retry, never persists.
+                self._last_llm_truncated = True
+                logger.error(
+                    "NREM: insight for '%s' TRUNCATED again at max_tokens=%d "
+                    "(finish_reason=length) — draft discarded before the "
+                    "preservation gate (capacity failure). Raise "
+                    "NREM_MAX_TOKENS_INSIGHT if this cluster is legitimately large.",
+                    entity, bounds[-1])
+                return None
         except Exception as e:
             logger.error(f"Insight synthesis error for {entity}: {type(e).__name__}: {str(e)}")
             return None
@@ -1855,16 +1933,23 @@ class ConsolidationDaemon:
                     summary = await self.generate_summary(
                         entity, contents, previous_summary, records=recs,
                         corrective=missing)
-                    if not summary and self._last_llm_truncated:
+                    corrective_truncated = bool(not summary and self._last_llm_truncated)
+                    if corrective_truncated:
                         # The corrective retry itself got truncated — a capacity
-                        # failure on top of the preservation miss; count both.
+                        # failure on top of the preservation miss.
                         rec.truncation_failures += 1
                         rec.truncation_failed.append(fold_key)
                     ok, missing = (summary_preserves(summary, anchors)
                                    if summary else (False, missing))
                 if not ok:
                     rec.preservation_failures += 1
-                    rec.preservation_failed.append(f"{entity}/{domain}")
+                    # F3: the dead-letter gauge counts occurrences across
+                    # preservation_failed || truncation_failed, so recording
+                    # this fold in BOTH lists charged one cycle twice and
+                    # killed the cluster in 2 cycles against a cap of 3.
+                    # A truncation is already counted above — count it once.
+                    if not corrective_truncated:
+                        rec.preservation_failed.append(fold_key)
                     logger.error(
                         "Preservation gate FAILED twice for '%s' [domain=%s] — summary "
                         "NOT written to Tier 3; still missing: %s. Re-queueing pg_ids %s. "
@@ -2432,15 +2517,19 @@ class ConsolidationDaemon:
             self._last_llm_truncated = False
             insight = await self.generate_insight(entity, blocks, previous_insight,
                                                   corrective=missing)
-            if not insight and self._last_llm_truncated:
-                # The corrective retry itself got truncated — count both.
+            corrective_truncated = bool(not insight and self._last_llm_truncated)
+            if corrective_truncated:
+                # The corrective retry itself got truncated.
                 cyc.truncation_failures += 1
                 cyc.truncation_failed.append(f"insight/{entity}")
             ok, missing = (summary_preserves(insight, anchors)
                            if insight else (False, missing))
         if not ok:
             cyc.preservation_failures += 1
-            cyc.preservation_failed.append(f"insight/{entity}")
+            # F3: see the fact-fold site — the dead-letter gauge sums both
+            # lists, so one cycle must appear in exactly one of them.
+            if not corrective_truncated:
+                cyc.preservation_failed.append(f"insight/{entity}")
             logger.error(
                 "Preservation gate FAILED twice for insight '%s' — NOT written to "
                 "Tier 3; still missing: %s. Ledger rows stay open; next sweep "
@@ -2535,20 +2624,37 @@ class ConsolidationDaemon:
                     new_id=summary_pg_id, old_ids=superseded_ids
                 )
 
-    async def _wait_for_forced_slot(self) -> bool:
-        """Forced-backstop fairness (F10): a due hard backstop may WAIT for a
-        free LLM slot — up to NREM_FORCED_SLOT_WAIT seconds, polling every
-        NREM_FORCED_SLOT_POLL — but it NEVER fires into a busy serial slot
-        (that queues a multi-minute fold behind a live generation and times it
-        out client-side while leaving a zombie generation server-side).
-        Returns True when a slot freed up, False when the wait expired."""
-        deadline = time.monotonic() + NREM_FORCED_SLOT_WAIT
-        while True:
-            if await pool_has_free_slot():
-                return True
-            if time.monotonic() >= deadline:
-                return False
-            await asyncio.sleep(NREM_FORCED_SLOT_POLL)
+    async def _wait_for_slot(self) -> bool:
+        """Wait for a free LLM slot, holding the NREM-priority advisory lock so
+        REM yields its turn instead of taking the slot back the moment it frees
+        (F2). NREM never fires into a busy serial slot — that queues a
+        multi-minute fold behind a live generation and times it out
+        client-side while leaving a zombie generation server-side.
+
+        Waits up to NREM_FORCED_SLOT_WAIT seconds, polling every
+        NREM_FORCED_SLOT_POLL. Returns True when a slot freed up, False when
+        the wait expired (caller defers and stays armed).
+
+        The priority lock is held ONLY for this bounded window and always
+        released on exit, so the arbiter cannot invert into REM starvation.
+        The poll also honours `is_running` (F6) so shutdown is not delayed by
+        up to the full wait budget."""
+        loop = asyncio.get_running_loop()
+        prio = await loop.run_in_executor(None, _take_nrem_priority_lock)
+        if prio is not None:
+            logger.info("NREM: queuing for the LLM slot (priority held — REM yields).")
+        try:
+            deadline = time.monotonic() + NREM_FORCED_SLOT_WAIT
+            while self.is_running:
+                if await pool_has_free_slot():
+                    return True
+                if time.monotonic() >= deadline:
+                    return False
+                await asyncio.sleep(NREM_FORCED_SLOT_POLL)
+            return False
+        finally:
+            if prio is not None:
+                await loop.run_in_executor(None, prio.close)
 
     async def _make_listen_conn(self):
         """Open a Postgres LISTEN connection and return (conn, cur)."""
@@ -2612,12 +2718,17 @@ class ConsolidationDaemon:
                         # (F10) — but consolidation NEVER fires into a busy
                         # serial slot, forced or not.
                         slot_free = await pool_has_free_slot()
-                        if not slot_free and forced:
+                        if not slot_free:
+                            # F2: BOTH paths queue with priority, not just the
+                            # forced one. Deferring immediately on the normal
+                            # path is what let REM — which re-arms faster and
+                            # holds the slot for minutes — take every slot and
+                            # starve consolidation entirely.
                             logger.warning(
-                                "NREM: hard backstop due but LLM pool busy — waiting up to "
-                                "%.0fs for a free slot (never firing into a busy slot).",
-                                NREM_FORCED_SLOT_WAIT)
-                            slot_free = await self._wait_for_forced_slot()
+                                "NREM: consolidation due (forced=%s) but LLM pool busy — "
+                                "queuing up to %.0fs for a free slot (never firing into "
+                                "a busy slot).", forced, NREM_FORCED_SLOT_WAIT)
+                            slot_free = await self._wait_for_slot()
                         if not slot_free:
                             if forced:
                                 logger.warning(
@@ -2651,7 +2762,10 @@ class ConsolidationDaemon:
                                    bool(self.pending_pg_ids)):
                         # Background hygiene — always yields to active inference;
                         # a deferred sweep retries after the pool-busy backoff.
-                        if not await pool_has_free_slot():
+                        # F2: queue with priority like the consolidation path,
+                        # otherwise the sweep never wins the slot either (the
+                        # insight backlog had gone 5.2 days without a fold).
+                        if not await pool_has_free_slot() and not await self._wait_for_slot():
                             from datetime import timedelta as _td
                             self._sweep_backoff_until = now + _td(seconds=60)
                             logger.info("NREM: LLM pool has no free slot — deferring sweep "

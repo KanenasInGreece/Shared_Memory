@@ -5,6 +5,56 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.7.2] — 2026-07-19
+
+Bug fix. A review of the previous release against the running system found that its new
+safeguards were individually correct but composed badly — and had quietly stopped the
+background memory-building cycles. No thematic summary had been produced in over four days,
+and nearly every record awaiting enrichment was accumulating failure marks it had not earned.
+Each safeguard passed its own tests; nothing tested how they behaved together.
+
+### Fixed
+
+- **A backend outage no longer counts against the records it interrupted.** Enrichment
+  processes records in batches to share the cost of a large shared prompt. When a batch call
+  failed for an infrastructure reason — the reasoning backend busy or briefly unreachable —
+  every record in that batch was marked as having failed, permanently lost its place in the
+  batched path, and moved one step closer to being abandoned. Over five days this affected
+  89 of 101 pending records, none of which had anything wrong with them. Failures are now
+  classified: only a failure that says something about *the record itself* is counted
+  against it.
+- **Consolidation can no longer be starved of the reasoning backend.** Enrichment and
+  consolidation share a single serial slot. Enrichment asks for it far more often and holds
+  it for minutes, so consolidation deferred indefinitely — 2,403 deferrals against 32 runs
+  in three days, none of which produced a summary. Consolidation now signals when it is
+  queuing for the slot and enrichment yields its turn. The signal is held only while
+  actually waiting and is released automatically if the process dies, so neither side can
+  starve the other.
+- **A cluster is no longer penalised twice for the same failed attempt.** One failed
+  consolidation was recorded in two separate counters that are summed when deciding to give
+  up on a cluster, so it was abandoned after two failures instead of three.
+- **Output limits no longer silently discard oversized work.** Generation limits correctly
+  reject truncated output rather than saving something incomplete, but the limit never
+  widened, so anything genuinely needing more room failed identically every time and was
+  eventually abandoned without notice. The limit is now widened once and retried before the
+  attempt is failed.
+- **Abandoned records are visible.** `GET /memory/telemetry` reports `rem_dead_lettered`,
+  `rem_failing` and `rem_max_attempts`, and the CLI `status` command surfaces them. A record
+  dropped from the enrichment queue still counted as "pending", so a backlog that had been
+  given up on looked identical to one waiting its turn.
+- **Shutdown is no longer delayed by a queued consolidation.** The wait loop now honours the
+  stop signal instead of running to its full timeout.
+
+### Configuration
+
+New optional settings, all documented in `shared-memory/.env.example` with defaults matching
+previous behaviour where behaviour did not change: `REM_TRUNCATION_RETRY_FACTOR`,
+`NREM_TRUNCATION_RETRY_FACTOR`, `NREM_PRIORITY_ADVISORY_LOCK_KEY`. `NREM_FORCED_SLOT_WAIT`
+now defaults to 1800s (was 300s) — the budget has to outlast the longest enrichment call or
+the queue expires before the slot is ever released.
+
+---
+
 ## [0.7.1] — 2026-07-19
 
 Operational hardening, found by running the enrichment rebuild against real hardware for the
