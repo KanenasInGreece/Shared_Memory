@@ -76,7 +76,7 @@ Commit findings, decisions, and technical facts to long-term shared memory.
 
 **`entities` is required for Tier 3 consolidation.** Supply 1–4 named concepts the fact is about. Facts saved without `entities` are stored and searchable but never synthesised into community summaries.
 
-**`project` / `domain` scopes consolidation (recommended).** NREM keys community summaries on **(entity, domain)** — facts that share an entity but carry different `project`/`domain` tags are never fused into one summary. Untagged facts collapse to domain `general` (the prior single-summary-per-entity behaviour). Tag saves whose entities span unrelated topics (e.g. `"project":"homelab"` vs `"project":"shared-memory"`) to keep summaries coherent.
+**`project` / `domain` scopes consolidation — autofilled, confirm when it matters.** NREM keys community summaries on **(entity, domain)**; facts sharing an entity but carrying different `project`/`domain` tags are never fused into one summary. **Omit `project` and the client derives it from the project folder name** (walking up to the nearest `.git`/`CLAUDE.md`/`AGENTS.md`; `SHARED_MEMORY_PROJECT` overrides; outside any project root it derives nothing). This is what keeps one project's tag identical across every agent and session — so **do not hand-type a project that differs from the folder**, and state the derived tag when saving work that belongs to a *different* project than the current directory. An explicit value always wins. Untagged facts fall back to domain `general` and fragment away from their project's cluster, so a save from outside a project root deserves an explicit tag. Set `domain` (not `project`) to sub-divide one project whose entities span unrelated topics.
 
 **`source_ref`:** a citation string for where the fact came from — stored on the `Fact` node and used to **auto-derive `fact_kind`** (`observation` = none · `discussion` = the reserved sentinel `"discussion_context"` · `tested` = a test path · `measured` = a code file · `researched` = any other file/URL). Examples: `"design-doc.pdf#p12"`, `"CLAUDE.md#L45-50"`, `"discussion_context"`.
 
@@ -149,7 +149,7 @@ Record architectural or design decisions with full PROV-O provenance — who dec
 - **MCP tool (LM Studio — Phase B):** Call `save_decision(title=..., decided_by=..., project=..., rationale=..., source=<model_name>)` — all comma-separated list fields optional.
 - **Raw JSON (legacy):** Pass a full `type=decision` metadata blob to `save`.
 
-**Required flags/fields:** `--title`, `--decided-by`, `--project`, `--rationale` (CLI); `title`, `decided_by`, `project`, `rationale`, `source` (MCP). Missing required fields return HTTP 400.
+**Required flags/fields:** `--title`, `--decided-by`, `--rationale` (CLI); `title`, `decided_by`, `project`, `rationale`, `source` (MCP). `--project` is optional on the CLI **only because it defaults to the derived folder name** — the gateway still rejects an empty project, so a decision saved from outside a project root fails loudly rather than landing untagged. Missing required fields return HTTP 400.
 
 **What happens on save:**
 1. Coordinator validates required decision fields at ingress (before any DB write)
