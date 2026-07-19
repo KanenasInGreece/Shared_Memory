@@ -9,6 +9,9 @@ Loop discipline (fix wave, 2026-07):
   truncation — a truncated draft can pass the anchor check) and never consumes
   the one corrective retry. Truncations are counted separately
   (extra.truncation_failures / extra.truncation_failed).
+  The bound is widened ONCE (NREM_TRUNCATION_RETRY_FACTOR) and the call retried
+  before the fold fails — a fixed bound plus the dead-letter cap below would
+  otherwise exclude any legitimately-large cluster permanently and silently.
 
 * Fold dead-letter cap: before folding a cluster, the (entity/domain or
   insight/entity) key is checked against the consolidation_runs ledger — if it
@@ -17,11 +20,20 @@ Loop discipline (fix wave, 2026-07):
   days (default 7), the cluster is SKIPPED and the key recorded in
   extra.fold_dead_letter. Operator reset = time passing beyond the window, or
   manual consolidation_runs cleanup (delete/backdate the failing rows).
+  A single failed fold is recorded in exactly ONE of those two arrays — the
+  gauge sums them, so double-recording charged one cycle twice.
 
-* Forced-backstop fairness: the MAX_DEFERRAL backstop still fires, but it
-  never fires INTO a busy serial LLM slot — at forced time it waits up to
-  NREM_FORCED_SLOT_WAIT seconds (polling every 10s) for a free slot, then
-  defers with reason 'pool_busy_forced', leaving the backstop armed.
+* Slot arbitration with REM: consolidation never fires INTO a busy serial LLM
+  slot, but it must not defer forever either — REM re-arms faster and its solo
+  units run for minutes, which starved consolidation completely (zero folds in
+  4.6 days). When a cycle is due and the pool is busy, NREM takes the
+  NREM_PRIORITY_ADVISORY_LOCK_KEY advisory lock and waits up to
+  NREM_FORCED_SLOT_WAIT seconds (polling every 10s); REM sees that lock at
+  cycle start and yields its turn. The lock is held ONLY while waiting and is
+  session-scoped, so neither daemon can wedge or starve the other. If the wait
+  expires the cycle defers ('pool_busy' / 'pool_busy_forced') and a forced
+  backstop stays armed. The budget must exceed the longest REM unit or the
+  queue expires before the slot is ever released.
 
 * IDLE_THRESHOLD_SEC ships at its documented intent (900s, env-tunable via
   NREM_IDLE_THRESHOLD_SEC); the shipped 60 was a testing value.
