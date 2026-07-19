@@ -784,19 +784,47 @@ class REMDaemon:
 
     # ── Neo4j reads ───────────────────────────────────────────────────────────
 
-    async def _fetch_non_rem_batch(self) -> tuple[list[int], dict[int, int]]:
-        """Non-REM anchor pg_ids, attempts-first then oldest-first.
+    async def _fetch_non_rem_batch(
+        self,
+    ) -> tuple[list[int], dict[int, int], dict[int, str]]:
+        """Non-REM anchor pg_ids, pickups-first then attempts then oldest-first.
 
-        Ordering `coalesce(rem_attempts,0) ASC, pg_id ASC`: fresh records
-        first (oldest-first clears the historical backlog and keeps the entity
-        registry maximally populated), previously-FAILED records behind them —
-        so a poison record can never freeze the queue head. Records at
-        REM_MAX_ATTEMPTS or more are DEAD-LETTERED: excluded here, their count
-        logged once per cycle (telemetry surfacing is a later wave's job;
-        operator reset = `SET n.rem_attempts = 0`).
+        Ordering `coalesce(rem_pickups,0) ASC, coalesce(rem_attempts,0) ASC,
+        pg_id ASC`. TWO counters, because rotation and retirement are different
+        questions with opposite accounting rules and one counter cannot answer
+        both (819):
 
-        Returns (pg_ids, {pg_id: rem_attempts}) — the attempt map drives the
-        batch→solo demotion in run_cycle.
+        * ``rem_pickups`` — FAIRNESS. Monotonic, never reset, incremented the
+          moment a record is picked up for processing regardless of outcome.
+          It is what makes the queue ROTATE: a record that was picked up moves
+          behind the ones that were not, so the tail is reachable within one
+          pass. Ordering on it is what fixes tail starvation — with a
+          failure-only counter the head was deterministic, so the arbiter's
+          record-boundary yield always cut at the same place and the tail was
+          structurally unreachable while the head was slow.
+        * ``rem_attempts`` — RETIREMENT. Incremented only on record-chargeable
+          failure classes, cleared to 0 on success, and the SOLE input to the
+          dead-letter cap below. Keying the cap on it alone is what makes it
+          structurally impossible for a backend outage to retire an otherwise
+          healthy record, however many times that record is picked up.
+
+        A high ``rem_pickups`` with ``rem_attempts`` still at 0 is the stranded
+        signal — picked up repeatedly, never succeeded, never blamed — i.e. the
+        ABANDONMENT case, which was invisible to every safety mechanism here
+        while both questions shared one counter.
+
+        Records at REM_MAX_ATTEMPTS or more are DEAD-LETTERED: excluded here,
+        their count logged once per cycle (operator reset =
+        `SET n.rem_attempts = 0`). Dead-lettering deletes nothing — the record
+        keeps its row, its node and its searchability; it only stops being
+        enriched.
+
+        Returns (pg_ids, {pg_id: rem_attempts}, {pg_id: selected label}). The
+        attempt map drives the batch→solo demotion in run_cycle; the LABEL map
+        drives the identity check (820) — REM selects a NODE but resolves
+        everything after that from the pg_id, so the label it selected must be
+        carried forward and checked against the label the Postgres record kind
+        implies, or the node marked processed may not be the node selected.
         """
         base = (
             f"MATCH (n)"
@@ -809,9 +837,12 @@ class REMDaemon:
             result = await session.run(
                 base +
                 f"   AND coalesce(n.rem_attempts, 0) < $max_attempts"
+                f"   AND coalesce(n.rem_invalid, false) = false"
                 f" RETURN n.pg_id AS pg_id,"
-                f"        coalesce(n.rem_attempts, 0) AS rem_attempts"
-                f" ORDER BY coalesce(n.rem_attempts, 0) ASC, n.pg_id ASC"
+                f"        coalesce(n.rem_attempts, 0) AS rem_attempts,"
+                f"        labels(n) AS labels"
+                f" ORDER BY coalesce(n.rem_pickups, 0) ASC,"
+                f"          coalesce(n.rem_attempts, 0) ASC, n.pg_id ASC"
                 f" LIMIT $limit",
                 limit=BATCH_SIZE, max_attempts=REM_MAX_ATTEMPTS,
             )
@@ -819,6 +850,7 @@ class REMDaemon:
             dead_result = await session.run(
                 base +
                 f"   AND coalesce(n.rem_attempts, 0) >= $max_attempts"
+                f"   AND coalesce(n.rem_invalid, false) = false"
                 f" RETURN count(n) AS dead",
                 max_attempts=REM_MAX_ATTEMPTS,
             )
@@ -832,12 +864,20 @@ class REMDaemon:
             )
         pg_ids: list[int] = []
         attempts: dict[int, int] = {}
+        sel_labels: dict[int, str] = {}
+        record_labels = {ONT.fact, ONT.decision, ONT.retrospective}
         for r in rows:
             if r.get("pg_id") is None:
                 continue
             pg_ids.append(r["pg_id"])
             attempts[r["pg_id"]] = int(r.get("rem_attempts") or 0)
-        return pg_ids, attempts
+            # The RECORD label the queue matched on. A node may carry others
+            # (or, on a corrupt write, more than one record label) — record
+            # the first that made it selectable, deterministically ordered so
+            # the identity check is stable across cycles.
+            matched = sorted(set(r.get("labels") or []) & record_labels)
+            sel_labels[r["pg_id"]] = matched[0] if matched else ""
+        return pg_ids, attempts, sel_labels
 
     async def _bump_rem_attempts(self, pg_ids: list[int]) -> None:
         """Durable failure counter (poison-record escape hatch): +1 on the
@@ -858,6 +898,76 @@ class REMDaemon:
                 )
         except Exception as exc:
             logger.warning("REM: rem_attempts bump failed for %s: %s", pg_ids, exc)
+
+    async def _bump_rem_pickups(self, pg_ids: list[int]) -> None:
+        """Durable FAIRNESS counter (819): +1 the moment a record is picked up
+        for processing, written BEFORE the expensive call so a crash, an early
+        return or an abandoned cycle all still account. Monotonic — never
+        reset, never refunded, and never an input to the dead-letter cap, so
+        charging a pickup can not retire a healthy record and the batch/solo
+        distinction that F1 turned on does not apply here.
+
+        Bumping every selected record at selection time would be wrong: a solo
+        record the arbiter yield never reaches was not picked up, and rotating
+        it would hide the tail it is meant to expose. Call sites bump the
+        batch in bulk (all its members really are handed to the call) and each
+        solo record individually, AFTER the yield check.
+
+        Best-effort: the bump must never mask the work it precedes."""
+        if not pg_ids:
+            return
+        try:
+            async with self.driver.session() as session:
+                await session.run(
+                    f"MATCH (n)"
+                    f" WHERE (n:{ONT.fact} OR n:{ONT.decision} OR n:{ONT.retrospective})"
+                    f"   AND n.pg_id IN $pg_ids"
+                    f" SET n.rem_pickups = coalesce(n.rem_pickups, 0) + 1",
+                    pg_ids=list(pg_ids),
+                )
+        except Exception as exc:
+            logger.warning("REM: rem_pickups bump failed for %s: %s", pg_ids, exc)
+
+    async def _mark_node_invalid(self, pg_id: int, label: str, reason: str) -> None:
+        """Retire ONE structurally invalid node from the queue (820).
+
+        REM selects a node but resolves the rest of the cycle from its pg_id,
+        so a node whose label disagrees with the Postgres record kind — or that
+        has no Postgres record at all — can never be the node the cycle marks
+        processed. It is unprocessable BY CONSTRUCTION and would otherwise be
+        re-selected every cycle forever, holding a queue slot no work can free.
+
+        The MATCH is LABEL-QUALIFIED: the invalid node and the real record
+        share a pg_id, so an unqualified match would retire the healthy twin.
+        Nothing is deleted — the node keeps its properties and edges for audit
+        — and no attempt is charged, because a corrupt write is not evidence
+        about the record."""
+        if not label:
+            logger.error(
+                "REM: pg_id=%d invalid node (%s) carries no record label — cannot "
+                "retire it safely without risking its healthy twin; skipping",
+                pg_id, reason,
+            )
+            return
+        try:
+            async with self.driver.session() as session:
+                await session.run(
+                    f"MATCH (n:{label} {{pg_id: $pg_id}})"
+                    f" SET n.rem_invalid = true,"
+                    f"     n.rem_invalid_reason = $reason,"
+                    f"     n.rem_processed = true",
+                    pg_id=pg_id, reason=reason,
+                )
+            logger.warning(
+                "REM: pg_id=%d retired an INVALID :%s node from the queue (%s) — "
+                "graph integrity defect, not a record failure; node kept for audit, "
+                "no attempt charged", pg_id, label, reason,
+            )
+        except Exception as exc:
+            logger.error(
+                "REM: pg_id=%d failed to retire invalid :%s node (%s): %s — it will "
+                "be re-selected next cycle", pg_id, label, reason, exc,
+            )
 
     async def _revert_rem_mark(self, pg_id: int, kind: str) -> None:
         """F5 stranded rows: a post-write failure (consistency mismatch or
@@ -2015,7 +2125,7 @@ class REMDaemon:
         handed to an LLM path this cycle. The caller needs BOTH to tell idle
         (nothing to do → back off) from failure (work existed but failed → keep
         BASE cadence; poison loops must not masquerade as idleness)."""
-        candidates, attempts_map = await self._fetch_non_rem_batch()
+        candidates, attempts_map, label_map = await self._fetch_non_rem_batch()
         if not candidates:
             return 0, 0
 
@@ -2100,10 +2210,32 @@ class REMDaemon:
             # dominant failure mode for a record that poisons a shared call.
             fact_items: list[dict] = []
             solo_ids: list[tuple[int, str]] = []   # (pg_id, kind) — decisions/retros + demoted facts
+            kind_to_label = {KIND_FACT:     ONT.fact,
+                             KIND_DECISION: ONT.decision,
+                             KIND_RETRO:    ONT.retrospective}
             for pg_id in pg_ids:
                 row = content_map.get(pg_id)
                 if not row or not row.get("content"):
-                    logger.warning("REM: pg_id=%d not in technical_docs — skipping", pg_id)
+                    # No Postgres record behind the node. Retiring it (rather
+                    # than the bare `continue` this used to be) is what stops
+                    # it holding a queue slot forever — the outbox filter above
+                    # already guarantees the save committed, so an absent row
+                    # means the node, not the timing, is wrong.
+                    await self._mark_node_invalid(
+                        pg_id, label_map.get(pg_id, ""), "no_postgres_record")
+                    continue
+                # IDENTITY CHECK (820): the node REM selected must be the node
+                # REM will mark processed. Everything below resolves from the
+                # pg_id, and the anchor written by _apply_fact_result is
+                # derived from the Postgres kind — so a selected label that
+                # disagrees with that kind means the cycle would enrich and
+                # mark a DIFFERENT node, leaving the selected one unprocessed
+                # and permanently re-selected. Retire it instead.
+                expected = kind_to_label.get(row["kind"], ONT.fact)
+                selected = label_map.get(pg_id, "")
+                if selected and selected != expected:
+                    await self._mark_node_invalid(
+                        pg_id, selected, f"label_mismatch:{selected}!={expected}")
                     continue
                 if row["kind"] == KIND_FACT and attempts_map.get(pg_id, 0) == 0:
                     fact_items.append({"pg_id": pg_id, "content": row["content"],
@@ -2117,6 +2249,11 @@ class REMDaemon:
 
             if len(fact_items) > 1:
                 attempted += len(fact_items)
+                # Every member really is handed to this call, so the whole
+                # batch is picked up together. Safe to bulk-bump: pickups feed
+                # rotation only, never the dead-letter cap, so this cannot
+                # repeat F1 (charging a batch-wide 503 to innocent records).
+                await self._bump_rem_pickups([it["pg_id"] for it in fact_items])
                 self._last_llm_failure = None
                 results, call_timing, model = await self._llm_process_batch(
                     fact_items, closed_set)
@@ -2160,6 +2297,7 @@ class REMDaemon:
             elif fact_items:
                 it = fact_items[0]
                 attempted += 1
+                await self._bump_rem_pickups([it["pg_id"]])
                 if await self._process_fact(
                         it["pg_id"], it["content"], KIND_FACT, closed_set, registry,
                         conn, loop, manifest=it["manifest"], run_id=run_id):
@@ -2178,6 +2316,10 @@ class REMDaemon:
                         solo_done, len(solo_ids))
                     break
                 attempted += 1
+                # Per-RECORD, and only past the yield: a record the yield never
+                # reached was not picked up and must not rotate, or the tail
+                # this counter exists to expose stays hidden.
+                await self._bump_rem_pickups([pg_id])
                 if await self._process_fact(
                         pg_id, content_map[pg_id]["content"], kind, closed_set,
                         registry, conn, loop,

@@ -101,7 +101,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.7.2"
+FRAMEWORK_VERSION = "0.7.3"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -1356,11 +1356,26 @@ class MemoryCoordinator:
             if grounded:
                 await self._write_typed_grounding(session, ONT.decision, pg_id, grounded)
             elif grounded_in_flat:
+                # Legacy path — RESOLVE the cited id's real label before linking.
+                # This used to MERGE the target as a :Fact unconditionally, which
+                # manufactured a contentless phantom whenever the cited record was
+                # a decision or a retrospective: the real node kept its own label,
+                # so the stub was never filled, never enriched, and sat in the REM
+                # queue forever (820). A pg_id does not imply a Fact — check what
+                # the id actually refers to and attach to THAT node, creating the
+                # placeholder only when no record node exists yet.
                 await session.run(
                     f"MATCH (d:{ONT.decision} {{pg_id: $pg_id}})"
-                    f" FOREACH (fid IN $grounded_in |"
+                    f" UNWIND $grounded_in AS fid"
+                    f" OPTIONAL MATCH (g)"
+                    f"   WHERE (g:{ONT.fact} OR g:{ONT.decision} OR g:{ONT.retrospective})"
+                    f"     AND g.pg_id = fid"
+                    f" WITH d, fid, collect(g)[0] AS existing"
+                    f" FOREACH (_ IN CASE WHEN existing IS NULL THEN [1] ELSE [] END |"
                     f"   MERGE (gf:{ONT.fact} {{pg_id: fid}})"
-                    f"   MERGE (d)-[:{ONT.grounded_in}]->(gf) )",
+                    f"   MERGE (d)-[:{ONT.grounded_in}]->(gf) )"
+                    f" FOREACH (_ IN CASE WHEN existing IS NULL THEN [] ELSE [1] END |"
+                    f"   MERGE (d)-[:{ONT.grounded_in}]->(existing) )",
                     pg_id=pg_id, grounded_in=grounded_in_flat,
                 )
         async with self._acquire() as conn:
