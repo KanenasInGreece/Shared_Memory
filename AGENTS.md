@@ -213,7 +213,16 @@ journalctl --user -u hive-mind-gateway.service -n 50   # daemon logs
 uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py status   # telemetry
 ```
 
-`status: degraded` on `/health` names the down backend. `consolidation.stalled: true` means the dream cycle hasn't completed within its threshold — check the reasoning LLM first.
+`status: degraded` on `/health` names the down backend.
+
+**Reading `consolidation`.** There is more than one consolidation cycle type, and they have very different costs and cadences, so read the per-type block rather than the headline:
+
+- `stalled: true` is an **OR across cycle types** — it means *at least one* is stalled. **`stalled_types` names which**, and is the only actionable field; a healthy cycle can sit beside a stalled sibling.
+- Per type, `eligible_clusters` is that cycle's own gate census. **`0` means "it looked and there was nothing to do" — that is idle, not broken**, and it is the normal state when the enrichment pass hasn't yet produced a dense enough cluster. Only a *non-zero* backlog with no successful fold is a real stall.
+- `runs_24h` counts runs of the cycle body; `deferred_24h` (due but skipped, usually the inference slot was busy) and `idle_24h` (gate ran, nothing eligible) are reported separately. A cycle with high `deferred_24h` is losing the slot, not failing.
+- `last_success_age_seconds` is tagged with `last_success_cycle_type` — the type that achieved it, which may not be the type you are asking about.
+
+So the triage order is: `stalled_types` → that type's `eligible_clusters` → its `last_deferred_reason` → only then the reasoning LLM.
 
 ### Upgrade (gateway host)
 
