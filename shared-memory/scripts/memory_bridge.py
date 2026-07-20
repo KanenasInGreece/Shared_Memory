@@ -29,7 +29,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.7.4"
+VERSION = "0.7.5"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v3: review-edges / label-edges require the gateway's /memory/relations/* routes.
@@ -628,7 +628,15 @@ def format_status(payload: dict) -> str:
     if cn and "error" not in cn:
         age = cn.get("last_success_age_seconds")
         age_s = f"{age}s ago" if age is not None else "—"
-        flag = "STALLED ⚠" if cn.get("stalled") else "ok"
+        # Name the cycle type behind the headline age and behind the stall.
+        # A bare "STALLED, last success 456107s ago" reads as "consolidation is
+        # dead" even when a sibling type folded minutes ago — it was one type's
+        # number wearing the whole system's label.
+        if cn.get("last_success_cycle_type"):
+            age_s += f" ({cn['last_success_cycle_type']})"
+        stalled_types = cn.get("stalled_types") or []
+        flag = ("STALLED ⚠ [" + ", ".join(stalled_types) + "]") if stalled_types \
+            else ("STALLED ⚠" if cn.get("stalled") else "ok")
         lines.append(f"  consolidation: {flag} | last {cn.get('last_outcome') or '—'} "
                      f"| last success {age_s}")
         for ct in ("insight", "fact_consolidation"):
@@ -649,6 +657,16 @@ def format_status(payload: dict) -> str:
                 if c.get("eligible_oldest_age_seconds") is not None:
                     cov += f" (oldest {c['eligible_oldest_age_seconds']}s)"
                 parts.append(cov)
+            # Per-type cost + throughput: what this cycle type actually costs a
+            # slot, and what it returned for it. Only shown once the type has
+            # run in the window — a bare "0 folds" from no runs would read as
+            # failure rather than absence.
+            if c.get("runs_24h"):
+                thru = f"{c['runs_24h']} runs/24h"
+                if c.get("cycle_seconds_avg") is not None:
+                    thru += f" avg {c['cycle_seconds_avg']}s"
+                thru += f", folds {c.get('folds_succeeded_24h', 0)}/{c.get('folds_attempted_24h', 0)}"
+                parts.append(thru)
             lines.append(f"    {ct}: " + ", ".join(parts))
     elif "error" in cn:
         lines.append(f"  consolidation: ERROR {cn['error']}")

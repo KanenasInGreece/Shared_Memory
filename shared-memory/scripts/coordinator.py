@@ -101,7 +101,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.7.4"
+FRAMEWORK_VERSION = "0.7.5"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -779,6 +779,59 @@ def _consolidation_stall_verdict(last_success_age, in_flight, has_backlog, thres
         return False
     return last_success_age is None or last_success_age > threshold
 
+
+# Every consolidation cycle type, in report order. One tuple so the per-type
+# roll-up and the per-type report can never drift apart.
+CONSOLIDATION_CYCLE_TYPES = ("insight", "fact_consolidation")
+
+
+def _consolidation_rollup(by_type: dict, any_stalled: bool, started_at: dict,
+                          cycle_types=CONSOLIDATION_CYCLE_TYPES) -> dict:
+    """Top-level consolidation keys derived from EVERY cycle type.
+
+    These keys used to be mirrored from the insight cycle alone. That made a
+    healthy cycle unreportable: fact consolidation folded 17 clusters in 24h
+    while the headline read "stalled, last success 5.3 days ago" — which was
+    insight's age, for a cycle type the reader was not asking about. A headline
+    that names one type while claiming to describe consolidation is not a
+    summary, it is a wrong answer.
+
+    So: `last_success_age_seconds` is now the MOST RECENT success across types
+    (the honest answer to "when did consolidation last succeed"), tagged with
+    the type that achieved it, and `last_outcome`/`last_deferred_reason` come
+    from whichever type ran most recently rather than a hardcoded one.
+    `stalled` stays an OR — a stalled sibling must still raise the flag — but
+    `stalled_types` now names who, so the flag is actionable. Pure → testable.
+    """
+    ages = [(by_type[ct]["last_success_age_seconds"], ct)
+            for ct in cycle_types
+            if isinstance(by_type.get(ct), dict)
+            and by_type[ct]["last_success_age_seconds"] is not None]
+    freshest = min(ages) if ages else (None, None)
+
+    # "Most recent activity" orders on the RAW started_at datetimes, never on
+    # their ISO strings: string ordering is only correct while every value
+    # carries the same UTC offset, which is true of one timestamptz column
+    # today and silently wrong the day it is not. A type that never ran has no
+    # timestamp and must not win by sorting as empty.
+    started = [(started_at[ct], ct)
+               for ct in cycle_types
+               if started_at.get(ct) is not None]
+    latest_ct = max(started)[1] if started else None
+    latest = by_type.get(latest_ct) if latest_ct else None
+
+    return {
+        "stalled": any_stalled,
+        "stalled_types": [ct for ct in cycle_types
+                          if isinstance(by_type.get(ct), dict)
+                          and by_type[ct]["stalled"]],
+        "last_success_age_seconds": freshest[0],
+        "last_success_cycle_type": freshest[1],
+        "last_outcome": latest["last_outcome"] if latest else None,
+        "last_deferred_reason": latest["last_deferred_reason"] if latest else None,
+        "last_active_cycle_type": latest_ct,
+    }
+
 # Canonical project names (decision pg_id 276): the project folder name is
 # canonical, and free-text drift ("shared_memory" vs "shared-memory") breaks
 # the insight gate's ≥2-distinct-projects rule. PROJECT_ALIASES maps legacy
@@ -1034,6 +1087,8 @@ class MemoryCoordinator:
         # first refresh lands (stalled is never asserted on no data).
         self._consolidation_health: dict = {"stalled": False, "last_outcome": None,
                                              "last_success_age_seconds": None,
+                                             "last_success_cycle_type": None,
+                                             "stalled_types": [],
                                              "inference_busy": "unknown", "fresh": False}
         self._consolidation_health_task: asyncio.Task | None = None
 
@@ -3380,6 +3435,10 @@ class MemoryCoordinator:
             WITH ranked AS (
               SELECT cycle_type, started_at, finished_at, outcome, error_class, error_msg,
                      eligible_clusters, eligible_oldest_age_seconds, extra,
+                     -- Projected into the CTE because the outer aggregate reads
+                     -- them; a column that exists on consolidation_runs but is
+                     -- not listed here is invisible downstream.
+                     folds_succeeded, folds_attempted,
                      max(finished_at) FILTER (WHERE folds_succeeded > 0)
                          OVER (PARTITION BY cycle_type) AS last_success
               FROM consolidation_runs
@@ -3388,6 +3447,20 @@ class MemoryCoordinator:
               max(last_success) AS last_success,
               (array_agg(outcome ORDER BY started_at DESC))[1] AS last_outcome,
               EXTRACT(EPOCH FROM now() - max(last_success))::int AS last_success_age,
+              -- Per-type timing + throughput (decision: price each cycle type
+              -- separately). The whole-cycle timer is skewed by slot contention
+              -- and cannot honestly price either daemon's slot cost, so average
+              -- only COMPLETED runs and bound the window to 24h — an all-history
+              -- mean would be dominated by long-dead configurations.
+              max(started_at) AS last_started,
+              avg(EXTRACT(EPOCH FROM finished_at - started_at))
+                  FILTER (WHERE outcome = 'completed' AND finished_at IS NOT NULL
+                          AND started_at > now() - interval '24 hours') AS cycle_seconds_avg,
+              count(*) FILTER (WHERE started_at > now() - interval '24 hours') AS runs_24h,
+              sum(folds_succeeded) FILTER (WHERE started_at > now() - interval '24 hours')
+                  AS folds_succeeded_24h,
+              sum(folds_attempted) FILTER (WHERE started_at > now() - interval '24 hours')
+                  AS folds_attempted_24h,
               count(*) FILTER (WHERE finished_at IS NULL
                   AND started_at > now() - make_interval(secs => $1)) AS inflight,
               count(*) FILTER (WHERE outcome = 'crashed'
@@ -3419,13 +3492,15 @@ class MemoryCoordinator:
 
         out: dict = {"stall_threshold_seconds": CONSOLIDATION_STALL_THRESHOLD_SEC}
         any_stalled = False
-        for ct in ("insight", "fact_consolidation"):
+        started_at: dict = {}
+        for ct in CONSOLIDATION_CYCLE_TYPES:
             r = by_type.get(ct)
             age = r["last_success_age"] if r else None
             in_flight = bool(r["inflight"]) if r else False
             elig = r["eligible_clusters"] if r else None
             # Backlog must match the gate the cycle ACTUALLY folds on (see
             # _consolidation_backlog): the recorded eligible_clusters, not nrem.
+            started_at[ct] = r["last_started"] if r else None
             backlog_count = _consolidation_backlog(elig, backlog.get(ct, 0))
             has_backlog = backlog_count > 0
             stalled = _consolidation_stall_verdict(
@@ -3448,14 +3523,24 @@ class MemoryCoordinator:
                 # Why the most-recent deferral happened (None if never deferred);
                 # only meaningful when last_outcome == "deferred".
                 "last_deferred_reason": (r["last_deferred_reason"] if r else None),
+                # Per-type cost + throughput. cycle_seconds_avg is the mean of
+                # COMPLETED runs in the last 24h — the per-type price a slot
+                # allocator needs; the whole-cycle timer cannot supply it.
+                "cycle_seconds_avg": (
+                    round(float(r["cycle_seconds_avg"]), 1)
+                    if r and r["cycle_seconds_avg"] is not None else None),
+                "runs_24h": int(r["runs_24h"]) if r and r["runs_24h"] is not None else 0,
+                "folds_succeeded_24h": (
+                    int(r["folds_succeeded_24h"])
+                    if r and r["folds_succeeded_24h"] is not None else 0),
+                "folds_attempted_24h": (
+                    int(r["folds_attempted_24h"])
+                    if r and r["folds_attempted_24h"] is not None else 0),
+                "last_started": (
+                    r["last_started"].isoformat()
+                    if r and r["last_started"] is not None else None),
             }
-        # Top-level signal keys mirror the insight cycle (the fragile one the
-        # signal exists for); stalled is OR across cycle types.
-        ins = out["insight"]
-        out["stalled"] = any_stalled
-        out["last_outcome"] = ins["last_outcome"]
-        out["last_success_age_seconds"] = ins["last_success_age_seconds"]
-        out["last_deferred_reason"] = ins["last_deferred_reason"]
+        out.update(_consolidation_rollup(out, any_stalled, started_at))
         return out
 
     async def _consolidation_telemetry(self) -> dict:
@@ -3483,6 +3568,14 @@ class MemoryCoordinator:
                     "stalled": full["stalled"],
                     "last_outcome": full["last_outcome"],
                     "last_success_age_seconds": full["last_success_age_seconds"],
+                    # Which type the headline age belongs to, and who is
+                    # actually stalled — without these two the compact /health
+                    # snapshot cannot be read correctly when the types disagree.
+                    # Read tolerantly: a missing roll-up key must degrade this
+                    # one field, never abort the refresh and blank the whole
+                    # snapshot (which would report the system as unknown).
+                    "last_success_cycle_type": full.get("last_success_cycle_type"),
+                    "stalled_types": full.get("stalled_types", []),
                     "inference_busy": inference_busy,
                     "fresh": True,
                 }

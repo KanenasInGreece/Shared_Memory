@@ -1539,10 +1539,14 @@ The coordinator rolls this up onto two read-only surfaces (the Monitor consumes 
 
 - **`GET /health`** carries a cached `consolidation` block (refreshed in the background so `/health` stays DB-free):
   ```json
-  "consolidation": { "stalled": false, "last_outcome": "completed", "last_success_age_seconds": 312, "fresh": true }
+  "consolidation": { "stalled": true, "stalled_types": ["insight"], "last_outcome": "completed",
+                     "last_success_age_seconds": 312, "last_success_cycle_type": "fact_consolidation",
+                     "fresh": true }
   ```
   `stalled` is **true** only when an eligible backlog exists, no fold has succeeded within `CONSOLIDATION_STALL_THRESHOLD_SEC` (default 2.5× the NREM sweep interval), and nothing is in-flight — so a merely-slow LLM fold reads as in-flight, not stalled. The backlog is measured by the cycle's own gate census, not the looser density count, so a dense cluster the strict insight gate rejects is **not** flagged.
-- **`GET /memory/telemetry`** carries a fuller `consolidation` section: per cycle type (`insight`, `fact_consolidation`) the last outcome, success age, in-flight flag, consecutive failures, last error, plus **coverage** — `eligible_clusters` (uncovered insight opportunities) and `eligible_oldest_age_seconds` (how long the most-neglected actionable cluster has waited, anchored on the K-th-oldest member's `neo4j_outbox.created_at` — the self-cleaning outbox doubles as a write-time index over exactly the un-consolidated working set).
+
+  **The headline keys describe every cycle type, and say which one they came from.** `stalled` stays an OR across types — a stalled cycle must still raise the flag — but `stalled_types` names which ones, and `last_success_age_seconds` reports the **most recent** success across types, tagged by `last_success_cycle_type`. Read together they distinguish "consolidation is dead" from "one cycle type is idle while another folds normally", which a single mirrored number cannot.
+- **`GET /memory/telemetry`** carries a fuller `consolidation` section: per cycle type (`insight`, `fact_consolidation`) the last outcome, success age, in-flight flag, consecutive failures, last error, **cost and throughput** (`runs_24h`, `cycle_seconds_avg` over completed runs only, `folds_succeeded_24h`/`folds_attempted_24h`), plus **coverage** — `eligible_clusters` (uncovered insight opportunities) and `eligible_oldest_age_seconds` (how long the most-neglected actionable cluster has waited, anchored on the K-th-oldest member's `neo4j_outbox.created_at` — the self-cleaning outbox doubles as a write-time index over exactly the un-consolidated working set). Cycle types differ by orders of magnitude in what they cost a slot, so a single whole-cycle timer cannot price either of them.
 
 GPU/backup **deferrals** are recorded too, so a stall is attributable (starved vs. crashing); orphaned in-flight rows are reaped on daemon restart. Tunables: `CONSOLIDATION_STALL_THRESHOLD_SEC`, `CONSOLIDATION_HEALTH_REFRESH_SEC`, `CONSOLIDATION_ORPHAN_TIMEOUT_SEC`, `CONSOLIDATION_RUNS_RETENTION_DAYS` (see `.env.example`).
 
