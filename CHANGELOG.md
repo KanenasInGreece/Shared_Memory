@@ -5,6 +5,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.7.7] — 2026-07-20
+
+Follow-through on the previous release. The non-run counters it added were served by the API but
+never rendered by the CLI, so an operator reading `status` saw a run count with no sign of what
+else had happened — the same shape of misleading headline 0.7.5 and 0.7.6 were about.
+
+### Fixed
+
+- **The CLI status report now shows the non-runs beside the run count**: `non-runs N deferred/M
+  idle`, omitted entirely when both are zero so a healthy cycle prints no noise. Without it,
+  "9 runs/24h" concealed that 7 further wake-ups had been deferred for a busy inference slot.
+- **Operator triage guidance in `AGENTS.md` brought up to the code.** It still described a single
+  consolidation cycle and sent the reader to the reasoning LLM first. It now documents the
+  per-type block, that `stalled` is an OR whose actionable field is `stalled_types`, that
+  `eligible_clusters: 0` means *idle, not broken*, and the triage order that follows from that.
+
+---
+
 ## [0.7.6] — 2026-07-20
 
 Scheduling. The consolidation daemon decided it had work to do by watching saves arrive — but a

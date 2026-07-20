@@ -29,7 +29,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.7.6"
+VERSION = "0.7.7"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v3: review-edges / label-edges require the gateway's /memory/relations/* routes.
@@ -667,6 +667,14 @@ def format_status(payload: dict) -> str:
                     thru += f" avg {c['cycle_seconds_avg']}s"
                 thru += f", folds {c.get('folds_succeeded_24h', 0)}/{c.get('folds_attempted_24h', 0)}"
                 parts.append(thru)
+            # Non-runs, shown beside the run count so the rate cannot be read as
+            # the whole story: deferred = due but the slot was busy, idle = the
+            # gate ran and found nothing. Omitted when both are zero rather than
+            # printing noise on a healthy cycle.
+            if c.get("deferred_24h") or c.get("idle_24h"):
+                parts.append(
+                    f"non-runs {c.get('deferred_24h', 0)} deferred"
+                    f"/{c.get('idle_24h', 0)} idle")
             lines.append(f"    {ct}: " + ", ".join(parts))
     elif "error" in cn:
         lines.append(f"  consolidation: ERROR {cn['error']}")
