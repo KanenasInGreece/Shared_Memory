@@ -1725,7 +1725,11 @@ Edit `mcp.json` — replace all `YOUR_*` placeholders with real values and updat
 
 The `rag-orchestrator` entry runs the custom MCP server for this framework. It is the only memory MCP server needed — it covers semantic retrieval (Tier 1 + Tier 3) and Neo4j graph expansion in a single call, and routes all writes through the coordinator's atomicity and locking guarantees.
 
-> **Why no separate graph MCP?** A direct-bolt Neo4j MCP server (e.g. `neo4j-agent-memory`) bypasses the coordinator entirely: no per-entity locks, no outbox atomicity, no SHA-256 deduplication, and no read-only Cypher guard. Any write it makes produces orphaned Neo4j nodes with no corresponding Postgres record — invisible to semantic search and outside the consolidation pipeline. `rag-orchestrator` already includes Neo4j graph expansion; a separate graph MCP adds ambiguity and write-safety risk without adding capability.
+> **Why no separate database MCP — for either store.** A direct-bolt Neo4j MCP server (e.g. `neo4j-agent-memory`) or a direct Postgres MCP server (e.g. `@modelcontextprotocol/server-postgres` pointed at `agent_data`) bypasses the coordinator entirely: no per-entity locks, no outbox atomicity, no SHA-256 deduplication, no read-only Cypher guard — and, most importantly, **no read authorization**. The coordinator filters every read on the `visibility` column (`global`, the caller's own `private`, rows matching its `scope`); a raw SQL or Cypher connection filters on nothing, so the model can read every private record any agent ever saved. Writes are worse: they produce rows or nodes with no counterpart in the other store — invisible to semantic search and outside the consolidation pipeline.
+>
+> This is not hypothetical. Until v0.8.0 the `rag-orchestrator` server itself held direct database connections, and it had this exact defect; removing them is what that release was. Registering a database MCP alongside it re-opens the hole from the other side.
+>
+> `rag-orchestrator` already covers Tier-1 and Tier-3 retrieval plus graph expansion in a single authorized call. A separate database MCP adds no capability — only ambiguity and an unguarded path to the same data.
 
 ```json
 {
