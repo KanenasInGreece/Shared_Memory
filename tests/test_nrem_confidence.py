@@ -587,6 +587,36 @@ async def test_preservation_retry_succeeds_with_corrective_prompt(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_preservation_second_retry_recovers_what_first_missed(monkeypatch):
+    """The actual reason NREM_PRESERVATION_MAX_RETRIES was raised from 1 to 2:
+    a decision cluster's anchor set is several independent tokens that must
+    ALL match on the SAME attempt, so a single retry's recovery probability
+    compounds down fast as cluster size grows. Here the first corrective
+    retry still drops the anchor, but the SECOND recovers it — the fold must
+    still be written, not dead-lettered, and the rule itself (hard-required,
+    zero coverage tolerance) is exercised unchanged throughout."""
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    daemon, _ = daemon_with_fake_graph()
+    conn = StubConn(script=_thematic_conn_script())
+    finish = {}
+    _wire_thematic(monkeypatch, daemon, conn, finish)
+    daemon.generate_summary = AsyncMock(side_effect=[
+        "A summary about the consolidation daemon only.",       # drops 'applies'
+        "Still just the consolidation daemon.",                  # retry 1 — still drops it
+        "The consolidation daemon; the outbox worker applies rows.",  # retry 2 — recovers
+    ])
+
+    await daemon._consolidate_clusters([_CLUSTER], gate=_gate())
+
+    assert daemon.generate_summary.await_count == 3
+    assert any(s.startswith("INSERT INTO community_summaries") for s, _ in conn.executed)
+    extra = finish["kwargs"]["extra"]
+    assert extra["preservation_retries"] == 2
+    assert extra["preservation_failures"] == 0
+    assert daemon.pending_pg_ids == set()
+
+
+@pytest.mark.asyncio
 async def test_preservation_double_failure_requeues_and_blocks_tier3(monkeypatch, caplog):
     """Both drafts drop an anchor → the summary is NEVER written, the pg_ids are
     re-queued, and the failure lands in extra + a loud log line."""
@@ -596,7 +626,7 @@ async def test_preservation_double_failure_requeues_and_blocks_tier3(monkeypatch
     finish = {}
     _wire_thematic(monkeypatch, daemon, conn, finish)
     daemon.generate_summary = AsyncMock(side_effect=[
-        "Nothing relevant at all.", "Still nothing relevant."])
+        "Nothing relevant at all.", "Still nothing relevant.", "Still nothing at all."])
 
     with caplog.at_level("INFO"):
         await daemon._consolidate_clusters([_CLUSTER], gate=_gate(),
@@ -611,13 +641,14 @@ async def test_preservation_double_failure_requeues_and_blocks_tier3(monkeypatch
     assert finish["args"][1] == "completed"           # cycle completed; the FOLD failed
     assert finish["args"][2:5] == (1, 0, 1)           # attempted/succeeded/failed
     extra = finish["kwargs"]["extra"]
-    assert extra["preservation_retries"] == 1
+    # NREM_PRESERVATION_MAX_RETRIES=2 — both corrective retries fail before giving up.
+    assert extra["preservation_retries"] == 2
     assert extra["preservation_failures"] == 1
     assert extra["preservation_failed"] == ["TestEntity/general"]
     assert extra["edges_awaiting_calibration"] == 3
     assert extra["machine_edges_consumed"] == 1
     assert extra["calibration"] == {"entity_relation": False, "evidential": False}
-    assert any("Preservation gate FAILED twice" in m for m in caplog.messages)
+    assert any("Preservation gate FAILED after 2 corrective retries" in m for m in caplog.messages)
     assert any("edges_awaiting_calibration=3" in m for m in caplog.messages)
 
 
@@ -627,7 +658,8 @@ async def test_insight_preservation_double_failure_no_write(monkeypatch, caplog)
     write, False returned (open ledger rows are the durable requeue)."""
     monkeypatch.delenv("MOCK_LLM", raising=False)
     daemon, _ = daemon_with_fake_graph([FakeResult([]), FakeResult([])])
-    daemon.generate_insight = AsyncMock(side_effect=["irrelevant", "still irrelevant"])
+    daemon.generate_insight = AsyncMock(side_effect=[
+        "irrelevant", "still irrelevant", "still irrelevant again"])
     daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
     conn = StubConn(script=_fold_script_two_decisions())
     cyc = _CycleRec()
@@ -637,13 +669,16 @@ async def test_insight_preservation_double_failure_no_write(monkeypatch, caplog)
                                         gate=_gate(), cyc=cyc)
 
     assert ok is False
-    assert daemon.generate_insight.await_count == 2
+    # NREM_PRESERVATION_MAX_RETRIES=2 — initial attempt + 2 corrective retries.
+    assert daemon.generate_insight.await_count == 3
     assert daemon.generate_insight.call_args_list[1].kwargs["corrective"]
+    assert daemon.generate_insight.call_args_list[2].kwargs["corrective"]
     assert not any(s.startswith("INSERT INTO community_summaries") for s, _ in conn.executed)
-    assert cyc.preservation_retries == 1
+    assert cyc.preservation_retries == 2
     assert cyc.preservation_failures == 1
     assert cyc.preservation_failed == ["insight/OutboxPattern"]
-    assert any("Preservation gate FAILED twice for insight" in m for m in caplog.messages)
+    assert any("Preservation gate FAILED after 2 corrective retries for insight" in m
+               for m in caplog.messages)
 
 
 # ── MOCK_LLM end-to-end passes the gate honestly ──────────────────────────────
