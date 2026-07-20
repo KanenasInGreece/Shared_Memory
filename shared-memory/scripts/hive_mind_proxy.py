@@ -381,6 +381,11 @@ class AsyncHiveMindProxy:
         # Initialized to None so exception handlers can check object state directly
         # (.prepared attribute) rather than relying on a parallel boolean flag.
         proxy_resp: web.StreamResponse | None = None
+        # LLM requests buffer their body up front into llm_body, so it is safe to
+        # resend on a retry. Embeddings/reranking stream request.content instead,
+        # which is consumed on first use and can never be safely retried — so the
+        # stale-connection retry below is scoped to llm_backend is not None.
+        max_attempts = 2 if llm_backend is not None else 1
 
         try:
             # Reserve the in-flight slot INSIDE the try, so the finally below is
@@ -389,58 +394,79 @@ class AsyncHiveMindProxy:
             # early client disconnect — in which a slot leaked permanently. A leaked
             # slot makes the pool read busy forever, which starves the idle-gated
             # dream daemons (NREM defers on a never-idle pool) with no way back
-            # short of a gateway restart.
+            # short of a gateway restart. One reservation covers both attempts —
+            # a retry is the same logical request, not a second one.
             if llm_backend is not None:
                 _llm_inflight[llm_backend] = _llm_inflight.get(llm_backend, 0) + 1
                 _llm_inflight_started.setdefault(llm_backend, []).append(time.monotonic())
                 _llm_routed[llm_backend] = _llm_routed.get(llm_backend, 0) + 1
-            async with self.session.request(
-                method=request.method,
-                url=target_url,
-                headers=upstream_headers,
-                data=upstream_data,
-                allow_redirects=False,  # proxy must pass redirects through, never chase them
-            ) as upstream:
 
-                proxy_resp = web.StreamResponse(
-                    status=upstream.status,
-                    headers=self._filter_headers(upstream.headers),
-                )
-                # Stamp the serving backend so daemons can attribute per-backend
-                # telemetry (obs tok/s) without learning routing — observability only.
-                if llm_backend is not None:
-                    proxy_resp.headers["X-SM-LLM-Backend"] = llm_backend
-                await proxy_resp.prepare(request)
-
-                # write_eof() lives inside the same try as the chunk loop so that
-                # an EOF-time disconnect is handled by the same except clauses.
+            for attempt in range(max_attempts):
                 try:
-                    async for chunk in upstream.content.iter_any():
-                        await proxy_resp.write(chunk)
-                    await proxy_resp.write_eof()
+                    async with self.session.request(
+                        method=request.method,
+                        url=target_url,
+                        headers=upstream_headers,
+                        data=upstream_data,
+                        allow_redirects=False,  # proxy must pass redirects through, never chase them
+                    ) as upstream:
 
-                except asyncio.CancelledError:
-                    # CancelledError is the event loop signalling task cancellation
-                    # (shutdown, timeout, framework teardown). It is NOT a disconnect
-                    # signal. Must always be re-raised so the event loop can complete
-                    # its cancellation sequence; swallowing it stalls graceful shutdown.
-                    log.warning("Handler task cancelled during stream: %s", target_url)
+                        proxy_resp = web.StreamResponse(
+                            status=upstream.status,
+                            headers=self._filter_headers(upstream.headers),
+                        )
+                        # Stamp the serving backend so daemons can attribute per-backend
+                        # telemetry (obs tok/s) without learning routing — observability only.
+                        if llm_backend is not None:
+                            proxy_resp.headers["X-SM-LLM-Backend"] = llm_backend
+                        await proxy_resp.prepare(request)
+
+                        # write_eof() lives inside the same try as the chunk loop so that
+                        # an EOF-time disconnect is handled by the same except clauses.
+                        try:
+                            async for chunk in upstream.content.iter_any():
+                                await proxy_resp.write(chunk)
+                            await proxy_resp.write_eof()
+
+                        except asyncio.CancelledError:
+                            # CancelledError is the event loop signalling task cancellation
+                            # (shutdown, timeout, framework teardown). It is NOT a disconnect
+                            # signal. Must always be re-raised so the event loop can complete
+                            # its cancellation sequence; swallowing it stalls graceful shutdown.
+                            log.warning("Handler task cancelled during stream: %s", target_url)
+                            raise
+
+                        except UPSTREAM_DISCONNECT as e:
+                            # Upstream server dropped the connection mid-stream (clean close or
+                            # abrupt reset). Response headers are already on the wire; log and
+                            # return the partial response rather than attempting a new reply.
+                            log.warning("Upstream dropped connection mid-stream: %s — %s", target_url, e)
+
+                        except (ConnectionResetError, IOError) as e:
+                            # OS-level socket reset from the downstream client.
+                            # Nothing more can be sent; log and return.
+                            log.warning("Client disconnected mid-stream: %s — %s", target_url, e)
+
+                        if llm_backend is not None:
+                            _llm_mark_ok(llm_backend)   # connected + served — clear fail streak
+                        return proxy_resp
+
+                except ServerDisconnectedError as e:
+                    # A pooled connection reused just as the backend started closing
+                    # it ("Cannot write to closing transport") — a connection-reuse
+                    # race, not evidence the backend is down (enable_cleanup_closed
+                    # already evicts the stale socket). proxy_resp is still None here:
+                    # the failure happens writing the request, before any response is
+                    # read, so retrying on a fresh connection is safe. First-attempt-
+                    # only: a second failure in a row is treated as a real problem,
+                    # same as before this retry existed.
+                    if attempt < max_attempts - 1 and proxy_resp is None:
+                        log.warning(
+                            "Stale connection to %s (%s) — retrying once on a fresh "
+                            "connection before treating this as a backend failure.",
+                            target_url, e)
+                        continue
                     raise
-
-                except UPSTREAM_DISCONNECT as e:
-                    # Upstream server dropped the connection mid-stream (clean close or
-                    # abrupt reset). Response headers are already on the wire; log and
-                    # return the partial response rather than attempting a new reply.
-                    log.warning("Upstream dropped connection mid-stream: %s — %s", target_url, e)
-
-                except (ConnectionResetError, IOError) as e:
-                    # OS-level socket reset from the downstream client.
-                    # Nothing more can be sent; log and return.
-                    log.warning("Client disconnected mid-stream: %s — %s", target_url, e)
-
-                if llm_backend is not None:
-                    _llm_mark_ok(llm_backend)   # connected + served — clear fail streak
-                return proxy_resp
 
         except asyncio.CancelledError:
             # CancelledError is BaseException (Python 3.8+) and won't be caught by
