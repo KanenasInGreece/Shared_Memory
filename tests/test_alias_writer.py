@@ -98,3 +98,59 @@ def test_adjudicate_batch_tolerates_salvaged_idx(monkeypatch):
     out = alias_writer.adjudicate_batch(_batch())
     assert out[0]["verdict"] == "alias"
     assert out[1]["verdict"] == "distinct"
+
+
+# ── tier2_due (decision 852 — single-condition cadence, pure) ────────────────
+
+def test_tier2_due_never_run_is_maximally_stale():
+    due, reason = alias_writer.tier2_due(None)
+    assert due is True and reason == "never_run"
+
+
+def test_tier2_due_before_interval_is_not_due():
+    due, reason = alias_writer.tier2_due(10.0, interval_hours=24.0)
+    assert due is False and reason == "not_due"
+
+
+def test_tier2_due_at_or_past_interval_fires():
+    due, reason = alias_writer.tier2_due(24.0, interval_hours=24.0)
+    assert due is True and reason == "interval_elapsed"
+    due, reason = alias_writer.tier2_due(500.0, interval_hours=24.0)
+    assert due is True and reason == "interval_elapsed"
+
+
+def test_tier2_due_respects_env_default():
+    # Regression guard for the dead-code bug this decision fixed: there must
+    # be exactly ONE threshold, not extra force/backstop thresholds that sit
+    # above it and can therefore never be reached.
+    assert alias_writer.SWEEP_INTERVAL_HOURS == 24.0
+
+
+# ── hours_since_last_tier2_apply (thin SQL wrapper) ──────────────────────────
+
+class _StubCursor:
+    def __init__(self, row):
+        self._row = row
+    def execute(self, sql, params=None):
+        assert "alias_adjudications" in sql and "method = 'llm'" in sql
+    def fetchone(self):
+        return self._row
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        return False
+
+
+class _StubConn:
+    def __init__(self, row):
+        self._row = row
+    def cursor(self):
+        return _StubCursor(self._row)
+
+
+def test_hours_since_last_tier2_apply_none_when_never_run():
+    assert alias_writer.hours_since_last_tier2_apply(_StubConn((None,))) is None
+
+
+def test_hours_since_last_tier2_apply_returns_hours():
+    assert alias_writer.hours_since_last_tier2_apply(_StubConn((12.5,))) == 12.5

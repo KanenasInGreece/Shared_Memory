@@ -59,6 +59,15 @@ LLM_BATCH = int(os.environ.get("ALIAS_LLM_BATCH", "10"))
 # quirk — so this mirrors the daemons' 0.6 default rather than a near-greedy 0.2.
 LLM_TEMPERATURE = float(os.environ.get(
     "ALIAS_LLM_TEMPERATURE", os.environ.get("DREAM_TEMPERATURE", "0.6")))
+# Decision 852: Tier-2 (LLM-adjudicated) cadence, single condition. Alias-
+# adjudication quality gates consolidation quality (a fragmented/wrongly-
+# merged entity graph degrades every downstream NREM/insight fold), so this
+# does not defer to REM/NREM pool business the way an earlier design (850,
+# refined by 852) did — a compound trigger with extra "force" thresholds
+# above this interval, which became unreachable dead code once the interval
+# leg stopped deferring. Tier 1 (deterministic auto-accept) is unconditional
+# regardless of this — see run_sweep.
+SWEEP_INTERVAL_HOURS = float(os.environ.get("ALIAS_SWEEP_INTERVAL_HOURS", "24"))
 
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 
@@ -309,15 +318,47 @@ def _write_alias_edge(session, a: str, b: str, method: str,
     ).consume()
 
 
+def hours_since_last_tier2_apply(conn) -> float | None:
+    """Hours since the most recent LLM-adjudicated row was written. None means
+    Tier 2 has never run — treated as maximally stale by tier2_due. Reuses the
+    durable alias_adjudications ledger as the clock (no separate marker/state
+    needed) — the same "read the durable ledger, not an ephemeral in-memory
+    marker" preference NREM's own eligibility fix (decision 840) established."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT EXTRACT(EPOCH FROM (now() - MAX(created_at))) / 3600.0 "
+            "FROM alias_adjudications WHERE method = 'llm'"
+        )
+        row = cur.fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+
+
+def tier2_due(hours_since_last_apply: float | None,
+              interval_hours: float = SWEEP_INTERVAL_HOURS) -> tuple[bool, str]:
+    """Decision 852 — single condition, pure (no I/O): Tier 2 runs whenever
+    it has been at least ``interval_hours`` since the last one, regardless of
+    REM/NREM pool business. ``hours_since_last_apply=None`` (never run) is
+    maximally stale, always due. Returns (due, reason) — reason is "never_run"
+    | "interval_elapsed" | "not_due", logged as telemetry by the caller so an
+    operator can see WHY a given auto-sweep did or didn't escalate to Tier 2."""
+    if hours_since_last_apply is None:
+        return True, "never_run"
+    if hours_since_last_apply >= interval_hours:
+        return True, "interval_elapsed"
+    return False, "not_due"
+
+
 def run_sweep(threshold: float = COSINE_THRESHOLD, k: int = ANN_K,
-              limit: int | None = None) -> dict:
-    """Full writer: candidate-gen → auto-accept + LLM-adjudicate → write ALIASES
-    edges → persist verdicts → refresh alias components. Writes only accepted
-    aliases; distinct verdicts are recorded so they are not re-asked."""
+              limit: int | None = None, tier2_enabled: bool = True) -> dict:
+    """Full writer: candidate-gen → auto-accept (+ LLM-adjudicate when
+    ``tier2_enabled``) → write ALIASES edges → persist verdicts → refresh
+    alias components. Writes only accepted aliases; distinct verdicts are
+    recorded so they are not re-asked. Tier 1 is unconditional regardless of
+    ``tier2_enabled`` — decision 852."""
     cand = build_candidates(threshold=threshold, k=k)
     conn = psycopg2.connect(PG_CONN, connect_timeout=5)
     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
-    accepted = rejected = 0
+    accepted = rejected = unresolved = 0
     try:
         with driver.session() as session:
             # Tier 1 — normalized-exact auto-accept.
@@ -330,8 +371,9 @@ def run_sweep(threshold: float = COSINE_THRESHOLD, k: int = ANN_K,
                 accepted += 1
             _record_adjudications(conn, auto_rows)
 
-            # Tier 2 — LLM adjudication in batches.
-            llm = cand["llm_candidates"]
+            # Tier 2 — LLM adjudication in batches. Gated by decision 852
+            # (single-condition cadence) at the call site, never here.
+            llm = cand["llm_candidates"] if tier2_enabled else []
             if limit is not None:
                 llm = llm[:limit]
             for start in range(0, len(llm), LLM_BATCH):
@@ -341,7 +383,8 @@ def run_sweep(threshold: float = COSINE_THRESHOLD, k: int = ANN_K,
                 for i, c in enumerate(batch):
                     v = verdicts.get(i)
                     if not v:
-                        continue                     # unresolved → leave for next sweep
+                        unresolved += 1              # unresolved → leave for next sweep
+                        continue
                     verdict = "alias" if v.get("verdict") == "alias" else "distinct"
                     conf = v.get("confidence")
                     conf = float(conf) if isinstance(conf, (int, float)) else None
@@ -360,6 +403,7 @@ def run_sweep(threshold: float = COSINE_THRESHOLD, k: int = ANN_K,
         conn.close()
         driver.close()
     return {"aliases_written": accepted, "distinct_recorded": rejected,
+            "llm_unresolved": unresolved, "tier2_enabled": tier2_enabled,
             "auto_accept": len(cand["auto_accept"]),
             "llm_candidates": len(cand["llm_candidates"]),
             "components_stamped": stamped}
@@ -386,12 +430,47 @@ def adjudication_stats() -> dict:
             "distinct": total - aliases, "breakdown": by}
 
 
+def run_auto_sweep(threshold: float = COSINE_THRESHOLD, k: int = ANN_K,
+                    limit: int | None = None) -> dict:
+    """Decision 852's cadence, self-contained: Tier 1 always writes; Tier 2
+    writes only when ``tier2_due`` says so, checked against the durable
+    alias_adjudications ledger (no separate marker file/state — safe to call
+    as often as a scheduler likes, since it decides its own due-ness rather
+    than trusting the caller's interval to match ALIAS_SWEEP_INTERVAL_HOURS).
+    Logs the trigger reason and Tier-1/Tier-2/unresolved counts — the
+    telemetry an operator needs to see WHY a given invocation did or didn't
+    escalate, and what it did once it did."""
+    conn = psycopg2.connect(PG_CONN, connect_timeout=5)
+    try:
+        hours = hours_since_last_tier2_apply(conn)
+    finally:
+        conn.close()
+    due, reason = tier2_due(hours)
+    result = run_sweep(threshold=threshold, k=k, limit=limit, tier2_enabled=due)
+    result["trigger_reason"] = reason
+    result["hours_since_last_tier2_apply"] = hours
+    print(
+        f"[alias-sweep auto] trigger={reason} tier2_enabled={due} "
+        f"hours_since_last_apply={hours} "
+        f"tier1_written={result['auto_accept']} "
+        f"tier2_candidates={result['llm_candidates']} "
+        f"aliases_written={result['aliases_written']} "
+        f"distinct_recorded={result['distinct_recorded']} "
+        f"llm_unresolved={result['llm_unresolved']}",
+        file=sys.stderr,
+    )
+    return result
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Alias-writer sweep (ADR-017 A).")
     ap.add_argument("--dry-run", action="store_true",
                     help="generate candidates only — no LLM, no writes")
     ap.add_argument("--apply", action="store_true",
-                    help="run LLM adjudication and WRITE ALIASES edges")
+                    help="run LLM adjudication and WRITE ALIASES edges (always, ignoring cadence)")
+    ap.add_argument("--auto", action="store_true",
+                    help="Tier 1 always; Tier 2 only if due per decision 852's cadence "
+                         "(ALIAS_SWEEP_INTERVAL_HOURS) — the mode a scheduler should call")
     ap.add_argument("--stats", action="store_true",
                     help="print the adjudication-ledger summary (precision-review surface)")
     ap.add_argument("--json", action="store_true", help="machine-readable candidate dump")
@@ -402,6 +481,9 @@ def main() -> None:
     if args.stats:
         print(json.dumps(adjudication_stats(), indent=2))
         return
+    if args.auto:
+        print(json.dumps(run_auto_sweep(threshold=args.threshold, limit=args.limit), indent=2))
+        return
     if args.apply:
         print(json.dumps(run_sweep(threshold=args.threshold, limit=args.limit), indent=2))
         return
@@ -411,7 +493,8 @@ def main() -> None:
     elif args.dry_run:
         _print_dry_run(result)
     else:
-        sys.exit("choose --dry-run (candidates only) or --apply (adjudicate + write)")
+        sys.exit("choose --dry-run (candidates only), --auto (cadence-gated), "
+                  "or --apply (adjudicate + write unconditionally)")
 
 
 if __name__ == "__main__":
