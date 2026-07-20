@@ -2411,22 +2411,48 @@ class ConsolidationDaemon:
         non-superseded decisions converging on a shared grounded Entity
         (non-mega-hub, carrying at least one Fact) across ≥2 distinct
         projects, where at least one decision has any HAD_OUTCOME edge —
-        existence means reality has weighed in at least once."""
+        existence means reality has weighed in at least once.
+
+        ADR-017: clusters are keyed on the ALIAS COMPONENT, not the bare
+        entity — the same join `_find_anchored_clusters` already applies to
+        facts, ported here so decision/insight clusters merge alias-linked
+        surface forms (e.g. 'Cloe VM'/'CloeVM') instead of treating them as
+        two separate, thinner clusters. The canonical name is the
+        lexicographically smallest member, matching the fact-fold's rule.
+        No-op-safe: with no ALIASES edges every entity is its own component."""
         async with self.driver.session() as session:
             result = await session.run(
-                f"MATCH (d:{ONT.decision})-[:{ONT.entity_link_alias}|{ONT.entity_link}]->(e:{ONT.entity})"
+                f"MATCH (d0:{ONT.decision})-[:{ONT.entity_link_alias}|{ONT.entity_link}]->(e0:{ONT.entity})"
+                f" WHERE d0.pg_id IS NOT NULL"
+                f"   AND coalesce(d0.consolidated, false) = false"
+                f"   AND coalesce(d0.rem_processed, false) = true"
+                f"   AND coalesce(d0.superseded, false) = false"
+                f"   AND size([(e0)--(x) | x]) <= $hub_cap"
+                f"   AND size([(e0)<-[:{ONT.entity_link_alias}|{ONT.entity_link}]-(f:{ONT.fact}) | f]) > 0"
+                f" WITH DISTINCT e0"
+                f" CALL (e0) {{"
+                f"   OPTIONAL MATCH (sib:{ONT.entity})"
+                f"     WHERE e0.alias_component IS NOT NULL"
+                f"       AND sib.alias_component = e0.alias_component"
+                f"   WITH e0, collect(sib) AS sibs"
+                f"   RETURN CASE WHEN e0.alias_component IS NULL"
+                f"               THEN [e0] ELSE sibs END AS members"
+                f" }}"
+                f" WITH coalesce(e0.alias_component, elementId(e0)) AS comp, members"
+                f" WITH comp, head(collect(members)) AS members"   # dedup anchors → 1 row/component
+                f" UNWIND members AS m"
+                f" MATCH (m)<-[:{ONT.entity_link_alias}|{ONT.entity_link}]-(d:{ONT.decision})"
                 f" WHERE d.pg_id IS NOT NULL"
                 f"   AND coalesce(d.consolidated, false) = false"
                 f"   AND coalesce(d.rem_processed, false) = true"
                 f"   AND coalesce(d.superseded, false) = false"
-                f"   AND size([(e)--(x) | x]) <= $hub_cap"
-                f"   AND size([(e)<-[:{ONT.entity_link_alias}|{ONT.entity_link}]-(f:{ONT.fact}) | f]) > 0"
                 f" MATCH (d)-[:{ONT.project_of}]->(p:{ONT.project})"
-                f" WITH e, collect(DISTINCT d) AS ds, collect(DISTINCT p.name) AS projects"
+                f" WITH members, collect(DISTINCT d) AS ds, collect(DISTINCT p.name) AS projects"
                 f" WHERE size(ds) >= $threshold"
                 f"   AND size(projects) >= 2"
                 f"   AND any(d IN ds WHERE size([(d)-[:{ONT.had_outcome}]->(x) | x]) > 0)"
-                f" RETURN e.name AS entity,"
+                f" RETURN reduce(c = null, nm IN [x IN members | x.name] |"
+                f"          CASE WHEN c IS NULL OR nm < c THEN nm ELSE c END) AS entity,"
                 f"        [d IN ds | d.pg_id] AS decision_ids,"
                 f"        projects",
                 hub_cap=INSIGHT_HUB_DEGREE_CAP, threshold=INSIGHT_THRESHOLD)
