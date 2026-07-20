@@ -5,9 +5,9 @@ set fed by the `new_artifact` NOTIFY — which answers "was a record written?",
 while the cycle's work needs "is a record ENRICHED into a dense cluster?". Every
 save was therefore a claim of eligibility the daemon could not honour: it took
 the exclusive LLM slot and then discovered it had nothing to do. Three further
-Two further symptoms of the same cause are covered here too — the cycle that
-discarded its own entry points on the no-cluster path, and the backstop that
-had to be re-anchored on eligibility age once due-ness stopped tracking saves.
+symptoms of the same cause are covered here too — the idle clock that could not
+see REM, the cycle that discarded its own entry points on the no-cluster path,
+and the idle cycle that could not say it was idle (and so was reported stalled).
 
 No DB, no Neo4j, no LLM.
 """
@@ -55,8 +55,8 @@ def test_not_due_while_the_system_is_still_busy():
 
 
 def test_backstop_forces_on_ELIGIBILITY_age_not_on_notification_age():
-    """Due-ness no longer tracks notifications at all, so the backstop must
-    anchor on how long real work has been waiting."""
+    """The idle clock can now be held open indefinitely by REM, so the backstop
+    must anchor on how long real work has been waiting."""
     assert _due(0, DEFER, T) == (True, True)
     assert _due(0, DEFER - 1, T) == (False, False)
 
@@ -192,6 +192,94 @@ async def test_first_probe_on_an_empty_ledger_leaves_nothing_due(monkeypatch):
     d, _ = _daemon(monkeypatch, [[]])
     assert await d._refresh_backlog(NOW) == []
     assert d._backlog_eligible_since is None
+
+
+# ── the idle clock can see REM ───────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_busy_pool_refreshes_the_consolidation_clock(monkeypatch):
+    """The consolidation clock used to be written in exactly one place — the
+    notify handler — so REM could hold the LLM slot for twenty minutes while it
+    ran on and NREM became due mid-batch. No threshold value fixes a clock that
+    cannot see the largest consumer of the resource it guards."""
+    d = ConsolidationDaemon()
+    stale = NOW - timedelta(hours=1)
+    d.last_activity = d.last_busy = stale
+
+    async def _busy():
+        return False
+    monkeypatch.setattr(cl, "pool_has_free_slot", _busy)
+
+    await d._note_pool_activity(NOW)
+    assert d.last_busy == NOW
+    assert d._quiet_since(NOW) == 0
+
+
+@pytest.mark.asyncio
+async def test_busy_pool_does_NOT_touch_the_sweep_clock(monkeypatch):
+    """The two clocks are split on purpose. The hygiene sweep (backfill,
+    reconciliation, insight pass) has NO backstop, so gating it on a clock a
+    busy pool can hold open indefinitely would let a continuously-loaded system
+    suppress it forever — the 5.2-day insight drought, rebuilt."""
+    d = ConsolidationDaemon()
+    stale = NOW - timedelta(hours=1)
+    d.last_activity = d.last_busy = stale
+
+    async def _busy():
+        return False
+    monkeypatch.setattr(cl, "pool_has_free_slot", _busy)
+
+    await d._note_pool_activity(NOW)
+    assert d.last_activity == stale
+    assert cl.sweep_due(NOW, last_sweep_time=NOW - timedelta(hours=2),
+                        last_activity=d.last_activity, has_pending=False,
+                        idle_threshold=900, sweep_interval=3600)
+
+
+@pytest.mark.asyncio
+async def test_free_pool_leaves_both_clocks_running(monkeypatch):
+    d = ConsolidationDaemon()
+    stale = NOW - timedelta(hours=1)
+    d.last_activity = d.last_busy = stale
+
+    async def _free():
+        return True
+    monkeypatch.setattr(cl, "pool_has_free_slot", _free)
+
+    await d._note_pool_activity(NOW)
+    assert d.last_busy == stale and d.last_activity == stale
+    assert d._quiet_since(NOW) == 3600
+
+
+def test_quiet_since_takes_the_LATER_of_the_two_clocks():
+    """A save during a busy pool, or a busy pool after a save — either way the
+    system was not quiet since the more recent of them."""
+    d = ConsolidationDaemon()
+    d.last_activity = NOW - timedelta(seconds=30)
+    d.last_busy = NOW - timedelta(seconds=600)
+    assert d._quiet_since(NOW) == 30
+    d.last_activity = NOW - timedelta(seconds=600)
+    d.last_busy = NOW - timedelta(seconds=30)
+    assert d._quiet_since(NOW) == 30
+
+
+@pytest.mark.asyncio
+async def test_pool_probe_is_rate_limited(monkeypatch):
+    """One /pool/status GET per NREM_POOL_PROBE_SEC, not one per 1s listen tick."""
+    d = ConsolidationDaemon()
+    probes = []
+
+    async def _busy():
+        probes.append(1)
+        return False
+    monkeypatch.setattr(cl, "pool_has_free_slot", _busy)
+    monkeypatch.setattr(cl, "NREM_POOL_PROBE_SEC", 15)
+
+    await d._note_pool_activity(NOW)
+    await d._note_pool_activity(NOW + timedelta(seconds=14))
+    assert len(probes) == 1
+    await d._note_pool_activity(NOW + timedelta(seconds=15))
+    assert len(probes) == 2
 
 
 # ── the cycle no longer eats its own entry points ────────────────────────────

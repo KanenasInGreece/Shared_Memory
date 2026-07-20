@@ -94,6 +94,12 @@ DENSITY_THRESHOLD = ONT.density_threshold
 # exists, never that an eligible cluster does. One cheap indexed read per
 # interval; the interval also bounds how stale the observed backlog may be.
 NREM_ELIGIBILITY_RECHECK_SEC = int(os.environ.get("NREM_ELIGIBILITY_RECHECK_SEC", "60"))
+# How often the idle clock probes the LLM pool. The clock that decides "the
+# system is quiet" must be able to SEE the largest consumer of the resource it
+# is guarding; before this it was written in exactly one place (the notify
+# handler), so REM could hold the slot for twenty minutes while the clock ran
+# on. No threshold value can fix a blind clock.
+NREM_POOL_PROBE_SEC = int(os.environ.get("NREM_POOL_PROBE_SEC", "15"))
 
 # ── Output bounds + truncation detection ─────────────────────────────────────
 # OPERATOR CONSTRAINT: a bound that processes but gives incomplete saves /
@@ -757,10 +763,11 @@ def consolidation_due(seconds_since_activity, seconds_eligible, backlog_size,
     therefore a claim of eligibility the daemon could not honour.
 
     `seconds_eligible` is how long the backlog has continuously met the
-    threshold. Anchoring the hard backstop on ELIGIBILITY age rather than on
-    the age of the first unconsolidated notification keeps it meaningful when
-    the idle clock is held open by something other than saves. None = not
-    currently eligible.
+    threshold — the backstop now anchors on ELIGIBILITY age rather than on the
+    age of the first unconsolidated notification. That matters because the idle
+    clock can now be held open indefinitely by REM (see NREM_POOL_PROBE_SEC):
+    a backstop keyed to saves would never fire on a pool REM keeps busy, so the
+    honest clock would have bought starvation. None = not currently eligible.
 
     Pure (no I/O) so the rule is unit-testable.
     """
@@ -1266,6 +1273,22 @@ class ConsolidationDaemon:
         self._backlog: list = []
         self._backlog_checked_at: datetime | None = None
         self._backlog_eligible_since: datetime | None = None
+        # TWO clocks, deliberately. `last_activity` keeps its original meaning —
+        # the last save notification — and still gates the periodic hygiene
+        # sweep. `last_busy` additionally tracks the shared LLM pool, and gates
+        # the event-driven consolidation cycle.
+        #
+        # They are split because the two consumers want different things from
+        # "quiet". Consolidation competes with REM for the exclusive slot, so it
+        # must not be declared due while REM holds it — that is the whole point
+        # of making the clock pool-aware. The sweep does backfill,
+        # reconciliation and the insight pass; it has NO backstop, so gating it
+        # on a clock a busy pool can hold open indefinitely would let a
+        # continuously-loaded system suppress it forever. (The insight cycle has
+        # already gone 5.2 days without a fold once; do not rebuild that.)
+        self.last_busy = datetime.now()
+        # Last time the idle clock probed the LLM pool.
+        self._pool_probed_at: datetime | None = None
         self.driver = AsyncGraphDatabase.driver(
             NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS),
             max_connection_pool_size=NEO4J_MAX_POOL,
@@ -1349,6 +1372,34 @@ class ConsolidationDaemon:
                 "(%d rem_reviewed facts < %d) — no cluster can be due.",
                 len(self._backlog), DENSITY_THRESHOLD)
         return self._backlog
+
+    def _quiet_since(self, now):
+        """Seconds the system has been quiet, for the consolidation gate — the
+        later of "last save notification" and "last observed busy pool"."""
+        return (now - max(self.last_activity, self.last_busy)).total_seconds()
+
+    async def _note_pool_activity(self, now):
+        """Refresh the CONSOLIDATION idle clock while the LLM pool is busy.
+
+        The clock consolidation gates on used to mean "a save notification
+        arrived", which made it blind to REM — the largest consumer of the very
+        slot the clock is guarding. NREM was therefore GUARANTEED to become due
+        partway through any long REM batch, and would then queue for a slot REM
+        was still holding. `last_busy` means what its name says: the last moment
+        the system was busy, whoever was busy.
+
+        Writes `last_busy`, never `last_activity`, so the hygiene sweep keeps
+        its original notification-only clock (see __init__).
+
+        Rate-limited to one /pool/status GET per NREM_POOL_PROBE_SEC, and
+        fail-open like every other pool probe (an unreachable gateway must never
+        block dreaming permanently)."""
+        if (self._pool_probed_at is not None
+                and (now - self._pool_probed_at).total_seconds() < NREM_POOL_PROBE_SEC):
+            return
+        self._pool_probed_at = now
+        if not await pool_has_free_slot():
+            self.last_busy = now
 
     @contextlib.asynccontextmanager
     async def _record_cycle(self, cycle_type):
@@ -2029,7 +2080,7 @@ class ConsolidationDaemon:
             # The fact path never recorded this, and NULL is not "no data" to
             # the health surface — it is the trigger for a looser fallback
             # backlog, so a correctly-idle fact_consolidation was reported
-            # STALLED against a predicate it does not fold on.
+            # STALLED against a predicate it does not use.
             member_id_lists = [list(w[3]) for w in work_items]
             all_member_ids = [pid for ids in member_id_lists for pid in ids]
             ts_map = await loop.run_in_executor(
@@ -2902,7 +2953,11 @@ class ConsolidationDaemon:
                             merge_logs(log_dir)
                         self.last_log_merge_date = today
 
-                    seconds_since_activity = (now - self.last_activity).total_seconds()
+                    # The consolidation clock must see the whole system, not just
+                    # saves — otherwise it declares "quiet" while REM holds the
+                    # slot. The sweep below keeps the notification-only clock.
+                    await self._note_pool_activity(now)
+                    seconds_since_activity = self._quiet_since(now)
 
                     # Due-ness reads the DURABLE ledger predicate, never the
                     # ephemeral save-notification set (see consolidation_due).
@@ -2943,7 +2998,7 @@ class ConsolidationDaemon:
                         else:
                             # Backup fence: SHARED advisory lock held across the cycle.
                             # If the gateway holds it EXCLUSIVE (backup dumping), defer —
-                            # pending_pg_ids stay intact (cleared only inside the cycle).
+                            # the ledger is durable, so nothing is lost by waiting.
                             gate = await loop.run_in_executor(None, _try_backup_shared_lock)
                             if gate is None:
                                 logger.info("NREM: backup in progress — deferring consolidation; the durable backlog keeps it due.")
@@ -2970,7 +3025,7 @@ class ConsolidationDaemon:
                                     # backstop measures "eligible and NOT YET
                                     # ATTENDED", so attending resets it.
                                     after = datetime.now()
-                                    self.last_activity = after
+                                    self.last_busy = after
                                     await self._refresh_backlog(after, force=True)
                                     if self._backlog_eligible_since is not None:
                                         self._backlog_eligible_since = after
