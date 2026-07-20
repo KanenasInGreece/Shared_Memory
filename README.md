@@ -15,6 +15,7 @@ Most agent-memory systems are a library bolted onto one assistant. This one is a
 ![Grok](https://img.shields.io/badge/Grok-Skill-blue)
 ![Antigravity CLI](https://img.shields.io/badge/Antigravity_CLI-Skill-blue)
 ![LM Studio](https://img.shields.io/badge/LM_Studio-MCP-blue)
+![Windows clients](https://img.shields.io/badge/Clients-Linux_%C2%B7_macOS_%C2%B7_Windows-blue)
 ![Neo4j](https://img.shields.io/badge/Neo4j-Graph-green)
 ![Postgres](https://img.shields.io/badge/Postgres%2Bpgvector-Vector-green)
 ![BGE-M3](https://img.shields.io/badge/BGE--M3-1024--dim-purple)
@@ -148,6 +149,14 @@ The shared memory framework is built around this idea: your tools should capture
 - **LM Studio / AnythingLLM / any MCP host** — uses an MCP server (`vector-skill.py`), registered in `mcp.json`. The model calls `save_artifact`, `hybrid_search_and_rerank`, `record_lineage` and the rest as tools. Like every other client it is a **thin HTTP client**: it holds no database connection and needs no database driver.
 
 The infrastructure underneath all agents is identical: one coordinator managing all Postgres and Neo4j connections, one embedding space enforced by BGE-M3, one consolidation daemon synthesising shared narratives. The agents differ; the memory layer does not.
+
+### The agents do not have to share the server's machine — or its operating system
+
+Every client here is a **thin HTTP client**. None of them holds a database connection, imports a database driver, or reaches past the gateway — and that is enforced by tests, not just intended. What a client machine needs is Python, `httpx`, and a route to port 8888.
+
+So the server side — Postgres, Neo4j, the BGE models, the dream daemons — can sit on a Linux box, while a **Windows** workstation running LM Studio, AnythingLLM, or any other MCP host registers `vector-skill.py` and works against that same memory: same graph, same decisions, same consolidated narratives as every CLI agent on every other machine. macOS likewise. The Unix-socket path used for operator attribution on the server host is auto-detected and falls back to TCP when it is absent, so a non-Linux client needs no configuration to opt out of it.
+
+The security posture survives the trip, because it never depended on the client: read authorization is applied gateway-side against the caller's token, so a remote client sees exactly what it is permitted to see and has no other route to the data. See [§10a](#10a-remote-clients-ssh-tunnel-access) for setup — and use an encrypted transport, since bearer tokens are plaintext over HTTP.
 
 The design is intentionally agent-agnostic: any tool that can make HTTP calls can reach the coordinator directly on port 8888. Adding a new agent type is a matter of packaging — not changing the backend.
 
