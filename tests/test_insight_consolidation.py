@@ -326,6 +326,27 @@ async def test_fresh_cluster_gate_encodes_ratified_rules():
 
 
 @pytest.mark.asyncio
+async def test_fresh_cluster_gate_joins_alias_component():
+    """ADR-017: insight clustering must merge alias-linked entity variants
+    (e.g. 'Cloe VM'/'CloeVM') the same way _find_anchored_clusters already
+    does for facts — previously this query grouped on the bare e.name and
+    never saw the alias_component property at all."""
+    daemon, session = daemon_with_fake_graph([FakeResult([])])
+    await daemon._find_fresh_insight_clusters()
+    query, _params = session.calls[0]
+    assert "alias_component" in query
+    assert "CALL (e0)" in query
+    # Canonical name = lexicographically smallest member — same rule as the
+    # fact-fold path, so the (entity) cluster key stays stable across cycles.
+    assert "reduce(c = null, nm IN [x IN members | x.name]" in query
+    # Decisions are re-gathered from EVERY alias member, not just the anchor
+    # entity that matched first — otherwise a decision linked only to the
+    # second surface form would still be missed.
+    assert "UNWIND members AS m" in query
+    assert "MATCH (m)<-[:" in query
+
+
+@pytest.mark.asyncio
 async def test_generate_insight_mock_mode(monkeypatch):
     monkeypatch.setenv("MOCK_LLM", "1")
     daemon, _ = daemon_with_fake_graph()

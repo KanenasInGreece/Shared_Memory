@@ -98,3 +98,131 @@ def test_adjudicate_batch_tolerates_salvaged_idx(monkeypatch):
     out = alias_writer.adjudicate_batch(_batch())
     assert out[0]["verdict"] == "alias"
     assert out[1]["verdict"] == "distinct"
+
+
+# ── tier2_due (decision 852 — single-condition cadence, pure) ────────────────
+
+def test_tier2_due_never_run_is_maximally_stale():
+    due, reason = alias_writer.tier2_due(None)
+    assert due is True and reason == "never_run"
+
+
+def test_tier2_due_before_interval_is_not_due():
+    due, reason = alias_writer.tier2_due(10.0, interval_hours=24.0)
+    assert due is False and reason == "not_due"
+
+
+def test_tier2_due_at_or_past_interval_fires():
+    due, reason = alias_writer.tier2_due(24.0, interval_hours=24.0)
+    assert due is True and reason == "interval_elapsed"
+    due, reason = alias_writer.tier2_due(500.0, interval_hours=24.0)
+    assert due is True and reason == "interval_elapsed"
+
+
+def test_tier2_due_respects_env_default():
+    # Regression guard for the dead-code bug this decision fixed: there must
+    # be exactly ONE threshold, not extra force/backstop thresholds that sit
+    # above it and can therefore never be reached.
+    assert alias_writer.SWEEP_INTERVAL_HOURS == 24.0
+
+
+# ── hours_since_last_tier2_apply (thin SQL wrapper) ──────────────────────────
+
+class _StubCursor:
+    def __init__(self, row):
+        self._row = row
+    def execute(self, sql, params=None):
+        assert "alias_adjudications" in sql and "method = 'llm'" in sql
+    def fetchone(self):
+        return self._row
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        return False
+
+
+class _StubConn:
+    def __init__(self, row):
+        self._row = row
+    def cursor(self):
+        return _StubCursor(self._row)
+
+
+def test_hours_since_last_tier2_apply_none_when_never_run():
+    assert alias_writer.hours_since_last_tier2_apply(_StubConn((None,))) is None
+
+
+def test_hours_since_last_tier2_apply_returns_hours():
+    assert alias_writer.hours_since_last_tier2_apply(_StubConn((12.5,))) == 12.5
+
+
+# ── run_sweep Tier-2 concurrent dispatch (fakes DB/Neo4j) ────────────────────
+
+class _FakePgConn:
+    """Records every executed statement; cursor() is a no-op context manager
+    good enough for execute_values-based inserts (psycopg2.extras is not
+    monkeypatched — _record_adjudications's execute_values call would need a
+    real connection, so this test patches _record_adjudications directly and
+    only checks it was called with the right accumulated rows)."""
+    def close(self):
+        pass
+
+
+class _FakeSession:
+    def __init__(self):
+        self.written_edges = []
+    def run(self, *a, **k):
+        self.written_edges.append(k)
+        class _Result:
+            def consume(self):
+                return None
+        return _Result()
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeDriver:
+    def __init__(self, session):
+        self._session = session
+    def session(self):
+        return self._session
+    def close(self):
+        pass
+
+
+def test_run_sweep_dispatches_all_tier2_batches_concurrently(monkeypatch):
+    # Two batches' worth of LLM candidates; adjudicate_batch is monkeypatched
+    # to return a verdict keyed only by the batch's OWN local index (0/1) —
+    # exactly what the real function does — so this also guards against a
+    # regression where concurrent dispatch cross-wires one batch's verdicts
+    # onto another's candidates.
+    candidates = [{"a": f"A{i}", "b": f"B{i}", "cosine": 0.9, "lexical_jaccard": 0.5,
+                   "shared_facts": 0, "domain_disjoint": False} for i in range(12)]
+    monkeypatch.setattr(alias_writer, "build_candidates",
+                        lambda threshold, k: {"auto_accept": [], "llm_candidates": candidates})
+    monkeypatch.setattr(alias_writer.psycopg2, "connect", lambda *a, **k: _FakePgConn())
+    session = _FakeSession()
+    monkeypatch.setattr(alias_writer, "GraphDatabase",
+                        type("_G", (), {"driver": staticmethod(lambda *a, **k: _FakeDriver(session))}))
+    monkeypatch.setattr(alias_writer.alias_graph, "refresh_components", lambda s: 0)
+
+    seen_batches = []
+    recorded = []
+    def fake_adjudicate(batch):
+        seen_batches.append(batch)
+        return {i: {"verdict": "alias", "confidence": 0.9} for i in range(len(batch))}
+    monkeypatch.setattr(alias_writer, "adjudicate_batch", fake_adjudicate)
+    monkeypatch.setattr(alias_writer, "_record_adjudications",
+                        lambda conn, rows: recorded.extend(rows))
+
+    result = alias_writer.run_sweep(limit=None)
+
+    # LLM_BATCH default is 10 → 12 candidates split into batches of 10 + 2.
+    assert sorted(len(b) for b in seen_batches) == [2, 10]
+    assert sum(len(b) for b in seen_batches) == 12          # every candidate dispatched exactly once
+    assert result["aliases_written"] == 12                   # all verdicts were "alias"
+    assert result["llm_unresolved"] == 0
+    assert len(session.written_edges) == 12                  # one ALIASES write per accepted pair
+    assert len(recorded) == 12                                # both batches' rows made it to the ledger
