@@ -7,7 +7,7 @@ Loop discipline (fix wave, 2026-07):
   and finish_reason='length' FAILS the unit: a truncated draft is discarded
   BEFORE the preservation gate ever sees it (the gate detects omission, not
   truncation — a truncated draft can pass the anchor check) and never consumes
-  the one corrective retry. Truncations are counted separately
+  a corrective retry (NREM_PRESERVATION_MAX_RETRIES). Truncations are counted separately
   (extra.truncation_failures / extra.truncation_failed).
   The bound is widened ONCE (NREM_TRUNCATION_RETRY_FACTOR) and the call retried
   before the fold fails — a fixed bound plus the dead-letter cap below would
@@ -116,6 +116,17 @@ NREM_MAX_TOKENS_INSIGHT = int(os.environ.get("NREM_MAX_TOKENS_INSIGHT", "2048"))
 # just gets one wider try first.
 NREM_TRUNCATION_RETRY_FACTOR = float(
     os.environ.get("NREM_TRUNCATION_RETRY_FACTOR", "2.0"))
+
+# Preservation-gate corrective retries (raised from 1 to 2, decision pending
+# this session): the hard-required/zero-coverage-tolerance RULE for decision/
+# retrospective anchors is deliberately untouched — that is the operator's
+# core demand and stays as strict as ever. What changed is that a decision
+# cluster's anchor set is itself several independent tokens that must ALL
+# match on the SAME retry, so one retry's success probability compounds down
+# fast as cluster size grows (a fixed per-anchor recovery rate raised to the
+# Nth power). More attempts at the SAME strict bar, not a looser bar.
+NREM_PRESERVATION_MAX_RETRIES = int(
+    os.environ.get("NREM_PRESERVATION_MAX_RETRIES", "2"))
 
 # Fold dead-letter cap (see module docstring): key occurrences in
 # preservation_failed/truncation_failed extras within the window → skip.
@@ -2179,18 +2190,24 @@ class ConsolidationDaemon:
                     continue
 
                 # 2b. PRESERVATION GATE (stage 5, the operator's core demand):
-                #     every captured record must survive into the summary. One
-                #     corrective retry naming the dropped anchors; on a second
-                #     failure the summary is NOT written — a summary that
-                #     silently drops gated capture must never reach Tier 3.
+                #     every captured record must survive into the summary.
+                #     Up to NREM_PRESERVATION_MAX_RETRIES corrective retries
+                #     naming the dropped anchors; on final failure the summary
+                #     is NOT written — a summary that silently drops gated
+                #     capture must never reach Tier 3. The RULE (hard-required,
+                #     zero coverage tolerance for decision/retro anchors) is
+                #     unchanged — this only gives it more real attempts.
                 ok, missing = summary_preserves(summary, anchors)
-                if not ok:
+                corrective_truncated = False
+                for _ in range(NREM_PRESERVATION_MAX_RETRIES):
+                    if ok:
+                        break
                     rec.preservation_retries += 1
                     logger.warning(
                         "Preservation gate: summary for '%s' [domain=%s] dropped %d "
-                        "captured record(s) (%s) — one corrective retry. "
-                        "(preservation_retries=%d)",
-                        entity, domain, len(missing), missing, rec.preservation_retries)
+                        "captured record(s) (%s) — corrective retry (attempt %d/%d).",
+                        entity, domain, len(missing), missing,
+                        rec.preservation_retries, NREM_PRESERVATION_MAX_RETRIES)
                     self._last_llm_truncated = False
                     summary = await self.generate_summary(
                         entity, contents, previous_summary, records=recs,
@@ -2198,9 +2215,11 @@ class ConsolidationDaemon:
                     corrective_truncated = bool(not summary and self._last_llm_truncated)
                     if corrective_truncated:
                         # The corrective retry itself got truncated — a capacity
-                        # failure on top of the preservation miss.
+                        # failure on top of the preservation miss. Don't keep
+                        # retrying into more truncation.
                         rec.truncation_failures += 1
                         rec.truncation_failed.append(fold_key)
+                        break
                     ok, missing = (summary_preserves(summary, anchors)
                                    if summary else (False, missing))
                 if not ok:
@@ -2213,10 +2232,11 @@ class ConsolidationDaemon:
                     if not corrective_truncated:
                         rec.preservation_failed.append(fold_key)
                     logger.error(
-                        "Preservation gate FAILED twice for '%s' [domain=%s] — summary "
-                        "NOT written to Tier 3; still missing: %s. Re-queueing pg_ids %s. "
-                        "(preservation_failures=%d)",
-                        entity, domain, missing, pg_ids, rec.preservation_failures)
+                        "Preservation gate FAILED after %d corrective retries for '%s' "
+                        "[domain=%s] — summary NOT written to Tier 3; still missing: %s. "
+                        "Re-queueing pg_ids %s. (preservation_failures=%d)",
+                        NREM_PRESERVATION_MAX_RETRIES, entity, domain, missing, pg_ids,
+                        rec.preservation_failures)
                     rec.fold(False)
                     self._requeue(pg_ids)
                     continue
@@ -2638,7 +2658,7 @@ class ConsolidationDaemon:
         """One insight fold: authoritative decision content from Postgres +
         cumulative HAD_OUTCOME wording from the graph + typed grounding-edge
         evidence lines (stage 5, gated per family by the calibration snapshot)
-        → LLM synthesis → deterministic preservation gate (one corrective retry)
+        → LLM synthesis → deterministic preservation gate (NREM_PRESERVATION_MAX_RETRIES corrective retries)
         → embed → always-INSERT + ledger flip (one transaction) → supersession →
         graph marking → close consumed rows. Returns True only when an insight
         was actually written; False on any abort (so the caller does not
@@ -2796,24 +2816,36 @@ class ConsolidationDaemon:
 
         # PRESERVATION GATE (stage 5): every decision's title anchor and each
         # latest retro's rating word must survive into the insight — all HARD
-        # anchors. One corrective retry; on a second failure the insight is NOT
-        # written (the open ledger rows are the durable requeue: decisions have
-        # no NOTIFY path, so the next sweep retries this exact fold).
+        # anchors, zero coverage tolerance (unchanged — the operator's core
+        # demand). Up to NREM_PRESERVATION_MAX_RETRIES corrective retries: a
+        # decision cluster's anchor set is several independent tokens that
+        # must ALL match on the SAME attempt, so one retry's success
+        # probability compounds down fast as the cluster grows — more real
+        # attempts at the same strict bar, not a looser one. On final failure
+        # the insight is NOT written (the open ledger rows are the durable
+        # requeue: decisions have no NOTIFY path, so the next sweep retries
+        # this exact fold).
         ok, missing = summary_preserves(insight, anchors)
-        if not ok:
+        corrective_truncated = False
+        for _ in range(NREM_PRESERVATION_MAX_RETRIES):
+            if ok:
+                break
             cyc.preservation_retries += 1
             logger.warning(
                 "Preservation gate: insight for '%s' dropped %d captured anchor(s) "
-                "(%s) — one corrective retry. (preservation_retries=%d)",
-                entity, len(missing), missing, cyc.preservation_retries)
+                "(%s) — corrective retry (attempt %d/%d).",
+                entity, len(missing), missing,
+                cyc.preservation_retries, NREM_PRESERVATION_MAX_RETRIES)
             self._last_llm_truncated = False
             insight = await self.generate_insight(entity, blocks, previous_insight,
                                                   corrective=missing)
             corrective_truncated = bool(not insight and self._last_llm_truncated)
             if corrective_truncated:
-                # The corrective retry itself got truncated.
+                # The corrective retry itself got truncated. Don't keep
+                # retrying into more truncation.
                 cyc.truncation_failures += 1
                 cyc.truncation_failed.append(f"insight/{entity}")
+                break
             ok, missing = (summary_preserves(insight, anchors)
                            if insight else (False, missing))
         if not ok:
@@ -2823,10 +2855,10 @@ class ConsolidationDaemon:
             if not corrective_truncated:
                 cyc.preservation_failed.append(f"insight/{entity}")
             logger.error(
-                "Preservation gate FAILED twice for insight '%s' — NOT written to "
-                "Tier 3; still missing: %s. Ledger rows stay open; next sweep "
-                "retries. (preservation_failures=%d)",
-                entity, missing, cyc.preservation_failures)
+                "Preservation gate FAILED after %d corrective retries for insight "
+                "'%s' — NOT written to Tier 3; still missing: %s. Ledger rows stay "
+                "open; next sweep retries. (preservation_failures=%d)",
+                NREM_PRESERVATION_MAX_RETRIES, entity, missing, cyc.preservation_failures)
             return False
 
         embedding = await self.get_embedding(insight)
