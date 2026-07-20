@@ -24,14 +24,42 @@ MOCK_CONTENT = "MCP test content"
 MOCK_QUERY = "MCP test query"
 
 @pytest.mark.asyncio
-async def test_mcp_get_embedding_success():
-    with patch("httpx.AsyncClient.post") as mock_post:
-        mock_post.return_value = MagicMock(
-            status_code=200,
-            json=lambda: {"data": [{"embedding": MOCK_EMBEDDING}]}
-        )
-        embedding = await vector_skill.get_embedding("hello")
-        assert embedding == MOCK_EMBEDDING
+async def test_thin_client_owns_no_database_handles():
+    """The whole point of the re-cut. This MCP server used to run its own copy of
+    the retrieval chain against Postgres and Neo4j — which meant a second
+    implementation of the read path, and therefore a second implementation of its
+    ACCESS CONTROL that simply did not have any: the gateway filters every read on
+    `visibility` (global / own private / matching scope), a direct
+    `SELECT ... WHERE NOT superseded` filters on none. It also drifted, and it
+    imported server-side modules into a client.
+
+    If any of these names come back, that whole class of defect comes back with
+    them."""
+    for name in ("get_pg_conn", "release_pg_conn", "get_neo4j",
+                 "_graph_entity_fallback", "get_embedding",
+                 "DB_CONN", "NEO4J_URI", "NEO4J_AUTH"):
+        assert not hasattr(vector_skill, name), (
+            f"{name} is back — vector-skill must reach memory only through the gateway")
+    # Scan CODE only — the module docstring narrates the removed design on
+    # purpose, and a prose mention of it is the opposite of a regression.
+    src = open(os.path.join(os.path.dirname(__file__), "..", "vector-skill.py")).read()
+    code = "\n".join(l for l in src.splitlines()
+                     if l.strip() and not l.startswith(("#", " ", "\t")) or
+                     l.lstrip().startswith(("import ", "from ", "sys.path")))
+    for banned in ("import psycopg2", "from neo4j import",
+                   "from ontology import", "sys.path.insert"):
+        assert banned not in code, f"{banned!r} must not appear in a thin client"
+
+
+@pytest.mark.asyncio
+async def test_client_speaks_the_gateway_wire_version():
+    """A stale API_VERSION makes the gateway log skew on every single request."""
+    bridge = open(os.path.join(os.path.dirname(__file__), "..",
+                               "shared-memory", "scripts", "memory_bridge.py")).read()
+    expected = int(next(l for l in bridge.splitlines()
+                        if l.startswith("API_VERSION")).split("=")[1])
+    assert vector_skill.API_VERSION == expected
+
 
 @pytest.mark.asyncio
 async def test_mcp_save_artifact_success():
@@ -100,54 +128,75 @@ async def test_mcp_save_artifact_missing_source_rejected_client_side():
     mock_post.assert_not_called()
 
 @pytest.mark.asyncio
-async def test_mcp_hybrid_search_expanded_success():
-    with patch("vector_skill.get_embedding", return_value=MOCK_EMBEDDING), \
-         patch("vector_skill.get_pg_conn") as mock_pg_conn, \
-         patch("vector_skill.release_pg_conn") as mock_pg_release, \
-         patch("httpx.AsyncClient.post") as mock_rerank_post, \
-         patch("vector_skill.get_neo4j") as mock_neo4j:
-        
-        # Postgres mock for both summaries and candidates
-        mock_cur = mock_pg_conn.return_value.cursor.return_value.__enter__.return_value
-        # First call for summary, second for candidates
-        mock_cur.fetchone.return_value = ["Global summary text"]
-        mock_cur.fetchall.return_value = [(MOCK_PG_ID, MOCK_CONTENT, {"source": "mcp"})]
-        
-        # Reranker
-        mock_rerank_post.return_value = MagicMock(
-            status_code=200,
-            json=lambda: {"results": [{"index": 0, "relevance_score": 0.88}]}
-        )
-        
-        # Neo4j Expansion
-        mock_session = mock_neo4j.return_value.session.return_value.__enter__.return_value
-        mock_session.run.return_value = [
-            {"labels": ["Project"], "name": "SharedMem", "rel_type": "BELONGS_TO"}
-        ]
-        
+async def test_mcp_hybrid_search_goes_through_the_gateway():
+    """Search delegates the entire chain — embedding, vector search, reranking,
+    graph expansion AND read authorization — to POST /memory/search, and renders
+    what comes back. The qualified `ref` is surfaced verbatim rather than reduced
+    to a bare integer, because a bare integer taken off a summary result resolves
+    against the facts table (decision 822)."""
+    payload = {"results": [
+        {"pg_id": 87, "ref": "summary:87", "record_type": "summary", "tier": 3,
+         "content": "Global summary text", "source_pg_ids": [1, 2], "score": None},
+        {"pg_id": 92, "ref": "insight:92", "record_type": "insight", "tier": 3,
+         "content": "Cross-project principle", "source_pg_ids": [3], "score": None},
+        {"pg_id": MOCK_PG_ID, "ref": f"fact:{MOCK_PG_ID}", "record_type": "fact",
+         "tier": 1, "content": MOCK_CONTENT, "metadata": {"source": "mcp"},
+         "score": 0.88, "graph_context": "BELONGS_TO -> SharedMem"},
+    ]}
+    mock_response = MagicMock(status_code=200, json=lambda: payload)
+    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
         result = await vector_skill.hybrid_search_and_rerank(MOCK_QUERY)
-        
-        assert "Global Context Summary" in result
-        assert "Global summary text" in result
-        assert "Unified Memory Results" in result
-        assert "Score: 0.88" in result
-        assert "BELONGS_TO -> SharedMem" in result
-        assert mock_pg_release.call_count >= 2
+
+    call = mock_post.call_args
+    assert call.args[0].endswith("/memory/search")
+    assert call.kwargs["json"]["query"] == MOCK_QUERY
+    # rendered
+    assert "Global Context Summary" in result and "Global summary text" in result
+    assert "Insight (cross-project principle)" in result
+    assert "Unified Memory Results" in result
+    assert "Score: 0.88" in result
+    assert "BELONGS_TO -> SharedMem" in result
+    # qualified refs surfaced, never a bare id for a summary
+    assert "summary:87" in result and f"fact:{MOCK_PG_ID}" in result
+
 
 @pytest.mark.asyncio
-async def test_mcp_archive_reasoning_trace_success():
-    with patch("vector_skill.get_embedding", return_value=MOCK_EMBEDDING), \
-         patch("vector_skill.get_neo4j") as mock_neo4j:
-        
-        mock_session = mock_neo4j.return_value.session.return_value.__enter__.return_value
-        
-        steps = [{"thought": "research", "tool": "grep", "result": "found"}]
+async def test_mcp_hybrid_search_reports_a_down_gateway_plainly():
+    """The gateway is now the only path to memory, so an outage is a hard failure.
+    Saying so beats returning an empty result set that reads as 'nothing found'."""
+    with patch("httpx.AsyncClient.post", side_effect=RuntimeError("connection refused")):
+        result = await vector_skill.hybrid_search_and_rerank(MOCK_QUERY)
+    assert "unreachable" in result.lower()
+    assert "hive-mind-gateway" in result
+
+
+@pytest.mark.asyncio
+async def test_mcp_archive_reasoning_trace_saves_a_record():
+    """It used to CREATE ReasoningTrace/ReasoningStep nodes straight in Neo4j,
+    which bypasses the outbox (the thing that makes a save atomic across both
+    stores) and bypasses read authorization — durable in one store, visible to
+    everyone. Now it is an ordinary record on the ordinary save path."""
+    mock_response = MagicMock(status_code=200, json=lambda: {
+        "status": "success", "pg_id": MOCK_PG_ID, "neo4j": "pending", "message": "ok"})
+    steps = [{"thought": "research", "tool": "grep", "result": "found"}]
+    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
         result = await vector_skill.archive_reasoning_trace("sess_1", "test task", steps)
-        
-        assert "Success" in result
-        assert "1 steps" in result
-        # Check that MERGE/CREATE were called for root and steps
-        assert mock_session.run.call_count >= 2
+
+    assert "Success" in result
+    call = mock_post.call_args
+    assert call.args[0].endswith("/memory/save")
+    meta = call.kwargs["json"]["metadata"]
+    assert meta["type"] == "reasoning_trace"
+    assert meta["session_id"] == "sess_1"
+    assert meta["step_count"] == 1
+    assert "research" in call.kwargs["json"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_archive_reasoning_trace_rejects_empty():
+    result = await vector_skill.archive_reasoning_trace("sess_1", "t", [])
+    assert "Error" in result
+
 
 @pytest.mark.asyncio
 async def test_mcp_save_decision_success():
@@ -207,25 +256,59 @@ async def test_mcp_save_decision_coordinator_returns_400():
 
 
 @pytest.mark.asyncio
-async def test_mcp_check_memory_health():
-    with patch("vector_skill.get_pg_conn") as mock_pg_conn, \
-         patch("vector_skill.release_pg_conn") as mock_pg_release, \
-         patch("httpx.AsyncClient.post") as mock_http_post:
-        
-        # Postgres OK
-        mock_cur = mock_pg_conn.return_value.cursor.return_value.__enter__.return_value
-        mock_cur.fetchone.return_value = [100]
-        
-        # APIs OK
-        mock_http_post.return_value = MagicMock(status_code=200)
-        
-        result_str = await vector_skill.check_memory_health()
-        result = json.loads(result_str)
-        
-        assert result["status"] == "healthy"
-        assert result["components"]["postgres"]["docs"] == 100
-        assert result["components"]["retriever"]["status"] == "OK"
-        mock_pg_release.assert_called()
+async def test_mcp_check_memory_health_asks_the_gateway():
+    """Health is what the gateway reports — daemons, backends, consolidation
+    liveness — not a row count from a database handle this client should not
+    hold. It is also the only check that exercises the path the client uses."""
+    gw = {"status": "ok", "version": "0.7.7", "api_version": 3,
+          "daemon": "running", "rem_daemon": "running", "embedder": "ok"}
+    mock_response = MagicMock(status_code=200, json=lambda: gw)
+    with patch("httpx.AsyncClient.get", return_value=mock_response) as mock_get:
+        result = json.loads(await vector_skill.check_memory_health())
+
+    assert mock_get.call_args.args[0].endswith("/health")
+    assert result["status"] == "ok"
+    assert result["client"]["version"] == vector_skill.VERSION
+    assert "version_skew" not in result["client"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_check_memory_health_names_version_skew():
+    gw = {"status": "ok", "api_version": 99}
+    mock_response = MagicMock(status_code=200, json=lambda: gw)
+    with patch("httpx.AsyncClient.get", return_value=mock_response):
+        result = json.loads(await vector_skill.check_memory_health())
+    assert "version_skew" in result["client"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_check_memory_health_unreachable_gateway():
+    with patch("httpx.AsyncClient.get", side_effect=RuntimeError("refused")):
+        result = json.loads(await vector_skill.check_memory_health())
+    assert result["status"] == "unreachable"
+
+
+@pytest.mark.asyncio
+async def test_mcp_record_lineage_requires_a_valid_ref():
+    """A bare id is accepted for compatibility; a malformed or wrongly-typed
+    qualified ref is refused before it can resolve against the wrong table."""
+    bad = await vector_skill.record_lineage("summary:notanumber")
+    assert "Error" in bad
+    bad2 = await vector_skill.record_lineage("widget:12")
+    assert "Error" in bad2
+
+    mock_response = MagicMock(status_code=200, json=lambda: {"pg_id": 87, "exists": True})
+    with patch("httpx.AsyncClient.get", return_value=mock_response) as mock_get:
+        ok = await vector_skill.record_lineage("summary:87")
+    assert mock_get.call_args.args[0].endswith("/memory/status/summary:87")
+    assert json.loads(ok)["exists"] is True
+
+
+@pytest.mark.asyncio
+async def test_mcp_review_edges_validates_family():
+    bad = await vector_skill.review_edges("not_a_family")
+    assert "Error" in bad
+    assert vector_skill.RELATION_FAMILIES == ("entity_relation", "evidential")
 
 
 # ── supersede / review_hold MCP tools (fact supersession, decision 381/384) ──
