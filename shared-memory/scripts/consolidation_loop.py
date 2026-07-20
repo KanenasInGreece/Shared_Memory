@@ -280,28 +280,52 @@ def _crun_finish(run_id, outcome, attempted=0, succeeded=0, failed=0,
         logger.warning("consolidation_runs: could not finalize run %s (%s)", run_id, e)
 
 
-def _crun_record_deferred(cycle_type, reason):
-    """Record a throttled 'deferred' run row when a DUE cycle is skipped (GPU
-    busy / backup quiesce) — makes a later stall attributable. The skip itself is
-    already logged by the caller (the existing 'deferring' line), so this is the
-    DB half only. Failsafe."""
+def _crun_record_terminal(cycle_type, outcome, extra=None, eligible_clusters=None):
+    """Record a throttled zero-duration run row for a cycle that reached a
+    terminal state without folding — 'deferred' (skipped: GPU busy / backup
+    quiesce) or 'idle' (ran the gate, found nothing eligible). Both make a later
+    stall verdict attributable; the caller has already emitted the corroborating
+    journal line, so this is the DB half only. Throttled per cycle_type so a
+    1-second listen tick cannot flood the table. Failsafe."""
     try:
         c = psycopg2.connect(PG_CONN, connect_timeout=5)
         try:
             with c.cursor() as cur:
                 cur.execute(
                     "INSERT INTO consolidation_runs"
-                    " (cycle_type, started_at, finished_at, outcome, extra)"
-                    " SELECT %s, now(), now(), 'deferred', %s::jsonb"
+                    " (cycle_type, started_at, finished_at, outcome, extra,"
+                    "  eligible_clusters)"
+                    " SELECT %s, now(), now(), %s, %s::jsonb, %s"
                     " WHERE NOT EXISTS ("
                     "   SELECT 1 FROM consolidation_runs WHERE cycle_type=%s"
+                    "     AND outcome=%s"
                     "     AND started_at > now() - make_interval(secs => %s))",
-                    (cycle_type, json.dumps({"reason": reason}), cycle_type, _DEFER_THROTTLE_SEC))
+                    (cycle_type, outcome, json.dumps(extra) if extra else None,
+                     eligible_clusters, cycle_type, outcome, _DEFER_THROTTLE_SEC))
             c.commit()
         finally:
             c.close()
     except Exception as e:
-        logger.warning("consolidation_runs: could not record deferral (%s)", e)
+        logger.warning("consolidation_runs: could not record %s (%s)", outcome, e)
+
+
+def _crun_record_deferred(cycle_type, reason):
+    """Record a throttled 'deferred' run row when a DUE cycle is skipped."""
+    _crun_record_terminal(cycle_type, "deferred", extra={"reason": reason})
+
+
+def _crun_record_idle(cycle_type, eligible_clusters=0):
+    """Record a throttled 'idle' run row: the cycle DID evaluate its own gate
+    and that gate found `eligible_clusters` clusters (normally 0).
+
+    This closes a FALSE-POSITIVE STALL. The health surface derives a cycle's
+    backlog from the last `eligible_clusters` the daemon recorded, falling back
+    to the looser nrem density count when it has recorded none. Fact
+    consolidation only ever opened a run row when it had clusters to fold, so
+    it recorded NULL forever, always took the fallback, and was reported
+    STALLED while its own gate was correctly saying "nothing is eligible".
+    A cycle that is idle must be able to SAY it is idle."""
+    _crun_record_terminal(cycle_type, "idle", eligible_clusters=eligible_clusters)
 
 
 def _crun_recover_and_prune():
@@ -1525,6 +1549,10 @@ class ConsolidationDaemon:
                     "REM processes %d facts every ~120s; check 'rem_daemon' in /health.",
                     DENSITY_THRESHOLD, 5,
                 )
+                # Say so on the record: an unrecorded idle run is read as a
+                # stall by the health surface (see _crun_record_idle).
+                await loop.run_in_executor(
+                    None, lambda: _crun_record_idle("fact_consolidation"))
                 return
 
             await self._consolidate_clusters(clusters, gate=gate, edge_stats=edge_stats)
@@ -1685,6 +1713,8 @@ class ConsolidationDaemon:
                         "Ledger sweep: %d facts awaiting NREM (< %d) — no cluster can be due.",
                         len(backlog), DENSITY_THRESHOLD,
                     )
+                await loop.run_in_executor(
+                    None, lambda: _crun_record_idle("fact_consolidation"))
                 return
 
             clusters, edge_stats = await self._find_anchored_clusters(backlog, gate)
@@ -1694,6 +1724,8 @@ class ConsolidationDaemon:
                     "(density_threshold=%d per entity+domain).",
                     len(backlog), DENSITY_THRESHOLD,
                 )
+                await loop.run_in_executor(
+                    None, lambda: _crun_record_idle("fact_consolidation"))
                 return
 
             logger.info("Ledger sweep: backlog of %d facts → %d eligible cluster(s).",
@@ -1765,6 +1797,8 @@ class ConsolidationDaemon:
 
             if not clusters:
                 logger.info("Global sweep: no eligible clusters (density_threshold=%d).", DENSITY_THRESHOLD)
+                await loop.run_in_executor(
+                    None, lambda: _crun_record_idle("fact_consolidation"))
                 return
 
             logger.info(
@@ -1855,6 +1889,23 @@ class ConsolidationDaemon:
                     domain_map, DENSITY_THRESHOLD,
                 ):
                     work_items.append((cluster['entity'], dom, c, p, aliases))
+
+            # Coverage census — captured after the gate, before folding, so a
+            # crash mid-fold still records what was eligible (same contract as
+            # the insight path). The count is taken AFTER the (entity, domain)
+            # re-split because that is the gate this cycle actually folds on.
+            #
+            # The fact path never recorded this, and NULL is not "no data" to
+            # the health surface — it is the trigger for a looser fallback
+            # backlog, so a correctly-idle fact_consolidation was reported
+            # STALLED against a predicate it does not fold on.
+            member_id_lists = [list(w[3]) for w in work_items]
+            all_member_ids = [pid for ids in member_id_lists for pid in ids]
+            ts_map = await loop.run_in_executor(
+                None, lambda: _fetch_outbox_created_at(all_member_ids))
+            rec.eligible_clusters = len(work_items)
+            rec.eligible_oldest_age = _kth_oldest_age_seconds(
+                member_id_lists, ts_map, DENSITY_THRESHOLD)
 
             # Fold dead-letter cap (see module docstring): keys that failed the
             # preservation/truncation gates NREM_FOLD_FAIL_CAP times within the
@@ -2122,7 +2173,9 @@ class ConsolidationDaemon:
                 rec.succeeded, rec.attempted, type(e).__name__, str(e)[:200], run_id)
             await loop.run_in_executor(None, lambda: _crun_finish(
                 run_id, "crashed", rec.attempted, rec.succeeded, rec.failed,
-                type(e).__name__, str(e), extra=rec.extra()))
+                type(e).__name__, str(e), extra=rec.extra(),
+                eligible_clusters=rec.eligible_clusters,
+                eligible_oldest_age=rec.eligible_oldest_age))
             raise
         else:
             logger.info(
@@ -2130,7 +2183,9 @@ class ConsolidationDaemon:
                 rec.succeeded, rec.attempted, run_id, rec.extra())
             await loop.run_in_executor(None, lambda: _crun_finish(
                 run_id, "completed", rec.attempted, rec.succeeded, rec.failed,
-                extra=rec.extra()))
+                extra=rec.extra(),
+                eligible_clusters=rec.eligible_clusters,
+                eligible_oldest_age=rec.eligible_oldest_age))
         finally:
             await loop.run_in_executor(None, conn.close)
 

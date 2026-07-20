@@ -3456,7 +3456,19 @@ class MemoryCoordinator:
               avg(EXTRACT(EPOCH FROM finished_at - started_at))
                   FILTER (WHERE outcome = 'completed' AND finished_at IS NOT NULL
                           AND started_at > now() - interval '24 hours') AS cycle_seconds_avg,
-              count(*) FILTER (WHERE started_at > now() - interval '24 hours') AS runs_24h,
+              -- runs_24h counts runs of the cycle BODY. A 'deferred' row (the
+              -- cycle was due and skipped) and an 'idle' row (the gate ran and
+              -- found nothing eligible) are zero-duration records of a
+              -- NON-run: counting them here would inflate the rate that sits
+              -- beside cycle_seconds_avg and misprice the cycle. They are
+              -- reported on their own keys instead.
+              count(*) FILTER (WHERE started_at > now() - interval '24 hours'
+                  AND outcome IS DISTINCT FROM 'deferred'
+                  AND outcome IS DISTINCT FROM 'idle') AS runs_24h,
+              count(*) FILTER (WHERE started_at > now() - interval '24 hours'
+                  AND outcome = 'deferred') AS deferred_24h,
+              count(*) FILTER (WHERE started_at > now() - interval '24 hours'
+                  AND outcome = 'idle') AS idle_24h,
               sum(folds_succeeded) FILTER (WHERE started_at > now() - interval '24 hours')
                   AS folds_succeeded_24h,
               sum(folds_attempted) FILTER (WHERE started_at > now() - interval '24 hours')
@@ -3530,6 +3542,12 @@ class MemoryCoordinator:
                     round(float(r["cycle_seconds_avg"]), 1)
                     if r and r["cycle_seconds_avg"] is not None else None),
                 "runs_24h": int(r["runs_24h"]) if r and r["runs_24h"] is not None else 0,
+                # Non-runs, reported separately so runs_24h stays a price the
+                # slot allocator can divide by: the cycle was due and skipped
+                # (deferred), or its gate ran and found nothing (idle).
+                "deferred_24h": (
+                    int(r["deferred_24h"]) if r and r["deferred_24h"] is not None else 0),
+                "idle_24h": int(r["idle_24h"]) if r and r["idle_24h"] is not None else 0,
                 "folds_succeeded_24h": (
                     int(r["folds_succeeded_24h"])
                     if r and r["folds_succeeded_24h"] is not None else 0),

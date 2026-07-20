@@ -497,7 +497,10 @@ def _thematic_conn_script(insert_id=90):
             (1, "general", "fact", "tests/test_x.py", d),
             (2, "general", "fact", None, d),
         ]},
-        # 2. fold dead-letter counts (own-conn SELECT; empty → no dead-lettering)
+        # 2. coverage census — _fetch_outbox_created_at over the work items'
+        #    pg_ids (own-conn SELECT, so it lands on this same stub)
+        {"rowcount": 2, "rows": []},
+        # 3. fold dead-letter counts (own-conn SELECT; empty → no dead-lettering)
         {"rowcount": 0, "rows": []},
         # 3. previous summary fetch
         {"rowcount": 0, "rows": []},
@@ -645,6 +648,12 @@ async def test_mock_llm_thematic_fold_passes_preservation_gate(monkeypatch):
     assert extra["preservation_retries"] == 0
     assert extra["preservation_failures"] == 0
     assert finish["args"][2:5] == (1, 1, 0)
+    # Coverage census: the fact path recorded eligible_clusters=NULL on EVERY
+    # run, and NULL is not "no data" to the health surface — it is the trigger
+    # for a looser fallback backlog, so a correctly-idle fact_consolidation was
+    # reported STALLED against a predicate it does not fold on. The count is the
+    # post-(entity,domain)-split work items, i.e. the gate actually folded.
+    assert finish["kwargs"]["eligible_clusters"] == 1
     # graph marking ran
     assert any("consolidated = true" in q for q, _ in session.calls)
 
