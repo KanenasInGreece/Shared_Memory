@@ -20,10 +20,6 @@
         "--with",
         "httpx",
         "--with",
-        "psycopg2-binary",
-        "--with",
-        "neo4j",
-        "--with",
         "python-dotenv",
         "python",
         "/path/to/your/shared_mem/vector-skill.py"

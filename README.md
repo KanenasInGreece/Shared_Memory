@@ -145,7 +145,7 @@ The shared memory framework is built around this idea: your tools should capture
 
 - **Antigravity CLI** (`agy`) — uses `memory_bridge.py` packaged as a skill (`/activate shared-memory`). Install the skill directory under `~/.gemini/skills/` (the legacy path inherited from Gemini CLI, which Antigravity replaced).
 
-- **LM Studio** — uses an MCP server (`vector-skill.py`), registered in `mcp.json`. The model calls `save_artifact` and `hybrid_search_and_rerank` as tools against the same backend.
+- **LM Studio / AnythingLLM / any MCP host** — uses an MCP server (`vector-skill.py`), registered in `mcp.json`. The model calls `save_artifact`, `hybrid_search_and_rerank`, `record_lineage` and the rest as tools. Like every other client it is a **thin HTTP client**: it holds no database connection and needs no database driver.
 
 The infrastructure underneath all agents is identical: one coordinator managing all Postgres and Neo4j connections, one embedding space enforced by BGE-M3, one consolidation daemon synthesising shared narratives. The agents differ; the memory layer does not.
 
@@ -918,11 +918,9 @@ Edit `mcp.json` from this repo: replace all `YOUR_*` placeholders with real valu
 "rag-orchestrator": {
   "command": "uv",
   "args": ["run", "--with", "fastmcp", "--with", "httpx",
-           "--with", "psycopg2-binary", "--with", "neo4j",
            "--with", "python-dotenv", "python", "/path/to/vector-skill.py"],
   "env": {
-    "NEO4J_PASSWORD":  "your-neo4j-password",
-    "PG_PASSWORD":     "your-postgres-password",
+    "COORDINATOR_URL": "http://localhost:8888",
     "AGENT_TOKEN":     "tok_your_lm_studio_token"
   }
 }
@@ -949,11 +947,21 @@ Start LM Studio. The `rag-orchestrator` MCP server should appear in the tool pan
 
 ## 10a. Remote Clients: SSH Tunnel Access
 
-A remote client is any machine that runs an AI CLI tool (Antigravity CLI, Claude Code, Grok, etc.) but **cannot run the infrastructure** — no Docker, no Postgres, no Neo4j, no BGE models. Only `memory_bridge.py` runs on the remote machine; all storage and compute stay on the host.
+A remote client is any machine that runs an AI tool but **cannot run the infrastructure** — no Docker, no Postgres, no Neo4j, no BGE models. Only the thin client runs on the remote machine; all storage and compute stay on the host.
 
-**Requirements on the remote machine:**
-- `uv` — install with `curl -LsSf https://astral.sh/uv/install.sh | sh` (handles all Python dependencies automatically). Alternatively: `python3` + `pip install httpx python-dotenv` and replace `uv run --with httpx --with python-dotenv python` with `python3` in all commands.
-- SSH access to the machine running the gateway
+> ### The client does not have to be Linux, and does not have to be a CLI
+>
+> **Every client surface in this framework is a thin HTTP client.** That is not a convenience — it is the whole portability story, and it is enforced: no client holds a database connection, imports a database driver, or reaches past the gateway. What a client machine needs is Python, `httpx`, and a route to port 8888.
+>
+> So a **Windows workstation** running LM Studio, AnythingLLM, or any other MCP host can register `vector-skill.py` and use a shared memory whose Postgres, Neo4j, BGE models and dream daemons all live on a Linux server — reading and writing the same graph as every CLI agent, and *seeing exactly what its token is permitted to see*, because read authorization is applied gateway-side and cannot be bypassed by a client that has no other way in.
+>
+> Verified: neither `memory_bridge.py` nor `vector-skill.py` imports a POSIX-only module; their only third-party dependencies are `httpx` (plus `fastmcp` for the MCP surface). The Unix-socket path used for operator attribution on the gateway host is **auto-detected and degrades to TCP** when absent, which is the Windows case — no configuration needed to disable it.
+>
+> This was not true before v0.8.0: the MCP surface opened its own Postgres pool and a hardcoded `bolt://localhost:7687` Neo4j driver, so an off-host client would have needed both database ports exposed across the network. Now it needs one HTTP endpoint.
+
+**Requirements on the remote machine (Linux, macOS or Windows):**
+- `uv` — install with `curl -LsSf https://astral.sh/uv/install.sh | sh` (Windows: `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"`). It handles all Python dependencies automatically. Alternatively: `python3` + `pip install httpx python-dotenv` (add `fastmcp` for the MCP surface) and replace `uv run --with httpx --with python-dotenv python` with `python3` in all commands.
+- A network route to the gateway — an SSH tunnel (below), or any encrypted overlay such as Tailscale or WireGuard. Bearer tokens travel in plaintext over HTTP, so the transport must be encrypted; never expose `:8888` to an untrusted network.
 - A distinct token registered in the gateway's `AGENT_TOKENS`
 
 > **Not required remotely:** Docker, the databases, the BGE models, and `nvtop`. GPU-aware dreaming ([§13](#13-the-sleep-cycle--rem-and-nrem-consolidation)) runs entirely on the infrastructure host — `nvtop` belongs there, not on the remote client. Inference you trigger remotely still executes on the host GPU, so it is detected correctly.
@@ -1697,7 +1705,7 @@ Policy (in `ops/shared-memory.logrotate`): `daily`, `maxsize 50M`, `rotate 14`, 
 
 ## 15. Retrieval: Three-Tier Lookup
 
-Both the MCP tool (`hybrid_search_and_rerank` in `vector-skill.py`) and the CLI (`memory_bridge.py search`) implement the same retrieval chain:
+Every client — the MCP tool (`hybrid_search_and_rerank` in `vector-skill.py`), the CLI (`memory_bridge.py search`), or any HTTP caller — gets the same retrieval chain, because none of them implements it. It lives once, in the coordinator, behind `POST /memory/search`. A second implementation would be a second implementation of the read authorization that guards it, which is exactly how the MCP surface once ended up serving records it should have filtered. The chain is:
 
 1. **Embed the query** via BGE-M3 through `:8888`.
 2. **Global context scan:** query `community_summaries` — the nearest active **insight** (`kind='insight'`, cross-project principle — surfaced first as `tier: "insight_summary"`) and the nearest thematic match. Insights outrank thematic narratives: a principle validated by at least one retrospective carries more weight than a single-domain synthesis.
@@ -1727,8 +1735,6 @@ The `rag-orchestrator` entry runs the custom MCP server for this framework. It i
       "args": [
         "run", "--with", "fastmcp",
         "--with", "httpx",
-        "--with", "psycopg2-binary",
-        "--with", "neo4j",
         "--with", "python-dotenv",
         "python", "/path/to/your/vector-skill.py"
       ]

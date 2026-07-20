@@ -5,6 +5,70 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.0] — 2026-07-20
+
+The MCP surface becomes a thin client, like every other client. `vector-skill.py` — the server an
+MCP host such as LM Studio or AnythingLLM registers — had been running its own copy of the
+retrieval chain directly against Postgres and Neo4j. This release removes every database handle
+from it. The headline consequence is a security fix; the durable consequence is that the client
+tier is now genuinely portable.
+
+### Security
+
+- **Read authorization was bypassed on the MCP surface.** The gateway filters every read on the
+  `visibility` column — `global`, the caller's own `private`, and rows matching the caller's
+  `scope`. `vector-skill.py` queried `technical_docs` and `community_summaries` directly with only
+  a `superseded` filter, so an MCP host could retrieve other agents' private records and
+  scope-restricted rows. It now calls `POST /memory/search` like every other client and receives
+  exactly what its token permits. **A second implementation of a read path is a second
+  implementation of its access control** — and this one had none.
+- **`archive_reasoning_trace` wrote its own subgraph straight to Neo4j**, bypassing the outbox
+  that makes a save atomic across both stores, and bypassing authorization. Traces were durable in
+  one store only and visible to everyone. A trace is now an ordinary record on the ordinary save
+  path: embedded, access-controlled, searchable, and eligible for consolidation.
+
+### Fixed
+
+- **`API_VERSION` was 2 while the gateway spoke 3**, so every request from an MCP host logged a
+  version skew. Now 3, and pinned by a test that reads the value out of `memory_bridge.py`.
+- **A hardcoded `bolt://localhost:7687`** violated the rule that every endpoint is an
+  env-overridable default. It is gone rather than parameterised — the client has no business
+  holding a graph driver.
+- **The MCP surface imported `ontology` off `shared-memory/scripts`** — the operations surface,
+  which is never shipped to clients — to build its Cypher. Removed with the Cypher.
+- **`check_memory_health` counted rows over its own Postgres connection.** It now reports what
+  `GET /health` reports (daemons, backends, consolidation liveness) and names any client/gateway
+  version skew — which is also the only check that exercises the path the client actually uses.
+- **Qualified record references reached the MCP surface** (decision 822): search results render
+  the gateway's `ref` (`fact:816`, `summary:87`) rather than a bare integer, and the new
+  `record_lineage` tool refuses a malformed or wrongly-typed reference instead of resolving it
+  against the wrong table.
+
+### Added
+
+- **`record_lineage`, `graph_query`, `review_edges`, `label_edges`** — reads and adjudication tools
+  the CLI skill had and the MCP surface did not.
+- **`RETRO_RATINGS` and `RELATION_FAMILIES` mirrored** from the gateway, so retrospective ratings
+  and calibration families are validated client-side as they are in the CLI client.
+
+### Portability — the client can be Windows
+
+Because no client holds a database connection any more, a **Windows** machine running LM Studio,
+AnythingLLM or any MCP host can use a framework whose databases, embedding models and dream
+daemons all live on a Linux server. Verified: neither client imports a POSIX-only module, their
+only third-party dependencies are `httpx` (plus `fastmcp` for the MCP surface), and the Unix-socket
+path used for operator attribution auto-detects and **degrades to TCP** when absent — which is the
+Windows case, needing no configuration. Before this release the MCP surface would have required
+both database ports exposed across the network. `mcp.json` no longer installs `psycopg2-binary` or
+`neo4j`, and no longer needs database credentials — only `COORDINATOR_URL` and `AGENT_TOKEN`.
+
+### Changed
+
+- `tests/test_vector_skill.py` rewritten where it asserted the old direct-database behaviour, plus
+  a guard test that fails if any database handle, driver import, or server-module import returns.
+
+---
+
 ## [0.7.7] — 2026-07-20
 
 Follow-through on the previous release. The non-run counters it added were served by the API but

@@ -1,14 +1,44 @@
-import httpx
-import psycopg2
-from psycopg2 import pool
+"""
+Vector Skill — MCP server exposing the shared memory to an MCP host (LM Studio).
+
+THIN CLIENT (ADR-014). This process owns no database connections. Every
+operation is an HTTP call to the Hive-Mind Gateway on :8888, which is the single
+component that talks to Postgres and Neo4j.
+
+That was not always true, and the reason it matters is not tidiness. This server
+used to run its own copy of the retrieval chain — its own vector query, its own
+Tier-3 lookup, its own graph expansion — straight against the databases. Three
+consequences, all of them real:
+
+  * READ AUTHORIZATION WAS BYPASSED. The gateway applies a visibility predicate
+    to every read (`global`, own `private`, matching `scope`). A direct
+    `SELECT ... FROM technical_docs WHERE NOT superseded` applies none, so this
+    host could retrieve other agents' private records and scope-restricted rows.
+    A second implementation of a read path is a second implementation of its
+    access control, and this one simply did not have any.
+  * IT DRIFTED. Every retrieval improvement had to be made twice, and in
+    practice was made once — so this host silently served months-old ranking
+    behaviour while every other agent got the current chain.
+  * IT IMPORTED SERVER MODULES. The Cypher it built needed `ontology`, pulled in
+    off `shared-memory/scripts`, which is the operations surface and is not
+    shipped to clients.
+
+So: search, graph queries, lineage and saves all go through the gateway, and
+this file holds rendering plus the MCP tool surface. Nothing else.
+
+MCP tools: hybrid_search_and_rerank, save_artifact, archive_reasoning_trace,
+save_decision, save_retrospective, supersede, review_hold, check_memory_health,
+memory_telemetry, record_lineage, graph_query, review_edges, label_edges.
+"""
+import asyncio
 import json
+import logging
 import os
 import sys
-import logging
-import asyncio
 from datetime import datetime
+
+import httpx
 from fastmcp import FastMCP
-from neo4j import GraphDatabase
 
 # Load .env from the same directory as this script so credentials are available
 # when LM Studio (or any MCP host) spawns this process without inheriting the shell env.
@@ -18,24 +48,39 @@ try:
 except ImportError:
     pass  # python-dotenv not installed; rely on env vars being set externally
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "shared-memory", "scripts"))
-from ontology import ONT
-
 # Configure logging to stderr for MCP visibility
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("RAG_Orchestrator")
 
 mcp = FastMCP("Local_RAG_Orchestrator")
 
-# Standardized endpoints via Hive-Mind Gateway (8888)
-RETRIEVER_URL = "http://localhost:8888/v1/embeddings"
-RERANKER_URL = "http://localhost:8888/v1/reranking"
+# The one endpoint this process talks to. Env-overridable like every other
+# endpoint in the framework — never assume the bundled port layout.
+COORDINATOR_BASE = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
+AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 
 # Wire contract this MCP server speaks on its /memory/* gateway calls. Keep in
 # step with API_VERSION in coordinator.py / memory_bridge.py — the gateway logs
 # a warning (coordinator._check_client_version) if they disagree.
-API_VERSION = 2
+# v3: review_edges / label_edges require the gateway's /memory/relations/* routes.
+API_VERSION = 3
+VERSION = "0.8.0"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
+
+# Constants that MUST mirror the gateway's (a thin client never imports server
+# modules, so they are restated here and kept in step by review).
+# relation_confidence.FAMILIES:
+RELATION_FAMILIES = ("entity_relation", "evidential")
+# ontology.RETRO_RATINGS — outcome STATES, not valence:
+RETRO_RATINGS = ("validated", "mixed", "refined", "pending", "reversed")
+# Record types that may qualify a reference. A record id is unique only WITHIN
+# its table — technical_docs and community_summaries run independent sequences —
+# so a bare integer lifted off a summary result resolves against the wrong table
+# and returns a confident, unrelated record (decision 822).
+RECORD_TYPES = ("fact", "decision", "retrospective", "summary", "insight")
+
+SEARCH_TIMEOUT = httpx.Timeout(60.0, connect=5.0)
+CALL_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
 
 
 def _auth_headers() -> dict:
@@ -50,7 +95,9 @@ def _auth_headers() -> dict:
         headers["Authorization"] = f"Bearer {token}"
     return headers
 
+
 _CONTENT_SIZE_WARN_BYTES = 10 * 1024
+
 
 def _append_log(tool: str, min_level: int, event: str, data: dict, content: str = None) -> None:
     log_level = int(os.environ.get("MEMORY_LOG_LEVEL", "0"))
@@ -67,285 +114,119 @@ def _append_log(tool: str, min_level: int, event: str, data: dict, content: str 
         with open(os.path.join(log_dir, f"{tool}.log"), "a") as f:
             f.write(json.dumps(entry) + "\n")
     except OSError as e:
-        import sys
         print(f"[WARN] shared-memory: audit log unavailable ({e})", file=sys.stderr)
     except Exception:
         pass  # logging must never break the save path
-_pg_pass = os.environ.get("PG_PASSWORD", "")
-DB_CONN = os.environ.get(
-    "PG_CONN",
-    f"dbname=agent_data user=postgres password={_pg_pass} host=localhost"
-)
-NEO4J_URI = "bolt://localhost:7687"
-NEO4J_AUTH = ("neo4j", os.environ.get("NEO4J_PASSWORD", ""))
-
-# Embedding timeout: BGE-M3 is fast even for long inputs.
-EMBED_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
-# Reranking timeout: BGE-Reranker processes each (query, doc) pair sequentially;
-# 10 full-content candidates can exceed 20s on CPU-only inference stacks.
-RERANK_TIMEOUT = httpx.Timeout(120.0, connect=5.0)
-# Legacy alias kept for callers not yet updated.
-TIMEOUT = EMBED_TIMEOUT
-# If the top reranker score is below this value, episodic results are not
-# confidently relevant and the entity-graph fallback is triggered.
-LOW_CONFIDENCE_THRESHOLD = -3.0
-
-# Global Drivers
-_neo4j_driver = None
-_pg_pool = None
-
-def get_neo4j():
-    global _neo4j_driver
-    if _neo4j_driver is None:
-        _neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
-    return _neo4j_driver
-
-def get_pg_conn():
-    global _pg_pool
-    if _pg_pool is None:
-        # ThreadedConnectionPool is mandatory for multi-agent MCP servers
-        _pg_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, DB_CONN)
-    return _pg_pool.getconn()
-
-def release_pg_conn(conn):
-    _pg_pool.putconn(conn)
-
-async def get_embedding(text: str):
-    """Internal helper to get embeddings with retry logic."""
-    try:
-        async with httpx.AsyncClient(timeout=EMBED_TIMEOUT) as client:
-            resp = await client.post(
-                RETRIEVER_URL,
-                json={"input": text, "model": "bge-m3"},
-                headers=_auth_headers(),
-            )
-            resp.raise_for_status()
-            return resp.json()["data"][0]["embedding"]
-    except Exception as e:
-        logger.warning(f"Embedding service unreachable or slow: {str(e)}")
-        return None
 
 
-def _graph_entity_fallback(query: str, limit: int = 5) -> str:
-    """Entity-graph search used when reranker confidence is low.
-    Extracts significant words from the query, matches against Entity.name nodes,
-    follows MENTIONS edges to Fact nodes, fetches full content from Postgres."""
-    terms = [w.lower() for w in query.split() if len(w) > 3]
-    if not terms:
-        return ""
-    try:
-        driver = get_neo4j()
-        with driver.session() as session:
-            result = session.run(
-                f"MATCH (e:{ONT.entity})"
-                f" WHERE any(term IN $terms WHERE toLower(e.name) CONTAINS term)"
-                f" MATCH (f:{ONT.fact})-[:{ONT.entity_link}]->(e)"
-                f" RETURN DISTINCT f.pg_id LIMIT $cap",
-                terms=terms, cap=limit * 2
-            )
-            pg_ids = [r["f.pg_id"] for r in result if r["f.pg_id"] is not None]
-    except Exception as e:
-        logger.warning(f"Graph entity fallback Neo4j query failed: {e}")
-        return ""
-    if not pg_ids:
-        return ""
-    try:
-        conn = get_pg_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT content, metadata FROM technical_docs"
-                    " WHERE id = ANY(%s) LIMIT %s",
-                    (pg_ids, limit)
-                )
-                rows = cur.fetchall()
-        finally:
-            release_pg_conn(conn)
-    except Exception as e:
-        logger.warning(f"Graph entity fallback Postgres fetch failed: {e}")
-        return ""
-    docs = []
-    for content, meta in rows:
+def _unavailable(exc: Exception) -> str:
+    """Uniform message when the gateway cannot be reached. The gateway is the
+    only path to memory now, so this is a hard failure rather than a degraded
+    mode — saying so plainly beats silently returning nothing."""
+    return (f"Error: memory gateway unreachable at {COORDINATOR_BASE} ({exc}). "
+            "Start it with: systemctl --user start hive-mind-gateway.service")
+
+
+def _auth_rejected(tool: str) -> str:
+    _append_log(tool, 2, "auth_failed",
+                {"hint": "Check AGENT_TOKEN in this skill's .env matches a gateway AGENT_TOKENS entry"})
+    return ("Error: the gateway rejected this client's token. Set AGENT_TOKEN in "
+            "the .env beside vector-skill.py (or in the mcp.json env block).")
+
+
+def _valid_ref(ref: str) -> bool:
+    """A bare id, or a qualified `type:id` reference (decision 822)."""
+    head, _, tail = str(ref).partition(":")
+    if tail:
+        return tail.lstrip("-").isdigit() and head.lower() in RECORD_TYPES
+    return str(ref).lstrip("-").isdigit()
+
+
+# ── Rendering ────────────────────────────────────────────────────────────────
+
+def _render_results(results: list, elapsed: float) -> str:
+    """Render the gateway's search response for an MCP host.
+
+    Every result carries the gateway's own `ref` (`fact:816`, `summary:87`) and
+    `record_type`. Those are surfaced verbatim rather than reduced to a bare
+    integer, because the bare integer is exactly what makes a follow-up lookup
+    resolve against the wrong table.
+    """
+    if not results:
+        return "Result: No relevant documentation found."
+
+    # Tier-3 narratives (thematic summaries, cross-project insights) lead, as
+    # the gateway ordered them; the precision facts follow with their scores.
+    tier3 = [r for r in results if r.get("record_type") in ("summary", "insight")]
+    tier1 = [r for r in results if r not in tier3]
+
+    out = []
+    for r in tier3:
+        kind = "Insight (cross-project principle)" if r.get("record_type") == "insight" \
+               else "Global Context Summary"
+        head = f"### {kind}  [{r.get('ref', r.get('pg_id'))}]"
+        src = r.get("source_pg_ids") or []
+        if src:
+            head += f"\n_synthesised from {len(src)} record(s)_"
+        out.append(f"{head}\n{r.get('content', '')}")
+
+    body = []
+    for r in tier1:
+        meta = r.get("metadata") or {}
         source = meta.get("source", "unknown") if isinstance(meta, dict) else "unknown"
-        docs.append(f"[Graph Fallback | Source: {source}]\n{content}")
-    return "\n\n---\n\n".join(docs)
+        score = r.get("score")
+        bits = [f"Ref: {r.get('ref', r.get('pg_id'))}", f"Source: {source}"]
+        if score is not None:
+            bits.insert(0, f"Score: {score:.2f}")
+        line = f"[{' | '.join(bits)}]"
+        gc = r.get("graph_context")
+        if gc:
+            line += f"\n[Graph Context]: {gc if isinstance(gc, str) else json.dumps(gc)}"
+        ents = r.get("matched_entities")
+        if ents:
+            line += f"\n[Matched entities]: {', '.join(map(str, ents))}"
+        body.append(f"{line}\n{r.get('content', '')}")
 
+    header = f"### Unified Memory Results ({len(tier1)} item(s) found in {elapsed:.2f}s)\n\n"
+    parts = out + [header + "\n\n---\n\n".join(body)] if body else out
+    return "\n\n---\n\n".join(parts)
+
+
+# ── Retrieval ────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 async def hybrid_search_and_rerank(query: str, limit: int = 5) -> str:
     """
-    Performs semantic search with Global Context (Summaries) and Relational Expansion (Neo4j).
-    Links Postgres technical docs with Neo4j entity relationships and hierarchical summaries.
+    Search the shared memory: Tier-3 thematic/insight narratives for orientation,
+    Tier-1 facts for precision, expanded through the entity graph.
+
+    Delegates the whole retrieval chain — embedding, vector search, reranking,
+    graph expansion, and READ AUTHORIZATION — to the gateway, so this host sees
+    exactly what every other agent sees, and only what it is permitted to see.
     """
-    logger.info(f"Starting expanded search for: {query[:50]}...")
-    start_time = datetime.now()
-
+    logger.info(f"Search: {query[:50]}...")
+    start = datetime.now()
     try:
-        # 1. Generate Embedding
-        query_vector = await get_embedding(query)
-        if not query_vector:
-            return "Error: Embedding service down. Cannot perform high-precision search."
-
-        # 2. Global Context Search (Postgres community_summaries).
-        #    Insights (cross-project principles, decision 276) surface above
-        #    the nearest thematic summary — mirrors coordinator handle_search.
-        global_context = ""
-        conn = get_pg_conn()
-        try:
-            with conn.cursor() as cur:
-                def _stale_warning(src_ids, metadata):
-                    # decision 384: warn when a returned summary was synthesised
-                    # from a now-superseded fact (minus reviewed-and-held, 8e).
-                    if not src_ids:
-                        return ""
-                    try:
-                        cur.execute(
-                            "SELECT id, superseded_by FROM technical_docs"
-                            " WHERE id = ANY(%s) AND superseded",
-                            (list(src_ids),),
-                        )
-                        stale = cur.fetchall()
-                    except Exception:
-                        conn.rollback()  # pre-013 schema — no superseded_by column
-                        return ""
-                    md = metadata if isinstance(metadata, dict) else {}
-                    acked = {e.get("old") for e in (md.get("reviewed_supersessions") or [])
-                             if isinstance(e, dict)}
-                    pairs = [f"{old}->{by if by is not None else 'retracted'}"
-                             for old, by in stale if old not in acked]
-                    if not pairs:
-                        return ""
-                    return ("\n[⚠ STALE SOURCES: built on superseded fact(s) "
-                            + ", ".join(pairs)
-                            + " — verify the successor before relying on this]\n")
-                try:
-                    cur.execute("""
-                        SELECT content, source_pg_ids, metadata FROM community_summaries
-                        WHERE NOT superseded AND metadata->>'kind' = 'insight'
-                        ORDER BY embedding <=> %s::vector LIMIT 1
-                    """, (query_vector,))
-                    i_row = cur.fetchone()
-                    if i_row:
-                        global_context += (f"### Insight (cross-project principle)\n{i_row[0]}"
-                                           f"{_stale_warning(i_row[1], i_row[2])}\n\n---\n\n")
-                    cur.execute("""
-                        SELECT content, source_pg_ids, metadata FROM community_summaries
-                        WHERE NOT superseded
-                          AND COALESCE(metadata->>'kind', 'thematic') <> 'insight'
-                        ORDER BY embedding <=> %s::vector LIMIT 1
-                    """, (query_vector,))
-                    g_row = cur.fetchone()
-                    if g_row:
-                        global_context += (f"### Global Context Summary\n{g_row[0]}"
-                                           f"{_stale_warning(g_row[1], g_row[2])}\n\n---\n\n")
-                except Exception:
-                    conn.rollback()  # pre-migration schema — unfiltered, content-only fallback
-                    cur.execute("""
-                        SELECT content FROM community_summaries
-                        ORDER BY embedding <=> %s::vector LIMIT 1
-                    """, (query_vector,))
-                    g_row = cur.fetchone()
-                    if g_row:
-                        global_context += f"### Global Context Summary\n{g_row[0]}\n\n---\n\n"
-        except Exception as e:
-            logger.warning(f"Global context retrieval failed: {str(e)}")
-        finally:
-            release_pg_conn(conn)
-
-        # 3. Vector Search (Postgres technical_docs) — reversed decisions
-        #    (superseded=true, migration 009) are excluded when the column exists.
-        conn = get_pg_conn()
-        try:
-            with conn.cursor() as cur:
-                try:
-                    cur.execute("""
-                        SELECT id, content, metadata FROM technical_docs
-                        WHERE NOT superseded
-                        ORDER BY embedding <=> %s::vector LIMIT 10
-                    """, (query_vector,))
-                except Exception:
-                    conn.rollback()
-                    cur.execute("""
-                        SELECT id, content, metadata FROM technical_docs
-                        ORDER BY embedding <=> %s::vector LIMIT 10
-                    """, (query_vector,))
-                rows = cur.fetchall()
-                ids = [row[0] for row in rows]
-                candidates = [row[1] for row in rows]
-                meta = [row[2] for row in rows]
-        finally:
-            release_pg_conn(conn)
-
-        if not candidates:
-            return "Result: No relevant documentation found."
-
-        # 4. Rerank — full document content, no truncation.
-        async with httpx.AsyncClient(timeout=RERANK_TIMEOUT) as client:
-            resp = await client.post(RERANKER_URL, json={
-                "query": query,
-                "documents": candidates,
-                "top_k": limit
-            }, headers=_auth_headers())
-            resp.raise_for_status()
-            rerank_results = resp.json()["results"]
-
-        # Low-confidence check — trigger entity-graph fallback if no result is
-        # confidently relevant (best score below threshold).
-        best_score = max((r["relevance_score"] for r in rerank_results), default=-999.0)
-        graph_supplement = ""
-        if best_score < LOW_CONFIDENCE_THRESHOLD:
-            logger.warning(
-                "Reranker low confidence (best=%.2f < %.1f) — querying entity graph",
-                best_score, LOW_CONFIDENCE_THRESHOLD,
+        async with httpx.AsyncClient(timeout=SEARCH_TIMEOUT) as client:
+            r = await client.post(
+                f"{COORDINATOR_BASE}/memory/search",
+                json={"query": query, "limit": limit, "agent_id": AGENT_ID},
+                headers=_auth_headers(),
             )
-            graph_supplement = _graph_entity_fallback(query, limit)
+            if r.status_code == 401:
+                return _auth_rejected("vector_skill")
+            r.raise_for_status()
+            payload = r.json()
+    except Exception as exc:
+        logger.error(f"Search failed: {exc}")
+        return _unavailable(exc)
 
-        # 5. Relational Expansion (Neo4j)
-        driver = get_neo4j()
-        output_docs = []
-        for res in rerank_results:
-            idx = res["index"]
-            score = res["relevance_score"]
-            pg_id = ids[idx]
-            content = candidates[idx]
-            m = meta[idx]
+    results = payload.get("results", payload)
+    if isinstance(results, dict) and results.get("status") == "error":
+        return f"Error: {results.get('message', 'search failed')}"
+    return _render_results(results if isinstance(results, list) else [],
+                           (datetime.now() - start).total_seconds())
 
-            relational_context = ""
-            try:
-                with driver.session() as session:
-                    graph_result = session.run(
-                        f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
-                        " OPTIONAL MATCH (f)-[r]-(related)"
-                        " RETURN labels(related) as labels, related.name as name, type(r) as rel_type"
-                        " LIMIT 5",
-                        pg_id=pg_id)
-
-                    rels = []
-                    for record in graph_result:
-                        if record["name"]:
-                            rels.append(f"{record['rel_type']} -> {record['name']} ({record['labels'][0]})")
-
-                    if rels:
-                        relational_context = "\n[Graph Context]: " + " | ".join(rels)
-            except Exception as ge:
-                logger.warning(f"Neo4j expansion failed for ID {pg_id}: {str(ge)}")
-
-            source = m.get("source", "unknown") if isinstance(m, dict) else "unknown"
-            output_docs.append(f"[Score: {score:.2f} | Source: {source}]{relational_context}\n{content}")
-
-        duration = (datetime.now() - start_time).total_seconds()
-        header = f"### Unified Memory Results ({len(output_docs)} items found in {duration:.2f}s)\n\n"
-        result_text = global_context + header + "\n\n---\n\n".join(output_docs)
-        if graph_supplement:
-            result_text += (
-                "\n\n---\n\n### Entity Graph Results (low confidence — supplementary)\n\n"
-                + graph_supplement
-            )
-        return result_text
-
-    except Exception as e:
-        logger.error(f"Search failed: {str(e)}")
-        return f"Error: {str(e)}"
 
 @mcp.tool()
 async def save_artifact(content: str, metadata_json: str = "{}") -> str:
@@ -397,7 +278,7 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
     m_data.setdefault("model", m_data["source"])
     entities = m_data.get("entities", [])
 
-    coordinator_url = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
+    coordinator_url = COORDINATOR_BASE
     agent_id = os.environ.get("AGENT_ID", "lm_studio")
 
     try:
@@ -435,44 +316,36 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
 @mcp.tool()
 async def archive_reasoning_trace(session_id: str, task: str, steps: list) -> str:
     """
-    Archives the agent's reasoning path as a linked graph chain in Neo4j.
-    Steps should be a list of dicts: [{'thought': '...', 'tool': '...', 'result': '...'}]
+    Archive the agent's reasoning path as a memory record.
+
+    `steps` is a list of dicts: [{'thought': ..., 'tool': ..., 'result': ...}].
+
+    This used to CREATE ReasoningTrace/ReasoningStep nodes straight in Neo4j.
+    A client writing its own subgraph bypasses the outbox — which is what makes
+    a save atomic across Postgres and Neo4j — and bypasses read authorization,
+    so the trace was durable in one store only and visible to everyone. It is
+    now saved through the normal save path: one record, embedded, access-
+    controlled, searchable, and eligible for consolidation like any other.
     """
-    try:
-        task_embedding = await get_embedding(task)
+    if not steps:
+        return "Error: no steps to archive."
+    lines = [f"Reasoning trace for task: {task}", ""]
+    for i, step in enumerate(steps):
+        lines.append(f"{i + 1}. Thought: {step.get('thought', '')}")
+        if step.get("tool"):
+            lines.append(f"   Tool: {step['tool']}")
+        if step.get("result") is not None:
+            lines.append(f"   Result: {step['result']}")
+    content = "\n".join(lines)
+    metadata = {
+        "source": os.environ.get("AGENT_ID", "vector_skill"),
+        "type": "reasoning_trace",
+        "session_id": session_id,
+        "task": task,
+        "step_count": len(steps),
+    }
+    return await save_artifact(content, json.dumps(metadata))
 
-        driver = get_neo4j()
-        with driver.session() as session:
-            session.run(
-                f"MERGE (t:{ONT.reasoning_trace} {{id: $session_id}})"
-                " SET t.task = $task,"
-                "     t.timestamp = datetime()",
-                session_id=session_id, task=task)
-
-            prev_id = session_id
-            for i, step in enumerate(steps):
-                step_id = f"{session_id}_step_{i}"
-                content = f"Thought: {step.get('thought', '')}\nTool: {step.get('tool', '')}"
-
-                step_embedding = await get_embedding(content)
-
-                session.run(
-                    " MATCH (prev) WHERE prev.id = $prev_id"
-                    f" CREATE (s:{ONT.reasoning_step} {{id: $step_id}})"
-                    " SET s.content = $content,"
-                    "     s.result = $result,"
-                    "     s.index = $i"
-                    f" CREATE (prev)-[:{ONT.reasoning_next}]->(s)",
-                    prev_id=prev_id, step_id=step_id, content=content,
-                    result=str(step.get('result', '')), i=i)
-
-                prev_id = step_id
-
-        logger.info(f"Trace archived for session {session_id}")
-        return f"Success: Archived reasoning trace with {len(steps)} steps."
-    except Exception as e:
-        logger.error(f"Trace archive failed: {str(e)}")
-        return f"Error: {str(e)}"
 
 @mcp.tool()
 async def save_decision(
@@ -517,7 +390,7 @@ async def save_decision(
     }
     content = f"{title}\n\n{rationale}"
 
-    coordinator_url = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
+    coordinator_url = COORDINATOR_BASE
     agent_id = os.environ.get("AGENT_ID", "lm_studio")
 
     try:
@@ -567,7 +440,7 @@ async def save_retrospective(
     pending | reversed ('reversed' supersedes the decision; nuance goes in notes).
     Optional: date (ISO string, default: today).
     """
-    coordinator_url = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
+    coordinator_url = COORDINATOR_BASE
     agent_id = os.environ.get("AGENT_ID", "lm_studio")
 
     payload = {
@@ -617,7 +490,7 @@ async def supersede(pg_id: int, by: int = 0) -> str:
     Required: pg_id (the fact to retract).
     Optional: by (pg_id of an existing successor fact to point at; omit / 0 = none).
     """
-    coordinator_url = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
+    coordinator_url = COORDINATOR_BASE
     payload = {"pg_id": pg_id}
     if by and by > 0:
         payload["by"] = by
@@ -654,7 +527,7 @@ async def review_hold(summary_id: int, pg_id: int) -> str:
     Required: summary_id (the community_summaries id), pg_id (the superseded
     source fact to acknowledge).
     """
-    coordinator_url = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
+    coordinator_url = COORDINATOR_BASE
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(
@@ -677,44 +550,37 @@ async def review_hold(summary_id: int, pg_id: int) -> str:
 
 @mcp.tool()
 async def check_memory_health() -> str:
-    """Full-stack diagnostic for the Shared Memory infrastructure."""
-    stats = {"status": "healthy", "components": {}}
+    """
+    Full-stack diagnostic for the shared-memory infrastructure.
 
-    # Check Postgres
+    Reports what the gateway reports — embedder, reranker, reasoning backends,
+    both dream daemons, and consolidation liveness — rather than opening its own
+    database connection to count rows. The gateway is the component that knows
+    whether the stack is healthy; asking it is also the only check that
+    exercises the path this client actually uses.
+    """
     try:
-        conn = get_pg_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT count(*) FROM technical_docs")
-                count = cur.fetchone()[0]
-                stats["components"]["postgres"] = {"status": "OK", "docs": count}
-        finally:
-            release_pg_conn(conn)
-    except Exception as e:
-        stats["status"] = "degraded"
-        stats["components"]["postgres"] = {"status": "FAIL", "error": str(e)}
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{COORDINATOR_BASE}/health",
+                                    headers=_auth_headers())
+        if resp.status_code == 401:
+            return _auth_rejected("vector_skill")
+        payload = resp.json()
+    except Exception as exc:
+        return json.dumps({"status": "unreachable",
+                           "gateway": COORDINATOR_BASE,
+                           "error": str(exc),
+                           "hint": "systemctl --user start hive-mind-gateway.service"},
+                          indent=2)
+    payload["client"] = {"tool": "vector-skill", "version": VERSION,
+                         "api_version": API_VERSION}
+    gw_api = payload.get("api_version")
+    if gw_api is not None and gw_api != API_VERSION:
+        payload["client"]["version_skew"] = (
+            f"this client speaks v{API_VERSION}, gateway speaks v{gw_api} — "
+            "upgrade whichever is older")
+    return json.dumps(payload, indent=2, default=str)
 
-    # Check Retriever (via Gateway)
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(RETRIEVER_URL, json={"input": "healthcheck", "model": "bge-m3"},
-                                     headers=_auth_headers())
-            stats["components"]["retriever"] = {"status": "OK" if resp.status_code == 200 else "FAIL"}
-    except Exception as e:
-        stats["status"] = "degraded"
-        stats["components"]["retriever"] = {"status": "FAIL", "error": str(e)}
-
-    # Check Reranker (via Gateway)
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(RERANKER_URL, json={"query": "health", "documents": ["check"]},
-                                     headers=_auth_headers())
-            stats["components"]["reranker"] = {"status": "OK" if resp.status_code == 200 else "FAIL"}
-    except Exception as e:
-        stats["status"] = "degraded"
-        stats["components"]["reranker"] = {"status": "FAIL", "error": str(e)}
-
-    return json.dumps(stats, indent=2)
 
 @mcp.tool()
 async def memory_telemetry() -> str:
@@ -726,7 +592,7 @@ async def memory_telemetry() -> str:
     has work pending or is caught up — it is the same snapshot the CLI agents get
     via `memory_bridge.py status`. Read-only; no direct database access needed.
     """
-    coordinator_url = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
+    coordinator_url = COORDINATOR_BASE
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
@@ -739,6 +605,112 @@ async def memory_telemetry() -> str:
         return json.dumps(resp.json(), indent=2)
     except Exception as e:
         return f"Error: gateway unreachable — {e}"
+
+
+# ── Reads that the CLI skill already had and this surface did not ────────────
+
+@mcp.tool()
+async def record_lineage(ref: str) -> str:
+    """
+    "What happened to this record?" — its state, its dream-cycle stamps
+    (applied → rem_reviewed → consolidated), and which summary it was folded
+    into, with the fact→summary latency.
+
+    `ref` takes a bare id or a QUALIFIED reference: "fact:816", "decision:840",
+    "summary:87". Prefer the qualified form and take it verbatim from a search
+    result. A record id is unique only within its table, and facts and summaries
+    run independent sequences — so a bare integer lifted off a summary result
+    resolves against the facts table and returns a confident, unrelated record.
+    """
+    ref = str(ref).strip()
+    if not _valid_ref(ref):
+        return ("Error: ref must be a bare id or type:id, where type is one of "
+                + ", ".join(RECORD_TYPES))
+    try:
+        async with httpx.AsyncClient(timeout=CALL_TIMEOUT) as client:
+            r = await client.get(f"{COORDINATOR_BASE}/memory/status/{ref}",
+                                 headers=_auth_headers())
+            if r.status_code == 401:
+                return _auth_rejected("vector_skill")
+            return json.dumps(r.json(), indent=2, default=str)
+    except Exception as exc:
+        return _unavailable(exc)
+
+
+@mcp.tool()
+async def graph_query(cypher: str) -> str:
+    """
+    Run a READ-ONLY Cypher query against the knowledge graph.
+
+    The gateway enforces read-only: CREATE, DELETE, DETACH DELETE, SET, MERGE,
+    CALL, LOAD CSV and DROP are rejected there, not here — a client-side check
+    would be advisory only.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=CALL_TIMEOUT) as client:
+            r = await client.post(f"{COORDINATOR_BASE}/memory/graph",
+                                  json={"cypher": cypher, "params": {}},
+                                  headers=_auth_headers())
+            if r.status_code == 401:
+                return _auth_rejected("vector_skill")
+            payload = r.json()
+    except Exception as exc:
+        return _unavailable(exc)
+    return json.dumps(payload.get("records", payload), indent=2, default=str)
+
+
+# ── Relation adjudication (API v3) ───────────────────────────────────────────
+
+@mcp.tool()
+async def review_edges(family: str = "entity_relation", limit: int = 20) -> str:
+    """
+    Fetch machine-proposed graph edges awaiting operator adjudication.
+
+    `family` is one of: entity_relation, evidential. Each family calibrates on
+    its own operator-label curve, so they are reviewed separately.
+    """
+    if family not in RELATION_FAMILIES:
+        return f"Error: family must be one of {', '.join(RELATION_FAMILIES)}"
+    try:
+        async with httpx.AsyncClient(timeout=CALL_TIMEOUT) as client:
+            r = await client.get(
+                f"{COORDINATOR_BASE}/memory/relations/review",
+                params={"family": family, "limit": limit},
+                headers=_auth_headers())
+            if r.status_code == 401:
+                return _auth_rejected("vector_skill")
+            return json.dumps(r.json(), indent=2, default=str)
+    except Exception as exc:
+        return _unavailable(exc)
+
+
+@mcp.tool()
+async def label_edges(labels_json: str, promote: list = None) -> str:
+    """
+    Record operator labels on proposed edges — the calibration signal.
+
+    `labels_json` maps adjudication id to verdict, e.g.
+    '{"12": "correct", "13": "incorrect"}'. `promote` optionally lists ids to
+    promote to operator-asserted edges.
+    """
+    try:
+        labels = json.loads(labels_json)
+        if not isinstance(labels, dict):
+            raise ValueError("labels_json must be a JSON object")
+    except Exception as exc:
+        return f"Error: could not parse labels_json ({exc})"
+    try:
+        async with httpx.AsyncClient(timeout=CALL_TIMEOUT) as client:
+            r = await client.post(
+                f"{COORDINATOR_BASE}/memory/relations/label",
+                json={"labels": labels, "promote": promote or []},
+                headers=_auth_headers())
+            if r.status_code == 401:
+                return _auth_rejected("vector_skill")
+            return json.dumps(r.json(), indent=2, default=str)
+    except Exception as exc:
+        return _unavailable(exc)
+
 
 if __name__ == "__main__":
     mcp.run()
