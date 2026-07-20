@@ -5,6 +5,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.1] — 2026-07-20
+
+The shipped `mcp.json` template still contained the defect v0.8.0 had just removed from the code.
+
+### Security
+
+- **`postgres-vector` removed from the `mcp.json` template.** It registered
+  `@modelcontextprotocol/server-postgres` pointed straight at the memory database, handing the
+  model unfiltered read/write SQL: no `visibility` filter, no outbox, no deduplication, no
+  read-only guard. v0.8.0 removed exactly this bypass from `vector-skill.py`; shipping a template
+  that re-opens it from the other side made that fix cosmetic for anyone following the setup
+  guide. `rag-orchestrator` already covers Tier-1 and Tier-3 retrieval plus graph expansion in one
+  authorized call, so nothing is lost.
+- **The template no longer passes database credentials to the MCP server.** `NEO4J_PASSWORD` and
+  `PG_PASSWORD` are gone from its env block, replaced by `COORDINATOR_URL` and `AGENT_TOKEN` — the
+  only two values a thin client needs. A process with no database driver has no business holding
+  database passwords.
+
+### Documentation
+
+- README's *"Why no separate graph MCP?"* note now covers **both** stores, leads with read
+  authorization rather than write atomicity, and states plainly that this was a real defect in
+  this framework until v0.8.0 rather than a hypothetical.
+
+---
+
 ## [0.8.0] — 2026-07-20
 
 The MCP surface becomes a thin client, like every other client. `vector-skill.py` — the server an

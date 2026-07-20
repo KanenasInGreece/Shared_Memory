@@ -23,15 +23,11 @@
         "python-dotenv",
         "python",
         "/path/to/your/shared_mem/vector-skill.py"
-      ]
-    },
-    "postgres-vector": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-postgres",
-        "postgresql://postgres:YOUR_PG_PASSWORD@localhost:5432/agent_data"
-      ]
+      ],
+      "env": {
+        "COORDINATOR_URL": "http://localhost:8888",
+        "AGENT_TOKEN": "YOUR_LM_STUDIO_AGENT_TOKEN"
+      }
     },
     "filesystem": {
       "command": "npx",
