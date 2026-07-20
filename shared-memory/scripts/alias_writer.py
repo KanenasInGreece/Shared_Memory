@@ -77,6 +77,33 @@ LLM_TEMPERATURE = float(os.environ.get(
 # leg stopped deferring. Tier 1 (deterministic auto-accept) is unconditional
 # regardless of this — see run_sweep.
 SWEEP_INTERVAL_HOURS = float(os.environ.get("ALIAS_SWEEP_INTERVAL_HOURS", "24"))
+# The 24h default was picked back when LLM_BACKENDS only ever had one entry —
+# a conservative "don't add extra contention on the box's single reasoning
+# slot" number, not a measured one. With N backends configured, Tier 2 has
+# N-way more spare capacity than that default assumed, so the effective
+# interval scales down with backend count — bounded by a floor so it can
+# never run away as backend count grows. Read fresh per sweep (not cached at
+# import time) so a live LLM_BACKENDS edit is picked up on the next auto-run,
+# no restart needed — alias-sweep is invoked fresh per cron/systemd firing.
+ALIAS_SWEEP_FLOOR_HOURS = float(os.environ.get("ALIAS_SWEEP_FLOOR_HOURS", "6"))
+
+
+def _llm_backend_count() -> int:
+    """Number of entries in LLM_BACKENDS (comma-separated, optional @weight
+    suffix per entry — same format hive_mind_proxy.py parses). Unset/empty
+    means the single-backend fallback (LLM_DEFAULT_TARGET) applies, so that
+    counts as 1, matching the runtime reality it can't see from here without
+    an HTTP round-trip to the gateway."""
+    raw = os.environ.get("LLM_BACKENDS", "")
+    entries = [e.strip() for e in raw.split(",") if e.strip()]
+    return max(1, len(entries))
+
+
+def effective_sweep_interval_hours() -> float:
+    """SWEEP_INTERVAL_HOURS scaled down by how many LLM backends are
+    configured right now, floored at ALIAS_SWEEP_FLOOR_HOURS. 1 backend ->
+    unchanged (24h default); 2 backends -> 12h; etc., never below the floor."""
+    return max(ALIAS_SWEEP_FLOOR_HOURS, SWEEP_INTERVAL_HOURS / _llm_backend_count())
 
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 
@@ -462,13 +489,17 @@ def run_auto_sweep(threshold: float = COSINE_THRESHOLD, k: int = ANN_K,
         hours = hours_since_last_tier2_apply(conn)
     finally:
         conn.close()
-    due, reason = tier2_due(hours)
+    interval = effective_sweep_interval_hours()
+    due, reason = tier2_due(hours, interval_hours=interval)
     result = run_sweep(threshold=threshold, k=k, limit=limit, tier2_enabled=due)
     result["trigger_reason"] = reason
     result["hours_since_last_tier2_apply"] = hours
+    result["effective_interval_hours"] = interval
+    result["llm_backend_count"] = _llm_backend_count()
     print(
         f"[alias-sweep auto] trigger={reason} tier2_enabled={due} "
         f"hours_since_last_apply={hours} "
+        f"interval_hours={interval} (backends={result['llm_backend_count']}) "
         f"tier1_written={result['auto_accept']} "
         f"tier2_candidates={result['llm_candidates']} "
         f"aliases_written={result['aliases_written']} "
