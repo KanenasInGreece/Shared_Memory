@@ -88,6 +88,12 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "local-model")
 IDLE_THRESHOLD_SEC = int(os.environ.get("NREM_IDLE_THRESHOLD_SEC", "900"))
 MAX_DEFERRAL_SEC = IDLE_THRESHOLD_SEC * 3
 DENSITY_THRESHOLD = ONT.density_threshold
+# How often the daemon re-reads the DURABLE eligibility predicate (the
+# rem_reviewed outbox backlog). Due-ness is a property of that ledger, not of
+# the save notifications that happen to have arrived — a save means a record
+# exists, never that an eligible cluster does. One cheap indexed read per
+# interval; the interval also bounds how stale the observed backlog may be.
+NREM_ELIGIBILITY_RECHECK_SEC = int(os.environ.get("NREM_ELIGIBILITY_RECHECK_SEC", "60"))
 
 # ── Output bounds + truncation detection ─────────────────────────────────────
 # OPERATOR CONSTRAINT: a bound that processes but gives incomplete saves /
@@ -717,16 +723,54 @@ def sweep_due(now, last_sweep_time, last_activity, has_pending,
               idle_threshold=IDLE_THRESHOLD_SEC, sweep_interval=SWEEP_INTERVAL_SEC):
     """Gate for the periodic global density sweep.
 
-    The sweep runs only when the daemon is otherwise quiet: no pending
-    event-driven entry points (those take priority), the idle threshold has
-    passed since the last notification, and the sweep interval has elapsed.
+    The sweep runs only when the daemon is otherwise quiet: no event-driven
+    consolidation is due (that takes priority), the idle threshold has passed
+    since the last activity, and the sweep interval has elapsed.
     Pure function (no I/O) so the gating rule is unit-testable.
+
+    `has_pending` is the CALLER'S due-ness answer, not "notifications exist".
+    Passing the raw notification set here used to be equivalent; once due-ness
+    moved to the durable ledger it stopped being — a save that can never form
+    an eligible cluster would have pinned the set non-empty forever and blocked
+    the ledger sweep and the insight cycle along with it.
     """
     if has_pending:
         return False
     if (now - last_activity).total_seconds() < idle_threshold:
         return False
     return (now - last_sweep_time).total_seconds() >= sweep_interval
+
+
+def consolidation_due(seconds_since_activity, seconds_eligible, backlog_size,
+                      density_threshold=DENSITY_THRESHOLD,
+                      idle_threshold=IDLE_THRESHOLD_SEC,
+                      max_deferral=MAX_DEFERRAL_SEC):
+    """Gate for the event-driven fact-consolidation cycle. Returns (due, forced).
+
+    The FIRST condition is the durable one: fewer than `density_threshold`
+    facts sitting at 'rem_reviewed' in the outbox means no cluster can possibly
+    clear the density gate, so the cycle has nothing to do and must not take
+    the exclusive LLM slot to discover that. This used to fire on
+    `pending_pg_ids` — the ephemeral in-memory set fed by save NOTIFYs — which
+    answers a different question entirely: a save means a record was WRITTEN,
+    while the work needs records ENRICHED into a dense cluster. Every save was
+    therefore a claim of eligibility the daemon could not honour.
+
+    `seconds_eligible` is how long the backlog has continuously met the
+    threshold. Anchoring the hard backstop on ELIGIBILITY age rather than on
+    the age of the first unconsolidated notification keeps it meaningful when
+    the idle clock is held open by something other than saves. None = not
+    currently eligible.
+
+    Pure (no I/O) so the rule is unit-testable.
+    """
+    if backlog_size < density_threshold:
+        return (False, False)
+    if seconds_since_activity >= idle_threshold:
+        return (True, False)
+    if seconds_eligible is not None and seconds_eligible >= max_deferral:
+        return (True, True)
+    return (False, False)
 
 
 # ── Outbox dream-cycle ledger — fact path only (decision pg_id 267) ───────────
@@ -1213,6 +1257,15 @@ class ConsolidationDaemon:
         # this many seconds before the next attempt. The DB deferral record is
         # separately throttled by _DEFER_THROTTLE_SEC.
         self._sweep_backoff_until: datetime | None = None
+        # Durable eligibility state (see consolidation_due). `_backlog` is the
+        # last observed rem_reviewed fact backlog — the cycle's entry points AND
+        # its due-ness predicate, both read from the same durable ledger so they
+        # cannot disagree. `_backlog_eligible_since` is when it last became
+        # eligible (None while below the density threshold), which anchors the
+        # backstop on eligibility age rather than on notification age.
+        self._backlog: list = []
+        self._backlog_checked_at: datetime | None = None
+        self._backlog_eligible_since: datetime | None = None
         self.driver = AsyncGraphDatabase.driver(
             NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS),
             max_connection_pool_size=NEO4J_MAX_POOL,
@@ -1241,6 +1294,61 @@ class ConsolidationDaemon:
         if pg_ids and not self.pending_pg_ids and self.first_notification_time is None:
             self.first_notification_time = datetime.now()
         self.pending_pg_ids.update(pg_ids)
+
+    async def _refresh_backlog(self, now, force=False):
+        """Re-read the durable eligibility predicate at most once per
+        NREM_ELIGIBILITY_RECHECK_SEC (or immediately when `force`), and maintain
+        the eligibility clock. Returns the observed backlog.
+
+        Fails CLOSED on a DB error: an unreadable ledger is not evidence that
+        work exists, and the cost of guessing wrong is the exclusive LLM slot.
+        The previous observation is kept so a transient blip does not reset the
+        eligibility clock and rearm the backstop from zero."""
+        due = (force or self._backlog_checked_at is None
+               or (now - self._backlog_checked_at).total_seconds()
+               >= NREM_ELIGIBILITY_RECHECK_SEC)
+        if not due:
+            return self._backlog
+
+        loop = asyncio.get_running_loop()
+        def _read():
+            conn = psycopg2.connect(PG_CONN, connect_timeout=5)
+            try:
+                return fetch_ledger_backlog(conn)
+            finally:
+                conn.close()
+        try:
+            self._backlog = await loop.run_in_executor(None, _read)
+        except Exception as e:
+            logger.warning(
+                "NREM: could not read the rem_reviewed backlog (%s) — keeping the "
+                "previous observation of %d; the cycle stays gated on it.",
+                e, len(self._backlog))
+            # Say it on the record, not only in the log. A daemon acting on a
+            # stale eligibility view looks exactly like a daemon with nothing to
+            # do — both report "not due" — so without this the operator cannot
+            # tell a quiet system from a blind one.
+            await loop.run_in_executor(
+                None, lambda: _crun_record_deferred(
+                    "fact_consolidation", "eligibility_read_failed"))
+            return self._backlog
+        finally:
+            self._backlog_checked_at = now
+
+        if len(self._backlog) >= DENSITY_THRESHOLD:
+            if self._backlog_eligible_since is None:
+                self._backlog_eligible_since = now
+                logger.info(
+                    "NREM: durable backlog reached the density threshold "
+                    "(%d rem_reviewed facts >= %d) — consolidation is now eligible.",
+                    len(self._backlog), DENSITY_THRESHOLD)
+        elif self._backlog_eligible_since is not None:
+            self._backlog_eligible_since = None
+            logger.info(
+                "NREM: durable backlog fell below the density threshold "
+                "(%d rem_reviewed facts < %d) — no cluster can be due.",
+                len(self._backlog), DENSITY_THRESHOLD)
+        return self._backlog
 
     @contextlib.asynccontextmanager
     async def _record_cycle(self, cycle_type):
@@ -1525,13 +1633,34 @@ class ConsolidationDaemon:
             logger.error(f"Insight synthesis error for {entity}: {type(e).__name__}: {str(e)}")
             return None
 
-    async def run_consolidation_cycle(self):
-        """Targeted density-based consolidation using pending_pg_ids as entry points."""
-        if not self.pending_pg_ids:
+    async def run_consolidation_cycle(self, ids=None):
+        """Targeted density-based consolidation.
+
+        Entry points come from the DURABLE outbox ledger (facts at
+        'rem_reviewed'), not from `pending_pg_ids`. That set answered the wrong
+        question — it named records that had been SAVED, while the cycle needs
+        records ENRICHED — and it was also destructive: it was cleared before
+        the clusters were found, and the no-cluster path returned without
+        requeueing (`_requeue` is exception-only), so a no-op run consumed its
+        own entry points and the facts behind them went unconsidered until some
+        unrelated save happened to re-trigger the cycle.
+
+        Reading the ledger fixes both at once: the predicate is durable, so
+        there is nothing to lose and nothing to requeue — the same rows are
+        still there on the next pass, and they leave only when they consolidate.
+        `pending_pg_ids` survives as the ACTIVITY signal it always really was
+        (it feeds the idle clock and `sweep_due`), and is cleared here because
+        this cycle has now considered everything those notifications could have
+        contributed."""
+        # Requeued ids are unioned in as belt-and-braces: a fold that failed
+        # left its outbox rows at 'rem_reviewed', so the ledger already carries
+        # them — but a re-queue must never depend on that being true.
+        ids_to_process = sorted(
+            set(ids if ids is not None else self._backlog) | set(self.pending_pg_ids))
+        if not ids_to_process:
             return
 
-        logger.info(f"Sleep cycle triggered. Evaluating density for {len(self.pending_pg_ids)} entry points...")
-        ids_to_process = list(self.pending_pg_ids)
+        logger.info(f"Sleep cycle triggered. Evaluating density for {len(ids_to_process)} entry points...")
         self.pending_pg_ids.clear()
         self.first_notification_time = None
 
@@ -1544,10 +1673,11 @@ class ConsolidationDaemon:
 
             if not clusters:
                 logger.info(
-                    "No rem_processed clusters found (density_threshold=%d). "
-                    "NREM waits for REM enrichment — expected on fresh install or upgrade. "
+                    "No rem_processed clusters found among %d rem_reviewed facts "
+                    "(density_threshold=%d). NREM waits for REM enrichment — "
+                    "expected on fresh install or upgrade. "
                     "REM processes %d facts every ~120s; check 'rem_daemon' in /health.",
-                    DENSITY_THRESHOLD, 5,
+                    len(ids_to_process), DENSITY_THRESHOLD, 5,
                 )
                 # Say so on the record: an unrecorded idle run is read as a
                 # stall by the health surface (see _crun_record_idle).
@@ -1558,8 +1688,9 @@ class ConsolidationDaemon:
             await self._consolidate_clusters(clusters, gate=gate, edge_stats=edge_stats)
 
         except Exception as e:
+            # Nothing to re-queue — the entry points came from the durable
+            # ledger and are still there for the next pass.
             logger.error(f"Consolidation cycle failed: {str(e)}")
-            self._requeue(ids_to_process)
 
     async def _find_anchored_clusters(self, ids, gate=None):
         """Entity clusters reachable from the given fact pg_ids that meet the
@@ -2773,16 +2904,14 @@ class ConsolidationDaemon:
 
                     seconds_since_activity = (now - self.last_activity).total_seconds()
 
-                    should_consolidate = False
-                    forced = False
-                    if self.pending_pg_ids:
-                        if seconds_since_activity >= IDLE_THRESHOLD_SEC:
-                            should_consolidate = True
-                        elif self.first_notification_time:
-                            seconds_since_first = (now - self.first_notification_time).total_seconds()
-                            if seconds_since_first >= MAX_DEFERRAL_SEC:
-                                should_consolidate = True
-                                forced = True
+                    # Due-ness reads the DURABLE ledger predicate, never the
+                    # ephemeral save-notification set (see consolidation_due).
+                    backlog = await self._refresh_backlog(now)
+                    seconds_eligible = (
+                        (now - self._backlog_eligible_since).total_seconds()
+                        if self._backlog_eligible_since is not None else None)
+                    should_consolidate, forced = consolidation_due(
+                        seconds_since_activity, seconds_eligible, len(backlog))
 
                     if should_consolidate:
                         # Yield to active user inference on the GPU. The hard
@@ -2817,21 +2946,38 @@ class ConsolidationDaemon:
                             # pending_pg_ids stay intact (cleared only inside the cycle).
                             gate = await loop.run_in_executor(None, _try_backup_shared_lock)
                             if gate is None:
-                                logger.info("NREM: backup in progress — deferring consolidation; pending entries kept.")
+                                logger.info("NREM: backup in progress — deferring consolidation; the durable backlog keeps it due.")
                                 await loop.run_in_executor(None, lambda: _crun_record_deferred("fact_consolidation", "backup_in_progress"))
                             else:
                                 try:
                                     if forced:
-                                        logger.info(f"Hard backstop reached ({seconds_since_first:.1f}s). Forcing consolidation (ignoring GPU activity).")
+                                        logger.info(
+                                            "Hard backstop reached (%.1fs eligible). Forcing "
+                                            "consolidation (ignoring GPU activity).", seconds_eligible)
                                     else:
                                         logger.info("Idle threshold reached. Starting consolidation.")
-                                    await self.run_consolidation_cycle()
+                                    await self.run_consolidation_cycle(backlog)
                                 finally:
                                     await loop.run_in_executor(None, gate.close)
+                                    # Re-arm both clocks. The durable predicate
+                                    # does not clear itself the way the old
+                                    # pending set did — a cycle that folds
+                                    # nothing leaves the backlog exactly as it
+                                    # found it — so without this the daemon
+                                    # would re-fire on the very next 1s tick and
+                                    # spin. A cycle is itself system activity
+                                    # (it just held the LLM slot), and the
+                                    # backstop measures "eligible and NOT YET
+                                    # ATTENDED", so attending resets it.
+                                    after = datetime.now()
+                                    self.last_activity = after
+                                    await self._refresh_backlog(after, force=True)
+                                    if self._backlog_eligible_since is not None:
+                                        self._backlog_eligible_since = after
                     elif (self._sweep_backoff_until is None
                           or now >= self._sweep_backoff_until) and \
                          sweep_due(now, self.last_sweep_time, self.last_activity,
-                                   bool(self.pending_pg_ids)):
+                                   should_consolidate):
                         # Background hygiene — always yields to active inference;
                         # a deferred sweep retries after the pool-busy backoff.
                         # F2: queue with priority like the consolidation path,
@@ -2898,6 +3044,10 @@ class ConsolidationDaemon:
                                 if not self.pending_pg_ids:
                                     self.first_notification_time = datetime.now()
                                 self.pending_pg_ids.add(pg_id)
+                                # A save is ACTIVITY, never ELIGIBILITY. It
+                                # refreshes the idle clock (someone is working)
+                                # and nothing more — the eligibility question is
+                                # asked of the durable ledger in _refresh_backlog.
                                 self.last_activity = datetime.now()
                         except json.JSONDecodeError:
                             logger.error(f"Failed to decode notification payload: {notify.payload}")
