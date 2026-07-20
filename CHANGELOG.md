@@ -5,6 +5,73 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.7.6] — 2026-07-20
+
+Scheduling. The consolidation daemon decided it had work to do by watching saves arrive — but a
+save means a record was *written*, and consolidation's work needs records *enriched* into a
+cluster dense enough to fold. Those are different questions, and the daemon was asking the wrong
+one: it would take the exclusive inference slot on the strength of a notification and then
+discover there was nothing eligible. Three further behaviours carried the same confusion, and a
+fourth defect in how the cycle was *reported* meant a correctly-idle daemon looked broken.
+
+Landed as three ordered commits — instrumentation first, then the predicate, then the clocks —
+so a regression bisects to one of them.
+
+### Fixed
+
+- **Consolidation due-ness now reads the durable ledger, not the in-memory notification set.**
+  The predicate is the count of fact rows at `rem_reviewed` in `neo4j_outbox` — records enriched
+  but not yet folded — re-read every `NREM_ELIGIBILITY_RECHECK_SEC` (default 60 s, one cheap
+  indexed read). Below the density threshold no cluster can exist, so the cycle is not due and
+  does not compete for the inference slot. The predicate already existed and was already read
+  *correctly*, but only on the periodic sweep's slow path; the fast path used the wrong one.
+- **The cycle no longer consumes its own entry points.** They come from that same durable
+  backlog, so a run that folds nothing leaves the work exactly where it found it. The previous
+  cycle cleared its pending set *before* finding clusters, and the no-cluster path returned
+  without requeueing (re-queueing was reachable only from an exception handler), so a no-op run
+  discarded the facts it had been asked about until an unrelated save re-triggered it.
+- **An unreadable ledger fails closed, visibly.** The previous observation is kept, so a
+  transient database blip neither invents work nor rearms the backstop at zero — and a
+  `eligibility_read_failed` deferral is recorded, because a daemon acting on a stale view
+  reports "not due", which is precisely what a daemon with nothing to do reports. Without the
+  record, an operator cannot tell a quiet system from a blind one.
+- **The consolidation idle clock can see the whole system.** It was written in exactly one place
+  — the notification handler — so the clock deciding "the system is quiet" was blind to the
+  enrichment daemon's own inference calls, and consolidation was *guaranteed* to become due
+  partway through any long batch. It is now also refreshed while the LLM pool is busy (probed
+  every `NREM_POOL_PROBE_SEC`, default 15 s, fail-open). No timer value can fix a clock that
+  cannot see the largest consumer of the resource it guards. The hard backstop is correspondingly
+  re-anchored on how long the backlog has been **eligible**, so an honest clock is not traded for
+  indefinite deferral.
+- **The periodic hygiene sweep keeps its own, notification-only clock.** The two consumers want
+  different things from "quiet": consolidation must not fire while the exclusive slot is held,
+  but the sweep — backfill, reconciliation, the insight pass — has no backstop, so gating it on a
+  clock a busy pool can hold open indefinitely would let a loaded system suppress maintenance
+  forever. Splitting the clocks keeps each honest about what it measures.
+- **A false-positive stall verdict: an idle cycle can now say it is idle.** Fact consolidation
+  opened a run row only when it already had clusters to fold, so it recorded
+  `eligible_clusters = NULL` on every run — and `NULL` is not "no data" to the health surface, it
+  is the trigger for a looser fallback backlog. A cycle whose own gate correctly reported nothing
+  eligible was therefore reported **stalled**. Every run now records its census (the count after
+  the `(entity, domain)` re-split, the gate it actually folds on), plus a throttled `idle` run
+  row when that count is zero.
+- **`runs_24h` counted things that were not runs.** Measured live: the insight cycle reported 16
+  runs in 24 h, of which **7 were deferrals** — a 78 % inflation on the number sitting beside
+  `cycle_seconds_avg`, which is the per-unit price a slot allocator divides by. It now counts
+  runs of the cycle body only.
+
+### Added
+
+- `deferred_24h` and `idle_24h` per cycle type on `GET /memory/telemetry` and in the CLI status
+  report, so the non-runs are still visible rather than silently folded into the run count.
+- `NREM_ELIGIBILITY_RECHECK_SEC` and `NREM_POOL_PROBE_SEC`, both documented in `.env.example`.
+- `tests/test_nrem_eligibility.py` (26 cases) covering the pure due-ness rule, the durable
+  probe's rate limiting / eligibility clock / fail-closed-and-recorded behaviour, both clocks,
+  and the cycle's entry-point and idle-record handling. Mutation-checked: seven mutations, each
+  killed by its own test.
+
+---
+
 ## [0.7.5] — 2026-07-20
 
 Observability. Consolidation runs as two distinct cycle types with very different costs and
