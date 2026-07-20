@@ -29,6 +29,7 @@ from consolidation_loop import (
     OPERATOR_ASSERTED,
     _CycleRec,
     _default_calibration_gate,
+    corrective_block,
     preservation_anchor,
     summary_preserves,
 )
@@ -263,6 +264,24 @@ def test_summary_preserves_pass_and_missing():
     assert not ok and missing == ["outbox"]
 
 
+def test_corrective_block_empty_is_noop():
+    assert corrective_block([]) == ""
+    assert corrective_block(None) == ""
+
+
+def test_corrective_block_demands_verbatim_substring():
+    text = corrective_block(["Outbox-to-Ingest Adopt Gated Promotion", "refined"])
+    # The bug this fixes: the old wording just said "integrate each of them",
+    # which let the LLM paraphrase — exactly what breaks summary_preserves's
+    # exact-substring check on a hyphenated compound token. The retry must
+    # say verbatim/character-for-character explicitly, and quote each
+    # fragment so hyphenation/spelling survives copy-through.
+    assert "EXACT, literal, character-for-character substring" in text
+    assert '"Outbox-to-Ingest Adopt Gated Promotion"' in text
+    assert '"refined"' in text
+    assert "none may be omitted" in text.lower()
+
+
 def test_summary_preserves_fact_slack_ten_percent():
     # 10 plain-fact anchors, 1 missing → 90% coverage → PASS (paraphrase slack).
     anchors = [(f"anchorword{i}", False) for i in range(10)]
@@ -347,8 +366,9 @@ async def test_generate_summary_corrective_paragraph_names_dropped_anchors(monke
     daemon, _ = daemon_with_fake_graph()
     await daemon.generate_summary("E", ["f1"], corrective=["consolidation", "outbox"])
     prompt = captured["prompt"]
-    assert "CORRECTION: the following captured records were dropped" in prompt
-    assert "consolidation; outbox" in prompt
+    assert "CORRECTION: the previous draft dropped" in prompt
+    assert "EXACT, literal, character-for-character substring" in prompt
+    assert '"consolidation"' in prompt and '"outbox"' in prompt
 
 
 @pytest.mark.asyncio
