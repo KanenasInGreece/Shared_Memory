@@ -35,6 +35,7 @@ import re
 import sys
 import json
 import argparse
+import concurrent.futures
 
 import httpx
 import psycopg2
@@ -55,6 +56,14 @@ REASONER_URL = os.environ.get("REASONER_URL", "http://localhost:8888/v1/chat/com
 # Model id sent on every reasoning call — see the LLM_MODEL note in rem_loop.py.
 LLM_MODEL = os.environ.get("LLM_MODEL", "local-model")
 LLM_BATCH = int(os.environ.get("ALIAS_LLM_BATCH", "10"))
+# Batches dispatch concurrently (ThreadPoolExecutor — adjudicate_batch is a
+# blocking httpx.post, so the GIL releases during the call). With a single
+# backend this still pipelines through the gateway's own request queue; with
+# LLM_BACKENDS configuring more than one, concurrent dispatch is what actually
+# lets the gateway's least-in-flight routing spread batches across them —
+# sequential dispatch could never do that no matter how many backends exist.
+# Mirrors the LLM_AFFINITY_MAX_INFLIGHT=4 default already used gateway-side.
+LLM_MAX_CONCURRENT = int(os.environ.get("ALIAS_LLM_MAX_CONCURRENT", "4"))
 # Gemma-4 (the dream reasoner) degrades at very low temperature — a documented
 # quirk — so this mirrors the daemons' 0.6 default rather than a near-greedy 0.2.
 LLM_TEMPERATURE = float(os.environ.get(
@@ -371,32 +380,40 @@ def run_sweep(threshold: float = COSINE_THRESHOLD, k: int = ANN_K,
                 accepted += 1
             _record_adjudications(conn, auto_rows)
 
-            # Tier 2 — LLM adjudication in batches. Gated by decision 852
-            # (single-condition cadence) at the call site, never here.
+            # Tier 2 — LLM adjudication, batches dispatched CONCURRENTLY
+            # (adjudicate_batch calls are independent — no shared mutable
+            # state — so only the writes below need the main thread). Gated
+            # by decision 852 (single-condition cadence) at the call site,
+            # never here.
             llm = cand["llm_candidates"] if tier2_enabled else []
             if limit is not None:
                 llm = llm[:limit]
-            for start in range(0, len(llm), LLM_BATCH):
-                batch = llm[start:start + LLM_BATCH]
-                verdicts = adjudicate_batch(batch)
-                rows = []
-                for i, c in enumerate(batch):
-                    v = verdicts.get(i)
-                    if not v:
-                        unresolved += 1              # unresolved → leave for next sweep
-                        continue
-                    verdict = "alias" if v.get("verdict") == "alias" else "distinct"
-                    conf = v.get("confidence")
-                    conf = float(conf) if isinstance(conf, (int, float)) else None
-                    if verdict == "alias":
-                        _write_alias_edge(session, c["a"], c["b"], "llm", conf, c["cosine"])
-                        accepted += 1
-                    else:
-                        rejected += 1
-                    rows.append((c["a"], c["b"], verdict, "llm", conf, c["cosine"],
-                                 c["lexical_jaccard"], c["shared_facts"],
-                                 c["domain_disjoint"], str(v.get("rationale", ""))[:500]))
-                _record_adjudications(conn, rows)
+            batches = [llm[start:start + LLM_BATCH] for start in range(0, len(llm), LLM_BATCH)]
+            if batches:
+                with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=min(LLM_MAX_CONCURRENT, len(batches))) as pool:
+                    futures = {pool.submit(adjudicate_batch, b): b for b in batches}
+                    for fut in concurrent.futures.as_completed(futures):
+                        batch = futures[fut]
+                        verdicts = fut.result()
+                        rows = []
+                        for i, c in enumerate(batch):
+                            v = verdicts.get(i)
+                            if not v:
+                                unresolved += 1      # unresolved → leave for next sweep
+                                continue
+                            verdict = "alias" if v.get("verdict") == "alias" else "distinct"
+                            conf = v.get("confidence")
+                            conf = float(conf) if isinstance(conf, (int, float)) else None
+                            if verdict == "alias":
+                                _write_alias_edge(session, c["a"], c["b"], "llm", conf, c["cosine"])
+                                accepted += 1
+                            else:
+                                rejected += 1
+                            rows.append((c["a"], c["b"], verdict, "llm", conf, c["cosine"],
+                                         c["lexical_jaccard"], c["shared_facts"],
+                                         c["domain_disjoint"], str(v.get("rationale", ""))[:500]))
+                        _record_adjudications(conn, rows)
 
             stamped = alias_graph.refresh_components(session)
     finally:
