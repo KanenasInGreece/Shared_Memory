@@ -10,6 +10,8 @@ What makes it more than a shared notepad is *what* it remembers: not your code (
 
 Most agent-memory systems are a library bolted onto one assistant. This one is a **shared substrate**: independent tools — Claude Code, Codex CLI, Grok, Antigravity CLI, and LM Studio — each connect to one local gateway and read and write the same store. It sits *between* your tools instead of inside any one of them, so adding a tool is a packaging step, not a rebuild ([§1](#1-the-vision-one-brain-many-agents)).
 
+**Nor does it have to be one machine.** Every client is a thin HTTP client — no database connection, no driver, nothing that reaches past the gateway. So the heavy half (Postgres, Neo4j, the embedding models, the nightly consolidation) can live on one Linux box while a Windows laptop running LM Studio, or a Mac running Claude Code, reads and writes the same memory. Your token decides what you see; the operating system does not come into it.
+
 ![Claude Code](https://img.shields.io/badge/Claude_Code-Skill-blue)
 ![Codex CLI](https://img.shields.io/badge/Codex_CLI-Skill-blue)
 ![Grok](https://img.shields.io/badge/Grok-Skill-blue)
