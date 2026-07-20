@@ -126,6 +126,36 @@ def test_tier2_due_respects_env_default():
     assert alias_writer.SWEEP_INTERVAL_HOURS == 24.0
 
 
+# ── backend-count-aware interval scaling ─────────────────────────────────────
+
+def test_llm_backend_count_defaults_to_one_when_unset(monkeypatch):
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    assert alias_writer._llm_backend_count() == 1
+
+
+def test_llm_backend_count_ignores_weight_suffix_and_blanks(monkeypatch):
+    monkeypatch.setenv("LLM_BACKENDS", "http://localhost:5000@3,http://localhost:4000@1,")
+    assert alias_writer._llm_backend_count() == 2
+
+
+def test_effective_interval_unscaled_at_one_backend(monkeypatch):
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    assert alias_writer.effective_sweep_interval_hours() == alias_writer.SWEEP_INTERVAL_HOURS
+
+
+def test_effective_interval_scales_down_with_more_backends(monkeypatch):
+    monkeypatch.setenv("LLM_BACKENDS", "http://localhost:5000,http://localhost:4000")
+    assert alias_writer.effective_sweep_interval_hours() == (
+        alias_writer.SWEEP_INTERVAL_HOURS / 2)
+
+
+def test_effective_interval_never_drops_below_floor(monkeypatch):
+    monkeypatch.setenv(
+        "LLM_BACKENDS",
+        ",".join(f"http://localhost:{p}" for p in range(5000, 5000 + 20)))
+    assert alias_writer.effective_sweep_interval_hours() == alias_writer.ALIAS_SWEEP_FLOOR_HOURS
+
+
 # ── hours_since_last_tier2_apply (thin SQL wrapper) ──────────────────────────
 
 class _StubCursor:
