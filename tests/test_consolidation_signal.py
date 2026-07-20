@@ -258,3 +258,100 @@ async def test_refresh_failure_keeps_inference_busy_not_idle(monkeypatch):
     # A compute failure must NOT flip the busy signal to "idle"; keep prior + stale.
     assert snap["inference_busy"] == "busy"
     assert snap["fresh"] is False
+
+
+# ── Top-level roll-up across cycle types (pure) ──────────────────────────────
+# Regression cover for the reporting defect: the headline keys were mirrored
+# from the insight cycle alone, so a fact-consolidation cycle that folded
+# minutes ago was reported as "stalled, last success 5.3 days ago" — insight's
+# number wearing the whole system's label.
+
+from datetime import datetime, timedelta, timezone
+
+
+def _ct(age, stalled, outcome="completed", deferred=None):
+    return {"last_success_age_seconds": age, "stalled": stalled,
+            "last_outcome": outcome, "last_deferred_reason": deferred}
+
+
+def test_rollup_headline_age_is_the_freshest_success_not_insight():
+    """The exact live case: insight 5.3 days stale, fact_consolidation folded
+    22 minutes ago. The headline must report the RECENT one and name it."""
+    now = datetime.now(timezone.utc)
+    by_type = {"insight": _ct(456107, True),
+               "fact_consolidation": _ct(1320, False)}
+    started = {"insight": now - timedelta(seconds=60),
+               "fact_consolidation": now - timedelta(seconds=10)}
+    out = co._consolidation_rollup(by_type, True, started)
+    assert out["last_success_age_seconds"] == 1320
+    assert out["last_success_cycle_type"] == "fact_consolidation"
+
+
+def test_rollup_names_which_types_are_stalled():
+    now = datetime.now(timezone.utc)
+    by_type = {"insight": _ct(456107, True),
+               "fact_consolidation": _ct(1320, False)}
+    started = {"insight": now, "fact_consolidation": now}
+    out = co._consolidation_rollup(by_type, True, started)
+    # stalled stays an OR — a stalled sibling must still raise the flag …
+    assert out["stalled"] is True
+    # … but it now says WHO, which is what makes the flag actionable.
+    assert out["stalled_types"] == ["insight"]
+
+
+def test_rollup_outcome_comes_from_the_most_recently_STARTED_type():
+    """last_outcome must follow actual recency, not a hardcoded type."""
+    now = datetime.now(timezone.utc)
+    by_type = {"insight": _ct(10, False, outcome="deferred", deferred="pool_busy"),
+               "fact_consolidation": _ct(20, False, outcome="completed")}
+    # insight ran most recently → its outcome and reason lead.
+    out = co._consolidation_rollup(
+        by_type, False,
+        {"insight": now, "fact_consolidation": now - timedelta(hours=1)})
+    assert (out["last_outcome"], out["last_deferred_reason"]) == ("deferred", "pool_busy")
+    assert out["last_active_cycle_type"] == "insight"
+    # Flip which one is newer → the other type leads. Guards against the
+    # hardcoding this whole change removes.
+    out2 = co._consolidation_rollup(
+        by_type, False,
+        {"insight": now - timedelta(hours=1), "fact_consolidation": now})
+    assert (out2["last_outcome"], out2["last_deferred_reason"]) == ("completed", None)
+    assert out2["last_active_cycle_type"] == "fact_consolidation"
+
+
+def test_rollup_ordering_is_by_datetime_not_iso_string():
+    """A type whose timestamp carries a different UTC offset must still order
+    correctly — ISO-string comparison would get this backwards."""
+    now = datetime.now(timezone.utc)
+    by_type = {"insight": _ct(10, False, outcome="deferred"),
+               "fact_consolidation": _ct(20, False, outcome="completed")}
+    # Same instant, but expressed at +02:00 — lexicographically LARGER than the
+    # +00:00 string while being 30 minutes EARLIER in real time.
+    earlier_but_bigger_string = (now - timedelta(minutes=30)).astimezone(
+        timezone(timedelta(hours=2)))
+    out = co._consolidation_rollup(
+        by_type, False,
+        {"insight": earlier_but_bigger_string, "fact_consolidation": now})
+    assert out["last_active_cycle_type"] == "fact_consolidation"
+
+
+def test_rollup_survives_types_that_never_ran():
+    """No rows at all: no crash, nothing asserted, no type invented."""
+    by_type = {"insight": _ct(None, False, outcome=None),
+               "fact_consolidation": _ct(None, False, outcome=None)}
+    out = co._consolidation_rollup(by_type, False,
+                                   {"insight": None, "fact_consolidation": None})
+    assert out["last_success_age_seconds"] is None
+    assert out["last_success_cycle_type"] is None
+    assert out["last_active_cycle_type"] is None
+    assert out["stalled_types"] == []
+
+
+def test_rollup_ignores_a_type_with_no_success_when_another_has_one():
+    now = datetime.now(timezone.utc)
+    by_type = {"insight": _ct(None, True),
+               "fact_consolidation": _ct(900, False)}
+    out = co._consolidation_rollup(by_type, True,
+                                   {"insight": now, "fact_consolidation": now})
+    assert out["last_success_age_seconds"] == 900
+    assert out["last_success_cycle_type"] == "fact_consolidation"

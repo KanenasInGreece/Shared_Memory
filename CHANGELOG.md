@@ -5,6 +5,39 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.7.5] — 2026-07-20
+
+Observability. Consolidation runs as two distinct cycle types with very different costs and
+cadences, but the health surface described them with a single set of headline numbers taken
+from one of them. A cycle type that was folding normally could therefore be reported as
+stalled for days, because the headline was reporting its idle sibling's age under a label that
+claimed to describe consolidation as a whole.
+
+### Fixed
+
+- **The consolidation headline now describes every cycle type, and says which one it came
+  from.** `last_success_age_seconds` reports the most recent success across cycle types and is
+  tagged with `last_success_cycle_type`; `last_outcome` and `last_deferred_reason` follow
+  whichever type actually ran most recently instead of a hardcoded one. `stalled` remains an OR
+  across types — a stalled cycle must still raise the flag — but the new `stalled_types` names
+  which ones, so the flag can be acted on rather than merely noticed.
+
+### Added
+
+- **Per-cycle-type cost and throughput** on `GET /memory/telemetry` and in the CLI status
+  report: `runs_24h`, `cycle_seconds_avg` (averaged over completed runs only, so deferrals and
+  in-flight runs cannot flatter it), and `folds_succeeded_24h` / `folds_attempted_24h`. The
+  pre-existing whole-cycle timer is skewed by contention for the shared inference slot and
+  cannot price either cycle type; these can.
+
+### Notes
+
+- Additive for clients: every previous field keeps its name and type. Readers that consume only
+  the documented fields see corrected values rather than a changed contract, so the API version
+  is unchanged. Older gateways that do not send `stalled_types` still render a plain stall flag.
+
+---
+
 ## [0.7.4] — 2026-07-20
 
 Correctness at the API boundary. A record id is unique only *within its table* — original

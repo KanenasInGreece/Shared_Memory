@@ -192,3 +192,60 @@ def test_format_status_renders_sections():
 def test_format_status_passes_through_errors():
     err = {"status": "error", "message": "Coordinator rejected token."}
     assert "rejected token" in memory_bridge.format_status(err)
+
+
+def test_format_status_names_the_stalled_type_and_the_successful_one():
+    """The reporting defect this guards: a headline reading "STALLED, last
+    success 456107s ago" while a sibling cycle type folded 4 hours ago. The
+    render must name WHICH type is stalled and which the age belongs to."""
+    payload = {"status": "success", "telemetry": {"consolidation": {
+        "stalled": True,
+        "stalled_types": ["insight"],
+        "last_outcome": "completed",
+        "last_success_age_seconds": 14863,
+        "last_success_cycle_type": "fact_consolidation",
+        "insight": {"last_outcome": "completed", "stalled": True,
+                    "runs_24h": 16, "cycle_seconds_avg": 0.1,
+                    "folds_succeeded_24h": 0, "folds_attempted_24h": 0},
+        "fact_consolidation": {"last_outcome": "completed", "stalled": False,
+                               "runs_24h": 39, "cycle_seconds_avg": 192.4,
+                               "folds_succeeded_24h": 17, "folds_attempted_24h": 69},
+    }}}
+    out = memory_bridge.format_status(payload)
+    assert "STALLED ⚠ [insight]" in out
+    assert "14863s ago (fact_consolidation)" in out
+    # Per-type cost + throughput must both render — this is what prices a slot.
+    assert "16 runs/24h avg 0.1s, folds 0/0" in out
+    assert "39 runs/24h avg 192.4s, folds 17/69" in out
+
+
+def test_format_status_falls_back_when_gateway_predates_stalled_types():
+    """An older gateway sends `stalled` with no `stalled_types`. The client must
+    still report the stall rather than silently rendering it as ok."""
+    out = memory_bridge.format_status(
+        {"status": "success", "telemetry": {"consolidation": {
+            "stalled": True, "last_outcome": "completed",
+            "last_success_age_seconds": 99}}})
+    assert "STALLED ⚠" in out
+    assert "99s ago" in out
+
+
+def test_tracked_client_copies_are_byte_identical():
+    """The client ships as TWO tracked files — the development source under the
+    server tree and the skill copy agents install — kept in agreement only by
+    sync_skills.sh. This suite imports the SKILL COPY, so an edit to the source
+    that was never synced would be validated against the stale file and pass,
+    reporting coverage for code that is not the code under test. (Found by three
+    mutations surviving against the source while dying instantly against the
+    copy.) Fail loudly here instead: if this test fails, run sync_skills.sh.
+    """
+    root = os.path.join(os.path.dirname(__file__), "..")
+    source = os.path.join(root, "shared-memory", "scripts", "memory_bridge.py")
+    shipped = os.path.join(root, "shared-memory-skill", "shared-memory",
+                           "scripts", "memory_bridge.py")
+    with open(source, "rb") as f_src, open(shipped, "rb") as f_ship:
+        assert f_src.read() == f_ship.read(), (
+            "memory_bridge.py copies have diverged — the tests import the skill "
+            "copy, so the source edit is UNTESTED. Run: bash "
+            "shared-memory/scripts/sync_skills.sh"
+        )
