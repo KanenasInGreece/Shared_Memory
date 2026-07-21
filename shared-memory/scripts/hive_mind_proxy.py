@@ -86,6 +86,12 @@ ROUTING_MAP = {
     "/v1/embeddings": EMBEDDER_URL,
     "/v1/reranking":  RERANKER_URL,
 }
+# Embeddings/reranking bodies at or under this size get buffered (not streamed),
+# which is what makes the stale-connection retry possible for them. Every real
+# caller (coordinator._embed) sends one text field capped at EMBED_MAX_CHARS
+# (24000 chars, ~24KB as JSON) — 1MB is a generous margin above that observed
+# traffic while still refusing to buffer something genuinely large.
+EMBED_RERANK_BUFFER_CAP = int(os.environ.get("EMBED_RERANK_BUFFER_CAP", str(1024 * 1024)))
 # Fallback used ONLY when LLM_BACKENDS is unset. Deployments differ — LM Studio
 # defaults to :1234, llama.cpp servers commonly :8080 — so keep this overridable
 # instead of baking one port into the code. LLM_BACKENDS is the real knob.
@@ -368,24 +374,40 @@ class AsyncHiveMindProxy:
         upstream_headers = self._filter_headers(request.headers)
 
         # Stream the request body directly to the upstream without buffering it
-        # into a single byte array first. This keeps memory footprint flat even
-        # for large GraphRAG ingestion payloads.
+        # into a single byte array first, UNLESS it's small enough that buffering
+        # (and the stale-connection retry that requires a buffered body — see
+        # ServerDisconnectedError handling below) is worth it. Every real caller
+        # (coordinator._embed) sends one text field capped at EMBED_MAX_CHARS
+        # (24000 chars), so this covers all observed traffic; anything with no
+        # Content-Length or over the cap keeps streaming as before (memory-flat,
+        # unprotected by the retry — the original behaviour for oversized/chunked
+        # bodies, e.g. large GraphRAG ingestion payloads if any client ever sends
+        # one through this path).
         # NOTE: this bypasses the client_max_size check that request.read() would
         # enforce. Acceptable for this trusted localhost deployment; revisit if the
         # proxy is ever exposed to untrusted clients.
-        # LLM requests forward the buffered body (already read for affinity hashing);
-        # embeddings/reranking keep streaming so large batches stay memory-flat.
-        upstream_data = llm_body if llm_body is not None else (
-            request.content if request.can_read_body else None)
+        embed_body: bytes | None = None
+        if llm_body is None and request.can_read_body:
+            content_length = request.content_length
+            if content_length is not None and content_length <= EMBED_RERANK_BUFFER_CAP:
+                embed_body = await request.read()
+
+        upstream_data = (
+            llm_body if llm_body is not None else
+            embed_body if embed_body is not None else
+            (request.content if request.can_read_body else None)
+        )
 
         # Initialized to None so exception handlers can check object state directly
         # (.prepared attribute) rather than relying on a parallel boolean flag.
         proxy_resp: web.StreamResponse | None = None
-        # LLM requests buffer their body up front into llm_body, so it is safe to
-        # resend on a retry. Embeddings/reranking stream request.content instead,
-        # which is consumed on first use and can never be safely retried — so the
-        # stale-connection retry below is scoped to llm_backend is not None.
-        max_attempts = 2 if llm_backend is not None else 1
+        # A retry is only safe when the body was buffered (llm_body, always; or
+        # embed_body, when small enough — see above) rather than streamed via
+        # request.content, which is consumed on first use and can never be
+        # resent. Anything still streaming keeps the pre-fix single-attempt
+        # behaviour.
+        have_buffered_body = llm_body is not None or embed_body is not None
+        max_attempts = 2 if have_buffered_body else 1
 
         try:
             # Reserve the in-flight slot INSIDE the try, so the finally below is
