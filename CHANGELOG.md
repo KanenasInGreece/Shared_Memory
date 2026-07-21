@@ -5,6 +5,62 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.2] — 2026-07-21
+
+A multi-backend LLM pool exposed two real bugs: a connection-pool race that ejected healthy
+backends, and an alias-adjudication cadence tuned for a single backend. Both fixed and
+verified live against a two-card pool. The NREM preservation gate also picked up a second
+corrective attempt and two entity-resolution fixes.
+
+### Fixed
+
+- **False-positive backend ejection under concurrent load.** A pooled `aiohttp` connection
+  reused just as the upstream started closing it raised `ServerDisconnectedError` ("Cannot
+  write to closing transport"). The gateway treated this as proof the backend was down; two
+  in a row within the fail-window tripped the circuit breaker and ejected a backend that was
+  independently confirmed healthy via a direct `/health` check at the same moment. Now retries
+  once on a fresh connection before counting it as a failure — scoped initially to LLM traffic
+  (buffered request body, safe to resend), then extended to embeddings/reranking once the same
+  signature reproduced there against the embedder.
+- **Embeddings/reranking bodies now buffered when small enough to make the same retry safe**
+  (`EMBED_RERANK_BUFFER_CAP`, default 1MB — a wide margin over the ~24KB single-text payloads
+  every real caller sends). Investigated and ruled out context-size/truncation as a contributing
+  cause first: the embedder's own logs show real token counts topping out around 4444 of its
+  8192-token limit, and every logged request returned `200 OK` — `EMBED_MAX_CHARS=24000` is a
+  deliberate estimate derived from that same context limit, not an arbitrary number, and was
+  never the actual bottleneck.
+- **Preservation-gate corrective retries raised 1 → 2.** A decision cluster's anchor set is
+  several independent tokens that must all match on the same attempt, so one retry's recovery
+  probability compounds down fast as cluster size grows even with the verbatim-prompt fix
+  already in place. More attempts at the same bar, never a looser one.
+- **Insight clustering now joins on `alias_component`**, the same join fact-clustering already
+  used, so alias-linked entity surface forms merge into one insight cluster instead of two
+  thinner ones.
+- **Preservation-gate corrective-retry prompt now states the verbatim requirement explicitly** —
+  root-caused why the one retry almost never recovered a dropped anchor: the retry listed bare
+  fragments with no instruction that the anchor check is an exact, case-insensitive substring
+  match, so any paraphrase on retry broke it.
+
+### Changed
+
+- **Alias-adjudication Tier-2 cadence now scales with configured backend count**
+  (`ALIAS_SWEEP_INTERVAL_HOURS / len(LLM_BACKENDS)`, floored at `ALIAS_SWEEP_FLOOR_HOURS`,
+  default 6h). The 24h default had no measured rationale — a conservative choice from when
+  `LLM_BACKENDS` only ever had one entry. With N backends, Tier-2 adjudication has N-way more
+  spare capacity than that default assumed. The effective interval and backend count are now
+  logged alongside the existing trigger-reason line for auditability.
+- **Alias-sweep cadence collapsed to one condition** (Tier 1 always unconditional; Tier 2 fires
+  whenever `hours_since_last_tier2_apply >= ALIAS_SWEEP_INTERVAL_HOURS`, read from the durable
+  ledger — no busy-deferral). Tier-2 batches now dispatch concurrently
+  (`ALIAS_LLM_MAX_CONCURRENT`) for when more than one LLM backend is configured.
+
+### Documentation
+
+- README clarity pass — trimmed redundant explanation, tightened framing of the framework's
+  purpose.
+
+---
+
 ## [0.8.1] — 2026-07-20
 
 The shipped `mcp.json` template still contained the defect v0.8.0 had just removed from the code.
