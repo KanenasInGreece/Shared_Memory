@@ -5,6 +5,41 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.5] — 2026-07-22
+
+The NREM fold dead-letter cap keyed on a lexicographic-min alias label — deliberately
+stable across cycles as cluster membership grows, so `community_summaries` upserts land
+on the same row — reused unmodified as the dead-letter ledger's own identity, which needs
+the opposite property. Two symptoms observed live in production: an alias merge that
+created a bigger, never-attempted candidate could still resolve to a label already
+carrying a smaller pre-merge candidate's failure history, and unmerged surface-form
+variants of the same entity ("Cloe VM" / "CloeVM") accumulated separate failure counts
+under different labels — both blocking real Tier-3 output.
+
+### Fixed
+
+- **Fold dead-letter identity is now content-derived, not label-derived.** Replaced the
+  label-keyed lookup with a key built from the fold candidate's own member records, as
+  sorted qualified refs (decision 822's `fact:N` / `decision:N` form) — reusing the
+  existing qualified-reference scheme rather than a bare-int convention, which would have
+  reintroduced the exact pg_id-per-table collision decision 822 closed elsewhere
+  (`technical_docs` and `community_summaries` run independent id sequences, and an insight
+  refold pairs a `community_summaries` id with `technical_docs` decision ids for one
+  candidate). The human-readable label is unchanged in `fold_dead_letter` telemetry and
+  log lines — only the internal lookup key changed. Extracted `make_ref`/`parse_ref`/
+  `doc_record_type`/`summary_record_type` out of `coordinator.py` into a new shared
+  module, `record_ref.py`, so the NREM daemon (a separate process) can reuse them without
+  importing the full gateway module.
+
+### Note
+
+Deploying this resets any currently dead-lettered cluster's failure history: prior
+failures were recorded under the old label-keyed format, so a lookup against the new
+ref-keyed format starts at zero. Clusters stuck at the fail cap under the old scheme get
+a fresh attempt rather than waiting out the 7-day window.
+
+---
+
 ## [0.8.4] — 2026-07-21
 
 v0.8.3 shipped `CONSTITUTION_SNIPPET.md` as "the canonical, versioned block an installer proposes"
