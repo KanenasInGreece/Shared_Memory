@@ -5,6 +5,50 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.3] — 2026-07-21
+
+Remote clients had no way to update their own skill install, and no standing prompt to actually
+use shared memory proactively once installed. Both closed: a self-updating script for the client
+side, and a reusable constitution-file snippet an install can propose adding to an agent's own
+guidance file.
+
+### Added
+
+- **`update_skill.sh`** — ships inside every skill install (`scripts/update_skill.sh`) and
+  self-updates it: fetches a `MANIFEST.txt` (data, not a hardcoded file list, so a future file
+  added to the skill package never requires this script to change), checks version before
+  touching anything, stages every file before applying any of them (one failed fetch aborts
+  cleanly, nothing partially applied), and merges `.env.example` **additively** — new keys an
+  upgrade introduces are appended, an existing key (including the agent's `AGENT_TOKEN`) is never
+  touched. Verifies gateway compatibility via `memory_bridge.py doctor` after updating. Works
+  identically over `https://` (a real remote update) or `file://` (local dev sync, see below) —
+  tested through 7+ scenarios on a local mock-HTTP-server harness: success, idempotency, network
+  failure, partial failure with clean recovery, missing/placeholder token, incompatible-after-
+  update, and a manifest missing its trailing newline.
+- **`CONSTITUTION_SNIPPET.md`** — the canonical, marker-delimited (`<!-- shared-memory:
+  constitution-snippet v1 -->`), versioned text an installer proposes inserting into an operator's
+  own constitution file (`CLAUDE.md` / `GEMINI.md` / `AGENTS.md`) so an agent leans on shared
+  memory proactively — search before pursuing an approach, propose recording facts after a
+  direction-setting discussion, confirm with the operator before saving any decision. Always
+  proposed for confirmation, never written silently.
+- **SKILL.md § Updating This Skill** — documents `update_skill.sh`, and states explicitly what was
+  previously undefined: while a client is version-incompatible, `search` stays safe (read-only)
+  but `save` / `save_decision` / `save_retrospective` are unsafe until compatibility is restored.
+
+### Changed
+
+- **`sync_skills.sh` now reuses `update_skill.sh`'s tested logic** instead of a second,
+  separately-debugged copy-loop: it refreshes the tracked skill copy
+  (`shared-memory-skill/shared-memory/`) from the framework source, then — for every real
+  (non-symlinked) local agent install — invokes that install's own `update_skill.sh` with
+  `RAW_BASE=file://…` and `FORCE=1`. Symlinked installs (already pointing straight at the repo's
+  own files) are skipped entirely; running the update logic against one would silently convert the
+  symlink into a static copy. Also gained an always-refresh-before-invoking step for
+  `update_skill.sh` itself, after testing surfaced a stale pre-redesign copy in one real install
+  that failed on outdated path assumptions until refreshed unconditionally.
+- **README § Remote Clients** — initial install now also fetches `update_skill.sh`, and the
+  "Updating the skill" section points at running the script instead of raw `curl` commands.
+
 ## [0.8.2] — 2026-07-21
 
 A multi-backend LLM pool exposed two real bugs: a connection-pool race that ejected healthy

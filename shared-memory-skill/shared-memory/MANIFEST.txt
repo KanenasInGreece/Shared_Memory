@@ -1,0 +1,17 @@
+# Every file listed here (relative to this directory) ships to a client
+# install via update_skill.sh, whether over file:// (local sync) or https://
+# (remote update). Blank lines and lines starting with # are ignored.
+#
+# .env is deliberately NEVER listed — it is user-specific (holds this agent's
+# AGENT_TOKEN) and is never shipped, only merged into (see .env.example
+# below, which IS shipped and drives that merge, but is never copied as-is
+# over a live .env).
+#
+# Add a new file here when it's added to this directory — that's the whole
+# maintenance surface; update_skill.sh does not hardcode file names.
+
+SKILL.md
+.env.example
+scripts/memory_bridge.py
+scripts/update_skill.sh
+Documentation/schema.md

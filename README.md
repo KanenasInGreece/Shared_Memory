@@ -1030,6 +1030,10 @@ curl -fsSL https://raw.githubusercontent.com/KanenasInGreece/Shared_Memory/main/
 
 curl -fsSL https://raw.githubusercontent.com/KanenasInGreece/Shared_Memory/main/shared-memory-skill/shared-memory/SKILL.md \
   -o ~/.gemini/skills/shared-memory/SKILL.md
+
+curl -fsSL https://raw.githubusercontent.com/KanenasInGreece/Shared_Memory/main/shared-memory-skill/shared-memory/scripts/update_skill.sh \
+  -o ~/.gemini/skills/shared-memory/scripts/update_skill.sh
+chmod +x ~/.gemini/skills/shared-memory/scripts/update_skill.sh
 ```
 
 ### Step 4 — Configure the remote `.env`
@@ -1056,7 +1060,7 @@ A valid response (even empty results) confirms the tunnel, token, and `.env` are
 
 ### Updating the skill
 
-When a new version is released, re-run the two `curl` commands from Step 3 to pull the latest `memory_bridge.py` and `SKILL.md`. No other files are needed on the remote machine. Then run `memory_bridge.py doctor` — if it reports `compat: incompatible`, the gateway and this client disagree on `api_version`; upgrade whichever side it names (the gateway upgrades via `git pull` + restart on its host, not from here).
+When a new version is released, run `bash ~/.gemini/skills/shared-memory/scripts/update_skill.sh` — it pulls `memory_bridge.py`, `SKILL.md`, and itself fresh, checking first whether an update is actually needed, and never touches `.env` (your token is untouched; any new optional key a release introduces gets added without disturbing what's already set). It ends by re-running `doctor` — if that still reports `compat: incompatible`, the gateway and this client disagree on `api_version`; upgrade the gateway (`git pull` + restart on its host, not from here). No other files are needed on the remote machine.
 
 ---
 

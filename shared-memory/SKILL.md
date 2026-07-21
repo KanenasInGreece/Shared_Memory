@@ -485,6 +485,39 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 ## Reference
 
 - **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.5.0", "api_version": 1, "tool": "shared-memory-framework"}`
+
+### Updating This Skill
+
+If `doctor` reports `compat: incompatible` (or anything else looks stale),
+don't trust this installed copy to fix itself — run the update script that
+ships alongside `memory_bridge.py`:
+
+```bash
+bash ~/.gemini/skills/shared-memory/scripts/update_skill.sh
+```
+(Substitute `~/.gemini` with this agent's actual prefix — see the table near
+the top of this file.)
+
+It fetches `memory_bridge.py`, `SKILL.md`, and itself fresh from GitHub —
+checking first whether an update is actually needed, so a client already
+current does nothing — and re-runs `doctor` at the end to confirm
+`compat: ok`. It **never overwrites `.env`**: your `AGENT_TOKEN` is
+untouched; any *new* optional key a framework upgrade introduces is added
+without disturbing anything already set. It fails gracefully on a network
+problem (nothing is changed, re-run once connectivity is back), and if only
+part of the fetch succeeds, the files that didn't land are never partially
+applied — only a fully-fetched file replaces the one it's updating.
+
+**While `compat: incompatible`:** `search` stays safe (read-only, degrades
+gracefully) — but do not `save` / `save_decision` / `save_retrospective`
+until compat is restored. A client on the wrong `api_version` can silently
+malform what it writes, and a malformed write is much harder to undo than a
+paused one. Tell the operator what `doctor` reported and that writes are
+paused, rather than guessing at compatibility.
+
+No other files change on the client. The gateway itself is upgraded
+separately, on its own host — see [server-setup.md](Documentation/server-setup.md).
+
 - **Operations runbook:** gateway/daemon install + upgrade — [server-setup.md](Documentation/server-setup.md)
 - **Schema:** Neo4j labels, relationship types, Postgres tables — [schema.md](Documentation/schema.md)
 - **Embedding mandate:** All calls route through the gateway (:8888). Never call port 8070 (BGE-M3) or 8071 (BGE-Reranker) directly — the gateway enforces 1024-dim consistency across all agents.
