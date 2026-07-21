@@ -101,3 +101,75 @@ def test_inflight_not_reserved_when_request_never_dispatches(monkeypatch):
     except RuntimeError:
         pass                                              # raised before the try
     assert g._llm_inflight["http://a:5000"] == 0
+
+
+# ── stale-connection retry: exact exception type matters ────────────────────
+# Regression guard for a real production bug: the retry was originally written
+# to catch ServerDisconnectedError, but the actual exception aiohttp 3.14
+# raises for "Cannot write to closing transport" is ClientConnectionResetError
+# — a sibling class, not a subclass. The retry never fired in production
+# despite two merged, released PRs claiming to fix it (verified live: zero
+# "retrying once" log lines across a 24h window with 15 occurrences of the
+# error it was meant to catch). This test exercises the actual exception type,
+# not a stand-in, so a future regression back to the wrong class fails here
+# instead of silently shipping again.
+
+class _ResetOnceThenBoomSession:
+    """First .request() call raises the real stale-connection exception
+    (proving the retry path engages); second call raises a plain ClientError
+    (proving it gives up after exactly one retry, not infinitely). Takes the
+    exception classes as constructor args rather than importing them at
+    module scope, so it always exercises whatever hive_mind_proxy actually
+    imported — not a copy that could drift from it."""
+    closed = False
+    def __init__(self, reset_exc, client_exc):
+        self.calls = 0
+        self._reset_exc = reset_exc
+        self._client_exc = client_exc
+    def request(self, *a, **k):
+        self.calls += 1
+        if self.calls == 1:
+            raise self._reset_exc("Cannot write to closing transport")
+        raise self._client_exc("still down")
+
+
+def test_retries_once_on_client_connection_reset(monkeypatch):
+    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    import hive_mind_proxy as g
+    importlib.reload(g)
+
+    proxy = g.AsyncHiveMindProxy()
+    session = _ResetOnceThenBoomSession(g.ClientConnectionResetError, g.ClientError)
+    proxy.session = session
+    resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
+
+    assert session.calls == 2                    # retried exactly once, not zero, not looped
+    assert resp.status == 503                     # then failed normally, like before the fix
+    assert g._llm_inflight["http://a:5000"] == 0   # slot still released, not leaked
+
+
+def test_embed_body_buffered_under_cap_is_retry_eligible(monkeypatch):
+    """Embeddings/reranking requests get the same protection as LLM traffic
+    when their body is small enough to buffer (the gap PR #145 was meant to
+    close) — verified via the same real exception type as the LLM-path test."""
+    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    import hive_mind_proxy as g
+    importlib.reload(g)
+
+    class _EmbedReq:
+        method = "POST"
+        path = "/v1/embeddings"           # IS in ROUTING_MAP -> not the LLM branch
+        rel_url = "/v1/embeddings"
+        headers = {}
+        can_read_body = True
+        content_length = 40               # small, well under EMBED_RERANK_BUFFER_CAP
+        async def read(self):
+            return b'{"input":"hello","model":"bge-m3"}'
+
+    proxy = g.AsyncHiveMindProxy()
+    session = _ResetOnceThenBoomSession(g.ClientConnectionResetError, g.ClientError)
+    proxy.session = session
+    resp = asyncio.run(proxy.handle_proxy(_EmbedReq()))
+
+    assert session.calls == 2             # the embeddings leg also got the retry
+    assert resp.status == 503
