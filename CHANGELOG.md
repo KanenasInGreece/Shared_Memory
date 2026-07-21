@@ -5,6 +5,43 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.4] — 2026-07-21
+
+v0.8.3 shipped `CONSTITUTION_SNIPPET.md` as "the canonical, versioned block an installer proposes"
+but never actually wired it in: it wasn't in the skill's `MANIFEST.txt` (so `update_skill.sh` never
+shipped it to a client), and `AGENTS.md`'s own install walkthrough (Phase 8b) still proposed its own
+separately-worded, unversioned paragraph instead of the canonical file. Live-tested in the same
+session: the v1 wording, already loaded, did not cause an agent to search shared memory before
+starting a task squarely in its domain — a dense, separately-loaded local per-project memory index
+felt like "enough context," even though it is a different store than the one the snippet is about.
+
+### Fixed
+
+- **`CONSTITUTION_SNIPPET.md` is now actually shipped and referenced.** Added to
+  `shared-memory-skill/shared-memory/MANIFEST.txt` (so `update_skill.sh` fetches it over both
+  `file://` and `https://`) and to `sync_skills.sh`'s Phase 1 copy step (so edits to the framework
+  source propagate into the tracked skill copy same as `SKILL.md`). `AGENTS.md` Phase 8b now points
+  an installing agent at this file and says to copy it verbatim, instead of carrying its own
+  duplicate, drift-prone paragraph.
+- **New `AGENTS.md` Phase 8c + `SKILL.md` § Updating This Skill** — after `update_skill.sh` runs,
+  compare the operator's installed constitution-snippet version marker against the freshly-fetched
+  file's; if it advanced, propose replacing the block (never silently), so a wording fix in a later
+  release actually reaches an operator who already accepted an earlier version.
+
+### Changed
+
+- **`CONSTITUTION_SNIPPET.md` bumped v1 → v2.** The search-trigger sentence was rewritten from a
+  subjective "whenever context feels incomplete" gate — which a model can rationalize past when
+  *something* is already loaded in context — to an explicit trigger category (project direction, a
+  prior decision, a claim that may have been superseded) plus an explicit ranking: shared memory is
+  authoritative for that category, locally preloaded per-project notes are supplementary and can be
+  stale. Consulted an independent second opinion (Cloe) on the wording, framed neutrally with two
+  unlabeled candidates; her diagnosis matched the observed failure and named the mechanism precisely
+  — context presence substituting for a retrieval action, and any wording that still leaves the
+  agent a relevance judgment call remains gameable, this fix included.
+
+---
+
 ## [0.8.3] — 2026-07-21
 
 Remote clients had no way to update their own skill install, and no standing prompt to actually
