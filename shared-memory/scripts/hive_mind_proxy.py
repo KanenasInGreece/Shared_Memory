@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from aiohttp import web, ClientSession, ClientTimeout, TCPConnector
 from aiohttp.client_exceptions import (
+    ClientConnectionResetError,
     ClientError,
     ServerDisconnectedError,
 )
@@ -473,15 +474,22 @@ class AsyncHiveMindProxy:
                             _llm_mark_ok(llm_backend)   # connected + served — clear fail streak
                         return proxy_resp
 
-                except ServerDisconnectedError as e:
+                except (ClientConnectionResetError, ServerDisconnectedError) as e:
                     # A pooled connection reused just as the backend started closing
-                    # it ("Cannot write to closing transport") — a connection-reuse
-                    # race, not evidence the backend is down (enable_cleanup_closed
-                    # already evicts the stale socket). proxy_resp is still None here:
-                    # the failure happens writing the request, before any response is
-                    # read, so retrying on a fresh connection is safe. First-attempt-
-                    # only: a second failure in a row is treated as a real problem,
-                    # same as before this retry existed.
+                    # it — a connection-reuse race, not evidence the backend is down
+                    # (enable_cleanup_closed already evicts the stale socket).
+                    # "Cannot write to closing transport" (the write-phase reset,
+                    # verified live as the actual exception raised — aiohttp 3.14
+                    # ClientConnectionResetError, NOT ServerDisconnectedError, which
+                    # an earlier version of this fix caught instead and which never
+                    # once matched this error in production) is caught here alongside
+                    # ServerDisconnectedError (the read-phase counterpart) since both
+                    # represent the same underlying race, just observed at a
+                    # different point in the request lifecycle. proxy_resp is still
+                    # None here: the failure happens writing the request, before any
+                    # response is read, so retrying on a fresh connection is safe.
+                    # First-attempt-only: a second failure in a row is treated as a
+                    # real problem, same as before this retry existed.
                     if attempt < max_attempts - 1 and proxy_resp is None:
                         log.warning(
                             "Stale connection to %s (%s) — retrying once on a fresh "
