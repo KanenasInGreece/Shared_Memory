@@ -11,6 +11,7 @@
 # maintenance surface; update_skill.sh does not hardcode file names.
 
 SKILL.md
+CONSTITUTION_SNIPPET.md
 .env.example
 scripts/memory_bridge.py
 scripts/update_skill.sh

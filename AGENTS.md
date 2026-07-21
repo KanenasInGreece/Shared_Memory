@@ -159,17 +159,24 @@ standing behavior lives in each agent's own constitution file (`~/.claude/CLAUDE
 `~/.grok/AGENTS.md`, `~/.codex/AGENTS.md`, Antigravity's `~/.gemini/` equivalent, …). For every
 agent installed in Phase 8, **ask the user**: *"Would you like a short section in this agent's
 constitution describing the shared memory as its preferred depository of knowledge?"* If yes,
-append (adapting the file's tone; never overwrite existing content):
-
-> **Shared memory (gateway `:8888`) is the preferred depository of knowledge on this machine.**
-> Search it before starting any non-trivial task — prior facts, decisions, and retrospectives are
-> the context a seasoned collaborator would want on day one. Capture as you work: durable results
-> as facts; choices as decisions grounded in those facts (ask the user before recording a
-> decision); outcomes as retrospectives once evidence shows whether a decision held. When the
-> skill expects an elicited field you cannot infer, ask the user rather than invent. Field schemas:
-> the `shared-memory` skill's `SKILL.md`.
+copy the block verbatim from **`CONSTITUTION_SNIPPET.md`** (shipped alongside `SKILL.md` in this
+same skill directory — the file, not this paragraph, is the canonical source of truth) into the
+constitution file, adapting only the surrounding tone if needed and never overwriting existing
+content. Do not regenerate or paraphrase the block — copying it verbatim keeps it marker-delimited
+and versioned (`<!-- shared-memory:constitution-snippet vN -->`), which is what lets a later
+update (Phase 8c below) detect drift and re-propose instead of duplicating it.
 
 Respect a "no" without re-asking; the skill remains fully usable without it.
+
+### Phase 8c — Keep an installed constitution line current (per agent, on update)
+
+`CONSTITUTION_SNIPPET.md`'s version marker can advance between framework releases (a wording fix,
+for instance). After running `update_skill.sh` for an agent that already has the block installed
+(Phase 8b), compare the version marker in the operator's constitution file against the one in the
+freshly-updated `CONSTITUTION_SNIPPET.md`. If they differ, **propose** replacing the old
+marker-delimited block with the new one (show what changed and why) — never overwrite it silently.
+If the agent's constitution file has no marker-delimited block at all, treat it as never having
+been offered and fall back to Phase 8b.
 
 ## Runbooks
 

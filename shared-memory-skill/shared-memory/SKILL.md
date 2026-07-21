@@ -498,15 +498,25 @@ bash ~/.gemini/skills/shared-memory/scripts/update_skill.sh
 (Substitute `~/.gemini` with this agent's actual prefix — see the table near
 the top of this file.)
 
-It fetches `memory_bridge.py`, `SKILL.md`, and itself fresh from GitHub —
-checking first whether an update is actually needed, so a client already
-current does nothing — and re-runs `doctor` at the end to confirm
-`compat: ok`. It **never overwrites `.env`**: your `AGENT_TOKEN` is
-untouched; any *new* optional key a framework upgrade introduces is added
-without disturbing anything already set. It fails gracefully on a network
-problem (nothing is changed, re-run once connectivity is back), and if only
-part of the fetch succeeds, the files that didn't land are never partially
-applied — only a fully-fetched file replaces the one it's updating.
+It fetches every file listed in `MANIFEST.txt` fresh from GitHub — currently
+`SKILL.md`, `CONSTITUTION_SNIPPET.md`, `.env.example`, `memory_bridge.py`,
+`update_skill.sh` itself, and `Documentation/schema.md` — checking first
+whether an update is actually needed, so a client already current does
+nothing, and re-runs `doctor` at the end to confirm `compat: ok`. It **never
+overwrites `.env`**: your `AGENT_TOKEN` is untouched; any *new* optional key a
+framework upgrade introduces is added without disturbing anything already
+set. It fails gracefully on a network problem (nothing is changed, re-run
+once connectivity is back), and if only part of the fetch succeeds, the files
+that didn't land are never partially applied — only a fully-fetched file
+replaces the one it's updating.
+
+**If this agent's constitution file already carries a `<!-- shared-memory:
+constitution-snippet vN -->` block** (offered during install, see `AGENTS.md`
+Phase 8b), compare its version marker against the one in the freshly-fetched
+`CONSTITUTION_SNIPPET.md` after this update. A newer marker means the
+canonical wording changed — propose replacing the old block with the new one
+(state what changed and why), never overwrite it silently. See `AGENTS.md`
+Phase 8c.
 
 **While `compat: incompatible`:** `search` stays safe (read-only, degrades
 gracefully) — but do not `save` / `save_decision` / `save_retrospective`

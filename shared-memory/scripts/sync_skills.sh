@@ -56,6 +56,12 @@ else
   echo "↔  same inode (repo-linked): SKILL.md"
 fi
 
+if cp "$SRC/CONSTITUTION_SNIPPET.md" "$SKILL_COPY/CONSTITUTION_SNIPPET.md" 2>/dev/null; then
+  echo "✓ CONSTITUTION_SNIPPET.md → shared-memory-skill (source of truth)"
+else
+  echo "↔  same inode (repo-linked): CONSTITUTION_SNIPPET.md"
+fi
+
 for script in "${CLIENT_SCRIPTS[@]}"; do
   src="$SRC/scripts/$script"
   dest="$SKILL_COPY/scripts/$script"
