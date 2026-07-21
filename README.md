@@ -55,11 +55,15 @@ Most agent-memory systems are a library bolted onto one assistant. This one is a
 
 ## Quick Start
 
-The rest of this README explains *why* each piece exists. This chapter is the *order to do things in* — a complete first-time setup that points to the chapter with the detail for each step, so nothing is repeated. Do the steps in sequence.
+The rest of this README explains *why* each piece exists. This chapter is the *order to do things in* — a complete first-time setup that points to the chapter with the detail for each step, so nothing is repeated.
+
+**Is this for you?** If everything you need fits in one chat window with one assistant, you don't need this — a plain file is about as good, and we said so above. This is for when you run more than one AI tool, or work across more than one project, and want what one of them figures out to already be there the next time any of them is asked. If that's you, the setup below costs about an hour, most of it unattended.
 
 **What you are standing up:** a local GraphRAG memory shared by every AI tool on your machine — CLI agents and LM Studio alike. They talk only to one gateway on `127.0.0.1:8888`; the gateway owns Postgres (vectors + facts) and Neo4j (the graph), and runs the REM/NREM sleep cycle that turns saved facts into shared knowledge.
 
-> **Prefer to have an agent do this?** Open your coding agent (Claude Code, Codex CLI, Antigravity CLI, Grok, …) at the repo root and say: *"Read `AGENTS.md` and set up the framework."* Part 1 of [`AGENTS.md`](AGENTS.md) has the agent interview you for the required choices (data folders, model files, your reasoning-LLM address and port, which agents get tokens), then drive the same steps 1–9 below — writing your `.env` from the template, minting tokens, and verifying health. The same file carries the day-2 **start / stop / status / upgrade / backup** runbooks, so "stop the framework" or "upgrade the framework" also work as agent requests. The steps below remain the manual, self-explanatory path.
+>**The fast path — hand it to an agent.** Open your coding agent (Claude Code, Codex CLI, Antigravity CLI, Grok, …) at the repo root and say: *"Read `AGENTS.md` and set up the framework."* Part 1 of [`AGENTS.md`](AGENTS.md) interviews you for the required choices — data folders, model files, your reasoning-LLM address and port, which agents get tokens — then drives the same steps 1–9 below for you: writing `.env` from the template, minting tokens, verifying health. The same file carries the day-2 runbooks, so "stop the framework" or "upgrade the framework" work as agent requests too.
+
+**The manual path — the numbered steps below.** They're what the agent runs on your behalf: self-contained, idempotent, safe to re-run. Follow them by hand if you'd rather, or read them to see what your agent just did.
 
 ### Two surfaces: usage vs. operations
 
@@ -79,7 +83,7 @@ The framework has two distinct surfaces with separate lifecycles. Conflating the
 
 ### Resources & prerequisites
 
-**Hardware — lean minimum:** **16 GB RAM · ~8 GB VRAM · ~30 GB free disk.** Postgres + Neo4j take ~6 GB RAM between them; BGE-M3 and the reranker are small; your **reasoning LLM dominates VRAM**.
+**Hardware — lean minimum:** **16 GB RAM · ~8 GB VRAM · ~30 GB free disk.** Postgres + Neo4j take ~6 GB RAM between them; BGE-M3 and the reranker are small; your **reasoning LLM dominates VRAM**. This is the **backend requirement, not the client-side.**
 
 **Software:** Docker + Docker Compose · [`uv`](https://docs.astral.sh/uv/) (recommended — every command here uses it; or Python 3.11+ with `pip`) · a server for your reasoning LLM on `:5000` (LM Studio, or any OpenAI-compatible endpoint) — the embedder and reranker run as Docker containers from the compose file, so they need no separate install · at least one consumer that talks to the memory: a **CLI agent** (Claude Code, Antigravity CLI, Grok, or Codex CLI) and/or **LM Studio** — which serves a model and provides a chat interface, reaching the memory through MCP rather than as an agent.
 
