@@ -13,13 +13,22 @@ Loop discipline (fix wave, 2026-07):
   before the fold fails — a fixed bound plus the dead-letter cap below would
   otherwise exclude any legitimately-large cluster permanently and silently.
 
-* Fold dead-letter cap: before folding a cluster, the (entity/domain or
-  insight/entity) key is checked against the consolidation_runs ledger — if it
-  appears in preservation_failed / truncation_failed extras
-  NREM_FOLD_FAIL_CAP times (default 3) within the last NREM_FOLD_FAIL_WINDOW
-  days (default 7), the cluster is SKIPPED and the key recorded in
-  extra.fold_dead_letter. Operator reset = time passing beyond the window, or
-  manual consolidation_runs cleanup (delete/backdate the failing rows).
+* Fold dead-letter cap: before folding a cluster, a CONTENT-DERIVED key —
+  the cluster's own member records as sorted qualified refs (decision 822's
+  fact:N / decision:N form; see record_ref.py and _fold_identity()) — is
+  checked against the consolidation_runs ledger. If it appears in
+  preservation_failed / truncation_failed extras NREM_FOLD_FAIL_CAP times
+  (default 3) within the last NREM_FOLD_FAIL_WINDOW days (default 7), the
+  cluster is SKIPPED and a human-readable label (entity/domain or
+  insight/entity) is recorded in extra.fold_dead_letter for telemetry.
+  Operator reset = time passing beyond the window, or manual
+  consolidation_runs cleanup (delete/backdate the failing rows). Keying on
+  member refs rather than the display label is deliberate (decision 882):
+  the label is a lexicographic-min alias chosen to stay STABLE across cycles
+  even as cluster membership grows (correct for the community_summaries
+  upsert key) — the opposite of what a failure ledger needs, which is to
+  recognise a genuinely different (e.g. alias-merged) candidate as new
+  rather than inherit a smaller pre-merge candidate's failure history.
   A single failed fold is recorded in exactly ONE of those two arrays — the
   gauge sums them, so double-recording charged one cycle twice.
 
@@ -59,6 +68,7 @@ from ontology import (
 import relation_confidence as rc_conf
 from pool_status import pool_has_free_slot
 from dream_telemetry import record_llm_call, adaptive_ceiling
+from record_ref import make_ref
 
 # Configuration — set via environment variables or .env file
 NEO4J_URI = "bolt://localhost:7687"
@@ -383,8 +393,9 @@ def _crun_recover_and_prune():
 
 def fetch_fold_dead_letter_counts():
     """Fold dead-letter gauge: {fold_key: n} — how many times each fold key
-    ('entity/domain' or 'insight/entity') appears in the preservation_failed
-    and truncation_failed extras of consolidation_runs rows started within the
+    (a candidate's content-derived identity, _fold_identity()'s sorted
+    qualified refs — decision 882) appears in the preservation_failed and
+    truncation_failed extras of consolidation_runs rows started within the
     last NREM_FOLD_FAIL_WINDOW days. At NREM_FOLD_FAIL_CAP the callers SKIP the
     cluster (fold dead-letter) instead of burning an LLM fold on it every
     cycle. Own short conn (instrumentation never shares the cycle's conn);
@@ -408,6 +419,25 @@ def fetch_fold_dead_letter_counts():
     except Exception as e:
         logger.warning("fold dead-letter: ledger fetch failed (%s) — no dead-lettering this pass", e)
         return {}
+
+
+def _fold_identity(record_type, ids):
+    """Content-derived dead-letter identity for a fold candidate (decision
+    882): its own member records, as sorted qualified refs
+    (record_ref.make_ref — decision 822's fact:N / decision:N form), joined
+    into one string. Unlike the display label (a lexicographic-min alias
+    name that is DELIBERATELY stable across cycles even as membership
+    changes — see the module docstring), this key changes whenever the
+    member set changes, so an alias merge or new content correctly produces
+    a fresh candidate instead of inheriting a smaller/different candidate's
+    failure history. Qualifying every ref by record_type also avoids the
+    cross-table pg_id collision decision 822 already diagnosed (technical_docs
+    and community_summaries run independent sequences) — relevant because a
+    caller could otherwise mix ids from both, as fetch_refold_insights does.
+    ``ids`` may contain duplicates/be unsorted; both are normalised here so
+    the same logical member set always produces the same string regardless
+    of caller ordering."""
+    return ",".join(sorted(make_ref(record_type, i) for i in {int(x) for x in ids}))
 
 
 def _fetch_outbox_created_at(pg_ids):
@@ -2120,14 +2150,19 @@ class ConsolidationDaemon:
 
             for entity, domain, contents, pg_ids, aliases in work_items:
 
-                fold_key = f"{entity}/{domain}"
+                # label is the human-readable display name (telemetry/logs);
+                # fold_key is the content-derived dead-letter identity — see
+                # _fold_identity's docstring for why these must NOT be the
+                # same string (decision 882).
+                label = f"{entity}/{domain}"
+                fold_key = _fold_identity("fact", pg_ids)
                 if dead_letter.get(fold_key, 0) >= NREM_FOLD_FAIL_CAP:
-                    rec.fold_dead_letter.append(fold_key)
+                    rec.fold_dead_letter.append(label)
                     logger.error(
                         "NREM fold dead-letter: '%s' failed preservation/truncation "
                         "%d time(s) within %dd (cap %d) — SKIPPING this cluster. "
                         "Operator reset = window expiry or consolidation_runs cleanup.",
-                        fold_key, dead_letter[fold_key], NREM_FOLD_FAIL_WINDOW,
+                        label, dead_letter[fold_key], NREM_FOLD_FAIL_WINDOW,
                         NREM_FOLD_FAIL_CAP)
                     continue
 
@@ -2589,15 +2624,22 @@ class ConsolidationDaemon:
                 # call sites so _fold_insight's query order stays untouched.
                 dead_letter = await loop.run_in_executor(None, fetch_fold_dead_letter_counts)
 
-                def _dead_lettered(entity):
-                    key = f"insight/{entity}"
+                def _dead_lettered(entity, decision_ids):
+                    # label is the human-readable display name (telemetry/
+                    # logs); key is the content-derived dead-letter identity
+                    # — see _fold_identity's docstring (decision 882). Must
+                    # match what _fold_insight computes internally from the
+                    # SAME decision_ids for a failure recorded here to be
+                    # found on a later lookup.
+                    label = f"insight/{entity}"
+                    key = _fold_identity("decision", decision_ids)
                     if dead_letter.get(key, 0) >= NREM_FOLD_FAIL_CAP:
-                        rec.fold_dead_letter.append(key)
+                        rec.fold_dead_letter.append(label)
                         logger.error(
                             "NREM fold dead-letter: '%s' failed preservation/"
                             "truncation %d time(s) within %dd (cap %d) — SKIPPING. "
                             "Operator reset = window expiry or consolidation_runs cleanup.",
-                            key, dead_letter[key], NREM_FOLD_FAIL_WINDOW,
+                            label, dead_letter[key], NREM_FOLD_FAIL_WINDOW,
                             NREM_FOLD_FAIL_CAP)
                         return True
                     return False
@@ -2607,7 +2649,7 @@ class ConsolidationDaemon:
                 # that shares its ids — that work should still be tried this pass.
                 folded: set = set()
                 for old_id, entity, src_ids, prev_content in refolds:
-                    if _dead_lettered(entity):
+                    if _dead_lettered(entity, src_ids):
                         continue
                     logger.info(
                         "Insight cycle: re-folding insight %d ('%s') — new retrospective(s) on %s.",
@@ -2638,7 +2680,7 @@ class ConsolidationDaemon:
                     ids = [int(i) for i in c["decision_ids"] if i is not None]
                     if not ids or any(i in folded for i in ids):
                         continue  # already folded as a re-fold this pass
-                    if _dead_lettered(c["entity"]):
+                    if _dead_lettered(c["entity"], ids):
                         continue
                     logger.info(
                         "Insight cycle: fresh cluster on '%s' — %d decisions across projects %s.",
@@ -2669,6 +2711,11 @@ class ConsolidationDaemon:
         gate = gate or _default_calibration_gate()
         cyc = cyc if cyc is not None else _CycleRec()
         src_ids = sorted({int(i) for i in decision_ids})
+        # Content-derived dead-letter identity (decision 882) — recomputed
+        # here from the SAME decision_ids the caller's _dead_lettered() used,
+        # so a failure recorded on this exact candidate is found on the next
+        # lookup regardless of what label the entity resolves to that cycle.
+        fold_key = _fold_identity("decision", src_ids)
 
         def _fetch_decisions():
             with conn.cursor() as cur:
@@ -2805,7 +2852,7 @@ class ConsolidationDaemon:
                 # Open ledger rows are the durable requeue; the fold-failure
                 # cap dead-letters repeat offenders.
                 cyc.truncation_failures += 1
-                cyc.truncation_failed.append(f"insight/{entity}")
+                cyc.truncation_failed.append(fold_key)
                 logger.error(
                     "Truncation failure for insight '%s' — fold fails (no gate, "
                     "no retry, nothing persisted); ledger rows stay open. "
@@ -2844,7 +2891,7 @@ class ConsolidationDaemon:
                 # The corrective retry itself got truncated. Don't keep
                 # retrying into more truncation.
                 cyc.truncation_failures += 1
-                cyc.truncation_failed.append(f"insight/{entity}")
+                cyc.truncation_failed.append(fold_key)
                 break
             ok, missing = (summary_preserves(insight, anchors)
                            if insight else (False, missing))
@@ -2853,7 +2900,7 @@ class ConsolidationDaemon:
             # F3: see the fact-fold site — the dead-letter gauge sums both
             # lists, so one cycle must appear in exactly one of them.
             if not corrective_truncated:
-                cyc.preservation_failed.append(f"insight/{entity}")
+                cyc.preservation_failed.append(fold_key)
             logger.error(
                 "Preservation gate FAILED after %d corrective retries for insight "
                 "'%s' — NOT written to Tier 3; still missing: %s. Ledger rows stay "

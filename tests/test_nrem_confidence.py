@@ -644,7 +644,9 @@ async def test_preservation_double_failure_requeues_and_blocks_tier3(monkeypatch
     # NREM_PRESERVATION_MAX_RETRIES=2 — both corrective retries fail before giving up.
     assert extra["preservation_retries"] == 2
     assert extra["preservation_failures"] == 1
-    assert extra["preservation_failed"] == ["TestEntity/general"]
+    # Content-derived dead-letter key (decision 882), not the display label —
+    # sorted qualified refs over the cluster's own pg_ids ([1, 2]).
+    assert extra["preservation_failed"] == ["fact:1,fact:2"]
     assert extra["edges_awaiting_calibration"] == 3
     assert extra["machine_edges_consumed"] == 1
     assert extra["calibration"] == {"entity_relation": False, "evidential": False}
@@ -676,7 +678,9 @@ async def test_insight_preservation_double_failure_no_write(monkeypatch, caplog)
     assert not any(s.startswith("INSERT INTO community_summaries") for s, _ in conn.executed)
     assert cyc.preservation_retries == 2
     assert cyc.preservation_failures == 1
-    assert cyc.preservation_failed == ["insight/OutboxPattern"]
+    # Content-derived dead-letter key (decision 882), not the display label —
+    # sorted qualified refs over the fold's own decision_ids ([245, 267]).
+    assert cyc.preservation_failed == ["decision:245,decision:267"]
     assert any("Preservation gate FAILED after 2 corrective retries for insight" in m
                for m in caplog.messages)
 
@@ -910,4 +914,39 @@ async def test_insight_truncated_off_gate_not_written(monkeypatch):
     assert ok is False
     assert cyc.truncation_failures == 1
     assert cyc.preservation_retries == 0 and cyc.preservation_failures == 0
-    assert not any(s.startswith("INSERT INTO community_summaries") for s, _ in conn.executed)
+
+
+# ── Fold dead-letter identity is content-derived, not label-derived (882) ────
+
+def test_fold_identity_deterministic_regardless_of_order_and_duplicates():
+    """Same member set, any input ordering/duplication, must always produce
+    the exact same string — the dead-letter ledger is a literal-string
+    lookup, so anything less than byte-identical output breaks matching."""
+    assert cl._fold_identity("fact", [5, 12, 3]) == cl._fold_identity("fact", [12, 3, 5])
+    assert cl._fold_identity("fact", [5, 5, 12, 3, 3]) == cl._fold_identity("fact", [12, 3, 5])
+
+
+def test_fold_identity_different_record_types_never_collide():
+    """A technical_docs id and an unrelated community_summaries id of the same
+    integer value must produce different keys — the exact collision decision
+    822 diagnosed for bare pg_ids (fact 881: fetch_refold_insights pairs a
+    summary id with technical_docs decision ids for one candidate)."""
+    fact_key = cl._fold_identity("fact", [5])
+    decision_key = cl._fold_identity("decision", [5])
+    summary_key = cl._fold_identity("summary", [5])
+    assert len({fact_key, decision_key, summary_key}) == 3
+
+
+def test_fold_identity_changes_when_alias_merge_grows_membership():
+    """The bug this replaces: two surface forms of the same entity ('Cloe VM'
+    id 10, 'CloeVM' id 20) each independently dead-letter under their own
+    label. Once alias resolution merges them, the fold candidate becomes the
+    UNION of both — and that union's identity must differ from EITHER
+    pre-merge singleton's identity, so it gets a fresh attempt instead of
+    inheriting either side's failure count (decision 882)."""
+    pre_merge_a = cl._fold_identity("fact", [10])
+    pre_merge_b = cl._fold_identity("fact", [20])
+    post_merge = cl._fold_identity("fact", [10, 20])
+    assert post_merge != pre_merge_a
+    assert post_merge != pre_merge_b
+    assert len({pre_merge_a, pre_merge_b, post_merge}) == 3
