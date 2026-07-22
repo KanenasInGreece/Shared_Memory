@@ -922,8 +922,9 @@ async def test_handle_telemetry_rolls_up_postgres_and_neo4j():
     mock_session.run = AsyncMock(side_effect=[
         _result([{"rem": True, "con": True, "n": 96}, {"rem": False, "con": False, "n": 1}]),
         _result([{"rem": True, "n": 4}, {"rem": False, "n": 71}]),
-        # rem_attempts distribution over pending records
-        _result([{"a": 0, "n": 60}, {"a": 2, "n": 9}, {"a": 5, "n": 3}]),
+        # rem_attempts/rem_passed_over distribution over pending records
+        _result([{"a": 0, "p": 0, "n": 60}, {"a": 2, "p": 1, "n": 9},
+                  {"a": 5, "p": 3, "n": 3}]),
     ])
 
     resp = await c.handle_telemetry(_make_request({}))
@@ -943,6 +944,10 @@ async def test_handle_telemetry_rolls_up_postgres_and_neo4j():
     assert t["neo4j"]["rem_dead_lettered"] == 3
     assert t["neo4j"]["rem_failing"] == 9
     assert t["neo4j"]["rem_max_attempts"] == 5
+    # STEP 3 (decision 890) — fairness gauge: total = sum(n*p), starved = rows
+    # at/above REM_STARVED_THRESHOLD (default 3).
+    assert t["neo4j"]["rem_passed_over_total"] == 60 * 0 + 9 * 1 + 3 * 3
+    assert t["neo4j"]["rem_starved_pending"] == 3
 
 
 @pytest.mark.asyncio
@@ -956,7 +961,7 @@ async def test_handle_telemetry_survives_partial_backend_failure():
     mock_session.run = AsyncMock(side_effect=[
         _result([{"rem": True, "con": False, "n": 5}]),
         _result([{"rem": False, "n": 2}]),
-        _result([{"a": 0, "n": 2}]),
+        _result([{"a": 0, "p": 0, "n": 2}]),
     ])
 
     resp = await c.handle_telemetry(_make_request({}))

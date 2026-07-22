@@ -187,14 +187,15 @@ async def test_fetch_non_rem_batch_orders_pickups_first_then_attempts_then_pg_id
     daemon, mock_session = _make_daemon()
     mock_result = MagicMock()
     mock_result.data = AsyncMock(return_value=[
-        {"pg_id": 1, "rem_attempts": 0, "labels": [rem_mod.ONT.fact]},
-        {"pg_id": 2, "rem_attempts": 1, "labels": [rem_mod.ONT.decision]}])
+        {"pg_id": 1, "rem_attempts": 0, "rem_passed_over": 0, "labels": [rem_mod.ONT.fact]},
+        {"pg_id": 2, "rem_attempts": 1, "rem_passed_over": 2, "labels": [rem_mod.ONT.decision]}])
     mock_session.run = AsyncMock(return_value=mock_result)
 
-    pg_ids, attempts, labels = await daemon._fetch_non_rem_batch()
+    pg_ids, attempts, labels, passed_over = await daemon._fetch_non_rem_batch()
 
     assert pg_ids == [1, 2]
     assert attempts == {1: 0, 2: 1}
+    assert passed_over == {1: 0, 2: 2}
     assert labels == {1: rem_mod.ONT.fact, 2: rem_mod.ONT.decision}
     fetch_call = mock_session.run.call_args_list[0]
     cypher = fetch_call.args[0]
@@ -204,6 +205,7 @@ async def test_fetch_non_rem_batch_orders_pickups_first_then_attempts_then_pg_id
     assert "coalesce(n.rem_attempts, 0) < $max_attempts" in cypher
     assert "rem_pickups, 0) < $max_attempts" not in cypher
     assert "coalesce(n.rem_invalid, false) = false" in cypher
+    assert "coalesce(n.rem_passed_over, 0) AS rem_passed_over" in cypher
     assert fetch_call.kwargs["max_attempts"] == rem_mod.REM_MAX_ATTEMPTS
     # a second query counts the dead-lettered records for the cycle log
     dead_cypher = mock_session.run.call_args_list[1].args[0]
@@ -1056,9 +1058,10 @@ def test_rem_and_nrem_priority_lock_keys_match():
 # testable.
 
 def _cycle_daemon(monkeypatch, pg_ids, kinds, *, queuing=None, attempts=None,
-                  labels=None, content_map=None):
+                  labels=None, content_map=None, passed_over=None):
     daemon, _ = _make_daemon()
     attempts = attempts or {p: 0 for p in pg_ids}
+    passed_over = passed_over or {p: 0 for p in pg_ids}
     if content_map is None:
         content_map = {p: {"content": "c", "kind": kinds[p], "created_at": None}
                        for p in pg_ids}
@@ -1070,8 +1073,9 @@ def _cycle_daemon(monkeypatch, pg_ids, kinds, *, queuing=None, attempts=None,
         labels = {p: _k2l[kinds[p]] for p in pg_ids}
 
     daemon._fetch_non_rem_batch = AsyncMock(
-        return_value=(list(pg_ids), attempts, labels))
+        return_value=(list(pg_ids), attempts, labels, passed_over))
     daemon._bump_rem_pickups = AsyncMock()
+    daemon._bump_rem_passed_over = AsyncMock()
     daemon._mark_node_invalid = AsyncMock()
     daemon._open_pg_conn = lambda: MagicMock()
     daemon._recent_write_happened = AsyncMock(return_value=False)
@@ -1208,6 +1212,60 @@ async def test_run_cycle_does_not_charge_pickups_to_records_the_yield_never_reac
 
     bumped = [i for call in daemon._bump_rem_pickups.await_args_list for i in call.args[0]]
     assert bumped == [11], f"only the reached record rotates, got {bumped}"
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_bumps_passed_over_for_records_the_yield_left_behind(monkeypatch):
+    """STEP 3 (decision 890): the exact set the yield skips — remaining[solo_done:]
+    at the moment the check trips — is what gets charged, no more, no less."""
+    ids = [11, 12, 13]
+    probes = {"n": 0}
+    def _queuing(_conn):
+        probes["n"] += 1
+        return probes["n"] > 2          # free at cycle start + record 11, then queued
+    daemon = _cycle_daemon(monkeypatch, ids, {i: rem_mod.KIND_DECISION for i in ids},
+                           queuing=_queuing)
+    daemon._process_fact = AsyncMock(return_value=True)
+
+    await daemon.run_cycle()
+
+    bumped = [i for call in daemon._bump_rem_passed_over.await_args_list for i in call.args[0]]
+    assert bumped == [12, 13], f"only the skipped tail is charged, got {bumped}"
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_drains_starved_records_unconditionally_before_the_yield_check(monkeypatch):
+    """A record at/above REM_STARVED_THRESHOLD is promoted into a sub-queue
+    drained FIRST, with NO yield check inside it — the whole point is a
+    persistently-queuing NREM cannot re-starve a record this mechanism already
+    promoted. Only the non-starved remainder is subject to the arbiter yield."""
+    ids = [11, 12, 13]
+    kinds = {i: rem_mod.KIND_DECISION for i in ids}
+    # 13 is starved (>= threshold). NREM is free at cycle start (probe 1, so
+    # the cycle actually begins) but queuing on every check thereafter — which
+    # would normally stop REM cold at the very first non-starved record.
+    probes = {"n": 0}
+    def _queuing(_conn):
+        probes["n"] += 1
+        return probes["n"] > 1
+    daemon = _cycle_daemon(monkeypatch, ids, kinds,
+                           passed_over={11: 0, 12: 0, 13: rem_mod.REM_STARVED_THRESHOLD},
+                           queuing=_queuing)
+    seen = []
+    async def _fake(pg_id, *a, **k):
+        seen.append(pg_id)
+        return True
+    daemon._process_fact = _fake
+
+    processed, attempted = await daemon.run_cycle()
+
+    assert seen == [13], "the starved record must be processed despite NREM queuing throughout"
+    assert processed == 1 and attempted == 1
+    # The starved record's pickup resets rem_passed_over (via _bump_rem_pickups
+    # in the live SET clause) — never itself re-charged as passed-over.
+    passed_over_calls = [i for call in daemon._bump_rem_passed_over.await_args_list
+                          for i in call.args[0]]
+    assert 13 not in passed_over_calls
 
 
 @pytest.mark.asyncio

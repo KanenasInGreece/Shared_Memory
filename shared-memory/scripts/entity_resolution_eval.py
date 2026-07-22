@@ -88,14 +88,30 @@ def _auth_headers() -> dict:
 
 
 def fetch_entities() -> list[dict]:
-    """Every Entity plus the pg_ids of the (non-superseded) facts/decisions that
-    MENTION it — the basis for deriving each entity's domain set."""
+    """Every genuinely-referenced Entity plus the pg_ids of the (non-superseded)
+    facts/decisions that MENTION it — the basis for deriving each entity's
+    domain set AND the alias-candidate pool (both callers of this function).
+
+    Requires >=1 non-superseded MENTIONS edge (decision 890 / fact 889's
+    follow-up finding): a Decision's own CONSIDERED/REJECTED/UNDER_CONDITIONS/
+    PRODUCES_INSIGHT targets are free-text provenance, deliberately allowed to
+    be arbitrary-length prose (rem_loop.py's registry gate, decision 718, keeps
+    unregistered free phrases from ever minting a NEW node here going forward)
+    — but pre-718 legacy nodes of that shape still exist with zero MENTIONS
+    edges, and alias-candidate generation was treating them as ordinary named
+    entities, producing nonsensical merges like a Decision's condition text
+    aliased to the real entity it happens to mention in passing. Requiring a
+    MENTIONS edge is the single point excluding them everywhere this harness
+    is reused, without enumerating relationship types (robust to new spine
+    relationships being added later)."""
     cypher = (
         f"MATCH (e:{ONT.entity}) "
         f"OPTIONAL MATCH (n)-[:{ONT.entity_link}]->(e) "
         f"  WHERE n.pg_id IS NOT NULL AND coalesce(n.superseded,false) = false "
-        f"RETURN e.name AS name, collect(DISTINCT n.pg_id) AS pg_ids "
-        f"ORDER BY name"
+        f"WITH e, collect(DISTINCT n.pg_id) AS pg_ids "
+        f"WHERE size(pg_ids) > 0 "
+        f"RETURN e.name AS name, pg_ids "
+        f"ORDER BY e.name"
     )
     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
     try:

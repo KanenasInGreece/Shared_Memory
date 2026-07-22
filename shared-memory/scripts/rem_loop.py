@@ -283,6 +283,13 @@ REM_TRUNCATION_RETRY_FACTOR = float(os.environ.get("REM_TRUNCATION_RETRY_FACTOR"
 # march five innocent records toward dead-letter (fix-wave A′ F1).
 REM_MAX_ATTEMPTS = int(os.environ.get("REM_MAX_ATTEMPTS", "5"))
 
+# STEP 3 (decision 890) — batch-vs-solo starvation. A solo record passed over
+# this many times by the NREM-queuing yield is promoted into the starved
+# sub-queue, drained unconditionally (no yield check) at the START of the next
+# solo pass. Few records, ever, should reach this — it is a rescue valve, not
+# the normal path.
+REM_STARVED_THRESHOLD = int(os.environ.get("REM_STARVED_THRESHOLD", "3"))
+
 # LLM failure classes recorded on REMDaemon._last_llm_failure.
 LLM_FAIL_TRANSPORT = "transport"   # HTTP non-200 / connection / gateway-shape — NOT chargeable
 LLM_FAIL_TRUNCATED = "truncated"   # finish_reason=length even after the widened retry
@@ -786,7 +793,7 @@ class REMDaemon:
 
     async def _fetch_non_rem_batch(
         self,
-    ) -> tuple[list[int], dict[int, int], dict[int, str]]:
+    ) -> tuple[list[int], dict[int, int], dict[int, str], dict[int, int]]:
         """Non-REM anchor pg_ids, pickups-first then attempts then oldest-first.
 
         Ordering `coalesce(rem_pickups,0) ASC, coalesce(rem_attempts,0) ASC,
@@ -819,12 +826,16 @@ class REMDaemon:
         keeps its row, its node and its searchability; it only stops being
         enriched.
 
-        Returns (pg_ids, {pg_id: rem_attempts}, {pg_id: selected label}). The
-        attempt map drives the batch→solo demotion in run_cycle; the LABEL map
-        drives the identity check (820) — REM selects a NODE but resolves
-        everything after that from the pg_id, so the label it selected must be
-        carried forward and checked against the label the Postgres record kind
-        implies, or the node marked processed may not be the node selected.
+        Returns (pg_ids, {pg_id: rem_attempts}, {pg_id: selected label},
+        {pg_id: rem_passed_over}). The attempt map drives the batch→solo
+        demotion in run_cycle; the LABEL map drives the identity check (820) —
+        REM selects a NODE but resolves everything after that from the pg_id,
+        so the label it selected must be carried forward and checked against
+        the label the Postgres record kind implies, or the node marked
+        processed may not be the node selected. The passed-over map drives the
+        starved sub-queue promotion (STEP 3, decision 890's REM half) — a
+        scheduling-event counter, distinct from rem_pickups/rem_attempts,
+        which both describe what happened TO the record.
         """
         base = (
             f"MATCH (n)"
@@ -840,6 +851,7 @@ class REMDaemon:
                 f"   AND coalesce(n.rem_invalid, false) = false"
                 f" RETURN n.pg_id AS pg_id,"
                 f"        coalesce(n.rem_attempts, 0) AS rem_attempts,"
+                f"        coalesce(n.rem_passed_over, 0) AS rem_passed_over,"
                 f"        labels(n) AS labels"
                 f" ORDER BY coalesce(n.rem_pickups, 0) ASC,"
                 f"          coalesce(n.rem_attempts, 0) ASC, n.pg_id ASC"
@@ -864,6 +876,7 @@ class REMDaemon:
             )
         pg_ids: list[int] = []
         attempts: dict[int, int] = {}
+        passed_over: dict[int, int] = {}
         sel_labels: dict[int, str] = {}
         record_labels = {ONT.fact, ONT.decision, ONT.retrospective}
         for r in rows:
@@ -871,13 +884,14 @@ class REMDaemon:
                 continue
             pg_ids.append(r["pg_id"])
             attempts[r["pg_id"]] = int(r.get("rem_attempts") or 0)
+            passed_over[r["pg_id"]] = int(r.get("rem_passed_over") or 0)
             # The RECORD label the queue matched on. A node may carry others
             # (or, on a corrupt write, more than one record label) — record
             # the first that made it selectable, deterministically ordered so
             # the identity check is stable across cycles.
             matched = sorted(set(r.get("labels") or []) & record_labels)
             sel_labels[r["pg_id"]] = matched[0] if matched else ""
-        return pg_ids, attempts, sel_labels
+        return pg_ids, attempts, sel_labels, passed_over
 
     async def _bump_rem_attempts(self, pg_ids: list[int]) -> None:
         """Durable failure counter (poison-record escape hatch): +1 on the
@@ -922,11 +936,46 @@ class REMDaemon:
                     f"MATCH (n)"
                     f" WHERE (n:{ONT.fact} OR n:{ONT.decision} OR n:{ONT.retrospective})"
                     f"   AND n.pg_id IN $pg_ids"
-                    f" SET n.rem_pickups = coalesce(n.rem_pickups, 0) + 1",
+                    # Reset rem_passed_over in the SAME statement: a record
+                    # earns its starved-queue promotion by being repeatedly
+                    # SKIPPED, never by time, and the moment it's actually
+                    # picked up is the one unambiguous "no longer starved"
+                    # event (decision 890's REM half, STEP 3).
+                    f" SET n.rem_pickups = coalesce(n.rem_pickups, 0) + 1,"
+                    f"     n.rem_passed_over = 0",
                     pg_ids=list(pg_ids),
                 )
         except Exception as exc:
             logger.warning("REM: rem_pickups bump failed for %s: %s", pg_ids, exc)
+
+    async def _bump_rem_passed_over(self, pg_ids: list[int]) -> None:
+        """Scheduling-event counter (STEP 3, decision 890): +1 the moment the
+        yield fires on a solo record that WOULD have been selected this cycle
+        absent the yield — the set is `remaining[solo_done:]`, already
+        computed at the point the yield check trips, so this charges exactly
+        the records the arbiter skipped, no more.
+
+        Distinct from rem_pickups/rem_attempts, which both describe what
+        happened TO the record; this describes what the SCHEDULER did (the
+        exact distinction that keeps this clear of the 819 overloading
+        mistake). Reset only on successful pickup (see `_bump_rem_pickups`),
+        never by time — a persistently-queuing NREM cannot be waited out by
+        the clock, only by actually processing the record.
+
+        Best-effort: the bump must never mask the yield it's counting."""
+        if not pg_ids:
+            return
+        try:
+            async with self.driver.session() as session:
+                await session.run(
+                    f"MATCH (n)"
+                    f" WHERE (n:{ONT.fact} OR n:{ONT.decision} OR n:{ONT.retrospective})"
+                    f"   AND n.pg_id IN $pg_ids"
+                    f" SET n.rem_passed_over = coalesce(n.rem_passed_over, 0) + 1",
+                    pg_ids=list(pg_ids),
+                )
+        except Exception as exc:
+            logger.warning("REM: rem_passed_over bump failed for %s: %s", pg_ids, exc)
 
     async def _mark_node_invalid(self, pg_id: int, label: str, reason: str) -> None:
         """Retire ONE structurally invalid node from the queue (820).
@@ -2125,7 +2174,7 @@ class REMDaemon:
         handed to an LLM path this cycle. The caller needs BOTH to tell idle
         (nothing to do → back off) from failure (work existed but failed → keep
         BASE cadence; poison loops must not masquerade as idleness)."""
-        candidates, attempts_map, label_map = await self._fetch_non_rem_batch()
+        candidates, attempts_map, label_map, passed_over_map = await self._fetch_non_rem_batch()
         if not candidates:
             return 0, 0
 
@@ -2303,17 +2352,41 @@ class REMDaemon:
                         conn, loop, manifest=it["manifest"], run_id=run_id):
                     processed += 1
 
-            for solo_done, (pg_id, kind) in enumerate(solo_ids):
+            # STEP 3 (decision 890) — starved sub-queue: a record repeatedly
+            # skipped by the yield below (rem_passed_over >= threshold) is
+            # drained FIRST and UNCONDITIONALLY, with no yield check inside
+            # this loop. A persistently-queuing NREM would otherwise re-starve
+            # exactly the records this mechanism exists to rescue — the
+            # promotion has to buy at least one guaranteed attempt per cycle,
+            # bounded by how few records ever reach the threshold.
+            starved_ids = {pg_id for pg_id, _ in solo_ids
+                           if passed_over_map.get(pg_id, 0) >= REM_STARVED_THRESHOLD}
+            starved  = [(pg_id, kind) for pg_id, kind in solo_ids if pg_id in starved_ids]
+            remaining = [(pg_id, kind) for pg_id, kind in solo_ids if pg_id not in starved_ids]
+
+            for pg_id, kind in starved:
+                attempted += 1
+                await self._bump_rem_pickups([pg_id])
+                if await self._process_fact(
+                        pg_id, content_map[pg_id]["content"], kind, closed_set,
+                        registry, conn, loop,
+                        manifest=manifests.get(pg_id) or {}, run_id=run_id):
+                    processed += 1
+
+            for solo_done, (pg_id, kind) in enumerate(remaining):
                 # F2: yield at RECORD boundaries, not just cycle boundaries.
                 # A cycle can hold up to BATCH_SIZE solo records at ~20 minutes
                 # each, so a cycle-start-only check let REM own the slot for
                 # well over an hour while NREM's queue expired — the starvation
                 # the arbiter exists to prevent, just on a longer clock.
                 if await loop.run_in_executor(None, lambda: _nrem_is_queuing(conn)):
+                    passed_ids = [pid for pid, _ in remaining[solo_done:]]
+                    await self._bump_rem_passed_over(passed_ids)
                     logger.info(
                         "REM: NREM is queuing for the LLM slot — yielding after "
-                        "%d/%d solo record(s) handled; the rest retry next cycle.",
-                        solo_done, len(solo_ids))
+                        "%d/%d non-starved solo record(s) handled (%d starved "
+                        "record(s) already drained); %d passed-over.",
+                        solo_done, len(remaining), len(starved), len(passed_ids))
                     break
                 attempted += 1
                 # Per-RECORD, and only past the yield: a record the yield never

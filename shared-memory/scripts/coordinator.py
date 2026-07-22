@@ -101,7 +101,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.5"
+FRAMEWORK_VERSION = "0.8.6"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -451,6 +451,11 @@ BACKUP_ADVISORY_LOCK_KEY    = _env_int("BACKUP_ADVISORY_LOCK_KEY", 8765309)
 # cap, it only needs the threshold to report how many records REM has given up
 # on. MUST match the daemon's default.
 REM_MAX_ATTEMPTS            = _env_int("REM_MAX_ATTEMPTS", 5)
+# Read-only mirror of rem_loop.REM_STARVED_THRESHOLD (decision 890, STEP 3) —
+# the gateway never runs the starved-drain itself, it only needs the threshold
+# to report how many pending records are AT the promotion point. MUST match
+# the daemon's default.
+REM_STARVED_THRESHOLD        = _env_int("REM_STARVED_THRESHOLD", 3)
 # Seconds the gateway waits for in-flight daemon cycles to release their shared lock
 # before reporting drain_timeout. Bounds the quiesce handshake.
 BACKUP_DAEMON_DRAIN_TIMEOUT = _env_float("BACKUP_DAEMON_DRAIN_TIMEOUT", 45.0)
@@ -2530,8 +2535,17 @@ class MemoryCoordinator:
                 " OPTIONAL MATCH (n)-[r]-(related)"
                 # ADR-017: also pull each related Entity's alias siblings so
                 # search surfaces every surface form of a concept. One query,
-                # no-op-safe (empty when no ALIASES edges exist).
+                # no-op-safe (empty when no ALIASES edges exist). Gated on
+                # ontology.py's GENUINELY_REFERENCED_ENTITY_RULE (decision 890)
+                # so a Decision-provenance node's stray legacy ALIASES edge
+                # (pre-718) never surfaces a wrongly-merged real entity name
+                # as if it were a "surface form" of free-text condition/
+                # alternative content — same criterion as fetch_entities().
                 f" OPTIONAL MATCH (related)-[:{ONT.aliases}]-(al:{ONT.entity})"
+                f"   WHERE EXISTS {{"
+                f"     MATCH (related)<-[:{ONT.entity_link}]-(m)"
+                f"     WHERE m.pg_id IS NOT NULL AND coalesce(m.superseded,false) = false"
+                f"   }}"
                 " WITH n, r, related, labels(related) AS labels,"
                 "      collect(DISTINCT al.name) AS aliases"
                 # Highest-signal edges survive the cap: provenance-bearing
@@ -3162,7 +3176,8 @@ class MemoryCoordinator:
                     f"   AND coalesce(n.rem_processed,false) = false"
                     f"   AND coalesce(n.superseded,false) = false"
                     f"   AND n.pg_id IS NOT NULL"
-                    f" RETURN coalesce(n.rem_attempts,0) AS a, count(*) AS n"
+                    f" RETURN coalesce(n.rem_attempts,0) AS a,"
+                    f"        coalesce(n.rem_passed_over,0) AS p, count(*) AS n"
                 )
                 attempts = await ares.data()
             _cap = REM_MAX_ATTEMPTS
@@ -3179,6 +3194,13 @@ class MemoryCoordinator:
                 # Pending records carrying at least one failed attempt.
                 "rem_failing":          sum(r["n"] for r in attempts if 0 < r["a"] < _cap),
                 "rem_max_attempts":     _cap,
+                # STEP 3 (decision 890) fairness gauge — ships dormant (reads 0
+                # until the solo backlog is large enough to re-exercise the
+                # batch-vs-solo yield path; baseline: 8/15 yields at 0 solo
+                # records handled, 2026-07-20 12:28-22:41, before this fix).
+                "rem_passed_over_total": sum(r["n"] * r["p"] for r in attempts),
+                "rem_starved_pending":  sum(r["n"] for r in attempts
+                                            if r["p"] >= REM_STARVED_THRESHOLD),
             }
         except Exception as exc:
             snap["neo4j"] = {"error": str(exc)}
@@ -3718,6 +3740,15 @@ class MemoryCoordinator:
               (mostly REM-typed-edge targets). A coverage/fragmentation proxy, NOT
               dead refs.
           singleton_entities — mentioned by exactly one live fact (fragmentation proxy)
+          genuinely_referenced_entities — entities meeting ontology.py's
+              GENUINELY_REFERENCED_ENTITY_RULE (>=1 non-superseded MENTIONS edge,
+              decision 890): the population alias/duplicate-resolution work should
+              be measured against, NOT entities_total — entities_total also
+              includes Decision provenance-text nodes (CONSIDERED/REJECTED/
+              UNDER_CONDITIONS/PRODUCES_INSIGHT targets), which alias coverage %
+              was previously silently diluted by (~54% of entities_total on this
+              graph, live-measured 2026-07-22). Kept as a separate field rather
+              than redefining entities_total, which other consumers may depend on.
           alias_edges / alias_covered_entities — populate once ADR-017 ships alias
               edges; 0 until then (an honest gap, the metric to watch climb)
           top_hubs         — highest-degree entities, the consolidation backbone
@@ -3734,7 +3765,8 @@ class MemoryCoordinator:
                 f"RETURN count(e) AS total, "
                 f"  sum(CASE WHEN NOT (e)--() THEN 1 ELSE 0 END) AS orphans, "
                 f"  sum(CASE WHEN mentions = 0 AND (e)--() THEN 1 ELSE 0 END) AS unmentioned, "
-                f"  sum(CASE WHEN mentions = 1 THEN 1 ELSE 0 END) AS singletons"
+                f"  sum(CASE WHEN mentions = 1 THEN 1 ELSE 0 END) AS singletons, "
+                f"  sum(CASE WHEN mentions >= 1 THEN 1 ELSE 0 END) AS genuinely_referenced"
             )).single()
             aliases = await (await session.run(
                 f"MATCH ()-[r:{self._ALIAS_REL}]-() RETURN count(DISTINCT r) AS edges"
@@ -3760,6 +3792,7 @@ class MemoryCoordinator:
             "orphan_entities": deg["orphans"] or 0,
             "unmentioned_entities": deg["unmentioned"] or 0,
             "singleton_entities": deg["singletons"] or 0,
+            "genuinely_referenced_entities": deg["genuinely_referenced"] or 0,
             "alias_edges": aliases["edges"] or 0,
             "alias_covered_entities": covered["c"] or 0,
             "alias_components": comp["groups"] or 0,

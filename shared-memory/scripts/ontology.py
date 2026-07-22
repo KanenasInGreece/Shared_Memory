@@ -210,6 +210,41 @@ def sanitize_entity_names(raw_names: object) -> list[str]:
     return out
 
 
+# ── Genuinely-referenced entity (decision 890, fact 889's follow-up finding) ──
+# A shape/length-clean name is not the same question as "is this actually a
+# named entity". A Decision's own CONSIDERED/REJECTED/UNDER_CONDITIONS/
+# PRODUCES_INSIGHT targets are free-text provenance — deliberately allowed to
+# be arbitrary-length prose (rem_loop.py's registry gate, decision 718, already
+# stops NEW unregistered free phrases from minting a node via those relationship
+# types) — but legacy nodes of that shape predate 718 and carry no MENTIONS
+# edge at all. Anything that treats every :Entity node as an equally valid
+# alias/duplicate-resolution candidate (alias-writer's candidate generation,
+# entity-resolution evaluation, entity-graph telemetry, search-time ALIASES
+# expansion) must apply this SAME criterion, or the same node is "real" in one
+# read path and "provenance noise" in another — exactly the inconsistency this
+# ontology module exists to prevent.
+#
+# THE RULE, to be applied identically everywhere a consumer decides whether an
+# :Entity node is eligible for alias/duplicate consideration:
+#
+#   Eligible  IFF  it has >=1 incoming, non-superseded MENTIONS edge.
+#
+# Deliberately a POSITIVE check on MENTIONS (the one spine relationship whose
+# whole purpose is "content genuinely referenced this as a named entity"),
+# not an enumeration of provenance relationship types to exclude — a 5th
+# provenance-style relationship type added later cannot silently bypass this
+# check the way an exclusion list could. Synchronous scripts share the actual
+# query (`entity_resolution_eval.fetch_entities`); the async gateway
+# (`coordinator.py`, a different runtime/driver) cannot import that function,
+# so it re-expresses the SAME rule in its own Cypher — any consumer doing so
+# must match this criterion exactly, not approximate it.
+GENUINELY_REFERENCED_ENTITY_RULE = (
+    "requires >=1 incoming, non-superseded MENTIONS edge — see ontology.py's "
+    "GENUINELY_REFERENCED_ENTITY_RULE docstring (decision 890) before changing "
+    "how any :Entity consumer decides candidacy for alias/duplicate resolution"
+)
+
+
 # ── Fact epistemic kind (soft, DERIVED from source_ref) ───────────────────────
 # fact_kind is a soft tag — NOT a spine sub-label — giving a stored fact its
 # evidential weight for the high-signal grounding story (decision 552 + the

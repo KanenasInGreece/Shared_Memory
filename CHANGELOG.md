@@ -5,6 +5,54 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.6] — 2026-07-22
+
+Two independent defects, both traced to live examples on the running graph
+rather than assumed from a single incident.
+
+### Fixed
+
+- **Alias-writer no longer treats Decision provenance text as a named entity.**
+  A Decision's own `CONSIDERED`/`REJECTED`/`UNDER_CONDITIONS`/`PRODUCES_INSIGHT`
+  targets are free-text provenance (conditions, alternatives, insight text),
+  deliberately allowed to be arbitrary-length prose and never meant to
+  represent canonical named entities — but alias-candidate generation pulled
+  every `:Entity` node uniformly, so a Decision's condition text could be
+  merged via `ALIASES` with an unrelated real entity whenever the strings
+  overlapped (e.g. `"must be performed on Cloe VM"` merged with the real
+  `Cloe VM` entity at 0.85 confidence). Fixed at the single shared root
+  (`entity_resolution_eval.fetch_entities()`, used by both the alias-writer
+  and the ER evaluation harness): a node is only eligible for alias/duplicate
+  consideration if it carries at least one non-superseded `MENTIONS` edge —
+  a positive check on the one relationship whose purpose is "genuinely
+  referenced as a named entity," not an enumeration of provenance types to
+  exclude, so a future provenance-style relationship can't silently bypass
+  it. Applied consistently everywhere else the same distinction matters:
+  `coordinator.py`'s entity-graph telemetry now reports
+  `genuinely_referenced_entities` alongside the existing (now-understood-to-be
+  mixed-population) `entities_total`, and search-time `ALIASES`-sibling
+  expansion no longer surfaces a wrongly-merged real entity name as if it
+  were a "surface form" of a Decision's free-text content. Root-caused with
+  an independent Cloe consult; ~54% of `entities_total` on the live graph
+  turned out to be this provenance-text population, not genuine entities.
+- **REM's batch-vs-solo starvation (arbiter STEP 3).** REM processed batched
+  facts first (~17 minutes), then iterated solo records with a yield check
+  before each; NREM re-arms roughly every 15 minutes, so the yield could fire
+  on the very first solo record — 8 of 15 recorded yield events handled zero
+  solo records before backing off. Added `rem_passed_over`, a scheduling-event
+  counter distinct from `rem_pickups`/`rem_attempts` (both describe what
+  happened TO a record; this describes what the scheduler did) — incremented
+  for exactly the solo records a yield skips. A record at or above
+  `REM_STARVED_THRESHOLD` (default 3) is promoted into a sub-queue drained
+  unconditionally, with no yield check, at the start of the next solo pass —
+  a persistently-queuing NREM can no longer re-starve a record already
+  promoted. New `/memory/telemetry` fields `rem_passed_over_total` /
+  `rem_starved_pending` ship ahead of the fix actually being exercised again
+  (the current backlog is thin enough that the path is dormant) so the next
+  time it fires there's a real before/after baseline to compare against.
+
+---
+
 ## [0.8.5] — 2026-07-22
 
 The NREM fold dead-letter cap keyed on a lexicographic-min alias label — deliberately
