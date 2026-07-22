@@ -920,8 +920,15 @@ async def test_handle_telemetry_rolls_up_postgres_and_neo4j():
     def _result(rows):
         r = MagicMock(); r.data = AsyncMock(return_value=rows); return r
     mock_session.run = AsyncMock(side_effect=[
-        _result([{"rem": True, "con": True, "n": 96}, {"rem": False, "con": False, "n": 1}]),
-        _result([{"rem": True, "n": 4}, {"rem": False, "n": 71}]),
+        _result([{"rem": True, "con": True, "superseded": False, "n": 96},
+                  {"rem": False, "con": False, "superseded": False, "n": 1},
+                  # Superseded facts are permanently excluded from REM's own
+                  # candidacy query — they must not inflate facts_rem_pending
+                  # with a backlog REM will never touch (the bug this covers).
+                  {"rem": False, "con": False, "superseded": True, "n": 12}]),
+        _result([{"rem": True, "superseded": False, "n": 4},
+                  {"rem": False, "superseded": False, "n": 71},
+                  {"rem": False, "superseded": True, "n": 2}]),
         # rem_attempts/rem_passed_over distribution over pending records
         _result([{"a": 0, "p": 0, "n": 60}, {"a": 2, "p": 1, "n": 9},
                   {"a": 5, "p": 3, "n": 3}]),
@@ -934,11 +941,11 @@ async def test_handle_telemetry_rolls_up_postgres_and_neo4j():
     assert t["postgres"]["technical_docs_superseded"] == 4
     assert t["postgres"]["outbox"] == {"applied": 10, "rem_reviewed": 3}
     assert t["postgres"]["community_summaries"]["insight"] == 0
-    assert t["neo4j"]["facts_total"] == 97
-    assert t["neo4j"]["facts_rem_pending"] == 1
+    assert t["neo4j"]["facts_total"] == 109
+    assert t["neo4j"]["facts_rem_pending"] == 1       # the 12 superseded-pending facts are excluded
     assert t["neo4j"]["facts_unconsolidated"] == 0   # only rem=True & con=False counts; here 96 are consolidated
-    assert t["neo4j"]["decisions_total"] == 75
-    assert t["neo4j"]["decisions_rem_pending"] == 71
+    assert t["neo4j"]["decisions_total"] == 77
+    assert t["neo4j"]["decisions_rem_pending"] == 71  # the 2 superseded-pending decisions are excluded
     # F5: records REM has given up on are visible, not just silently absent
     # from its queue while still counted as "pending".
     assert t["neo4j"]["rem_dead_lettered"] == 3
@@ -959,8 +966,8 @@ async def test_handle_telemetry_survives_partial_backend_failure():
     def _result(rows):
         r = MagicMock(); r.data = AsyncMock(return_value=rows); return r
     mock_session.run = AsyncMock(side_effect=[
-        _result([{"rem": True, "con": False, "n": 5}]),
-        _result([{"rem": False, "n": 2}]),
+        _result([{"rem": True, "con": False, "superseded": False, "n": 5}]),
+        _result([{"rem": False, "superseded": False, "n": 2}]),
         _result([{"a": 0, "p": 0, "n": 2}]),
     ])
 
