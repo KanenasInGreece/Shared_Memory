@@ -5,6 +5,35 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.7] — 2026-07-23
+
+### Fixed
+
+- **Telemetry over-counted REM's backlog with records REM will never touch.**
+  `GET /memory/telemetry`'s `facts_rem_pending` / `decisions_rem_pending`
+  counted every `Fact`/`Decision` node with `rem_processed=false`, but never
+  excluded `superseded=true` — while REM's own candidacy query
+  (`rem_loop.py:_fetch_non_rem_batch`) has always excluded superseded records.
+  A record superseded before REM ever processed it inflated the reported
+  backlog permanently: REM will never enrich it (by design), so no operator
+  action could ever clear the count. Caught live while investigating an
+  apparently-stuck REM daemon — the real pending queue was a single record,
+  not the 13 facts / 2 decisions the status line reported. Fixed by adding
+  the same `superseded=false` filter already used two queries below in the
+  same function (`rem_dead_lettered`/`rem_failing`), so all three counters
+  now agree with what REM itself will actually pick up.
+- **Stale test assumption on REM's temperature.** `test_llm_process_uses_
+  configured_temperature` asserted the configured `REM_TEMPERATURE` could
+  never legitimately be `0.1`, on the belief REM was "no longer" Qwen-tuned —
+  but this deployment is still on Qwen3, where near-greedy decoding (`0.1`)
+  is the correct, current setting (`REM_TEMPERATURE`'s own docstring). The
+  test's real invariant is configurability (the request body reads the
+  module constant, never a hardcoded literal), not any specific value —
+  rewritten to prove that by monkeypatching to a distinctive value instead
+  of asserting the deployment's current default is wrong.
+
+---
+
 ## [0.8.6] — 2026-07-22
 
 Two independent defects, both traced to live examples on the running graph

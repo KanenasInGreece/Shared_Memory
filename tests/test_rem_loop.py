@@ -556,9 +556,16 @@ def test_search_tier3_query_excludes_superseded():
 
 @pytest.mark.asyncio
 async def test_llm_process_uses_configured_temperature(monkeypatch):
-    """REM must send REM_TEMPERATURE (default 0.6, Gemma-friendly), not a hardcoded 0.1."""
+    """REM must send whatever REM_TEMPERATURE is currently configured to, read
+    from the module constant at call time, not a value hardcoded in the request
+    body. 0.1 is a legitimate configured value (Qwen-class models prefer
+    near-greedy decoding, per REM_TEMPERATURE's own docstring) and must not be
+    asserted against — the invariant is configurability, not any specific
+    number, so the test proves it by monkeypatching to a distinctive value
+    rather than asserting the deployment's current default is/isn't 0.1."""
     daemon, _ = _make_daemon()
     monkeypatch.delenv("MOCK_LLM", raising=False)
+    monkeypatch.setattr(rem_mod, "REM_TEMPERATURE", 0.42)
 
     captured = {}
     class _Resp:
@@ -573,11 +580,7 @@ async def test_llm_process_uses_configured_temperature(monkeypatch):
 
     await daemon._llm_process("some content", rem_mod.KIND_FACT, [], {})
 
-    from rem_loop import REM_TEMPERATURE
-    assert "temperature" in captured
-    assert captured["temperature"] == REM_TEMPERATURE
-    assert captured["temperature"] != 0.1   # no longer the Qwen-tuned constant
-    assert isinstance(REM_TEMPERATURE, float)
+    assert captured.get("temperature") == 0.42
 
 
 @pytest.mark.asyncio
