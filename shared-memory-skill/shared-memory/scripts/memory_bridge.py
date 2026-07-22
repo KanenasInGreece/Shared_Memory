@@ -29,7 +29,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.8.5"
+VERSION = "0.8.6"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v3: review-edges / label-edges require the gateway's /memory/relations/* routes.
@@ -600,6 +600,15 @@ def format_status(payload: dict) -> str:
             lines.append(f"  REM enrichment: {_failing} retrying | "
                          f"{_dead} DEAD-LETTERED at {nj.get('rem_max_attempts','?')} "
                          f"attempts{_warn}")
+        # Fairness gauge (decision 890, STEP 3) — ships dormant (both read 0
+        # until the solo backlog is large enough to re-exercise the
+        # batch-vs-solo yield path); only printed once either climbs above 0,
+        # matching the enrichment-health line's pattern above.
+        _passed_over = nj.get("rem_passed_over_total", 0) or 0
+        _starved = nj.get("rem_starved_pending", 0) or 0
+        if _passed_over or _starved:
+            lines.append(f"  REM fairness: {_passed_over} passed-over event(s) | "
+                         f"{_starved} record(s) at/above starvation threshold")
     # Entity-graph shape (ADR-017). singletons = mentioned by one fact only
     # (fragmentation proxy); aliases climb from 0 once the alias layer ships.
     eg = t.get("entity_graph", {})
