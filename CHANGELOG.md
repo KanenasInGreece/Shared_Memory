@@ -5,6 +5,52 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.8] — 2026-07-23
+
+Full code review + security review of the gateway, both triggered proactively
+(not by an incident). One real authorization bypass, plus every finding the
+review surfaced.
+
+### Security
+
+- **Read-role tokens could reach the LLM/embeddings proxy passthrough.**
+  `_read_role_permits()` granted any path matching `path.startswith("/memory/
+  status/")`, but the real route (`/memory/status/{pg_id}`) has a single-
+  segment dynamic pattern that never spans a `/` — so a crafted path like
+  `/memory/status/1/x` passed the role check while not matching the real
+  route at all, falling through to the catch-all proxy passthrough underneath
+  a "granted" verdict. Confirmed empirically against aiohttp's own compiled
+  `DynamicResource` regex before fixing. Fixed with a `fullmatch` regex
+  mirroring aiohttp's exact `{pg_id}` pattern instead of a prefix check.
+
+### Fixed
+
+- **LM Studio's `save_decision`/`save_retrospective` MCP tools had no way to
+  ground a record in supporting facts or mark a field elicited** — the
+  coordinator has supported both since decision 582/559, but `vector-skill.py`
+  never exposed `grounded_in`/`elicited` params, unlike the CLI skill. Added,
+  matching `memory_bridge.py`'s exact grammar.
+- `handle_retrospective`'s `pg_id` check accepted `bool` (every sibling
+  handler already excluded it).
+- `handle_supersede` now rejects pointing a retraction at an already-
+  superseded successor (a stale multi-hop chain: A -> B -> C where B is
+  itself stale, with no signal to a consumer told "see B").
+- `handle_search`'s per-result Neo4j graph-context expansion was N+1 (up to
+  ~102 sequential queries per call at `limit=100`) — batched into one
+  `UNWIND` + correlated `CALL (pg_id) {...}` subquery, preserving the
+  per-anchor cap exactly. Verified against live data: identical output,
+  old vs. new, for 5 real records.
+- `handle_relations_label`'s per-row ledger fetch was the same N+1 pattern —
+  batched into one `WHERE id = ANY($1)` fetch.
+- `handle_search`'s `limit` and `handle_save`/`handle_retrospective`'s
+  `entities` are now type-checked before use (previously an unhandled
+  TypeError on a malformed value surfaced as a bare 500).
+- Added the self-test the review recommended for `BoundedKeyedLocks`'
+  dependency on `asyncio.Lock`'s undocumented `_waiters` attribute — fails
+  loudly at test time if a future CPython release ever removes it.
+
+---
+
 ## [0.8.7] — 2026-07-23
 
 ### Fixed

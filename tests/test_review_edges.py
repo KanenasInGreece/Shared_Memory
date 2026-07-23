@@ -286,7 +286,7 @@ async def test_review_caps_limit_at_100():
 async def test_label_applies_and_promote_flips_asserted_by():
     c, mock_conn, mock_session = _coordinator_with_mocks()
     row = _entity_row()
-    mock_conn.fetchrow = AsyncMock(return_value=row)
+    mock_conn.fetch = AsyncMock(return_value=[row])
 
     resp = await c.handle_relations_label(_make_request(
         {"labels": {"12": "correct"}, "promote": [12]}))
@@ -310,7 +310,7 @@ async def test_label_applies_and_promote_flips_asserted_by():
 @pytest.mark.asyncio
 async def test_promote_refuses_row_not_labeled_correct():
     c, mock_conn, mock_session = _coordinator_with_mocks()
-    mock_conn.fetchrow = AsyncMock(return_value=_entity_row(operator_label=None))
+    mock_conn.fetch = AsyncMock(return_value=[_entity_row(operator_label=None)])
     resp = await c.handle_relations_label(_make_request({"promote": [12]}))
     out = json.loads(resp.text)["outcomes"]["12"]
     assert out["promoted"] is False and "correct" in out["error"]
@@ -323,7 +323,7 @@ async def test_promote_refuses_row_not_labeled_correct():
 @pytest.mark.asyncio
 async def test_promote_accepts_previously_recorded_correct_label():
     c, mock_conn, mock_session = _coordinator_with_mocks()
-    mock_conn.fetchrow = AsyncMock(return_value=_entity_row(operator_label="correct"))
+    mock_conn.fetch = AsyncMock(return_value=[_entity_row(operator_label="correct")])
     resp = await c.handle_relations_label(_make_request({"promote": [12]}))
     out = json.loads(resp.text)["outcomes"]["12"]
     assert out["promoted"] is True
@@ -336,8 +336,8 @@ async def test_promote_never_interpolates_non_schema_rel_type():
     reject sentinel 'NONE', or a poisoned string) must never reach Cypher."""
     c, mock_conn, mock_session = _coordinator_with_mocks()
     evil = "DEPENDS_ON]->(x) DETACH DELETE x //"
-    mock_conn.fetchrow = AsyncMock(return_value=_entity_row(
-        rel_type=evil, operator_label="correct"))
+    mock_conn.fetch = AsyncMock(return_value=[_entity_row(
+        rel_type=evil, operator_label="correct")])
     resp = await c.handle_relations_label(_make_request({"promote": [12]}))
     out = json.loads(resp.text)["outcomes"]["12"]
     assert out["promoted"] is True and out["edges_updated"] == 0
@@ -350,7 +350,7 @@ async def test_incorrect_label_deletes_only_machine_asserted_edges():
     an operator-asserted edge survives an 'incorrect' label; the ledger row
     is updated, never deleted."""
     c, mock_conn, mock_session = _coordinator_with_mocks()
-    mock_conn.fetchrow = AsyncMock(return_value=_evidential_row())
+    mock_conn.fetch = AsyncMock(return_value=[_evidential_row()])
 
     resp = await c.handle_relations_label(_make_request(
         {"labels": {"33": "incorrect"}}))
@@ -375,8 +375,8 @@ async def test_incorrect_label_deletes_only_machine_asserted_edges():
 @pytest.mark.asyncio
 async def test_incorrect_label_on_reject_verdict_touches_no_edge():
     c, mock_conn, mock_session = _coordinator_with_mocks()
-    mock_conn.fetchrow = AsyncMock(return_value=_entity_row(
-        rel_type="NONE", verdict="reject"))
+    mock_conn.fetch = AsyncMock(return_value=[_entity_row(
+        rel_type="NONE", verdict="reject")])
     resp = await c.handle_relations_label(_make_request(
         {"labels": {"12": "incorrect"}}))
     out = json.loads(resp.text)["outcomes"]["12"]
@@ -398,9 +398,36 @@ async def test_label_validation_errors():
 
 
 @pytest.mark.asyncio
+async def test_label_batches_ledger_fetch_into_one_query():
+    """Code-review finding: both loops re-fetched each ledger row individually
+    (fetchrow per id) rather than one `WHERE id = ANY($1)` fetch. With 2 label
+    rows and 1 promote row (one id, 12, shared by both labels and promote — it
+    must be fetched exactly once, not twice), conn.fetch must be called
+    exactly ONCE for the ledger rows, not per-row."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+    rows = [
+        _entity_row(id=12, operator_label="correct"),
+        _evidential_row(id=33),
+    ]
+    mock_conn.fetch = AsyncMock(return_value=rows)
+
+    resp = await c.handle_relations_label(_make_request(
+        {"labels": {"33": "correct"}, "promote": [12]}))
+
+    assert resp.status == 200
+    out = json.loads(resp.text)["outcomes"]
+    assert out["33"]["labeled"] == "correct"
+    assert out["12"]["promoted"] is True
+    # Exactly one batched ledger fetch, covering the union of both loops' ids.
+    assert mock_conn.fetch.await_count == 1
+    fetched_ids = mock_conn.fetch.await_args.args[1]
+    assert sorted(fetched_ids) == [12, 33]
+
+
+@pytest.mark.asyncio
 async def test_label_missing_row_reports_per_row_error():
     c, mock_conn, _ = _coordinator_with_mocks()
-    mock_conn.fetchrow = AsyncMock(return_value=None)
+    mock_conn.fetch = AsyncMock(return_value=[])   # batched fetch: no row for id 999
     resp = await c.handle_relations_label(_make_request(
         {"labels": {"999": "correct"}}))
     assert resp.status == 200

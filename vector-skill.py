@@ -64,7 +64,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # a warning (coordinator._check_client_version) if they disagree.
 # v3: review_edges / label_edges require the gateway's /memory/relations/* routes.
 API_VERSION = 3
-VERSION = "0.8.7"
+VERSION = "0.8.8"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server
@@ -358,6 +358,8 @@ async def save_decision(
     alternatives: str = "",
     confidence: str = "",
     entities: str = "",
+    grounded_in: str = "",
+    elicited: bool = False,
 ) -> str:
     """
     Save an architectural or design decision with full PROV-O provenance.
@@ -367,6 +369,10 @@ async def save_decision(
 
     Required: title, decided_by, project, rationale, source (loaded model name).
     Optional: assisted_by, alternatives, confidence, entities — all comma-separated.
+    grounded_in: pg_ids this decision rests on, "pgid[:role],pgid" — role one of
+    based_on/considered/rejected/under_conditions/informed_by (bare id picks the
+    fact's kind-derived default). elicited: set True when the operator was asked
+    for these fields (drives spine-coverage telemetry, decision 559).
     """
     decision_data: dict = {
         "title": title,
@@ -388,6 +394,29 @@ async def save_decision(
         "entities": [e.strip() for e in entities.split(",") if e.strip()],
         "decision": decision_data,
     }
+    # grounded_in: same "pgid[:role],pgid" grammar as memory_bridge.py's
+    # build_decision_metadata — materialised as typed (:Decision)-[:ROLE]->
+    # (:Fact|:Decision) edges by the outbox worker.
+    gi: list = []
+    grounded_roles: dict = {}
+    for tok in grounded_in.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        pid_str, _, role = tok.partition(":")
+        pid_str = pid_str.strip()
+        if not pid_str.isdigit():
+            continue
+        pid = int(pid_str)
+        gi.append(pid)
+        if role.strip():
+            grounded_roles[str(pid)] = role.strip().lower()
+    if gi:
+        metadata["grounded_in"] = gi
+    if grounded_roles:
+        metadata["grounded_roles"] = grounded_roles
+    if elicited:
+        metadata["elicited"] = True
     content = f"{title}\n\n{rationale}"
 
     coordinator_url = COORDINATOR_BASE
@@ -425,6 +454,8 @@ async def save_retrospective(
     notes: str,
     source: str,
     date: str = "",
+    grounded_in: str = "",
+    elicited: bool = False,
 ) -> str:
     """
     Record an outcome for an existing Decision as a full retrospective record
@@ -438,7 +469,10 @@ async def save_retrospective(
     Required: pg_id (returned by save_decision), rating, notes, source.
     rating is a closed outcome-state enum: validated | mixed | refined |
     pending | reversed ('reversed' supersedes the decision; nuance goes in notes).
-    Optional: date (ISO string, default: today).
+    Optional: date (ISO string, default: today). grounded_in: pg_ids of the facts
+    that MEASURED this outcome, same "pgid[:role],pgid" grammar as save_decision
+    (test-grounded retrospectives, decision 542). elicited: set True when the
+    operator was asked for these fields.
     """
     coordinator_url = COORDINATOR_BASE
     agent_id = os.environ.get("AGENT_ID", "lm_studio")
@@ -450,6 +484,26 @@ async def save_retrospective(
         "date": date or datetime.now().date().isoformat(),
         "agent_id": source or agent_id,
     }
+    gi: list = []
+    grounded_roles: dict = {}
+    for tok in grounded_in.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        pid_str, _, role = tok.partition(":")
+        pid_str = pid_str.strip()
+        if not pid_str.isdigit():
+            continue
+        pid = int(pid_str)
+        gi.append(pid)
+        if role.strip():
+            grounded_roles[str(pid)] = role.strip().lower()
+    if gi:
+        payload["grounded_in"] = gi
+    if grounded_roles:
+        payload["grounded_roles"] = grounded_roles
+    if elicited:
+        payload["elicited"] = True
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:

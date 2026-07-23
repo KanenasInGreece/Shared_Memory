@@ -148,7 +148,10 @@ async def test_expansion_anchors_fact_decision_and_retrospective():
     """The expansion Cypher must anchor on Fact OR Decision OR Retrospective —
     Decision and Retrospective results get graph context, not just Facts."""
     c, mock_conn, mock_session = _coordinator_with_mocks()
-    rows = [_row(labels=["Retrospective"], name=None, pg_id=719,
+    # handle_search now batches all ranked hits' expansion into ONE Neo4j call
+    # (_expand_graph_context_batch) — rows carry anchor_pg_id (the grouping
+    # key) plus rel_pg_id for the related node's own id.
+    rows = [_row(labels=["Retrospective"], name=None, anchor_pg_id=577, rel_pg_id=719,
                  rel_type="HAD_OUTCOME", direction="in",
                  rel_props={"trigger": True}, snippet="held up well")]
     mock_reranker = _search_mocks(c, mock_session, [rows])
@@ -168,7 +171,54 @@ async def test_expansion_anchors_fact_decision_and_retrospective():
     assert f"n:{ont.fact}" in cypher
     assert f"n:{ont.decision}" in cypher
     assert f"n:{ont.retrospective}" in cypher
-    assert mock_session.run.await_args_list[0].kwargs["pg_id"] == 577
+    assert mock_session.run.await_args_list[0].kwargs["pg_ids"] == [577]
+
+
+# ── batched expansion — one Neo4j round-trip per search, not one per result ──
+
+@pytest.mark.asyncio
+async def test_search_expansion_is_batched_not_one_call_per_hit():
+    """Code-review finding: handle_search issued one _expand_graph_context
+    round-trip PER Tier-1 hit (an N+1 pattern, up to ~102 sequential queries
+    at limit=100). With 3 ranked hits, Neo4j must be called exactly ONCE for
+    the fact/decision/retrospective expansion — via UNWIND, not a loop — and
+    each hit's graph_context must still be attributed to the right anchor."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+
+    mock_conn.fetch = AsyncMock(return_value=[
+        {"id": 1, "content": "fact one",   "metadata": {"entities": [], "source": "claude"}},
+        {"id": 2, "content": "fact two",   "metadata": {"entities": [], "source": "claude"}},
+        {"id": 3, "content": "fact three", "metadata": {"entities": [], "source": "claude"}},
+    ])
+    # One batched result set covering all three anchors, out of anchor order
+    # (2, then 1, then 3) to prove grouping is by anchor_pg_id, not row order.
+    rows = [
+        _row(labels=["Entity"], name="B", anchor_pg_id=2, rel_type="MENTIONS"),
+        _row(labels=["Entity"], name="A", anchor_pg_id=1, rel_type="MENTIONS"),
+        _row(labels=["Entity"], name="C", anchor_pg_id=3, rel_type="MENTIONS"),
+        _row(labels=["Entity"], name="A2", anchor_pg_id=1, rel_type="MENTIONS"),
+    ]
+    mock_session.run = AsyncMock(return_value=_AsyncRows(rows))
+
+    mock_reranker = MagicMock()
+    mock_reranker.raise_for_status = MagicMock()
+    mock_reranker.json = MagicMock(return_value={"results": [
+        {"index": 0, "relevance_score": 3.0},
+        {"index": 1, "relevance_score": 2.0},
+        {"index": 2, "relevance_score": 1.0},
+    ]})
+
+    results = await _run_search(c, mock_reranker, "three facts")
+
+    # Exactly one Neo4j round-trip for the whole batch of 3 hits — not 3.
+    assert mock_session.run.await_count == 1
+    called_pg_ids = mock_session.run.await_args.kwargs["pg_ids"]
+    assert sorted(called_pg_ids) == [1, 2, 3]
+
+    by_pg_id = {r["pg_id"]: r for r in results if r["tier"] == "fact"}
+    assert {e["name"] for e in by_pg_id[1]["graph_context"]} == {"A", "A2"}
+    assert {e["name"] for e in by_pg_id[2]["graph_context"]} == {"B"}
+    assert {e["name"] for e in by_pg_id[3]["graph_context"]} == {"C"}
 
 
 # ── (b) pg_id-keyed neighbors are never dropped ───────────────────────────────
@@ -376,12 +426,15 @@ async def test_summary_result_carries_pgid_and_populated_graph_context():
     ])
 
     summary_rows = [
-        _row(labels=["Fact"], name=None, pg_id=42, rel_type="SUMMARIZED_BY",
+        _row(labels=["Fact"], name=None, anchor_pg_id=88, rel_pg_id=42,
+             rel_type="SUMMARIZED_BY",
              direction="in", rel_props={}, snippet="outbox rows are atomic"),
-        _row(labels=["Fact"], name=None, pg_id=43, rel_type="SUMMARIZED_BY",
+        _row(labels=["Fact"], name=None, anchor_pg_id=88, rel_pg_id=43,
+             rel_type="SUMMARIZED_BY",
              direction="in", rel_props={}, snippet="worker applies async"),
     ]
-    # session.run call order: summary walk first, then the fact expansion
+    # session.run call order: batched summary walk first, then the batched
+    # fact expansion (both are single calls now, not one-per-record).
     mock_reranker = _search_mocks(c, mock_session, [summary_rows, []])
 
     results = await _run_search(c, mock_reranker, "outbox pattern")
@@ -397,7 +450,7 @@ async def test_summary_result_carries_pgid_and_populated_graph_context():
     # the walk anchored on the CommunitySummary label with the summary's id
     walk_call = mock_session.run.await_args_list[0]
     assert f"n:{coordinator_mod.ONT.community_summary}" in walk_call.args[0]
-    assert walk_call.kwargs["pg_id"] == 88
+    assert walk_call.kwargs["pg_ids"] == [88]
 
 
 @pytest.mark.asyncio
@@ -413,7 +466,7 @@ async def test_insight_summary_also_carries_pgid_and_walks_graph():
     mock_conn.fetch = AsyncMock(return_value=[
         {"id": 1, "content": "fact", "metadata": {"entities": [], "source": "claude"}},
     ])
-    ins_rows = [_row(labels=["Decision"], name=None, pg_id=245,
+    ins_rows = [_row(labels=["Decision"], name=None, anchor_pg_id=91, rel_pg_id=245,
                      rel_type="SUMMARIZED_BY", direction="in",
                      rel_props={}, snippet="we decided the outbox")]
     mock_reranker = _search_mocks(c, mock_session, [ins_rows, []])
