@@ -111,6 +111,23 @@ DEFAULT_TARGET = os.environ.get("LLM_DEFAULT_TARGET", "http://localhost:5000")
 # meaningless), NOT a gateway queue (forward-and-absorb into llama.cpp's own slot
 # queue keeps the gateway stateless). A backend that fails twice in a window is put
 # in cooldown; requests retry on the next-best backend — one card always serves.
+#
+# LLM_BACKENDS_JSON is the preferred form when any backend needs its own
+# credential (a paid cloud API, e.g. DeepSeek/xAI) or its own model id — the
+# plain comma form above has no way to carry either. It takes priority over
+# LLM_BACKENDS when set:
+#   LLM_BACKENDS_JSON=[{"url":"http://localhost:5000"},
+#                       {"url":"https://api.deepseek.com/v1",
+#                        "token_env":"DEEPSEEK_API_KEY","model":"deepseek-chat"}]
+# `token_env` names an env var the gateway PROCESS must already have — never a
+# literal secret. The gateway resolves it once at startup and, for every request
+# routed to that backend, sets Authorization from it — the client's own
+# Authorization (its gateway auth token) is never forwarded to any backend, see
+# _filter_headers. A configured token_env that isn't actually set excludes that
+# backend from the pool (loud, at startup) rather than sending a doomed request.
+# `model` overrides the global LLM_MODEL for that backend only — see the model
+# rewrite in handle_proxy. See shared-memory/ops/README.md for how to get the
+# named var into the gateway's process env (systemd EnvironmentFile, etc.).
 def _parse_backend(entry: str) -> tuple[str, float]:
     url, _, w = entry.strip().partition("@")
     try:
@@ -120,11 +137,55 @@ def _parse_backend(entry: str) -> tuple[str, float]:
     return url.rstrip("/"), max(weight, 0.1)
 
 
-_raw_backends = [_parse_backend(e) for e in os.environ.get("LLM_BACKENDS", "").split(",") if e.strip()]
-if not _raw_backends:
-    _raw_backends = [(DEFAULT_TARGET, 1.0)]
-LLM_BACKENDS: list[str] = [u for u, _ in _raw_backends]
-LLM_WEIGHTS: dict[str, float] = {u: w for u, w in _raw_backends}
+def _load_llm_backends() -> tuple[list[str], dict[str, float], dict[str, "str | None"], dict[str, "str | None"]]:
+    raw_json = os.environ.get("LLM_BACKENDS_JSON", "").strip()
+    if raw_json:
+        try:
+            entries = json.loads(raw_json)
+            if not isinstance(entries, list):
+                raise ValueError("LLM_BACKENDS_JSON must be a JSON array")
+        except (json.JSONDecodeError, ValueError) as e:
+            log.error("LLM_BACKENDS_JSON invalid (%s) — falling back to LLM_BACKENDS/LLM_DEFAULT_TARGET", e)
+            entries = []
+        urls: list[str] = []
+        weights: dict[str, float] = {}
+        tokens: dict[str, "str | None"] = {}
+        models: dict[str, "str | None"] = {}
+        for entry in entries:
+            url = str(entry.get("url", "")).rstrip("/")
+            if not url:
+                continue
+            token_env = entry.get("token_env")
+            token = None
+            if token_env:
+                token = os.environ.get(token_env)
+                if not token:
+                    log.warning(
+                        "LLM backend %s configured with token_env=%s but that "
+                        "variable is not set in the gateway's own environment — "
+                        "excluding this backend from the pool.", url, token_env)
+                    continue
+            urls.append(url)
+            weights[url] = max(float(entry.get("weight", 1.0) or 1.0), 0.1)
+            tokens[url] = token
+            models[url] = entry.get("model") or None
+        if urls:
+            return urls, weights, tokens, models
+        log.error("LLM_BACKENDS_JSON produced no usable backend — falling back to LLM_BACKENDS/LLM_DEFAULT_TARGET")
+
+    _raw_backends = [_parse_backend(e) for e in os.environ.get("LLM_BACKENDS", "").split(",") if e.strip()]
+    if not _raw_backends:
+        _raw_backends = [(DEFAULT_TARGET, 1.0)]
+    urls = [u for u, _ in _raw_backends]
+    weights = {u: w for u, w in _raw_backends}
+    return urls, weights, {u: None for u in urls}, {u: None for u in urls}
+
+
+LLM_BACKENDS: list[str]
+LLM_WEIGHTS: dict[str, float]
+LLM_BACKEND_TOKENS: dict[str, "str | None"]
+LLM_BACKEND_MODELS: dict[str, "str | None"]
+LLM_BACKENDS, LLM_WEIGHTS, LLM_BACKEND_TOKENS, LLM_BACKEND_MODELS = _load_llm_backends()
 
 # Failure/cooldown (advisor spec): N fails within a window → cooldown; re-probed
 # (a normal request) after it elapses. A success clears the fail streak.
@@ -340,11 +401,17 @@ class AsyncHiveMindProxy:
             log.info("Upstream client session closed.")
 
     def _filter_headers(self, headers) -> dict:
-        """Strip hop-by-hop and Host headers.
-        Applied identically to both request (→ upstream) and response (→ client)."""
+        """Strip hop-by-hop, Host, and Authorization headers.
+        Applied identically to both request (→ upstream) and response (→ client).
+        Authorization is never forwarded: what a client sends here is its OWN
+        gateway auth token (see coordinator.auth_middleware) — a credential
+        scoped to talking to the gateway, not to whatever sits behind it. A
+        backend that needs its own credential (a paid cloud API) gets one
+        added back explicitly in handle_proxy, from LLM_BACKENDS_JSON's
+        token_env — never from what the client happened to send."""
         return {
             k: v for k, v in headers.items()
-            if k.lower() not in HOP_BY_HOP and k.lower() != "host"
+            if k.lower() not in HOP_BY_HOP and k.lower() not in ("host", "authorization")
         }
 
     async def handle_proxy(self, request: web.Request) -> web.StreamResponse:
@@ -369,10 +436,31 @@ class AsyncHiveMindProxy:
             llm_backend = _select_llm_backend(role, _affinity_key(llm_body))
             target_base = llm_backend
 
+            # Per-backend model override (LLM_BACKENDS_JSON "model") — a cloud
+            # endpoint needs its real model id, not the local "local-model"
+            # every caller sends by default. Best-effort: an unparseable body
+            # is forwarded unchanged rather than dropped.
+            backend_model = LLM_BACKEND_MODELS.get(llm_backend)
+            if backend_model:
+                try:
+                    payload = json.loads(llm_body)
+                    if isinstance(payload, dict) and "model" in payload:
+                        payload["model"] = backend_model
+                        llm_body = json.dumps(payload).encode("utf-8")
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    log.warning("Could not apply model override for %s — forwarding body unchanged", llm_backend)
+
         target_url = f"{target_base}{request.rel_url}"
         log.debug("→ %s %s", request.method, target_url)
 
         upstream_headers = self._filter_headers(request.headers)
+        # Authorization was just stripped above (see _filter_headers) — add it
+        # back ONLY for a backend that has its own configured credential. Every
+        # other backend (local, or one with no token_env) gets none, same as today.
+        if llm_backend is not None:
+            backend_token = LLM_BACKEND_TOKENS.get(llm_backend)
+            if backend_token:
+                upstream_headers["Authorization"] = f"Bearer {backend_token}"
 
         # Stream the request body directly to the upstream without buffering it
         # into a single byte array first, UNLESS it's small enough that buffering
