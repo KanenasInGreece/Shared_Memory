@@ -5,6 +5,50 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.10] — 2026-07-23
+
+### Security
+
+- `GET /health`'s `config.llm_backends` now carries `has_credential` (bool)
+  and `model` per backend — tracked regardless of whether an external/paid
+  backend is actually configured, so the capability is monitor-visible from
+  the moment it exists. Gated behind a valid gateway bearer token: an
+  anonymous caller still sees only `url`/`weight`, unchanged from before. The
+  raw token itself is never exposed to any caller — verified by forcing real
+  `ClientError`/`TimeoutError`/generic `Exception` paths through the proxy
+  with a real token configured and inspecting the actual client-visible
+  response.
+- `LLM_BACKENDS_JSON` now **rejects** a literal `token`/`api_key`/`secret`/
+  `key` field instead of silently ignoring it — that backend is excluded
+  from the pool with a loud, specific log line, rather than the real secret
+  sitting in plaintext in whatever file holds the config while the backend
+  silently gets no credential either way.
+- Verified empirically, for both token types (gateway access tokens and LLM
+  API tokens), that neither can leak through telemetry or the audit log —
+  new tests drive real requests through the actual code paths (including a
+  full flush-and-grep of the async audit-log writer) rather than relying on
+  code review alone.
+
+### Added
+
+- **`shared-memory/ops/install_service.sh`** — installs
+  `hive-mind-gateway.service`, substitutes `WorkingDirectory`/`Documentation`
+  for the actual checkout (converts an SSH `origin` remote to a browsable
+  `https://` URL), `daemon-reload`, `enable --now`, `loginctl enable-linger`.
+  Idempotent, offered as a prompt at the end of `install_framework.sh`.
+- **`shared-memory/ops/install_llm_backends.sh`** — interactive per-backend
+  wizard: URL, optional local systemd supervision (takes the operator's own
+  launch command, never constructs one), optional credential (only the
+  env-var **name**, with a shape-validated rejection loop that catches a
+  pasted literal key). Writes `LLM_BACKENDS_JSON`, replacing cleanly on
+  re-run. Also offered from `install_framework.sh`.
+- `AGENTS.md`, `README.md`, and `shared-memory/ops/README.md` updated so the
+  never-write-a-raw-key-to-a-file convention is enforced at every surface an
+  operator or an operating agent actually touches, not just documented in
+  one place.
+
+---
+
 ## [0.8.9] — 2026-07-23
 
 ### Security
