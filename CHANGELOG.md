@@ -5,6 +5,41 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.9] — 2026-07-23
+
+### Security
+
+- **The proxy forwarded a client's own gateway-auth `Authorization` header
+  verbatim to whatever LLM backend served a request.** Local llama.cpp
+  backends ignore unknown headers so this was invisible, but a client's
+  internal gateway token would leak to any external backend added to the
+  pool — and could never have been a valid credential for one anyway.
+  `_filter_headers` now strips `Authorization` unconditionally for every
+  proxied request (LLM pool, embedder, reranker, both retry attempts).
+
+### Added
+
+- **`LLM_BACKENDS_JSON`** — lets a reasoning-LLM backend carry its own
+  `token_env` (an env var *name*, resolved from the gateway's own process
+  environment at startup — never a literal secret written to `.env` or any
+  file) and its own `model` id override, injected only for that backend,
+  never from the client. This is what makes a real external/cloud LLM
+  (tested live against DeepSeek's API) a genuinely supported pool member
+  alongside local hardware backends, rather than a silent misconfiguration.
+  The plain `LLM_BACKENDS` comma form keeps working unchanged for anyone who
+  doesn't need this. A `token_env` naming an unset variable excludes that
+  backend from the pool at startup (logged) rather than sending a doomed
+  request; the pool always falls back to a usable backend, so an all-LLM-
+  down state degrades to per-request 503/504 on the reasoning endpoint only
+  — save/search never touch this pool.
+- `shared-memory/ops/README.md` documents the credential-handling
+  convention: keep the raw key in an encrypted store (e.g. `pass`,
+  GPG-backed), export it in the shell, bridge into the systemd `--user`
+  manager with `systemctl --user import-environment` — never write it to a
+  file this framework manages.
+
+---
+
 ## [0.8.8] — 2026-07-23
 
 Full code review + security review of the gateway, both triggered proactively
