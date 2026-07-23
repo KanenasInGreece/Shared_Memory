@@ -19,6 +19,18 @@ decouples the gateway's lifetime from any login session.
 ### Install
 
 ```bash
+bash shared-memory/ops/install_service.sh
+```
+
+Idempotent — substitutes the unit's `WorkingDirectory`/`Documentation` for this
+checkout, `daemon-reload`s, `enable --now`s, and runs `loginctl enable-linger`,
+then prints the verify/log commands. `install_framework.sh` also offers this as
+a prompt at the end of first-time setup. Safe to re-run any time (e.g. after
+moving the repo).
+
+Equivalent by hand, if you'd rather see every step:
+
+```bash
 # 1. Edit the unit: set WorkingDirectory to your repo root and the Documentation URL.
 cp shared-memory/ops/hive-mind-gateway.service ~/.config/systemd/user/
 
@@ -46,10 +58,22 @@ step is what makes it survive logout and reboot.
 
 ## Reasoning-LLM backends (`LLM_BACKENDS_JSON`) — credentials, never in a file
 
-`LLM_BACKENDS_JSON` (see `shared-memory/.env.example`) lets the gateway route to
-more than one reasoning LLM, local or remote, including a paid cloud API. Each
-entry is a URL plus an optional `token_env` — the **name** of an env var, never
-a literal key:
+```bash
+bash shared-memory/ops/install_llm_backends.sh
+```
+
+Interactive, per backend: URL, whether this machine should supervise it as a
+systemd service (takes *your* launch command — it won't construct one, GPUs
+and models vary too much), and whether it needs a credential — if so, it takes
+**only** the env-var name, with a shape check that rejects anything that looks
+like a pasted literal key rather than a name. Writes `LLM_BACKENDS_JSON` below.
+Safe to re-run (each run replaces the line fresh). `install_framework.sh` also
+offers this as a prompt at the end of first-time setup.
+
+By hand: `LLM_BACKENDS_JSON` (see `shared-memory/.env.example`) lets the
+gateway route to more than one reasoning LLM, local or remote, including a
+paid cloud API. Each entry is a URL plus an optional `token_env` — the **name**
+of an env var, never a literal key:
 
 ```json
 LLM_BACKENDS_JSON=[{"url":"http://localhost:5000"},
