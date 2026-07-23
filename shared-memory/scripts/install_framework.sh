@@ -56,9 +56,25 @@ echo "✓ Wrote $ENV_FILE (chmod 600) and created data dirs."
 echo "  Confirm it is gitignored:   git -C \"$REPO_DIR\" check-ignore shared-memory/.env"
 echo "  Bring up the stack:         docker compose -f \"$REPO_DIR/postgres_neo4j_limits.yaml\" --env-file \"$ENV_FILE\" up -d"
 echo "  Then mint client tokens:    uv run python shared-memory/scripts/generate_tokens.py"
+
 echo
-echo "  Using a PAID/cloud reasoning-LLM backend (DeepSeek, xAI, OpenRouter, ...)?"
-echo "  Its API key is NEVER pasted into $ENV_FILE or any file this framework writes —"
-echo "  see shared-memory/ops/README.md, \"Reasoning-LLM backends\", for the LLM_BACKENDS_JSON"
-echo "  / token_env convention (encrypted store -> shell export -> systemctl --user"
-echo "  import-environment). There is no automated wizard for this yet — follow that doc by hand."
+if command -v systemctl >/dev/null 2>&1; then
+  read -r -p "Install the gateway as a systemd --user service now (auto-start on boot, clean shutdown, no manual restart step)? [Y/n] " svc_yn
+  if [[ ! "${svc_yn:-Y}" =~ ^[Nn]$ ]]; then
+    bash "$FRAMEWORK_DIR/ops/install_service.sh"
+  else
+    echo "  Skipped. Install later:      bash shared-memory/ops/install_service.sh"
+  fi
+else
+  echo "  systemd not found — skipping the service-install prompt. The gateway still"
+  echo "  runs fine started by hand; it just won't survive logout/reboot without one."
+fi
+
+echo
+read -r -p "Configure reasoning-LLM backend(s) now (local, remote, or a paid cloud API)? [y/N] " llm_yn
+if [[ "${llm_yn:-N}" =~ ^[Yy]$ ]]; then
+  bash "$FRAMEWORK_DIR/ops/install_llm_backends.sh"
+else
+  echo "  Skipped. A single default backend at LLM_DEFAULT_TARGET (http://localhost:5000)"
+  echo "  is used until you configure one:  bash shared-memory/ops/install_llm_backends.sh"
+fi
