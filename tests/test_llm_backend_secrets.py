@@ -131,6 +131,134 @@ def test_all_json_backends_excluded_falls_back_not_crashes(monkeypatch):
     assert g._select_llm_backend("", None)           # does not raise
 
 
+class _HealthProbeResp:
+    status = 200
+
+
+class _HealthProbeCm:
+    async def __aenter__(self):
+        return _HealthProbeResp()
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _HealthProbeSession:
+    """No real network — every probe (/health, /v1/models) just reports 200."""
+    def get(self, url, timeout=None):
+        return _HealthProbeCm()
+
+
+def _health_request(headers):
+    """Minimal stand-in for aiohttp.web.Request as handle_health uses it —
+    mirrors the MagicMock pattern in test_backup_quiesce.py's
+    test_health_surfaces_backup_in_progress."""
+    class _Req:
+        pass
+    req = _Req()
+    req.headers = headers
+    req.app = {"proxy": None}  # patched in below
+    return req
+
+
+def test_health_config_hides_credential_fields_from_unauthenticated_caller(monkeypatch):
+    """/health itself stays unauthenticated (liveness must work without a token) —
+    but a caller presenting no valid bearer token must not learn which backend
+    has a live paid credential attached."""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-should-never-leak")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "model": "deepseek-chat"},
+    ]))
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    import coordinator
+    coordinator._AGENT_TOKENS.clear()          # no valid token exists at all
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _HealthProbeSession()
+    req = _health_request({})                  # no Authorization header
+    req.app = {"proxy": proxy}
+
+    body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
+    entry = body["config"]["llm_backends"][0]
+    assert entry["url"] == "https://api.deepseek.com/v1"
+    assert "has_credential" not in entry
+    assert "model" not in entry
+    assert "sk-should-never-leak" not in json.dumps(body)
+
+
+def test_health_config_shows_bool_and_model_for_authenticated_caller_never_the_token(monkeypatch):
+    """A caller WITH a valid gateway bearer token may see has_credential (bool)
+    and the model override -- but never the raw token value, under any caller."""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-should-never-leak")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "model": "deepseek-chat"},
+        {"url": "http://localhost:5000"},
+    ]))
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    import coordinator
+    coordinator._AGENT_TOKENS.clear()
+    coordinator._AGENT_TOKENS["tok_valid_test"] = "claude"
+    try:
+        proxy = g.AsyncHiveMindProxy()
+        proxy.session = _HealthProbeSession()
+        req = _health_request({"Authorization": "Bearer tok_valid_test"})
+        req.app = {"proxy": proxy}
+
+        body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
+        by_url = {e["url"]: e for e in body["config"]["llm_backends"]}
+        assert by_url["https://api.deepseek.com/v1"]["has_credential"] is True
+        assert by_url["https://api.deepseek.com/v1"]["model"] == "deepseek-chat"
+        assert by_url["http://localhost:5000"]["has_credential"] is False
+        assert by_url["http://localhost:5000"]["model"] is None
+        # The raw secret must never appear anywhere in the response, authenticated or not.
+        assert "sk-should-never-leak" not in json.dumps(body)
+    finally:
+        coordinator._AGENT_TOKENS.clear()
+
+
+class _FailSession:
+    """Raises a given exception on every .request() -- models what a real
+    unreachable/erroring backend looks like, so error-path RESPONSES (what a
+    valid, full-access agent token actually sees back) can be inspected for a
+    leaked secret, not just the outbound call. This is the realistic threat:
+    a legitimate coder's agent, possibly reaching the gateway remotely over an
+    SSH tunnel (a supported topology, see SKILL.md 10a), not an anonymous
+    attacker -- so every client-visible surface, including error bodies and
+    response headers, must never carry the raw token, only its own gateway
+    identity is ever meant to be visible to it."""
+    closed = False
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def request(self, *a, **kw):
+        raise self._exc
+
+
+def test_token_never_leaks_into_client_visible_error_response(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-must-never-appear-to-any-client")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "model": "deepseek-chat"},
+    ]))
+    import hive_mind_proxy as g
+    importlib.reload(g)
+
+    for exc in (
+        g.ClientError("connection refused"),
+        asyncio.TimeoutError(),
+        RuntimeError("some unexpected failure mentioning the request object"),
+    ):
+        proxy = g.AsyncHiveMindProxy()
+        proxy.session = _FailSession(exc)
+        resp = asyncio.run(proxy.handle_proxy(_Req()))
+        assert resp.status in (503, 504, 500)
+        assert "sk-must-never-appear-to-any-client" not in resp.body.decode()
+        assert all("sk-must-never-appear-to-any-client" not in str(v)
+                   for v in resp.headers.values())
+
+
 def test_embedder_target_never_gets_authorization_either(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
     monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
