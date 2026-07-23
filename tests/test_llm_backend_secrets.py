@@ -84,6 +84,26 @@ def test_missing_token_env_excludes_backend_not_silently_unauthenticated(monkeyp
     assert "https://api.x.ai/v1" not in g.LLM_BACKENDS
 
 
+def test_literal_secret_field_rejected_not_silently_dropped(monkeypatch):
+    """A mistaken raw "token"/"api_key" field (instead of token_env) must exclude
+    that backend loudly, not silently strip the field and leave it tokenless --
+    the whole point is to catch the exact mistake that would otherwise put a
+    real secret in a file this framework reads (.env / an EnvironmentFile)."""
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://local:5000"},
+        {"url": "https://api.deepseek.com/v1", "token": "sk-oops-a-literal-secret"},
+        {"url": "https://api.x.ai/v1", "api_key": "xai-oops-another-literal-secret"},
+    ]))
+    import hive_mind_proxy as g
+    importlib.reload(g)
+
+    assert g.LLM_BACKENDS == ["http://local:5000"]
+    assert "https://api.deepseek.com/v1" not in g.LLM_BACKENDS
+    assert "https://api.x.ai/v1" not in g.LLM_BACKENDS
+    assert "sk-oops-a-literal-secret" not in (g.LLM_BACKEND_TOKENS.values())
+    assert "xai-oops-another-literal-secret" not in (g.LLM_BACKEND_TOKENS.values())
+
+
 def test_legacy_llm_backends_unaffected_when_json_unset(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
     monkeypatch.setenv("LLM_BACKENDS", "http://a:5000@2,http://b:4000")

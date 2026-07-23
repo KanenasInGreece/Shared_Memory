@@ -640,7 +640,9 @@ The reasoning LLM behind `/v1/chat/completions` can be a **single** OpenAI-compa
 - Unset `LLM_BACKENDS` → a single backend, behaviour identical to a classic single-server setup (its address is `LLM_DEFAULT_TARGET`, so a server on a different port needs no code change).
 - `LLM_MODEL` sets the model name sent on every reasoning call. The default suits servers that ignore that field; set the real id for anything that validates it — a named-model server, a routing proxy, a hosted OpenAI-compatible endpoint, or a desktop app with several models loaded.
 
-`GET /health` reports the pool (`llm`, and per-backend `llm_pool` with weight, in-flight, requests routed, failures, and cooldown) so the realised load split is observable.
+**A pool member can be a paid cloud API, not just local/self-hosted hardware** — `LLM_BACKENDS_JSON` (in place of the plain `LLM_BACKENDS` above) lets any entry carry its own `token_env` (the **name** of an env var the gateway resolves from its own process environment at startup) and its own `model` override. The literal key is never written to `.env`, a systemd unit, or any file this framework manages — see `shared-memory/ops/README.md`, "Reasoning-LLM backends", for the full credential-handling convention (an encrypted secret store, exported in the shell, bridged into the gateway's systemd `--user` manager with `systemctl --user import-environment`). A `token_env` naming a variable that isn't actually set excludes that one backend from the pool at startup (logged), rather than sending a request with no valid credential.
+
+`GET /health` reports the pool (`llm`, and per-backend `llm_pool` with weight, in-flight, requests routed, failures, and cooldown) so the realised load split is observable. An **authenticated** caller additionally sees `has_credential` (bool) and `model` per backend in `config.llm_backends` — never the credential itself; an anonymous caller sees only `url`/`weight`, same as before `LLM_BACKENDS_JSON` existed.
 
 ### From ThreadingHTTPServer to async aiohttp — why streaming required a rewrite
 
