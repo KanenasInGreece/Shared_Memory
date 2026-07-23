@@ -149,6 +149,25 @@ async def test_plain_fact_save_skips_decision_validation():
 
 
 @pytest.mark.asyncio
+async def test_handle_save_rejects_non_list_entities():
+    """metadata.entities must be a list. A string silently iterated per-
+    character (nonsensical, one lock per char); a non-iterable (e.g. an int)
+    raised an unhandled TypeError from set(entities) — a bare 500 instead of
+    the clean 400 every other malformed-metadata path in this handler returns.
+    Must 400 before ever reaching the embedder."""
+    c, _, _ = _coordinator_with_mocks()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)) as mock_embed:
+        for bad in ("SharedMemory", 42, {"a": 1}):
+            req = _make_request({
+                "content": "some content",
+                "metadata": {"source": "claude", "entities": bad},
+            })
+            resp = await c.handle_save(req)
+            assert resp.status == 400, f"entities={bad!r} should 400, got {resp.status}"
+        mock_embed.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_valid_decision_save_passes_validation():
     c, mock_conn, _ = _coordinator_with_mocks()
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
@@ -407,6 +426,86 @@ async def test_handle_retrospective_missing_fields_returns_400():
     assert body["status"] == "error"
 
 
+@pytest.mark.asyncio
+async def test_handle_retrospective_rejects_bool_pg_id():
+    """bool is an int subclass in Python (isinstance(True, int) is True) — every
+    sibling handler (handle_save's supersedes, handle_supersede's pg_id/by,
+    handle_review_hold's summary_id/pg_id) explicitly excludes it. This one
+    didn't: {"pg_id": true, ...} must 400, not reach the DB with a bool bound
+    to an integer column."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+
+    req = _make_request({"pg_id": True, "rating": "validated", "notes": "n"})
+    resp = await c.handle_retrospective(req)
+    assert resp.status == 400
+    body = json.loads(resp.body)
+    assert body["status"] == "error"
+    mock_conn.fetchval.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_retrospective_rejects_non_list_entities():
+    """Same class of gap as handle_save: entities must be a list. A bare int
+    (or any non-iterable) would otherwise raise an unhandled TypeError from
+    the `for e in (raw_entities or [])` comprehension — a bare 500 instead
+    of the clean 400 every other malformed-field path returns."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+    mock_conn.fetchval = AsyncMock(return_value=1)   # pg_id exists, if reached
+
+    req = _make_request({
+        "pg_id": 42, "rating": "validated", "notes": "n", "entities": 42,
+    })
+    resp = await c.handle_retrospective(req)
+    assert resp.status == 400
+    mock_conn.fetchval.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_supersede_rejects_already_superseded_successor():
+    """A stale multi-hop chain (A -> B -> C, where B is itself already
+    superseded) must be rejected: handle_supersede checked `by` exists but
+    never checked whether IT was already superseded, unlike the parallel check
+    on `pg_id` two lines above and handle_save's `supersedes` validation."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+    # First fetchrow: the pg_id (A) being retracted — not yet superseded.
+    # Second fetchrow: the successor (B) being pointed at — ALREADY superseded.
+    mock_conn.fetchrow = AsyncMock(side_effect=[
+        {"superseded": False},
+        {"superseded": True},
+    ])
+
+    req = _make_request({"pg_id": 10, "by": 20})
+    resp = await c.handle_supersede(req)
+
+    assert resp.status == 400
+    body = json.loads(resp.body)
+    assert body["status"] == "error"
+    assert "already superseded" in body["message"]
+    mock_conn.execute.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_supersede_accepts_live_successor():
+    """Sanity: a successor that is NOT superseded must still be accepted (no
+    regression from the new check)."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+    mock_conn.fetchrow = AsyncMock(side_effect=[
+        {"superseded": False},
+        {"superseded": False},
+    ])
+    mock_conn.fetchval = AsyncMock(return_value=None)   # ride-along probe: no live outbox row
+    mock_conn.fetch    = AsyncMock(return_value=[])     # purge query
+
+    req = _make_request({"pg_id": 10, "by": 20})
+    resp = await c.handle_supersede(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.body)
+    assert body["status"] == "success"
+    assert body["superseded"] == 10
+    assert body["superseded_by"] == 20
+
+
 # ── Recency-aware retrieval (retro-as-record stage 4) ─────────────────────────
 
 def test_rerank_doc_text_prepends_date_for_outcome_records():
@@ -564,6 +663,19 @@ class _AsyncIter:
         return self
     async def __anext__(self):
         raise StopAsyncIteration
+
+
+@pytest.mark.asyncio
+async def test_search_rejects_non_integer_limit():
+    """A non-integer limit (e.g. a string, or a client-sent None) must 400, not
+    raise an unhandled TypeError from int(None)/int('abc') and surface as a
+    bare 500 — every other malformed-field path in this file returns a clean
+    400 instead."""
+    c, _, _ = _coordinator_with_mocks()
+    for bad in ("abc", None, [5], 5.5, True):
+        req = _make_request({"query": "anything", "limit": bad})
+        resp = await c.handle_search(req)
+        assert resp.status == 400, f"limit={bad!r} should 400, got {resp.status}"
 
 
 @pytest.mark.asyncio
@@ -773,6 +885,71 @@ async def test_handle_save_agent_id_falls_back_to_body_without_auth():
         if "INSERT INTO technical_docs" in c_.args[0]
     )
     assert insert_call.args[5] == "claude_code"
+
+
+# ── Read-role route gating — _read_role_permits ──────────────────────────────
+
+def test_read_role_permits_allows_exact_allowlisted_routes():
+    """The fixed _READ_ROLE_ROUTES entries (telemetry, graph) are always reachable
+    by a read-only role, with or without a trailing slash."""
+    for path in ("/memory/telemetry", "/memory/telemetry/"):
+        req = MagicMock(method="GET", path=path)
+        assert coordinator_mod._read_role_permits(req) is True
+    req = MagicMock(method="POST", path="/memory/graph")
+    assert coordinator_mod._read_role_permits(req) is True
+
+
+def test_read_role_permits_allows_memory_status_with_pg_id():
+    """GET /memory/status/{pg_id} — the one path-param route a read role may
+    reach — is granted for a real single-segment id, trailing slash or not."""
+    for path in ("/memory/status/123", "/memory/status/123/"):
+        req = MagicMock(method="GET", path=path)
+        assert coordinator_mod._read_role_permits(req) is True
+
+
+def test_read_role_permits_rejects_crafted_extra_segment_path():
+    """Security regression: a crafted path like "/memory/status/1/x" must NOT be
+    granted. aiohttp's real /memory/status/{pg_id} route has a single-segment
+    dynamic pattern (`[^{}/]+`, never spanning a "/") and does not match this
+    path, so it falls through to the catch-all proxy passthrough — a bare
+    `startswith("/memory/status/")` check let a read-only role token (e.g. the
+    monitor's) reach that passthrough anyway, bypassing the role gate entirely."""
+    for path in ("/memory/status/1/anything", "/memory/status/1/x/y", "/memory/status/"):
+        req = MagicMock(method="GET", path=path)
+        assert coordinator_mod._read_role_permits(req) is False
+
+
+def test_read_role_permits_rejects_non_get_and_unrelated_paths():
+    """A read role may not reach /memory/status/{pg_id} via any method but GET,
+    nor any path outside the allowlist."""
+    assert coordinator_mod._read_role_permits(
+        MagicMock(method="DELETE", path="/memory/status/123")) is False
+    assert coordinator_mod._read_role_permits(
+        MagicMock(method="GET", path="/memory/save")) is False
+    assert coordinator_mod._read_role_permits(
+        MagicMock(method="POST", path="/v1/embeddings")) is False
+
+
+# ── BoundedKeyedLocks — undocumented CPython internal dependency ─────────────
+
+def test_asyncio_lock_still_exposes_waiters_attribute():
+    """Code-review finding: BoundedKeyedLocks._evict_idle reads asyncio.Lock's
+    private `_waiters` via getattr(..., None), which degrades SAFELY if the
+    attribute is ever renamed (a missing attribute reads as "no waiters",
+    permitting eviction) — but that degrade-path is silent, not loud, and
+    would quietly re-open the exact race the per-entity lock exists to
+    prevent (two callers believing they hold exclusive access to the same
+    entity key). This test is the suggested self-test: it fails LOUDLY, at
+    test time, the moment a CPython release ever removes or renames the
+    attribute this class depends on — instead of the fragility only showing
+    up as a silent behavior change in production."""
+    lock = asyncio.Lock()
+    assert hasattr(lock, "_waiters"), (
+        "asyncio.Lock no longer exposes _waiters — "
+        "shared-memory/scripts/coordinator.py:BoundedKeyedLocks._evict_idle "
+        "depends on it (see the comment at that call site) and needs a new "
+        "eviction-safety check for this Python version."
+    )
 
 
 # ── JSONB double-encoding regression (v0.4.2) ────────────────────────────────

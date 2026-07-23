@@ -227,6 +227,50 @@ async def test_mcp_save_decision_success():
 
 
 @pytest.mark.asyncio
+async def test_mcp_save_decision_grounded_in_and_elicited():
+    """save_decision must expose grounded_in/elicited (capture-surface parity
+    with memory_bridge.py's build_decision_metadata) — before this fix an LM
+    Studio agent had no way to ground a decision in supporting facts or mark
+    a field elicited at all, regardless of intent."""
+    mock_response = MagicMock()
+    mock_response.json = lambda: {"status": "success", "pg_id": 78}
+
+    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
+        await vector_skill.save_decision(
+            title="T", decided_by="X", project="P", rationale="R", source="qwen3",
+            grounded_in="601:considered,602,603:rejected",
+            elicited=True,
+        )
+
+    call_kwargs = mock_post.call_args
+    payload = call_kwargs[1]["json"] if "json" in call_kwargs[1] else call_kwargs.kwargs["json"]
+    meta = payload["metadata"]
+    assert meta["grounded_in"] == [601, 602, 603]
+    assert meta["grounded_roles"] == {"601": "considered", "603": "rejected"}
+    assert meta["elicited"] is True
+
+
+@pytest.mark.asyncio
+async def test_mcp_save_decision_omits_grounded_in_and_elicited_when_absent():
+    """Defaults stay silent — no empty grounded_in/elicited keys clutter every
+    plain decision save."""
+    mock_response = MagicMock()
+    mock_response.json = lambda: {"status": "success", "pg_id": 79}
+
+    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
+        await vector_skill.save_decision(
+            title="T", decided_by="X", project="P", rationale="R", source="qwen3",
+        )
+
+    call_kwargs = mock_post.call_args
+    payload = call_kwargs[1]["json"] if "json" in call_kwargs[1] else call_kwargs.kwargs["json"]
+    meta = payload["metadata"]
+    assert "grounded_in" not in meta
+    assert "grounded_roles" not in meta
+    assert "elicited" not in meta
+
+
+@pytest.mark.asyncio
 async def test_mcp_save_decision_coordinator_down():
     """save_decision returns a readable error when the coordinator is unreachable."""
     with patch("httpx.AsyncClient.post", side_effect=Exception("connection refused")):
@@ -253,6 +297,48 @@ async def test_mcp_save_decision_coordinator_returns_400():
         )
     assert "Error" in result
     assert "rationale" in result
+
+
+@pytest.mark.asyncio
+async def test_mcp_save_retrospective_success():
+    """save_retrospective routes through the coordinator and reports the
+    target decision's pg_id plus this record's own pg_id. No prior test
+    covered this tool at all."""
+    mock_response = MagicMock()
+    mock_response.json = lambda: {"status": "success", "pg_id": 91, "target_pg_id": 43}
+
+    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
+        result = await vector_skill.save_retrospective(
+            pg_id=43, rating="validated", notes="held up in prod", source="qwen3",
+        )
+
+    assert "Decision pg_id=43" in result
+    assert "record pg_id=91" in result
+    call_kwargs = mock_post.call_args
+    payload = call_kwargs[1]["json"] if "json" in call_kwargs[1] else call_kwargs.kwargs["json"]
+    assert payload["pg_id"] == 43
+    assert payload["rating"] == "validated"
+
+
+@pytest.mark.asyncio
+async def test_mcp_save_retrospective_grounded_in_and_elicited():
+    """save_retrospective must expose grounded_in/elicited too — same capture-
+    surface parity gap as save_decision, same fix."""
+    mock_response = MagicMock()
+    mock_response.json = lambda: {"status": "success", "pg_id": 92, "target_pg_id": 43}
+
+    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
+        await vector_skill.save_retrospective(
+            pg_id=43, rating="validated", notes="n", source="qwen3",
+            grounded_in="601,602:considered",
+            elicited=True,
+        )
+
+    call_kwargs = mock_post.call_args
+    payload = call_kwargs[1]["json"] if "json" in call_kwargs[1] else call_kwargs.kwargs["json"]
+    assert payload["grounded_in"] == [601, 602]
+    assert payload["grounded_roles"] == {"602": "considered"}
+    assert payload["elicited"] is True
 
 
 @pytest.mark.asyncio

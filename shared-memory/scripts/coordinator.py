@@ -101,7 +101,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.7"
+FRAMEWORK_VERSION = "0.8.8"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -286,6 +286,12 @@ def _load_agent_roles() -> dict[str, str]:
 _AGENT_ROLES: dict[str, str] = _load_agent_roles()
 
 
+# Mirrors aiohttp's own DynamicResource pattern for a `{name}` path segment
+# (`web_urldispatcher.DynamicResource.GOOD = "[^{}/]+"`) so this check only ever
+# grants what the registered `/memory/status/{pg_id}` route can actually match.
+_MEMORY_STATUS_RE = re.compile(r"/memory/status/[^{}/]+")
+
+
 def _read_role_permits(request: web.Request) -> bool:
     """True if a read-only role may reach this route (method+path allowlist)."""
     path = request.path.rstrip("/") or "/"
@@ -293,8 +299,13 @@ def _read_role_permits(request: web.Request) -> bool:
         return True
     # Per-record lineage — GET /memory/status/{pg_id} — is read-only (no mutation),
     # so a read-role client (e.g. the Monitor drilling into a record) may reach it.
-    # It carries a path param, so it is matched by prefix rather than a fixed entry.
-    return request.method == "GET" and path.startswith("/memory/status/")
+    # It carries a path param, so it is matched by a fullmatch regex, NOT a prefix
+    # check — a bare `startswith("/memory/status/")` let a crafted extra-segment
+    # path (e.g. "/memory/status/1/x") pass this gate while aiohttp's own single-
+    # segment {pg_id} pattern does NOT match it, so the request actually falls
+    # through to the catch-all proxy passthrough underneath a "granted" verdict —
+    # a read-role token reaching the LLM/embeddings proxy it's meant to be denied.
+    return request.method == "GET" and bool(_MEMORY_STATUS_RE.fullmatch(path))
 
 
 # ── Pluggable identity resolution ───────────────────────────────────────────────
@@ -1714,7 +1725,12 @@ class MemoryCoordinator:
                     status=400,
                 )
 
-        entities     = metadata.get("entities", [])
+        entities = metadata.get("entities", [])
+        if not isinstance(entities, list):
+            return web.json_response(
+                {"status": "error", "message": "metadata.entities must be a list"},
+                status=400,
+            )
         content_hash = hashlib.sha256(content.encode()).hexdigest()
 
         # Embedding — hard mandate; no save without a vector
@@ -1908,12 +1924,22 @@ class MemoryCoordinator:
                     status=400,
                 )
             if by is not None:
-                succ = await conn.fetchval(
-                    "SELECT 1 FROM technical_docs WHERE id = $1", by
+                succ = await conn.fetchrow(
+                    "SELECT superseded FROM technical_docs WHERE id = $1", by
                 )
                 if succ is None:
                     return web.json_response(
                         {"status": "error", "message": f"successor {by} not found"},
+                        status=400,
+                    )
+                # A stale multi-hop chain (A -> B -> C where B is itself already
+                # superseded) leaves a consumer told "A is stale, see B" with no
+                # signal that B is ALSO stale — mirrors the existing check on
+                # pg_id above and the parallel check in handle_save's `supersedes`.
+                if succ["superseded"]:
+                    return web.json_response(
+                        {"status": "error",
+                         "message": f"successor {by} is itself already superseded"},
                         status=400,
                     )
 
@@ -2053,7 +2079,7 @@ class MemoryCoordinator:
         # Verified token identity over the client's script-name default ("memory_bridge").
         agent_id = request.get("authenticated_agent") or body.get("agent_id", "unknown")
 
-        if not isinstance(pg_id, int) or not rating or not notes:
+        if isinstance(pg_id, bool) or not isinstance(pg_id, int) or not rating or not notes:
             return web.json_response(
                 {"status": "error", "message": "pg_id (int), rating, and notes are required"},
                 status=400,
@@ -2075,13 +2101,18 @@ class MemoryCoordinator:
         # The retro's own record metadata. Person-axis enforcement as in
         # handle_save: principal is stamped from the kernel-attested identity.
         source_ref = body.get("source_ref") or None
+        raw_entities = body.get("entities")
+        if raw_entities is not None and not isinstance(raw_entities, list):
+            return web.json_response(
+                {"status": "error", "message": "entities must be a list"}, status=400
+            )
         metadata = {
             "type": "retrospective",
             "source": agent_id,
             "target_pg_id": pg_id,
             "rating": rating,
             "date": date,
-            "entities": [e for e in (body.get("entities") or [])
+            "entities": [e for e in (raw_entities or [])
                          if isinstance(e, str) and e.strip()],
         }
         if source_ref:
@@ -2451,11 +2482,18 @@ class MemoryCoordinator:
 
         _ROW_SQL = ("SELECT id, family, src_name, tgt_name, src_pg_id, tgt_pg_id,"
                     "       rel_type, verdict, operator_label, promoted_at"
-                    " FROM relation_adjudications WHERE id = $1")
+                    " FROM relation_adjudications WHERE id = ANY($1)")
         outcomes: dict[str, dict] = {}
         async with self._acquire() as conn:
+            # One batched fetch for every row either loop needs (an id in both
+            # `labels` and `promote` is fetched once, not twice) instead of a
+            # fetchrow per row — same N+1 pattern as _expand_graph_context_batch
+            # fixed above, flagged by this repo's own code-review process.
+            all_rids = sorted(set(labels.keys()) | set(promote))
+            rows_by_id = {row["id"]: row for row in await conn.fetch(_ROW_SQL, all_rids)}
+
             for rid, lab in labels.items():
-                row = await conn.fetchrow(_ROW_SQL, rid)
+                row = rows_by_id.get(rid)
                 if row is None:
                     outcomes[str(rid)] = {"error": "ledger row not found"}
                     continue
@@ -2479,7 +2517,7 @@ class MemoryCoordinator:
                 outcomes[str(rid)] = out
 
             for rid in promote:
-                row = await conn.fetchrow(_ROW_SQL, rid)
+                row = rows_by_id.get(rid)
                 out = outcomes.setdefault(str(rid), {})
                 if row is None:
                     out["error"] = "ledger row not found"
@@ -2588,6 +2626,79 @@ class MemoryCoordinator:
             return []
         return ctx
 
+    async def _expand_graph_context_batch(
+        self, session, pg_ids: list[int], anchor_labels: tuple[str, ...],
+    ) -> dict[int, list[dict]]:
+        """Batched form of `_expand_graph_context`: one Neo4j round-trip for
+        every anchor in `pg_ids` instead of one round-trip per anchor.
+
+        `handle_search`'s two `_expand_graph_context` loops were N+1 — up to
+        ~102 sequential queries per call (this repo's own code-review process
+        flagged it). Same query body as `_expand_graph_context`, wrapped in a
+        `CALL (pg_id) {{ ... LIMIT $cap }}` correlated subquery per `UNWIND`ed
+        anchor so the per-anchor cap is preserved exactly (a single flat `LIMIT` across
+        all anchors combined would silently change behaviour, not just
+        performance). Returns `{pg_id: [entries]}`; any `pg_id` with no anchor
+        node or no edges maps to `[]`, matching `_expand_graph_context`'s
+        single-anchor return. Same degrade-to-empty contract on failure —
+        graph context enriches a search, it never fails one, so a query error
+        here returns `{}` (every caller treats a missing key as `[]` via `.get`).
+        """
+        if not pg_ids:
+            return {}
+        out: dict[int, list[dict]] = {pid: [] for pid in pg_ids}
+        anchor_where = " OR ".join(f"n:{lbl}" for lbl in anchor_labels)
+        try:
+            result = await session.run(
+                "UNWIND $pg_ids AS pg_id"
+                " CALL (pg_id) {"
+                f"   MATCH (n {{pg_id: pg_id}}) WHERE {anchor_where}"
+                "   OPTIONAL MATCH (n)-[r]-(related)"
+                f"   OPTIONAL MATCH (related)-[:{ONT.aliases}]-(al:{ONT.entity})"
+                f"     WHERE EXISTS {{"
+                f"       MATCH (related)<-[:{ONT.entity_link}]-(m)"
+                f"       WHERE m.pg_id IS NOT NULL AND coalesce(m.superseded,false) = false"
+                f"     }}"
+                "   WITH n, r, related, labels(related) AS labels,"
+                "        collect(DISTINCT al.name) AS aliases"
+                "   ORDER BY CASE WHEN r.asserted_by IS NOT NULL THEN 0 ELSE 1 END,"
+                f"            CASE WHEN type(r) = '{ONT.entity_link}' THEN 1 ELSE 0 END"
+                "   LIMIT $cap"
+                "   RETURN labels, related.name AS name, related.pg_id AS rel_pg_id,"
+                "          type(r) AS rel_type,"
+                "          CASE WHEN r IS NULL THEN null"
+                "               WHEN startNode(r) = n THEN 'out' ELSE 'in' END AS direction,"
+                "          properties(r) AS rel_props,"
+                "          left(coalesce(related.content, related.title,"
+                "                        related.rationale, related.notes,"
+                "                        related.rem_summary), 120) AS snippet,"
+                "          aliases"
+                " }"
+                " RETURN pg_id AS anchor_pg_id, labels, name, rel_pg_id, rel_type,"
+                "        direction, rel_props, snippet, aliases",
+                pg_ids=list(pg_ids), cap=GRAPH_EXPANSION_LIMIT,
+            )
+            async for rec in result:
+                if not rec["rel_type"]:
+                    continue  # OPTIONAL MATCH row for an anchor with no edges
+                entry = {
+                    "rel_type": rec["rel_type"],
+                    "direction": rec["direction"],
+                    "properties": _json_safe(dict(rec["rel_props"] or {})),
+                    "label": rec["labels"][0] if rec["labels"] else None,
+                }
+                if rec["name"]:
+                    entry["name"] = rec["name"]
+                    if rec["aliases"]:
+                        entry["aliases"] = rec["aliases"]
+                else:
+                    entry["pg_id"] = rec["rel_pg_id"]
+                    entry["snippet"] = rec["snippet"]
+                out[rec["anchor_pg_id"]].append(entry)
+        except Exception:
+            return {pid: [] for pid in pg_ids}
+        return out
+
     async def handle_search(self, request: web.Request) -> web.Response:
         try:
             body = await request.json()
@@ -2597,7 +2708,12 @@ class MemoryCoordinator:
             )
 
         query = body.get("query", "")
-        limit = min(max(1, int(body.get("limit", 5))), 100)
+        limit = body.get("limit", 5)
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            return web.json_response(
+                {"status": "error", "message": "limit must be an integer"}, status=400
+            )
+        limit = min(max(1, limit), 100)
         scope = body.get("scope")  # None = no scope filter
         # Read authorization — the server-verified identity gates which rows this
         # caller may see (visibility column). None = anonymous → 'global' only.
@@ -2846,21 +2962,29 @@ class MemoryCoordinator:
         async with self._neo4j.session() as session:
             # Summary→sources walk: a Tier-3 narrative's graph context (its
             # SUMMARIZED_BY source records + any typed edges) surfaces the same
-            # way a record's does. Degrades to [] on any Neo4j failure.
+            # way a record's does. Degrades to [] on any Neo4j failure. Batched
+            # (one round-trip for every summary/insight anchor, not one per) —
+            # was an N+1 here, up to ~102 sequential queries per search call.
+            summary_pg_ids = [res["pg_id"] for res in final if res.get("pg_id") is not None]
+            summary_ctx = await self._expand_graph_context_batch(
+                session, summary_pg_ids, (ONT.community_summary,)
+            )
             for res in final:
                 if res.get("pg_id") is not None:
-                    res["graph_context"] = await self._expand_graph_context(
-                        session, res["pg_id"], (ONT.community_summary,)
-                    )
+                    res["graph_context"] = summary_ctx.get(res["pg_id"], [])
+
+            # Same batching for the Tier-1 hits' graph context. Anchor on ALL
+            # record labels — Decision and Retrospective rows get graph context
+            # too, not just Facts (read contract).
+            fact_pg_ids = [ids[hit["index"]] for hit in ranked]
+            fact_ctx = await self._expand_graph_context_batch(
+                session, fact_pg_ids, (ONT.fact, ONT.decision, ONT.retrospective)
+            )
             for hit in ranked:
                 idx   = hit["index"]
                 pg_id = ids[idx]
                 raw_score = hit["relevance_score"]
-                # Anchor on ALL record labels — Decision and Retrospective rows
-                # get graph context too, not just Facts (read contract).
-                ctx = await self._expand_graph_context(
-                    session, pg_id, (ONT.fact, ONT.decision, ONT.retrospective)
-                )
+                ctx = fact_ctx.get(pg_id, [])
                 # `tier` says WHERE the hit came from; `record_type` says WHAT it
                 # is. They are not the same: the Tier-1 "fact" tier carries
                 # decisions and retrospectives too, and the id namespace is keyed
