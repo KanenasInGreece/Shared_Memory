@@ -40,6 +40,7 @@ from coordinator import (
     attach as attach_coordinator,
     auth_middleware,
     backup_quiesce_active,
+    resolve_identity,
     _AGENT_TOKENS,
     AUTH_SCHEME,
     FRAMEWORK_VERSION,
@@ -997,10 +998,27 @@ async def handle_health(request: web.Request) -> web.Response:
     # environment — so the live LLM/tuning setup is inspectable via /health
     # without reading .env on the host (and works for a single backend too, where
     # llm_pool above is omitted). Secrets (AGENT_TOKENS, PG/NEO4J passwords) are
-    # NEVER echoed here.
+    # NEVER echoed here — has_credential is a bool, never the token itself.
+    # Tracked regardless of whether any backend actually uses it today, so the
+    # capability (external/paid backends, LLM_BACKENDS_JSON) is monitor-visible
+    # from the moment it's configured, not only once someone goes looking (fact 898).
+    #
+    # has_credential/model are gated behind a VALID bearer token, unlike the rest
+    # of /health (deliberately unauthenticated so liveness probes work without a
+    # token). Confirming "this specific backend has a live paid key loaded right
+    # now" is materially more sensitive than a bare URL — a URL alone doesn't
+    # confirm a credential is actually attached, and every backend that reaches
+    # LLM_BACKENDS at all already has one iff it needed one (an unresolved
+    # token_env excludes it from the pool entirely, see _load_llm_backends). An
+    # anonymous caller gets url/weight only, same shape as before this change.
+    caller_authenticated = bool(resolve_identity(request))
     checks["config"] = {
-        "llm_backends": [{"url": b, "weight": LLM_WEIGHTS.get(b, 1.0)}
-                         for b in LLM_BACKENDS],
+        "llm_backends": [
+            {"url": b, "weight": LLM_WEIGHTS.get(b, 1.0),
+             **({"has_credential": LLM_BACKEND_TOKENS.get(b) is not None,
+                 "model": LLM_BACKEND_MODELS.get(b)} if caller_authenticated else {})}
+            for b in LLM_BACKENDS
+        ],
         "llm_pool_tuning": {
             "fail_threshold": LLM_FAIL_THRESHOLD,
             "fail_window_s": LLM_FAIL_WINDOW,
