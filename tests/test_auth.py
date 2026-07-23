@@ -307,3 +307,28 @@ async def test_full_role_agent_can_still_save():
     req = _make_request("/memory/save", auth_header="Bearer tok_abc", method="POST")
     resp = await mod.auth_middleware(req, _noop_handler)
     assert resp.status == 200
+
+
+# ── the audit log records WHO, never the credential itself ───────────────────
+
+@pytest.mark.asyncio
+async def test_audit_log_never_records_the_raw_gateway_token(tmp_path):
+    """_audit() takes agent_name (the resolved identity), never the token — this
+    proves it end to end through a real file write, not just by reading the
+    call site: drive a real request with a real token through auth_middleware,
+    flush the async log writer, and confirm the token substring never lands on
+    disk while the agent's own name (the thing that SHOULD be there) does."""
+    log_path = tmp_path / "audit.jsonl"
+    os.environ["GATEWAY_AUDIT_LOG_PATH"] = str(log_path)
+    try:
+        mod = load_coordinator("claude:tok_super_secret_gateway_credential")
+        req = _make_request("/memory/save", auth_header="Bearer tok_super_secret_gateway_credential", method="POST")
+        resp = await mod.auth_middleware(req, _noop_handler)
+        assert resp.status == 200
+
+        await mod._audit_writer.flush()
+        content = log_path.read_text()
+        assert "tok_super_secret_gateway_credential" not in content
+        assert '"agent":"claude"' in content
+    finally:
+        os.environ.pop("GATEWAY_AUDIT_LOG_PATH", None)

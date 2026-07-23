@@ -156,6 +156,24 @@ def _load_llm_backends() -> tuple[list[str], dict[str, float], dict[str, "str | 
             url = str(entry.get("url", "")).rstrip("/")
             if not url:
                 continue
+            # Refuse a literal secret in config, loudly — the schema only ever
+            # reads token_env (a NAME). Silently ignoring a stray "token"/"api_key"
+            # field would be worse than rejecting it: the real key would already
+            # be sitting in plaintext in whatever file holds LLM_BACKENDS_JSON
+            # (.env or an EnvironmentFile), AND the backend would silently get no
+            # credential at all. Exclude the backend and say exactly why.
+            _raw_secret_fields = [f for f in ("token", "api_key", "apikey", "secret", "key")
+                                   if entry.get(f)]
+            if _raw_secret_fields:
+                log.error(
+                    "LLM_BACKENDS_JSON entry for %s has a literal %s field — this "
+                    "framework never accepts a raw secret in config. Use token_env "
+                    "instead: the NAME of an env var already exported in the "
+                    "gateway's own process environment (see "
+                    "shared-memory/ops/README.md, 'Reasoning-LLM backends'). "
+                    "Excluding this backend from the pool.",
+                    url, _raw_secret_fields)
+                continue
             token_env = entry.get("token_env")
             token = None
             if token_env:
