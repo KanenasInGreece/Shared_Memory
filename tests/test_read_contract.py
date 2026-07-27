@@ -266,6 +266,99 @@ async def test_pgid_keyed_neighbor_without_text_gets_null_snippet():
     assert ctx[0]["snippet"] is None
 
 
+# ── (b′) ADR node props on the one-hop neighbor (decision 909) ────────────────
+
+def test_neighbor_adr_props_collects_only_set_keys():
+    """_neighbor_adr_props packs a folded decision's confidence/alternatives and
+    a folded fact's fact_kind/source_ref, dropping unset keys and JSON-safing
+    the alternatives list. A neighbor carrying none returns {}."""
+    fn = coordinator_mod._neighbor_adr_props
+    dec = fn({"adr_confidence": "high",
+              "adr_alternatives": ["flat GROUNDED_IN", "no typing"],
+              "adr_fact_kind": None, "adr_source_ref": None})
+    assert dec == {"confidence": "high",
+                   "alternatives": ["flat GROUNDED_IN", "no typing"]}
+
+    fact = fn({"adr_confidence": None, "adr_alternatives": None,
+               "adr_fact_kind": "measured", "adr_source_ref": "coordinator.py#L42"})
+    assert fact == {"fact_kind": "measured", "source_ref": "coordinator.py#L42"}
+
+    # A bare neighbor (e.g. a CommunitySummary) carries none → no adr_props.
+    assert fn({"adr_confidence": None, "adr_alternatives": None,
+               "adr_fact_kind": None, "adr_source_ref": None}) == {}
+    # Missing columns entirely (older single-anchor rows / stubs) are tolerated.
+    assert fn({}) == {}
+
+
+@pytest.mark.asyncio
+async def test_decision_neighbor_surfaces_confidence_and_alternatives():
+    """An insight_summary folds Decisions; the folded Decision one hop away now
+    carries its confidence + alternatives in adr_props WITHOUT a second query."""
+    c, _, mock_session = _coordinator_with_mocks()
+    mock_session.run = AsyncMock(return_value=_AsyncRows([
+        _row(labels=["Decision"], name=None, pg_id=579,
+             rel_type="SUMMARIZED_BY", direction="in", rel_props={},
+             snippet="Grounding relations should be role-typed",
+             adr_confidence="high",
+             adr_alternatives=["keep the flat GROUNDED_IN"]),
+    ]))
+    ctx = await c._expand_graph_context(
+        mock_session, 123, (coordinator_mod.ONT.community_summary,))
+    assert ctx[0]["pg_id"] == 579
+    assert ctx[0]["adr_props"] == {
+        "confidence": "high",
+        "alternatives": ["keep the flat GROUNDED_IN"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_fact_neighbor_surfaces_fact_kind_and_source_ref():
+    """A thematic community_summary folds Facts; the folded Fact one hop away now
+    carries its evidence weight (fact_kind + source_ref) in adr_props."""
+    c, _, mock_session = _coordinator_with_mocks()
+    mock_session.run = AsyncMock(return_value=_AsyncRows([
+        _row(labels=["Fact"], name=None, pg_id=804,
+             rel_type="SUMMARIZED_BY", direction="in", rel_props={},
+             snippet="the embedding model contract is fixed",
+             adr_fact_kind="measured", adr_source_ref="design-doc.pdf#p12"),
+    ]))
+    ctx = await c._expand_graph_context(
+        mock_session, 88, (coordinator_mod.ONT.community_summary,))
+    assert ctx[0]["adr_props"] == {
+        "fact_kind": "measured", "source_ref": "design-doc.pdf#p12"}
+
+
+@pytest.mark.asyncio
+async def test_neighbor_without_adr_props_omits_the_key():
+    """A neighbor carrying no ADR node property gets no adr_props key at all —
+    additive, so existing consumers are unaffected."""
+    c, _, mock_session = _coordinator_with_mocks()
+    mock_session.run = AsyncMock(return_value=_AsyncRows([
+        _row(labels=["CommunitySummary"], name=None, pg_id=88,
+             rel_type="SUMMARIZED_BY", rel_props={}, snippet=None),
+    ]))
+    ctx = await c._expand_graph_context(
+        mock_session, 42, (coordinator_mod.ONT.fact,))
+    assert "adr_props" not in ctx[0]
+
+
+def test_expansion_cypher_projects_adr_node_props_both_forms():
+    """Stubs never execute Cypher, so pin the projection textually: both the
+    single-anchor and batched expansion queries must SELECT the ADR node props,
+    or the surfacing above silently regresses to snippet-only (decision 909)."""
+    import inspect
+    src = inspect.getsource(coordinator_mod.MemoryCoordinator._expand_graph_context)
+    src_batch = inspect.getsource(
+        coordinator_mod.MemoryCoordinator._expand_graph_context_batch)
+    for body in (src, src_batch):
+        assert "related.confidence AS adr_confidence" in body
+        assert "related.alternatives AS adr_alternatives" in body
+        assert "related.fact_kind AS adr_fact_kind" in body
+        assert "related.source_ref AS adr_source_ref" in body
+    # The batch form must also pass the columns through its OUTER return.
+    assert "adr_confidence, adr_alternatives, adr_fact_kind, adr_source_ref" in src_batch
+
+
 # ── (c) direction + full edge property map ────────────────────────────────────
 
 @pytest.mark.asyncio
