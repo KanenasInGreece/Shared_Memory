@@ -63,7 +63,8 @@ import time
 from datetime import datetime
 from neo4j import AsyncGraphDatabase
 from ontology import (
-    ONT, fact_kind_from_source_ref, GROUNDING_ROLES, default_grounding_role,
+    ONT, fact_kind_from_source_ref, origin_location,
+    GROUNDING_ROLES, default_grounding_role,
 )
 import relation_confidence as rc_conf
 from pool_status import pool_has_free_slot
@@ -711,6 +712,25 @@ def preservation_anchor(content, record_type="fact"):
             seen.add(p.lower())
             out.append(p)
     return " ".join(out)
+
+
+def fold_record_line(record, content):
+    """Render one fold-prompt line for a record, differentiating it by TYPE,
+    evidential KIND, ORIGIN locus (decision 916) and capture date — differentiated
+    capture in, differentiated synthesis out. `record` is None (or non-dict) for a
+    fact predating capture metadata → a bare [FACT] line. The origin marker is
+    emitted ONLY when there is a citable locus (absent for observations and
+    discussions), so it never invents provenance a fact does not have. Pure →
+    testable (the fold's per-line format is unit-checkable without an LLM)."""
+    if not isinstance(record, dict):
+        return f"[FACT] {content}"
+    origin = record.get("origin")
+    origin_marker = f' from="{origin}"' if origin else ""
+    return (f"[{str(record.get('rtype', 'fact')).upper()}"
+            f" kind={record.get('kind', 'observation')}"
+            f"{origin_marker}"
+            f" recorded={record.get('recorded', 'unknown')}"
+            f" pg_id={record.get('pg_id', '?')}] {content}")
 
 
 def summary_preserves(summary, anchors, coverage=PRESERVATION_COVERAGE):
@@ -1549,13 +1569,8 @@ class ConsolidationDaemon:
         # derived from source_ref) and its capture date — differentiated capture in,
         # differentiated synthesis out.
         def _line(i, content):
-            r = records[i] if records and i < len(records) and isinstance(records[i], dict) else None
-            if not r:
-                return f"[FACT] {content}"
-            return (f"[{str(r.get('rtype', 'fact')).upper()}"
-                    f" kind={r.get('kind', 'observation')}"
-                    f" recorded={r.get('recorded', 'unknown')}"
-                    f" pg_id={r.get('pg_id', '?')}] {content}")
+            r = records[i] if records and i < len(records) else None
+            return fold_record_line(r, content)
         facts_block = "\n".join(_line(i, f) for i, f in enumerate(facts))
 
         preservation_rules = (
@@ -2106,6 +2121,10 @@ class ConsolidationDaemon:
                             "domain": r[1],
                             "rtype": r[2] or "fact",
                             "kind": fact_kind_from_source_ref(r[3]),
+                            # ORIGIN locus (decision 916): where the knowledge came
+                            # from, so the fold can cite it ("measured from
+                            # coordinator.py"). Threaded as a PROPERTY, never an edge.
+                            "origin": origin_location(r[3]),
                             "recorded": str(r[4]) if r[4] else "unknown",
                         }
                         for r in cur.fetchall()
