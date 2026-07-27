@@ -414,8 +414,12 @@ def _fold_script_two_decisions():
     return [
         # 1. decision content fetch
         {"rowcount": 2, "rows": [
-            (245, "Choose outbox pattern for atomic writes", "shared-memory-GitHub"),
-            (267, "Adopt listen notify triggers everywhere", "tier3-cloe"),
+            # (id, content, project, confidence, alternatives) — confidence +
+            # structured alternatives are first-write ADR fields now pulled into
+            # the fold so synthesis can weigh them (captured -> must reach synthesis).
+            (245, "Choose outbox pattern for atomic writes", "shared-memory-GitHub",
+             "high", ["synchronous writes", "no outbox"]),
+            (267, "Adopt listen notify triggers everywhere", "tier3-cloe", None, None),
         ]},
         # 2. fetch_insight_outbox_rows snapshot
         {"rowcount": 2, "rows": [(101,), (102,)]},
@@ -473,6 +477,14 @@ async def test_grounding_lines_render_and_gate_by_family(monkeypatch):
     blocks = daemon.generate_insight.call_args.args[1]
     d245 = next(b for b in blocks if b.startswith("[DECISION pg_id=245"))
     d267 = next(b for b in blocks if b.startswith("[DECISION pg_id=267"))
+    # First-write ADR fields now reach synthesis (captured -> must reach synthesis):
+    # decision 245 carried confidence + a structured alternatives list.
+    assert "[DECISION CONFIDENCE at decision time: high]" in d245
+    assert ("[DECISION ALTERNATIVES CONSIDERED (first-write): "
+            "synchronous writes; no outbox]") in d245
+    # decision 267 carried neither — no line is fabricated when the field is null.
+    assert "DECISION CONFIDENCE" not in d267
+    assert "DECISION ALTERNATIVES" not in d267
     # Operator edge — authoritative form, after the retro lines.
     assert "[GROUNDING role=GROUNDED_IN asserted_by=operator] OutboxPattern" in d245
     assert d245.index("[RETROSPECTIVE") < d245.index("[GROUNDING")

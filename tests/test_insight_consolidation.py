@@ -361,8 +361,8 @@ def _fold_script():
     return [
         # 1. decision content fetch
         {"rowcount": 2, "rows": [
-            (245, "Decision A\n\nrationale A", "shared-memory-GitHub"),
-            (267, "Decision B\n\nrationale B", "tier3-cloe"),
+            (245, "Decision A\n\nrationale A", "shared-memory-GitHub", "high", ["alt A1", "alt A2"]),
+            (267, "Decision B\n\nrationale B", "tier3-cloe", None, None),
         ]},
         # 2. fetch_insight_outbox_rows snapshot
         {"rowcount": 2, "rows": [(101,), (102,)]},
@@ -428,8 +428,8 @@ async def test_fold_insight_v2_retro_latest_full_older_compressed(monkeypatch):
     conn = StubConn(script=[
         # 1. decision content fetch
         {"rowcount": 2, "rows": [
-            (245, "Decision A", "shared-memory-GitHub"),
-            (267, "Decision B", "tier3-cloe"),
+            (245, "Decision A", "shared-memory-GitHub", None, None),
+            (267, "Decision B", "tier3-cloe", None, None),
         ]},
         # 2. fetch_retro_records — retro rows
         {"rowcount": 1, "rows": [
