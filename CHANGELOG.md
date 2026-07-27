@@ -5,6 +5,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.12] — 2026-07-27
+
+### Added
+
+- **Facts now carry their own provenance in the graph, not just in metadata.**
+  Previously only decisions recorded *who* and *with what tool* as traversable
+  relationships; a fact's origin lived only as flat metadata. At first write a
+  fact now gains a custody trail — the agent that produced the record, the
+  operator it acted on behalf of, and the project it belongs to — modelled as a
+  delegation (the record is attributed to the agent, and the agent acts on behalf
+  of the person) rather than attributing the knowledge directly to the operator.
+  That distinction matters: a fact surfaced by a web search or a code review is
+  *committed by* an operator but not *authored by* them, so custody and authorship
+  are kept separate. All three values are derived automatically — the person from
+  the kernel-attested login, the agent from the request token, the project from
+  the working folder — so nothing new is asked of the caller. Each edge is written
+  only when its value is known (e.g. the person is omitted on a transport with no
+  attested login).
+
+### Changed
+
+- **Thematic summaries can now cite where a fact came from.** The consolidation
+  fold already told the model each record's evidential *kind* (measured, tested,
+  researched, …); it now also carries the citable *origin* — the file path or
+  source domain a fact was derived from — so a synthesised narrative can say
+  "measured from `coordinator.py`" instead of just "measured". The origin travels
+  as a threaded property derived deterministically from the source citation, not
+  as a graph edge: clustering facts by source is a filter, not a traversal, so no
+  new node or relationship type is introduced. Observations and discussions, which
+  have no external origin, carry no origin marker.
+
 ## [0.8.11] — 2026-07-27
 
 ### Changed

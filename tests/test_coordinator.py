@@ -239,6 +239,83 @@ async def test_apply_outbox_row_plain_fact_does_not_call_decision_path():
         mock_session.run.assert_awaited()   # standard path ran
 
 
+# ── Fact custody provenance (decision 915) ────────────────────────────────────
+# NOTE: these pin the Python/params contract. The Cypher itself is STUBBED here
+# (mock_session.run never executes it), so the delegation-pair semantics and the
+# CASE gating (no edges for a 'coordinator' fallback source / absent person /
+# absent project) are verified LIVE against Neo4j — a green unit proves the wiring,
+# not the query. See the first-write custody verification (decision 915).
+
+@pytest.mark.asyncio
+async def test_handle_save_carries_fact_custody_into_outbox_params():
+    """Ingress must stamp the DERIVED custody axes into the fact's outbox
+    cypher_params: person from the kernel-attested principal, project from the
+    (normalised) folder. These feed the WAS_ATTRIBUTED_TO / ACTED_ON_BEHALF_OF /
+    PROJECT_OF edges the apply-path writes."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request(
+            {
+                "content": "a plain fact from a session",
+                "metadata": {
+                    "source": "claude",
+                    "entities": ["SharedMemory"],
+                    "project": "shared-memory-GitHub",
+                },
+            },
+            principal={"user": "xenofon", "uid": 1000, "pid": 42},
+        )
+        resp = await c.handle_save(req)
+    assert resp.status == 200
+    # Find the neo4j_outbox INSERT and inspect the cypher_params dict it stored.
+    outbox_params = None
+    for call_obj in mock_conn.execute.await_args_list:
+        sql = call_obj.args[0] if call_obj.args else ""
+        if "neo4j_outbox" in sql:
+            outbox_params = call_obj.args[2]
+            break
+    assert outbox_params is not None, "no neo4j_outbox INSERT was issued"
+    assert outbox_params["person"] == "xenofon"          # kernel principal, not a client claim
+    assert outbox_params["project"] == "shared-memory-GitHub"
+
+
+@pytest.mark.asyncio
+async def test_apply_outbox_row_fact_writes_custody_delegation_pair():
+    """The standard fact apply-path Cypher must mint the delegation pair:
+    (fact)-[WAS_ATTRIBUTED_TO]->(AIAgent), (AIAgent)-[ACTED_ON_BEHALF_OF]->(Human),
+    (fact)-[PROJECT_OF]->(Project) — reading person/project/source from params.
+    WAS_ATTRIBUTED_TO must NOT point at the human (decision 915: that would read
+    as authorship, not custody)."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+
+    params = {
+        "type": "fact",
+        "entities": ["SharedMemory"],
+        "source": "claude",
+        "person": "xenofon",
+        "project": "shared-memory-GitHub",
+        "content_snippet": "a plain fact",
+    }
+    await c._apply_outbox_row(outbox_id=7, pg_id=71, params=params, retries=0)
+
+    # First session.run is the Fact MERGE (+ custody). Inspect its query + kwargs.
+    first = mock_session.run.await_args_list[0]
+    query = first.args[0]
+    kwargs = first.kwargs
+    assert "WAS_ATTRIBUTED_TO" in query
+    assert "ACTED_ON_BEHALF_OF" in query
+    assert "PROJECT_OF" in query
+    # The attribution target is the AIAgent, and the human is reached via delegation.
+    assert "MERGE (a:AIAgent {name: $source})" in query
+    assert "-[:WAS_ATTRIBUTED_TO]->(a)" in query
+    assert "(a)-[:ACTED_ON_BEHALF_OF]->(h)" in query
+    # Never attribute a fact directly to the human (custody ≠ authorship).
+    assert "-[:WAS_ATTRIBUTED_TO]->(h)" not in query
+    assert kwargs["person"] == "xenofon"
+    assert kwargs["project"] == "shared-memory-GitHub"
+    assert kwargs["source"] == "claude"
+
+
 # ── Decision Neo4j writes ─────────────────────────────────────────────────────
 
 @pytest.mark.asyncio

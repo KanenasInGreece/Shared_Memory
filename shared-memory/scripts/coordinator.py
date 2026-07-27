@@ -101,7 +101,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.11"
+FRAMEWORK_VERSION = "0.8.12"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -1300,12 +1300,35 @@ class MemoryCoordinator:
                     f"     f.fact_kind = $fact_kind"
                     + (" SET f.source_ref = $source_ref" if source_ref else "")
                     + f" WITH f"
+                    # Fact-custody edges (decision 915): the agent GENERATED this
+                    # record (WAS_ATTRIBUTED_TO), acting ON BEHALF OF the operator
+                    # (ACTED_ON_BEHALF_OF — delegation, NOT authorship: this is why we
+                    # do not point WAS_ATTRIBUTED_TO at the human as decisions do),
+                    # scoped to a project. All three are DERIVED (agent = token source,
+                    # person = kernel principal, project = folder) and written only when
+                    # present. The 'coordinator' fallback source is the system itself,
+                    # not a real agent, so it mints no AIAgent node.
+                    f" FOREACH (_ IN CASE WHEN $source <> '' AND $source <> 'coordinator'"
+                    f"                    THEN [1] ELSE [] END |"
+                    f"   MERGE (a:{ONT.ai_agent} {{name: $source}})"
+                    f"   MERGE (f)-[:{ONT.was_attributed_to}]->(a))"
+                    f" FOREACH (_ IN CASE WHEN $source <> '' AND $source <> 'coordinator'"
+                    f"                    AND $person <> '' THEN [1] ELSE [] END |"
+                    f"   MERGE (a:{ONT.ai_agent} {{name: $source}})"
+                    f"   MERGE (h:{ONT.human} {{name: $person}})"
+                    f"   MERGE (a)-[:{ONT.acted_on_behalf_of}]->(h))"
+                    f" FOREACH (_ IN CASE WHEN $project <> '' THEN [1] ELSE [] END |"
+                    f"   MERGE (p:{ONT.project} {{name: $project}})"
+                    f"   MERGE (f)-[:{ONT.project_of}]->(p))"
+                    + f" WITH f"
                     f" UNWIND $entities AS ename"
                     f" MERGE (e:{ONT.entity} {{name: ename}})"
                     f" MERGE (f)-[:{ONT.entity_link}]->(e)",
                     pg_id=pg_id,
                     content=params.get("content_snippet", "")[:200],
                     source=params.get("source", "coordinator"),
+                    person=params.get("person") or "",
+                    project=params.get("project") or "",
                     fact_kind=fact_kind,
                     entities=self._gate_graph_entities(pg_id, params.get("entities", [])),
                     **( {"source_ref": source_ref} if source_ref else {} ),
@@ -1827,6 +1850,16 @@ class MemoryCoordinator:
                             "source": metadata.get("source", "coordinator"),
                             "entities": entities,
                             "agent_id": agent_id,
+                            # Fact-provenance axes (decision 912) — materialised as
+                            # traversable edges on the :Fact node so provenance is a
+                            # type-bounded subgraph, not just Postgres metadata. All
+                            # three are DERIVED, never elicited: person = kernel-attested
+                            # principal (SO_PEERCRED user, "user from system", None on
+                            # TCP), agent = the token-verified source ("agent from token"),
+                            # project = the normalised folder name ("project from folder").
+                            # Each edge is written only when its value is present.
+                            "person": metadata.get("principal"),
+                            "project": metadata.get("project"),
                             "type": metadata.get("type", "fact"),
                             "decision": metadata.get("decision", {}),
                             "source_ref": metadata.get("source_ref") or None,

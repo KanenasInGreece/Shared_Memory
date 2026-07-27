@@ -1,6 +1,7 @@
 import os
 import re
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 _VALID_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -282,6 +283,30 @@ def fact_kind_from_source_ref(source_ref: object) -> str:
     if base.endswith(_CODE_SUFFIXES):
         return "measured"
     return "researched"
+
+
+def origin_location(source_ref: object) -> str:
+    """The human-citable ORIGIN locus of a fact, derived from its source_ref
+    (decision 916). Pure, deterministic — the SAME classification as
+    fact_kind_from_source_ref, but returning WHERE the knowledge came from so a
+    fold can cite it ("measured from coordinator.py"). Empty string when there is
+    no citable external locus — a bare observation (no source_ref) or a discussion
+    (the conversation itself, already conveyed by kind='discussion'):
+
+      none / empty          → ''            (observation — no origin clause)
+      'discussion_context'  → ''            (kind='discussion' already says it)
+      http(s):// URL        → the domain    ('arxiv.org')
+      code / test / doc path→ the path, sub-document locator (#L10, @00:04) stripped
+    """
+    if not isinstance(source_ref, str) or not source_ref.strip():
+        return ""
+    s = source_ref.strip()
+    if s.lower() == DISCUSSION_CONTEXT:
+        return ""
+    if s.lower().startswith(("http://", "https://")):
+        netloc = urlparse(s).netloc
+        return netloc or s
+    return s.split("#", 1)[0].split("@", 1)[0].strip()
 
 
 # ── Decision→fact grounding roles + advisory fact_kind gate (decision 582) ─────
