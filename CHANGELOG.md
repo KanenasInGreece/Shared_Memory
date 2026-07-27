@@ -5,6 +5,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.11] — 2026-07-27
+
+### Changed
+
+- **Graph expansion now carries a neighbour's decision/evidence metadata in the
+  search hit itself — no second query.** When a search returns a summary, its
+  one-hop graph context lists the records the summary was folded from (the
+  decisions behind a cross-project insight, the facts behind a thematic
+  summary) — but previously each of those neighbours came back as an id plus a
+  120-character snippet only, so *how confident* a folded decision was, *which
+  alternatives it rejected*, and a folded fact's *evidence weight* (its kind and
+  source citation) were dropped even though they sit on the very node already
+  being read. The expansion now projects those properties into an `adr_props`
+  object on each neighbour — a decision's `confidence` and `alternatives`, a
+  fact's `fact_kind` and `source_ref` — closing the gap for zero extra queries
+  and no extra graph traversal. Deeper provenance that genuinely lives further
+  out in the graph (the person who decided, the grounding evidence, the recorded
+  outcome) is unchanged here and remains a deliberate, separately-designed
+  opt-in. Purely additive: the key appears only on neighbours that carry those
+  properties, so existing `graph_context` consumers are unaffected.
+
+---
+
 ## [0.8.10] — 2026-07-23
 
 ### Security

@@ -101,7 +101,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.10"
+FRAMEWORK_VERSION = "0.8.11"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -979,6 +979,36 @@ def _json_safe(value):
             except Exception:
                 break
     return str(value)
+
+
+def _neighbor_adr_props(rec) -> dict:
+    """Collect the ADR node properties a graph-expansion row projects for a
+    pg_id-keyed neighbor (Decision: confidence/alternatives; Fact: fact_kind/
+    source_ref), returning only the keys that are set.
+
+    These already sit on the one-hop neighbor node — projecting them lets a
+    summary hit carry a folded decision's confidence/alternatives and a folded
+    fact's evidence weight WITHOUT a second query (decision 909). A neighbor
+    that carries none returns ``{}`` (no ``adr_props`` key is added). Missing
+    projection columns (older single-anchor callers, test stubs) are tolerated
+    via ``.get``. Pure — never raises, so it can never fail a search.
+    """
+    def _g(key):
+        try:
+            return rec[key]
+        except (KeyError, TypeError, IndexError):
+            return None
+    adr: dict = {}
+    if _g("adr_confidence"):
+        adr["confidence"] = _g("adr_confidence")
+    alts = _g("adr_alternatives")
+    if alts:
+        adr["alternatives"] = _json_safe(list(alts))
+    if _g("adr_fact_kind"):
+        adr["fact_kind"] = _g("adr_fact_kind")
+    if _g("adr_source_ref"):
+        adr["source_ref"] = _g("adr_source_ref")
+    return adr
 
 
 def _outbox_backoff_delay(retries: int) -> float:
@@ -2599,6 +2629,15 @@ class MemoryCoordinator:
                 "        left(coalesce(related.content, related.title,"
                 "                      related.rationale, related.notes,"
                 "                      related.rem_summary), 120) AS snippet,"
+                # ADR node properties already sitting on this one-hop neighbor —
+                # projected so a summary hit carries a folded decision's
+                # confidence/alternatives and a folded fact's fact_kind/source_ref
+                # WITHOUT a second query (decision 909). Null on neighbors that
+                # do not carry them; folded into `adr_props` below only when set.
+                "        related.confidence AS adr_confidence,"
+                "        related.alternatives AS adr_alternatives,"
+                "        related.fact_kind AS adr_fact_kind,"
+                "        related.source_ref AS adr_source_ref,"
                 "        aliases",
                 pg_id=pg_id, cap=GRAPH_EXPANSION_LIMIT,
             )
@@ -2621,6 +2660,9 @@ class MemoryCoordinator:
                     # CommunitySummary) — previously dropped by the name filter.
                     entry["pg_id"] = rec["pg_id"]
                     entry["snippet"] = rec["snippet"]
+                    adr = _neighbor_adr_props(rec)
+                    if adr:
+                        entry["adr_props"] = adr
                 ctx.append(entry)
         except Exception:
             return []
@@ -2672,10 +2714,18 @@ class MemoryCoordinator:
                 "          left(coalesce(related.content, related.title,"
                 "                        related.rationale, related.notes,"
                 "                        related.rem_summary), 120) AS snippet,"
+                # ADR node props on the one-hop neighbor — see the single-anchor
+                # form above (decision 909). Same projection, batched.
+                "          related.confidence AS adr_confidence,"
+                "          related.alternatives AS adr_alternatives,"
+                "          related.fact_kind AS adr_fact_kind,"
+                "          related.source_ref AS adr_source_ref,"
                 "          aliases"
                 " }"
                 " RETURN pg_id AS anchor_pg_id, labels, name, rel_pg_id, rel_type,"
-                "        direction, rel_props, snippet, aliases",
+                "        direction, rel_props, snippet,"
+                "        adr_confidence, adr_alternatives, adr_fact_kind, adr_source_ref,"
+                "        aliases",
                 pg_ids=list(pg_ids), cap=GRAPH_EXPANSION_LIMIT,
             )
             async for rec in result:
@@ -2694,6 +2744,9 @@ class MemoryCoordinator:
                 else:
                     entry["pg_id"] = rec["rel_pg_id"]
                     entry["snippet"] = rec["snippet"]
+                    adr = _neighbor_adr_props(rec)
+                    if adr:
+                        entry["adr_props"] = adr
                 out[rec["anchor_pg_id"]].append(entry)
         except Exception:
             return {pid: [] for pid in pg_ids}
