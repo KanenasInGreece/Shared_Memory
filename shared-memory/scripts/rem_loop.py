@@ -399,6 +399,31 @@ _ENTITY_SUBLABELS: frozenset[str] = frozenset({
     ONT.component, ONT.system, ONT.model, ONT.concept, ONT.document,
 })
 
+# The sub-label vocabulary SHOWN TO THE LLM, derived from ONT so a rename/extend
+# in ontology.yaml carries into the prompt — not just into the validator. Keying
+# each gloss to the ONT attribute (not a hardcoded word) is what closes the silent
+# drop: the prompt used to ask for the literal "Component" while the validator only
+# accepted the configured name, so a renamed DOMAIN sub-label was proposed by the
+# LLM and then silently rejected, leaving the entity untyped. Glosses match the
+# ontology.yaml comments; on the default names this renders byte-identical to the
+# old hardcoded text. (This is the same pattern _ONTOLOGY_VOCAB already uses for the
+# relationship names.)
+_SUBLABEL_GLOSS: tuple[tuple[str, str], ...] = (
+    (ONT.component, "a software unit we build: module/class/script/daemon"),
+    (ONT.system,    "a service/datastore/framework/infrastructure we run"),
+    (ONT.model,     "an AI/ML model"),
+    (ONT.concept,   "a pattern/technique/principle"),
+    (ONT.document,  "a spec/ADR/README/research artifact"),
+)
+# Enumerated choice, e.g. "Component|System|Model|Concept|Document|OTHER" — always
+# matches what the validator (_ENTITY_SUBLABELS) accepts, by construction.
+_SUBLABEL_CHOICE: str = "|".join([name for name, _ in _SUBLABEL_GLOSS] + ["OTHER"])
+# Descriptive task clause listing each configured sub-label with its gloss.
+_SUBLABEL_TASK: str = (
+    ", ".join(f"{name} ({gloss})" for name, gloss in _SUBLABEL_GLOSS)
+    + ", or OTHER (a person, a project, or none of the above)"
+)
+
 # Decision-specific extras written on the Decision anchor — targets are
 # registry-gated (718): only ALREADY-known entities are minted; free phrases
 # live as decision properties from first-write.
@@ -689,15 +714,12 @@ def build_single_prompt(content: str, kind: str, closed_set: list[dict],
         "For each: supply the exact name (from known typed nodes if it matches) and the most "
         "appropriate relationship type.",
         "2. For each such entity marked [untyped] in KNOWN TYPED NODES, or absent from that "
-        "list, also supply \"type\": exactly one of Component (a software unit we build: "
-        "module/class/script/daemon), System (a service/datastore/framework/infrastructure "
-        "we run), Model (an AI/ML model), Concept (a pattern/technique/principle), Document "
-        "(a spec/ADR/README/research artifact), or OTHER (a person, a project, or none of "
-        "the above). OMIT \"type\" for entities already typed.",
+        "list, also supply \"type\": exactly one of " + _SUBLABEL_TASK
+        + ". OMIT \"type\" for entities already typed.",
     ]
     shape_fields = [
         '  "relationships": [{"name": "<entity name>", "rel_type": "<REL_TYPE>", '
-        '"type": "<Component|System|Model|Concept|Document|OTHER>"}, ...]'
+        '"type": "<' + _SUBLABEL_CHOICE + '>"}, ...]'
     ]
     if want_summary:
         tasks.append(
@@ -1749,13 +1771,14 @@ class REMDaemon:
             "its manifest does NOT already hold (not an operator entity, not an already-"
             "captured edge target). Give the exact name (match KNOWN TYPED NODES where "
             "possible) and a relationship type; add \"type\" (exactly one of "
-            "Component|System|Model|Concept|Document|OTHER) ONLY for entities marked "
+            + _SUBLABEL_CHOICE + ") ONLY for entities marked "
             "[untyped] or absent from KNOWN TYPED NODES.\n"
             "- If a fact references nothing new, still emit its line as "
             '{"idx": <n>, "relationships": []} so alignment is preserved.\n'
             f"{summary_rule}\n\n"
             "Each line must match:\n"
-            '{"idx": <n>, "relationships": [{"name": "<entity>", "rel_type": "<REL_TYPE>", "type": "<Component|System|Model|Concept|Document|OTHER>"}]}'
+            '{"idx": <n>, "relationships": [{"name": "<entity>", "rel_type": "<REL_TYPE>", "type": "<'
+            + _SUBLABEL_CHOICE + '>"}]}'
         )
 
     def _parse_jsonl_batch(
@@ -2007,14 +2030,27 @@ class REMDaemon:
         # sub-label} for entities the LLM typed AND that are not already typed
         # in the registry (never reclassify existing nodes).
         entity_types: dict[str, str] = {}
+        dropped_types: list[str] = []
         for rel in relationships:
             if not isinstance(rel, dict):
                 continue
             nm = sanitize_entity_name(rel.get("name"))
             ty = (rel.get("type") or "").strip()
-            if (nm and ty in _ENTITY_SUBLABELS
-                    and not registry.get(nm, {}).get("typed")):
+            if nm and ty in _ENTITY_SUBLABELS and not registry.get(nm, {}).get("typed"):
                 entity_types[nm] = ty
+            elif nm and ty and ty.upper() != "OTHER" and ty not in _ENTITY_SUBLABELS \
+                    and not registry.get(nm, {}).get("typed"):
+                # A proposed sub-label outside the configured vocabulary. This used
+                # to be dropped SILENTLY — the failure mode when the prompt and the
+                # ONT-derived validator disagreed (renamed ontology.yaml label). The
+                # prompt is now ONT-derived so this should not happen, but surface it
+                # rather than swallow it, so any residual drift is visible not silent.
+                dropped_types.append(f"{nm}:{ty}")
+        if dropped_types:
+            logger.warning(
+                "REM: pg_id=%s dropped %d out-of-vocabulary sub-label proposal(s) "
+                "(not in configured %s): %s — entity left untyped",
+                pg_id, len(dropped_types), sorted(_ENTITY_SUBLABELS), dropped_types)
 
         # Grounding telemetry (Task 15, measure-first): how many referenced entities
         # matched the grounding set vs were newly minted — the mint_rate gates the

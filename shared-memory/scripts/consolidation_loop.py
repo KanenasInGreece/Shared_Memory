@@ -1689,8 +1689,12 @@ class ConsolidationDaemon:
             f"discussion). Treat [GROUNDING] lines as the decision's evidence base — "
             f"operator-asserted grounding is authoritative; lines marked MACHINE-PROPOSED "
             f"are candidate connections to weigh, not established facts, and must be "
-            f"attributed as machine-proposed if used. State the principle, the supporting "
-            f"evidence per project, and any known limits.\n"
+            f"attributed as machine-proposed if used. A [DECISION CONFIDENCE ...] line is how "
+            f"firmly that decision was held at the time — a principle resting on high-confidence "
+            f"decisions is firmer than one resting on low-confidence ones. A [DECISION ALTERNATIVES "
+            f"CONSIDERED ...] line lists the options that decision's author weighed and did not take; "
+            f"use them to state what the principle chose AGAINST, not only what it chose. State the "
+            f"principle, the supporting evidence per project, and any known limits.\n"
             f"{corrective_text}\n"
             f"### INSIGHT:"
         )
@@ -2720,9 +2724,19 @@ class ConsolidationDaemon:
         def _fetch_decisions():
             with conn.cursor() as cur:
                 cur.execute(
+                    # confidence + the structured alternatives list are first-write
+                    # ADR fields the operator was asked for (spine coverage tracks
+                    # both) but they live in metadata, not in the content prose the
+                    # fold reads — so without pulling them here they were captured,
+                    # stored, and never reached synthesis. The principle: anything we
+                    # made a point to elicit must reach synthesis or demonstrably
+                    # direct it. (rationale/title already reach: save_decision sets
+                    # content = title + rationale.)
                     "SELECT id, content,"
                     "       COALESCE(metadata->'decision'->>'project',"
-                    "                metadata->>'project', '')"
+                    "                metadata->>'project', ''),"
+                    "       metadata->'decision'->>'confidence',"
+                    "       metadata->'decision'->'alternatives'"
                     "  FROM technical_docs WHERE id = ANY(%s) ORDER BY id",
                     (src_ids,),
                 )
@@ -2783,10 +2797,27 @@ class ConsolidationDaemon:
         blocks = []
         anchors = []      # preservation gate: decision titles + latest ratings, all HARD
         seen_projects = set()
-        for pg_id, content, project in rows:
+        for pg_id, content, project, confidence, alternatives in rows:
             seen_projects.add(project or "unknown")
             block = f"[DECISION pg_id={pg_id} project={project or 'unknown'}]\n{content}"
             anchors.append((preservation_anchor(content, "decision"), True))
+            # First-write ADR reasoning that lives in metadata, not in content —
+            # injected so synthesis can weigh it. Confidence qualifies how firmly
+            # the decision was held; the structured alternatives are the decision's
+            # OWN recorded rejected options (more complete than the lossy REM-
+            # re-extracted CONSIDERED/REJECTED edges, which drop free phrases).
+            if confidence:
+                block += f"\n[DECISION CONFIDENCE at decision time: {confidence}]"
+            alts = alternatives if isinstance(alternatives, list) else None
+            if alts is None and isinstance(alternatives, str):
+                try:
+                    parsed = json.loads(alternatives)
+                    alts = parsed if isinstance(parsed, list) else None
+                except (ValueError, TypeError):
+                    alts = None
+            if alts:
+                block += ("\n[DECISION ALTERNATIVES CONSIDERED (first-write): "
+                          + "; ".join(str(a) for a in alts if a) + "]")
             outs = by_decision.get(pg_id, [])   # date-ascending from the query
             for o in outs[:-1]:
                 block += (
