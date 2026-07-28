@@ -5,7 +5,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.8.14] — 2026-07-28
+
+### Added
+
+- **Graph-integrity defects are now visible.** The enrichment pass has always
+  been able to spot a node whose *label* contradicts the record its id names —
+  the signature of a write path that stored something under the wrong type. It
+  retired such nodes, recorded the diagnosis on them, and logged a warning. But
+  nothing ever read that verdict, so the only trace was a log line scrolling
+  past and a property nobody queried. Three separate write-path defects were
+  each detected correctly this way and still went unnoticed for weeks, found
+  only when someone went looking by hand.
+
+  The count now appears on the health endpoint, and a breakdown — how many, and
+  which label was written where — on the telemetry endpoint and in the client's
+  `status` output, so a dashboard or an agent can see it without a bespoke
+  query. Read it as a **defect, not a backlog**: it does not drain on its own,
+  so any non-zero value names a writer that needs fixing and nodes that need
+  repairing. Until the first probe completes the count reads as *unknown* rather
+  than zero, so "not yet checked" can never be mistaken for "verified clean".
 
 ### Changed
 

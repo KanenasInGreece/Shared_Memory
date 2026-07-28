@@ -1156,6 +1156,68 @@ async def test_retrospective_v2_inherits_target_project_and_stores_record():
         b"retrospective:240:partly held").hexdigest()
 
 
+# ── Graph-integrity telemetry (decision 928) ──────────────────────────────────
+
+def _integrity_result(rows):
+    """Stub the `await (await session.run(...)).data()` shape used by the
+    Neo4j telemetry helpers."""
+    res = AsyncMock()
+    res.data = AsyncMock(return_value=rows)
+    return res
+
+
+@pytest.mark.asyncio
+async def test_graph_integrity_reports_clean_when_no_invalid_nodes():
+    """0 invalid nodes is the expected steady state, and must be reported as an
+    affirmative `clean`, not as an absent field a dashboard could misread."""
+    c, _, mock_session = _coordinator_with_mocks()
+    mock_session.run = AsyncMock(return_value=_integrity_result([]))
+
+    out = await c._graph_integrity()
+
+    assert out == {"invalid_nodes": 0, "by_reason": {}, "by_label": {},
+                   "clean": True}
+
+
+@pytest.mark.asyncio
+async def test_graph_integrity_groups_by_reason_and_label():
+    """REM's verdict is surfaced grouped, so the SHAPE of the write-path defect
+    is legible without a follow-up query — which label got written, and what it
+    should have been. This is the signal that existed for weeks and that nothing
+    read: three defects were each diagnosed here and found only by hand."""
+    c, _, mock_session = _coordinator_with_mocks()
+    mock_session.run = AsyncMock(return_value=_integrity_result([
+        {"label": "Fact", "reason": "label_mismatch:Fact!=Decision", "c": 7},
+        {"label": "Fact", "reason": "label_mismatch:Fact!=Retrospective", "c": 2},
+    ]))
+
+    out = await c._graph_integrity()
+
+    assert out["invalid_nodes"] == 9
+    assert out["clean"] is False
+    # Ordered most-common first so the dominant defect leads.
+    assert list(out["by_reason"]) == ["label_mismatch:Fact!=Decision",
+                                      "label_mismatch:Fact!=Retrospective"]
+    assert out["by_reason"]["label_mismatch:Fact!=Decision"] == 7
+    assert out["by_label"] == {"Fact": 9}
+
+
+@pytest.mark.asyncio
+async def test_graph_integrity_tolerates_null_reason_and_label():
+    """A node flagged before the reason field existed must still be counted —
+    an integrity probe that drops rows it cannot label understates the defect."""
+    c, _, mock_session = _coordinator_with_mocks()
+    mock_session.run = AsyncMock(return_value=_integrity_result([
+        {"label": None, "reason": None, "c": 3},
+    ]))
+
+    out = await c._graph_integrity()
+
+    assert out["invalid_nodes"] == 3
+    assert out["by_reason"] == {"unspecified": 3}
+    assert out["by_label"] == {"unlabelled": 3}
+
+
 # ── Grounding-target label resolution (bug 578's shape, for every record type) ─
 
 @pytest.mark.asyncio
