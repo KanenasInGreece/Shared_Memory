@@ -5,6 +5,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.15] — 2026-07-28
+
+### Fixed
+
+- **The graph-integrity count is reported at the top level of the health
+  response**, not nested inside the consolidation block. It rides the same
+  cached snapshot for cheapness, but it is not a dream-cycle metric — it counts
+  nodes a write path stored under the wrong label — and nesting it there would
+  have led a dashboard to render it as part of consolidation health. Caught
+  before any consumer had read it.
+
 ## [0.8.14] — 2026-07-28
 
 ### Added
