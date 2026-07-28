@@ -5,6 +5,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.13] — 2026-07-28
+
+### Fixed
+
+- **A decision could not be grounded on a retrospective — the link was silently
+  discarded.** When a decision records the evidence it rests on, each target is
+  looked up so the edge can point at the real record. That lookup recognised only
+  two kinds of target, decisions and plain facts, so a **retrospective** target
+  fell through to the plain-fact default: the graph gained an empty placeholder
+  node carrying the retrospective's id, while the retrospective itself was never
+  linked. Nothing failed and nothing was logged — the save succeeded and the
+  relationship simply did not exist.
+
+  This matters because it breaks the framework's own outcome loop at its most
+  useful point. A decision is judged by a retrospective; when that verdict is
+  *refined* or *reversed*, the decision that replaces it is naturally grounded on
+  that retrospective. That is the one link which explains **why** a later decision
+  was made — and it was exactly the link being dropped. The target's label is now
+  resolved from its actual record type, exhaustively, so every spine record kind
+  is a valid grounding target. An unknown or absent type still resolves to a plain
+  fact, as before.
+
+  Deployments that already attempted such a link keep the placeholder node until
+  repaired; the relationship, its role, and its operator attribution were all
+  recorded faithfully and only ever pointed at the wrong node.
+
 ## [0.8.12] — 2026-07-27
 
 ### Added

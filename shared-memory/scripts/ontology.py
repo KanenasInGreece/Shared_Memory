@@ -309,6 +309,29 @@ def origin_location(source_ref: object) -> str:
     return s.split("#", 1)[0].split("@", 1)[0].strip()
 
 
+# ── Record type → graph label (the grounding-target resolver) ─────────────────
+# A grounding target is any SPINE record, not only a Fact. Resolving its label
+# from technical_docs `metadata->>'type'` MUST be exhaustive over the record
+# types: a type that falls through to a default mints a stub node under the
+# WRONG label, leaving the real node unlinked (the shadow-node class of defect,
+# bug 578 — originally found for Decision targets, and repeated for
+# Retrospective targets until this map replaced a binary conditional).
+RECORD_TYPE_LABELS: dict[str, str] = {
+    "decision":      ONT.decision,
+    "retrospective": ONT.retrospective,
+    "fact":          ONT.fact,
+}
+
+
+def record_label_for_type(record_type: object) -> str:
+    """Graph label for a technical_docs record type. Plain facts carry no
+    explicit `type`, so None/unknown resolves to Fact — the historical default,
+    kept deliberately so an untyped legacy row still lands on a real label."""
+    if not isinstance(record_type, str):
+        return ONT.fact
+    return RECORD_TYPE_LABELS.get(record_type.strip().lower(), ONT.fact)
+
+
 # ── Decision→fact grounding roles + advisory fact_kind gate (decision 582) ─────
 # A decision links to each grounding fact by a ROLE relation, not a flat GROUNDED_IN.
 # GROUNDING_ROLES maps the operator-facing role word (elicited via --grounded-in
