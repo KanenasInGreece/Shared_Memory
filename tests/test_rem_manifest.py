@@ -113,7 +113,8 @@ def test_build_manifest_empty_row_degenerates():
     an empty manifest — no flag, no legacy branch."""
     m = rem_mod.build_manifest({"content": "old fact", "kind": "fact"}, None)
     assert m["kind"] == "fact"
-    assert m["fact_kind"] == "observation"
+    # An un-source_ref'd record falls to the floor, which is `discussion`.
+    assert m["fact_kind"] == "discussion"
     assert m["entities"] == [] and m["existing_edges"] == []
     block = rem_mod._manifest_block(m)
     assert "nothing captured yet" in block            # delta → full extraction

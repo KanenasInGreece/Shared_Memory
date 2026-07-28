@@ -250,35 +250,74 @@ GENUINELY_REFERENCED_ENTITY_RULE = (
 # fact_kind is a soft tag — NOT a spine sub-label — giving a stored fact its
 # evidential weight for the high-signal grounding story (decision 552 + the
 # fact-overload discussion). It is DERIVED from source_ref, never elicited
-# separately. A plain stored fact is an observation; its source upgrades it.
-DISCUSSION_CONTEXT: str = "discussion_context"  # reserved source_ref for conversation-derived facts
+# separately.
+#
+# THE FLOOR IS `discussion`, NOT `observation`. Every fact is produced in a
+# conversation; that is the base case, not a degenerate one. What a source_ref
+# records is which EXTERNAL context entered that conversation and upgraded it:
+#   code            -> measured
+#   external source -> researched
+#   empirical check -> tested   (a test run, OR a reading off the LIVE system)
+#   nothing external, a conclusion reasoned out in the discussion -> observation
+# So `observation` is a deliberate QUALIFIER ("we reasoned this out"), never a
+# default — an unmarked fact is `discussion`, which the advisory gate then
+# grounds softly as INFORMED_BY rather than as hard evidence. That is the point:
+# an unqualified claim should not enter synthesis weighted as evidence.
+DISCUSSION_CONTEXT: str = "discussion_context"    # explicit form of the default
+OBSERVATION_CONTEXT: str = "observation_context"  # a conclusion reasoned out in the discussion
+
+# Empirical readings off the RUNNING system (graph census, /health, journal) are
+# `tested` — they are verified against reality, not derived from code. They have
+# no file to cite, so they carry a `live:` locus (e.g. "live:neo4j/entity-census")
+# or a datastore URI. Without this they would fall to the floor and a measurement
+# of 4,318 live nodes would weigh the same as a passing remark.
+LIVE_PREFIX: str = "live:"
+_LIVE_SCHEMES: tuple[str, ...] = ("neo4j://", "bolt://", "postgres://", "postgresql://")
 
 _CODE_SUFFIXES: tuple[str, ...] = (
     ".py", ".js", ".ts", ".tsx", ".go", ".rs", ".java", ".c", ".cc", ".cpp",
     ".h", ".sh", ".sql", ".yaml", ".yml", ".toml",
 )
 
+# A path is a TEST path when a path COMPONENT is test-like — not when the string
+# merely contains "test". A substring check promoted `scripts/latest_run.py` and
+# `notes/greatest_hits.md` to `tested`, the highest evidential weight, because
+# "latest" and "greatest" contain "test". Evidence weight must never inflate by
+# accident: the insight prompt tells the model tested/measured outranks
+# discussion, so a false `tested` silently strengthens a claim.
+_TEST_TOKEN_RE = re.compile(r"(?:^|[/\\._-])tests?(?:[/\\._-]|$)")
+
 
 def fact_kind_from_source_ref(source_ref: object) -> str:
     """Derive a fact's soft epistemic kind from its source_ref. Pure, deterministic.
 
-      none / empty          → 'observation'  (a plain stored fact)
-      'discussion_context'  → 'discussion'   (from a conversation)
-      http(s):// URL        → 'researched'   (external source)
-      points into a test    → 'tested'       (empirically verified)
-      a source-code file    → 'measured'     (measured from code)
-      any other cited doc   → 'researched'
+    The FLOOR is 'discussion' — every fact comes out of a conversation, and a
+    source_ref names the external context that upgraded it (see the block
+    comment above). 'observation' is a deliberate qualifier, never a default.
+
+      none / empty            → 'discussion'   (the floor: unmarked = conversational)
+      'discussion_context'    → 'discussion'   (the explicit form of the floor)
+      'observation_context'   → 'observation'  (a conclusion reasoned out in the discussion)
+      'live:...' / db URI     → 'tested'       (empirical reading off the RUNNING system)
+      http(s):// URL          → 'researched'   (external source)
+      points into a test path → 'tested'       (empirically verified)
+      a source-code file      → 'measured'     (measured from code)
+      any other cited doc     → 'researched'
     """
     if not isinstance(source_ref, str) or not source_ref.strip():
-        return "observation"
+        return "discussion"
     low = source_ref.strip().lower()
     if low == DISCUSSION_CONTEXT:
         return "discussion"
+    if low == OBSERVATION_CONTEXT:
+        return "observation"
+    if low.startswith(LIVE_PREFIX) or low.startswith(_LIVE_SCHEMES):
+        return "tested"
     if low.startswith(("http://", "https://")):
         return "researched"
     # strip a sub-document locator (file#L10, video@00:04) before keyword/suffix checks
     base = low.split("#", 1)[0].split("@", 1)[0].strip()
-    if "test" in base:
+    if _TEST_TOKEN_RE.search(base):
         return "tested"
     if base.endswith(_CODE_SUFFIXES):
         return "measured"
@@ -290,20 +329,27 @@ def origin_location(source_ref: object) -> str:
     (decision 916). Pure, deterministic — the SAME classification as
     fact_kind_from_source_ref, but returning WHERE the knowledge came from so a
     fold can cite it ("measured from coordinator.py"). Empty string when there is
-    no citable external locus — a bare observation (no source_ref) or a discussion
-    (the conversation itself, already conveyed by kind='discussion'):
+    no citable EXTERNAL locus — the two conversational kinds are the conversation
+    itself, which the kind already conveys:
 
-      none / empty          → ''            (observation — no origin clause)
-      'discussion_context'  → ''            (kind='discussion' already says it)
+      none / empty          → ''            (the floor — kind='discussion' says it)
+      'discussion_context'  → ''            (same, stated explicitly)
+      'observation_context' → ''            (reasoned in-discussion; nothing external to cite)
+      'live:neo4j/census'   → 'neo4j/census' (the live locus, prefix stripped)
       http(s):// URL        → the domain    ('arxiv.org')
       code / test / doc path→ the path, sub-document locator (#L10, @00:04) stripped
     """
     if not isinstance(source_ref, str) or not source_ref.strip():
         return ""
     s = source_ref.strip()
-    if s.lower() == DISCUSSION_CONTEXT:
+    low = s.lower()
+    if low in (DISCUSSION_CONTEXT, OBSERVATION_CONTEXT):
         return ""
-    if s.lower().startswith(("http://", "https://")):
+    if low.startswith(LIVE_PREFIX):
+        # The locus is what was read, not the marker: "live:neo4j/entity-census"
+        # cites as "neo4j/entity-census".
+        return s[len(LIVE_PREFIX):].strip() or s
+    if low.startswith(("http://", "https://")):
         netloc = urlparse(s).netloc
         return netloc or s
     return s.split("#", 1)[0].split("@", 1)[0].strip()

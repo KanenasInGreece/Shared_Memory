@@ -8,20 +8,59 @@ from ontology import (  # noqa: E402
     fact_kind_from_source_ref as fk,
     origin_location as ol,
     DISCUSSION_CONTEXT,
+    OBSERVATION_CONTEXT,
+    LIVE_PREFIX,
 )
 
 
-def test_observation_when_no_source():
-    assert fk(None) == "observation"
-    assert fk("") == "observation"
-    assert fk("   ") == "observation"
-    assert fk(123) == "observation"
+def test_discussion_is_the_floor_when_no_source():
+    """Every fact comes out of a conversation — that is the base case, not a
+    degenerate one. An unmarked fact is `discussion`, which the advisory gate
+    grounds softly (INFORMED_BY): an unqualified claim must not enter synthesis
+    weighted as evidence."""
+    assert fk(None) == "discussion"
+    assert fk("") == "discussion"
+    assert fk("   ") == "discussion"
+    assert fk(123) == "discussion"
 
 
 def test_discussion_sentinel():
     assert DISCUSSION_CONTEXT == "discussion_context"
     assert fk(DISCUSSION_CONTEXT) == "discussion"
     assert fk("discussion_context") == "discussion"
+
+
+def test_observation_is_a_qualifier_not_a_default():
+    """`observation` now means 'a conclusion reasoned out in the discussion' and
+    must be asserted explicitly — it is never what an unmarked fact falls to."""
+    assert OBSERVATION_CONTEXT == "observation_context"
+    assert fk(OBSERVATION_CONTEXT) == "observation"
+    assert ol(OBSERVATION_CONTEXT) == ""      # nothing external to cite
+
+
+def test_live_system_readings_are_tested():
+    """A reading off the RUNNING system is empirical, not code-derived: a graph
+    census, /health, the journal. Without this it fell to the floor and a
+    measurement of thousands of live nodes weighed the same as a remark."""
+    assert fk(LIVE_PREFIX + "neo4j/entity-census") == "tested"
+    assert fk("live:health") == "tested"
+    assert fk("neo4j://agent_data") == "tested"
+    assert fk("postgresql://localhost/agent_data") == "tested"
+    # the locus cites what was read, without the marker
+    assert ol("live:neo4j/entity-census") == "neo4j/entity-census"
+
+
+def test_test_path_matches_a_component_not_a_substring():
+    """Evidence weight must never inflate by accident. A substring check
+    promoted any path containing 'latest'/'greatest' to `tested`, the highest
+    weight, which the insight prompt treats as outranking discussion."""
+    assert fk("scripts/latest_run.py") == "measured"
+    assert fk("notes/greatest_hits.md") == "researched"
+    assert fk("docs/attestation.md") == "researched"
+    # genuine test paths still resolve, on any component separator
+    assert fk("src/test/helpers.py") == "tested"
+    assert fk("a_test.py") == "tested"
+    assert fk("tests/test_coordinator.py") == "tested"
 
 
 def test_researched_url():
