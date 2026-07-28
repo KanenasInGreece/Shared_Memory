@@ -102,7 +102,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.13"
+FRAMEWORK_VERSION = "0.8.14"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -1097,6 +1097,10 @@ class MemoryCoordinator:
                                              "last_success_age_seconds": None,
                                              "last_success_cycle_type": None,
                                              "stalled_types": [],
+                                             # None (not 0) until the first refresh:
+                                             # "not yet probed" must never read as
+                                             # "verified clean" (decision 928).
+                                             "graph_invalid_nodes": None,
                                              "inference_busy": "unknown", "fresh": False}
         self._consolidation_health_task: asyncio.Task | None = None
 
@@ -3468,6 +3472,15 @@ class MemoryCoordinator:
         except Exception as exc:
             snap["compliance"] = {"error": str(exc)}
 
+        # Graph integrity (decision 928) — REM's label_mismatch verdict, which it
+        # has always computed and nothing ever read. A write-path defect signal,
+        # not a backlog: non-zero means a writer is producing nodes under the
+        # wrong label and someone must fix it.
+        try:
+            snap["graph_integrity"] = await self._graph_integrity()
+        except Exception as exc:
+            snap["graph_integrity"] = {"error": str(exc)}
+
         # Consolidation signal (ADR-018) — the dream-cycle liveness rollup from
         # the daemon's consolidation_runs ledger: per-cycle-type last outcome,
         # success age, in-flight, last error, plus the derived stall verdict.
@@ -3790,8 +3803,22 @@ class MemoryCoordinator:
                 # request. Tri-state: "unknown" when nvtop is absent — surfaced as-is
                 # so the monitor never shows a false "idle".
                 inference_busy = await inference_busy_state()
+                # Graph integrity rides the same background refresh (decision
+                # 928) so /health stays a cached read and never queries Neo4j
+                # per request. Only the COUNT is carried here — the by_reason /
+                # by_label breakdown stays on /memory/telemetry, which is
+                # auth-scoped and already heavier.
+                try:
+                    integrity = await self._graph_integrity()
+                    invalid_nodes = integrity["invalid_nodes"]
+                except Exception:
+                    # Never let an integrity probe blank the whole snapshot and
+                    # report the system as unknown — the same tolerance the
+                    # roll-up keys get below.
+                    invalid_nodes = None
                 self._consolidation_health = {
                     "stalled": full["stalled"],
+                    "graph_invalid_nodes": invalid_nodes,
                     "last_outcome": full["last_outcome"],
                     "last_success_age_seconds": full["last_success_age_seconds"],
                     # Which type the headline age belongs to, and who is
@@ -4066,6 +4093,52 @@ class MemoryCoordinator:
             "invalid_relationships": invalid_rels,
         }
 
+    async def _graph_integrity(self) -> dict:
+        """Graph-integrity telemetry (decision 928): nodes REM retired because
+        their LABEL contradicted the record their pg_id names.
+
+        REM already detects this precisely — it retires the node, records
+        `rem_invalid_reason` on it, and logs a WARNING — but nothing consumed
+        that verdict, so the only trace was a log line scrolling past and a
+        property nobody queried. Three separate write-path defects were each
+        diagnosed correctly here and still found only by a hand-written Cypher
+        hunt weeks later. This makes the existing signal visible; it adds no
+        detection of its own.
+
+        Read it as a WRITE-PATH defect, never as a retryable record failure: a
+        mismatch means some writer produced a node under the wrong label, so the
+        fix is to correct that writer and repair the node. `invalid_nodes` is
+        expected to be 0 — any non-zero value is a standing defect, not a queue
+        depth that drains on its own.
+        """
+        async with self._neo4j.session() as session:
+            rows = await (await session.run(
+                "MATCH (n) WHERE coalesce(n.rem_invalid, false) = true "
+                "RETURN head(labels(n)) AS label, "
+                "       n.rem_invalid_reason AS reason, "
+                "       count(*) AS c"
+            )).data()
+        total = sum(r["c"] for r in rows)
+
+        def _rollup(key: str, fallback: str) -> dict:
+            # SUM per key — the query groups by (label, reason), so one label
+            # spans several reasons and vice versa. Building the dict directly
+            # from the rows would let a later row overwrite an earlier one and
+            # silently UNDER-report the defect, which is the one direction an
+            # integrity metric must never fail in.
+            acc: dict[str, int] = {}
+            for r in rows:
+                acc[r[key] or fallback] = acc.get(r[key] or fallback, 0) + r["c"]
+            return dict(sorted(acc.items(), key=lambda kv: (-kv[1], kv[0])))
+
+        return {
+            "invalid_nodes": total,
+            # Grouped so the shape of the defect is legible without a follow-up
+            # query: which label got written, and what it should have been.
+            "by_reason": _rollup("reason", "unspecified"),
+            "by_label": _rollup("label", "unlabelled"),
+            "clean": total == 0,
+        }
 
     # ── POST /admin/backup (quiesce / resume) ─────────────────────────────────
 

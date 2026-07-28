@@ -29,7 +29,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.8.13"
+VERSION = "0.8.14"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v3: review-edges / label-edges require the gateway's /memory/relations/* routes.
@@ -620,6 +620,21 @@ def format_status(payload: dict) -> str:
                      f"| orphans {eg.get('orphan_entities',0)} | aliases {eg.get('alias_edges',0)}{_pct}")
     elif "error" in eg:
         lines.append(f"  entities: ERROR {eg['error']}")
+    # Graph integrity — nodes REM retired because their label contradicted the
+    # record their id names. A WRITE-PATH defect, not a backlog: it does not
+    # drain on its own, so anything above 0 names a writer that needs fixing.
+    gi = t.get("graph_integrity", {})
+    if gi and "error" not in gi:
+        _bad = gi.get("invalid_nodes", 0) or 0
+        if _bad:
+            _why = ", ".join(f"{k} x{v}" for k, v in (gi.get("by_reason") or {}).items())
+            lines.append(f"  graph integrity: {_bad} INVALID node(s) ⚠ — {_why}")
+            lines.append("    (a writer produced nodes under the wrong label — "
+                         "fix the writer, then repair the nodes)")
+        else:
+            lines.append("  graph integrity: ok (0 invalid nodes)")
+    elif "error" in gi:
+        lines.append(f"  graph integrity: ERROR {gi['error']}")
     nr = t.get("nrem", {})
     if nr and "error" not in nr:
         lines.append(f"  NREM cycles: {nr.get('total_cycles','?')} pending "
