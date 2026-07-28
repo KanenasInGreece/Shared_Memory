@@ -240,29 +240,76 @@ def _registry():
 
 
 def test_plan_edges_novelty_excludes_manifest_existing():
+    # Every name here is registry-known: since 937 an unknown name is dropped
+    # before novelty is ever scored, so novelty is a question about EXISTING
+    # nodes only.
+    registry = _registry() | {
+        "coordinator": {"label": ONT.entity, "default_rel": ONT.entity_link,
+                        "typed": True, "pg_id": None},
+        "BGE-M3":      {"label": ONT.entity, "default_rel": ONT.entity_link,
+                        "typed": True, "pg_id": None},
+    }
     manifest = {"entities": ["coordinator"],
                 "existing_edges": [{"rel_type": ONT.entity_link, "target": "Neo4j",
                                     "asserted_by": "operator"}]}
     result = {"relationships": [
         {"name": "Neo4j",       "rel_type": ONT.entity_link},   # existing edge
         {"name": "coordinator", "rel_type": ONT.entity_link},   # operator entity
-        {"name": "BGE-M3",      "rel_type": ONT.entity_link},   # genuinely new
+        {"name": "BGE-M3",      "rel_type": ONT.entity_link},   # new EDGE, known node
     ]}
-    plan = rem_mod.plan_edges(result, _registry(), rem_mod.KIND_FACT, manifest)
+    plan = rem_mod.plan_edges(result, registry, rem_mod.KIND_FACT, manifest)
     by_name = {e["name"]: e for e in plan["edges"]}
     assert by_name["Neo4j"]["novel"] is False         # operator edge never re-scored
     assert by_name["coordinator"]["novel"] is False
     assert by_name["BGE-M3"]["novel"] is True
 
 
-def test_plan_edges_unknown_name_falls_back_to_mentions():
-    """727 §1: MENTIONS demoted to the explicit fallback for unknown names."""
+def test_plan_edges_unknown_name_is_dropped_not_minted():
+    """937: REM links but never mints. An unknown name used to fall back to a
+    brand-new generic :Entity via MENTIONS (727 §1) — the one path every
+    fragment entity in the graph came from. It is now dropped instead."""
+    plan = rem_mod.plan_edges(
+        {"relationships": [{"name": "BrandNewThing", "rel_type": "WAS_ATTRIBUTED_TO"}]},
+        _registry(), rem_mod.KIND_FACT, {})
+    assert plan["edges"] == []
+    assert plan["mint_dropped"] == ["BrandNewThing"]
+
+
+def test_plan_edges_known_name_still_links_under_the_mint_gate():
+    """The gate must block CREATION only — linking to an existing node is REM's
+    whole job and has to keep working."""
+    plan = rem_mod.plan_edges(
+        {"relationships": [{"name": "Neo4j", "rel_type": ONT.entity_link}]},
+        _registry(), rem_mod.KIND_FACT, {})
+    (e,) = plan["edges"]
+    assert e["name"] == "Neo4j" and e["rel_type"] == ONT.entity_link
+    assert plan["mint_dropped"] == []
+
+
+def test_plan_edges_mint_gate_is_env_overridable(monkeypatch):
+    """Setting REM_MAY_MINT_ENTITIES restores the pre-937 fallback exactly, so a
+    deployment whose capture surface never names entities can opt back in."""
+    monkeypatch.setattr(rem_mod, "REM_MAY_MINT_ENTITIES", True)
     plan = rem_mod.plan_edges(
         {"relationships": [{"name": "BrandNewThing", "rel_type": "WAS_ATTRIBUTED_TO"}]},
         _registry(), rem_mod.KIND_FACT, {})
     (e,) = plan["edges"]
     assert e["label"] == ONT.entity and e["rel_type"] == ONT.entity_link
     assert e["novel"] is True
+    assert plan["mint_dropped"] == []
+
+
+def test_plan_edges_mint_gate_is_per_name_not_all_or_nothing():
+    """One unknown name in a batch must not cost the known ones their edges —
+    the gate is a per-name refusal, not a whole-result rejection."""
+    result = {"relationships": [
+        {"name": "BrandNewThing", "rel_type": ONT.entity_link, "type": "Component"},
+        {"name": "Neo4j",         "rel_type": ONT.entity_link, "type": "System"},
+        {"name": "Xenofon",       "rel_type": ONT.was_attributed_to},
+    ]}
+    plan = rem_mod.plan_edges(result, _registry(), rem_mod.KIND_FACT, {})
+    assert sorted(e["name"] for e in plan["edges"]) == ["Neo4j", "Xenofon"]
+    assert plan["mint_dropped"] == ["BrandNewThing"]
 
 
 def test_plan_edges_grounded_in_remapped_to_informed_by():
@@ -360,6 +407,15 @@ def test_build_verify_prompt_compact():
 
 # ── _apply_fact_result wiring: confidence, provenance, ledger ─────────────────
 
+def _known(*names):
+    """Registry in which each name is an already-existing :Entity. Since 937 REM
+    refuses to mint, so any _apply test about EDGE behaviour must hand it nodes
+    that exist — otherwise the mint gate drops the name first and the test
+    silently stops exercising what it claims to."""
+    return {n: {"label": ONT.entity, "default_rel": ONT.entity_link,
+                "typed": True, "pg_id": None} for n in names}
+
+
 def _apply(daemon, conn, kind, result, registry, manifest, monkeypatch=None,
            original="the decision rationale", model="test-model", run_id="run-1"):
     loop = asyncio.new_event_loop()
@@ -381,7 +437,7 @@ def test_apply_stamps_rem_provenance_with_vote_confidence(monkeypatch):
     manifest = {"fact_kind": "tested", "entities": [], "existing_edges": []}
     result = {"relationships": [{"name": "BGE-M3", "rel_type": ONT.entity_link}]}
 
-    ok = _apply(daemon, conn, rem_mod.KIND_DECISION, result, {}, manifest)
+    ok = _apply(daemon, conn, rem_mod.KIND_DECISION, result, _known("BGE-M3"), manifest)
 
     assert ok is True
     merge_calls = [c for c in mock_session.run.call_args_list
@@ -407,7 +463,7 @@ def test_apply_discussion_votes_one_skips_edge(monkeypatch):
     manifest = {"fact_kind": "discussion", "entities": [], "existing_edges": []}
     result = {"relationships": [{"name": "SpeculativeThing", "rel_type": ONT.entity_link}]}
 
-    ok = _apply(daemon, conn, rem_mod.KIND_DECISION, result, {}, manifest)
+    ok = _apply(daemon, conn, rem_mod.KIND_DECISION, result, _known("SpeculativeThing"), manifest)
 
     assert ok is True
     cyphers = [c.args[0] for c in mock_session.run.call_args_list]
@@ -429,7 +485,7 @@ def test_apply_low_vote_non_discussion_still_minted(monkeypatch):
     manifest = {"fact_kind": "observation", "entities": [], "existing_edges": []}
     result = {"relationships": [{"name": "WeakEdgeTarget", "rel_type": ONT.entity_link}]}
 
-    ok = _apply(daemon, conn, rem_mod.KIND_DECISION, result, {}, manifest)
+    ok = _apply(daemon, conn, rem_mod.KIND_DECISION, result, _known("WeakEdgeTarget"), manifest)
 
     assert ok is True
     merge_calls = [c for c in mock_session.run.call_args_list

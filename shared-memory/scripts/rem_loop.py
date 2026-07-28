@@ -290,6 +290,18 @@ REM_MAX_ATTEMPTS = int(os.environ.get("REM_MAX_ATTEMPTS", "5"))
 # the normal path.
 REM_STARVED_THRESHOLD = int(os.environ.get("REM_STARVED_THRESHOLD", "3"))
 
+# Decision 937 — REM may LINK but never MINT. The general relationships branch
+# used to resolve an unknown name to a generic :Entity, so REM held naming
+# authority on one branch while the decision extras were already registry-gated
+# (718). Every fragment-shaped :Entity in the graph was traced to that branch;
+# the first-write path, the only other creator, had produced none of them. So the
+# same gate now covers both branches: an unknown name is DROPPED, not minted.
+# Sub-typing is unaffected — it adds a label to a node that already exists.
+# Env-overridable because "REM discovers new entities" is a legitimate posture for
+# a deployment whose capture surface does not name entities up front; here it is
+# off, and turning it on restores the pre-937 behaviour exactly.
+REM_MAY_MINT_ENTITIES: bool = os.environ.get("REM_MAY_MINT_ENTITIES", "0").strip().lower() in ("1", "true", "yes")
+
 # LLM failure classes recorded on REMDaemon._last_llm_failure.
 LLM_FAIL_TRANSPORT = "transport"   # HTTP non-200 / connection / gateway-shape — NOT chargeable
 LLM_FAIL_TRUNCATED = "truncated"   # finish_reason=length even after the widened retry
@@ -634,8 +646,8 @@ def plan_edges(result: dict, registry: dict[str, dict], kind: str,
     Pure — no I/O; the caller logs the returned drop/remap lists.
 
     Returns {"edges": [...], "dropped_names": [...], "extras_dropped": [...],
-             "grounded_in_remaps": [...]} where each edge is
-    {"name", "label", "rel_type", "novel", "evidential", "tgt_pg_id"}.
+             "mint_dropped": [...], "grounded_in_remaps": [...]} where each edge
+    is {"name", "label", "rel_type", "novel", "evidential", "tgt_pg_id"}.
 
       novel      — (name, rel_type) not already captured per the manifest
                    (existing edges + operator entities). Only novel edges are
@@ -646,10 +658,14 @@ def plan_edges(result: dict, registry: dict[str, dict], kind: str,
                    mintable) and reported in grounded_in_remaps.
       Decision extras (718): targets minted ONLY when already registry-known;
                    unknown free phrases land in extras_dropped.
+      Every branch (937): REM links, never mints. A name absent from the registry
+                   is dropped into mint_dropped instead of creating a node, unless
+                   REM_MAY_MINT_ENTITIES re-enables the pre-937 behaviour.
     """
     existing = _existing_edge_set(manifest)
     edges: list[dict] = []
     dropped_names: list[str] = []
+    mint_dropped: list[str] = []
     remaps: list[str] = []
     seen: set[tuple[str, str]] = set()
 
@@ -676,6 +692,13 @@ def plan_edges(result: dict, registry: dict[str, dict], kind: str,
             if isinstance(raw_name, str) and raw_name.strip():
                 dropped_names.append(raw_name.strip())
             continue
+        # 937: link-only. An unknown name would have become a brand-new generic
+        # :Entity here — the single path every fragment entity in the graph came
+        # from. Drop it before any relation is resolved, so nothing downstream
+        # (sub-typing included) can reference a node that must not be created.
+        if not REM_MAY_MINT_ENTITIES and name not in registry:
+            mint_dropped.append(name)
+            continue
         suggested = rel.get("rel_type", ONT.entity_link)
         label, rel_type = _resolve_rel(name, suggested, registry)
         if isinstance(suggested, str) and suggested.strip().upper() == ONT.grounded_in:
@@ -694,7 +717,8 @@ def plan_edges(result: dict, registry: dict[str, dict], kind: str,
                 _add(name, registry[name]["label"], rel_type, evidential=False)
 
     return {"edges": edges, "dropped_names": dropped_names,
-            "extras_dropped": extras_dropped, "grounded_in_remaps": remaps}
+            "extras_dropped": extras_dropped, "mint_dropped": mint_dropped,
+            "grounded_in_remaps": remaps}
 
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
@@ -782,6 +806,11 @@ def _build_verify_prompt(content: str, proposed: list[dict]) -> str:
 # ── REMDaemon ─────────────────────────────────────────────────────────────────
 
 class REMDaemon:
+    # 937 mint-gate counter, declared at class level so an instance built without
+    # __init__ (the test harness does this) still has it. See __init__ for what
+    # it counts.
+    _mint_dropped_total: int = 0
+
     def __init__(self) -> None:
         self.driver     = AsyncGraphDatabase.driver(
             NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS),
@@ -796,6 +825,11 @@ class REMDaemon:
         # serially within a cycle (same convention as NREM's
         # _last_llm_truncated), so signatures stay stable.
         self._last_llm_failure: str | None = None
+        # 937 mint-gate counter: how many unknown names REM declined to mint over
+        # this daemon's lifetime. Process-local by design — the durable record is
+        # the per-record log line; this is the cheap running total the journal can
+        # be checked against to see the gate actually biting.
+        self._mint_dropped_total: int = 0
 
     # ── Postgres connection factory ───────────────────────────────────────────
 
@@ -2025,6 +2059,14 @@ class REMDaemon:
             logger.info("REM extras gate (718): pg_id=%d dropped %d non-registry "
                         "target(s): %s", pg_id, len(plan["extras_dropped"]),
                         plan["extras_dropped"])
+        if plan["mint_dropped"]:
+            # 937: the link-only gate. This is the before/after signal for the
+            # fragment-minting rate — a durable count of what REM WOULD have
+            # created, so the fix is measurable rather than merely asserted.
+            self._mint_dropped_total += len(plan["mint_dropped"])
+            logger.info("REM mint gate (937): pg_id=%d dropped %d unknown name(s) "
+                        "REM would have minted: %s", pg_id,
+                        len(plan["mint_dropped"]), plan["mint_dropped"])
 
         # Stage 1.3 entity sub-typing — DELTA only: collect {sanitized name ->
         # sub-label} for entities the LLM typed AND that are not already typed
@@ -2036,6 +2078,8 @@ class REMDaemon:
                 continue
             nm = sanitize_entity_name(rel.get("name"))
             ty = (rel.get("type") or "").strip()
+            if nm and not REM_MAY_MINT_ENTITIES and nm not in registry:
+                continue   # 937: dropped above — never sub-type a node we refused to create
             if nm and ty in _ENTITY_SUBLABELS and not registry.get(nm, {}).get("typed"):
                 entity_types[nm] = ty
             elif nm and ty and ty.upper() != "OTHER" and ty not in _ENTITY_SUBLABELS \
