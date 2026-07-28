@@ -193,10 +193,12 @@ uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/s
 **Why-To loop query (raw Cypher; Phase D will add a named shortcut):**
 ```
 uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py graph \
-  "MATCH (d:Decision)-[o:HAD_OUTCOME]->()
+  "MATCH (d:Decision)-[o:HAD_OUTCOME]->(r:Retrospective)
    WHERE toLower(d.title) CONTAINS 'outbox'
-   RETURN d.title, o.rating, o.notes, o.date ORDER BY o.date DESC LIMIT 1"
+   RETURN d.title, r.rating, r.content, o.date ORDER BY o.date DESC LIMIT 1"
 ```
+`rating`/`notes` live on the **Retrospective node** (`r.rating`, `r.content` — a 200-char snippet; the
+full notes are the record's Tier-1 content), not on the `HAD_OUTCOME` edge, which carries only `date`.
 
 ### Task 6 — Review & calibrate machine-proposed relation edges
 
@@ -327,10 +329,10 @@ Now the Why-To check is informative for any future agent:
 ```bash
 uv run --with httpx \
   python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py query why-to-check --title "lock"
-# → [{d.title: "Sort entity locks by name...",
-#     o.rating: "validated",
-#     o.notes: "No deadlocks observed...",
-#     o.date: "2026-06-19"}]
+# → [{d.title: "Sort entity locks by name...", d.pg_id: 43,
+#     rating: "validated", decided_by: "Xenofon",
+#     notes: "No deadlocks observed...",
+#     date: "2026-06-19"}]
 ```
 
 ### F. LM Studio (MCP tools — same operations)
