@@ -1080,9 +1080,16 @@ async def handle_health(request: web.Request) -> web.Response:
             # so the monitor shows "unknown", never a false "idle". Distinct from
             # checks["llm"], which is a reachability probe of the configured pool.
             checks["inference_busy"] = consolidation.get("inference_busy", "unknown")
+            # Graph integrity is NOT a dream-cycle metric — it counts nodes a
+            # write path stored under the wrong label. It rides the same cached
+            # snapshot for cheapness, but it is surfaced TOP-LEVEL so a monitor
+            # never renders it inside the consolidation tile. None = not yet
+            # probed, which must never be read as "verified clean" (decision 928).
+            checks["graph_invalid_nodes"] = consolidation.get("graph_invalid_nodes")
         except Exception:
             checks["consolidation"] = {"fresh": False}
             checks["inference_busy"] = "unknown"
+            checks["graph_invalid_nodes"] = None
 
     return web.json_response(checks, status=200 if critical_ok else 503)
 
