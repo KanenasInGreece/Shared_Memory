@@ -5,6 +5,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- **A fact's default evidential kind is now `discussion`, not `observation`.**
+  Every fact is produced in a conversation — that is the base case, not a
+  degenerate one. What a citation records is which *external* context entered
+  that conversation and raised the fact above it: source code, an external
+  source, or an empirical check. `observation` accordingly stops being the
+  default and becomes what it always should have meant — *a conclusion reasoned
+  out in the discussion* — which is now stated explicitly rather than being
+  where unmarked facts silently landed.
+
+  This has a deliberate consequence. An unmarked fact grounds a decision as
+  *soft input* rather than as *hard evidence*, because the advisory gate maps
+  the conversational kind to the softer grounding relation. An unqualified claim
+  should not enter synthesis carrying the weight of evidence, and previously it
+  did. Existing relationships keep the role they were written with; nothing is
+  rewritten.
+
+- **Readings taken from the running system now count as empirically verified.**
+  A census of the live graph, a health reading, a check against the journal — all
+  are verified against reality rather than derived from code, but they cite no
+  file, so they used to fall to the floor and weigh the same as a passing
+  remark. A citation may now name a live locus, and is classified as tested.
+
+### Fixed
+
+- **A path merely containing the letters "test" was treated as a test path**, and
+  so promoted to the *highest* evidential weight. Files like `latest_run.py` or
+  `greatest_hits.md` qualified. Since synthesis is told that tested and measured
+  evidence outranks discussion, this silently strengthened claims nobody had
+  verified. A citation must now name a test as an actual path component.
+
 ## [0.8.13] — 2026-07-28
 
 ### Fixed
