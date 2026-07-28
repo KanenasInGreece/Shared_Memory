@@ -54,6 +54,7 @@ from ontology import (
     ONT, sanitize_entity_names, sanitize_entity_name,
     KNOWN_LABELS, KNOWN_RELATIONSHIPS, fact_kind_from_source_ref,
     GROUNDING_ROLES, default_grounding_role, RETRO_RATINGS,
+    record_label_for_type,
 )
 
 log = logging.getLogger("coordinator")
@@ -101,7 +102,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.12"
+FRAMEWORK_VERSION = "0.8.13"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -1390,11 +1391,19 @@ class MemoryCoordinator:
         self, conn, grounded_ids: list, grounded_roles: dict
     ) -> list:
         """Resolve grounded pg_ids to typed edges (decision 582, OPTION A). For each
-        target, look up its node label (Fact vs Decision) and fact_kind from
-        technical_docs, then choose the ROLE: an explicit operator role
-        (asserted_by=operator) or the fact_kind default (asserted_by=system_default).
+        target, look up its node label (Fact / Decision / Retrospective) and
+        fact_kind from technical_docs, then choose the ROLE: an explicit operator
+        role (asserted_by=operator) or the fact_kind default
+        (asserted_by=system_default).
         Advisory — no silent rewrite; an operator role always wins. Returns
-        [{pg_id, rel, asserted_by, label}] for the cross-type apoc writer."""
+        [{pg_id, rel, asserted_by, label}] for the cross-type apoc writer.
+
+        The label comes from `record_label_for_type` — exhaustive over the spine
+        record types on purpose. A binary Decision-else-Fact conditional here is
+        what made a Retrospective target mint a hollow :Fact stub while the real
+        :Retrospective stayed unlinked (bug 578's shape, repeated); grounding a
+        successor decision on the retrospective that drove it is a first-class
+        lineage, so its target label must resolve correctly."""
         if not grounded_ids:
             return []
         rows = await conn.fetch(
@@ -1406,7 +1415,7 @@ class MemoryCoordinator:
         out: list[dict] = []
         for pid in grounded_ids:
             r = meta.get(pid)
-            label = ONT.decision if (r and r["type"] == "decision") else ONT.fact
+            label = record_label_for_type(r["type"] if r else None)
             requested = (grounded_roles.get(str(pid)) or "").strip().lower()
             if requested in GROUNDING_ROLES:
                 rel, asserted_by = GROUNDING_ROLES[requested], "operator"

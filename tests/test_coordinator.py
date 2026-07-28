@@ -1156,6 +1156,55 @@ async def test_retrospective_v2_inherits_target_project_and_stores_record():
         b"retrospective:240:partly held").hexdigest()
 
 
+# ── Grounding-target label resolution (bug 578's shape, for every record type) ─
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("record_type,expected_label", [
+    ("decision", "Decision"),
+    ("retrospective", "Retrospective"),
+    ("fact", "Fact"),
+    (None, "Fact"),          # plain facts carry no explicit type
+    ("unheard_of", "Fact"),  # unknown type still lands on a real label
+])
+async def test_resolve_typed_grounding_labels_every_record_type(
+    record_type, expected_label
+):
+    """A grounding target's label must be resolved from its ACTUAL record type.
+
+    Reproduces the shadow-node defect from the logic alone: the resolver used to
+    be a binary `Decision if type == 'decision' else Fact`, so a RETROSPECTIVE
+    target fell through to Fact. The writer then MERGEd a hollow :Fact stub at
+    the retrospective's pg_id while the real :Retrospective node stayed unlinked
+    — bug 578 all over again, and it silently discards exactly the lineage that
+    grounds a successor decision on the retrospective which drove it.
+    """
+    c, mock_conn, _ = _coordinator_with_mocks()
+    mock_conn.fetch = AsyncMock(return_value=[
+        {"id": 849, "type": record_type, "source_ref": None},
+    ])
+
+    out = await c._resolve_typed_grounding(mock_conn, [849], {})
+
+    assert len(out) == 1
+    assert out[0]["pg_id"] == 849
+    assert out[0]["label"] == expected_label
+
+
+@pytest.mark.asyncio
+async def test_resolve_typed_grounding_retrospective_keeps_operator_role():
+    """The operator's asserted role survives on a retrospective-typed target —
+    label resolution must not disturb the advisory-gate outcome (decision 582)."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+    mock_conn.fetch = AsyncMock(return_value=[
+        {"id": 851, "type": "retrospective", "source_ref": None},
+    ])
+
+    out = await c._resolve_typed_grounding(mock_conn, [851], {"851": "considered"})
+
+    assert out[0] == {"pg_id": 851, "rel": "CONSIDERED",
+                      "asserted_by": "operator", "label": "Retrospective"}
+
+
 # ── GET /memory/telemetry rollup ──────────────────────────────────────────────
 
 @pytest.mark.asyncio
