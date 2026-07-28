@@ -5,6 +5,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.16] — 2026-07-28
+
+### Changed
+
+- **The enrichment pass now links but never creates.** When it proposed a
+  relationship to a name that did not yet exist as a node, it created one. That
+  was the single path by which sentence fragments — a clause lifted out of a
+  rationale, not a concept anyone named — became first-class entities, and from
+  there became candidates for alias resolution and keys for thematic summaries.
+  Measured against a live graph, every fragment-shaped entity present had come
+  from that path; the capture path, the only other way an entity can be created,
+  had produced none of them. So the gate that already governed one branch of
+  enrichment now governs all of them: an unrecognised name is dropped and
+  counted, never minted. Sub-typing is unaffected, because it labels a node that
+  already exists.
+
+  This makes the capture surface the sole origin of entities, which is where a
+  human has actually named the concept. Deployments whose capture surface does
+  not name entities up front can restore the previous behaviour by setting
+  `REM_MAY_MINT_ENTITIES=1`; the count of refused names is reported in the
+  journal so the effect is observable either way.
+
 ## [0.8.15] — 2026-07-28
 
 ### Fixed
