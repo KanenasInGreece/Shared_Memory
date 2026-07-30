@@ -60,15 +60,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   list did two different jobs.** The enrichment prompt lists known entity names so
   the model matches them exactly instead of coining near-duplicates, and the same
   list is what the link gate resolves proposals against — the names *shown* and the
-  names *accepted* were a single fetch, capped at 1500 and ordered by name. Once a
-  graph passes that many nodes, the tail of the alphabet falls out of both halves at
-  once: an entity is never offered to the model, and if the model names it anyway
-  from the record's own text, the gate treats it as unknown and drops the edge. On a
-  live graph of ~2600 named nodes that hid roughly half the entities from a
-  mechanism whose entire purpose is to find them, so facts stopped accumulating on
-  the entities they were about, and those entities stopped moving toward the
-  density threshold a thematic summary needs. The truncation was logged, but as a
-  prompt-size warning — nothing said that acceptance had narrowed too.
+  names *accepted* were a single fetch ordered by name, capped by `ENTITY_SET_LIMIT`
+  (default 1500). Once a graph passes that cap, the tail of the alphabet falls out of
+  both halves at once: an entity is never offered to the model, and if the model
+  names it anyway from the record's own text, the gate treats it as unknown and drops
+  the edge. So facts stopped accumulating on the entities they were about, and those
+  entities stopped moving toward the density threshold a thematic summary needs. The
+  truncation was logged, but as a prompt-size warning — nothing said that acceptance
+  had narrowed too.
+
+  Scale of the loss, stated separately from the default because the two differ. The
+  install where this was found runs `ENTITY_SET_LIMIT=2000` against 2599 distinct
+  named nodes, so **~609 names (≈23%) were invisible** — the observed `grounding_n`
+  topped out at 1996 and the fetch returned exactly its 2000-row limit, which is
+  what raised the truncation warnings. On the shipped default of 1500 the same graph
+  would hide ~1099 names (≈42%). Both are the same defect; only the magnitude scales
+  with the cap.
 
   The two sets are now bounded by what each is for. The accept set is the whole
   registry, under a high safety valve (`ENTITY_REGISTRY_LIMIT`) that means "prune
@@ -84,7 +91,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   install it held 4396 names against ~2600 existing ones, and more than half of a
   top-80 recall were names the graph no longer has. Offering those invites a
   proposal the link gate must then reject, so they are discarded before the prompt
-  is built.
+  is built. The gap is not hypothetical drift: a single entity-hygiene pass had
+  removed 1,840 nodes whose embedding rows all remained, which accounts for nearly
+  the whole discrepancy.
 
 ### Changed
 
