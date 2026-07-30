@@ -5,6 +5,49 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.21] — 2026-07-30
+
+### Fixed
+
+- **The MCP client could load the framework's own env, inheriting every other
+  agent's credentials.** It loaded `.env` from the directory it is installed in,
+  which is the right shape — a per-install file is what lets a second MCP host hold
+  its own token — but this script ships at the repo root, and that is exactly where a
+  pre-0.6 install keeps the **framework** env: `AGENT_TOKENS` (the entire registry),
+  `PG_PASSWORD` and `NEO4J_PASSWORD`. A client that reads it holds every agent's
+  token, which defeats the purpose of per-agent tokens being separately identifiable
+  and separately revocable.
+
+  It still loads the file beside itself, but now refuses one carrying server-only
+  keys and says what to do instead: give the client its own directory and `.env`
+  (only `AGENT_TOKEN`, optionally `COORDINATOR_URL` / `AGENT_ID`), point the new
+  `VECTOR_SKILL_ENV` at one, or inject the token through the MCP host's own env
+  block. `AGENT_TOKEN` is deliberately not mistaken for `AGENT_TOKENS`, and
+  commented keys do not trigger the refusal, so a `.env` copied from `.env.example`
+  still loads.
+
+  Worth stating plainly, because it shaped the fix: **client identity comes from the
+  token, server-side.** The gateway overwrites a record's `source` with the
+  authenticated agent, so a client cannot assert who it is. `AGENT_ID` is only a
+  local label — but it had two different defaults, one at module level and another at
+  three call sites, so a single process labelled itself inconsistently depending on
+  which tool ran. It is read in one place now.
+
+- **Six MCP tools handled a rejected token without recording it.** A helper already
+  existed that both logs the auth failure and returns a uniform message, but six
+  tools inlined their own copy of the text and skipped the logging — and those six
+  were all the **write** tools, so write-path auth failures never reached the audit
+  log at all. Three variants of the message had drifted apart, and the guidance in
+  five of them was already stale. Every one of the twelve `401` paths now uses the
+  helper, called with the calling tool's name rather than a constant, so the log says
+  which call was rejected and the token-source guidance lives in exactly one place.
+
+### Removed
+
+- `import asyncio` from the MCP server — unused. Verified by reference analysis
+  rather than inspection: it was the only genuinely dead name in the file, since the
+  tool functions that look unreferenced are registered by decorator.
+
 ## [0.8.20] — 2026-07-30
 
 ### Fixed
