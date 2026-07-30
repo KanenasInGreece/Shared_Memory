@@ -30,7 +30,6 @@ MCP tools: hybrid_search_and_rerank, save_artifact, archive_reasoning_trace,
 save_decision, save_retrospective, supersede, review_hold, check_memory_health,
 memory_telemetry, record_lineage, graph_query, review_edges, label_edges.
 """
-import asyncio
 import json
 import logging
 import os
@@ -40,13 +39,62 @@ from datetime import datetime
 import httpx
 from fastmcp import FastMCP
 
-# Load .env from the same directory as this script so credentials are available
-# when LM Studio (or any MCP host) spawns this process without inheriting the shell env.
+# ── Client-scoped credentials ────────────────────────────────────────────────
+#
+# This process is a CLIENT. The only secrets it may hold are its OWN AGENT_TOKEN
+# and the gateway URL — never the framework/server env, which carries
+# PG_PASSWORD, NEO4J_PASSWORD and the entire AGENT_TOKENS registry. A client that
+# loaded that file would inherit every other agent's credentials, and the point
+# of per-agent tokens is that each origin is separately identifiable and
+# separately revocable.
+#
+# The two collide by default: this script lives at the repo root, so "the .env
+# beside me" is exactly where a pre-0.6 install still keeps the server env. So
+# load the file beside this script — which is what makes a per-install copy work,
+# the same shape as each CLI agent owning its own skill .env — but REFUSE one that
+# is recognisably the server's, and say why. Any MCP host can install its own copy
+# in its own directory with its own token; nothing here assumes LM Studio.
+#
+# VECTOR_SKILL_ENV overrides the path outright, for an install that keeps its
+# client env somewhere else. An MCP host that injects AGENT_TOKEN through its own
+# config block (mcp.json's `env`) needs no file at all — that path is unaffected.
+_SERVER_ONLY_KEYS = ("AGENT_TOKENS=", "PG_PASSWORD=", "NEO4J_PASSWORD=")
+
+
+def _looks_like_server_env(path: str) -> bool:
+    """True when this .env is the FRAMEWORK's, not a client's. Best-effort: an
+    unreadable file is not treated as a server env, since the only cost of trying
+    to load it is dotenv's own failure."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                stripped = line.lstrip()
+                if stripped.startswith("#"):
+                    continue
+                if any(key in stripped for key in _SERVER_ONLY_KEYS):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+_ENV_PATH = os.environ.get("VECTOR_SKILL_ENV", "").strip() or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".env")
 try:
     from dotenv import load_dotenv
-    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 except ImportError:
     pass  # python-dotenv not installed; rely on env vars being set externally
+else:
+    if os.path.isfile(_ENV_PATH) and _looks_like_server_env(_ENV_PATH):
+        sys.stderr.write(
+            f"[rag-orchestrator] refusing to load {_ENV_PATH}: it holds "
+            "server-only keys (AGENT_TOKENS / PG_PASSWORD / NEO4J_PASSWORD), so "
+            "it is the framework env, not this client's. Give this MCP client its "
+            "own directory with its own .env containing only AGENT_TOKEN (and "
+            "optionally COORDINATOR_URL / AGENT_ID), set VECTOR_SKILL_ENV to that "
+            "file, or inject AGENT_TOKEN via the MCP host's own env block.\n")
+    else:
+        load_dotenv(_ENV_PATH)
 
 # Configure logging to stderr for MCP visibility
 logging.basicConfig(level=logging.INFO)
@@ -128,10 +176,16 @@ def _unavailable(exc: Exception) -> str:
 
 
 def _auth_rejected(tool: str) -> str:
+    """The ONE 401 response. Six tools used to inline their own copy of this
+    message and so never logged the failure — and the write tools were the six,
+    which is the worse half to lose from the audit trail. `tool` is the calling
+    tool's own name, so the log says which call was rejected."""
     _append_log(tool, 2, "auth_failed",
-                {"hint": "Check AGENT_TOKEN in this skill's .env matches a gateway AGENT_TOKENS entry"})
+                {"hint": "Check AGENT_TOKEN matches a gateway AGENT_TOKENS entry"})
     return ("Error: the gateway rejected this client's token. Set AGENT_TOKEN in "
-            "the .env beside vector-skill.py (or in the mcp.json env block).")
+            "this client's own .env (beside this script, or wherever "
+            "VECTOR_SKILL_ENV points), or in the MCP host's env block. It must "
+            "match an entry in the gateway's AGENT_TOKENS.")
 
 
 def _valid_ref(ref: str) -> bool:
@@ -214,7 +268,7 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5) -> str:
                 headers=_auth_headers(),
             )
             if r.status_code == 401:
-                return _auth_rejected("vector_skill")
+                return _auth_rejected("hybrid_search_and_rerank")
             r.raise_for_status()
             payload = r.json()
     except Exception as exc:
@@ -279,7 +333,7 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
     entities = m_data.get("entities", [])
 
     coordinator_url = COORDINATOR_BASE
-    agent_id = os.environ.get("AGENT_ID", "lm_studio")
+    agent_id = AGENT_ID
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -289,7 +343,7 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
                 headers=_auth_headers(),
             )
             if r.status_code == 401:
-                return "Error: Coordinator rejected token. Set AGENT_TOKEN in mcp.json env block."
+                return _auth_rejected("save_artifact")
             result = r.json()
     except Exception as exc:
         _append_log("vector_skill", 2, "gateway_down", {"content_preview": content[:100]}, content)
@@ -338,7 +392,7 @@ async def archive_reasoning_trace(session_id: str, task: str, steps: list) -> st
             lines.append(f"   Result: {step['result']}")
     content = "\n".join(lines)
     metadata = {
-        "source": os.environ.get("AGENT_ID", "vector_skill"),
+        "source": AGENT_ID,
         "type": "reasoning_trace",
         "session_id": session_id,
         "task": task,
@@ -420,7 +474,7 @@ async def save_decision(
     content = f"{title}\n\n{rationale}"
 
     coordinator_url = COORDINATOR_BASE
-    agent_id = os.environ.get("AGENT_ID", "lm_studio")
+    agent_id = AGENT_ID
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -430,7 +484,7 @@ async def save_decision(
                 headers=_auth_headers(),
             )
             if r.status_code == 401:
-                return "Error: Coordinator rejected token. Set AGENT_TOKEN in mcp.json env block."
+                return _auth_rejected("save_decision")
             result = r.json()
     except Exception as exc:
         return (
@@ -475,7 +529,7 @@ async def save_retrospective(
     operator was asked for these fields.
     """
     coordinator_url = COORDINATOR_BASE
-    agent_id = os.environ.get("AGENT_ID", "lm_studio")
+    agent_id = AGENT_ID
 
     payload = {
         "pg_id": pg_id,
@@ -513,7 +567,7 @@ async def save_retrospective(
                 headers=_auth_headers(),
             )
             if r.status_code == 401:
-                return "Error: Coordinator rejected token. Set AGENT_TOKEN in mcp.json env block."
+                return _auth_rejected("save_retrospective")
             result = r.json()
     except Exception as exc:
         return (
@@ -556,7 +610,7 @@ async def supersede(pg_id: int, by: int = 0) -> str:
                 headers=_auth_headers(),
             )
             if r.status_code == 401:
-                return "Error: Coordinator rejected token. Set AGENT_TOKEN in mcp.json env block."
+                return _auth_rejected("supersede")
             result = r.json()
     except Exception as exc:
         return (
@@ -590,7 +644,7 @@ async def review_hold(summary_id: int, pg_id: int) -> str:
                 headers=_auth_headers(),
             )
             if r.status_code == 401:
-                return "Error: Coordinator rejected token. Set AGENT_TOKEN in mcp.json env block."
+                return _auth_rejected("review_hold")
             result = r.json()
     except Exception as exc:
         return (
@@ -618,7 +672,7 @@ async def check_memory_health() -> str:
             resp = await client.get(f"{COORDINATOR_BASE}/health",
                                     headers=_auth_headers())
         if resp.status_code == 401:
-            return _auth_rejected("vector_skill")
+            return _auth_rejected("check_memory_health")
         payload = resp.json()
     except Exception as exc:
         return json.dumps({"status": "unreachable",
@@ -653,7 +707,7 @@ async def memory_telemetry() -> str:
                 f"{coordinator_url}/memory/telemetry", headers=_auth_headers()
             )
         if resp.status_code == 401:
-            return "Error: coordinator rejected token (check AGENT_TOKEN in mcp.json)."
+            return _auth_rejected("memory_telemetry")
         if resp.status_code >= 400:
             return f"Error: coordinator returned HTTP {resp.status_code}."
         return json.dumps(resp.json(), indent=2)
@@ -685,7 +739,7 @@ async def record_lineage(ref: str) -> str:
             r = await client.get(f"{COORDINATOR_BASE}/memory/status/{ref}",
                                  headers=_auth_headers())
             if r.status_code == 401:
-                return _auth_rejected("vector_skill")
+                return _auth_rejected("record_lineage")
             return json.dumps(r.json(), indent=2, default=str)
     except Exception as exc:
         return _unavailable(exc)
@@ -706,7 +760,7 @@ async def graph_query(cypher: str) -> str:
                                   json={"cypher": cypher, "params": {}},
                                   headers=_auth_headers())
             if r.status_code == 401:
-                return _auth_rejected("vector_skill")
+                return _auth_rejected("graph_query")
             payload = r.json()
     except Exception as exc:
         return _unavailable(exc)
@@ -732,7 +786,7 @@ async def review_edges(family: str = "entity_relation", limit: int = 20) -> str:
                 params={"family": family, "limit": limit},
                 headers=_auth_headers())
             if r.status_code == 401:
-                return _auth_rejected("vector_skill")
+                return _auth_rejected("review_edges")
             return json.dumps(r.json(), indent=2, default=str)
     except Exception as exc:
         return _unavailable(exc)
@@ -760,7 +814,7 @@ async def label_edges(labels_json: str, promote: list = None) -> str:
                 json={"labels": labels, "promote": promote or []},
                 headers=_auth_headers())
             if r.status_code == 401:
-                return _auth_rejected("vector_skill")
+                return _auth_rejected("label_edges")
             return json.dumps(r.json(), indent=2, default=str)
     except Exception as exc:
         return _unavailable(exc)

@@ -453,3 +453,111 @@ async def test_mcp_review_hold():
     call = mock_post.call_args
     assert call.args[0].endswith("/memory/review_hold")
     assert call.kwargs["json"] == {"summary_id": 3, "pg_id": 5}
+
+
+# ── Client-scoped env: never load the framework/server env ───────────────────
+
+def _vs_module():
+    """Load vector-skill.py fresh (module name has a dash, so import by path)."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(__file__), "..", "vector-skill.py")
+    spec = importlib.util.spec_from_file_location("vector_skill_env", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_server_env_is_recognised_and_refused(tmp_path):
+    """A client must never inherit the framework env: it carries the whole
+    AGENT_TOKENS registry plus both DB passwords, so loading it would hand this
+    one client every other agent's credentials and defeat per-origin tokens."""
+    vs = _vs_module()
+    for key in ("AGENT_TOKENS=claude:tok_a,grok:tok_b",
+                "PG_PASSWORD=hunter2",
+                "NEO4J_PASSWORD=hunter2"):
+        f = tmp_path / f"{key.split('=')[0]}.env"
+        f.write_text(f"COORDINATOR_URL=http://localhost:8888\n{key}\n")
+        assert vs._looks_like_server_env(str(f)) is True, key
+
+
+def test_client_env_is_accepted(tmp_path):
+    """AGENT_TOKEN (singular) is exactly what a client SHOULD hold."""
+    vs = _vs_module()
+    f = tmp_path / "client.env"
+    f.write_text("AGENT_TOKEN=tok_mine\nCOORDINATOR_URL=http://localhost:8888\n"
+                 "AGENT_ID=some_other_host\n")
+    assert vs._looks_like_server_env(str(f)) is False
+
+
+def test_agent_token_singular_is_not_mistaken_for_the_registry(tmp_path):
+    """The obvious footgun: AGENT_TOKEN vs AGENT_TOKENS differ by one character,
+    and refusing a legitimate client env would break every MCP install."""
+    vs = _vs_module()
+    f = tmp_path / "singular.env"
+    f.write_text("AGENT_TOKEN=tok_mine\n")
+    assert vs._looks_like_server_env(str(f)) is False
+
+
+def test_commented_server_keys_do_not_trigger_the_refusal(tmp_path):
+    """.env files are copied from .env.example, which carries commented keys."""
+    vs = _vs_module()
+    f = tmp_path / "commented.env"
+    f.write_text("# AGENT_TOKENS=agent:tok\n# PG_PASSWORD=\nAGENT_TOKEN=tok_mine\n")
+    assert vs._looks_like_server_env(str(f)) is False
+
+
+def test_missing_file_is_not_a_server_env(tmp_path):
+    vs = _vs_module()
+    assert vs._looks_like_server_env(str(tmp_path / "nope.env")) is False
+
+
+def test_agent_id_is_read_in_exactly_one_place():
+    """AGENT_ID is a LOCAL label only — the gateway overwrites metadata["source"]
+    with the authenticated token identity (coordinator.py), so per-origin
+    differentiation is by TOKEN, server-side, and never by this value. It still
+    wants one source: it used to default to "vector_skill" at module level and
+    "lm_studio" at three call sites, so logs and the search agent_id field
+    disagreed within a single process depending on which tool ran.
+    """
+    src = open(os.path.join(os.path.dirname(__file__), "..", "vector-skill.py"),
+               encoding="utf-8").read()
+    assert src.count('os.environ.get("AGENT_ID"') == 1, (
+        "AGENT_ID is read in more than one place — a second default can diverge "
+        "from the first, which is the inconsistency this pins"
+    )
+
+
+def test_every_401_routes_through_the_auth_helper():
+    """Six tools — all of them WRITE tools — inlined their own 401 message and so
+    never logged the auth failure, which is the worse half to lose from the audit
+    trail. Three different message texts had already drifted apart. One helper
+    now owns the response, and it is the single place the token-source guidance
+    lives, so it cannot go stale in five copies again.
+    """
+    path = os.path.join(os.path.dirname(__file__), "..", "vector-skill.py")
+    src = open(path, encoding="utf-8").read()
+    lines = src.split("\n")
+
+    checks = [i for i, l in enumerate(lines) if "status_code == 401" in l]
+    assert checks, "no 401 handling found at all"
+    for i in checks:
+        following = lines[i + 1]
+        assert "_auth_rejected(" in following, (
+            f"line {i + 2} handles a 401 without the helper — it will not log the "
+            f"failure: {following.strip()[:70]}"
+        )
+
+    assert "rejected token" not in src.lower().replace(
+        "rejected this client's token", ""), (
+        "an inline 401 message is back; _auth_rejected owns that text"
+    )
+
+
+def test_auth_helper_is_called_with_the_calling_tool_name():
+    """The log's `tool` field was the literal "vector_skill" at every site, so it
+    never said which call was rejected."""
+    path = os.path.join(os.path.dirname(__file__), "..", "vector-skill.py")
+    src = open(path, encoding="utf-8").read()
+    assert '_auth_rejected("vector_skill")' not in src, (
+        "the helper is being passed the client name instead of the tool name"
+    )
