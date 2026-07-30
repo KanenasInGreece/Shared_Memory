@@ -11,9 +11,9 @@ CLI usage:
     python memory_bridge.py search "<query>" [limit]
     python memory_bridge.py graph  "<cypher>"
     python memory_bridge.py save_decision --title "..." --decided-by "..." \
-        --project "..." --rationale "..." [--source "..."] \
-        [--assisted-by "a,b"] [--alternatives "x,y"] \
-        [--confidence "high"] [--entities "E1,E2"]
+        --project "..." --rationale "..." --grounded-in "601:based_on,602" \
+        [--source "..."] [--assisted-by "a,b"] [--alternatives "x,y"] \
+        [--confidence "high"]
     python memory_bridge.py review-edges [entity_relation|evidential] [N]
     python memory_bridge.py label-edges "12=correct,13=incorrect" [--promote 12]
 """
@@ -29,7 +29,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.8.25"
+VERSION = "0.8.26"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v3: review-edges / label-edges require the gateway's /memory/relations/* routes.
@@ -328,7 +328,18 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
         _append_log("memory_bridge", 3, "save_success",
                     {"pg_id": pg_id, "source": metadata.get("source"), "entity_count": len(entities)},
                     content)
-        if not entities:
+        # What "unreachable by synthesis" MEANS depends on the record type, so the
+        # warning has to follow it. A fact mints its own topics, so an empty
+        # `entities` is the defect. A judgement mints none by design — it inherits
+        # from the facts it cites — so the equivalent defect is empty grounding,
+        # and warning `no_entities` there would fire on every decision saved
+        # exactly as instructed, training the operator to ignore the log.
+        if metadata.get("type") in ("decision", "retrospective"):
+            if not metadata.get("grounded_in"):
+                _append_log("memory_bridge", 1, "no_grounding",
+                            {"pg_id": pg_id, "source": metadata.get("source"),
+                             "type": metadata.get("type")}, content)
+        elif not entities:
             _append_log("memory_bridge", 1, "no_entities", {"pg_id": pg_id, "source": metadata.get("source")}, content)
     else:
         _append_log("memory_bridge", 2, "save_failed", {"response": result, "content_preview": content[:100]}, content)
@@ -1139,10 +1150,15 @@ async def main() -> None:
         p.add_argument("--confidence",  default="",
                        help="Confidence level (e.g. high, medium, low)")
         p.add_argument("--entities",    default="",
-                       help="Comma-separated Neo4j entities to link")
+                       help="DEPRECATED — kept for older callers and IGNORED by the "
+                            "graph. A decision mints no entity; it inherits the topics "
+                            "of the facts in --grounded-in. Use that instead.")
         p.add_argument("--grounded-in", default="",
-                       help="Comma-separated pg_ids of the facts this decision rests on "
-                            "(include at least the conversation fact — grounding floor)")
+                       help="Comma-separated pg_ids of the facts this decision rests on, "
+                            "optionally with a role: '601:based_on,602'. THIS is what "
+                            "gives the decision its topics — an ungrounded decision "
+                            "reaches no cluster and never enters synthesis. Include at "
+                            "least the conversation fact (grounding floor).")
         p.add_argument("--elicited",    action="store_true",
                        help="The spine fields were elicited from the operator (an elicited "
                             "null is deliberate; coverage telemetry counts the ask)")
@@ -1185,7 +1201,9 @@ async def main() -> None:
                             "outcome, optionally with a role: '601,602:considered'. A "
                             "test-grounded decision deserves a test-grounded retrospective.")
         p.add_argument("--entities",    default="",
-                       help="Comma-separated Neo4j entities to link")
+                       help="DEPRECATED — kept for older callers and IGNORED by the "
+                            "graph. A retrospective inherits the topics of the facts "
+                            "in --grounded-in, falling back to the decision it judges.")
         p.add_argument("--source-ref",  default="",
                        help="Where the outcome evidence lives (test file, URL, "
                             "'discussion_context') — derives the record's fact_kind")

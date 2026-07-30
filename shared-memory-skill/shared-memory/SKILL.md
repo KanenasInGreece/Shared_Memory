@@ -74,7 +74,7 @@ Commit findings, decisions, and technical facts to long-term shared memory.
 
 **`source`** — the gateway stamps this with the authenticated token identity (`claude`, `gemini`, `lm_studio`, etc.); any client-supplied value is overridden. Pass any non-empty string to satisfy the schema — `entities` and `project` matter more. For non-authenticated (legacy) installs, pass the agent name explicitly.
 
-**`entities` is required for Tier 3 consolidation — and it is now the ONLY way a new concept enters the graph.** Supply 1–4 named concepts the fact is about. Facts saved without `entities` are stored and searchable but never synthesised into community summaries. Name each one as a **concept, not a sentence** (`OutboxPattern`, not `must be performed on the VM`): the enrichment pass links to existing nodes but never invents one, so a concept you omit here simply never becomes a cluster key, and a phrase you type here becomes one permanently.
+**`entities` is required for Tier 3 consolidation — and a FACT is now the only place a new concept can enter the graph at all.** Supply 1–4 named concepts the fact is about. Facts saved without `entities` are stored and searchable but never synthesised into community summaries. Name each one as a **concept, not a sentence** (`OutboxPattern`, not `must be performed on the VM`): the enrichment pass links to existing nodes but never invents one, and decisions and retrospectives no longer name their own — they inherit from the facts they rest on. So a concept you omit here never becomes a cluster key for the fact *or* for anything later grounded in it, and a phrase you type here becomes one permanently.
 
 **`project` / `domain` scopes consolidation — autofilled, confirm when it matters.** NREM keys community summaries on **(entity, domain)**; facts sharing an entity but carrying different `project`/`domain` tags are never fused into one summary. **Omit `project` and the client derives it from the project folder name** (walking up to the nearest `.git`/`CLAUDE.md`/`AGENTS.md`; `SHARED_MEMORY_PROJECT` overrides; outside any project root it derives nothing). This is what keeps one project's tag identical across every agent and session — so **do not hand-type a project that differs from the folder**, and state the derived tag when saving work that belongs to a *different* project than the current directory. An explicit value always wins. Untagged facts fall back to domain `general` and fragment away from their project's cluster, so a save from outside a project root deserves an explicit tag. Set `domain` (not `project`) to sub-divide one project whose entities span unrelated topics.
 
@@ -106,6 +106,8 @@ Commit findings, decisions, and technical facts to long-term shared memory.
 … memory_bridge.py review-hold --summary-id <id> --pg-id <superseded_source_pg_id>
 ```
 Supersession is **explicit, never automatic** (similarity is not a correctness signal). Propagation is **lazy**: dependent summaries/insights aren't re-folded on supersede — they're flagged at retrieval via `stale_sources` (above) and judged at the point of use.
+
+**⚠ Supersession is the FACT lifecycle — decisions and retrospectives are refused (HTTP 400).** A fact is a claim about the world, so when the world changes the claim is retracted. A judgement is not a claim about the world: it is a dated act by a person, and the record that it turned out wrong is a **retrospective**, not a retraction. So **to overturn a decision, save a retrospective against it with `--rating reversed`** — that marks the decision superseded as the *consequence* of a verdict which stays in the graph, leaving lineage a later decision can ground on. Retracting it directly would erase the reasoning instead of recording that it was overturned. **To revise a retrospective, save a NEW one against the same decision** — a retrospective is dated to when it was made, and the latest live verdict is the one that counts.
 
 ### 3. Relational Querying (Neo4j)
 Query the knowledge graph for structural and provenance context.
@@ -142,21 +144,28 @@ Record architectural or design decisions with full PROV-O provenance — who dec
     --title "Add consolidation daemon" \
     --decided-by "Xenofon" \
     --project "shared_memory" \
-    --rationale "Simulate dreaming; reduce hot-path latency via outbox" \
+    --rationale "Simulate dreaming; reduce hot-path latency via outbox. Rejected synchronous writes because they put LLM latency on the save path; rejected no consolidation because facts then never fuse. Conditions: holds while writes stay single-node." \
     --assisted-by "claude-sonnet-4-6" \
     --alternatives "synchronous writes, no consolidation" \
     --confidence "high" \
-    --entities "Consolidator,SharedMemory"
+    --grounded-in "601:based_on,602"
   ```
 - **MCP tool (LM Studio — Phase B):** Call `save_decision(title=..., decided_by=..., project=..., rationale=..., source=<model_name>)` — all comma-separated list fields optional.
 - **Raw JSON (legacy):** Pass a full `type=decision` metadata blob to `save`.
 
 **Required flags/fields:** `--title`, `--decided-by`, `--rationale` (CLI); `title`, `decided_by`, `project`, `rationale`, `source` (MCP). `--project` is optional on the CLI **only because it defaults to the derived folder name** — the gateway still rejects an empty project, so a decision saved from outside a project root fails loudly rather than landing untagged. Missing required fields return HTTP 400.
 
+**`--decided-by` is a narrative claim; the gateway canonicalises it.** When the connection carries a kernel-attested principal, the operator's OS account becomes the stored `decided_by` and your wording is preserved as `decided_by_claimed`. So state who decided in whatever form is natural — but do **not** fold the assisting AI into it (`"<operator> + <agent>"`): that is what `--assisted-by` is for, and each such spelling used to mint its own person and split one operator across Tier-3 provenance. Over a TCP connection there is no principal and the claim stands exactly as given.
+
+**⚠ `--grounded-in` is what gives a decision its topics — a decision NEVER names its own.** It mints no entities: its cluster keys are inherited by traversing to the facts it rests on, so an ungrounded decision reaches nothing and is invisible to cross-project synthesis. Elicit the pg_ids of the facts that drove it (`"601:based_on,602"` — same grammar as the retrospective; a bare id takes the fact-kind default role). **Every role confers topics** — `based_on`, `considered`, `rejected`, `under_conditions` and `informed_by` alike — so pick the role that is *true*, never the one you think will register. You may also ground on an **earlier decision or the retrospective that overturned one**: that lineage passes through to *its* facts, so the topics still arrive. If the operator can name no fact, say so rather than saving a decision that floats: search for the facts, or save them first. `--entities` on a decision is accepted for older callers and **ignored by the graph** — do not pass it.
+
+**⚠ `--rationale` carries the two things no other field can hold: the CONDITIONS and the REJECTIONS — elicit both.** `--alternatives` records *what* was not taken and has no room for *why not*; nothing anywhere holds the conditions the decision is expected to hold under. So ask for both and write them into the rationale text: what would have to stay true for this to remain the right call, and what was wrong with each option passed over. When the operator says there are no conditions, record that **explicitly** ("conditions: none") rather than omitting it — an absent clause and a deliberate "none" are different claims, and only the explicit one shows a later reader the question was asked. Cross-project synthesis is instructed to state each principle's limits *and* what it chose against; a rationale supplying neither invites the model to invent both.
+
 **What happens on save:**
 1. Coordinator validates required decision fields at ingress (before any DB write)
 2. Upserts into Postgres `technical_docs` (same idempotency as plain facts)
-3. Outbox worker writes Decision→Human→Project→AIAgent subgraph in Neo4j with PROV-O edges: `WAS_ATTRIBUTED_TO`, `PROJECT_OF`, `WAS_ASSISTED_BY`, `MENTIONS`
+3. Outbox worker writes Decision→Human→Project→AIAgent subgraph in Neo4j with PROV-O edges: `WAS_ATTRIBUTED_TO`, `PROJECT_OF`, `WAS_ASSISTED_BY`, plus `GROUNDED_IN` to each cited fact
+4. `MENTIONS` edges are then **inherited** — every entity on the grounding facts, operator-asserted grounding first, falling back to the decision's latest live retrospective's facts when it grounds nothing itself
 
 **Query decisions later:**
 ```
@@ -186,7 +195,9 @@ uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/s
 **MCP tool (LM Studio):** `save_retrospective(pg_id=42, rating="validated", notes="...", source="qwen3")`
 
 **Required:** `--pg-id` (int, returned by `save_decision`), `--rating`, `--notes`
-**Optional:** `--date` (ISO, default today), `--source` (default `$AGENT_ID`), `--grounded-in` (pg_ids+roles of the outcome evidence), `--entities`, `--source-ref`, `--elicited`
+**Optional:** `--date` (ISO, default today), `--source` (default `$AGENT_ID`), `--grounded-in` (pg_ids+roles of the outcome evidence), `--source-ref`, `--elicited`
+
+**A retrospective names no entities either — same rule as the decision.** Its topics are inherited from the facts in `--grounded-in`, falling back to the decision it judges when it cites none. So `--grounded-in` is the field that decides whether the outcome reaches synthesis at all; `--entities` is accepted for older callers and ignored by the graph.
 
 **`--rating` is a closed outcome-state enum:** `validated` (held up), `mixed` (partly), `refined` (the decision evolved), `pending` (not yet judged), `reversed` (withdrawn — supersedes the decision: it disappears from Tier-1 search and never seeds a new cross-project insight; existing insights re-fold with the reversal as a known limit). States, not grades — the nuance and the measured delta belong in `--notes`, which is what insight synthesis quotes.
 
@@ -240,15 +251,15 @@ uv run --with httpx \
   --title "Sort entity locks by name to prevent deadlocks" \
   --decided-by "Xenofon" \
   --project "shared-memory" \
-  --rationale "Two concurrent saves with overlapping entity sets can deadlock if each acquires locks in a different order. Sorting guarantees a consistent acquisition order." \
+  --rationale "Two concurrent saves with overlapping entity sets can deadlock if each acquires locks in a different order. Sorting guarantees a consistent acquisition order. Rejected a single global lock because it serialises unrelated saves; rejected no per-entity locking because the deadlock is real and observed. Conditions: holds while lock acquisition stays in one process — a second writer would need a shared lock service." \
   --assisted-by "claude-sonnet-4-6" \
   --alternatives "single global lock,no per-entity locking" \
   --confidence "high" \
-  --entities "coordinator,OutboxPattern,SharedMemory"
+  --grounded-in "42:based_on"
 # → {"status":"success","pg_id":43,...}
 ```
 
-Note the `pg_id` — you'll attach a retrospective to it.
+Note the `pg_id` — you'll attach a retrospective to it. `--grounded-in 42` cites the fact saved in step A: that is what gives this decision its topics (it names none of its own) and what carries it into synthesis. The rationale states its conditions explicitly, because "none" and "never asked" must not look alike.
 
 ### C. Search from a different agent
 
@@ -355,9 +366,9 @@ Args: {
   "title": "Sort entity locks by name",
   "decided_by": "Xenofon",
   "project": "shared-memory",
-  "rationale": "Consistent acquisition order eliminates deadlock risk.",
+  "rationale": "Consistent acquisition order eliminates deadlock risk. Rejected a single global lock: it serialises unrelated saves. Conditions: none while writes stay single-process.",
   "source": "qwen3-27b",
-  "entities": "coordinator,OutboxPattern,SharedMemory"
+  "grounded_in": "42"
 }
 
 # Save a retrospective (rating: validated|mixed|refined|pending|reversed)

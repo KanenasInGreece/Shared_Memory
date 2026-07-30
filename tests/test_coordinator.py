@@ -36,6 +36,7 @@ def load_coordinator():
 
 coordinator_mod = load_coordinator()
 MemoryCoordinator = coordinator_mod.MemoryCoordinator
+ONT = coordinator_mod.ONT
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -338,9 +339,9 @@ async def test_apply_decision_outbox_row_writes_correct_nodes():
 
     await c._apply_decision_outbox_row(outbox_id=1, pg_id=42, params=params)
 
-    # Neo4j session.run should have been called with the Decision Cypher
-    assert mock_session.run.await_count == 1
-    cypher_call = mock_session.run.call_args
+    # Two statements now: the Decision projection, then entity INHERITANCE.
+    assert mock_session.run.await_count == 2
+    cypher_call = mock_session.run.call_args_list[0]
     cypher = cypher_call.args[0]
     assert "Decision" in cypher
     assert "Human"    in cypher
@@ -356,7 +357,11 @@ async def test_apply_decision_outbox_row_writes_correct_nodes():
     assert kwargs["project"]    == "shared_memory"
     assert kwargs["rationale"]  == "simulate dreaming"
     assert kwargs["assisted_by"] == ["claude-code"]
-    assert kwargs["entities"]    == ["Consolidator", "SharedMemory"]
+
+    # A decision MINTS NO ENTITIES: the caller's names are kept in Postgres but
+    # never projected, and the projection can no longer create an :Entity node.
+    assert "entities" not in kwargs
+    assert f"MERGE (e:{ONT.entity}" not in cypher
 
     # Outbox row should be marked applied
     mock_conn.execute.assert_awaited()
@@ -382,8 +387,348 @@ async def test_apply_decision_outbox_row_handles_empty_assisted_by():
     }
 
     await c._apply_decision_outbox_row(outbox_id=2, pg_id=50, params=params)
-    assert mock_session.run.await_count == 1
+    assert mock_session.run.await_count == 2   # projection + entity inheritance
     mock_conn.execute.assert_awaited()
+
+
+# ── decided_by normalisation onto the attested principal ─────────────────────
+
+_norm = coordinator_mod._normalise_decided_by
+
+
+def _decision_meta(decided_by, principal="xenofon"):
+    md = {"type": "decision", "decision": {"decided_by": decided_by,
+                                           "project": "p", "rationale": "r"}}
+    if principal is not None:
+        md["principal"] = principal
+    return md
+
+
+@pytest.mark.parametrize("claimed", [
+    "Xenofon",                      # case variant
+    "Xenofon + Antigravity",        # operator compounded with the assisting agent
+    "Xenofon & Antigravity",
+    "xenofon & Cloe & Gemini",
+    "Antigravity",                  # the agent claimed the decision outright
+    "  Xenofon  ",                  # stray whitespace
+])
+def test_decided_by_collapses_onto_the_principal(claimed):
+    """Every spelling of one operator must land on the SAME person, or a single
+    operator's decisions report as several distinct humans in Tier-3 provenance."""
+    md = _decision_meta(claimed)
+    assert _norm(md) is True
+    assert md["decision"]["decided_by"] == "xenofon"
+    assert md["decision"]["decided_by_claimed"] == claimed.strip()
+
+
+def test_decided_by_already_canonical_is_left_untouched():
+    """No rewrite, no audit field, no log line when the claim already matches."""
+    md = _decision_meta("xenofon")
+    assert _norm(md) is False
+    assert md["decision"]["decided_by"] == "xenofon"
+    assert "decided_by_claimed" not in md["decision"]
+
+
+def test_decided_by_without_a_principal_is_never_guessed():
+    """TCP transport carries no kernel credential. The claim stands as given —
+    the same 'honestly unknown, never guessed' rule _apply_principal follows."""
+    md = _decision_meta("Xenofon + Antigravity", principal=None)
+    assert _norm(md) is False
+    assert md["decision"]["decided_by"] == "Xenofon + Antigravity"
+    assert "decided_by_claimed" not in md["decision"]
+
+
+def test_normalisation_ignores_non_decision_records():
+    """Facts and retrospectives carry no decided_by — the principal is their whole
+    person axis, and this must not invent a decision object on them."""
+    md = {"type": "retrospective", "principal": "xenofon"}
+    assert _norm(md) is False
+    assert md == {"type": "retrospective", "principal": "xenofon"}
+
+
+@pytest.mark.asyncio
+async def test_non_string_decided_by_is_rejected_not_silently_destroyed():
+    """A list is truthy, so it used to pass the required-field check and then be
+    overwritten by the principal — and _normalise_decided_by can only preserve a
+    STRING claim, so the operator's wording was lost with no trace. Refuse it
+    while the caller still holds the value."""
+    c, _, _ = _coordinator_with_mocks()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request(
+            {"content": "x",
+             "metadata": {"source": "claude", "type": "decision",
+                          "decision": {"decided_by": ["Xenofon"],
+                                       "project": "p", "rationale": "r"}}},
+            principal={"user": "xenofon"},
+        )
+        resp = await c.handle_save(req)
+    assert resp.status == 400
+    assert "decided_by" in resp.text
+
+
+# ── supersession is the FACT lifecycle — judgements are refused ──────────────
+
+_sup_err = coordinator_mod._supersession_target_error
+
+
+def test_a_decision_may_not_be_superseded_directly():
+    """Overturning a decision goes through a retrospective rated 'reversed',
+    which marks it superseded as the CONSEQUENCE of a verdict that stays in the
+    graph. A direct retract would delete the reasoning instead of recording that
+    it was overturned — and leave no verdict a successor could ground on."""
+    msg = _sup_err(42, "decision")
+    assert msg and "reversed" in msg
+
+
+def test_a_retrospective_may_not_be_superseded():
+    """A retrospective is dated to when it was made; a changed outcome is a NEW
+    retrospective. Inheritance already prefers the latest live verdict, so
+    nothing needs retracting for the newer judgement to take effect."""
+    msg = _sup_err(900, "retrospective")
+    assert msg and "new retrospective" in msg.lower()
+
+
+@pytest.mark.parametrize("kind", [None, "fact", "", "  Fact  "])
+def test_plain_facts_remain_supersedable(kind):
+    """Supersession is the fact lifecycle and must stay open for facts —
+    including legacy rows whose type is NULL."""
+    assert _sup_err(7, kind) is None
+
+
+@pytest.mark.asyncio
+async def test_handle_supersede_refuses_a_decision_target():
+    """The guard is enforced at the ROUTE, not merely available as a helper."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+    mock_conn.fetchrow = AsyncMock(return_value={"superseded": False, "type": "decision"})
+    resp = await c.handle_supersede(_make_request({"pg_id": 42}))
+    assert resp.status == 400
+    assert "reversed" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_missing_decided_by_still_400s_rather_than_being_filled_in():
+    """Order matters: normalisation runs AFTER validation, so an agent that omits
+    the field is told so instead of having the socket answer for it."""
+    c, _, _ = _coordinator_with_mocks()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request(
+            {"content": "x",
+             "metadata": {"source": "claude", "type": "decision",
+                          "decision": {"project": "p", "rationale": "r"}}},
+            principal={"user": "xenofon"},
+        )
+        resp = await c.handle_save(req)
+    assert resp.status == 400
+    assert "decided_by" in resp.text
+
+
+# ── Decision entity INHERITANCE (decisions traverse to facts, never mint) ────
+
+class _TieredSession:
+    """Neo4j session stub returning a scripted per-call `n` from .single().
+
+    `yields` is one entry per session.run() call, in order. Every executed
+    Cypher string is recorded so the tier that fired can be identified.
+    """
+    def __init__(self, yields):
+        self._yields = list(yields)
+        self.cyphers = []
+
+    async def run(self, cypher, **kwargs):
+        self.cyphers.append(cypher)
+        n = self._yields.pop(0) if self._yields else 0
+        result = AsyncMock()
+        result.single = AsyncMock(return_value={"n": n})
+        return result
+
+
+@pytest.mark.asyncio
+async def test_inheritance_prefers_operator_grounding_and_stops_there():
+    """Tier 1 (operator-asserted GROUNDED_IN) wins outright — the weaker tiers
+    must not even be queried, or a system_default edge could dilute the topics
+    an operator explicitly grounded the decision in."""
+    session = _TieredSession([4])
+    n = await MemoryCoordinator._inherit_entities_from_facts(session, 42)
+
+    assert n == 4
+    assert len(session.cyphers) == 1
+    assert "g.asserted_by = 'operator'" in session.cyphers[0]
+
+
+@pytest.mark.asyncio
+async def test_inheritance_falls_back_to_system_then_retrospective():
+    """A decision with no operator grounding falls to system_default/legacy
+    edges; one with neither reaches facts only through its retrospective."""
+    session = _TieredSession([0, 3])
+    assert await MemoryCoordinator._inherit_entities_from_facts(session, 42) == 3
+    assert len(session.cyphers) == 2
+    assert "coalesce(g.asserted_by, '') <> 'operator'" in session.cyphers[1]
+
+    session = _TieredSession([0, 0, 2])
+    assert await MemoryCoordinator._inherit_entities_from_facts(session, 42) == 2
+    assert len(session.cyphers) == 3
+    retro_cypher = session.cyphers[2]
+    assert ONT.had_outcome in retro_cypher
+    assert ONT.retrospective in retro_cypher
+    # Ties break on the retro's OWN id — the decision's id cannot disambiguate
+    # its own retrospectives — and a dateless retro must sort LAST, which is not
+    # where a bare `o.date DESC` would put null.
+    assert "ORDER BY coalesce(o.date, '') DESC, o.pg_id DESC" in retro_cypher
+    # The ordering runs AFTER the topic match, so the newest retrospective that
+    # actually reaches facts wins. Ordering first would let an ungrounded newest
+    # verdict be picked and blank the tier while a grounded sibling sat there.
+    assert retro_cypher.index("collect(DISTINCT e)") < retro_cypher.index("ORDER BY")
+    # Forward guard only: nothing sets `superseded` on a :Retrospective today
+    # (the reversal marks the DECISION), so this filter is currently inert — it
+    # is not evidence that a retracted verdict is excluded.
+    assert "coalesce(o.superseded, false) = false" in retro_cypher
+
+
+@pytest.mark.asyncio
+async def test_retrospective_inherits_by_the_same_rule_hopping_the_other_way():
+    """Retrospectives mint no entities either, and share the writer. Their
+    outcome tier traverses HAD_OUTCOME BACKWARDS — a retrospective judges one
+    decision, so there is nothing to order or supersede-filter on that hop."""
+    session = _TieredSession([0, 0, 5])
+    n = await MemoryCoordinator._inherit_entities_from_facts(
+        session, 900, ONT.retrospective)
+
+    assert n == 5
+    for cypher in session.cyphers:
+        assert f"MATCH (a:{ONT.retrospective} {{pg_id: $pg_id}})" in cypher
+        assert f"MERGE (e:{ONT.entity}" not in cypher
+    outcome_cypher = session.cyphers[2]
+    assert f"<-[:{ONT.had_outcome}]-(o:{ONT.decision})" in outcome_cypher
+    # the decision-only ordering must NOT leak onto this hop
+    assert "ORDER BY" not in outcome_cypher
+    # A reversing verdict marks its target decision superseded moments earlier in
+    # the same projection. Filtering the judgement here would blank the topics of
+    # the very record doing the reversing, so this hop is deliberately unfiltered.
+    assert "o.superseded" not in outcome_cypher
+
+
+@pytest.mark.asyncio
+async def test_inheritance_walks_every_grounding_role_not_just_grounded_in():
+    """The defect this closes: four of the six role words produce a relationship
+    that is NOT GROUNDED_IN, and INFORMED_BY is what a discussion-kind fact
+    defaults to when the operator names no role at all — the bare-pg_id path the
+    skill documents. Matching GROUNDED_IN alone made a decision that cited its
+    evidence inherit nothing and never reach consolidation."""
+    from ontology import GROUNDING_ROLES, GROUNDING_RELATIONS
+
+    session = _TieredSession([0, 0, 0])
+    await MemoryCoordinator._inherit_entities_from_facts(session, 42)
+
+    # every relationship any role can produce must appear in every tier
+    assert set(GROUNDING_RELATIONS) >= set(GROUNDING_ROLES.values())
+    for cypher in session.cyphers:
+        for rel in GROUNDING_RELATIONS:
+            assert rel in cypher, f"{rel} missing — a {rel} grounding donates nothing"
+    for rel in ("CONSIDERED", "REJECTED", "UNDER_CONDITIONS", "INFORMED_BY"):
+        assert rel in GROUNDING_RELATIONS
+
+
+@pytest.mark.asyncio
+async def test_inheritance_passes_through_a_cited_judgement_to_its_facts():
+    """Provenance allows grounding a decision on an earlier decision or on the
+    retrospective that overturned it. That citation must still reach topics —
+    through the cited record's OWN facts, never by copying the labels it carries
+    (REM may have added those). `*0..1` is the whole mechanism: zero hops when
+    the target is the fact itself, one when it is a judgement."""
+    session = _TieredSession([0, 0, 0])
+    await MemoryCoordinator._inherit_entities_from_facts(session, 42)
+
+    for cypher in session.cyphers:
+        assert "*0..1" in cypher
+        # the walk always TERMINATES on a fact — judgements only pass through
+        assert f"(f:{ONT.fact})" in cypher
+
+
+@pytest.mark.asyncio
+async def test_inheritance_filters_superseded_facts_but_not_judgements():
+    """A retracted FACT must stop being a cluster key for everything that cited
+    it. A superseded JUDGEMENT is different: a decision is overturned by a
+    reversing retrospective, and a successor grounded on the decision it replaces
+    is still ABOUT what that decision was about."""
+    session = _TieredSession([0, 0, 0])
+    await MemoryCoordinator._inherit_entities_from_facts(session, 42)
+
+    for cypher in session.cyphers:
+        assert "coalesce(f.superseded, false) = false" in cypher
+        # no filter on the pass-through target
+        assert "coalesce(t.superseded" not in cypher
+
+
+@pytest.mark.asyncio
+async def test_inheritance_never_mints_an_entity_on_any_tier():
+    """The whole point of the rule: every tier MATCHes existing Entity nodes and
+    MERGEs only the relationship. A `MERGE (e:Entity {name: ...})` on any tier
+    would reopen the free-text faucet this change closed."""
+    session = _TieredSession([0, 0, 0])
+    assert await MemoryCoordinator._inherit_entities_from_facts(session, 42) == 0
+    assert len(session.cyphers) == 3
+    for cypher in session.cyphers:
+        assert f"MERGE (e:{ONT.entity}" not in cypher
+        assert f"MERGE (x:{ONT.entity}" not in cypher
+        assert f"({ONT.entity} {{name:" not in cypher
+        # topics are only ever read off facts
+        assert f"(f:{ONT.fact})" in cypher
+
+
+@pytest.mark.asyncio
+async def test_decision_inheritance_runs_after_grounding_is_written():
+    """Order matters: the traversal reads GROUNDED_IN edges, so it must run
+    after _write_typed_grounding — otherwise a first write inherits nothing."""
+    c, _, mock_session = _coordinator_with_mocks()
+    calls = []
+    with patch.object(c, "_write_typed_grounding",
+                      new=AsyncMock(side_effect=lambda *a, **k: calls.append("grounding"))), \
+         patch.object(c, "_inherit_entities_from_facts",
+                      new=AsyncMock(side_effect=lambda *a, **k: calls.append("inherit"))):
+        await c._apply_decision_outbox_row(
+            outbox_id=1, pg_id=42,
+            params={"decision": {"decided_by": "X", "project": "p"},
+                    "grounded": [{"pg_id": 7, "rel": ONT.grounded_in,
+                                  "asserted_by": "operator", "label": ONT.fact}]},
+        )
+    assert calls == ["grounding", "inherit"]
+
+
+@pytest.mark.asyncio
+async def test_retrospective_projection_inherits_for_itself_and_its_target():
+    """The outcome tier can never fire at decision first write — no
+    retrospective exists yet. The retrospective projection is the moment it
+    becomes possible, so it must run inheritance twice: once for itself, once
+    for the decision it judges."""
+    c, _, mock_session = _coordinator_with_mocks()
+    with patch.object(c, "_inherit_entities_from_facts", new=AsyncMock()) as inherit:
+        await c._apply_retrospective_outbox_row(
+            outbox_id=1, pg_id=900,
+            params={"v": 2, "target_pg_id": 42, "entities": ["Ignored"],
+                    "retrospective": {"rating": "held", "date": "2026-07-30"}},
+        )
+    assert [(call.args[1], call.args[2]) for call in inherit.await_args_list] == [
+        (900, ONT.retrospective),   # itself, from its own grounding
+        (42,  ONT.decision),        # then the decision it judges
+    ]
+
+
+@pytest.mark.asyncio
+async def test_retrospective_projection_mints_no_entities():
+    """The caller may still send `entities` (older clients do); the graph must
+    ignore them exactly as the decision path now does."""
+    c, _, mock_session = _coordinator_with_mocks()
+    with patch.object(c, "_inherit_entities_from_facts", new=AsyncMock()):
+        await c._apply_retrospective_outbox_row(
+            outbox_id=1, pg_id=900,
+            params={"v": 2, "target_pg_id": 42,
+                    "entities": ["FreeTextName", "AnotherOne"],
+                    "retrospective": {"rating": "held", "date": "2026-07-30"}},
+        )
+    node_call = mock_session.run.call_args_list[0]
+    assert f"MERGE (r:{ONT.retrospective}" in node_call.args[0]
+    assert f"MERGE (e:{ONT.entity}" not in node_call.args[0]
+    assert "entities" not in node_call.kwargs
 
 
 # ── Retrospective outbox dispatch and Neo4j writes (Phase C) ─────────────────
@@ -464,7 +809,9 @@ async def test_apply_retrospective_v2_creates_node_and_trigger_edge():
     node_q = cyphers[0]
     assert "MERGE (r:Retrospective {pg_id: $pg_id}" in node_q
     assert "r.rating" in node_q and "r.fact_kind" in node_q
-    assert "MENTIONS" in node_q
+    # The node projection no longer mints topics — a retrospective inherits them
+    # from its facts like a decision does (see the inheritance tests above).
+    assert "MENTIONS" not in node_q
     edge_q = cyphers[1]
     assert "MATCH (d:Decision {pg_id: $target}" in edge_q
     assert "HAD_OUTCOME" in edge_q and "MERGE" in edge_q
@@ -547,7 +894,7 @@ async def test_handle_supersede_rejects_already_superseded_successor():
     # First fetchrow: the pg_id (A) being retracted — not yet superseded.
     # Second fetchrow: the successor (B) being pointed at — ALREADY superseded.
     mock_conn.fetchrow = AsyncMock(side_effect=[
-        {"superseded": False},
+        {"superseded": False, "type": None},
         {"superseded": True},
     ])
 
@@ -567,7 +914,7 @@ async def test_handle_supersede_accepts_live_successor():
     regression from the new check)."""
     c, mock_conn, _ = _coordinator_with_mocks()
     mock_conn.fetchrow = AsyncMock(side_effect=[
-        {"superseded": False},
+        {"superseded": False, "type": None},
         {"superseded": False},
     ])
     mock_conn.fetchval = AsyncMock(return_value=None)   # ride-along probe: no live outbox row
