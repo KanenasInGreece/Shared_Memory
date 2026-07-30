@@ -123,7 +123,7 @@ async def test_supersede_target_not_found():
 @pytest.mark.asyncio
 async def test_supersede_already_superseded():
     c, conn, _ = _coord()
-    conn.fetchrow = AsyncMock(return_value={"superseded": True})
+    conn.fetchrow = AsyncMock(return_value={"superseded": True, "type": None})
     resp = await c.handle_supersede(_make_request({"pg_id": 5}))
     assert resp.status == 400
     assert "already superseded" in json.loads(resp.text)["message"]
@@ -134,7 +134,7 @@ async def test_supersede_already_superseded():
 @pytest.mark.asyncio
 async def test_supersede_bare_retract_flags_writes_outbox_and_purges():
     c, conn, _ = _coord()
-    conn.fetchrow = AsyncMock(return_value={"superseded": False})
+    conn.fetchrow = AsyncMock(return_value={"superseded": False, "type": None})
     conn.fetch = AsyncMock(return_value=[(101,)])  # one orphan fact row purged
     resp = await c.handle_supersede(_make_request({"pg_id": 5}))
     assert resp.status == 200
@@ -158,7 +158,7 @@ async def test_supersede_bare_retract_flags_writes_outbox_and_purges():
 @pytest.mark.asyncio
 async def test_supersede_with_live_successor_rides_along_no_purge():
     c, conn, _ = _coord()
-    conn.fetchrow = AsyncMock(return_value={"superseded": False})
+    conn.fetchrow = AsyncMock(return_value={"superseded": False, "type": None})
     # successor exists (fetchval #1) AND has a live fact outbox row (fetchval #2)
     conn.fetchval = AsyncMock(side_effect=[1, 1])
     resp = await c.handle_supersede(_make_request({"pg_id": 5, "by": 9}))
@@ -194,7 +194,7 @@ async def test_save_supersedes_target_not_found():
 async def test_save_supersedes_success_flags_and_piggybacks():
     c, conn, _ = _coord()
     # 1st fetchrow = supersedes target check; 2nd = INSERT RETURNING id
-    conn.fetchrow = AsyncMock(side_effect=[{"superseded": False}, {"id": 100}])
+    conn.fetchrow = AsyncMock(side_effect=[{"superseded": False, "type": None}, {"id": 100}])
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         req = _make_request({"content": "corrected",
                              "metadata": {"source": "claude", "entities": ["X"],
@@ -253,8 +253,19 @@ async def test_fact_outbox_piggyback_marks_old_and_links_supersedes():
 async def test_supersede_outbox_row_self_deletes():
     c, conn, session = _coord()
     await c._apply_supersede_outbox_row(1, {"old_pg_id": 5, "new_pg_id": 10})
-    assert session.run.await_count == 1
-    assert "SUPERSEDES" in str(session.run.call_args_list[0].args[0])
+    cyphers = [str(call.args[0]) for call in session.run.call_args_list]
+    # ensure-old, mark-old, ensure-new, link — four statements, and the mark and
+    # link steps MATCH across every spine label so a judgement's pg_id can never
+    # be answered by a phantom :Fact minted beside the real node.
+    assert len(cyphers) == 4
+    assert any("SUPERSEDES" in q for q in cyphers)
+    spine = "Fact|Decision|Retrospective"
+    assert spine in cyphers[1] and "SET o.superseded = true" in cyphers[1]
+    assert spine in cyphers[3]
+    # the placeholder is only ever minted behind a "no spine node exists" guard
+    for q in (cyphers[0], cyphers[2]):
+        assert "MERGE (p:Fact {pg_id: $pg_id})" in q
+        assert "size(ns) = 0" in q
     assert any("DELETE FROM neo4j_outbox WHERE id" in str(call.args[0])
                for call in conn.execute.call_args_list)
 

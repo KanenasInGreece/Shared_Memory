@@ -112,7 +112,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # a warning (coordinator._check_client_version) if they disagree.
 # v3: review_edges / label_edges require the gateway's /memory/relations/* routes.
 API_VERSION = 3
-VERSION = "0.8.25"
+VERSION = "0.8.26"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server
@@ -422,11 +422,34 @@ async def save_decision(
     subgraph is written by the outbox worker — no direct Neo4j writes here.
 
     Required: title, decided_by, project, rationale, source (loaded model name).
-    Optional: assisted_by, alternatives, confidence, entities — all comma-separated.
-    grounded_in: pg_ids this decision rests on, "pgid[:role],pgid" — role one of
-    based_on/considered/rejected/under_conditions/informed_by (bare id picks the
-    fact's kind-derived default). elicited: set True when the operator was asked
-    for these fields (drives spine-coverage telemetry, decision 559).
+    Optional: assisted_by, alternatives, confidence — all comma-separated.
+
+    grounded_in is the important one: a decision NAMES NO ENTITIES of its own,
+    it inherits its topics from the facts it rests on, so an ungrounded decision
+    reaches no cluster and never enters cross-project synthesis. Format
+    "pgid[:role],pgid" — role one of based_on/considered/rejected/
+    under_conditions/informed_by (bare id picks the fact's kind-derived default).
+    `entities` is accepted for older callers and IGNORED by the graph.
+
+    The rationale carries the two things no other field holds: the CONDITIONS
+    the decision is expected to hold under, and WHY each alternative was
+    rejected — `alternatives` records only what was passed over, never why.
+    Write both into the rationale. State "conditions: none" explicitly when
+    there are none, so a deliberate absence cannot be mistaken for an unasked
+    question. Synthesis is told to state each principle's limits and what it
+    chose against; supplying neither invites the model to invent both.
+
+    decided_by names the PERSON only. Do not fold the assisting model into it
+    ("<operator> + <agent>") — that is what assisted_by is for. Each such
+    spelling mints its own :Human node and splits one operator across provenance.
+    Over a UNIX socket the gateway canonicalises this onto the kernel-attested
+    OS account and keeps the wording as decided_by_claimed; this MCP client
+    connects over TCP, which carries no kernel credential, so nothing is
+    attested and whatever is typed here is stored verbatim. The discipline is
+    the caller's on this path.
+
+    elicited: set True when the operator was asked for these fields (drives
+    spine-coverage telemetry, decision 559).
     """
     decision_data: dict = {
         "title": title,
@@ -525,8 +548,10 @@ async def save_retrospective(
     pending | reversed ('reversed' supersedes the decision; nuance goes in notes).
     Optional: date (ISO string, default: today). grounded_in: pg_ids of the facts
     that MEASURED this outcome, same "pgid[:role],pgid" grammar as save_decision
-    (test-grounded retrospectives, decision 542). elicited: set True when the
-    operator was asked for these fields.
+    (test-grounded retrospectives, decision 542). A retrospective names no
+    entities either — it inherits its topics from those facts, falling back to
+    the decision it judges — so grounded_in is what carries the outcome into
+    synthesis. elicited: set True when the operator was asked for these fields.
     """
     coordinator_url = COORDINATOR_BASE
     agent_id = AGENT_ID
@@ -586,7 +611,15 @@ async def save_retrospective(
 @mcp.tool()
 async def supersede(pg_id: int, by: int = 0) -> str:
     """
-    Retract / supersede an existing fact (decision 381/384). Soft — the old fact
+    Retract / supersede an existing FACT (decision 381/384). Decisions and
+    retrospectives are refused with HTTP 400: supersession is the fact
+    lifecycle. To overturn a decision call save_retrospective against it with
+    rating='reversed' — that marks it superseded as the consequence of a verdict
+    that stays in the graph for a successor to ground on. To revise a
+    retrospective, save a NEW one against the same decision; the latest live
+    verdict is the one that counts.
+
+    Soft — the old fact
     is KEPT (provenance) but flagged, hidden from search, and excluded from
     consolidation. Supersession is EXPLICIT; never infer it from similarity.
 

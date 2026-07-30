@@ -5,6 +5,92 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.26] — 2026-07-31
+
+### Changed
+
+- **Decisions and retrospectives no longer name their own topics — they inherit
+  them from the evidence they rest on.** A fact is the only record that can
+  introduce a concept into the graph. A judgement's topics are now derived by
+  walking its grounding edges to the facts beneath them, so the same concept can
+  never arrive twice under two spellings: once vetted on a fact, once free-typed
+  beside a decision.
+
+  The walk is three tiers, first non-empty winning: grounding the operator
+  asserted, then grounding the system defaulted from `fact_kind`, then — for a
+  record citing no evidence of its own — the facts of the record across the
+  `HAD_OUTCOME` edge. That last tier is what lets a decision which grounds
+  nothing still reach consolidation through the retrospective that judged it.
+
+  `entities` on a decision or retrospective is still accepted for older callers
+  and is ignored by the graph. It remains required on facts.
+
+### Fixed
+
+- **Four of the six grounding roles donated no topics at all.** Inheritance
+  matched `GROUNDED_IN` alone, but a grounding role is written as one of five
+  relationships — `considered`, `rejected`, `under_conditions` and `informed_by`
+  each produce their own. The bare-pg_id path made this routine rather than
+  exotic: a fact with no `source_ref` derives `fact_kind = discussion`, whose
+  default role is `INFORMED_BY`, so a decision citing its evidence in the exact
+  form the documentation recommends inherited nothing and never reached
+  consolidation. The relation set is now derived from the role map itself, so a
+  role cannot be added without every traversal that reads grounding seeing it.
+
+- **Grounding on an earlier decision or retrospective reached no topics.**
+  Citing a prior judgement is first-class lineage, but the walk required a fact
+  as the immediate target. It now passes through a cited judgement to *its*
+  facts — one hop, terminating on a fact — so provenance chains carry topics
+  without ever copying the labels a judgement happens to hold.
+
+- **A retrospective that cited nothing could blank the tier for a decision whose
+  older retrospective did cite something.** The newest verdict was selected
+  before checking it reached any facts. Selection now happens after the topic
+  match, so the newest retrospective *with* evidence wins; a retrospective
+  carrying no date sorts last rather than first.
+
+- **Retracted facts kept acting as cluster keys.** Superseded facts are now
+  excluded from inheritance. Superseded *judgements* are deliberately not — a
+  decision overturned by a reversal is still what its successor is about, and
+  filtering there would blank the reversing verdict's own topics.
+
+- **Decisions and retrospectives could be superseded directly, corrupting the
+  graph.** Supersession is the fact lifecycle: a fact is a claim about the world
+  and is retracted when the world changes, whereas a judgement is a dated act and
+  the record that it turned out wrong is a *retrospective*. Both ingress paths now
+  refuse a judgement target. Overturning a decision goes through a retrospective
+  rated `reversed`, which marks it superseded as the consequence of a verdict that
+  stays in the graph for a successor to ground on; revising a retrospective means
+  saving a new one, since the latest live verdict is the one that counts.
+
+  The supersession mirror also matched its target as `MERGE (old:Fact {pg_id})`,
+  which matches on label and property together — so a judgement's id minted a
+  second, phantom `:Fact` carrying the supersession while the real node stayed
+  unmarked. It now marks the real node under any spine label and creates a
+  placeholder only when nothing carries that id.
+
+- **A non-text `decided_by` was silently destroyed.** A JSON client sending a
+  list passed the truthiness check at ingress and was then overwritten by the
+  attested principal, which can only preserve a string claim. Decision fields are
+  now required to be non-empty strings, so the wording is refused while the caller
+  still holds it rather than lost without trace.
+
+- **The client surface contradicted the new rule.** Both CLI subcommands still
+  advertised `--entities` as the field that links topics, the usage block omitted
+  `--grounded-in`, and every decision saved as documented tripped a level-1
+  `no_entities` warning. `--entities` is now marked deprecated and ignored,
+  `--grounded-in` is documented as the load-bearing field, and the warning follows
+  the record type — judgements warn on absent *grounding*.
+
+### Known issue
+
+- REM's novelty gate still treats caller-supplied `entities` as already-captured
+  `MENTIONS` edges, a claim first write no longer makes. A decision saved with
+  `entities` and no `grounded_in` therefore gets no edge from either side. Tracked
+  in issue #180.
+
+---
+
 ## [0.8.25] — 2026-07-30
 
 ### Fixed

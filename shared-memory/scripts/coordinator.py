@@ -53,7 +53,7 @@ from log_hygiene import AsyncLineWriter
 from ontology import (
     ONT, sanitize_entity_names, sanitize_entity_name,
     KNOWN_LABELS, KNOWN_RELATIONSHIPS, fact_kind_from_source_ref,
-    GROUNDING_ROLES, default_grounding_role, RETRO_RATINGS,
+    GROUNDING_ROLES, GROUNDING_RELATIONS, default_grounding_role, RETRO_RATINGS,
     record_label_for_type,
 )
 
@@ -102,7 +102,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.25"
+FRAMEWORK_VERSION = "0.8.26"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -420,6 +420,85 @@ def _peer_identity(request: web.Request) -> dict[str, Any] | None:
 # Fields the server owns on the person axis. The client may never set these: they are
 # stripped from any client payload and re-stamped from the kernel-attested principal.
 _PRINCIPAL_KEYS = ("uid", "gid", "pid", "login_uid", "login_user", "session")
+
+
+def _normalise_decided_by(metadata: dict[str, Any]) -> bool:
+    """Canonicalise a decision's person axis onto the KERNEL-ATTESTED principal.
+
+    `decided_by` is free text an agent types, so it drifts: the same operator has
+    arrived as a case variant, and as a compound naming the AI that helped
+    ("<operator> + <agent>") or naming only the agent. Each spelling mints its own
+    :Human node and splits that person across Tier-3 provenance, so a summary
+    sourced from one operator's decisions can report several.
+
+    The OS account behind the socket is already the normal form — server-owned,
+    unforgeable, and identical for every write that operator makes. So when a
+    principal exists it BECOMES `decided_by`, and the original wording is kept as
+    `decided_by_claimed` whenever it differed, losing nothing: the attested axis is
+    what provenance joins on, the claim is what the operator said.
+
+    This deliberately does NOT parse compounds. Splitting "<operator> + <agent>"
+    would need heuristics about which component is a person, and the principal
+    already answers that without guessing — the AI's contribution belongs in
+    `assisted_by`, which the caller sets directly.
+
+    With no principal (TCP transport carries no kernel credential) the claim is
+    left exactly as given — honestly unknown, never guessed, matching
+    _apply_principal. Returns True when the stored value changed.
+    """
+    if not isinstance(metadata, dict) or metadata.get("type") != "decision":
+        return False
+    principal = metadata.get("principal")
+    decision  = metadata.get("decision")
+    if not principal or not isinstance(principal, str) or not isinstance(decision, dict):
+        return False
+    claimed = decision.get("decided_by")
+    claimed = claimed.strip() if isinstance(claimed, str) else ""
+    if claimed == principal:
+        return False
+    if claimed:
+        decision["decided_by_claimed"] = claimed
+    decision["decided_by"] = principal
+    return True
+
+
+def _supersession_target_error(pg_id: int, record_type: object) -> str | None:
+    """Reject supersession of a JUDGEMENT record. Returns an error message, or
+    None when the target may be superseded.
+
+    Supersession is the FACT lifecycle: a fact is a claim about the world, and
+    when the world changes the claim is retracted and replaced. A judgement is
+    not a claim about the world — it is a dated act by a person, and the record
+    that it turned out wrong is a RETROSPECTIVE, not a retraction. Overturning a
+    decision therefore goes through `rating='reversed'`, which marks the decision
+    superseded as a CONSEQUENCE of a verdict that stays in the graph, leaving the
+    lineage a successor can ground on. Retracting it directly would delete the
+    reasoning instead of recording that it was overturned.
+
+    A retrospective is refused for the mirror-image reason: it is an observation
+    dated to when it was made, so a changed outcome is a NEW retrospective, not
+    an edit of the old one. Entity inheritance already prefers the latest live
+    verdict, so nothing needs retracting for the newer judgement to take effect.
+
+    Both refusals also close a real corruption: the supersede mirror MERGEs its
+    target as a :Fact by pg_id, so superseding a decision or retrospective minted
+    a phantom :Fact node carrying that id while the real node stayed unmarked.
+    """
+    kind = (record_type or "fact").strip().lower() if isinstance(record_type, str) else "fact"
+    if kind == "decision":
+        return (
+            f"record {pg_id} is a decision and cannot be superseded directly — "
+            "save a retrospective with rating='reversed' against it instead. That "
+            "records WHY it was overturned, marks the decision superseded, and "
+            "leaves a verdict a later decision can ground on."
+        )
+    if kind == "retrospective":
+        return (
+            f"record {pg_id} is a retrospective and cannot be superseded — a "
+            "retrospective is dated to when it was made. Save a NEW retrospective "
+            "against the same decision; the newer verdict is the one that counts."
+        )
+    return None
 
 
 def _apply_principal(target: dict[str, Any], principal: dict[str, Any] | None) -> dict[str, Any]:
@@ -1466,16 +1545,143 @@ class MemoryCoordinator:
             pg_id=pg_id, grounded=grounded,
         )
 
+    @staticmethod
+    async def _inherit_entities_from_facts(
+        session, pg_id: int, anchor_label: str = None
+    ) -> int:
+        """Give a judgement record its topics by TRAVERSING TO ITS FACTS — never
+        by minting. Shared by Decision and Retrospective so the two can never
+        drift (the failure shape _write_typed_grounding already guards against).
+
+        Both record types rest on facts, and those facts already carry the
+        operator-vetted entity vocabulary. So a record's join keys are the union
+        of its evidence's join keys. This LINKS ONLY: every Entity is MATCHed,
+        never MERGEd, so neither record type can introduce a name that no fact
+        ever justified (the first-write half of "link, never mint" — decision
+        937 closed the same faucet on REM).
+
+        Three tiers, first non-empty wins:
+          1. Grounding edges the OPERATOR asserted — the hard basis.
+          2. Grounding edges the system defaulted from fact_kind, plus legacy
+             edges carrying no asserted_by stamp.
+          3. The facts of the record on the OTHER SIDE of the HAD_OUTCOME edge —
+             for a decision, its LATEST live retrospective that actually reaches
+             topics; for a retrospective, the decision it judges. The rescue path
+             for a record that cites no evidence of its own, and what can make a
+             decision eligible for consolidation despite grounding nothing itself.
+
+        Tier 1 outranks tier 2 on WHO asserted the edge, never on which role word
+        was typed: every relationship in ONT GROUNDING_RELATIONS is walked, not
+        GROUNDED_IN alone. Four of the six role words (considered, rejected,
+        under_conditions, informed_by) produce a different relationship, and
+        INFORMED_BY is what a discussion-kind fact defaults to when the operator
+        names no role — the bare-pg_id path the skill documents. Matching one
+        relationship made a decision that cited its evidence inherit nothing.
+
+        The walk ends on a FACT, one or two hops out: `*0..1` means the grounding
+        target is either the fact itself, or a judgement whose OWN facts are then
+        read. Provenance allows a decision to be grounded on an earlier decision
+        or retrospective, so that citation must still reach topics — through the
+        cited record's facts, never by copying the labels it carries (which REM
+        may have added). Facts mint; judgements only ever pass through.
+
+        The superseded filter sits on the FACT and nowhere else. A retracted fact
+        must stop being a cluster key for everything that cited it — that is the
+        topic source going away. A superseded JUDGEMENT is a different thing: a
+        decision is overturned by a reversing retrospective, and grounding a
+        successor on the decision it replaces (or on the retrospective that
+        overturned it) is first-class lineage, so the pass-through hop is
+        deliberately unfiltered — the successor is still ABOUT what the reversed
+        decision was about. Filtering there would also blank the reversing
+        verdict's own topics, since the reversal marks its target superseded
+        moments earlier in the same projection. In the zero-length case the
+        target IS the fact, so one filter covers both shapes.
+
+        "Latest" orders by date then pg_id — the RETROSPECTIVE's own id, never
+        the decision's — so a decision holding several retros dated the same day
+        resolves deterministically instead of arbitrarily. Ordering happens AFTER
+        the topic match, so an ungrounded newest retrospective yields to the
+        newest one that has facts instead of blanking the tier. `coalesce(date,
+        '')` keeps a dateless retro last rather than first, which is where null
+        would sort under DESC.
+
+        Returns the number of entities linked (0 when the record reaches no
+        facts by any route — a real state, not an error: it means nothing yet
+        grounds it).
+        """
+        anchor = anchor_label or ONT.decision
+        is_decision = anchor == ONT.decision
+        rels = "|".join(GROUNDING_RELATIONS)
+        # From a grounding target to the facts that carry the topics: the target
+        # itself when it is a Fact, otherwise the facts IT grounds in.
+        to_facts = (
+            f"-[:{rels}*0..1]->(f:{ONT.fact})"
+            f" WHERE coalesce(f.superseded, false) = false"
+            f" MATCH (f)-[:{ONT.entity_link}|{ONT.entity_link_alias}]->(e:{ONT.entity})"
+        )
+        link = (f" FOREACH (x IN es | MERGE (a)-[:{ONT.entity_link}]->(x))"
+                f" RETURN size(es) AS n")
+        for tier in ("operator", "system", "outcome"):
+            if tier == "outcome":
+                # Hop the HAD_OUTCOME edge to the counterpart record, then read
+                # ITS grounding facts. Direction and ordering differ by anchor:
+                # a decision may hold many retrospectives (pick the live latest
+                # that reaches topics); a retrospective judges exactly one
+                # decision — and must read it even when the reversal it carries
+                # has just marked that decision superseded.
+                if is_decision:
+                    cypher = (
+                        f"MATCH (a:{anchor} {{pg_id: $pg_id}})"
+                        f"-[:{ONT.had_outcome}]->(o:{ONT.retrospective})"
+                        f" WHERE coalesce(o.superseded, false) = false"
+                        f" MATCH (o)-[:{rels}]->(t){to_facts}"
+                        f" WITH a, o, collect(DISTINCT e) AS es"
+                        f" ORDER BY coalesce(o.date, '') DESC, o.pg_id DESC LIMIT 1"
+                        + link
+                    )
+                else:
+                    cypher = (
+                        f"MATCH (a:{anchor} {{pg_id: $pg_id}})"
+                        f"<-[:{ONT.had_outcome}]-(o:{ONT.decision})"
+                        f" MATCH (o)-[:{rels}]->(t){to_facts}"
+                        f" WITH a, collect(DISTINCT e) AS es"
+                        + link
+                    )
+            else:
+                where = ("g.asserted_by = 'operator'" if tier == "operator"
+                         else "coalesce(g.asserted_by, '') <> 'operator'")
+                cypher = (
+                    f"MATCH (a:{anchor} {{pg_id: $pg_id}})-[g:{rels}]->(t)"
+                    f" WHERE {where}"
+                    f" MATCH (t){to_facts}"
+                    f" WITH a, collect(DISTINCT e) AS es"
+                    + link
+                )
+            rec = await (await session.run(cypher, pg_id=pg_id)).single()
+            n = (rec["n"] if rec else 0) or 0
+            if n:
+                log.debug("%s pg_id=%d inherited %d entities via %s grounding",
+                          anchor, pg_id, n, tier)
+                return n
+        return 0
+
     async def _apply_decision_outbox_row(
         self, outbox_id: int, pg_id: int, params: dict
     ) -> None:
         """
         Materialise a Decision node and its PROV-O edges in Neo4j.
 
-        Creates: Decision, Human (decided_by), Project, AIAgent(s) (assisted_by),
-        and Entity nodes for each name in entities.  FOREACH handles empty lists
-        so the query is safe regardless of whether assisted_by or entities are set.
-        All writes in one session — atomic on transient failures (MERGE is idempotent).
+        Creates: Decision, Human (decided_by), Project, AIAgent(s) (assisted_by).
+        FOREACH handles empty lists so the query is safe regardless of whether
+        assisted_by is set. All writes in one session — atomic on transient
+        failures (MERGE is idempotent).
+
+        A decision MINTS NO ENTITIES. It INHERITS them by traversing its
+        grounding path to facts — see _inherit_entities_from_facts. The
+        caller-supplied `entities` metadata stays in Postgres (Tier 1 pristine)
+        but is no longer projected into the graph: a decision's topics are
+        whatever its evidence is about, never a second free-text vocabulary
+        minted alongside it.
         """
         decision = params.get("decision", {})
         grounded = params.get("grounded") or []
@@ -1504,11 +1710,6 @@ class MemoryCoordinator:
                 f" FOREACH (ai_name IN $assisted_by |"
                 f"   MERGE (a:{ONT.ai_agent} {{name: ai_name}})"
                 f"   MERGE (d)-[:{ONT.was_assisted_by}]->(a)"
-                f" )"
-                f" WITH d"
-                f" FOREACH (ename IN $entities |"
-                f"   MERGE (e:{ONT.entity} {{name: ename}})"
-                f"   MERGE (d)-[:{ONT.entity_link}]->(e)"
                 f" )",
                 pg_id=pg_id,
                 title=decision.get("title", params.get("content_snippet", "")[:100]),
@@ -1520,7 +1721,6 @@ class MemoryCoordinator:
                 decided_by=decision.get("decided_by", "unknown"),
                 project=decision.get("project", "unknown"),
                 assisted_by=decision.get("assisted_by", []),
-                entities=self._gate_graph_entities(pg_id, params.get("entities", [])),
             )
             # Typed decision→fact grounding (decision 582): shared writer — see
             # _write_typed_grounding. Legacy flat GROUNDED_IN is the fallback for
@@ -1550,6 +1750,12 @@ class MemoryCoordinator:
                     f"   MERGE (d)-[:{ONT.grounded_in}]->(existing) )",
                     pg_id=pg_id, grounded_in=grounded_in_flat,
                 )
+            # Topics come from the evidence, so this runs AFTER grounding exists.
+            # At first write the retrospective tier cannot fire — no retro exists
+            # yet — so a decision grounded in nothing starts with no entities and
+            # acquires them when its first retrospective lands (see the
+            # retrospective projection, which re-runs this for its target).
+            await self._inherit_entities_from_facts(session, pg_id)
         async with self._acquire() as conn:
             await conn.execute(
                 "UPDATE neo4j_outbox SET status='applied', applied_at=now() WHERE id=$1",
@@ -1566,9 +1772,11 @@ class MemoryCoordinator:
         v2 (params['v'] == 2, retro-as-record): pg_id is the RETRO'S OWN id.
         MERGE a :Retrospective node (rating/date/content-snippet/source/
         fact_kind), link the target Decision via the HAD_OUTCOME trigger edge,
-        MENTIONS edges for elicited entities (gated), and the typed grounding
-        ROLE edges (shared writer). The target Decision is matched in its own
-        statement so a missing decision leaves the record intact (edge no-op).
+        then the typed grounding ROLE edges (shared writer). The target Decision
+        is matched in its own statement so a missing decision leaves the record
+        intact (edge no-op). MENTIONS edges are NOT written here: a retrospective
+        mints no entity, it inherits the topics of the facts it grounds in — see
+        _inherit_entities_from_facts, which runs last for exactly that reason.
 
         Legacy (no 'v'): pg_id is the TARGET DECISION's id — a HAD_OUTCOME
         self-loop carrying rating/date/notes as edge properties. Kept until the
@@ -1590,18 +1798,13 @@ class MemoryCoordinator:
                     f" SET r.rating = $rating, r.date = $date,"
                     f"     r.content = $content, r.source = $source,"
                     f"     r.fact_kind = $fact_kind"
-                    + (" SET r.source_ref = $source_ref" if source_ref else "")
-                    + f" WITH r"
-                    f" UNWIND $entities AS ename"
-                    f" MERGE (e:{ONT.entity} {{name: ename}})"
-                    f" MERGE (r)-[:{ONT.entity_link}]->(e)",
+                    + (" SET r.source_ref = $source_ref" if source_ref else ""),
                     pg_id=pg_id,
                     rating=retro.get("rating", ""),
                     date=retro.get("date", ""),
                     content=params.get("content_snippet", "")[:200],
                     source=params.get("source", "coordinator"),
                     fact_kind=params.get("fact_kind") or "observation",
-                    entities=self._gate_graph_entities(pg_id, params.get("entities", [])),
                     **({"source_ref": source_ref} if source_ref else {}),
                 )
                 # HAD_OUTCOME trigger edge from the target Decision (+ reversal
@@ -1620,6 +1823,25 @@ class MemoryCoordinator:
                 await self._write_typed_grounding(
                     session, ONT.retrospective, pg_id, params.get("grounded") or []
                 )
+                # A retrospective MINTS NO ENTITIES either — same rule, same
+                # writer. Its topics are its evidence's topics, falling back to
+                # the decision it judges when it grounds nothing itself. Runs
+                # after its grounding AND after HAD_OUTCOME, since both tiers
+                # read those edges.
+                await self._inherit_entities_from_facts(
+                    session, pg_id, ONT.retrospective
+                )
+                # Then re-run the TARGET decision's inheritance now that a
+                # retrospective (and its grounding) exists: this is the only
+                # moment the decision's outcome tier can fire, and it is what
+                # lets a decision that cites no evidence of its own still reach
+                # facts — and so become eligible for consolidation — through the
+                # retrospective that judged it. A decision already carrying
+                # operator or system grounding is unaffected: earlier tiers win.
+                if target_pg_id is not None:
+                    await self._inherit_entities_from_facts(
+                        session, target_pg_id, ONT.decision
+                    )
             else:
                 superseded_clause = " SET d.superseded = true" if reversal else ""
                 await session.run(
@@ -1638,29 +1860,62 @@ class MemoryCoordinator:
             )
         log.debug("outbox: applied retrospective pg_id=%d (outbox_id=%d)", pg_id, outbox_id)
 
+    # Resolve a pg_id to the node that ALREADY carries it under any spine label,
+    # creating a :Fact placeholder only when no such node exists. A plain
+    # `MERGE (n:Fact {pg_id: $id})` matches on label+property together, so a
+    # pg_id belonging to a :Decision or :Retrospective node does not match and a
+    # SECOND, phantom :Fact node is minted beside the real record — carrying the
+    # supersession while the real node stays unmarked. Ingress now refuses to
+    # supersede a judgement at all (_supersession_target_error), but outbox rows
+    # queued before that guard existed still replay through here, and the
+    # successor side was never guarded at ingress at all. The placeholder branch
+    # is kept because the target's own outbox row may not have applied yet — the
+    # original reason this was a MERGE.
+    _SPINE = f"{ONT.fact}|{ONT.decision}|{ONT.retrospective}"
+
+    async def _ensure_spine_node(self, session, pg_id: int) -> None:
+        """Make sure SOME spine node carries this pg_id, minting a :Fact
+        placeholder only when none does. The placeholder branch is why this was
+        a MERGE originally: the record's own outbox row may not have applied
+        yet, and the supersession must still be recorded."""
+        await session.run(
+            f"OPTIONAL MATCH (n:{self._SPINE}) WHERE n.pg_id = $pg_id"
+            f" WITH collect(n) AS ns"
+            f" FOREACH (_ IN CASE WHEN size(ns) = 0 THEN [1] ELSE [] END |"
+            f"   MERGE (p:{ONT.fact} {{pg_id: $pg_id}}) )",
+            pg_id=pg_id,
+        )
+
     async def _apply_supersede_outbox_row(self, outbox_id: int, params: dict) -> None:
         """Standalone supersession mirror for the /memory/supersede route (bare
         retract, or point an existing fact at an existing successor — no new fact
-        to piggyback on). MERGE old so it is marked even if its own row has not
-        applied; optional (new)-[:SUPERSEDES]->(old) edge to an existing successor.
-        One-shot: the row is DELETED on success — it carries no dream lifecycle and
-        must never count as working-set backlog."""
+        to piggyback on). One-shot: the row is DELETED on success — it carries no
+        dream lifecycle and must never count as working-set backlog.
+
+        Marks the REAL node carrying the pg_id under ANY spine label. A plain
+        `MERGE (old:Fact {pg_id: $id})` matches on label+property together, so a
+        pg_id belonging to a :Decision or :Retrospective node does not match and
+        a SECOND, phantom :Fact is minted beside the real record — carrying the
+        supersession while the real node stays unmarked. Ingress now refuses to
+        supersede a judgement at all (_supersession_target_error), but rows
+        queued before that guard replay through here, and the SUCCESSOR side is
+        not guarded at ingress at all."""
         old_id = params.get("old_pg_id")
         new_id = params.get("new_pg_id")
         async with self._neo4j.session() as session:
+            await self._ensure_spine_node(session, old_id)
+            await session.run(
+                f"MATCH (o:{self._SPINE}) WHERE o.pg_id = $old_id"
+                f" SET o.superseded = true",
+                old_id=old_id,
+            )
             if new_id is not None:
+                await self._ensure_spine_node(session, new_id)
                 await session.run(
-                    f"MERGE (old:{ONT.fact} {{pg_id: $old_id}})"
-                    f" SET old.superseded = true"
-                    f" WITH old"
-                    f" MERGE (new:{ONT.fact} {{pg_id: $new_id}})"
-                    f" MERGE (new)-[:{ONT.supersedes}]->(old)",
+                    f"MATCH (o:{self._SPINE}) WHERE o.pg_id = $old_id"
+                    f" MATCH (nw:{self._SPINE}) WHERE nw.pg_id = $new_id"
+                    f" MERGE (nw)-[:{ONT.supersedes}]->(o)",
                     old_id=old_id, new_id=new_id,
-                )
-            else:
-                await session.run(
-                    f"MERGE (old:{ONT.fact} {{pg_id: $old_id}}) SET old.superseded = true",
-                    old_id=old_id,
                 )
         async with self._acquire() as conn:
             await conn.execute("DELETE FROM neo4j_outbox WHERE id=$1", outbox_id)
@@ -1756,23 +2011,39 @@ class MemoryCoordinator:
         # before the row touches the outbox WAL.  Bad data from an LLM is rejected
         # here rather than replayed on every restart from a corrupt outbox entry.
         if metadata.get("type") == "decision":
-            decision_data = metadata.get("decision", {})
+            decision_data = metadata.get("decision")
+            decision_data = decision_data if isinstance(decision_data, dict) else {}
+            # Required AND textual. A non-string that happens to be truthy (a JSON
+            # client sending decided_by as a list) used to pass this check and then
+            # be silently discarded by _normalise_decided_by, which can only keep a
+            # string claim. Rejecting it here means the claim is never destroyed:
+            # the caller is told the shape is wrong while it still has the value.
             missing = [
                 f for f in ("decided_by", "project", "rationale")
-                if not decision_data.get(f)
+                if not isinstance(decision_data.get(f), str)
+                or not decision_data[f].strip()
             ]
             if missing:
                 return web.json_response(
                     {
                         "status": "error",
                         "message": (
-                            f"decision save missing required fields: {missing}. "
+                            f"decision save missing or non-text required fields: {missing}. "
                             "Include a 'decision' object in metadata with "
-                            "'decided_by', 'project', and 'rationale'."
+                            "'decided_by', 'project', and 'rationale', each a "
+                            "non-empty string."
                         ),
                     },
                     status=400,
                 )
+            # Canonicalise the person axis onto the attested principal — AFTER the
+            # required-field check, so omitting decided_by still fails loudly
+            # rather than being silently filled in from the socket.
+            if _normalise_decided_by(metadata):
+                log.info("decision ingress: decided_by normalised to principal %r "
+                         "(claim %r preserved)", metadata["decision"]["decided_by"],
+                         metadata["decision"].get("decided_by_claimed"))
+                body["metadata"] = metadata
 
         # Fact supersession (decision 381, refined by 384): an optional
         # `supersedes` pointer marks an existing fact superseded by THIS save.
@@ -1790,7 +2061,8 @@ class MemoryCoordinator:
                 )
             async with self._acquire() as conn:
                 target = await conn.fetchrow(
-                    "SELECT superseded FROM technical_docs WHERE id = $1", supersedes
+                    "SELECT superseded, metadata->>'type' AS type"
+                    " FROM technical_docs WHERE id = $1", supersedes
                 )
             if target is None:
                 return web.json_response(
@@ -1804,6 +2076,9 @@ class MemoryCoordinator:
                      "message": f"supersedes target {supersedes} is already superseded"},
                     status=400,
                 )
+            bad = _supersession_target_error(supersedes, target["type"])
+            if bad:
+                return web.json_response({"status": "error", "message": bad}, status=400)
 
         entities = metadata.get("entities", [])
         if not isinstance(entities, list):
@@ -2002,7 +2277,8 @@ class MemoryCoordinator:
 
         async with self._acquire() as conn:
             target = await conn.fetchrow(
-                "SELECT superseded FROM technical_docs WHERE id = $1", pg_id
+                "SELECT superseded, metadata->>'type' AS type"
+                " FROM technical_docs WHERE id = $1", pg_id
             )
             if target is None:
                 return web.json_response(
@@ -2013,6 +2289,9 @@ class MemoryCoordinator:
                     {"status": "error", "message": f"fact {pg_id} is already superseded"},
                     status=400,
                 )
+            bad = _supersession_target_error(pg_id, target["type"])
+            if bad:
+                return web.json_response({"status": "error", "message": bad}, status=400)
             if by is not None:
                 succ = await conn.fetchrow(
                     "SELECT superseded FROM technical_docs WHERE id = $1", by

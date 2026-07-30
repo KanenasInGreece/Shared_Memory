@@ -410,6 +410,20 @@ def default_grounding_role(fact_kind: object) -> str:
     return _FACT_KIND_DEFAULT_ROLE.get(fact_kind, ONT.grounded_in)
 
 
+# Every relationship a grounding edge can carry — DERIVED from both role sources
+# (the operator's word and the fact_kind default) so a role can never be added
+# without every traversal that reads grounding seeing it.
+#
+# Anything walking "what grounds this record" must match ALL of these, never
+# GROUNDED_IN alone: four of the six role words produce a different relation, and
+# INFORMED_BY is what a discussion-kind fact defaults to when the operator names
+# no role at all — the bare-pg_id path. Matching one relation makes a decision
+# that cites its evidence read as though it rests on nothing.
+GROUNDING_RELATIONS: tuple[str, ...] = tuple(sorted(
+    set(GROUNDING_ROLES.values()) | set(_FACT_KIND_DEFAULT_ROLE.values()) | {ONT.grounded_in}
+))
+
+
 # ── Retrospective outcome-state ratings (spine) ───────────────────────────────
 # The one machine-readable outcome field on a retrospective record (retro-as-node
 # session). Outcome STATES, not valence: 'reversed' keeps its structural semantics
