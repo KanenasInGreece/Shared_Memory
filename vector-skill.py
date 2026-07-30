@@ -64,7 +64,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # a warning (coordinator._check_client_version) if they disagree.
 # v3: review_edges / label_edges require the gateway's /memory/relations/* routes.
 API_VERSION = 3
-VERSION = "0.8.16"
+VERSION = "0.8.17"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server

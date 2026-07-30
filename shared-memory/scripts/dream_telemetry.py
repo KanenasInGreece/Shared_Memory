@@ -47,22 +47,38 @@ def adaptive_ceiling(prompt_chars: int, units: int = 0) -> float:
 
 
 def record_grounding(grounding_n: int, referenced: int, matched: int,
-                     minted: int, *, pg_id: int | None = None) -> dict:
-    """Record REM grounding effectiveness for the chunk-strategy decision (Task 15,
-    measure-first). mint_rate = minted/referenced: how often the LLM coined a NEW
-    entity instead of matching one in the grounding set. A high rate with a big
-    grounding set means the set is not helping (safe to shrink); a low rate means
-    the grounding is doing real entity-linking work (shrinking it risks duplicates,
-    undermining entity resolution). Never raises."""
+                     minted: int, *, pg_id: int | None = None,
+                     shown: int | None = None, mode: str | None = None) -> dict:
+    """Record REM grounding effectiveness per record (Task 15, measure-first).
+
+    `grounding_n` is the ACCEPT set (every name the link gate will resolve),
+    `shown` the SHOW set (candidates this record's prompt actually listed), and
+    `mode` how the show set was chosen — "knn" (semantic recall) or "fallback"
+    (alphabetical slice; the embedder or the entity store was unavailable).
+
+    `minted` is retained as the on-disk key but its meaning changed with the
+    link-only gate: a referenced name absent from the accept set is now DROPPED,
+    not created. It is therefore emitted as `unresolved` / `unresolved_rate` too,
+    and read as LOST LINKS — a fact whose mention of a real entity never became
+    an edge, so that entity's cluster stopped growing toward the fold threshold.
+    Lower is better, and it is the metric a grounding change is judged on.
+
+    `mode` is what keeps that judgement honest: a spike in unresolved_rate under
+    "fallback" is an embedder outage, not a regression in recall. Never raises.
+    """
     rate = round(minted / referenced, 3) if referenced else None
     rec = {
         "ts": round(time.time(), 3), "kind": "rem_grounding", "pg_id": pg_id,
         "grounding_n": grounding_n, "referenced": referenced,
         "matched": matched, "minted": minted, "mint_rate": rate,
+        # Same two numbers under the names that now describe them.
+        "unresolved": minted, "unresolved_rate": rate,
+        "shown": shown, "mode": mode,
     }
     try:
-        logger.info("rem-grounding pg_id=%s grounding_n=%d referenced=%d matched=%d minted=%d mint_rate=%s",
-                    pg_id, grounding_n, referenced, matched, minted, rate)
+        logger.info("rem-grounding pg_id=%s accept_n=%d shown=%s mode=%s referenced=%d "
+                    "matched=%d unresolved=%d unresolved_rate=%s",
+                    pg_id, grounding_n, shown, mode, referenced, matched, minted, rate)
         if DREAM_METRICS_PATH:
             append_secure(DREAM_METRICS_PATH, json.dumps(rec))
     except Exception as exc:

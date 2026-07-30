@@ -5,6 +5,64 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.17] — 2026-07-30
+
+### Fixed
+
+- **Enrichment was dropping mentions of entities that exist, because one capped
+  list did two different jobs.** The enrichment prompt lists known entity names so
+  the model matches them exactly instead of coining near-duplicates, and the same
+  list is what the link gate resolves proposals against — the names *shown* and the
+  names *accepted* were a single fetch, capped at 1500 and ordered by name. Once a
+  graph passes that many nodes, the tail of the alphabet falls out of both halves at
+  once: an entity is never offered to the model, and if the model names it anyway
+  from the record's own text, the gate treats it as unknown and drops the edge. On a
+  live graph of ~2600 named nodes that hid roughly half the entities from a
+  mechanism whose entire purpose is to find them, so facts stopped accumulating on
+  the entities they were about, and those entities stopped moving toward the
+  density threshold a thematic summary needs. The truncation was logged, but as a
+  prompt-size warning — nothing said that acceptance had narrowed too.
+
+  The two sets are now bounded by what each is for. The accept set is the whole
+  registry, under a high safety valve (`ENTITY_REGISTRY_LIMIT`) that means "prune
+  the graph" rather than "tune this". The shown set is the `ENTITY_PROMPT_K`
+  entities nearest the record's own text, ranked by embedding cosine — relevance
+  instead of alphabet, so the prompt gets *smaller* as the graph grows while
+  covering the entities a record is actually about. Because the gate now accepts
+  names the prompt never showed, a miss in ranking costs prompt relevance and no
+  longer costs a dropped link.
+
+- **Ranked candidates are filtered against the live graph.** The entity-embedding
+  store is insert-only and outlives the nodes it describes; measured on a live
+  install it held 4396 names against ~2600 existing ones, and more than half of a
+  top-80 recall were names the graph no longer has. Offering those invites a
+  proposal the link gate must then reject, so they are discarded before the prompt
+  is built.
+
+### Changed
+
+- **Semantic recall degrades, never fails.** If the embedder is unreachable or the
+  embedding store is empty, grounding falls back to the previous alphabetical slice
+  (`ENTITY_SET_LIMIT`, unchanged in meaning and default) rather than to an empty
+  list — an empty shown set would leave the model nothing to match and turn every
+  name it produces into a dropped edge, which is the worst outcome precisely when
+  retrieval is already degraded.
+
+- **Batched enrichment merges its members' candidates round-robin.** One shared
+  prompt covers several records, so each contributes its nearest entities in turn
+  under the shared budget; concatenating would spend it on the first record and
+  leave the last ungrounded.
+
+- **Grounding telemetry now separates what was offered from what can be accepted,
+  and names the number that matters.** Each record reports the accept-set size, the
+  shown-set size, and whether the shown set came from semantic recall or the
+  fallback. The count of referenced-but-unrecognised names is reported as
+  `unresolved` (the previous key is kept for continuity with metrics already on
+  disk): since the link gate stopped creating nodes, that number is no longer
+  entities coined, it is **links lost** — a record mentioning a real entity whose
+  edge was never written. The recall mode is what keeps it honest, distinguishing a
+  genuine regression from an embedder outage.
+
 ## [0.8.16] — 2026-07-28
 
 ### Changed

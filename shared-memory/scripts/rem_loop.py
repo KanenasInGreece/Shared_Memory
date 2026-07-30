@@ -132,6 +132,11 @@ PG_CONN      = os.environ.get(
 # telemetry, so it is deliberately NOT an env knob: the shipped compose fixes the
 # topology. LLM choice belongs to the gateway (LLM_BACKENDS), never to a client.
 REASONER_URL   = "http://localhost:8888/v1/chat/completions"
+# Same rule for embeddings: the 1024-dim mandate is enforced BY the gateway, so a
+# client that reached the embedder directly could silently write a different
+# geometry into a store the recall path compares by cosine. Not an env knob, for
+# the same reason REASONER_URL is not one.
+RETRIEVER_URL  = "http://localhost:8888/v1/embeddings"
 # Model id sent on every reasoning call. "local-model" suits llama.cpp / LM Studio,
 # which ignore the field — but a backend that VALIDATES model ids (vLLM or TGI with
 # named models, an OpenRouter/LiteLLM router, an OpenAI-compatible cloud endpoint, or
@@ -169,13 +174,37 @@ def adaptive_poll_sleep(idle_streak: int) -> float:
     return max(MIN_POLL_SEC,
                min(MAX_POLL_SEC, BASE_POLL_SEC * (2 ** min(idle_streak - 1, 8))))
 BATCH_SIZE         = 5     # facts per cycle (LLM calls are the latency bottleneck)
-# Closed-set cap for the REM grounding prompt. Every typed node (up to this cap)
-# is listed in each REM prompt so the LLM matches existing entity names exactly
-# instead of minting near-duplicates. Raising it improves grounding but enlarges
-# every prompt — keep LM Studio context >= ~16K if you push it high. Env-tunable
-# as the typed-node graph grows; the real fix for unbounded growth is per-domain
-# scoping / embedding-retrieval of relevant entities (roadmap).
-ENTITY_SET_LIMIT   = int(os.environ.get("ENTITY_SET_LIMIT", "1500"))
+# ── Grounding: the registry and the prompt slice are DIFFERENT sets ───────────
+#
+# These two used to be one capped fetch, and that conflation was a defect. The
+# closed set served two jobs at once — the names SHOWN to the LLM, and the names
+# ACCEPTED from it (the 937 link-only gate resolves against the same dict) — under
+# one `ORDER BY name LIMIT 1500`. Past 1500 named nodes the tail of the alphabet
+# fell out of both: a fact mentioning a known entity whose name sorts late was
+# neither offered the name nor allowed to use it, so the mention was dropped and
+# the entity's cluster silently stopped growing. Recall loss disguised as a gate.
+#
+# They are now bounded separately, by what each one is for:
+#
+#   ENTITY_REGISTRY_LIMIT — the ACCEPT set. A safety bound, not a working limit:
+#       name→label for every typed node, which the gate needs in FULL or it
+#       rejects names that exist. Cheap (a dict of strings) — set it high enough
+#       that it never bites and treat the warning as "prune the graph".
+#   ENTITY_PROMPT_K       — the SHOW set. The k nearest entity names to THIS
+#       record's text, by BGE-M3 cosine over the `entity_embeddings` store. Recall
+#       now scales with relevance instead of the alphabet, and the prompt gets
+#       smaller rather than larger as the graph grows.
+#   ENTITY_SET_LIMIT      — the FALLBACK slice, unchanged in meaning and default.
+#       Used when semantic recall is unavailable (embedder down, empty store), so
+#       a retrieval outage degrades to today's behaviour and never to no grounding
+#       — an empty SHOW set would make the gate drop nearly everything.
+ENTITY_REGISTRY_LIMIT = int(os.environ.get("ENTITY_REGISTRY_LIMIT", "20000"))
+ENTITY_PROMPT_K       = int(os.environ.get("ENTITY_PROMPT_K", "80"))
+ENTITY_SET_LIMIT      = int(os.environ.get("ENTITY_SET_LIMIT", "1500"))
+# Chars of a record's text sent to the embedder when ranking entity candidates.
+# BGE-M3 truncates at its own context anyway; capping here keeps the recall call
+# cheap and bounded for a long record.
+GROUNDING_EMBED_CAP   = int(os.environ.get("GROUNDING_EMBED_CAP", "4000"))
 # REM_LLM_TIMEOUT removed (ADR-021): the per-call timeout is now adaptive —
 # adaptive_ceiling(len(prompt)) — so a big grounding prompt is never killed for
 # being big. Only the floor (LLM_CEILING_FLOOR, default 600s) remains tunable.
@@ -470,7 +499,8 @@ Relationship types (choose the most precise fit for each referenced entity):
 Rules:
 - Match entity names from the known typed-node list EXACTLY (case-sensitive).
 - For Human / AIAgent / Project / Decision nodes, prefer the typed relationship.
-- For names NOT in the known list, use {ONT.entity_link} — they will become generic Entity nodes.
+- The known list is the NEAREST entities to this record, not the whole graph — a name missing from it may still exist, so name it exactly as the content spells it.
+- Names NOT in the known list are DROPPED, not created: prefer an exact match from the list whenever the content plainly means it.
 - CONSIDERED, REJECTED, UNDER_CONDITIONS, PRODUCES_INSIGHT apply only when processing a Decision."""
 
 
@@ -621,6 +651,43 @@ def _existing_edge_set(manifest: dict) -> set[tuple[str, str]]:
     for ent in manifest.get("entities") or []:
         existing.add((ent, ONT.entity_link))
     return existing
+
+
+def select_prompt_slice(closed_set: list[dict], ranked_names: list[str],
+                        k: int, fallback_limit: int) -> tuple[list[dict], str]:
+    """Choose the entity rows SHOWN to the LLM for one record. Pure — no I/O.
+
+    `ranked_names` is nearest-first from semantic recall. Returns
+    (rows, mode) where mode is "knn" or "fallback".
+
+    Two properties this must hold, both learned from live data:
+
+    * **Ghost filter.** A ranked name with no row in `closed_set` is DISCARDED,
+      never shown. `entity_embeddings` is insert-only and outlives the nodes it
+      describes — measured 2026-07-30, it held 4396 names against ~2600 live
+      ones. Offering a name the graph no longer has invites the LLM to reference
+      it, and the 937 gate then drops the edge: a wasted proposal every time.
+    * **Fallback is the alphabetical slice, never the empty set.** No ranked
+      names means recall failed, and grounding matters MOST in that case — an
+      empty SHOW set leaves the LLM nothing to match, so every name it coins is
+      unknown to the gate and dropped.
+    """
+    if not ranked_names:
+        return closed_set[:fallback_limit], "fallback"
+    by_name = {r["name"]: r for r in closed_set if r.get("name")}
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for name in ranked_names:
+        if name in seen or name not in by_name:
+            continue          # ghost filter: ranked but not in the live graph
+        seen.add(name)
+        rows.append(by_name[name])
+        if len(rows) >= k:
+            break
+    if not rows:
+        # Every candidate was a ghost. Same reasoning as the empty-recall case.
+        return closed_set[:fallback_limit], "fallback"
+    return rows, "knn"
 
 
 def _entity_lines(closed_set: list[dict]) -> str:
@@ -1097,13 +1164,17 @@ class REMDaemon:
             )
 
     async def _fetch_closed_entity_set(self) -> list[dict]:
-        """All existing typed nodes — closed set for LLM ontology grounding.
+        """Every existing typed node — the ACCEPT set the 937 gate resolves against.
 
         Carries pg_id (Decision nodes: the evidential ledger endpoint, 727) and
         the full label list (so untyped Entity nodes can be marked for the
-        delta sub-typing task). ORDER BY name keeps the LIMIT slice
-        deterministic across restarts; a warning is logged when the limit is
-        reached so operators know the registry is truncated.
+        delta sub-typing task). ORDER BY name keeps the slice deterministic
+        across restarts, which is what makes the fallback path reproducible.
+
+        Bounded by ENTITY_REGISTRY_LIMIT, a safety valve rather than a working
+        limit — see the constant. This used to be capped at ENTITY_SET_LIMIT,
+        the same 1500 that sized the prompt, which made the gate reject names
+        that exist purely because they sort late.
         """
         async with self.driver.session() as session:
             result = await session.run(
@@ -1114,16 +1185,111 @@ class REMDaemon:
                 f" RETURN labels(n) AS labels, n.name AS name, n.pg_id AS pg_id"
                 f" ORDER BY n.name"
                 f" LIMIT $limit",
-                limit=ENTITY_SET_LIMIT,
+                limit=ENTITY_REGISTRY_LIMIT,
             )
             rows = await result.data()
-        if len(rows) == ENTITY_SET_LIMIT:
+        if len(rows) == ENTITY_REGISTRY_LIMIT:
             logger.warning(
-                "REM: closed entity set hit LIMIT %d — some typed nodes excluded; "
-                "raise ENTITY_SET_LIMIT or prune the graph",
-                ENTITY_SET_LIMIT,
+                "REM: entity REGISTRY hit LIMIT %d — typed nodes beyond it are "
+                "unknown to the link gate and their mentions will be dropped; "
+                "raise ENTITY_REGISTRY_LIMIT or prune the graph",
+                ENTITY_REGISTRY_LIMIT,
             )
         return rows
+
+    # ── Semantic grounding recall ─────────────────────────────────────────────
+
+    async def _embed(self, text: str) -> list[float] | None:
+        """1024-dim BGE-M3 embedding for a record's text, via the gateway.
+        Returns None on any failure — the caller falls back to the alphabetical
+        slice, so recall degrades and never breaks the cycle."""
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.post(
+                    RETRIEVER_URL,
+                    headers=_auth_headers(),
+                    json={"input": text[:GROUNDING_EMBED_CAP], "model": "bge-m3"},
+                )
+                resp.raise_for_status()
+                return resp.json()["data"][0]["embedding"]
+        except Exception as exc:
+            logger.warning("REM grounding: embed failed (%s) — alphabetical fallback", exc)
+            return None
+
+    async def _nearest_entity_names(self, embedding: list[float], k: int,
+                                    conn, loop) -> list[str]:
+        """The k nearest `entity_embeddings` names to one embedding, nearest first.
+
+        Read-only, HNSW-indexed (`vector_cosine_ops`), and deliberately NOT
+        filtered by a distance floor: this feeds a prompt whose consumer is an LLM
+        that reads the full record and picks for itself, so an irrelevant candidate
+        costs a few prompt tokens while a missing one costs a dropped edge. Recall
+        is the job here; precision belongs to the call that follows.
+        """
+        vec = "[" + ",".join(repr(float(x)) for x in embedding) + "]"
+
+        def _run() -> list[str]:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT name FROM entity_embeddings "
+                    "ORDER BY embedding <=> %s::vector LIMIT %s",
+                    (vec, k),
+                )
+                return [r[0] for r in cur.fetchall()]
+
+        try:
+            return await loop.run_in_executor(None, _run)
+        except Exception as exc:
+            logger.warning("REM grounding: entity kNN failed (%s) — alphabetical "
+                           "fallback", exc)
+            return []
+
+    async def _grounding_slice(self, texts: list[str], closed_set: list[dict],
+                              conn, loop) -> tuple[list[dict], str]:
+        """The SHOW set for one LLM call: entities nearest to the record(s) it covers.
+
+        `texts` is one record's content, or a batch's contents. Per-record ranked
+        lists are merged ROUND-ROBIN rather than concatenated, so in a batch every
+        record contributes its best candidates under the shared k budget — a
+        concatenation would spend the whole budget on the first record and leave
+        the last one ungrounded, which is the batch-alignment failure this daemon
+        already fights elsewhere.
+
+        Over-fetches per record (k each) because the ghost filter in
+        select_prompt_slice discards candidates the live graph no longer has.
+        """
+        if not texts or not closed_set:
+            return select_prompt_slice(closed_set, [], ENTITY_PROMPT_K, ENTITY_SET_LIMIT)
+        if os.getenv("MOCK_LLM") == "1":
+            # MOCK_LLM means "no model traffic" and the embedder is model traffic
+            # reached over the same gateway. Without this a mocked test would make
+            # a real HTTP call, so the fallback slice keeps the mode deterministic.
+            return select_prompt_slice(closed_set, [], ENTITY_PROMPT_K, ENTITY_SET_LIMIT)
+        # Embeddings are independent HTTP calls → issued concurrently. The kNN
+        # queries that follow are NOT: they share one psycopg2 connection, which is
+        # not safe for concurrent use, so they stay sequential on purpose. They are
+        # index lookups behind one round trip each; the embeddings were the latency.
+        embeddings = await asyncio.gather(
+            *(self._embed(t) for t in texts), return_exceptions=True)
+        ranked_lists: list[list[str]] = []
+        for emb in embeddings:
+            if isinstance(emb, BaseException) or emb is None:
+                if isinstance(emb, BaseException):
+                    logger.warning("REM grounding: embed raised (%s) — record "
+                                   "contributes no candidates", emb)
+                continue
+            names = await self._nearest_entity_names(emb, ENTITY_PROMPT_K, conn, loop)
+            if names:
+                ranked_lists.append(names)
+        merged: list[str] = []
+        seen: set[str] = set()
+        for tier in range(max((len(l) for l in ranked_lists), default=0)):
+            for names in ranked_lists:
+                if tier < len(names) and names[tier] not in seen:
+                    seen.add(names[tier])
+                    merged.append(names[tier])
+        return select_prompt_slice(closed_set, merged, ENTITY_PROMPT_K,
+                                   ENTITY_SET_LIMIT)
 
     async def _fetch_existing_edges(self, pg_ids: list[int]) -> dict[int, list[dict]]:
         """Existing outgoing edges for a batch of anchors — ONE query per batch
@@ -1978,9 +2144,16 @@ class REMDaemon:
         """Full REM pipeline for one record. Returns True on success.
         RECORD-CHARGEABLE failure classes count a durable rem_attempts on the
         anchor (poison-record escape hatch); a TRANSPORT failure does not —
-        it says nothing about this record (F1)."""
+        it says nothing about this record (F1).
+
+        `closed_set` arrives as the FULL registry pool; the prompt is grounded on
+        the semantic slice of it nearest to this record's own text, while
+        `registry` (unsliced) remains what the link gate accepts.
+        """
         self._last_llm_failure = None
-        result, model = await self._llm_process(content, kind, closed_set,
+        slice_rows, slice_mode = await self._grounding_slice(
+            [content], closed_set, conn, loop)
+        result, model = await self._llm_process(content, kind, slice_rows,
                                                 manifest, pg_id=pg_id)
         if not result:
             failure = self._last_llm_failure or LLM_FAIL_TRANSPORT
@@ -1996,7 +2169,8 @@ class REMDaemon:
         return await self._apply_fact_result(
             pg_id, kind, result, registry, conn, loop,
             original_content=content, manifest=manifest,
-            model=model, run_id=run_id)
+            model=model, run_id=run_id,
+            grounding=(len(slice_rows), slice_mode))
 
     async def _apply_fact_result(
         self,
@@ -2010,10 +2184,14 @@ class REMDaemon:
         manifest: dict | None = None,
         model: str = "local-model",
         run_id: str = "",
+        grounding: tuple[int, str] | None = None,
     ) -> bool:
         """Write one enrichment result (from the single OR batched LLM call) to
         Neo4j + evidential ledger + outbox + NREM notify. Shared by both paths.
         True on success.
+
+        `grounding` is (slice_size, mode) for the prompt this result came from —
+        telemetry only, so a caller that has not computed it may omit it.
 
         Sequence: plan the DELTA edges against the manifest (novelty, gates,
         GROUNDED_IN remap) → verify novel edges (k=3 self-consistency) → stamp
@@ -2096,14 +2274,26 @@ class REMDaemon:
                 "(not in configured %s): %s — entity left untyped",
                 pg_id, len(dropped_types), sorted(_ENTITY_SUBLABELS), dropped_types)
 
-        # Grounding telemetry (Task 15, measure-first): how many referenced entities
-        # matched the grounding set vs were newly minted — the mint_rate gates the
-        # grounding-reduction-vs-batching decision. Observability only.
+        # Grounding telemetry (Task 15, measure-first). The fourth number is the one
+        # that matters now and its MEANING CHANGED at 937: a referenced name absent
+        # from the accept set is no longer minted, it is DROPPED — a lost link, not a
+        # new node. So it is reported as `unresolved` (the key `minted` is kept for
+        # continuity with metrics already on disk) and it is the primary before/after
+        # signal for grounding recall: the same LLM, the same records, fewer names it
+        # names that the graph refuses.
+        #
+        # `shown` vs `accept_n` is the split the single capped closed set could not
+        # express — how many candidates the prompt offered vs how many names exist to
+        # be accepted. A high unresolved_rate with mode="knn" says recall missed; the
+        # same rate with mode="fallback" says the embedder was down and the number is
+        # about the outage, not about grounding.
         _ref = {(r.get("name") or "").strip() for r in relationships if isinstance(r, dict)}
         _ref.discard("")
         _matched = _ref & set(registry.keys())
+        _shown, _mode = grounding if grounding else (len(registry), "unknown")
         record_grounding(len(registry), len(_ref), len(_matched),
-                         len(_ref) - len(_matched), pg_id=pg_id)
+                         len(_ref) - len(_matched), pg_id=pg_id,
+                         shown=_shown, mode=_mode)
 
         # k=3 self-consistency on NOVEL edges only (already-captured edges are
         # never re-scored — the manifest's existing set filtered them out of
@@ -2384,8 +2574,12 @@ class REMDaemon:
                 # repeat F1 (charging a batch-wide 503 to innocent records).
                 await self._bump_rem_pickups([it["pg_id"] for it in fact_items])
                 self._last_llm_failure = None
+                # One SHOW set for the shared call — the round-robin union of each
+                # member's nearest entities, so no member is left ungrounded.
+                batch_slice, batch_mode = await self._grounding_slice(
+                    [it["content"] for it in fact_items], closed_set, conn, loop)
                 results, call_timing, model = await self._llm_process_batch(
-                    fact_items, closed_set)
+                    fact_items, batch_slice)
                 if results is None:
                     # F1: the CALL failed (transport/HTTP/envelope). That is
                     # evidence about the backend, not about these facts — no
@@ -2411,7 +2605,8 @@ class REMDaemon:
                     if res and await self._apply_fact_result(
                             it["pg_id"], KIND_FACT, res, registry, conn, loop,
                             original_content=it["content"],
-                            manifest=it["manifest"], model=model, run_id=run_id):
+                            manifest=it["manifest"], model=model, run_id=run_id,
+                            grounding=(len(batch_slice), batch_mode)):
                         processed += 1
                         # Durable REM timing (decision 570) — per-CALL metrics shared by
                         # the batch, plus this fact's own poll_ms. Written after the
