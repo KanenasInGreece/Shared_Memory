@@ -1487,10 +1487,17 @@ def test_embed_truncates_oversized_input():
         def raise_for_status(self): pass
         def json(self): return {"data": [{"embedding": [0.1, 0.2]}]}
     class FakeClient:
-        async def post(self, url, json=None): captured["len"] = len(json["input"]); return FakeResp()
+        async def post(self, url, json=None, timeout=None):
+            captured["len"] = len(json["input"]); captured["timeout"] = timeout
+            return FakeResp()
     long = "x" * (coord.EMBED_MAX_CHARS + 5000)
     out = asyncio.run(coord.MemoryCoordinator._embed(None, long, FakeClient()))
     assert captured["len"] == coord.EMBED_MAX_CHARS and out == [0.1, 0.2]
+    # The timeout is sized on the CLAMPED length, and a maximally-sized input
+    # must get the full-context ceiling — the shared client default (30s) was
+    # not even enough for this function's own clamp.
+    assert captured["timeout"] == coord.embed_ceiling(coord.EMBED_MAX_CHARS)
+    assert captured["timeout"] > 30.0
 
 
 def test_embed_passes_short_input_untruncated():
@@ -1501,6 +1508,11 @@ def test_embed_passes_short_input_untruncated():
         def raise_for_status(self): pass
         def json(self): return {"data": [{"embedding": [0.0]}]}
     class FakeClient:
-        async def post(self, url, json=None): captured["len"] = len(json["input"]); return FakeResp()
+        async def post(self, url, json=None, timeout=None):
+            captured["len"] = len(json["input"]); captured["timeout"] = timeout
+            return FakeResp()
     asyncio.run(coord.MemoryCoordinator._embed(None, "short text", FakeClient()))
     assert captured["len"] == len("short text")
+    # A short save sits on the floor — the derivation must not make small
+    # writes wait longer than they used to.
+    assert captured["timeout"] == coord.EMBED_TIMEOUT_FLOOR_S
