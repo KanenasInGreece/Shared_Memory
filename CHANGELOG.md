@@ -5,6 +5,61 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.23] — 2026-07-30
+
+### Fixed
+
+- **Tier-3 synthesis was bounded below the floor it had to clear, so the busiest
+  clusters could not fold at all.** Both NREM fold prompts are cumulative: each is
+  handed the previous summary (or insight) and told to expand it, so a successful
+  fold must re-emit that entire narrative before adding a single new record. The
+  previous narrative's own length is therefore a hard floor under the output bound —
+  and it rises every time the fold succeeds. The shipped 2048 sat at **0.62x** that
+  floor for this framework's own busiest cluster, whose existing summary was 3315
+  tokens. Below the floor the fold cannot succeed by any path, and the two recorded
+  failure modes are one cause wearing two hats: obey the bound and content must be
+  dropped, which fails the *preservation gate*; obey the gate and the bound is
+  overrun, which fails as *truncation*. After `NREM_FOLD_FAIL_CAP` of either, the
+  dead-letter cap removes the cluster from Tier 3 entirely. Because the floor is the
+  existing narrative, the domains with the most accumulated history cross it first —
+  the failure lands precisely on the clusters that matter most, and it presents as a
+  consolidation stall rather than as a misconfiguration. Both bounds now default to
+  8192; the widened truncation retry follows at 16384.
+
+- **The per-call timeout was blind to the output bound, so raising that bound traded
+  one failure for a worse one.** `adaptive_ceiling` scaled with prompt size and work
+  units — both *input* terms — while decode time is driven by `max_tokens`. A widened
+  16384-token retry needs roughly 1638s at the shipped throughput floor but received
+  the 600s default, so the long generation the retry exists to permit was killed by
+  its own timeout. That is strictly worse than truncating: a timeout raises a generic
+  exception rather than setting the truncation flag, so it is never counted in
+  `truncation_failures` and the capacity failure leaves no trace in telemetry. The
+  ceiling now takes a fourth term, `max_tokens / LLM_MIN_TOK_S`, and both NREM call
+  sites size it on the **widest** bound they may retry at rather than the first one
+  they try.
+
+### Added
+
+- **`LLM_MIN_TOK_S`** (default `10`) — the slowest generation rate, in tokens per
+  second, that the ceiling will sit through. This is the one constant that is purely
+  a property of the operator's hardware, so it is an env knob and is documented as
+  the value to expect to change. It is set deliberately *below* observed throughput
+  rather than at it, because a ceiling sized on the average kills every
+  slower-than-average run; the reference rig measured min 11.29 / mean 13.93 / max
+  15.10 tok/s over 16 folds. Keep `max_tokens / LLM_MIN_TOK_S` under
+  `NREM_FORCED_SLOT_WAIT` or a long fold outlasts REM's willingness to yield the
+  shared LLM slot.
+
+- **`LLM_CEILING_FLOOR` is now documented in `.env.example`.** It governed every
+  dream LLM call's timeout and had never been published as a tunable.
+
+### Changed
+
+- `adaptive_ceiling(prompt_chars, units=0, max_tokens=0)` takes an optional third
+  argument. The parameter is additive and defaults to the term being inert, so every
+  pre-existing call site — REM's three and `relation_sweep`'s two — keeps its exact
+  previous ceiling. A regression test asserts that equivalence directly.
+
 ## [0.8.22] — 2026-07-30
 
 ### Fixed

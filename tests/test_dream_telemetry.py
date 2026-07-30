@@ -69,6 +69,44 @@ def test_adaptive_ceiling_floor_and_scaling(monkeypatch):
     assert dt.adaptive_ceiling(4400, 79) == 1185.0
 
 
+def test_adaptive_ceiling_output_bound_dominates(monkeypatch):
+    """Decode time tracks the OUTPUT bound, so max_tokens must be able to win.
+
+    The input-only ceiling was blind to it: a widened NREM retry at 16384 tokens
+    needs ~1638s at the shipped 10 tok/s floor but got the 600s floor, so the
+    generation the retry exists to allow was killed by its own timeout — and a
+    timeout is not counted as a truncation, so the capacity failure went unseen.
+    """
+    dt = _fresh(monkeypatch)
+    # 16384 / 10 tok/s = 1638.4s, beating the 600s floor and both input terms
+    assert dt.adaptive_ceiling(1000, 0, max_tokens=16384) == 1638.4
+    # a small bound must NOT drag the ceiling below the floor
+    assert dt.adaptive_ceiling(1000, 0, max_tokens=250) == 600.0
+    # input terms still win when they are the larger cost
+    assert dt.adaptive_ceiling(400_000, 0, max_tokens=8192) == 4000.0
+
+
+def test_adaptive_ceiling_omitting_max_tokens_is_unchanged(monkeypatch):
+    """The new parameter is additive — every pre-existing call site keeps its
+    exact previous ceiling, so REM/relation_sweep are untouched by this change."""
+    dt = _fresh(monkeypatch)
+    for prompt_chars, units in ((1000, 0), (80_000, 0), (4400, 79)):
+        assert (dt.adaptive_ceiling(prompt_chars, units)
+                == dt.adaptive_ceiling(prompt_chars, units, max_tokens=0))
+
+
+def test_llm_min_tok_s_is_env_tunable(monkeypatch):
+    """Throughput is purely a property of the operator's hardware — a slower rig
+    must be able to buy more wall-clock without editing code."""
+    monkeypatch.setenv("LLM_MIN_TOK_S", "5")
+    dt = _fresh(monkeypatch)
+    assert dt.adaptive_ceiling(1000, 0, max_tokens=16384) == 3276.8
+    # a zero/absurd setting must not raise ZeroDivisionError, just disable the term
+    monkeypatch.setenv("LLM_MIN_TOK_S", "0")
+    dt = _fresh(monkeypatch)
+    assert dt.adaptive_ceiling(1000, 0, max_tokens=16384) == 600.0
+
+
 def test_record_grounding_mint_rate(monkeypatch):
     dt = _fresh(monkeypatch)
     rec = dt.record_grounding(grounding_n=1500, referenced=10, matched=7, minted=3, pg_id=42)

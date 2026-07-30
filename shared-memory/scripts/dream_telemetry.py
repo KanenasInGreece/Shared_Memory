@@ -38,12 +38,36 @@ DREAM_METRICS_PATH = os.environ.get("DREAM_METRICS_PATH", "").strip() or None
 # work unit count (NREM cluster facts), so a big job is never killed for being big.
 CEILING_FLOOR_S = float(os.environ.get("LLM_CEILING_FLOOR", "600"))
 
+# Slowest generation rate the ceiling is willing to sit through, tokens/second.
+# The prompt/unit terms above size the ceiling on the INPUT, but decode time is
+# driven by the OUTPUT bound — so a raised max_tokens silently outgrew the
+# ceiling and turned "this cluster needs a longer narrative" into an opaque
+# timeout, which (unlike a truncation) is not even counted as a capacity
+# failure. This term makes the ceiling scale with what actually costs the time.
+#
+# DELIBERATELY BELOW OBSERVED THROUGHPUT, NOT AT IT: a ceiling sized on the
+# average kills every slower-than-average run. Measured here across 16 NREM
+# calls: min 11.29, mean 13.93, max 15.10 tok/s (Qwen3-14B Q4_K_M on one Arc
+# card, single slot). 10 leaves margin under the observed floor. It is an env
+# knob because this is the one constant that is purely a property of somebody
+# else's hardware — a faster rig should raise it, a CPU-only one must lower it.
+#
+# Keep the product (max_tokens / this) under the slot-arbiter budget
+# (NREM_FORCED_SLOT_WAIT, default 1800s) or a long fold outlasts REM's
+# willingness to yield the shared slot and the two daemons start fighting.
+LLM_MIN_TOK_S = float(os.environ.get("LLM_MIN_TOK_S", "10"))
 
-def adaptive_ceiling(prompt_chars: int, units: int = 0) -> float:
+
+def adaptive_ceiling(prompt_chars: int, units: int = 0,
+                     max_tokens: int = 0) -> float:
     """Per-call hard ceiling in seconds, scaled to the work. `prompt_chars` = len
     of the prompt sent; `units` = count of work items (NREM cluster size; 0 for REM
-    per-fact). Replaces the fixed timeout so valid long generations are not killed."""
-    return max(CEILING_FLOOR_S, prompt_chars / 100.0, units * 15.0)
+    per-fact); `max_tokens` = the OUTPUT bound requested, which dominates decode
+    time — pass the WIDEST bound a call site may retry at, not the first one it
+    tries. Omitting it keeps the pre-existing input-only behaviour exactly.
+    Replaces the fixed timeout so valid long generations are not killed."""
+    return max(CEILING_FLOOR_S, prompt_chars / 100.0, units * 15.0,
+               max_tokens / LLM_MIN_TOK_S if LLM_MIN_TOK_S > 0 else 0.0)
 
 
 def record_grounding(grounding_n: int, referenced: int, matched: int,
