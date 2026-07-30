@@ -102,7 +102,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.17"
+FRAMEWORK_VERSION = "0.8.18"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -3526,8 +3526,14 @@ class MemoryCoordinator:
         elicited saves*; (B) emergent = metadata keys captured but NOT first-write
         projected (promotion candidates); (C) alias-adjudication volume (does the
         deterministic projection keep the graph clean). No hot-path counters."""
+        # Keys that ARE first-write projected, so they must NOT be reported as
+        # promotion candidates in family (B). `rating` and `target_pg_id` joined
+        # this set when the retrospectives block below started projecting them —
+        # leaving them in the emergent list would advertise, as an unmet
+        # opportunity, the very measurement that now exists.
         PROJECTED = {"source", "type", "entities", "decision", "source_ref",
-                     "supersedes", "grounded_in", "fact_kind", "elicited"}
+                     "supersedes", "grounded_in", "fact_kind", "elicited",
+                     "rating", "target_pg_id"}
 
         def pct(a: int, b: int) -> float:
             return round(100.0 * a / b, 1) if b else 0.0
@@ -3542,13 +3548,33 @@ class MemoryCoordinator:
                 " FROM technical_docs"
                 " WHERE metadata->>'type'='decision' AND NOT superseded"
             )
+            # `facts` means FACTS. It used to mean "everything that is not a
+            # decision", which silently absorbed every retrospective into the
+            # total — so retrospective first-write quality was unmeasurable and
+            # the facts figure was diluted by records held to different required
+            # fields. Retrospectives now have their own block below, and the two
+            # totals no longer double-count the same records.
             frow = await conn.fetchrow(
                 "SELECT count(*) AS n,"
                 " count(*) FILTER (WHERE metadata ? 'source_ref') AS sref,"
                 " count(*) FILTER (WHERE (metadata->>'elicited')='true') AS elicited"
                 " FROM technical_docs"
-                " WHERE (metadata->>'type' IS NULL OR metadata->>'type' <> 'decision')"
+                " WHERE (metadata->>'type' IS NULL"
+                "        OR metadata->>'type' NOT IN ('decision', 'retrospective'))"
                 "   AND NOT superseded"
+            )
+            # Retrospectives carry their spine fields at the TOP level of metadata
+            # (`rating`, `target_pg_id`), not nested under a per-type object the way
+            # a decision's alternatives/confidence are — so these are direct `?`
+            # checks, matching how the write path actually stores them.
+            rrow = await conn.fetchrow(
+                "SELECT count(*) AS n,"
+                " count(*) FILTER (WHERE metadata ? 'rating') AS rating,"
+                " count(*) FILTER (WHERE metadata ? 'target_pg_id') AS target,"
+                " count(*) FILTER (WHERE metadata ? 'grounded_in') AS grounded,"
+                " count(*) FILTER (WHERE (metadata->>'elicited')='true') AS elicited"
+                " FROM technical_docs"
+                " WHERE metadata->>'type'='retrospective' AND NOT superseded"
             )
             keys = await conn.fetch(
                 "SELECT k, count(*) AS n FROM technical_docs, jsonb_object_keys(metadata) k"
@@ -3564,7 +3590,7 @@ class MemoryCoordinator:
             except Exception as exc:
                 alias = {"error": str(exc)}
 
-        dn, fn = drow["n"], frow["n"]
+        dn, fn, rn = drow["n"], frow["n"], rrow["n"]
         emergent = [{"key": r["k"], "n": r["n"]}
                     for r in keys if r["k"] not in PROJECTED][:12]
         return {
@@ -3579,6 +3605,19 @@ class MemoryCoordinator:
                 "total": fn,
                 "source_ref_pct": pct(frow["sref"], fn),
                 "elicited_pct": pct(frow["elicited"], fn),
+            },
+            # A retrospective's required fields are its own: the outcome state it
+            # reports (`rating`), the decision it judges (`target_pg_id`), and the
+            # records that MEASURED that outcome (`grounded_in`). The first two are
+            # set by every write path, so they read as a regression alarm rather
+            # than a trend; grounded_in is the one that carries signal — a
+            # retrospective without it asserts an outcome nothing backs.
+            "retrospectives": {
+                "total": rn,
+                "rating_pct": pct(rrow["rating"], rn),
+                "target_pg_id_pct": pct(rrow["target"], rn),
+                "grounded_in_pct": pct(rrow["grounded"], rn),
+                "elicited_pct": pct(rrow["elicited"], rn),
             },
             "emergent_unprojected_fields": emergent,
             "alias": alias,

@@ -5,6 +5,53 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.18] — 2026-07-30
+
+### Added
+
+- **Retrospectives are measured on their own terms.** The spine-coverage telemetry
+  reported completeness for two record types, `decisions` and `facts` — and `facts`
+  meant "everything that is not a decision", so every retrospective was counted
+  inside it. A retrospective's required fields are not a fact's: it reports an
+  outcome state (`rating`), names the decision it judges (`target_pg_id`), and cites
+  the records that measured that outcome (`grounded_in`). None of those were
+  measured, so retrospective first-write quality was invisible, and a project whose
+  standing rule is measure-first cannot improve what it does not measure.
+
+  `telemetry.spine` now carries a `retrospectives` block reporting `total`,
+  `rating_pct`, `target_pg_id_pct`, `grounded_in_pct` and `elicited_pct`. The data
+  was already being captured — the two fields the block projects were sitting in
+  `emergent_unprojected_fields`, which is the list of keys stored but never
+  measured — so this is a read-side projection with no schema change, no
+  capture-surface change, and no API version bump.
+
+  On the live install this immediately surfaced what the bundling hid: `rating` and
+  `target_pg_id` are set on every retrospective (100% each, since every write path
+  sets them — read those as a regression alarm rather than a trend), while
+  `grounded_in` sits at **17.4%**. Most retrospectives assert an outcome without
+  citing what measured it, which is exactly the gap the metric exists to expose.
+
+### Changed
+
+- **⚠ `spine.facts` now means facts — its total will DROP for consumers.** Excluding
+  retrospectives (and decisions, as before) is required for the blocks to be
+  coherent: leaving the old predicate while adding a retrospectives block would
+  count 839 records as 994, since every retrospective would appear in two totals.
+  Dashboards rendering `spine.facts.total` will see it fall by the retrospective
+  count. The response *shape* is unchanged and no existing field was renamed or
+  removed, so this needs no API version bump — but it is a semantic change to a
+  number consumers already display, and it is deliberate.
+
+  It also corrects a figure that was understating fact quality: `source_ref_pct`
+  reads **100%** over true facts, against **78%** when retrospectives — which
+  mostly lack `source_ref` — were diluting the denominator. The bundled number was
+  not merely coarse, it was wrong about facts.
+
+- **`rating` and `target_pg_id` no longer appear as promotion candidates.**
+  `emergent_unprojected_fields` lists metadata keys captured but not projected;
+  now that these two are measured, continuing to list them would advertise as an
+  unmet opportunity the very metric that just landed.
+
 ## [0.8.17] — 2026-07-30
 
 ### Fixed
@@ -13,15 +60,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   list did two different jobs.** The enrichment prompt lists known entity names so
   the model matches them exactly instead of coining near-duplicates, and the same
   list is what the link gate resolves proposals against — the names *shown* and the
-  names *accepted* were a single fetch, capped at 1500 and ordered by name. Once a
-  graph passes that many nodes, the tail of the alphabet falls out of both halves at
-  once: an entity is never offered to the model, and if the model names it anyway
-  from the record's own text, the gate treats it as unknown and drops the edge. On a
-  live graph of ~2600 named nodes that hid roughly half the entities from a
-  mechanism whose entire purpose is to find them, so facts stopped accumulating on
-  the entities they were about, and those entities stopped moving toward the
-  density threshold a thematic summary needs. The truncation was logged, but as a
-  prompt-size warning — nothing said that acceptance had narrowed too.
+  names *accepted* were a single fetch ordered by name, capped by `ENTITY_SET_LIMIT`
+  (default 1500). Once a graph passes that cap, the tail of the alphabet falls out of
+  both halves at once: an entity is never offered to the model, and if the model
+  names it anyway from the record's own text, the gate treats it as unknown and drops
+  the edge. So facts stopped accumulating on the entities they were about, and those
+  entities stopped moving toward the density threshold a thematic summary needs. The
+  truncation was logged, but as a prompt-size warning — nothing said that acceptance
+  had narrowed too.
+
+  Scale of the loss, stated separately from the default because the two differ. The
+  install where this was found runs `ENTITY_SET_LIMIT=2000` against 2599 distinct
+  named nodes, so **~609 names (≈23%) were invisible** — the observed `grounding_n`
+  topped out at 1996 and the fetch returned exactly its 2000-row limit, which is
+  what raised the truncation warnings. On the shipped default of 1500 the same graph
+  would hide ~1099 names (≈42%). Both are the same defect; only the magnitude scales
+  with the cap.
 
   The two sets are now bounded by what each is for. The accept set is the whole
   registry, under a high safety valve (`ENTITY_REGISTRY_LIMIT`) that means "prune
@@ -37,7 +91,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   install it held 4396 names against ~2600 existing ones, and more than half of a
   top-80 recall were names the graph no longer has. Offering those invites a
   proposal the link gate must then reject, so they are discarded before the prompt
-  is built.
+  is built. The gap is not hypothetical drift: a single entity-hygiene pass had
+  removed 1,840 nodes whose embedding rows all remained, which accounts for nearly
+  the whole discrepancy.
 
 ### Changed
 
