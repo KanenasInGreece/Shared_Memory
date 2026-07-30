@@ -561,3 +561,102 @@ def test_auth_helper_is_called_with_the_calling_tool_name():
     assert '_auth_rejected("vector_skill")' not in src, (
         "the helper is being passed the client name instead of the tool name"
     )
+
+
+# ── The docs that describe this surface must track it (change Group 1) ────────
+
+def _repo(*parts):
+    return os.path.join(os.path.dirname(__file__), "..", *parts)
+
+
+def _registered_tools() -> list:
+    """Tool names actually registered with @mcp.tool, read from the source."""
+    import ast
+    tree = ast.parse(open(_repo("vector-skill.py"), encoding="utf-8").read())
+    names = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for dec in node.decorator_list:
+                target = dec.func if isinstance(dec, ast.Call) else dec
+                if isinstance(target, ast.Attribute) and target.attr == "tool":
+                    names.append(node.name)
+    return names
+
+
+def test_system_prompt_names_every_registered_mcp_tool():
+    """The MCP surface grew to 13 tools while its system prompt described 8 — so a
+    model driven by it never knew it could trace lineage, query the graph, or take
+    part in relation calibration. Adding a tool without documenting it makes the
+    tool unreachable in practice."""
+    tools = _registered_tools()
+    assert len(tools) >= 13, f"expected the full tool surface, found {tools}"
+    prompt = open(_repo("system-prompt.md"), encoding="utf-8").read()
+    missing = [t for t in tools if t not in prompt]
+    assert not missing, f"system-prompt.md does not mention MCP tool(s): {missing}"
+
+
+def test_system_prompt_does_not_send_the_model_to_a_database_mcp():
+    """It used to list `neo4j-memory` as search step 2. A direct-bolt database MCP
+    connects past the gateway, and the gateway is what applies the read-visibility
+    predicate — so that fallback pointed at the exact unauthorized path removed
+    from this client in v0.8.0."""
+    prompt = open(_repo("system-prompt.md"), encoding="utf-8").read()
+    assert "Never register or reach for a database MCP" in prompt, (
+        "the prohibition on database MCPs is missing"
+    )
+    # BOTH stores, named. Postgres is the more tempting one — a generic SQL MCP
+    # looks harmless next to a graph driver, and it reaches the same rows with the
+    # same absence of a visibility predicate.
+    for store in ("Postgres", "Neo4j"):
+        assert store in prompt.split("Never register or reach for a database MCP")[1][:600], (
+            f"the prohibition does not name {store} — a reader will assume it is "
+            f"about the other store only"
+        )
+    section = prompt.split("# SEARCH-FIRST MANDATE")[1].split("\n# ", 1)[0]
+    # Only the ENUMERATED steps — the prohibition below them names the forbidden
+    # servers on purpose, so scanning the whole section would flag its own warning.
+    steps = [l for l in section.splitlines()
+             if l.lstrip().startswith(("1.", "2.", "3.", "4."))]
+    assert steps, "the search hierarchy has no enumerated steps"
+    joined = "\n".join(steps).lower()
+    for forbidden in ("neo4j-memory", "server-postgres", "postgres-mcp",
+                      "mcp-postgres", "server-neo4j"):
+        assert forbidden not in joined, (
+            f"a direct database MCP ({forbidden}) is back among the recommended "
+            f"search steps — it reaches the rows with no visibility predicate"
+        )
+    assert "graph_query" in joined, (
+        "the authorized graph fallback should be the escalation step"
+    )
+
+
+def test_shipped_mcp_config_registers_no_database_server():
+    """The config we ship must not itself register the thing the prompt forbids.
+    A database MCP alongside rag-orchestrator re-opens read authorization from the
+    other side: the gateway filters every read on `visibility`, a raw SQL or Bolt
+    connection filters on nothing."""
+    import json as _json
+    cfg = _json.load(open(_repo("mcp.json"), encoding="utf-8"))
+    servers = cfg.get("mcpServers") or cfg
+    for name, entry in servers.items():
+        blob = (name + " " + _json.dumps(entry)).lower()
+        for forbidden in ("server-postgres", "postgres-mcp", "mcp-postgres",
+                          "neo4j-memory", "server-neo4j", "psycopg", "bolt://"):
+            assert forbidden not in blob, (
+                f"mcp.json server '{name}' looks like a direct database MCP "
+                f"({forbidden}) — memory access goes through the gateway only"
+            )
+
+
+def test_readme_mcp_config_block_carries_the_token():
+    """README's rag-orchestrator example had no env block at all, so anyone
+    following it built a client with no AGENT_TOKEN — auth has been mandatory
+    since v0.3.5, so every call would 401. Broken on arrival, not merely stale."""
+    readme = open(_repo("README.md"), encoding="utf-8").read()
+    section = readme.split("## 16. LM Studio MCP Configuration")[1].split("\n## ")[0]
+    block = section.split('"rag-orchestrator"')[1].split('"tavily-mcp"')[0]
+    assert '"AGENT_TOKEN"' in block, (
+        "the rag-orchestrator example omits AGENT_TOKEN — following it yields a "
+        "client that 401s on every call"
+    )
+    assert '"COORDINATOR_URL"' in block

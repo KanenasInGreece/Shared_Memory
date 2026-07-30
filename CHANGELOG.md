@@ -5,6 +5,58 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.22] — 2026-07-30
+
+### Fixed
+
+- **The shipped system prompt sent the model to an unauthorized path.** Its search
+  hierarchy listed a direct-Bolt Neo4j MCP as the fallback when graph depth was
+  insufficient — the exact class of access the README forbids and that was removed
+  from the MCP client itself in 0.8.0. A database MCP connects past the gateway, and
+  the gateway is what applies read authorization: it filters every read on
+  `visibility` (`global`, the caller's own `private`, rows matching its `scope`),
+  while a raw SQL or Bolt connection filters on nothing and returns every private
+  record any agent ever saved. The escalation step is now the authorized
+  `graph_query` tool, and the prohibition is stated for **both** stores — the SQL one
+  named explicitly, since a generic query tool looks harmless beside a graph driver
+  and reaches the same rows with the same absence of a predicate.
+
+- **The README's MCP config example produced a client that could not authenticate.**
+  The `rag-orchestrator` entry carried no `env` block at all, so it had neither
+  `AGENT_TOKEN` nor `COORDINATOR_URL` — while the surrounding prose told the reader
+  to replace "all `YOUR_*` placeholders", of which the block contained only a Tavily
+  key. Every memory route has required a bearer token since 0.3.5, so anyone
+  following that section built a client that came up and then failed every call with
+  a 401. Broken on arrival rather than merely out of date. The block now carries both
+  values, with the token's three valid locations spelled out and the one that is a
+  trap called out: on the gateway host the client sits beside the *framework* env,
+  which it refuses to load.
+
+- **Five of thirteen MCP tools were undocumented in the system prompt**, so a model
+  driven by it had no way to know it could trace a record's lineage, run an
+  authorized graph query, archive a reasoning trace, or take part in relation
+  calibration. The calibration pair matters most: machine-asserted edges stay
+  invisible to synthesis until a family has roughly twenty operator labels, so an
+  undocumented tool meant an inert half of the graph with nothing indicating why.
+
+### Changed
+
+- **The system prompt now states the rules that decide what gets written**, none of
+  which it previously carried: that a record id is unique only within its table, so
+  a bare integer taken off a summary result resolves against the wrong one; that
+  decisions and retrospectives require asking the operator for grounding, roles,
+  alternatives and confidence before saving; that `rating` is a closed set of outcome
+  states rather than a grade; and that the token, not any client-supplied field, is
+  what identifies who saved a record.
+
+### Added
+
+- **Guards tying the docs to the surface they describe.** The system prompt must name
+  every tool the MCP server registers — derived from the source, so adding a tool
+  without documenting it fails. The search hierarchy must not name a database MCP for
+  either store, the prohibition must name both, and the shipped `mcp.json` must not
+  itself register one. The README's config example must carry `AGENT_TOKEN`.
+
 ## [0.8.21] — 2026-07-30
 
 ### Fixed

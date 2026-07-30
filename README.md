@@ -1760,7 +1760,11 @@ The `rag-orchestrator` entry runs the custom MCP server for this framework. It i
         "--with", "httpx",
         "--with", "python-dotenv",
         "python", "/path/to/your/vector-skill.py"
-      ]
+      ],
+      "env": {
+        "COORDINATOR_URL": "http://localhost:8888",
+        "AGENT_TOKEN": "YOUR_LM_STUDIO_AGENT_TOKEN"
+      }
     },
     "tavily-mcp": {
       "command": "npx",
@@ -1772,6 +1776,24 @@ The `rag-orchestrator` entry runs the custom MCP server for this framework. It i
   }
 }
 ```
+
+**The `env` block is not optional.** Every memory route requires `Authorization: Bearer <token>`
+([§10](#10-agent-integration-first-time-setup)), so without `AGENT_TOKEN` this client comes up and
+then fails every call with a 401. Use the `lm_studio` token minted by `bootstrap_tokens.sh` — its own,
+never one shared with another agent, because the gateway stamps each saved record's `source` from the
+token and that is the only thing that distinguishes one origin from another. `COORDINATOR_URL` is the
+gateway; set it to the Linux box's address (or an SSH tunnel, [§10a](#10a-remote-clients-ssh-tunnel-access))
+when LM Studio runs on a different machine.
+
+**Where the token may live — three places, one of them a trap.** The `env` block above is the
+recommended one. Alternatively the client reads a `.env` **beside `vector-skill.py`**, or the file that
+`VECTOR_SKILL_ENV` points at. That client `.env` holds only `AGENT_TOKEN` (optionally
+`COORDINATOR_URL` / `AGENT_ID`) — and if the file it finds contains `AGENT_TOKENS`, `PG_PASSWORD` or
+`NEO4J_PASSWORD`, it **refuses to load it and says so**, because those belong to the *framework* env
+and a client holding the token registry holds every other agent's identity. That refusal matters on the
+gateway host specifically, where `vector-skill.py` sits next to exactly such a file: give the MCP client
+its own directory, or point `VECTOR_SKILL_ENV` somewhere else. After any token change, restart LM Studio
+completely — MCP servers read their environment once, at spawn.
 
 ### Web search — choose your provider
 
