@@ -1260,10 +1260,23 @@ class REMDaemon:
         """
         if not texts or not closed_set:
             return select_prompt_slice(closed_set, [], ENTITY_PROMPT_K, ENTITY_SET_LIMIT)
+        if os.getenv("MOCK_LLM") == "1":
+            # MOCK_LLM means "no model traffic" and the embedder is model traffic
+            # reached over the same gateway. Without this a mocked test would make
+            # a real HTTP call, so the fallback slice keeps the mode deterministic.
+            return select_prompt_slice(closed_set, [], ENTITY_PROMPT_K, ENTITY_SET_LIMIT)
+        # Embeddings are independent HTTP calls → issued concurrently. The kNN
+        # queries that follow are NOT: they share one psycopg2 connection, which is
+        # not safe for concurrent use, so they stay sequential on purpose. They are
+        # index lookups behind one round trip each; the embeddings were the latency.
+        embeddings = await asyncio.gather(
+            *(self._embed(t) for t in texts), return_exceptions=True)
         ranked_lists: list[list[str]] = []
-        for text in texts:
-            emb = await self._embed(text)
-            if emb is None:
+        for emb in embeddings:
+            if isinstance(emb, BaseException) or emb is None:
+                if isinstance(emb, BaseException):
+                    logger.warning("REM grounding: embed raised (%s) — record "
+                                   "contributes no candidates", emb)
                 continue
             names = await self._nearest_entity_names(emb, ENTITY_PROMPT_K, conn, loop)
             if names:

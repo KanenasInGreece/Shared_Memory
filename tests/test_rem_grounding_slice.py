@@ -203,6 +203,63 @@ def test_grounding_slice_falls_back_when_knn_returns_nothing():
     assert mode == "fallback"
 
 
+def test_grounding_slice_under_mock_llm_makes_no_network_call():
+    """MOCK_LLM=1 means no model traffic, and the embedder is model traffic over
+    the same gateway — a mocked test must not reach the network."""
+    daemon, _ = _make_daemon()
+    daemon._embed = AsyncMock(side_effect=AssertionError("embedder called under MOCK_LLM"))
+    os.environ["MOCK_LLM"] = "1"
+    try:
+        rows, mode = asyncio.run(
+            daemon._grounding_slice(["text"], _rows("a", "b"), MagicMock(),
+                                   asyncio.new_event_loop()))
+    finally:
+        del os.environ["MOCK_LLM"]
+    assert mode == "fallback"
+    assert len(rows) == 2
+    daemon._embed.assert_not_called()
+
+
+def test_grounding_slice_embeds_batch_concurrently():
+    """The embeddings are independent HTTP calls, so a batch issues them together
+    rather than paying N sequential round trips."""
+    daemon, _ = _make_daemon()
+    inflight = {"now": 0, "max": 0}
+
+    async def _slow_embed(_text):
+        inflight["now"] += 1
+        inflight["max"] = max(inflight["max"], inflight["now"])
+        await asyncio.sleep(0.01)
+        inflight["now"] -= 1
+        return [0.0] * 8
+
+    daemon._embed = _slow_embed
+    daemon._nearest_entity_names = AsyncMock(return_value=["a"])
+    asyncio.run(daemon._grounding_slice(["t1", "t2", "t3"], _rows("a"),
+                                       MagicMock(), asyncio.new_event_loop()))
+    assert inflight["max"] == 3
+
+
+def test_grounding_slice_survives_one_embed_raising():
+    """One record's embedding failing must not lose the others' candidates."""
+    daemon, _ = _make_daemon()
+    calls = {"n": 0}
+
+    async def _flaky(_text):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("gateway hiccup")
+        return [0.0] * 8
+
+    daemon._embed = _flaky
+    daemon._nearest_entity_names = AsyncMock(return_value=["b"])
+    rows, mode = asyncio.run(
+        daemon._grounding_slice(["t1", "t2"], _rows("a", "b"), MagicMock(),
+                               asyncio.new_event_loop()))
+    assert mode == "knn"
+    assert [r["name"] for r in rows] == ["b"]
+
+
 def test_grounding_slice_empty_closed_set_is_fallback_not_crash():
     daemon, _ = _make_daemon()
     rows, mode = asyncio.run(
