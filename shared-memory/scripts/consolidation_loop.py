@@ -706,6 +706,16 @@ _ANCHOR_STOPWORDS = frozenset({
 # Plain facts tolerate this much anchor slack for legitimate paraphrase;
 # decision/retrospective anchors are never droppable regardless.
 PRESERVATION_COVERAGE = 0.90
+# ...but slack is spent as a COUNT of dropped anchors, and `total` is a small
+# integer, so a bare ratio quantises the promise away: floor(total * 0.10) is
+# ZERO for every cluster below 10. DENSITY_THRESHOLD makes 5-9 the ordinary
+# band, so the ratio advertised paraphrase slack that the common case never
+# received, then stepped discontinuously — 9 records all-or-nothing, 10 records
+# one free drop. Clusters at or above this many units get at least one
+# droppable SOFT anchor; smaller ones stay all-or-nothing. The hard-required
+# rule for decision/retrospective anchors is untouched by any of this.
+PRESERVATION_SLACK_MIN_UNITS = int(
+    os.environ.get("NREM_PRESERVATION_SLACK_MIN_UNITS", "5"))
 
 
 def preservation_anchor(content, record_type="fact"):
@@ -760,13 +770,19 @@ def fold_record_line(record, content):
             f" pg_id={record.get('pg_id', '?')}] {content}")
 
 
-def summary_preserves(summary, anchors, coverage=PRESERVATION_COVERAGE):
+def summary_preserves(summary, anchors, coverage=PRESERVATION_COVERAGE,
+                      slack_min_units=None):
     """Deterministic preservation check — pure. ``anchors`` is a list of
     (anchor, required) pairs; an anchor is FOUND when every one of its
     whitespace-separated tokens appears case-insensitively in the summary
     (token-level containment absorbs re-ordering, not omission). PASS when
-    >= ``coverage`` of anchors are found AND every required (decision/
-    retrospective) anchor is found. Returns (ok, missing_anchor_list)."""
+    the number of dropped anchors is within the slack budget AND every
+    required (decision/retrospective) anchor is found. The budget is
+    ``floor(total * (1 - coverage))``, raised to at least one droppable anchor
+    once the cluster reaches ``slack_min_units`` records — without that floor
+    the ratio rounds to zero slack for every cluster below 10 and the
+    advertised tolerance never reaches the ordinary 5-9 band. Returns
+    (ok, missing_anchor_list)."""
     text = (summary or "").lower()
     missing = []
     found = 0
@@ -784,7 +800,12 @@ def summary_preserves(summary, anchors, coverage=PRESERVATION_COVERAGE):
                 hard_missing = True
     if total == 0:
         return True, []
-    ok = (found / total) >= coverage and not hard_missing
+    if slack_min_units is None:
+        slack_min_units = PRESERVATION_SLACK_MIN_UNITS
+    allowed = int(total * (1.0 - coverage))
+    if total >= slack_min_units:
+        allowed = max(allowed, 1)
+    ok = (total - found) <= allowed and not hard_missing
     return ok, missing
 
 

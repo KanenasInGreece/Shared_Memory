@@ -5,6 +5,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.24] — 2026-07-30
+
+### Fixed
+
+- **The preservation gate's paraphrase slack rounded away to nothing for the
+  cluster sizes that actually occur.** Plain-fact anchors are meant to tolerate a
+  little loss to legitimate paraphrase, expressed as a 90% coverage ratio. But
+  slack is spent as a whole number of dropped anchors, and cluster sizes are small
+  integers, so `floor(size * 0.10)` is **zero for every cluster below ten records**.
+  The density threshold makes five-to-nine the ordinary band, so the advertised
+  tolerance never reached the common case — and the ratio also stepped
+  discontinuously across neighbouring sizes, gating a nine-record cluster strictly
+  all-or-nothing while its ten-record neighbour got one free drop. The budget is now
+  a count with an explicit floor (`NREM_PRESERVATION_SLACK_MIN_UNITS`, default 5):
+  clusters at or above the floor get at least one droppable soft anchor, smaller
+  ones stay absolute, and the budget never shrinks as a cluster grows.
+
+  **The hard-required rule for decision and retrospective anchors is untouched** —
+  the slack floor can never rescue one, and is covered by a test that says so.
+  Note this corrects the *parameter*, not fold reliability: folds observed failing
+  in practice drop more anchors than any slack setting would forgive, and each
+  corrective retry drops a *different* subset rather than converging. That is an
+  anchor-design problem, tracked separately.
+
+---
+
 ## [0.8.23] — 2026-07-30
 
 ### Fixed

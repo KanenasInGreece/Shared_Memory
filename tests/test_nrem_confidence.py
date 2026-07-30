@@ -294,6 +294,64 @@ def test_summary_preserves_fact_slack_ten_percent():
     assert not ok
 
 
+def test_summary_preserves_slack_reaches_the_ordinary_cluster_band():
+    """The ratio alone quantises to zero slack below 10 anchors — and
+    DENSITY_THRESHOLD makes 5-9 the ordinary band, so the advertised
+    paraphrase tolerance never reached the common case. One dropped soft
+    anchor must be survivable at every size from the slack floor upward."""
+    for n in range(5, 12):
+        anchors = [(f"anchorword{i}", False) for i in range(n)]
+        text = " ".join(f"anchorword{i}" for i in range(n - 1))   # 1 dropped
+        ok, missing = summary_preserves(text, anchors)
+        assert ok, f"one dropped soft anchor must survive at cluster size {n}"
+        assert missing == [f"anchorword{n - 1}"]
+
+
+def test_summary_preserves_slack_is_monotone_no_cliff_at_ten():
+    """No discontinuity: a 9-record cluster must not be gated harder than a
+    10-record one. Before the count-based budget, 9 tolerated zero drops and
+    10 tolerated one — neighbouring sizes with materially different gates."""
+    def tolerated(n):
+        anchors = [(f"anchorword{i}", False) for i in range(n)]
+        drops = 0
+        while drops < n:
+            text = " ".join(f"anchorword{i}" for i in range(n - drops - 1))
+            ok, _ = summary_preserves(text, anchors)
+            if not ok:
+                break
+            drops += 1
+        return drops
+    budgets = [tolerated(n) for n in range(2, 22)]
+    assert budgets == sorted(budgets), f"slack must not shrink as n grows: {budgets}"
+    assert tolerated(9) == tolerated(10) == 1
+
+
+def test_summary_preserves_tiny_clusters_stay_all_or_nothing():
+    """Below the slack floor the gate stays absolute — a 2-record cluster
+    must not get a 50%-loss allowance out of the rounding fix."""
+    for n in (2, 3, 4):
+        anchors = [(f"anchorword{i}", False) for i in range(n)]
+        text = " ".join(f"anchorword{i}" for i in range(n - 1))
+        ok, _ = summary_preserves(text, anchors)
+        assert not ok, f"cluster size {n} is below the slack floor — no drops"
+
+
+def test_summary_preserves_slack_floor_is_tunable():
+    anchors = [(f"anchorword{i}", False) for i in range(6)]
+    text = " ".join(f"anchorword{i}" for i in range(5))           # 1 dropped
+    assert summary_preserves(text, anchors, slack_min_units=5)[0]
+    assert not summary_preserves(text, anchors, slack_min_units=9)[0]
+
+
+def test_summary_preserves_hard_anchor_ignores_the_slack_floor():
+    """The slack budget must never rescue a decision/retrospective anchor —
+    the operator's core demand is untouched by the rounding fix."""
+    anchors = [(f"anchorword{i}", False) for i in range(8)] + [("decisiontitle", True)]
+    text = " ".join(f"anchorword{i}" for i in range(8))           # only the hard one missing
+    ok, missing = summary_preserves(text, anchors)
+    assert not ok and missing == ["decisiontitle"]
+
+
 def test_summary_preserves_decision_anchor_never_droppable():
     # Same 90% coverage, but the missing anchor is a DECISION anchor → hard fail.
     anchors = [(f"anchorword{i}", False) for i in range(9)] + [("decisiontitle", True)]
