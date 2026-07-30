@@ -165,3 +165,74 @@ def test_writes_jsonl_when_path_set(monkeypatch, tmp_path):
     assert len(lines) == 2
     first = json.loads(lines[0])
     assert first["phase"] == "REM" and first["backend"] == "b1"
+
+
+# ── embed_ceiling: the embedder's context is the invariant ────────────────────
+
+def test_embed_ceiling_scales_with_input_and_holds_a_floor(monkeypatch):
+    dt = _fresh(monkeypatch)
+    # Small inputs sit on the floor — connection setup dominates, not compute.
+    assert dt.embed_ceiling(0) == dt.EMBED_TIMEOUT_FLOOR_S
+    assert dt.embed_ceiling(500) == dt.EMBED_TIMEOUT_FLOOR_S
+    # Large inputs scale: tokens / throughput floor * safety factor.
+    big = dt.embed_ceiling(18_000)
+    assert big == (18_000 / dt.EMBED_CHARS_PER_TOKEN) / dt.EMBED_MIN_TOK_S \
+        * dt.EMBED_SAFETY_FACTOR
+    assert big > dt.EMBED_TIMEOUT_FLOOR_S
+
+
+def test_embed_ceiling_is_monotone_and_bounded_by_the_context(monkeypatch):
+    """The ceiling never exceeds the full-context time, because callers clamp
+    input to EMBED_MAX_CHARS. An input ten times the clamp costs the same."""
+    dt = _fresh(monkeypatch)
+    vals = [dt.embed_ceiling(n) for n in range(0, 120_000, 2_000)]
+    assert vals == sorted(vals), "ceiling must never shrink as input grows"
+    full = dt.embed_ceiling(dt.EMBED_MAX_CHARS)
+    assert dt.embed_ceiling(dt.EMBED_MAX_CHARS * 10) == full
+    expected = (dt.EMBED_MAX_CONTEXT_TOKENS / dt.EMBED_MIN_TOK_S
+                * dt.EMBED_SAFETY_FACTOR)
+    assert abs(full - expected) < 1e-6
+
+
+def test_embed_ceiling_covers_the_measured_cost_at_full_context(monkeypatch):
+    """Regression guard tied to measurement, not taste. BGE-M3 on CPU was timed
+    at 50.3 s for 7414 tokens, fitting wall = 1.92e-3*n + 6.48e-7*n^2 to within
+    0.52 s — about 59 s at the 8192-token context. The shipped defaults must
+    leave headroom over that, or the ceiling reintroduces the bug it fixes."""
+    dt = _fresh(monkeypatch)
+    n = dt.EMBED_MAX_CONTEXT_TOKENS
+    measured_worst = 1.92e-3 * n + 6.48e-7 * n ** 2
+    assert dt.embed_ceiling(dt.EMBED_MAX_CHARS) > measured_worst
+    # ...and the OLD hardcoded 20s did not, which is why folds were lost.
+    assert measured_worst > 20.0
+
+
+def test_embed_max_chars_derives_from_the_context(monkeypatch):
+    monkeypatch.setenv("EMBED_MAX_CONTEXT_TOKENS", "4096")
+    monkeypatch.setenv("EMBED_CHARS_PER_TOKEN", "3.0")
+    monkeypatch.delenv("EMBED_MAX_CHARS", raising=False)
+    dt = _fresh(monkeypatch)
+    assert dt.EMBED_MAX_CHARS == 12_288
+
+
+def test_embed_ceiling_knobs_are_env_tunable(monkeypatch):
+    monkeypatch.setenv("EMBED_MIN_TOK_S", "400")       # a GPU-backed embedder
+    monkeypatch.setenv("EMBED_TIMEOUT_FLOOR_S", "5")
+    monkeypatch.setenv("EMBED_SAFETY_FACTOR", "2.0")
+    dt = _fresh(monkeypatch)
+    assert dt.embed_ceiling(dt.EMBED_MAX_CHARS) == \
+        dt.EMBED_MAX_CONTEXT_TOKENS / 400 * 2.0
+    assert dt.embed_ceiling(1) == 5.0
+
+
+def test_embed_ceiling_degrades_safely_on_nonsense_config(monkeypatch):
+    monkeypatch.setenv("EMBED_MIN_TOK_S", "0")
+    dt = _fresh(monkeypatch)
+    assert dt.embed_ceiling(50_000) == dt.EMBED_TIMEOUT_FLOOR_S
+
+
+def test_adaptive_ceiling_llm_side_is_untouched(monkeypatch):
+    """The embedder work must not have moved the LLM ceiling — its timings stay
+    exactly as configured, no safety factor applied."""
+    dt = _fresh(monkeypatch)
+    assert dt.adaptive_ceiling(1000, 0, max_tokens=16384) == 16384 / dt.LLM_MIN_TOK_S

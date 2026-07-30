@@ -68,7 +68,8 @@ from ontology import (
 )
 import relation_confidence as rc_conf
 from pool_status import pool_has_free_slot
-from dream_telemetry import record_llm_call, adaptive_ceiling
+from dream_telemetry import (record_llm_call, adaptive_ceiling, embed_ceiling,
+                             EMBED_MAX_CHARS)
 from record_ref import make_ref
 
 # Configuration — set via environment variables or .env file
@@ -1574,9 +1575,32 @@ class ConsolidationDaemon:
                 extra=rec.extra()))
 
     async def get_embedding(self, text):
-        """Standardized 1024-dim BGE-M3 embedding call."""
+        """Standardized 1024-dim BGE-M3 embedding call.
+
+        Two guards the save path already had and this one did not — a fold
+        reaches here after minutes of generation, so anything lost here is
+        expensive:
+
+        1. TRUNCATE to the embedder's context. Over its limit BGE-M3 refuses
+           the whole input (HTTP 500 'too large to process'), so a summary
+           bigger than the context window is unvectorisable and the fold dies
+           having produced a perfectly good narrative. Vectorising the first
+           EMBED_MAX_CHARS is strictly better: the FULL text is still stored
+           and returned, only the vector is computed from the prefix.
+        2. SIZE THE TIMEOUT ON THE INPUT. Embedding cost is superlinear in
+           length, so the old constant 20 s covered barely half the context
+           window and killed large summaries deterministically.
+        """
+        if len(text) > EMBED_MAX_CHARS:
+            logger.warning(
+                "Embedding input %d chars > %d — vectorising the leading "
+                "%d chars to fit the embedder context (full text is still "
+                "stored and searchable).",
+                len(text), EMBED_MAX_CHARS, EMBED_MAX_CHARS)
+            text = text[:EMBED_MAX_CHARS]
+        ceiling = embed_ceiling(len(text))
         try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
+            async with httpx.AsyncClient(timeout=ceiling) as client:
                 resp = await client.post(
                     RETRIEVER_URL,
                     headers=_auth_headers(),
@@ -1585,7 +1609,11 @@ class ConsolidationDaemon:
                 resp.raise_for_status()
                 return resp.json()["data"][0]["embedding"]
         except Exception as e:
-            logger.error(f"Embedding error: {str(e)}")
+            # Name the exception CLASS: the bare str() of an httpx timeout is
+            # empty, which printed "Embedding error:" and told the operator
+            # nothing about whether it timed out, was refused, or 500'd.
+            logger.error("Embedding error after %.0fs ceiling on %d chars: %s: %s",
+                         ceiling, len(text), type(e).__name__, e)
             return None
 
     async def generate_summary(self, entity, facts, previous_summary=None,

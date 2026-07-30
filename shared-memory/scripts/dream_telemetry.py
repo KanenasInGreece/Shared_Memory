@@ -57,6 +57,67 @@ CEILING_FLOOR_S = float(os.environ.get("LLM_CEILING_FLOOR", "600"))
 # willingness to yield the shared slot and the two daemons start fighting.
 LLM_MIN_TOK_S = float(os.environ.get("LLM_MIN_TOK_S", "10"))
 
+# ── Embedding call sizing ────────────────────────────────────────────────────
+# Same lesson as LLM_MIN_TOK_S above, on the other backend. Embedding cost is
+# NOT constant and not even linear: measured on BGE-M3 (335M Q8_0, llama.cpp,
+# CPU) throughput fell threefold from 438 tok/s at 236 tokens to 148 tok/s at
+# 7414, fitting a linear term plus a quadratic attention term to within 0.52 s
+# across the range. A CONSTANT timeout therefore under-provisions exactly the
+# large inputs that need it most: the shipped 20 s covered only ~52% of the
+# embedder's own 8192-token context, so a fold could synthesise a summary it
+# could never vectorise, and lose the whole generation to a timeout.
+#
+# ANCHOR THE FLOOR AT MAX CONTEXT, NOT AT THE AVERAGE. Because the true cost is
+# superlinear, a linear rule is safe only when its throughput floor is taken
+# from the SLOWEST (largest-input) observation. Checked against the measurement:
+# anchored on the worst observed 147.5 tok/s a linear rule predicts 56 s at 8192
+# tokens against a true 59 s — under by 4 s, absorbed by the margin below;
+# anchored on the mean 273 tok/s it predicts 30 s against the same 59 s, under
+# by 29 s, and would fail every large call while looking correct on small ones.
+# The default sits below the worst observation for that margin. A GPU-backed or
+# faster embedder should raise it; a slower box must lower it.
+EMBED_MIN_TOK_S = float(os.environ.get("EMBED_MIN_TOK_S", "100"))
+# THE INVARIANT IS THE EMBEDDER'S CONTEXT. BGE-M3 has a hard 8192-token window
+# and REFUSES anything larger outright (HTTP 500 "input is too large to
+# process") rather than truncating it. So every caller clamps its input, and
+# BECAUSE the input is clamped the longest embedding call this framework can
+# ever make is a known, fixed quantity — the ceiling is computed from it here
+# rather than guessed at each call site. Env-tunable only because a different
+# deployment may run a different embedder; the derivation stays in code.
+EMBED_MAX_CONTEXT_TOKENS = int(os.environ.get("EMBED_MAX_CONTEXT_TOKENS", "8192"))
+# Conservative chars-per-token, used for BOTH the clamp and the token estimate.
+# Held BELOW the ~4.3 measured for English prose because code, identifiers and
+# non-English tokenize denser: a low value truncates earlier (never overruns the
+# context) and over-estimates tokens (never under-sizes the timeout). Both
+# errors are on the safe side, which is why one constant serves both uses.
+EMBED_CHARS_PER_TOKEN = float(os.environ.get("EMBED_CHARS_PER_TOKEN", "3.0"))
+# Longest input ever SENT to the embedder — derived from the context above, not
+# a magic number. The FULL text is always kept in Tier 1 and still returned by
+# search; only the vector is computed from the leading slice.
+EMBED_MAX_CHARS = int(os.environ.get(
+    "EMBED_MAX_CHARS", str(int(EMBED_MAX_CONTEXT_TOKENS * EMBED_CHARS_PER_TOKEN))))
+# Margin over the derived time. Not the invariant — just headroom, because
+# measured throughput falls as the input grows, so a ceiling fitted exactly to
+# the floor has nothing left for the slowest run at the largest size.
+EMBED_SAFETY_FACTOR = float(os.environ.get("EMBED_SAFETY_FACTOR", "1.5"))
+# Floor for small inputs — connection setup, and queueing behind another
+# request, because the embedder serialises.
+EMBED_TIMEOUT_FLOOR_S = float(os.environ.get("EMBED_TIMEOUT_FLOOR_S", "20"))
+
+
+def embed_ceiling(input_chars: int) -> float:
+    """Per-request embedding timeout in seconds, derived from input SIZE.
+
+    Bounded by construction: callers clamp input to ``EMBED_MAX_CHARS``, so the
+    ceiling can never exceed the full-context time — at the shipped defaults
+    8192 / 100 * 1.5 = 123 s, against a measured true cost of ~59 s at that
+    size. Pure → unit-testable without an embedder."""
+    if EMBED_CHARS_PER_TOKEN <= 0 or EMBED_MIN_TOK_S <= 0:
+        return EMBED_TIMEOUT_FLOOR_S
+    est_tokens = min(max(0, int(input_chars)), EMBED_MAX_CHARS) / EMBED_CHARS_PER_TOKEN
+    return max(EMBED_TIMEOUT_FLOOR_S,
+               est_tokens / EMBED_MIN_TOK_S * EMBED_SAFETY_FACTOR)
+
 
 def adaptive_ceiling(prompt_chars: int, units: int = 0,
                      max_tokens: int = 0) -> float:
