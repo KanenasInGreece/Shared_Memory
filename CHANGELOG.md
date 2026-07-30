@@ -5,6 +5,48 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.19] — 2026-07-30
+
+### Fixed
+
+- **`sync_skills.sh` silently stopped updating `SKILL.md` on every install whose
+  client script was symlinked.** The per-agent loop short-circuited on "this install
+  is repo-linked, already current" when it found `memory_bridge.py` to be a symlink,
+  and skipped the rest of the work for that agent. But `memory_bridge.py` is the
+  *only* file that is ever symlinked — `SKILL.md` is **copied**. So on every install
+  configured the recommended way, `SKILL.md` was written once at install time and
+  never refreshed again, while sync reported success on every run.
+
+  This is the worst file to rot silently. `SKILL.md` **is** the elicitation surface:
+  it carries the prompts that decide which fields an operator is asked for before a
+  save. A stale copy asks for the wrong fields, and the capture-surface review that
+  is a release gate reads the file **in the repo**, not the one agents actually have
+  — so the gate could pass on every release while the deployed prompts drifted
+  arbitrarily far behind. Measured on the machine where this was found, three of four
+  agent installs were serving a `SKILL.md` many versions old.
+
+  `SKILL.md` is now refreshed **before** the symlink check, which is narrowed to what
+  it can legitimately claim: the *scripts* are auto-current. A symlinked `SKILL.md`
+  (an unusual but valid layout) is skipped rather than written through, and a refresh
+  now prints distinctly from a no-op, so the next silent drift is visible.
+
+### Changed
+
+- **The Why-To loop example no longer promises a shortcut that already exists.** It
+  was labelled as raw Cypher pending a future named shortcut; `why-to-check` has
+  shipped for some time and is documented directly above it, so the example now
+  points at the shortcut and presents itself as the underlying form. The query body
+  was already correct — `rating` and the notes live on the `Retrospective` node, not
+  on the `HAD_OUTCOME` edge, which carries only `date`.
+
+### Added
+
+- **Guards so this class of drift fails loudly.** The two tracked `SKILL.md` copies
+  must be byte-identical, mirroring the invariant the client script already had; and
+  the ordering the fix depends on — the copy preceding the short-circuit — is pinned
+  directly, along with the symlink guard and the distinct refresh reporting. The
+  ordering guard was mutation-checked: restoring the original ordering fails it.
+
 ## [0.8.18] — 2026-07-30
 
 ### Added

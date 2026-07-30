@@ -92,8 +92,27 @@ for dir in "${AGENTS[@]}"; do
     echo "SKIP (not installed): $dir"
     continue
   fi
-  if [ -L "$dir/scripts/memory_bridge.py" ] || [ -L "$dir/scripts" ] || [ -L "$dir/SKILL.md" ]; then
-    echo "↔  symlink (repo-linked, already current): $dir"
+  # SKILL.md is COPIED into every install — only memory_bridge.py is symlinked —
+  # so it must be refreshed BEFORE the symlink short-circuit below, never after.
+  # This copy used to sit after it, so an install whose script was a symlink was
+  # declared "already current" as a whole and its SKILL.md was never touched
+  # again. The symlink makes the SCRIPT auto-current and says nothing about the
+  # capture surface: measured on this machine, three of four agents were serving
+  # a SKILL.md many versions behind while sync reported them current every run.
+  # That is the worst shape for this file to rot in, because SKILL.md IS the
+  # elicitation surface — a stale copy asks the operator for the wrong fields and
+  # nothing anywhere reports a problem.
+  if [ ! -L "$dir/SKILL.md" ] && [ -f "$SKILL_COPY/SKILL.md" ]; then
+    if cmp -s "$SKILL_COPY/SKILL.md" "$dir/SKILL.md"; then
+      echo "=  SKILL.md already current: $dir"
+    else
+      cp "$SKILL_COPY/SKILL.md" "$dir/SKILL.md"
+      echo "✓ SKILL.md REFRESHED (was stale): $dir"
+    fi
+  fi
+
+  if [ -L "$dir/scripts/memory_bridge.py" ] || [ -L "$dir/scripts" ]; then
+    echo "↔  scripts symlinked (repo-linked, auto-current): $dir"
     continue
   fi
 

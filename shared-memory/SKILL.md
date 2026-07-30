@@ -190,7 +190,7 @@ uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/s
 
 **`--rating` is a closed outcome-state enum:** `validated` (held up), `mixed` (partly), `refined` (the decision evolved), `pending` (not yet judged), `reversed` (withdrawn — supersedes the decision: it disappears from Tier-1 search and never seeds a new cross-project insight; existing insights re-fold with the reversal as a known limit). States, not grades — the nuance and the measured delta belong in `--notes`, which is what insight synthesis quotes.
 
-**Why-To loop query (raw Cypher; Phase D will add a named shortcut):**
+**Why-To loop query** — prefer the `why-to-check` shortcut above; this is the raw form it runs:
 ```
 uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py graph \
   "MATCH (d:Decision)-[o:HAD_OUTCOME]->(r:Retrospective)
