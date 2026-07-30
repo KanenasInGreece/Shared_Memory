@@ -116,8 +116,31 @@ NREM_POOL_PROBE_SEC = int(os.environ.get("NREM_POOL_PROBE_SEC", "15"))
 # OPERATOR CONSTRAINT: a bound that processes but gives incomplete saves /
 # truncated summaries is worse than no bound at all — a truncated draft is
 # never persisted, never repair-salvaged, never fed to the preservation gate.
-NREM_MAX_TOKENS_SUMMARY = int(os.environ.get("NREM_MAX_TOKENS_SUMMARY", "2048"))
-NREM_MAX_TOKENS_INSIGHT = int(os.environ.get("NREM_MAX_TOKENS_INSIGHT", "2048"))
+#
+# THE BOUND HAS A FLOOR IT MUST CLEAR, AND THAT FLOOR GROWS. Both fold prompts
+# are CUMULATIVE: generate_summary is handed the previous summary and told to
+# expand it, generate_insight the previous insight. So a successful fold must
+# RE-EMIT the whole previous narrative before it adds a single new record. The
+# previous narrative's own length is therefore a hard floor under the output
+# bound, and it rises every time the fold succeeds.
+#
+# Set below that floor, the fold cannot succeed by ANY path, and both failure
+# modes are the same cause wearing two hats:
+#   * obey the bound   -> content must be dropped -> the PRESERVATION GATE fails
+#   * obey the gate    -> the bound is exceeded   -> TRUNCATION fails
+# and after NREM_FOLD_FAIL_CAP of either, the dead-letter cap removes the
+# cluster from Tier 3 entirely. The most-consolidated domains cross the floor
+# first, so the failure lands on exactly the clusters carrying the most history.
+#
+# That is not hypothetical: the shipped 2048 was 0.62x the floor for this
+# framework's own busiest cluster (a 3315-token summary), which stalled fact
+# consolidation outright. 8192 clears every active summary observed here with
+# >2x headroom while staying far inside both the context window and the
+# LLM_CEILING_FLOOR wall-clock budget — the practical limit is generation TIME,
+# not context. Raise it if a legitimately larger narrative truncates; the
+# `truncation_failures` / `truncation_failed` telemetry is what says so.
+NREM_MAX_TOKENS_SUMMARY = int(os.environ.get("NREM_MAX_TOKENS_SUMMARY", "8192"))
+NREM_MAX_TOKENS_INSIGHT = int(os.environ.get("NREM_MAX_TOKENS_INSIGHT", "8192"))
 
 # On a truncated draft the bound is widened ONCE and the call retried before
 # the fold is failed. A FIXED bound plus the fold dead-letter cap would
@@ -248,7 +271,11 @@ SWEEP_INTERVAL_SEC = int(os.environ.get("NREM_SWEEP_INTERVAL_SEC", "3600"))
 # for both daemons) in .env for Qwen-class models. Overrides the LM Studio preset.
 NREM_TEMPERATURE = float(os.environ.get("NREM_TEMPERATURE", os.environ.get("DREAM_TEMPERATURE", "0.6")))
 # NREM_LLM_TIMEOUT removed (ADR-021): per-call timeout is now adaptive —
-# adaptive_ceiling(len(prompt), units=cluster_size). Floor: LLM_CEILING_FLOOR (600s).
+# adaptive_ceiling(len(prompt), units=cluster_size, max_tokens=widest_bound).
+# Floor: LLM_CEILING_FLOOR (600s). The max_tokens term matters most here: decode
+# time tracks the OUTPUT bound, so the ceiling must be sized on the WIDEST bound
+# a call may retry at (bounds[-1]) or the widened truncation retry is killed by
+# its own timeout instead of completing.
 
 # ── Consolidation run ledger (ADR-018) ──────────────────────────────────────
 # One consolidation_runs row per cycle so a silent fold crash becomes queryable
@@ -1610,13 +1637,18 @@ class ConsolidationDaemon:
                 f"{corrective_text}"
             )
 
-        _ceiling = adaptive_ceiling(len(prompt), units=len(facts))
         # F4: try the default bound, then ONCE at a widened bound if the draft
         # was cut. Without the second try a cluster that simply needs a longer
         # narrative truncates every cycle and the fold dead-letter cap removes
         # it from Tier 3 for good, silently.
         bounds = [NREM_MAX_TOKENS_SUMMARY,
                   int(NREM_MAX_TOKENS_SUMMARY * NREM_TRUNCATION_RETRY_FACTOR)]
+        # Size the ceiling on the WIDEST bound, not the first: httpx applies the
+        # timeout per request, so a ceiling that only fits bounds[0] kills the
+        # widened retry mid-generation — converting the truncation this retry
+        # exists to fix into a bare timeout that is not counted as one.
+        _ceiling = adaptive_ceiling(len(prompt), units=len(facts),
+                                    max_tokens=bounds[-1])
         try:
             async with httpx.AsyncClient(timeout=_ceiling) as client:
                 for i, max_tokens in enumerate(bounds):
@@ -1714,10 +1746,12 @@ class ConsolidationDaemon:
             f"### INSIGHT:"
         )
 
-        _ceiling = adaptive_ceiling(len(prompt), units=len(decision_blocks))
         # F4: widen the bound once before failing the fold — see generate_summary.
         bounds = [NREM_MAX_TOKENS_INSIGHT,
                   int(NREM_MAX_TOKENS_INSIGHT * NREM_TRUNCATION_RETRY_FACTOR)]
+        # Ceiling sized on the widest bound — see generate_summary.
+        _ceiling = adaptive_ceiling(len(prompt), units=len(decision_blocks),
+                                    max_tokens=bounds[-1])
         try:
             async with httpx.AsyncClient(timeout=_ceiling) as client:
                 for i, max_tokens in enumerate(bounds):
