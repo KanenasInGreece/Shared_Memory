@@ -102,7 +102,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.24"
+FRAMEWORK_VERSION = "0.8.25"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -638,12 +638,19 @@ EMBED_RETRIES = 4
 EMBED_BACKOFF = 0.5      # seconds × attempt number  (0.5 s, 1 s, 1.5 s, 2 s)
 # BGE-M3 runs with -c 8192 (context tokens). An input over that fails to embed —
 # which would abort a save or drop a community summary from search. Truncate the
-# EMBEDDING input to a conservative char budget (~<=8000 tokens at ~3 chars/token,
-# safely under 8192); the FULL text is always kept in Tier 1 (technical_docs), so
-# search still returns it — only the vector is computed from the prefix. Prompted
-# by an advisor hitting a smaller BGE-M3 limit; guards us as summaries grow with
-# the larger-context work. Env-tunable if the embedder's -c changes.
-EMBED_MAX_CHARS = int(os.environ.get("EMBED_MAX_CHARS", "24000"))
+# EMBEDDING input to a conservative char budget derived from that context; the
+# FULL text is always kept in Tier 1 (technical_docs), so search still returns
+# it — only the vector is computed from the prefix. Prompted by an advisor
+# hitting a smaller BGE-M3 limit; guards us as summaries grow with the
+# larger-context work.
+#
+# The clamp AND the request timeout both come from dream_telemetry so the save
+# path and the NREM fold path cannot drift apart — they call one embedder with
+# one context limit, so they get one derivation. (dream_telemetry imports only
+# stdlib + log_hygiene, which this module already depends on, so this does not
+# pull psycopg2 into the gateway venv.)
+from dream_telemetry import (EMBED_MAX_CHARS, EMBED_TIMEOUT_FLOOR_S,  # noqa: E402
+                             embed_ceiling)
 
 # Read-contract graph expansion cap: how many edges surface per anchored record
 # in search results. Env-tunable. Ordering (in the expansion Cypher) puts
@@ -1195,9 +1202,16 @@ class MemoryCoordinator:
             log.warning("embed input %d chars > %d — truncating to fit BGE-M3 8192-ctx "
                         "(full text kept in Tier 1)", len(text), EMBED_MAX_CHARS)
             text = text[:EMBED_MAX_CHARS]
+        # Per-request timeout sized on the clamped input, overriding the shared
+        # client's default. Embedding cost is superlinear in length, so a
+        # constant that suits a short fact under-provisions a long decision or a
+        # maximally-sized summary — the client default of 30s did not even cover
+        # this function's own clamp.
+        ceiling = embed_ceiling(len(text))
         for attempt in range(1, EMBED_RETRIES + 1):
             try:
-                r = await client.post(EMBED_URL, json={"input": text, "model": "bge-m3"})
+                r = await client.post(EMBED_URL, json={"input": text, "model": "bge-m3"},
+                                      timeout=ceiling)
                 r.raise_for_status()
                 return r.json()["data"][0]["embedding"]
             except Exception as exc:

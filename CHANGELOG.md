@@ -5,6 +5,56 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.25] — 2026-07-30
+
+### Fixed
+
+- **A completed Tier-3 narrative could be discarded because the embedding call
+  timed out.** The consolidation daemon embedded with a hardcoded 20-second
+  timeout, no retry, and no clamp on input size — none of the guards the save
+  path already had, on the code path that handles the system's *largest* texts
+  and reaches the embedder only after minutes of generation.
+
+  Embedding cost is superlinear in input length. Measured on the reference rig
+  (BGE-M3 335M Q8_0, llama.cpp, CPU): throughput falls from 438 tok/s at 236
+  tokens to 148 tok/s at 7 414, fitting `wall = 1.92e-3·n + 6.48e-7·n²` to
+  within 0.52 s across the range — roughly 59 s at the model's 8 192-token
+  context. **The 20-second constant therefore covered only about 52% of the
+  embedder's own context window**, so a fold could synthesise a summary it was
+  structurally unable to vectorise, and lose the entire generation. The failure
+  was also attributed to nothing: it is neither a preservation nor a truncation
+  failure, so it was invisible to both telemetry and the dead-letter cap.
+
+  **The embedder's context is now the invariant the timeout is derived from.**
+  BGE-M3 refuses an oversized input outright rather than truncating, so every
+  caller clamps what it sends; because the input is clamped, the longest
+  embedding call the framework can make is a fixed known quantity, and the
+  timeout is computed from it in code: `tokens / EMBED_MIN_TOK_S ×
+  EMBED_SAFETY_FACTOR`, floored for small inputs. At the shipped defaults a
+  full-context call gets 123 s against a measured true cost of ~59 s, and a
+  short save still sits on the 20 s floor.
+
+  Both embedding paths now share one derivation, so the save path and the fold
+  path cannot drift apart — they call one embedder with one context limit. This
+  also raised the coordinator's own ceiling: its shared 30-second client default
+  did not cover the maximally-sized input its own clamp allows (~36 s).
+
+  New env knobs, all documented in `.env.example`: `EMBED_MAX_CONTEXT_TOKENS`,
+  `EMBED_CHARS_PER_TOKEN`, `EMBED_MIN_TOK_S`, `EMBED_SAFETY_FACTOR`,
+  `EMBED_TIMEOUT_FLOOR_S`. `EMBED_MAX_CHARS` still overrides directly but now
+  *defaults* to `EMBED_MAX_CONTEXT_TOKENS × EMBED_CHARS_PER_TOKEN` (24 576,
+  previously a flat 24 000) rather than being a magic number.
+
+  **LLM timings are deliberately untouched** — `adaptive_ceiling` and
+  `LLM_MIN_TOK_S` behave exactly as before, guarded by a test.
+
+- **`Embedding error:` logged nothing after the colon.** The handler printed
+  `str(e)`, which is empty for an httpx timeout, so an operator could not tell a
+  timeout from a refusal from a 500. It now names the exception class, the
+  ceiling that was applied, and the input size.
+
+---
+
 ## [0.8.24] — 2026-07-30
 
 ### Fixed
