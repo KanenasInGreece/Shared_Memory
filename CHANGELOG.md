@@ -5,6 +5,79 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.20] — 2026-07-30
+
+### Fixed
+
+- **A client self-update skipped everything when only `SKILL.md` had changed.**
+  `update_skill.sh` compared the installed `memory_bridge.py`'s `VERSION` against the
+  remote one and, on a match, printed *"Already up to date. Nothing to do."* and
+  exited before fetching a single file. But that version anchors the *client script*,
+  not the package: a release that touched only `SKILL.md` — the elicitation surface,
+  which decides what an operator is asked for before a save — left every remote client
+  reporting itself current while serving stale prompts indefinitely. Nothing enforced
+  "if `SKILL.md` changed, `VERSION` must bump"; it was a human habit, and one
+  docs-only merge would have broken it silently. This is the same class as the sync
+  short-circuit fixed in 0.8.19, on the remote path where nobody would notice.
+
+  The decision is now made on **content, per file**, at apply time: every manifest
+  file is fetched (a handful of small files — cheaper than being wrong) and only files
+  that actually differ are replaced. Versions are still read, for the message. Each
+  outcome reports distinctly — `REFRESHED` never reads the same as `already current` —
+  so the next drift is visible rather than hidden behind uniform success output.
+
+- **`AGENTS.md` Phase 8 installed two of the six files the skill ships, breaking its
+  own later phases.** It said to install `SKILL.md` and `memory_bridge.py`. The
+  package manifest also ships `CONSTITUTION_SNIPPET.md`, `.env.example`,
+  `scripts/update_skill.sh` and `Documentation/schema.md` — and Phase 8b copies its
+  block from `CONSTITUTION_SNIPPET.md` *in the skill directory*, while Phase 8c and
+  every later update run `update_skill.sh` *from there*. An agent following Phase 8
+  literally produced an install that could not perform the phases immediately after
+  it. Phase 8 now names the manifest as the authority, directs the agent to let the
+  tooling read it, and states the symlink-versus-copy rule explicitly: the script is
+  symlinked, `SKILL.md` is copied, and a symlinked `SKILL.md` opts that install out of
+  automatic refresh.
+
+- **The consolidation triage guide sent the operating agent to the wrong endpoint.**
+  `AGENTS.md` described the per-type fields — `eligible_clusters`, `runs_24h`,
+  `deferred_24h`, `idle_24h`, `last_deferred_reason` — under a section that opens with
+  `curl /health`. Those live on `GET /memory/telemetry` (what the client's `status`
+  reads); `/health` carries only the summary (`stalled`, `stalled_types`,
+  `last_success_age_seconds`, `last_success_cycle_type`). Every field name was
+  correct, so the error was invisible until an agent actually looked for a per-type
+  value and found nothing — at precisely the step the guide calls the actionable one.
+  The two halves are now split by endpoint, and the stated triage order says where to
+  switch.
+
+- **The enrichment prompt could contradict the entity gate it describes.** The rule
+  telling the model what happens to an unrecognised name was written as a literal
+  "DROPPED, not created" — true only because creation is off by default. With
+  `REM_MAY_MINT_ENTITIES=1` the prompt asserted the opposite of what the code would
+  do, which is exactly the defect fixed in 0.8.16/0.8.17, where the prompt had gone
+  on promising that unknown names "will become generic Entity nodes" long after they
+  stopped doing so. The rule is now derived from the flag rather than typed
+  separately, so the two cannot diverge again.
+
+### Changed
+
+- **The MCP surface is documented at the parity it actually has.** The skill
+  documented six MCP tools; thirteen exist. `graph_query`, `record_lineage`,
+  `memory_telemetry`, `check_memory_health`, `review_edges`, `label_edges` and
+  `archive_reasoning_trace` were all reachable but unmentioned, so an MCP client had
+  no way to know it could read telemetry, trace a record's lineage, or take part in
+  relation calibration at all. The code was ahead of its documentation, not behind.
+
+### Added
+
+- **Guards for the whole client-distribution surface.** The two tracked
+  `update_skill.sh` copies must be byte-identical; version equality must not
+  short-circuit the update; the apply step must compare content per file; refresh and
+  no-op must report differently; `AGENTS.md` must mention every file the manifest
+  ships, so Phase 8 cannot silently fall behind the package again; and the prompt's
+  mint rule must track the flag in both settings. The load-bearing guards were
+  mutation-checked — restoring the early exit, and removing the per-file comparison,
+  each fail their own test.
+
 ## [0.8.19] — 2026-07-30
 
 ### Fixed

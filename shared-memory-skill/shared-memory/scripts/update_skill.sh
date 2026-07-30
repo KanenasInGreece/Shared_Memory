@@ -29,10 +29,12 @@ SKILL_DIR="$(dirname "$SCRIPT_DIR")"
 # the SKILL root (the tracked shared-memory-skill/shared-memory directory),
 # not the repo root — every manifest path is relative to this.
 RAW_BASE="${SHARED_MEMORY_UPDATE_RAW_BASE:-https://raw.githubusercontent.com/KanenasInGreece/Shared_Memory/main/shared-memory-skill/shared-memory}"
-# FORCE=1 skips the version-equality skip below — needed for local dev sync,
-# where content can differ without VERSION having bumped yet (the common case
-# between releases). A real remote update always wants the skip, so this stays
-# unset there.
+# FORCE=1 re-applies every fetched file even when its content already matches.
+# It used to mean "skip the version-equality early exit", which is no longer a
+# thing that exists — the apply step compares CONTENT per file, so an unforced
+# run already picks up a change that did not bump VERSION. Kept because the local
+# dev sync wants unconditional re-application, and because a caller that has to
+# defeat a staleness check is a smell worth keeping visible in one named knob.
 FORCE="${SHARED_MEMORY_UPDATE_FORCE:-0}"
 ENV_FILE="$SKILL_DIR/.env"
 TMP_TAG="update_skill.$$"
@@ -79,9 +81,21 @@ if ! fetch "$RAW_BASE/MANIFEST.txt" "$MANIFEST"; then
     exit 1
 fi
 
-# ── 3. Version check FIRST — don't touch anything if nothing changed
-#    (unless FORCE=1). memory_bridge.py is the version anchor; fetched here
-#    once and reused in the copy loop below rather than fetched twice. ─────
+# ── 3. Read both versions — for the MESSAGE, not as a skip condition.
+#
+#    Version equality used to exit 0 here with "Already up to date. Nothing to
+#    do." That was wrong, and silently: the version compared is
+#    memory_bridge.py's, so a release that changed only SKILL.md — the
+#    ELICITATION surface, which decides what an operator is asked for before a
+#    save — left every remote client reporting itself current while serving
+#    stale prompts indefinitely. Nothing enforces "if SKILL.md changed, VERSION
+#    must bump"; it was a human habit, and one docs-only merge would have broken
+#    it. Same class as the sync_skills.sh symlink short-circuit fixed in 0.8.19.
+#
+#    So the decision is made on CONTENT, per file, at apply time (step 6): every
+#    manifest file is fetched (a handful of small files — cheaper than being
+#    wrong) and only files that actually differ are replaced. memory_bridge.py
+#    is still fetched here once and reused below rather than fetched twice. ───
 LOCAL_VERSION=""
 [ -f "$SCRIPT_DIR/memory_bridge.py" ] && \
     LOCAL_VERSION="$(grep -m1 '^VERSION = ' "$SCRIPT_DIR/memory_bridge.py" 2>/dev/null | sed 's/VERSION = "\(.*\)"/\1/')"
@@ -94,12 +108,12 @@ if ! fetch "$RAW_BASE/scripts/memory_bridge.py" "$MB_STAGE"; then
 fi
 REMOTE_VERSION="$(grep -m1 '^VERSION = ' "$MB_STAGE" 2>/dev/null | sed 's/VERSION = "\(.*\)"/\1/')"
 
-if [ "$FORCE" != "1" ] && [ -n "$LOCAL_VERSION" ] && [ "$LOCAL_VERSION" = "$REMOTE_VERSION" ]; then
-    echo "✓ Already up to date (version $LOCAL_VERSION). Nothing to do."
-    exit 0
+if [ -n "$LOCAL_VERSION" ] && [ "$LOCAL_VERSION" = "$REMOTE_VERSION" ]; then
+    echo "Client and remote are both version $REMOTE_VERSION — comparing file"
+    echo "contents anyway, because a release can change SKILL.md alone."
+else
+    echo "Update available: ${LOCAL_VERSION:-none installed} → $REMOTE_VERSION"
 fi
-
-echo "Update available: ${LOCAL_VERSION:-none installed} → $REMOTE_VERSION"
 echo ""
 
 # ── 4. Fetch every manifest file to <dest>.new (temp-then-atomic-rename —
@@ -119,7 +133,7 @@ while IFS= read -r rel || [ -n "$rel" ]; do
 
     if [ "$rel" = "scripts/memory_bridge.py" ]; then
         STAGED_SRC+=("$MB_STAGE"); STAGED_DEST+=("$dest")
-        echo "✓ memory_bridge.py"
+        echo "   fetched memory_bridge.py"
         continue
     fi
     if [ "$rel" = ".env.example" ]; then
@@ -140,7 +154,7 @@ while IFS= read -r rel || [ -n "$rel" ]; do
     stage="/tmp/${TMP_TAG}.$(echo "$rel" | tr '/' '_')"
     if fetch "$RAW_BASE/$rel" "$stage"; then
         STAGED_SRC+=("$stage"); STAGED_DEST+=("$dest")
-        echo "✓ $rel"
+        echo "   fetched $rel"
     else
         echo "✗ $rel fetch failed — aborting, nothing was changed"
         exit 1
@@ -165,11 +179,32 @@ elif [ -n "$ENV_EXAMPLE_STAGE" ] && [ ! -f "$ENV_FILE" ]; then
     echo "  (skipping .env merge — no .env exists yet, see token warning above)"
 fi
 
-# ── 6. Now actually apply every staged file — everything fetched cleanly,
-#    so this is the only step that touches a real destination. ─────────────
+# ── 6. Apply every staged file whose CONTENT differs — everything fetched
+#    cleanly, so this is the only step that touches a real destination.
+#
+#    Per-file comparison is what makes this correct: no file can be skipped
+#    because some OTHER file's version looked current. And each outcome prints
+#    distinctly — "REFRESHED" must never read the same as "already current", or
+#    the next silent drift is as undetectable as this one was. FORCE=1 re-applies
+#    regardless, which is what the local dev sync wants. ────────────────────
+refreshed=0
+unchanged=0
 for i in "${!STAGED_SRC[@]}"; do
-    mv "${STAGED_SRC[$i]}" "${STAGED_DEST[$i]}"
+    src="${STAGED_SRC[$i]}"
+    dst="${STAGED_DEST[$i]}"
+    rel="${dst#"$SKILL_DIR"/}"
+    if [ "$FORCE" != "1" ] && cmp -s "$src" "$dst"; then
+        echo "=  $rel already current"
+        rm -f "$src"
+        unchanged=$((unchanged + 1))
+    else
+        mv "$src" "$dst"
+        echo "✓  $rel REFRESHED"
+        refreshed=$((refreshed + 1))
+    fi
 done
+echo ""
+echo "Applied: $refreshed refreshed, $unchanged already current."
 
 # Refresh this script itself last. temp-then-rename is safe to do to a script
 # bash is still executing (rename() doesn't affect an already-open file
@@ -177,9 +212,13 @@ done
 # matters has already landed.
 UPDATE_SELF_STAGE="/tmp/${TMP_TAG}.update_skill.sh"
 if fetch "$RAW_BASE/scripts/update_skill.sh" "$UPDATE_SELF_STAGE"; then
-    chmod +x "$UPDATE_SELF_STAGE"
-    mv "$UPDATE_SELF_STAGE" "$SCRIPT_DIR/update_skill.sh"
-    echo "✓ update_skill.sh (this script, refreshed for next time)"
+    if [ "$FORCE" != "1" ] && cmp -s "$UPDATE_SELF_STAGE" "$SCRIPT_DIR/update_skill.sh"; then
+        echo "=  update_skill.sh (this script) already current"
+    else
+        chmod +x "$UPDATE_SELF_STAGE"
+        mv "$UPDATE_SELF_STAGE" "$SCRIPT_DIR/update_skill.sh"
+        echo "✓  update_skill.sh REFRESHED (this script, for next time)"
+    fi
 else
     echo "  (this script itself wasn't refreshed — everything else updated fine)"
 fi

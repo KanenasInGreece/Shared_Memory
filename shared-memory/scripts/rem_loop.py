@@ -483,6 +483,20 @@ _EXTRA_RESULT_KEYS: dict[str, str] = {
     ONT.produces_insight: "produces_insight",
 }
 
+# What the prompt tells the model about unknown names MUST track what the gate
+# actually does with them, and that is env-dependent. Stating "DROPPED" while
+# REM_MAY_MINT_ENTITIES=1 would teach the model the opposite of the truth — the
+# same defect as the pre-937 line that promised unknown names "will become generic
+# Entity nodes" long after they stopped doing so. Derived from the flag, not typed
+# twice.
+_MINT_RULE = (
+    "Unknown names WILL be created as new generic Entity nodes, so coin one only "
+    "when the content really introduces a new concept."
+    if REM_MAY_MINT_ENTITIES else
+    "Names NOT in the known list are DROPPED, not created: prefer an exact match "
+    "from the list whenever the content plainly means it."
+)
+
 # Human-readable ontology vocabulary shown to the LLM in every prompt.
 _ONTOLOGY_VOCAB = f"""\
 Relationship types (choose the most precise fit for each referenced entity):
@@ -500,7 +514,7 @@ Rules:
 - Match entity names from the known typed-node list EXACTLY (case-sensitive).
 - For Human / AIAgent / Project / Decision nodes, prefer the typed relationship.
 - The known list is the NEAREST entities to this record, not the whole graph — a name missing from it may still exist, so name it exactly as the content spells it.
-- Names NOT in the known list are DROPPED, not created: prefer an exact match from the list whenever the content plainly means it.
+- {_MINT_RULE}
 - CONSIDERED, REJECTED, UNDER_CONDITIONS, PRODUCES_INSIGHT apply only when processing a Decision."""
 
 

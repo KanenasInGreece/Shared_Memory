@@ -137,7 +137,11 @@ curl -s http://localhost:8888/health
 
 ### Phase 8 — Install the skill into each agent
 
-For every agent from Q5, follow README §10 (§10a for remote/laptop clients): create the agent's skill dir (Antigravity CLI uses the legacy `~/.gemini/skills/` path), symlink/copy `memory_bridge.py` + `SKILL.md`, and write that agent's own `AGENT_TOKEN` into the skill `.env` (template: `shared-memory-skill/shared-memory/.env.example`). LM Studio instead registers `vector-skill.py` through `mcp.json` (fill the `YOUR_*` placeholders) and needs a full restart after token changes.
+For every agent from Q5, follow README §10 (§10a for remote/laptop clients): create the agent's skill dir (Antigravity CLI uses the legacy `~/.gemini/skills/` path), install the skill package, and write that agent's own `AGENT_TOKEN` into the skill `.env` (template: `shared-memory-skill/shared-memory/.env.example`). LM Studio instead registers `vector-skill.py` through `mcp.json` (fill the `YOUR_*` placeholders) and needs a full restart after token changes.
+
+**What "the skill package" is — `shared-memory-skill/shared-memory/MANIFEST.txt` is the authority, not a list in this file.** It currently ships `SKILL.md`, `CONSTITUTION_SNIPPET.md`, `.env.example`, `scripts/memory_bridge.py`, `scripts/update_skill.sh` and `Documentation/schema.md`. Install all of it: two later phases depend on files an "just SKILL.md and the script" install would leave out — Phase 8b copies its block from `CONSTITUTION_SNIPPET.md` *in the skill directory*, and Phase 8c and every future update run `scripts/update_skill.sh` *from there*. The reliable way to get it right is to let the tooling do it: create the directory with `memory_bridge.py` in place, then run `update_skill.sh` (or `sync_skills.sh` on the gateway host), which reads the manifest so a file added to the package later needs no change here.
+
+**Symlink the script; COPY `SKILL.md`.** A symlinked `memory_bridge.py` is auto-current, which is why it is the recommended layout. `SKILL.md` is deliberately copied — and a *symlinked* `SKILL.md` is skipped by `sync_skills.sh` rather than written through to the repo, so symlinking it opts that install out of automatic refresh of the elicitation surface. Do not.
 
 Final end-to-end check, as an agent (uses the skill path, exercises auth + embedding + storage):
 
@@ -225,14 +229,20 @@ uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridg
 
 `status: degraded` on `/health` names the down backend.
 
-**Reading `consolidation`.** There is more than one consolidation cycle type, and they have very different costs and cadences, so read the per-type block rather than the headline:
+**Reading `consolidation` — the two halves live on DIFFERENT endpoints.** There is more than one consolidation cycle type, with very different costs and cadences, so the per-type block is what you act on. But `/health` carries only the summary; the per-type census is on `/memory/telemetry`, which is what `memory_bridge.py status` reads. Asking `/health` for a per-type field returns nothing and is the easiest way to get stuck mid-triage.
 
-- `stalled: true` is an **OR across cycle types** — it means *at least one* is stalled. **`stalled_types` names which**, and is the only actionable field; a healthy cycle can sit beside a stalled sibling.
-- Per type, `eligible_clusters` is that cycle's own gate census. **`0` means "it looked and there was nothing to do" — that is idle, not broken**, and it is the normal state when the enrichment pass hasn't yet produced a dense enough cluster. Only a *non-zero* backlog with no successful fold is a real stall.
-- `runs_24h` counts runs of the cycle body; `deferred_24h` (due but skipped, usually the inference slot was busy) and `idle_24h` (gate ran, nothing eligible) are reported separately. A cycle with high `deferred_24h` is losing the slot, not failing.
+On **`/health`** → `consolidation`, the summary:
+
+- `stalled: true` is an **OR across cycle types** — it means *at least one* is stalled. **`stalled_types` names which**, and is the only actionable field here; a healthy cycle can sit beside a stalled sibling.
 - `last_success_age_seconds` is tagged with `last_success_cycle_type` — the type that achieved it, which may not be the type you are asking about.
 
-So the triage order is: `stalled_types` → that type's `eligible_clusters` → its `last_deferred_reason` → only then the reasoning LLM.
+On **`GET /memory/telemetry`** → `consolidation.<cycle_type>` (e.g. `consolidation.fact_consolidation`, `consolidation.insight`), the per-type detail:
+
+- `eligible_clusters` is that cycle's own gate census. **`0` means "it looked and there was nothing to do" — that is idle, not broken**, and it is the normal state when the enrichment pass hasn't yet produced a dense enough cluster. Only a *non-zero* backlog with no successful fold is a real stall.
+- `runs_24h` counts runs of the cycle body; `deferred_24h` (due but skipped, usually the inference slot was busy) and `idle_24h` (gate ran, nothing eligible) are reported separately. A cycle with high `deferred_24h` is losing the slot, not failing.
+- `last_deferred_reason` says *why* it yielded; `folds_attempted_24h` / `folds_succeeded_24h` separate "tried and failed" from "never tried".
+
+So the triage order is: `/health` → `stalled_types` → then switch to `status` / `/memory/telemetry` for that type's `eligible_clusters` → its `last_deferred_reason` → only then the reasoning LLM.
 
 ### Upgrade (gateway host)
 

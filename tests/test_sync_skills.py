@@ -19,6 +19,7 @@ not run here — the behaviour was verified by hand against all four live instal
 """
 
 import os
+import sys
 
 import pytest
 
@@ -97,3 +98,119 @@ def test_refresh_is_reported_distinctly_from_already_current():
     text = _script()
     assert "SKILL.md REFRESHED" in text
     assert "SKILL.md already current" in text
+
+
+# ── update_skill.sh: the REMOTE path had the same hazard, version-gated ───────
+
+UPDATE_SRC = os.path.join(ROOT, "shared-memory", "scripts", "update_skill.sh")
+UPDATE_SHIPPED = os.path.join(ROOT, "shared-memory-skill", "shared-memory",
+                              "scripts", "update_skill.sh")
+
+
+def _update_script() -> str:
+    with open(UPDATE_SRC, encoding="utf-8") as f:
+        return f.read()
+
+
+def test_tracked_update_skill_copies_are_byte_identical():
+    """update_skill.sh ships to clients from the skill copy, so a fix applied only
+    to the source reaches nobody."""
+    with open(UPDATE_SRC, "rb") as f_src, open(UPDATE_SHIPPED, "rb") as f_ship:
+        assert f_src.read() == f_ship.read(), (
+            "update_skill.sh copies have diverged — clients fetch the SKILL copy. "
+            "Run: bash shared-memory/scripts/sync_skills.sh"
+        )
+
+
+def test_version_equality_does_not_short_circuit_the_update():
+    """The remote analogue of the sync bug. update_skill.sh compared
+    memory_bridge.py's VERSION and exited 0 with "Already up to date" — so a
+    release that changed only SKILL.md never reached any remote client, and
+    nothing enforces "if SKILL.md changed, VERSION must bump". The version may be
+    read for the message; it must not gate the work.
+    """
+    text = _update_script()
+    gate = text.find('[ "$LOCAL_VERSION" = "$REMOTE_VERSION" ]')
+    assert gate != -1, "the version comparison is gone entirely — expected it kept for the message"
+    # No early exit may follow the comparison before the fetch loop begins.
+    fetch_loop = text.find("while IFS= read -r rel")
+    assert fetch_loop > gate
+    between = text[gate:fetch_loop]
+    assert "exit 0" not in between, (
+        "update_skill.sh exits before fetching when versions match — a SKILL.md-only "
+        "release would never reach a remote client"
+    )
+
+
+def test_apply_step_compares_content_per_file():
+    """Content, not version, is what decides. `cmp -s` per staged file is the
+    mechanism; without it the script is back to trusting a version anchor."""
+    text = _update_script()
+    assert 'cmp -s "$src" "$dst"' in text, (
+        "the apply step does not compare content per file"
+    )
+
+
+def test_update_reports_refreshed_distinctly_from_current():
+    text = _update_script()
+    assert "REFRESHED" in text
+    assert "already current" in text
+
+
+# ── AGENTS.md must not drift from the shipped package ────────────────────────
+
+def test_agents_md_names_every_file_the_manifest_ships():
+    """AGENTS.md Phase 8 used to tell the operating agent to install SKILL.md and
+    memory_bridge.py only — 2 of 6 shipped files — which broke its OWN later
+    phases: 8b copies from CONSTITUTION_SNIPPET.md in the skill dir, and 8c runs
+    update_skill.sh from there. If a file joins the manifest, Phase 8 has to know.
+    """
+    manifest = os.path.join(ROOT, "shared-memory-skill", "shared-memory",
+                            "MANIFEST.txt")
+    with open(manifest, encoding="utf-8") as f:
+        shipped = [ln.strip() for ln in f
+                   if ln.strip() and not ln.strip().startswith("#")]
+    with open(os.path.join(ROOT, "AGENTS.md"), encoding="utf-8") as f:
+        agents = f.read()
+    missing = [rel for rel in shipped if os.path.basename(rel) not in agents]
+    assert not missing, (
+        f"AGENTS.md does not mention shipped skill file(s): {missing} — Phase 8 "
+        f"would install an incomplete package"
+    )
+
+
+# ── The REM prompt must state what the gate actually does ─────────────────────
+
+def test_mint_rule_in_prompt_tracks_the_env_flag():
+    """A prompt that contradicts the code teaches the model the wrong contract —
+    the pre-937 line promised unknown names "will become generic Entity nodes"
+    long after they stopped doing so. The rule is derived from
+    REM_MAY_MINT_ENTITIES, so it cannot drift from the gate again.
+    """
+    import importlib.util as iu
+    scripts = os.path.normpath(os.path.join(ROOT, "shared-memory", "scripts"))
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+
+    def _load(mint_enabled: str):
+        os.environ["REM_MAY_MINT_ENTITIES"] = mint_enabled
+        spec = iu.spec_from_file_location(
+            f"rem_loop_mint_{mint_enabled}", os.path.join(scripts, "rem_loop.py"))
+        mod = iu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    prev = os.environ.get("REM_MAY_MINT_ENTITIES")
+    try:
+        off = _load("0")
+        assert "DROPPED, not created" in off._ONTOLOGY_VOCAB
+        assert "WILL be created" not in off._ONTOLOGY_VOCAB
+
+        on = _load("1")
+        assert "WILL be created" in on._ONTOLOGY_VOCAB
+        assert "DROPPED, not created" not in on._ONTOLOGY_VOCAB
+    finally:
+        if prev is None:
+            os.environ.pop("REM_MAY_MINT_ENTITIES", None)
+        else:
+            os.environ["REM_MAY_MINT_ENTITIES"] = prev

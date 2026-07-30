@@ -374,6 +374,8 @@ Tool: review_hold
 Args: {"summary_id": 12, "pg_id": 43}
 ```
 
+The MCP surface is at parity with the CLI, so anything above with a CLI equivalent has a tool: `graph_query`, `record_lineage` (pass a qualified `ref`), `memory_telemetry` and `check_memory_health` (the `status` / `doctor` pair), `review_edges` / `label_edges` for relation calibration, and `archive_reasoning_trace`. Same auth, same qualified-ref rules, same operator-involvement expectations as the CLI forms.
+
 ---
 
 ## Authentication (client side)
