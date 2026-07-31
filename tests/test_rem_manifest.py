@@ -714,6 +714,16 @@ def test_accept_set_withholds_entities_no_first_write_ever_named():
 
     assert "fw.asserted_by IS NULL" in accept_q
     assert "src.pg_id IS NOT NULL" in accept_q
+    # The Fact label on the NAMER is the whole rule. A bare MENTIONS edge is
+    # written by two writers: a fact's first write (a person naming a concept)
+    # and _inherit_entities_from_facts (a judgement copying its facts' topics,
+    # REM-asserted ones included, WITHOUT their asserted_by). Drop the label and
+    # inheritance launders REM's own output back into the accept set: REM names
+    # a fact -> a decision grounded in it inherits a bare edge -> the name reads
+    # as first-write-named -> REM may link it anywhere. Measured when caught:
+    # 432 of 2127 entities qualified only via a judgement's bare edge, 94 of
+    # them traceable to REM.
+    assert f"(src:{ONT.fact})" in accept_q
     # Scoped to Entity: the predicate rides on the Entity arm of the OR only.
     entity_arm = accept_q.split(f"OR (n:{ONT.entity}")[1]
     assert "asserted_by IS NULL" in entity_arm

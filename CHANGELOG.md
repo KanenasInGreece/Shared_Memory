@@ -5,6 +5,41 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.28] — 2026-07-31
+
+### Fixed
+
+- **The rule shipped one release ago was leaking, and the leak ran backwards
+  through the graph.** The enrichment pass may only link to a concept that first
+  write named, and that was tested by looking for a mention edge carrying no
+  machine stamp. Two different writers leave that mark, and only one of them is a
+  person naming something: a fact's first write, which materialises the operator's
+  list — and the inheritance walk that gives a decision or retrospective its
+  topics, which copies whatever its facts already carry, **machine-added names
+  included, without their stamp**.
+
+  So there was a cycle. The pass adds a name to a fact, correctly marked as its
+  own and correctly refused. A decision resting on that fact then inherits the
+  name unmarked. The name now reads as one a person chose, and the pass may link
+  it to anything, anywhere. Enrichment was laundering its own output back into the
+  set it is supposed to be constrained by.
+
+  The test now requires the naming record to be a **fact**. Measured on a live
+  graph: 2127 concept nodes, 1023 named by a fact, and **432 that qualified only
+  through a judgement's unmarked edge** — 94 of them traceable to the enrichment
+  pass. On the worked case, 20 of the 31 machine-added topics stop qualifying.
+  The accept set drops from 1455 concepts to 1023.
+
+  The remaining 338 are the older second vocabulary source: decisions used to name
+  their own concepts at first write, which is the very faucet the inheritance rule
+  closed. Those names were never vetted on a fact either, so they fall outside on
+  the same reasoning rather than by accident.
+
+- **A claim in the previous release's own documentation was false and is
+  corrected.** It stated that the pass could never re-qualify a name it had
+  introduced, because everything it writes carries its stamp. That reasoning
+  skipped the inheritance step, which strips the stamp.
+
 ## [0.8.27] — 2026-07-31
 
 ### Changed
