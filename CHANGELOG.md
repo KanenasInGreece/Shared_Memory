@@ -5,6 +5,50 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.27] — 2026-07-31
+
+### Changed
+
+- **The enrichment pass connects; it does not reinvent.** It may now only link a
+  record to a concept that *first write* named — an entity carrying a mention
+  with no machine stamp, from a real record. Everything it writes carries its own
+  stamp, so it can never re-qualify a name it introduced itself: the gate cannot
+  bootstrap on its own output.
+
+  This targets relations, not vocabulary. Creating entities was already closed;
+  what was still open was the enrichment pass building links *into* names only it
+  had ever used, which then read as topics a person had chosen. Measured on a
+  live graph before the change: of 2584 concept nodes, 1449 had been named by a
+  person at capture time, 677 only by the enrichment pass — and those 677 had
+  accumulated 897 machine links between them.
+
+  Stated plainly, because the number invites over-reading: this does **not**
+  catch a sentence-shaped name that *capture itself* admitted. On the worked
+  case — a record saved with three deliberate concepts that acquired thirty-one
+  more — every added name is first-write-named somewhere and survives the gate.
+  That is a capture-surface problem and is not addressed here.
+
+- **Entity creation is no longer configurable.** The setting that let a
+  deployment re-enable machine-minted entities is gone, along with the branch it
+  guarded and the prompt sentence that tracked it. An enrichment pass that coins
+  vocabulary produces names no one chose, and retrieval rests on join keys a
+  person is accountable for — so this is a property of the framework rather than
+  a deployment posture. The prompt now states the one behaviour there is.
+
+- **A decision's alternatives, conditions and insights may only point at
+  concepts.** That branch never passed through relationship resolution, so
+  nothing stopped the enrichment pass asserting "considered" against the person
+  who made the decision. The door was open and had not been walked through; it is
+  closed now.
+
+### Observability
+
+- The accept set reports what it withheld, per cycle, so the rule is falsifiable
+  in production rather than merely asserted.
+- The link-gate journal line was reworded: a refused name is now either absent
+  from the graph *or* deliberately withheld, and reading the count as a pure
+  creation rate would over-report it.
+
 ## [0.8.26] — 2026-07-31
 
 ### Changed

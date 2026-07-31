@@ -153,7 +153,9 @@ def test_registry_fetch_uses_registry_limit_not_prompt_limit():
 
     asyncio.run(daemon._fetch_closed_entity_set())
 
-    _, kwargs = session.run.call_args
+    # call 0 is the accept set; call 1 is the withheld count (978), which takes
+    # no limit — read the first, not the last.
+    _, kwargs = session.run.call_args_list[0]
     assert kwargs["limit"] == rem_mod.ENTITY_REGISTRY_LIMIT
 
 

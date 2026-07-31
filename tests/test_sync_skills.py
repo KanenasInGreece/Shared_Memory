@@ -181,36 +181,26 @@ def test_agents_md_names_every_file_the_manifest_ships():
 
 # ── The REM prompt must state what the gate actually does ─────────────────────
 
-def test_mint_rule_in_prompt_tracks_the_env_flag():
+def test_mint_rule_in_prompt_states_the_unconditional_gate():
     """A prompt that contradicts the code teaches the model the wrong contract —
-    the pre-937 line promised unknown names "will become generic Entity nodes"
-    long after they stopped doing so. The rule is derived from
-    REM_MAY_MINT_ENTITIES, so it cannot drift from the gate again.
+    the old line promised unknown names "will become generic Entity nodes" long
+    after they stopped doing so, and was then made to track an env flag. Decision
+    978 removed the flag, so the sentence must state the one behaviour there is,
+    and must not come back as a conditional.
     """
     import importlib.util as iu
     scripts = os.path.normpath(os.path.join(ROOT, "shared-memory", "scripts"))
     if scripts not in sys.path:
         sys.path.insert(0, scripts)
 
-    def _load(mint_enabled: str):
-        os.environ["REM_MAY_MINT_ENTITIES"] = mint_enabled
+    os.environ["REM_MAY_MINT_ENTITIES"] = "1"     # retired: must be ignored
+    try:
         spec = iu.spec_from_file_location(
-            f"rem_loop_mint_{mint_enabled}", os.path.join(scripts, "rem_loop.py"))
+            "rem_loop_mint_rule", os.path.join(scripts, "rem_loop.py"))
         mod = iu.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        return mod
-
-    prev = os.environ.get("REM_MAY_MINT_ENTITIES")
-    try:
-        off = _load("0")
-        assert "DROPPED, not created" in off._ONTOLOGY_VOCAB
-        assert "WILL be created" not in off._ONTOLOGY_VOCAB
-
-        on = _load("1")
-        assert "WILL be created" in on._ONTOLOGY_VOCAB
-        assert "DROPPED, not created" not in on._ONTOLOGY_VOCAB
+        assert "DROPPED, not created" in mod._ONTOLOGY_VOCAB
+        assert "WILL be created" not in mod._ONTOLOGY_VOCAB
+        assert not hasattr(mod, "REM_MAY_MINT_ENTITIES")
     finally:
-        if prev is None:
-            os.environ.pop("REM_MAY_MINT_ENTITIES", None)
-        else:
-            os.environ["REM_MAY_MINT_ENTITIES"] = prev
+        os.environ.pop("REM_MAY_MINT_ENTITIES", None)

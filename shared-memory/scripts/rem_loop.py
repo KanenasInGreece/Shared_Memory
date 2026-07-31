@@ -178,7 +178,7 @@ BATCH_SIZE         = 5     # facts per cycle (LLM calls are the latency bottlene
 #
 # These two used to be one capped fetch, and that conflation was a defect. The
 # closed set served two jobs at once — the names SHOWN to the LLM, and the names
-# ACCEPTED from it (the 937 link-only gate resolves against the same dict) — under
+# ACCEPTED from it (the link-only gate resolves against the same dict) — under
 # one `ORDER BY name LIMIT 1500`. Past 1500 named nodes the tail of the alphabet
 # fell out of both: a fact mentioning a known entity whose name sorts late was
 # neither offered the name nor allowed to use it, so the mention was dropped and
@@ -319,17 +319,22 @@ REM_MAX_ATTEMPTS = int(os.environ.get("REM_MAX_ATTEMPTS", "5"))
 # the normal path.
 REM_STARVED_THRESHOLD = int(os.environ.get("REM_STARVED_THRESHOLD", "3"))
 
-# Decision 937 — REM may LINK but never MINT. The general relationships branch
-# used to resolve an unknown name to a generic :Entity, so REM held naming
-# authority on one branch while the decision extras were already registry-gated
-# (718). Every fragment-shaped :Entity in the graph was traced to that branch;
-# the first-write path, the only other creator, had produced none of them. So the
-# same gate now covers both branches: an unknown name is DROPPED, not minted.
-# Sub-typing is unaffected — it adds a label to a node that already exists.
-# Env-overridable because "REM discovers new entities" is a legitimate posture for
-# a deployment whose capture surface does not name entities up front; here it is
-# off, and turning it on restores the pre-937 behaviour exactly.
-REM_MAY_MINT_ENTITIES: bool = os.environ.get("REM_MAY_MINT_ENTITIES", "0").strip().lower() in ("1", "true", "yes")
+# REM LINKS; IT NEVER MINTS, AND THAT IS NOT CONFIGURABLE.
+#
+# The general relationships branch used to resolve an unknown name to a generic
+# :Entity, so REM held naming authority on one branch while the decision extras
+# were already registry-gated. Every fragment-shaped :Entity in the graph was
+# traced to that branch; the first-write path, the only other creator, had
+# produced none of them. An unknown name is DROPPED. Sub-typing is unaffected —
+# it adds a label to a node that already exists.
+#
+# This used to be an env flag on the argument that "REM discovers new entities"
+# is a legitimate posture for a deployment whose capture surface does not name
+# entities up front. It is not a posture, it is a defect with a switch on it:
+# an enrichment pass that coins vocabulary produces names no one chose, and the
+# framework's whole retrieval story rests on join keys a person is accountable
+# for. So there is no flag — what the framework does is decided here, once,
+# for every deployment.
 
 # LLM failure classes recorded on REMDaemon._last_llm_failure.
 LLM_FAIL_TRANSPORT = "transport"   # HTTP non-200 / connection / gateway-shape — NOT chargeable
@@ -425,6 +430,15 @@ _LABEL_DEFAULT_REL: dict[str, str] = {
 
 # Relationship types allowed per label. LLM suggestions outside the set
 # fall back to the label's default.
+#
+# ⚠ This governs the RELATIONSHIPS branch only — it is not the whole story for
+# what may point at a node. The decision-extras branch writes CONSIDERED /
+# REJECTED / UNDER_CONDITIONS / PRODUCES_INSIGHT at an :Entity without consulting
+# this dict, and those four are deliberately absent from the Entity set below. So
+# reading `_LABEL_ALLOWED_RELS[Entity]` alone would wrongly conclude that an
+# Entity can only be reached by MENTIONS/REPORTS_ON. Both branches are gated;
+# they are gated in different places, and the extras branch is gated on the
+# TARGET LABEL (978) rather than on the relation.
 _LABEL_ALLOWED_RELS: dict[str, frozenset[str]] = {
     ONT.human:    frozenset({ONT.was_attributed_to, ONT.entity_link}),
     ONT.ai_agent: frozenset({ONT.was_assisted_by,   ONT.entity_link}),
@@ -484,15 +498,10 @@ _EXTRA_RESULT_KEYS: dict[str, str] = {
 }
 
 # What the prompt tells the model about unknown names MUST track what the gate
-# actually does with them, and that is env-dependent. Stating "DROPPED" while
-# REM_MAY_MINT_ENTITIES=1 would teach the model the opposite of the truth — the
-# same defect as the pre-937 line that promised unknown names "will become generic
-# Entity nodes" long after they stopped doing so. Derived from the flag, not typed
-# twice.
+# actually does with them. It once promised that unknown names "will become
+# generic Entity nodes" long after they had stopped doing so, and then tracked an
+# env flag; now the behaviour is unconditional, so the sentence is too.
 _MINT_RULE = (
-    "Unknown names WILL be created as new generic Entity nodes, so coin one only "
-    "when the content really introduces a new concept."
-    if REM_MAY_MINT_ENTITIES else
     "Names NOT in the known list are DROPPED, not created: prefer an exact match "
     "from the list whenever the content plainly means it."
 )
@@ -707,7 +716,7 @@ def select_prompt_slice(closed_set: list[dict], ranked_names: list[str],
       never shown. `entity_embeddings` is insert-only and outlives the nodes it
       describes — measured 2026-07-30, it held 4396 names against ~2600 live
       ones. Offering a name the graph no longer has invites the LLM to reference
-      it, and the 937 gate then drops the edge: a wasted proposal every time.
+      it, and the link gate then drops the edge: a wasted proposal every time.
     * **Fallback is the alphabetical slice, never the empty set.** No ranked
       names means recall failed, and grounding matters MOST in that case — an
       empty SHOW set leaves the LLM nothing to match, so every name it coins is
@@ -764,11 +773,13 @@ def plan_edges(result: dict, registry: dict[str, dict], kind: str,
                    Decision (727 rung 1) → born-below cap + ledger row.
       GROUNDED_IN suggestions are remapped by resolution (never machine-
                    mintable) and reported in grounded_in_remaps.
-      Decision extras (718): targets minted ONLY when already registry-known;
-                   unknown free phrases land in extras_dropped.
-      Every branch (937): REM links, never mints. A name absent from the registry
-                   is dropped into mint_dropped instead of creating a node, unless
-                   REM_MAY_MINT_ENTITIES re-enables the pre-937 behaviour.
+      Decision extras (718): targets linked ONLY when already registry-known AND
+                   the known node is an :Entity (domain-range, 978); anything
+                   else lands in extras_dropped.
+      Every branch: REM links, never mints — unconditionally, no env escape. A
+                   name absent from the registry is dropped into mint_dropped
+                   instead of creating a node, and since 978 the registry omits
+                   every Entity no first write ever named.
     """
     existing = _existing_edge_set(manifest)
     edges: list[dict] = []
@@ -800,11 +811,14 @@ def plan_edges(result: dict, registry: dict[str, dict], kind: str,
             if isinstance(raw_name, str) and raw_name.strip():
                 dropped_names.append(raw_name.strip())
             continue
-        # 937: link-only. An unknown name would have become a brand-new generic
+        # Link-only. An unknown name would have become a brand-new generic
         # :Entity here — the single path every fragment entity in the graph came
         # from. Drop it before any relation is resolved, so nothing downstream
         # (sub-typing included) can reference a node that must not be created.
-        if not REM_MAY_MINT_ENTITIES and name not in registry:
+        # "Unknown" now also covers a name the registry deliberately withholds:
+        # an Entity no first write ever named is not an accept-set member, so a
+        # proposal naming it lands here and is dropped like any other.
+        if name not in registry:
             mint_dropped.append(name)
             continue
         suggested = rel.get("rel_type", ONT.entity_link)
@@ -822,7 +836,19 @@ def plan_edges(result: dict, registry: dict[str, dict], kind: str,
                 if name not in registry:
                     extras_dropped.append(name)   # 718: unknown free phrase → not minted
                     continue
-                _add(name, registry[name]["label"], rel_type, evidential=False)
+                # DOMAIN-RANGE gate (978). These four relations describe what a
+                # decision weighed — alternatives, conditions, insights — and
+                # their range is a CONCEPT. The registry also holds Human,
+                # AIAgent, Project and Decision nodes, and this branch (unlike
+                # the relationships branch) never passes through _resolve_rel,
+                # so without this check REM could assert CONSIDERED onto a
+                # person. Live at the time of writing: every machine-asserted
+                # extra already pointed at an :Entity — the door was open, not
+                # walked through.
+                if registry[name]["label"] != ONT.entity:
+                    extras_dropped.append(name)
+                    continue
+                _add(name, ONT.entity, rel_type, evidential=False)
 
     return {"edges": edges, "dropped_names": dropped_names,
             "extras_dropped": extras_dropped, "mint_dropped": mint_dropped,
@@ -914,7 +940,7 @@ def _build_verify_prompt(content: str, proposed: list[dict]) -> str:
 # ── REMDaemon ─────────────────────────────────────────────────────────────────
 
 class REMDaemon:
-    # 937 mint-gate counter, declared at class level so an instance built without
+    # Link-gate counter, declared at class level so an instance built without
     # __init__ (the test harness does this) still has it. See __init__ for what
     # it counts.
     _mint_dropped_total: int = 0
@@ -933,9 +959,10 @@ class REMDaemon:
         # serially within a cycle (same convention as NREM's
         # _last_llm_truncated), so signatures stay stable.
         self._last_llm_failure: str | None = None
-        # 937 mint-gate counter: how many unknown names REM declined to mint over
-        # this daemon's lifetime. Process-local by design — the durable record is
-        # the per-record log line; this is the cheap running total the journal can
+        # Link-gate counter: how many proposed names REM declined to link over
+        # this daemon's lifetime — absent from the graph, or withheld by the
+        # accept set. Process-local by design — the durable record is the
+        # per-record log line; this is the cheap running total the journal can
         # be checked against to see the gate actually biting.
         self._mint_dropped_total: int = 0
 
@@ -1205,7 +1232,49 @@ class REMDaemon:
             )
 
     async def _fetch_closed_entity_set(self) -> list[dict]:
-        """Every existing typed node — the ACCEPT set the 937 gate resolves against.
+        """The ACCEPT set the link gate resolves against — and the ONLY place
+        that decides what REM is allowed to connect a record to.
+
+        AN ENTITY QUALIFIES ONLY IF FIRST WRITE NAMED IT (978). Concretely: it
+        carries at least one incoming MENTIONS edge with no `asserted_by`, from a
+        node that has a pg_id. That stamp is exactly first write's signature —
+        the coordinator writes a bare MERGE for each name in a fact's `entities`
+        list, and the judgement-inheritance walk writes the same bare edge to
+        entities a fact had already justified. REM stamps `asserted_by='rem'` on
+        everything it writes, so its own past output can never re-qualify a name:
+        the gate cannot bootstrap itself.
+
+        WHY PROVENANCE AND NOT DEGREE. A frequency threshold would have measured
+        how often a name recurs; this measures whether a person ever chose it.
+        Measured on the live graph when the rule was written: 2584 Entity nodes,
+        of which 1449 first-write-named, 677 named only by REM and 458 reachable
+        only as decision-provenance targets (CONSIDERED/REJECTED/
+        UNDER_CONDITIONS/PRODUCES_INSIGHT). The 677 had received 897 REM MENTIONS
+        edges between them — vocabulary the enrichment pass introduced to itself.
+
+        WHAT THIS DOES NOT FIX, stated so no one reads more into it than is
+        there: it does not catch a phrase-shaped name that FIRST WRITE admitted.
+        Every one of the 31 machine-added topics on the worked case (a fact saved
+        with 3 deliberate concepts) is first-write-named somewhere and survives
+        this gate. That is a capture-surface problem, not a REM problem.
+
+        Human / AIAgent / Project / Decision are UNFILTERED. They are spine nodes
+        with their own identity and their own creator; they were never minted
+        from free text, so the provenance question does not arise for them.
+        (Decision is unfiltered here but is discarded one step later regardless:
+        decisions carry `title`, not `name`, and _build_entity_registry skips
+        nameless rows — so the evidential rung of 727 has never been plannable.
+        Recorded as a measured defect, deliberately NOT fixed here because making
+        it fire means REM proposing decision-to-decision links, which is the
+        node-to-node relation capability still awaiting traversal rules.)
+
+        A SUPERSEDED naming record still qualifies its entities, deliberately.
+        The filter asks whether a person ever chose the name, and supersession
+        retracts a CLAIM, not the vocabulary the claim was filed under — the
+        successor almost always reuses the same concepts, and dropping them would
+        strand the successor's own topics. This is the one place the codebase
+        does NOT filter on `superseded`, so the omission is stated rather than
+        left to look like an oversight.
 
         Carries pg_id (Decision nodes: the evidential ledger endpoint, 727) and
         the full label list (so untyped Entity nodes can be marked for the
@@ -1217,18 +1286,50 @@ class REMDaemon:
         the same 1500 that sized the prompt, which made the gate reject names
         that exist purely because they sort late.
         """
+        first_write_named = (
+            f"EXISTS {{ MATCH (src)-[fw:{ONT.entity_link}]->(n)"
+            f"          WHERE fw.asserted_by IS NULL AND src.pg_id IS NOT NULL }}"
+        )
         async with self.driver.session() as session:
             result = await session.run(
                 f"MATCH (n)"
                 f" WHERE n:{ONT.human} OR n:{ONT.ai_agent}"
-                f"    OR n:{ONT.project} OR n:{ONT.entity}"
-                f"    OR n:{ONT.decision}"
+                f"    OR n:{ONT.project} OR n:{ONT.decision}"
+                f"    OR (n:{ONT.entity} AND {first_write_named})"
                 f" RETURN labels(n) AS labels, n.name AS name, n.pg_id AS pg_id"
                 f" ORDER BY n.name"
                 f" LIMIT $limit",
                 limit=ENTITY_REGISTRY_LIMIT,
             )
             rows = await result.data()
+            # The withheld count is the gate's own before/after signal: it says
+            # how much vocabulary REM is being kept away from, and it must be
+            # visible or the rule is unfalsifiable in production.
+            #
+            # BEST-EFFORT, and the try is load-bearing. This is telemetry for a
+            # log line; the accept set above is the work. Letting it raise would
+            # abort the whole enrichment cycle, and — worse — run() would then
+            # see count==attempted==0 and increment idle_streak, backing the
+            # daemon off toward MAX_POLL_SEC. A telemetry blip would read as a
+            # quiet system, which is the exact failure the "FAILURE ≠ IDLE"
+            # invariant in run() exists to prevent.
+            withheld_rows = []
+            try:
+                withheld_result = await session.run(
+                    f"MATCH (n:{ONT.entity}) WHERE NOT {first_write_named}"
+                    f" RETURN count(n) AS withheld"
+                )
+                withheld_rows = await withheld_result.data()
+            except Exception as exc:
+                logger.warning("REM accept set: withheld-count query failed "
+                               "(%s) — accept set itself is unaffected", exc)
+        withheld = (withheld_rows[0].get("withheld") if withheld_rows else 0) or 0
+        if withheld:
+            logger.info(
+                "REM accept set: %d node(s) offered, %d Entity node(s) WITHHELD — "
+                "no first write ever named them, so REM may not link to them (978)",
+                len(rows), withheld,
+            )
         if len(rows) == ENTITY_REGISTRY_LIMIT:
             logger.warning(
                 "REM: entity REGISTRY hit LIMIT %d — typed nodes beyond it are "
@@ -2279,12 +2380,16 @@ class REMDaemon:
                         "target(s): %s", pg_id, len(plan["extras_dropped"]),
                         plan["extras_dropped"])
         if plan["mint_dropped"]:
-            # 937: the link-only gate. This is the before/after signal for the
-            # fragment-minting rate — a durable count of what REM WOULD have
-            # created, so the fix is measurable rather than merely asserted.
+            # The link-only gate, and the before/after signal for it. NOTE the
+            # MEANING WIDENED at 978 and the wording follows it: a dropped name
+            # is now either one that exists nowhere (REM would have minted it) or
+            # one the accept set deliberately withholds (an Entity no first write
+            # named). Both are "REM proposed a link the graph refuses"; reading
+            # this number as a pure minting rate would over-report creation.
             self._mint_dropped_total += len(plan["mint_dropped"])
-            logger.info("REM mint gate (937): pg_id=%d dropped %d unknown name(s) "
-                        "REM would have minted: %s", pg_id,
+            logger.info("REM link gate: pg_id=%d dropped %d name(s) not in the "
+                        "accept set (absent, or withheld as never first-write "
+                        "named): %s", pg_id,
                         len(plan["mint_dropped"]), plan["mint_dropped"])
 
         # Stage 1.3 entity sub-typing — DELTA only: collect {sanitized name ->
@@ -2297,8 +2402,8 @@ class REMDaemon:
                 continue
             nm = sanitize_entity_name(rel.get("name"))
             ty = (rel.get("type") or "").strip()
-            if nm and not REM_MAY_MINT_ENTITIES and nm not in registry:
-                continue   # 937: dropped above — never sub-type a node we refused to create
+            if nm and nm not in registry:
+                continue   # dropped above — never sub-type a node we refused to link
             if nm and ty in _ENTITY_SUBLABELS and not registry.get(nm, {}).get("typed"):
                 entity_types[nm] = ty
             elif nm and ty and ty.upper() != "OTHER" and ty not in _ENTITY_SUBLABELS \
@@ -2316,9 +2421,10 @@ class REMDaemon:
                 pg_id, len(dropped_types), sorted(_ENTITY_SUBLABELS), dropped_types)
 
         # Grounding telemetry (Task 15, measure-first). The fourth number is the one
-        # that matters now and its MEANING CHANGED at 937: a referenced name absent
-        # from the accept set is no longer minted, it is DROPPED — a lost link, not a
-        # new node. So it is reported as `unresolved` (the key `minted` is kept for
+        # that matters now and its MEANING CHANGED twice: a referenced name absent
+        # from the accept set is not minted, it is DROPPED — a lost link, not a
+        # new node — and since 978 the accept set also withholds every Entity no
+        # first write ever named. So it is reported as `unresolved` (the key `minted` is kept for
         # continuity with metrics already on disk) and it is the primary before/after
         # signal for grounding recall: the same LLM, the same records, fewer names it
         # names that the graph refuses.
