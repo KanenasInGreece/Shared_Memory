@@ -299,7 +299,7 @@ def test_plan_edges_novelty_excludes_manifest_existing():
 
 
 def test_plan_edges_unknown_name_is_dropped_not_minted():
-    """937: REM links but never mints. An unknown name used to fall back to a
+    """REM links but never mints. An unknown name used to fall back to a
     brand-new generic :Entity via MENTIONS (727 §1) — the one path every
     fragment entity in the graph came from. It is now dropped instead."""
     plan = rem_mod.plan_edges(
@@ -320,17 +320,17 @@ def test_plan_edges_known_name_still_links_under_the_mint_gate():
     assert plan["mint_dropped"] == []
 
 
-def test_plan_edges_mint_gate_is_env_overridable(monkeypatch):
-    """Setting REM_MAY_MINT_ENTITIES restores the pre-937 fallback exactly, so a
-    deployment whose capture surface never names entities can opt back in."""
-    monkeypatch.setattr(rem_mod, "REM_MAY_MINT_ENTITIES", True)
+def test_minting_has_no_env_escape_hatch(monkeypatch):
+    """Decision 978 removed the opt-in: minting is a property of the framework,
+    not a deployment posture. Setting the retired variable must change nothing —
+    if the module ever grows the flag back, this fails."""
+    assert not hasattr(rem_mod, "REM_MAY_MINT_ENTITIES")
+    monkeypatch.setenv("REM_MAY_MINT_ENTITIES", "1")
     plan = rem_mod.plan_edges(
         {"relationships": [{"name": "BrandNewThing", "rel_type": "WAS_ATTRIBUTED_TO"}]},
         _registry(), rem_mod.KIND_FACT, {})
-    (e,) = plan["edges"]
-    assert e["label"] == ONT.entity and e["rel_type"] == ONT.entity_link
-    assert e["novel"] is True
-    assert plan["mint_dropped"] == []
+    assert plan["edges"] == []
+    assert plan["mint_dropped"] == ["BrandNewThing"]
 
 
 def test_plan_edges_mint_gate_is_per_name_not_all_or_nothing():
@@ -693,3 +693,65 @@ def test_process_fact_mock_end_to_end(monkeypatch):
     sqls = [s for s, _ in executed]
     assert any("rem_reviewed" in s for s in sqls)             # outbox marked
     assert any("pg_notify" in s for s in sqls)                # NREM notified
+
+
+# ── Decision 978: REM connects, it does not reinvent ──────────────────────────
+
+def test_accept_set_withholds_entities_no_first_write_ever_named():
+    """The accept set is where the 978 rule lives, and it is a PROVENANCE test,
+    not a frequency one: an :Entity qualifies only if some record named it at
+    first write — a MENTIONS edge with no asserted_by. REM stamps everything it
+    writes with asserted_by='rem', so the predicate is what stops the gate
+    bootstrapping itself on its own past output.
+
+    The query cannot be executed here (all Cypher is stubbed), so this pins the
+    contract the live run verified: the predicate is present, it is scoped to
+    :Entity, and the spine labels are NOT subject to it.
+    """
+    d, session = _make_daemon([])
+    asyncio.run(d._fetch_closed_entity_set())
+    accept_q = session.run.call_args_list[0][0][0]
+
+    assert "fw.asserted_by IS NULL" in accept_q
+    assert "src.pg_id IS NOT NULL" in accept_q
+    # Scoped to Entity: the predicate rides on the Entity arm of the OR only.
+    entity_arm = accept_q.split(f"OR (n:{ONT.entity}")[1]
+    assert "asserted_by IS NULL" in entity_arm
+    # Spine labels are offered unconditionally — they were never minted from
+    # free text, so the provenance question does not arise for them.
+    for spine in (ONT.human, ONT.ai_agent, ONT.project, ONT.decision):
+        assert f"n:{spine}" in accept_q.split(f"OR (n:{ONT.entity}")[0]
+
+
+def test_accept_set_reports_what_it_withheld():
+    """A gate with no metric is unfalsifiable in production. The withheld count
+    is a SECOND query on purpose — the accept set returns rows, so the ones it
+    refuses cannot be counted from its own result."""
+    d, session = _make_daemon([])
+    asyncio.run(d._fetch_closed_entity_set())
+    assert session.run.await_count == 2
+    withheld_q = session.run.call_args_list[1][0][0]
+    assert "count(n) AS withheld" in withheld_q
+    assert "NOT EXISTS" in withheld_q
+
+
+def test_decision_extras_refuse_a_non_entity_target():
+    """Domain-range (978). CONSIDERED/REJECTED/UNDER_CONDITIONS/PRODUCES_INSIGHT
+    describe what a decision weighed; their range is a CONCEPT. This branch never
+    passes through _resolve_rel, so without the label check REM could assert
+    CONSIDERED onto the Human node that made the decision."""
+    plan = rem_mod.plan_edges(
+        {"considered": ["Xenofon"], "rejected": ["prior-dec"], "under_conditions": ["Neo4j"]},
+        _registry(), rem_mod.KIND_DECISION, {})
+    kept = {(e["name"], e["rel_type"]) for e in plan["edges"]}
+    assert kept == {("Neo4j", ONT.under_conditions)}      # the only :Entity target
+    assert sorted(plan["extras_dropped"]) == ["Xenofon", "prior-dec"]
+
+
+def test_decision_extras_still_link_a_known_entity():
+    """The domain-range gate must not cost the legitimate case its edge."""
+    plan = rem_mod.plan_edges(
+        {"considered": ["Neo4j"]}, _registry(), rem_mod.KIND_DECISION, {})
+    (e,) = plan["edges"]
+    assert (e["name"], e["label"], e["rel_type"]) == ("Neo4j", ONT.entity, ONT.considered)
+    assert plan["extras_dropped"] == []
