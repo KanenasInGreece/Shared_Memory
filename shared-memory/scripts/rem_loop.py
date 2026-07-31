@@ -1235,14 +1235,39 @@ class REMDaemon:
         """The ACCEPT set the link gate resolves against — and the ONLY place
         that decides what REM is allowed to connect a record to.
 
-        AN ENTITY QUALIFIES ONLY IF FIRST WRITE NAMED IT (978). Concretely: it
-        carries at least one incoming MENTIONS edge with no `asserted_by`, from a
-        node that has a pg_id. That stamp is exactly first write's signature —
-        the coordinator writes a bare MERGE for each name in a fact's `entities`
-        list, and the judgement-inheritance walk writes the same bare edge to
-        entities a fact had already justified. REM stamps `asserted_by='rem'` on
-        everything it writes, so its own past output can never re-qualify a name:
-        the gate cannot bootstrap itself.
+        AN ENTITY QUALIFIES ONLY IF A **FACT** NAMED IT AT FIRST WRITE (978).
+        Concretely: it carries at least one incoming MENTIONS edge with no
+        `asserted_by`, **from a node labelled Fact** that has a pg_id.
+
+        THE `Fact` LABEL IS LOAD-BEARING — omitting it opened a laundering path
+        that defeated the whole rule, and this is the corrected form. A bare
+        MENTIONS edge is written by TWO different writers, and only one of them
+        is a person naming a concept:
+
+        * A FACT's bare edge is first write materialising the operator's
+          `entities` list. That is the signal the rule is about.
+        * A JUDGEMENT's bare edge is `_inherit_entities_from_facts` — the walk
+          that gives a decision or retrospective its topics. It MATCHes whatever
+          its facts already carry, INCLUDING edges REM asserted, and re-writes
+          them with no `asserted_by` of its own. So the inheritance step STRIPS
+          THE PROVENANCE STAMP.
+
+        The laundering cycle that made possible: REM adds a name to a fact
+        (`asserted_by='rem'`, correctly not qualifying) → a decision grounded in
+        that fact inherits it as a BARE edge → the entity now looks
+        first-write-named → REM may link to it freely, on any record. Measured
+        when this was caught: of 2127 Entity nodes, 1023 are named by a fact,
+        while 432 qualified ONLY through a judgement's bare edge — 94 of those
+        traceable to REM's own output. Requiring the Fact label withholds all
+        432. On the worked case (a fact saved with 3 concepts that acquired 31
+        machine-added topics) it withholds 20 of the 31, including `fact 887`,
+        `INSIGHT_THRESHOLD=2` and `_decision_/memory/decision`.
+
+        The other 338 of those 432 are the pre-0.8.26 SECOND FAUCET — decisions
+        used to mint their own entities at first write, which is exactly the
+        unvetted vocabulary source decision 971 closed. Those names were never
+        vetted on a fact either, so they belong outside the accept set on the
+        same reasoning, not by coincidence.
 
         WHY PROVENANCE AND NOT DEGREE. A frequency threshold would have measured
         how often a name recurs; this measures whether a person ever chose it.
@@ -1286,8 +1311,11 @@ class REMDaemon:
         the same 1500 that sized the prompt, which made the gate reject names
         that exist purely because they sort late.
         """
+        # `src:Fact` is the fix, not a detail — see the docstring. Without the
+        # label this reads a judgement's INHERITED edge as a naming event, and
+        # inheritance strips REM's provenance stamp.
         first_write_named = (
-            f"EXISTS {{ MATCH (src)-[fw:{ONT.entity_link}]->(n)"
+            f"EXISTS {{ MATCH (src:{ONT.fact})-[fw:{ONT.entity_link}]->(n)"
             f"          WHERE fw.asserted_by IS NULL AND src.pg_id IS NOT NULL }}"
         )
         async with self.driver.session() as session:
