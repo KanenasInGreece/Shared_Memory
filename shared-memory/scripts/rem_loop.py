@@ -635,7 +635,18 @@ def _manifest_block(m: dict) -> str:
             pass
     lines = [" | ".join(head)]
     if m.get("entities"):
-        lines.append("operator entities (already captured): " + ", ".join(m["entities"]))
+        # Same type split as _existing_edge_set, and it must stay in step with it:
+        # the gate decides what is re-scored, this decides what the model is TOLD
+        # is captured. On a fact the names are real edges. On a judgement they are
+        # only what the caller typed — since v0.8.26 first write mints nothing from
+        # them — so presenting them as captured taught the model to skip exactly the
+        # edges it was there to propose.
+        lines.append(
+            ("operator entities (already captured): "
+             if m.get("kind", KIND_FACT) == KIND_FACT
+             else "operator entity hints (NOT captured — propose them if the text supports it): ")
+            + ", ".join(m["entities"])
+        )
     edges = m.get("existing_edges") or []
     if edges:
         lines.append("already captured edges:")
@@ -653,17 +664,33 @@ def _manifest_block(m: dict) -> str:
 
 def _existing_edge_set(manifest: dict) -> set[tuple[str, str]]:
     """(target name, rel_type) pairs already captured on the anchor — the
-    novelty gate for machine-minted edges. Operator entities count as captured
-    MENTIONS (first-write materialises them as such), so operator-asserted
-    edges are never re-scored."""
+    novelty gate for machine-minted edges.
+
+    `existing_edges` is read from the graph and is always true. The caller's
+    `entities` list is a CLAIM about what first write did with it, and whether
+    that claim holds depends on the record type:
+
+    * On a FACT it holds. First write mints an Entity per name and materialises
+      a MENTIONS edge, so re-scoring those would waste every proposal.
+    * On a DECISION or RETROSPECTIVE it is FALSE as of v0.8.26. Judgements no
+      longer mint entities at all — they inherit their topics by walking to
+      their facts — so a name in `entities` may correspond to no edge whatever.
+      Counting it as captured suppressed the one path left that could have
+      created it: a judgement saved with `entities` and no grounding got an
+      edge from NEITHER side, not from first write and not from REM.
+
+    Reading the claim only on facts leaves judgements gated on the graph alone,
+    which is the only source that was ever authoritative for them.
+    """
     manifest = manifest or {}
     existing = {
         (e.get("target"), e.get("rel_type"))
         for e in (manifest.get("existing_edges") or [])
         if e.get("target")
     }
-    for ent in manifest.get("entities") or []:
-        existing.add((ent, ONT.entity_link))
+    if manifest.get("kind", KIND_FACT) == KIND_FACT:
+        for ent in manifest.get("entities") or []:
+            existing.add((ent, ONT.entity_link))
     return existing
 
 
