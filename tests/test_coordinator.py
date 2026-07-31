@@ -1445,7 +1445,8 @@ async def test_retrospective_binds_cypher_params_as_object():
         {"id": 911},                                                          # retro row
     ])
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
-        req = _make_request({"pg_id": 240, "rating": "Validated", "notes": "held up well"})
+        req = _make_request({"pg_id": 240, "rating": "Validated", "notes": "held up well",
+                                "grounded_in": [700]})
         resp = await c.handle_retrospective(req)
     assert resp.status == 200
     body = json.loads(resp.body)
@@ -1747,7 +1748,8 @@ async def test_retrospective_reversed_marks_decision_superseded():
 
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         req = _make_request({"pg_id": 42, "rating": "Reversed",
-                             "notes": "approach withdrawn", "agent_id": "claude_code"})
+                             "notes": "approach withdrawn", "agent_id": "claude_code",
+                             "grounded_in": [700]})
         resp = await c.handle_retrospective(req)
 
     assert resp.status == 200
@@ -1770,7 +1772,7 @@ async def test_retrospective_normal_rating_has_no_reversal_side_effects():
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         resp = await c.handle_retrospective(_make_request(
             {"pg_id": 42, "rating": "validated", "notes": "held up",
-             "agent_id": "claude_code"}
+             "agent_id": "claude_code", "grounded_in": [700]}
         ))
 
     assert resp.status == 200

@@ -1197,13 +1197,16 @@ async def main() -> None:
         p.add_argument("--source", default=AGENT_ID,
                        help="Agent/model recording the outcome (default: $AGENT_ID)")
         p.add_argument("--grounded-in", default="",
-                       help="Comma-separated pg_ids of the facts that MEASURED this "
-                            "outcome, optionally with a role: '601,602:considered'. A "
-                            "test-grounded decision deserves a test-grounded retrospective.")
+                       required=True,
+                       help="REQUIRED. Comma-separated pg_ids of the facts that "
+                            "MEASURED this outcome, optionally with a role: "
+                            "'601,602:considered'. The gateway refuses an ungrounded "
+                            "retrospective: it measures nothing, and it is also what "
+                            "gives the decision it judges its topics.")
         p.add_argument("--entities",    default="",
                        help="DEPRECATED — kept for older callers and IGNORED by the "
                             "graph. A retrospective inherits the topics of the facts "
-                            "in --grounded-in, falling back to the decision it judges.")
+                            "in --grounded-in, which is required.")
         p.add_argument("--source-ref",  default="",
                        help="Where the outcome evidence lives (test file, URL, "
                             "'discussion_context') — derives the record's fact_kind")

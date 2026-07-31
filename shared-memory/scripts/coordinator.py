@@ -501,6 +501,48 @@ def _supersession_target_error(pg_id: int, record_type: object) -> str | None:
     return None
 
 
+def save_response_warning(record_type: object, entities, grounded_in) -> str:
+    """The save response's advisory suffix — WHICH omission leaves this record
+    unreachable by synthesis, stated per record type.
+
+    "Unreachable" means something different for each type, so one message
+    cannot serve both. A FACT mints the entity vocabulary; an empty `entities`
+    is therefore the defect it has always been, and the record will never reach
+    Tier 3. A DECISION mints nothing by design — since v0.8.26 it inherits its
+    topics by walking to the facts it rests on — so warning it about `entities`
+    fires on every decision saved exactly as instructed and teaches the operator
+    the opposite of the shipped rule. The client-side twin of this message was
+    already made type-aware; this is the server half of the same edit.
+
+    A decision that rests on no fact is NOT an error. The greenfield case is
+    real and supported: a project with no facts yet, where the operator decides
+    on experience — which is also why a decision may ground on another decision.
+    But it is UNUSUAL, and the only thing that makes it legible later is the
+    retrospective that eventually measures it, whose facts the decision then
+    inherits across HAD_OUTCOME. So the note says exactly that, and does not
+    pretend the record is broken.
+
+    Retrospectives never reach this function: grounding is REQUIRED of them at
+    ingress (an ungrounded verdict measures nothing), so the omission is a 400,
+    not a warning. Returns "" when nothing is missing.
+    """
+    kind = record_type.strip().lower() if isinstance(record_type, str) else "fact"
+    if kind == "decision":
+        if grounded_in:
+            return ""
+        return (
+            " NOTE: this decision rests on no fact — unusual, and valid only when"
+            " meant (a call made on experience before the project has evidence)."
+            " It inherits its topics from the facts of the retrospective that"
+            " later measures it, so that retrospective is what makes it legible."
+        )
+    if kind == "retrospective":
+        return ""
+    if entities:
+        return ""
+    return " WARNING: no 'entities' in metadata — fact ineligible for Tier 3 consolidation."
+
+
 def _apply_principal(target: dict[str, Any], principal: dict[str, Any] | None) -> dict[str, Any]:
     """Stamp the operator identity DETERMINISTICALLY onto a payload dict.
 
@@ -2223,10 +2265,8 @@ class MemoryCoordinator:
         else:
             neo4j_status = "pending"
 
-        warn = (
-            ""
-            if entities
-            else " WARNING: no 'entities' in metadata — fact ineligible for Tier 3 consolidation."
+        warn = save_response_warning(
+            metadata.get("type"), entities, metadata.get("grounded_in")
         )
         superseded_pg_id = (
             supersedes if (supersedes is not None and supersedes != pg_id) else None
@@ -2492,11 +2532,28 @@ class MemoryCoordinator:
             g for g in (body.get("grounded_in") or [])
             if isinstance(g, int) and not isinstance(g, bool)
         ]
-        if grounded_ids:
-            metadata["grounded_in"] = grounded_ids
-            roles = body.get("grounded_roles") or {}
-            if isinstance(roles, dict) and roles:
-                metadata["grounded_roles"] = roles
+        # Grounding is REQUIRED of a retrospective, and this is the asymmetry
+        # between the two judgement types. A decision may legitimately rest on
+        # experience alone before its project has any evidence. A retrospective
+        # cannot: it exists to report what MEASURING the outcome showed, so with
+        # nothing measured it asserts a verdict from nowhere — and it is also the
+        # route by which an ungrounded decision finally reaches topics, across
+        # HAD_OUTCOME. An ungrounded retrospective therefore breaks two records,
+        # not one, which is why this is a refusal and not a warning.
+        if not grounded_ids:
+            return web.json_response(
+                {"status": "error",
+                 "message": ("grounded_in is required on a retrospective — name the "
+                             "pg_id(s) of the fact(s) that measured this outcome. A "
+                             "verdict resting on nothing measures nothing, and it is "
+                             "also what gives the decision it judges its topics. Save "
+                             "the measurement as a fact first, then cite it here.")},
+                status=400,
+            )
+        metadata["grounded_in"] = grounded_ids
+        roles = body.get("grounded_roles") or {}
+        if isinstance(roles, dict) and roles:
+            metadata["grounded_roles"] = roles
         _apply_principal(metadata, request.get("principal"))
 
         # Cheap indexed existence pre-check BEFORE the GPU embedding — a typoed

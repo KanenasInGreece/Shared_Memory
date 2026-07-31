@@ -126,10 +126,44 @@ def test_manifest_block_renders_edges_roles_and_asserted_by():
     assert "fact_kind: tested" in block
     assert "title: Route embeddings through the gateway" in block
     assert "recorded: 2026-07-11" in block
-    assert "operator entities (already captured): coordinator, Neo4j" in block
+    # _RICH_ROW is a DECISION, and a decision mints nothing from `entities`, so
+    # the block must not claim those names are captured (issue #180).
+    assert "operator entity hints (NOT captured" in block
+    assert "coordinator, Neo4j" in block
+    # The real-edge block keeps its wording; only the entities line changes.
+    assert "operator entities (already captured)" not in block
     assert "-[MENTIONS]-> coordinator (asserted_by=operator)" in block
     assert "-[GROUNDED_IN]-> record pg_id 542 (asserted_by=operator)" in block
     assert "nothing captured yet" not in block
+
+
+def test_existing_edge_set_reads_entities_only_on_facts():
+    """Issue #180 — the novelty gate's other half. `existing_edges` comes from
+    the graph and always counts; `entities` is a claim about what first write
+    did, true only for a fact. On a judgement, a name with no graph edge must
+    stay PROPOSABLE: since v0.8.26 first write mints nothing from it, so
+    counting it as captured left the edge uncreatable from either side.
+    """
+    ent_rel = rem_mod.ONT.entity_link
+    fact = rem_mod.build_manifest(dict(_RICH_ROW, kind="fact"), _RICH_EDGES)
+    assert ("Neo4j", ent_rel) in rem_mod._existing_edge_set(fact)
+
+    for kind in ("decision", "retrospective"):
+        m = rem_mod.build_manifest(dict(_RICH_ROW, kind=kind), _RICH_EDGES)
+        got = rem_mod._existing_edge_set(m)
+        # "Neo4j" is named in `entities` but has no edge → still proposable.
+        assert ("Neo4j", ent_rel) not in got
+        # "coordinator" has a REAL MENTIONS edge → captured, whatever the type.
+        assert ("coordinator", ent_rel) in got
+
+
+def test_manifest_block_fact_entities_are_still_captured():
+    """The type split, from the other side: first write DOES materialise a
+    fact's `entities` as MENTIONS, so on a fact the claim is true and the
+    wording must stay — a fact's names are not re-proposed."""
+    row = dict(_RICH_ROW, kind="fact")
+    block = rem_mod._manifest_block(rem_mod.build_manifest(row, _RICH_EDGES))
+    assert "operator entities (already captured): coordinator, Neo4j" in block
 
 
 def test_batch_fetch_content_selects_manifest_fields():
