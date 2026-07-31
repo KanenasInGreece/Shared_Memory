@@ -430,6 +430,15 @@ _LABEL_DEFAULT_REL: dict[str, str] = {
 
 # Relationship types allowed per label. LLM suggestions outside the set
 # fall back to the label's default.
+#
+# ⚠ This governs the RELATIONSHIPS branch only — it is not the whole story for
+# what may point at a node. The decision-extras branch writes CONSIDERED /
+# REJECTED / UNDER_CONDITIONS / PRODUCES_INSIGHT at an :Entity without consulting
+# this dict, and those four are deliberately absent from the Entity set below. So
+# reading `_LABEL_ALLOWED_RELS[Entity]` alone would wrongly conclude that an
+# Entity can only be reached by MENTIONS/REPORTS_ON. Both branches are gated;
+# they are gated in different places, and the extras branch is gated on the
+# TARGET LABEL (978) rather than on the relation.
 _LABEL_ALLOWED_RELS: dict[str, frozenset[str]] = {
     ONT.human:    frozenset({ONT.was_attributed_to, ONT.entity_link}),
     ONT.ai_agent: frozenset({ONT.was_assisted_by,   ONT.entity_link}),
@@ -1252,6 +1261,20 @@ class REMDaemon:
         Human / AIAgent / Project / Decision are UNFILTERED. They are spine nodes
         with their own identity and their own creator; they were never minted
         from free text, so the provenance question does not arise for them.
+        (Decision is unfiltered here but is discarded one step later regardless:
+        decisions carry `title`, not `name`, and _build_entity_registry skips
+        nameless rows — so the evidential rung of 727 has never been plannable.
+        Recorded as a measured defect, deliberately NOT fixed here because making
+        it fire means REM proposing decision-to-decision links, which is the
+        node-to-node relation capability still awaiting traversal rules.)
+
+        A SUPERSEDED naming record still qualifies its entities, deliberately.
+        The filter asks whether a person ever chose the name, and supersession
+        retracts a CLAIM, not the vocabulary the claim was filed under — the
+        successor almost always reuses the same concepts, and dropping them would
+        strand the successor's own topics. This is the one place the codebase
+        does NOT filter on `superseded`, so the omission is stated rather than
+        left to look like an oversight.
 
         Carries pg_id (Decision nodes: the evidential ledger endpoint, 727) and
         the full label list (so untyped Entity nodes can be marked for the
@@ -1282,11 +1305,24 @@ class REMDaemon:
             # The withheld count is the gate's own before/after signal: it says
             # how much vocabulary REM is being kept away from, and it must be
             # visible or the rule is unfalsifiable in production.
-            withheld_result = await session.run(
-                f"MATCH (n:{ONT.entity}) WHERE NOT {first_write_named}"
-                f" RETURN count(n) AS withheld"
-            )
-            withheld_rows = await withheld_result.data()
+            #
+            # BEST-EFFORT, and the try is load-bearing. This is telemetry for a
+            # log line; the accept set above is the work. Letting it raise would
+            # abort the whole enrichment cycle, and — worse — run() would then
+            # see count==attempted==0 and increment idle_streak, backing the
+            # daemon off toward MAX_POLL_SEC. A telemetry blip would read as a
+            # quiet system, which is the exact failure the "FAILURE ≠ IDLE"
+            # invariant in run() exists to prevent.
+            withheld_rows = []
+            try:
+                withheld_result = await session.run(
+                    f"MATCH (n:{ONT.entity}) WHERE NOT {first_write_named}"
+                    f" RETURN count(n) AS withheld"
+                )
+                withheld_rows = await withheld_result.data()
+            except Exception as exc:
+                logger.warning("REM accept set: withheld-count query failed "
+                               "(%s) — accept set itself is unaffected", exc)
         withheld = (withheld_rows[0].get("withheld") if withheld_rows else 0) or 0
         if withheld:
             logger.info(

@@ -755,3 +755,24 @@ def test_decision_extras_still_link_a_known_entity():
     (e,) = plan["edges"]
     assert (e["name"], e["label"], e["rel_type"]) == ("Neo4j", ONT.entity, ONT.considered)
     assert plan["extras_dropped"] == []
+
+
+def test_accept_set_survives_a_failing_withheld_count():
+    """The withheld count is telemetry for a log line; the accept set is the
+    work. If the count query raises, the cycle must still get its rows —
+    otherwise run() sees count==attempted==0, increments idle_streak and backs
+    the daemon off toward MAX_POLL_SEC, reading a telemetry blip as a quiet
+    system (the FAILURE != IDLE invariant)."""
+    d, session = _make_daemon()
+    accept_result = MagicMock()
+    accept_result.data = AsyncMock(return_value=[{"labels": [ONT.entity],
+                                                  "name": "Neo4j", "pg_id": None}])
+
+    async def _run(query, **kw):
+        if "withheld" in query:
+            raise RuntimeError("neo4j transient")
+        return accept_result
+
+    session.run = AsyncMock(side_effect=_run)
+    rows = asyncio.run(d._fetch_closed_entity_set())
+    assert [r["name"] for r in rows] == ["Neo4j"]      # work unaffected
