@@ -5,6 +5,66 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.36] — 2026-08-04
+
+### Added
+
+- **A record whose project could not be established at first write can now have
+  it established later — through exactly one writer.** Such a record is
+  *parked*: it saves, searches and enriches normally, and is simply never folded
+  into a project's narrative. Establishing the project afterwards is a state
+  transition, and routing it through a single writer is deliberate — a property
+  that gates behaviour must not have a second writer, which is a defect this
+  project has already shipped once.
+
+  The transition only ever runs one way. A record that already names a project
+  is refused, because overwriting an established answer is how a value changes
+  meaning without anyone deciding that it should. The cost of that choice is
+  that a wrong promotion cannot be undone through the supported path, so every
+  promotion writes a durable ledger row recording what the value was before, on
+  what basis it changed, and who asked. The Postgres metadata and the graph edge
+  are written in one transaction, the graph half through the outbox, so a
+  partial run leaves durable work rather than half a graph.
+
+  The automatic caller establishes a parked fact's project from the judgements
+  that cite it as evidence, and only when those judgements agree on exactly one
+  project. Two answers leave the record parked: parked is visible and
+  repairable, and a plausible wrong project is neither.
+
+- **Two repair tools.** One reconciles the graph's project edge to the value
+  Postgres holds — in that direction only, since Postgres is where the value was
+  asserted and validated, and copying an edge back into metadata would turn a
+  graph-side accident into an asserted fact. The other establishes projects for
+  parked records from their citing judgements. Both report by default, write
+  only when asked, and refuse outright when they cannot confirm the running
+  server is new enough to apply what they produce.
+
+### Fixed
+
+- **A record could accumulate more than one project.** The graph writer only
+  ever added an edge, never replaced one, which is correct while every target
+  has no edge and wrong as soon as one does. Records therefore kept stale
+  project edges alongside current ones, and "which project is this in?" could
+  give two different answers depending on whether you asked the database or
+  counted edges. The writer now replaces, and a repair pass collapsed the
+  existing cases.
+
+- **The fresh-install schema was missing every foreign key.** The tool that
+  generates it renders tables, indexes and check constraints by inspecting a
+  built database — and silently discarded foreign keys, with a comment claiming
+  the schema used none while one had existed for months. So a guarantee held on
+  every upgraded deployment and on no new one, which is the worst shape a schema
+  difference can take, and nothing could notice because the only thing that
+  reads that file is an install nobody re-inspects. Foreign keys are now
+  emitted, and the result is verified by building a database from that file
+  alone and comparing it against a migrated one.
+
+- **Three maintenance scripts could not run on a correctly-installed machine.**
+  They looked for credentials only in the repository root while the documented
+  location is the framework directory, so they failed with an empty password
+  rather than a missing one. One of them claimed in its own documentation to
+  match the migration tool, which had always looked in both places.
+
 ## [0.8.35] — 2026-08-03
 
 ### Fixed

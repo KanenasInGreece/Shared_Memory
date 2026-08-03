@@ -33,8 +33,14 @@ SCHEMA_FILE = MIGRATIONS_DIR / "schema_init.sql"
 
 
 def _load_env() -> None:
-    env_path = MIGRATIONS_DIR.parent.parent / ".env"
-    if not env_path.exists():
+    # The framework env is shared-memory/.env; the repo root is the FALLBACK.
+    # Same candidate order as apply.py — these two are always run back to back
+    # (apply, then regenerate), and reading different files made the second half
+    # of that pair die on `fe_sendauth: no password supplied` on an install that
+    # keeps credentials only where the documented setup puts them.
+    candidates = [MIGRATIONS_DIR.parent / ".env", MIGRATIONS_DIR.parent.parent / ".env"]
+    env_path = next((p for p in candidates if p.exists()), None)
+    if env_path is None:
         return
     for line in env_path.read_text().splitlines():
         line = line.strip()
@@ -136,9 +142,11 @@ def fetch_table_constraints(cur, table: str) -> list[str]:
     everywhere it was tested and nowhere it was not.
 
     NOT NULL and PRIMARY KEY are excluded because render_column already emits
-    them; foreign keys are excluded here for the same reason ordering matters —
-    they are not yet used by this schema, and emitting one before its target
-    table exists would break the very install path this file serves.
+    them. FOREIGN KEYS are excluded HERE but not from the file — see
+    fetch_foreign_keys, which emits them after every table exists. Inline was
+    never an option: tables are rendered in name order, and `project_promotions`
+    sorts before the `projects` it references, so an inline REFERENCES would
+    break the very install path this file serves.
     """
     cur.execute("""
         SELECT conname, pg_get_constraintdef(oid) AS condef
@@ -147,6 +155,57 @@ def fetch_table_constraints(cur, table: str) -> list[str]:
         ORDER BY conname
     """, (table,))
     return [f"CONSTRAINT {name} {defn}" for name, defn in cur.fetchall()]
+
+
+def fetch_foreign_keys(cur) -> list[tuple[str, str, str]]:
+    """Every FOREIGN KEY in the schema, as (table, constraint name, definition).
+
+    ⚠ THE GENERATOR USED TO EMIT NONE AT ALL. It rendered primary keys and, since
+    the CHECK fix, table CHECKs — and dropped foreign keys on the floor, with a
+    comment claiming the schema did not use any. It already did:
+    `technical_docs.superseded_by` has referenced `technical_docs(id)` since fact
+    supersession shipped, so every fresh install has been missing it while every
+    upgraded deployment had it. That is the same divergence the CHECK fix was
+    written for, in a second dimension, and it stayed invisible because the only
+    thing that reads this file is an install nobody re-inspects.
+
+    Emitted as ALTER TABLE after all tables exist, never inline: tables render in
+    name order, and a referencing table can sort before the one it points at.
+    """
+    cur.execute("""
+        SELECT rel.relname, con.conname, pg_get_constraintdef(con.oid)
+        FROM pg_constraint con
+        JOIN pg_class rel ON rel.oid = con.conrelid
+        JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+        WHERE con.contype = 'f' AND nsp.nspname = 'public'
+        ORDER BY rel.relname, con.conname
+    """)
+    return [(t, n, d) for t, n, d in cur.fetchall()]
+
+
+def render_foreign_keys(cur) -> list[str]:
+    """ALTER TABLE statements, each guarded so the file stays re-runnable.
+
+    Postgres has no ADD CONSTRAINT IF NOT EXISTS, and this file promises
+    idempotency throughout — so the guard is explicit rather than assumed.
+    """
+    fks = fetch_foreign_keys(cur)
+    if not fks:
+        return []
+    out = [
+        "-- ─── Foreign keys ──────────────────────────────────────────────────────────",
+        "-- Added after every table exists: a referencing table can sort before its",
+        "-- target, so these cannot be inline column constraints.",
+        "",
+    ]
+    for table, name, defn in fks:
+        out.append(
+            "DO $$ BEGIN\n"
+            f"    ALTER TABLE {table} ADD CONSTRAINT {name} {defn};\n"
+            "EXCEPTION WHEN duplicate_object THEN NULL;\n"
+            "END $$;\n"
+        )
+    return out
 
 
 def fetch_extensions(cur) -> list[str]:
@@ -279,6 +338,8 @@ def generate(conn) -> str:
             sections.append("")
             sections.extend(idx_lines)
         sections.append("")
+
+    sections.extend(render_foreign_keys(cur))
 
     sections.append("COMMIT;")
     return "\n".join(sections) + "\n"
