@@ -56,6 +56,10 @@ from ontology import (
     GROUNDING_ROLES, GROUNDING_RELATIONS, default_grounding_role, RETRO_RATINGS,
     record_label_for_type,
 )
+from project_axis import PROJECT_SQL
+from insight_gate import (
+    INSIGHT_THRESHOLD, INSIGHT_HUB_DEGREE_CAP, insight_cluster_cypher,
+)
 
 log = logging.getLogger("coordinator")
 
@@ -102,7 +106,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.30"
+FRAMEWORK_VERSION = "0.8.31"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -847,13 +851,13 @@ GATEWAY_AUDIT_LOG_PATH = os.environ.get("GATEWAY_AUDIT_LOG_PATH", "").strip()
 _audit_writer = AsyncLineWriter(GATEWAY_AUDIT_LOG_PATH) if GATEWAY_AUDIT_LOG_PATH else None
 
 # NREM dream-cycle backlog gauge (GET /memory/telemetry). A "cycle" is one
-# (entity, domain) cluster that meets the consolidation density threshold —
-# the unit NREM actually fires on, NOT the raw unconsolidated fact count. Fact
-# clusters reuse ONT.density_threshold (the same value consolidation_loop.py
-# gates on). Decision clusters track the Phase 3a insight-consolidation design
-# (≥2 rem_processed, unconsolidated decisions per (entity, domain)).
+# cluster that meets the gate NREM actually fires on, NOT a raw unconsolidated
+# record count. Fact clusters reuse ONT.density_threshold (the same value
+# consolidation_loop.py gates on) partitioned by project_axis.PROJECT_SQL.
+# Decision cycles run the insight gate itself, count-only, from insight_gate.py
+# — its own threshold travels with it, so a deployment that tunes
+# insight_threshold sees the tuned number here rather than a hardcoded twin.
 DEFAULT_DOMAIN = "general"
-NREM_DECISION_THRESHOLD = 2
 
 # ── Consolidation health signal (ADR-018) ───────────────────────────────────
 # The coordinator rolls up the daemon's consolidation_runs ledger into a cached
@@ -967,11 +971,16 @@ def _normalize_project(name):
 
 
 def _count_domain_cycles(pg_ids: list[int], domain_map: dict[int, str], threshold: int) -> int:
-    """Partition pg_ids by domain and count buckets meeting the density threshold.
+    """Partition pg_ids by project and count buckets meeting the density threshold.
 
-    Pure function (no I/O) so the per-(entity, domain) gating rule is unit-testable.
+    Pure function (no I/O) so the per-(entity, project) gating rule is unit-testable.
     Mirrors consolidation_loop.eligible_domain_clusters' partitioning, but returns
     a count rather than the work items — telemetry needs the gauge, not the payload.
+
+    FACTS ONLY. The decision call site is gone: decisions are gated by the
+    insight predicate (a shared grounded entity, ≥2 distinct projects, ≥1
+    outcome), which a Postgres partition cannot express at all, so counting them
+    this way answered a question nobody asks. See insight_gate.py.
     """
     by_domain: dict[str, int] = {}
     for pid in pg_ids:
@@ -2636,10 +2645,9 @@ class MemoryCoordinator:
             async with self._acquire() as conn:
                 async with conn.transaction():
                     target = await conn.fetchrow(
-                        "SELECT id, metadata->>'type' AS type,"
-                        "       COALESCE(metadata->'decision'->>'project',"
-                        "                metadata->>'project') AS project"
-                        " FROM technical_docs WHERE id=$1 FOR SHARE",
+                        f"SELECT id, metadata->>'type' AS type,"
+                        f"       {PROJECT_SQL} AS project"
+                        f" FROM technical_docs WHERE id=$1 FOR SHARE",
                         pg_id,
                     )
                     if not target:
@@ -4278,9 +4286,11 @@ class MemoryCoordinator:
     async def _nrem_cycle_counts(self) -> dict:
         """Pending NREM consolidation cycles for facts and decisions.
 
-        Reproduces consolidation_loop's gating: entity clusters of
-        rem_processed, unconsolidated nodes, re-partitioned per (entity, domain)
-        and counted only where a bucket meets its density threshold.
+        Reproduces consolidation_loop's gating, and for decisions it now IS that
+        gating: facts are entity clusters of rem_processed, unconsolidated nodes
+        re-partitioned per (entity, project) and counted where a bucket meets its
+        density threshold; decisions run insight_gate.insight_cluster_cypher
+        count-only, the same query the daemon folds on.
         """
         # Neo4j: clusters of eligible facts (global, not just pending ids).
         # ADR-017: grouped by ALIAS COMPONENT, identical to the gate
@@ -4316,31 +4326,32 @@ class MemoryCoordinator:
                 threshold=ONT.density_threshold,
             )
             fact_clusters = await fres.data()
-            dres = await session.run(
-                f"MATCH (d:{ONT.decision})"
-                f" WHERE coalesce(d.rem_processed,false) = true"
-                f"   AND coalesce(d.consolidated,false) = false"
-                f"   AND coalesce(d.superseded,false) = false"
-                f" RETURN collect(d.pg_id) AS pg_ids"
+            # The insight gate, count-only — the SAME Cypher the daemon folds on
+            # (insight_gate.insight_cluster_cypher), not a Postgres partition of
+            # every eligible Decision node. The old chain collected decisions
+            # flat and bucketed them by project: no shared grounded entity, no
+            # ≥2-distinct-projects rule, no HAD_OUTCOME. It reported a backlog
+            # the daemon could not fold, and re-chaining its project resolution
+            # would only have made a meaningless number better-sourced.
+            ires = await session.run(
+                insight_cluster_cypher(count_only=True),
+                hub_cap=INSIGHT_HUB_DEGREE_CAP, threshold=INSIGHT_THRESHOLD,
             )
-            drows = await dres.data()
-        decision_ids = [int(x) for x in (drows[0]["pg_ids"] if drows else []) if x is not None]
+            irows = await ires.data()
+        decision_cycles = int(irows[0]["cycles"]) if irows else 0
 
-        # Postgres: authoritative domain per pg_id across all eligible nodes.
+        # Postgres: authoritative project per pg_id across all eligible facts.
         all_ids = sorted(
             {int(pid) for c in fact_clusters for pid in (c["pg_ids"] or []) if pid is not None}
-            | set(decision_ids)
         )
         domain_map: dict[int, str] = {}
         if all_ids:
             async with self._acquire() as conn:
                 rows = await conn.fetch(
-                    # `scope` is excluded on purpose — it is an access-control axis,
-                    # not a topical one; see consolidation_loop's domain-map note.
-                    # This must mirror that chain exactly or the eligibility count
-                    # reported here diverges from what the daemon actually folds.
-                    "SELECT id, COALESCE(metadata->>'project', metadata->>'domain',"
-                    " $2) AS domain FROM technical_docs WHERE id = ANY($1)",
+                    # project_axis.PROJECT_SQL — the one resolution, so this
+                    # gauge and the fold cannot describe different populations.
+                    f"SELECT id, COALESCE({PROJECT_SQL}, $2) AS domain"
+                    f" FROM technical_docs WHERE id = ANY($1)",
                     all_ids, DEFAULT_DOMAIN,
                 )
             domain_map = {r["id"]: r["domain"] for r in rows}
@@ -4352,15 +4363,12 @@ class MemoryCoordinator:
             )
             for c in fact_clusters
         )
-        decision_cycles = _count_domain_cycles(
-            decision_ids, domain_map, NREM_DECISION_THRESHOLD
-        )
         return {
             "fact_cycles": fact_cycles,
             "decision_cycles": decision_cycles,
             "total_cycles": fact_cycles + decision_cycles,
             "fact_threshold": ONT.density_threshold,
-            "decision_threshold": NREM_DECISION_THRESHOLD,
+            "decision_threshold": INSIGHT_THRESHOLD,
         }
 
     async def _metadata_breakdown(self) -> dict:
@@ -4381,7 +4389,7 @@ class MemoryCoordinator:
                 " count(*)::int AS count FROM technical_docs GROUP BY 1 ORDER BY count DESC LIMIT 12"
             )
             domains = await conn.fetch(
-                "SELECT COALESCE(metadata->>'project', metadata->>'domain', 'general') AS key,"
+                f"SELECT COALESCE({PROJECT_SQL}, 'general') AS key,"
                 " count(*)::int AS count FROM technical_docs GROUP BY 1 ORDER BY count DESC LIMIT 12"
             )
             summaries = await conn.fetch(

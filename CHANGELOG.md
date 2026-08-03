@@ -5,6 +5,50 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.31] — 2026-08-03
+
+### Changed
+
+- **One project resolution, shared by every reader.** Which project a record
+  belongs to was worked out in eight places across five files. Three agreed;
+  two also fell back to the record's `domain`, and one further to its `scope`.
+  So the same record could answer "which project?" differently depending on
+  which component asked — and because a judgement carries its project inside
+  its decision payload rather than at the top level, **219 of 261 decisions
+  read as untagged while carrying a project all along**. The resolution now
+  lives in one place and every reader imports it. `domain` leaves the chain: a
+  domain is a **section of** a project, and a section cannot stand in for the
+  whole it belongs to. `scope` leaves it too — scope is access control, so
+  resolving through it keys a record by who may *see* it rather than what it is
+  *about*, which on any deployment that uses scopes partitions summaries along
+  permission lines. The one deliberate exception is the spelling-normalisation
+  tool, which must find a record whose old project name is shadowed by a newer
+  one and so matches **either** field rather than resolving between them.
+
+- **The decision backlog gauge now runs the gate it claims to measure.**
+  It counted every decision awaiting consolidation and grouped them by project
+  — no shared subject, no requirement that a cluster span two projects, no
+  requirement that any decision had an outcome recorded against it. Those are
+  the actual conditions the consolidation daemon folds on, and none of them can
+  be expressed as a grouping of stored values, so the gauge reported a backlog
+  the daemon could not act on. Re-sourcing its project values would only have
+  made a meaningless number better-sourced, so the count is now the daemon's
+  own query with a count in place of its result rows: one definition, two
+  projections, unable to drift. **This moves reported numbers without changing
+  any fold behaviour** — on the development corpus the decision backlog reads 0
+  where it read 2, and the funnel behind it is 108 candidate clusters → 3 that
+  span two projects → 0 with an outcome recorded. What blocks these folds is
+  decisions still owing a retrospective, not density.
+
+- **The reported decision threshold tracks the real gate** instead of a
+  hardcoded copy that sat beside it, so a deployment that tunes the
+  consolidation threshold now sees the tuned value rather than a stale twin.
+
+- **The enrichment pass is told which project a record belongs to.** Its
+  capture manifest read only the top-level field, so every decision reached the
+  enrichment prompt with no project at all — the model was asked to enrich a
+  record while the record's project was withheld from it.
+
 ## [0.8.30] — 2026-08-03
 
 ### Changed

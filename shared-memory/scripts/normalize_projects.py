@@ -32,6 +32,7 @@ from neo4j import GraphDatabase
 
 sys.path.insert(0, os.path.dirname(__file__))
 from ontology import ONT  # noqa: E402
+from project_axis import PROJECT_MATCH_SQL  # noqa: E402
 
 
 def _load_env() -> None:
@@ -72,10 +73,14 @@ def parse_alias_map(raw: str) -> dict:
 def normalize_postgres(conn, aliases: dict, dry_run: bool) -> None:
     with conn.cursor() as cur:
         for old, new in aliases.items():
+            # PROJECT_MATCH_SQL, deliberately NOT project_axis.PROJECT_SQL: this
+            # counts rows that need REWRITING, and a row carrying the old name in
+            # the decision blob and the new one at the top level still does. The
+            # resolution's COALESCE would shadow that row and under-reach. The
+            # two UPDATEs below stay per-field for the same reason.
             cur.execute(
                 "SELECT count(*) FROM technical_docs"
-                " WHERE metadata->>'project' = %s"
-                "    OR metadata->'decision'->>'project' = %s",
+                f" WHERE {PROJECT_MATCH_SQL.format(p='%s')}",
                 (old, old),
             )
             n = cur.fetchone()[0]

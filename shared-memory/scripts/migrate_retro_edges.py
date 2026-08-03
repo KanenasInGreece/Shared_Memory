@@ -46,6 +46,7 @@ from neo4j import GraphDatabase
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ontology import ONT, RETRO_RATINGS  # noqa: E402
+from project_axis import PROJECT_SQL  # noqa: E402
 
 
 def _load_env() -> None:
@@ -218,8 +219,7 @@ def apply_plan(plan: list[dict], conn, driver) -> dict:
             # inherit the target decision's project (as the v2 write path does)
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT COALESCE(metadata->'decision'->>'project',"
-                    "                metadata->>'project') FROM technical_docs WHERE id=%s",
+                    f"SELECT {PROJECT_SQL} FROM technical_docs WHERE id=%s",
                     (p["decision_id"],),
                 )
                 row = cur.fetchone()
