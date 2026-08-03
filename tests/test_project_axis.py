@@ -314,17 +314,26 @@ async def test_backfill_row_writes_only_the_project_edge():
 
 
 @pytest.mark.asyncio
-async def test_backfill_matches_the_fact_and_never_mints_one():
-    """A backfill mints no records. MERGE on the fact would conjure a phantom
-    :Fact whose only property is a pg_id — the exact defect the supersede
-    handler documents."""
+async def test_backfill_matches_the_record_and_never_mints_one():
+    """A backfill mints no records. MERGE on the target would conjure a phantom
+    node whose only property is a pg_id — the exact defect the supersede
+    handler documents.
+
+    Asserted as MATCH-not-MERGE on the target rather than as an exact opening
+    string: the row now matches the whole SPINE (a promotion can target a
+    judgement, and matching :Fact alone would silently drop those rows) and
+    deletes the stale edge first (P19). Pinning the literal prefix made this
+    test fail for a change that strengthened the very property it protects.
+    """
     rec = _Recorder()
     coord = rec.coordinator()
     await coord._apply_project_of_outbox_row(7, 42, {"type": "project_of",
                                                      "project": "smg"})
     query = rec.cypher[0][0]
-    assert query.startswith("MATCH (f:Fact {pg_id: $pg_id})")
-    assert "MERGE (f:Fact" not in query
+    assert query.startswith("MATCH ("), "the target is matched, never merged"
+    # The ONLY node this row may create is the :Project it points at.
+    merged_labels = re.findall(r"MERGE \(\w+:(\w+)", query)
+    assert merged_labels == ["Project"], merged_labels
 
 
 @pytest.mark.asyncio

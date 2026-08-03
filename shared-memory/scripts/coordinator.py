@@ -64,6 +64,9 @@ from project_axis import (
 from insight_gate import (
     INSIGHT_THRESHOLD, INSIGHT_HUB_DEGREE_CAP, insight_cluster_cypher,
 )
+from project_promotion import (
+    promote_record, sole_project, METHOD_GROUNDING,
+)
 
 log = logging.getLogger("coordinator")
 
@@ -110,7 +113,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.35"
+FRAMEWORK_VERSION = "0.8.36"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -1562,6 +1565,62 @@ class MemoryCoordinator:
                         outbox_id, delay,
                     )
 
+    async def _promote_grounded_parked_facts(
+        self, conn, grounded_typed: list, agent_id: str, judgement_pg_id: int
+    ) -> list:
+        """Caller 1 — a judgement that grounds a PARKED fact establishes its
+        project, when the judgements grounding that fact agree on exactly one.
+
+        The evidence is the fact's own grounding neighbourhood, not just the
+        judgement being written: the query below reads EVERY judgement citing
+        the fact, including the one this transaction just inserted. Two
+        judgements naming two projects leave the fact parked — `sole_project`
+        is the ambiguity guard, and abstentions (judgements with no project of
+        their own) are ignored rather than counted as dissent.
+
+        ⚠ EACH PROMOTION RUNS IN ITS OWN SAVEPOINT, and that is not tidiness.
+        This runs INSIDE the save's transaction so the promotion is atomic with
+        the record that justified it — but a failing statement poisons a
+        Postgres transaction, so without a savepoint one bad promotion would
+        roll back the SAVE it rode in on. That would turn an opportunistic
+        enrichment into a new way for `/memory/save` to fail, which is the same
+        shape as the telemetry query that would have made a REM blip read as a
+        quiet system. The save is the work; this is a passenger.
+        """
+        promoted: list = []
+        for g in grounded_typed or []:
+            if g.get("label") != ONT.fact:
+                continue
+            target_id = g.get("pg_id")
+            if not isinstance(target_id, int) or isinstance(target_id, bool):
+                continue
+            try:
+                async with conn.transaction():
+                    rows = await conn.fetch(
+                        f"SELECT DISTINCT {PROJECT_SQL} AS project"
+                        f" FROM technical_docs"
+                        f" WHERE metadata->>'type' IN ('decision', 'retrospective')"
+                        f"   AND metadata->'grounded_in' @> to_jsonb($1::bigint)",
+                        target_id,
+                    )
+                    agreed = sole_project([r["project"] for r in rows])
+                    if agreed is None:
+                        continue
+                    result = await promote_record(
+                        conn, target_id, agreed,
+                        method=METHOD_GROUNDING,
+                        actor=agent_id or "coordinator",
+                        note=f"grounded by judgement pg_id={judgement_pg_id}",
+                    )
+                    if result["promoted"]:
+                        promoted.append(target_id)
+            except Exception as exc:
+                log.warning(
+                    "grounding promotion failed for pg_id=%s (save unaffected): %s",
+                    target_id, exc,
+                )
+        return promoted
+
     async def _resolve_typed_grounding(
         self, conn, grounded_ids: list, grounded_roles: dict
     ) -> list:
@@ -2041,9 +2100,10 @@ class MemoryCoordinator:
     async def _apply_project_of_outbox_row(
         self, outbox_id: int, pg_id: int, params: dict
     ) -> None:
-        """Attach an EXISTING :Fact to its :Project — the narrow repair row that
-        backfill_project_of.py enqueues, so a historical gap is closed through
-        the outbox instead of by writing Neo4j directly.
+        """Point an EXISTING spine record at its :Project — the narrow repair row
+        that backfill_project_of.py and the promotion writer enqueue, so both the
+        historical gap and the parked → real transition close through the outbox
+        instead of by writing Neo4j directly.
 
         ⚠ It exists because re-enqueuing an ordinary fact row would be actively
         DESTRUCTIVE. That row's Cypher also re-runs `UNWIND $entities MERGE
@@ -2051,9 +2111,22 @@ class MemoryCoordinator:
         sweep deliberately deleted — the below-floor cleanup would silently undo
         itself. A repair must touch only what it repairs.
 
-        MATCH on the fact, never MERGE: a backfill mints no records. If the node
-        is gone the row is dropped rather than conjuring a phantom :Fact whose
-        only property is a pg_id.
+        MATCH on the record, never MERGE: a repair mints no records. If the node
+        is gone the row is dropped rather than conjuring a phantom whose only
+        property is a pg_id. The match is over the SPINE, not :Fact alone —
+        a promotion cascades to retrospectives (P20), and matching one label
+        would silently drop those rows.
+
+        ⚠ IT REPLACES, IT DOES NOT ACCUMULATE (P19). This used to be a bare
+        MERGE, and a bare MERGE is only correct while every target has no edge —
+        which is true of the backfill's population by construction and false of
+        the promotion writer's. Measured before this changed: 35 parked facts
+        already carried an edge Postgres could not justify, and 4 spine nodes
+        carried TWO project edges. A record belongs to one project, and the
+        Postgres resolution is that answer (P1), so the graph mirrors it rather
+        than keeping every value ever written. Deleting first is unconditional
+        on purpose — a flag that can be omitted is how the second-writer defect
+        arrives, and on a node with no edge the delete is simply a no-op.
 
         One-shot, DELETED on success, following the supersede row: it carries no
         dream lifecycle and must never be counted as working-set backlog.
@@ -2062,9 +2135,12 @@ class MemoryCoordinator:
         if project:
             async with self._neo4j.session() as session:
                 await session.run(
-                    f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
+                    f"MATCH (n:{self._SPINE}) WHERE n.pg_id = $pg_id"
+                    f" OPTIONAL MATCH (n)-[stale:{ONT.project_of}]->()"
+                    f" DELETE stale"
+                    f" WITH DISTINCT n"
                     f" MERGE (p:{ONT.project} {{name: $project}})"
-                    f" MERGE (f)-[:{ONT.project_of}]->(p)",
+                    f" MERGE (n)-[:{ONT.project_of}]->(p)",
                     pg_id=pg_id, project=project,
                 )
         async with self._acquire() as conn:
@@ -2417,6 +2493,14 @@ class MemoryCoordinator:
                     ]
                     grounded_typed = await self._resolve_typed_grounding(
                         conn, grounded_ids, metadata.get("grounded_roles") or {}
+                    )
+
+                    # Caller 1 of the promotion writer: a parked fact cited as
+                    # evidence inherits the project its citing judgements agree
+                    # on. Fires here because this is where grounded pg_ids are
+                    # already resolved to real records with real labels.
+                    await self._promote_grounded_parked_facts(
+                        conn, grounded_typed, agent_id, pg_id
                     )
 
                     # Outbox row written atomically with the fact.
@@ -2851,6 +2935,31 @@ class MemoryCoordinator:
                         )
                     # Inherit the target's project so domain-scoped reads see the
                     # retro beside its decision.
+                    #
+                    # ⚠ OPEN, deliberately not settled here: whether a
+                    # retrospective's project MUST equal its decision's — i.e.
+                    # whether it is derived rather than self-asserted.
+                    #
+                    # The case FOR it: a retrospective never needs to span
+                    # projects, because a decision in one project affecting
+                    # another is expressed as an INTERMEDIATE DECISION in the
+                    # second project grounded in the first — and that decision
+                    # carries its own same-project retrospective. Cross-project
+                    # linkage then lives decision→decision, where it is explicit,
+                    # rather than inside a retrospective, where it would be
+                    # implicit. Both halves check out against the live corpus
+                    # (2026-08-04): 0 of 162 retrospectives differ from their
+                    # target, and the intermediate-decision pattern is already in
+                    # use — 28 decision→judgement grounding links, one of them
+                    # genuinely cross-project (a decision in one project grounded
+                    # in a decision in another).
+                    #
+                    # If it is ratified, this line becomes unconditional — a
+                    # PARKED target would then have to CLEAR the retro's own
+                    # value rather than leave it standing — and the promotion
+                    # writer gains a cascade, because it would then be a second
+                    # writer of a derived value. Until that is decided, behaviour
+                    # is left exactly as it was.
                     if target["project"]:
                         metadata["project"] = target["project"]
 
@@ -2874,6 +2983,13 @@ class MemoryCoordinator:
 
                     grounded_typed = await self._resolve_typed_grounding(
                         conn, grounded_ids, metadata.get("grounded_roles") or {}
+                    )
+
+                    # Caller 1, retrospective side — a retrospective is a
+                    # judgement too, and the plan is explicit that both kinds
+                    # supply a project to the facts they cite.
+                    await self._promote_grounded_parked_facts(
+                        conn, grounded_typed, agent_id, retro_pg_id
                     )
 
                     # Outbox row under the RETRO'S OWN pg_id — ordinary record

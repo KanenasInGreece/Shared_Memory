@@ -36,12 +36,24 @@ from project_axis import PROJECT_MATCH_SQL  # noqa: E402
 
 
 def _load_env() -> None:
-    """Populate credentials from the repo-root .env, matching migrations/
-    apply.py and hive_mind_proxy.py — this is a standalone CLI run in a fresh
-    shell where PG_PASSWORD/NEO4J_PASSWORD are otherwise unset (CLAUDE.md:
-    credentials are read from .env, never hardcoded)."""
-    env_path = Path(__file__).resolve().parent.parent.parent / ".env"
-    if not env_path.exists():
+    """Populate credentials from the framework .env — this is a standalone CLI
+    run in a fresh shell where PG_PASSWORD/NEO4J_PASSWORD are otherwise unset
+    (credentials are read from .env, never hardcoded).
+
+    ⚠ THE FRAMEWORK ENV IS ``shared-memory/.env``; the repo root is the
+    FALLBACK. This used to read the repo-root path only, and its docstring
+    claimed that matched ``migrations/apply.py`` — which tries the framework
+    path first. On an install that keeps credentials only where the documented
+    setup puts them, this script therefore connected with an empty password and
+    died on `fe_sendauth: no password supplied`: a shipped tool that could not
+    run at all, reported by nothing until someone tried to use it. Same
+    candidate order as apply.py, so there is one answer to "where does the
+    password live" rather than one per script.
+    """
+    here = Path(__file__).resolve().parent
+    candidates = [here.parent / ".env", here.parent.parent / ".env"]
+    env_path = next((p for p in candidates if p.exists()), None)
+    if env_path is None:
         return
     for line in env_path.read_text().splitlines():
         line = line.strip()
@@ -57,8 +69,11 @@ _pg_pass = os.environ.get("PG_PASSWORD", "")
 PG_CONN = os.environ.get(
     "PG_CONN", f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
 )
-NEO4J_URI = "bolt://localhost:7687"
-NEO4J_AUTH = ("neo4j", os.environ.get("NEO4J_PASSWORD", ""))
+# Env-overridable, never a baked-in literal: our bolt port is one valid
+# configuration, not the configuration. Matches backfill_project_of.py.
+NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_AUTH = (os.environ.get("NEO4J_USER", "neo4j"),
+              os.environ.get("NEO4J_PASSWORD", ""))
 
 
 def parse_alias_map(raw: str) -> dict:
