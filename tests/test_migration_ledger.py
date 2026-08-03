@@ -88,7 +88,8 @@ def test_the_destructive_dedup_is_guarded_against_the_later_key():
     assert "IF to_regclass" in guard
 
 
-def test_an_empty_ledger_on_a_populated_database_refuses_rather_than_re_running():    """The refusal must key on the ledger being EMPTY, not on the table being
+def test_an_empty_ledger_on_a_populated_database_refuses_rather_than_re_running():
+    """The refusal must key on the ledger being EMPTY, not on the table being
     ABSENT. A run that created the table then failed before recording anything —
     or a ledger cleared by hand — leaves it present and empty, and keying on
     absence let that fall through to the fresh-install path, which re-runs every
