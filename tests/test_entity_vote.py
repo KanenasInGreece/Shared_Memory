@@ -167,3 +167,41 @@ def test_a_name_with_no_folder_is_absent_not_dead():
     verdict, folder, _ = classify("tier3-telemetry", FOLDERS)
     assert verdict == "absent"
     assert folder is None
+
+
+# ── The population selector — the mistake made twice ─────────────────────────
+
+def test_pass2_selects_parked_facts_from_postgres_never_from_the_graph_edge():
+    """"Parked" is a property of the RESOLUTION, not of the graph.
+
+    Selecting facts that lack a PROJECT_OF edge looks equivalent and is not: on
+    this corpus 28 facts were parked in Postgres while carrying an edge nothing
+    could justify, so an edge-side selector silently drops exactly the records
+    most in need of repair. That error was made twice — once measuring the
+    population as 91 instead of 126, once in this script's first draft — which
+    is why it is pinned here rather than left to care.
+    """
+    import backfill_promote_entity_vote as pass2
+    sql = pass2.PARKED_FACTS_SQL
+    assert "technical_docs" in sql
+    assert "PROJECT_OF" not in sql.upper(), "the population must not be graph-derived"
+    assert "general_discussion" in sql, "the sentinel is parked too, not just NULL"
+    # Judgements are excluded: they resolve already, and the vote is about facts.
+    assert "'decision'" in sql and "'retrospective'" in sql
+
+
+def test_pass2_excludes_mega_hubs_and_axis_as_topic_entities_from_the_vote():
+    """A mega-hub says nothing about any one fact, and an axis-as-topic node is
+    the axis wearing an entity's label — letting a fact vote on itself."""
+    import backfill_promote_entity_vote as pass2
+    assert "$hub_cap" in pass2.VOTE_CYPHER
+    assert "'Project:'" in pass2.VOTE_CYPHER
+
+
+def test_pass2_writes_only_the_unanimous_band():
+    """Proposals are never written. Asserted on the guard the runner actually
+    uses, so widening it means deleting this test on purpose."""
+    import backfill_promote_entity_vote as pass2
+    assert pass2.is_auto(BAND_AUTO)
+    for band in (BAND_HIGH, BAND_REVIEW, BAND_NONE):
+        assert not pass2.is_auto(band)
