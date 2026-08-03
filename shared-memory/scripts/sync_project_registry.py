@@ -68,6 +68,7 @@ _load_env()
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from project_axis import PROJECT_SQL, SENTINEL  # noqa: E402
+from project_alias import ACTIVE_ALIASES_SQL  # noqa: E402
 
 PG_CONN = (
     f"postgresql://{os.environ.get('PG_USER', 'postgres')}:"
@@ -182,6 +183,18 @@ def main() -> int:
         with conn.cursor() as cur:
             cur.execute("SELECT name FROM projects")
             registered = {r[0] for r in cur.fetchall()}
+            # A decision made once must never return to the queue: a name with
+            # an ACTIVE alias has already been adjudicated and resolves at
+            # ingress, so surfacing it again is asking the operator to redo work.
+            try:
+                cur.execute(ACTIVE_ALIASES_SQL)
+                aliased = {r[0]: r[1] for r in cur.fetchall()}
+            except Exception:
+                # The alias tables predate no deployment this ships to, but a
+                # reporting tool must not die because an optional table is
+                # missing — it would take the whole registry report with it.
+                conn.rollback()
+                aliased = {}
             cur.execute(
                 f"SELECT {PROJECT_SQL} AS p, count(*) FROM technical_docs"
                 f" WHERE {PROJECT_SQL} IS NOT NULL GROUP BY 1"
@@ -209,6 +222,9 @@ def main() -> int:
         for name, count in sorted(in_use.items(), key=lambda kv: -kv[1]):
             verdict, folder, ratio = classify(name, folders)
             if verdict == "exact":
+                continue
+            if name in aliased:
+                # Settled already — resolved at ingress to aliased[name].
                 continue
             surface += 1
             if verdict == "variant":

@@ -118,6 +118,68 @@ def normalize_postgres(conn, aliases: dict, dry_run: bool) -> None:
         conn.commit()
 
 
+def record_aliases(conn, aliases: dict, dry_run: bool) -> None:
+    """Remember each rename, so it never has to be decided twice.
+
+    Rewriting the records is only half a rename. Without this the retired name
+    comes back the moment a machine that still uses it saves again, and it reads
+    as an unregistered stranger to every later review.
+
+    ⚠ THE ORDER HERE IS THE INVARIANT (A3 then A1), not a preference:
+
+      1. Re-point every alias already aimed at the old name. This is what keeps
+         resolution ONE HOP: a chain a→b→c collapses to a→c and b→c at write
+         time, so ingress never walks links and can never meet a cycle.
+      2. DELETE the old registry row before interning it as an alias. A1 says a
+         string is never both a registered project and an alias, and the
+         database enforces it with a trigger — so inserting first would simply
+         be refused.
+      3. Only then map old → new.
+
+    A registry row that cannot be removed (something still references it) is
+    REPORTED and skipped, never forced: a rename that has to break a reference
+    is not a rename, it is a different decision.
+    """
+    with conn.cursor() as cur:
+        for old, new in aliases.items():
+            if old == new:
+                continue
+            cur.execute("SELECT 1 FROM projects WHERE name = %s", (new,))
+            if cur.fetchone() is None:
+                print(f"  alias: SKIPPED {old!r} → {new!r} — {new!r} is not registered")
+                continue
+            if dry_run:
+                print(f"  alias: would record {old!r} → {new!r}")
+                continue
+            try:
+                cur.execute(
+                    "UPDATE project_aliases SET project = %s"
+                    " WHERE project = %s AND active",
+                    (new, old),
+                )
+                repointed = cur.rowcount
+                cur.execute("DELETE FROM projects WHERE name = %s", (old,))
+                cur.execute(
+                    "INSERT INTO aliases (name) VALUES (%s)"
+                    " ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name"
+                    " RETURNING id",
+                    (old,),
+                )
+                alias_id = cur.fetchone()[0]
+                cur.execute(
+                    "INSERT INTO project_aliases (alias_id, project, reason, created_by)"
+                    " VALUES (%s, %s, %s, 'normalize_projects')"
+                    " ON CONFLICT DO NOTHING",
+                    (alias_id, new, f"renamed to {new}"),
+                )
+                conn.commit()
+                extra = f", {repointed} existing alias(es) re-pointed" if repointed else ""
+                print(f"  alias: recorded {old!r} → {new!r}{extra}")
+            except Exception as exc:
+                conn.rollback()
+                print(f"  alias: FAILED for {old!r} → {new!r} — {exc}")
+
+
 def normalize_neo4j(driver, aliases: dict, dry_run: bool) -> None:
     with driver.session() as session:
         for old, new in aliases.items():
@@ -174,6 +236,8 @@ def main() -> None:
     conn = psycopg2.connect(PG_CONN, connect_timeout=5)
     try:
         normalize_postgres(conn, aliases, args.dry_run)
+        # Applying a rename and remembering it are one act, not two.
+        record_aliases(conn, aliases, args.dry_run)
     finally:
         conn.close()
 
