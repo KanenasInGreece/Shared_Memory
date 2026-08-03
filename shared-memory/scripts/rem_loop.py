@@ -110,8 +110,15 @@ from dream_telemetry import (
 # ── Environment ───────────────────────────────────────────────────────────────
 
 def _load_env() -> None:
-    env_path = Path(__file__).parent.parent.parent / ".env"
-    if not env_path.exists():
+    # The framework env is shared-memory/.env; the repo root is the FALLBACK.
+    # Same candidate order as hive_mind_proxy.py and apply.py. Reading the root
+    # alone is harmless while the daemon is spawned by the gateway (which has
+    # already populated the environment), and silently wrong the moment this
+    # file is run on its own — which is exactly how it is debugged.
+    here = Path(__file__).resolve().parent
+    candidates = [here.parent / ".env", here.parent.parent / ".env"]
+    env_path = next((p for p in candidates if p.exists()), None)
+    if env_path is None:
         return
     for line in env_path.read_text().splitlines():
         line = line.strip()

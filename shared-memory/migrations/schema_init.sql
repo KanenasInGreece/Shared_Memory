@@ -120,6 +120,23 @@ CREATE TABLE IF NOT EXISTS neo4j_outbox (
 CREATE INDEX IF NOT EXISTS neo4j_outbox_pending_id_idx ON public.neo4j_outbox USING btree (id) WHERE (status = 'pending'::text);
 CREATE INDEX IF NOT EXISTS neo4j_outbox_pending_idx ON public.neo4j_outbox USING btree (status) WHERE (status = 'pending'::text);
 
+-- ─── project_promotions ─────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS project_promotions (
+    id               BIGSERIAL PRIMARY KEY,
+    pg_id            BIGINT NOT NULL,
+    from_project     TEXT,
+    to_project       TEXT NOT NULL,
+    method           TEXT NOT NULL,
+    actor            TEXT NOT NULL,
+    note             TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT project_promotions_from_parked CHECK (((from_project IS NULL) OR (from_project = 'general_discussion'::text))),
+    CONSTRAINT project_promotions_to_real CHECK (((btrim(to_project) <> ''::text) AND (to_project <> 'general_discussion'::text)))
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_promotions_created_at ON public.project_promotions USING btree (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_project_promotions_pg_id ON public.project_promotions USING btree (pg_id);
+
 -- ─── projects ───────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS projects (
     name             TEXT PRIMARY KEY,
@@ -189,5 +206,19 @@ CREATE INDEX IF NOT EXISTS technical_docs_embedding_idx ON public.technical_docs
 CREATE INDEX IF NOT EXISTS technical_docs_scope_idx ON public.technical_docs USING btree (scope);
 CREATE INDEX IF NOT EXISTS technical_docs_superseded_by_idx ON public.technical_docs USING btree (superseded_by) WHERE (superseded_by IS NOT NULL);
 CREATE INDEX IF NOT EXISTS technical_docs_visibility_idx ON public.technical_docs USING btree (visibility);
+
+-- ─── Foreign keys ──────────────────────────────────────────────────────────
+-- Added after every table exists: a referencing table can sort before its
+-- target, so these cannot be inline column constraints.
+
+DO $$ BEGIN
+    ALTER TABLE project_promotions ADD CONSTRAINT project_promotions_to_project_fkey FOREIGN KEY (to_project) REFERENCES projects(name);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE technical_docs ADD CONSTRAINT technical_docs_superseded_by_fkey FOREIGN KEY (superseded_by) REFERENCES technical_docs(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 
 COMMIT;
