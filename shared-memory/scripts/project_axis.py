@@ -48,6 +48,23 @@ PROJECT_MATCH_SQL = (
 SENTINEL = "general_discussion"
 
 
+def fold_eligible(project) -> bool:
+    """Invariant P2 — a record with no resolvable project folds NOTHING.
+
+    The one predicate both partitioners call, because the rule is easy to state
+    and easy to half-implement. "Not eligible" means the record is **skipped**,
+    never bucketed: grouping the unresolvable ones together under a shared key
+    is the `general` bucket rebuilt by accident, and that bucket is precisely
+    what fused unrelated facts into one narrative. Two records that each fail to
+    name a project have nothing in common — their shared property is an ABSENCE,
+    and an absence is not a topic.
+
+    Empty and whitespace-only count as absent: a key that renders as nothing is
+    the same defect wearing a different value.
+    """
+    return isinstance(project, str) and bool(project.strip())
+
+
 def resolve_project(metadata):
     """The Python twin of :data:`PROJECT_SQL` — same order, same exclusions.
 

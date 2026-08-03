@@ -215,3 +215,142 @@ def test_reported_decision_threshold_tracks_the_real_gate():
 
     assert coordinator.INSIGHT_THRESHOLD is INSIGHT_THRESHOLD
     assert not hasattr(coordinator, "NREM_DECISION_THRESHOLD")
+
+
+# ── P2/P3 — an unresolvable project folds nothing (v0.8.32) ──────────────────
+
+def test_fold_eligible_rejects_every_shape_of_absence():
+    from project_axis import fold_eligible
+
+    assert fold_eligible("shared-memory-GitHub") is True
+    assert fold_eligible(None) is False
+    assert fold_eligible("") is False
+    assert fold_eligible("   ") is False
+    assert fold_eligible(0) is False
+    assert fold_eligible(["smg"]) is False
+
+
+def test_both_partitioners_use_the_same_eligibility_predicate():
+    """The gauge and the fold agreeing is not a coincidence to be maintained by
+    hand — they call one function."""
+    import consolidation_loop
+    import coordinator
+
+    assert consolidation_loop.fold_eligible is coordinator.fold_eligible
+
+
+def test_the_fold_key_query_no_longer_invents_a_bucket():
+    """The SQL must let NULL through so the partitioner can exclude it. A
+    COALESCE here would rebuild the `general` bucket underneath the guard,
+    and every unit test above would still pass."""
+    src = open(os.path.join(_SCRIPTS, "consolidation_loop.py"), encoding="utf-8").read()
+    assert "f\"SELECT id, {PROJECT_SQL},\"" in src
+    assert "COALESCE({PROJECT_SQL}, 'general')" not in src
+
+    coord = open(os.path.join(_SCRIPTS, "coordinator.py"), encoding="utf-8").read()
+    assert "f\"SELECT id, {PROJECT_SQL} AS domain\"" in coord
+    assert "DEFAULT_DOMAIN" not in coord.split("# NREM dream-cycle backlog gauge")[0]
+
+
+def test_project_node_is_minted_from_the_resolved_project():
+    """P3 — never from a section, never from a chain."""
+    coord = open(os.path.join(_SCRIPTS, "coordinator.py"), encoding="utf-8").read()
+    assert '"project": resolve_project(metadata),' in coord
+    assert '"project": metadata.get("project"),' not in coord
+
+
+# ── The PROJECT_OF backfill row (v0.8.32) ────────────────────────────────────
+
+class _Recorder:
+    """Captures the Cypher a handler runs, plus the SQL it issues."""
+
+    def __init__(self):
+        self.cypher = []
+        self.sql = []
+
+    def coordinator(self):
+        from coordinator import MemoryCoordinator
+        c = MemoryCoordinator()
+
+        async def run(query, **params):
+            self.cypher.append((query, params))
+            r = MagicMock()
+            r.data = AsyncMock(return_value=[])
+            return r
+
+        session = MagicMock()
+        session.run = run
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        c._neo4j = MagicMock()
+        c._neo4j.session = MagicMock(return_value=session)
+
+        conn = MagicMock()
+        conn.execute = AsyncMock(side_effect=lambda *a: self.sql.append(a))
+        acq = MagicMock()
+        acq.__aenter__ = AsyncMock(return_value=conn)
+        acq.__aexit__ = AsyncMock(return_value=False)
+        c._acquire = MagicMock(return_value=acq)
+        return c
+
+
+@pytest.mark.asyncio
+async def test_backfill_row_writes_only_the_project_edge():
+    """THE safety property. Re-enqueuing an ordinary fact row would re-run its
+    `UNWIND $entities MERGE MENTIONS`, resurrecting every enrichment edge a
+    later sweep deliberately deleted. The repair row must touch nothing else."""
+    rec = _Recorder()
+    coord = rec.coordinator()
+    await coord._apply_project_of_outbox_row(7, 42, {"type": "project_of",
+                                                     "project": "smg"})
+    assert len(rec.cypher) == 1
+    query, params = rec.cypher[0]
+    assert "PROJECT_OF" in query
+    assert "MENTIONS" not in query
+    assert "$entities" not in query
+    assert "f.content" not in query
+    assert params == {"pg_id": 42, "project": "smg"}
+
+
+@pytest.mark.asyncio
+async def test_backfill_matches_the_fact_and_never_mints_one():
+    """A backfill mints no records. MERGE on the fact would conjure a phantom
+    :Fact whose only property is a pg_id — the exact defect the supersede
+    handler documents."""
+    rec = _Recorder()
+    coord = rec.coordinator()
+    await coord._apply_project_of_outbox_row(7, 42, {"type": "project_of",
+                                                     "project": "smg"})
+    query = rec.cypher[0][0]
+    assert query.startswith("MATCH (f:Fact {pg_id: $pg_id})")
+    assert "MERGE (f:Fact" not in query
+
+
+@pytest.mark.asyncio
+async def test_backfill_row_is_deleted_not_left_as_backlog():
+    """One-shot, like the supersede row: it carries no dream lifecycle, so
+    leaving it applied would inflate the outbox working set forever."""
+    rec = _Recorder()
+    coord = rec.coordinator()
+    await coord._apply_project_of_outbox_row(7, 42, {"type": "project_of",
+                                                     "project": "smg"})
+    assert rec.sql == [("DELETE FROM neo4j_outbox WHERE id=$1", 7)]
+
+
+@pytest.mark.asyncio
+async def test_backfill_row_with_no_project_writes_nothing():
+    """P3 — never mint a :Project from an absent value."""
+    rec = _Recorder()
+    coord = rec.coordinator()
+    await coord._apply_project_of_outbox_row(7, 42, {"type": "project_of",
+                                                     "project": "  "})
+    assert rec.cypher == []
+    assert rec.sql == [("DELETE FROM neo4j_outbox WHERE id=$1", 7)]
+
+
+def test_backfill_never_writes_neo4j_directly():
+    """The script's whole contract: it enqueues, the worker applies."""
+    src = open(os.path.join(_SCRIPTS, "backfill_project_of.py"), encoding="utf-8").read()
+    assert "INSERT INTO neo4j_outbox" in src
+    assert "'pending'" in src          # the status the worker actually polls
+    assert "MERGE" not in src          # no Cypher writes of its own

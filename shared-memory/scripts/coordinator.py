@@ -56,7 +56,7 @@ from ontology import (
     GROUNDING_ROLES, GROUNDING_RELATIONS, default_grounding_role, RETRO_RATINGS,
     record_label_for_type,
 )
-from project_axis import PROJECT_SQL
+from project_axis import PROJECT_SQL, fold_eligible, resolve_project
 from insight_gate import (
     INSIGHT_THRESHOLD, INSIGHT_HUB_DEGREE_CAP, insight_cluster_cypher,
 )
@@ -106,7 +106,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.31"
+FRAMEWORK_VERSION = "0.8.32"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -853,11 +853,15 @@ _audit_writer = AsyncLineWriter(GATEWAY_AUDIT_LOG_PATH) if GATEWAY_AUDIT_LOG_PAT
 # NREM dream-cycle backlog gauge (GET /memory/telemetry). A "cycle" is one
 # cluster that meets the gate NREM actually fires on, NOT a raw unconsolidated
 # record count. Fact clusters reuse ONT.density_threshold (the same value
-# consolidation_loop.py gates on) partitioned by project_axis.PROJECT_SQL.
-# Decision cycles run the insight gate itself, count-only, from insight_gate.py
-# — its own threshold travels with it, so a deployment that tunes
-# insight_threshold sees the tuned number here rather than a hardcoded twin.
-DEFAULT_DOMAIN = "general"
+# consolidation_loop.py gates on) partitioned by project_axis.PROJECT_SQL, with
+# unresolvable-project records excluded rather than pooled (P2). Decision cycles
+# run the insight gate itself, count-only, from insight_gate.py — its own
+# threshold travels with it, so a deployment that tunes insight_threshold sees
+# the tuned number here rather than a hardcoded twin.
+#
+# There is deliberately no default-project constant here any more: the gauge
+# never invents a key. consolidation_loop keeps DEFAULT_DOMAIN for a summary's
+# OWN stored key, which is a different thing from a fact's fold key.
 
 # ── Consolidation health signal (ADR-018) ───────────────────────────────────
 # The coordinator rolls up the daemon's consolidation_runs ledger into a cached
@@ -984,7 +988,12 @@ def _count_domain_cycles(pg_ids: list[int], domain_map: dict[int, str], threshol
     """
     by_domain: dict[str, int] = {}
     for pid in pg_ids:
-        dom = domain_map.get(pid) or DEFAULT_DOMAIN
+        dom = domain_map.get(pid)
+        # P2, via the SAME predicate the daemon partitions on: an unresolvable
+        # project is skipped, never bucketed. A gauge that counted them together
+        # would report a cycle the fold refuses to run.
+        if not fold_eligible(dom):
+            continue
         by_domain[dom] = by_domain.get(dom, 0) + 1
     return sum(1 for n in by_domain.values() if n >= threshold)
 
@@ -1441,6 +1450,10 @@ class MemoryCoordinator:
 
             if params.get("type") == "supersede":
                 await self._apply_supersede_outbox_row(outbox_id, params)
+                return
+
+            if params.get("type") == "project_of":
+                await self._apply_project_of_outbox_row(outbox_id, pg_id, params)
                 return
 
             # Standard Fact + Entity MERGE — all writes in one round-trip so they
@@ -2016,6 +2029,42 @@ class MemoryCoordinator:
             old_id, new_id, outbox_id,
         )
 
+    async def _apply_project_of_outbox_row(
+        self, outbox_id: int, pg_id: int, params: dict
+    ) -> None:
+        """Attach an EXISTING :Fact to its :Project — the narrow repair row that
+        backfill_project_of.py enqueues, so a historical gap is closed through
+        the outbox instead of by writing Neo4j directly.
+
+        ⚠ It exists because re-enqueuing an ordinary fact row would be actively
+        DESTRUCTIVE. That row's Cypher also re-runs `UNWIND $entities MERGE
+        MENTIONS`, so replaying it would resurrect every enrichment edge a later
+        sweep deliberately deleted — the below-floor cleanup would silently undo
+        itself. A repair must touch only what it repairs.
+
+        MATCH on the fact, never MERGE: a backfill mints no records. If the node
+        is gone the row is dropped rather than conjuring a phantom :Fact whose
+        only property is a pg_id.
+
+        One-shot, DELETED on success, following the supersede row: it carries no
+        dream lifecycle and must never be counted as working-set backlog.
+        """
+        project = (params.get("project") or "").strip()
+        if project:
+            async with self._neo4j.session() as session:
+                await session.run(
+                    f"MATCH (f:{ONT.fact} {{pg_id: $pg_id}})"
+                    f" MERGE (p:{ONT.project} {{name: $project}})"
+                    f" MERGE (f)-[:{ONT.project_of}]->(p)",
+                    pg_id=pg_id, project=project,
+                )
+        async with self._acquire() as conn:
+            await conn.execute("DELETE FROM neo4j_outbox WHERE id=$1", outbox_id)
+        log.info(
+            "outbox: backfilled PROJECT_OF pg_id=%s project=%r (outbox_id=%d, row deleted)",
+            pg_id, project or "(none — skipped)", outbox_id,
+        )
+
     async def _wait_for_outbox(self, pg_id: int) -> bool:
         """Poll until the outbox row for pg_id is applied, or CONSISTENCY_TIMEOUT expires."""
         loop = asyncio.get_running_loop()
@@ -2253,7 +2302,11 @@ class MemoryCoordinator:
                             # project = the normalised folder name ("project from folder").
                             # Each edge is written only when its value is present.
                             "person": metadata.get("principal"),
-                            "project": metadata.get("project"),
+                            # P3 — the resolved PROJECT, never a section and never
+                            # a chain: a :Project node must be a project. Uses the
+                            # one resolution so a record whose project lives in the
+                            # decision payload mints the same node a fact would.
+                            "project": resolve_project(metadata),
                             "type": metadata.get("type", "fact"),
                             "decision": metadata.get("decision", {}),
                             "source_ref": metadata.get("source_ref") or None,
@@ -4350,9 +4403,9 @@ class MemoryCoordinator:
                 rows = await conn.fetch(
                     # project_axis.PROJECT_SQL — the one resolution, so this
                     # gauge and the fold cannot describe different populations.
-                    f"SELECT id, COALESCE({PROJECT_SQL}, $2) AS domain"
+                    f"SELECT id, {PROJECT_SQL} AS domain"
                     f" FROM technical_docs WHERE id = ANY($1)",
-                    all_ids, DEFAULT_DOMAIN,
+                    all_ids,
                 )
             domain_map = {r["id"]: r["domain"] for r in rows}
 
@@ -4389,7 +4442,7 @@ class MemoryCoordinator:
                 " count(*)::int AS count FROM technical_docs GROUP BY 1 ORDER BY count DESC LIMIT 12"
             )
             domains = await conn.fetch(
-                f"SELECT COALESCE({PROJECT_SQL}, 'general') AS key,"
+                f"SELECT COALESCE({PROJECT_SQL}, '(none)') AS key,"
                 " count(*)::int AS count FROM technical_docs GROUP BY 1 ORDER BY count DESC LIMIT 12"
             )
             summaries = await conn.fetch(

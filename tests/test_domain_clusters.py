@@ -39,20 +39,44 @@ def test_facts_spread_thinly_yield_no_clusters():
     assert eligible_domain_clusters(contents, pg_ids, domain_map, threshold=3) == []
 
 
-def test_untagged_facts_collapse_to_default_domain():
+def test_untagged_facts_are_excluded_not_pooled():
+    """INVERTED at v0.8.32 (P2). These facts used to collapse into one
+    DEFAULT_DOMAIN bucket and fold together — 127 facts fusing 12 narratives
+    whose only shared property was that nobody had said where they came from."""
     contents = ["a", "b"]
     pg_ids = [1, 2]
     domain_map = {}  # nothing tagged
     result = eligible_domain_clusters(contents, pg_ids, domain_map, threshold=2)
-    assert result == [(DEFAULT_DOMAIN, ["a", "b"], [1, 2])]
+    assert result == []
 
 
-def test_empty_domain_value_falls_back_to_default():
+def test_empty_project_value_is_excluded_not_defaulted():
+    """A key that renders as nothing is the same defect wearing a value."""
     contents = ["a", "b"]
     pg_ids = [1, 2]
-    domain_map = {1: "", 2: None}  # falsy domains
+    domain_map = {1: "", 2: None, 3: "   "}  # falsy / whitespace-only
     result = eligible_domain_clusters(contents, pg_ids, domain_map, threshold=2)
-    assert result == [(DEFAULT_DOMAIN, ["a", "b"], [1, 2])]
+    assert result == []
+
+
+def test_two_unresolvable_records_never_group_together():
+    """The precise wording of P2. Excluding them is not enough on its own — the
+    failure mode is that they share a key BECAUSE they both lack one."""
+    contents = ["a", "b", "c", "d"]
+    pg_ids = [1, 2, 3, 4]
+    domain_map = {1: None, 2: "", 3: None, 4: None}
+    assert eligible_domain_clusters(contents, pg_ids, domain_map, threshold=2) == []
+
+
+def test_resolvable_facts_still_fold_beside_unresolvable_ones():
+    """Exclusion must be surgical: one entity carrying both populations still
+    folds the tagged half."""
+    contents = ["a", "b", "c"]
+    pg_ids = [1, 2, 3]
+    domain_map = {1: "smg", 2: "smg", 3: None}
+    assert eligible_domain_clusters(contents, pg_ids, domain_map, threshold=2) == [
+        ("smg", ["a", "b"], [1, 2])
+    ]
 
 
 def test_content_pgid_alignment_preserved_per_domain():
@@ -92,10 +116,21 @@ def test_count_cycles_thinly_spread_yields_zero():
     assert _count_domain_cycles([1, 2, 3, 4], {1: "x", 2: "x", 3: "y", 4: "y"}, threshold=3) == 0
 
 
-def test_count_cycles_untagged_collapse_to_default():
-    # No domain tags → all collapse to one bucket
-    assert _count_domain_cycles([1, 2], {}, threshold=2) == 1
+def test_count_cycles_untagged_are_excluded_not_pooled():
+    """INVERTED at v0.8.32 (P2) — the gauge must not count a cycle the fold
+    refuses to run."""
+    assert _count_domain_cycles([1, 2], {}, threshold=2) == 0
 
 
-def test_count_cycles_empty_domain_falls_back_to_default():
-    assert _count_domain_cycles([1, 2], {1: "", 2: None}, threshold=2) == 1
+def test_count_cycles_empty_project_is_excluded():
+    assert _count_domain_cycles([1, 2], {1: "", 2: None}, threshold=2) == 0
+
+
+def test_count_cycles_matches_the_partitioner_on_mixed_input():
+    """The gauge and the fold must agree record-for-record, or telemetry drifts
+    from behaviour again — the defect the previous release existed to end."""
+    pg_ids = [1, 2, 3, 4]
+    domain_map = {1: "smg", 2: "smg", 3: None, 4: ""}
+    assert _count_domain_cycles(pg_ids, domain_map, threshold=2) == 1
+    assert len(eligible_domain_clusters(["a", "b", "c", "d"], pg_ids,
+                                        domain_map, threshold=2)) == 1
