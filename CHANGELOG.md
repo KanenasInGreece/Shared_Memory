@@ -5,6 +5,59 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.32] — 2026-08-03
+
+### Changed
+
+- **A record with no resolvable project now folds nothing, instead of pooling
+  with every other such record.** An untagged record used to fall back to a
+  default key, so *every* record in the corpus that nobody had assigned to a
+  project shared one bucket — and once that bucket passed the density
+  threshold it folded, fusing unrelated material into a single narrative on the
+  strength of a property none of them had. An absence is not a subject: two
+  records that each fail to name a project have nothing in common. They are now
+  skipped rather than grouped, and the daemon's partitioner and the telemetry
+  gauge call one predicate so they cannot disagree about which records those
+  are. On the development corpus this affects 129 records and freezes 12
+  existing summaries built on the old bucket — see *Known limitation*.
+
+- **A project node is created only from a project.** The node and its edge are
+  written from the record's resolved project, never from a section of one and
+  never through a fallback chain, so the set of projects in the graph stays a
+  set of projects.
+
+### Added
+
+- **A backfill for the project edge on records written before it existed**, run
+  as a prerequisite of this release rather than a follow-up: nothing can be
+  gated on an axis that two thirds of the corpus does not carry. It **enqueues
+  repair work through the same outbox every other write uses** — it never writes
+  the graph directly — so a partial run leaves durable work rather than half a
+  graph. Dry-run by default, idempotent, and it leaves records with no
+  resolvable project alone rather than inventing one for them.
+
+  The repair is deliberately **narrow**: replaying an ordinary record write
+  would also re-run that record's subject links and resurrect every enrichment
+  edge a later sweep deliberately removed. It matches the existing record and
+  never creates one, and its queue row is deleted on success so a repair is
+  never mistaken for pending work.
+
+  It **refuses to run against a server too old to understand it**, and fails
+  closed when it cannot determine the server's version. An older server would
+  treat the repair as an ordinary record write and blank the stored content of
+  every record it touched — the guard makes that ordering error unarmable
+  rather than merely documented.
+
+### Known limitation
+
+Twelve summaries synthesised from the old shared bucket remain active and
+searchable but will never be refreshed, because the key they were built on no
+longer forms. Their content is not wrong — it was synthesised from real
+records — and retiring them now would destroy narratives for records that are
+about to be repaired. Once those records carry their real project they will
+fold under it, and the stale pair should then be retired; that belongs with the
+repair release, not here.
+
 ## [0.8.31] — 2026-08-03
 
 ### Changed
