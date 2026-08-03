@@ -340,3 +340,52 @@ async def test_a_project_of_row_with_no_project_touches_neo4j_not_at_all():
         7, 549, {"type": "project_of", "project": ""}
     )
     assert session.queries == []
+
+
+# ── The reconciler's predicate — repair a disagreement, never fill an absence ─
+
+def _find_drift(*a, **kw):
+    from reconcile_project_edges import find_drift
+    return find_drift(*a, **kw)
+
+
+def test_reconciler_repairs_a_wrong_edge():
+    drift = _find_drift({7: "tier3-cloe"}, {7: ["shared-memory-GitHub"]}, set())
+    assert drift == {7: (["shared-memory-GitHub"], "tier3-cloe")}
+
+
+def test_reconciler_collapses_an_extra_edge():
+    """A bare MERGE only ever adds, so a record can name two projects at once."""
+    drift = _find_drift({7: "tier3-cloe"}, {7: ["tier3-cloe", "smg"]}, set())
+    assert 7 in drift
+
+
+def test_reconciler_leaves_an_agreeing_record_alone():
+    assert _find_drift({7: "smg"}, {7: ["smg"]}, set()) == {}
+
+
+def test_reconciler_never_fills_an_absence():
+    """Repairing a disagreement is not the same act as filling a gap. On the
+    live corpus 161 of 167 candidates were edgeless retrospectives, and whether
+    those SHOULD carry the edge is still an open question — so a tool that
+    treated absence as drift would have made a 161-edge graph change wearing the
+    label of a repair."""
+    assert _find_drift({7: "smg"}, {7: []}, set()) == {}
+
+
+def test_reconciler_leaves_parked_records_to_the_promotion_path():
+    """A parked record carrying an edge is the promotion writer's population;
+    clearing it first would destroy the only surviving hint about where the
+    record belongs before anything has been decided about it."""
+    assert _find_drift({7: None}, {7: ["smg"]}, set()) == {}
+    assert _find_drift({7: "general_discussion"}, {7: ["smg"]}, set()) == {}
+
+
+def test_reconciler_skips_rows_already_queued():
+    """Re-running before the worker drains must not enqueue the same repair."""
+    assert _find_drift({7: "a"}, {7: ["b"]}, {7}) == {}
+
+
+def test_reconciler_ignores_a_node_with_no_postgres_row():
+    """A graph node whose record is gone has nothing to be reconciled against."""
+    assert _find_drift({}, {7: ["smg"]}, set()) == {}
