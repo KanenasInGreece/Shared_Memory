@@ -126,6 +126,29 @@ def fetch_pk_columns(cur, table: str) -> set[str]:
     return {s.strip() for s in inner.split(",")}
 
 
+def fetch_table_constraints(cur, table: str) -> list[str]:
+    """Table-level CHECK constraints, rendered as they were declared.
+
+    Without this the generator silently DROPPED them: the fresh-install fast path
+    rebuilt every table from columns and indexes alone, so a constraint that a
+    migration had added existed on upgraded deployments and on NO new one. That
+    is the worst shape a schema divergence can take — the guarantee holds
+    everywhere it was tested and nowhere it was not.
+
+    NOT NULL and PRIMARY KEY are excluded because render_column already emits
+    them; foreign keys are excluded here for the same reason ordering matters —
+    they are not yet used by this schema, and emitting one before its target
+    table exists would break the very install path this file serves.
+    """
+    cur.execute("""
+        SELECT conname, pg_get_constraintdef(oid) AS condef
+        FROM pg_constraint
+        WHERE conrelid = %s::regclass AND contype = 'c'
+        ORDER BY conname
+    """, (table,))
+    return [f"CONSTRAINT {name} {defn}" for name, defn in cur.fetchall()]
+
+
 def fetch_extensions(cur) -> list[str]:
     cur.execute("SELECT extname FROM pg_extension WHERE extname <> 'plpgsql' ORDER BY extname")
     return [row[0] for row in cur.fetchall()]
@@ -193,6 +216,7 @@ def render_table(cur, table: str) -> str:
     cols = fetch_columns(cur, table)
     pk_cols = fetch_pk_columns(cur, table)
     col_lines = [render_column(cur, table, col, pk_cols) for col in cols]
+    col_lines += [f"    {c}" for c in fetch_table_constraints(cur, table)]
     body = ",\n".join(col_lines)
     return f"CREATE TABLE IF NOT EXISTS {table} (\n{body}\n);"
 
