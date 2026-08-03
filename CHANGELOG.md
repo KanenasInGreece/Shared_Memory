@@ -5,6 +5,49 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.35] — 2026-08-03
+
+### Fixed
+
+- **Migrations now run exactly once. They used to be re-run in full, every
+  time.** The apply tool listed every numbered migration and executed all of
+  them on each invocation, while its own documentation said it ran "all
+  pending" — nothing anywhere recorded what had already been applied, so
+  "pending" silently meant "all of them". Most migrations tolerate that, which
+  is why it went unnoticed across twenty-two of them. But tolerance is not the
+  same as being safe to repeat: one migration removes duplicate summaries on a
+  key that a **later** migration changed, and re-running it against the newer
+  schema deleted twelve summaries that were legitimately distinct under the key
+  in force.
+
+  The general point is not about that one file. **A migration is written
+  against the schema as it stood at that moment**, so running it again later
+  runs it against a schema it was never written for. Making every migration
+  safe to repeat is not achievable; running each one once is.
+
+  **The database is now its own ledger** — the record of which migrations have
+  run is a table inside the database being migrated, not a file beside the
+  migrations or state kept in the repository. So the answer to "how far has
+  this database got?" travels with the database itself: restore a backup and
+  the record comes back with it, already agreeing with the schema it describes;
+  copy a deployment and the copy knows its own version; point the tool at
+  another host and it reads that host's state. The tool reads that mark and
+  resumes from it, and a migration and its ledger entry are committed together,
+  so a half-applied migration can never be recorded as done and skipped
+  thereafter.
+
+  A database that predates this record is not guessed about in either
+  direction: the tool refuses to proceed and asks for a one-time instruction to
+  adopt what has already run. Guessing "already applied" would skip a genuinely
+  new migration; guessing "not applied" would repeat the original failure.
+
+  The duplicate-removal step is **additionally guarded** to do nothing once the
+  newer key exists — the ledger is the real fix, but a destructive step should
+  assert that its assumptions still hold rather than trust them. That guard
+  proved its worth immediately: while the refusal path was being tested, a
+  second route into "re-run everything" was found, and the schema came through
+  intact only because the guard was there.
+
 ## [0.8.34] — 2026-08-03
 
 ### Fixed
