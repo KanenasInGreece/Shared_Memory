@@ -228,7 +228,11 @@ async def test_review_returns_rows_and_calibration_envelope():
     assert cal["family"] == "entity_relation"
     assert cal["labels"] == 3 and cal["calibrated"] is False
     assert cal["min_labels"] == coordinator_mod.RELCONF_MIN_LABELS
-    assert cal["threshold"] == pytest.approx(0.60)
+    # Read from the module rather than restated: the consumption threshold moves
+    # with the WRITE floor (989), and a literal here would just have to be
+    # chased each time instead of proving the envelope reports what is configured.
+    assert cal["threshold"] == pytest.approx(
+        coordinator_mod.RELCONF_CONSUME_THRESHOLD["entity_relation"])
     assert cal["bands"][0]["precision"] == pytest.approx(0.667)
     # stratified sample: deciles round-robin, newest-first inside each decile
     sql = mock_conn.fetch.await_args_list[0].args[0]

@@ -102,7 +102,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.28"
+FRAMEWORK_VERSION = "0.8.29"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -790,8 +790,13 @@ RELATION_FAMILIES: tuple[str, ...] = ("entity_relation", "evidential")
 # asserted_by values a machine minted — the ONLY values the guarded edge delete
 # may remove; an operator-asserted edge is never deleted by a label.
 RELATION_MACHINE_ASSERTED: tuple[str, ...] = ("rem", "rem_sweep")
+# Stamp carried by a judgement's COPY of a topic its evidence already had — see
+# _inherit_entities_from_facts (989). Mirrors relation_confidence.ASSERTED_INHERITED.
+RELATION_ASSERTED_INHERITED = "inherited"
 RELCONF_CONSUME_THRESHOLD: dict[str, float] = {
-    "entity_relation": _env_float("RELCONF_CONSUME_ENTITY", 0.60),
+    # 0.68 mirrors the WRITE floor exactly (989): what is trusted enough to
+    # write is trusted enough to fold. Keep in step with relation_confidence.
+    "entity_relation": _env_float("RELCONF_CONSUME_ENTITY", 0.68),
     "evidential":      _env_float("RELCONF_CONSUME_EVIDENTIAL", 0.70),
 }
 RELCONF_MIN_LABELS = _env_int("RELCONF_MIN_LABELS", 20)
@@ -1659,10 +1664,46 @@ class MemoryCoordinator:
         to_facts = (
             f"-[:{rels}*0..1]->(f:{ONT.fact})"
             f" WHERE coalesce(f.superseded, false) = false"
-            f" MATCH (f)-[:{ONT.entity_link}|{ONT.entity_link_alias}]->(e:{ONT.entity})"
+            f" MATCH (f)-[fe:{ONT.entity_link}|{ONT.entity_link_alias}]->(e:{ONT.entity})"
         )
-        link = (f" FOREACH (x IN es | MERGE (a)-[:{ONT.entity_link}]->(x))"
-                f" RETURN size(es) AS n")
+        # The inherited edge is STAMPED (989). It used to be written bare, and a
+        # bare MENTIONS is precisely the signature first write leaves when the
+        # OPERATOR names a concept on a fact — so a copy was indistinguishable
+        # from a naming. That is not a cosmetic confusion: the accept set once
+        # read these copies as first-write namings and let the enrichment pass
+        # link to names it had itself produced (the v0.8.28 cycle). Stamping
+        # removes the ambiguity at the source instead of guarding against it
+        # downstream.
+        #
+        # Standing carries across rather than being re-derived: if ANY source
+        # edge for this entity was an operator naming (bare, no confidence) the
+        # copy is operator-grade and carries no confidence; otherwise it takes
+        # the STRONGEST machine confidence among its sources. consumable()
+        # reads exactly that convention.
+        #
+        # Forward only — no backfill. The bare edges already in the graph mix
+        # fact projection, inheritance, and pre-0.8.26 judgement minting, and
+        # for older judgement rows those are not separable after the fact; a
+        # backfill would be a guess written down as provenance.
+        link = (
+            f" WITH a, pairs UNWIND pairs AS p"
+            f" WITH a, p[0] AS e, p[1] AS c"
+            # `collect()` DISCARDS nulls, so an all-operator source set collects
+            # to an EMPTY list rather than a list of nulls — testing the list
+            # for a null member therefore never fires, and every operator naming
+            # would inherit as confidence 0.0: numeric, machine-grade, and BELOW
+            # every threshold, i.e. the exact opposite of operator standing.
+            # Count the rows instead and compare: fewer collected than seen
+            # means at least one source carried no confidence.
+            f" WITH a, e, count(*) AS srcs, collect(c) AS cs"
+            f" WITH a, e, CASE WHEN size(cs) < srcs THEN null"
+            f"                 ELSE reduce(mx = 0.0, z IN cs |"
+            f"                             CASE WHEN z > mx THEN z ELSE mx END) END AS conf"
+            f" MERGE (a)-[m:{ONT.entity_link}]->(e)"
+            f"   ON CREATE SET m.asserted_by = '{RELATION_ASSERTED_INHERITED}',"
+            f"                 m.confidence  = conf"
+            f" WITH count(e) AS n RETURN n"
+        )
         for tier in ("operator", "system", "outcome"):
             if tier == "outcome":
                 # Hop the HAD_OUTCOME edge to the counterpart record, then read
@@ -1677,7 +1718,7 @@ class MemoryCoordinator:
                         f"-[:{ONT.had_outcome}]->(o:{ONT.retrospective})"
                         f" WHERE coalesce(o.superseded, false) = false"
                         f" MATCH (o)-[:{rels}]->(t){to_facts}"
-                        f" WITH a, o, collect(DISTINCT e) AS es"
+                        f" WITH a, o, collect(DISTINCT [e, fe.confidence]) AS pairs"
                         f" ORDER BY coalesce(o.date, '') DESC, o.pg_id DESC LIMIT 1"
                         + link
                     )
@@ -1686,7 +1727,7 @@ class MemoryCoordinator:
                         f"MATCH (a:{anchor} {{pg_id: $pg_id}})"
                         f"<-[:{ONT.had_outcome}]-(o:{ONT.decision})"
                         f" MATCH (o)-[:{rels}]->(t){to_facts}"
-                        f" WITH a, collect(DISTINCT e) AS es"
+                        f" WITH a, collect(DISTINCT [e, fe.confidence]) AS pairs"
                         + link
                     )
             else:
@@ -1696,7 +1737,7 @@ class MemoryCoordinator:
                     f"MATCH (a:{anchor} {{pg_id: $pg_id}})-[g:{rels}]->(t)"
                     f" WHERE {where}"
                     f" MATCH (t){to_facts}"
-                    f" WITH a, collect(DISTINCT e) AS es"
+                    f" WITH a, collect(DISTINCT [e, fe.confidence]) AS pairs"
                     + link
                 )
             rec = await (await session.run(cypher, pg_id=pg_id)).single()

@@ -577,7 +577,7 @@ async def test_inheritance_falls_back_to_system_then_retrospective():
     # The ordering runs AFTER the topic match, so the newest retrospective that
     # actually reaches facts wins. Ordering first would let an ungrounded newest
     # verdict be picked and blank the tier while a grounded sibling sat there.
-    assert retro_cypher.index("collect(DISTINCT e)") < retro_cypher.index("ORDER BY")
+    assert retro_cypher.index("collect(DISTINCT [e,") < retro_cypher.index("ORDER BY")
     # Forward guard only: nothing sets `superseded` on a :Retrospective today
     # (the reversal marks the DECISION), so this filter is currently inert — it
     # is not evidence that a retracted verdict is excluded.
@@ -605,6 +605,36 @@ async def test_retrospective_inherits_by_the_same_rule_hopping_the_other_way():
     # the same projection. Filtering the judgement here would blank the topics of
     # the very record doing the reversing, so this hop is deliberately unfiltered.
     assert "o.superseded" not in outcome_cypher
+
+
+@pytest.mark.asyncio
+async def test_inheritance_stamps_the_copy_it_writes():
+    """A judgement's copy of its evidence's topic is STAMPED (989). It used to
+    be written bare — and a bare MENTIONS is exactly the signature first write
+    leaves when the OPERATOR names a concept on a fact. The two were therefore
+    indistinguishable, which is how machine-added names came to read as
+    first-write namings and re-qualified themselves as link targets.
+
+    Standing carries across rather than being re-derived: any operator source
+    (null confidence) makes the copy operator-grade; otherwise it takes the
+    strongest machine confidence among its sources."""
+    session = _TieredSession([0, 0, 0])
+    await MemoryCoordinator._inherit_entities_from_facts(session, 42)
+
+    for cypher in session.cyphers:
+        assert f"asserted_by = '{coordinator_mod.RELATION_ASSERTED_INHERITED}'" in cypher
+        # the source edge is bound and its confidence collected per entity
+        assert "fe.confidence" in cypher
+        # ⚠ Found on the LIVE graph, not here: `collect()` DISCARDS nulls, so an
+        # all-operator source set collects EMPTY and a null-member test never
+        # fires — every operator naming then inherited confidence 0.0, which is
+        # numeric, machine-grade and below every threshold. The null signal must
+        # come from comparing counts, never from inspecting the collected list.
+        assert "count(*) AS srcs" in cypher and "size(cs) < srcs THEN null" in cypher
+        assert "IN cs WHERE z IS NULL" not in cypher
+        # ON CREATE only — an edge already there (an operator's own, or one from
+        # an earlier projection) is never rewritten or downgraded
+        assert "ON CREATE SET" in cypher
 
 
 @pytest.mark.asyncio

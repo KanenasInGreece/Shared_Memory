@@ -149,6 +149,61 @@ def test_gate_semantics_match_consumable():
     assert not rc.consumable(rc.FAMILY_ENTITY, "rem_sweep", thr - 0.01, True)
 
 
+def test_inherited_edge_takes_its_source_standing_not_a_new_one():
+    """A judgement's COPY of its evidence's topic (989) is stated explicitly in
+    consumable() rather than falling through to the legacy branch. Copied from
+    an operator naming (no confidence) it is operator-grade; copied from a
+    machine edge it carries that score and is gated exactly as the original was.
+
+    The distinction is what stopped a machine name from reading as a first-write
+    one: before the stamp, an inherited edge was written BARE — the same
+    signature an operator naming leaves."""
+    thr = rc.CONSUME_THRESHOLD[rc.FAMILY_ENTITY]
+    inh = rc.ASSERTED_INHERITED
+    # copied from an operator naming → no confidence → operator-grade
+    assert rc.consumable(rc.FAMILY_ENTITY, inh, None, False)
+    # copied from a machine edge → gated on the family exactly like the source
+    assert rc.consumable(rc.FAMILY_ENTITY, inh, thr, True)
+    assert not rc.consumable(rc.FAMILY_ENTITY, inh, thr - 0.01, True)
+    assert not rc.consumable(rc.FAMILY_ENTITY, inh, thr, False)   # uncalibrated
+    # and it is NOT the legacy class: a scored copy in an uncalibrated family
+    # must not pass the way a bare pre-provenance edge does
+    assert rc.consumable(rc.FAMILY_ENTITY, None, thr, False)
+
+
+# ── The WRITE floor (989) — the gate that stopped being consumption-only ──────
+
+def test_write_admitted_floors_entity_family_and_fails_closed():
+    floor = rc.WRITE_FLOOR[rc.FAMILY_ENTITY]
+    # at/above the floor with real verification → written
+    assert rc.write_admitted(rc.FAMILY_ENTITY, 3, 3, floor)
+    assert rc.write_admitted(rc.FAMILY_ENTITY, 2, 3, floor + 0.01)
+    # below → withheld
+    assert not rc.write_admitted(rc.FAMILY_ENTITY, 1, 3, floor - 0.0001)
+    # no numeric confidence → withheld (never written "just in case")
+    assert not rc.write_admitted(rc.FAMILY_ENTITY, 3, 3, None)
+    # FAIL-CLOSED: k <= 1 means no verification call succeeded. votes/k is then
+    # 1.0 and vote_confidence would hand it the CEILING — the one input where
+    # the score is highest precisely because nothing checked it.
+    assert rc.vote_confidence(1, 1, "tested") == pytest.approx(0.95)
+    assert not rc.write_admitted(rc.FAMILY_ENTITY, 1, 1, 0.95)
+    assert not rc.write_admitted(rc.FAMILY_EVIDENTIAL, 1, 1, 0.95)
+
+
+def test_write_floor_never_applies_to_the_evidential_family():
+    """Evidential proposals are BORN capped below their own consumption
+    threshold (rung 1) so that adjudication promotes them, never the proposer.
+    A write floor above that cap would make every one of them unwritable at
+    birth — closing the ladder silently instead of leaving it visibly unbuilt."""
+    assert rc.FAMILY_EVIDENTIAL not in rc.WRITE_FLOOR
+    assert rc.EVIDENTIAL_BORN_BELOW_CAP < rc.WRITE_FLOOR[rc.FAMILY_ENTITY]
+    # a fully-confirmed evidential edge sits below the entity floor by design,
+    # and is still written
+    conf = rc.vote_confidence(3, 3, "tested", family=rc.FAMILY_EVIDENTIAL)
+    assert conf < rc.WRITE_FLOOR[rc.FAMILY_ENTITY]
+    assert rc.write_admitted(rc.FAMILY_EVIDENTIAL, 3, 3, conf)
+
+
 def test_default_gate_is_fail_closed():
     g = _default_calibration_gate()
     for fam in rc.FAMILIES:
