@@ -569,6 +569,16 @@ Rules:
 
 # ── Pure helpers ──────────────────────────────────────────────────────────────
 
+# The AXIS labels. A project (and, from the domain registry, a domain) says which
+# project a record BELONGS TO — it is established at first write from the client's
+# working directory, or later by the promotion writer, and never inferred from
+# what a record happens to talk about. REM must not reference one at all: not to
+# write the axis edge (P18), and not to point MENTIONS at it (P14, "neither axis
+# is a topic"). Listed once, so adding `:Domain` closes both branches at once
+# rather than requiring the same three-table edit to be remembered twice.
+_AXIS_LABELS: frozenset[str] = frozenset({ONT.project})
+
+
 def _safe_label(labels: list[str]) -> str:
     """Return the first ontology-known label from a Neo4j labels() result.
 
@@ -682,6 +692,23 @@ def _build_entity_registry(closed_set: list[dict]) -> dict[str, dict]:
         name   = row.get("name")
         labels = row.get("labels") or []
         if not name:
+            continue
+        # ⚠ AXIS NODES ARE REFUSED HERE, on the RAW labels, and this gate is
+        # deliberately redundant with the accept-set query.
+        #
+        # It has to be, because `_safe_label` COERCES: any label not in
+        # _KNOWN_LABELS becomes ONT.entity. Now that the axis labels are (rightly)
+        # out of that set, a :Project arriving here would not be rejected — it
+        # would be silently reclassified as an ordinary :Entity and handed
+        # MENTIONS as its default relation. That is the axis-as-topic violation
+        # (P14) reached by a different road, and nothing downstream would object,
+        # because downstream would see an Entity.
+        #
+        # So the query is not allowed to be the only thing standing between the
+        # corpus and that: REM writing the project axis was a live defect
+        # precisely because one gate was assumed to cover a case it did not.
+        # Keyed on the raw labels, since the coercion is what hides the problem.
+        if _AXIS_LABELS & set(labels):
             continue
         label = _safe_label(labels)
         entry = {

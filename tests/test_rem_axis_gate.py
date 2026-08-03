@@ -102,3 +102,79 @@ def test_the_entity_registry_offers_no_project_to_reference():
     # The labels it DOES offer must all be ones REM can actually write.
     for label in (ONT.human, ONT.ai_agent, ONT.decision):
         assert label in rem_loop._KNOWN_LABELS
+
+
+# ── The paths that actually plan edges, for EVERY record kind ────────────────
+#
+# The tables above are necessary and not sufficient: plan_edges has two branches
+# and they are gated in different places — the relationships branch through
+# _resolve_rel, the decision-extras branch on the target label. A decision or a
+# retrospective must reach the axis through neither.
+
+def _registry_with_a_project():
+    """An accept set that still contains a :Project row — the state the query is
+    supposed to prevent, used here to prove the SECOND gate holds on its own."""
+    return rem_loop._build_entity_registry([
+        {"name": "shared-memory-monitor", "labels": [ONT.project], "pg_id": None},
+        {"name": "Coordinator", "labels": [ONT.entity], "pg_id": None},
+    ])
+
+
+def test_an_axis_node_never_enters_the_registry_even_if_the_query_returns_one():
+    """The redundant gate, and it must be redundant.
+
+    `_safe_label` COERCES an unknown label to :Entity, so with the axis labels
+    removed from _KNOWN_LABELS a :Project reaching the registry would be
+    silently reclassified as an ordinary entity and handed MENTIONS — the
+    axis-as-topic violation by another road, invisible downstream.
+    """
+    registry = _registry_with_a_project()
+    assert "shared-memory-monitor" not in registry
+    assert "Coordinator" in registry
+
+
+def _plan(kind, rel_name, rel_type=None, extras=None):
+    result = {"relationships": [{"name": rel_name, **({"rel_type": rel_type} if rel_type else {})}]}
+    if extras:
+        result.update(extras)
+    manifest = {"kind": kind, "entities": [], "existing_edges": [],
+                "fact_kind": None, "source_ref": None, "project": None,
+                "decision_title": None, "rating": None, "created_at": None}
+    return rem_loop.plan_edges(result, _registry_with_a_project(), kind, manifest)
+
+
+@pytest.mark.parametrize("kind", [
+    rem_loop.KIND_FACT, rem_loop.KIND_DECISION, rem_loop.KIND_RETRO,
+])
+def test_no_record_kind_can_link_to_a_project(kind):
+    """Facts, decisions AND retrospectives. The axis is established at first
+    write; no record type may acquire it by being enriched."""
+    plan = _plan(kind, "shared-memory-monitor", ONT.project_of)
+    assert plan["edges"] == []
+    assert "shared-memory-monitor" in plan["mint_dropped"]
+
+
+@pytest.mark.parametrize("kind", [
+    rem_loop.KIND_FACT, rem_loop.KIND_DECISION, rem_loop.KIND_RETRO,
+])
+def test_no_record_kind_can_mention_a_project_either(kind):
+    """P14 — the axis is not a topic. Proposing MENTIONS rather than the axis
+    edge must fail the same way, or the fix only moved the defect."""
+    plan = _plan(kind, "shared-memory-monitor", ONT.entity_link)
+    assert plan["edges"] == []
+
+
+def test_the_decision_extras_branch_cannot_reach_a_project():
+    """CONSIDERED / REJECTED / UNDER_CONDITIONS / PRODUCES_INSIGHT never pass
+    through _resolve_rel, so the relationships-branch gate does not cover them."""
+    extras = {key: ["shared-memory-monitor"] for key in rem_loop._EXTRA_RESULT_KEYS.values()}
+    plan = _plan(rem_loop.KIND_DECISION, "Coordinator", ONT.entity_link, extras=extras)
+    assert all(e["name"] != "shared-memory-monitor" for e in plan["edges"])
+    assert all(e["rel_type"] != ONT.project_of for e in plan["edges"])
+
+
+def test_a_legitimate_entity_still_links_on_every_kind():
+    """The gate must not be a blanket refusal — enrichment still has to work."""
+    for kind in (rem_loop.KIND_FACT, rem_loop.KIND_DECISION, rem_loop.KIND_RETRO):
+        plan = _plan(kind, "Coordinator", ONT.entity_link)
+        assert [e["name"] for e in plan["edges"]] == ["Coordinator"], kind
