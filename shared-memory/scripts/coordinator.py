@@ -67,6 +67,7 @@ from insight_gate import (
 from project_promotion import (
     promote_record, sole_project, METHOD_GROUNDING,
 )
+from project_alias import ALIAS_RESOLVE_SQL
 
 log = logging.getLogger("coordinator")
 
@@ -113,7 +114,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.36"
+FRAMEWORK_VERSION = "0.8.37"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -2194,6 +2195,23 @@ class MemoryCoordinator:
         if await self._project_registered(supplied):
             return None
 
+        # A retired spelling resolves to the name that replaced it, and the
+        # record is stored under the CANONICAL name. This is what makes a rename
+        # durable: a folder on another machine still carries the old name, and
+        # without this the next save from it recreates the variant the merge
+        # just removed. Rewriting here rather than resolving in every reader is
+        # the same choice PROJECT_SQL made — one resolution, at ingress.
+        canonical = await self._resolve_project_alias(supplied)
+        if canonical is not None:
+            log.info("project alias: %r → %r (record stored as the canonical name)",
+                     supplied, canonical)
+            if isinstance(metadata.get("decision"), dict) and \
+                    metadata["decision"].get("project"):
+                metadata["decision"]["project"] = canonical
+            else:
+                metadata["project"] = canonical
+            return None
+
         # P9 — the second submission is ACCEPTED, in any of its three forms: pick
         # a proposal (now a registry hit), declare a new project, or park it on
         # the sentinel. There is deliberately NO round counter on the server: the
@@ -2212,6 +2230,30 @@ class MemoryCoordinator:
         """Is this an established project? (P4, migration 022's registry.)"""
         async with self._acquire() as conn:
             return await conn.fetchval(PROJECT_EXISTS_SQL, name) is not None
+
+    async def _resolve_project_alias(self, name: str) -> str | None:
+        """The canonical project a retired spelling resolves to, or None.
+
+        ONE lookup, never a walk (A3). Chains exist in this corpus — one project
+        has been spelled three ways across two machines — but they are collapsed
+        when the rename is WRITTEN, so every active alias points directly at a
+        canonical name. Following links here would put a graph walk on the
+        ingress path, and a walk can cycle.
+
+        Failure is treated as "not an alias" rather than propagated: this sits
+        between the registry check and the 400, so an error here must produce
+        the ordinary rejection an unknown project already gets, not a 500 on a
+        save that was merely using an unregistered name.
+        """
+        try:
+            async with self._acquire() as conn:
+                return await conn.fetchval(
+                    ALIAS_RESOLVE_SQL.format(p="$1"), name
+                )
+        except Exception as exc:
+            log.warning("alias lookup failed for %r, treating as unknown: %s",
+                        name, exc)
+            return None
 
     async def _register_project(self, name: str, agent_id: str) -> None:
         """Register a project the caller declared new (P9's second form).

@@ -426,9 +426,19 @@ def _parse_llm_json(candidate: str):
 # Only labels whose identity key IS `name` belong here.
 # CommunitySummary / ReasoningTrace / ReasoningStep are keyed by pg_id, not name —
 # including them would create structurally incompatible phantom nodes.
+# ⚠ ONT.project IS DELIBERATELY ABSENT — see P14/P18. A project is an AXIS, not
+# a topic: it says which project a record belongs to, and that is established at
+# first write from the client's working directory (or by the promotion writer),
+# never inferred from what a record happens to talk about. While `:Project` was
+# in this set REM could mint one from any name the LLM proposed and attach the
+# axis edge itself, so ANY fact whose text mentioned another project acquired a
+# second, false PROJECT_OF — observed live on a fact whose content discussed
+# `shared-memory-monitor` while belonging to `shared-memory-GitHub`. It also kept
+# retired alias nodes alive by hanging MENTIONS on them after a merge had removed
+# every legitimate edge. `:Domain` must never be added here for the same reason.
 _KNOWN_LABELS: frozenset[str] = frozenset({
     ONT.fact, ONT.entity, ONT.decision,
-    ONT.human, ONT.ai_agent, ONT.project, ONT.activity, ONT.milestone,
+    ONT.human, ONT.ai_agent, ONT.activity, ONT.milestone,
 })
 
 # Default relationship assigned when a known typed node is referenced and
@@ -436,7 +446,9 @@ _KNOWN_LABELS: frozenset[str] = frozenset({
 _LABEL_DEFAULT_REL: dict[str, str] = {
     ONT.human:    ONT.was_attributed_to,
     ONT.ai_agent: ONT.was_assisted_by,
-    ONT.project:  ONT.project_of,
+    # No ONT.project entry: REM cannot reference a :Project at all (see
+    # _KNOWN_LABELS), so a default relation for one would be unreachable code
+    # that documents a capability the gate has removed.
     ONT.decision: ONT.informed_by,
     ONT.entity:   ONT.entity_link,
 }
@@ -455,7 +467,9 @@ _LABEL_DEFAULT_REL: dict[str, str] = {
 _LABEL_ALLOWED_RELS: dict[str, frozenset[str]] = {
     ONT.human:    frozenset({ONT.was_attributed_to, ONT.entity_link}),
     ONT.ai_agent: frozenset({ONT.was_assisted_by,   ONT.entity_link}),
-    ONT.project:  frozenset({ONT.project_of,         ONT.entity_link}),
+    # No ONT.project entry. It used to permit PROJECT_OF *and* MENTIONS at a
+    # :Project — the first made REM a second writer of the project axis, the
+    # second made the axis a topic. Both are now impossible upstream.
     ONT.decision: frozenset({ONT.informed_by,         ONT.entity_link}),
     ONT.entity:   frozenset({ONT.entity_link,         ONT.entity_link_alias}),
 }
@@ -538,7 +552,6 @@ Relationship types (choose the most precise fit for each referenced entity):
   {ONT.entity_link:<24} Fact/Decision mentions a generic named concept
   {ONT.was_attributed_to:<24} Fact/Decision is owned by or attributed to a Human
   {ONT.was_assisted_by:<24} Fact/Decision was produced with help from an AIAgent
-  {ONT.project_of:<24} Fact/Decision belongs to / is scoped to a Project
   {ONT.informed_by:<24} Fact/Decision was informed by a prior Decision
   {ONT.produces_insight:<24} What knowledge or insight does this fact/decision generate?
   {ONT.under_conditions:<24} What constraints or conditions bound this decision?
@@ -555,6 +568,16 @@ Rules:
 
 
 # ── Pure helpers ──────────────────────────────────────────────────────────────
+
+# The AXIS labels. A project (and, from the domain registry, a domain) says which
+# project a record BELONGS TO — it is established at first write from the client's
+# working directory, or later by the promotion writer, and never inferred from
+# what a record happens to talk about. REM must not reference one at all: not to
+# write the axis edge (P18), and not to point MENTIONS at it (P14, "neither axis
+# is a topic"). Listed once, so adding `:Domain` closes both branches at once
+# rather than requiring the same three-table edit to be remembered twice.
+_AXIS_LABELS: frozenset[str] = frozenset({ONT.project})
+
 
 def _safe_label(labels: list[str]) -> str:
     """Return the first ontology-known label from a Neo4j labels() result.
@@ -669,6 +692,23 @@ def _build_entity_registry(closed_set: list[dict]) -> dict[str, dict]:
         name   = row.get("name")
         labels = row.get("labels") or []
         if not name:
+            continue
+        # ⚠ AXIS NODES ARE REFUSED HERE, on the RAW labels, and this gate is
+        # deliberately redundant with the accept-set query.
+        #
+        # It has to be, because `_safe_label` COERCES: any label not in
+        # _KNOWN_LABELS becomes ONT.entity. Now that the axis labels are (rightly)
+        # out of that set, a :Project arriving here would not be rejected — it
+        # would be silently reclassified as an ordinary :Entity and handed
+        # MENTIONS as its default relation. That is the axis-as-topic violation
+        # (P14) reached by a different road, and nothing downstream would object,
+        # because downstream would see an Entity.
+        #
+        # So the query is not allowed to be the only thing standing between the
+        # corpus and that: REM writing the project axis was a live defect
+        # precisely because one gate was assumed to cover a case it did not.
+        # Keyed on the raw labels, since the coercion is what hides the problem.
+        if _AXIS_LABELS & set(labels):
             continue
         label = _safe_label(labels)
         entry = {
@@ -1541,9 +1581,13 @@ class REMDaemon:
         namings = f"COUNT {{ {_live_naming} }}"
         async with self.driver.session() as session:
             result = await session.run(
+                # :Project is deliberately NOT offered. REM cannot write to one
+                # (see _KNOWN_LABELS), and a prompt that hides a gate the code
+                # HAS invites volume the gate then throws away — the same
+                # reasoning as _VERIFY_RULE, applied to the registry.
                 f"MATCH (n)"
                 f" WHERE n:{ONT.human} OR n:{ONT.ai_agent}"
-                f"    OR n:{ONT.project} OR n:{ONT.decision}"
+                f"    OR n:{ONT.decision}"
                 f"    OR (n:{ONT.entity} AND {first_write_named})"
                 f" RETURN labels(n) AS labels, n.name AS name, n.pg_id AS pg_id,"
                 f"        n.alias_component AS alias_component,"

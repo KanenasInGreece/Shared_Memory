@@ -5,6 +5,75 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.37] — 2026-08-04
+
+### Fixed
+
+- **The enrichment cycle was quietly rewriting which project a record belongs
+  to.** A record's project is part of its identity: it is established when the
+  record is written, from the working directory it was written in. The
+  enrichment pass — which reads a record's text and links it to the things it
+  talks about — was also permitted to create project nodes and attach that
+  identity edge itself. So **any record whose text merely mentioned another
+  project could end up claiming to belong to both**, and the two answers to
+  "which project is this in?" depended on whether you asked the database or the
+  graph.
+
+  It also kept retired project names alive: after two spellings of one project
+  were merged, enrichment would re-attach references to the retired node,
+  leaving something the merge had just finished removing.
+
+  Enrichment can no longer refer to a project at all — not to write the identity
+  edge, and not to mention one as though it were a topic. The guard is in two
+  independent places on purpose. The first removal alone would have left a
+  subtler version of the same problem, because unrecognised node types are
+  silently treated as ordinary topics, so a project would have slipped through
+  wearing a different hat. The prompt no longer advertises the capability
+  either, and the test that checks this derives what the prompt may say from
+  what the code will accept, so the two cannot drift apart again.
+
+### Added
+
+- **A renamed project is now remembered, not merely renamed.** Renaming used to
+  rewrite every record onto the new name and forget the old one, which failed
+  in two ways. The retired name came *back* — a folder on another machine still
+  carried it, so the next save from that machine recreated the variant the
+  rename had just removed. And with the judgement recorded nowhere, the old
+  name looked like an unknown stranger to every later review, so a decision made
+  once had to be made again every time anybody looked.
+
+  Retired names now resolve to the current one as records arrive, and the record
+  is stored under the current name. A machine that cannot be reached, or a
+  folder nobody wants to rename, stops mattering. The mapping is kept rather than
+  applied and discarded, so the history of a name is a question the database can
+  answer. Renaming and remembering happen together, in one step.
+
+  Resolution deliberately follows exactly one link. Chains do occur — one project
+  here had been spelled three ways across two machines — and following a chain
+  while records are being saved could loop. Chains are collapsed when the rename
+  is recorded instead, so arrival stays a single lookup.
+
+- **Projects can be registered from the directories that define them.** A project
+  name is the project folder name, so which projects exist is a directory
+  listing rather than something to infer from stored records — inferring it
+  registers the misspellings alongside the projects. Names matching a folder need
+  no thought; everything else is surfaced as a question, which on this corpus cut
+  the names needing a human decision from seventeen to nine. Near-misses and
+  names with no local folder (work assisted from another machine is not the same
+  as work retired) are reported, never resolved automatically.
+
+- **A tool to make the graph's project edge agree with the database.** It repairs
+  a *disagreement* and never fills an *absence* — the two look alike in a query
+  and are not the same act, and conflating them would have made a large silent
+  change wearing the label of a repair.
+
+### Fixed (schema)
+
+- **Functions and triggers were missing from the fresh-install schema**, the
+  third kind of object the generator had silently dropped after check
+  constraints and foreign keys. A rule that no single table can enforce alone
+  would have held on every upgraded deployment and on no new one.
+
 ## [0.8.36] — 2026-08-04
 
 ### Added

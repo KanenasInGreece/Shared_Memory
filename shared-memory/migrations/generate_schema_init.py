@@ -208,6 +208,89 @@ def render_foreign_keys(cur) -> list[str]:
     return out
 
 
+def fetch_functions(cur) -> list[str]:
+    """Every function this schema DEFINES, rendered as it was declared.
+
+    ⚠ Extension-owned functions are excluded, and that filter is the whole
+    difficulty: `CREATE EXTENSION vector` alone installs ~150 functions into
+    `public`, so emitting everything would rebuild pgvector's API by hand and
+    then conflict with the extension itself. `pg_depend` with deptype 'e' is
+    what distinguishes "installed by an extension" from "written by us".
+    """
+    cur.execute("""
+        SELECT pg_get_functiondef(p.oid)
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public'
+          AND NOT EXISTS (
+              SELECT 1 FROM pg_depend d
+              WHERE d.objid = p.oid AND d.deptype = 'e'
+          )
+        ORDER BY p.proname
+    """)
+    return [row[0] for row in cur.fetchall()]
+
+
+def fetch_triggers(cur) -> list[tuple[str, str, str]]:
+    """(trigger name, table, definition) for every non-internal trigger.
+
+    ⚠ THE GENERATOR EMITTED NONE OF THESE EITHER. That is the third class of
+    object it has silently dropped, after CHECKs and foreign keys, and it was
+    about to matter: this schema's cross-table alias rule — an alias and a
+    canonical project name must never be the same string — is enforceable only
+    by a trigger, because no single CHECK can see two tables. Without this it
+    would have held on every upgraded deployment and on no new one.
+
+    A NOTE ON WHAT THIS DOES *NOT* FIX, because the first reading was wrong. A
+    long-lived deployment may also carry triggers that no migration creates,
+    added by hand before the chain existed. Those are LOCAL DRIFT, not a gap in
+    this file: the generator builds its scratch database from the migrations, so
+    it can only emit what the chain produces, and a hand-made trigger is
+    invisible to it by construction. Such a trigger belongs in a migration or
+    nowhere — and before assuming it is load-bearing, check whether the
+    application already does the same work, because a duplicate is the more
+    likely explanation for something nobody wrote down.
+
+    The general lesson is not "add triggers": a generator that renders SOME
+    kinds of object will keep missing the kinds nobody has needed yet, so the
+    check that matters is building the database from this file and comparing it
+    against a migrated one.
+    """
+    cur.execute("""
+        SELECT t.tgname, c.relname, pg_get_triggerdef(t.oid)
+        FROM pg_trigger t
+        JOIN pg_class c ON c.oid = t.tgrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE NOT t.tgisinternal AND n.nspname = 'public'
+        ORDER BY c.relname, t.tgname
+    """)
+    return [(r[0], r[1], r[2]) for r in cur.fetchall()]
+
+
+def render_functions_and_triggers(cur) -> list[str]:
+    """Functions first, then the triggers that call them — a trigger cannot be
+    created before the function it names exists."""
+    functions = fetch_functions(cur)
+    triggers = fetch_triggers(cur)
+    if not functions and not triggers:
+        return []
+    out: list[str] = []
+    if functions:
+        out.append("-- ─── Functions ─────────────────────────────────────────────────────────────")
+        out.append("")
+        # pg_get_functiondef already emits CREATE OR REPLACE, so this is
+        # re-runnable without a guard.
+        out.extend(f"{fn};\n" for fn in functions)
+    if triggers:
+        out.append("-- ─── Triggers ──────────────────────────────────────────────────────────────")
+        out.append("-- Created after the functions they call. DROP-then-CREATE because Postgres")
+        out.append("-- has no CREATE TRIGGER IF NOT EXISTS and this file promises idempotency.")
+        out.append("")
+        for name, table, defn in triggers:
+            out.append(f"DROP TRIGGER IF EXISTS {name} ON {table};\n{defn};\n")
+    return out
+
+
 def fetch_extensions(cur) -> list[str]:
     cur.execute("SELECT extname FROM pg_extension WHERE extname <> 'plpgsql' ORDER BY extname")
     return [row[0] for row in cur.fetchall()]
@@ -340,6 +423,7 @@ def generate(conn) -> str:
         sections.append("")
 
     sections.extend(render_foreign_keys(cur))
+    sections.extend(render_functions_and_triggers(cur))
 
     sections.append("COMMIT;")
     return "\n".join(sections) + "\n"
