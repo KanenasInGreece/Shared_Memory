@@ -146,7 +146,14 @@ class FakeConn:
 
 @pytest.mark.asyncio
 async def test_promotion_writes_metadata_outbox_and_ledger():
-    """Both stores plus the durable record, in the caller's transaction."""
+    """Both stores plus the durable record, in the caller's transaction.
+
+    ⚠ Matched with startswith, never with `in`. A substring check is satisfied
+    by the statement appearing in a COMMENT — deleting the ledger write and
+    leaving `-- INSERT INTO project_promotions` behind survived this test until
+    it was written this way. That is the same failure mode as asserting on
+    source text, reached from a different direction.
+    """
     conn = FakeConn(current=None)
     result = await promote_record(
         conn, 549, "shared-memory-GitHub",
@@ -155,9 +162,32 @@ async def test_promotion_writes_metadata_outbox_and_ledger():
     assert result["promoted"] is True
     assert result["from"] is None
     stmts = conn.statements()
-    assert any(s.startswith("UPDATE technical_docs") for s in stmts)
-    assert any("INSERT INTO neo4j_outbox" in s for s in stmts)
-    assert any("INSERT INTO project_promotions" in s for s in stmts)
+    assert sum(s.startswith("UPDATE technical_docs") for s in stmts) == 1
+    assert sum(s.startswith("INSERT INTO neo4j_outbox") for s in stmts) == 1
+    assert sum(s.startswith("INSERT INTO project_promotions") for s in stmts) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_ledger_row_carries_the_whole_transition():
+    """The ledger is the ONLY durable evidence for a one-way write. A row that
+    omits where the record came from, or on what basis, cannot answer the
+    question it exists to answer — so the values are asserted, not just the
+    statement's presence."""
+    conn = FakeConn(current=SENTINEL)
+    await promote_record(
+        conn, 549, "shared-memory-GitHub",
+        method=METHOD_GROUNDING, actor="claude", note="grounded by pg_id=1000",
+    )
+    ledger = [a for s, a in conn.executed
+              if s.startswith("INSERT INTO project_promotions")]
+    assert len(ledger) == 1
+    pg_id, from_project, to_project, method, actor, note = ledger[0]
+    assert pg_id == 549
+    assert from_project == SENTINEL          # where it came FROM, not just where it went
+    assert to_project == "shared-memory-GitHub"
+    assert method == METHOD_GROUNDING        # on what basis
+    assert actor == "claude"                 # who asked
+    assert "1000" in note                    # and the evidence for it
 
 
 @pytest.mark.asyncio
