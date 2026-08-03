@@ -61,7 +61,7 @@ _load_env()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ontology import ONT  # noqa: E402
 from project_axis import PROJECT_SQL  # noqa: E402
-from project_promotion import promote_record  # noqa: E402
+from project_promotion import promote_record, METHOD_OPERATOR  # noqa: E402
 from entity_vote import (  # noqa: E402
     tally, vote_band, is_auto, BAND_AUTO, BAND_HIGH, BAND_REVIEW, BAND_NONE,
     MIN_SUPPORT, REVIEW_FLOOR, CLOSE_REVIEW_CEILING,
@@ -159,7 +159,55 @@ def write_review_file(path: str, groups: dict) -> None:
     Path(path).write_text("\n".join(lines) + "\n")
 
 
-async def run(apply: bool, review_file: str | None) -> int:
+async def _apply_confirmed(conn, groups, confirm: str, excluded: str) -> int:
+    """Write the proposals an operator has confirmed.
+
+    ⚠ THE VOTE IS RE-DERIVED, never read back from the file or the message that
+    listed it. Two reasons, both live: promoting a record makes it a VOTING
+    NEIGHBOUR, so earlier writes in this same run change later tallies — the
+    proposal count moved 62 → 64 for exactly that reason — and an operator may
+    confirm from a listing produced minutes or days earlier. A confirmation is
+    approval of a JUDGEMENT, not of a stale row, so anything whose proposal no
+    longer stands is refused rather than written on the strength of an old
+    number.
+    """
+    skip = {int(x) for x in excluded.split(",") if x.strip().isdigit()}
+    proposals = {r["pg_id"]: r for r in groups[BAND_HIGH] + groups[BAND_REVIEW]}
+    if confirm.strip().lower() == "proposed":
+        wanted = set(proposals)
+    else:
+        wanted = {int(x) for x in confirm.split(",") if x.strip().isdigit()}
+    wanted -= skip
+
+    written = refused = 0
+    for pg_id in sorted(wanted):
+        row = proposals.get(pg_id)
+        if row is None:
+            print(f"  refused pg_id={pg_id}: no live proposal — the vote no longer "
+                  f"places it in a review band")
+            refused += 1
+            continue
+        async with conn.transaction():
+            result = await promote_record(
+                conn, pg_id, row["project"],
+                method=METHOD_OPERATOR, actor="operator",
+                note=(f"operator-confirmed entity vote: {row['share']:.0%} of "
+                      f"{row['support']} neighbouring facts; competing "
+                      f"{[(p, n) for p, n in row['all'] if p != row['project']] or 'none'}"),
+            )
+        if result["promoted"]:
+            written += 1
+        else:
+            refused += 1
+            print(f"  refused pg_id={pg_id}: {result['reason']}")
+    if skip:
+        print(f"  withheld by --except: {sorted(skip)}")
+    print(f"\nOperator-confirmed: wrote {written}, refused {refused}.")
+    return written
+
+
+async def run(apply: bool, review_file: str | None,
+              confirm: str = "", excluded: str = "") -> int:
     import asyncpg
     from neo4j import AsyncGraphDatabase
 
@@ -202,6 +250,14 @@ async def run(apply: bool, review_file: str | None) -> int:
         if review_file:
             write_review_file(review_file, groups)
             print(f"\nProposals written to {review_file}")
+
+        if confirm:
+            raw, parsed = gateway_version()
+            if not gateway_has_promotion_writer(parsed):
+                print(f"\nREFUSING: gateway reports {raw!r}.", file=sys.stderr)
+                return 3
+            await _apply_confirmed(conn, groups, confirm, excluded)
+            return 0
 
         if not apply:
             print("\nDry run — nothing written. Re-run with --apply.")
@@ -246,8 +302,14 @@ def main() -> int:
                     help="write the unanimous band (proposals are never written)")
     ap.add_argument("--review-file", default=None,
                     help="path to write the operator proposal file")
+    ap.add_argument("--confirm", default="",
+                    help="operator-confirmed proposals: 'proposed' for every "
+                         "row in the review bands, or a comma-separated id list")
+    ap.add_argument("--except", dest="excluded", default="",
+                    help="comma-separated pg_ids to withhold from --confirm")
     args = ap.parse_args()
-    return asyncio.run(run(args.apply, args.review_file))
+    return asyncio.run(run(args.apply, args.review_file,
+                          args.confirm, args.excluded))
 
 
 if __name__ == "__main__":
