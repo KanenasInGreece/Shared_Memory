@@ -86,3 +86,22 @@ def test_the_destructive_dedup_is_guarded_against_the_later_key():
         "the entity-level dedup is not guarded by the presence of the later "
         "(entity, domain) index")
     assert "IF to_regclass" in guard
+
+
+def test_an_empty_ledger_on_a_populated_database_refuses_rather_than_re_running():
+    """The refusal must key on the ledger being EMPTY, not on the table being
+    ABSENT. A run that created the table then failed before recording anything —
+    or a ledger cleared by hand — leaves it present and empty, and keying on
+    absence let that fall through to the fresh-install path, which re-runs every
+    migration against a populated database. That is the original bug, reachable
+    by a second route.
+    """
+    src = open(os.path.join(os.path.dirname(__file__), "..", "shared-memory",
+                            "migrations", "apply.py"), encoding="utf-8").read()
+    guard = src.split("Make the operator choose, once.")[1].split("\n")[0:20]
+    guard = "\n".join(guard)
+    condition = [l for l in guard.splitlines() if l.strip().startswith("if ")][0]
+    assert "not applied" in condition, "the refusal must test the ledger's EMPTINESS"
+    assert "had_ledger" not in condition, (
+        "the refusal must not key on the ledger TABLE's absence — an empty table "
+        "on a populated database would fall through to re-running everything")

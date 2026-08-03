@@ -176,7 +176,6 @@ def main() -> int:
     conn = psycopg2.connect(_pg_conn())
     try:
         with conn.cursor() as cur:
-            had_ledger = _table_exists(cur, "schema_migrations")
             framework = _table_exists(cur, _FRAMEWORK_TABLE)
         with conn:
             with conn.cursor() as cur:
@@ -209,11 +208,20 @@ def main() -> int:
                 print(f"  [{'x' if f.name in applied else ' '}] {f.name}")
             return 0
 
-        # A database that predates the ledger has had every migration applied
-        # already, but do not GUESS: silently adopting would skip a genuinely new
-        # file, and silently running would repeat the exact failure this ledger
-        # exists to prevent. Make the operator choose, once.
-        if not had_ledger and framework and not applied:
+        # A populated database with an EMPTY ledger has had every migration
+        # applied already, but do not GUESS: silently adopting would skip a
+        # genuinely new file, and silently running would repeat the exact failure
+        # this ledger exists to prevent. Make the operator choose, once.
+        #
+        # ⚠ The condition is "the ledger is empty", NOT "the ledger table is
+        # missing". Those are different states and the difference bites: a run
+        # that created the table and then failed before recording anything, or a
+        # ledger cleared by hand, leaves the table present and empty — and keying
+        # on the table's absence let that fall straight through to "fresh
+        # install", which re-runs every migration against a populated database.
+        # Found by testing the refusal path itself; the schema survived only
+        # because migration 002's dedup is separately guarded.
+        if framework and not applied:
             print(
                 "This database predates migration tracking: the framework schema "
                 "exists but no migration ledger does.\n\n"
