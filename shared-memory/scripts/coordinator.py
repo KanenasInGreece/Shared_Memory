@@ -1688,8 +1688,15 @@ class MemoryCoordinator:
         link = (
             f" WITH a, pairs UNWIND pairs AS p"
             f" WITH a, p[0] AS e, p[1] AS c"
-            f" WITH a, e, collect(c) AS cs"
-            f" WITH a, e, CASE WHEN any(z IN cs WHERE z IS NULL) THEN null"
+            # `collect()` DISCARDS nulls, so an all-operator source set collects
+            # to an EMPTY list rather than a list of nulls — testing the list
+            # for a null member therefore never fires, and every operator naming
+            # would inherit as confidence 0.0: numeric, machine-grade, and BELOW
+            # every threshold, i.e. the exact opposite of operator standing.
+            # Count the rows instead and compare: fewer collected than seen
+            # means at least one source carried no confidence.
+            f" WITH a, e, count(*) AS srcs, collect(c) AS cs"
+            f" WITH a, e, CASE WHEN size(cs) < srcs THEN null"
             f"                 ELSE reduce(mx = 0.0, z IN cs |"
             f"                             CASE WHEN z > mx THEN z ELSE mx END) END AS conf"
             f" MERGE (a)-[m:{ONT.entity_link}]->(e)"

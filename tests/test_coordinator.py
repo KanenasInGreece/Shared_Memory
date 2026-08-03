@@ -625,7 +625,13 @@ async def test_inheritance_stamps_the_copy_it_writes():
         assert f"asserted_by = '{coordinator_mod.RELATION_ASSERTED_INHERITED}'" in cypher
         # the source edge is bound and its confidence collected per entity
         assert "fe.confidence" in cypher
-        assert "any(z IN cs WHERE z IS NULL) THEN null" in cypher
+        # ⚠ Found on the LIVE graph, not here: `collect()` DISCARDS nulls, so an
+        # all-operator source set collects EMPTY and a null-member test never
+        # fires — every operator naming then inherited confidence 0.0, which is
+        # numeric, machine-grade and below every threshold. The null signal must
+        # come from comparing counts, never from inspecting the collected list.
+        assert "count(*) AS srcs" in cypher and "size(cs) < srcs THEN null" in cypher
+        assert "IN cs WHERE z IS NULL" not in cypher
         # ON CREATE only — an edge already there (an operator's own, or one from
         # an earlier projection) is never rewritten or downgraded
         assert "ON CREATE SET" in cypher
