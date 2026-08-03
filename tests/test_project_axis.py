@@ -354,3 +354,49 @@ def test_backfill_never_writes_neo4j_directly():
     assert "INSERT INTO neo4j_outbox" in src
     assert "'pending'" in src          # the status the worker actually polls
     assert "MERGE" not in src          # no Cypher writes of its own
+
+
+def test_backfill_refuses_against_a_gateway_that_cannot_handle_the_row():
+    """The ordering hazard, made unarmable — and asserted on BEHAVIOUR, not on
+    source text: a guard whose condition is disabled leaves its own message in
+    the file, so a text assertion passes while the guard is dead.
+
+    A worker predating this row type treats it as an ordinary fact row and runs
+    `SET f.content = $content` with content the row does not carry, blanking the
+    content of every fact it touches. Silent graph-side data loss.
+    """
+    import importlib
+    bf = importlib.import_module("backfill_project_of")
+
+    assert bf.gateway_handles_project_of((0, 8, 32)) is True
+    assert bf.gateway_handles_project_of((0, 9, 0)) is True
+    assert bf.gateway_handles_project_of((1, 0, 0)) is True
+    assert bf.gateway_handles_project_of((0, 8, 31)) is False
+    assert bf.gateway_handles_project_of((0, 7, 9)) is False
+
+
+def test_backfill_fails_closed_when_the_version_is_unknowable():
+    """'Cannot tell' is not 'safe to write'."""
+    import importlib
+    bf = importlib.import_module("backfill_project_of")
+
+    assert bf.gateway_handles_project_of(None) is False
+
+    old = bf.GATEWAY_URL
+    try:
+        bf.GATEWAY_URL = "http://127.0.0.1:1"   # nothing listens here
+        raw, parsed = bf.gateway_version()
+        assert parsed is None
+        assert bf.gateway_handles_project_of(parsed) is False
+    finally:
+        bf.GATEWAY_URL = old
+
+
+def test_backfill_consults_the_guard_before_inserting():
+    """Placement matters as much as the predicate: the check must gate the
+    INSERT, not merely exist somewhere in the file."""
+    src = open(os.path.join(_SCRIPTS, "backfill_project_of.py"), encoding="utf-8").read()
+    apply_path = src.split("Dry run — nothing enqueued")[1]
+    assert apply_path.index("gateway_handles_project_of") < apply_path.index(
+        "INSERT INTO neo4j_outbox"
+    )

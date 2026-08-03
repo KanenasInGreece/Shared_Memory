@@ -20,6 +20,13 @@ Facts whose project does not resolve are **left alone**: they have no project to
 backfill, and inventing one is the bucket this whole line of work exists to
 remove. They are the repair path's population, not this script's.
 
+⚠⚠ **The gateway must already be running the code that HANDLES this row type.**
+An older worker does not recognise ``project_of`` and falls through to its
+ordinary fact branch, which runs ``SET f.content = $content`` with the content
+this row does not carry — blanking the content of every fact it touches. That is
+silent, graph-side data loss, so the version check below is a GUARD, not a
+convenience: enqueue only after the deploy, never before.
+
 Dry-run by default. Idempotent: re-running enqueues nothing for facts that
 already have the edge, and skips any fact with a row already pending.
 
@@ -30,10 +37,38 @@ import argparse
 import json
 import os
 import sys
+import urllib.request
 from pathlib import Path
 
 import psycopg2
 from neo4j import GraphDatabase
+
+# The first version whose outbox worker handles a 'project_of' row.
+MIN_GATEWAY_VERSION = (0, 8, 32)
+GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://localhost:8888")
+
+
+def gateway_version() -> tuple[str, tuple[int, ...] | None]:
+    """(raw, parsed) version of the RUNNING gateway. parsed is None whenever the
+    answer is not knowable — unreachable, refused, or unparseable."""
+    try:
+        with urllib.request.urlopen(f"{GATEWAY_URL}/health", timeout=10) as r:
+            raw = json.load(r).get("version", "")
+    except Exception as exc:
+        return f"unreachable ({exc})", None
+    try:
+        return raw, tuple(int(p) for p in raw.split(".")[:3])
+    except ValueError:
+        return raw, None
+
+
+def gateway_handles_project_of(parsed) -> bool:
+    """Whether it is SAFE to enqueue against the running gateway.
+
+    Fails closed: an unknown version is not permission to write. Getting this
+    backwards is not a missed optimisation — it blanks fact content.
+    """
+    return parsed is not None and tuple(parsed) >= MIN_GATEWAY_VERSION
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ontology import ONT  # noqa: E402
@@ -129,6 +164,19 @@ def main() -> int:
         if not targets:
             print("\nNothing to do.")
             return 0
+
+        # GUARD, not a courtesy — see the module docstring.
+        raw, parsed = gateway_version()
+        if not gateway_handles_project_of(parsed):
+            need = ".".join(str(p) for p in MIN_GATEWAY_VERSION)
+            print(f"\nREFUSING to enqueue: the running gateway reports {raw!r}, and "
+                  f"these rows are only handled from {need}.\n"
+                  f"An older worker would fall through to its ordinary fact branch "
+                  f"and BLANK the content of every fact it touched.\n"
+                  f"Deploy first (restart the gateway on this code), then re-run.",
+                  file=sys.stderr)
+            return 3
+        print(f"\nRunning gateway is {raw} — handles these rows.")
 
         with conn.cursor() as cur:
             for pg_id, project in sorted(targets.items()):
