@@ -122,6 +122,27 @@ def pending(files: list[Path], latest: str | None) -> list[Path]:
     return [f for f in files if f.name > latest]
 
 
+def needs_adoption(framework_present: bool, applied: set[str]) -> bool:
+    """Whether this database must be adopted before anything may run.
+
+    True when the framework schema exists but the ledger records nothing: those
+    migrations HAVE run (the old tool ran them all, every time), so running them
+    again is the failure this ledger exists to prevent — and adopting silently
+    would skip a genuinely new file. The operator chooses, once.
+
+    ⚠ It tests the ledger's EMPTINESS, not the ledger TABLE's absence. Those are
+    different states: a run that created the table then failed before recording
+    anything, or a ledger cleared by hand, leaves it present and empty. Keying on
+    absence let that fall through to the fresh-install path and re-run every
+    migration against a populated database.
+
+    Pure, so the rule is testable — the version of this that lived inline as an
+    `if` was only reachable through a live database, and a mutation that disabled
+    it survived a test asserting on the condition's text.
+    """
+    return framework_present and not applied
+
+
 def latest_applied(cur) -> str | None:
     """How far this database has got — the field apply resumes from."""
     cur.execute("SELECT max(filename) FROM schema_migrations")
@@ -221,7 +242,7 @@ def main() -> int:
         # install", which re-runs every migration against a populated database.
         # Found by testing the refusal path itself; the schema survived only
         # because migration 002's dedup is separately guarded.
-        if framework and not applied:
+        if needs_adoption(framework, applied):
             print(
                 "This database predates migration tracking: the framework schema "
                 "exists but no migration ledger does.\n\n"

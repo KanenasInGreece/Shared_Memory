@@ -88,20 +88,22 @@ def test_the_destructive_dedup_is_guarded_against_the_later_key():
     assert "IF to_regclass" in guard
 
 
-def test_an_empty_ledger_on_a_populated_database_refuses_rather_than_re_running():
-    """The refusal must key on the ledger being EMPTY, not on the table being
+def test_an_empty_ledger_on_a_populated_database_refuses_rather_than_re_running():    """The refusal must key on the ledger being EMPTY, not on the table being
     ABSENT. A run that created the table then failed before recording anything —
     or a ledger cleared by hand — leaves it present and empty, and keying on
     absence let that fall through to the fresh-install path, which re-runs every
     migration against a populated database. That is the original bug, reachable
     by a second route.
+
+    Asserted on BEHAVIOUR: the first version of this test read the condition's
+    source text, and a mutation disabling the guard with `if False and ...` left
+    that text intact and survived.
     """
-    src = open(os.path.join(os.path.dirname(__file__), "..", "shared-memory",
-                            "migrations", "apply.py"), encoding="utf-8").read()
-    guard = src.split("Make the operator choose, once.")[1].split("\n")[0:20]
-    guard = "\n".join(guard)
-    condition = [l for l in guard.splitlines() if l.strip().startswith("if ")][0]
-    assert "not applied" in condition, "the refusal must test the ledger's EMPTINESS"
-    assert "had_ledger" not in condition, (
-        "the refusal must not key on the ledger TABLE's absence — an empty table "
-        "on a populated database would fall through to re-running everything")
+    assert apply_mod.needs_adoption(True, set()) is True
+    assert apply_mod.needs_adoption(True, {"001_a.sql"}) is False
+
+
+def test_a_fresh_database_is_never_asked_to_adopt():
+    """No framework schema means the migrations genuinely have not run."""
+    assert apply_mod.needs_adoption(False, set()) is False
+    assert apply_mod.pending(FILES, None) == FILES
