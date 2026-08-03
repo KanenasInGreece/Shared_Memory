@@ -787,8 +787,19 @@ def test_accept_set_withholds_entities_no_first_write_ever_named():
     assert "asserted_by IS NULL" in entity_arm
     # Spine labels are offered unconditionally — they were never minted from
     # free text, so the provenance question does not arise for them.
-    for spine in (ONT.human, ONT.ai_agent, ONT.project, ONT.decision):
+    #
+    # ⚠ :Project IS EXCLUDED, and that exclusion corrects the sentence above.
+    # It WAS minted from free text: `ONT.project` sat in _KNOWN_LABELS with
+    # PROJECT_OF as its default relation, so REM could mint a project node from
+    # any name the model proposed and write the axis edge itself — observed live
+    # on a fact belonging to one project whose text discussed another, which
+    # ended up claiming both. The axis is not a topic (P14) and REM writes
+    # neither axis (P18), so REM can now write no relation at a :Project at all;
+    # offering one here would invite references the gate discards.
+    # See tests/test_rem_axis_gate.py.
+    for spine in (ONT.human, ONT.ai_agent, ONT.decision):
         assert f"n:{spine}" in accept_q.split(f"OR (n:{ONT.entity}")[0]
+    assert f"n:{ONT.project}" not in accept_q
 
 
 def test_accept_set_refuses_a_namer_that_has_been_superseded():
