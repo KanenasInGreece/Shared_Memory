@@ -49,6 +49,17 @@ CREATE TABLE IF NOT EXISTS alias_adjudications (
 CREATE UNIQUE INDEX IF NOT EXISTS alias_adjudications_name_a_name_b_key ON public.alias_adjudications USING btree (name_a, name_b);
 CREATE INDEX IF NOT EXISTS alias_adjudications_verdict_idx ON public.alias_adjudications USING btree (verdict);
 
+-- ─── aliases ────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS aliases (
+    id               BIGSERIAL PRIMARY KEY,
+    name             TEXT NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT aliases_not_blank CHECK ((btrim(name) <> ''::text)),
+    CONSTRAINT aliases_sentinel_reserved CHECK ((name <> 'general_discussion'::text))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS aliases_name_key ON public.aliases USING btree (name);
+
 -- ─── community_summaries ────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS community_summaries (
     id               SERIAL PRIMARY KEY,
@@ -119,6 +130,22 @@ CREATE TABLE IF NOT EXISTS neo4j_outbox (
 
 CREATE INDEX IF NOT EXISTS neo4j_outbox_pending_id_idx ON public.neo4j_outbox USING btree (id) WHERE (status = 'pending'::text);
 CREATE INDEX IF NOT EXISTS neo4j_outbox_pending_idx ON public.neo4j_outbox USING btree (status) WHERE (status = 'pending'::text);
+
+-- ─── project_aliases ────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS project_aliases (
+    id               BIGSERIAL PRIMARY KEY,
+    alias_id         BIGINT NOT NULL,
+    project          TEXT NOT NULL,
+    active           BOOLEAN NOT NULL DEFAULT true,
+    reason           TEXT,
+    created_by       TEXT NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    superseded_at    TIMESTAMPTZ,
+    CONSTRAINT project_aliases_superseded_consistent CHECK (((active AND (superseded_at IS NULL)) OR ((NOT active) AND (superseded_at IS NOT NULL))))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_aliases_one_active ON public.project_aliases USING btree (alias_id) WHERE active;
+CREATE INDEX IF NOT EXISTS idx_project_aliases_project ON public.project_aliases USING btree (project);
 
 -- ─── project_promotions ─────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS project_promotions (
@@ -212,6 +239,16 @@ CREATE INDEX IF NOT EXISTS technical_docs_visibility_idx ON public.technical_doc
 -- target, so these cannot be inline column constraints.
 
 DO $$ BEGIN
+    ALTER TABLE project_aliases ADD CONSTRAINT project_aliases_alias_id_fkey FOREIGN KEY (alias_id) REFERENCES aliases(id);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE project_aliases ADD CONSTRAINT project_aliases_project_fkey FOREIGN KEY (project) REFERENCES projects(name);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
     ALTER TABLE project_promotions ADD CONSTRAINT project_promotions_to_project_fkey FOREIGN KEY (to_project) REFERENCES projects(name);
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
@@ -220,5 +257,49 @@ DO $$ BEGIN
     ALTER TABLE technical_docs ADD CONSTRAINT technical_docs_superseded_by_fkey FOREIGN KEY (superseded_by) REFERENCES technical_docs(id) ON DELETE SET NULL;
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
+
+-- ─── Functions ─────────────────────────────────────────────────────────────
+
+CREATE OR REPLACE FUNCTION public.assert_alias_namespaces_disjoint()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+    IF TG_TABLE_NAME = 'project_aliases' THEN
+        IF NEW.active AND EXISTS (
+            SELECT 1 FROM projects p
+              JOIN aliases a ON a.id = NEW.alias_id
+             WHERE p.name = a.name
+        ) THEN
+            RAISE EXCEPTION
+                'alias % is also a registered project — an alias and a canonical '
+                'name must never be the same string (A1)',
+                (SELECT name FROM aliases WHERE id = NEW.alias_id);
+        END IF;
+    ELSE  -- projects
+        IF EXISTS (
+            SELECT 1 FROM project_aliases pa
+              JOIN aliases a ON a.id = pa.alias_id
+             WHERE pa.active AND a.name = NEW.name
+        ) THEN
+            RAISE EXCEPTION
+                'project % is already an active alias for another project — '
+                'register the canonical name instead (A1)', NEW.name;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$function$
+;
+
+-- ─── Triggers ──────────────────────────────────────────────────────────────
+-- Created after the functions they call. DROP-then-CREATE because Postgres
+-- has no CREATE TRIGGER IF NOT EXISTS and this file promises idempotency.
+
+DROP TRIGGER IF EXISTS trg_project_aliases_disjoint ON project_aliases;
+CREATE TRIGGER trg_project_aliases_disjoint BEFORE INSERT OR UPDATE ON public.project_aliases FOR EACH ROW EXECUTE FUNCTION assert_alias_namespaces_disjoint();
+
+DROP TRIGGER IF EXISTS trg_projects_disjoint ON projects;
+CREATE TRIGGER trg_projects_disjoint BEFORE INSERT OR UPDATE ON public.projects FOR EACH ROW EXECUTE FUNCTION assert_alias_namespaces_disjoint();
 
 COMMIT;
