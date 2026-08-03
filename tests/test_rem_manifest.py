@@ -483,9 +483,10 @@ def test_apply_stamps_rem_provenance_with_vote_confidence(monkeypatch):
     assert props["model"] == "test-model" and props["run_id"] == "run-1"
 
 
-def test_apply_discussion_votes_one_skips_edge(monkeypatch):
-    """fact_kind='discussion' + denied by both verifications (votes 1/3) →
-    the edge is NOT minted (logged); everything else about the record proceeds."""
+def test_apply_denied_edge_is_withheld_below_the_write_floor(monkeypatch):
+    """Denied by both verifications (votes 1/3) → the edge is NOT written; the
+    record itself still completes. This used to be gated on fact_kind being
+    'discussion'; the floor (989) is kind-independent."""
     monkeypatch.delenv("MOCK_LLM", raising=False)
     daemon, mock_session = _make_daemon()
     conn, _ = _make_conn()
@@ -505,9 +506,13 @@ def test_apply_discussion_votes_one_skips_edge(monkeypatch):
     assert "rem_processed" in cyphers[-1]                     # record still done
 
 
-def test_apply_low_vote_non_discussion_still_minted(monkeypatch):
-    """Non-discussion low-vote edges are still minted with low confidence —
-    consumption gating is NREM's job."""
+def test_apply_low_vote_non_discussion_is_no_longer_minted(monkeypatch):
+    """THE CONTRACT THAT CHANGED (989). A low-vote edge on a NON-discussion
+    source used to be minted anyway — "consumption gating is NREM's job" — which
+    handed the LOOSER gate to the better-evidenced record. Consumption gating
+    was then measured not to contain anything, because a written edge is still
+    read by humans and still copied upward by judgement inheritance. It is now
+    withheld like any other."""
     monkeypatch.delenv("MOCK_LLM", raising=False)
     daemon, mock_session = _make_daemon()
     conn, _ = _make_conn()
@@ -522,11 +527,64 @@ def test_apply_low_vote_non_discussion_still_minted(monkeypatch):
     ok = _apply(daemon, conn, rem_mod.KIND_DECISION, result, _known("WeakEdgeTarget"), manifest)
 
     assert ok is True
-    merge_calls = [c for c in mock_session.run.call_args_list
-                   if "ON CREATE SET" in c.args[0]]
-    assert merge_calls
-    props = merge_calls[0].kwargs["rows"][0]["props"]
-    assert props["confidence"] == rc.vote_confidence(1, 3, "observation")
+    assert rc.vote_confidence(1, 3, "observation") < rc.WRITE_FLOOR[rc.FAMILY_ENTITY]
+    cyphers = [c.args[0] for c in mock_session.run.call_args_list]
+    assert not any("ON CREATE SET" in c for c in cyphers)     # withheld
+    assert "rem_processed" in cyphers[-1]                     # record still done
+
+
+@pytest.mark.parametrize("fact_kind,admitted", [
+    ("tested",      True),    # 2/3 + 0.10 = 0.7667
+    ("measured",    True),    # 2/3 + 0.07 = 0.7367
+    ("researched",  True),    # 2/3 + 0.03 = 0.6967 — the reason the floor is 0.68
+    ("observation", False),   # 2/3 + 0.00 = 0.6667
+    ("discussion",  False),   # 2/3 - 0.10 = 0.5667
+])
+def test_write_floor_admits_a_majority_only_for_cited_sources(monkeypatch, fact_kind, admitted):
+    """A two-of-three majority carries a record that CITES A REAL SOURCE; an
+    uncited or conversational one needs unanimity. The kind still moves the
+    score — it no longer moves the gate."""
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    daemon, mock_session = _make_daemon()
+    conn, _ = _make_conn()
+
+    async def _fake_verify(content, proposed, pg_id):
+        return [2] * len(proposed), 3          # confirmed by one of two re-reads
+    daemon._verify_novel_edges = _fake_verify
+
+    manifest = {"fact_kind": fact_kind, "entities": [], "existing_edges": []}
+    result = {"relationships": [{"name": "MajorityTarget", "rel_type": ONT.entity_link}]}
+
+    _apply(daemon, conn, rem_mod.KIND_DECISION, result, _known("MajorityTarget"), manifest)
+
+    minted = any("ON CREATE SET" in c.args[0] for c in mock_session.run.call_args_list)
+    assert minted is admitted
+
+
+def test_apply_is_fail_closed_when_no_verification_call_succeeded(monkeypatch):
+    """FAIL-CLOSED (989). When every verification call fails, k degrades to 1
+    and votes stay 1 — so `votes/k` is 1.0 and the arithmetic would award the
+    MAXIMUM confidence to a proposal nothing checked. Unverified is not
+    unanimous. Nothing is written."""
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    daemon, mock_session = _make_daemon()
+    conn, _ = _make_conn()
+
+    async def _fake_verify(content, proposed, pg_id):
+        return [1] * len(proposed), 1          # every call failed
+    daemon._verify_novel_edges = _fake_verify
+
+    manifest = {"fact_kind": "tested", "entities": [], "existing_edges": []}
+    result = {"relationships": [{"name": "UncheckedTarget", "rel_type": ONT.entity_link}]}
+
+    ok = _apply(daemon, conn, rem_mod.KIND_DECISION, result, _known("UncheckedTarget"), manifest)
+
+    assert ok is True
+    # The confidence the OLD arithmetic would have handed it, for the record.
+    assert rc.vote_confidence(1, 1, "tested") == pytest.approx(0.95)
+    cyphers = [c.args[0] for c in mock_session.run.call_args_list]
+    assert not any("ON CREATE SET" in c for c in cyphers)
+    assert "rem_processed" in cyphers[-1]
 
 
 def test_apply_evidential_ledger_row_rem_k3_and_cap(monkeypatch):

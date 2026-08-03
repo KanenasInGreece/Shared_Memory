@@ -33,6 +33,7 @@ ASSERTED_OPERATOR       = "operator"        # first-write explicit operator role
 ASSERTED_SYSTEM_DEFAULT = "system_default"  # first-write fact_kind default gate
 ASSERTED_REM            = "rem"             # per-record REM enrichment
 ASSERTED_REM_SWEEP      = "rem_sweep"       # periodic evidence sweep
+ASSERTED_INHERITED      = "inherited"       # judgement copied it from its facts
 MACHINE_ASSERTED = frozenset({ASSERTED_REM, ASSERTED_REM_SWEEP})
 
 # ── calibration families (727: the evidential family gets its own curve —
@@ -46,8 +47,34 @@ FAMILIES = (FAMILY_ENTITY, FAMILY_EVIDENTIAL)
 # run grounds them — see calibration_state: an uncalibrated family's machine
 # edges are not consumed at all, so these values only act post-calibration)
 CONSUME_THRESHOLD = {
-    FAMILY_ENTITY:     float(os.environ.get("RELCONF_CONSUME_ENTITY", "0.60")),
+    FAMILY_ENTITY:     float(os.environ.get("RELCONF_CONSUME_ENTITY", "0.68")),
     FAMILY_EVIDENTIAL: float(os.environ.get("RELCONF_CONSUME_EVIDENTIAL", "0.70")),
+}
+
+# ── the WRITE floor (989) — machine ENTITY edges must earn their place in the
+# graph, not merely be excluded from folding later.
+#
+# Gating consumption alone was measured NOT to contain anything: a below-
+# threshold edge is still what a human reads on the record, and judgement
+# inheritance copies a fact's mention edges upward. So the floor gates the
+# WRITE, and the record-kind-conditional skip it replaces is gone — that skip
+# gave the LOOSER gate to the better-evidenced source, which inverted its own
+# intent.
+#
+# 0.68, not 0.70, is deliberate: at k=3 the vote share plus the fact_kind prior
+# puts a 'researched' record's 2-of-3 majority at 0.6967, so 0.70 would exclude
+# it by an arithmetic accident of the prior table rather than by judgement. The
+# rule the number expresses: a fact carrying a REAL CITATION may link on a
+# two-of-three majority; an uncited or conversational record needs unanimity.
+#
+# ⚠ ENTITY FAMILY ONLY — never the evidential one. Evidential proposals are
+# record→record links BORN capped below their own consumption threshold
+# (EVIDENTIAL_BORN_BELOW_CAP, rung 1 of the 727 ladder) precisely so a machine
+# proposal cannot promote itself and must be lifted by operator adjudication.
+# A write floor above that cap would make every evidential edge unwritable at
+# birth — silently closing the ladder instead of leaving it visibly unbuilt.
+WRITE_FLOOR = {
+    FAMILY_ENTITY: float(os.environ.get("RELCONF_WRITE_FLOOR", "0.68")),
 }
 # Evidential proposals are BORN below the consumption threshold (727 rung 1):
 # rung-1 confidence is capped here; only adjudication (rung 2) or operator
@@ -123,12 +150,45 @@ def consumable(family: str, asserted_by: object, confidence: object,
     would silently sever every pre-rebuild cluster."""
     if asserted_by in (ASSERTED_OPERATOR, ASSERTED_SYSTEM_DEFAULT):
         return True
+    if asserted_by == ASSERTED_INHERITED:
+        # A judgement's COPY of a topic its evidence already carried (989). It
+        # inherits the SOURCE edge's standing rather than getting one of its
+        # own: an operator naming carries no confidence and passes; a machine
+        # edge carries its score across and is gated exactly as it was on the
+        # fact. Stated explicitly so an inherited edge can never fall through
+        # to the legacy branch below and be consumed on era-gating alone.
+        if not isinstance(confidence, (int, float)):
+            return True
+        return calibrated and float(confidence) >= CONSUME_THRESHOLD[family]
     if asserted_by in MACHINE_ASSERTED:
         if not calibrated or not isinstance(confidence, (int, float)):
             return False
         return float(confidence) >= CONSUME_THRESHOLD[family]
     # legacy / unstamped edge → visible at neutral weight (LEGACY_MENTIONS_PRIOR)
     return True
+
+
+def write_admitted(family: str, votes: int, k: int, confidence: object) -> bool:
+    """May a MACHINE-asserted edge be WRITTEN at all (989)? The gate that used
+    to sit only on consumption — measured not to contain anything, because a
+    below-threshold edge is still read by humans and still copied upward by
+    judgement inheritance.
+
+    FAIL-CLOSED on verification, for EVERY family: k <= 1 means no verification
+    call succeeded, so `votes/k` is 1/1 and the arithmetic would hand an
+    unverified proposal the MAXIMUM confidence. Unverified is not unanimous —
+    it is unknown, and unknown does not enter the graph.
+
+    The FLOOR itself is entity-family only. The evidential family is absent
+    from WRITE_FLOOR by design: its proposals are born capped below their own
+    consumption threshold so that adjudication, not the proposer, promotes
+    them. Flooring them would make them unwritable at birth."""
+    if k <= 1:
+        return False
+    floor = WRITE_FLOOR.get(family)
+    if floor is None:
+        return True
+    return isinstance(confidence, (int, float)) and float(confidence) >= floor
 
 
 # ── ledger helpers (relation_adjudications, migration 020) ────────────────────

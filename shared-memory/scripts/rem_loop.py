@@ -26,8 +26,13 @@ Pipeline per record (anchor kinds: Fact, Decision, Retrospective):
      chars of content); votes = 1 + confirmations, k = 1 + calls that SUCCEEDED
      (LLM failure degrades k, never blocks enrichment). confidence =
      relation_confidence.vote_confidence(votes, k, fact_kind, family).
-     Low-vote edges are still minted (consumption gating is NREM's job) EXCEPT
-     fact_kind='discussion' with votes==1 after real verification → skipped.
+     The score then gates the WRITE, not just later consumption (989): an edge
+     is written only if relation_confidence.write_admitted() passes it —
+     confidence >= the entity-family floor, and k > 1 so an edge no verification
+     call could reach is never written at the maximum score. The floor is
+     kind-INDEPENDENT: fact_kind still moves the score, it no longer moves the
+     gate. The evidential family is exempt from the floor by design (its
+     proposals are born capped below consumption; rung 1 of the 727 ladder).
   7. Universal edge provenance (726 §2): every minted edge carries
      edge_properties(asserted_by='rem', confidence, model, run_id) applied via
      MERGE … ON CREATE SET — an EXISTING edge (e.g. operator grounding) is
@@ -506,6 +511,19 @@ _MINT_RULE = (
     "from the list whenever the content plainly means it."
 )
 
+# The second thing that happens to a proposal, and the model is told about it
+# for the same reason it is told about the first: a prompt that describes a
+# gate the code no longer has teaches the wrong contract, and one that hides a
+# gate the code DOES have invites volume the gate then throws away. Every name
+# proposed here is re-read against this same content and discarded unless the
+# re-read confirms it — so a name the content only loosely suggests costs a
+# round-trip and yields nothing.
+_VERIFY_RULE = (
+    "Each proposal is INDEPENDENTLY RE-CHECKED against this content and dropped "
+    "unless the re-check confirms it: name only what the content actually says, "
+    "never what it merely brings to mind."
+)
+
 # Human-readable ontology vocabulary shown to the LLM in every prompt.
 _ONTOLOGY_VOCAB = f"""\
 Relationship types (choose the most precise fit for each referenced entity):
@@ -524,6 +542,7 @@ Rules:
 - For Human / AIAgent / Project / Decision nodes, prefer the typed relationship.
 - The known list is the NEAREST entities to this record, not the whole graph — a name missing from it may still exist, so name it exactly as the content spells it.
 - {_MINT_RULE}
+- {_VERIFY_RULE}
 - CONSIDERED, REJECTED, UNDER_CONDITIONS, PRODUCES_INSIGHT apply only when processing a Decision."""
 
 
@@ -940,10 +959,11 @@ def _build_verify_prompt(content: str, proposed: list[dict]) -> str:
 # ── REMDaemon ─────────────────────────────────────────────────────────────────
 
 class REMDaemon:
-    # Link-gate counter, declared at class level so an instance built without
-    # __init__ (the test harness does this) still has it. See __init__ for what
-    # it counts.
+    # Gate counters, declared at class level so an instance built without
+    # __init__ (the test harness does this) still has them. See __init__ for
+    # what each one counts — the two are NOT interchangeable.
     _mint_dropped_total: int = 0
+    _floor_dropped_total: int = 0
 
     def __init__(self) -> None:
         self.driver     = AsyncGraphDatabase.driver(
@@ -965,6 +985,14 @@ class REMDaemon:
         # per-record log line; this is the cheap running total the journal can
         # be checked against to see the gate actually biting.
         self._mint_dropped_total: int = 0
+        # WRITE-FLOOR counter (989) — deliberately SEPARATE from the one above,
+        # because the two answer different questions and merging them would
+        # make either number unreadable. _mint_dropped counts names REM could
+        # not REACH (absent from the graph, or withheld by the accept set);
+        # _floor_dropped counts names it reached and the VERIFICATION refused.
+        # A rise in the first is a vocabulary question, a rise in the second is
+        # an extraction-quality one.
+        self._floor_dropped_total: int = 0
 
     # ── Postgres connection factory ───────────────────────────────────────────
 
@@ -2482,6 +2510,7 @@ class REMDaemon:
 
         kept: list[dict] = []
         ledger_rows: list[dict] = []
+        floor_dropped = 0
         for e, v in zip(novel, votes):
             family = rc.FAMILY_EVIDENTIAL if e["evidential"] else rc.FAMILY_ENTITY
             try:
@@ -2492,13 +2521,18 @@ class REMDaemon:
                 continue
             if e["evidential"]:
                 conf = min(conf, rc.EVIDENTIAL_BORN_BELOW_CAP)   # born-below rule (727 rung 1)
-            if fact_kind == "discussion" and v == 1 and k > 1:
-                # Denied by every real verification on the weakest source kind
-                # → not minted (all other low-vote edges still are; consumption
-                # gating is NREM's job).
-                logger.info("REM: pg_id=%d skipping unverified edge -[%s]-> %r "
-                            "(fact_kind=discussion, votes %d/%d)",
-                            pg_id, e["rel_type"], e["name"], v, k)
+            if not rc.write_admitted(family, v, k, conf):
+                # The WRITE floor (989), replacing the fact_kind-conditional
+                # skip that stood here. That rule dropped an unverified edge
+                # ONLY on 'discussion' sources, so a record carrying a real
+                # citation had its denied proposals written anyway — the better
+                # evidence got the looser gate. Now one rule, kind-independent:
+                # the kind's prior still moves the score, it no longer moves
+                # the gate. k <= 1 (no verification succeeded) fails closed.
+                floor_dropped += 1
+                logger.info("REM: pg_id=%d WITHHELD below write floor "
+                            "-[%s]-> %r (votes %d/%d, fact_kind=%s, conf=%.4f)",
+                            pg_id, e["rel_type"], e["name"], v, k, fact_kind, conf)
                 continue
             e["props"] = rc.edge_properties(
                 asserted_by=rc.ASSERTED_REM, confidence=conf,
@@ -2510,6 +2544,8 @@ class REMDaemon:
                     "rel_type": e["rel_type"], "confidence": conf,
                     "votes": v, "k": k,
                 })
+
+        self._floor_dropped_total += floor_dropped
 
         # Single Neo4j session: edges first, rem_processed=true last.
         try:
@@ -2606,8 +2642,9 @@ class REMDaemon:
 
         logger.info(
             "REM: pg_id=%d done (kind=%s, novel_edges=%d, already_captured=%d, "
-            "k=%d, evidential=%d, outbox_marked=%s)",
-            pg_id, kind, len(kept), already, k, len(ledger_rows), outbox_marked,
+            "floor_withheld=%d, k=%d, evidential=%d, outbox_marked=%s)",
+            pg_id, kind, len(kept), already, floor_dropped, k,
+            len(ledger_rows), outbox_marked,
         )
         return True
 

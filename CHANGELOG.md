@@ -5,6 +5,58 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.29] — 2026-08-03
+
+### Changed
+
+- **A proposed link now has to survive its own re-check before it is written.**
+  The enrichment pass proposes a connection, then re-reads the record to confirm
+  it. That verdict used to govern only whether a later synthesis stage could
+  *use* the edge — the edge itself was written regardless. Measured on a worked
+  case: a record whose every proposal was denied by both re-checks still gained
+  24 links, because the withholding rule applied only to records with no cited
+  source. **The better-evidenced a record was, the looser its gate.** The
+  confidence now gates the write itself, on one rule that no longer varies by
+  record kind: a record citing a real source (code, a test, an external
+  document) may link on a majority re-check, while an uncited or conversational
+  one needs unanimity. The record's kind still moves the score; it no longer
+  moves the gate.
+
+- **Consumption threshold raised to match the write floor.** What is trusted
+  enough to enter the graph is trusted enough to be folded into a summary; two
+  different numbers for those two questions is what let the gap fill with links
+  nothing would ever read.
+
+### Fixed
+
+- **Verification now fails closed.** When every re-check call failed, the vote
+  arithmetic divided one vote by one attempt and handed the proposal the
+  *highest possible* confidence — the score peaked precisely because nothing had
+  checked it. Unverified is not unanimous. No successful re-check now means no
+  edge, in every relationship family. (No occurrence of this is present in two
+  months of retained logs; it was a latent hole, and a gate that depends on the
+  score made it load-bearing.)
+
+- **A judgement's copy of its evidence's topics is stamped as a copy.** It used
+  to be written unmarked, which is exactly the signature first write leaves when
+  the *operator* names a concept — so a copy was indistinguishable from a
+  naming, and machine-added names could re-qualify themselves as valid link
+  targets through it. The copy now records that it is one, and carries the
+  standing of what it copied: from an operator naming it is operator-grade, from
+  a machine link it carries that link's score and is gated exactly as the
+  original was. Applied to new writes only — the unmarked edges already in the
+  graph mix three different writers, and for older records they cannot be told
+  apart after the fact.
+
+### Note
+
+- Record→record proposals are deliberately exempt from the write floor. They are
+  born capped *below* their own usability threshold so that human adjudication,
+  never the proposer, promotes them; a floor above that cap would make them
+  unwritable at birth and close that path silently.
+
+---
+
 ## [0.8.28] — 2026-07-31
 
 ### Fixed
