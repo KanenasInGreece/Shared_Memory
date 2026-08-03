@@ -5,6 +5,43 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.30] — 2026-08-03
+
+### Changed
+
+- **The enrichment pass now works in concepts, not in spellings.** The alias
+  layer already groups every surface form of one concept — `LM Studio`,
+  `LMStudio`, `LM_Studio`, `lm_studio` — and both the folding stage and search
+  group on that verdict. The enrichment pass was the one consumer that did not:
+  it resolved on the raw name, so its prompt offered four separate "known nodes"
+  for one thing, the model proposed several of them, and the re-check correctly
+  confirmed each — four true links to one concept, and no confidence floor could
+  ever reach them, because the same question was simply being asked four times.
+  A proposal now **matches on any known spelling and is written to one canonical
+  node**: the form the most first-write records actually use, ties broken
+  alphabetically, so the choice is stable and moves only when people write. The
+  novelty check, the recall budget and the sub-typing pass all compare concepts
+  too — a record already linked under one spelling no longer acquires a second
+  edge under another, and a record's candidate budget buys distinct concepts
+  rather than several ways of writing one. Measured on a live graph: 1015
+  accepted spellings resolve to 814 concepts across 106 collision groups, every
+  one of which the alias layer had already grouped.
+
+- **A retracted claim no longer keeps its vocabulary eligible for new links.**
+  An entity became linkable once some record named it at first write, and a
+  *superseded* record still counted — reasoned at the time as "supersession
+  retracts a claim, not the vocabulary it was filed under, and the successor
+  almost always reuses the same concepts". That second clause undid the first: a
+  successor that reuses the concept **is** a live first-write namer, so the
+  entity qualifies through the successor and never needed the exemption. What the
+  exemption actually protected was the opposite case — names a person filed and
+  then retracted, with no successor reusing them. On the live graph 11 of 1026
+  eligible entities were held up by a superseded namer alone, several of them
+  parse artefacts, two already accreting machine links. Eligibility now requires
+  a **live** first write. Nothing is deleted and existing links are untouched;
+  the retired names simply stop being reachable for new ones, and no record
+  anywhere depended on one for a topic.
+
 ## [0.8.29] — 2026-08-03
 
 ### Changed
