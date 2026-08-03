@@ -5,6 +5,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.34] — 2026-08-03
+
+### Fixed
+
+- **The fresh-install schema was silently dropping every table-level CHECK
+  constraint.** The file new deployments build from is generated from the live
+  database, and the generator rebuilt each table from its columns and indexes
+  alone — so a constraint added by a migration existed on every **upgraded**
+  deployment and on **no new one**. That is the worst shape a schema divergence
+  can take: the guarantee holds everywhere it was tested and nowhere it was not,
+  and nothing in the upgrade path can notice.
+
+  Recovered by the fix: the reservation that stops the no-project sentinel being
+  registered as a real project — which is enforced in the schema precisely so no
+  future code path can bypass it, and was therefore absent exactly where that
+  mattered most — and **seven constraints on the relation-adjudication ledger**
+  that had been missing from fresh installs since that table was introduced,
+  covering its family, verdict, method, operator label, evidence support, the
+  confidence range, and the rule tying its family to which columns must be set.
+
+  The regression tests read the generated file rather than the generator's code,
+  because a generator that still contains the right function but no longer calls
+  it would pass a source-level check.
+
 ## [0.8.33] — 2026-08-03
 
 ### Added

@@ -26,6 +26,8 @@
 BEGIN;
 
 -- ─── Extensions ────────────────────────────────────────────────────────────
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
 CREATE EXTENSION IF NOT EXISTS vector;
 
 -- ─── alias_adjudications ────────────────────────────────────────────────────────
@@ -118,6 +120,17 @@ CREATE TABLE IF NOT EXISTS neo4j_outbox (
 CREATE INDEX IF NOT EXISTS neo4j_outbox_pending_id_idx ON public.neo4j_outbox USING btree (id) WHERE (status = 'pending'::text);
 CREATE INDEX IF NOT EXISTS neo4j_outbox_pending_idx ON public.neo4j_outbox USING btree (status) WHERE (status = 'pending'::text);
 
+-- ─── projects ───────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS projects (
+    name             TEXT PRIMARY KEY,
+    description      TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_by       TEXT,
+    CONSTRAINT projects_sentinel_reserved CHECK ((name <> 'general_discussion'::text))
+);
+
+CREATE INDEX IF NOT EXISTS idx_projects_name_trgm ON public.projects USING gin (name gin_trgm_ops);
+
 -- ─── relation_adjudications ─────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS relation_adjudications (
     id               BIGSERIAL PRIMARY KEY,
@@ -139,7 +152,14 @@ CREATE TABLE IF NOT EXISTS relation_adjudications (
     operator_labeled_at TIMESTAMPTZ,
     promoted_at      TIMESTAMPTZ,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT relation_adjudications_check CHECK ((((family = 'entity_relation'::text) AND (src_name IS NOT NULL) AND (tgt_name IS NOT NULL) AND (src_pg_id IS NULL) AND (tgt_pg_id IS NULL)) OR ((family = 'evidential'::text) AND (src_pg_id IS NOT NULL) AND (tgt_pg_id IS NOT NULL) AND (src_name IS NULL) AND (tgt_name IS NULL)))),
+    CONSTRAINT relation_adjudications_confidence_check CHECK (((confidence IS NULL) OR ((confidence >= (0.0)::double precision) AND (confidence <= (1.0)::double precision)))),
+    CONSTRAINT relation_adjudications_family_check CHECK ((family = ANY (ARRAY['entity_relation'::text, 'evidential'::text]))),
+    CONSTRAINT relation_adjudications_method_check CHECK ((method = ANY (ARRAY['llm_sweep'::text, 'rem_k3'::text, 'operator'::text]))),
+    CONSTRAINT relation_adjudications_operator_label_check CHECK (((operator_label IS NULL) OR (operator_label = ANY (ARRAY['correct'::text, 'incorrect'::text])))),
+    CONSTRAINT relation_adjudications_support_check CHECK (((support IS NULL) OR (support = ANY (ARRAY['text_only'::text, 'graph_evidence'::text])))),
+    CONSTRAINT relation_adjudications_verdict_check CHECK ((verdict = ANY (ARRAY['accept'::text, 'reject'::text])))
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS relation_adjudications_entity_uniq ON public.relation_adjudications USING btree (family, src_name, tgt_name, rel_type) WHERE (family = 'entity_relation'::text);
