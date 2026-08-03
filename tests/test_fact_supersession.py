@@ -66,7 +66,10 @@ def _coord():
     c = MemoryCoordinator()
     conn = AsyncMock()
     conn.fetchrow = AsyncMock(return_value={"id": 99})
-    conn.fetchval = AsyncMock(return_value=None)
+    # fetchval also answers the project-registry lookup at ingress (v0.8.33);
+    # 1 = 'this project is registered', so these tests reach the behaviour
+    # they are actually about instead of stopping at the project gate.
+    conn.fetchval = AsyncMock(return_value=1)
     conn.fetch = AsyncMock(return_value=[])
     conn.execute = AsyncMock()
     conn.transaction = MagicMock(return_value=_async_ctx(None))
@@ -174,7 +177,7 @@ async def test_supersede_with_live_successor_rides_along_no_purge():
 @pytest.mark.asyncio
 async def test_save_supersedes_must_be_int():
     c, _, _ = _coord()
-    req = _make_request({"content": "x", "metadata": {"source": "claude", "supersedes": "5"}})
+    req = _make_request({"content": "x", "metadata": {"project": "shared-memory-GitHub", "source": "claude", "supersedes": "5"}})
     resp = await c.handle_save(req)
     assert resp.status == 400
     assert "supersedes must be an integer" in json.loads(resp.text)["message"]
@@ -184,7 +187,7 @@ async def test_save_supersedes_must_be_int():
 async def test_save_supersedes_target_not_found():
     c, conn, _ = _coord()
     conn.fetchrow = AsyncMock(return_value=None)
-    req = _make_request({"content": "x", "metadata": {"source": "claude", "supersedes": 7}})
+    req = _make_request({"content": "x", "metadata": {"project": "shared-memory-GitHub", "source": "claude", "supersedes": 7}})
     resp = await c.handle_save(req)
     assert resp.status == 400
     assert "not found" in json.loads(resp.text)["message"]
@@ -197,7 +200,7 @@ async def test_save_supersedes_success_flags_and_piggybacks():
     conn.fetchrow = AsyncMock(side_effect=[{"superseded": False, "type": None}, {"id": 100}])
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         req = _make_request({"content": "corrected",
-                             "metadata": {"source": "claude", "entities": ["X"],
+                             "metadata": {"project": "shared-memory-GitHub", "source": "claude", "entities": ["X"],
                                           "supersedes": 7}})
         resp = await c.handle_save(req)
     assert resp.status == 200

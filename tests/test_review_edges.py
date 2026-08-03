@@ -158,9 +158,9 @@ def _evidential_row(**over):
 
 # ── api_version contract — bumped consistently in BOTH files ──────────────────
 
-def test_api_version_is_3_in_coordinator_and_client():
-    assert coordinator_mod.API_VERSION == 3
-    assert memory_bridge.API_VERSION == 3
+def test_api_version_is_4_in_coordinator_and_client():
+    assert coordinator_mod.API_VERSION == 4
+    assert memory_bridge.API_VERSION == 4
     assert coordinator_mod.API_VERSION == memory_bridge.API_VERSION
 
 

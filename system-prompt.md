@@ -55,12 +55,15 @@ gap in this store.
 
 - **Facts:** Call `save_artifact` after any significant finding. Always include:
   - `"source":"lm_studio"` — the gateway stamps this with your token identity; client value is overridden. For decisions, model name goes in `assisted_by`, not here.
+  - `"project":"<project folder name>"` — **required; the save is rejected without it.** It is checked against a registry, so a typo is refused rather than silently becoming a new project.
   - `"entities":["E1","E2"]` — required for Tier 3 consolidation eligibility
   - `"source_ref":"file.py#line"` — optional; preserves lineage to the exact code or document
 
   ```json
-  {"source":"lm_studio","entities":["OutboxPattern","coordinator"],"source_ref":"coordinator.py#start()"}
+  {"source":"lm_studio","project":"shared-memory-GitHub","entities":["OutboxPattern","coordinator"],"source_ref":"coordinator.py#start()"}
   ```
+
+  **If a save is rejected for the project, ASK THE OPERATOR — never guess one.** A plausible wrong project is worse than none: a parked record is visible and repairable, a misfiled one is neither. The error is `project_required` (none supplied) or `project_unknown` (not registered), and a near miss carries `proposals` from the registry. Answer it in exactly one of three ways: pick a proposal, re-send with `"new_project": true` to register a genuinely new project, or use `"general_discussion"` for a finding that belongs to no project — it saves and searches normally but is never folded into a project's narrative. Re-sending the same unregistered name is refused however often it is asked.
 
 - **Decisions:** Use `save_decision` for architectural or process choices — structured provenance (who, which AI, project, rationale, alternatives). Note the returned `pg_id` — you'll use it to attach a retrospective later.
 

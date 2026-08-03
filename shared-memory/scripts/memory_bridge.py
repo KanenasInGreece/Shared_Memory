@@ -29,11 +29,16 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.8.32"
+VERSION = "0.8.33"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v3: review-edges / label-edges require the gateway's /memory/relations/* routes.
-API_VERSION = 3
+# v4 (project registry): a fact save without a REGISTERED metadata.project is
+# rejected 400 carrying error=project_required|project_unknown plus near-match
+# proposals. BREAKING for any client that saved untagged facts. The second
+# submission is accepted in three forms: a proposal, new_project=true, or the
+# reserved sentinel general_discussion.
+API_VERSION = 4
 
 # Relation-adjudication calibration families — MUST mirror
 # relation_confidence.FAMILIES on the gateway (the thin client never imports
@@ -301,6 +306,23 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
     # away from their own project's cluster and never reach a summary.
     if not metadata.get("project"):
         derived = derive_project()
+        if not derived:
+            # Second chance, and only a deterministic one: when the working
+            # directory is not inside any project root but the record cites an
+            # ABSOLUTE path, that path is itself evidence of where the record
+            # belongs — walk up from it exactly as the cwd walk does.
+            #
+            # Its honest value is forward-looking: on this corpus it rescues 0 of
+            # 127 untagged records, because none of their refs are absolute. It is
+            # correct for records written from now on, and that is the whole claim.
+            #
+            # NO relative-prefix inference. A ref like "scripts/foo.py" names no
+            # filesystem location, so guessing a project from its first segment is
+            # the entity vote wearing a different hat — a plausible wrong project,
+            # which is worse than none.
+            ref = metadata.get("source_ref")
+            if isinstance(ref, str) and os.path.isabs(ref):
+                derived = derive_project(os.path.dirname(ref))
         if derived:
             metadata["project"] = derived
             _append_log("memory_bridge", 3, "project_derived", {"project": derived})

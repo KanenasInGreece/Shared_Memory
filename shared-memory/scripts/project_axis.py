@@ -48,6 +48,47 @@ PROJECT_MATCH_SQL = (
 SENTINEL = "general_discussion"
 
 
+# ── The registry (migration 022) ─────────────────────────────────────────────
+# A project used to be whatever string a client sent, so there was nothing for a
+# value to be unknown AGAINST: a typo and a new project were the same event, and
+# both entered the corpus silently. These two statements are what make an
+# unrecognised value loud instead of merely new.
+
+PROJECT_EXISTS_SQL = "SELECT 1 FROM projects WHERE name = $1"
+
+# Proposals for a value that missed. TRIGRAM FIRST, and that ordering is a
+# dependency decision, not a ranking preference: trigram needs no embedder, so
+# registration cannot be taken down by an embedding outage. A vector signal over
+# name + description is added for DOMAINS, where an operator typing `crypto`
+# should reach a section named `security` whose description mentions key
+# handling — names alone cannot carry that, and descriptions are what make it
+# work. Project names are short and typo-shaped, so trigram carries them.
+PROJECT_PROPOSALS_SQL = (
+    "SELECT name FROM projects"
+    " WHERE similarity(name, $1) >= $2"
+    " ORDER BY similarity(name, $1) DESC, name"
+    " LIMIT $3"
+)
+
+# Deliberately loose. A rejected save is a dead end unless the proposals are
+# usable, and a near-miss on a hyphenated name scores lower than intuition
+# suggests ("shared memory" vs "shared-memory-GitHub").
+PROPOSAL_SIMILARITY = 0.25
+PROPOSAL_LIMIT = 5
+
+
+def project_for_graph(metadata):
+    """The project a `:Project` NODE may be minted from — P3 and P8 together.
+
+    Resolution, minus the sentinel. A parked record still saves, still searches
+    and still goes through enrichment; what it must not do is put a placeholder
+    into the project set, where the insight gate's ">= 2 distinct projects" rule
+    would count it as a project like any other and fold on it.
+    """
+    project = resolve_project(metadata)
+    return None if project == SENTINEL else project
+
+
 def fold_eligible(project) -> bool:
     """Invariant P2 — a record with no resolvable project folds NOTHING.
 
@@ -61,8 +102,17 @@ def fold_eligible(project) -> bool:
 
     Empty and whitespace-only count as absent: a key that renders as nothing is
     the same defect wearing a different value.
+
+    The SENTINEL is excluded too (P5). It is a real, searchable, enrichable
+    value — it is simply not a SUBJECT, so folding on it would rebuild the
+    `general` bucket under a new name, which is the one outcome this whole line
+    of work exists to prevent.
     """
-    return isinstance(project, str) and bool(project.strip())
+    return (
+        isinstance(project, str)
+        and bool(project.strip())
+        and project.strip() != SENTINEL
+    )
 
 
 def resolve_project(metadata):

@@ -56,7 +56,11 @@ from ontology import (
     GROUNDING_ROLES, GROUNDING_RELATIONS, default_grounding_role, RETRO_RATINGS,
     record_label_for_type,
 )
-from project_axis import PROJECT_SQL, fold_eligible, resolve_project
+from project_axis import (
+    PROJECT_SQL, PROJECT_EXISTS_SQL, PROJECT_PROPOSALS_SQL,
+    PROPOSAL_SIMILARITY, PROPOSAL_LIMIT, SENTINEL,
+    fold_eligible, resolve_project, project_for_graph,
+)
 from insight_gate import (
     INSIGHT_THRESHOLD, INSIGHT_HUB_DEGREE_CAP, insight_cluster_cypher,
 )
@@ -106,7 +110,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.32"
+FRAMEWORK_VERSION = "0.8.33"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -114,7 +118,12 @@ FRAMEWORK_VERSION = "0.8.32"
 # and /memory/relations/label (the review-edges / label-edges client commands
 # require them) — the operator is the calibration oracle for machine-minted
 # relation edges (decisions 726/727).
-API_VERSION = 3
+# v4 (project registry): a fact save without a REGISTERED metadata.project is
+# rejected 400 carrying error=project_required|project_unknown plus near-match
+# proposals. BREAKING for any client that saved untagged facts. The second
+# submission is accepted in three forms: a proposal, new_project=true, or the
+# reserved sentinel general_discussion.
+API_VERSION = 4
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # ── Record references: a record id is only unique WITHIN ITS TABLE ────────────
@@ -2082,6 +2091,118 @@ class MemoryCoordinator:
 
     # ── POST /memory/save ─────────────────────────────────────────────────────
 
+    async def _project_ingress_error(self, metadata: dict, agent_id: str) -> dict | None:
+        """The whole project-ingress rule (P4, P9). Returns the 400 body, or None
+        when the save may proceed. Registers the project as a side effect when the
+        caller declares it new — that IS the acceptance.
+        """
+        # Scope, verified in code rather than assumed: DECISIONS already fail
+        # without decision.project further down handle_save, and RETROSPECTIVES
+        # use their own endpoint and inherit the target decision's project. This
+        # is the fact path only.
+        if metadata.get("type") in ("decision", "retrospective"):
+            return None
+
+        # ⚠ The check is on `project`, never on a chain. A record carrying only a
+        # `domain` is NOT accepted as tagged: a domain is a SECTION of a project,
+        # so accepting it would let a part vouch for the whole.
+        supplied = resolve_project(metadata)
+        if not supplied:
+            return await self._project_rejection("project_required", None)
+
+        # The sentinel is a legitimate answer, not a bypass: it saves, searches
+        # and enriches, and is simply never folded as a subject (P5).
+        if supplied == SENTINEL:
+            return None
+
+        if await self._project_registered(supplied):
+            return None
+
+        # P9 — the second submission is ACCEPTED, in any of its three forms: pick
+        # a proposal (now a registry hit), declare a new project, or park it on
+        # the sentinel. There is deliberately NO round counter on the server: the
+        # bound comes from those three forms all succeeding, not from per-caller
+        # state a gateway would have to keep and expire. What the gateway never
+        # does, however many times it is asked, is accept an unregistered name.
+        if metadata.get("new_project") is True:
+            await self._register_project(supplied, agent_id)
+            log.info("project registry: %r registered by %s (new_project)",
+                     supplied, agent_id)
+            return None
+
+        return await self._project_rejection("project_unknown", supplied)
+
+    async def _project_registered(self, name: str) -> bool:
+        """Is this an established project? (P4, migration 022's registry.)"""
+        async with self._acquire() as conn:
+            return await conn.fetchval(PROJECT_EXISTS_SQL, name) is not None
+
+    async def _register_project(self, name: str, agent_id: str) -> None:
+        """Register a project the caller declared new (P9's second form).
+
+        No description: it is owed from the operator, and a placeholder would
+        claim one was supplied. The sentinel can never arrive here — it short
+        circuits above — and the schema's CHECK constraint keeps that true even
+        if a future caller reaches this by another path.
+        """
+        async with self._acquire() as conn:
+            await conn.execute(
+                "INSERT INTO projects (name, created_by) VALUES ($1, $2)"
+                " ON CONFLICT (name) DO NOTHING",
+                name, agent_id or "unknown",
+            )
+
+    async def _project_proposals(self, name: str | None) -> list[str]:
+        """Registry neighbours of a value that missed.
+
+        ⚠ A DELIBERATE REVERSAL, recorded rather than slipped in: the earlier
+        design returned no project names at all, reasoning that a list discloses
+        the shape of other agents' work. Proposals disclose a
+        relevance-filtered SLICE of that shape — far narrower than a full list —
+        and without them a rejection is a dead end the caller cannot act on
+        except by guessing. Accepted knowingly.
+        """
+        if not name:
+            return []
+        async with self._acquire() as conn:
+            rows = await conn.fetch(
+                PROJECT_PROPOSALS_SQL, name, PROPOSAL_SIMILARITY, PROPOSAL_LIMIT
+            )
+        return [r["name"] for r in rows]
+
+    async def _project_rejection(self, error: str, supplied: str | None) -> dict:
+        """The 400 body. One status code, so a client branches on `error` rather
+        than on HTTP semantics — nothing here CONFLICTS, so 409 would be wrong.
+
+        The message tells the model to ASK THE OPERATOR rather than infer. An
+        agent that guesses a project produces a record filed under a plausible
+        wrong name, which is worse than one that is parked: parked is visible and
+        repairable, wrong is neither.
+        """
+        proposals = await self._project_proposals(supplied)
+        if error == "project_required":
+            message = (
+                "metadata.project is required. The canonical value is the PROJECT "
+                "FOLDER NAME, and the client derives it from the working directory "
+                "— an empty value means the save was issued from outside any project "
+                "root. ASK THE OPERATOR which project this belongs to rather than "
+                "inferring one; a plausible wrong project is worse than none. If it "
+                f"genuinely belongs to no project, send {SENTINEL!r}, which saves and "
+                "searches normally but is never folded into a project's narrative."
+            )
+        else:
+            message = (
+                f"project {supplied!r} is not registered. Either it is a typo for an "
+                "existing project — the proposals list near matches — or it is a new "
+                "project, in which case re-send with metadata.new_project = true to "
+                "register it. ASK THE OPERATOR which, rather than picking for them. "
+                f"If it belongs to no project, send {SENTINEL!r}."
+            )
+        body = {"status": "error", "error": error, "message": message}
+        if proposals:
+            body["proposals"] = proposals
+        return body
+
     async def handle_save(self, request: web.Request) -> web.Response:
         try:
             body = await request.json()
@@ -2147,6 +2268,24 @@ class MemoryCoordinator:
                 },
                 status=400,
             )
+
+        # Project is REQUIRED on a fact, and checked against the registry (P4).
+        #
+        # Unconditional — no env gate. A nullifiable invariant is not an invariant,
+        # and the failure it guards against is silent: an untagged record saves
+        # cleanly, searches cleanly, and simply never reaches synthesis.
+        #
+        # ⚠ The check is on `project`, never on a chain. A record carrying only a
+        # `domain` is NOT accepted as tagged: a domain is a SECTION of a project,
+        # so accepting it here would mean a part vouching for the whole.
+        #
+        # Scope, verified in code rather than assumed: DECISIONS already fail
+        # without decision.project a few lines below, and RETROSPECTIVES use their
+        # own endpoint and inherit the target decision's project. This is the fact
+        # path only.
+        project_error = await self._project_ingress_error(metadata, agent_id)
+        if project_error is not None:
+            return web.json_response(project_error, status=400)
 
         # Decision saves require structured provenance fields — validated at ingress
         # before the row touches the outbox WAL.  Bad data from an LLM is rejected
@@ -2302,11 +2441,13 @@ class MemoryCoordinator:
                             # project = the normalised folder name ("project from folder").
                             # Each edge is written only when its value is present.
                             "person": metadata.get("principal"),
-                            # P3 — the resolved PROJECT, never a section and never
-                            # a chain: a :Project node must be a project. Uses the
-                            # one resolution so a record whose project lives in the
-                            # decision payload mints the same node a fact would.
-                            "project": resolve_project(metadata),
+                            # P3 + P8 — the resolved PROJECT, never a section and
+                            # never a chain, and never the SENTINEL: a :Project node
+                            # must be a project. A parked record saves, searches and
+                            # enriches normally but puts no placeholder into the
+                            # project set, where the insight gate's ">= 2 distinct
+                            # projects" rule would count it as a subject.
+                            "project": project_for_graph(metadata),
                             "type": metadata.get("type", "fact"),
                             "decision": metadata.get("decision", {}),
                             "source_ref": metadata.get("source_ref") or None,

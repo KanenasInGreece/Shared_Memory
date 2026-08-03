@@ -5,6 +5,67 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.33] — 2026-08-03
+
+### Added
+
+- **A projects registry, so an unrecognised project is loud instead of merely
+  new.** Until now a project was whatever string a client happened to send, and
+  there was nothing for a value to be unknown *against* — a typo and a genuinely
+  new project were the same event, and both entered the corpus in silence. The
+  registry is seeded from the projects a deployment is already using, read from
+  its own records rather than any hardcoded list, so it fits whatever install it
+  runs on. **Descriptions are deliberately left empty**: a description is what
+  the synthesis prompt reads as framing, so inventing one would put words into
+  the corpus that nobody wrote — an empty description says "not yet supplied"
+  where a guess would say "supplied, and wrong".
+
+### Changed
+
+- **A fact save without a registered project is now rejected.** The rejection
+  carries which of the two things went wrong — nothing supplied, or supplied but
+  unrecognised — and, for a near miss, **near-match proposals from the registry**
+  so the caller can act on it instead of guessing. Matching is by name
+  similarity, which needs no embedder: registration therefore cannot be taken
+  down by an embedding outage, which a vector-only lookup would risk.
+
+  **The exchange ends in one of three ways, and only these three:** pick a
+  proposal, declare the value a new project and register it, or park the record
+  on the sentinel. Re-sending the same unregistered name is refused however often
+  it is asked. There is no retry counter on the server — the bound comes from
+  those three answers all being accepted, not from per-caller state a server
+  would have to keep and expire.
+
+  ⚠ **This is a breaking protocol change** (`api_version` 3 → 4) for any client
+  that saved facts without a project. Update every client together.
+
+- **The rejection tells the model to ask the operator, not to infer.** An agent
+  that guesses produces a record filed under a plausible wrong project, which is
+  worse than one left unfiled: unfiled is visible and repairable, misfiled is
+  neither.
+
+- **`general_discussion` is a reserved sentinel for a record that belongs to no
+  project.** It saves, searches and gets enriched like any other record, and is
+  never folded into a project's narrative or counted as a project. The name
+  cannot be registered as a real project — the database refuses it, so no future
+  code path can claim it by accident.
+
+- **The client derives the project from an absolute source reference** when the
+  working directory is not inside any project root. Deterministic only: a
+  relative reference names no location, so nothing is guessed from it.
+
+- **Reasoning traces carry a project like any other record.** Exempting them
+  would have quietly rebuilt the very population of untagged records this work
+  removes, so the tool takes the project explicitly rather than defaulting it.
+
+### Fixed
+
+- **The schema reference shipped to clients had fallen several releases behind
+  its source**, missing two tables and a column documented long ago. The
+  copy-parity check now reads the ship manifest instead of a hand-written list of
+  two files, so every shipped file is compared and a newly shipped one is covered
+  without anyone remembering to add it.
+
 ## [0.8.32] — 2026-08-03
 
 ### Changed

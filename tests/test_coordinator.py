@@ -141,7 +141,7 @@ async def test_plain_fact_save_skips_decision_validation():
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         req = _make_request({
             "content": "plain fact content",
-            "metadata": {"source": "claude-code", "entities": ["SharedMemory"]},
+            "metadata": {"project": "shared-memory-GitHub", "source": "claude-code", "entities": ["SharedMemory"]},
         })
         resp = await c.handle_save(req)
     assert resp.status == 200
@@ -1063,7 +1063,7 @@ async def test_save_propagates_source_ref_to_outbox_cypher_params():
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         req = _make_request({
             "content": "Fact with sub-document reference",
-            "metadata": {
+            "metadata": {"project": "shared-memory-GitHub", 
                 "source": "claude-code",
                 "entities": ["SharedMemory"],
                 "source_ref": "design-doc.pdf#p12",
@@ -1093,7 +1093,7 @@ async def test_save_without_source_ref_stores_none_in_outbox():
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         req = _make_request({
             "content": "Plain fact with no source reference",
-            "metadata": {"source": "claude-code", "entities": ["SharedMemory"]},
+            "metadata": {"project": "shared-memory-GitHub", "source": "claude-code", "entities": ["SharedMemory"]},
         })
         resp = await c.handle_save(req)
 
@@ -1273,7 +1273,7 @@ async def test_handle_save_source_overwritten_by_authenticated_agent():
         req = _make_request(
             {
                 "content": "some content",
-                "metadata": {"source": "imposter", "entities": ["Entity1"]},
+                "metadata": {"project": "shared-memory-GitHub", "source": "imposter", "entities": ["Entity1"]},
             },
             authenticated_agent="claude",
         )
@@ -1303,7 +1303,7 @@ async def test_handle_save_agent_id_stamped_from_verified_identity():
         req = _make_request(
             {
                 "content": "some content",
-                "metadata": {"source": "claude", "entities": ["Entity1"]},
+                "metadata": {"project": "shared-memory-GitHub", "source": "claude", "entities": ["Entity1"]},
                 "agent_id": "memory_bridge",   # client default
             },
             authenticated_agent="grok",
@@ -1328,7 +1328,7 @@ async def test_handle_save_agent_id_falls_back_to_body_without_auth():
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         req = _make_request({
             "content": "some content",
-            "metadata": {"source": "claude", "entities": ["Entity1"]},
+            "metadata": {"project": "shared-memory-GitHub", "source": "claude", "entities": ["Entity1"]},
             "agent_id": "claude_code",
         })  # authenticated_agent defaults to None
         resp = await c.handle_save(req)
@@ -1432,7 +1432,7 @@ async def test_save_binds_metadata_as_object_not_stringified():
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         req = _make_request({
             "content": "fact for encoding check",
-            "metadata": {"source": "claude-code", "entities": ["SharedMemory"]},
+            "metadata": {"project": "shared-memory-GitHub", "source": "claude-code", "entities": ["SharedMemory"]},
         })
         resp = await c.handle_save(req)
     assert resp.status == 200
@@ -1454,7 +1454,7 @@ async def test_save_coerces_stringified_metadata_to_object():
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         req = _make_request({
             "content": "fact with stringified metadata",
-            "metadata": json.dumps({"source": "grok", "entities": ["X"]}),
+            "metadata": json.dumps({"source": "grok", "project": "shared-memory-GitHub", "entities": ["X"]}),
         })
         resp = await c.handle_save(req)
     assert resp.status == 200
