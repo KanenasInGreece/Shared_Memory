@@ -28,7 +28,7 @@ from entity_vote import (
     tally, vote_band, is_auto,
     BAND_AUTO, BAND_HIGH, BAND_REVIEW, BAND_NONE,
 )
-from sync_project_registry import classify
+from sync_project_registry import classify, normalise_key, collisions
 
 
 # ── Tallying ─────────────────────────────────────────────────────────────────
@@ -119,8 +119,37 @@ def test_case_differences_resolve_to_the_folder_spelling():
     """A directory listing is the canonical casing; treating a case difference
     as a separate project splits a project against itself."""
     verdict, folder, _ = classify("Shared-Memory-GitHub", FOLDERS)
-    assert verdict == "case"
+    assert verdict == "variant"
     assert folder == "shared-memory-GitHub"
+
+
+def test_separator_style_is_never_a_real_difference():
+    """`shared_memory_monitor` and `shared-memory-monitor` are one project
+    written by two tools. Before the normalised key these fell through to fuzzy
+    matching, where a near-miss is only ever REPORTED — so a pure spelling
+    variant would have been queued for human adjudication forever."""
+    for spelling in ("shared_memory_monitor", "shared.memory.monitor",
+                     "shared memory monitor", "  Shared-Memory-Monitor  "):
+        verdict, folder, _ = classify(spelling, FOLDERS)
+        assert verdict == "variant", spelling
+        assert folder == "shared-memory-monitor"
+
+
+def test_the_key_folds_separators_and_case_but_never_words():
+    assert normalise_key("Shared_Memory Monitor") == normalise_key("shared-memory-monitor")
+    assert normalise_key("  a__b  ") == "a-b"
+    # WORDS are meaning, not spelling: folding these would merge a sister project
+    # into the one beside it, which is the loss this axis exists to prevent.
+    assert normalise_key("tier3") != normalise_key("tier3-cloe")
+    assert normalise_key("shared-memory") != normalise_key("shared-memory-monitor")
+    assert normalise_key("Shared_Memory") != normalise_key("shared-memory-GitHub")
+
+
+def test_two_folders_that_normalise_alike_are_reported_never_merged():
+    """Two real directories competing for one registry row is a problem only the
+    operator can settle."""
+    assert collisions({"my-proj", "my_proj"}) == {"my-proj": ["my-proj", "my_proj"]}
+    assert collisions(FOLDERS) == {}
 
 
 def test_a_near_miss_is_surfaced_never_auto_resolved():

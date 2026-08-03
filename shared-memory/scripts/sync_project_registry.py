@@ -40,7 +40,9 @@ configuration.
 import argparse
 import difflib
 import os
+import re
 import sys
+import unicodedata
 from pathlib import Path
 
 import psycopg2
@@ -93,24 +95,67 @@ def project_folders(roots: list[str]) -> set[str]:
     return names
 
 
+def normalise_key(name: str) -> str:
+    """The comparison key two spellings of ONE project must share.
+
+    Comparing raw strings is too strict and comparing fuzzily is too loose, so
+    the middle step is an explicit key, and what it folds away is a deliberate
+    list of things that are NEVER a real difference between project names:
+
+      * unicode composition — 'e' + combining acute vs 'é' are the same letter,
+        and which one lands in a name depends on the keyboard that typed it;
+      * case — a directory listing is the canonical casing;
+      * surrounding whitespace, and separator RUNS;
+      * WHICH separator — `_`, `-`, `.` and space are interchangeable in
+        practice. `shared_memory_monitor` and `shared-memory-monitor` are one
+        project written by two tools, not two projects.
+
+    What it deliberately does NOT fold: extra or missing WORDS. `tier3` and
+    `tier3-cloe` keep different keys, and `Shared_Memory` does not collapse into
+    `shared-memory-GitHub`. Those are the cases where a rename, an abbreviation
+    and a genuinely distinct project are indistinguishable without knowing the
+    history — so they stay a QUESTION rather than becoming an automatic answer.
+    Folding them here would have silently merged a sister project into the one
+    beside it, which is the exact loss this whole axis is guarding against.
+    """
+    s = unicodedata.normalize("NFKC", name).strip().casefold()
+    s = re.sub(r"[\s_.\-]+", "-", s)
+    return s.strip("-")
+
+
 def classify(name: str, folders: set[str]) -> tuple[str, str | None, float]:
     """(verdict, matched folder, similarity) for one stored project name.
 
-    Case-insensitive equality counts as a match to the FOLDER's spelling: a
-    directory listing is the canonical casing, and treating a case difference as
-    a separate project would split a project against itself.
+    Four verdicts, narrowing: an exact string; a spelling VARIANT that shares the
+    normalised key; a fuzzy near-miss; nothing. Only the first two are answers —
+    the rest are questions for the operator.
     """
     if name in folders:
         return "exact", name, 1.0
-    by_lower = {f.lower(): f for f in folders}
-    if name.lower() in by_lower:
-        return "case", by_lower[name.lower()], 1.0
-    close = difflib.get_close_matches(
-        name.lower(), list(by_lower), n=1, cutoff=CLOSE_MATCH_CUTOFF)
+    by_key: dict[str, str] = {}
+    for folder in folders:
+        # First spelling wins only when two folders collide, which `collisions`
+        # reports separately — it is a real problem, not something to resolve here.
+        by_key.setdefault(normalise_key(folder), folder)
+    key = normalise_key(name)
+    if key in by_key:
+        return "variant", by_key[key], 1.0
+    close = difflib.get_close_matches(key, list(by_key), n=1, cutoff=CLOSE_MATCH_CUTOFF)
     if close:
-        ratio = difflib.SequenceMatcher(None, name.lower(), close[0]).ratio()
-        return "close", by_lower[close[0]], ratio
+        ratio = difflib.SequenceMatcher(None, key, close[0]).ratio()
+        return "close", by_key[close[0]], ratio
     return "absent", None, 0.0
+
+
+def collisions(folders: set[str]) -> dict[str, list[str]]:
+    """Folder names that normalise to the same key — two directories that this
+    system cannot tell apart. Reported, never resolved: it means two real
+    directories would compete for one registry row, and only the operator can
+    say which is intended."""
+    seen: dict[str, list[str]] = {}
+    for folder in sorted(folders):
+        seen.setdefault(normalise_key(folder), []).append(folder)
+    return {k: v for k, v in seen.items() if len(v) > 1}
 
 
 def main() -> int:
@@ -147,6 +192,12 @@ def main() -> int:
         folders.discard(SENTINEL)
         to_add = sorted(folders - registered)
 
+        dupes = collisions(folders)
+        if dupes:
+            print("⚠ FOLDER NAMES THAT NORMALISE THE SAME — two directories, one key:")
+            for key, names in dupes.items():
+                print(f"      {key!r}: {names}")
+            print()
         print(f"Project folders found      : {len(folders)}")
         print(f"Already registered         : {len(folders & registered)}")
         print(f"NEW — would be registered  : {len(to_add)}")
@@ -160,8 +211,9 @@ def main() -> int:
             if verdict == "exact":
                 continue
             surface += 1
-            if verdict == "case":
-                print(f"   {count:5}  {name!r} → folder spelling {folder!r}  (case only)")
+            if verdict == "variant":
+                print(f"   {count:5}  {name!r} → folder spelling {folder!r}"
+                      f"   (same name, different separators/case)")
             elif verdict == "close":
                 print(f"   {count:5}  {name!r} ~{ratio:.0%}~ {folder!r}"
                       f"   RENAME or DISTINCT PROJECT?")
