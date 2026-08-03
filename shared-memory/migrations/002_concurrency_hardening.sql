@@ -25,11 +25,36 @@ BEGIN;
 
 -- Step 1: Remove duplicate rows, keeping only the most recent per entity.
 -- Uses a self-join: delete rows where a newer row for the same entity exists.
-DELETE FROM community_summaries a
-USING community_summaries b
-WHERE a.id < b.id
-  AND a.metadata->>'entity' = b.metadata->>'entity'
-  AND a.metadata->>'entity' IS NOT NULL;
+--
+-- ⚠ GUARDED, and the guard is not decoration. This DELETE keeps one summary per
+-- ENTITY, which was the summary key when this migration was written. Migration
+-- 007 re-keyed summaries on (entity, domain), so from that point on several
+-- summaries legitimately share an entity — and running this statement against
+-- the later schema deletes all but one of them. That is not hypothetical: the
+-- old apply.py re-ran every migration on every invocation, and this statement
+-- destroyed 12 live summaries.
+--
+-- apply.py now runs each migration exactly once, which is the real fix. This
+-- guard is defence in depth for any path that reaches this file again: if the
+-- (entity, domain) index exists, the schema has moved past the key this DELETE
+-- assumes and the dedup is not merely unnecessary but wrong.
+--
+-- The general rule this stands for: a migration is written against the schema as
+-- it was at that moment, so a destructive step must assert that assumption still
+-- holds rather than trusting it.
+DO $guard$
+BEGIN
+    IF to_regclass('public.community_summaries_entity_domain_unique') IS NOT NULL THEN
+        RAISE NOTICE 'migration 002: entity-level dedup SKIPPED — summaries are keyed on (entity, domain) since migration 007, so this DELETE would destroy legitimately distinct summaries.';
+    ELSE
+        DELETE FROM community_summaries a
+        USING community_summaries b
+        WHERE a.id < b.id
+          AND a.metadata->>'entity' = b.metadata->>'entity'
+          AND a.metadata->>'entity' IS NOT NULL;
+    END IF;
+END
+$guard$;
 
 -- Step 2: Unique partial index on entity name.
 -- Partial (WHERE entity IS NOT NULL) so rows without an entity key are unaffected.
