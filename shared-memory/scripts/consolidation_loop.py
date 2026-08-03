@@ -70,7 +70,7 @@ import relation_confidence as rc_conf
 from insight_gate import (
     INSIGHT_THRESHOLD, INSIGHT_HUB_DEGREE_CAP, insight_cluster_cypher,
 )
-from project_axis import PROJECT_SQL
+from project_axis import PROJECT_SQL, fold_eligible
 from pool_status import pool_has_free_slot
 from dream_telemetry import (record_llm_call, adaptive_ceiling, embed_ceiling,
                              EMBED_MAX_CHARS)
@@ -841,20 +841,29 @@ def corrective_block(missing):
 
 
 def eligible_domain_clusters(contents, pg_ids, domain_map, threshold):
-    """Partition one entity's facts by domain, keeping only domains that meet
+    """Partition one entity's facts by project, keeping only projects that meet
     the density threshold.
 
-    NREM keys community summaries on (entity, domain) so that facts from
-    unrelated domains sharing an entity are never fused into one narrative.
-    ``domain_map`` maps pg_id → domain (derived from Postgres metadata); a
-    missing or empty domain falls back to DEFAULT_DOMAIN.
+    NREM keys community summaries on (entity, project) so that facts from
+    unrelated projects sharing an entity are never fused into one narrative.
+    ``domain_map`` maps pg_id → project (project_axis.PROJECT_SQL over Postgres
+    metadata).
 
-    Returns a list of (domain, contents, pg_ids) tuples — one per qualifying
-    domain. Pure function (no I/O) so the partition rule is unit-testable.
+    ⚠ Invariant P2: a fact whose project does not resolve is **skipped**, not
+    bucketed. It used to fall back to DEFAULT_DOMAIN, which meant every untagged
+    fact in the corpus pooled into one key and folded together — 127 facts
+    fusing 12 active narratives whose only shared property was that nobody had
+    said where they came from. An absence is not a topic, so two such facts must
+    never group.
+
+    Returns a list of (project, contents, pg_ids) tuples — one per qualifying
+    project. Pure function (no I/O) so the partition rule is unit-testable.
     """
     by_domain: dict = {}
     for content, pid in zip(contents, pg_ids):
-        dom = domain_map.get(pid) or DEFAULT_DOMAIN
+        dom = domain_map.get(pid)
+        if not fold_eligible(dom):
+            continue
         bucket = by_domain.setdefault(dom, ([], []))
         bucket[0].append(content)
         bucket[1].append(pid)
@@ -2199,7 +2208,7 @@ class ConsolidationDaemon:
                     return {}
                 with conn.cursor() as cur:
                     cur.execute(
-                        f"SELECT id, COALESCE({PROJECT_SQL}, 'general'),"
+                        f"SELECT id, {PROJECT_SQL},"
                         " COALESCE(metadata->>'type', 'fact'),"
                         " metadata->>'source_ref', created_at::date"
                         " FROM technical_docs WHERE id = ANY(%s)",

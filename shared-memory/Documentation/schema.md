@@ -252,7 +252,7 @@ Written by the outbox worker for `type:decision` saves.
 |---|---|---|
 | `WAS_ATTRIBUTED_TO` | `(:Decision)-[:WAS_ATTRIBUTED_TO]->(:Human)` | Who owns the decision |
 | `WAS_ASSISTED_BY` | `(:Decision)-[:WAS_ASSISTED_BY]->(:AIAgent)` | Which AI tool(s) assisted |
-| `PROJECT_OF` | `(:Decision)-[:PROJECT_OF]->(:Project)` | Which project the decision belongs to |
+| `PROJECT_OF` | `(:Fact\|:Decision)-[:PROJECT_OF]->(:Project)` | Which project the record belongs to. Written at first write from the record's resolved project — a `:Project` node is only ever minted from a **project**, never from a section of one. A record whose project does not resolve gets no edge and no node; it is left for the repair path rather than attached to an invented default. |
 | `WAS_GENERATED_BY` | `(:Decision)-[:WAS_GENERATED_BY]->(:Activity)` | Which session produced it (reserved) |
 | `ACTED_ON_BEHALF_OF` | `(:AIAgent)-[:ACTED_ON_BEHALF_OF]->(:Human)` | Delegation chain (reserved) |
 | `SUPERSEDES` | `(:Decision)-[:SUPERSEDES]->(:Decision)` | Replaces a prior decision |
