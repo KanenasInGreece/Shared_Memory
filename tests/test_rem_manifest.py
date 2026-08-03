@@ -791,6 +791,40 @@ def test_accept_set_withholds_entities_no_first_write_ever_named():
         assert f"n:{spine}" in accept_q.split(f"OR (n:{ONT.entity}")[0]
 
 
+def test_accept_set_refuses_a_namer_that_has_been_superseded():
+    """The rule used to EXEMPT superseded namers, on the reasoning that
+    supersession retracts a claim and not the vocabulary it was filed under,
+    "because the successor almost always reuses the same concepts". That second
+    clause undid the first: a successor which reuses the concept IS a live
+    first-write namer, so the entity qualifies through the successor and needs no
+    exemption. The exemption could therefore only ever bite where NO live fact
+    names the entity — precisely the retracted-vocabulary case it was written to
+    protect against.
+
+    Measured when this was corrected: 11 of 1026 accept-set members qualified on
+    a superseded namer alone (`_decision`, `_memory`, `TestProbe`,
+    `RELATION_FAMILIES`, …), two of them already accreting REM links, and no live
+    fact anywhere depended on one for a topic.
+
+    Cypher is stubbed, so this pins the predicate; the count was verified live.
+    """
+    d, session = _make_daemon([])
+    asyncio.run(d._fetch_closed_entity_set())
+    accept_q = session.run.call_args_list[0][0][0]
+
+    assert "coalesce(src.superseded, false) = false" in accept_q
+    # On the NAMER, not on the entity: `n` is the thing being qualified and has
+    # no superseded state of its own. Guarding the wrong node would read as
+    # enforced and admit every retracted spelling.
+    entity_arm = accept_q.split(f"OR (n:{ONT.entity}")[1]
+    assert "src.superseded" in entity_arm
+    assert "n.superseded" not in accept_q
+    # The withheld count must ask the SAME question, or the gate's own metric
+    # reports a set that is not the one being refused.
+    withheld_q = session.run.call_args_list[1][0][0]
+    assert "coalesce(src.superseded, false) = false" in withheld_q
+
+
 def test_accept_set_reports_what_it_withheld():
     """A gate with no metric is unfalsifiable in production. The withheld count
     is a SECOND query on purpose — the accept set returns rows, so the ones it

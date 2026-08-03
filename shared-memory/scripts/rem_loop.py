@@ -560,9 +560,85 @@ def _safe_label(labels: list[str]) -> str:
     return ONT.entity
 
 
+def collapse_alias_components(closed_set: list[dict]) -> list[dict]:
+    """Collapse the accept set from SPELLINGS to CONCEPTS. Pure — no I/O.
+
+    The alias layer (alias_graph.py, GDS wcc) already stamps
+    `Entity.alias_component` on every surface form of one concept, and NREM and
+    search both group on it. REM was the one consumer that did not: its registry
+    was keyed on the raw `name` string, so the prompt offered the model four
+    separate "known nodes" for `LM Studio` / `LMStudio` / `LM_Studio` /
+    `lm_studio`, the model dutifully proposed several of them, and the verifier
+    correctly confirmed each one — four edges to one concept, all of them true,
+    all but one redundant. That is not a verification failure and no confidence
+    floor can reach it: the same question was simply asked four times.
+
+    Measured on the live graph when this landed: 1015 accept-set rows collapse to
+    814 concepts across 106 collision groups, and EVERY one of those groups was
+    already a single alias component. The graph knew; REM did not ask.
+
+    Returns one row per concept, canonical row first-class and the other
+    spellings attached as `aliases` (rendered to the prompt as "also written
+    as …", so the model can still match whatever spelling the content uses).
+
+    CANONICAL CHOICE — most first-write namings, ties broken alphabetically. It
+    has to be deterministic AND stable, because an unstable canonical would write
+    a fresh duplicate every time it flipped, which is the defect this fixes. Live
+    namings only change when a PERSON saves a fact naming that spelling — REM's
+    own edges carry `asserted_by` and are excluded from the count — so the
+    canonical moves toward the spelling people actually use and never drifts on
+    machine output.
+
+    Rows with no `alias_component` (spine nodes, and any Entity the alias layer
+    has not grouped) are each their own concept, keyed on the name. This mirrors
+    alias_graph's documented grouping key, `coalesce(alias_component,
+    elementId(e))`; name is the equivalent stable identity here and is what the
+    rest of REM already resolves on.
+
+    ⚠ This makes the ALIAS LAYER load-bearing for REM: a wrong component merges
+    two concepts into one for enrichment purposes, where before it merely
+    mis-grouped them for folding. The layer is imperfect today (component 401
+    holds `Project: tier3` and `Tier-3 output` beside `Tier3` — phrase-shaped
+    names FIRST WRITE admitted, the capture-surface problem 978 already
+    disclaims). The trade is deliberate: a wrong merge costs one over-broad
+    concept, while the status quo cost a duplicate edge on every record that
+    mentioned any well-known name.
+    """
+    groups: dict[object, list[dict]] = defaultdict(list)
+    for row in closed_set:
+        name = row.get("name")
+        if not name:
+            continue          # Decision nodes carry `title`, not `name` (727)
+        comp = row.get("alias_component")
+        groups[("c", comp) if comp is not None else ("n", name)].append(row)
+
+    collapsed: list[dict] = []
+    for key in sorted(groups, key=lambda k: (str(k[0]), str(k[1]))):
+        members = groups[key]
+        # Most-named first, then alphabetical — the tie-break is what makes a
+        # component with no namings at all (spine nodes) still deterministic.
+        members = sorted(members, key=lambda r: (-int(r.get("namings") or 0),
+                                                 r.get("name") or ""))
+        head, rest = members[0], members[1:]
+        # A concept is TYPED if any spelling is: the sub-label lives on a node,
+        # and asking the model to re-type a concept one of whose forms is already
+        # classified is exactly the waste the delta principle exists to avoid.
+        labels: list[str] = []
+        for r in members:
+            for lbl in (r.get("labels") or []):
+                if lbl not in labels:
+                    labels.append(lbl)
+        collapsed.append({
+            **head,
+            "labels":  labels,
+            "aliases": [r["name"] for r in rest],
+        })
+    return collapsed
+
+
 def _build_entity_registry(closed_set: list[dict]) -> dict[str, dict]:
-    """Build name→{label, default_rel, typed, pg_id} registry from the closed
-    typed-node set.
+    """Build name→{label, default_rel, typed, pg_id, canonical} registry from the
+    closed typed-node set.
 
     Enforces type consistency: once "Xenofon" is registered as Human, every
     subsequent encounter in the same batch uses the same label and compatible
@@ -572,6 +648,13 @@ def _build_entity_registry(closed_set: list[dict]) -> dict[str, dict]:
     node that never needs one): sub-type classification is asked ONLY for
     untyped entities (delta principle). `pg_id` — carried for Decision nodes so
     evidential proposals can write their ledger row (727 rung 1).
+
+    `canonical` — the name an accepted proposal is actually WRITTEN to. Every
+    alias of a collapsed concept is registered as its own key pointing at the
+    same entry, which is what lets the gate MATCH any spelling the content uses
+    while the graph only ever RECEIVES one. Matching and writing were the same
+    string before the alias collapse; they are now deliberately different, and
+    everything downstream of planning must use `canonical`.
     """
     registry: dict[str, dict] = {}
     for row in closed_set:
@@ -580,13 +663,34 @@ def _build_entity_registry(closed_set: list[dict]) -> dict[str, dict]:
         if not name:
             continue
         label = _safe_label(labels)
-        registry[name] = {
+        entry = {
             "label":       label,
             "default_rel": _LABEL_DEFAULT_REL.get(label, ONT.entity_link),
             "typed":       label != ONT.entity or bool(set(labels) & _ENTITY_SUBLABELS),
             "pg_id":       row.get("pg_id"),
+            "canonical":   name,
         }
+        # A concept's own head always takes its key. An alias only fills a key
+        # nothing has claimed. Live case this decides: TWO nodes are named
+        # `lm_studio` — an :Entity in the LM Studio alias component and the
+        # :AIAgent identity that the MCP client authenticates as. The registry is
+        # name-keyed and can hold one, and which one used to depend on Cypher's
+        # row order. Now the AIAgent keeps the key as the head of its own
+        # concept, the Entity spelling stays reachable through its canonical
+        # `LM_Studio`, and a proposal naming `lm_studio` resolves to the agent —
+        # which is what the name means when a person writes it.
+        registry[name] = entry
+        for alias in (row.get("aliases") or []):
+            if alias and alias not in registry:
+                registry[alias] = entry
     return registry
+
+
+def canonical_name(name: str, registry: dict[str, dict]) -> str:
+    """The node a proposal for `name` is written to. Unknown names resolve to
+    themselves — planning drops them before anything is written, so this only
+    has to be total, not clever."""
+    return registry.get(name, {}).get("canonical", name)
 
 
 def _resolve_rel(name: str, suggested_rel: str, registry: dict[str, dict]) -> tuple[str, str]:
@@ -690,9 +794,20 @@ def _manifest_block(m: dict) -> str:
     return "\n".join(lines)
 
 
-def _existing_edge_set(manifest: dict) -> set[tuple[str, str]]:
+def _existing_edge_set(manifest: dict,
+                       registry: dict[str, dict] | None = None) -> set[tuple[str, str]]:
     """(target name, rel_type) pairs already captured on the anchor — the
     novelty gate for machine-minted edges.
+
+    Both sides are CANONICALISED through the registry, and that is load-bearing
+    for the alias collapse rather than tidiness. Planning now writes a proposal
+    to its concept's canonical node, so an anchor already carrying
+    `-[MENTIONS]->(LM Studio)` would see a proposal resolving to `LM_Studio` as
+    novel and add the second edge — the collapse would have produced the very
+    duplication it exists to prevent, one spelling later. Comparing concepts on
+    both sides is what closes that. The registry is optional so the pure-function
+    contract survives callers that have no registry to hand; without one this
+    degrades to the pre-collapse behaviour of comparing raw names.
 
     `existing_edges` is read from the graph and is always true. The caller's
     `entities` list is a CLAIM about what first write did with it, and whether
@@ -711,14 +826,15 @@ def _existing_edge_set(manifest: dict) -> set[tuple[str, str]]:
     which is the only source that was ever authoritative for them.
     """
     manifest = manifest or {}
+    reg = registry or {}
     existing = {
-        (e.get("target"), e.get("rel_type"))
+        (canonical_name(e["target"], reg), e.get("rel_type"))
         for e in (manifest.get("existing_edges") or [])
         if e.get("target")
     }
     if manifest.get("kind", KIND_FACT) == KIND_FACT:
         for ent in manifest.get("entities") or []:
-            existing.add((ent, ONT.entity_link))
+            existing.add((canonical_name(ent, reg), ONT.entity_link))
     return existing
 
 
@@ -740,17 +856,36 @@ def select_prompt_slice(closed_set: list[dict], ranked_names: list[str],
       names means recall failed, and grounding matters MOST in that case — an
       empty SHOW set leaves the LLM nothing to match, so every name it coins is
       unknown to the gate and dropped.
+
+    `closed_set` arrives ALIAS-COLLAPSED, and both properties above are stated in
+    terms of concepts rather than spellings as a result. A ranked name that is an
+    alias resolves to its concept instead of being discarded as a ghost (recall
+    goes UP), and a concept already taken cannot be taken again under a second
+    spelling — so the k budget buys k distinct concepts rather than, at worst, k
+    ways of writing one. `entity_embeddings` is keyed on the surface name and is
+    left alone deliberately: it is the recall layer, and it should keep matching
+    whatever a record actually says.
     """
     if not ranked_names:
         return closed_set[:fallback_limit], "fallback"
-    by_name = {r["name"]: r for r in closed_set if r.get("name")}
+    by_name: dict[str, dict] = {}
+    for r in closed_set:
+        if not r.get("name"):
+            continue
+        by_name.setdefault(r["name"], r)
+        for alias in (r.get("aliases") or []):
+            if alias:
+                by_name.setdefault(alias, r)
     rows: list[dict] = []
     seen: set[str] = set()
     for name in ranked_names:
-        if name in seen or name not in by_name:
+        row = by_name.get(name)
+        # Dedupe on the CONCEPT (the row's canonical name), not on the ranked
+        # string: two spellings of one concept must not consume two slots.
+        if row is None or row["name"] in seen:
             continue          # ghost filter: ranked but not in the live graph
-        seen.add(name)
-        rows.append(by_name[name])
+        seen.add(row["name"])
+        rows.append(row)
         if len(rows) >= k:
             break
     if not rows:
@@ -762,7 +897,14 @@ def select_prompt_slice(closed_set: list[dict], ranked_names: list[str],
 def _entity_lines(closed_set: list[dict]) -> str:
     """Render the closed typed-node set for the prompt. Generic Entity nodes
     without a sub-label are marked [untyped] so the LLM classifies ONLY those
-    (delta principle for sub-typing)."""
+    (delta principle for sub-typing).
+
+    A collapsed concept renders as ONE line naming its canonical spelling, with
+    the other surface forms listed after it. The alternates are shown rather than
+    hidden because the prompt's standing rule is to match a known name EXACTLY:
+    a record that writes "LM Studio" must still be able to find the concept whose
+    canonical form is "LM_Studio". What the model may match widened; what the
+    graph receives did not."""
     out = []
     for r in closed_set:
         if not r.get("name"):
@@ -770,7 +912,12 @@ def _entity_lines(closed_set: list[dict]) -> str:
         labels = r.get("labels") or []
         label = _safe_label(labels)
         untyped = label == ONT.entity and not (set(labels) & _ENTITY_SUBLABELS)
-        out.append(f"  {label}: {r['name']}" + (" [untyped]" if untyped else ""))
+        aliases = [a for a in (r.get("aliases") or []) if a]
+        out.append(
+            f"  {label}: {r['name']}"
+            + (" [untyped]" if untyped else "")
+            + (f"  (also written as: {', '.join(aliases)})" if aliases else "")
+        )
     return "\n".join(out) or "  (none yet)"
 
 
@@ -798,9 +945,17 @@ def plan_edges(result: dict, registry: dict[str, dict], kind: str,
       Every branch: REM links, never mints — unconditionally, no env escape. A
                    name absent from the registry is dropped into mint_dropped
                    instead of creating a node, and since 978 the registry omits
-                   every Entity no first write ever named.
+                   every Entity no first write ever named, and every Entity whose
+                   only namer has since been superseded.
+      ALIAS COLLAPSE: a proposal MATCHES on any registered spelling and is
+                   WRITTEN to its concept's canonical node. The dedupe set and
+                   the novelty check therefore both key on the canonical name —
+                   which is what makes several spellings of one concept collapse
+                   into a single proposal here, before they cost k verification
+                   round-trips each and before they reach the graph as separate
+                   edges.
     """
-    existing = _existing_edge_set(manifest)
+    existing = _existing_edge_set(manifest, registry)
     edges: list[dict] = []
     dropped_names: list[str] = []
     mint_dropped: list[str] = []
@@ -808,12 +963,13 @@ def plan_edges(result: dict, registry: dict[str, dict], kind: str,
     seen: set[tuple[str, str]] = set()
 
     def _add(name: str, label: str, rel_type: str, evidential: bool) -> None:
-        if (name, rel_type) in seen:
+        canon = canonical_name(name, registry)
+        if (canon, rel_type) in seen:
             return
-        seen.add((name, rel_type))
+        seen.add((canon, rel_type))
         edges.append({
-            "name": name, "label": label, "rel_type": rel_type,
-            "novel": (name, rel_type) not in existing,
+            "name": canon, "label": label, "rel_type": rel_type,
+            "novel": (canon, rel_type) not in existing,
             "evidential": evidential,
             "tgt_pg_id": registry.get(name, {}).get("pg_id") if evidential else None,
         })
@@ -1321,18 +1477,40 @@ class REMDaemon:
         it fire means REM proposing decision-to-decision links, which is the
         node-to-node relation capability still awaiting traversal rules.)
 
-        A SUPERSEDED naming record still qualifies its entities, deliberately.
-        The filter asks whether a person ever chose the name, and supersession
-        retracts a CLAIM, not the vocabulary the claim was filed under — the
-        successor almost always reuses the same concepts, and dropping them would
-        strand the successor's own topics. This is the one place the codebase
-        does NOT filter on `superseded`, so the omission is stated rather than
-        left to look like an oversight.
+        A SUPERSEDED naming record NO LONGER QUALIFIES its entities. The rule
+        used to exempt them, reasoning that supersession retracts a CLAIM and not
+        the vocabulary the claim was filed under, and that "the successor almost
+        always reuses the same concepts". That second clause is what undid the
+        first: a successor that reuses the concept IS a live first-write namer,
+        so the entity qualifies through the successor and needs no exemption. The
+        exemption could therefore only ever bite where NO live fact names the
+        entity — precisely the case where the vocabulary was retracted along with
+        the claim, which is the opposite of what it was written to protect.
+
+        Measured on the live graph when this was corrected: of 1026 accept-set
+        members, 11 qualified on a superseded namer ALONE — `_decision`,
+        `_memory`, `TestProbe`, `RELATION_FAMILIES`, `TypedGroundingVerify`,
+        `Klaus`, `T3_Neuro_Architecture`, `ModelAllocation`, `MultiBackend`,
+        `LLMAdjudication`, `Tier-3`. Two (`Tier-3`, `_decision`) have a live
+        sibling in their alias component and so lose nothing; the other nine are
+        component singletons and are the retracted-vocabulary junk the rule
+        exists to keep REM away from. Two of the eleven were already accreting
+        REM links. Zero live facts depend on any of them for a topic.
+
+        The stranding risk quoted by the old exemption was checked directly
+        rather than argued: no live Fact anywhere holds its only operator-named
+        topic through an entity that leaves the set.
 
         Carries pg_id (Decision nodes: the evidential ledger endpoint, 727) and
         the full label list (so untyped Entity nodes can be marked for the
         delta sub-typing task). ORDER BY name keeps the slice deterministic
         across restarts, which is what makes the fallback path reproducible.
+
+        Also carries `alias_component` and `namings`, the two inputs
+        collapse_alias_components needs: the component is the alias layer's own
+        verdict on which surface spellings are one concept, and the naming count
+        (first-write namings by LIVE facts — the same predicate as the gate, so
+        the two can never disagree) picks the canonical spelling among them.
 
         Bounded by ENTITY_REGISTRY_LIMIT, a safety valve rather than a working
         limit — see the constant. This used to be capped at ENTITY_SET_LIMIT,
@@ -1342,17 +1520,26 @@ class REMDaemon:
         # `src:Fact` is the fix, not a detail — see the docstring. Without the
         # label this reads a judgement's INHERITED edge as a naming event, and
         # inheritance strips REM's provenance stamp.
-        first_write_named = (
-            f"EXISTS {{ MATCH (src:{ONT.fact})-[fw:{ONT.entity_link}]->(n)"
-            f"          WHERE fw.asserted_by IS NULL AND src.pg_id IS NOT NULL }}"
+        # `src:Fact` and the `superseded` clause are BOTH the rule, not details —
+        # see the docstring. Without the label this reads a judgement's INHERITED
+        # edge as a naming event; without the superseded clause it reads a
+        # retracted claim's vocabulary as a live choice.
+        _live_naming = (
+            f"MATCH (src:{ONT.fact})-[fw:{ONT.entity_link}]->(n)"
+            f" WHERE fw.asserted_by IS NULL AND src.pg_id IS NOT NULL"
+            f"   AND coalesce(src.superseded, false) = false"
         )
+        first_write_named = f"EXISTS {{ {_live_naming} }}"
+        namings = f"COUNT {{ {_live_naming} }}"
         async with self.driver.session() as session:
             result = await session.run(
                 f"MATCH (n)"
                 f" WHERE n:{ONT.human} OR n:{ONT.ai_agent}"
                 f"    OR n:{ONT.project} OR n:{ONT.decision}"
                 f"    OR (n:{ONT.entity} AND {first_write_named})"
-                f" RETURN labels(n) AS labels, n.name AS name, n.pg_id AS pg_id"
+                f" RETURN labels(n) AS labels, n.name AS name, n.pg_id AS pg_id,"
+                f"        n.alias_component AS alias_component,"
+                f"        {namings} AS namings"
                 f" ORDER BY n.name"
                 f" LIMIT $limit",
                 limit=ENTITY_REGISTRY_LIMIT,
@@ -1383,7 +1570,8 @@ class REMDaemon:
         if withheld:
             logger.info(
                 "REM accept set: %d node(s) offered, %d Entity node(s) WITHHELD — "
-                "no first write ever named them, so REM may not link to them (978)",
+                "no LIVE first write names them (never named, or their only namer "
+                "has been superseded), so REM may not link to them (978)",
                 len(rows), withheld,
             )
         if len(rows) == ENTITY_REGISTRY_LIMIT:
@@ -2444,13 +2632,18 @@ class REMDaemon:
             # this number as a pure minting rate would over-report creation.
             self._mint_dropped_total += len(plan["mint_dropped"])
             logger.info("REM link gate: pg_id=%d dropped %d name(s) not in the "
-                        "accept set (absent, or withheld as never first-write "
-                        "named): %s", pg_id,
+                        "accept set (absent, or withheld because no LIVE first "
+                        "write names them): %s", pg_id,
                         len(plan["mint_dropped"]), plan["mint_dropped"])
 
         # Stage 1.3 entity sub-typing — DELTA only: collect {sanitized name ->
         # sub-label} for entities the LLM typed AND that are not already typed
         # in the registry (never reclassify existing nodes).
+        #
+        # Keyed on the CANONICAL name for the same reason the edges are: the
+        # write applies `SET e:<sub>` by name, so typing the spelling the model
+        # happened to use would decorate a sibling node instead of the one the
+        # edge points at, leaving the concept untyped and re-asked every cycle.
         entity_types: dict[str, str] = {}
         dropped_types: list[str] = []
         for rel in relationships:
@@ -2461,7 +2654,7 @@ class REMDaemon:
             if nm and nm not in registry:
                 continue   # dropped above — never sub-type a node we refused to link
             if nm and ty in _ENTITY_SUBLABELS and not registry.get(nm, {}).get("typed"):
-                entity_types[nm] = ty
+                entity_types[canonical_name(nm, registry)] = ty
             elif nm and ty and ty.upper() != "OTHER" and ty not in _ENTITY_SUBLABELS \
                     and not registry.get(nm, {}).get("typed"):
                 # A proposed sub-label outside the configured vocabulary. This used
@@ -2727,8 +2920,21 @@ class REMDaemon:
                 for pg, row in content_map.items()
             }
 
-            closed_set  = await self._fetch_closed_entity_set()
-            registry    = _build_entity_registry(closed_set)
+            # SPELLINGS → CONCEPTS, once per cycle and before anything reads the
+            # set. Everything downstream — the grounding slice, both prompt
+            # builders, the registry, the novelty gate, the write — sees concepts
+            # from here on, so there is exactly one place where a surface form can
+            # still enter and exactly one place to look when one does.
+            raw_closed = await self._fetch_closed_entity_set()
+            closed_set = collapse_alias_components(raw_closed)
+            registry   = _build_entity_registry(closed_set)
+            if len(closed_set) != len(raw_closed):
+                logger.info(
+                    "REM accept set: %d spelling(s) collapsed to %d concept(s) via "
+                    "the alias layer — proposals match any form and are written to "
+                    "the canonical node",
+                    len(raw_closed), len(closed_set),
+                )
 
             processed = 0
             attempted = 0
