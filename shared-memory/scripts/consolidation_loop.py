@@ -67,6 +67,10 @@ from ontology import (
     GROUNDING_ROLES, default_grounding_role,
 )
 import relation_confidence as rc_conf
+from insight_gate import (
+    INSIGHT_THRESHOLD, INSIGHT_HUB_DEGREE_CAP, insight_cluster_cypher,
+)
+from project_axis import PROJECT_SQL
 from pool_status import pool_has_free_slot
 from dream_telemetry import (record_llm_call, adaptive_ceiling, embed_ceiling,
                              EMBED_MAX_CHARS)
@@ -1086,11 +1090,11 @@ def close_ledger_rows(conn, pg_ids, context="consolidation"):
 # the trigger is the durable ledger: decisions have no :Fact node, so the
 # event-driven NOTIFY path is structurally deaf to them.
 
-INSIGHT_THRESHOLD = ONT.insight_threshold
-# Entities whose total degree exceeds this cap are mega-hubs (e.g. the project
-# itself): clustering through them links everything to everything and produces
-# meaningless insights. Context only, never a cluster key.
-INSIGHT_HUB_DEGREE_CAP = int(os.environ.get("INSIGHT_HUB_DEGREE_CAP", "50"))
+# The predicate itself, its two thresholds and the hub cap now live in
+# insight_gate.py — the coordinator's eligibility telemetry runs the SAME query
+# projected to a count, and two copies of a gate is how telemetry came to report
+# a backlog the daemon could not fold. Re-exported here so this module's own
+# readers (and its tests) keep their names.
 INSIGHT_DOMAIN = "insight"
 
 
@@ -2175,13 +2179,16 @@ class ConsolidationDaemon:
         )
         try:
             # Record map for every fact across all clusters (single batch).
-            # Domain = COALESCE(project, domain, 'general') from the
-            # authoritative Postgres metadata — the Neo4j Fact node does not
-            # carry a domain. `scope` is deliberately NOT in this chain: it is an
-            # ACCESS-CONTROL axis (it pairs with visibility='scope' on the read
-            # path), so including it keys a summary by who may SEE a record rather
-            # than what it is ABOUT. On a deployment that uses scopes, that
-            # silently partitions summaries along permission lines. Stage 5 also
+            # The fold key is project_axis.PROJECT_SQL — the ONE resolution every
+            # reader shares, so telemetry and the fold cannot diverge even for a
+            # single release. Neither `domain` nor `scope` is in that chain: a
+            # domain is a SECTION of a project and cannot stand in for the whole,
+            # and `scope` is an ACCESS-CONTROL axis (it pairs with
+            # visibility='scope' on the read path), so including it would key a
+            # summary by who may SEE a record rather than what it is ABOUT — on a
+            # deployment that uses scopes, silently partitioning summaries along
+            # permission lines. The 'general' fallback survives this release and
+            # leaves the fact-key path in the next one. Stage 5 also
             # pulls each record's TYPE, its
             # evidential KIND (derived from source_ref, the same derivation the
             # write path uses) and capture date, so fold blocks differentiate
@@ -2192,8 +2199,7 @@ class ConsolidationDaemon:
                     return {}
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT id, COALESCE(metadata->>'project',"
-                        " metadata->>'domain', 'general'),"
+                        f"SELECT id, COALESCE({PROJECT_SQL}, 'general'),"
                         " COALESCE(metadata->>'type', 'fact'),"
                         " metadata->>'source_ref', created_at::date"
                         " FROM technical_docs WHERE id = ANY(%s)",
@@ -2579,55 +2585,13 @@ class ConsolidationDaemon:
     # ── Insight consolidation (decision pg_id 276) ────────────────────────────
 
     async def _find_fresh_insight_clusters(self):
-        """Ratified eligibility gate — pure graph state, no LLM, no rating
-        semantics: ≥ INSIGHT_THRESHOLD unconsolidated, REM-enriched,
-        non-superseded decisions converging on a shared grounded Entity
-        (non-mega-hub, carrying at least one Fact) across ≥2 distinct
-        projects, where at least one decision has any HAD_OUTCOME edge —
-        existence means reality has weighed in at least once.
-
-        ADR-017: clusters are keyed on the ALIAS COMPONENT, not the bare
-        entity — the same join `_find_anchored_clusters` already applies to
-        facts, ported here so decision/insight clusters merge alias-linked
-        surface forms (e.g. 'Cloe VM'/'CloeVM') instead of treating them as
-        two separate, thinner clusters. The canonical name is the
-        lexicographically smallest member, matching the fact-fold's rule.
-        No-op-safe: with no ALIASES edges every entity is its own component."""
+        """The work items behind the eligibility gate — see
+        insight_gate.insight_cluster_cypher for the predicate itself, which the
+        coordinator's telemetry runs count-only so the gauge and the fold can
+        never again describe different populations."""
         async with self.driver.session() as session:
             result = await session.run(
-                f"MATCH (d0:{ONT.decision})-[:{ONT.entity_link_alias}|{ONT.entity_link}]->(e0:{ONT.entity})"
-                f" WHERE d0.pg_id IS NOT NULL"
-                f"   AND coalesce(d0.consolidated, false) = false"
-                f"   AND coalesce(d0.rem_processed, false) = true"
-                f"   AND coalesce(d0.superseded, false) = false"
-                f"   AND size([(e0)--(x) | x]) <= $hub_cap"
-                f"   AND size([(e0)<-[:{ONT.entity_link_alias}|{ONT.entity_link}]-(f:{ONT.fact}) | f]) > 0"
-                f" WITH DISTINCT e0"
-                f" CALL (e0) {{"
-                f"   OPTIONAL MATCH (sib:{ONT.entity})"
-                f"     WHERE e0.alias_component IS NOT NULL"
-                f"       AND sib.alias_component = e0.alias_component"
-                f"   WITH e0, collect(sib) AS sibs"
-                f"   RETURN CASE WHEN e0.alias_component IS NULL"
-                f"               THEN [e0] ELSE sibs END AS members"
-                f" }}"
-                f" WITH coalesce(e0.alias_component, elementId(e0)) AS comp, members"
-                f" WITH comp, head(collect(members)) AS members"   # dedup anchors → 1 row/component
-                f" UNWIND members AS m"
-                f" MATCH (m)<-[:{ONT.entity_link_alias}|{ONT.entity_link}]-(d:{ONT.decision})"
-                f" WHERE d.pg_id IS NOT NULL"
-                f"   AND coalesce(d.consolidated, false) = false"
-                f"   AND coalesce(d.rem_processed, false) = true"
-                f"   AND coalesce(d.superseded, false) = false"
-                f" MATCH (d)-[:{ONT.project_of}]->(p:{ONT.project})"
-                f" WITH members, collect(DISTINCT d) AS ds, collect(DISTINCT p.name) AS projects"
-                f" WHERE size(ds) >= $threshold"
-                f"   AND size(projects) >= 2"
-                f"   AND any(d IN ds WHERE size([(d)-[:{ONT.had_outcome}]->(x) | x]) > 0)"
-                f" RETURN reduce(c = null, nm IN [x IN members | x.name] |"
-                f"          CASE WHEN c IS NULL OR nm < c THEN nm ELSE c END) AS entity,"
-                f"        [d IN ds | d.pg_id] AS decision_ids,"
-                f"        projects",
+                insight_cluster_cypher(),
                 hub_cap=INSIGHT_HUB_DEGREE_CAP, threshold=INSIGHT_THRESHOLD)
             return await result.data()
 
@@ -2834,9 +2798,7 @@ class ConsolidationDaemon:
                     # made a point to elicit must reach synthesis or demonstrably
                     # direct it. (rationale/title already reach: save_decision sets
                     # content = title + rationale.)
-                    "SELECT id, content,"
-                    "       COALESCE(metadata->'decision'->>'project',"
-                    "                metadata->>'project', ''),"
+                    f"SELECT id, content, COALESCE({PROJECT_SQL}, ''),"
                     "       metadata->'decision'->>'confidence',"
                     "       metadata->'decision'->'alternatives'"
                     "  FROM technical_docs WHERE id = ANY(%s) ORDER BY id",

@@ -99,6 +99,7 @@ from ontology import (
     fact_kind_from_source_ref,
 )
 import relation_confidence as rc
+from project_axis import PROJECT_SQL
 from pool_status import pool_has_free_slot
 from log_hygiene import append_secure
 from dream_telemetry import (
@@ -1781,13 +1782,18 @@ class REMDaemon:
         def _fetch() -> dict[int, dict]:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, content, metadata->>'type' AS doc_type, created_at,"
-                    "       metadata->>'source_ref'          AS source_ref,"
-                    "       metadata->'entities'              AS entities,"
-                    "       metadata->>'project'              AS project,"
-                    "       metadata->'decision'->>'title'    AS decision_title,"
-                    "       metadata->>'rating'               AS rating"
-                    " FROM technical_docs WHERE id = ANY(%s)",
+                    f"SELECT id, content, metadata->>'type' AS doc_type, created_at,"
+                    f"       metadata->>'source_ref'          AS source_ref,"
+                    f"       metadata->'entities'              AS entities,"
+                    # project_axis.PROJECT_SQL, not the bare top-level field.
+                    # Judgements carry their project inside the decision blob, so
+                    # every decision previously reached the manifest with no
+                    # project at all — the prompt asked the model to enrich a
+                    # record while withholding which project it belonged to.
+                    f"       {PROJECT_SQL}                     AS project,"
+                    f"       metadata->'decision'->>'title'    AS decision_title,"
+                    f"       metadata->>'rating'               AS rating"
+                    f" FROM technical_docs WHERE id = ANY(%s)",
                     (pg_ids,),
                 )
                 return {

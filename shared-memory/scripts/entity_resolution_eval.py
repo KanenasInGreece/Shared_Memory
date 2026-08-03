@@ -60,6 +60,7 @@ from neo4j import GraphDatabase
 # Resolve sibling imports (ontology) the same way the daemons do.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ontology import ONT
+from project_axis import PROJECT_SQL
 
 # ── Config — mirrors consolidation_loop.py so one .env drives everything ──────
 NEO4J_URI  = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
@@ -122,17 +123,23 @@ def fetch_entities() -> list[dict]:
 
 
 def fetch_domains(pg_ids: list[int]) -> dict[int, str]:
-    """pg_id → domain (project | domain | scope | 'general'), the same coalesce the
-    coordinator's telemetry breakdown uses, so the axis matches the rest of the system."""
+    """pg_id → project, via project_axis.PROJECT_SQL — the one resolution every
+    reader in the system shares.
+
+    `scope` and `domain` both LEFT this chain: scope is access control, and a
+    domain is a section of a project rather than a substitute for one. On this
+    corpus 127 records resolved by `scope` alone, so they now read as the
+    undetermined bucket — which is what they always were. The eval's axis is
+    narrower and honest, not broken."""
     if not pg_ids:
         return {}
     conn = psycopg2.connect(PG_CONN, connect_timeout=5)
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, COALESCE(metadata->>'project', metadata->>'domain', scope, 'general') "
+                f"SELECT id, COALESCE({PROJECT_SQL}, %s) "
                 "FROM technical_docs WHERE id = ANY(%s)",
-                (pg_ids,),
+                (_UNDETERMINED, pg_ids),
             )
             return {row[0]: row[1] for row in cur.fetchall()}
     finally:
