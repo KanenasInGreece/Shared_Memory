@@ -74,7 +74,7 @@ async def test_mcp_save_artifact_success():
 
     with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
         result = await vector_skill.save_artifact(
-            MOCK_CONTENT, '{"source":"qwen3-27b","entities":["TestEntity"]}'
+            MOCK_CONTENT, '{"source":"qwen3-27b","project":"shared-memory-GitHub","entities":["TestEntity"]}'
         )
 
     assert "Success" in result
@@ -95,7 +95,7 @@ async def test_mcp_save_artifact_gateway_down():
     """save_artifact returns a readable error when the gateway is unreachable."""
     with patch("httpx.AsyncClient.post", side_effect=Exception("connection refused")):
         result = await vector_skill.save_artifact(
-            MOCK_CONTENT, '{"source":"qwen3-27b"}'
+            MOCK_CONTENT, '{"source":"qwen3-27b","project":"shared-memory-GitHub"}'
         )
     assert "Error" in result
     assert "hive_mind_proxy.py" in result
@@ -112,7 +112,7 @@ async def test_mcp_save_artifact_surfaces_coordinator_error():
     }
     with patch("httpx.AsyncClient.post", return_value=mock_response):
         result = await vector_skill.save_artifact(
-            MOCK_CONTENT, '{"source":"qwen3-27b"}'
+            MOCK_CONTENT, '{"source":"qwen3-27b","project":"shared-memory-GitHub"}'
         )
     assert "Error" in result
     assert "Embedding service unreachable" in result
@@ -180,7 +180,7 @@ async def test_mcp_archive_reasoning_trace_saves_a_record():
         "status": "success", "pg_id": MOCK_PG_ID, "neo4j": "pending", "message": "ok"})
     steps = [{"thought": "research", "tool": "grep", "result": "found"}]
     with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
-        result = await vector_skill.archive_reasoning_trace("sess_1", "test task", steps)
+        result = await vector_skill.archive_reasoning_trace("sess_1", "test task", steps, project="shared-memory-GitHub")
 
     assert "Success" in result
     call = mock_post.call_args
@@ -346,7 +346,7 @@ async def test_mcp_check_memory_health_asks_the_gateway():
     """Health is what the gateway reports — daemons, backends, consolidation
     liveness — not a row count from a database handle this client should not
     hold. It is also the only check that exercises the path the client uses."""
-    gw = {"status": "ok", "version": "0.7.7", "api_version": 3,
+    gw = {"status": "ok", "version": "0.7.7", "api_version": 4,
           "daemon": "running", "rem_daemon": "running", "embedder": "ok"}
     mock_response = MagicMock(status_code=200, json=lambda: gw)
     with patch("httpx.AsyncClient.get", return_value=mock_response) as mock_get:

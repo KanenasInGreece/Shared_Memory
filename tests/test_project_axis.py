@@ -255,8 +255,9 @@ def test_the_fold_key_query_no_longer_invents_a_bucket():
 def test_project_node_is_minted_from_the_resolved_project():
     """P3 — never from a section, never from a chain."""
     coord = open(os.path.join(_SCRIPTS, "coordinator.py"), encoding="utf-8").read()
-    assert '"project": resolve_project(metadata),' in coord
+    assert '"project": project_for_graph(metadata),' in coord
     assert '"project": metadata.get("project"),' not in coord
+    assert '"project": resolve_project(metadata),' not in coord
 
 
 # ── The PROJECT_OF backfill row (v0.8.32) ────────────────────────────────────

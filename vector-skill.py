@@ -111,8 +111,13 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # step with API_VERSION in coordinator.py / memory_bridge.py — the gateway logs
 # a warning (coordinator._check_client_version) if they disagree.
 # v3: review_edges / label_edges require the gateway's /memory/relations/* routes.
-API_VERSION = 3
-VERSION = "0.8.32"
+# v4 (project registry): a fact save without a REGISTERED metadata.project is
+# rejected 400 carrying error=project_required|project_unknown plus near-match
+# proposals. BREAKING for any client that saved untagged facts. The second
+# submission is accepted in three forms: a proposal, new_project=true, or the
+# reserved sentinel general_discussion.
+API_VERSION = 4
+VERSION = "0.8.33"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server
@@ -297,6 +302,15 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
 
     Idempotent: identical content reuses the existing row.
 
+    metadata_json MUST carry "project" on a fact — the canonical value is the
+    project folder name, checked against a registry. A save with none, or with an
+    unregistered value, returns 400 carrying an "error" of project_required or
+    project_unknown plus near-match "proposals". Ask the operator which project
+    applies rather than inferring one; re-send with "new_project": true to
+    register a genuinely new project, or use "general_discussion" for a record
+    that belongs to no project (it saves and searches normally but is never
+    folded into a project's narrative).
+
     Supersede-on-save: include "supersedes": <old_pg_id> in metadata_json to save
     this as a CORRECTION that retires an older fact in one call (the old fact is
     kept but flagged + hidden from search). To retract a fact WITHOUT a
@@ -323,6 +337,22 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
             "Error: metadata.source is required — set it to the loaded model name "
             "(e.g. 'qwen3-27b', 'llama3-70b'). "
             "Facts without provenance are rejected to protect memory integrity."
+        )
+
+    # Project is required on a fact, exactly as on the CLI front door — the two
+    # are doors to one gateway, and a rule enforced on only one of them is a rule
+    # with a way around it. There is no cwd to derive from here (the MCP server
+    # runs wherever the host launched it), so the model must supply it: ask the
+    # operator which project this belongs to rather than inferring one.
+    if m_data.get("type") not in ("decision", "retrospective") and not m_data.get("project"):
+        _append_log("vector_skill", 2, "missing_project", {"content_preview": content[:100]}, content)
+        return (
+            "Error: metadata.project is required — the canonical value is the "
+            "PROJECT FOLDER NAME. Ask the operator which project this belongs to "
+            "rather than inferring one; a plausible wrong project is worse than "
+            "none. If it belongs to no project, use 'general_discussion', which "
+            "saves and searches normally but is never folded into a project's "
+            "narrative. If the project is new, also set metadata.new_project=true."
         )
 
     m_data["timestamp"] = datetime.now().isoformat()
@@ -368,11 +398,18 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
     return f"Success (pg_id={pg_id}, neo4j={neo4j_status}): {result.get('message', '')}".rstrip()
 
 @mcp.tool()
-async def archive_reasoning_trace(session_id: str, task: str, steps: list) -> str:
+async def archive_reasoning_trace(session_id: str, task: str, steps: list,
+                                  project: str = "") -> str:
     """
     Archive the agent's reasoning path as a memory record.
 
     `steps` is a list of dicts: [{'thought': ..., 'tool': ..., 'result': ...}].
+
+    `project` is REQUIRED, exactly as for any other record — a trace belongs to
+    the work that produced it. It is deliberately NOT exempt and NOT defaulted to
+    the sentinel: exempting it would quietly rebuild the untagged population the
+    project axis exists to remove, and defaulting it would park records without
+    anyone deciding to. Ask the operator, or pass 'general_discussion' knowingly.
 
     This used to CREATE ReasoningTrace/ReasoningStep nodes straight in Neo4j.
     A client writing its own subgraph bypasses the outbox — which is what makes
@@ -398,6 +435,8 @@ async def archive_reasoning_trace(session_id: str, task: str, steps: list) -> st
         "task": task,
         "step_count": len(steps),
     }
+    if project:
+        metadata["project"] = project
     return await save_artifact(content, json.dumps(metadata))
 
 

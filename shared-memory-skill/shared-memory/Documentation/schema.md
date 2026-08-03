@@ -20,6 +20,7 @@ Holds every artifact saved by any agent. This is the authoritative fact store.
 | `visibility` | `TEXT NOT NULL DEFAULT 'global'` | Read policy, **enforced on every `/memory/search` read** (v0.6.2): `'global'` = all callers; `'private'` = only the owning `agent_id`; `'scope'` = only a caller asserting the matching `scope`. Anonymous callers (no verified identity) see `'global'` only — fail closed. Gates Tier-1 and Tier-3 alike, so a private fact's community summary never leaks. |
 | `superseded` | `BOOLEAN NOT NULL DEFAULT false` | Soft-supersede flag. Set when (a) a retrospective with `rating="reversed"` lands on a decision row (pg_id 276), or (b) a **fact** is superseded by a correction (`save --supersedes`) or retracted (`POST /memory/supersede`) — decision 381. Mirrored as `superseded = true` on the graph `:Fact`/`:Decision` node. Tier-1 search, REM/NREM selection, and the working-set census all exclude superseded rows; the row is kept (provenance, compare/contrast). Added by migration 009. |
 | `superseded_by` | `INTEGER REFERENCES technical_docs(id) ON DELETE SET NULL` | The successor fact when this row was superseded by a correction; `NULL` for a live row, a bare retract, or a reversed decision. Powers the retrieval-time `stale_sources: [{old, superseded_by}]` annotation (decision 384) as a cheap join — no Neo4j hop. Added by migration 013. |
+| `created_at` | `TIMESTAMPTZ DEFAULT now()` | Server-stamped creation time (migration 015) — temporal provenance for **reranker recency** (`id` is creation *order*, not time-magnitude). Backfilled from `neo4j_outbox.created_at` where recoverable; `NULL` = unknown (consolidated/legacy rows whose outbox row was already deleted), which the reranker treats as "old / no recency boost". Index `technical_docs_created_at_idx`. |
 
 **Indexes:** `technical_docs_embedding_idx` — `ivfflat (embedding vector_cosine_ops)`; btree indexes on `agent_id`, `scope`, `visibility`; partial `technical_docs_superseded_by_idx` on `superseded_by WHERE superseded_by IS NOT NULL`
 
@@ -126,6 +127,70 @@ One row per consolidation/insight **cycle** so a fold outcome is queryable state
 
 ---
 
+### `entity_embeddings` — alias candidate-generation store (ADR-017, migration 014)
+
+Entity **names** embedded once (BGE-M3, 1024-dim, via the gateway) so the alias writer finds cosine-near
+candidates with an indexed ANN query instead of re-embedding the whole entity set each sweep. Vectors stay in
+Postgres (Neo4j remains the structure tier); reuses the `technical_docs` HNSW pattern.
+
+| Column | Type | Notes |
+|---|---|---|
+| `name` | `TEXT PRIMARY KEY` | Entity identity (the coordinator MERGEs entities by name) |
+| `embedding` | `vector(1024)` | BGE-M3 name embedding (the gateway 1024-dim contract) |
+| `updated_at` | `TIMESTAMPTZ` | Last upsert |
+
+**Indexes:** `entity_embeddings_embedding_idx` — `hnsw (embedding vector_cosine_ops)`.
+
+### `alias_adjudications` — alias verdict ledger (ADR-017, migration 014)
+
+Per-pair `alias` / `distinct` verdicts from the writer — both the audit trail (method / confidence / signals /
+rationale, revocable) and the idempotency cache: a sweep skips pairs already judged, so the LLM is never re-asked.
+
+| Column | Type | Notes |
+|---|---|---|
+| `name_a`, `name_b` | `TEXT` | Canonical order `name_a < name_b`; `UNIQUE(name_a, name_b)` |
+| `verdict` | `TEXT` | `alias` \| `distinct` |
+| `method` | `TEXT` | `normalized_exact` (auto-accept) \| `llm` |
+| `confidence` | `REAL` | 0..1 (llm) or 1.0 (normalized-exact) |
+| `cosine`, `lexical_jaccard`, `shared_facts`, `domain_disjoint` | `REAL`/`INT`/`BOOLEAN` | Signals recorded at adjudication |
+| `rationale` | `TEXT` | Short LLM justification (audit) |
+
+**Indexes:** `alias_adjudications_verdict_idx` on `(verdict)`.
+
+### `relation_adjudications` — machine-relation verdict + calibration ledger (migration 020)
+
+One ledger for BOTH machine-minted relation families: `entity_relation` (typed
+Entity→Entity edges from the evidence sweep / REM, name-keyed endpoints) and
+`evidential` (record→record proposals such as `Decision INFORMED_BY Fact`,
+pg_id-keyed endpoints; `GROUNDED_IN` is never machine-minted so it never appears
+here). Every machine verdict lands here with its quantitative signals; operator
+labels recorded on these rows are the ONLY calibration input — per-family
+reliability curves are computed from them, and a family's confidence thresholds
+act only once it is calibrated (~20 labels). Also the audit trail and the
+don't-re-ask idempotency cache. One CURRENT row per directed edge per family:
+a re-score updates the row in place and preserves the prior rung inside
+`signals.prior_rungs` (the evidential ladder: `rem_k3` proposal → `llm_sweep`
+re-score → operator label/promotion).
+
+| Column | Type | Notes |
+|---|---|---|
+| `family` | `TEXT` | `entity_relation` \| `evidential` (CHECK-enforced endpoint encoding per family) |
+| `src_name`, `tgt_name` | `TEXT` | Entity endpoints (entity_relation family; directed) |
+| `src_pg_id`, `tgt_pg_id` | `BIGINT` | Record endpoints (evidential family; directed) |
+| `rel_type` | `TEXT` | The typed relation; rejects use the sentinel `NONE` (never interpolated into Cypher) |
+| `verdict` | `TEXT` | `accept` \| `reject` |
+| `method` | `TEXT` | `llm_sweep` \| `rem_k3` \| `operator` |
+| `confidence` | `REAL` | 0..1; evidential `rem_k3` rows are capped BELOW the consumption threshold (born-below rule) |
+| `support` | `TEXT` | `graph_evidence` (≥2 corroborating facts) \| `text_only` |
+| `signals` | `JSONB` | co-occurrence count, sub-labels, vote share, `prior_rungs` history, … |
+| `operator_label` | `TEXT` | `correct` \| `incorrect` — the calibration oracle (review-edges flow) |
+| `promoted_at` | `TIMESTAMPTZ` | Operator promotion → live edge `asserted_by='operator'` |
+| `model`, `run_id`, `rationale` | `TEXT` | Audit: adjudicating model, sweep/cycle correlation id, short justification |
+
+**Indexes:** partial UNIQUE per family on the directed edge; `(family, operator_label, created_at)` for review/calibration reads.
+
+---
+
 ## Neo4j (Relational Memory)
 
 > Configurable via `ontology.yaml`. Label and relationship keys map directly to the `labels:` and `relationships:` sections.
@@ -162,6 +227,7 @@ Written by the outbox worker when `metadata["type"] == "decision"`.
 | Label | Purpose |
 |---|---|
 | `Decision` | An architectural or design decision — keyed by `pg_id`, links to all PROV-O edges. Lifecycle flags: `rem_processed` (REM enrichment done), `consolidated` (folded into an insight), `superseded` (reversed via `rating="reversed"`). |
+| `Retrospective` | A recorded outcome for a decision (retro-as-record, v2) — keyed by `pg_id` like Fact/Decision. Carries `rating` (outcome-state enum: `validated`\|`mixed`\|`refined`\|`pending`\|`reversed`), `date`, `content` (notes snippet; full notes in Postgres), `source`, `fact_kind`, and `rem_processed`. Reached from its decision via the `HAD_OUTCOME` trigger edge; grounds in evidence facts via typed ROLE edges. Framework-defined — never configurable via `ontology.yaml`. |
 | `Human` | A person who owns or makes a decision (`decided_by` field) |
 | `AIAgent` | An AI tool that assisted in the decision (`assisted_by` list) |
 | `Project` | Project scope — root node for decisions and milestones |
@@ -186,12 +252,13 @@ Written by the outbox worker for `type:decision` saves.
 |---|---|---|
 | `WAS_ATTRIBUTED_TO` | `(:Decision)-[:WAS_ATTRIBUTED_TO]->(:Human)` | Who owns the decision |
 | `WAS_ASSISTED_BY` | `(:Decision)-[:WAS_ASSISTED_BY]->(:AIAgent)` | Which AI tool(s) assisted |
-| `PROJECT_OF` | `(:Decision)-[:PROJECT_OF]->(:Project)` | Which project the decision belongs to |
+| `PROJECT_OF` | `(:Fact\|:Decision)-[:PROJECT_OF]->(:Project)` | Which project the record belongs to. Written at first write from the record's resolved project — a `:Project` node is only ever minted from a **project**, never from a section of one. A record whose project does not resolve gets no edge and no node; it is left for the repair path rather than attached to an invented default. |
 | `WAS_GENERATED_BY` | `(:Decision)-[:WAS_GENERATED_BY]->(:Activity)` | Which session produced it (reserved) |
 | `ACTED_ON_BEHALF_OF` | `(:AIAgent)-[:ACTED_ON_BEHALF_OF]->(:Human)` | Delegation chain (reserved) |
 | `SUPERSEDES` | `(:Decision)-[:SUPERSEDES]->(:Decision)` | Replaces a prior decision |
-| `INFORMED_BY` | `(:Decision)-[:INFORMED_BY]->(:Decision)` | Prior decision used as input |
-| `HAD_OUTCOME` | `(:Decision)-[:HAD_OUTCOME {rating,date,notes}]->()` | Retrospective — dated edge property, not a node |
+| `INFORMED_BY` | `(:Decision)-[:INFORMED_BY]->(:Decision)` | Prior decision used as input. Populated by reference resolution (Stage 1.2b) from textual cross-references in content, plus any explicit links. |
+| `REFERENCES` | `(:Fact\|:Decision)-[:REFERENCES]->(:Fact\|:Decision)` | A record cross-reference resolved from content (Stage 1.2b): a context-gated pg-id mention (e.g. "refines decision 381") that resolves to a real record. `Decision→Decision` is promoted to `INFORMED_BY`; everything else is `REFERENCES`. Carries `resolved_from='content'` + `cue`. Never auto-`SUPERSEDES` (explicit-only). |
+| `HAD_OUTCOME` | `(:Decision)-[:HAD_OUTCOME {date}]->(:Retrospective)` | Retro-as-record (v2): the trigger edge to the retrospective RECORD (rating/date/content live on the node). Legacy pre-conversion shape: a self-loop `(:Decision)-[:HAD_OUTCOME {rating,date,notes}]->(:Decision)` with the payload as edge props — readers accept both during the transition |
 | `SUPERSEDES` | `(:CommunitySummary)-[:SUPERSEDES]->(:CommunitySummary)` | Also written between CommunitySummary nodes when supersession rule fires (v0.4.0) |
 | `SUPERSEDES` | `(:Fact)-[:SUPERSEDES]->(:Fact)` | A correction supersedes an older fact (decision 381); the old `:Fact` also gets `superseded = true` so REM/NREM skip it |
 
@@ -206,30 +273,62 @@ Written by the REM daemon during idle-time fact enrichment. These relationships 
 | `CONSIDERED` | `(:Decision)-[:CONSIDERED]->(:Entity)` | Alternatives evaluated for the decision |
 | `REJECTED` | `(:Decision)-[:REJECTED]->(:Entity)` | Alternatives explicitly ruled out |
 
+**Typed decision grounding (v0.6.4):** the grounding edges that link a `Decision` to the *records it rests on* are role-typed — `GROUNDED_IN` (basis), `CONSIDERED`, `REJECTED`, `UNDER_CONDITIONS`, or `INFORMED_BY`, targeting `(:Fact\|:Decision)`. First write picks the relation from the operator-supplied role (`--grounded-in "42:considered"`) or, when omitted, from the grounded fact's `fact_kind` — a `discussion` defaults to `INFORMED_BY`, other kinds to `GROUNDED_IN` (advisory, never enforced). Each edge carries an **`asserted_by`** property (`operator` \| `system_default`). The target is matched by `pg_id` **across labels**, so grounding a decision in another decision links the real node rather than an empty placeholder.
+
+**Typed Entity→Entity relationships (REM rebuild):** the domain-layer relations
+(`DEPENDS_ON`, `PART_OF`, `IMPLEMENTS`, `PRODUCES`, `CONSUMES`, `RUNS_ON`,
+`CONFIGURES`, `DESCRIBES`, `VALIDATES`) are minted by the periodic **evidence
+sweep** (`relation_sweep.py`), never by the per-record save or enrichment path:
+candidate pairs come from co-occurrence across facts aggregated per alias
+component, are legality-gated by the ontology `DOMAIN_RANGE` map in both
+directions, LLM-adjudicated in batches against shared-fact evidence, and every
+verdict lands in `relation_adjudications`. `MENTIONS` remains the explicit
+neutral-weight fallback.
+
+**Universal machine-edge provenance (two-axis: who asserted × how evidenced):**
+every machine-minted edge carries `asserted_by` (`rem` = per-record enrichment,
+`rem_sweep` = evidence sweep), `confidence` (k-vote self-consistency for REM,
+adjudication score for the sweep), `model`, `run_id`, `created_at` — stamped
+`ON CREATE` only, so an existing edge (in particular an operator-asserted one)
+is never re-stamped; operator promotion via the review flow flips
+`asserted_by` to `operator`. Pre-rebuild edges carry no `asserted_by` and are
+consumed at a fixed neutral prior (era-gated legacy class — no LLM backfill).
+Consolidation consumes a machine edge only when its family is CALIBRATED and
+its confidence clears the family threshold; operator and legacy edges are
+always consumable.
+
 **`rem_processed` Fact property:** after REM enriches a Fact node, it sets `rem_processed = true`. NREM (`consolidation_loop.py`) requires this flag before including a Fact in a consolidation cluster — `WHERE coalesce(neighbor.rem_processed, false) = true`. A Fact whose Neo4j write is still pending in the outbox is never marked `rem_processed`.
 
 **Entity type registry:** REM builds a closed registry from all existing typed nodes (`Human`, `AIAgent`, `Project`, `Decision`, `Entity`) before each batch. Once a name is registered (e.g. "Xenofon → Human"), every occurrence in the batch uses the same label and a compatible relationship type. The LLM cannot reclassify existing nodes.
 
-### Retrospective write protocol
+### Retrospective write protocol (v2 — retro-as-record)
 
-To record an outcome on an existing Decision, `POST /memory/retrospective` with:
+A retrospective is a **full record**: its own `technical_docs` row (content = the notes, embedded and searchable), plus a `:Retrospective` node in the graph. `POST /memory/retrospective` with:
 
 ```json
-{"pg_id": 42, "rating": "high", "notes": "Held up in prod.", "agent_id": "claude_code"}
+{"pg_id": 42, "rating": "validated", "notes": "Held up in prod.",
+ "grounded_in": [601], "grounded_roles": {"601": "based_on"},
+ "source_ref": "tests/test_outbox_ledger.py", "elicited": true,
+ "agent_id": "claude_code"}
 ```
 
-The coordinator verifies the `pg_id` exists in `technical_docs`, then writes a `neo4j_outbox` row with `type=retrospective`. The outbox worker issues:
+The coordinator validates the rating against the outcome-state enum, verifies the target `pg_id` exists, embeds the notes (hard mandate), inserts the retro's own row (inheriting the target's `project`), and writes a `neo4j_outbox` row **under the retro's own pg_id** (`type=retrospective`, `v: 2`, `target_pg_id` = the decision). The outbox worker materialises:
 
 ```cypher
-MATCH (d:Decision {pg_id: $pg_id})
-CREATE (d)-[:HAD_OUTCOME {rating: $rating, date: $date, notes: $notes}]->(d)
+MERGE (r:Retrospective {pg_id: $pg_id})            // rating, date, content snippet,
+SET r.rating = ..., r.fact_kind = ...              // source, fact_kind on the node
+MATCH (d:Decision {pg_id: $target})
+MERGE (d)-[:HAD_OUTCOME {date: $date}]->(r)        // the TRIGGER edge
+// + MENTIONS edges for elicited entities, + typed grounding ROLE edges
+// (GROUNDED_IN/CONSIDERED/... with asserted_by) to the facts that MEASURED
+// the outcome — a test-grounded decision gets a test-grounded retrospective.
 ```
 
-Self-loop pattern — each call creates a new dated edge; multiple retrospectives per Decision are allowed. `date` defaults to today (ISO) if omitted.
+Multiple retrospectives per Decision are allowed; consumers treat the **newest as the decision's current verdict**. `date` defaults to today (ISO). Legacy pre-conversion rows (no `v`) still produce the old self-loop; the one-time migration converts existing self-loops to records.
 
-**Two roles, one record (decision pg_id 276):** the `HAD_OUTCOME` edge is the **permanent outcome archive** — insight folds read every edge's wording verbatim, including on cumulative re-folds. The outbox row is only the **trigger**: while it is open (`applied`/`rem_reviewed`), the retrospective has not been folded into an insight yet; the fold consumes it (flips to `consolidated`, then deletes after the graph marking). A retro row on a decision in no insight and no qualifying cluster stays open deliberately.
+**Lifecycle:** the retro's outbox row lives the ordinary record lifecycle (`applied` → `rem_reviewed` after REM enriches the node → `consolidated` when an insight fold consumes it → deleted after the graph marking). Insight triggers key retro rows on `COALESCE(cypher_params->>'target_pg_id', pg_id)` so legacy rows (decision's pg_id) and v2 rows (retro's own pg_id) behave identically. A retro row on a decision in no insight and no qualifying cluster stays open deliberately.
 
-**`rating` semantics:** free text, with one structural value — `"reversed"` marks the target decision `superseded` in `technical_docs` and on the `:Decision` node (excluded from Tier-1 search and from fresh insight clusters). Every other rating carries no enum meaning; its wording reaches Tier 3 through the insight narrative.
+**`rating` semantics:** a closed outcome-state enum — `validated` \| `mixed` \| `refined` \| `pending` \| `reversed`. `"reversed"` is structural: it marks the target decision `superseded` in `technical_docs` and on the `:Decision` node (excluded from Tier-1 search and from fresh insight clusters). States, not grades — the nuance belongs in the notes, which insight synthesis quotes. Legacy free-text ratings are preserved as `metadata.original_rating` by the migration.
 
 ### Provenance query examples
 
