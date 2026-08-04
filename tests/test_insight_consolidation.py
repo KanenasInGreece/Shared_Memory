@@ -27,6 +27,7 @@ from consolidation_loop import (
     fetch_refold_insights,
     fetch_retro_records,
     fetch_unreconciled_insights,
+    render_alternative_lines,
     supersede_covered_summaries,
     write_insight_summary,
 )
@@ -527,3 +528,33 @@ async def test_run_insight_cycle_calls_fold_with_compatible_signature(monkeypatc
 
     assert daemon._fold_insight.await_count == 1
     assert "projects" not in daemon._fold_insight.await_args.kwargs
+
+
+# ── The fold prompt must not re-ambiguate what the capture surface preserved ──
+#
+# The write side stopped splitting alternatives on commas (v0.8.38). That is
+# only half the round trip: the fold prompt joined them back together with
+# "; ", and 138 of the 530 alternative entries in the corpus contain a
+# semicolon — so the model saw an entry boundary that was not one. Changing how
+# a value is WRITTEN is not finished until retrieval semantics are checked.
+
+def test_each_alternative_gets_its_own_line():
+    out = render_alternative_lines(["first option", "second option"])
+    assert out.count("[DECISION ALTERNATIVE ") == 2
+    assert "1 of 2" in out and "2 of 2" in out
+
+
+def test_an_alternative_containing_a_semicolon_is_not_split_by_the_render():
+    """The live shape: a real entry carrying its own semicolons must still
+    render as ONE line, or the fold reads it as several options."""
+    alt = "keep memory_bridge import (rejected: false coupling); keep direct psycopg2"
+    out = render_alternative_lines([alt])
+    assert out.count("[DECISION ALTERNATIVE ") == 1
+    assert alt in out
+    assert "1 of 1" in out
+
+
+def test_absent_or_empty_alternatives_render_nothing():
+    assert render_alternative_lines(None) == ""
+    assert render_alternative_lines([]) == ""
+    assert render_alternative_lines(["", "  "]) == ""
