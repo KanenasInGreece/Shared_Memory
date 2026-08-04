@@ -533,13 +533,24 @@ The resulting tables — `technical_docs` (Tier 1), `community_summaries` (Tier 
 |---|---|---|---|
 | `fact_pg_id` | `Fact` | `pg_id` | One Fact node per Postgres row |
 | `entity_name` | `Entity` | `name` | Consolidation anchor — no duplicate hubs |
-| `community_summary_pg` | `CommunitySummary` | `pg_id` | One summary node per summary row |
+| `community_summary_pg_id` | `CommunitySummary` | `pg_id` | One summary node per summary row |
 | `decision_pg_id` | `Decision` | `pg_id` | One Decision node per Postgres row |
 | `human_name` | `Human` | `name` | PROV-O provenance — dedup by person name |
 | `ai_agent_name` | `AIAgent` | `name` | PROV-O provenance — dedup by tool name |
 | `project_name` | `Project` | `name` | PROV-O provenance — dedup by project name |
 
 If you customise label names in `ontology.yaml`, edit `neo4j_init.cypher` to match before running it.
+
+**Verify them — re-running the file is not proof that they are in force.** Unlike Postgres, Neo4j has no migration ledger, so a long-lived instance enforces whatever was true the day someone last applied this file. A missing uniqueness constraint is silent by construction: `MERGE` keeps working, writes keep succeeding, and the only symptom is a duplicate node appearing under a race — at which point the constraint that would have prevented it is the thing you no longer have.
+
+```bash
+uv run --with neo4j python shared-memory/migrations/verify_neo4j_init.py           # report only
+uv run --with neo4j python shared-memory/migrations/verify_neo4j_init.py --apply   # create what is missing
+```
+
+It diffs every constraint the file declares against the live instance, counts the duplicate values that would make each missing one impossible to create, and reports constraints belonging to another system as foreign rather than touching them. Exit status is 1 when a declared constraint is not in force, so CI can gate on it.
+
+⚠ **A plain index on the same key blocks the constraint, and re-running `neo4j_init.cypher` will not clear it.** Neo4j refuses `CREATE CONSTRAINT` while a non-constraint index covers the same label and property (*"There already exists an index (:Entity {name})"*). A fresh install never meets this, because the constraints are applied before anything else creates an index; an instance where someone added a lookup index by hand is blocked indefinitely. `--apply` drops the conflicting plain index first, which costs nothing — a uniqueness constraint creates its own backing index on the same key.
 
 ### Upgrading from an earlier schema
 

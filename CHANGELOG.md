@@ -5,6 +5,101 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.41] — 2026-08-04
+
+### Fixed
+
+- **Renaming a project is now one transaction per pair, applied whole or not at
+  all.** `normalize_projects.py` used to run three independent sweeps over the
+  alias map: rewrite every record and commit, then try to record every alias,
+  then rewire every graph node. The second sweep could fail on a pair the first
+  had already committed, and the third ran regardless of both — so a single
+  failure left a state no sweep could describe: records moved onto the new name,
+  the old name still registered with no alias recorded, and the graph pointing
+  at the new node anyway. None of it was reported as a failure, and the exit
+  status was zero.
+
+  Each pair is now one transaction. It commits whole or rolls back whole, its
+  graph half runs **only** if its Postgres half committed, a failed pair is
+  named with its reason and does not stop the pairs after it, and the run exits
+  non-zero when any pair failed. The target's registration is checked **before**
+  any write rather than after the records were already committed onto it.
+
+  This matters because two foreign keys point at `projects.name`, so retiring a
+  registry row can be vetoed — and atomicity is what makes that veto harmless:
+  the pair rolls back, the old name stays registered and still resolves, and
+  every save keeps working. The hazard was never the veto, it was the half-write.
+
+- **A rename no longer destroys the name a promotions-ledger row originally
+  targeted.** Ledger rows are re-pointed inside the same transaction, with the
+  original target preserved in the row's own `note`. The ledger exists to answer
+  *what was this before*; silently rewriting its target would destroy exactly
+  the evidence that makes a one-way write auditable. Never `ON UPDATE CASCADE`,
+  which would do the same damage with no trace at all.
+
+- **`--dry-run` is now a real preflight.** It reports the records, ledger rows
+  and alias rows a rename will touch — including **superseded** alias rows,
+  which are deliberately not re-pointed (re-pointing them would falsify the
+  history they exist to preserve) and will therefore veto the rename. Finding
+  that out from a failed run is finding it out too late.
+
+- **`sync_skills.sh` no longer refreshes a hardcoded subset of the client
+  package.** Phase 2 and the parity test both read `MANIFEST.txt`; phase 1 read
+  a list of filenames in the script. So a file could be added to the manifest,
+  ship to every agent, and be refreshed by nobody. `Documentation/schema.md` was
+  updated at source in two consecutive releases, copied to the tracked skill
+  tree in neither, and shipped stale to every client for both — while the script
+  printed success. Phase 1 is now driven by the manifest too, so the manifest's
+  own promise that it is "the whole maintenance surface" is true.
+
+- **`Decision.alternatives` can no longer be shredded into single characters on
+  the read path.** The graph-expansion projection called `list()` on the
+  property unconditionally. All 223 Decision nodes currently hold a Neo4j LIST
+  OF STRING, where that is a harmless passthrough — but this property has been
+  written as a JSON *string* before, and `list()` on a string explodes three
+  alternatives into several hundred one-character ones. A string is now one
+  entry.
+
+### Added
+
+- **`migrations/verify_neo4j_init.py` — proof that the declared Neo4j
+  constraints are actually in force.** Postgres has a migration ledger; Neo4j
+  has none. `neo4j_init.cypher` is a one-time manual step, so a long-lived
+  instance enforces whatever was true the day someone last applied it, and a
+  constraint added in a later release reaches new installs and nobody else. That
+  failure is silent by construction: `MERGE` keeps working, writes keep
+  succeeding, and the only symptom is a duplicate node appearing under a race —
+  at which point the constraint that would have prevented it is the thing you no
+  longer have.
+
+  The script diffs declared against live, and for each missing constraint counts
+  the duplicate values that would make `CREATE CONSTRAINT` fail — because
+  "missing" and "cannot be added without repairing data first" are very
+  different situations and the difference must not be discovered halfway through
+  an apply. Constraints belonging to another system on a shared instance are
+  reported as foreign, never touched. Read-only by default; `--apply` creates
+  what is missing. Exit status 1 when a declared constraint is not in force.
+
+  ⚠ It also handles an upgrade trap that re-running `neo4j_init.cypher` cannot:
+  Neo4j refuses `CREATE CONSTRAINT` while a **plain index** covers the same
+  label and property. A fresh install never meets this, because the constraints
+  are applied before anything creates an index; an instance where someone added
+  a lookup index by hand is blocked indefinitely, with no error unless somebody
+  goes looking. `--apply` drops the conflicting index first, which costs nothing
+  — a uniqueness constraint creates its own backing index on the same key.
+
+### Changed
+
+- **`AGENTS.md` upgrade path and README §6 now cover the Neo4j side.** The
+  documented upgrade ran `apply.py` and restarted, which covers Postgres and
+  says nothing about Neo4j; and README described `neo4j_init.cypher` as
+  idempotent and safe to re-run, which is true and insufficient — re-running it
+  does not clear a blocking plain index and does not tell you whether anything
+  is enforced. Both now point at the verifier, and Phase 5 confirms both stores
+  rather than trusting an exit status.
+
+---
+
 ## [0.8.40] — 2026-08-04
 
 ### Added

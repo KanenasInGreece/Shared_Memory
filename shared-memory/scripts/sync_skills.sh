@@ -48,34 +48,42 @@ PRUNE=0
 [ "${1:-}" = "--prune" ] && PRUNE=1
 
 # ── Phase 1: framework source → tracked skill copy (the distribution source) ─
-CLIENT_SCRIPTS=(memory_bridge.py update_skill.sh)
-
-if cp "$SRC/SKILL.md" "$SKILL_COPY/SKILL.md" 2>/dev/null; then
-  echo "✓ SKILL.md → shared-memory-skill (source of truth)"
-else
-  echo "↔  same inode (repo-linked): SKILL.md"
-fi
-
-if cp "$SRC/CONSTITUTION_SNIPPET.md" "$SKILL_COPY/CONSTITUTION_SNIPPET.md" 2>/dev/null; then
-  echo "✓ CONSTITUTION_SNIPPET.md → shared-memory-skill (source of truth)"
-else
-  echo "↔  same inode (repo-linked): CONSTITUTION_SNIPPET.md"
-fi
-
-for script in "${CLIENT_SCRIPTS[@]}"; do
-  src="$SRC/scripts/$script"
-  dest="$SKILL_COPY/scripts/$script"
+#
+# ⚠ DRIVEN BY MANIFEST.txt, THE SAME LIST PHASE 2 SHIPS. This used to be a
+# hardcoded pair of filenames plus CLIENT_SCRIPTS=(memory_bridge.py
+# update_skill.sh), while phase 2 and the parity test both read the manifest —
+# so a file could be added to the manifest, ship to every agent, and be refreshed
+# by nobody. That is exactly what happened to Documentation/schema.md: updated at
+# source in two consecutive releases, never copied here, and shipped stale to
+# every client for both of them while this script printed success.
+#
+# The manifest's own header promises "that's the whole maintenance surface".
+# Now it is one for real, rather than one of two lists that must be kept in
+# step by memory.
+while IFS= read -r rel; do
+  case "$rel" in ""|\#*) continue ;; esac
+  # .env.example is NOT a copy — it is a DIFFERENT file that happens to share a
+  # name. The client env holds only this agent's AGENT_TOKEN; the server env
+  # holds PG_PASSWORD, NEO4J_PASSWORD and every agent's token, and vector-skill.py
+  # refuses to load one that looks like the other. Copying it would ship exactly
+  # the mistake that guard exists to prevent.
+  [ "$rel" = ".env.example" ] && continue
+  src="$SRC/$rel"
+  dest="$SKILL_COPY/$rel"
+  # Files that live ONLY in the skill tree (no source twin) are shipped by
+  # phase 2 and have nothing to be refreshed from.
   [ -f "$src" ] || continue
+  mkdir -p "$(dirname "$dest")"
   if cp "$src" "$dest" 2>/dev/null; then
     # A .sh script must land executable regardless of the source file's own
     # mode bit — a plain Write/edit doesn't preserve chmod +x, and that
     # silently ships a script nobody can run until someone notices.
-    case "$script" in *.sh) chmod +x "$dest" ;; esac
-    echo "✓ $script → shared-memory-skill (source of truth)"
+    case "$rel" in *.sh) chmod +x "$dest" ;; esac
+    echo "✓ $rel → shared-memory-skill (source of truth)"
   else
-    echo "↔  same inode (repo-linked): $script"
+    echo "↔  same inode (repo-linked): $rel"
   fi
-done
+done < "$SKILL_COPY/MANIFEST.txt"
 echo ""
 
 # ── Phase 2: tracked skill copy → every REAL agent install, via THIS
