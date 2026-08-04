@@ -264,13 +264,27 @@ HAVING max(1 - (a.embedding <=> b.embedding)) >= $2   -- the floor; see below
 ⚠ **The floor is not optional, and it is per-deployment.** `ORDER BY … LIMIT 10`
 without one always returns ten rows, so the query cannot say *"nothing here
 considered the same thing"* — it just ranks the noise. Short technical prose
-embeds into a narrow band, and the top of that band is nowhere near a real
-match. Derive the floor from the corpus rather than guessing it: sample random
-cross-decision pairs for the baseline, then compare against pairs you can
-confirm by reading. On a corpus of a few hundred alternatives the two
-populations separate cleanly, with genuine restatements of the same option
-scoring far above the baseline's 99th percentile — take the floor from that gap,
-and re-derive it if the embedding model changes.
+embeds into a narrow band, and the top of that band is nowhere near a real match.
+
+**It is a BLOCKING KEY, not a verdict.** The floor selects candidates that a
+reader or a downstream gate then judges — the same rule this framework already
+applies to alias candidates, where cosine generates candidates and the LLM
+decides. Read a sample of the pairs a candidate floor admits: near the boundary a
+substantial share are not the same consideration at all, sharing only the *shape*
+of a rejection ("X (rejected: …)" resembles every other rejection). Choose the
+floor for the recall you want in that candidate set, not for precision it cannot
+deliver on its own.
+
+**Derive it from the corpus's own tail, not from a guessed constant.** Compute the
+distribution over all cross-decision pairs — on a few hundred alternatives that is
+a hundred thousand pairs and costs a single query — and take the floor from just
+above a high percentile (p99.9 is a reasonable anchor).
+
+⚠ **Do not look for "the maximum of unrelated pairs" to sit above.** There isn't
+one: genuine matches live in the same population as the noise, so the maximum is
+whatever the strongest true match scores. Sampling a small subset appears to give
+such a maximum only because it missed the true pairs — a landmark that moves with
+sample size is not a landmark. Re-derive whenever the embedding model changes.
 
 An alternative's own text is reached from the graph by dereferencing the
 `:Decision` node's `pg_id` into Postgres — the graph is not a second home for
