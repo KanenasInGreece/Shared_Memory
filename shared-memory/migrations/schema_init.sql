@@ -292,6 +292,20 @@ END;
 $function$
 ;
 
+CREATE OR REPLACE FUNCTION public.notify_new_artifact()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  -- The payload carries the row id so the daemon can act without re-querying
+  -- for what just changed. Postgres caps a notification payload at 8000 bytes,
+  -- which is why this sends an identifier and never the content.
+  PERFORM pg_notify('new_artifact', json_build_object('pg_id', NEW.id)::text);
+  RETURN NEW;
+END;
+$function$
+;
+
 -- ─── Triggers ──────────────────────────────────────────────────────────────
 -- Created after the functions they call. DROP-then-CREATE because Postgres
 -- has no CREATE TRIGGER IF NOT EXISTS and this file promises idempotency.
@@ -301,5 +315,8 @@ CREATE TRIGGER trg_project_aliases_disjoint BEFORE INSERT OR UPDATE ON public.pr
 
 DROP TRIGGER IF EXISTS trg_projects_disjoint ON projects;
 CREATE TRIGGER trg_projects_disjoint BEFORE INSERT OR UPDATE ON public.projects FOR EACH ROW EXECUTE FUNCTION assert_alias_namespaces_disjoint();
+
+DROP TRIGGER IF EXISTS trg_notify_new_artifact ON technical_docs;
+CREATE TRIGGER trg_notify_new_artifact AFTER INSERT ON public.technical_docs FOR EACH ROW EXECUTE FUNCTION notify_new_artifact();
 
 COMMIT;
