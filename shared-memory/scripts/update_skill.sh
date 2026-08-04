@@ -150,7 +150,16 @@ while IFS= read -r rel || [ -n "$rel" ]; do
         continue   # handled last, after everything else has applied cleanly
     fi
 
-    mkdir -p "$(dirname "$dest")"
+    # A symlinked SUBDIRECTORY is dissolved before anything is written inside
+    # it: applying into `scripts/` when that is a link into a source checkout
+    # would write into the checkout, not the install. Same copy-only rule as the
+    # files themselves.
+    dest_dir="$(dirname "$dest")"
+    if [ -L "$dest_dir" ]; then
+        echo "   $(basename "$dest_dir")/ was a symlink — replacing with a real directory"
+        rm -f "$dest_dir"
+    fi
+    mkdir -p "$dest_dir"
     stage="/tmp/${TMP_TAG}.$(echo "$rel" | tr '/' '_')"
     if fetch "$RAW_BASE/$rel" "$stage"; then
         STAGED_SRC+=("$stage"); STAGED_DEST+=("$dest")
@@ -193,7 +202,19 @@ for i in "${!STAGED_SRC[@]}"; do
     src="${STAGED_SRC[$i]}"
     dst="${STAGED_DEST[$i]}"
     rel="${dst#"$SKILL_DIR"/}"
-    if [ "$FORCE" != "1" ] && cmp -s "$src" "$dst"; then
+    # ⛔ AN INSTALLED FILE IS ALWAYS A REAL COPY, NEVER A SYMLINK (Xenofon,
+    # 2026-08-04). A link into a checkout breaks the moment that checkout is
+    # moved, renamed or archived — silently, and for every agent at once. So a
+    # symlink found here is REPLACED. `mv` already replaces the link rather than
+    # writing through it, but the `rm -f` is explicit: `cmp` below FOLLOWS the
+    # link, so a link pointing at identical content would otherwise be reported
+    # "already current" and survive forever.
+    if [ -L "$dst" ]; then
+        rm -f "$dst"
+        mv "$src" "$dst"
+        echo "✓  $rel REFRESHED (replaced a symlink with a real copy)"
+        refreshed=$((refreshed + 1))
+    elif [ "$FORCE" != "1" ] && cmp -s "$src" "$dst"; then
         echo "=  $rel already current"
         rm -f "$src"
         unchanged=$((unchanged + 1))

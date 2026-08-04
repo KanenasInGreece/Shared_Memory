@@ -60,6 +60,15 @@ PRUNE=0
 # The manifest's own header promises "that's the whole maintenance surface".
 # Now it is one for real, rather than one of two lists that must be kept in
 # step by memory.
+#
+# SHARED_MEMORY_SYNC_SKIP_TRACKED=1 skips this phase. It exists for the delivery
+# TESTS: they execute this script for real, and phase 1 writes into the repo's
+# own tracked copy — so a test run would silently REPAIR a genuine drift and make
+# the parity guard pass vacuously, depending on nothing more than test order. A
+# harness that repairs the thing it is meant to detect is worse than no harness.
+if [ "${SHARED_MEMORY_SYNC_SKIP_TRACKED:-}" = "1" ]; then
+  echo "(skipping phase 1 — SHARED_MEMORY_SYNC_SKIP_TRACKED=1)"
+else
 while IFS= read -r rel; do
   case "$rel" in ""|\#*) continue ;; esac
   # .env.example is NOT a copy — it is a DIFFERENT file that happens to share a
@@ -84,45 +93,102 @@ while IFS= read -r rel; do
     echo "↔  same inode (repo-linked): $rel"
   fi
 done < "$SKILL_COPY/MANIFEST.txt"
+fi
 echo ""
 
 # ── Phase 2: tracked skill copy → every REAL agent install, via THIS
 #    project's own update_skill.sh — see header for why not a parallel loop. ─
-AGENTS=(
-  "$HOME/.claude/skills/shared-memory"
-  "$HOME/.codex/skills/shared-memory"
-  "$HOME/.gemini/skills/shared-memory"
-  "$HOME/.grok/skills/shared-memory"
-)
+# Env-overridable (colon-separated), never a fixed layout: these four are OUR
+# agent set, not THE agent set, and a deployment with different tools installed
+# elsewhere must not need this file edited. It is also what makes phase 2's
+# delivery testable at all — a test points it at a temporary tree and asserts
+# what actually lands there, rather than reading this script's source and
+# believing it.
+if [ -n "${SHARED_MEMORY_SYNC_AGENTS:-}" ]; then
+  IFS=':' read -r -a AGENTS <<< "$SHARED_MEMORY_SYNC_AGENTS"
+else
+  AGENTS=(
+    "$HOME/.claude/skills/shared-memory"
+    "$HOME/.codex/skills/shared-memory"
+    "$HOME/.gemini/skills/shared-memory"
+    "$HOME/.grok/skills/shared-memory"
+  )
+fi
 
 for dir in "${AGENTS[@]}"; do
   if [ ! -d "$dir" ]; then
     echo "SKIP (not installed): $dir"
     continue
   fi
-  # SKILL.md is COPIED into every install — only memory_bridge.py is symlinked —
-  # so it must be refreshed BEFORE the symlink short-circuit below, never after.
-  # This copy used to sit after it, so an install whose script was a symlink was
-  # declared "already current" as a whole and its SKILL.md was never touched
-  # again. The symlink makes the SCRIPT auto-current and says nothing about the
-  # capture surface: measured on this machine, three of four agents were serving
-  # a SKILL.md many versions behind while sync reported them current every run.
-  # That is the worst shape for this file to rot in, because SKILL.md IS the
-  # elicitation surface — a stale copy asks the operator for the wrong fields and
-  # nothing anywhere reports a problem.
-  if [ ! -L "$dir/SKILL.md" ] && [ -f "$SKILL_COPY/SKILL.md" ]; then
-    if cmp -s "$SKILL_COPY/SKILL.md" "$dir/SKILL.md"; then
-      echo "=  SKILL.md already current: $dir"
-    else
-      cp "$SKILL_COPY/SKILL.md" "$dir/SKILL.md"
-      echo "✓ SKILL.md REFRESHED (was stale): $dir"
-    fi
-  fi
-
-  if [ -L "$dir/scripts/memory_bridge.py" ] || [ -L "$dir/scripts" ]; then
-    echo "↔  scripts symlinked (repo-linked, auto-current): $dir"
+  # ⛔ AN INSTALL DIRECTORY THAT IS ITSELF A SYMLINK IS REFUSED. Copying into it
+  # would write THROUGH the link into the repo's own tracked copy — the source
+  # would silently become the destination. README used to offer exactly this
+  # arrangement for one agent; it no longer does (see the copy-only rule below).
+  if [ -L "$dir" ]; then
+    echo "⛔ REFUSING $dir — it is a symlink to $(readlink "$dir")."
+    echo "   Copying into it would write into the source tree. Replace it with a"
+    echo "   real directory:  rm '$dir' && mkdir -p '$dir'  then re-run."
     continue
   fi
+
+  # ⛔ A SYMLINKED SUBDIRECTORY IS EVEN MORE DANGEROUS THAN A SYMLINKED FILE, and
+  # it must be dissolved BEFORE anything writes inside it. If `scripts/` is a
+  # link into the repo, then `rm -f "$dir/scripts/memory_bridge.py"` below would
+  # delete the REPO's copy, not the install's. Replace the link with a real
+  # directory holding the same contents; nothing is lost, because the source of
+  # those contents is the tracked skill tree we are about to copy from anyway.
+  for sub in scripts Documentation; do
+    if [ -L "$dir/$sub" ]; then
+      echo "✓ $sub/ was a symlink into the repo — replacing it with a real directory: $dir"
+      rm -f "$dir/$sub"
+      mkdir -p "$dir/$sub"
+    fi
+  done
+
+  # ⚠ EVERY MANIFEST FILE IS REFRESHED, AND THE LIST IS THE MANIFEST — NOT A
+  # FILENAME WRITTEN HERE.
+  #
+  # This has now failed twice, the same way, because the fix was per-file both
+  # times. First SKILL.md: an install whose script was a symlink was declared
+  # "already current" as a whole, and three of four agents served a SKILL.md many
+  # versions behind while sync reported them current every run. SKILL.md was
+  # hoisted above the short-circuit — and then Documentation/schema.md was added
+  # to the manifest and fell into exactly the same hole, missing entirely from
+  # .codex and .grok while this script printed success.
+  #
+  # ⛔ EVERY INSTALLED FILE IS A REAL COPY — NEVER A SYMLINK INTO THIS REPO.
+  # (Xenofon, 2026-08-04.) Repo-linking made a file auto-current at the cost of
+  # binding every agent on the machine to this checkout's PATH: move, rename or
+  # archive the project and all four installs break at once, silently, and the
+  # only symptom is a skill that no longer runs. Staleness is the lesser risk
+  # BECAUSE IT IS DETECTABLE — every file is content-compared on each sync, and
+  # `doctor` reports version skew — whereas a dangling link is discovered by an
+  # agent failing mid-task. It also matches how everyone ELSE gets this package:
+  # update_skill.sh fetches it from GitHub and writes real files, so the local
+  # dev path now produces the same result as the shipped one instead of a shape
+  # only this machine has.
+  #
+  # An existing symlink is therefore REPLACED, not preserved and not written
+  # through: `rm -f` first, because `cp` onto a symlink follows it and would
+  # write into the source tree.
+  while IFS= read -r rel; do
+    case "$rel" in ""|\#*) continue ;; esac
+    # .env.example is MERGED into a live .env by update_skill.sh, never copied
+    # over it — a copy would overwrite this agent's AGENT_TOKEN.
+    [ "$rel" = ".env.example" ] && continue
+    [ -f "$SKILL_COPY/$rel" ] || continue
+    if [ ! -L "$dir/$rel" ] && cmp -s "$SKILL_COPY/$rel" "$dir/$rel"; then
+      echo "=  $rel already current: $dir"
+    else
+      was_link=""
+      [ -L "$dir/$rel" ] && was_link=" (replaced a symlink into the repo)"
+      mkdir -p "$(dirname "$dir/$rel")"
+      rm -f "$dir/$rel"
+      cp "$SKILL_COPY/$rel" "$dir/$rel"
+      case "$rel" in *.sh) chmod +x "$dir/$rel" ;; esac
+      echo "✓ $rel REFRESHED (was stale or absent)$was_link: $dir"
+    fi
+  done < "$SKILL_COPY/MANIFEST.txt"
 
   # Always refresh update_skill.sh from the tracked copy BEFORE invoking it —
   # never conditionally, even if one already exists. A stale copy (e.g. from

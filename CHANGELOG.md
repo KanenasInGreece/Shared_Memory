@@ -5,6 +5,69 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.42] — 2026-08-04
+
+### Fixed
+
+- **Both skill-delivery paths now agree on what a symlink means, and neither
+  skips the manifest.** v0.8.41 made `sync_skills.sh` phase 1 manifest-driven;
+  verifying the result on four real installs showed **two of them had never
+  received `Documentation/schema.md` at all**, while the script reported
+  success. Phase 2 short-circuited on `scripts/` being a symlink and `continue`d
+  past everything else — so the symlink, which only makes `memory_bridge.py`
+  auto-current, was being read as "this whole install is current".
+
+  This is the second time that short-circuit has caused exactly this, and the
+  first fix is why it recurred: `SKILL.md` was hoisted above the `continue`, a
+  per-*file* repair to a per-*loop* defect, so the next file added to the
+  manifest fell into the identical hole. Phase 2 now iterates `MANIFEST.txt`,
+  and the short-circuit decides one thing only — whether `update_skill.sh` needs
+  to run.
+
+- **`update_skill.sh` no longer writes through a symlink.** It applied every
+  staged file with `mv`, which *replaces* a symlink with a regular file. So the
+  self-update path silently undid the arrangement the sync path depends on: a
+  repo-linked file, auto-current by construction, became a frozen copy of that
+  day's content — invisible until it had gone stale. The exact mirror of the
+  defect above, on the other delivery path. A symlinked destination is now left
+  as a link and reported as such.
+
+### Changed
+
+- **⛔ An installed skill file is now always a REAL COPY, never a symlink into a
+  source checkout.** Repo-linking `memory_bridge.py` bought auto-currency at a
+  price that is only visible once: it binds every agent on the machine to one
+  checkout's *path*, so moving, renaming or archiving the project breaks all of
+  them at once — silently, with the first symptom being an agent failing
+  mid-task. Staleness is the lesser risk precisely because it is **detectable**:
+  every file is content-compared on each sync and `doctor` reports version skew.
+  It also makes the local development path produce the same result as the
+  shipped one, since `update_skill.sh` fetches from GitHub and writes real files
+  for everybody else already.
+
+  Both delivery paths now **replace** any symlink they find, and both close the
+  hazard that creates: `cp` and `cmp` each *follow* a link, so a naive
+  implementation would write into the source tree and would report a link
+  pointing at identical content as "already current" forever. A symlinked
+  `scripts/` or `Documentation/` is dissolved into a real directory before
+  anything is written inside it, and `sync_skills.sh` **refuses** an install
+  directory that is itself a link rather than making the source its own
+  destination. README's four per-agent blocks now copy the whole package —
+  they previously installed two of the six files the manifest ships — and
+  `AGENTS.md` states the copy-only rule.
+
+- **`sync_skills.sh`'s agent list is env-overridable** via
+  `SHARED_MEMORY_SYNC_AGENTS` (colon-separated), instead of four `$HOME` paths
+  baked into a code path. Those four are *our* agent set, not *the* agent set —
+  and hardcoding them is also what made this delivery logic untestable, which is
+  how the same defect shipped twice. `tests/test_skill_delivery.py` now runs the
+  real scripts against a temporary tree and asserts what actually lands there,
+  because the whole defect class lives in shell control flow: a test that read
+  the source for a filename would have passed throughout both failures, since
+  the filename was there — above a `continue` that skipped it.
+
+---
+
 ## [0.8.41] — 2026-08-04
 
 ### Fixed
