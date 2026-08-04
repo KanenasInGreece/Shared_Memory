@@ -5,6 +5,63 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.38] — 2026-08-04
+
+### Added
+
+- **A parked record can now have its project established from the records it
+  shares subject matter with.** The previous repair reads the judgements that
+  cite a record as evidence, which only helps a record something else has
+  already reasoned about. Most parked records have no such citation, but they do
+  carry the things they are about — and the other records about those same
+  things mostly do name a project. Where those neighbours agree, that agreement
+  is evidence about this record.
+
+  **How far that evidence is allowed to go was measured, not assumed.** Held out
+  against records whose project was already known, the vote was right 96.9% of
+  the time at seventy percent agreement or better — real signal against a 66.2%
+  base rate for simply guessing the largest project. It is still not enough to
+  write with, because **every error it made was a sister project being absorbed
+  into the larger one beside it**, one of them at 95% agreement across twenty
+  supporting records. Raising the bar does not fix that failure, since a sister
+  project quietly losing its records is not a rounding error — it is exactly the
+  distinction the axis exists to preserve, being deleted in the direction of
+  whatever already dominates. Only unanimity measured clean, so **unanimity is
+  the only thing written without a person**; everything else is proposed, grouped
+  by confidence, and shown alongside the projects it competed against rather than
+  as a bare winner.
+
+  Two kinds of neighbour are excluded. A subject linked to nearly everything says
+  nothing about any one record, so it is capped — reusing the threshold the
+  insight gate already uses, so that "too connected to mean anything" has one
+  definition rather than one per consumer. And a subject that is really the
+  project axis wearing a topic's label is excluded too, which both stops a record
+  voting on itself and means removing those nodes later cannot retroactively
+  change what this pass decided.
+
+- **Confirming a proposal approves a judgement, never a stale row.** The
+  operator-confirmation path re-derives every vote at the moment it writes.
+  Promoting a record makes it a voting neighbour, so earlier writes within a
+  single run legitimately change later tallies — the proposal count moved during
+  the first live run for exactly that reason — and a person may be confirming
+  from a listing produced days earlier. Anything whose proposal no longer stands
+  is refused rather than written on the strength of an old number.
+
+  Every promotion goes through the one promotion writer, so a repair pass and
+  live ingress cannot drift into two notions of what promoting means, and each
+  ledger row carries the agreement share, the number of supporting records, and
+  the projects that competed.
+
+### Fixed
+
+- **The population of parked records is read from the database, never from the
+  graph.** "Parked" is a property of the stored resolution; selecting records
+  that lack the project edge instead looks equivalent and is not, because a
+  record can be parked in the database while carrying an edge nothing can
+  justify. An edge-side selector silently drops exactly the records most in need
+  of repair. This mistake has been made twice here, so it is now pinned by a
+  test rather than left to care.
+
 ## [0.8.37] — 2026-08-04
 
 ### Fixed
