@@ -88,36 +88,61 @@ echo ""
 
 # ── Phase 2: tracked skill copy → every REAL agent install, via THIS
 #    project's own update_skill.sh — see header for why not a parallel loop. ─
-AGENTS=(
-  "$HOME/.claude/skills/shared-memory"
-  "$HOME/.codex/skills/shared-memory"
-  "$HOME/.gemini/skills/shared-memory"
-  "$HOME/.grok/skills/shared-memory"
-)
+# Env-overridable (colon-separated), never a fixed layout: these four are OUR
+# agent set, not THE agent set, and a deployment with different tools installed
+# elsewhere must not need this file edited. It is also what makes phase 2's
+# delivery testable at all — a test points it at a temporary tree and asserts
+# what actually lands there, rather than reading this script's source and
+# believing it.
+if [ -n "${SHARED_MEMORY_SYNC_AGENTS:-}" ]; then
+  IFS=':' read -r -a AGENTS <<< "$SHARED_MEMORY_SYNC_AGENTS"
+else
+  AGENTS=(
+    "$HOME/.claude/skills/shared-memory"
+    "$HOME/.codex/skills/shared-memory"
+    "$HOME/.gemini/skills/shared-memory"
+    "$HOME/.grok/skills/shared-memory"
+  )
+fi
 
 for dir in "${AGENTS[@]}"; do
   if [ ! -d "$dir" ]; then
     echo "SKIP (not installed): $dir"
     continue
   fi
-  # SKILL.md is COPIED into every install — only memory_bridge.py is symlinked —
-  # so it must be refreshed BEFORE the symlink short-circuit below, never after.
-  # This copy used to sit after it, so an install whose script was a symlink was
-  # declared "already current" as a whole and its SKILL.md was never touched
-  # again. The symlink makes the SCRIPT auto-current and says nothing about the
-  # capture surface: measured on this machine, three of four agents were serving
-  # a SKILL.md many versions behind while sync reported them current every run.
-  # That is the worst shape for this file to rot in, because SKILL.md IS the
-  # elicitation surface — a stale copy asks the operator for the wrong fields and
-  # nothing anywhere reports a problem.
-  if [ ! -L "$dir/SKILL.md" ] && [ -f "$SKILL_COPY/SKILL.md" ]; then
-    if cmp -s "$SKILL_COPY/SKILL.md" "$dir/SKILL.md"; then
-      echo "=  SKILL.md already current: $dir"
+  # ⚠ EVERY MANIFEST FILE IS REFRESHED BEFORE THE SYMLINK SHORT-CIRCUIT BELOW,
+  # AND THE LIST IS THE MANIFEST — NOT A FILENAME WRITTEN HERE.
+  #
+  # This has now failed twice, the same way, because the fix was per-file both
+  # times. First SKILL.md: an install whose script was a symlink was declared
+  # "already current" as a whole, and three of four agents served a SKILL.md many
+  # versions behind while sync reported them current every run. SKILL.md was
+  # hoisted above the short-circuit — and then Documentation/schema.md was added
+  # to the manifest and fell into exactly the same hole, missing entirely from
+  # .codex and .grok while this script printed success.
+  #
+  # The symlink makes the SCRIPT auto-current. It says NOTHING about the capture
+  # surface, the constitution snippet, the schema doc, or anything else added to
+  # the package later. So the loop is over the manifest, and the short-circuit
+  # below now decides one thing only: whether update_skill.sh needs to run.
+  while IFS= read -r rel; do
+    case "$rel" in ""|\#*) continue ;; esac
+    # .env.example is MERGED into a live .env by update_skill.sh, never copied
+    # over it — a copy would overwrite this agent's AGENT_TOKEN.
+    [ "$rel" = ".env.example" ] && continue
+    # A symlinked path is repo-linked and already current by construction;
+    # copying onto it would replace the link with a file and freeze it.
+    [ -L "$dir/$rel" ] && continue
+    [ -f "$SKILL_COPY/$rel" ] || continue
+    if cmp -s "$SKILL_COPY/$rel" "$dir/$rel"; then
+      echo "=  $rel already current: $dir"
     else
-      cp "$SKILL_COPY/SKILL.md" "$dir/SKILL.md"
-      echo "✓ SKILL.md REFRESHED (was stale): $dir"
+      mkdir -p "$(dirname "$dir/$rel")"
+      cp "$SKILL_COPY/$rel" "$dir/$rel"
+      case "$rel" in *.sh) chmod +x "$dir/$rel" ;; esac
+      echo "✓ $rel REFRESHED (was stale or absent): $dir"
     fi
-  fi
+  done < "$SKILL_COPY/MANIFEST.txt"
 
   if [ -L "$dir/scripts/memory_bridge.py" ] || [ -L "$dir/scripts" ]; then
     echo "↔  scripts symlinked (repo-linked, auto-current): $dir"

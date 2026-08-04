@@ -5,6 +5,47 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.42] — 2026-08-04
+
+### Fixed
+
+- **Both skill-delivery paths now agree on what a symlink means, and neither
+  skips the manifest.** v0.8.41 made `sync_skills.sh` phase 1 manifest-driven;
+  verifying the result on four real installs showed **two of them had never
+  received `Documentation/schema.md` at all**, while the script reported
+  success. Phase 2 short-circuited on `scripts/` being a symlink and `continue`d
+  past everything else — so the symlink, which only makes `memory_bridge.py`
+  auto-current, was being read as "this whole install is current".
+
+  This is the second time that short-circuit has caused exactly this, and the
+  first fix is why it recurred: `SKILL.md` was hoisted above the `continue`, a
+  per-*file* repair to a per-*loop* defect, so the next file added to the
+  manifest fell into the identical hole. Phase 2 now iterates `MANIFEST.txt`,
+  and the short-circuit decides one thing only — whether `update_skill.sh` needs
+  to run.
+
+- **`update_skill.sh` no longer writes through a symlink.** It applied every
+  staged file with `mv`, which *replaces* a symlink with a regular file. So the
+  self-update path silently undid the arrangement the sync path depends on: a
+  repo-linked file, auto-current by construction, became a frozen copy of that
+  day's content — invisible until it had gone stale. The exact mirror of the
+  defect above, on the other delivery path. A symlinked destination is now left
+  as a link and reported as such.
+
+### Changed
+
+- **`sync_skills.sh`'s agent list is env-overridable** via
+  `SHARED_MEMORY_SYNC_AGENTS` (colon-separated), instead of four `$HOME` paths
+  baked into a code path. Those four are *our* agent set, not *the* agent set —
+  and hardcoding them is also what made this delivery logic untestable, which is
+  how the same defect shipped twice. `tests/test_skill_delivery.py` now runs the
+  real scripts against a temporary tree and asserts what actually lands there,
+  because the whole defect class lives in shell control flow: a test that read
+  the source for a filename would have passed throughout both failures, since
+  the filename was there — above a `continue` that skipped it.
+
+---
+
 ## [0.8.41] — 2026-08-04
 
 ### Fixed

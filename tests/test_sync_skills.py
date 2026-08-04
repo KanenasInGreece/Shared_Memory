@@ -52,21 +52,32 @@ def test_tracked_skill_md_copies_are_byte_identical():
 
 # ── SKILL.md must be refreshed BEFORE the symlink short-circuit ──────────────
 
-def test_skill_md_copy_precedes_the_symlink_short_circuit():
-    """The ordering IS the fix. A symlinked memory_bridge.py means the SCRIPT is
-    auto-current; it says nothing about SKILL.md, which is copied. So the copy has
-    to happen before any `continue` that skips the install.
+def test_the_per_agent_refresh_is_driven_by_the_manifest_not_by_filenames():
+    """⛔ THIS TEST REPLACED ONE THAT PASSED THROUGH TWO FAILURES OF THE THING IT
+    CLAIMED TO GUARD, and the replacement is the lesson.
+
+    The old test asserted that the literal string `cp "$SKILL_COPY/SKILL.md"
+    "$dir/SKILL.md"` appeared before the symlink short-circuit. That was true,
+    and the delivery was still broken — because the guarantee needed is not
+    "SKILL.md is copied early", it is "EVERY MANIFEST FILE is copied". Hoisting
+    one filename above a `continue` fixed one file and left the `continue` in
+    place, so `Documentation/schema.md` was added to the manifest later and was
+    missing entirely from two of four live installs, with sync reporting success.
+
+    Naming a file in a test is naming the file you already thought of. The real
+    behaviour is asserted by executing the script — see test_skill_delivery.py,
+    which points it at a temporary tree via SHARED_MEMORY_SYNC_AGENTS and checks
+    what actually lands. This test keeps only the structural claim that cannot
+    regress into a per-file list.
     """
     text = _script()
-    copy_at = text.find('cp "$SKILL_COPY/SKILL.md" "$dir/SKILL.md"')
-    skip_at = text.find('[ -L "$dir/scripts/memory_bridge.py" ]')
-    assert copy_at != -1, "per-agent SKILL.md copy is missing from sync_skills.sh"
-    assert skip_at != -1, "symlink short-circuit is missing from sync_skills.sh"
-    assert copy_at < skip_at, (
-        "SKILL.md is copied AFTER the symlink short-circuit, so any install with a "
-        "repo-linked memory_bridge.py will never receive a SKILL.md update — the "
-        "capture surface rots while sync reports success"
-    )
+    assert 'done < "$SKILL_COPY/MANIFEST.txt"' in text, (
+        "sync_skills.sh no longer iterates MANIFEST.txt — a hardcoded file list "
+        "is how this defect shipped twice")
+    # Both phases must be manifest-driven: phase 1 (source → tracked copy) and
+    # phase 2 (tracked copy → each install). One of each is not enough.
+    assert text.count('done < "$SKILL_COPY/MANIFEST.txt"') >= 2, (
+        "only one phase reads the manifest; the other is back to a fixed list")
 
 
 def test_symlinked_skill_md_is_not_a_reason_to_skip_the_install():
@@ -82,22 +93,27 @@ def test_symlinked_skill_md_is_not_a_reason_to_skip_the_install():
     )
 
 
-def test_skill_md_copy_is_guarded_against_writing_through_a_symlink():
-    """If an install DOES symlink SKILL.md, copying over it would write through to
-    the repo. The copy is guarded by `! -L` so that case is skipped, not clobbered."""
-    text = _script()
-    copy_at = text.find('cp "$SKILL_COPY/SKILL.md" "$dir/SKILL.md"')
-    guard_at = text.find('[ ! -L "$dir/SKILL.md" ]')
-    assert guard_at != -1, "per-agent SKILL.md copy is not guarded against symlinks"
-    assert guard_at < copy_at, "the `! -L` guard must precede the copy"
+def test_both_delivery_paths_refuse_to_write_through_a_symlink():
+    """A symlinked path is repo-linked and auto-current; copying onto it replaces
+    the link with a frozen file. BOTH paths must agree — sync_skills.sh used to
+    skip symlinked installs entirely while update_skill.sh `mv`-ed straight over
+    the link, so one silently undid the other's arrangement.
+
+    The executable proof is in test_skill_delivery.py; this pins the guard's
+    presence on each path so neither can quietly lose it.
+    """
+    assert '[ -L "$dir/$rel" ] && continue' in _script(), (
+        "sync_skills.sh would copy onto a symlink and freeze it")
+    assert 'if [ -L "$dst" ]; then' in _update_script(), (
+        "update_skill.sh would mv over a symlink, replacing it with a file")
 
 
 def test_refresh_is_reported_distinctly_from_already_current():
     """The defect was invisible because sync printed only success. A refresh and a
     no-op must read differently, or the next silent drift is equally undetectable."""
     text = _script()
-    assert "SKILL.md REFRESHED" in text
-    assert "SKILL.md already current" in text
+    assert "REFRESHED (was stale or absent)" in text
+    assert "already current" in text
 
 
 # ── update_skill.sh: the REMOTE path had the same hazard, version-gated ───────

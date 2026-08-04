@@ -193,7 +193,18 @@ for i in "${!STAGED_SRC[@]}"; do
     src="${STAGED_SRC[$i]}"
     dst="${STAGED_DEST[$i]}"
     rel="${dst#"$SKILL_DIR"/}"
-    if [ "$FORCE" != "1" ] && cmp -s "$src" "$dst"; then
+    # ⚠ NEVER WRITE THROUGH A SYMLINK. `mv` onto one REPLACES the link with a
+    # regular file, so a repo-linked path — auto-current by construction —
+    # becomes a frozen copy of today's content, and the freeze is invisible
+    # until it has gone stale. This is the exact mirror of the sync_skills.sh
+    # defect (which skipped symlinked installs entirely): the two delivery paths
+    # must agree that a symlink means "already current, leave it alone", or one
+    # of them silently undoes the other's arrangement.
+    if [ -L "$dst" ]; then
+        echo "↔  $rel repo-linked (symlink, auto-current) — left as a link"
+        rm -f "$src"
+        unchanged=$((unchanged + 1))
+    elif [ "$FORCE" != "1" ] && cmp -s "$src" "$dst"; then
         echo "=  $rel already current"
         rm -f "$src"
         unchanged=$((unchanged + 1))
