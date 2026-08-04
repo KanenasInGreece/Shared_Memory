@@ -724,7 +724,7 @@ HTTP 200 means the save/search path (embedder + reranker) is operational. HTTP 5
 
 This section covers where to place files and how to register each agent. For runtime usage (commands and examples) see [§11: Agent Access: CLI and MCP](#11-agent-access-cli-and-mcp).
 
-> **The skill is a thin client.** The only script it needs is `memory_bridge.py` (an HTTP client to the gateway on `:8888`). The daemons run on the gateway host from this repo (§9) — **never install a daemon into a skill dir**. Each per-agent block below symlinks `memory_bridge.py` alone; standing up the gateway/daemons is a separate, gateway-host task ([server-setup.md](shared-memory/Documentation/server-setup.md)). After installing, run `memory_bridge.py doctor` to confirm the client and gateway agree on `api_version`.
+> **The skill is a thin client.** The only script it needs is `memory_bridge.py` (an HTTP client to the gateway on `:8888`). The daemons run on the gateway host from this repo (§9) — **never install a daemon into a skill dir**. Each per-agent block below copies the client package; standing up the gateway/daemons is a separate, gateway-host task ([server-setup.md](shared-memory/Documentation/server-setup.md)). After installing, run `memory_bridge.py doctor` to confirm the client and gateway agree on `api_version`.
 
 ### Clone the repository and set up the environment
 
@@ -836,18 +836,14 @@ uv run --with httpx --with python-dotenv \
 
 ### Claude Code
 
-Claude Code loads skills from `~/.claude/skills/`. Create the skill directory with a symlink so scripts always stay in sync with the repo:
+Claude Code loads skills from `~/.claude/skills/`. Copy the whole package — it is a thin client, so this is only the CLI script plus its documentation; the daemons stay server-side on the gateway host (see `server-setup.md`).
 
 ```bash
-mkdir -p ~/.claude/skills/shared-memory/scripts
-
-# Symlink the CLIENT SCRIPT ONLY — the skill is a thin client. The daemons are
-# server-side and run from the repo on the gateway host (see server-setup.md).
-ln -s /path/to/Shared_Memory/shared-memory/scripts/memory_bridge.py ~/.claude/skills/shared-memory/scripts/memory_bridge.py
-
-# Copy SKILL.md (or symlink it too)
-cp shared-memory-skill/shared-memory/SKILL.md ~/.claude/skills/shared-memory/SKILL.md
+mkdir -p ~/.claude/skills
+cp -r shared-memory-skill/shared-memory ~/.claude/skills/shared-memory
 ```
+
+Copy the **directory**, not a hand-picked file or two: `MANIFEST.txt` lists everything the package ships, and later steps depend on files an "just SKILL.md and the script" install would leave out.
 
 Invoke in any Claude Code session:
 
@@ -857,16 +853,11 @@ Invoke in any Claude Code session:
 
 ### Grok
 
-Grok loads skills from `~/.grok/skills/`. Same symlink pattern:
+Grok loads skills from `~/.grok/skills/`. Same pattern — copy the whole package:
 
 ```bash
-mkdir -p ~/.grok/skills/shared-memory/scripts
-
-# Symlink the client script only (thin client — daemons stay on the gateway host)
-ln -s /path/to/Shared_Memory/shared-memory/scripts/memory_bridge.py ~/.grok/skills/shared-memory/scripts/memory_bridge.py
-
-# Copy SKILL.md
-cp shared-memory-skill/shared-memory/SKILL.md ~/.grok/skills/shared-memory/SKILL.md
+mkdir -p ~/.grok/skills
+cp -r shared-memory-skill/shared-memory ~/.grok/skills/shared-memory
 ```
 
 Invoke in any Grok session:
@@ -880,13 +871,8 @@ Invoke in any Grok session:
 Codex CLI loads skills from `~/.codex/skills/` (global) or `.agents/skills/` (project-level). Install globally so the skill is available in every project:
 
 ```bash
-mkdir -p ~/.codex/skills/shared-memory/scripts
-
-# Symlink the client script only (thin client — daemons stay on the gateway host)
-ln -s /path/to/Shared_Memory/shared-memory/scripts/memory_bridge.py ~/.codex/skills/shared-memory/scripts/memory_bridge.py
-
-# Copy SKILL.md
-cp shared-memory/SKILL.md ~/.codex/skills/shared-memory/SKILL.md
+mkdir -p ~/.codex/skills
+cp -r shared-memory-skill/shared-memory ~/.codex/skills/shared-memory
 ```
 
 Invoke explicitly in any Codex CLI session:
@@ -905,12 +891,7 @@ Codex CLI also supports **implicit invocation**: if the description in SKILL.md'
 
 ```bash
 mkdir -p ~/.gemini/skills
-
-# Copy (standalone — updates require a re-copy)
 cp -r shared-memory-skill/shared-memory ~/.gemini/skills/shared-memory
-
-# Or symlink (always in sync with the repo)
-ln -s /path/to/Shared_Memory/shared-memory-skill/shared-memory ~/.gemini/skills/shared-memory
 ```
 
 Activate in any Antigravity CLI session:

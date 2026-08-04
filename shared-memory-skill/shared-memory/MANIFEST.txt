@@ -10,6 +10,14 @@
 # Add a new file here when it's added to this directory — that's the whole
 # maintenance surface; update_skill.sh does not hardcode file names.
 
+# MANIFEST.txt ships ITSELF, deliberately. update_skill.sh always fetches the
+# manifest from the REMOTE — the list of files a new version ships has to come
+# from that version, never from what the client happens to hold — so the copy
+# installed here is not what drives an update. It is what lets an install answer
+# "am I complete?" WITHOUT network access. Two installs once sat for two
+# releases missing a file that nothing local could name.
+
+MANIFEST.txt
 SKILL.md
 CONSTITUTION_SNIPPET.md
 .env.example

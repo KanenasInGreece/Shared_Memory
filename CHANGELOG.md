@@ -34,6 +34,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **⛔ An installed skill file is now always a REAL COPY, never a symlink into a
+  source checkout.** Repo-linking `memory_bridge.py` bought auto-currency at a
+  price that is only visible once: it binds every agent on the machine to one
+  checkout's *path*, so moving, renaming or archiving the project breaks all of
+  them at once — silently, with the first symptom being an agent failing
+  mid-task. Staleness is the lesser risk precisely because it is **detectable**:
+  every file is content-compared on each sync and `doctor` reports version skew.
+  It also makes the local development path produce the same result as the
+  shipped one, since `update_skill.sh` fetches from GitHub and writes real files
+  for everybody else already.
+
+  Both delivery paths now **replace** any symlink they find, and both close the
+  hazard that creates: `cp` and `cmp` each *follow* a link, so a naive
+  implementation would write into the source tree and would report a link
+  pointing at identical content as "already current" forever. A symlinked
+  `scripts/` or `Documentation/` is dissolved into a real directory before
+  anything is written inside it, and `sync_skills.sh` **refuses** an install
+  directory that is itself a link rather than making the source its own
+  destination. README's four per-agent blocks now copy the whole package —
+  they previously installed two of the six files the manifest ships — and
+  `AGENTS.md` states the copy-only rule.
+
 - **`sync_skills.sh`'s agent list is env-overridable** via
   `SHARED_MEMORY_SYNC_AGENTS` (colon-separated), instead of four `$HOME` paths
   baked into a code path. Those four are *our* agent set, not *the* agent set —

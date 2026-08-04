@@ -10,11 +10,24 @@ failure was visible: `sync_skills.sh` printed success on every run.
   * Then Documentation/schema.md, added to the manifest later, fell into the
     identical hole and was missing ENTIRELY from two of four installs.
 
-The symlink makes the SCRIPT auto-current. It says nothing about the capture
+The symlink made the SCRIPT auto-current. It said nothing about the capture
 surface, the constitution snippet, the schema doc, or anything added to the
 package next — which is exactly what a per-file fix cannot express.
 
-⚠ THIS TEST RUNS THE REAL SCRIPT against a temporary tree, because the whole
+⛔ AND THE SYMLINKS THEMSELVES ARE NOW GONE (Xenofon, 2026-08-04): every
+installed file is a REAL COPY. Repo-linking bought auto-currency by binding
+every agent on the machine to one checkout's path, so moving, renaming or
+archiving the project breaks all of them at once — silently, discovered only by
+an agent failing mid-task. Staleness is the lesser risk because it is
+DETECTABLE: every file is content-compared on each sync. It also makes the local
+dev path produce the same result as the shipped one, since update_skill.sh
+fetches from GitHub and writes real files for everyone else already.
+
+That policy creates its own hazard, which these tests pin: `cp` and `cmp` both
+FOLLOW a symlink, so a naive implementation would write into the source tree and
+would report a link to identical content as "already current" forever.
+
+⚠ THESE TESTS RUN THE REAL SCRIPTS against a temporary tree, because the whole
 defect class lives in the shell control flow. A test that read the source for a
 filename would have PASSED throughout both failures above: the filename was
 there, above a `continue` that skipped it.
@@ -47,6 +60,13 @@ _NOT_COPIED = {".env.example", "scripts/update_skill.sh"}
 def _run_sync(agent_dirs):
     env = dict(os.environ)
     env["SHARED_MEMORY_SYNC_AGENTS"] = ":".join(agent_dirs)
+    # ⚠ Phase 1 (source → tracked copy) is SKIPPED here, and that matters. These
+    # tests run the real script, and phase 1 writes into the repo's own tracked
+    # copy — so without this, a test run would silently REPAIR a genuine drift
+    # and make test_every_manifest_file_is_byte_identical_across_both_tracked_copies
+    # pass vacuously, decided by nothing but test order. A harness that repairs
+    # what it is meant to detect is worse than no harness.
+    env["SHARED_MEMORY_SYNC_SKIP_TRACKED"] = "1"
     return subprocess.run(["bash", _SYNC], capture_output=True, text=True,
                           env=env, cwd=_REPO, timeout=180)
 
@@ -112,9 +132,16 @@ def test_a_stale_file_is_actually_refreshed_not_merely_present(tmp_path):
         assert shipped == source, f"{rel} was left stale\n{result.stdout}"
 
 
-def test_a_symlinked_file_is_left_as_a_link(tmp_path):
-    """Copying onto a symlink would replace the link with a file and freeze it
-    at today's content — turning an auto-current path into a stale one."""
+def test_an_installed_file_is_a_real_copy_never_a_symlink(tmp_path):
+    """⛔ POLICY (Xenofon, 2026-08-04): installs hold REAL COPIES.
+
+    Repo-linking made a file auto-current at the cost of binding every agent on
+    the machine to one checkout's PATH — move, rename or archive the project and
+    all of them break at once, silently, discovered only by an agent failing
+    mid-task. Staleness is the lesser risk because it is DETECTABLE: every file
+    is content-compared on each sync. So a symlink found in an install is
+    replaced, not preserved.
+    """
     install = tmp_path / "agent" / "skills" / "shared-memory"
     install.mkdir(parents=True)
     os.symlink(os.path.join(_SKILL_COPY, "scripts"), install / "scripts")
@@ -122,21 +149,54 @@ def test_a_symlinked_file_is_left_as_a_link(tmp_path):
 
     result = _run_sync([str(install)])
     assert result.returncode == 0, result.stdout + result.stderr
-    assert (install / "SKILL.md").is_symlink(), (
-        "a repo-linked SKILL.md was replaced by a copy")
+    for rel in ("SKILL.md", "scripts", "scripts/memory_bridge.py"):
+        assert not (install / rel).is_symlink(), (
+            f"{rel} is still a symlink into the source tree\n{result.stdout}")
+    assert (install / "SKILL.md").read_text() == \
+        open(os.path.join(_SKILL_COPY, "SKILL.md"), encoding="utf-8").read()
 
 
-def test_update_skill_does_not_write_through_a_symlink(tmp_path):
+def test_writing_into_a_symlinked_subdirectory_never_touches_the_source(tmp_path):
+    """The hazard the policy creates and must therefore close: `rm -f` inside a
+    symlinked `scripts/` would delete the SOURCE tree's file, not the install's.
+    The link is dissolved into a real directory before anything is written."""
+    install = tmp_path / "agent" / "skills" / "shared-memory"
+    install.mkdir(parents=True)
+    os.symlink(os.path.join(_SKILL_COPY, "scripts"), install / "scripts")
+
+    before = open(os.path.join(_SKILL_COPY, "scripts", "memory_bridge.py"), "rb").read()
+    result = _run_sync([str(install)])
+    assert result.returncode == 0, result.stdout + result.stderr
+    after = open(os.path.join(_SKILL_COPY, "scripts", "memory_bridge.py"), "rb").read()
+    assert before == after, "the sync wrote through a symlink into the source tree"
+    assert (install / "scripts" / "memory_bridge.py").is_file()
+
+
+def test_an_install_directory_that_is_itself_a_symlink_is_refused(tmp_path):
+    """The worst shape: copying into it would make the source its own
+    destination. Refused with an instruction, never silently followed."""
+    real = tmp_path / "elsewhere"
+    real.mkdir()
+    install = tmp_path / "agent" / "skills" / "shared-memory"
+    install.parent.mkdir(parents=True)
+    os.symlink(real, install)
+
+    result = _run_sync([str(install)])
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "REFUSING" in result.stdout, result.stdout
+    assert not (real / "SKILL.md").exists(), "it wrote through the directory link"
+
+
+def test_update_skill_replaces_a_symlink_with_a_real_copy(tmp_path):
     """D1's mirror, on the OTHER delivery path.
 
-    `update_skill.sh` applied every staged file with `mv`, and `mv` onto a
-    symlink REPLACES the link with a regular file. So the self-update path
-    silently undid the arrangement the sync path relies on: a repo-linked file,
-    auto-current by construction, became a frozen copy of that day's content —
-    and the freeze is invisible until it has gone stale.
+    The two delivery paths must agree that an installed file is a real copy. The
+    subtle half is `cmp`: it FOLLOWS a symlink, so a link pointing at identical
+    content reports "already current" and survives every update forever. The
+    link has to be detected, not compared.
 
     Runs the real script with a file:// source, so it exercises fetch, stage and
-    apply exactly as a remote update would.
+    apply exactly as a remote update from GitHub would.
     """
     install = tmp_path / "agent" / "skills" / "shared-memory"
     (install / "scripts").mkdir(parents=True)
@@ -154,12 +214,11 @@ def test_update_skill_does_not_write_through_a_symlink(tmp_path):
                             capture_output=True, text=True, env=env, timeout=180)
     assert result.returncode == 0, result.stdout + result.stderr
 
-    assert (install / "SKILL.md").is_symlink(), (
-        f"update_skill.sh replaced a repo-linked SKILL.md with a copy\n{result.stdout}")
-    assert (install / "scripts" / "memory_bridge.py").is_symlink(), (
-        f"update_skill.sh replaced a repo-linked memory_bridge.py with a copy\n"
-        f"{result.stdout}")
-    # And it still delivers the files that are NOT links.
+    for rel in ("SKILL.md", "scripts/memory_bridge.py"):
+        assert not (install / rel).is_symlink(), (
+            f"update_skill.sh left {rel} as a symlink into a checkout\n{result.stdout}")
+        assert (install / rel).is_file()
+    # And it still delivers everything else in the manifest.
     assert (install / "Documentation" / "schema.md").exists()
 
 

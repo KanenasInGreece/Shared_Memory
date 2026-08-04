@@ -80,32 +80,44 @@ def test_the_per_agent_refresh_is_driven_by_the_manifest_not_by_filenames():
         "only one phase reads the manifest; the other is back to a fixed list")
 
 
-def test_symlinked_skill_md_is_not_a_reason_to_skip_the_install():
-    """`-L $dir/SKILL.md` used to be one of the short-circuit conditions, which is
-    backwards: SKILL.md being a symlink is the one case where it needs no copy, not
-    a reason to skip the scripts too. It must not gate the whole install."""
-    text = _script()
-    skip_line_start = text.find('if [ -L "$dir/scripts/memory_bridge.py" ]')
-    assert skip_line_start != -1
-    skip_condition = text[skip_line_start:text.find("then", skip_line_start)]
-    assert '"$dir/SKILL.md"' not in skip_condition, (
-        "a symlinked SKILL.md must not short-circuit the whole install"
-    )
+def test_no_symlink_short_circuit_survives_anywhere_in_the_per_agent_loop():
+    """⛔ The `continue` is GONE, and it must not come back in any form.
 
-
-def test_both_delivery_paths_refuse_to_write_through_a_symlink():
-    """A symlinked path is repo-linked and auto-current; copying onto it replaces
-    the link with a frozen file. BOTH paths must agree — sync_skills.sh used to
-    skip symlinked installs entirely while update_skill.sh `mv`-ed straight over
-    the link, so one silently undid the other's arrangement.
-
-    The executable proof is in test_skill_delivery.py; this pins the guard's
-    presence on each path so neither can quietly lose it.
+    It caused this defect twice — first skipping SKILL.md, then skipping
+    Documentation/schema.md — because "the script is a symlink" was read as
+    "this whole install is current". Under the copy-only policy there are no
+    symlinked installs to short-circuit for, so the condition has no remaining
+    justification and its return would be a regression by construction.
     """
-    assert '[ -L "$dir/$rel" ] && continue' in _script(), (
-        "sync_skills.sh would copy onto a symlink and freeze it")
-    assert 'if [ -L "$dst" ]; then' in _update_script(), (
-        "update_skill.sh would mv over a symlink, replacing it with a file")
+    text = _script()
+    assert '[ -L "$dir/scripts/memory_bridge.py" ]' not in text, (
+        "the symlink short-circuit is back in sync_skills.sh")
+    assert "scripts symlinked (repo-linked, auto-current)" not in text, (
+        "sync_skills.sh still treats a symlinked install as auto-current")
+
+
+def test_both_delivery_paths_replace_a_symlink_rather_than_following_it():
+    """⛔ COPY-ONLY (Xenofon, 2026-08-04): an installed file is a real copy.
+
+    A link into a checkout binds every agent on the machine to that checkout's
+    PATH — move or archive the project and all of them break at once, silently.
+    Staleness is the lesser risk because it is detectable on every sync.
+
+    The hazard the policy CREATES is the one pinned here: `cp` follows a symlink
+    and would write into the source tree, and `cmp` follows one too, so a link
+    pointing at identical content would report "already current" and survive
+    forever. Both paths must therefore detect the link rather than compare
+    through it. Executable proof is in test_skill_delivery.py.
+    """
+    sync = _script()
+    assert 'rm -f "$dir/$rel"' in sync, (
+        "sync_skills.sh would cp THROUGH a symlink into the source tree")
+    assert '[ ! -L "$dir/$rel" ] && cmp -s' in sync, (
+        "sync_skills.sh compares through the link, so a symlink reads as current")
+    upd = _update_script()
+    assert 'if [ -L "$dst" ]; then' in upd, (
+        "update_skill.sh no longer detects a symlinked destination")
+    assert 'REFRESHED (replaced a symlink with a real copy)' in upd
 
 
 def test_refresh_is_reported_distinctly_from_already_current():

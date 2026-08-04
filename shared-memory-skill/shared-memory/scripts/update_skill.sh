@@ -150,7 +150,16 @@ while IFS= read -r rel || [ -n "$rel" ]; do
         continue   # handled last, after everything else has applied cleanly
     fi
 
-    mkdir -p "$(dirname "$dest")"
+    # A symlinked SUBDIRECTORY is dissolved before anything is written inside
+    # it: applying into `scripts/` when that is a link into a source checkout
+    # would write into the checkout, not the install. Same copy-only rule as the
+    # files themselves.
+    dest_dir="$(dirname "$dest")"
+    if [ -L "$dest_dir" ]; then
+        echo "   $(basename "$dest_dir")/ was a symlink — replacing with a real directory"
+        rm -f "$dest_dir"
+    fi
+    mkdir -p "$dest_dir"
     stage="/tmp/${TMP_TAG}.$(echo "$rel" | tr '/' '_')"
     if fetch "$RAW_BASE/$rel" "$stage"; then
         STAGED_SRC+=("$stage"); STAGED_DEST+=("$dest")
@@ -193,17 +202,18 @@ for i in "${!STAGED_SRC[@]}"; do
     src="${STAGED_SRC[$i]}"
     dst="${STAGED_DEST[$i]}"
     rel="${dst#"$SKILL_DIR"/}"
-    # ⚠ NEVER WRITE THROUGH A SYMLINK. `mv` onto one REPLACES the link with a
-    # regular file, so a repo-linked path — auto-current by construction —
-    # becomes a frozen copy of today's content, and the freeze is invisible
-    # until it has gone stale. This is the exact mirror of the sync_skills.sh
-    # defect (which skipped symlinked installs entirely): the two delivery paths
-    # must agree that a symlink means "already current, leave it alone", or one
-    # of them silently undoes the other's arrangement.
+    # ⛔ AN INSTALLED FILE IS ALWAYS A REAL COPY, NEVER A SYMLINK (Xenofon,
+    # 2026-08-04). A link into a checkout breaks the moment that checkout is
+    # moved, renamed or archived — silently, and for every agent at once. So a
+    # symlink found here is REPLACED. `mv` already replaces the link rather than
+    # writing through it, but the `rm -f` is explicit: `cmp` below FOLLOWS the
+    # link, so a link pointing at identical content would otherwise be reported
+    # "already current" and survive forever.
     if [ -L "$dst" ]; then
-        echo "↔  $rel repo-linked (symlink, auto-current) — left as a link"
-        rm -f "$src"
-        unchanged=$((unchanged + 1))
+        rm -f "$dst"
+        mv "$src" "$dst"
+        echo "✓  $rel REFRESHED (replaced a symlink with a real copy)"
+        refreshed=$((refreshed + 1))
     elif [ "$FORCE" != "1" ] && cmp -s "$src" "$dst"; then
         echo "=  $rel already current"
         rm -f "$src"
