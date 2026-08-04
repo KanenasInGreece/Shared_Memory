@@ -5,6 +5,48 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.38] — 2026-08-04
+
+### Fixed
+
+- **A decision's considered alternatives were being torn into pieces as they
+  were saved.** Both ways into the framework — the command-line skill and the
+  MCP tool — accepted the alternatives as one string and split it on commas.
+  A well-written alternative contains commas, because it names the option *and*
+  says what was wrong with it, so any such entry was stored as fragments that
+  do not stand alone. It happened silently, in both stores, and nothing in the
+  record afterwards said which pieces had once been a single thought. Across
+  this framework's own corpus it had damaged **one decision in five** of those
+  carrying alternatives.
+
+  The separator is now gone rather than replaced. **Pass the flag once per
+  alternative** (`--alternatives "…" --alternatives "…"`); the MCP tool takes a
+  list. A value arriving as a single string is recorded as exactly one
+  alternative — at worst under-split, and never inventing an option nobody
+  wrote. Both front doors were changed together: they carried identical code,
+  so fixing one would have left the other quietly shredding.
+
+- **The synthesis prompt then re-created the same ambiguity when reading them
+  back.** Alternatives were rendered to the summarising model as a single line
+  joined with semicolons — and a quarter of the entries in a real corpus contain
+  a semicolon of their own, so the model could not tell where one option ended
+  and the next began. A decision could be stored perfectly and still be read
+  back shredded. Each alternative is now rendered on its own numbered line, so
+  an entry may hold any punctuation at all.
+
+  The general rule this establishes: **a separator that can occur in the data is
+  not a delimiter** — on the way in or the way out. Changing how a value is
+  written is not finished until the paths that read it have been traced.
+
+### Changed
+
+- The skill and system prompt now ask for each alternative as **self-contained
+  prose carrying its own reason** — "no consolidation at all (facts then never
+  fuse)" rather than "no consolidation" — because each alternative is indexed
+  independently, and a bare fragment gives later retrieval nothing to match on.
+
+---
+
 ## [0.8.37] — 2026-08-04
 
 ### Fixed
