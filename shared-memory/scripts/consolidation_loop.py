@@ -756,6 +756,27 @@ def preservation_anchor(content, record_type="fact"):
     return " ".join(out)
 
 
+def render_alternative_lines(alts) -> str:
+    """Render a decision's first-write alternatives for the fold prompt — ONE
+    LINE PER ALTERNATIVE, never a separator-joined run. Pure → testable.
+
+    This was `"; ".join(...)`, and **138 of the 530 alternative entries in the
+    corpus contain a semicolon**, so the model could not tell an entry boundary
+    from punctuation inside an entry. It is the write side's comma defect one
+    level up, and it is the same lesson: a separator that can occur in the data
+    is not a delimiter. Enumerating makes the boundary structural, so an entry
+    may hold any punctuation at all — which is exactly what a well-written
+    alternative does.
+
+    Returns "" for an absent or empty list, so the caller can append blindly.
+    """
+    picked = [s for s in (str(a).strip() for a in (alts or [])) if s]
+    return "".join(
+        f"\n[DECISION ALTERNATIVE {i} of {len(picked)} CONSIDERED (first-write): {a}]"
+        for i, a in enumerate(picked, 1)
+    )
+
+
 def fold_record_line(record, content):
     """Render one fold-prompt line for a record, differentiating it by TYPE,
     evidential KIND, ORIGIN locus (decision 916) and capture date — differentiated
@@ -1800,9 +1821,11 @@ class ConsolidationDaemon:
             f"are candidate connections to weigh, not established facts, and must be "
             f"attributed as machine-proposed if used. A [DECISION CONFIDENCE ...] line is how "
             f"firmly that decision was held at the time — a principle resting on high-confidence "
-            f"decisions is firmer than one resting on low-confidence ones. A [DECISION ALTERNATIVES "
-            f"CONSIDERED ...] line lists the options that decision's author weighed and did not take; "
-            f"use them to state what the principle chose AGAINST, not only what it chose. State the "
+            f"decisions is firmer than one resting on low-confidence ones. Each [DECISION ALTERNATIVE "
+            f"i of n CONSIDERED ...] line carries exactly ONE option that decision's author weighed "
+            f"and did not take — one line per option, so an option may itself contain any "
+            f"punctuation; use them to state what the principle chose AGAINST, not only what it "
+            f"chose. State the "
             f"principle, the supporting evidence per project, and any known limits.\n"
             f"{corrective_text}\n"
             f"### INSIGHT:"
@@ -2888,9 +2911,7 @@ class ConsolidationDaemon:
                     alts = parsed if isinstance(parsed, list) else None
                 except (ValueError, TypeError):
                     alts = None
-            if alts:
-                block += ("\n[DECISION ALTERNATIVES CONSIDERED (first-write): "
-                          + "; ".join(str(a) for a in alts if a) + "]")
+            block += render_alternative_lines(alts)
             outs = by_decision.get(pg_id, [])   # date-ascending from the query
             for o in outs[:-1]:
                 block += (

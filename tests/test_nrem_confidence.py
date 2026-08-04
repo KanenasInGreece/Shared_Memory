@@ -593,11 +593,16 @@ async def test_grounding_lines_render_and_gate_by_family(monkeypatch):
     # First-write ADR fields now reach synthesis (captured -> must reach synthesis):
     # decision 245 carried confidence + a structured alternatives list.
     assert "[DECISION CONFIDENCE at decision time: high]" in d245
-    assert ("[DECISION ALTERNATIVES CONSIDERED (first-write): "
-            "synchronous writes; no outbox]") in d245
+    # ONE LINE PER ALTERNATIVE (v0.8.38). This used to assert a "; "-joined run,
+    # which was unreadable for the 138 corpus entries that contain a semicolon
+    # of their own — the fold could not tell an entry boundary from punctuation.
+    assert ("[DECISION ALTERNATIVE 1 of 2 CONSIDERED (first-write): "
+            "synchronous writes]") in d245
+    assert ("[DECISION ALTERNATIVE 2 of 2 CONSIDERED (first-write): "
+            "no outbox]") in d245
     # decision 267 carried neither — no line is fabricated when the field is null.
     assert "DECISION CONFIDENCE" not in d267
-    assert "DECISION ALTERNATIVES" not in d267
+    assert "DECISION ALTERNATIVE" not in d267
     # Operator edge — authoritative form, after the retro lines.
     assert "[GROUNDING role=GROUNDED_IN asserted_by=operator] OutboxPattern" in d245
     assert d245.index("[RETROSPECTIVE") < d245.index("[GROUNDING")

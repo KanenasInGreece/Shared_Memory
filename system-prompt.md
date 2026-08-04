@@ -39,7 +39,8 @@ Saving is not a silent pass-through, and the two record types carry different we
 
 - **Decisions and retrospectives — ask.** One short batched question proposing defaults the operator
   confirms or adjusts: `grounded_in` (the ids of the records this rests on, **each with its role** —
-  `based_on`, `considered`, `rejected`, `under_conditions`), `alternatives`, `confidence`, and for a
+  `based_on`, `considered`, `rejected`, `under_conditions`), `alternatives` (**a list — one entry per
+  option**, stored verbatim, so an option may contain commas), `confidence`, and for a
   retrospective the target decision and the rating. Pass the role explicitly (`"601:based_on,602:considered"`)
   so it is recorded as operator-asserted; a bare id silently falls back to a system default.
 - **Facts — a mention is enough.** State what you are about to store and the `source_ref` you inferred;
@@ -76,7 +77,7 @@ gap in this store.
     "rationale": "Atomic commit guarantees: Postgres and outbox row in one transaction.",
     "source": "lm_studio",
     "assisted_by": "qwen3-27b",
-    "alternatives": "synchronous writes,no Neo4j",
+    "alternatives": ["synchronous writes (LLM latency on the save path)", "no Neo4j"],
     "entities": "OutboxPattern,Neo4j,SharedMemory"
   }
   ```
