@@ -290,6 +290,27 @@ def test_neighbor_adr_props_collects_only_set_keys():
     assert fn({}) == {}
 
 
+def test_a_string_alternatives_property_is_one_entry_not_a_pile_of_letters():
+    """The guard fact 910 asked for, never built until now.
+
+    `Decision.alternatives` holds a Neo4j LIST OF STRING on all 223 nodes today,
+    so a bare `list()` is a passthrough and nothing looks wrong. But this same
+    property HAS been written as a JSON string before — and `list()` on a string
+    shreds it into single characters, so three alternatives become several
+    hundred one-character ones and every reader downstream renders garbage.
+
+    A string is ONE entry. Asserted on the value, not on the source text: a
+    guard disabled with `if False and …` leaves its own text in the file.
+    """
+    fn = coordinator_mod._neighbor_adr_props
+    shreddable = '["flat GROUNDED_IN", "no typing"]'
+    assert fn({"adr_alternatives": shreddable}) == {"alternatives": [shreddable]}
+    # A real list is still passed through unchanged.
+    assert fn({"adr_alternatives": ["a", "b"]}) == {"alternatives": ["a", "b"]}
+    # A tuple (driver variation) is a sequence, not a scalar.
+    assert fn({"adr_alternatives": ("a", "b")}) == {"alternatives": ["a", "b"]}
+
+
 @pytest.mark.asyncio
 async def test_decision_neighbor_surfaces_confidence_and_alternatives():
     """An insight_summary folds Decisions; the folded Decision one hop away now

@@ -114,7 +114,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.40"
+FRAMEWORK_VERSION = "0.8.41"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -1196,7 +1196,14 @@ def _neighbor_adr_props(rec) -> dict:
         adr["confidence"] = _g("adr_confidence")
     alts = _g("adr_alternatives")
     if alts:
-        adr["alternatives"] = _json_safe(list(alts))
+        # ⚠ NEVER bare-list() this. All 223 Decision nodes currently hold a Neo4j
+        # LIST OF STRING, where list() is a passthrough — but this same property
+        # has been written as a JSON *string* before, and list() on a string
+        # explodes it into single characters, turning three alternatives into
+        # several hundred one-character ones. A string is ONE entry, not a
+        # sequence of them.
+        adr["alternatives"] = _json_safe(
+            list(alts) if isinstance(alts, (list, tuple)) else [alts])
     if _g("adr_fact_kind"):
         adr["fact_kind"] = _g("adr_fact_kind")
     if _g("adr_source_ref"):
