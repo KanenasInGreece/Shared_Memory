@@ -155,7 +155,7 @@ Record architectural or design decisions with full PROV-O provenance — who dec
     --confidence "high" \
     --grounded-in "601:based_on,602"
   ```
-  ⚠ **`--alternatives` is ONE option per flag — repeat it.** The value is stored verbatim and is never split, so an option may contain commas and brackets. Passing several options in one flag records them as a single alternative.
+  ⚠ **`--alternatives` is ONE option per flag — repeat it.** The value is stored verbatim and is never split, so an option may contain commas and brackets; passing several options in one flag records them as a single alternative. **Write each option as SELF-CONTAINED prose with its reason** — *"no consolidation at all (facts then never fuse)"*, not *"no consolidation"*. Each alternative is indexed on its own so that decisions can later be grouped by what they considered, and a bare fragment carries no meaning to match on.
 - **MCP tool (LM Studio — Phase B):** Call `save_decision(title=..., decided_by=..., project=..., rationale=..., source=<model_name>)` — optional fields are comma-separated **except `alternatives`, which is a LIST, one entry per option**.
 - **Raw JSON (legacy):** Pass a full `type=decision` metadata blob to `save`.
 
