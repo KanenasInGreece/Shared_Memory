@@ -71,7 +71,9 @@ def _coord():
     # they are actually about instead of stopping at the project gate.
     conn.fetchval = AsyncMock(return_value=1)
     conn.fetch = AsyncMock(return_value=[])
-    conn.execute = AsyncMock()
+    # Command status string, as asyncpg returns — see the note in
+    # test_coordinator.py's _coordinator_with_mocks.
+    conn.execute = AsyncMock(return_value="DELETE 0")
     conn.transaction = MagicMock(return_value=_async_ctx(None))
     pool = MagicMock()
     pool.acquire = MagicMock(return_value=_async_ctx(conn))

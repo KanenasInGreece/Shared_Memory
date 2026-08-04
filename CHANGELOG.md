@@ -5,6 +5,60 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.40] — 2026-08-04
+
+### Added
+
+- **Decisions can now be grouped by what they CONSIDERED, not only by what they
+  concluded.** A decision records the options it weighed, but a decision has one
+  embedding and it is dominated by the decision's own text — so two records that
+  weighed the same option look unrelated unless their headlines happen to agree.
+  Each alternative now becomes a row in `decision_alternatives` with a vector of
+  its own, keyed back to the decision, so an alternative-level match resolves to
+  a pair of **decisions**, which is the answer wanted. Postgres only: a node per
+  alternative would be a mostly-singleton node named with free prose.
+
+  The vectors are filled **after** the save, by a background worker, so a
+  decision that weighed eight options costs the same single embedding call on
+  the request path as one that weighed none. What makes that safe is that
+  pending work is a query over committed rows (`embedding IS NULL`) rather than
+  a queue held in a process: a crash or a restart between the write and the
+  embed leaves work the next sweep finds. A pending row is never written off —
+  the attempt counter drives backoff and raises a `failing` flag in telemetry,
+  but no value of it stops a row being retried, because an alternative that
+  cannot be embedded is nearly always a statement about the embedder rather than
+  about the row.
+
+  Alternatives are **reconciled, never appended**. A save can rewrite a record
+  in place, and alternatives do get rewritten; the write path converges on the
+  decision's own array, so entries whose text is unchanged keep their vectors,
+  changed entries return to pending, and retracted ones are removed. Saving the
+  same decision twice therefore embeds nothing.
+
+- **Coverage for the above** at `GET /memory/telemetry` →
+  `spine.alternative_vectors`: entries, embedded, pending, failing, and the age
+  of the oldest pending row. Existing `decisions.alternatives_pct` says how many
+  decisions *recorded* alternatives; this says how many of those entries are
+  actually retrievable, and a full percentage beside a stalled backlog means the
+  populator has stopped.
+
+- `Documentation/schema.md` documents the table, the reconcile rule, and the
+  decision-pair similarity query — including why that query **needs a similarity
+  floor derived from the deployment's own corpus**, since ranking without one can
+  never answer "nothing here considered the same thing".
+
+### Notes
+
+- Migration **026** creates the table and deliberately performs **no backfill**.
+  Seeding rows from records that already exist is a data operation calibrated on
+  a corpus, not schema; and filling the table at migration time would make the
+  populator's first sweep a bulk run, which looks nothing like the steady state
+  it has to be verified in. An upgrading deployment fills forward from the next
+  decision saved, and may seed its history whenever it chooses — the reconciler
+  converges, so that is safe to run at any time.
+
+---
+
 ## [0.8.39] — 2026-08-04
 
 ### Fixed

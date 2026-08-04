@@ -105,6 +105,28 @@ CREATE TABLE IF NOT EXISTS consolidation_runs (
 CREATE INDEX IF NOT EXISTS consolidation_runs_inflight_idx ON public.consolidation_runs USING btree (started_at DESC) WHERE (finished_at IS NULL);
 CREATE INDEX IF NOT EXISTS consolidation_runs_type_started_idx ON public.consolidation_runs USING btree (cycle_type, started_at DESC);
 
+-- ─── decision_alternatives ──────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS decision_alternatives (
+    id               BIGSERIAL PRIMARY KEY,
+    decision_pg_id   BIGINT NOT NULL,
+    ordinal          INTEGER NOT NULL,
+    text             TEXT NOT NULL,
+    embedding        vector(1024),
+    embedded_at      TIMESTAMPTZ,
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    last_error       TEXT,
+    next_attempt_at  TIMESTAMPTZ,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT decision_alternatives_embedded_consistent CHECK (((embedding IS NULL) = (embedded_at IS NULL))),
+    CONSTRAINT decision_alternatives_ordinal_nonneg CHECK ((ordinal >= 0)),
+    CONSTRAINT decision_alternatives_text_not_blank CHECK ((btrim(text) <> ''::text))
+);
+
+CREATE INDEX IF NOT EXISTS decision_alternatives_decision_idx ON public.decision_alternatives USING btree (decision_pg_id);
+CREATE UNIQUE INDEX IF NOT EXISTS decision_alternatives_decision_ordinal_idx ON public.decision_alternatives USING btree (decision_pg_id, ordinal);
+CREATE INDEX IF NOT EXISTS decision_alternatives_embedding_idx ON public.decision_alternatives USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS decision_alternatives_pending_idx ON public.decision_alternatives USING btree (next_attempt_at NULLS FIRST) WHERE (embedding IS NULL);
+
 -- ─── entity_embeddings ──────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS entity_embeddings (
     name             TEXT PRIMARY KEY,
@@ -237,6 +259,11 @@ CREATE INDEX IF NOT EXISTS technical_docs_visibility_idx ON public.technical_doc
 -- ─── Foreign keys ──────────────────────────────────────────────────────────
 -- Added after every table exists: a referencing table can sort before its
 -- target, so these cannot be inline column constraints.
+
+DO $$ BEGIN
+    ALTER TABLE decision_alternatives ADD CONSTRAINT decision_alternatives_decision_pg_id_fkey FOREIGN KEY (decision_pg_id) REFERENCES technical_docs(id) ON DELETE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 
 DO $$ BEGIN
     ALTER TABLE project_aliases ADD CONSTRAINT project_aliases_alias_id_fkey FOREIGN KEY (alias_id) REFERENCES aliases(id);
