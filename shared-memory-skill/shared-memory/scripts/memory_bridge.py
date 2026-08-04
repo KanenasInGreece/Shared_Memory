@@ -12,8 +12,8 @@ CLI usage:
     python memory_bridge.py graph  "<cypher>"
     python memory_bridge.py save_decision --title "..." --decided-by "..." \
         --project "..." --rationale "..." --grounded-in "601:based_on,602" \
-        [--source "..."] [--assisted-by "a,b"] [--alternatives "x,y"] \
-        [--confidence "high"]
+        [--source "..."] [--assisted-by "a,b"] [--confidence "high"] \
+        [--alternatives "one option" --alternatives "another, with a comma"]
     python memory_bridge.py review-edges [entity_relation|evidential] [N]
     python memory_bridge.py label-edges "12=correct,13=incorrect" [--promote 12]
 """
@@ -29,7 +29,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.8.37"
+VERSION = "0.8.38"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v3: review-edges / label-edges require the gateway's /memory/relations/* routes.
@@ -740,6 +740,32 @@ def format_status(payload: dict) -> str:
 
 # ── Decision shortcut ─────────────────────────────────────────────────────────
 
+def alternatives_list(alternatives) -> list[str]:
+    """One value in, ONE alternative out — verbatim, and never split.
+
+    This used to be ``alternatives.split(",")``. A well-written alternative
+    contains commas — *"use explicit Neo4j transactions for atomicity (APOC not
+    available, auto-commit is the existing pattern)"* — so it was stored as two
+    fragments that do not stand alone, in Postgres AND in the graph's ADR
+    properties, with no warning. Measured across the corpus: 21% of the
+    decisions carrying alternatives held at least one fragment, and nothing in
+    the record said which pieces had once been a single entry.
+
+    A capture surface must not accept a value it cannot faithfully represent,
+    so the separator is gone rather than replaced. Repeat the flag once per
+    alternative; a value that arrives as one string is one alternative, which is
+    at worst under-split and never invents an option nobody wrote.
+
+    Accepts a list (the CLI's repeated flag, or a JSON array over the wire) or a
+    lone string. Blank entries are dropped — an empty value is an absence.
+    """
+    if alternatives is None:
+        return []
+    if isinstance(alternatives, str):
+        alternatives = [alternatives]
+    return [str(a).strip() for a in alternatives if str(a).strip()]
+
+
 def build_decision_metadata(
     title: str,
     decided_by: str,
@@ -747,7 +773,7 @@ def build_decision_metadata(
     rationale: str,
     source: str = None,
     assisted_by: str = "",
-    alternatives: str = "",
+    alternatives=None,
     confidence: str = "",
     entities: str = "",
     grounded_in: str = "",
@@ -768,8 +794,9 @@ def build_decision_metadata(
     }
     if assisted_by:
         decision["assisted_by"] = [a.strip() for a in assisted_by.split(",") if a.strip()]
-    if alternatives:
-        decision["alternatives"] = [a.strip() for a in alternatives.split(",") if a.strip()]
+    alts = alternatives_list(alternatives)
+    if alts:
+        decision["alternatives"] = alts
     if confidence:
         decision["confidence"] = confidence
 
@@ -1167,8 +1194,12 @@ async def main() -> None:
                        help="Agent/model saving this record (default: $AGENT_ID)")
         p.add_argument("--assisted-by", default="",
                        help="Comma-separated AI agents that assisted")
-        p.add_argument("--alternatives", default="",
-                       help="Comma-separated alternatives that were considered")
+        p.add_argument("--alternatives", action="append", default=None,
+                       metavar="ALTERNATIVE",
+                       help="ONE alternative that was considered. Repeat the flag "
+                            "for each one — the value is stored VERBATIM and is "
+                            "never split, so an alternative may contain commas, "
+                            "brackets and any other punctuation.")
         p.add_argument("--confidence",  default="",
                        help="Confidence level (e.g. high, medium, low)")
         p.add_argument("--entities",    default="",

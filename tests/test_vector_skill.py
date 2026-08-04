@@ -271,6 +271,44 @@ async def test_mcp_save_decision_omits_grounded_in_and_elicited_when_absent():
 
 
 @pytest.mark.asyncio
+async def test_mcp_save_decision_stores_an_alternative_containing_a_comma_whole():
+    """Group 1 parity: this client carried the SAME `.split(",")` as
+    memory_bridge.py, so the shredding was never a CLI defect — both front doors
+    fragmented a well-written alternative, in Postgres and in the graph. A
+    capture surface must not accept a value it cannot faithfully represent."""
+    alt = "use explicit Neo4j transactions for atomicity (APOC not available, auto-commit is the existing pattern)"
+    mock_response = MagicMock()
+    mock_response.json = lambda: {"status": "success", "pg_id": 80}
+
+    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
+        await vector_skill.save_decision(
+            title="T", decided_by="X", project="P", rationale="R", source="qwen3",
+            alternatives=[alt],
+        )
+
+    call_kwargs = mock_post.call_args
+    payload = call_kwargs[1]["json"] if "json" in call_kwargs[1] else call_kwargs.kwargs["json"]
+    assert payload["metadata"]["decision"]["alternatives"] == [alt]
+
+
+@pytest.mark.asyncio
+async def test_mcp_save_decision_treats_a_lone_string_as_one_alternative():
+    """Under-splitting is the safe direction — it never invents an option."""
+    mock_response = MagicMock()
+    mock_response.json = lambda: {"status": "success", "pg_id": 81}
+
+    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
+        await vector_skill.save_decision(
+            title="T", decided_by="X", project="P", rationale="R", source="qwen3",
+            alternatives="psycopg2, aiopg",
+        )
+
+    call_kwargs = mock_post.call_args
+    payload = call_kwargs[1]["json"] if "json" in call_kwargs[1] else call_kwargs.kwargs["json"]
+    assert payload["metadata"]["decision"]["alternatives"] == ["psycopg2, aiopg"]
+
+
+@pytest.mark.asyncio
 async def test_mcp_save_decision_coordinator_down():
     """save_decision returns a readable error when the coordinator is unreachable."""
     with patch("httpx.AsyncClient.post", side_effect=Exception("connection refused")):

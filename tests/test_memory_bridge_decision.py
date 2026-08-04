@@ -63,7 +63,7 @@ def test_all_optional_fields():
         rationale="async I/O",
         source="claude-code",
         assisted_by="claude-sonnet-4-6, grok-3",
-        alternatives="psycopg2, aiopg",
+        alternatives=["psycopg2", "aiopg"],
         confidence="high",
         entities="asyncpg, PostgreSQL, SharedMemory",
     )
@@ -72,6 +72,42 @@ def test_all_optional_fields():
     assert meta["decision"]["alternatives"] == ["psycopg2", "aiopg"]
     assert meta["decision"]["confidence"] == "high"
     assert meta["entities"] == ["asyncpg", "PostgreSQL", "SharedMemory"]
+
+
+# ── alternatives are stored VERBATIM — the capture surface must not shred ─────
+#
+# `--alternatives` used to split on ",". A well-written alternative contains
+# commas, so 46 of the 217 decisions carrying alternatives ended up holding
+# fragments that do not stand alone — in Postgres AND in the graph's ADR
+# properties, with no warning and no way to tell afterwards which pieces had
+# once been one entry.
+
+def test_an_alternative_containing_a_comma_survives_as_one_entry():
+    """The defect, stated as the test that would have caught it. This exact
+    shape (pg_id 194) was stored as two meaningless halves."""
+    alt = "use explicit Neo4j transactions for atomicity (APOC not available, auto-commit is the existing pattern)"
+    _, meta = mb.build_decision_metadata(
+        title="T", decided_by="X", project="P", rationale="R",
+        alternatives=[alt],
+    )
+    assert meta["decision"]["alternatives"] == [alt]
+
+
+def test_a_lone_string_is_one_alternative_not_a_list_to_split():
+    """Under-splitting is the safe direction: a caller who passes one string
+    gets exactly what they typed. Splitting would invent options nobody wrote."""
+    assert mb.alternatives_list("a, b, c") == ["a, b, c"]
+
+
+def test_repeating_the_flag_is_what_produces_several_alternatives():
+    assert mb.alternatives_list(["first (with, commas)", "second"]) == [
+        "first (with, commas)", "second"]
+
+
+def test_blank_and_absent_alternatives_are_an_absence():
+    assert mb.alternatives_list(None) == []
+    assert mb.alternatives_list("") == []
+    assert mb.alternatives_list(["", "  ", "real"]) == ["real"]
 
 
 def test_date_is_valid_iso():
@@ -85,7 +121,7 @@ def test_empty_comma_strings_produce_empty_lists():
     _, meta = mb.build_decision_metadata(
         title="T", decided_by="X", project="P", rationale="R",
         assisted_by="",
-        alternatives="",
+        alternatives=None,
         entities=",,,",
     )
     assert meta["entities"] == []

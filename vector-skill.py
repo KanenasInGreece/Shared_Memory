@@ -117,7 +117,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.8.37"
+VERSION = "0.8.38"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server
@@ -440,6 +440,28 @@ async def archive_reasoning_trace(session_id: str, task: str, steps: list,
     return await save_artifact(content, json.dumps(metadata))
 
 
+def _alternatives_list(alternatives) -> list[str]:
+    """One value in, ONE alternative out — verbatim, and never split.
+
+    Deliberately duplicated from memory_bridge.alternatives_list rather than
+    imported: a thin client never imports server modules, and these two files
+    are the framework's two independent front doors. They carried the SAME
+    `alternatives.split(",")` and shredded identically, which is why the fix
+    belongs in both — a capability corrected on one client and not the other is
+    the Group 1 parity defect this framework keeps paying for.
+
+    A well-written alternative contains commas, so splitting on one stored
+    fragments that do not stand alone, in Postgres AND in the graph, with no
+    warning. Accepts a list (one entry per option) or a lone string (exactly one
+    option — under-splitting never invents an option nobody wrote).
+    """
+    if alternatives is None:
+        return []
+    if isinstance(alternatives, str):
+        alternatives = [alternatives]
+    return [str(a).strip() for a in alternatives if str(a).strip()]
+
+
 @mcp.tool()
 async def save_decision(
     title: str,
@@ -448,7 +470,7 @@ async def save_decision(
     rationale: str,
     source: str,
     assisted_by: str = "",
-    alternatives: str = "",
+    alternatives: list[str] | str = "",
     confidence: str = "",
     entities: str = "",
     grounded_in: str = "",
@@ -461,7 +483,12 @@ async def save_decision(
     subgraph is written by the outbox worker — no direct Neo4j writes here.
 
     Required: title, decided_by, project, rationale, source (loaded model name).
-    Optional: assisted_by, alternatives, confidence — all comma-separated.
+    Optional: assisted_by (comma-separated), confidence, and `alternatives` —
+    a LIST, one entry per alternative. `alternatives` is never split on any
+    separator, so an entry may contain commas and brackets; passing a lone
+    string records exactly one alternative. This is deliberate: splitting on
+    commas shredded 21% of the decisions that carried alternatives, because a
+    well-written option contains them.
 
     grounded_in is the important one: a decision NAMES NO ENTITIES of its own,
     it inherits its topics from the facts it rests on, so an ungrounded decision
@@ -499,8 +526,9 @@ async def save_decision(
     }
     if assisted_by:
         decision_data["assisted_by"] = [a.strip() for a in assisted_by.split(",") if a.strip()]
-    if alternatives:
-        decision_data["alternatives"] = [a.strip() for a in alternatives.split(",") if a.strip()]
+    alts = _alternatives_list(alternatives)
+    if alts:
+        decision_data["alternatives"] = alts
     if confidence:
         decision_data["confidence"] = confidence
 

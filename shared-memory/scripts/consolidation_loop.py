@@ -1800,9 +1800,11 @@ class ConsolidationDaemon:
             f"are candidate connections to weigh, not established facts, and must be "
             f"attributed as machine-proposed if used. A [DECISION CONFIDENCE ...] line is how "
             f"firmly that decision was held at the time — a principle resting on high-confidence "
-            f"decisions is firmer than one resting on low-confidence ones. A [DECISION ALTERNATIVES "
-            f"CONSIDERED ...] line lists the options that decision's author weighed and did not take; "
-            f"use them to state what the principle chose AGAINST, not only what it chose. State the "
+            f"decisions is firmer than one resting on low-confidence ones. Each [DECISION ALTERNATIVE "
+            f"i of n CONSIDERED ...] line carries exactly ONE option that decision's author weighed "
+            f"and did not take — one line per option, so an option may itself contain any "
+            f"punctuation; use them to state what the principle chose AGAINST, not only what it "
+            f"chose. State the "
             f"principle, the supporting evidence per project, and any known limits.\n"
             f"{corrective_text}\n"
             f"### INSIGHT:"
@@ -2888,9 +2890,17 @@ class ConsolidationDaemon:
                     alts = parsed if isinstance(parsed, list) else None
                 except (ValueError, TypeError):
                     alts = None
-            if alts:
-                block += ("\n[DECISION ALTERNATIVES CONSIDERED (first-write): "
-                          + "; ".join(str(a) for a in alts if a) + "]")
+            # ONE LINE PER ALTERNATIVE — never a separator-joined run. This was
+            # `"; ".join(...)`, and 26% of the alternative entries in the corpus
+            # contain a semicolon, so the model could not tell an entry boundary
+            # from punctuation inside an entry. That is the same defect the write
+            # side had with commas, one level up: a separator that can occur in
+            # the data is not a delimiter. Enumerating makes the boundary
+            # structural, so an entry may hold any punctuation at all.
+            picked = [str(a) for a in alts if a]
+            for i, a in enumerate(picked, 1):
+                block += (f"\n[DECISION ALTERNATIVE {i} of {len(picked)} "
+                          f"CONSIDERED (first-write): {a}]")
             outs = by_decision.get(pg_id, [])   # date-ascending from the query
             for o in outs[:-1]:
                 block += (
