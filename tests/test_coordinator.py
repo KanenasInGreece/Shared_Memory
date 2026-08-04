@@ -66,7 +66,13 @@ def _coordinator_with_mocks():
     # asyncpg connection mock — transaction() must return an async ctx manager
     mock_conn = AsyncMock()
     mock_conn.fetchrow   = AsyncMock(return_value={"id": 99})
-    mock_conn.execute    = AsyncMock()
+    # asyncpg's execute() returns the COMMAND STATUS STRING ("DELETE 3"), and
+    # callers here parse it for a row count — the outbox recovery at startup and
+    # the alternatives reconciler both do. A bare AsyncMock returns a mock whose
+    # .split() is another mock, so a stub that omits this makes faithful code
+    # look broken.
+    mock_conn.execute    = AsyncMock(return_value="DELETE 0")
+    mock_conn.fetch      = AsyncMock(return_value=[])
     mock_conn.transaction = MagicMock(return_value=_async_ctx(None))
 
     # asyncpg pool mock — acquire() must return an async ctx manager

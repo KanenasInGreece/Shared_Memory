@@ -191,6 +191,93 @@ re-score → operator label/promotion).
 
 ---
 
+### `decision_alternatives` — one row and one vector per option considered (migration 026)
+
+A decision stores the options it weighed in `metadata.decision.alternatives`, and
+that stays the source of truth. This table exists for the question the array
+cannot answer: **which decisions considered the same thing?** A decision has a
+single embedding, dominated by its own text, so two records that both weighed
+"one vector per record versus one per fragment" look unrelated unless their
+headlines happen to agree. Giving each alternative its own vector — and keeping
+`decision_pg_id` beside it — resolves an alternative-level similarity back to a
+pair of **decisions**, which is the answer wanted.
+
+Postgres only. There is no node, no entity and no graph half: a node per
+alternative would be a mostly-singleton node named with free prose.
+
+| Column | Type | Notes |
+|---|---|---|
+| `decision_pg_id` | `BIGINT` | FK → `technical_docs(id)` **ON DELETE CASCADE** — an alternative has no meaning without its decision |
+| `ordinal` | `INTEGER` | Position in the decision's OWN array, 0-based. Blank entries are skipped **without renumbering**, so the ordinal keeps pointing at the same entry |
+| `text` | `TEXT` | The alternative verbatim. Punctuation inside an entry is prose, never a delimiter |
+| `embedding` | `vector(1024)` | BGE-M3. **NULL means PENDING, never "has no vector"** |
+| `embedded_at` | `TIMESTAMPTZ` | CHECK-tied to `embedding`: both set or both null |
+| `attempts`, `last_error`, `next_attempt_at` | | Consecutive-failure count driving exponential backoff. **Not a budget** — no value of `attempts` removes a row from the pending set |
+| `created_at` | `TIMESTAMPTZ` | Also the attribution trail: rows created long after their decision were seeded by an operation, not by the save path |
+
+**Write path.** Rows are reconciled inside the save's own transaction — the
+record and its alternatives commit together — and carry no embedding. The
+coordinator's alternative-vector worker fills them afterwards, in batches,
+through the same embedding endpoint every other vector uses. So a decision that
+weighed eight options costs the same **one** embedding call on the request path
+as one that weighed none.
+
+**Reconcile, never append.** A save can rewrite a record in place
+(`ON CONFLICT (content_hash) DO UPDATE`), and alternatives do get rewritten. The
+reconciler converges on the decision's array: entries whose text is unchanged are
+not touched and keep their vectors, changed entries return to pending, retracted
+ones are deleted. An idempotent re-save therefore embeds nothing.
+
+**Pending is a query, not a queue** (`WHERE embedding IS NULL`), which is what
+makes filling them asynchronously safe: the pending state lives in a committed
+row, so a crash or restart between the write and the embed leaves work the next
+sweep finds. Nothing needs to remember what was in flight.
+
+**Indexes:** UNIQUE `(decision_pg_id, ordinal)`; HNSW `vector_cosine_ops` on
+`embedding`; a partial index on `next_attempt_at WHERE embedding IS NULL` so the
+worker's scan grows with the backlog rather than with the corpus.
+
+**Coverage** is reported at `GET /memory/telemetry` → `spine.alternative_vectors`
+(`entries / embedded / pending / failing / oldest_pending_age_s`). A full
+`decisions.alternatives_pct` beside a stalled `pending` means the populator has
+stopped — the two measure different things and both are needed.
+
+**Grouping decisions by what they considered** — the query this table exists for:
+
+```sql
+-- Decisions whose alternatives are closest to those of decision $1,
+-- scored by the best-matching pair of alternatives.
+SELECT b.decision_pg_id,
+       max(1 - (a.embedding <=> b.embedding)) AS best_similarity
+  FROM decision_alternatives a
+  JOIN decision_alternatives b
+    ON b.decision_pg_id <> a.decision_pg_id
+ WHERE a.decision_pg_id = $1
+   AND a.embedding IS NOT NULL
+   AND b.embedding IS NOT NULL
+ GROUP BY b.decision_pg_id
+HAVING max(1 - (a.embedding <=> b.embedding)) >= $2   -- the floor; see below
+ ORDER BY best_similarity DESC
+ LIMIT 10;
+```
+
+⚠ **The floor is not optional, and it is per-deployment.** `ORDER BY … LIMIT 10`
+without one always returns ten rows, so the query cannot say *"nothing here
+considered the same thing"* — it just ranks the noise. Short technical prose
+embeds into a narrow band, and the top of that band is nowhere near a real
+match. Derive the floor from the corpus rather than guessing it: sample random
+cross-decision pairs for the baseline, then compare against pairs you can
+confirm by reading. On a corpus of a few hundred alternatives the two
+populations separate cleanly, with genuine restatements of the same option
+scoring far above the baseline's 99th percentile — take the floor from that gap,
+and re-derive it if the embedding model changes.
+
+An alternative's own text is reached from the graph by dereferencing the
+`:Decision` node's `pg_id` into Postgres — the graph is not a second home for
+this data.
+
+---
+
 ## Neo4j (Relational Memory)
 
 > Configurable via `ontology.yaml`. Label and relationship keys map directly to the `labels:` and `relationships:` sections.

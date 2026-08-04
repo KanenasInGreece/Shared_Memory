@@ -114,7 +114,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.39"
+FRAMEWORK_VERSION = "0.8.40"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -842,6 +842,34 @@ CONSISTENCY_TIMEOUT  = 15.0  # seconds to wait for ?consistency=neo4j
 OUTBOX_BACKOFF_BASE = _env_float("OUTBOX_BACKOFF_BASE", 2.0)   # seconds
 OUTBOX_BACKOFF_MAX  = _env_float("OUTBOX_BACKOFF_MAX", 300.0)  # seconds (cap)
 
+# Per-alternative vectors (migration 026). A decision's alternatives are written
+# to `decision_alternatives` inside the save transaction with a NULL embedding,
+# and filled here afterwards — the save path stays one embedding call regardless
+# of how many options a decision weighed.
+#
+# THE TABLE IS THE QUEUE, which is what makes the async choice safe: pending
+# work is `embedding IS NULL` in a committed row, so a restart between the write
+# and the embed cannot strand anything. The sweep interval is therefore a
+# latency knob, not a correctness one.
+ALT_VECTOR_POLL_INTERVAL = _env_float("ALT_VECTOR_POLL_INTERVAL", 10.0)
+ALT_VECTOR_BATCH_SIZE    = _env_int("ALT_VECTOR_BATCH_SIZE", 32)
+
+# A PENDING ROW IS NEVER ABANDONED, and this threshold does not abandon it.
+#
+# The outbox gives up after OUTBOX_MAX_RETRIES because a Cypher statement can be
+# permanently unapplyable. An alternative cannot: the text is non-blank, clamped
+# to the embedder's context, and already stored — so essentially the only way to
+# fail is that the embedder is unavailable, which is a condition of the SYSTEM
+# and says nothing about the row. Charging a batch-wide outage to each row until
+# it is written off is the v0.7.2 defect exactly (a batch 503 charged to every
+# record, which stopped the cycle for days).
+#
+# So `attempts` counts CONSECUTIVE failures, resets on success, and drives the
+# backoff. Past this threshold the row is reported as `failing` in telemetry
+# with its last error, and keeps retrying at the capped interval — visible, and
+# still recoverable the moment the embedder returns.
+ALT_VECTOR_FAILING_AFTER = _env_int("ALT_VECTOR_FAILING_AFTER", 5)
+
 # Per-entity write-lock registry size. Locks are kept only for keys in active
 # use; idle locks are evicted LRU once the registry exceeds this bound, so the
 # map cannot grow unbounded with unique entity names over months of operation.
@@ -1267,6 +1295,7 @@ class MemoryCoordinator:
                                              "graph_invalid_nodes": None,
                                              "inference_busy": "unknown", "fresh": False}
         self._consolidation_health_task: asyncio.Task | None = None
+        self._alt_vector_task: asyncio.Task | None = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -1290,7 +1319,14 @@ class MemoryCoordinator:
         self._outbox_task = asyncio.create_task(self._outbox_worker(), name="outbox-worker")
         self._consolidation_health_task = asyncio.create_task(
             self._consolidation_health_refresher(), name="consolidation-health")
-        log.info("coordinator ready (pool %d–%d, outbox worker running)", POOL_MIN, POOL_MAX)
+        # No startup recovery step, unlike the outbox above: pending work here
+        # is `embedding IS NULL`, a state the row was committed in rather than
+        # one a running process moved it to. There is nothing for a restart to
+        # put back.
+        self._alt_vector_task = asyncio.create_task(
+            self._alternative_vector_worker(), name="alternative-vector-worker")
+        log.info("coordinator ready (pool %d–%d, outbox + alternative-vector workers running)",
+                 POOL_MIN, POOL_MAX)
         if _AGENT_TOKENS:
             log.info(
                 "coordinator auth enabled — %d agent(s): %s",
@@ -1307,7 +1343,8 @@ class MemoryCoordinator:
             log.warning("Run: uv run python shared-memory/scripts/generate_tokens.py to bootstrap")
 
     async def stop(self) -> None:
-        for task in (self._outbox_task, self._consolidation_health_task):
+        for task in (self._outbox_task, self._consolidation_health_task,
+                     self._alt_vector_task):
             if task:
                 task.cancel()
                 try:
@@ -1380,6 +1417,52 @@ class MemoryCoordinator:
                 wait = EMBED_BACKOFF * attempt
                 log.warning(
                     "embed attempt %d/%d failed (%s) — retry in %.1f s",
+                    attempt, EMBED_RETRIES, exc, wait,
+                )
+                await asyncio.sleep(wait)
+
+    async def _embed_many(
+        self, texts: list[str], client: httpx.AsyncClient
+    ) -> list[list[float]]:
+        """Embed several texts in ONE request, preserving input order.
+
+        The embedder accepts a list on `input` and returns one object per item
+        carrying its own `index`. The results are re-ordered by that index
+        rather than trusted to arrive in order — a response that came back
+        shuffled would otherwise attach every vector to the wrong alternative,
+        which is invisible in the data and fatal to the similarity it exists for.
+
+        Same clamp as `_embed`, applied per item, and the timeout is sized on
+        the TOTAL payload because the whole batch travels as one request.
+        """
+        if not texts:
+            return []
+        clamped = [t[:EMBED_MAX_CHARS] for t in texts]
+        ceiling = embed_ceiling(sum(len(t) for t in clamped))
+        for attempt in range(1, EMBED_RETRIES + 1):
+            try:
+                r = await client.post(
+                    EMBED_URL, json={"input": clamped, "model": "bge-m3"},
+                    timeout=ceiling,
+                )
+                r.raise_for_status()
+                data = r.json()["data"]
+                if len(data) != len(clamped):
+                    raise RuntimeError(
+                        f"embedder returned {len(data)} vectors for "
+                        f"{len(clamped)} inputs"
+                    )
+                ordered = sorted(data, key=lambda d: d.get("index", 0))
+                return [d["embedding"] for d in ordered]
+            except Exception as exc:
+                if attempt == EMBED_RETRIES:
+                    raise RuntimeError(
+                        f"Batch embedding failed after {EMBED_RETRIES} attempts "
+                        f"({len(clamped)} inputs): {exc}"
+                    ) from exc
+                wait = EMBED_BACKOFF * attempt
+                log.warning(
+                    "batch embed attempt %d/%d failed (%s) — retry in %.1f s",
                     attempt, EMBED_RETRIES, exc, wait,
                 )
                 await asyncio.sleep(wait)
@@ -1565,6 +1648,172 @@ class MemoryCoordinator:
                         " WHERE id=$1",
                         outbox_id, delay,
                     )
+
+    # ── Per-alternative vectors ───────────────────────────────────────────────
+
+    @staticmethod
+    def _desired_alternatives(metadata: dict) -> list[tuple[int, str]]:
+        """The (ordinal, text) pairs a record's metadata calls for.
+
+        Pure, so the convergence rule is testable without a database. The
+        ordinal is the position in the decision's OWN array, and blank entries
+        are dropped without renumbering what follows — an alternative's ordinal
+        has to keep pointing at the same entry of `metadata.decision.alternatives`
+        or the two stores stop agreeing about which option is which.
+
+        A record that is not a decision, or carries no alternatives, wants NO
+        rows — which is what makes this converge rather than accumulate: the
+        same code path that adds a new alternative removes a retracted one.
+        """
+        if metadata.get("type") != "decision":
+            return []
+        alts = (metadata.get("decision") or {}).get("alternatives")
+        if not isinstance(alts, list):
+            return []
+        return [(i, t) for i, t in enumerate(alts)
+                if isinstance(t, str) and t.strip()]
+
+    async def _reconcile_decision_alternatives(
+        self, conn, pg_id: int, metadata: dict
+    ) -> dict:
+        """Converge `decision_alternatives` on what this save actually says.
+
+        RECONCILE, NEVER APPEND. A save can rewrite an existing record in place
+        — `ON CONFLICT (content_hash) DO UPDATE` — and alternatives do get
+        rewritten: the repair that rejoined 46 shredded decisions changed the
+        text of rows that already existed. Appending would leave the fragments
+        behind as vectors that cluster on nothing, which is the failure the
+        repair was ordered before the vectors to avoid.
+
+        UNCHANGED TEXT IS NOT TOUCHED, and that is enforced by the statement
+        rather than by care: the `DO UPDATE` carries a `WHERE text IS DISTINCT
+        FROM` guard, so an idempotent re-save of a decision with five
+        alternatives writes nothing and re-embeds nothing. Only an entry whose
+        text actually differs is reset to pending.
+
+        Runs INSIDE the save transaction, so the rows and the record they belong
+        to commit together — there is no window where a decision exists with a
+        stale alternative set.
+        """
+        desired = self._desired_alternatives(metadata)
+        ordinals = [o for o, _ in desired]
+        texts = [t for _, t in desired]
+
+        # Anything not in the desired set goes, including every row when the
+        # set is empty: `NOT (ordinal = ANY('{}'))` is true for all rows.
+        removed = await conn.execute(
+            "DELETE FROM decision_alternatives"
+            " WHERE decision_pg_id = $1 AND NOT (ordinal = ANY($2::int[]))",
+            pg_id, ordinals,
+        )
+        written = []
+        if desired:
+            written = await conn.fetch(
+                "INSERT INTO decision_alternatives (decision_pg_id, ordinal, text)"
+                " SELECT $1, o, t FROM unnest($2::int[], $3::text[]) AS x(o, t)"
+                " ON CONFLICT (decision_pg_id, ordinal) DO UPDATE"
+                "    SET text = EXCLUDED.text,"
+                # A changed alternative is a DIFFERENT alternative: its old
+                # vector describes text nobody wrote any more, so the row goes
+                # back to pending rather than keeping a stale embedding.
+                "        embedding = NULL, embedded_at = NULL,"
+                "        attempts = 0, last_error = NULL, next_attempt_at = NULL"
+                "  WHERE decision_alternatives.text IS DISTINCT FROM EXCLUDED.text"
+                " RETURNING id",
+                pg_id, ordinals, texts,
+            )
+        return {"desired": len(desired),
+                "written": len(written),
+                "removed": int(removed.split()[-1]) if removed else 0}
+
+    async def _alternative_vector_worker(self) -> None:
+        """Background task: fill alternatives whose embedding is still NULL."""
+        log.info("alternative-vector worker started (poll every %.1f s)",
+                 ALT_VECTOR_POLL_INTERVAL)
+        while True:
+            try:
+                await self._fill_pending_alternative_vectors()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # FAILURE ≠ IDLE. A sweep that dies quietly leaves a table full
+                # of pending rows and a worker that looks like it has nothing to
+                # do; the loop survives, and the error is on the record.
+                log.error("alternative-vector worker error: %s", exc, exc_info=True)
+            await asyncio.sleep(ALT_VECTOR_POLL_INTERVAL)
+
+    async def _fill_pending_alternative_vectors(self) -> int:
+        """One sweep: embed a batch of pending alternatives. Returns rows filled.
+
+        The pending set is a QUERY (`embedding IS NULL`), not a queue held in
+        this process, which is the whole reason the write path can be async: a
+        restart between the save and the embed leaves committed rows that the
+        next sweep picks up. Nothing needs to remember what was in flight.
+
+        No GPU gate. Consolidation defers on inference load because a fold is a
+        long LLM call; an embedding is small and the save path already issues one
+        unconditionally, so deferring here would add latency to the backlog
+        without relieving anything the folds compete for.
+        """
+        async with self._acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, text FROM decision_alternatives"
+                " WHERE embedding IS NULL"
+                "   AND (next_attempt_at IS NULL OR next_attempt_at <= now())"
+                " ORDER BY attempts, id"
+                " LIMIT $1",
+                ALT_VECTOR_BATCH_SIZE,
+            )
+        if not rows:
+            return 0
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                vectors = await self._embed_many([r["text"] for r in rows], client)
+        except Exception as exc:
+            await self._defer_pending_alternatives([r["id"] for r in rows], exc)
+            return 0
+
+        async with self._acquire() as conn:
+            async with conn.transaction():
+                for row, vec in zip(rows, vectors):
+                    await conn.execute(
+                        "UPDATE decision_alternatives"
+                        "   SET embedding = $2::vector, embedded_at = now(),"
+                        "       attempts = 0, last_error = NULL,"
+                        "       next_attempt_at = NULL"
+                        # The row may have been reset to a NEW text while this
+                        # batch was in flight (a re-save mid-sweep). Writing the
+                        # old vector onto it would attach an embedding to text
+                        # it does not describe, so the update is conditioned on
+                        # the row still being the one that was read.
+                        " WHERE id = $1 AND text = $3 AND embedding IS NULL",
+                        row["id"], str(vec), row["text"],
+                    )
+        log.info("alternative vectors: embedded %d row(s)", len(rows))
+        return len(rows)
+
+    async def _defer_pending_alternatives(self, ids: list[int], exc: Exception) -> None:
+        """Back off a batch that could not be embedded — WITHOUT writing it off.
+
+        `attempts` is a consecutive-failure counter here, not a budget: it grows
+        the backoff and raises the `failing` flag in telemetry, and no value of
+        it stops the row being retried. See ALT_VECTOR_FAILING_AFTER for why an
+        alternative that cannot be embedded is nearly always a statement about
+        the embedder rather than about the row.
+        """
+        async with self._acquire() as conn:
+            await conn.execute(
+                "UPDATE decision_alternatives"
+                "   SET attempts = attempts + 1,"
+                "       last_error = $2,"
+                "       next_attempt_at = now() + make_interval("
+                "           secs => least($3, $4 * power(2, attempts)))"
+                " WHERE id = ANY($1::bigint[])",
+                ids, str(exc)[:500],
+                OUTBOX_BACKOFF_MAX, OUTBOX_BACKOFF_BASE,
+            )
+        log.warning("alternative vectors: %d row(s) deferred — %s", len(ids), exc)
 
     async def _promote_grounded_parked_facts(
         self, conn, grounded_typed: list, agent_id: str, judgement_pg_id: int
@@ -2499,6 +2748,7 @@ class MemoryCoordinator:
         # lock this save is about to hold. Track only locks actually acquired: if acquire()
         # is cancelled mid-list, the finally releases only what we hold.
         acquired: list[asyncio.Lock] = []
+        alt_stats: dict | None = None
         try:
             for e in sorted(set(entities)):
                 lk = await self._lock_for(e)
@@ -2618,6 +2868,15 @@ class MemoryCoordinator:
                             supersedes, pg_id,
                         )
 
+                    # Per-alternative rows, written with the record they belong
+                    # to (migration 026). Text only — the embedding is filled by
+                    # the background worker, so a decision that weighed eight
+                    # options costs the same one embedding call on the save path
+                    # as one that weighed none.
+                    alt_stats = await self._reconcile_decision_alternatives(
+                        conn, pg_id, metadata
+                    )
+
                     # Wake the consolidation daemon
                     await conn.execute(
                         "SELECT pg_notify('new_artifact', $1)",
@@ -2626,6 +2885,15 @@ class MemoryCoordinator:
         finally:
             for lk in acquired:
                 lk.release()
+
+        # Every durable row leaves a log line: a table that gained or lost rows
+        # silently is one nobody can explain later. Logged after commit, so the
+        # line means the rows are actually there.
+        if alt_stats and (alt_stats["written"] or alt_stats["removed"]):
+            log.info(
+                "alternatives: pg_id=%d wants %d row(s) — %d written pending, %d removed",
+                pg_id, alt_stats["desired"], alt_stats["written"], alt_stats["removed"],
+            )
 
         # Neo4j is applied asynchronously by the outbox worker.
         # ?consistency=neo4j blocks until the row is marked applied.
@@ -4331,6 +4599,53 @@ class MemoryCoordinator:
                 "SELECT k, count(*) AS n FROM technical_docs, jsonb_object_keys(metadata) k"
                 " WHERE NOT superseded GROUP BY k ORDER BY n DESC"
             )
+            # Per-alternative vectors (migration 026). `alternatives_pct` above
+            # says how many decisions RECORDED alternatives; this says how many
+            # of those entries are actually retrievable by similarity. The two
+            # answer different questions and both are needed — a full
+            # `alternatives_pct` beside a stalled `pending` is a populator that
+            # has stopped, which no coverage figure would show.
+            #
+            # `failing` is the working/failing split Group 3 asks for: rows that
+            # keep coming back are counted separately from rows that simply have
+            # not been reached yet, and `oldest_pending_age_s` distinguishes a
+            # backlog that is draining from one that is stuck.
+            try:
+                arow = await conn.fetchrow(
+                    "SELECT count(*) AS entries,"
+                    " count(*) FILTER (WHERE embedding IS NOT NULL) AS embedded,"
+                    " count(*) FILTER (WHERE embedding IS NULL) AS pending,"
+                    " count(*) FILTER (WHERE embedding IS NULL AND attempts >= $1)"
+                    "     AS failing,"
+                    " count(DISTINCT decision_pg_id) AS decisions,"
+                    # FILTER belongs to the AGGREGATE, not to the expression
+                    # wrapping it: `extract(...) FILTER (...)` parses as a
+                    # filter on a non-aggregate and is a syntax error. Caught
+                    # only by running it — the suite stubs every query.
+                    " extract(epoch FROM now() -"
+                    "     min(created_at) FILTER (WHERE embedding IS NULL))"
+                    "     AS oldest_pending_age_s"
+                    " FROM decision_alternatives",
+                    ALT_VECTOR_FAILING_AFTER,
+                )
+                alt_vectors = {
+                    "entries": arow["entries"],
+                    "decisions": arow["decisions"],
+                    "embedded": arow["embedded"],
+                    "pending": arow["pending"],
+                    "failing": arow["failing"],
+                    "embedded_pct": pct(arow["embedded"], arow["entries"]),
+                    "oldest_pending_age_s": (
+                        round(float(arow["oldest_pending_age_s"]), 1)
+                        if arow["oldest_pending_age_s"] is not None else None
+                    ),
+                }
+            except Exception as exc:
+                # Reported, never raised: this block is a measurement inside a
+                # read endpoint, and a telemetry query that propagates would take
+                # the whole rollup down with it.
+                alt_vectors = {"error": str(exc)}
+
             try:
                 alias_total = await conn.fetchval("SELECT count(*) FROM alias_adjudications")
                 asplit = await conn.fetch(
@@ -4352,6 +4667,7 @@ class MemoryCoordinator:
                 "confidence_pct": pct(drow["conf"], dn),
                 "elicited_pct": pct(drow["elicited"], dn),
             },
+            "alternative_vectors": alt_vectors,
             "facts": {
                 "total": fn,
                 "source_ref_pct": pct(frow["sref"], fn),
