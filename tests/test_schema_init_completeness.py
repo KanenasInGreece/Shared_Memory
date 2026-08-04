@@ -1,0 +1,95 @@
+"""The fresh-install path must ship every object the running system depends on.
+
+`schema_init.sql` is applied INSTEAD of the migration chain on a new deployment,
+and nothing else reads it. So when it is incomplete the only person who finds
+out is a stranger setting the framework up for the first time — and they have no
+baseline to compare against. A guarantee that holds on every upgraded deployment
+and on no new one is the worst shape a schema divergence can take.
+
+These tests read the shipped ARTEFACTS rather than restating a list, which is
+the same discipline the client-copy and constraint checks arrived at: a
+hardcoded parity list goes stale invisibly, so derive the check from the thing
+it is checking.
+
+⚠ WHAT THESE DO **NOT** PROVE. They are string checks over a file. They cannot
+tell whether the SQL parses, whether the trigger fires, or whether a fresh
+database ends up equivalent to a live one. `migrations/verify_schema_init.py`
+does that — it builds a throwaway database from `schema_init.sql` alone and
+diffs the catalogues against the live schema. Run it after every migration; a
+green suite here proves nothing about it.
+"""
+import os
+import re
+
+MIGRATIONS = os.path.join(os.path.dirname(__file__), "..", "shared-memory", "migrations")
+
+
+def _schema_init() -> str:
+    with open(os.path.join(MIGRATIONS, "schema_init.sql"), encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _all_migration_sql() -> str:
+    out = []
+    for name in sorted(os.listdir(MIGRATIONS)):
+        if name.endswith(".sql") and name != "schema_init.sql":
+            with open(os.path.join(MIGRATIONS, name), encoding="utf-8") as fh:
+                out.append(fh.read())
+    return "\n".join(out)
+
+
+# ── The save → consolidation wake-up signal ──────────────────────────────────
+#
+# The consolidation daemon LISTENs on `new_artifact`. For years nothing in this
+# repository sent on that channel: the trigger existed only on the deployment
+# the framework was developed on, created there by hand. Every other install ran
+# a daemon waiting on a channel with no sender — not silent (a poll and a
+# backstop still drive the cycle) but never prompted by an actual save.
+
+def test_the_notify_channel_the_daemon_listens_on_has_a_sender():
+    """Derived from the daemon, not restated beside it: whatever channel
+    consolidation_loop LISTENs on must be sent to by shipped SQL."""
+    loop_path = os.path.join(os.path.dirname(__file__), "..", "shared-memory",
+                             "scripts", "consolidation_loop.py")
+    with open(loop_path, encoding="utf-8") as fh:
+        listened = set(re.findall(r"LISTEN\s+(\w+)\s*;", fh.read()))
+    assert listened, "consolidation_loop no longer LISTENs — update this test deliberately"
+
+    shipped = _schema_init() + _all_migration_sql()
+    for channel in listened:
+        assert f"pg_notify('{channel}'" in shipped, (
+            f"the daemon LISTENs on '{channel}' but no shipped migration or "
+            f"schema_init.sql ever sends on it — a fresh install would wait forever")
+
+
+def test_schema_init_carries_the_notify_trigger_and_its_function():
+    """The function alone is not enough; a trigger has to call it."""
+    sql = _schema_init()
+    assert "FUNCTION notify_new_artifact()" in sql
+    assert "CREATE TRIGGER trg_notify_new_artifact" in sql
+    assert "ON technical_docs" in sql
+
+
+def test_the_notify_trigger_fires_on_insert_only():
+    """AFTER INSERT, deliberately not AFTER UPDATE. The channel means 'a new
+    artifact arrived'. Firing on UPDATE would make every metadata repair and
+    backfill look like a fresh save and wake the cycle for work already done —
+    and this framework runs one-time repairs over live data routinely."""
+    sql = _schema_init()
+    block = sql[sql.index("CREATE TRIGGER trg_notify_new_artifact"):]
+    block = block[:block.index(";")]
+    assert "AFTER INSERT" in block
+    assert "UPDATE" not in block, "the notify trigger must not fire on UPDATE"
+
+
+def test_every_function_in_schema_init_is_reachable_from_a_migration():
+    """schema_init.sql is RENDERED by applying the migration chain to a scratch
+    database, so anything in it must come from a migration. An object that
+    exists only on one live machine cannot reach either install path — which is
+    exactly how the notify trigger went missing for so long."""
+    init_fns = set(re.findall(r"FUNCTION (?:public\.)?(\w+)\(", _schema_init()))
+    chain = _all_migration_sql()
+    for fn in init_fns:
+        assert fn in chain, (
+            f"{fn}() is in schema_init.sql but no migration creates it — it cannot "
+            f"survive a regeneration, and a chain-based install will not have it")
