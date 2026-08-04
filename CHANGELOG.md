@@ -5,6 +5,55 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.39] — 2026-08-04
+
+### Fixed
+
+- **A new install's consolidation cycle was never told that anything had been
+  saved.** The consolidation daemon waits on a Postgres notification channel for
+  saves to arrive, and something has to send on that channel — a trigger on the
+  records table. **That trigger was never shipped.** It existed on the machine
+  this framework was developed on, where it had been created by hand early on,
+  and no migration created it, so it was absent from the migration chain and
+  absent from the fresh-install schema too. Every other deployment has been
+  running a daemon listening to a channel with no sender.
+
+  The cost was not silence — the listener also polls, and carries its own idle
+  and backstop thresholds, so consolidation still ran eventually. What was lost
+  is the prompt path: a save no longer announced itself, and a cycle only began
+  when the backstop fired. The system looked like it was working, slowly, for a
+  reason nothing reported.
+
+  The trigger and its function now ship as a migration, and are therefore
+  present in the fresh-install schema as well. The change is a no-op on any
+  deployment that already had them.
+
+### Added
+
+- **A check that proves the fresh-install schema, rather than trusting it.**
+  `migrations/verify_schema_init.py` builds a throwaway database from the
+  fresh-install file alone, diffs its tables, constraints, functions and
+  triggers against a live database, and exits non-zero if a new install would
+  differ. **Run it after every migration.** It touches no data: the live
+  database is opened read-only and never written, and the throwaway is dropped
+  behind a name-prefix guard.
+
+  It reconciles a unique constraint against a unique *index* before reporting,
+  because the two enforce the same thing and the schema generator re-emits one
+  as the other — the point is to diff behaviour, not catalogue rows.
+
+  **This defect was its first finding.** It is the class of problem that is
+  invisible from the inside: introspecting a working database finds the object
+  and concludes the schema is fine. Only building a database from the shipped
+  files and comparing shows the gap.
+
+- Tests asserting that every channel the daemon listens on has a sender in
+  shipped SQL, and that every function in the fresh-install schema is reachable
+  from a migration — derived from the daemon and the migration chain rather than
+  restated beside them, so they cannot quietly go stale.
+
+---
+
 ## [0.8.38] — 2026-08-04
 
 ### Fixed
