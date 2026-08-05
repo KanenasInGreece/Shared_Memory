@@ -1094,11 +1094,17 @@ async def handle_health(request: web.Request) -> web.Response:
             # "complete". An ADDITIVE field: a monitor that does not know it
             # renders exactly as before.
             checks["project_identity"] = consolidation.get("project_identity")
+            # Domain identity (migration 028) — the same kind of signal for the
+            # sibling axis: registry vs graph, plus whether every section is
+            # attached to its project, which is what the cross-domain walk will
+            # depend on. Additive; None = not yet probed, never "complete".
+            checks["domain_identity"] = consolidation.get("domain_identity")
         except Exception:
             checks["consolidation"] = {"fresh": False}
             checks["inference_busy"] = "unknown"
             checks["graph_invalid_nodes"] = None
             checks["project_identity"] = None
+            checks["domain_identity"] = None
 
     return web.json_response(checks, status=200 if critical_ok else 503)
 

@@ -53,3 +53,12 @@ CREATE CONSTRAINT project_name IF NOT EXISTS
 // reconcile_project_identity.py is what completes it.
 CREATE CONSTRAINT project_identity IF NOT EXISTS
     FOR (n:Project) REQUIRE n.project_id IS UNIQUE;
+
+// Domain: a SECTION of one project (migration 028). Keyed on the registry id
+// and never on the name, because a domain's name is unique only WITHIN its
+// project — two projects may each have an `operations` section, and a
+// name-keyed constraint would collapse them into one node carrying both
+// projects' records. There is deliberately no name constraint here for that
+// reason: on this axis the name is a label, and the id is the identity.
+CREATE CONSTRAINT domain_identity IF NOT EXISTS
+    FOR (n:Domain) REQUIRE n.domain_id IS UNIQUE;

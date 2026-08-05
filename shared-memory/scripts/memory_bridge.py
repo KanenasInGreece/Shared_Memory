@@ -29,7 +29,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.8.46"
+VERSION = "0.8.47"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v3: review-edges / label-edges require the gateway's /memory/relations/* routes.
@@ -1130,9 +1130,16 @@ async def main() -> None:
         p.add_argument("--supersedes", type=int, default=None,
                        help="pg_id of an existing fact this save supersedes "
                             "(soft-retire: old fact kept, flagged, hidden from search)")
+        # Repeatable, never comma-split. A separator that can occur inside a
+        # value is not a delimiter — the lesson --alternatives taught, applied
+        # before this surface can repeat it.
+        p.add_argument("--domain", action="append", default=None, metavar="NAME",
+                       help="a registered SECTION of this project (repeat for "
+                            "several). Must already be registered, or re-send "
+                            "with new_domain in the metadata to register it.")
         sargs = p.parse_args(sys.argv[2:])
         metadata = sargs.metadata
-        if sargs.supersedes is not None:
+        if sargs.supersedes is not None or sargs.domain:
             try:
                 mobj = json.loads(metadata) if isinstance(metadata, str) else metadata
             except (json.JSONDecodeError, ValueError) as e:
@@ -1140,7 +1147,10 @@ async def main() -> None:
                 sys.exit(1)
             if not isinstance(mobj, dict):
                 mobj = {}
-            mobj["supersedes"] = sargs.supersedes
+            if sargs.supersedes is not None:
+                mobj["supersedes"] = sargs.supersedes
+            if sargs.domain:
+                mobj["domains"] = sargs.domain
             metadata = json.dumps(mobj)
         print(json.dumps(await save_artifact(sargs.content, metadata), indent=2))
     elif action == "supersede":
@@ -1207,6 +1217,16 @@ async def main() -> None:
         # Still mandatory at the gateway, so a save from outside any project root
         # fails loudly rather than recording a decision with no project.
         p.add_argument("--project",     default="",     help="Project context (default: project folder name)")
+        p.add_argument("--domain", action="append", default=None, metavar="NAME",
+                       help="a registered SECTION of this project (repeat for "
+                            "several). A decision asserts its OWN sections — it "
+                            "does not inherit them from its evidence, because a "
+                            "decision routinely reaches further than the fact "
+                            "that prompted it.")
+        p.add_argument("--new-domain", action="store_true",
+                       help="THE OPERATOR HAS CONFIRMED these sections are new and "
+                            "registers them. Ask first — the registry exists so a "
+                            "misspelling and a new section stop being one event.")
         p.add_argument("--rationale",   required=True,  help="Why this decision was made")
         p.add_argument("--source",      default=AGENT_ID,
                        help="Agent/model saving this record (default: $AGENT_ID)")

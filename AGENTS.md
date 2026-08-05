@@ -261,8 +261,19 @@ uv run --with psycopg2-binary --with neo4j python \
 uv run --with neo4j python shared-memory/migrations/verify_neo4j_init.py # Neo4j has NO ledger
 systemctl --user restart hive-mind-gateway.service
 curl -s http://localhost:8888/health                                     # api_version, status ok
+uv run --with psycopg2-binary python \
+    shared-memory/scripts/backfill_domain_of.py                          # AFTER restart — see below
 bash shared-memory/scripts/sync_skills.sh                                # refresh installed skills
 ```
+
+⚠ **`backfill_domain_of.py` runs AFTER the restart, and that ordering is a guard rather than a
+preference.** It enqueues a narrow repair row that only a gateway from v0.8.47 understands; an older
+worker does not recognise the row type, falls through to its ordinary fact branch, and blanks the
+content of every record it touches. The script refuses to enqueue against a gateway that is too old —
+including one it cannot reach, because an unknown version is not permission to write — so running it
+early is safe but pointless. It is **dry-run by default**; nothing is enqueued without `--apply`.
+It is also only needed on a deployment whose records already carry a `domain` in their metadata: a
+new install has none, and every save from here on writes its own edge.
 
 ⚠ **`reconcile_project_identity.py` is the graph half of a Postgres migration, and no migration can
 run it for you.** A project's identity is a registry row id; the `:Project` node carries that id so the
@@ -273,6 +284,15 @@ does not break writes**: records still save, still search, still enrich. What st
 synthesis* — the gate fails closed on a node with no identity — which presents as a system with nothing
 to fold rather than as an error. `GET /health` → `project_identity` is where that state is visible
 (`complete: false` with an `unidentified` count).
+
+⚠ **The domain axis has the same shape and one extra number.** `GET /health` → `domain_identity`
+reports `unregistered` / `mismatched` between the registry and the graph, plus **`unattached`** — a
+`:Domain` node with no `PROJECT_OF` edge, i.e. a section belonging to no project. That last one is
+reported for a walk that does not exist yet: cross-project and cross-domain synthesis will traverse
+`(:Domain)-[:PROJECT_OF]->(:Project)`, and a section missing that edge would silently drop out of it,
+which looks like a quiet corpus rather than an error. A **fresh install reads `nodes: 0,
+registry_rows: 0, complete: true`** and that is correct — domains are optional, and an empty registry
+is the right starting state. Sections are registered through ingress the same way projects are.
 
 ⚠ **Run the Neo4j check on every upgrade, and do not assume it is redundant.** `apply.py` covers Postgres only, and Postgres has a migration ledger that records what has been applied. **Neo4j has none** — `neo4j_init.cypher` is a one-time manual step, so a long-lived instance enforces whatever constraint set was true the day someone last ran it, and a constraint added to the file in a later release reaches new installs and nobody else. A missing uniqueness constraint is silent: `MERGE` keeps working and the only symptom is a duplicate node appearing under a race. Add `--apply` to create what is missing; it exits 1 when a declared constraint is not in force, so it is safe to gate on. *(This is not hypothetical — the deployment this framework was built on was enforcing one of the seven declared constraints, and a plain index on `Entity.name` was blocking a second. `--apply` handles that case; re-running `neo4j_init.cypher` does not.)*
 

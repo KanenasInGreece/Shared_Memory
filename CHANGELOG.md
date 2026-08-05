@@ -5,6 +5,97 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.47] — 2026-08-05
+
+### Added
+
+- **A domain is now a registered SECTION of one project, with an identity of its
+  own.** `domain` had been a free-text metadata field with nothing to be unknown
+  against: a typo and a new section were the same event and both entered the
+  corpus silently. Migration 028 adds `project_domains` — keyed on a surrogate
+  `id`, referencing `projects(id)` and never a project name, with the section's
+  label unique only *within* its project because `operations` under one project
+  and `operations` under another are different sections that share a word. Its
+  alias junction `domain_aliases` lands in the same migration rather than as a
+  follow-up, so a retired spelling resolves from the first day the axis exists.
+
+  Ingress mirrors the project protocol exactly: an unregistered value is refused
+  `400 domain_unknown` with proposals, and the second submission registers it —
+  behind the same two naming guards a new project faces, because the agent that
+  sets the flag is the agent that makes the typo. Proposals match a section's
+  **description** as well as its name, which is the one real difference from the
+  project axis: project names are short and typo-shaped, while an operator
+  reaching for a section may type a word that appears nowhere in its name.
+
+  The graph gains `(:Fact|:Decision|:Retrospective)-[:DOMAIN_OF]->(:Domain)-[:PROJECT_OF]->(:Project)`,
+  written in the existing single outbox round-trip. `:Domain` and `DOMAIN_OF` are
+  **spine**, pinned in code — an amendment to the frozen-spine decision, made
+  because the fold gate is intended to read this axis, and a renameable label
+  would falsify `ontology.yaml`'s own promise that consolidation touches only
+  spine identifiers.
+
+- **Who controls which axis, stated once and enforced.** A **fact** asserts its
+  own project and domain and mints its own entities. A **decision** asserts its
+  own project and domain, and inherits its entities from the facts it grounds
+  in. A **retrospective** asserts neither axis — project *and* domain both come
+  from the decision it judges, so a verdict is always filed with what it judges
+  rather than with the later evidence that measured it; one that supplies a
+  domain is refused `400`.
+
+  A decision that names no domain inherits its grounding facts' sections as a
+  **default, never a ceiling**. This is the load-bearing part: a decision reaches
+  further than the fact that prompted it. A fact may observe that agents write to
+  the graph directly — an infrastructure observation — while the decision it
+  provokes governs which agents are *authorised* to write, which is about access
+  and sits above the infrastructure that prompted it. Capping a decision at its
+  evidence's sections would file it away from the section that most needs to
+  surface it. The rule guards itself on the existing provenance stamp: a bare
+  edge is an assertion, a stamped one is a default, and inheritance declines
+  wherever an assertion exists.
+
+- **`--domain` on the CLI (repeatable) and on `save_decision`**, plus the MCP
+  equivalent. The value is stored verbatim and never split on a separator, since
+  a separator that can occur inside a value is not a delimiter. The skill
+  elicits a section **only when the record's project already has registered
+  ones** — a project with an empty registry is never prompted, so the first
+  section in any project stays a deliberate act.
+
+- **`GET /health` → `domain_identity`**, beside `project_identity`: registry
+  versus graph, plus `unattached` — a section with no `PROJECT_OF` edge. That
+  last number exists for a traversal that has not been built yet. Cross-project
+  and cross-domain synthesis will walk from a section to its project and from a
+  record to its grounding facts, and a section missing that edge would drop out
+  of the walk silently, presenting as a quiet corpus rather than an error.
+
+- **`backfill_domain_of.py`** enqueues the historical population through the
+  outbox, in two modes: a record's own sections, or a re-run of the gateway's own
+  inheritance query for a judgement that asserted none. The second mode exists so
+  the rule has a single implementation — a repair that re-derives a rule is a
+  repair that can disagree with the thing it repairs.
+
+### Notes
+
+- **Migration 028 ships schema and nothing else — no seed, no data repair.** A
+  seed on this axis cannot be derived from the data the way the project registry
+  seeded itself, because the values needing registration are exactly the ones
+  that must not be registered verbatim. An empty `project_domains` is the correct
+  state for a new install: sections arrive through ingress, like projects.
+
+- **There is deliberately no name-keyed `:Domain` fallback**, unlike the project
+  axis. Losing a `PROJECT_OF` edge violates an axis that already gates folding,
+  so that write falls back to a name; nothing gates on domain yet and the value
+  survives in Postgres either way, so the honest answer to "no identity" is no
+  edge and a log line.
+
+- **Known, unchanged, and named so it is not mistaken for a defect:** the
+  consolidation daemon's internal `domain` variable holds the *project*, and
+  `community_summaries.metadata->>'domain'` stores a project name. Nothing in the
+  fold path reads a record's `metadata->>'domain'`, which is why this release
+  cannot change fold behaviour. Untangling that naming belongs with the release
+  that moves the fold gate onto these axes.
+
+---
+
 ## [0.8.46] — 2026-08-05
 
 ### Changed
