@@ -5,6 +5,54 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.46] — 2026-08-05
+
+### Changed
+
+- **A decision's options and confidence are no longer copied into the graph —
+  they are read from the record that owns them.** Both values were written onto
+  the `:Decision` node at first write and projected back out of graph expansion
+  into a search hit's `adr_props`. Nothing anywhere filtered, ordered or matched
+  on either one: they were only ever rendered. A second copy of a value nobody
+  walks on buys nothing the node's `pg_id` does not already give, while
+  guaranteeing that the two stores can disagree — and they did. The copy of the
+  options silently missed the majority of decisions for months, and the
+  confidence copy was measured in exactly that state when this shipped: present
+  on every decision that records one in Postgres, present on barely a third of
+  the nodes, with a clean cutover no writer could ever close.
+
+  Graph expansion now dereferences both from Postgres in **one batched
+  primary-key lookup for the whole walk**, keyed on the `pg_id` every neighbour
+  already carries — sub-millisecond, and skipped entirely when a walk turns up
+  no decision. The search response is unchanged, field for field, so no client
+  needs anything and the wire contract stays at `api_version 4`.
+
+  This is the successor to the projection-widening decision, not a reversal of
+  it: that decision bought richer hits at zero extra query and deliberately left
+  deeper provenance behind. What it deferred is what arrives here — the reader
+  reaches the record instead of a copy of part of it.
+
+  ⚠ **The rule this applies, and its limit:** *duplicate what the walk consumes,
+  dereference what the reader renders*. It is a test to apply, not a preference —
+  applied to a project's identity the same rule says the opposite, because the
+  synthesis gate walks on it. A fact's evidence weight stays on the node here for
+  a different reason again: it is **derived** at write, not copied, which makes it
+  a separate question rather than the same one.
+
+- **The guard against shredded options moved with the value it protects.** A
+  bare `list()` over a JSON *string* explodes it into single characters, turning
+  three options into several hundred one-character ones. Every store that has
+  held this value has been able to hold it as a string, so the guard now sits on
+  the Postgres read rather than on the graph read that no longer happens.
+
+- **The dereference cannot fail a search.** Graph context enriches a search and
+  has never been allowed to fail one; adding a query to that path would have
+  changed its failure modes, so the whole helper — fetch *and* row handling — is
+  fail-open and logs. A payload error costs the hit its `adr_props` and nothing
+  else.
+
+---
+
 ## [0.8.45] — 2026-08-05
 
 ### Fixed

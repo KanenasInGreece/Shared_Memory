@@ -269,67 +269,163 @@ async def test_pgid_keyed_neighbor_without_text_gets_null_snippet():
 # ── (b′) ADR node props on the one-hop neighbor (decision 909) ────────────────
 
 def test_neighbor_adr_props_collects_only_set_keys():
-    """_neighbor_adr_props packs a folded decision's confidence/alternatives and
-    a folded fact's fact_kind/source_ref, dropping unset keys and JSON-safing
-    the alternatives list. A neighbor carrying none returns {}."""
-    fn = coordinator_mod._neighbor_adr_props
-    dec = fn({"adr_confidence": "high",
-              "adr_alternatives": ["flat GROUNDED_IN", "no typing"],
-              "adr_fact_kind": None, "adr_source_ref": None})
-    assert dec == {"confidence": "high",
-                   "alternatives": ["flat GROUNDED_IN", "no typing"]}
+    """_neighbor_adr_props packs a folded fact's evidence weight (fact_kind +
+    source_ref), dropping unset keys. A neighbor carrying none returns {}.
 
-    fact = fn({"adr_confidence": None, "adr_alternatives": None,
-               "adr_fact_kind": "measured", "adr_source_ref": "coordinator.py#L42"})
+    A DECISION's confidence/alternatives are deliberately NOT among the keys it
+    can produce — they are payload, dereferenced from Postgres.
+    """
+    fn = coordinator_mod._neighbor_adr_props
+    fact = fn({"adr_fact_kind": "measured", "adr_source_ref": "coordinator.py#L42"})
     assert fact == {"fact_kind": "measured", "source_ref": "coordinator.py#L42"}
 
     # A bare neighbor (e.g. a CommunitySummary) carries none → no adr_props.
-    assert fn({"adr_confidence": None, "adr_alternatives": None,
-               "adr_fact_kind": None, "adr_source_ref": None}) == {}
+    assert fn({"adr_fact_kind": None, "adr_source_ref": None}) == {}
     # Missing columns entirely (older single-anchor rows / stubs) are tolerated.
     assert fn({}) == {}
+    # Even if a node still carries the old copies, this reader will not serve
+    # them — the graph is no longer the store for them.
+    assert fn({"adr_confidence": "high", "adr_alternatives": ["a", "b"]}) == {}
 
 
-def test_a_string_alternatives_property_is_one_entry_not_a_pile_of_letters():
-    """The guard fact 910 asked for, never built until now.
+def test_a_string_alternatives_value_is_one_entry_not_a_pile_of_letters():
+    """The guard fact 910 asked for, now on the store that actually holds the
+    value.
 
-    `Decision.alternatives` holds a Neo4j LIST OF STRING on all 223 nodes today,
-    so a bare `list()` is a passthrough and nothing looks wrong. But this same
-    property HAS been written as a JSON string before — and `list()` on a string
-    shreds it into single characters, so three alternatives become several
-    hundred one-character ones and every reader downstream renders garbage.
+    Postgres holds a JSON array for every decision that has the key today, so a
+    bare `list()` is a passthrough and nothing looks wrong. But this value HAS
+    been stored as a JSON string before — and `list()` on a string shreds it
+    into single characters, so three alternatives become several hundred
+    one-character ones and every reader downstream renders garbage. The trap
+    moved stores when the read moved; the guard moved with it.
 
     A string is ONE entry. Asserted on the value, not on the source text: a
     guard disabled with `if False and …` leaves its own text in the file.
     """
-    fn = coordinator_mod._neighbor_adr_props
+    fn = coordinator_mod._decision_payload_props
     shreddable = '["flat GROUNDED_IN", "no typing"]'
-    assert fn({"adr_alternatives": shreddable}) == {"alternatives": [shreddable]}
+    assert fn(shreddable, None) == {"alternatives": [shreddable]}
     # A real list is still passed through unchanged.
-    assert fn({"adr_alternatives": ["a", "b"]}) == {"alternatives": ["a", "b"]}
+    assert fn(["a", "b"], None) == {"alternatives": ["a", "b"]}
     # A tuple (driver variation) is a sequence, not a scalar.
-    assert fn({"adr_alternatives": ("a", "b")}) == {"alternatives": ["a", "b"]}
+    assert fn(("a", "b"), None) == {"alternatives": ["a", "b"]}
+    # Unset values produce no keys at all — an absent key and an empty list are
+    # the same claim, and neither should render as "alternatives: []".
+    assert fn(None, None) == {}
+    assert fn([], "") == {}
+    assert fn(None, "high") == {"confidence": "high"}
 
 
 @pytest.mark.asyncio
-async def test_decision_neighbor_surfaces_confidence_and_alternatives():
-    """An insight_summary folds Decisions; the folded Decision one hop away now
-    carries its confidence + alternatives in adr_props WITHOUT a second query."""
-    c, _, mock_session = _coordinator_with_mocks()
+async def test_decision_neighbor_payload_comes_from_postgres_not_the_graph():
+    """An insight_summary folds Decisions; the folded Decision one hop away
+    carries its confidence + alternatives in adr_props — read from POSTGRES by
+    the pg_id the subgraph already carries, not from a copy on the node.
+
+    The node here carries NOTHING (which is the state of 183 of our decisions
+    for confidence, and was the state of 64% of them for alternatives until a
+    one-time sync repaired it). The payload still surfaces, because the store
+    of truth is the one being read.
+    """
+    c, mock_conn, mock_session = _coordinator_with_mocks()
     mock_session.run = AsyncMock(return_value=_AsyncRows([
         _row(labels=["Decision"], name=None, pg_id=579,
              rel_type="SUMMARIZED_BY", direction="in", rel_props={},
-             snippet="Grounding relations should be role-typed",
-             adr_confidence="high",
-             adr_alternatives=["keep the flat GROUNDED_IN"]),
+             snippet="Grounding relations should be role-typed"),
     ]))
+    mock_conn.fetch = AsyncMock(return_value=[
+        {"id": 579, "alternatives": ["keep the flat GROUNDED_IN"],
+         "confidence": "high"},
+    ])
     ctx = await c._expand_graph_context(
         mock_session, 123, (coordinator_mod.ONT.community_summary,))
     assert ctx[0]["pg_id"] == 579
     assert ctx[0]["adr_props"] == {
-        "confidence": "high",
         "alternatives": ["keep the flat GROUNDED_IN"],
+        "confidence": "high",
     }
+    # The dereference is keyed on the neighbor's pg_id and asks for exactly the
+    # two payload fields — one batched primary-key lookup, never an N+1.
+    sql, ids = mock_conn.fetch.await_args.args[0], mock_conn.fetch.await_args.args[1]
+    assert "id = ANY($1::bigint[])" in sql
+    assert ids == [579]
+
+
+@pytest.mark.asyncio
+async def test_only_decision_neighbors_are_dereferenced():
+    """A Fact/Entity neighbor is never looked up in technical_docs — the
+    payload query exists for decisions, and a walk that has no decision in it
+    must cost ZERO extra queries (the property decision 909 was protecting)."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+    mock_session.run = AsyncMock(return_value=_AsyncRows([
+        _row(labels=["Fact"], name=None, pg_id=601, rel_type="GROUNDED_IN",
+             direction="out", rel_props={}, snippet="tests pass",
+             adr_fact_kind="measured"),
+        _row(labels=["Entity"], name="Postgres", pg_id=None,
+             rel_type="MENTIONS", direction="out", rel_props={}, snippet=None),
+    ]))
+    ctx = await c._expand_graph_context(
+        mock_session, 123, (coordinator_mod.ONT.community_summary,))
+    assert ctx[0]["adr_props"] == {"fact_kind": "measured"}
+    mock_conn.fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_payload_dereference_never_fails_the_walk():
+    """Adding a query to a work path changes that path's failure modes — the
+    lesson from the REM telemetry blip. Graph context enriches a search and
+    must never fail one, so a payload error leaves the entries intact and
+    simply without adr_props."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+    mock_session.run = AsyncMock(return_value=_AsyncRows([
+        _row(labels=["Decision"], name=None, pg_id=579,
+             rel_type="SUMMARIZED_BY", direction="in", rel_props={},
+             snippet="Grounding relations should be role-typed"),
+    ]))
+    mock_conn.fetch = AsyncMock(side_effect=RuntimeError("pool exhausted"))
+    ctx = await c._expand_graph_context(
+        mock_session, 123, (coordinator_mod.ONT.community_summary,))
+    assert len(ctx) == 1
+    assert ctx[0]["pg_id"] == 579
+    assert "adr_props" not in ctx[0]
+
+    # Same contract in the batched form, which is the one search actually uses.
+    mock_session.run = AsyncMock(return_value=_AsyncRows([
+        _row(labels=["Decision"], name=None, anchor_pg_id=91, rel_pg_id=579,
+             rel_type="SUMMARIZED_BY", direction="in", rel_props={},
+             snippet="Grounding relations should be role-typed"),
+    ]))
+    out = await c._expand_graph_context_batch(
+        mock_session, [91], (coordinator_mod.ONT.community_summary,))
+    assert out[91][0]["pg_id"] == 579
+    assert "adr_props" not in out[91][0]
+
+
+@pytest.mark.asyncio
+async def test_batched_expansion_dereferences_every_anchor_in_one_query():
+    """The batch form exists to make the walk one round-trip; a per-anchor
+    payload query would undo that. Two anchors, two decision neighbors, ONE
+    dereference carrying both ids."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+    mock_session.run = AsyncMock(return_value=_AsyncRows([
+        _row(labels=["Decision"], name=None, anchor_pg_id=91, rel_pg_id=579,
+             rel_type="SUMMARIZED_BY", direction="in", rel_props={},
+             snippet="role-typed grounding"),
+        _row(labels=["Decision"], name=None, anchor_pg_id=92, rel_pg_id=580,
+             rel_type="SUMMARIZED_BY", direction="in", rel_props={},
+             snippet="the outbox is atomic"),
+    ]))
+    mock_conn.fetch = AsyncMock(return_value=[
+        {"id": 579, "alternatives": ["keep the flat GROUNDED_IN"], "confidence": "high"},
+        {"id": 580, "alternatives": None, "confidence": "medium"},
+    ])
+    out = await c._expand_graph_context_batch(
+        mock_session, [91, 92], (coordinator_mod.ONT.community_summary,))
+    assert out[91][0]["adr_props"] == {
+        "alternatives": ["keep the flat GROUNDED_IN"], "confidence": "high"}
+    assert out[92][0]["adr_props"] == {"confidence": "medium"}
+    assert mock_conn.fetch.await_count == 1
+    assert mock_conn.fetch.await_args.args[1] == [579, 580]
 
 
 @pytest.mark.asyncio
@@ -372,12 +468,14 @@ def test_expansion_cypher_projects_adr_node_props_both_forms():
     src_batch = inspect.getsource(
         coordinator_mod.MemoryCoordinator._expand_graph_context_batch)
     for body in (src, src_batch):
-        assert "related.confidence AS adr_confidence" in body
-        assert "related.alternatives AS adr_alternatives" in body
         assert "related.fact_kind AS adr_fact_kind" in body
         assert "related.source_ref AS adr_source_ref" in body
+        # ⛔ And the payload copies must NOT come back — a re-added projection
+        # would silently restore the divergence class the dereference removed.
+        assert "adr_confidence" not in body
+        assert "adr_alternatives" not in body
     # The batch form must also pass the columns through its OUTER return.
-    assert "adr_confidence, adr_alternatives, adr_fact_kind, adr_source_ref" in src_batch
+    assert "adr_fact_kind, adr_source_ref" in src_batch
 
 
 # ── (c) direction + full edge property map ────────────────────────────────────

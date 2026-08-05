@@ -376,6 +376,43 @@ async def test_apply_decision_outbox_row_writes_correct_nodes():
 
 
 @pytest.mark.asyncio
+async def test_a_decisions_payload_is_not_copied_into_the_graph():
+    """confidence + alternatives are PAYLOAD: nothing walks on them, so the
+    node carries the pg_id and Postgres carries the values.
+
+    A second copy of a value nobody filters or orders on buys nothing the
+    pg_id does not already give, and guarantees a divergence class — measured
+    live before this shipped as Postgres 236 decisions with a confidence
+    against the graph's 85, a clean cutover with no writer able to close it.
+    Both the SET clause and the parameter must be gone: a parameter passed to
+    a query that no longer names it is the residue that invites the clause
+    back.
+    """
+    c, _, mock_session = _coordinator_with_mocks()
+    await c._apply_decision_outbox_row(outbox_id=3, pg_id=60, params={
+        "decision": {
+            "title": "Dereference the payload",
+            "decided_by": "Xenofon",
+            "project": "shared-memory-GitHub",
+            "rationale": "the copy earns nothing the pg_id does not give",
+            "confidence": "high",
+            "alternatives": ["keep projecting it from the node"],
+        },
+        "source": "claude-code",
+        "content_snippet": "We decided to dereference the payload.",
+    })
+    cypher = mock_session.run.call_args_list[0].args[0]
+    kwargs = mock_session.run.call_args_list[0].kwargs
+    assert "d.alternatives" not in cypher
+    assert "d.confidence" not in cypher
+    assert "alternatives" not in kwargs
+    assert "confidence" not in kwargs
+    # The identity the payload is reached BY is still written.
+    assert "pg_id: $pg_id" in cypher
+    assert kwargs["pg_id"] == 60
+
+
+@pytest.mark.asyncio
 async def test_apply_decision_outbox_row_handles_empty_assisted_by():
     """Empty assisted_by must not crash (FOREACH handles empty lists in Cypher)."""
     c, mock_conn, mock_session = _coordinator_with_mocks()

@@ -374,7 +374,7 @@ Written by the outbox worker when `metadata["type"] == "decision"`.
 
 | Label | Purpose |
 |---|---|
-| `Decision` | An architectural or design decision — keyed by `pg_id`, links to all PROV-O edges. Lifecycle flags: `rem_processed` (REM enrichment done), `consolidated` (folded into an insight), `superseded` (reversed via `rating="reversed"`). |
+| `Decision` | An architectural or design decision — keyed by `pg_id`, links to all PROV-O edges. Lifecycle flags: `rem_processed` (REM enrichment done), `consolidated` (folded into an insight), `superseded` (reversed via `rating="reversed"`). ⚠ **The options weighed and the confidence held are NOT node properties** — no query filters, orders or matches on them, so they are payload and live once, in Postgres (`metadata->'decision'`), reached by this node's `pg_id`. Graph expansion dereferences them into a search hit's `adr_props`. A record property the graph must *walk* on (a project identity, a lifecycle flag) is duplicated deliberately; one only ever rendered is not. |
 | `Retrospective` | A recorded outcome for a decision (retro-as-record, v2) — keyed by `pg_id` like Fact/Decision. Carries `rating` (outcome-state enum: `validated`\|`mixed`\|`refined`\|`pending`\|`reversed`), `date`, `content` (notes snippet; full notes in Postgres), `source`, `fact_kind`, and `rem_processed`. Reached from its decision via the `HAD_OUTCOME` trigger edge; grounds in evidence facts via typed ROLE edges. Framework-defined — never configurable via `ontology.yaml`. |
 | `Human` | A person who owns or makes a decision (`decided_by` field) |
 | `AIAgent` | An AI tool that assisted in the decision (`assisted_by` list) |
