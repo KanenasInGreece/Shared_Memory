@@ -74,16 +74,35 @@ FOREIGN_LABELS = {
 
 
 def _load_env() -> None:
-    """Candidate-list form, copied from apply.py. The framework env is
-    shared-memory/.env; the repo root is only a FALLBACK."""
-    try:
-        from dotenv import load_dotenv
-    except ImportError:
-        return
-    for candidate in (HERE.parent / ".env", HERE.parent.parent / ".env"):
-        if candidate.is_file():
-            load_dotenv(candidate)
+    """Load the framework env WITHOUT depending on python-dotenv.
 
+    ⚠ THIS USED TO IMPORT `dotenv` AND `return` SILENTLY WHEN IT WAS ABSENT, and
+    that is a worse failure than it looks. Nothing was loaded, so the very next
+    connection attempted came back `fe_sendauth: no password supplied` — a
+    CREDENTIALS error for what is actually a missing dependency, sending the
+    reader to check passwords, roles and pg_hba while the real cause was the
+    invocation. Worst of all in THIS file, whose whole job is to prove a
+    property: a checker that dies for a reason it misreports teaches the wrong
+    lesson twice.
+
+    So it parses the file itself, exactly as apply.py does — no dependency, no
+    silent path. The framework env is `shared-memory/.env`; the repo root is
+    only a FALLBACK, and the candidate-list form is what keeps a correctly
+    installed machine working (three scripts once read the root alone and died).
+
+    First definition wins, and the real environment always wins: values already
+    exported must not be overwritten by a file, or an operator pointing the tool
+    at another database with an env var would silently be given this one.
+    """
+    for candidate in (HERE.parent / ".env", HERE.parent.parent / ".env"):
+        if not candidate.is_file():
+            continue
+        for line in candidate.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            os.environ.setdefault(key.strip(), val.strip())
 
 def declared_constraints(text: str) -> dict:
     """{name: (label, property)} for every constraint the shipped file declares."""
