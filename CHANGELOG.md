@@ -5,6 +5,104 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.44] — 2026-08-05
+
+### Changed
+
+- **A project is now an identity, and its name is a label on it.** The registry
+  gained a surrogate key (`projects.id`, migration 027); the name stays unique
+  and queryable, which is what a client asserts, an operator types, and the
+  client-side graph templates filter on. The two tables that referenced the name
+  now reference the identity.
+
+  The reason this is not bookkeeping: **the project axis gates consolidation.**
+  The cross-project fold requires decisions from at least two distinct projects,
+  and it counted the project *name*. That is correct only while the set of
+  project nodes happens to be one-to-one with the registry — and nothing
+  enforced that. A partly-applied rename leaves two nodes for one project, the
+  same project counts twice, and a "cross-project" insight gets synthesised out
+  of a single project's decisions. An identity error on this axis is a synthesis
+  error, not a misfiled record.
+
+  A rename also stops being a distributed rewrite. Records, a registry row, two
+  referencing tables, a graph node and every belonging edge all carried the same
+  string, so moving it meant rewriting all of them with no stable thing to map
+  to. Now the identity never moves and the graph cost of a rename is one
+  property write on one node.
+
+- **The fold gate counts identities, and fails closed without one.** A project
+  node carrying no identity contributes nothing to the two-project rule rather
+  than falling back to its name — a fallback would keep the defect live for the
+  whole upgrade window, and permanently for any node the registry does not know.
+  The cost is a fold that does not happen; the alternative cost is a false
+  cross-project insight. The write path does the opposite and deliberately so: a
+  project it cannot identify still gets its node and its edge, because a record
+  with no project edge violates the axis outright.
+
+  ⚠ Not the internal node id, which was proposed and is **worse** than the name:
+  without a uniqueness constraint, two nodes sharing a name collapse correctly
+  under the name and would count as two under an element id.
+
+- **An alias is now an alternate label on one identity**, not a mapping between
+  two names. An inactive alias row therefore stays true forever instead of
+  needing re-pointing every time its target is renamed.
+
+- **The promotion ledger records both the name and the identity.** The name is
+  the evidence — what a record was moved onto, on the day it moved — and a
+  rename must never rewrite it. The id is the durable pointer. Its foreign key
+  on the mutable name is dropped: a ledger that remembers a name must not be
+  forced to forget it when that name stops being current.
+
+- **A decision's project is now checked against the registry, like a fact's.** Decisions were exempt, and the reasoning that exempted them mistook *presence* for *validity*: a decision does fail without a project field, but a present name that no registry knew was accepted, and the graph write then minted a project node for it. That is the one way the graph can end up holding a project the registry does not have — and unlike the ingress→outbox window, which leaves the graph *behind* the registry and always resolves itself, it never does. Retrospectives stay exempt, and that one is a scope statement rather than an oversight: they arrive on their own endpoint and inherit the project of the decision they judge.
+
+### Added
+
+- **Both facts and decisions may introduce a NEW project — and the gateway judges the name, not the claim.** Work legitimately starts before its project exists: a discussion produces an idea, the idea is saved as a fact, and a decision grounded on that fact commits to acting on it. So `new_project` is available on both record types (`--new-project` on `save_decision`, and the existing metadata field on a fact), declared **once**, on the first record that names the project.
+
+  But a declaration is not a defence, because **the client that sets the flag is the client that makes the spelling error**. Two refusals now stand in front of the registry:
+
+  - **`project_spelling_variant` — not overridable.** Names reduce to a comparison key (lowercase, alphanumerics only), so a proposal differing from a registered project only in separators or capitalisation is refused outright, naming the spelling to use. No confirmation can make it a separate project, because it is not one — every retired spelling this framework's registry carries as an alias arrived in exactly that shape.
+  - **`project_confusable` — refused once, then confirmable.** Above a trigram-similarity floor the response names the registered projects the proposal is close to, and the caller proceeds only by naming them back in `confirm_distinct_from` (`--distinct-from`). The confirmation is the neighbour's **name**, deliberately not a second boolean: a flag can be flipped without reading anything, while the name cannot be produced without having seen it. Each near match is its own claim — confirming one does not wave through another.
+
+  **The floor is derived, not guessed, and is env-overridable** (`PROJECT_CONFUSABLE_SIMILARITY`, default `0.60`) because it depends on how a deployment names things. Measured over all 666 pairs of one live 37-project registry: the closest legitimately *distinct* pair scored 0.500 and no pair reached 0.6, while typos of a registered name scored 0.78–1.00 and separator/case variants scored exactly 1.00. The default sits in the gap. Too low trains the reflex to override; too high never fires.
+
+  ⚠ Two things this deliberately does **not** do: it never auto-corrects a near-miss onto the closest registered project (that is inference, and a plausible wrong project is worse than a parked one), and it never refuses a similar name outright (a genuinely separate project with a similar name is real, and the operator is the one who knows).
+
+- **`scripts/reconcile_project_identity.py`** — the graph half of a Postgres
+  migration, which no migration can perform. It stamps existing project nodes
+  with their registry identity, matching by name once, and **refuses to create a
+  node or invent a registry row**: a node whose name is in no registry is
+  reported and left alone, because deciding what that means is an operator's
+  judgement about their own corpus. Idempotent; read-only without `--apply`; now
+  part of the documented upgrade path.
+
+- **`GET /health` → `project_identity`** — `nodes`, `unidentified`,
+  `mismatched`, `unregistered`, `complete`. Without it an unfinished upgrade is
+  invisible: cross-project folds simply stop happening, which looks exactly like
+  a quiet corpus. Additive — a monitor that does not know the field renders as
+  before. `api_version` is unchanged.
+
+### Fixed
+
+- **A fresh install could not register a single project — the schema generator
+  was dropping IDENTITY columns.** `schema_init.sql` rendered `id BIGINT PRIMARY
+  KEY` where the live column is `GENERATED BY DEFAULT AS IDENTITY`: valid DDL,
+  applies without error, matching constraints, and every insert then has to
+  supply the key the database was supposed to issue. Reproduced on a throwaway
+  database before the fix — the first `INSERT INTO projects` failed outright.
+
+  **This is the third class of DDL this generator has been found dropping**,
+  after every `CHECK` and every `FOREIGN KEY`, and all three shared one shape:
+  invisible to the entire test suite, because the only thing that reads that
+  file is an install nobody re-inspects. So the fix is in both halves —
+  the generator emits identity columns, and `verify_schema_init.py` now diffs
+  **key generation** per column, which is the check that would have caught all
+  three. Verified by running the verifier against the known-broken file and
+  confirming it fails, then against the regenerated one and confirming it
+  passes.
+
+---
+
 ## [0.8.43] — 2026-08-05
 
 ### Fixed

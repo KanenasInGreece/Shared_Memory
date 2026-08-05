@@ -28,18 +28,26 @@ called; deciding what that means is the gateway's job.
 # Resolve one name. `{p}` is the caller's placeholder style — asyncpg uses $1,
 # psycopg2 uses %s — matching PROJECT_MATCH_SQL's convention rather than picking
 # a driver for every future caller.
+#
+# ⚠ THE MAPPING IS TO AN IDENTITY, NOT TO A NAME (migration 027). The junction
+# stores ``project_id``; the CURRENT name is read back through the registry on
+# every resolution. That is what makes an alias row stay true across a rename
+# with no maintenance: the row records which project a retired spelling meant,
+# and what that project is called today is a question only the registry answers.
 ALIAS_RESOLVE_SQL = (
-    "SELECT pa.project"
+    "SELECT p.name"
     " FROM project_aliases pa"
     " JOIN aliases a ON a.id = pa.alias_id"
+    " JOIN projects p ON p.id = pa.project_id"
     " WHERE a.name = {p} AND pa.active"
 )
 
 # Every active alias, for the tools that must not re-ask a settled question.
 ACTIVE_ALIASES_SQL = (
-    "SELECT a.name, pa.project"
+    "SELECT a.name, p.name"
     " FROM project_aliases pa"
     " JOIN aliases a ON a.id = pa.alias_id"
+    " JOIN projects p ON p.id = pa.project_id"
     " WHERE pa.active"
 )
 

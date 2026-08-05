@@ -57,9 +57,10 @@ from ontology import (
     record_label_for_type,
 )
 from project_axis import (
-    PROJECT_SQL, PROJECT_EXISTS_SQL, PROJECT_PROPOSALS_SQL,
+    PROJECT_SQL, PROJECT_EXISTS_SQL, PROJECT_ID_SQL, PROJECT_PROPOSALS_SQL,
     PROPOSAL_SIMILARITY, PROPOSAL_LIMIT, SENTINEL,
-    fold_eligible, resolve_project, project_for_graph,
+    CONFUSABLE_SQL, CONFUSABLE_SIMILARITY, same_spelling, unconfirmed_confusables,
+    fold_eligible, resolve_project, project_for_graph, project_merge_cypher,
 )
 from insight_gate import (
     INSIGHT_THRESHOLD, INSIGHT_HUB_DEGREE_CAP, insight_cluster_cypher,
@@ -114,7 +115,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.43"
+FRAMEWORK_VERSION = "0.8.44"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -1300,6 +1301,10 @@ class MemoryCoordinator:
                                              # "not yet probed" must never read as
                                              # "verified clean" (decision 928).
                                              "graph_invalid_nodes": None,
+                                             # Same rule for the identity gauge:
+                                             # "not yet probed" must never read
+                                             # as "upgrade complete".
+                                             "project_identity": None,
                                              "inference_busy": "unknown", "fresh": False}
         self._consolidation_health_task: asyncio.Task | None = None
         self._alt_vector_task: asyncio.Task | None = None
@@ -1563,6 +1568,7 @@ class MemoryCoordinator:
             # succeed or fail atomically. MERGE is idempotent — safe to retry.
             source_ref = params.get("source_ref") or None
             fact_kind = params.get("fact_kind") or "observation"
+            project_id = await self._project_identity(params.get("project"))
             async with self._neo4j.session() as session:
                 await session.run(
                     f"MERGE (f:{ONT.fact} {{pg_id: $pg_id}})"
@@ -1588,7 +1594,7 @@ class MemoryCoordinator:
                     f"   MERGE (h:{ONT.human} {{name: $person}})"
                     f"   MERGE (a)-[:{ONT.acted_on_behalf_of}]->(h))"
                     f" FOREACH (_ IN CASE WHEN $project <> '' THEN [1] ELSE [] END |"
-                    f"   MERGE (p:{ONT.project} {{name: $project}})"
+                    f"   {project_merge_cypher(project_id)}"
                     f"   MERGE (f)-[:{ONT.project_of}]->(p))"
                     + f" WITH f"
                     f" UNWIND $entities AS ename"
@@ -1599,6 +1605,7 @@ class MemoryCoordinator:
                     source=params.get("source", "coordinator"),
                     person=params.get("person") or "",
                     project=params.get("project") or "",
+                    project_id=project_id,
                     fact_kind=fact_kind,
                     entities=self._gate_graph_entities(pg_id, params.get("entities", [])),
                     **( {"source_ref": source_ref} if source_ref else {} ),
@@ -2116,6 +2123,7 @@ class MemoryCoordinator:
         decision = params.get("decision", {})
         grounded = params.get("grounded") or []
         grounded_in_flat = params.get("grounded_in", [])
+        project_id = await self._project_identity(decision.get("project"))
         async with self._neo4j.session() as session:
             await session.run(
                 f"MERGE (d:{ONT.decision} {{pg_id: $pg_id}})"
@@ -2134,7 +2142,7 @@ class MemoryCoordinator:
                 f" MERGE (h:{ONT.human} {{name: $decided_by}})"
                 f" MERGE (d)-[:{ONT.was_attributed_to}]->(h)"
                 f" WITH d"
-                f" MERGE (p:{ONT.project} {{name: $project}})"
+                f" {project_merge_cypher(project_id)}"
                 f" MERGE (d)-[:{ONT.project_of}]->(p)"
                 f" WITH d"
                 f" FOREACH (ai_name IN $assisted_by |"
@@ -2150,6 +2158,7 @@ class MemoryCoordinator:
                 alternatives=[a for a in (decision.get("alternatives") or []) if isinstance(a, str)],
                 decided_by=decision.get("decided_by", "unknown"),
                 project=decision.get("project", "unknown"),
+                project_id=project_id,
                 assisted_by=decision.get("assisted_by", []),
             )
             # Typed decision→fact grounding (decision 582): shared writer — see
@@ -2390,15 +2399,16 @@ class MemoryCoordinator:
         """
         project = (params.get("project") or "").strip()
         if project:
+            project_id = await self._project_identity(project)
             async with self._neo4j.session() as session:
                 await session.run(
                     f"MATCH (n:{self._SPINE}) WHERE n.pg_id = $pg_id"
                     f" OPTIONAL MATCH (n)-[stale:{ONT.project_of}]->()"
                     f" DELETE stale"
                     f" WITH DISTINCT n"
-                    f" MERGE (p:{ONT.project} {{name: $project}})"
+                    f" {project_merge_cypher(project_id)}"
                     f" MERGE (n)-[:{ONT.project_of}]->(p)",
-                    pg_id=pg_id, project=project,
+                    pg_id=pg_id, project=project, project_id=project_id,
                 )
         async with self._acquire() as conn:
             await conn.execute("DELETE FROM neo4j_outbox WHERE id=$1", outbox_id)
@@ -2429,11 +2439,14 @@ class MemoryCoordinator:
         when the save may proceed. Registers the project as a side effect when the
         caller declares it new — that IS the acceptance.
         """
-        # Scope, verified in code rather than assumed: DECISIONS already fail
-        # without decision.project further down handle_save, and RETROSPECTIVES
-        # use their own endpoint and inherit the target decision's project. This
-        # is the fact path only.
-        if metadata.get("type") in ("decision", "retrospective"):
+        # Scope: RETROSPECTIVES only. They arrive on their own endpoint and
+        # inherit the project of the decision they judge, which passed this
+        # check itself — so re-checking here would demand a value the caller
+        # never supplies. DECISIONS were excluded alongside them until v0.8.44
+        # and should not have been: presence was mistaken for validity, and an
+        # unregistered name reached the graph as a project node. See the call
+        # site in handle_save.
+        if metadata.get("type") == "retrospective":
             return None
 
         # ⚠ The check is on `project`, never on a chain. A record carrying only a
@@ -2475,17 +2488,118 @@ class MemoryCoordinator:
         # state a gateway would have to keep and expire. What the gateway never
         # does, however many times it is asked, is accept an unregistered name.
         if metadata.get("new_project") is True:
+            # ⛔ A DECLARATION IS NOT A DEFENCE. The agent that sets this flag is
+            # the same agent that makes the spelling error, so accepting the
+            # claim on its own guards nothing: the operator says "go ahead with
+            # this idea", meaning THIS project, and a plausible variant becomes a
+            # second one. Every retired spelling in this registry arrived that
+            # way. So the claim faces the two checks below before it registers.
+            refusal = await self._new_project_refusal(supplied, metadata)
+            if refusal is not None:
+                return refusal
             await self._register_project(supplied, agent_id)
-            log.info("project registry: %r registered by %s (new_project)",
-                     supplied, agent_id)
+            log.info("project registry: %r registered by %s (new_project, "
+                     "record type %s)", supplied, agent_id,
+                     metadata.get("type") or "fact")
             return None
 
         return await self._project_rejection("project_unknown", supplied)
+
+    async def _new_project_refusal(self, supplied: str, metadata: dict) -> dict | None:
+        """Why this NEW-project declaration must not register — or None (P23).
+
+        Two checks, and only the second can be overridden, because they are
+        different claims about the world:
+
+        **A spelling of a registered project is never a new project.** Names
+        differing only in separators and case reduce to one spelling key, and no
+        confirmation can make them distinct — the caller is told the registered
+        spelling to use. This is not a judgement call: every rename this registry
+        has recorded was exactly this shape.
+
+        **A CONFUSABLE name is refused once and can be confirmed.** Above the
+        similarity floor the caller must name the registered project it means to
+        differ from. Naming it, rather than setting a second boolean, is the
+        point: a flag can be flipped without reading anything, while the name of
+        the neighbour cannot be produced without having seen it — which is what
+        puts the decision in front of the operator instead of inside the agent.
+
+        ⚠ Neither check refuses a genuinely new project outright, and that is
+        deliberate. Work legitimately starts with an idea, a fact, and a decision
+        to act on it, before any project exists. What must not happen is that a
+        project starts because a name was mistyped.
+        """
+        async with self._acquire() as conn:
+            rows = await conn.fetch(CONFUSABLE_SQL, supplied,
+                                    CONFUSABLE_SIMILARITY, PROPOSAL_LIMIT)
+        near = [r["name"] for r in rows]
+
+        variant = next((n for n in near if same_spelling(n, supplied)), None)
+        if variant is not None:
+            log.info("project registry: refused %r — a spelling of registered %r",
+                     supplied, variant)
+            return {
+                "status": "error",
+                "error": "project_spelling_variant",
+                "message": (
+                    f"project {supplied!r} differs from the registered project "
+                    f"{variant!r} only in separators or capitalisation, so it is a "
+                    f"SPELLING of it and not a new project. Save under {variant!r}. "
+                    "If the project genuinely needs to be renamed, that is a "
+                    "deliberate operation with its own tool and ledger, never a "
+                    "side effect of a save."
+                ),
+                "proposals": near,
+            }
+
+        unconfirmed = unconfirmed_confusables(
+            near, metadata.get("confirm_distinct_from"))
+        if unconfirmed:
+            log.info("project registry: %r held for confirmation against %s",
+                     supplied, unconfirmed)
+            return {
+                "status": "error",
+                "error": "project_confusable",
+                "message": (
+                    f"project {supplied!r} is close enough to an existing project to "
+                    f"be a typo for it: {unconfirmed}. ASK THE OPERATOR whether this "
+                    "is genuinely a separate project. If it is, re-send with "
+                    "metadata.confirm_distinct_from listing the projects above; if it "
+                    "is not, save under the existing name. Registering a variant is "
+                    "how one project quietly becomes two."
+                ),
+                "proposals": near,
+            }
+        return None
 
     async def _project_registered(self, name: str) -> bool:
         """Is this an established project? (P4, migration 022's registry.)"""
         async with self._acquire() as conn:
             return await conn.fetchval(PROJECT_EXISTS_SQL, name) is not None
+
+    async def _project_identity(self, project) -> int | None:
+        """The registry id behind a project name, or None (migration 027).
+
+        Deliberately UNCACHED. The registry is tens of rows and this is one
+        indexed lookup on a path that is already writing to two stores; a cache
+        would buy nothing measurable and would hold a stale answer across
+        exactly the operation the identity exists to survive — a rename.
+
+        None means "no identity to key on", from any cause: an unregistered
+        name, or a lookup that failed. Both take the write down the same
+        name-keyed fallback rather than losing the edge — see
+        ``project_merge_cypher``. A failure here must never turn a save into a
+        500, because the record and its project are both already valid.
+        """
+        if not isinstance(project, str) or not project.strip():
+            return None
+        try:
+            async with self._acquire() as conn:
+                return await conn.fetchval(PROJECT_ID_SQL, project.strip())
+        except Exception as exc:
+            log.warning("project identity lookup failed for %r, writing the "
+                        "project node keyed on its name: %s", project, exc)
+            return None
 
     async def _resolve_project_alias(self, name: str) -> str | None:
         """The canonical project a retired spelling resolves to, or None.
@@ -2643,24 +2757,6 @@ class MemoryCoordinator:
                 status=400,
             )
 
-        # Project is REQUIRED on a fact, and checked against the registry (P4).
-        #
-        # Unconditional — no env gate. A nullifiable invariant is not an invariant,
-        # and the failure it guards against is silent: an untagged record saves
-        # cleanly, searches cleanly, and simply never reaches synthesis.
-        #
-        # ⚠ The check is on `project`, never on a chain. A record carrying only a
-        # `domain` is NOT accepted as tagged: a domain is a SECTION of a project,
-        # so accepting it here would mean a part vouching for the whole.
-        #
-        # Scope, verified in code rather than assumed: DECISIONS already fail
-        # without decision.project a few lines below, and RETROSPECTIVES use their
-        # own endpoint and inherit the target decision's project. This is the fact
-        # path only.
-        project_error = await self._project_ingress_error(metadata, agent_id)
-        if project_error is not None:
-            return web.json_response(project_error, status=400)
-
         # Decision saves require structured provenance fields — validated at ingress
         # before the row touches the outbox WAL.  Bad data from an LLM is rejected
         # here rather than replayed on every restart from a corrupt outbox entry.
@@ -2698,6 +2794,40 @@ class MemoryCoordinator:
                          "(claim %r preserved)", metadata["decision"]["decided_by"],
                          metadata["decision"].get("decided_by_claimed"))
                 body["metadata"] = metadata
+
+        # Project is REQUIRED and checked against the registry (P4) — on FACTS
+        # and on DECISIONS alike.
+        #
+        # Unconditional — no env gate. A nullifiable invariant is not an invariant,
+        # and the failure it guards against is silent: an untagged record saves
+        # cleanly, searches cleanly, and simply never reaches synthesis.
+        #
+        # ⚠ The check is on `project`, never on a chain. A record carrying only a
+        # `domain` is NOT accepted as tagged: a domain is a SECTION of a project,
+        # so accepting it here would mean a part vouching for the whole.
+        #
+        # ⛔ DECISIONS WERE EXCLUDED FROM THIS UNTIL v0.8.44, and the reasoning
+        # that excluded them conflated PRESENCE with VALIDITY: "decisions already
+        # fail without decision.project". They do — but a present name that no
+        # registry knows was accepted, and the outbox then minted a `:Project`
+        # node for it. That is the one way the graph can end up holding a project
+        # the registry does not have, and unlike the ingress→outbox window (which
+        # leaves the graph BEHIND the registry, always safe) it does not resolve
+        # itself. Registration is what makes a project an identity, so a record
+        # that can create a node without one puts an unidentifiable project into
+        # the axis that gates consolidation.
+        #
+        # ⚠ IT RUNS AFTER the decision-shape check, deliberately: a decision with
+        # no project at all should still be told it is missing decided_by,
+        # project and rationale together, rather than being rejected for the
+        # project alone and coming back to discover the rest one at a time.
+        #
+        # RETROSPECTIVES stay out, and that one IS a scope statement rather than
+        # an oversight: they arrive on their own endpoint and inherit the project
+        # of the decision they judge — a decision that passed this very check.
+        project_error = await self._project_ingress_error(metadata, agent_id)
+        if project_error is not None:
+            return web.json_response(project_error, status=400)
 
         # Fact supersession (decision 381, refined by 384): an optional
         # `supersedes` pointer marks an existing fact superseded by THIS save.
@@ -4895,6 +5025,73 @@ class MemoryCoordinator:
         out.update(_consolidation_rollup(out, any_stalled, started_at))
         return out
 
+    async def _project_identity_health(self) -> dict:
+        """Is the project-identity upgrade complete on THIS deployment? (027)
+
+        Migration 027 gives every registry row an id; only
+        ``reconcile_project_identity.py`` can put that id on the graph nodes,
+        and until it has, the insight gate FAILS CLOSED on the nodes it has not
+        reached — they do not count toward its two-project rule. Without this
+        gauge that state is invisible: folds simply do not happen, which looks
+        exactly like a quiet corpus.
+
+        So the metric is named for the question an operator actually has —
+        ``complete`` — and counts the two distinguishable ways it can be false:
+
+          ``unidentified``  registered project nodes with no id: run reconcile
+          ``mismatched``    an id that disagrees with the registry: also
+                            reconcile, but read it first — it means the node was
+                            stamped against a registry row that has since moved
+          ``unregistered``  a node whose name has no registry row at all. NOT
+                            counted in ``complete``, because no tool can fix it
+                            without deciding what the project IS — an operator's
+                            call. It still cannot take part in a fold, which is
+                            why it is reported rather than left implicit.
+
+        ⚠ THE TWO DIRECTIONS OF DISAGREEMENT ARE NOT SYMMETRIC, and only one of
+        them is a defect. A project is registered at INGRESS, while its node is
+        written LATER by the outbox worker, so the stores legitimately disagree
+        for the length of that window — and a registered project that no record
+        has ever named has no node at all. **Fewer nodes than registry rows is
+        the normal resting state** (registry rows are a superset by
+        construction) and is deliberately not counted here at all. The reverse —
+        a node the registry does not know — cannot arise from that window in
+        that direction, so it is reported as its own number.
+
+        ⚠ THE READ ORDER IS PART OF THAT, not incidental: the graph is read
+        FIRST and the registry SECOND, so the registry snapshot is never older
+        than the node snapshot. A project registered concurrently therefore
+        cannot produce a phantom ``unregistered`` — its row is already visible by
+        the time the nodes are checked. Reversing these two reads would make the
+        normal ingress path emit false alarms.
+        """
+        async with self._neo4j.session() as session:
+            rows = await (await session.run(
+                f"MATCH (p:{ONT.project})"
+                f" RETURN p.name AS name, p.project_id AS project_id"
+            )).data()
+        async with self._acquire() as conn:
+            registry = {
+                r["name"]: r["id"]
+                for r in await conn.fetch("SELECT name, id FROM projects")
+            }
+        unidentified = mismatched = unregistered = 0
+        for row in rows:
+            expected = registry.get(row["name"])
+            if expected is None:
+                unregistered += 1
+            elif row["project_id"] is None:
+                unidentified += 1
+            elif row["project_id"] != expected:
+                mismatched += 1
+        return {
+            "nodes": len(rows),
+            "unidentified": unidentified,
+            "mismatched": mismatched,
+            "unregistered": unregistered,
+            "complete": unidentified == 0 and mismatched == 0,
+        }
+
     async def _consolidation_telemetry(self) -> dict:
         """Full consolidation section for /memory/telemetry (computed fresh)."""
         return await self._compute_consolidation_health()
@@ -4929,9 +5126,18 @@ class MemoryCoordinator:
                     # report the system as unknown — the same tolerance the
                     # roll-up keys get below.
                     invalid_nodes = None
+                try:
+                    project_identity = await self._project_identity_health()
+                except Exception:
+                    # Same tolerance, and the same reason it must be guarded at
+                    # all: a probe that raises inside the refresher would take
+                    # the whole cached snapshot down with it, so a metric about
+                    # an incomplete upgrade would present as a stalled system.
+                    project_identity = None
                 self._consolidation_health = {
                     "stalled": full["stalled"],
                     "graph_invalid_nodes": invalid_nodes,
+                    "project_identity": project_identity,
                     "last_outcome": full["last_outcome"],
                     "last_success_age_seconds": full["last_success_age_seconds"],
                     # Which type the headline age belongs to, and who is

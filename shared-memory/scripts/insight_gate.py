@@ -53,6 +53,27 @@ def insight_cluster_cypher(count_only: bool = False) -> str:
     Telemetry needs the gauge, not the payload — but it must be a gauge of the
     SAME predicate, which is the whole reason this is one function.
 
+    ⛔ THE DISCRIMINATOR IS REGISTRY IDENTITY, NOT THE NAME (migration 027).
+    "Two distinct projects" is counted over ``p.project_id``, while the payload
+    still reports names because names are what a reader renders. Counting the
+    name made the gate correct only while the node set happened to be one-to-one
+    with the registry, which nothing enforced: two nodes left by a partly-applied
+    rename make one project count twice and synthesise a "cross-project" insight
+    out of a single project's decisions. It must equally not be the internal node
+    id — with no uniqueness constraint two nodes sharing a name collapse
+    correctly under the name and would count as two under ``elementId``, which is
+    strictly worse than what it replaced.
+
+    ⚠ IT FAILS CLOSED, and that is the point of using ``collect`` rather than a
+    null test: ``collect`` DISCARDS nulls, so a project node with no identity
+    contributes nothing to ``project_ids`` and cannot carry a cluster over the
+    two-project line. An unidentified project therefore costs a fold that might
+    have been legitimate, which is the cheap direction — the expensive one is a
+    false cross-project insight, and a name fallback would keep that live for the
+    whole upgrade window and permanently for any residue. ``GET /health`` reports
+    how many project nodes are still unidentified so this is a visible state and
+    not a silent one.
+
     Parameters: ``$hub_cap``, ``$threshold``.
     """
     projection = (
@@ -89,9 +110,11 @@ def insight_cluster_cypher(count_only: bool = False) -> str:
         f"   AND coalesce(d.rem_processed, false) = true"
         f"   AND coalesce(d.superseded, false) = false"
         f" MATCH (d)-[:{ONT.project_of}]->(p:{ONT.project})"
-        f" WITH members, collect(DISTINCT d) AS ds, collect(DISTINCT p.name) AS projects"
+        f" WITH members, collect(DISTINCT d) AS ds,"
+        f"      collect(DISTINCT p.name) AS projects,"
+        f"      collect(DISTINCT p.project_id) AS project_ids"
         f" WHERE size(ds) >= $threshold"
-        f"   AND size(projects) >= 2"
+        f"   AND size(project_ids) >= 2"
         f"   AND any(d IN ds WHERE size([(d)-[:{ONT.had_outcome}]->(x) | x]) > 0)"
         + projection
     )

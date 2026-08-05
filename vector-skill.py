@@ -117,7 +117,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.8.43"
+VERSION = "0.8.44"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server
@@ -475,6 +475,8 @@ async def save_decision(
     entities: str = "",
     grounded_in: str = "",
     elicited: bool = False,
+    new_project: bool = False,
+    confirm_distinct_from: str = "",
 ) -> str:
     """
     Save an architectural or design decision with full PROV-O provenance.
@@ -516,6 +518,16 @@ async def save_decision(
 
     elicited: set True when the operator was asked for these fields (drives
     spine-coverage telemetry, decision 559).
+
+    project is checked against the registry exactly as a fact's is: an
+    unregistered value is refused with near-match proposals rather than
+    silently creating a project. new_project=true declares the value genuinely
+    new and registers it — pass it ONLY after the operator has confirmed the
+    spelling, because it is what separates a new project from a typo, and a
+    registry row is permanent. Work that introduces a project declares it ONCE,
+    on the first record that names it; everything saved afterwards simply uses
+    the now-registered name. If the name is not settled yet, save on
+    "general_discussion" and promote later — never invent a placeholder.
     """
     decision_data: dict = {
         "title": title,
@@ -538,6 +550,17 @@ async def save_decision(
         "entities": [e.strip() for e in entities.split(",") if e.strip()],
         "decision": decision_data,
     }
+    # The operator has confirmed this project is new, so the save registers it
+    # instead of being refused. Never inferred and never a default: from v0.8.44
+    # a decision's project is checked against the registry, and that check only
+    # means something if declaring a new project is a deliberate act.
+    if new_project:
+        metadata["new_project"] = True
+    # The registered projects this new one is deliberately NOT. Needed only when
+    # the gateway refuses the name as confusable — and it names which.
+    _distinct = [d.strip() for d in (confirm_distinct_from or "").split(",") if d.strip()]
+    if _distinct:
+        metadata["confirm_distinct_from"] = _distinct
     # grounded_in: same "pgid[:role],pgid" grammar as memory_bridge.py's
     # build_decision_metadata — materialised as typed (:Decision)-[:ROLE]->
     # (:Fact|:Decision) edges by the outbox worker.

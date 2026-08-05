@@ -134,7 +134,7 @@ def test_the_gate_carries_all_three_conditions():
     """The conditions a Postgres partition could not express — and the reason
     the old gauge said 2 where the daemon folds 0."""
     q = insight_cluster_cypher(count_only=True)
-    assert "size(projects) >= 2" in q
+    assert "size(project_ids) >= 2" in q
     assert "HAD_OUTCOME" in q
     assert "$hub_cap" in q
     assert "$threshold" in q
@@ -178,7 +178,7 @@ async def test_decision_cycles_reflects_the_insight_gate_not_a_partition():
     # It must have ASKED the graph the insight question — a partition of
     # Postgres project values would never issue this query.
     assert any("count(*) AS cycles" in q for q in captured)
-    assert any("size(projects) >= 2" in q for q in captured)
+    assert any("size(project_ids) >= 2" in q for q in captured)
 
 
 @pytest.mark.asyncio
@@ -269,7 +269,13 @@ class _Recorder:
         self.cypher = []
         self.sql = []
 
-    def coordinator(self):
+    def coordinator(self, project_id=None):
+        """``project_id`` is what the registry lookup returns (migration 027).
+
+        Default None — the pre-027 shape, and also what a deployment whose
+        registry does not hold the name gets. Pass an int to exercise the
+        identified path.
+        """
         from coordinator import MemoryCoordinator
         c = MemoryCoordinator()
 
@@ -288,6 +294,7 @@ class _Recorder:
 
         conn = MagicMock()
         conn.execute = AsyncMock(side_effect=lambda *a: self.sql.append(a))
+        conn.fetchval = AsyncMock(return_value=project_id)
         acq = MagicMock()
         acq.__aenter__ = AsyncMock(return_value=conn)
         acq.__aexit__ = AsyncMock(return_value=False)
@@ -310,7 +317,7 @@ async def test_backfill_row_writes_only_the_project_edge():
     assert "MENTIONS" not in query
     assert "$entities" not in query
     assert "f.content" not in query
-    assert params == {"pg_id": 42, "project": "smg"}
+    assert params == {"pg_id": 42, "project": "smg", "project_id": None}
 
 
 @pytest.mark.asyncio

@@ -22,6 +22,10 @@ SERVER-SIDE ONLY. Never added to ``sync_skills.sh`` or ``shared-memory-skill/``
 — the skill is a thin HTTP client and resolution happens at ingress.
 """
 
+import os
+
+from ontology import ONT
+
 # The canonical resolution, as SQL. Judgements carry their project inside the
 # decision blob; facts carry it at the top level. NULL when neither is present
 # — callers decide what an unresolvable project means, and from PR 2 that
@@ -56,6 +60,11 @@ SENTINEL = "general_discussion"
 
 PROJECT_EXISTS_SQL = "SELECT 1 FROM projects WHERE name = $1"
 
+# The registry IDENTITY behind a name (migration 027). The name is a label a
+# client asserts and an operator types; this is the thing that does not move
+# when the label does, and it is what the graph node is keyed on.
+PROJECT_ID_SQL = "SELECT id FROM projects WHERE name = $1"
+
 # Proposals for a value that missed. TRIGRAM FIRST, and that ordering is a
 # dependency decision, not a ranking preference: trigram needs no embedder, so
 # registration cannot be taken down by an embedding outage. A vector signal over
@@ -77,6 +86,71 @@ PROPOSAL_SIMILARITY = 0.25
 PROPOSAL_LIMIT = 5
 
 
+# ── Declaring a NEW project: the two ways it is really a typo ────────────────
+#
+# A registry only stops a misspelling from becoming a project if declaring a new
+# project is harder than mistyping an old one. It is the agent that sets the
+# "this is new" flag, and it is the agent that makes the spelling error, so a
+# flag alone guards nothing: the operator says "go ahead with this idea" meaning
+# THIS project, and a plausible variant silently becomes a second one. Every
+# retired spelling this corpus carries arrived exactly that way.
+#
+# So the same claim faces two checks, and only the second is overridable.
+
+def spelling_key(name) -> str:
+    """The comparison form: lowercase, letters and digits only.
+
+    ``Shared_Memory``, ``shared-memory`` and ``shared memory`` all reduce to one
+    key, which is the point — those are SPELLINGS of one project, never separate
+    projects, and no confirmation can make them separate. Separators and case
+    are the whole of the difference in every rename this registry has recorded.
+    """
+    if not isinstance(name, str):
+        return ""
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
+def same_spelling(a, b) -> bool:
+    """Do two names differ only in separators and case?"""
+    key = spelling_key(a)
+    return bool(key) and key == spelling_key(b)
+
+
+# Above this trigram similarity a proposed new name is CONFUSABLE with a
+# registered one and must be confirmed as deliberately distinct.
+#
+# ⚠ Derived from a live registry, not guessed, and env-overridable because the
+# right floor depends on how a deployment names things: measured over every pair
+# of 37 registered projects, the closest legitimately DISTINCT pair scored 0.500
+# and NO pair reached 0.6 — while realistic typos of a registered name scored
+# 0.78 to 1.00. The gap between those two populations is where this sits. Too
+# low and every new project needs an override, which trains the reflex to
+# override; too high and the check never fires.
+CONFUSABLE_SIMILARITY = float(os.environ.get("PROJECT_CONFUSABLE_SIMILARITY", "0.6"))
+
+CONFUSABLE_SQL = (
+    "SELECT name FROM projects"
+    " WHERE similarity(name, $1) >= $2 AND name <> $1"
+    " ORDER BY similarity(name, $1) DESC, name"
+    " LIMIT $3"
+)
+
+
+def unconfirmed_confusables(near, confirmed) -> list:
+    """Which near matches the caller has NOT confirmed it means to differ from.
+
+    Confirmation names the specific registered project being distinguished from,
+    rather than setting a second boolean: a flag can be flipped without reading
+    anything, while naming the neighbour cannot be produced without having seen
+    it. Compared on the spelling key, so confirming ``Alpha-Service`` confirms
+    ``alpha_service``.
+    """
+    if isinstance(confirmed, str):
+        confirmed = [confirmed]
+    keys = {spelling_key(c) for c in (confirmed or []) if isinstance(c, str)}
+    return [n for n in (near or []) if spelling_key(n) not in keys]
+
+
 def project_for_graph(metadata):
     """The project a `:Project` NODE may be minted from — P3 and P8 together.
 
@@ -87,6 +161,35 @@ def project_for_graph(metadata):
     """
     project = resolve_project(metadata)
     return None if project == SENTINEL else project
+
+
+def project_merge_cypher(project_id, var: str = "p", name_param: str = "$project") -> str:
+    """The MERGE that puts a record's project node in the graph (migration 027).
+
+    A pure function returning Cypher, so the identity rule can be asserted
+    directly rather than grepped out of three call sites that each embed it in a
+    different surrounding clause.
+
+    WITH an identity, the node is keyed on ``project_id`` and the name is SET as
+    a display label. That is what makes a rename cost one property write on one
+    node instead of a rewiring: the identity the edges hang off never moves.
+
+    WITHOUT one — the name is not in the registry, or this deployment has not
+    run the reconcile step yet — it falls back to keying on the name, exactly as
+    before this migration. That fallback is deliberate and it is NOT the gate's
+    fallback: the WRITE must never be lost, because a record with no project
+    edge violates the axis outright, while the READ side (the insight gate) must
+    fail closed. So an unidentified project still gets its edge, still searches,
+    still enriches — and simply does not count toward the two-project rule until
+    it has an identity. Losing the write instead would trade a synthesis risk
+    for data loss.
+    """
+    if project_id is None:
+        return f"MERGE ({var}:{ONT.project} {{name: {name_param}}})"
+    return (
+        f"MERGE ({var}:{ONT.project} {{project_id: $project_id}})"
+        f" SET {var}.name = {name_param}"
+    )
 
 
 def fold_eligible(project) -> bool:

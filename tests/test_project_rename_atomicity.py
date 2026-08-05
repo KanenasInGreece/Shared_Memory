@@ -79,7 +79,7 @@ def test_the_ledger_and_the_aliases_are_repointed_before_the_row_is_retired():
     be vetoed by rows this rename was about to move anyway."""
     retire = _index_of("DELETE FROM projects")
     assert _index_of("UPDATE project_promotions") < retire
-    assert _index_of("UPDATE project_aliases SET project") < retire
+    assert _index_of("UPDATE project_aliases") < retire
 
 
 # ── N2 — a rename never destroys the name a ledger row targeted ──────────────
@@ -109,7 +109,7 @@ def test_only_active_alias_rows_are_repointed():
     """A4 — mappings are superseded, never deleted. Re-pointing a superseded row
     would falsify the history it exists to preserve, so it is left alone and
     will veto the rename instead (see the module docstring)."""
-    i = _index_of("UPDATE project_aliases SET project")
+    i = _index_of("UPDATE project_aliases")
     sql, _ = rename_statements(OLD, NEW)[i]
     assert "AND active" in sql
 

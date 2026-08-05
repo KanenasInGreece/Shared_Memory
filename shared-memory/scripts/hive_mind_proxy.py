@@ -1086,10 +1086,19 @@ async def handle_health(request: web.Request) -> web.Response:
             # never renders it inside the consolidation tile. None = not yet
             # probed, which must never be read as "verified clean" (decision 928).
             checks["graph_invalid_nodes"] = consolidation.get("graph_invalid_nodes")
+            # Project identity (migration 027) — top-level for the same reason:
+            # it is an UPGRADE-completeness signal, not a dream-cycle metric. It
+            # answers "may this deployment be trusted to fold across projects
+            # yet", because the insight gate declines to count a project node
+            # that has no registry identity. None = not yet probed, never
+            # "complete". An ADDITIVE field: a monitor that does not know it
+            # renders exactly as before.
+            checks["project_identity"] = consolidation.get("project_identity")
         except Exception:
             checks["consolidation"] = {"fresh": False}
             checks["inference_busy"] = "unknown"
             checks["graph_invalid_nodes"] = None
+            checks["project_identity"] = None
 
     return web.json_response(checks, status=200 if critical_ok else 503)
 
