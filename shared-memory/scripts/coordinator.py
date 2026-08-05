@@ -57,9 +57,9 @@ from ontology import (
     record_label_for_type,
 )
 from project_axis import (
-    PROJECT_SQL, PROJECT_EXISTS_SQL, PROJECT_PROPOSALS_SQL,
+    PROJECT_SQL, PROJECT_EXISTS_SQL, PROJECT_ID_SQL, PROJECT_PROPOSALS_SQL,
     PROPOSAL_SIMILARITY, PROPOSAL_LIMIT, SENTINEL,
-    fold_eligible, resolve_project, project_for_graph,
+    fold_eligible, resolve_project, project_for_graph, project_merge_cypher,
 )
 from insight_gate import (
     INSIGHT_THRESHOLD, INSIGHT_HUB_DEGREE_CAP, insight_cluster_cypher,
@@ -1300,6 +1300,10 @@ class MemoryCoordinator:
                                              # "not yet probed" must never read as
                                              # "verified clean" (decision 928).
                                              "graph_invalid_nodes": None,
+                                             # Same rule for the identity gauge:
+                                             # "not yet probed" must never read
+                                             # as "upgrade complete".
+                                             "project_identity": None,
                                              "inference_busy": "unknown", "fresh": False}
         self._consolidation_health_task: asyncio.Task | None = None
         self._alt_vector_task: asyncio.Task | None = None
@@ -1563,6 +1567,7 @@ class MemoryCoordinator:
             # succeed or fail atomically. MERGE is idempotent — safe to retry.
             source_ref = params.get("source_ref") or None
             fact_kind = params.get("fact_kind") or "observation"
+            project_id = await self._project_identity(params.get("project"))
             async with self._neo4j.session() as session:
                 await session.run(
                     f"MERGE (f:{ONT.fact} {{pg_id: $pg_id}})"
@@ -1588,7 +1593,7 @@ class MemoryCoordinator:
                     f"   MERGE (h:{ONT.human} {{name: $person}})"
                     f"   MERGE (a)-[:{ONT.acted_on_behalf_of}]->(h))"
                     f" FOREACH (_ IN CASE WHEN $project <> '' THEN [1] ELSE [] END |"
-                    f"   MERGE (p:{ONT.project} {{name: $project}})"
+                    f"   {project_merge_cypher(project_id)}"
                     f"   MERGE (f)-[:{ONT.project_of}]->(p))"
                     + f" WITH f"
                     f" UNWIND $entities AS ename"
@@ -1599,6 +1604,7 @@ class MemoryCoordinator:
                     source=params.get("source", "coordinator"),
                     person=params.get("person") or "",
                     project=params.get("project") or "",
+                    project_id=project_id,
                     fact_kind=fact_kind,
                     entities=self._gate_graph_entities(pg_id, params.get("entities", [])),
                     **( {"source_ref": source_ref} if source_ref else {} ),
@@ -2116,6 +2122,7 @@ class MemoryCoordinator:
         decision = params.get("decision", {})
         grounded = params.get("grounded") or []
         grounded_in_flat = params.get("grounded_in", [])
+        project_id = await self._project_identity(decision.get("project"))
         async with self._neo4j.session() as session:
             await session.run(
                 f"MERGE (d:{ONT.decision} {{pg_id: $pg_id}})"
@@ -2134,7 +2141,7 @@ class MemoryCoordinator:
                 f" MERGE (h:{ONT.human} {{name: $decided_by}})"
                 f" MERGE (d)-[:{ONT.was_attributed_to}]->(h)"
                 f" WITH d"
-                f" MERGE (p:{ONT.project} {{name: $project}})"
+                f" {project_merge_cypher(project_id)}"
                 f" MERGE (d)-[:{ONT.project_of}]->(p)"
                 f" WITH d"
                 f" FOREACH (ai_name IN $assisted_by |"
@@ -2150,6 +2157,7 @@ class MemoryCoordinator:
                 alternatives=[a for a in (decision.get("alternatives") or []) if isinstance(a, str)],
                 decided_by=decision.get("decided_by", "unknown"),
                 project=decision.get("project", "unknown"),
+                project_id=project_id,
                 assisted_by=decision.get("assisted_by", []),
             )
             # Typed decision→fact grounding (decision 582): shared writer — see
@@ -2390,15 +2398,16 @@ class MemoryCoordinator:
         """
         project = (params.get("project") or "").strip()
         if project:
+            project_id = await self._project_identity(project)
             async with self._neo4j.session() as session:
                 await session.run(
                     f"MATCH (n:{self._SPINE}) WHERE n.pg_id = $pg_id"
                     f" OPTIONAL MATCH (n)-[stale:{ONT.project_of}]->()"
                     f" DELETE stale"
                     f" WITH DISTINCT n"
-                    f" MERGE (p:{ONT.project} {{name: $project}})"
+                    f" {project_merge_cypher(project_id)}"
                     f" MERGE (n)-[:{ONT.project_of}]->(p)",
-                    pg_id=pg_id, project=project,
+                    pg_id=pg_id, project=project, project_id=project_id,
                 )
         async with self._acquire() as conn:
             await conn.execute("DELETE FROM neo4j_outbox WHERE id=$1", outbox_id)
@@ -2486,6 +2495,30 @@ class MemoryCoordinator:
         """Is this an established project? (P4, migration 022's registry.)"""
         async with self._acquire() as conn:
             return await conn.fetchval(PROJECT_EXISTS_SQL, name) is not None
+
+    async def _project_identity(self, project) -> int | None:
+        """The registry id behind a project name, or None (migration 027).
+
+        Deliberately UNCACHED. The registry is tens of rows and this is one
+        indexed lookup on a path that is already writing to two stores; a cache
+        would buy nothing measurable and would hold a stale answer across
+        exactly the operation the identity exists to survive — a rename.
+
+        None means "no identity to key on", from any cause: an unregistered
+        name, or a lookup that failed. Both take the write down the same
+        name-keyed fallback rather than losing the edge — see
+        ``project_merge_cypher``. A failure here must never turn a save into a
+        500, because the record and its project are both already valid.
+        """
+        if not isinstance(project, str) or not project.strip():
+            return None
+        try:
+            async with self._acquire() as conn:
+                return await conn.fetchval(PROJECT_ID_SQL, project.strip())
+        except Exception as exc:
+            log.warning("project identity lookup failed for %r, writing the "
+                        "project node keyed on its name: %s", project, exc)
+            return None
 
     async def _resolve_project_alias(self, name: str) -> str | None:
         """The canonical project a retired spelling resolves to, or None.
@@ -4895,6 +4928,56 @@ class MemoryCoordinator:
         out.update(_consolidation_rollup(out, any_stalled, started_at))
         return out
 
+    async def _project_identity_health(self) -> dict:
+        """Is the project-identity upgrade complete on THIS deployment? (027)
+
+        Migration 027 gives every registry row an id; only
+        ``reconcile_project_identity.py`` can put that id on the graph nodes,
+        and until it has, the insight gate FAILS CLOSED on the nodes it has not
+        reached — they do not count toward its two-project rule. Without this
+        gauge that state is invisible: folds simply do not happen, which looks
+        exactly like a quiet corpus.
+
+        So the metric is named for the question an operator actually has —
+        ``complete`` — and counts the two distinguishable ways it can be false:
+
+          ``unidentified``  registered project nodes with no id: run reconcile
+          ``mismatched``    an id that disagrees with the registry: also
+                            reconcile, but read it first — it means the node was
+                            stamped against a registry row that has since moved
+          ``unregistered``  a node whose name has no registry row at all. NOT
+                            counted in ``complete``, because no tool can fix it
+                            without deciding what the project IS — an operator's
+                            call. It still cannot take part in a fold, which is
+                            why it is reported rather than left implicit.
+        """
+        async with self._neo4j.session() as session:
+            rows = await (await session.run(
+                f"MATCH (p:{ONT.project})"
+                f" RETURN p.name AS name, p.project_id AS project_id"
+            )).data()
+        async with self._acquire() as conn:
+            registry = {
+                r["name"]: r["id"]
+                for r in await conn.fetch("SELECT name, id FROM projects")
+            }
+        unidentified = mismatched = unregistered = 0
+        for row in rows:
+            expected = registry.get(row["name"])
+            if expected is None:
+                unregistered += 1
+            elif row["project_id"] is None:
+                unidentified += 1
+            elif row["project_id"] != expected:
+                mismatched += 1
+        return {
+            "nodes": len(rows),
+            "unidentified": unidentified,
+            "mismatched": mismatched,
+            "unregistered": unregistered,
+            "complete": unidentified == 0 and mismatched == 0,
+        }
+
     async def _consolidation_telemetry(self) -> dict:
         """Full consolidation section for /memory/telemetry (computed fresh)."""
         return await self._compute_consolidation_health()
@@ -4929,9 +5012,18 @@ class MemoryCoordinator:
                     # report the system as unknown — the same tolerance the
                     # roll-up keys get below.
                     invalid_nodes = None
+                try:
+                    project_identity = await self._project_identity_health()
+                except Exception:
+                    # Same tolerance, and the same reason it must be guarded at
+                    # all: a probe that raises inside the refresher would take
+                    # the whole cached snapshot down with it, so a metric about
+                    # an incomplete upgrade would present as a stalled system.
+                    project_identity = None
                 self._consolidation_health = {
                     "stalled": full["stalled"],
                     "graph_invalid_nodes": invalid_nodes,
+                    "project_identity": project_identity,
                     "last_outcome": full["last_outcome"],
                     "last_success_age_seconds": full["last_success_age_seconds"],
                     # Which type the headline age belongs to, and who is

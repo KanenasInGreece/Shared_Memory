@@ -316,7 +316,7 @@ async def test_fresh_cluster_gate_encodes_ratified_rules():
     assert "HAD_OUTCOME" in query
     assert "rating" not in query
     # ≥2 distinct projects; threshold and mega-hub cap parameterised.
-    assert "size(projects) >= 2" in query
+    assert "size(project_ids) >= 2" in query
     assert params["threshold"] == INSIGHT_THRESHOLD
     assert params["hub_cap"] == INSIGHT_HUB_DEGREE_CAP
     # Reversed decisions never seed a fresh cluster; re-folds keep them

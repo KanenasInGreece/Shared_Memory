@@ -169,10 +169,20 @@ async def promote_record(
     # The durable ledger row. Its CHECK constraints re-assert both halves of the
     # transition, so a caller that somehow bypassed `promotion_refusal` is
     # refused by the database rather than silently recorded.
+    #
+    # BOTH the name and the identity are recorded, and they answer different
+    # questions (migration 027). `to_project` is EVIDENCE — the name this record
+    # was actually moved onto, on the day it moved, which a later rename must
+    # never rewrite. `to_project_id` is the durable POINTER, so the row still
+    # resolves to the right project after that rename. The sub-select is the
+    # whole reason the column is NOT NULL: a promotion onto a name with no
+    # registry row fails here, in the same transaction as the record's own
+    # update, instead of writing a ledger row that points at nothing.
     await conn.execute(
         "INSERT INTO project_promotions"
-        " (pg_id, from_project, to_project, method, actor, note)"
-        " VALUES ($1, $2, $3, $4, $5, $6)",
+        " (pg_id, from_project, to_project, to_project_id, method, actor, note)"
+        " VALUES ($1, $2, $3, (SELECT id FROM projects WHERE name = $3),"
+        "         $4, $5, $6)",
         pg_id, current, target, method, actor, note,
     )
     # A durable ledger row always leaves a log line — the ledger is queried when

@@ -167,19 +167,33 @@ def rename_statements(old: str, new: str) -> list:
          (new, old)),
         # concat_ws skips NULLs, so a row with no note gets the trail alone
         # rather than a leading separator.
+        #
+        # ⚠ BOTH LEDGER COLUMNS MOVE, AND THEY MOVE FOR DIFFERENT REASONS
+        # (migration 027). `to_project_id` is re-pointed because the identity it
+        # named is about to be deleted and the foreign key would otherwise veto
+        # the rename. `to_project` is re-pointed because a promotion's target is
+        # a name a reader looks up — and the name it originally carried is
+        # preserved in the note, which is the trade this statement has always
+        # made. The id does not make the note redundant: the note says what the
+        # target was CALLED, the id says which project it IS.
         ("UPDATE project_promotions"
          "   SET to_project = %s,"
+         "       to_project_id = (SELECT id FROM projects WHERE name = %s),"
          "       note = concat_ws(' | ', note, %s || ' on ' || now())"
          " WHERE to_project = %s",
-         (new, trail, old)),
-        ("UPDATE project_aliases SET project = %s WHERE project = %s AND active",
+         (new, new, trail, old)),
+        ("UPDATE project_aliases"
+         "   SET project_id = (SELECT id FROM projects WHERE name = %s)"
+         " WHERE project_id = (SELECT id FROM projects WHERE name = %s)"
+         "   AND active",
          (new, old)),
         ("DELETE FROM projects WHERE name = %s", (old,)),
         ("WITH interned AS (" + ALIAS_UPSERT_SQL.format(p="%s") + ")"
-         " INSERT INTO project_aliases (alias_id, project, reason, created_by)"
-         " SELECT id, %s, %s, 'normalize_projects' FROM interned"
+         " INSERT INTO project_aliases (alias_id, project_id, reason, created_by)"
+         " SELECT interned.id, p.id, %s, 'normalize_projects'"
+         "   FROM interned, projects p WHERE p.name = %s"
          " ON CONFLICT DO NOTHING",
-         (old, new, f"renamed to {new}")),
+         (old, f"renamed to {new}", new)),
     ]
 
 
@@ -197,10 +211,12 @@ _PREFLIGHT = [
      "SELECT count(*) FROM project_promotions WHERE to_project = %s",
      lambda old: (old,)),
     ("active alias rows",
-     "SELECT count(*) FROM project_aliases WHERE project = %s AND active",
+     "SELECT count(*) FROM project_aliases pa JOIN projects p ON p.id = pa.project_id"
+     " WHERE p.name = %s AND pa.active",
      lambda old: (old,)),
     ("SUPERSEDED alias rows (these will VETO the rename)",
-     "SELECT count(*) FROM project_aliases WHERE project = %s AND NOT active",
+     "SELECT count(*) FROM project_aliases pa JOIN projects p ON p.id = pa.project_id"
+     " WHERE p.name = %s AND NOT pa.active",
      lambda old: (old,)),
 ]
 
@@ -263,8 +279,16 @@ def rename_pair(conn, old: str, new: str, dry_run: bool) -> bool:
     return apply_rename(conn, old, new)
 
 
-def rewire_neo4j(driver, old: str, new: str) -> None:
-    """The graph half — reached only for a pair whose Postgres half committed."""
+def rewire_neo4j(driver, old: str, new: str, new_id=None) -> None:
+    """The graph half — reached only for a pair whose Postgres half committed.
+
+    ``new_id`` is the surviving project's registry identity (migration 027). It
+    is passed rather than looked up here because this function is the graph half
+    of a transaction that has already committed in Postgres, and re-reading the
+    registry would be reading it at a different instant from the one that
+    decided the move. It may be None on a deployment that has not migrated;
+    then the node keeps its name-keyed shape, exactly as before.
+    """
     with driver.session() as session:
         count = session.run(
             f"MATCH (p:{ONT.project} {{name: $old}})<-[r]-() RETURN count(r) AS n",
@@ -273,14 +297,20 @@ def rewire_neo4j(driver, old: str, new: str) -> None:
         print(f"  neo4j: Project {old!r} → {new!r}: {count} inbound edge(s)")
         # Rewire PROJECT_OF edges (the only inbound type the ontology writes to
         # Project nodes) to the canonical node. MERGE keeps it idempotent.
+        # The surviving node is stamped with the identity it is surviving AS,
+        # because this is one of the two places a Project node can be minted and
+        # a node minted without an identity is one the insight gate will decline
+        # to count — a merge must not leave the graph less foldable than it
+        # found it.
         session.run(
             f"MATCH (alias:{ONT.project} {{name: $old}})"
             f" MERGE (canon:{ONT.project} {{name: $new}})"
+            f" SET canon.project_id = coalesce($new_id, canon.project_id)"
             f" WITH alias, canon"
             f" MATCH (n)-[r:{ONT.project_of}]->(alias)"
             f" MERGE (n)-[:{ONT.project_of}]->(canon)"
             f" DELETE r",
-            old=old, new=new,
+            old=old, new=new, new_id=new_id,
         )
         # Drop the alias node only when nothing else points at it — an
         # unexpected edge type means a manual look, not a silent delete.
@@ -331,7 +361,10 @@ def main() -> int:
         for old, new in aliases.items():
             if rename_pair(conn, old, new, args.dry_run):
                 committed.append((old, new))
-                rewire_neo4j(driver, old, new)
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id FROM projects WHERE name = %s", (new,))
+                    row = cur.fetchone()
+                rewire_neo4j(driver, old, new, row[0] if row else None)
             elif old == new:
                 continue          # a no-op, not a failure
             elif args.dry_run:

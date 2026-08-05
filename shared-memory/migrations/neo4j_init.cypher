@@ -44,3 +44,12 @@ CREATE CONSTRAINT ai_agent_name IF NOT EXISTS
 // Project: project scope node
 CREATE CONSTRAINT project_name IF NOT EXISTS
     FOR (n:Project) REQUIRE n.name IS UNIQUE;
+
+// Project identity: the registry id (migration 027). The name above is a LABEL
+// and may be renamed; this is the key the axis edges hang off and the key the
+// insight gate counts distinct projects by, so two nodes claiming one identity
+// would let a single project pass a cross-project rule. Nodes that do not carry
+// the property yet are unaffected — a deployment mid-upgrade still writes, and
+// reconcile_project_identity.py is what completes it.
+CREATE CONSTRAINT project_identity IF NOT EXISTS
+    FOR (n:Project) REQUIRE n.project_id IS UNIQUE;
