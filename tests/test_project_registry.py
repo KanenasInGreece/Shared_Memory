@@ -427,3 +427,30 @@ def test_a_reasoning_trace_carries_a_project_like_any_other_record():
         "anyone deciding to. Naming it in the docstring as a deliberate choice "
         "is the opposite, and is correct.")
     assert 'metadata["project"] = project' in body
+
+
+# ── The spelling gate must not depend on the trigram gate (v0.8.48) ──────────
+
+def test_spelling_variant_is_found_without_any_similarity_filtering():
+    """The shared helper, directly. A SPELLING is exact equality on a normalised
+    key; it must never be gated behind a fuzzy score. Measured live: `testing`
+    vs `Test_Ing` scores 0.545 against a floor of 0.6, so the variant never
+    reached this check and registered as new."""
+    from project_axis import spelling_variant_of
+    assert spelling_variant_of("Test_Ing", ["testing"]) == "testing"
+    assert spelling_variant_of("Alpha-Service", ["alpha_service"]) == "alpha_service"
+    assert spelling_variant_of("genuinely-new", ["testing", "alpha_service"]) is None
+
+
+@pytest.mark.asyncio
+async def test_a_project_spelling_variant_below_the_floor_is_still_refused():
+    """The project half of the same defect. `near` is EMPTY on purpose — that is
+    what a below-floor confusable query returns — so this dies if the spelling
+    check is ever fed the trigram neighbours again."""
+    c = _coord(registered=("alpha_service",))
+    conn = c._acquire.return_value.__aenter__.return_value
+    conn.fetch = AsyncMock(side_effect=[[], [{"name": "alpha_service"}]])
+    err = await c._project_ingress_error(
+        {"project": "Alpha-Service", "new_project": True}, "claude")
+    assert err["error"] == "project_spelling_variant"
+    c._register_project.assert_not_awaited()

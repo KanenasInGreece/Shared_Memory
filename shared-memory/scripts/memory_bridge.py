@@ -29,7 +29,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.8.47"
+VERSION = "0.8.48"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v3: review-edges / label-edges require the gateway's /memory/relations/* routes.
@@ -780,6 +780,8 @@ def build_decision_metadata(
     elicited: bool = False,
     new_project: bool = False,
     distinct_from: str = "",
+    domains=None,
+    new_domain: bool = False,
 ) -> tuple:
     """Build (content, metadata) for a decision save.
 
@@ -849,6 +851,24 @@ def build_decision_metadata(
     # until they are named, because naming the neighbour is something an agent
     # cannot do without having looked at it — which is what puts the choice in
     # front of the operator instead of inside the agent.
+    # domains: the SECTIONS of the project this decision belongs to. A decision
+    # ASSERTS these, exactly as it asserts its project — it does not inherit them
+    # from its evidence, because a decision reaches further than the fact that
+    # prompted it. They go inside the decision blob, beside `project`, because
+    # that is the half the gateway resolves a judgement's axes from; putting them
+    # at the top level would leave a decision's project and its domain coming
+    # from different halves of one record.
+    #
+    # ⚠ Threaded through EXPLICITLY. The flag existed for one release while this
+    # line did not, so `--domain` parsed cleanly, was dropped on the floor, and
+    # the decision silently fell back to inheriting its evidence's sections. It
+    # read as correct because the inherited answer happened to match what was
+    # asked for — a field the CLI accepts and the record never carries is the
+    # capture defect that hides longest.
+    if domains:
+        decision["domains"] = list(domains)
+    if new_domain:
+        metadata["new_domain"] = True
     df = [d.strip() for d in (distinct_from or "").split(",") if d.strip()]
     if df:
         metadata["confirm_distinct_from"] = df
@@ -1281,6 +1301,8 @@ async def main() -> None:
             elicited=args.elicited,
             new_project=args.new_project,
             distinct_from=args.distinct_from,
+            domains=args.domain,
+            new_domain=args.new_domain,
         )
         print(json.dumps(await save_artifact(content, metadata), indent=2))
     elif action == "save_retrospective":

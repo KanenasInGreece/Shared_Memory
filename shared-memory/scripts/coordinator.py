@@ -59,13 +59,15 @@ from ontology import (
 from project_axis import (
     PROJECT_SQL, PROJECT_EXISTS_SQL, PROJECT_ID_SQL, PROJECT_PROPOSALS_SQL,
     PROPOSAL_SIMILARITY, PROPOSAL_LIMIT, SENTINEL,
-    CONFUSABLE_SQL, CONFUSABLE_SIMILARITY, same_spelling, unconfirmed_confusables,
+    CONFUSABLE_SQL, CONFUSABLE_SIMILARITY, PROJECT_NAMES_SQL,
+    same_spelling, spelling_variant_of, unconfirmed_confusables,
     fold_eligible, resolve_project, project_for_graph, project_merge_cypher,
 )
 from domain_axis import (
     DOMAIN_EXISTS_SQL, DOMAIN_PROPOSALS_SQL, DOMAIN_PROPOSAL_SIMILARITY,
     DOMAIN_PROPOSAL_LIMIT, DOMAIN_CONFUSABLE_SQL, DOMAIN_CONFUSABLE_SIMILARITY,
     DOMAIN_ALIAS_RESOLVE_SQL, DOMAIN_REGISTER_SQL, DOMAIN_KEYS,
+    DOMAIN_NAMES_SQL,
     domain_merge_cypher, names_a_domain, resolve_domains,
 )
 from insight_gate import (
@@ -121,7 +123,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.47"
+FRAMEWORK_VERSION = "0.8.48"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -2823,9 +2825,17 @@ class MemoryCoordinator:
         async with self._acquire() as conn:
             rows = await conn.fetch(CONFUSABLE_SQL, supplied,
                                     CONFUSABLE_SIMILARITY, PROPOSAL_LIMIT)
+            # ⚠ THE SPELLING CHECK RUNS OVER THE WHOLE REGISTRY, NOT OVER `near`.
+            # It used to read the trigram neighbours, which silently made an
+            # EXACT rule conditional on a FUZZY one: a separator/case variant was
+            # refused only when it also scored above the similarity floor.
+            # Measured live — `testing` vs `Test_Ing` scores 0.545 against a
+            # floor of 0.6 — so a pure spelling variant registered as new,
+            # which is precisely the event this guard exists to prevent.
+            all_names = [r["name"] for r in await conn.fetch(PROJECT_NAMES_SQL)]
         near = [r["name"] for r in rows]
 
-        variant = next((n for n in near if same_spelling(n, supplied)), None)
+        variant = spelling_variant_of(supplied, all_names)
         if variant is not None:
             log.info("project registry: refused %r — a spelling of registered %r",
                      supplied, variant)
@@ -3004,9 +3014,13 @@ class MemoryCoordinator:
             rows = await conn.fetch(DOMAIN_CONFUSABLE_SQL, project_id, name,
                                     DOMAIN_CONFUSABLE_SIMILARITY,
                                     DOMAIN_PROPOSAL_LIMIT)
+            # Every section of THIS project, not just the trigram neighbours —
+            # see the identical note on the project axis above.
+            all_names = [r["name"]
+                         for r in await conn.fetch(DOMAIN_NAMES_SQL, project_id)]
         near = [r["name"] for r in rows]
 
-        variant = next((n for n in near if same_spelling(n, name)), None)
+        variant = spelling_variant_of(name, all_names)
         if variant is not None:
             log.info("domain registry: refused %r — a spelling of %r in project %r",
                      name, variant, project)
