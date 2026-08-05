@@ -29,7 +29,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.8.48"
+VERSION = "0.8.49"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v3: review-edges / label-edges require the gateway's /memory/relations/* routes.
@@ -1154,9 +1154,15 @@ async def main() -> None:
         # value is not a delimiter — the lesson --alternatives taught, applied
         # before this surface can repeat it.
         p.add_argument("--domain", action="append", default=None, metavar="NAME",
-                       help="a registered SECTION of this project (repeat for "
-                            "several). Must already be registered, or re-send "
-                            "with new_domain in the metadata to register it.")
+                       help="a registered SECTION of this project, e.g. --domain "
+                            "operations. REPEAT the flag for several; the value is "
+                            "stored verbatim and never split. Sections are "
+                            "project-local, so the same word under another project "
+                            "is a different section. Optional — a record with none "
+                            "is filed under its project, which is always correct. "
+                            "An unregistered name returns 400 domain_unknown with "
+                            "near matches; add \"new_domain\": true to the metadata "
+                            "to register it, after asking the operator.")
         sargs = p.parse_args(sys.argv[2:])
         metadata = sargs.metadata
         if sargs.supersedes is not None or sargs.domain:
@@ -1238,11 +1244,14 @@ async def main() -> None:
         # fails loudly rather than recording a decision with no project.
         p.add_argument("--project",     default="",     help="Project context (default: project folder name)")
         p.add_argument("--domain", action="append", default=None, metavar="NAME",
-                       help="a registered SECTION of this project (repeat for "
-                            "several). A decision asserts its OWN sections — it "
-                            "does not inherit them from its evidence, because a "
-                            "decision routinely reaches further than the fact "
-                            "that prompted it.")
+                       help="a registered SECTION of this project; REPEAT for "
+                            "several. A decision asserts its OWN sections rather "
+                            "than inheriting them, because a decision reaches "
+                            "further than the fact that prompted it — a fact about "
+                            "how agents write to the graph is infrastructure, while "
+                            "the decision on who may write is about access. Omit it "
+                            "and the decision takes its grounding facts' sections as "
+                            "a default, which any explicit value replaces.")
         p.add_argument("--new-domain", action="store_true",
                        help="THE OPERATOR HAS CONFIRMED these sections are new and "
                             "registers them. Ask first — the registry exists so a "
@@ -1265,11 +1274,17 @@ async def main() -> None:
                             "graph. A decision mints no entity; it inherits the topics "
                             "of the facts in --grounded-in. Use that instead.")
         p.add_argument("--grounded-in", default="",
-                       help="Comma-separated pg_ids of the facts this decision rests on, "
-                            "optionally with a role: '601:based_on,602'. THIS is what "
-                            "gives the decision its topics — an ungrounded decision "
-                            "reaches no cluster and never enters synthesis. Include at "
-                            "least the conversation fact (grounding floor).")
+                       help="pg_ids of the records this decision rests on, comma "
+                            "separated, each optionally carrying the ROLE it plays: "
+                            "'601:based_on,602,603:rejected'. Roles: based_on, "
+                            "considered, rejected, under_conditions, informed_by; a "
+                            "bare id takes a default from that fact's evidential "
+                            "kind. THIS is what gives the decision its topics — it "
+                            "mints none of its own, so an ungrounded decision reaches "
+                            "no cluster and never enters synthesis. Include at least "
+                            "the conversation fact. Legitimately empty only when the "
+                            "call really was made on experience; the gateway flags "
+                            "that rather than refusing it.")
         p.add_argument("--elicited",    action="store_true",
                        help="The spine fields were elicited from the operator (an elicited "
                             "null is deliberate; coverage telemetry counts the ask)")
@@ -1315,8 +1330,12 @@ async def main() -> None:
         p.add_argument("--pg-id",  required=True, type=int,
                        help="pg_id of the target Decision")
         p.add_argument("--rating", required=True,
-                       help=f"Outcome state, one of {list(RETRO_RATINGS)} — 'reversed' "
-                            "supersedes the decision; nuance goes in --notes")
+                       help=f"The outcome STATE, not a sentiment: {list(RETRO_RATINGS)}. "
+                            "'refined' means the decision evolved; 'pending' that it is "
+                            "not yet judged. 'reversed' is STRUCTURAL — it marks the "
+                            "decision superseded — so never reach for it merely to "
+                            "retire a record, which writes a false statement into the "
+                            "corpus. Nuance belongs in --notes.")
         p.add_argument("--notes",  required=True,
                        help="What actually happened / lessons learned (becomes the "
                             "record's searchable content)")
@@ -1326,18 +1345,26 @@ async def main() -> None:
                        help="Agent/model recording the outcome (default: $AGENT_ID)")
         p.add_argument("--grounded-in", default="",
                        required=True,
-                       help="REQUIRED. Comma-separated pg_ids of the facts that "
-                            "MEASURED this outcome, optionally with a role: "
-                            "'601,602:considered'. The gateway refuses an ungrounded "
-                            "retrospective: it measures nothing, and it is also what "
-                            "gives the decision it judges its topics.")
+                       help="REQUIRED — pg_ids of the facts that MEASURED this "
+                            "outcome, optionally with a role: '601,602:considered'. "
+                            "Required here and optional on a decision because a "
+                            "retrospective exists to report what measuring showed: "
+                            "with nothing measured it asserts a verdict from nowhere, "
+                            "and it also strands the decision it judges, which reaches "
+                            "its own topics through this record. Refused with 400 "
+                            "when absent.")
         p.add_argument("--entities",    default="",
                        help="DEPRECATED — kept for older callers and IGNORED by the "
                             "graph. A retrospective inherits the topics of the facts "
                             "in --grounded-in, which is required.")
         p.add_argument("--source-ref",  default="",
-                       help="Where the outcome evidence lives (test file, URL, "
-                            "'discussion_context') — derives the record's fact_kind")
+                       help="THE INSTRUMENT THAT MEASURED THIS OUTCOME — the test "
+                            "re-run, the live reading, the URL. A different question "
+                            "from a fact's source_ref, which says where the KNOWLEDGE "
+                            "came from, and one the grounding facts cannot answer for "
+                            "this record: they may belong to another project and cite "
+                            "a different file tree. A test-grounded decision earns a "
+                            "retrospective that re-references the same tests.")
         p.add_argument("--elicited",    action="store_true",
                        help="The fields were elicited from the operator")
         args = p.parse_args(sys.argv[2:])

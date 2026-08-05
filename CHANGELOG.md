@@ -5,6 +5,63 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.49] — 2026-08-06
+
+### Changed
+
+- **The capture surface now explains itself to someone who did not build it.**
+  Every field it asks for existed because something downstream breaks without
+  it, and that breakage is almost always SILENT — the save succeeds, the record
+  is searchable, and only synthesis quietly fails to happen. Until now the
+  surfaces described the fields accurately and assumed the reader already knew
+  why they mattered, which is only true of the people who designed them.
+
+  `SKILL.md` gains a **record-model section, placed before the tasks**: a table
+  of the three record types against who owns which field, then a paragraph per
+  field saying what it captures, which failure it prevents, and what it costs to
+  get wrong. It closes with what to derive silently, what to propose for
+  correction, and what must always be asked.
+
+  The `--help` strings gain the **contract** of each flag: shape, whether it
+  repeats, whether it is required, and what the gateway does when it is wrong.
+
+  The split is deliberate. Help text is read when the caller already knows it
+  wants the flag; `SKILL.md` is read when deciding whether a field applies at
+  all — and the elicitation decision, *should I interrupt the operator for
+  this?*, cannot be made from a description of the shape alone.
+
+- **`source_ref` is documented as answering a DIFFERENT question per record
+  type**, which was true in the code and stated nowhere. On a fact it is where
+  the KNOWLEDGE came from, and it silently sets that fact's evidential weight.
+  On a retrospective it names THE INSTRUMENT THAT MEASURED THE OUTCOME — a claim
+  its grounding facts cannot make on its behalf, because those facts may belong
+  to another project entirely and cite a different file tree.
+
+- **The asymmetry in `grounded_in` is now explained where it is enforced.** A
+  decision may rest on experience, because a project's first decisions are
+  genuinely made before it has evidence. A retrospective may not: it exists to
+  report what measuring showed, so with nothing measured it asserts a verdict
+  from nowhere — and it strands the decision it judges, which reaches its own
+  topics through it.
+
+- **And a test that fails when the contract moves without the documentation.**
+  A good intention does not survive forty releases — the stale examples above
+  are the proof. `tests/test_capture_surface_documented.py` asserts that every
+  capture flag a client offers, every ingress refusal the gateway can return,
+  every outcome rating, and the worked examples' version and `api_version` are
+  present in the skill document. It checks presence, never wording, so ordinary
+  edits do not fail it; what it makes impossible is ADDING a caller-visible part
+  of the contract that nobody explains. Its exemption list is the point rather
+  than a loophole: a new flag fails until someone either documents it or names
+  it mechanical, and both are answers. **It caught an omission on its first
+  run** — `domain_without_project`, a refusal shipped in v0.8.47 and documented
+  nowhere.
+
+Documentation, help text and one test. No behaviour change, no schema change, no
+wire-contract change.
+
+---
+
 ## [0.8.48] — 2026-08-06
 
 ### Fixed
