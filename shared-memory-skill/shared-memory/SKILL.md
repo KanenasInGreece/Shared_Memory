@@ -39,6 +39,91 @@ This skill bridges the Shared Memory Framework — a three-tier semantic and rel
 
 ---
 
+## The record model — what each field captures, and why it is asked for
+
+**Read this before eliciting anything.** Every field below exists because something downstream
+breaks without it, and the breakage is usually SILENT: the save succeeds, the record is searchable,
+and only synthesis quietly fails to happen. Knowing which failure a field prevents is what tells you
+whether it is worth interrupting the operator for.
+
+### Three record types, and who owns which field
+
+|  | project | domain | entities | source_ref | grounding |
+|---|---|---|---|---|---|
+| **fact** | asserts its own | asserts its own | **mints** them | origin of the knowledge | optional |
+| **decision** | asserts its own | asserts its own | inherits from its facts | rarely used | optional, flagged if absent |
+| **retrospective** | from the decision it judges | from the decision it judges | inherits from its facts | the instrument that measured the outcome | **required (400 without it)** |
+
+A record type that "inherits" a field must not send it — the gateway refuses a retrospective that
+names a domain, and ignores entity names on any judgement.
+
+### The fields
+
+**`project` — which body of work this belongs to.** The fold key: summaries are built per project, so
+two records sharing a topic but not a project are never fused into one narrative. It is checked
+against a registry, so an unregistered value is refused rather than silently creating a second
+project out of a typo. **What breaks if it is wrong:** the record is filed under a name nobody will
+think to look in — worse than being parked, because parked is visible and repairable. **Never infer
+it.** The client derives it from the project folder; if that fails, ask.
+
+**`domain` — a SECTION of that project** (`operations`, `architecture`), optional, and several are
+allowed. Sections are project-local: the same word under two projects means two different sections.
+**Why it exists:** a large project's records are all "about" the project, so the project alone stops
+discriminating between them. **Elicit it ONLY when the project already has registered sections** — a
+project with an empty registry is never prompted, which keeps the first section in any project a
+deliberate act rather than a nag. A record with no domain is filed under its project, which is always
+correct.
+
+**`entities` — the concepts a FACT is about, and the only place a concept can enter the graph.**
+These become the cluster keys consolidation groups on. **What breaks if you omit one:** that concept
+never becomes a cluster key for this fact, for anything later grounded in it, or for anything
+enrichment might link later — and a phrase you type here becomes a permanent node, where the only
+way back is to supersede the fact. Name concepts, not sentences (`OutboxPattern`, not `must be done
+on the VM`). Judgements do **not** take these: a decision's topics are whatever its evidence is
+about, reached by walking its grounding.
+
+**`source_ref` — a citation, and it answers a DIFFERENT question on each record type.** On a **fact**
+it is where the knowledge CAME FROM, and it silently sets that fact's evidential weight
+(`fact_kind`): a test path reads as `tested`, a code file as `measured`, a URL or document as
+`researched`, the sentinel `discussion_context` as `discussion`, nothing as `observation`. So it must
+be a REAL path — never chosen to obtain a weight, because the weight is what synthesis trusts. On a
+**retrospective** it names THE INSTRUMENT THAT MEASURED THE OUTCOME — the test re-run, the live
+reading — which is a different claim, and one its grounding facts cannot make for it: those facts may
+belong to another project entirely and cite a different file tree. A cited fact also earns more
+enrichment: proposed links are re-checked against the content, and a cited fact clears that check on
+a majority where an uncited one needs unanimity.
+
+**`grounded_in` — the records this one rests on, and the asymmetry is deliberate.** A **decision** may
+rest on experience alone: a project's first decisions are genuinely made before it has any evidence,
+so an ungrounded one is FLAGGED as unusual rather than refused. A **retrospective** is always
+required to be grounded and is refused `400` without it, because it exists to report what MEASURING
+showed — with nothing measured it asserts a verdict from nowhere. It is also how a judgement acquires
+its topics at all, so an ungrounded retrospective strands the decision it judges as well as itself.
+Each id may carry a role (`601:based_on`, `602:rejected`) saying HOW the record rests on it.
+
+**`alternatives` and `confidence` on a decision — what was weighed and how sure it was.** Stored
+once, on the record, and read back when a search surfaces the decision. Give each alternative as a
+separate value: they are never split on a separator, so an alternative may contain commas, brackets
+and any punctuation.
+
+**`rating` on a retrospective — the outcome STATE, not a sentiment.** `validated`, `mixed`,
+`refined`, `pending`, or `reversed` — and `reversed` is structural: it marks the decision superseded.
+Never reach for it merely to retire a record, because that writes a false statement into the corpus.
+Nuance belongs in the notes.
+
+**`supersedes` on a fact — a correction that retires an older fact** in one call. Soft: the old
+record is kept and flagged, hidden from search, and anything already built on it is re-checked rather
+than rewritten.
+
+### What to ask the operator, and what to decide yourself
+
+**Derive silently:** `project` (from the folder), `fact_kind` (from `source_ref`), a judgement's
+entities, project and domain (from what it rests on or judges).
+**Propose and let them correct:** `source_ref`, `entities`, `domain` when the project has sections.
+**Always ask, never infer:** an unregistered project or domain — registering one is permanent, and a
+misspelling and a new project must not be the same event. State what you are about to save and why,
+in one line, and let them adjust.
+
 ## Core Tasks
 
 ### 1. High-Precision Retrieval (Search & Rerank)
@@ -458,7 +543,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness:
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":4,"version":"0.8.48","daemon":"running","rem_daemon":"running",...}
+# → {"status":"ok","api_version":4,"version":"0.8.49","daemon":"running","rem_daemon":"running",...}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -514,7 +599,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.8.48", "api_version": 4, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.8.49", "api_version": 4, "tool": "shared-memory-framework"}`
 
 ### Updating This Skill
 
