@@ -5,6 +5,39 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.45] — 2026-08-05
+
+### Fixed
+
+- **The two verifiers could not run the way the documentation says to run them.**
+  `verify_schema_init.py` and `verify_neo4j_init.py` loaded their environment by
+  importing `python-dotenv` and **returning silently when it was absent**. Nothing
+  was loaded, so the next connection failed with `fe_sendauth: no password
+  supplied` — a **credentials** error reported for what is actually a **missing
+  dependency**, sending the reader to check passwords, roles and `pg_hba` while
+  the real cause was the invocation.
+
+  That is worse than an ordinary papercut for two reasons. First, **every
+  documented invocation omits the dependency**: `AGENTS.md` and `README.md`
+  between them show five `uv run` lines for these tools, none with
+  `--with python-dotenv`. So the documented way to prove an install was sound
+  could not work on a clean machine. Second, these are the two scripts whose
+  entire job is to **prove a property** — a checker that dies for a reason it
+  misreports teaches the wrong lesson twice, and the thing it was going to verify
+  goes unverified.
+
+  Both now parse the env file directly, in the same dependency-free,
+  candidate-list form `apply.py` has always used (framework `shared-memory/.env`
+  first, repo root as the pre-0.6 fallback), and neither can be defeated by a
+  missing package again. A real exported variable still wins over the file, so
+  pointing a tool at another database keeps working.
+
+  ⚠ **The audit that found it was of every `_load_env` in the framework, not of
+  one file** — the other fifteen were already self-parsing, and these two were the
+  outliers precisely because they were written later and reached for the library.
+
+---
+
 ## [0.8.44] — 2026-08-05
 
 ### Changed
