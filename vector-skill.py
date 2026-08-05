@@ -117,7 +117,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.8.46"
+VERSION = "0.8.47"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server
@@ -310,6 +310,22 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
     register a genuinely new project, or use "general_discussion" for a record
     that belongs to no project (it saves and searches normally but is never
     folded into a project's narrative).
+
+    metadata_json MAY carry "domain" — a registered SECTION of that project, as
+    a string or a list ("domains" is accepted for the list form). Sections are
+    project-local: the same name under two projects is two sections. The same
+    protocol as project applies — an unregistered value returns 400 with
+    "error": "domain_unknown" plus proposals (matched on a section's DESCRIPTION
+    as well as its name), and "new_domain": true registers it after the operator
+    confirms. Ask only when the project already HAS registered sections; a record
+    with no domain is filed under its project, which is always correct.
+
+    ⛔ A RETROSPECTIVE MUST NOT CARRY ONE (400
+    "domain_not_allowed_on_judgement"). Facts and decisions assert their own
+    project and domain; a retrospective inherits BOTH from the decision it
+    judges. A decision that names no domain inherits its grounding facts'
+    sections as a default — never a ceiling, because a decision routinely
+    reaches further than the fact that prompted it.
 
     Supersede-on-save: include "supersedes": <old_pg_id> in metadata_json to save
     this as a CORRECTION that retires an older fact in one call (the old fact is

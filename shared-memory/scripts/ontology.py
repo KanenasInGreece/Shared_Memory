@@ -25,6 +25,13 @@ class OntologyConfig:
     human: str = "Human"
     ai_agent: str = "AIAgent"
     project: str = "Project"
+    # A SECTION of one project (migration 028). SPINE, pinned here and never
+    # read from ontology.yaml — an AMENDMENT to decision 550, recorded as one.
+    # The yaml's own header promises that the consolidation cycle reads only
+    # spine identifiers and that the configurable vocabulary "never triggers or
+    # decides the consolidation mechanism"; the fold gate moves onto this axis,
+    # so a renameable `:Domain` would make that sentence false.
+    domain: str = "Domain"
     activity: str = "Activity"
     milestone: str = "Milestone"
     # Retrospective-as-record (retro-as-node session, 2026-07-14): a retrospective
@@ -52,6 +59,10 @@ class OntologyConfig:
     was_assisted_by: str = "WAS_ASSISTED_BY"
     was_generated_by: str = "WAS_GENERATED_BY"
     project_of: str = "PROJECT_OF"
+    # Record→section belonging, reusing PROJECT_OF's established direction: the
+    # chain reads (:Fact)-[:DOMAIN_OF]->(:Domain)-[:PROJECT_OF]->(:Project).
+    # SPINE, for the same reason `domain` above is.
+    domain_of: str = "DOMAIN_OF"
     acted_on_behalf_of: str = "ACTED_ON_BEHALF_OF"
     supersedes: str = "SUPERSEDES"
     informed_by: str = "INFORMED_BY"
@@ -165,6 +176,10 @@ _ENTITY_NOISE_NAMES: frozenset[str] = frozenset({
     "fact", "entity", "decision", "human", "aiagent", "project",
     "activity", "milestone", "communitysummary", "reasoningtrace", "reasoningstep",
     "retrospective",
+    # Added with the domain axis (028). `Domain:` was already refused as an axis
+    # DECLARATION by _AXIS_DECLARATION_RE; this catches the bare schema word, the
+    # same way "project" has been caught since the label existed.
+    "domain", "domain_of",
     # entity type sub-labels + typed relationships (decision 472) — schema vocabulary
     "component", "system", "model", "concept", "document",
     "depends_on", "part_of", "implements", "produces", "consumes",
@@ -481,15 +496,19 @@ RETRO_RATINGS: frozenset[str] = frozenset({
 SPINE_LABELS: frozenset[str] = frozenset({
     ONT.fact, ONT.entity, ONT.community_summary, ONT.reasoning_trace,
     ONT.reasoning_step, ONT.decision, ONT.human, ONT.ai_agent,
-    ONT.project, ONT.activity, ONT.milestone, ONT.retrospective,
+    ONT.project, ONT.domain, ONT.activity, ONT.milestone, ONT.retrospective,
 })
+# ⚠ NAMING TRAP, and it is worth the two lines: `DOMAIN_LABELS` below is the
+# CONFIGURABLE vocabulary — "domain" in the ontology sense of a subject area —
+# while `ONT.domain` is the belonging AXIS and is SPINE. The two senses of the
+# word sit three lines apart, so `:Domain` belongs in the set above, never here.
 DOMAIN_LABELS: frozenset[str] = frozenset({
     ONT.component, ONT.system, ONT.model, ONT.concept, ONT.document,
 })
 SPINE_RELATIONSHIPS: frozenset[str] = frozenset({
     ONT.entity_link, ONT.entity_link_alias, ONT.aliases, ONT.summarized_by,
     ONT.reasoning_next, ONT.was_attributed_to, ONT.was_assisted_by,
-    ONT.was_generated_by, ONT.project_of, ONT.acted_on_behalf_of,
+    ONT.was_generated_by, ONT.project_of, ONT.domain_of, ONT.acted_on_behalf_of,
     ONT.supersedes, ONT.informed_by, ONT.had_outcome, ONT.references,
     ONT.produces_insight, ONT.under_conditions, ONT.considered, ONT.rejected,
     ONT.grounded_in,

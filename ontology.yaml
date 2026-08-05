@@ -17,12 +17,18 @@
 #
 #   Spine node labels (always present):
 #     Fact, Entity, CommunitySummary, Insight (a kind of CommunitySummary),
-#     Decision, Human, AIAgent, Project, Activity, Milestone,
+#     Decision, Human, AIAgent, Project, Domain, Activity, Milestone,
 #     ReasoningTrace, ReasoningStep
+#
+#   ⚠ `Domain` above is the BELONGING AXIS — a registered SECTION of one project
+#   (`operations`, `infrastructure`) — and it is spine, pinned in code. It is not
+#   the "domain vocabulary" this file configures; that is the entity sub-types and
+#   typed relationships below, which describe what a record is ABOUT. One word,
+#   two jobs: belonging is spine, aboutness is yours.
 #
 #   Spine relationships (always present) — each 1-to-1 from a JSONB field:
 #     MENTIONS, REPORTS_ON (legacy), ALIASES, SUMMARIZED_BY, NEXT_STEP,
-#     WAS_ATTRIBUTED_TO, WAS_ASSISTED_BY, WAS_GENERATED_BY, PROJECT_OF,
+#     WAS_ATTRIBUTED_TO, WAS_ASSISTED_BY, WAS_GENERATED_BY, PROJECT_OF, DOMAIN_OF,
 #     ACTED_ON_BEHALF_OF, SUPERSEDES, INFORMED_BY, HAD_OUTCOME, REFERENCES,
 #     GROUNDED_IN, CONSIDERED, REJECTED, UNDER_CONDITIONS, PRODUCES_INSIGHT
 #

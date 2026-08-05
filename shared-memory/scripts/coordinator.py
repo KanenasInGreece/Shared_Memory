@@ -62,6 +62,12 @@ from project_axis import (
     CONFUSABLE_SQL, CONFUSABLE_SIMILARITY, same_spelling, unconfirmed_confusables,
     fold_eligible, resolve_project, project_for_graph, project_merge_cypher,
 )
+from domain_axis import (
+    DOMAIN_EXISTS_SQL, DOMAIN_PROPOSALS_SQL, DOMAIN_PROPOSAL_SIMILARITY,
+    DOMAIN_PROPOSAL_LIMIT, DOMAIN_CONFUSABLE_SQL, DOMAIN_CONFUSABLE_SIMILARITY,
+    DOMAIN_ALIAS_RESOLVE_SQL, DOMAIN_REGISTER_SQL, DOMAIN_KEYS,
+    domain_merge_cypher, names_a_domain, resolve_domains,
+)
 from insight_gate import (
     INSIGHT_THRESHOLD, INSIGHT_HUB_DEGREE_CAP, insight_cluster_cypher,
 )
@@ -115,7 +121,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.46"
+FRAMEWORK_VERSION = "0.8.47"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -1325,6 +1331,7 @@ class MemoryCoordinator:
                                              # "not yet probed" must never read
                                              # as "upgrade complete".
                                              "project_identity": None,
+                                             "domain_identity": None,
                                              "inference_busy": "unknown", "fresh": False}
         self._consolidation_health_task: asyncio.Task | None = None
         self._alt_vector_task: asyncio.Task | None = None
@@ -1584,11 +1591,17 @@ class MemoryCoordinator:
                 await self._apply_project_of_outbox_row(outbox_id, pg_id, params)
                 return
 
+            if params.get("type") == "domain_of":
+                await self._apply_domain_of_outbox_row(outbox_id, pg_id, params)
+                return
+
             # Standard Fact + Entity MERGE — all writes in one round-trip so they
             # succeed or fail atomically. MERGE is idempotent — safe to retry.
             source_ref = params.get("source_ref") or None
             fact_kind = params.get("fact_kind") or "observation"
             project_id = await self._project_identity(params.get("project"))
+            domain_ids = await self._domain_identities(
+                pg_id, project_id, params.get("domains"))
             async with self._neo4j.session() as session:
                 await session.run(
                     f"MERGE (f:{ONT.fact} {{pg_id: $pg_id}})"
@@ -1616,6 +1629,30 @@ class MemoryCoordinator:
                     f" FOREACH (_ IN CASE WHEN $project <> '' THEN [1] ELSE [] END |"
                     f"   {project_merge_cypher(project_id)}"
                     f"   MERGE (f)-[:{ONT.project_of}]->(p))"
+                    # The domain chain, in the SAME round-trip (028):
+                    # (:Fact)-[:DOMAIN_OF]->(:Domain)-[:PROJECT_OF]->(:Project).
+                    # One FOREACH per named section, keyed on the registry id —
+                    # there is no name-keyed form, so an unresolved section
+                    # simply contributes no row to $domains and no edge.
+                    # The Domain→Project edge reuses PROJECT_OF rather than
+                    # inventing a second belonging relation: a section belongs
+                    # to its project in exactly the sense a record does.
+                    # ⚠ The project node is MERGED AGAIN here rather than reusing
+                    # `p`. A variable bound inside a FOREACH does not survive it,
+                    # so `p` is simply not in scope in this block — and Cypher
+                    # would reject the query outright rather than silently
+                    # writing the wrong thing. Re-merging on the same key is
+                    # idempotent and reaches the same node; the name is SET by
+                    # the project block above, so it is not repeated here.
+                    + (
+                        f" FOREACH (row IN $domains |"
+                        f"   MERGE (dp:{ONT.project} {{project_id: $project_id}})"
+                        f"   {domain_merge_cypher(id_param='row.id')}"
+                        f"   SET d.name = row.name"
+                        f"   MERGE (f)-[:{ONT.domain_of}]->(d)"
+                        f"   MERGE (d)-[:{ONT.project_of}]->(dp))"
+                        if domain_ids and project_id is not None else ""
+                    )
                     + f" WITH f"
                     f" UNWIND $entities AS ename"
                     f" MERGE (e:{ONT.entity} {{name: ename}})"
@@ -1626,6 +1663,7 @@ class MemoryCoordinator:
                     person=params.get("person") or "",
                     project=params.get("project") or "",
                     project_id=project_id,
+                    domains=domain_ids,
                     fact_kind=fact_kind,
                     entities=self._gate_graph_entities(pg_id, params.get("entities", [])),
                     **( {"source_ref": source_ref} if source_ref else {} ),
@@ -2122,6 +2160,100 @@ class MemoryCoordinator:
                 return n
         return 0
 
+    async def _inherit_domains(self, session, pg_id: int,
+                               anchor_label: str = None) -> int:
+        """A judgement's DEFAULT sections, when it asserted none of its own.
+        Returns the number of `DOMAIN_OF` edges written.
+
+        Where they come from differs by record, and each route mirrors how that
+        record already gets its PROJECT:
+
+          decision       the union of the sections of the FACTS it grounds in.
+          retrospective  the sections of the DECISION it judges — the same source
+                         its project comes from, so a verdict is always filed
+                         with what it judges.
+
+        ⛔ A GOOD DEFAULT IS NOT AN ENFORCED ONE, and for a decision that
+        distinction is the whole rule. A decision REACHES FURTHER THAN ITS
+        EVIDENCE: a fact observes that agents write to the graph directly — an
+        infrastructure observation — while the decision it provokes may govern
+        which agents are AUTHORISED to write, which is about tokens and access
+        and sits above the infrastructure that prompted it. Inheriting would cap
+        the decision at its evidence's sections, so the section that most needs
+        to surface it never would. So a decision that names its own sections
+        keeps them, and one that names none takes its evidence's — which is right
+        far more often than it is wrong, and is never a ceiling.
+
+        ⚠ THE GUARD IS THE `asserted_by` STAMP, which is why this is safe to
+        re-run from anywhere. A self-asserted edge is written bare at first
+        write; an inherited one is stamped. So "did this record name its own?"
+        is answerable from the graph, and inheritance simply declines when the
+        answer is yes. Without that test, re-running after a retrospective landed
+        would ADD the evidence's sections to a decision that deliberately chose
+        different ones — silently converting an assertion into a superset.
+
+        ⚠ A RETROSPECTIVE DELIBERATELY DOES NOT READ ITS OWN GROUNDING FACTS,
+        which would have been the obvious symmetry with the entity inheritance
+        beside it. Those facts are the LATER measurement and routinely sit in a
+        different section from the decision. Entities are ABOUTNESS and
+        legitimately come from the measurement; domain is BELONGING and comes
+        from what is being judged.
+
+        No timing defect at first write — a decision's grounding and a
+        retrospective's target both exist before the row that reads them. A
+        section added LATER does not propagate on its own;
+        `backfill_domain_of.py`'s inherit mode re-runs exactly this query, which
+        is why the rule lives here rather than in that tool.
+        """
+        anchor = anchor_label or ONT.retrospective
+        # "Names no section of its own" — a bare DOMAIN_OF is an assertion, a
+        # stamped one is a copy. Same convention the entity inheritance uses.
+        self_asserted = (
+            f" WHERE NOT EXISTS {{ MATCH (a)-[sm:{ONT.domain_of}]->()"
+            f" WHERE sm.asserted_by IS NULL }}"
+        )
+        if anchor == ONT.decision:
+            rels = "|".join(GROUNDING_RELATIONS)
+            cypher = (
+                f"MATCH (a:{ONT.decision} {{pg_id: $pg_id}})"
+                + self_asserted +
+                f" MATCH (a)-[:{rels}]->(t)"
+                f" MATCH (t)-[:{rels}*0..1]->(f:{ONT.fact})"
+                f" WHERE coalesce(f.superseded, false) = false"
+                f" MATCH (f)-[:{ONT.domain_of}]->(d:{ONT.domain})"
+                f" WITH a, collect(DISTINCT d) AS ds"
+                f" UNWIND ds AS d"
+                f" MERGE (a)-[m:{ONT.domain_of}]->(d)"
+                f"   ON CREATE SET m.asserted_by = '{RELATION_ASSERTED_INHERITED}'"
+                f" WITH count(d) AS n RETURN n"
+            )
+        else:
+            cypher = (
+                f"MATCH (a:{anchor} {{pg_id: $pg_id}})"
+                + self_asserted +
+                f" MATCH (a)<-[:{ONT.had_outcome}]-(o:{ONT.decision})"
+                f" MATCH (o)-[:{ONT.domain_of}]->(d:{ONT.domain})"
+                f" WITH a, collect(DISTINCT d) AS ds"
+                f" UNWIND ds AS d"
+                f" MERGE (a)-[m:{ONT.domain_of}]->(d)"
+                f"   ON CREATE SET m.asserted_by = '{RELATION_ASSERTED_INHERITED}'"
+                f" WITH count(d) AS n RETURN n"
+            )
+        try:
+            rec = await (await session.run(cypher, pg_id=pg_id)).single()
+        except Exception as exc:
+            # Never let the belonging axis take down the record write. The
+            # judgement, its project and its grounding are all already correct;
+            # a missing inherited section is repairable by the backfill tool,
+            # while a failed outbox row would retry the whole projection.
+            log.warning("%s pg_id=%d: domain inheritance failed, record is intact "
+                        "and the edge is repairable: %s", anchor, pg_id, exc)
+            return 0
+        n = (rec["n"] if rec else 0) or 0
+        if n:
+            log.debug("%s pg_id=%d inherited %d domain(s)", anchor, pg_id, n)
+        return n
+
     async def _apply_decision_outbox_row(
         self, outbox_id: int, pg_id: int, params: dict
     ) -> None:
@@ -2144,6 +2276,12 @@ class MemoryCoordinator:
         grounded = params.get("grounded") or []
         grounded_in_flat = params.get("grounded_in", [])
         project_id = await self._project_identity(decision.get("project"))
+        # A decision SELF-ASSERTS its sections, exactly as it self-asserts its
+        # project — it is an axis-asserting record, not an inheriting one. What
+        # it inherits is what it is ABOUT (entities, below), never where it
+        # belongs. Ingress has already registry-checked every name here.
+        domain_ids = await self._domain_identities(
+            pg_id, project_id, params.get("domains"))
         async with self._neo4j.session() as session:
             await session.run(
                 f"MERGE (d:{ONT.decision} {{pg_id: $pg_id}})"
@@ -2165,7 +2303,21 @@ class MemoryCoordinator:
                 f" WITH d"
                 f" {project_merge_cypher(project_id)}"
                 f" MERGE (d)-[:{ONT.project_of}]->(p)"
-                f" WITH d"
+                # The decision's own sections, in the same round-trip. `d` is the
+                # Decision here, so the Domain node is bound as `dm` — and the
+                # project node is re-merged inside the FOREACH because a variable
+                # bound outside one is not usable as a MERGE target within it.
+                + (
+                    f" WITH d"
+                    f" FOREACH (row IN $domains |"
+                    f"   MERGE (dp:{ONT.project} {{project_id: $project_id}})"
+                    f"   MERGE (dm:{ONT.domain} {{domain_id: row.id}})"
+                    f"   SET dm.name = row.name"
+                    f"   MERGE (d)-[:{ONT.domain_of}]->(dm)"
+                    f"   MERGE (dm)-[:{ONT.project_of}]->(dp))"
+                    if domain_ids and project_id is not None else ""
+                )
+                + f" WITH d"
                 f" FOREACH (ai_name IN $assisted_by |"
                 f"   MERGE (a:{ONT.ai_agent} {{name: ai_name}})"
                 f"   MERGE (d)-[:{ONT.was_assisted_by}]->(a)"
@@ -2178,6 +2330,7 @@ class MemoryCoordinator:
                 decided_by=decision.get("decided_by", "unknown"),
                 project=decision.get("project", "unknown"),
                 project_id=project_id,
+                domains=domain_ids,
                 assisted_by=decision.get("assisted_by", []),
             )
             # Typed decision→fact grounding (decision 582): shared writer — see
@@ -2214,6 +2367,11 @@ class MemoryCoordinator:
             # acquires them when its first retrospective lands (see the
             # retrospective projection, which re-runs this for its target).
             await self._inherit_entities_from_facts(session, pg_id)
+            # Sections, AFTER grounding exists — and unconditionally, because the
+            # call guards itself: a decision that asserted its own sections above
+            # already carries a bare DOMAIN_OF edge and this declines. One that
+            # named none takes its evidence's sections as the default.
+            await self._inherit_domains(session, pg_id, ONT.decision)
         async with self._acquire() as conn:
             await conn.execute(
                 "UPDATE neo4j_outbox SET status='applied', applied_at=now() WHERE id=$1",
@@ -2300,6 +2458,20 @@ class MemoryCoordinator:
                     await self._inherit_entities_from_facts(
                         session, target_pg_id, ONT.decision
                     )
+                    # The decision's own default may also have become reachable:
+                    # a decision that asserted no section takes its evidence's,
+                    # and this is the moment that evidence can first exist (an
+                    # ungrounded decision reaches facts through its retrospective).
+                    # Declines on a decision that named its own.
+                    await self._inherit_domains(
+                        session, target_pg_id, ONT.decision
+                    )
+                # ⚠ THE RETROSPECTIVE'S SECTIONS COME LAST, and the order is the
+                # rule rather than tidiness: it reads the DECISION's edges, so
+                # running it before the line above would read them as they were
+                # before this same transaction completed them — and a verdict
+                # would inherit nothing while the decision it judges ends up filed.
+                await self._inherit_domains(session, pg_id, ONT.retrospective)
             else:
                 superseded_clause = " SET d.superseded = true" if reversal else ""
                 await session.run(
@@ -2434,6 +2606,106 @@ class MemoryCoordinator:
         log.info(
             "outbox: backfilled PROJECT_OF pg_id=%s project=%r (outbox_id=%d, row deleted)",
             pg_id, project or "(none — skipped)", outbox_id,
+        )
+
+    async def _apply_domain_of_outbox_row(
+        self, outbox_id: int, pg_id: int, params: dict
+    ) -> None:
+        """Point an EXISTING record at its :Domain(s) — the narrow repair row
+        `backfill_domain_of.py` enqueues, in two modes.
+
+        `domains: [names]`  a FACT's sections, resolved through the registry the
+                            same way first write resolves them.
+        `inherit: true`     a JUDGEMENT's sections, re-derived by running the
+                            SAME `_inherit_domains` rule the write path runs.
+
+        ⚠ THE INHERIT MODE EXISTS SO THE RULE HAS ONE IMPLEMENTATION. The obvious
+        alternative was to let the backfill tool compute a judgement's domains
+        from Postgres — decision → grounding facts → sections — which is a second
+        expression of P17 that can drift from this one. A repair that re-derives
+        a rule is a repair that can disagree with the thing it repairs.
+
+        Narrow, like `project_of` and for the same reason: replaying an ordinary
+        fact row would re-run its `MENTIONS` merges and resurrect enrichment
+        edges a later sweep deliberately deleted.
+
+        ⚠ IT REPLACES THE SET IT MANAGES, AND ONLY THAT SET — which is why the
+        two modes delete different things, and getting that wrong is not
+        cosmetic:
+
+          explicit  deletes EVERY DOMAIN_OF edge, then writes what Postgres
+                    says. The record's own assertion is the whole answer.
+          inherit   deletes only edges STAMPED `inherited` — never a bare one.
+
+        A bare edge is a SELF-ASSERTION. If inherit mode cleared those too it
+        would delete a decision's own sections and then re-derive its evidence's,
+        silently converting a deliberate choice into the default the operator
+        chose to override — and a decision reaches further than its evidence
+        precisely so that it CAN differ. Measured: one retrospective in this
+        corpus was enqueued in both modes, and the inherit row applied second
+        replaced its edge; that came out right only because a retrospective has
+        nothing to assert. On a decision the same sequence loses data.
+
+        That is the P19 lesson applied to a MULTI-valued axis: the rule is not
+        "exactly one edge", it is "the graph mirrors the current answer rather
+        than keeping every answer" — where the current answer is the assertion
+        when there is one, and the inheritance when there is not.
+
+        One-shot, DELETED on success: it carries no dream lifecycle and must
+        never be counted as working-set backlog.
+        """
+        inherit = bool(params.get("inherit"))
+        anchor = params.get("anchor") or ONT.decision
+        written = 0
+        async with self._neo4j.session() as session:
+            # MATCH, never MERGE — a repair mints no records. A record whose node
+            # is gone leaves the row dropped rather than conjuring a phantom.
+            exists = await (await session.run(
+                f"MATCH (n:{self._SPINE}) WHERE n.pg_id = $pg_id RETURN count(n) AS n",
+                pg_id=pg_id,
+            )).single()
+            if not exists or not exists["n"]:
+                log.info("outbox: domain_of pg_id=%s has no spine node — row dropped",
+                         pg_id)
+            elif inherit:
+                # Only what inheritance owns. A bare edge is the record's own
+                # assertion and outranks any default — see the docstring.
+                await session.run(
+                    f"MATCH (n:{self._SPINE}) WHERE n.pg_id = $pg_id"
+                    f" MATCH (n)-[stale:{ONT.domain_of}]->()"
+                    f" WHERE stale.asserted_by = $stamp"
+                    f" DELETE stale",
+                    pg_id=pg_id, stamp=RELATION_ASSERTED_INHERITED,
+                )
+                written = await self._inherit_domains(session, pg_id, anchor)
+            else:
+                project_id = await self._project_identity(params.get("project"))
+                domain_ids = await self._domain_identities(
+                    pg_id, project_id, params.get("domains"))
+                await session.run(
+                    f"MATCH (n:{self._SPINE}) WHERE n.pg_id = $pg_id"
+                    f" MATCH (n)-[stale:{ONT.domain_of}]->()"
+                    f" DELETE stale",
+                    pg_id=pg_id,
+                )
+                if domain_ids and project_id is not None:
+                    await session.run(
+                        f"MATCH (n:{self._SPINE}) WHERE n.pg_id = $pg_id"
+                        f" FOREACH (row IN $domains |"
+                        f"   MERGE (dp:{ONT.project} {{project_id: $project_id}})"
+                        f"   {domain_merge_cypher(id_param='row.id')}"
+                        f"   SET d.name = row.name"
+                        f"   MERGE (n)-[:{ONT.domain_of}]->(d)"
+                        f"   MERGE (d)-[:{ONT.project_of}]->(dp))",
+                        pg_id=pg_id, domains=domain_ids, project_id=project_id,
+                    )
+                    written = len(domain_ids)
+        async with self._acquire() as conn:
+            await conn.execute("DELETE FROM neo4j_outbox WHERE id=$1", outbox_id)
+        log.info(
+            "outbox: backfilled %s pg_id=%s edges=%d mode=%s (outbox_id=%d, row deleted)",
+            ONT.domain_of, pg_id, written, "inherit" if inherit else "explicit",
+            outbox_id,
         )
 
     async def _wait_for_outbox(self, pg_id: int) -> bool:
@@ -2590,6 +2862,359 @@ class MemoryCoordinator:
                 "proposals": near,
             }
         return None
+
+    # ── Domain ingress (P17, migration 028) ──────────────────────────────────
+
+    async def _domain_ingress_error(
+        self, metadata: dict, agent_id: str
+    ) -> dict | None:
+        """The whole domain-ingress rule. Returns the 400 body, or None when the
+        save may proceed. Registers a domain the caller declares new, exactly as
+        the project protocol does — that IS the acceptance.
+
+        ⚠ IT RUNS AFTER THE PROJECT CHECK, and the order is a dependency rather
+        than a preference: a domain is a section of a project, so there is
+        nothing to resolve it against until the project has been established.
+        By the time this runs, `metadata` carries the CANONICAL project name (an
+        alias has already been rewritten), which is what makes the registry
+        lookup below reach the right sections.
+
+        ⛔ WHICH RECORD CONTROLS WHICH AXIS — the rule this enforces, and the
+        reason a retrospective is refused while a decision is not:
+
+          FACT           project OWN · domain OWN · mints its own entities
+          DECISION       project OWN · domain OWN · entities INHERITED from the
+                         facts it grounds in
+          RETROSPECTIVE  project and domain BOTH from the DECISION it judges ·
+                         entities inherited from its grounding facts
+
+        A decision is an axis-asserting record. It already self-asserts its
+        project and is registry-checked on it, and a section is the same kind of
+        claim about the same thing — so it takes the same path a fact does,
+        including registering a new section under the naming guards. What a
+        decision does NOT control is what it is ABOUT: its topics come from its
+        evidence.
+
+        ⛔ AND THIS IS WHY IT CANNOT INHERIT, which was the obvious design and is
+        wrong: A DECISION REACHES FURTHER THAN THE FACT THAT PROMPTED IT. A fact
+        observes that agents write to the graph directly — an `infrastructure`
+        observation. The decision it provokes may govern which agents are
+        AUTHORISED to write, which is about tokens and access and sits above the
+        infrastructure it was prompted by. Inheriting would file that decision
+        only where its evidence was, so the section that most needs to surface it
+        never would. The scope of a judgement is not the scope of its evidence,
+        and only the person making it knows the difference.
+
+        A retrospective controls neither axis. Its project has always come from
+        the decision it judges, and its domain now follows the same route, so a
+        verdict is always filed with what it judges rather than with the later
+        evidence that measured it. A retrospective supplying a domain is
+        therefore refused — silently stripping it was the alternative and it is
+        worse: the save succeeds, the caller sees no complaint, and the agent
+        goes on sending a field that has never once had an effect.
+        """
+        record_type = doc_record_type(metadata)
+        if record_type == "retrospective":
+            if names_a_domain(metadata):
+                return self._domain_on_judgement_rejection(record_type)
+            return None
+
+        supplied = resolve_domains(metadata)
+        if not supplied:
+            return None
+
+        # The sentinel parks a record OUTSIDE any project, so it has no sections
+        # to be a member of. Refusing here rather than looking up a registry that
+        # cannot answer keeps the message about the real mistake.
+        project = resolve_project(metadata)
+        if project == SENTINEL:
+            return {
+                "status": "error",
+                "error": "domain_without_project",
+                "message": (
+                    f"a domain is a SECTION of a project, and this record is parked "
+                    f"on {SENTINEL!r} — which is not a project and has no sections. "
+                    "Either save it under the project whose section this is, or drop "
+                    "the domain."
+                ),
+            }
+
+        project_id = await self._project_identity(project)
+        if project_id is None:
+            # The project passed its own check, so this is not an unregistered
+            # name — it is a lookup that failed. Refusing the save would turn a
+            # transient database problem into a rejected record; accepting it
+            # keeps the value in Postgres, where the backfill can reach it.
+            log.warning("domain ingress: no identity for project %r — accepting the "
+                        "record with its domain unvalidated and unlinked", project)
+            return None
+
+        for name in supplied:
+            error = await self._domain_value_error(
+                name, project, project_id, metadata, agent_id)
+            if error is not None:
+                return error
+        return None
+
+    async def _domain_value_error(
+        self, name: str, project: str, project_id: int,
+        metadata: dict, agent_id: str,
+    ) -> dict | None:
+        """One domain value, through the same protocol a project name faces.
+
+        Registered → accepted. A retired spelling → rewritten to the canonical
+        section and accepted. Otherwise the caller is told, with proposals, and a
+        second submission declaring `new_domain` registers it — subject to the
+        same two naming guards a new project faces (decision 1048), because the
+        agent that sets the flag is the agent that makes the spelling error.
+        """
+        if await self._domain_registered(project_id, name):
+            return None
+
+        canonical = await self._resolve_domain_alias(project_id, name)
+        if canonical is not None:
+            log.info("domain alias: %r → %r in project %r (record stored as the "
+                     "canonical name)", name, canonical, project)
+            self._rewrite_domain(metadata, name, canonical)
+            return None
+
+        if metadata.get("new_domain") is True:
+            refusal = await self._new_domain_refusal(name, project, project_id, metadata)
+            if refusal is not None:
+                return refusal
+            await self._register_domain(project_id, name, agent_id)
+            log.info("domain registry: %r registered under project %r by %s "
+                     "(new_domain)", name, project, agent_id)
+            return None
+
+        return await self._domain_rejection(name, project, project_id)
+
+    async def _new_domain_refusal(
+        self, name: str, project: str, project_id: int, metadata: dict,
+    ) -> dict | None:
+        """Why this NEW-domain declaration must not register — or None.
+
+        The project axis' two checks (decision 1048), scoped to one project's
+        sections. A separator/case variant of a section this project already has
+        is a SPELLING of it and no confirmation can make it distinct; a merely
+        confusable name is held once and can be confirmed by naming the section
+        it means to differ from.
+        """
+        async with self._acquire() as conn:
+            rows = await conn.fetch(DOMAIN_CONFUSABLE_SQL, project_id, name,
+                                    DOMAIN_CONFUSABLE_SIMILARITY,
+                                    DOMAIN_PROPOSAL_LIMIT)
+        near = [r["name"] for r in rows]
+
+        variant = next((n for n in near if same_spelling(n, name)), None)
+        if variant is not None:
+            log.info("domain registry: refused %r — a spelling of %r in project %r",
+                     name, variant, project)
+            return {
+                "status": "error",
+                "error": "domain_spelling_variant",
+                "message": (
+                    f"domain {name!r} differs from {variant!r}, already a section of "
+                    f"{project!r}, only in separators or capitalisation — so it is a "
+                    f"SPELLING of it and not a new section. Save under {variant!r}."
+                ),
+                "proposals": near,
+            }
+
+        unconfirmed = unconfirmed_confusables(
+            near, metadata.get("confirm_distinct_from"))
+        if unconfirmed:
+            log.info("domain registry: %r held for confirmation against %s in "
+                     "project %r", name, unconfirmed, project)
+            return {
+                "status": "error",
+                "error": "domain_confusable",
+                "message": (
+                    f"domain {name!r} is close enough to a section {project!r} "
+                    f"already has to be a typo for it: {unconfirmed}. ASK THE "
+                    "OPERATOR whether this is genuinely a separate section. If it "
+                    "is, re-send with metadata.confirm_distinct_from listing the "
+                    "sections above; if it is not, save under the existing name."
+                ),
+                "proposals": near,
+            }
+        return None
+
+    @staticmethod
+    def _rewrite_domain(metadata: dict, old: str, new: str) -> None:
+        """Replace one domain value in place, under whichever key carried it.
+
+        The record is stored under the CANONICAL section name for the same
+        reason a project alias is rewritten at ingress: resolving on every read
+        instead would leave the retired spelling in the data forever, and the
+        next save from the same source would recreate it.
+
+        ⚠ It rewrites the DECISION BLOB as well as the top level, because that is
+        where a decision carries its axis values — the same two places
+        `resolve_domains` reads. A rewriter that reached fewer places than the
+        resolver would leave the old spelling in the half nobody rewrote, which
+        is exactly the shadowed-field defect `PROJECT_MATCH_SQL` exists to warn
+        about.
+        """
+        for blob in (metadata, metadata.get("decision")):
+            if not isinstance(blob, dict):
+                continue
+            for key in DOMAIN_KEYS:
+                value = blob.get(key)
+                if isinstance(value, str) and value.strip() == old:
+                    blob[key] = new
+                elif isinstance(value, (list, tuple)):
+                    blob[key] = [
+                        new if isinstance(v, str) and v.strip() == old else v
+                        for v in value
+                    ]
+
+    async def _domain_identities(
+        self, pg_id: int, project_id, raw_domains,
+    ) -> list[dict]:
+        """Resolve a record's domain NAMES to [{id, name}] for the graph write.
+
+        Returns only the sections the registry can identify, in the order they
+        were named. A name that resolves to nothing is LOGGED and dropped — the
+        no-name-keyed-fallback invariant — and the value stays verbatim in the
+        record's Postgres metadata, so `backfill_domain_of.py` can write the edge
+        once the section is registered.
+
+        ⚠ AN UNRESOLVED NAME IS NOT NORMAL HERE. Ingress refuses an unregistered
+        domain, so by the time a row is applied the registry has already
+        answered. Reaching this path means something changed underneath the row
+        — a section deleted between enqueue and apply, or a row enqueued by a
+        tool rather than by ingress — which is exactly why it gets a warning
+        rather than a debug line.
+        """
+        names = [n for n in (raw_domains or []) if isinstance(n, str) and n.strip()]
+        if not names or project_id is None:
+            if names:
+                log.warning("outbox: pg_id=%s names %d domain(s) but its project has "
+                            "no registry identity — no %s edge written",
+                            pg_id, len(names), ONT.domain_of)
+            return []
+        out: list[dict] = []
+        for name in names:
+            domain_id = await self._domain_identity(project_id, name)
+            if domain_id is None:
+                log.warning("outbox: domain %r is not a registered section of "
+                            "project id %s (pg_id=%s) — no %s edge written; the "
+                            "value is kept in the record's metadata",
+                            name, project_id, pg_id, ONT.domain_of)
+                continue
+            out.append({"id": domain_id, "name": name.strip()})
+        return out
+
+    async def _domain_registered(self, project_id: int, name: str) -> bool:
+        """Is this an established section of that project? (migration 028.)"""
+        async with self._acquire() as conn:
+            return await conn.fetchval(DOMAIN_EXISTS_SQL, project_id, name) is not None
+
+    async def _domain_identity(self, project_id, name) -> int | None:
+        """The registry id behind (project, section name), or None.
+
+        Uncached for the same reason ``_project_identity`` is: one indexed lookup
+        on a path already writing to two stores, and a cache would hold a stale
+        answer across exactly the operation an identity exists to survive.
+
+        None takes the write down the no-edge path — there is deliberately no
+        name-keyed rescue on this axis. See ``domain_merge_cypher``.
+        """
+        if project_id is None or not isinstance(name, str) or not name.strip():
+            return None
+        try:
+            async with self._acquire() as conn:
+                return await conn.fetchval(DOMAIN_EXISTS_SQL, project_id, name.strip())
+        except Exception as exc:
+            log.warning("domain identity lookup failed for %r in project id %s, "
+                        "the record keeps its domain and gets no edge: %s",
+                        name, project_id, exc)
+            return None
+
+    async def _resolve_domain_alias(self, project_id: int, name: str) -> str | None:
+        """The canonical section a retired spelling resolves to, or None.
+
+        ONE lookup, never a walk, and scoped to the project — the same shape as
+        the project alias resolver, for the same two reasons: chains are
+        collapsed when a rename is written, and a walk on the ingress path can
+        cycle. Failure is treated as "not an alias" so an error here produces the
+        ordinary rejection rather than a 500.
+        """
+        try:
+            async with self._acquire() as conn:
+                return await conn.fetchval(DOMAIN_ALIAS_RESOLVE_SQL, project_id, name)
+        except Exception as exc:
+            log.warning("domain alias lookup failed for %r, treating as unknown: %s",
+                        name, exc)
+            return None
+
+    async def _register_domain(self, project_id: int, name: str, agent_id: str) -> None:
+        """Register a section the caller declared new.
+
+        No description, for the same reason a new project gets none: it is owed
+        from the operator, and a placeholder would claim one was supplied. On
+        this axis that costs more than on the project axis — descriptions are
+        half of how domain proposals work — so an undescribed section is a real,
+        visible gap rather than a cosmetic one.
+        """
+        async with self._acquire() as conn:
+            await conn.execute(DOMAIN_REGISTER_SQL, project_id, name,
+                               agent_id or "unknown")
+
+    async def _domain_proposals(self, project_id: int, name: str) -> list[str]:
+        """Sections of THIS project near a value that missed — by name or by
+        description. The description half is what lets an operator reach a
+        section whose name they could not have guessed."""
+        async with self._acquire() as conn:
+            rows = await conn.fetch(
+                DOMAIN_PROPOSALS_SQL, project_id, name,
+                DOMAIN_PROPOSAL_SIMILARITY, DOMAIN_PROPOSAL_LIMIT,
+            )
+        return [r["name"] for r in rows]
+
+    def _domain_on_judgement_rejection(self, record_type: str) -> dict:
+        """The 400 a retrospective gets for naming a domain.
+
+        Only a retrospective reaches this. A decision self-asserts both axes and
+        goes down the ordinary registry path — see `_domain_ingress_error` for
+        which record controls what.
+        """
+        return {
+            "status": "error",
+            "error": "domain_not_allowed_on_judgement",
+            "message": (
+                f"a {record_type} does not name its own domain, for the same reason "
+                "it does not name its own project: both come from the DECISION it "
+                "judges, so a verdict is always filed with what it judges. Remove "
+                "the field and save again. If the section is wrong, it is wrong on "
+                "the decision — fix it there and this record follows."
+            ),
+        }
+
+    async def _domain_rejection(
+        self, name: str, project: str, project_id: int
+    ) -> dict:
+        """The 400 body for an unregistered section. One status code, so a client
+        branches on `error`; the message tells the model to ASK rather than
+        infer, because a plausible wrong section is a record filed under a name
+        nobody will think to look in."""
+        proposals = await self._domain_proposals(project_id, name)
+        body = {
+            "status": "error",
+            "error": "domain_unknown",
+            "message": (
+                f"domain {name!r} is not a registered section of project {project!r}. "
+                "Either it is a typo for one of the proposals, or it is a new "
+                "section, in which case re-send with metadata.new_domain = true to "
+                "register it. ASK THE OPERATOR which, rather than picking for them. "
+                "A record needs no domain at all — leaving it off files the record "
+                "under its project, which is always correct."
+            ),
+        }
+        if proposals:
+            body["proposals"] = proposals
+        return body
 
     async def _project_registered(self, name: str) -> bool:
         """Is this an established project? (P4, migration 022's registry.)"""
@@ -2848,6 +3473,15 @@ class MemoryCoordinator:
         if project_error is not None:
             return web.json_response(project_error, status=400)
 
+        # The domain axis (028), AFTER the project — a section cannot be resolved
+        # before the project that contains it, and by here the project name is
+        # canonical, so an aliased project reaches the right registry. A record
+        # naming no domain passes straight through: most do, and that is correct
+        # rather than untagged.
+        domain_error = await self._domain_ingress_error(metadata, agent_id)
+        if domain_error is not None:
+            return web.json_response(domain_error, status=400)
+
         # Fact supersession (decision 381, refined by 384): an optional
         # `supersedes` pointer marks an existing fact superseded by THIS save.
         # Validated at ingress — target must exist and not already be superseded —
@@ -2980,6 +3614,16 @@ class MemoryCoordinator:
                             # project set, where the insight gate's ">= 2 distinct
                             # projects" rule would count it as a subject.
                             "project": project_for_graph(metadata),
+                            # The SECTIONS of that project this record sits in
+                            # (028) — a list, because a record may sit in
+                            # several. Carried as NAMES and resolved to registry
+                            # ids by the worker, exactly as `project` is: the
+                            # outbox row must stay replayable, and an id
+                            # captured here would be a snapshot of the registry
+                            # at enqueue time rather than at apply time.
+                            # Judgements never reach this with a value — ingress
+                            # refuses one, and their domains are inherited.
+                            "domains": resolve_domains(metadata),
                             "type": metadata.get("type", "fact"),
                             "decision": metadata.get("decision", {}),
                             "source_ref": metadata.get("source_ref") or None,
@@ -3294,6 +3938,16 @@ class MemoryCoordinator:
                              "(outcome states — nuance belongs in the notes)")},
                 status=400,
             )
+
+        # P17 on this endpoint too. It reads differently here and that is exactly
+        # why it is needed: this handler BUILDS its own metadata from named body
+        # fields, so a client-supplied domain never reaches storage anyway — it
+        # is dropped on the floor with no complaint. Silence is what the rule is
+        # against. A retrospective inherits the domains of the facts it grounds
+        # in; being told so once is what stops an agent sending the field forever.
+        if names_a_domain(body):
+            return web.json_response(
+                self._domain_on_judgement_rejection("retrospective"), status=400)
 
         # Reversal (decision 276): rating 'reversed' is the structural rating —
         # it marks the DECISION superseded in both stores (Tier-1 filter +
@@ -5175,6 +5829,76 @@ class MemoryCoordinator:
             "complete": unidentified == 0 and mismatched == 0,
         }
 
+    async def _domain_identity_health(self) -> dict:
+        """Is the domain registry consistent with the graph? (P13, migration 028.)
+
+        The same question `project_identity` answers, asked of an axis that is
+        keyed on its identity from the first day — so the shapes it can go wrong
+        in are narrower and mean different things:
+
+          ``unregistered``  a `:Domain` node whose id is in no registry row. On
+                            this axis that is the ONLY real defect, and unlike
+                            its project twin it cannot be produced by the
+                            ordinary ingress→outbox window: a domain is
+                            registered BEFORE it can be written, so a node
+                            without a row means a row was deleted underneath it.
+          ``mismatched``    a node whose name disagrees with its registry row's
+                            — a rename that has not reached the graph. Harmless
+                            to belonging (the id is what edges hang off) and
+                            visible because a stale label is what a human reads.
+          ``unattached``    a `:Domain` with no `PROJECT_OF` edge — a section
+                            belonging to no project.
+
+        ⚠ `unattached` IS HERE FOR A TRAVERSAL THAT DOES NOT EXIST YET, and that
+        is deliberate rather than premature. Cross-project and cross-domain
+        synthesis will walk `(:Domain)<-[:DOMAIN_OF]-(record)-[:GROUNDED_IN]->
+        (:Fact)` and reach a project through `(:Domain)-[:PROJECT_OF]->`, then
+        count DISTINCT `domain_id` the same way the insight gate counts DISTINCT
+        `project_id` today. Both halves of that walk are properties of how the
+        node is WRITTEN, so they can be broken now and only discovered when the
+        gate is built — at which point a section silently missing from a walk
+        looks like a quiet corpus, which is the failure mode this whole axis
+        exists to remove. A number that is zero today is what makes it provable
+        that it stayed zero.
+
+        ⚠ FEWER NODES THAN REGISTRY ROWS IS THE NORMAL RESTING STATE and is not
+        counted, exactly as on the project axis: a section nobody has filed a
+        record under has no node. The registry is a superset by construction.
+
+        ⚠ THE READ ORDER IS PART OF THE RULE: graph FIRST, registry SECOND, so
+        the registry snapshot is never older than the node snapshot and a section
+        registered concurrently cannot present as `unregistered`.
+        """
+        async with self._neo4j.session() as session:
+            rows = await (await session.run(
+                f"MATCH (d:{ONT.domain})"
+                f" RETURN d.domain_id AS domain_id, d.name AS name,"
+                f"        EXISTS {{ (d)-[:{ONT.project_of}]->(:{ONT.project}) }}"
+                f"          AS attached"
+            )).data()
+        async with self._acquire() as conn:
+            registry = {
+                r["id"]: r["name"]
+                for r in await conn.fetch("SELECT id, name FROM project_domains")
+            }
+        unregistered = mismatched = unattached = 0
+        for row in rows:
+            expected = registry.get(row["domain_id"])
+            if expected is None:
+                unregistered += 1
+            elif row["name"] != expected:
+                mismatched += 1
+            if not row["attached"]:
+                unattached += 1
+        return {
+            "nodes": len(rows),
+            "registry_rows": len(registry),
+            "unregistered": unregistered,
+            "mismatched": mismatched,
+            "unattached": unattached,
+            "complete": unregistered == 0 and mismatched == 0 and unattached == 0,
+        }
+
     async def _consolidation_telemetry(self) -> dict:
         """Full consolidation section for /memory/telemetry (computed fresh)."""
         return await self._compute_consolidation_health()
@@ -5210,6 +5934,13 @@ class MemoryCoordinator:
                     # roll-up keys get below.
                     invalid_nodes = None
                 try:
+                    domain_identity = await self._domain_identity_health()
+                except Exception:
+                    # Same tolerance, same reason as the project probe below: a
+                    # metric about registry drift must never present as a
+                    # stalled system.
+                    domain_identity = None
+                try:
                     project_identity = await self._project_identity_health()
                 except Exception:
                     # Same tolerance, and the same reason it must be guarded at
@@ -5221,6 +5952,7 @@ class MemoryCoordinator:
                     "stalled": full["stalled"],
                     "graph_invalid_nodes": invalid_nodes,
                     "project_identity": project_identity,
+                    "domain_identity": domain_identity,
                     "last_outcome": full["last_outcome"],
                     "last_success_age_seconds": full["last_success_age_seconds"],
                     # Which type the headline age belongs to, and who is

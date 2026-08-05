@@ -345,8 +345,12 @@ async def test_apply_decision_outbox_row_writes_correct_nodes():
 
     await c._apply_decision_outbox_row(outbox_id=1, pg_id=42, params=params)
 
-    # Two statements now: the Decision projection, then entity INHERITANCE.
-    assert mock_session.run.await_count == 2
+    # Three statements now: the Decision projection, then entity INHERITANCE,
+    # then the DEFAULT-SECTION pass (028). The third runs unconditionally and
+    # guards itself — a decision that asserted its own sections already carries
+    # a bare DOMAIN_OF edge and the query declines; this one asserted none, so
+    # it takes its grounding facts'.
+    assert mock_session.run.await_count == 3
     cypher_call = mock_session.run.call_args_list[0]
     cypher = cypher_call.args[0]
     assert "Decision" in cypher
@@ -430,7 +434,8 @@ async def test_apply_decision_outbox_row_handles_empty_assisted_by():
     }
 
     await c._apply_decision_outbox_row(outbox_id=2, pg_id=50, params=params)
-    assert mock_session.run.await_count == 2   # projection + entity inheritance
+    # projection + entity inheritance + default-section pass (028)
+    assert mock_session.run.await_count == 3
     mock_conn.execute.assert_awaited()
 
 

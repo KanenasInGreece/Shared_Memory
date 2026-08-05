@@ -1581,10 +1581,15 @@ class REMDaemon:
         namings = f"COUNT {{ {_live_naming} }}"
         async with self.driver.session() as session:
             result = await session.run(
-                # :Project is deliberately NOT offered. REM cannot write to one
-                # (see _KNOWN_LABELS), and a prompt that hides a gate the code
-                # HAS invites volume the gate then throws away — the same
-                # reasoning as _VERIFY_RULE, applied to the registry.
+                # :Project and :Domain are deliberately NOT offered. REM cannot
+                # write to either (see _KNOWN_LABELS), and a prompt that hides a
+                # gate the code HAS invites volume the gate then throws away —
+                # the same reasoning as _VERIFY_RULE, applied to the registry.
+                # Both are BELONGING axes: they are established at first write
+                # from the record's own claim, never proposed by enrichment.
+                # This clause is an ALLOWLIST, so a label absent from it is
+                # unreachable — but say so, because "absent" and "excluded on
+                # purpose" read identically to the next person editing it.
                 f"MATCH (n)"
                 f" WHERE n:{ONT.human} OR n:{ONT.ai_agent}"
                 f"    OR n:{ONT.decision}"
