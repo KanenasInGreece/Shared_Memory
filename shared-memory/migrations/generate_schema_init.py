@@ -101,7 +101,8 @@ def fetch_tables(cur) -> list[str]:
 
 def fetch_columns(cur, table: str) -> list[dict]:
     cur.execute("""
-        SELECT column_name, data_type, udt_name, is_nullable, column_default
+        SELECT column_name, data_type, udt_name, is_nullable, column_default,
+               is_identity, identity_generation
         FROM information_schema.columns
         WHERE table_schema = 'public' AND table_name = %s
         ORDER BY ordinal_position
@@ -344,11 +345,26 @@ def render_column(cur, table: str, col: dict, pk_cols: set[str]) -> str:
         ctype = "BIGSERIAL" if ctype == "BIGINT" else "SERIAL"
         default = ""
 
+    # ⚠ AN IDENTITY COLUMN HAS NO `column_default` — it is generated, not
+    # defaulted, and information_schema reports it in two separate columns. A
+    # renderer that reads only the default emits a bare `BIGINT PRIMARY KEY`,
+    # which is valid DDL, applies without error, and leaves a fresh install
+    # unable to INSERT a single row: every write must then supply the key it was
+    # the database's job to issue. That is the THIRD class of DDL this generator
+    # has been found dropping — after every CHECK and every FOREIGN KEY — and
+    # all three shared one shape: invisible to the whole suite, because the only
+    # thing that reads this file is an install nobody re-inspects.
+    identity = ""
+    if col.get("is_identity") == "YES":
+        identity = f"GENERATED {col.get('identity_generation') or 'BY DEFAULT'} AS IDENTITY"
+
     parts = [f"    {name:<16} {ctype}"]
     if name in pk_cols:
         parts.append("PRIMARY KEY")
     elif col["is_nullable"] == "NO":
         parts.append("NOT NULL")
+    if identity:
+        parts.append(identity)
     if default and "nextval" not in default:
         parts.append(f"DEFAULT {default}")
     return " ".join(parts)

@@ -256,11 +256,23 @@ So the triage order is: `/health` → `stalled_types` → then switch to `status
 ```bash
 git pull
 uv run --with psycopg2-binary python shared-memory/migrations/apply.py   # BEFORE restart
+uv run --with psycopg2-binary --with neo4j python \
+    shared-memory/scripts/reconcile_project_identity.py --apply          # graph half of a migration
 uv run --with neo4j python shared-memory/migrations/verify_neo4j_init.py # Neo4j has NO ledger
 systemctl --user restart hive-mind-gateway.service
 curl -s http://localhost:8888/health                                     # api_version, status ok
 bash shared-memory/scripts/sync_skills.sh                                # refresh installed skills
 ```
+
+⚠ **`reconcile_project_identity.py` is the graph half of a Postgres migration, and no migration can
+run it for you.** A project's identity is a registry row id; the `:Project` node carries that id so the
+cross-project fold gate can count *identities* rather than a renameable name. `apply.py` creates the ids
+and cannot reach Neo4j, so this stamps the nodes. It is idempotent and read-only without `--apply` — run
+it on every upgrade, exactly like the Neo4j constraint check, and for the same reason. **Skipping it
+does not break writes**: records still save, still search, still enrich. What stops is *cross-project
+synthesis* — the gate fails closed on a node with no identity — which presents as a system with nothing
+to fold rather than as an error. `GET /health` → `project_identity` is where that state is visible
+(`complete: false` with an `unidentified` count).
 
 ⚠ **Run the Neo4j check on every upgrade, and do not assume it is redundant.** `apply.py` covers Postgres only, and Postgres has a migration ledger that records what has been applied. **Neo4j has none** — `neo4j_init.cypher` is a one-time manual step, so a long-lived instance enforces whatever constraint set was true the day someone last ran it, and a constraint added to the file in a later release reaches new installs and nobody else. A missing uniqueness constraint is silent: `MERGE` keeps working and the only symptom is a duplicate node appearing under a race. Add `--apply` to create what is missing; it exits 1 when a declared constraint is not in force, so it is safe to gate on. *(This is not hypothetical — the deployment this framework was built on was enforcing one of the seven declared constraints, and a plain index on `Entity.name` was blocking a second. `--apply` handles that case; re-running `neo4j_init.cypher` does not.)*
 
