@@ -53,7 +53,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   on the mutable name is dropped: a ledger that remembers a name must not be
   forced to forget it when that name stops being current.
 
+- **A decision's project is now checked against the registry, like a fact's.** Decisions were exempt, and the reasoning that exempted them mistook *presence* for *validity*: a decision does fail without a project field, but a present name that no registry knew was accepted, and the graph write then minted a project node for it. That is the one way the graph can end up holding a project the registry does not have — and unlike the ingress→outbox window, which leaves the graph *behind* the registry and always resolves itself, it never does. Retrospectives stay exempt, and that one is a scope statement rather than an oversight: they arrive on their own endpoint and inherit the project of the decision they judge.
+
 ### Added
+
+- **Both facts and decisions may introduce a NEW project — and the gateway judges the name, not the claim.** Work legitimately starts before its project exists: a discussion produces an idea, the idea is saved as a fact, and a decision grounded on that fact commits to acting on it. So `new_project` is available on both record types (`--new-project` on `save_decision`, and the existing metadata field on a fact), declared **once**, on the first record that names the project.
+
+  But a declaration is not a defence, because **the client that sets the flag is the client that makes the spelling error**. Two refusals now stand in front of the registry:
+
+  - **`project_spelling_variant` — not overridable.** Names reduce to a comparison key (lowercase, alphanumerics only), so a proposal differing from a registered project only in separators or capitalisation is refused outright, naming the spelling to use. No confirmation can make it a separate project, because it is not one — every retired spelling this framework's registry carries as an alias arrived in exactly that shape.
+  - **`project_confusable` — refused once, then confirmable.** Above a trigram-similarity floor the response names the registered projects the proposal is close to, and the caller proceeds only by naming them back in `confirm_distinct_from` (`--distinct-from`). The confirmation is the neighbour's **name**, deliberately not a second boolean: a flag can be flipped without reading anything, while the name cannot be produced without having seen it. Each near match is its own claim — confirming one does not wave through another.
+
+  **The floor is derived, not guessed, and is env-overridable** (`PROJECT_CONFUSABLE_SIMILARITY`, default `0.60`) because it depends on how a deployment names things. Measured over all 666 pairs of one live 37-project registry: the closest legitimately *distinct* pair scored 0.500 and no pair reached 0.6, while typos of a registered name scored 0.78–1.00 and separator/case variants scored exactly 1.00. The default sits in the gap. Too low trains the reflex to override; too high never fires.
+
+  ⚠ Two things this deliberately does **not** do: it never auto-corrects a near-miss onto the closest registered project (that is inference, and a plausible wrong project is worse than a parked one), and it never refuses a similar name outright (a genuinely separate project with a similar name is real, and the operator is the one who knows).
 
 - **`scripts/reconcile_project_identity.py`** — the graph half of a Postgres
   migration, which no migration can perform. It stamps existing project nodes
