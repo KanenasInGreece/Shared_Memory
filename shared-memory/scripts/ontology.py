@@ -174,14 +174,46 @@ _ENTITY_NOISE_NAMES: frozenset[str] = frozenset({
 _NUMERIC_NAME_RE = re.compile(r"^[0-9]+$")
 _WHITESPACE_RE = re.compile(r"\s+")
 
+# An AXIS DECLARATION is not a topic name (P14/P18). A name of the form
+# `Project: <something>` states which project a record BELONGS TO — that is
+# established at first write from the client's working directory, or later by the
+# promotion writer, and it is carried by the PROJECT_OF edge. Writing it into the
+# topic vocabulary as well makes the axis a hub that records cluster on, which is
+# how a project name ends up anchoring a Tier-3 narrative that is about a project
+# rather than about a theme.
+#
+# ⚠ DELIBERATELY A FORM TEST, NEVER A REGISTRY LOOKUP. Resolving a BARE name
+# against the project registry would be the obvious implementation and it is
+# wrong: registered project names are frequently real topics too — a project is
+# often named after the very thing its records discuss, and short registry names
+# are ordinary English words. Measured on a live corpus, one registry row was
+# simultaneously a `:System` entity carrying 91 inbound edges; a gate that
+# resolved bare names would have deleted a hub of true statements the same size
+# as the axis hub it was meant to remove.
+# A name that spells out `Project:` has declared
+# which axis it is on; a bare name has declared nothing. Keeping it a form test
+# also keeps this function PURE — no database, no I/O, same contract as every
+# other rule here.
+#
+# `Domain:` is included before the domain axis exists, on purpose: the axis is
+# specified and the same mistake is otherwise made twice.
+_AXIS_DECLARATION_RE = re.compile(r"^\s*(?:project|domain)\s*:", re.IGNORECASE)
+
 
 def sanitize_entity_name(raw: object) -> str | None:
     """Normalise and validate one entity name. Returns the cleaned name, or None
     if it must be rejected. Pure and deterministic — no I/O.
 
     Rejection rules: non-string / empty after strip; numeric-only (leaked pg-ids,
-    counts); shorter than MIN_ENTITY_NAME_LEN; lowercased form in the noise set.
-    Internal whitespace is collapsed to a single space; casing is preserved.
+    counts); shorter than MIN_ENTITY_NAME_LEN; lowercased form in the noise set;
+    an axis declaration (`Project:` / `Domain:` prefix — see
+    _AXIS_DECLARATION_RE). Internal whitespace is collapsed to a single space;
+    casing is preserved.
+
+    ⚠ This gate governs what reaches the GRAPH, never what is stored. Its callers
+    are the outbox→graph projection and REM's proposal gate; the Postgres write
+    path does not run it, so a rejected name stays verbatim in the record's
+    metadata (Tier 1 pristine) and remains searchable there.
     """
     if not isinstance(raw, str):
         return None
@@ -193,6 +225,8 @@ def sanitize_entity_name(raw: object) -> str | None:
     if len(name) < MIN_ENTITY_NAME_LEN:
         return None
     if name.lower() in _ENTITY_NOISE_NAMES:
+        return None
+    if _AXIS_DECLARATION_RE.match(name):
         return None
     return name
 

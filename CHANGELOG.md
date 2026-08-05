@@ -5,6 +5,52 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.43] — 2026-08-05
+
+### Fixed
+
+- **An axis declaration can no longer enter the graph as a topic.** A project
+  says which project a record *belongs to*. It is established at first write
+  from the client's working directory, and it is carried by its own edge — it is
+  never a subject a record can be *about*. A previous release closed the typed
+  door: the enrichment daemon can no longer create a project node, nor point any
+  relation at one. This closes the untyped door beside it, which is the one the
+  data actually came through.
+
+  A name of the form `Project: <something>` is an ordinary entity name. It never
+  touches the label allowlist, so nothing in the typed gate could see it, and it
+  arrived on the same relation every genuine topic uses. Measured on a live
+  corpus before the repair: **eleven such entities carrying 152 inbound edges**,
+  the largest of them the graph's second-biggest hub with 91. Every record that
+  merely *named* a project was being clustered with every other record naming
+  it — which is a cluster keyed on the axis, not on a theme, and it had reached
+  the point of anchoring narrative folds.
+
+  The inbound entity-name gate now rejects the `Project:` / `Domain:` form
+  wherever names enter the graph.
+
+  **This is deliberately a test of the name's FORM, never a lookup against the
+  project registry** — the obvious implementation, and the wrong one. Registered
+  project names are frequently real topics in their own right: a project is
+  often named after the very thing its records discuss, and short registry names
+  are ordinary English words. Measured on this corpus, one registry row was
+  simultaneously a system entity carrying 91 inbound edges — a gate that
+  resolved bare names against the registry would have deleted a hub of true
+  statements the same size as the axis hub it was meant to remove. A name that
+  spells out `Project:` has declared which axis it is on; a bare name has
+  declared nothing. Keeping it a form test also keeps the check pure — no
+  database, no I/O.
+
+  `Domain:` is rejected before the domain axis exists, on purpose: the axis is
+  specified, and the same mistake is otherwise made twice.
+
+  ⚠ **The gate governs what reaches the graph, never what is stored.** A
+  rejected name stays verbatim in the record's own metadata and remains
+  searchable there — the episodic tier is left pristine, as it is for every
+  other name this gate rejects.
+
+---
+
 ## [0.8.42] — 2026-08-04
 
 ### Fixed
