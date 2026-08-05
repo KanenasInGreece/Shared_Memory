@@ -778,6 +778,8 @@ def build_decision_metadata(
     entities: str = "",
     grounded_in: str = "",
     elicited: bool = False,
+    new_project: bool = False,
+    distinct_from: str = "",
 ) -> tuple:
     """Build (content, metadata) for a decision save.
 
@@ -834,6 +836,22 @@ def build_decision_metadata(
     # elicited null is a deliberate choice; coverage telemetry counts the ask.
     if elicited:
         metadata["elicited"] = True
+    # new_project: the OPERATOR has confirmed this project is new, so the save
+    # registers it instead of being refused. It is deliberately not a default
+    # and deliberately not inferred: from v0.8.44 a decision's project is
+    # checked against the registry, which only means anything if declaring a new
+    # one is a deliberate act. An agent that sets this to clear its own
+    # rejection has converted a typo into a permanent project.
+    if new_project:
+        metadata["new_project"] = True
+    # confirm_distinct_from: the registered projects this new one is deliberately
+    # NOT. The gateway refuses a new name that is confusable with an existing one
+    # until they are named, because naming the neighbour is something an agent
+    # cannot do without having looked at it — which is what puts the choice in
+    # front of the operator instead of inside the agent.
+    df = [d.strip() for d in (distinct_from or "").split(",") if d.strip()]
+    if df:
+        metadata["confirm_distinct_from"] = df
     return content, metadata
 
 
@@ -1215,6 +1233,19 @@ async def main() -> None:
         p.add_argument("--elicited",    action="store_true",
                        help="The spine fields were elicited from the operator (an elicited "
                             "null is deliberate; coverage telemetry counts the ask)")
+        p.add_argument("--distinct-from", default="",
+                       help="Comma-separated REGISTERED projects this new project "
+                            "is deliberately not. Required only when the gateway "
+                            "refuses the name as confusable with one of them — and "
+                            "it names which. Confirm with the operator first.")
+        p.add_argument("--new-project", action="store_true",
+                       help="THE OPERATOR HAS CONFIRMED this project is new and "
+                            "registers it. Only ever pass this after asking: a "
+                            "decision can now introduce a project, and the whole "
+                            "point of the registry is that a misspelling and a new "
+                            "project stop being the same event. Without it, an "
+                            "unregistered name is refused and answered with near "
+                            "matches from the registry.")
         args = p.parse_args(sys.argv[2:])
         content, metadata = build_decision_metadata(
             title=args.title,
@@ -1228,6 +1259,8 @@ async def main() -> None:
             entities=args.entities,
             grounded_in=args.grounded_in,
             elicited=args.elicited,
+            new_project=args.new_project,
+            distinct_from=args.distinct_from,
         )
         print(json.dumps(await save_artifact(content, metadata), indent=2))
     elif action == "save_retrospective":

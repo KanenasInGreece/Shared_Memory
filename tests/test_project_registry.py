@@ -30,6 +30,15 @@ def _coord(registered=("shared-memory-GitHub",), proposals=()):
     c._project_registered = AsyncMock(side_effect=lambda n: n in registered)
     c._project_proposals = AsyncMock(return_value=list(proposals))
     c._register_project = AsyncMock()
+    # No confusable neighbours unless a test says otherwise — the ordinary case
+    # for a genuinely new name, and the one the guard must stay quiet for.
+    conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[])
+    conn.fetchval = AsyncMock(return_value=None)
+    acq = MagicMock()
+    acq.__aenter__ = AsyncMock(return_value=conn)
+    acq.__aexit__ = AsyncMock(return_value=False)
+    c._acquire = MagicMock(return_value=acq)
     return c
 
 
@@ -75,13 +84,80 @@ async def test_an_unregistered_project_is_rejected_with_proposals():
 
 
 @pytest.mark.asyncio
-async def test_judgements_are_out_of_scope_here():
-    """Decisions already fail without decision.project further down handle_save;
-    retrospectives use their own endpoint and inherit the target's project.
-    Checking them again here would reject every retrospective."""
+async def test_a_retrospective_is_out_of_scope_here():
+    """It arrives on its own endpoint and inherits the project of the decision
+    it judges — a decision that passed this check itself. Re-checking here would
+    demand a value the caller never supplies and reject every retrospective."""
     coord = _coord()
-    assert await coord._project_ingress_error({"type": "decision"}, "c") is None
     assert await coord._project_ingress_error({"type": "retrospective"}, "c") is None
+
+
+@pytest.mark.asyncio
+async def test_a_decision_naming_an_unregistered_project_is_rejected():
+    """v0.8.44. Decisions were excluded from this check, and the reasoning that
+    excluded them mistook PRESENCE for VALIDITY: a decision does fail without
+    decision.project, but a present name no registry knew was accepted, and the
+    outbox then minted a project node for it. That is the one way the graph can
+    hold a project the registry does not — and unlike the ingress→outbox window
+    (which leaves the graph BEHIND the registry, always safe) it never resolves
+    itself."""
+    coord = _coord(proposals=["shared-memory-GitHub"])
+    err = await coord._project_ingress_error(
+        {"type": "decision", "decision": {"project": "shared-memry-GitHub"}}, "c")
+    assert err is not None
+    assert err["error"] == "project_unknown"
+    assert err["proposals"] == ["shared-memory-GitHub"]
+
+
+@pytest.mark.asyncio
+async def test_a_decision_on_a_registered_project_passes():
+    coord = _coord()
+    assert await coord._project_ingress_error(
+        {"type": "decision", "decision": {"project": "shared-memory-GitHub"}}, "c") is None
+
+
+@pytest.mark.asyncio
+async def test_a_decision_may_declare_a_new_project_with_the_operator_s_confirmation():
+    """The flow this exists for: a discussion produces an idea, the idea is
+    saved as a fact, and a decision grounded on that fact commits to acting on
+    it — and until that moment the project does not exist. So a decision must be
+    able to introduce one. What it must NOT be able to do is introduce one
+    silently, which is why the declaration is an explicit flag and not a
+    fallback."""
+    coord = _coord(registered=())
+    assert await coord._project_ingress_error(
+        {"type": "decision", "new_project": True,
+         "decision": {"project": "brand-new"}}, "c") is None
+    coord._register_project.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_decision_declared_once_needs_no_flag_on_the_records_that_follow():
+    """It is declared ONCE, on the first record that names it. Everything saved
+    afterwards in the same flow finds it registered — which is what makes the
+    confirmation a single deliberate act rather than a prompt on every save."""
+    registry = set()
+    coord = _coord(registered=registry)
+    coord._project_registered = AsyncMock(side_effect=lambda n: n in registry)
+    coord._register_project = AsyncMock(side_effect=lambda n, a: registry.add(n))
+
+    first = await coord._project_ingress_error(
+        {"source": "c", "project": "brand-new", "new_project": True}, "c")
+    second = await coord._project_ingress_error(
+        {"type": "decision", "decision": {"project": "brand-new"}}, "c")
+    assert first is None and second is None
+    coord._register_project.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_decisions_retired_spelling_is_rewritten_in_the_decision_blob():
+    """The alias rewrite has always known where a decision keeps its project;
+    only the early return kept decisions from reaching it."""
+    coord = _coord(registered=("shared-memory-GitHub",))
+    coord._resolve_project_alias = AsyncMock(return_value="shared-memory-GitHub")
+    metadata = {"type": "decision", "decision": {"project": "shared_memory"}}
+    assert await coord._project_ingress_error(metadata, "c") is None
+    assert metadata["decision"]["project"] == "shared-memory-GitHub"
 
 
 # ── P9 — the second submission is accepted, in three forms ──────────────────
@@ -98,8 +174,112 @@ async def test_second_submission_form_2_declares_a_new_project():
     coord = _coord(registered=())
     assert await coord._project_ingress_error(
         {"source": "c", "project": "brand-new", "new_project": True}, "c") is None
+
+
+# ── P23 — a declaration is not a defence ────────────────────────────────────
+#
+# The agent that sets new_project is the agent that makes the spelling error, so
+# the flag on its own guards nothing. Floor and populations measured on a live
+# registry: the closest legitimately DISTINCT pair of 37 registered projects
+# scored 0.500 and no pair reached 0.6, while typos of a registered name scored
+# 0.78–1.00 and separator/case variants scored exactly 1.00.
+
+def _coord_near(near, registered=()):
+    """A coordinator whose confusable lookup answers from a fixed list."""
+    coord = _coord(registered=registered)
+    conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[{"name": n} for n in near])
+    conn.fetchval = AsyncMock(return_value=None)
+    acq = MagicMock()
+    acq.__aenter__ = AsyncMock(return_value=conn)
+    acq.__aexit__ = AsyncMock(return_value=False)
+    coord._acquire = MagicMock(return_value=acq)
+    return coord
+
+
+@pytest.mark.asyncio
+async def test_a_separator_variant_can_never_be_declared_new():
+    """`alpha_service` is not a new project beside `alpha-service`; it is how
+    that project is spelled today by a machine that has the old folder name.
+    Unconfirmable on purpose — a rename is a deliberate operation with a ledger,
+    never a side effect of a save."""
+    coord = _coord_near(["alpha-service"])
+    err = await coord._project_ingress_error(
+        {"source": "c", "project": "Alpha_Service", "new_project": True}, "c")
+    assert err["error"] == "project_spelling_variant"
+    assert "alpha-service" in err["message"]
+    coord._register_project.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirming_a_spelling_variant_does_not_help():
+    """The override exists for names that are genuinely different strings. A
+    variant is the SAME name, and no confirmation makes it another project."""
+    coord = _coord_near(["alpha-service"])
+    err = await coord._project_ingress_error(
+        {"source": "c", "project": "alpha_service", "new_project": True,
+         "confirm_distinct_from": ["alpha-service"]}, "c")
+    assert err["error"] == "project_spelling_variant"
+    coord._register_project.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_confusable_name_is_refused_until_the_neighbour_is_named():
+    coord = _coord_near(["alpha-service"])
+    err = await coord._project_ingress_error(
+        {"source": "c", "project": "alpha-servize", "new_project": True}, "c")
+    assert err["error"] == "project_confusable"
+    assert "alpha-service" in err["message"]
+    assert err["proposals"] == ["alpha-service"]
+    coord._register_project.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_naming_the_neighbour_lets_a_genuinely_separate_project_through():
+    """The check must not block real work: a spin-off with a similar name is a
+    real project, and the operator is the one who knows."""
+    coord = _coord_near(["alpha-service"])
+    err = await coord._project_ingress_error(
+        {"source": "c", "project": "alpha-servize", "new_project": True,
+         "confirm_distinct_from": ["Alpha-Service"]}, "c")   # key-compared
+    assert err is None
     coord._register_project.assert_awaited_once()
-    assert coord._register_project.await_args[0][0] == "brand-new"
+
+
+@pytest.mark.asyncio
+async def test_confirming_one_neighbour_does_not_confirm_another():
+    """Each near match is its own claim. Confirming the one you noticed must not
+    wave through the one you did not."""
+    coord = _coord_near(["alpha-service", "alpha-tool"])
+    err = await coord._project_ingress_error(
+        {"source": "c", "project": "alpha-servize", "new_project": True,
+         "confirm_distinct_from": ["alpha-service"]}, "c")
+    assert err["error"] == "project_confusable"
+    assert "alpha-tool" in err["message"]
+    assert "alpha-service" not in err["message"]
+
+
+@pytest.mark.asyncio
+async def test_an_unmistakable_new_project_registers_with_no_extra_step():
+    """The guard must stay quiet for the ordinary case, or it trains the reflex
+    to override it."""
+    coord = _coord_near([])
+    assert await coord._project_ingress_error(
+        {"source": "c", "project": "unrelated-thing", "new_project": True}, "c") is None
+    coord._register_project.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_decision_faces_the_same_two_refusals():
+    """Same rule on both record types — a decision is the likelier place for
+    this to happen, because it is where 'let us act on this' is recorded."""
+    coord = _coord_near(["alpha-service"])
+    err = await coord._project_ingress_error(
+        {"type": "decision", "new_project": True,
+         "decision": {"project": "alpha_service"}}, "c")
+    assert err["error"] == "project_spelling_variant"
+    # Refused means refused: nothing reaches the registry on this path.
+    coord._register_project.assert_not_awaited()
 
 
 @pytest.mark.asyncio

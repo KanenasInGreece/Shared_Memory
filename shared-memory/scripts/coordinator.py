@@ -59,6 +59,7 @@ from ontology import (
 from project_axis import (
     PROJECT_SQL, PROJECT_EXISTS_SQL, PROJECT_ID_SQL, PROJECT_PROPOSALS_SQL,
     PROPOSAL_SIMILARITY, PROPOSAL_LIMIT, SENTINEL,
+    CONFUSABLE_SQL, CONFUSABLE_SIMILARITY, same_spelling, unconfirmed_confusables,
     fold_eligible, resolve_project, project_for_graph, project_merge_cypher,
 )
 from insight_gate import (
@@ -2438,11 +2439,14 @@ class MemoryCoordinator:
         when the save may proceed. Registers the project as a side effect when the
         caller declares it new — that IS the acceptance.
         """
-        # Scope, verified in code rather than assumed: DECISIONS already fail
-        # without decision.project further down handle_save, and RETROSPECTIVES
-        # use their own endpoint and inherit the target decision's project. This
-        # is the fact path only.
-        if metadata.get("type") in ("decision", "retrospective"):
+        # Scope: RETROSPECTIVES only. They arrive on their own endpoint and
+        # inherit the project of the decision they judge, which passed this
+        # check itself — so re-checking here would demand a value the caller
+        # never supplies. DECISIONS were excluded alongside them until v0.8.44
+        # and should not have been: presence was mistaken for validity, and an
+        # unregistered name reached the graph as a project node. See the call
+        # site in handle_save.
+        if metadata.get("type") == "retrospective":
             return None
 
         # ⚠ The check is on `project`, never on a chain. A record carrying only a
@@ -2484,12 +2488,89 @@ class MemoryCoordinator:
         # state a gateway would have to keep and expire. What the gateway never
         # does, however many times it is asked, is accept an unregistered name.
         if metadata.get("new_project") is True:
+            # ⛔ A DECLARATION IS NOT A DEFENCE. The agent that sets this flag is
+            # the same agent that makes the spelling error, so accepting the
+            # claim on its own guards nothing: the operator says "go ahead with
+            # this idea", meaning THIS project, and a plausible variant becomes a
+            # second one. Every retired spelling in this registry arrived that
+            # way. So the claim faces the two checks below before it registers.
+            refusal = await self._new_project_refusal(supplied, metadata)
+            if refusal is not None:
+                return refusal
             await self._register_project(supplied, agent_id)
-            log.info("project registry: %r registered by %s (new_project)",
-                     supplied, agent_id)
+            log.info("project registry: %r registered by %s (new_project, "
+                     "record type %s)", supplied, agent_id,
+                     metadata.get("type") or "fact")
             return None
 
         return await self._project_rejection("project_unknown", supplied)
+
+    async def _new_project_refusal(self, supplied: str, metadata: dict) -> dict | None:
+        """Why this NEW-project declaration must not register — or None (P23).
+
+        Two checks, and only the second can be overridden, because they are
+        different claims about the world:
+
+        **A spelling of a registered project is never a new project.** Names
+        differing only in separators and case reduce to one spelling key, and no
+        confirmation can make them distinct — the caller is told the registered
+        spelling to use. This is not a judgement call: every rename this registry
+        has recorded was exactly this shape.
+
+        **A CONFUSABLE name is refused once and can be confirmed.** Above the
+        similarity floor the caller must name the registered project it means to
+        differ from. Naming it, rather than setting a second boolean, is the
+        point: a flag can be flipped without reading anything, while the name of
+        the neighbour cannot be produced without having seen it — which is what
+        puts the decision in front of the operator instead of inside the agent.
+
+        ⚠ Neither check refuses a genuinely new project outright, and that is
+        deliberate. Work legitimately starts with an idea, a fact, and a decision
+        to act on it, before any project exists. What must not happen is that a
+        project starts because a name was mistyped.
+        """
+        async with self._acquire() as conn:
+            rows = await conn.fetch(CONFUSABLE_SQL, supplied,
+                                    CONFUSABLE_SIMILARITY, PROPOSAL_LIMIT)
+        near = [r["name"] for r in rows]
+
+        variant = next((n for n in near if same_spelling(n, supplied)), None)
+        if variant is not None:
+            log.info("project registry: refused %r — a spelling of registered %r",
+                     supplied, variant)
+            return {
+                "status": "error",
+                "error": "project_spelling_variant",
+                "message": (
+                    f"project {supplied!r} differs from the registered project "
+                    f"{variant!r} only in separators or capitalisation, so it is a "
+                    f"SPELLING of it and not a new project. Save under {variant!r}. "
+                    "If the project genuinely needs to be renamed, that is a "
+                    "deliberate operation with its own tool and ledger, never a "
+                    "side effect of a save."
+                ),
+                "proposals": near,
+            }
+
+        unconfirmed = unconfirmed_confusables(
+            near, metadata.get("confirm_distinct_from"))
+        if unconfirmed:
+            log.info("project registry: %r held for confirmation against %s",
+                     supplied, unconfirmed)
+            return {
+                "status": "error",
+                "error": "project_confusable",
+                "message": (
+                    f"project {supplied!r} is close enough to an existing project to "
+                    f"be a typo for it: {unconfirmed}. ASK THE OPERATOR whether this "
+                    "is genuinely a separate project. If it is, re-send with "
+                    "metadata.confirm_distinct_from listing the projects above; if it "
+                    "is not, save under the existing name. Registering a variant is "
+                    "how one project quietly becomes two."
+                ),
+                "proposals": near,
+            }
+        return None
 
     async def _project_registered(self, name: str) -> bool:
         """Is this an established project? (P4, migration 022's registry.)"""
@@ -2676,24 +2757,6 @@ class MemoryCoordinator:
                 status=400,
             )
 
-        # Project is REQUIRED on a fact, and checked against the registry (P4).
-        #
-        # Unconditional — no env gate. A nullifiable invariant is not an invariant,
-        # and the failure it guards against is silent: an untagged record saves
-        # cleanly, searches cleanly, and simply never reaches synthesis.
-        #
-        # ⚠ The check is on `project`, never on a chain. A record carrying only a
-        # `domain` is NOT accepted as tagged: a domain is a SECTION of a project,
-        # so accepting it here would mean a part vouching for the whole.
-        #
-        # Scope, verified in code rather than assumed: DECISIONS already fail
-        # without decision.project a few lines below, and RETROSPECTIVES use their
-        # own endpoint and inherit the target decision's project. This is the fact
-        # path only.
-        project_error = await self._project_ingress_error(metadata, agent_id)
-        if project_error is not None:
-            return web.json_response(project_error, status=400)
-
         # Decision saves require structured provenance fields — validated at ingress
         # before the row touches the outbox WAL.  Bad data from an LLM is rejected
         # here rather than replayed on every restart from a corrupt outbox entry.
@@ -2731,6 +2794,40 @@ class MemoryCoordinator:
                          "(claim %r preserved)", metadata["decision"]["decided_by"],
                          metadata["decision"].get("decided_by_claimed"))
                 body["metadata"] = metadata
+
+        # Project is REQUIRED and checked against the registry (P4) — on FACTS
+        # and on DECISIONS alike.
+        #
+        # Unconditional — no env gate. A nullifiable invariant is not an invariant,
+        # and the failure it guards against is silent: an untagged record saves
+        # cleanly, searches cleanly, and simply never reaches synthesis.
+        #
+        # ⚠ The check is on `project`, never on a chain. A record carrying only a
+        # `domain` is NOT accepted as tagged: a domain is a SECTION of a project,
+        # so accepting it here would mean a part vouching for the whole.
+        #
+        # ⛔ DECISIONS WERE EXCLUDED FROM THIS UNTIL v0.8.44, and the reasoning
+        # that excluded them conflated PRESENCE with VALIDITY: "decisions already
+        # fail without decision.project". They do — but a present name that no
+        # registry knows was accepted, and the outbox then minted a `:Project`
+        # node for it. That is the one way the graph can end up holding a project
+        # the registry does not have, and unlike the ingress→outbox window (which
+        # leaves the graph BEHIND the registry, always safe) it does not resolve
+        # itself. Registration is what makes a project an identity, so a record
+        # that can create a node without one puts an unidentifiable project into
+        # the axis that gates consolidation.
+        #
+        # ⚠ IT RUNS AFTER the decision-shape check, deliberately: a decision with
+        # no project at all should still be told it is missing decided_by,
+        # project and rationale together, rather than being rejected for the
+        # project alone and coming back to discover the rest one at a time.
+        #
+        # RETROSPECTIVES stay out, and that one IS a scope statement rather than
+        # an oversight: they arrive on their own endpoint and inherit the project
+        # of the decision they judge — a decision that passed this very check.
+        project_error = await self._project_ingress_error(metadata, agent_id)
+        if project_error is not None:
+            return web.json_response(project_error, status=400)
 
         # Fact supersession (decision 381, refined by 384): an optional
         # `supersedes` pointer marks an existing fact superseded by THIS save.
