@@ -358,3 +358,116 @@ def test_rem_can_never_mint_a_domain_node():
     import rem_loop
     assert ONT.domain not in rem_loop._KNOWN_LABELS
     assert ONT.domain_of not in rem_loop._KNOWN_LABELS
+
+
+# ── Regressions found by checking LIVE data after the release ────────────────
+
+def test_save_decision_domain_flag_reaches_the_record():
+    """A field the CLI accepts and the record never carries is the capture defect
+    that hides longest. `--domain` parsed cleanly for one release while nothing
+    threaded it into the metadata, so a decision silently fell back to inheriting
+    its evidence's sections — and read as correct, because the inherited answer
+    happened to match what was asked for."""
+    import memory_bridge as mb
+    _content, metadata = mb.build_decision_metadata(
+        title="t", decided_by="X", project="p", rationale="r",
+        domains=["architecture", "schema"], new_domain=True)
+    assert metadata["decision"]["domains"] == ["architecture", "schema"]
+    assert metadata["new_domain"] is True
+    # Same place the gateway resolves a judgement's project from — or a
+    # decision's two axes come from different halves of one record.
+    assert resolve_domains(metadata) == ["architecture", "schema"]
+
+
+def test_no_domain_flag_leaves_the_decision_free_to_inherit():
+    import memory_bridge as mb
+    _content, metadata = mb.build_decision_metadata(
+        title="t", decided_by="X", project="p", rationale="r")
+    assert resolve_domains(metadata) == []
+    assert "new_domain" not in metadata
+
+
+@pytest.mark.asyncio
+async def test_a_spelling_variant_below_the_similarity_floor_is_still_refused():
+    """The guard read the TRIGRAM NEIGHBOURS, which made an EXACT rule
+    conditional on a FUZZY one. Measured live: `testing` vs `Test_Ing` scores
+    0.545 against a floor of 0.6, so the variant never reached the spelling check
+    and registered as a brand-new section — the exact event the guard exists to
+    prevent. `near` here is EMPTY on purpose: that is what a below-floor
+    confusable query returns."""
+    c = _coord(registered={(6, "testing")}, near=[])
+    c._acquire.return_value.__aenter__.return_value.fetch = AsyncMock(
+        side_effect=[[], [{"name": "testing"}]])   # confusables, then all names
+    err = await c._domain_ingress_error(
+        dict(_fact("Test_Ing"), new_domain=True), "claude")
+    assert err["error"] == "domain_spelling_variant"
+    c._register_domain.assert_not_awaited()
+
+
+async def _decision_cypher(domains, monkeypatch_id=41):
+    """Capture the Cypher a decision projection emits, with domains resolvable."""
+    c = _coord()
+    c._domain_identity = AsyncMock(return_value=monkeypatch_id)
+    captured = []
+
+    async def run(q, **kw):
+        captured.append((q, kw))
+        res = MagicMock()
+        res.single = AsyncMock(return_value={"n": 0})
+        return res
+
+    session = MagicMock()
+    session.run = run
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=session)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    c._neo4j = MagicMock()
+    c._neo4j.session = MagicMock(return_value=ctx)
+    await c._apply_decision_outbox_row(1, 77, {
+        "decision": {"title": "t", "rationale": "r", "date": "d",
+                     "decided_by": "X", "project": "p", "assisted_by": []},
+        "domains": domains, "grounded": [], "grounded_in": [],
+    })
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_a_decision_with_an_explicit_domain_writes_its_OWN_edge():
+    """D4 — and this is the test that kills 'looks right by inheritance'. The
+    section must arrive on the decision's own projection statement, unstamped,
+    rather than via the inheritance pass, whose edges are stamped `inherited`.
+    A decision whose evidence happens to sit in the same section produces the
+    same NAME either way; only the provenance tells the two apart."""
+    captured = await _decision_cypher(["architecture"])
+    projection = captured[0][0]
+    assert f"MERGE (dm:{ONT.domain}" in projection
+    assert f"-[:{ONT.domain_of}]->(dm)" in projection
+    # Unstamped: nothing on the projection marks these as inherited.
+    assert "asserted_by" not in projection.split("FOREACH (row IN $domains")[1]
+    assert captured[0][1]["domains"] == [{"id": 41, "name": "architecture"}]
+
+
+@pytest.mark.asyncio
+async def test_a_decision_with_no_domain_writes_no_edge_and_leaves_inheritance_to_run():
+    """The default path: nothing asserted, so the projection carries no section
+    and the inheritance pass is what may supply one."""
+    captured = await _decision_cypher([])
+    projection = captured[0][0]
+    assert "FOREACH (row IN $domains" not in projection
+    inherit = [q for q, _ in captured if ONT.had_outcome in q or "$pg_id" in q]
+    assert any(ONT.domain_of in q for q in inherit), "inheritance must still run"
+
+
+@pytest.mark.asyncio
+async def test_inheritance_declines_when_the_record_asserted_its_own_sections():
+    """The guard that makes an explicit section survive every later re-run — of
+    the write path, of a landing retrospective, and of the repair tool. Without
+    it, re-running would ADD the evidence's sections to a decision that
+    deliberately chose different ones."""
+    captured = await _decision_cypher(["architecture"])
+    inherit = [q for q, _ in captured
+               if ONT.domain_of in q and "MERGE (a)-[m:" in q]
+    assert inherit, "the inheritance statement must still be issued"
+    for q in inherit:
+        assert "NOT EXISTS" in q and "asserted_by IS NULL" in q, (
+            "inheritance must decline wherever a self-asserted edge exists")

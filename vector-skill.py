@@ -117,7 +117,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.8.47"
+VERSION = "0.8.48"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server
@@ -493,12 +493,22 @@ async def save_decision(
     elicited: bool = False,
     new_project: bool = False,
     confirm_distinct_from: str = "",
+    domain: list[str] | str = "",
+    new_domain: bool = False,
 ) -> str:
     """
     Save an architectural or design decision with full PROV-O provenance.
 
     Routes through the Memory Coordinator so the Decision→Human→Project→AIAgent
     subgraph is written by the outbox worker — no direct Neo4j writes here.
+
+    `domain` names the SECTION(S) of the project this decision belongs to —
+    a list, or one name. A decision asserts its own sections just as it asserts
+    its own project; it does NOT inherit them from its evidence, because a
+    decision reaches further than the fact that prompted it. Naming none means
+    "take my grounding facts' sections", which is a default, never a ceiling.
+    Each must already be registered, or pass new_domain=True after the operator
+    confirms. A RETROSPECTIVE may never carry one.
 
     Required: title, decided_by, project, rationale, source (loaded model name).
     Optional: assisted_by (comma-separated), confidence, and `alternatives` —
@@ -570,6 +580,18 @@ async def save_decision(
     # instead of being refused. Never inferred and never a default: from v0.8.44
     # a decision's project is checked against the registry, and that check only
     # means something if declaring a new project is a deliberate act.
+    # The SECTIONS of the project this decision belongs to — a list, or one
+    # name. A decision ASSERTS these exactly as it asserts its project: it does
+    # not inherit them from its evidence, because a decision reaches further
+    # than the fact that prompted it. Naming none is fine and means "take my
+    # evidence's sections", which is a default and never a ceiling.
+    _domains = ([d.strip() for d in domain if isinstance(d, str) and d.strip()]
+                if isinstance(domain, list)
+                else [d.strip() for d in (domain or "").split(",") if d.strip()])
+    if _domains:
+        decision_data["domains"] = _domains
+    if new_domain:
+        metadata["new_domain"] = True
     if new_project:
         metadata["new_project"] = True
     # The registered projects this new one is deliberately NOT. Needed only when

@@ -5,6 +5,53 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.48] — 2026-08-06
+
+### Fixed
+
+- **A spelling variant could register as a new project or section whenever it
+  also scored below the similarity floor.** The guard that refuses a name
+  differing from a registered one only in separators or capitalisation was
+  applied to the TRIGRAM NEIGHBOURS a confusable query returned — which quietly
+  made an exact rule conditional on a fuzzy one. Measured on the live registry:
+  `testing` versus `Test_Ing` scores **0.545** against a floor of **0.6**, so the
+  variant never reached the check and registered as a brand-new value. This was
+  latent in the project registry from v0.8.44 and was reproduced on the domain
+  registry the day it shipped: `Shared_Memory_Monitor` is now refused against the
+  registered `shared-memory-monitor`, and was not before.
+
+  The spelling check now runs over **every** registered name, ahead of the
+  confusable query, through one shared pure helper both axes call. The floor was
+  deliberately **not** lowered: that would flatten two populations it exists to
+  separate — legitimately distinct names sit just under it — and would train the
+  reflex to override a warning that fires on correct input. The two gates answer
+  different questions and run in order: a SPELLING is exact equality on a
+  normalised key and cannot be confirmed away; a CONFUSABLE is a fuzzy neighbour
+  the operator may confirm as genuinely distinct. Both error codes are unchanged.
+
+- **`save_decision --domain` was parsed and dropped on the floor.** The flag
+  reached the argument parser and nothing threaded it into the record, so a
+  decision fell back to inheriting its evidence's sections. It read as correct
+  because the inherited answer happened to match what had been asked for — the
+  edge carried `asserted_by='inherited'` where an assertion should have been
+  bare. Now packed into the decision blob, beside `project`, which is the half
+  the gateway resolves a judgement's axes from. `vector-skill.py`'s
+  `save_decision` gains the same parameter, so the two front doors stay at parity.
+
+  The regression tests assert the **provenance of the edge**, not just the
+  presence of a section name: a decision whose evidence sits in the same section
+  produces the same name either way, and only the stamp tells an assertion from
+  a default.
+
+### Notes
+
+- A live probe over the registries found **no** existing pair of projects, and no
+  pair of sections within one project, sharing a spelling key — so the defect
+  registered nothing before it was caught beyond the one probe value, which was
+  retired.
+
+---
+
 ## [0.8.47] — 2026-08-05
 
 ### Added

@@ -112,6 +112,13 @@ DOMAIN_EXISTS_SQL = (
     "SELECT id FROM project_domains WHERE project_id = $1 AND name = $2"
 )
 
+# Every section name registered under one project, for the spelling-key
+# comparison. Unfiltered by similarity for the reason `PROJECT_NAMES_SQL`
+# documents: a spelling is an exact equality on a normalised key and must never
+# be gated behind a fuzzy score, or a variant that scores below the floor
+# registers as a new section.
+DOMAIN_NAMES_SQL = "SELECT name FROM project_domains WHERE project_id = $1"
+
 # Proposals for a value that missed. TRIGRAM over the name, UNION'd with a
 # description match, both scoped to the project.
 #

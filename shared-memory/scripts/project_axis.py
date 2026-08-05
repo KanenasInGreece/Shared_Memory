@@ -60,6 +60,24 @@ SENTINEL = "general_discussion"
 
 PROJECT_EXISTS_SQL = "SELECT 1 FROM projects WHERE name = $1"
 
+# EVERY registered name, for the spelling-key comparison below.
+#
+# ⚠ IT IS NOT FILTERED, and that is the whole point. The spelling check used to
+# run only over the TRIGRAM NEIGHBOURS a confusable query returned, which meant a
+# separator-and-case variant was refused only when it also happened to score
+# above the similarity floor. It frequently does not: measured on a live
+# registry, `testing` vs `Test_Ing` scores 0.545 against a floor of 0.6, so a
+# pure spelling variant registered as a brand-new value — the exact event the
+# guard exists to prevent, slipping past because a SEPARATE, softer heuristic
+# did not fire. A spelling is an EXACT equality on a normalised key; it must
+# never be gated behind a fuzzy score.
+#
+# The comparison is done in Python with `same_spelling` rather than as a
+# normalising SQL expression, deliberately: a registry is tens of rows, and
+# re-expressing `spelling_key` in SQL would create a second definition of the key
+# that can drift from the one every other caller uses.
+PROJECT_NAMES_SQL = "SELECT name FROM projects"
+
 # The registry IDENTITY behind a name (migration 027). The name is a label a
 # client asserts and an operator types; this is the thing that does not move
 # when the label does, and it is what the graph node is keyed on.
@@ -134,6 +152,32 @@ CONFUSABLE_SQL = (
     " ORDER BY similarity(name, $1) DESC, name"
     " LIMIT $3"
 )
+
+
+def spelling_variant_of(candidate, registered):
+    """The registered name `candidate` is merely a SPELLING of, or None. Pure.
+
+    THE ONE IMPLEMENTATION FOR BOTH AXES, because they enforce the same rule and
+    two loops would be two rules the day one of them is edited.
+
+    ⚠ `registered` MUST be every registered name, never a similarity-filtered
+    slice. This check used to be applied to the trigram neighbours a confusable
+    query returned, which quietly made an EXACT rule conditional on a FUZZY one:
+    a separator/case variant was refused only when it ALSO scored above the
+    similarity floor. Measured on a live registry, `testing` vs `Test_Ing` scores
+    0.545 against a floor of 0.6 — so a pure spelling variant registered as a
+    brand-new value, which is the precise event the guard exists to prevent.
+
+    ⛔ AND THE FIX IS NOT TO LOWER THE FLOOR. That would flatten two populations
+    the floor deliberately separates — legitimately distinct names sit just under
+    it — and would train the reflex to override a warning that fires on correct
+    input. The two gates answer different questions and run in order: a SPELLING
+    is exact equality on a normalised key and cannot be confirmed away; a
+    CONFUSABLE is a fuzzy neighbour the operator may confirm as genuinely
+    distinct.
+    """
+    return next((n for n in (registered or []) if same_spelling(n, candidate)),
+                None)
 
 
 def unconfirmed_confusables(near, confirmed) -> list:
