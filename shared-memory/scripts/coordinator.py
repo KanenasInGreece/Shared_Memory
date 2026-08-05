@@ -4950,6 +4950,23 @@ class MemoryCoordinator:
                             without deciding what the project IS — an operator's
                             call. It still cannot take part in a fold, which is
                             why it is reported rather than left implicit.
+
+        ⚠ THE TWO DIRECTIONS OF DISAGREEMENT ARE NOT SYMMETRIC, and only one of
+        them is a defect. A project is registered at INGRESS, while its node is
+        written LATER by the outbox worker, so the stores legitimately disagree
+        for the length of that window — and a registered project that no record
+        has ever named has no node at all. **Fewer nodes than registry rows is
+        the normal resting state** (registry rows are a superset by
+        construction) and is deliberately not counted here at all. The reverse —
+        a node the registry does not know — cannot arise from that window in
+        that direction, so it is reported as its own number.
+
+        ⚠ THE READ ORDER IS PART OF THAT, not incidental: the graph is read
+        FIRST and the registry SECOND, so the registry snapshot is never older
+        than the node snapshot. A project registered concurrently therefore
+        cannot produce a phantom ``unregistered`` — its row is already visible by
+        the time the nodes are checked. Reversing these two reads would make the
+        normal ingress path emit false alarms.
         """
         async with self._neo4j.session() as session:
             rows = await (await session.run(
