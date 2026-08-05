@@ -115,7 +115,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.45"
+FRAMEWORK_VERSION = "0.8.46"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -1177,15 +1177,19 @@ def _json_safe(value):
 
 def _neighbor_adr_props(rec) -> dict:
     """Collect the ADR node properties a graph-expansion row projects for a
-    pg_id-keyed neighbor (Decision: confidence/alternatives; Fact: fact_kind/
-    source_ref), returning only the keys that are set.
+    pg_id-keyed neighbor, returning only the keys that are set.
 
-    These already sit on the one-hop neighbor node — projecting them lets a
-    summary hit carry a folded decision's confidence/alternatives and a folded
-    fact's evidence weight WITHOUT a second query (decision 909). A neighbor
-    that carries none returns ``{}`` (no ``adr_props`` key is added). Missing
-    projection columns (older single-anchor callers, test stubs) are tolerated
-    via ``.get``. Pure — never raises, so it can never fail a search.
+    Fact/Retrospective evidence weight (``fact_kind``/``source_ref``) only.
+    A DECISION's ``confidence``/``alternatives`` are NOT read here any more —
+    they are payload and are dereferenced from Postgres by pg_id (see
+    ``_decision_payload_props``). ``fact_kind`` stays on the node because it is
+    DERIVED at write from ``source_ref`` rather than copied from a Postgres
+    column, which makes it a different question from a payload copy.
+
+    A neighbor that carries none returns ``{}`` (no ``adr_props`` key is
+    added). Missing projection columns (older single-anchor callers, test
+    stubs) are tolerated via ``.get``. Pure — never raises, so it can never
+    fail a search.
     """
     def _g(key):
         try:
@@ -1193,23 +1197,39 @@ def _neighbor_adr_props(rec) -> dict:
         except (KeyError, TypeError, IndexError):
             return None
     adr: dict = {}
-    if _g("adr_confidence"):
-        adr["confidence"] = _g("adr_confidence")
-    alts = _g("adr_alternatives")
-    if alts:
-        # ⚠ NEVER bare-list() this. All 223 Decision nodes currently hold a Neo4j
-        # LIST OF STRING, where list() is a passthrough — but this same property
-        # has been written as a JSON *string* before, and list() on a string
-        # explodes it into single characters, turning three alternatives into
-        # several hundred one-character ones. A string is ONE entry, not a
-        # sequence of them.
-        adr["alternatives"] = _json_safe(
-            list(alts) if isinstance(alts, (list, tuple)) else [alts])
     if _g("adr_fact_kind"):
         adr["fact_kind"] = _g("adr_fact_kind")
     if _g("adr_source_ref"):
         adr["source_ref"] = _g("adr_source_ref")
     return adr
+
+
+def _decision_payload_props(alternatives, confidence) -> dict:
+    """Build the ``adr_props`` payload for ONE decision from its Postgres
+    ``metadata->'decision'`` values, returning only the keys that are set.
+
+    This is the read half of *duplicate what the walk consumes, dereference
+    what the reader renders*: no Cypher filters or orders on these two, so the
+    graph carries neither and the record they belong to supplies them, reached
+    by the ``pg_id`` the subgraph already carries.
+
+    ⚠ NEVER bare-``list()`` the alternatives. Postgres holds a JSON array for
+    every decision that has the key today, where ``list()`` is a passthrough —
+    but this value has been stored as a JSON *string* before, and ``list()`` on
+    a string explodes it into single characters, turning three alternatives
+    into several hundred one-character ones. A string is ONE entry, not a
+    sequence of them. The trap moved stores; the guard moves with it.
+
+    Pure — never raises, so it can never fail a search.
+    """
+    props: dict = {}
+    if alternatives:
+        props["alternatives"] = _json_safe(
+            list(alternatives) if isinstance(alternatives, (list, tuple))
+            else [alternatives])
+    if confidence:
+        props["confidence"] = _json_safe(confidence)
+    return props
 
 
 def _outbox_backoff_delay(retries: int) -> float:
@@ -2130,14 +2150,15 @@ class MemoryCoordinator:
                 f"  SET d.title       = $title,"
                 f"      d.rationale   = $rationale,"
                 f"      d.date        = $date,"
-                f"      d.source      = $source,"
-                # confidence + alternatives are SPINE ADR fields, materialised
-                # deterministically as PROPERTIES (not entity nodes): the alias-
-                # pressure measurement (fact 551) showed alternatives are 65% free
-                # phrases, so minting them as :Entity would flood the graph — REM
-                # still extracts clean CONSIDERED entities from the text.
-                f"      d.confidence  = $confidence,"
-                f"      d.alternatives = $alternatives"
+                f"      d.source      = $source"
+                # ⛔ confidence + alternatives are deliberately NOT written here.
+                # They stay SPINE ADR fields and are still never minted as
+                # :Entity (fact 551: alternatives are 65% free phrases, which
+                # would flood the graph — REM still extracts clean CONSIDERED
+                # entities from the text). What changed is that they are not
+                # COPIED either: nothing walks on them, so the node carries the
+                # pg_id and the record carries the payload
+                # (`_attach_decision_payload`).
                 f" WITH d"
                 f" MERGE (h:{ONT.human} {{name: $decided_by}})"
                 f" MERGE (d)-[:{ONT.was_attributed_to}]->(h)"
@@ -2154,8 +2175,6 @@ class MemoryCoordinator:
                 rationale=decision.get("rationale", ""),
                 date=decision.get("date", ""),
                 source=params.get("source", "coordinator"),
-                confidence=decision.get("confidence") or "",
-                alternatives=[a for a in (decision.get("alternatives") or []) if isinstance(a, str)],
                 decided_by=decision.get("decided_by", "unknown"),
                 project=decision.get("project", "unknown"),
                 project_id=project_id,
@@ -3776,6 +3795,66 @@ class MemoryCoordinator:
 
     # ── POST /memory/search ───────────────────────────────────────────────────
 
+    async def _attach_decision_payload(self, entries: list[dict]) -> None:
+        """Fill every Decision neighbor's ``adr_props`` from POSTGRES, in ONE
+        query for the whole batch. Mutates ``entries`` in place.
+
+        WHY THIS IS NOT A GRAPH PROJECTION (the successor to decision 909).
+        909 widened the expansion projection so a hit carried a folded
+        decision's confidence/alternatives at zero extra query, accepting that
+        deeper provenance stayed behind. Both values are payload: no Cypher
+        anywhere filters, orders or matches on them — they are only ever
+        rendered. A second copy of a value nobody walks on buys nothing the
+        neighbor's ``pg_id`` does not already give, and guarantees a divergence
+        class instead: the graph copy of ``alternatives`` silently missed 64%
+        of decisions until a one-time sync repaired it, and ``confidence`` was
+        measured in exactly that state (Postgres 236 vs graph 85, a clean
+        cutover) at the time this shipped. Dereferencing removes the class
+        rather than repairing an instance of it.
+
+        The cost 909 was protecting is bounded and paid once per search, not
+        per hit: the neighbors are already collected, so this is a single
+        ``id = ANY(...)`` primary-key lookup, not an N+1.
+
+        ⚠ FAIL-OPEN, exactly like the expansion it completes: graph context
+        enriches a search and must never fail one. A payload error leaves the
+        entries without ``adr_props`` and logs — it never propagates.
+        """
+        wanted = sorted({
+            e["pg_id"] for e in entries
+            if e.get("pg_id") is not None and e.get("label") == ONT.decision
+        })
+        if not wanted:
+            return
+        try:
+            async with self._acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT id,"
+                    "       metadata->'decision'->'alternatives' AS alternatives,"
+                    "       metadata->'decision'->>'confidence'  AS confidence"
+                    " FROM technical_docs WHERE id = ANY($1::bigint[])",
+                    wanted,
+                )
+            # Row handling lives INSIDE the guard on purpose: a helper that
+            # fetches cannot be fail-open only for the fetch. Anything raised
+            # while reading a row would otherwise propagate out of the
+            # expansion — which is the whole failure mode being avoided.
+            payload = {
+                row["id"]: _decision_payload_props(
+                    row["alternatives"], row["confidence"])
+                for row in rows
+            }
+            for entry in entries:
+                props = payload.get(entry.get("pg_id"))
+                if props:
+                    entry.setdefault("adr_props", {}).update(props)
+        except Exception as exc:
+            log.warning(
+                "graph context: decision payload dereference failed for %d "
+                "neighbor(s) — hits keep their graph context without it: %s",
+                len(wanted), exc,
+            )
+
     async def _expand_graph_context(self, session, pg_id: int,
                                     anchor_labels: tuple[str, ...]) -> list[dict]:
         """Read-contract graph expansion for one anchored record.
@@ -3831,13 +3910,13 @@ class MemoryCoordinator:
                 "        left(coalesce(related.content, related.title,"
                 "                      related.rationale, related.notes,"
                 "                      related.rem_summary), 120) AS snippet,"
-                # ADR node properties already sitting on this one-hop neighbor —
-                # projected so a summary hit carries a folded decision's
-                # confidence/alternatives and a folded fact's fact_kind/source_ref
-                # WITHOUT a second query (decision 909). Null on neighbors that
-                # do not carry them; folded into `adr_props` below only when set.
-                "        related.confidence AS adr_confidence,"
-                "        related.alternatives AS adr_alternatives,"
+                # Evidence weight already sitting on this one-hop neighbor, so a
+                # summary hit carries a folded fact's fact_kind/source_ref with
+                # no second query (decision 909). A DECISION's confidence and
+                # alternatives are NOT projected here — they are payload, and
+                # `_attach_decision_payload` dereferences them from Postgres by
+                # the pg_id this row already carries. Null on neighbors that do
+                # not carry them; folded into `adr_props` below only when set.
                 "        related.fact_kind AS adr_fact_kind,"
                 "        related.source_ref AS adr_source_ref,"
                 "        aliases",
@@ -3868,6 +3947,7 @@ class MemoryCoordinator:
                 ctx.append(entry)
         except Exception:
             return []
+        await self._attach_decision_payload(ctx)
         return ctx
 
     async def _expand_graph_context_batch(
@@ -3916,17 +3996,16 @@ class MemoryCoordinator:
                 "          left(coalesce(related.content, related.title,"
                 "                        related.rationale, related.notes,"
                 "                        related.rem_summary), 120) AS snippet,"
-                # ADR node props on the one-hop neighbor — see the single-anchor
-                # form above (decision 909). Same projection, batched.
-                "          related.confidence AS adr_confidence,"
-                "          related.alternatives AS adr_alternatives,"
+                # Evidence weight on the one-hop neighbor — see the single-anchor
+                # form above (decision 909). Same projection, batched; a
+                # decision's payload is dereferenced from Postgres, not here.
                 "          related.fact_kind AS adr_fact_kind,"
                 "          related.source_ref AS adr_source_ref,"
                 "          aliases"
                 " }"
                 " RETURN pg_id AS anchor_pg_id, labels, name, rel_pg_id, rel_type,"
                 "        direction, rel_props, snippet,"
-                "        adr_confidence, adr_alternatives, adr_fact_kind, adr_source_ref,"
+                "        adr_fact_kind, adr_source_ref,"
                 "        aliases",
                 pg_ids=list(pg_ids), cap=GRAPH_EXPANSION_LIMIT,
             )
@@ -3952,6 +4031,10 @@ class MemoryCoordinator:
                 out[rec["anchor_pg_id"]].append(entry)
         except Exception:
             return {pid: [] for pid in pg_ids}
+        # ONE dereference for every anchor's neighbors together — the batching
+        # this function exists for would be undone by a query per anchor.
+        await self._attach_decision_payload(
+            [entry for entries in out.values() for entry in entries])
         return out
 
     async def handle_search(self, request: web.Request) -> web.Response:
