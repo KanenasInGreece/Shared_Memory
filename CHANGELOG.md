@@ -5,6 +5,48 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.50] — 2026-08-06
+
+### Added
+
+- **The change groups now enforce what can be enforced, and say plainly what
+  they cannot.** The rule that touching one member of a group means reviewing the
+  whole group is a discipline, and a discipline is what fails on the release
+  where someone is in a hurry. `tests/test_change_group_contracts.py` takes the
+  mechanically checkable obligations and makes them tests:
+
+  - **All four version pins must agree** (Group 1). The release version lives in
+    four files, two of them client copies — which is why even a server-side fix
+    touches this group — and until now nothing checked that a bump reached all
+    four. A missed one ships a client announcing a version the gateway does not
+    recognise, and the only symptom is a compatibility warning from a command
+    nobody runs on a good day, so the divergence outlives the change that caused
+    it. Both client copies must also pin one `api_version`.
+  - **Every table a migration creates must reach `schema_init.sql`** (Group 4),
+    and the migration chain must have no gaps or duplicate numbers. This cannot
+    see a missing constraint — only the live diff can — but it catches the
+    coarsest omission: a migration adding a table and nobody regenerating the
+    artefact a fresh install actually applies.
+  - **Every script the upgrade path names must exist** (Group 5). A documented
+    step naming a file that is not there fails on a stranger's machine while they
+    follow the instructions faithfully.
+
+  Each test names its group and the failure it prevents, and all are
+  mutation-verified.
+
+### Notes
+
+- **Three of five groups are still partly or wholly unenforced, and that is now
+  written down rather than assumed.** Group 3 (daemon behaviour and
+  observability) has no mechanical tie at all — whether a change can be seen
+  working *and* failing remains entirely a matter for eyes. Group 4's most
+  dangerous class, a constraint silently dropped from the fresh-install
+  artefact, has bitten three times and is caught only by `verify_schema_init.py`
+  run against a throwaway database. **A green suite does not mean a group was
+  cleared.**
+
+---
+
 ## [0.8.49] — 2026-08-06
 
 ### Changed
