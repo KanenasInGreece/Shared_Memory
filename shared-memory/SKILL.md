@@ -74,6 +74,15 @@ project with an empty registry is never prompted, which keeps the first section 
 deliberate act rather than a nag. A record with no domain is filed under its project, which is always
 correct.
 
+Its refusals, and the second submission each one expects: `domain_unknown` — not registered, so pick a
+proposal or re-send with `"new_domain": true` after asking; `domain_spelling_variant` — it differs from
+an existing section only in separators or case, so it IS that section and cannot be confirmed
+otherwise; `domain_confusable` — close enough to be a typo, so name the section it differs from in
+`confirm_distinct_from`; `domain_without_project` — the record is parked on the sentinel, which is not
+a project and has no sections, so either file it under the project whose section this is or drop the
+domain; `domain_not_allowed_on_judgement` — a retrospective may not name one, because it takes both
+axes from the decision it judges.
+
 **`entities` — the concepts a FACT is about, and the only place a concept can enter the graph.**
 These become the cluster keys consolidation groups on. **What breaks if you omit one:** that concept
 never becomes a cluster key for this fact, for anything later grounded in it, or for anything

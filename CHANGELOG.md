@@ -44,7 +44,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   from nowhere — and it strands the decision it judges, which reaches its own
   topics through it.
 
-Documentation and help text only. No behaviour change, no schema change, no
+- **And a test that fails when the contract moves without the documentation.**
+  A good intention does not survive forty releases — the stale examples above
+  are the proof. `tests/test_capture_surface_documented.py` asserts that every
+  capture flag a client offers, every ingress refusal the gateway can return,
+  every outcome rating, and the worked examples' version and `api_version` are
+  present in the skill document. It checks presence, never wording, so ordinary
+  edits do not fail it; what it makes impossible is ADDING a caller-visible part
+  of the contract that nobody explains. Its exemption list is the point rather
+  than a loophole: a new flag fails until someone either documents it or names
+  it mechanical, and both are answers. **It caught an omission on its first
+  run** — `domain_without_project`, a refusal shipped in v0.8.47 and documented
+  nowhere.
+
+Documentation, help text and one test. No behaviour change, no schema change, no
 wire-contract change.
 
 ---
