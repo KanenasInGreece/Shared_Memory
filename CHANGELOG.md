@@ -5,6 +5,44 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.52] — 2026-08-06
+
+### Added
+
+- **A GPU option for the two encoders, and the numbers to choose with.**
+  `compose.gpu-encoders.yaml` is an overlay that moves the embedder and reranker
+  onto a Vulkan-capable GPU — one image covering Intel, AMD and NVIDIA, so the
+  framework still never branches on vendor:
+
+  ```bash
+  docker compose -f postgres_neo4j_limits.yaml -f compose.gpu-encoders.yaml \
+                 --env-file shared-memory/.env up -d
+  ```
+
+  The default stays CPU. That is the point: the stack must come up on a machine
+  with no GPU, no driver and no vendor assumption.
+
+- **README §7 now states what CPU actually costs**, measured rather than
+  asserted: ~20 s to embed an 8,000-char record, ~64 s to rerank a typical
+  20-candidate search and ~146 s for a worst case. It also records that threads
+  are a weak lever — 4/10/20 threads gave 63.8/36.7/32.3 s on one payload, five
+  times the threads for twice the speed — because these models saturate memory
+  bandwidth long before they saturate cores.
+
+  ⚠ And it names `RERANK_MAX_DOC_CHARS` as a **concession, not a free win**:
+  retrieval selects on the embedding window, so ranking on a narrower slice can
+  demote a record for lacking the text it was selected for. On this corpus,
+  capping at 2,000 chars kept only about half of reranking's gain over vector
+  order. Once the encoders are on a GPU, raise it to `EMBED_MAX_CHARS` — the
+  reason to narrow it was latency, and it is gone.
+
+- **A documented silent-failure trap.** `EMBEDDER_URL` pointed at the reranker
+  does not fail: the reranker answers `/v1/embeddings` with HTTP 200 and a
+  1024-dimension vector — the exact shape BGE-M3 produces — that is essentially
+  all zeros. It passes a dimension check and a null check while carrying no
+  meaning. The embedder, asked to rerank, correctly refuses with HTTP 501. The
+  ports are one digit apart; one backend fails loud and its twin fails silent.
+
 ## [0.8.51] — 2026-08-06
 
 ### Fixed
