@@ -9,10 +9,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **A GPU option for the two encoders, and the numbers to choose with.**
-  `compose.gpu-encoders.yaml` is an overlay that moves the embedder and reranker
-  onto a Vulkan-capable GPU — one image covering Intel, AMD and NVIDIA, so the
-  framework still never branches on vendor:
+- **A working GPU sample for the two encoders, and the numbers to choose with.**
+  `compose.gpu-encoders.yaml` moves the embedder and reranker onto a
+  Vulkan-capable GPU — one image covering Intel, AMD and NVIDIA, so the
+  framework still never branches on vendor. It is a **sample we tested, not a
+  prescription**: the framework's only requirement is an embedding endpoint and
+  a reranking endpoint at `EMBEDDER_URL` / `RERANKER_URL`, and how you run them
+  is yours to optimise.
 
   ```bash
   docker compose -f postgres_neo4j_limits.yaml -f compose.gpu-encoders.yaml \

@@ -1,5 +1,11 @@
 # GPU overlay for the two encoder services (embedder + reranker).
 #
+# A WORKING SAMPLE, TESTED — not a prescription. The framework requires only an
+# embedding endpoint and a reranking endpoint it can reach (EMBEDDER_URL /
+# RERANKER_URL, defaulting to :8070 and :8071). Docker, bare llama-server, a GPU,
+# another machine entirely — run them however suits your hardware. This file
+# exists so there is a known-good starting point to diverge from.
+#
 # The base file `postgres_neo4j_limits.yaml` runs both encoders on CPU, which
 # WORKS and needs no special hardware — it is simply slow (see README §7 for the
 # measured numbers). This overlay moves both onto a Vulkan-capable GPU without
