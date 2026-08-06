@@ -1199,10 +1199,14 @@ async def test_search_response_fact_carries_tier_and_normalized_score():
     # Neo4j expansion: no related nodes (empty async iterator)
     mock_session.run = AsyncMock(return_value=_AsyncIter())
 
+    # ONE candidate list now: index 0 is the summary, index 1 the fact. The
+    # summary is scored ABOVE the fact here so this test still exercises the
+    # summary-then-fact shape — but by RANK, not by structural precedence.
     mock_reranker = MagicMock()
     mock_reranker.raise_for_status = MagicMock()
     mock_reranker.json = MagicMock(return_value={
-        "results": [{"index": 0, "relevance_score": 2.0}]
+        "results": [{"index": 0, "relevance_score": 3.0},
+                    {"index": 1, "relevance_score": 2.0}]
     })
 
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
@@ -1219,8 +1223,10 @@ async def test_search_response_fact_carries_tier_and_normalized_score():
     body    = json.loads(resp.text)
     results = body["results"]
 
-    # Community summary is prepended
+    # The summary leads because it OUTSCORED the fact, not because it was
+    # prepended — it carries a real score now for exactly that reason.
     assert results[0]["tier"] == "community_summary"
+    assert results[0]["score"] == 3.0
     assert results[0]["graph_context"] == []
 
     # Fact result shape
@@ -1771,19 +1777,38 @@ async def test_handle_telemetry_survives_partial_backend_failure():
 # ── Phase 3a — insight elevation, reversal hook, project normalisation ───────
 
 @pytest.mark.asyncio
-async def test_search_insight_elevated_above_thematic_summary():
-    """When an active kind='insight' summary exists, it surfaces FIRST with
-    tier='insight_summary'; the thematic summary follows (decision 276)."""
+async def test_insight_and_thematic_are_ordered_by_merit_not_by_force():
+    """Decision 245 specified that handle_search "elevates kind=insight above
+    thematic summaries, ranked by outcome_rating" — an ordering WITHIN the
+    Tier-3 set (never above facts), on the grounds that an insight carries the
+    highest distilled value.
+
+    That intent is REFINED here, not reversed. Value is in the seeker's mind,
+    not the provider's: a narrative cannot be declared most useful to a query it
+    was never compared against. So both narratives enter the reranker's
+    candidate set and an insight surfaces above a thematic summary when it
+    EARNS it for that query. The obligation moves upstream — onto forming
+    insights whose distilled value is evident — rather than being satisfied by a
+    structural rule.
+
+    (The shipped code never implemented 245's outcome_rating half in any case;
+    it pinned the nearest insight first regardless of rating.)
+
+    Here the thematic summary is the better answer for this query and therefore
+    outranks the insight — which the forced order made impossible.
+    """
     c, mock_conn, mock_session = _coordinator_with_mocks()
 
     mock_conn.fetchrow = AsyncMock(side_effect=[
-        {  # nearest insight
+        {  # nearest insight — index 0 in the candidate list
+            "id": 7,
             "content": "Cross-project principle about outbox ledgers",
             "metadata": {"kind": "insight", "entity": "OutboxPattern",
-                         "projects": ["shared-memory-GitHub", "tier3-cloe"]},
+                         "projects": ["alpha-service", "beta-service"]},
             "source_pg_ids": [245, 267],
         },
-        {  # nearest thematic summary
+        {  # nearest thematic summary — index 1
+            "id": 8,
             "content": "Thematic narrative",
             "metadata": {"entity": "OutboxPattern", "domain": "general"},
             "source_pg_ids": [1, 2, 3],
@@ -1794,9 +1819,14 @@ async def test_search_insight_elevated_above_thematic_summary():
     ])
     mock_session.run = AsyncMock(return_value=_AsyncIter())
 
+    # The THEMATIC summary (index 1) scores highest, the insight (index 0) last.
     mock_reranker = MagicMock()
     mock_reranker.raise_for_status = MagicMock()
-    mock_reranker.json = MagicMock(return_value={"results": [{"index": 0, "relevance_score": 1.0}]})
+    mock_reranker.json = MagicMock(return_value={
+        "results": [{"index": 1, "relevance_score": 5.0},
+                    {"index": 2, "relevance_score": 1.0},
+                    {"index": 0, "relevance_score": -4.0}]
+    })
 
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         with patch("httpx.AsyncClient") as mock_cls:
@@ -1808,10 +1838,51 @@ async def test_search_insight_elevated_above_thematic_summary():
             resp = await c.handle_search(_make_request({"query": "outbox", "limit": 5}))
 
     results = json.loads(resp.text)["results"]
-    assert results[0]["tier"] == "insight_summary"
-    assert results[0]["source_pg_ids"] == [245, 267]   # decision ids
-    assert results[1]["tier"] == "community_summary"
-    assert results[2]["tier"] == "fact"
+    assert [r["tier"] for r in results] == [
+        "community_summary", "fact", "insight_summary"
+    ], "narratives must take the position the reranker gave them"
+    # The insight kept its tier name and its decision-id provenance — only its
+    # guaranteed POSITION is gone.
+    assert results[2]["source_pg_ids"] == [245, 267]
+    assert results[2]["score"] == -4.0
+
+
+@pytest.mark.asyncio
+async def test_a_low_scoring_summary_falls_below_the_facts():
+    """The guarantee itself: measured on live data, the summary belonged at
+    median rank 6 of 21 while occupying rank 1 on every query. A summary the
+    reranker scores below the facts must now appear below them."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+
+    mock_conn.fetchrow = AsyncMock(side_effect=[None, {
+        "id": 99, "content": "unrelated narrative", "metadata": {},
+        "source_pg_ids": [1],
+    }])
+    mock_conn.fetch = AsyncMock(return_value=[
+        {"id": 1, "content": "fact one", "metadata": {"entities": [], "source": "claude"}},
+        {"id": 2, "content": "fact two", "metadata": {"entities": [], "source": "claude"}},
+    ])
+    mock_session.run = AsyncMock(return_value=_AsyncIter())
+
+    mock_reranker = MagicMock()
+    mock_reranker.raise_for_status = MagicMock()
+    mock_reranker.json = MagicMock(return_value={
+        "results": [{"index": 1, "relevance_score": 4.0},
+                    {"index": 2, "relevance_score": 2.0},
+                    {"index": 0, "relevance_score": -5.0}]
+    })
+
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        with patch("httpx.AsyncClient") as mock_cls:
+            mock_http = AsyncMock()
+            mock_http.post = AsyncMock(return_value=mock_reranker)
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_http)
+            mock_cls.return_value.__aexit__  = AsyncMock(return_value=None)
+
+            resp = await c.handle_search(_make_request({"query": "anything", "limit": 5}))
+
+    results = json.loads(resp.text)["results"]
+    assert [r["tier"] for r in results] == ["fact", "fact", "community_summary"]
 
 
 @pytest.mark.asyncio

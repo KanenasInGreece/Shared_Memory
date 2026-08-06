@@ -5,6 +5,48 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.54] — 2026-08-06
+
+### Changed
+
+- **Tier-3 narratives are now RANKED, not guaranteed a position.** A community
+  summary and a cross-project insight were fetched nearest-neighbour with
+  `LIMIT 1` and **no distance floor**, then placed above every fact without ever
+  being scored — so the most prominent slots in every answer were held by
+  records that had never been required to be relevant. A summary was not ranked
+  badly; it was **not ranked at all**.
+
+  Both now enter the reranker's candidate set and are scored against the facts
+  and against each other on one scale. **Measured before the change** (10
+  queries, the summary a search would return scored against the same 20 facts):
+  median rank **6 of 21**, a **negative** relevance score on **6 of 10**,
+  genuinely first on **2**. So the guarantee was wrong for 8 of 10 queries.
+
+  ⚠ **The tier is kept, only its guarantee is removed.** The summary was never
+  beaten by all twenty facts, and it earned first place twice on merit — so
+  narratives are demoted *into* the contest rather than dropped from it.
+
+  This **refines decision 245** rather than reversing it (`retrospective 1104`).
+  245 ordered insights above thematic summaries because an insight carries the
+  highest distilled value; that premise stands. What changes is that value is in
+  the seeker's mind, not the provider's — a narrative cannot be declared the
+  best answer to a query it was never compared against. The obligation moves
+  upstream, onto forming narratives whose value is evident on merit.
+
+- **A rerank failure now drops Tier-3 entirely rather than pinning it on top.**
+  Vector order is meaningful only *within* one table: summary distances and fact
+  distances come from separate queries and are never comparable. Emitting the
+  combined candidate list in index order would restore the guarantee at the exact
+  moment there is no evidence to justify any position for a narrative.
+
+- **The MCP client no longer re-imposes the ordering the gateway removed.**
+  `vector-skill.py` partitioned results and printed every Tier-3 row above every
+  fact, which was harmless only while the gateway pinned them there too — it
+  would have defeated this change at the MCP front door, showing a summary on top
+  carrying a score saying it belonged sixth. It now renders in server order, and
+  **shows Tier-3 scores**, which it previously omitted entirely. Its result count
+  also includes Tier-3 rows; it had counted only the facts.
+
 ## [0.8.53] — 2026-08-06
 
 ### Fixed

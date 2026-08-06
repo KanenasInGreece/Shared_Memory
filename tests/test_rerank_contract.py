@@ -330,3 +330,37 @@ async def test_candidate_pool_keeps_its_floor_for_small_limits():
 
     vector_call = mock_conn.fetch.await_args_list[0]
     assert 20 in vector_call.args, "the floor must survive a small limit"
+
+
+# ── R4 — the fallback must not smuggle the guarantee back in ────────────────
+
+@pytest.mark.asyncio
+async def test_fallback_drops_tier3_rather_than_pinning_it_on_top():
+    """When ranking is unavailable the results are in VECTOR order — and vector
+    order is only meaningful WITHIN one table. The summary distances come from a
+    different query than the fact distances and are never comparable, so
+    emitting the combined candidate list in index order would put narratives
+    first again, silently restoring the guarantee this release removed, at the
+    exact moment there is no evidence to justify any position for them.
+
+    The honest fallback is the facts in their own order and no narrative at all.
+    """
+    c, mock_conn, _ = _coordinator_with_mocks()
+    mock_conn.fetchrow = AsyncMock(side_effect=[
+        None,                                       # no insight
+        {"id": 77, "content": "a narrative", "metadata": {},
+         "source_pg_ids": [1]},                     # nearest thematic summary
+    ])
+    mock_conn.fetch = AsyncMock(return_value=_candidates(20))
+
+    failing = AsyncMock(side_effect=RuntimeError("connection refused"))
+    payload = await _search(c, failing, limit=5)
+    results = payload["results"]
+
+    assert len(results) == 5
+    assert all(r["tier"] == "fact" for r in results), (
+        f"a fallback must serve facts only; got {[r['tier'] for r in results]}"
+    )
+    # …and the facts must be the vector-order prefix, not offset by the dropped
+    # narrative — an off-by-one here would silently skip the nearest fact.
+    assert [r["pg_id"] for r in results] == [100, 101, 102, 103, 104]

@@ -123,7 +123,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.53"
+FRAMEWORK_VERSION = "0.8.54"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -4881,11 +4881,31 @@ class MemoryCoordinator:
             # Rerank — direct to port 8071 to avoid circular proxy call.
             # Decisions/retrospectives are scored WITH their recording date
             # prepended (recency-aware: the newest retro is the current verdict).
-            # Each document is clamped to the relevance window before it is sent:
-            # the full text is still what search RETURNS, only what the reranker
-            # SCORES is bounded. That is what makes the ceiling below a fixed
-            # quantity — same relationship EMBED_MAX_CHARS has with embed_ceiling.
+            # ⛔ TIER-3 NARRATIVES ARE CANDIDATES, NOT GUARANTEED POSITIONS.
+            # They used to be fetched nearest-neighbour with LIMIT 1 and NO
+            # distance floor, then placed ABOVE every fact without ever being
+            # scored — so the two most prominent slots of every answer were held
+            # by records that had never been required to be relevant, and a
+            # summary was not ranked badly, it was not ranked at all.
+            #
+            # Measured before this change (10 queries, summary scored against the
+            # same 20 facts): median rank 6 of 21, a NEGATIVE relevance score on
+            # 6 of 10, and genuinely first on 2. So the guarantee was wrong on 8
+            # of 10 — but the TIER is not noise, which is why summaries are
+            # demoted into the contest rather than dropped from it. They keep the
+            # top slot exactly when they earn it.
+            t3_rows = [r for r in (insight, summary) if r is not None]
+            n_t3 = len(t3_rows)
+
+            # ONE candidate list: summaries first BY INDEX ONLY (so a hit can be
+            # dispatched back to its kind), never by rank. Each document is
+            # clamped to the relevance window before it is sent — the full text
+            # is still what search RETURNS, only what the reranker SCORES is
+            # bounded, the same relationship EMBED_MAX_CHARS has with
+            # embed_ceiling.
             rerank_docs = [
+                clamp_rerank_doc(r["content"] or "") for r in t3_rows
+            ] + [
                 clamp_rerank_doc(_rerank_doc_text(c, m, t))
                 for c, m, t in zip(contents, metas, createds)
             ]
@@ -4917,8 +4937,17 @@ class MemoryCoordinator:
                             "for %d candidates", type(exc).__name__, exc,
                             len(rerank_docs))
                 self._rerank_failures += 1
+                # ⛔ THE FALLBACK DROPS TIER-3 ENTIRELY, and that is deliberate.
+                # Vector order is meaningful only WITHIN one table: the fact
+                # distances and the summary distances come from separate queries
+                # and are never comparable. Emitting the combined list in index
+                # order would put summaries first again — silently restoring the
+                # guarantee this release removed, at the exact moment there is no
+                # evidence to justify any position for them. When ranking is
+                # unavailable the honest answer is the facts in their own order,
+                # not a guess about where a narrative belongs.
                 ranked = [
-                    {"index": i, "relevance_score": None}
+                    {"index": i + n_t3, "relevance_score": None}
                     for i in range(len(candidates))
                 ]
             else:
@@ -4968,58 +4997,10 @@ class MemoryCoordinator:
                 if pid in stale_map and pid not in acked
             ]
 
-        # Neo4j relational expansion
+        # Neo4j relational expansion. `final` is built in the RERANKER'S ORDER,
+        # summaries and facts interleaved — no tier is inserted ahead of the
+        # ranking and none is appended after it.
         final: list[dict] = []
-        if insight:
-            # Insights rank above thematic summaries: a cross-project
-            # principle validated by at least one retrospective outranks a
-            # single-domain narrative. source_pg_ids are DECISION ids here.
-            ins_result = {
-                "tier": "insight_summary",
-                # A DIFFERENT id namespace from the fact tier below — same field
-                # name, independent sequence. record_type/ref disambiguate it.
-                "record_type": summary_record_type(insight["metadata"]),
-                "ref": make_ref(summary_record_type(insight["metadata"]),
-                                insight.get("id")),
-                # .get: tolerant of pre-change callers/stubs without the id
-                # column — pg_id (community_summaries.id = the CommunitySummary
-                # node key) enables the summary→sources graph walk below.
-                "pg_id": insight.get("id"),
-                "content": insight["content"],
-                "score": None,
-                "score_normalized": None,
-                "matched_entities": [],
-                "metadata": insight["metadata"],
-                "source_pg_ids": insight["source_pg_ids"],
-                "graph_context": [],
-            }
-            stale = _stale_sources(insight["source_pg_ids"], insight["metadata"])
-            if stale:
-                ins_result["stale_sources"] = stale
-            final.append(ins_result)
-        if summary:
-            # Surface the summary's provenance so an agent can trace a Tier-3
-            # narrative back to the exact Tier-1 facts it was synthesised from
-            # (source_pg_ids) — drill down via /memory/graph or status/{pg_id}.
-            sum_result = {
-                "tier": "community_summary",
-                # Same-name, different-namespace id — see the insight tier above.
-                "record_type": summary_record_type(summary["metadata"]),
-                "ref": make_ref(summary_record_type(summary["metadata"]),
-                                summary.get("id")),
-                "pg_id": summary.get("id"),
-                "content": summary["content"],
-                "score": None,
-                "score_normalized": None,
-                "matched_entities": [],
-                "metadata": summary["metadata"],
-                "source_pg_ids": summary["source_pg_ids"],
-                "graph_context": [],
-            }
-            stale = _stale_sources(summary["source_pg_ids"], summary["metadata"])
-            if stale:
-                sum_result["stale_sources"] = stale
-            final.append(sum_result)
 
         async with self._neo4j.session() as session:
             # Summary→sources walk: a Tier-3 narrative's graph context (its
@@ -5027,25 +5008,78 @@ class MemoryCoordinator:
             # way a record's does. Degrades to [] on any Neo4j failure. Batched
             # (one round-trip for every summary/insight anchor, not one per) —
             # was an N+1 here, up to ~102 sequential queries per search call.
-            summary_pg_ids = [res["pg_id"] for res in final if res.get("pg_id") is not None]
+            #
+            # ⚠ The two id namespaces are INDEPENDENT sequences that collide
+            # freely — community_summaries.id 42 and technical_docs.id 42 are
+            # different records — so the two context maps are kept apart and each
+            # hit is resolved against the one for ITS kind, never merged.
+            surviving_t3 = [t3_rows[h["index"]] for h in ranked
+                            if h["index"] < n_t3]
             summary_ctx = await self._expand_graph_context_batch(
-                session, summary_pg_ids, (ONT.community_summary,)
+                session,
+                [r.get("id") for r in surviving_t3 if r.get("id") is not None],
+                (ONT.community_summary,),
             )
-            for res in final:
-                if res.get("pg_id") is not None:
-                    res["graph_context"] = summary_ctx.get(res["pg_id"], [])
 
             # Same batching for the Tier-1 hits' graph context. Anchor on ALL
             # record labels — Decision and Retrospective rows get graph context
             # too, not just Facts (read contract).
-            fact_pg_ids = [ids[hit["index"]] for hit in ranked]
+            fact_pg_ids = [ids[h["index"] - n_t3] for h in ranked
+                           if h["index"] >= n_t3]
             fact_ctx = await self._expand_graph_context_batch(
                 session, fact_pg_ids, (ONT.fact, ONT.decision, ONT.retrospective)
             )
+
             for hit in ranked:
-                idx   = hit["index"]
-                pg_id = ids[idx]
                 raw_score = hit["relevance_score"]
+
+                if hit["index"] < n_t3:
+                    # A Tier-3 narrative that EARNED this position. It now
+                    # carries a score like anything else — the null score that
+                    # used to mark it was a consequence of never being ranked,
+                    # not a property of the tier.
+                    row  = t3_rows[hit["index"]]
+                    meta = row["metadata"]
+                    rtype = summary_record_type(meta)
+                    res = {
+                        # `insight_summary` still names the cross-project kind,
+                        # but it no longer implies a position: an insight and a
+                        # thematic summary are now ranked against each other and
+                        # against the facts, on the same scale.
+                        "tier": ("insight_summary" if rtype == "insight"
+                                 else "community_summary"),
+                        # A DIFFERENT id namespace from the fact tier — same
+                        # field name, independent sequence. record_type/ref
+                        # disambiguate it.
+                        "record_type": rtype,
+                        "ref": make_ref(rtype, row.get("id")),
+                        # .get: tolerant of pre-change callers/stubs without the
+                        # id column — pg_id (community_summaries.id = the
+                        # CommunitySummary node key) enables the walk above.
+                        "pg_id": row.get("id"),
+                        "content": row["content"],
+                        "ranked": reranked,
+                        "score": raw_score,
+                        "score_normalized": (_sigmoid(raw_score)
+                                             if raw_score is not None else None),
+                        "matched_entities": [],
+                        "metadata": meta,
+                        # Surface the summary's provenance so an agent can trace
+                        # a Tier-3 narrative back to the exact Tier-1 facts it
+                        # was synthesised from — drill down via /memory/graph or
+                        # status/{pg_id}.
+                        "source_pg_ids": row["source_pg_ids"],
+                        "graph_context": (summary_ctx.get(row.get("id"), [])
+                                          if row.get("id") is not None else []),
+                    }
+                    stale = _stale_sources(row["source_pg_ids"], meta)
+                    if stale:
+                        res["stale_sources"] = stale
+                    final.append(res)
+                    continue
+
+                idx   = hit["index"] - n_t3
+                pg_id = ids[idx]
                 ctx = fact_ctx.get(pg_id, [])
                 # `tier` says WHERE the hit came from; `record_type` says WHAT it
                 # is. They are not the same: the Tier-1 "fact" tier carries
