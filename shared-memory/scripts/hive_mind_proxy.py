@@ -7,6 +7,7 @@ import os
 import shutil
 import signal
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from aiohttp import web, ClientSession, ClientTimeout, TCPConnector
 from aiohttp.client_exceptions import (
@@ -909,6 +910,135 @@ async def handle_pool_status(request: web.Request) -> web.Response:
 
 
 # --------------------------------------------------------------------------- #
+# Backend CAPABILITY probing — "can it serve", not "is it up"
+# --------------------------------------------------------------------------- #
+# How often the capability probe re-measures. It costs real inference time on
+# the same backends that serve traffic, so it is deliberately infrequent.
+CAPABILITY_PROBE_INTERVAL_S = float(
+    os.environ.get("CAPABILITY_PROBE_INTERVAL_S", "600"))
+# The probe payload. Small enough to be cheap, large enough to be representative
+# — a one-token ping would measure nothing about the cost that actually matters.
+CAPABILITY_PROBE_DOCS = int(os.environ.get("CAPABILITY_PROBE_DOCS", "4"))
+CAPABILITY_PROBE_DOC_CHARS = int(
+    os.environ.get("CAPABILITY_PROBE_DOC_CHARS", "1000"))
+
+# Populated by the background probe; read by /health. "unknown" until the first
+# probe lands — NEVER asserted as healthy on no data (decision 928's rule: "not
+# yet probed" must not read as "verified clean").
+_capability: dict = {"status": "unknown", "probed_at": None}
+
+
+def capability_snapshot() -> dict:
+    return dict(_capability)
+
+
+async def _probe_capability(session) -> dict:
+    """Time both critical backends on a fixed, representative payload.
+
+    Reports the OBSERVED throughput and — the part that matters — projects it
+    onto the largest payload the framework can actually send, then compares that
+    against the timeout the caller would apply. `serves_full_payload: false` is
+    the machine-readable form of the defect that hid here: a backend that is up,
+    answers /health, and still cannot finish a real request in time."""
+    from dream_telemetry import (EMBED_MAX_CHARS, RERANK_MAX_DOC_CHARS,
+                                 embed_ceiling, rerank_ceiling)
+
+    out: dict = {"probed_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        out["gateway_host_load1"] = round(os.getloadavg()[0], 2)
+    except (OSError, AttributeError):
+        pass   # not available on every platform — never fail the probe for it
+
+    # ── reranker ────────────────────────────────────────────────────────────
+    docs = ["lorem ipsum dolor sit amet " * 40] * CAPABILITY_PROBE_DOCS
+    docs = [d[:CAPABILITY_PROBE_DOC_CHARS] for d in docs]
+    probe_chars = sum(len(d) for d in docs)
+    entry: dict = {"probe_chars": probe_chars}
+    try:
+        t0 = time.monotonic()
+        async with session.post(
+            f"{RERANKER_URL}/v1/reranking",
+            json={"query": "capability probe", "documents": docs,
+                  "top_n": len(docs)},
+            timeout=ClientTimeout(total=max(30.0, rerank_ceiling(docs))),
+        ) as r:
+            await r.read()
+            ok = r.status < 400
+        dt = max(time.monotonic() - t0, 1e-6)
+        entry["latency_s"] = round(dt, 2)
+        entry["throughput_chars_s"] = round(probe_chars / dt)
+        if ok and entry["throughput_chars_s"] > 0:
+            # The worst case this framework can actually send: a full candidate
+            # set of fully-clamped documents.
+            full_chars = 20 * RERANK_MAX_DOC_CHARS
+            projected = full_chars / entry["throughput_chars_s"]
+            allowed = rerank_ceiling(["x" * RERANK_MAX_DOC_CHARS] * 20)
+            entry["projected_full_payload_s"] = round(projected, 1)
+            entry["ceiling_s"] = round(allowed, 1)
+            entry["serves_full_payload"] = projected <= allowed
+            entry["status"] = "ok" if projected <= allowed else "too_slow"
+        else:
+            entry["status"] = "failing"
+    except Exception as exc:
+        entry["status"] = "failing"
+        entry["error"] = type(exc).__name__
+    out["reranker"] = entry
+
+    # ── embedder ────────────────────────────────────────────────────────────
+    text = ("lorem ipsum dolor sit amet " * 40)[:CAPABILITY_PROBE_DOC_CHARS]
+    entry = {"probe_chars": len(text)}
+    try:
+        t0 = time.monotonic()
+        async with session.post(
+            f"{EMBEDDER_URL}/v1/embeddings",
+            json={"input": text, "model": "bge-m3"},
+            timeout=ClientTimeout(total=max(30.0, embed_ceiling(len(text)))),
+        ) as r:
+            await r.read()
+            ok = r.status < 400
+        dt = max(time.monotonic() - t0, 1e-6)
+        entry["latency_s"] = round(dt, 2)
+        entry["throughput_chars_s"] = round(len(text) / dt)
+        if ok and entry["throughput_chars_s"] > 0:
+            projected = EMBED_MAX_CHARS / entry["throughput_chars_s"]
+            allowed = embed_ceiling(EMBED_MAX_CHARS)
+            entry["projected_full_payload_s"] = round(projected, 1)
+            entry["ceiling_s"] = round(allowed, 1)
+            entry["serves_full_payload"] = projected <= allowed
+            entry["status"] = "ok" if projected <= allowed else "too_slow"
+        else:
+            entry["status"] = "failing"
+    except Exception as exc:
+        entry["status"] = "failing"
+        entry["error"] = type(exc).__name__
+    out["embedder"] = entry
+
+    out["status"] = ("ok" if all(out[k].get("status") == "ok"
+                                 for k in ("reranker", "embedder"))
+                     else "degraded")
+    return out
+
+
+async def _capability_probe_daemon(proxy, stop_event) -> None:
+    """Refresh the capability snapshot on a slow cadence, forever.
+
+    Wrapped so a probe failure can never propagate: this is an OBSERVABILITY
+    path, and an unguarded exception here would take down the thing it exists
+    to report on (the trap named in CLAUDE.md's Group 3)."""
+    global _capability
+    while not stop_event.is_set():
+        try:
+            _capability = await _probe_capability(proxy.session)
+        except Exception as exc:
+            log.warning("capability probe failed: %s", exc)
+        try:
+            await asyncio.wait_for(stop_event.wait(),
+                                   timeout=CAPABILITY_PROBE_INTERVAL_S)
+        except asyncio.TimeoutError:
+            pass
+
+
+# --------------------------------------------------------------------------- #
 # Health endpoint
 # --------------------------------------------------------------------------- #
 async def handle_health(request: web.Request) -> web.Response:
@@ -940,6 +1070,21 @@ async def handle_health(request: web.Request) -> web.Response:
             checks[name] = "timeout"
         except Exception:
             checks[name] = "down"
+
+    # ⛔ LIVENESS IS NOT CAPABILITY. The two probes above ask "is the process
+    # up", which both backends answered "ok" throughout a period in which the
+    # reranker could not serve a single real request inside the caller's
+    # timeout: a full candidate set cost ~64 s against a 5 s ceiling, so every
+    # search silently fell back to unranked vector order while /health read
+    # green. A backend that answers /health and cannot do its job is the exact
+    # failure this section exists to make visible.
+    #
+    # So alongside liveness we report CAPABILITY, measured by sending a fixed
+    # representative payload to the real scoring endpoint and timing it. The
+    # result is CACHED and refreshed on a slow cadence by a background task —
+    # the probe costs real seconds, and /health is polled by the monitor, so it
+    # must never run inline. Same pattern as the consolidation snapshot below.
+    checks["backend_capability"] = capability_snapshot()
 
     # Reasoning-LLM backend pool — probe each; "llm" is ok if ANY is up (the pool
     # tolerates a down backend). Per-backend statuses are reported for observability;
@@ -1177,6 +1322,10 @@ async def main() -> None:
     stop_event = asyncio.Event()
     watchdog_task     = asyncio.create_task(_watchdog_daemon(stop_event))
     rem_watchdog_task = asyncio.create_task(_watchdog_rem_daemon(stop_event))
+    # Backend capability probe — measures whether the critical backends can
+    # actually SERVE, not merely whether they answer /health.
+    capability_task   = asyncio.create_task(
+        _capability_probe_daemon(proxy, stop_event))
     loop = asyncio.get_running_loop()
 
     def _on_shutdown_signal():
@@ -1223,7 +1372,8 @@ async def main() -> None:
             _rem_proc.kill()
     watchdog_task.cancel()
     rem_watchdog_task.cancel()
-    for task in (watchdog_task, rem_watchdog_task):
+    capability_task.cancel()
+    for task in (watchdog_task, rem_watchdog_task, capability_task):
         try:
             await task
         except asyncio.CancelledError:

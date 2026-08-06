@@ -5,6 +5,81 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.51] — 2026-08-06
+
+### Fixed
+
+- **The reranker had never run.** `handle_search` called the reranking backend
+  with a **constant `timeout=5.0`** while a real 20-candidate set costs tens of
+  seconds, so every search fell through to the exception branch and served
+  results in **vector order, unranked** — and did so invisibly, because the
+  fallback fabricated `relevance_score: 1.0` for every row, a value a working
+  reranker can legitimately emit. The recency-aware document text built for
+  decisions and retrospectives (so the newest retrospective reads as the current
+  verdict) had therefore never once affected an ordering.
+
+  The timeout is now **derived from the payload** by `rerank_ceiling()`, the
+  direct sibling of the existing `embed_ceiling()`. Both live in
+  `dream_telemetry.py`, both size a per-request ceiling from a throughput floor
+  anchored at the largest payload the framework can send, and both are
+  env-overridable (`RERANK_MIN_CHARS_S`, `RERANK_SAFETY_FACTOR`,
+  `RERANK_TIMEOUT_FLOOR_S`). The embedder had been brought under this rule and
+  its identically-configured twin had not; that gap was the whole defect.
+
+- **A successful rerank returned more results than the caller asked for.** The
+  request sent `top_k`, which the reranking server ignores — it honours `top_n` —
+  so the server scored and returned *all* candidates. Nothing truncated the
+  response, meaning a working reranker would have returned 20 rows for a
+  `limit: 5` search. This never surfaced only because the failure path capped at
+  `min(limit, …)`: **the two defects masked each other**, and fixing the timeout
+  alone would have broken the result-count contract in every client at once.
+  Both parameter spellings are now sent, and **neither is trusted** — the
+  coordinator enforces the caller's limit itself.
+
+- **A rerank failure is now visible instead of silent.** Results carry
+  `ranked: true|false`; a fallback result reports `score: null` rather than a
+  plausible fabricated one, is logged, and is counted. Serving vector order is a
+  different answer from serving a ranked one, and the response now says so.
+
+### Added
+
+- **`/health` reports whether the critical backends can SERVE, not merely whether
+  they answer.** Both encoders had reported `ok` throughout the total failure
+  above, because the probe was a liveness `GET /health`. A new background probe
+  times a fixed representative payload against the real scoring endpoints,
+  projects the observed throughput onto the largest payload the framework can
+  send, and compares that against the timeout that would apply — surfacing
+  `serves_full_payload: false` for a backend that is up and cannot do its job.
+  Cached and refreshed on a slow cadence (`CAPABILITY_PROBE_INTERVAL_S`), so
+  `/health` never runs inference inline, and guarded so an observability path can
+  never take down what it observes.
+
+- **A bounded relevance window, `RERANK_MAX_DOC_CHARS`.** Only the text the
+  reranker *scores* is bounded; the full record is still stored and still
+  returned by search. This is what makes the derived ceiling a finite quantity.
+  ⚠ It is a **latency concession, not a neutral default**: retrieval selects on
+  the embedding window, so ranking on a narrower slice can demote a record that
+  was correctly retrieved for something past the cut.
+
+### Security
+
+- **The embedder and reranker no longer publish on every host interface.**
+  `ports: ["8070:8070"]` binds all interfaces, and neither service has any
+  authentication — on a LAN that is an open embedding and reranking endpoint.
+  Publishing is now `${INFERENCE_BIND:-127.0.0.1}`. The container-internal
+  `--host 0.0.0.0` is correct and unchanged: binding loopback inside the network
+  namespace would make the service unreachable from the host.
+
+### Changed
+
+- **Encoder CPU threads are derived from the host instead of hardcoded.**
+  `--threads 4` becomes `${LLAMA_CPU_THREADS:-4}`, and `install_framework.sh`
+  computes roughly half the host's threads plus one, leaving room for Postgres,
+  Neo4j, the gateway and the desktop. ⚠ Documented alongside it: raising this
+  buys far less than it appears to — on the reference rig 5× the threads bought
+  2× the speed, because these models saturate memory bandwidth (and, on
+  multi-die CPUs, the inter-die fabric) long before they saturate cores.
+
 ## [0.8.50] — 2026-08-06
 
 ### Added

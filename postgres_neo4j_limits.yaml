@@ -62,16 +62,41 @@ services:
     restart: always
 
 # --- INFERENCE LAYER (CPU Optimized) ---
+  # ⛔ BIND TO LOOPBACK. Only the gateway talks to these two, and neither has
+  # ANY authentication — publishing them as "8070:8070" binds every host
+  # interface, so on a LAN they are an open embedding/reranking service and an
+  # open read path into whatever text a caller submits. The container-internal
+  # --host 0.0.0.0 below is correct and must stay (binding loopback INSIDE the
+  # network namespace makes the service unreachable from the host); it is the
+  # PUBLISH spec that decides exposure. Override INFERENCE_BIND only when the
+  # gateway genuinely runs on another host, and put a network you trust under it.
+  #
+  # THREAD BUDGET. Both encoders are CPU-bound and can run at the same time (a
+  # search reranks while a daemon or a save embeds), so they share one machine.
+  # LLAMA_CPU_THREADS is a BUDGET: about HALF the host's threads plus one,
+  # leaving the rest for Postgres, Neo4j, the gateway and the operator's
+  # desktop. install_framework.sh derives it from the host and writes it to
+  # .env; the 4 below is only the fallback for a hand-rolled deploy.
+  #
+  # ⚠ MORE THREADS BUY MUCH LESS THAN THEY LOOK LIKE THEY SHOULD. Measured on
+  # the reference deployment, an identical 73k-char rerank took 63.8 s at 4
+  # threads, 36.7 s at 10 and 32.3 s at 20 — 5x the threads for 2x the speed,
+  # because these models saturate memory bandwidth (and, on multi-die CPUs, the
+  # inter-die fabric) well before they saturate cores. If reranking is too slow,
+  # RERANK_MAX_DOC_CHARS and a GPU-backed build are the levers that actually
+  # move it; thread count is not.
+  #
   # Retriever: BGE-M3
   retriever-api:
     image: ghcr.io/ggml-org/llama.cpp:server
     container_name: llama-retriever
-    ports: ["8070:8070"]
+    ports: ["${INFERENCE_BIND:-127.0.0.1}:8070:8070"]
     volumes:
       - ${LLM_MODELS_DIR:-./models}:/models:ro,z
     command: >
       -m /models/gpustack/bge-m3-GGUF/bge-m3-Q8_0.gguf
-      --embedding --host 0.0.0.0 --port 8070 --threads 4  -c 8192 -b 8192 -ub 8192
+      --embedding --host 0.0.0.0 --port 8070
+      --threads ${LLAMA_CPU_THREADS:-4}  -c 8192 -b 8192 -ub 8192
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8070/health"]
       interval: 30s
@@ -84,12 +109,13 @@ services:
   reranker-api:
     image: ghcr.io/ggml-org/llama.cpp:server
     container_name: llama-reranker
-    ports: ["8071:8071"]
+    ports: ["${INFERENCE_BIND:-127.0.0.1}:8071:8071"]
     volumes:
       - ${LLM_MODELS_DIR:-./models}:/models:ro,z
     command: >
       -m /models/gpustack/bge-reranker-v2-m3-GGUF/bge-reranker-v2-m3-Q8_0.gguf
-      --rerank --host 0.0.0.0 --port 8071 --threads 4  -c 8192 -b 8192 -ub 8192
+      --rerank --host 0.0.0.0 --port 8071
+      --threads ${LLAMA_CPU_THREADS:-4}  -c 8192 -b 8192 -ub 8192
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8071/health"]
       interval: 30s
