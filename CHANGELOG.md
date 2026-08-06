@@ -5,6 +5,38 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.56] — 2026-08-06
+
+### Added
+
+- **The reranked set is an entry point into the graph, not the answer.** Every
+  returned decision is now walked to its **current lifecycle state**, so a
+  reader is never handed an ADR that has since been judged without being told.
+  Results carry `lifecycle: {rating, ref, retrospective_pg_id}`, and for the
+  ratings that qualify a decision — `refined`, `mixed`, `reversed` — the
+  retrospective's **own text** travels with it, because a rating word does not
+  carry the reasoning.
+
+  ⛔ **Ordered by `pg_id`, never by `date`.** A `Retrospective` node carries
+  `rating` and `pg_id` but **no `created_at`**; its only temporal property is
+  `date`, the *operator-supplied outcome date*. Measured: **19 of 27**
+  multi-verdict decisions have duplicate dates — one holds a `mixed` and a
+  `validated` **on the same day** — so ordering on it is non-deterministic.
+  `pg_id` is monotonic, already present, needs no join and no schema change, and
+  reproduces the Postgres census exactly.
+
+  ⚠ **Only the latest verdict counts, because lifecycle is not monotonic.**
+  Measured sequences run `validated → refined → validated` and
+  `refined → validated → validated`, so a rule keyed on *"has a refined
+  retrospective"* would retire decisions that were later re-validated.
+
+  **It attaches rather than appends.** The caller's `limit` is a contract
+  (v0.8.51), so the verdict enriches the decision row instead of adding a
+  companion record that would silently inflate the result set.
+
+  Enrichment, never a dependency: a Neo4j or Postgres fault degrades to no
+  lifecycle rather than to no search.
+
 ## [0.8.55] — 2026-08-06
 
 ### Fixed
