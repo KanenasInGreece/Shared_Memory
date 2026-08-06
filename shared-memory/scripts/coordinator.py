@@ -123,7 +123,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.54"
+FRAMEWORK_VERSION = "0.8.55"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -4582,7 +4582,19 @@ class MemoryCoordinator:
                 "      collect(DISTINCT al.name) AS aliases"
                 # Highest-signal edges survive the cap: provenance-bearing
                 # first, then any typed relation, bare MENTIONS last.
-                " ORDER BY CASE WHEN r.asserted_by IS NOT NULL THEN 0 ELSE 1 END,"
+                # LIFECYCLE EDGES RANK BY TYPE, NOT BY THE PROVENANCE STAMP.
+                # The stamp was never a proxy for "structurally important" — it
+                # means "something asserted this", and INHERITANCE is a something:
+                # it writes MENTIONS with asserted_by='inherited'. A decision with
+                # 31 such edges therefore buried its own HAD_OUTCOME (stamp null)
+                # below the cap, so a reader could not see the decision had been
+                # judged at all, and a retrospective did not surface the decision
+                # it judges. Measured: 131 decisions carry a verdict, 6 had it
+                # certainly hidden and 8 more at risk — growing as inheritance
+                # stamps more edges.
+                f" ORDER BY CASE WHEN type(r) IN ['{ONT.had_outcome}','{ONT.supersedes}',"
+                f"                                '{ONT.grounded_in}','{ONT.informed_by}'] THEN 0"
+                "               WHEN r.asserted_by IS NOT NULL THEN 1 ELSE 2 END,"
                 f"          CASE WHEN type(r) = '{ONT.entity_link}' THEN 1 ELSE 0 END"
                 " LIMIT $cap"
                 " RETURN labels, related.name AS name, related.pg_id AS pg_id,"
@@ -4668,7 +4680,12 @@ class MemoryCoordinator:
                 f"     }}"
                 "   WITH n, r, related, labels(related) AS labels,"
                 "        collect(DISTINCT al.name) AS aliases"
-                "   ORDER BY CASE WHEN r.asserted_by IS NOT NULL THEN 0 ELSE 1 END,"
+                # Lifecycle edges rank by TYPE — see the note on the
+                # single-anchor query above; inheritance stamps MENTIONS, so
+                # keying the first sort on asserted_by buried HAD_OUTCOME.
+                f"   ORDER BY CASE WHEN type(r) IN ['{ONT.had_outcome}','{ONT.supersedes}',"
+                f"                                  '{ONT.grounded_in}','{ONT.informed_by}'] THEN 0"
+                "                 WHEN r.asserted_by IS NOT NULL THEN 1 ELSE 2 END,"
                 f"            CASE WHEN type(r) = '{ONT.entity_link}' THEN 1 ELSE 0 END"
                 "   LIMIT $cap"
                 "   RETURN labels, related.name AS name, related.pg_id AS rel_pg_id,"
@@ -4758,7 +4775,8 @@ class MemoryCoordinator:
                     rows = await conn.fetch(
                         f"""
                         SELECT id, content, metadata FROM technical_docs
-                        WHERE (content ILIKE $1 OR metadata::text ILIKE $1)
+                        WHERE NOT superseded
+                          AND (content ILIKE $1 OR metadata::text ILIKE $1)
                           AND {vis_sql}
                         LIMIT $2
                         """,
@@ -4820,9 +4838,14 @@ class MemoryCoordinator:
                         "run migrations: uv run --with psycopg2-binary "
                         "python shared-memory/migrations/apply.py"
                     )
+                    # Same rule as the Tier-1 fallback: the `kind` column may
+                    # predate migration 006, but supersession is never dropped.
+                    # PROVEN before this change — querying with a superseded
+                    # summary's own text returned that summary from this branch
+                    # while the guarded query correctly returned a live one.
                     summary = await conn.fetchrow(
                         "SELECT id, content, metadata, source_pg_ids FROM community_summaries"
-                        f" WHERE {vis_t3}"
+                        f" WHERE NOT superseded AND {vis_t3}"
                         " ORDER BY embedding <=> $1::vector LIMIT 1",
                         str(q_vec), *vis_t3_params,
                     )
@@ -4858,11 +4881,18 @@ class MemoryCoordinator:
                         """,
                         *args,
                     )
-                except Exception:
+                except asyncpg.UndefinedColumnError:
+                    # PRE-MIGRATION SCHEMA ONLY, and it FAILS CLOSED on the
+                    # supersession guard: `created_at` may be absent on an old
+                    # install, but `superseded` is not optional — a search that
+                    # returns nothing is visibly broken, while one that quietly
+                    # serves retired records is invisibly wrong. The previous
+                    # bare `except` caught every error and dropped the guard
+                    # with it, so any transient fault served superseded rows.
                     candidates = await conn.fetch(
                         f"""
-                        SELECT id, content, metadata, created_at FROM technical_docs
-                        WHERE {vis_sql} {scope_sql}
+                        SELECT id, content, metadata FROM technical_docs
+                        WHERE NOT superseded AND {vis_sql} {scope_sql}
                         ORDER BY embedding <=> $1::vector LIMIT $2
                         """,
                         *args,

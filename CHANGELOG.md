@@ -5,6 +5,45 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.55] — 2026-08-06
+
+### Fixed
+
+- **Supersession was enforced on the happy path only.** Three retrieval paths
+  dropped the `NOT superseded` guard: the **keyword/ILIKE fallback** (which
+  answers whenever embedding is unavailable — reachable in normal operation),
+  the **Tier-1 vector fallback**, and the **Tier-3 thematic fallback**. Proven
+  before the fix, not inferred: the keyword query returned a superseded fact
+  beside the fact that superseded it — and that record had been retired
+  precisely *for asserting something wrong* — while the unguarded Tier-3 query
+  returned a superseded summary when the guarded one correctly returned a live
+  one. **39 superseded records were reachable this way**, spanning facts,
+  decisions and retrospectives.
+
+  All three now filter. ⚠ And the Tier-1 fallback's bare `except Exception`
+  became `except asyncpg.UndefinedColumnError`: it exists for one pre-migration
+  schema shape, but caught **every** error and dropped the guard with it, so any
+  transient fault served retired records. These paths now **fail closed** — a
+  search that returns nothing is visibly broken; one that quietly serves retired
+  ADRs is invisibly wrong.
+
+- **A decision's verdict was invisible in graph context.** The expansion ranked
+  edges by `CASE WHEN r.asserted_by IS NOT NULL` **first** — and inheritance
+  writes `MENTIONS` with `asserted_by='inherited'`. A decision carrying 31 such
+  edges against a cap of 15 therefore buried its own `HAD_OUTCOME`, so a reader
+  could not see it had been judged at all, and a retrospective did not surface
+  the decision it judges.
+
+  Lifecycle edges (`HAD_OUTCOME`, `SUPERSEDES`, `GROUNDED_IN`, `INFORMED_BY`)
+  now rank **by type**, ahead of everything else; the stamp still breaks ties
+  below that. The stamp was never a proxy for "structurally important" — it
+  means *something asserted this*, and inheritance is a something. Measured:
+  **131 decisions carry a verdict, 6 had it certainly hidden and 8 more at
+  risk**, growing as inheritance stamps more edges.
+
+  *(The same failure mode `CLAUDE.md` already names: a rule keyed on a
+  provenance stamp whose stamp acquired a second writer.)*
+
 ## [0.8.54] — 2026-08-06
 
 ### Changed
