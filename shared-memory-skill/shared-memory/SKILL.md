@@ -144,7 +144,7 @@ Search the shared memory with semantic similarity, reranking, and Neo4j relation
   ```
 - **MCP (LM Studio):** Use the `hybrid_search_and_rerank` tool from the `rag-orchestrator` MCP server.
 
-Returns: Tier 3 community summary (global context) + Tier 1 semantic hits + Neo4j relational expansion.
+Returns: Tier 1 semantic hits and Tier 3 narratives **ranked together on one scale**, plus Neo4j relational expansion. No tier holds a reserved position — a community summary or insight appears where its relevance to *your query* puts it, which may be first, last, or not at all.
 
 The Tier-3 community summary now carries `source_pg_ids` (and its `metadata`) — the exact Tier-1 facts it was synthesised from. Those are **facts-table** ids: trace a narrative to its sources with `lineage` on them, or `lineage summary:<id>` to get them already qualified (see the record-reference note under Task 3).
 
@@ -385,13 +385,9 @@ Result shape:
 {
   "results": [
     {
-      "tier": "community_summary",
-      "content": "The coordinator uses per-entity asyncio locks sorted by name to prevent deadlocks. Concurrent saves with overlapping entity sets acquire locks in consistent order...",
-      "score": null
-    },
-    {
       "tier": "fact",
       "content": "Sort entity locks by name to prevent deadlocks\n\nTwo concurrent saves...",
+      "ranked": true,
       "score": 3.1,
       "score_normalized": 0.96,
       "matched_entities": ["coordinator", "OutboxPattern"],
@@ -400,14 +396,24 @@ Result shape:
         {"rel_type": "WAS_ASSISTED_BY",   "name": "claude-sonnet-4-6", "label": "AIAgent"},
         {"rel_type": "PROJECT_OF",        "name": "shared-memory",     "label": "Project"}
       ]
+    },
+    {
+      "tier": "community_summary",
+      "content": "The coordinator uses per-entity asyncio locks sorted by name to prevent deadlocks. Concurrent saves with overlapping entity sets acquire locks in consistent order...",
+      "ranked": true,
+      "score": 0.8,
+      "score_normalized": 0.69,
+      "source_pg_ids": [412, 418, array_of_fact_ids]
     }
   ]
 }
 ```
 
-The first result is the **Tier-3 community summary** — the synthesised narrative across all related facts. The second is the **Tier-1 precision hit** — the original decision, with its full provenance chain in `graph_context`.
+**Read the order as an answer, not a layout.** Every row is scored by the reranker on the same scale, so the summary above sits *below* the fact because it was less relevant to this query — a different query would put it first. `score` is a raw relevance logit (unbounded, negative means "less relevant than not"); `score_normalized` is that value squashed into (0, 1).
 
-When a cross-project insight exists, a `"tier": "insight_summary"` result precedes the community summary — a principle synthesised from ≥2 decisions across different projects, validated by at least one retrospective; its `source_pg_ids` are **decision** ids.
+⚠ **`ranked: false` changes what the order means.** It marks a result set the reranker could not score, served in vector order instead. Positions are then weakly meaningful, `score` is `null`, and Tier-3 narratives are **omitted entirely** — without ranking there is no basis to place a narrative among facts, so none is guessed at.
+
+A `"tier": "insight_summary"` row is a principle synthesised from ≥2 decisions across different projects, validated by at least one retrospective; its `source_pg_ids` are **decision** ids rather than fact ids. It competes for position like everything else: an insight outranks a thematic summary when it earns it for your query, not by rule.
 
 ### D. Query the provenance graph
 
@@ -552,7 +558,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness:
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":4,"version":"0.8.53","daemon":"running","rem_daemon":"running",...}
+# → {"status":"ok","api_version":4,"version":"0.8.54","daemon":"running","rem_daemon":"running",...}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -608,7 +614,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.8.53", "api_version": 4, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.8.54", "api_version": 4, "tool": "shared-memory-framework"}`
 
 ### Updating This Skill
 

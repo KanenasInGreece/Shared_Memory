@@ -368,9 +368,9 @@ This is the problem the Shared Memory Framework is designed to address. The solu
 |---|---|---|---|
 | **1 — Episodic** | `technical_docs` (Postgres + pgvector) | Original facts, full content, surgical precision via cosine similarity | Hippocampus — fast, specific, pattern-separated |
 | **2 — Structural** | Neo4j `Fact` nodes (keyed by `pg_id`) | Relationships, provenance, `consolidated` flag, Entity hubs | Hippocampus — relational context cosine similarity cannot express |
-| **3 — Semantic** | `community_summaries` (Postgres + pgvector) | Consolidated thematic narratives; queried first on retrieval | Neocortex — slow, abstract, statistical regularities across episodes |
+| **3 — Semantic** | `community_summaries` (Postgres + pgvector) | Consolidated thematic narratives; ranked alongside Tier 1 on retrieval | Neocortex — slow, abstract, statistical regularities across episodes |
 
-**Retrieval always queries Tier 3 first** (thematic orientation), then Tier 1 (surgical precision), then expands through Neo4j (relational context). Artifacts saved by one agent become retrievable by all others once the sleep cycle runs (§13).
+**Retrieval draws from Tier 3 (thematic orientation) and Tier 1 (surgical precision) together, ranks them on one scale, and expands the survivors through Neo4j (relational context).** No tier holds a reserved position: a narrative appears where its relevance to the query puts it, which may be first, last, or nowhere. It used to be prepended unconditionally — fetched nearest-neighbour with no distance floor and never scored at all — so the most prominent slot in every answer was held by a record that had not been required to be relevant. Measured across ten queries before the change, the summary that occupied that slot belonged at median rank 6 of 21, and scored *negatively* on six of them. Artifacts saved by one agent become retrievable by all others once the sleep cycle runs (§13).
 
 ### Topology enforcement
 

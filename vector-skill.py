@@ -117,7 +117,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.8.53"
+VERSION = "0.8.54"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server
@@ -214,30 +214,38 @@ def _render_results(results: list, elapsed: float) -> str:
     if not results:
         return "Result: No relevant documentation found."
 
-    # Tier-3 narratives (thematic summaries, cross-project insights) lead, as
-    # the gateway ordered them; the precision facts follow with their scores.
-    tier3 = [r for r in results if r.get("record_type") in ("summary", "insight")]
-    tier1 = [r for r in results if r not in tier3]
-
-    out = []
-    for r in tier3:
-        kind = "Insight (cross-project principle)" if r.get("record_type") == "insight" \
-               else "Global Context Summary"
-        head = f"### {kind}  [{r.get('ref', r.get('pg_id'))}]"
-        src = r.get("source_pg_ids") or []
-        if src:
-            head += f"\n_synthesised from {len(src)} record(s)_"
-        out.append(f"{head}\n{r.get('content', '')}")
-
+    # ⛔ RENDER IN THE ORDER THE GATEWAY RETURNED. This used to partition the
+    # results and print every Tier-3 narrative above every fact — which was
+    # harmless only while the gateway pinned them there too. The gateway now
+    # RANKS summaries against facts on one scale and returns them interleaved,
+    # so re-grouping here would reinstate a guarantee the server deliberately
+    # removed, and would do it invisibly: the summary would sit on top carrying
+    # a score that says it belongs sixth.
+    #
+    # A client must not re-impose an ordering the server took a position on.
     body = []
-    for r in tier1:
-        meta = r.get("metadata") or {}
-        source = meta.get("source", "unknown") if isinstance(meta, dict) else "unknown"
+    for r in results:
+        rtype = r.get("record_type")
         score = r.get("score")
-        bits = [f"Ref: {r.get('ref', r.get('pg_id'))}", f"Source: {source}"]
-        if score is not None:
-            bits.insert(0, f"Score: {score:.2f}")
-        line = f"[{' | '.join(bits)}]"
+        if rtype in ("summary", "insight"):
+            kind = ("Insight (cross-project principle)" if rtype == "insight"
+                    else "Global Context Summary")
+            bits = [f"Ref: {r.get('ref', r.get('pg_id'))}"]
+            # Tier-3 rows carry a real score now; showing it is what makes the
+            # position it was given inspectable rather than a matter of trust.
+            if score is not None:
+                bits.insert(0, f"Score: {score:.2f}")
+            src = r.get("source_pg_ids") or []
+            if src:
+                bits.append(f"synthesised from {len(src)} record(s)")
+            line = f"### {kind}  [{' | '.join(bits)}]"
+        else:
+            meta = r.get("metadata") or {}
+            source = meta.get("source", "unknown") if isinstance(meta, dict) else "unknown"
+            bits = [f"Ref: {r.get('ref', r.get('pg_id'))}", f"Source: {source}"]
+            if score is not None:
+                bits.insert(0, f"Score: {score:.2f}")
+            line = f"[{' | '.join(bits)}]"
         gc = r.get("graph_context")
         if gc:
             line += f"\n[Graph Context]: {gc if isinstance(gc, str) else json.dumps(gc)}"
@@ -246,8 +254,10 @@ def _render_results(results: list, elapsed: float) -> str:
             line += f"\n[Matched entities]: {', '.join(map(str, ents))}"
         body.append(f"{line}\n{r.get('content', '')}")
 
-    header = f"### Unified Memory Results ({len(tier1)} item(s) found in {elapsed:.2f}s)\n\n"
-    parts = out + [header + "\n\n---\n\n".join(body)] if body else out
+    # Counts every row, Tier-3 included — the old header counted only the facts,
+    # so a result set was reported as smaller than what was printed.
+    header = f"### Unified Memory Results ({len(results)} item(s) found in {elapsed:.2f}s)\n\n"
+    parts = [header + "\n\n---\n\n".join(body)] if body else []
     return "\n\n---\n\n".join(parts)
 
 

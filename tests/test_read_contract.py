@@ -735,10 +735,13 @@ async def test_search_survives_neo4j_failure_on_both_walks():
     ])
     mock_session.run = AsyncMock(side_effect=Exception("neo4j down"))
 
+    # One candidate list: index 0 is the summary, index 1 the fact. Both walks
+    # must degrade to [] independently when Neo4j is down.
     mock_reranker = MagicMock()
     mock_reranker.raise_for_status = MagicMock()
     mock_reranker.json = MagicMock(return_value={
-        "results": [{"index": 0, "relevance_score": 1.0}]
+        "results": [{"index": 0, "relevance_score": 2.0},
+                    {"index": 1, "relevance_score": 1.0}]
     })
     results = await _run_search(c, mock_reranker)
 
