@@ -67,7 +67,22 @@ def test_sentinel_is_reserved_and_distinct():
 
 # ── P1 has teeth only if no reader keeps a private copy ──────────────────────
 
-_OWN_COPY = re.compile(r"COALESCE\(\s*metadata->[^)]*'project'", re.IGNORECASE)
+# A hand-rolled resolution is a COALESCE that CHAINS metadata paths — that is
+# what "resolving" means here, and every historical violation had that shape:
+# falling back from 'project' to 'domain' or 'scope', or re-spelling
+# PROJECT_SQL's own decision-blob chain.
+#
+# ⚠ It must NOT fire on `COALESCE(metadata->>'project', '')`, which is a
+# different operation: keying a community_summaries ROW on its own stored axis,
+# where the empty-string default is load-bearing for the unique index (a
+# domain-level summary has no entity, and NULL in a unique index makes
+# duplicates legal — migration 029). Requiring TWO metadata paths is what
+# separates "resolve a record's project" from "key a summary on its own".
+_OWN_COPY = re.compile(
+    r"COALESCE\(\s*metadata->[^)]*'project'[^)]*metadata->[^)]*\)"
+    r"|COALESCE\(\s*metadata->(?![^)]*'project'[^)]*'')[^)]*metadata->[^)]*'project'",
+    re.IGNORECASE,
+)
 
 # Python implicit string concatenation splits a query across source lines, so
 # collapse `" ... "  f" ... "` before looking for the pattern.
@@ -93,6 +108,31 @@ def test_no_reader_carries_its_own_project_resolution():
         "these modules hand-roll a project resolution instead of importing "
         f"project_axis.PROJECT_SQL: {offenders}"
     )
+
+
+def test_the_p1_guard_discriminates_resolution_from_a_summary_key():
+    """The guard above is only worth having if it still catches what it was
+    written for. PR 7 narrowed it — a summary's own axis key
+    (`COALESCE(metadata->>'project','')`, load-bearing for migration 029's
+    unique index) is not a resolution — so the narrowing is pinned here rather
+    than left to be re-derived. Every form below is a violation this project
+    actually had (see project_axis.py's docstring: two readers fell back to
+    `domain`, one to `scope`, and five re-spelled PROJECT_SQL)."""
+    must_fire = [
+        "COALESCE(metadata->>'project', metadata->>'domain')",
+        "COALESCE(metadata->>'project', metadata->>'scope')",
+        "COALESCE(metadata->'decision'->>'project', metadata->>'project')",
+        "COALESCE(metadata->>'domain', metadata->>'project')",
+    ]
+    must_not_fire = [
+        "COALESCE(metadata->>'project', '')",
+        "COALESCE(metadata->>'entity', '')",
+        "COALESCE(metadata->>'domain', '')",
+    ]
+    for src in must_fire:
+        assert _OWN_COPY.search(src), f"P1 guard no longer catches: {src}"
+    for src in must_not_fire:
+        assert not _OWN_COPY.search(src), f"P1 guard false-positives on: {src}"
 
 
 def test_every_reader_actually_imports_the_module():
@@ -247,8 +287,12 @@ def test_the_fold_key_query_no_longer_invents_a_bucket():
     assert "f\"SELECT id, {PROJECT_SQL},\"" in src
     assert "COALESCE({PROJECT_SQL}, 'general')" not in src
 
+    # ⚠ The alias is `AS project`, not `AS domain`. It always HELD the project;
+    # calling it `domain` was the naming trap PR 7 exists to untangle, and a
+    # test asserting the old spelling would pin the confusion in place.
     coord = open(os.path.join(_SCRIPTS, "coordinator.py"), encoding="utf-8").read()
-    assert "f\"SELECT id, {PROJECT_SQL} AS domain\"" in coord
+    assert "f\"SELECT id, {PROJECT_SQL} AS project" in coord
+    assert "{PROJECT_SQL} AS domain" not in coord
     assert "DEFAULT_DOMAIN" not in coord.split("# NREM dream-cycle backlog gauge")[0]
 
 

@@ -5,6 +5,55 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.58] — 2026-08-06
+
+### Changed
+
+- **NREM fact consolidation keys on registered project + section, at two levels
+  (plan PR 7).** The fold's internal `domain` variable and
+  `community_summaries.metadata.domain` historically held the **project** name.
+  That squat is removed: thematic summaries store `metadata.project`,
+  `metadata.domain` (section), and `metadata.level` (`entity` | `domain`).
+  Entity-level folds partition by `(entity, project, section)` with multi-domain
+  fan-out; domain-less facts still fold on the project alone (P15). Domain-level
+  folds partition by `(project, section)` for **registered** sections only (P16),
+  threshold `NREM_DOMAIN_THRESHOLD` (default = density threshold), with no entity
+  required. Telemetry NREM cycle counts use the same pure partitioners.
+
+- **Subset supersession of thematic summaries is scoped to the same `level`
+  (P12).** Without that, a domain-level fold's source set always covers every
+  finer entity-level subset and would retire them every cycle.
+
+- **Fold prompt:** the entity / topic string is a **payload pointer** into the
+  already-gated records (which excerpts to surface), not the membership key.
+  Membership is the project/section axis.
+
+### Fixed
+
+- **Decision 1080 — a judgement's `source_ref` is not evidential weight.**
+  Thematic fold lines used `fact_kind_from_source_ref` for every record type, so
+  a retrospective's instrument citation could present as `measured` evidence.
+  Judgements now take kind from their grounding facts; `origin_location` may
+  still cite the instrument.
+
+### Added
+
+- Migration **029** — backfill `metadata.project` from the historical domain
+  squat, clear section to `''`, stamp `level=entity`, replace the partial unique
+  index with `(entity, project, domain, level)` COALESCE form.
+- `NREM_DOMAIN_THRESHOLD` env knob.
+- `tests/test_nrem_axis_levels.py` — pure partitioners, P15/P16, 1080 kinds.
+
+### Notes
+
+- Supersession-driven **re-fold** of summaries that cite a retired fact (find →
+  substitute → refold → successor pointer) is **not** this release — that is plan
+  PR 8. Search still surfaces `stale_sources` until then.
+- Domain-level folds are rare on sparse section capture; verify live by
+  temporarily lowering `NREM_DOMAIN_THRESHOLD`, one fold, then restore.
+
+---
+
 ## [0.8.57] — 2026-08-06
 
 ### Fixed

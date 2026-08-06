@@ -123,7 +123,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.57"
+FRAMEWORK_VERSION = "0.8.58"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -1033,27 +1033,15 @@ def _normalize_project(name):
 
 
 def _count_domain_cycles(pg_ids: list[int], domain_map: dict[int, str], threshold: int) -> int:
-    """Partition pg_ids by project and count buckets meeting the density threshold.
+    """Legacy name: ``domain_map`` is the PROJECT map (historical squat).
 
-    Pure function (no I/O) so the per-(entity, project) gating rule is unit-testable.
-    Mirrors consolidation_loop.eligible_domain_clusters' partitioning, but returns
-    a count rather than the work items — telemetry needs the gauge, not the payload.
-
-    FACTS ONLY. The decision call site is gone: decisions are gated by the
-    insight predicate (a shared grounded entity, ≥2 distinct projects, ≥1
-    outcome), which a Postgres partition cannot express at all, so counting them
-    this way answered a question nobody asks. See insight_gate.py.
+    Delegates to consolidation_loop.count_entity_level_cycles with empty
+    sections (P15 only) so the gauge cannot invent a second partition rule.
+    Prefer count_entity_level_cycles + domains_map when sections are available.
     """
-    by_domain: dict[str, int] = {}
-    for pid in pg_ids:
-        dom = domain_map.get(pid)
-        # P2, via the SAME predicate the daemon partitions on: an unresolvable
-        # project is skipped, never bucketed. A gauge that counted them together
-        # would report a cycle the fold refuses to run.
-        if not fold_eligible(dom):
-            continue
-        by_domain[dom] = by_domain.get(dom, 0) + 1
-    return sum(1 for n in by_domain.values() if n >= threshold)
+    from consolidation_loop import count_entity_level_cycles
+    domains_map = {pid: [] for pid in pg_ids}
+    return count_entity_level_cycles(pg_ids, domain_map, domains_map, threshold)
 
 # Cypher write-operation guard — reject queries containing mutating keywords.
 # Defence-in-depth: blocks obvious destructive ops while a deeper Neo4j RBAC
@@ -6276,34 +6264,67 @@ class MemoryCoordinator:
             irows = await ires.data()
         decision_cycles = int(irows[0]["cycles"]) if irows else 0
 
-        # Postgres: authoritative project per pg_id across all eligible facts.
+        # Postgres: project + sections per pg_id — SAME pure partitioners as
+        # the fold (entity-level + domain-level). Never invent a second rule.
+        from consolidation_loop import (
+            count_entity_level_cycles, count_domain_level_cycles,
+            NREM_DOMAIN_THRESHOLD,
+        )
+        from domain_axis import resolve_domains as _resolve_domains
         all_ids = sorted(
             {int(pid) for c in fact_clusters for pid in (c["pg_ids"] or []) if pid is not None}
         )
-        domain_map: dict[int, str] = {}
+        project_map: dict[int, str] = {}
+        domains_map: dict[int, list] = {}
+        registered_sections: set = set()
         if all_ids:
             async with self._acquire() as conn:
                 rows = await conn.fetch(
-                    # project_axis.PROJECT_SQL — the one resolution, so this
-                    # gauge and the fold cannot describe different populations.
-                    f"SELECT id, {PROJECT_SQL} AS domain"
+                    f"SELECT id, {PROJECT_SQL} AS project, metadata"
                     f" FROM technical_docs WHERE id = ANY($1)",
                     all_ids,
                 )
-            domain_map = {r["id"]: r["domain"] for r in rows}
+                reg = await conn.fetch(
+                    "SELECT p.name AS project, d.name AS section"
+                    "  FROM project_domains d"
+                    "  JOIN projects p ON p.id = d.project_id"
+                )
+            for r in rows:
+                project_map[r["id"]] = r["project"]
+                meta = r["metadata"]
+                if isinstance(meta, str):
+                    import json as _json
+                    try:
+                        meta = _json.loads(meta)
+                    except (ValueError, TypeError):
+                        meta = {}
+                domains_map[r["id"]] = _resolve_domains(
+                    meta if isinstance(meta, dict) else {})
+            registered_sections = {
+                (r["project"], r["section"]) for r in reg
+            }
 
-        fact_cycles = sum(
-            _count_domain_cycles(
+        entity_cycles = sum(
+            count_entity_level_cycles(
                 [int(pid) for pid in (c["pg_ids"] or []) if pid is not None],
-                domain_map, ONT.density_threshold,
+                project_map, domains_map, ONT.density_threshold,
             )
             for c in fact_clusters
         )
+        # Domain-level: one count over the union of all eligible fact ids.
+        domain_cycles = count_domain_level_cycles(
+            all_ids, project_map, domains_map,
+            NREM_DOMAIN_THRESHOLD, registered_sections,
+        ) if all_ids else 0
+        fact_cycles = entity_cycles + domain_cycles
         return {
             "fact_cycles": fact_cycles,
+            "entity_level_cycles": entity_cycles,
+            "domain_level_cycles": domain_cycles,
             "decision_cycles": decision_cycles,
             "total_cycles": fact_cycles + decision_cycles,
             "fact_threshold": ONT.density_threshold,
+            "domain_threshold": NREM_DOMAIN_THRESHOLD,
             "decision_threshold": INSIGHT_THRESHOLD,
         }
 
