@@ -123,7 +123,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.50"
+FRAMEWORK_VERSION = "0.8.51"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -797,7 +797,8 @@ EMBED_BACKOFF = 0.5      # seconds × attempt number  (0.5 s, 1 s, 1.5 s, 2 s)
 # stdlib + log_hygiene, which this module already depends on, so this does not
 # pull psycopg2 into the gateway venv.)
 from dream_telemetry import (EMBED_MAX_CHARS, EMBED_TIMEOUT_FLOOR_S,  # noqa: E402
-                             embed_ceiling)
+                             RERANK_MAX_DOC_CHARS, clamp_rerank_doc,
+                             embed_ceiling, rerank_ceiling)
 
 # Read-contract graph expansion cap: how many edges surface per anchored record
 # in search results. Env-tunable. Ordering (in the expansion Cypher) puts
@@ -1314,6 +1315,13 @@ class MemoryCoordinator:
         self._neo4j: Any = None
         self._locks = BoundedKeyedLocks(LOCKS_MAX_SIZE)
         self._outbox_task: asyncio.Task | None = None
+        # Rerank outcome counters. The reranker is a separate process on the
+        # search path with a FALLBACK, so its total failure is silent by
+        # construction — it degrades to vector order and still answers. These
+        # make that visible: a rising failure count against a flat success count
+        # is a reranker that is up (it answers /health) but cannot serve.
+        self._rerank_successes = 0
+        self._rerank_failures = 0
         # Backup quiesce: dedicated connection holding the EXCLUSIVE advisory lock
         # (None = not held), plus the TTL auto-resume task.
         self._quiesce_conn: Any = None
@@ -4854,23 +4862,52 @@ class MemoryCoordinator:
             # Rerank — direct to port 8071 to avoid circular proxy call.
             # Decisions/retrospectives are scored WITH their recording date
             # prepended (recency-aware: the newest retro is the current verdict).
+            # Each document is clamped to the relevance window before it is sent:
+            # the full text is still what search RETURNS, only what the reranker
+            # SCORES is bounded. That is what makes the ceiling below a fixed
+            # quantity — same relationship EMBED_MAX_CHARS has with embed_ceiling.
             rerank_docs = [
-                _rerank_doc_text(c, m, t)
+                clamp_rerank_doc(_rerank_doc_text(c, m, t))
                 for c, m, t in zip(contents, metas, createds)
             ]
+            reranked = False
             try:
                 rr = await client.post(
                     RERANK_URL,
-                    json={"query": query, "documents": rerank_docs, "top_k": limit},
-                    timeout=5.0,
+                    # `top_n` is what llama.cpp's /v1/reranking honours; `top_k`
+                    # was silently IGNORED, so the server returned all 20
+                    # candidates and the caller's limit was enforced only by the
+                    # failure path. Both are sent because other reranking servers
+                    # spell it differently — but neither is TRUSTED: the slice
+                    # below is what actually enforces the contract.
+                    json={"query": query, "documents": rerank_docs,
+                          "top_n": limit, "top_k": limit},
+                    # Derived from the payload, never constant — a constant
+                    # under-provisions exactly the large sets that need it most.
+                    timeout=rerank_ceiling(rerank_docs),
                 )
                 rr.raise_for_status()
                 ranked = rr.json()["results"]
-            except Exception:
+                reranked = True
+            except Exception as exc:
+                # FAILURE != IDLE. The fallback serves VECTOR order, which is a
+                # different answer from a ranked one — so it is logged, counted
+                # and declared in the response rather than dressed up as a
+                # confident uniform score.
+                log.warning("rerank failed (%s: %s) — serving vector order "
+                            "for %d candidates", type(exc).__name__, exc,
+                            len(rerank_docs))
+                self._rerank_failures += 1
                 ranked = [
-                    {"index": i, "relevance_score": 1.0}
-                    for i in range(min(limit, len(candidates)))
+                    {"index": i, "relevance_score": None}
+                    for i in range(len(candidates))
                 ]
+            else:
+                self._rerank_successes += 1
+            # The caller's limit is enforced HERE, never delegated to the
+            # reranking server. A server that ignores its truncation parameter
+            # must not be able to inflate the result set.
+            ranked = ranked[:limit]
 
         # Retrieval-time supersession check (decision 384) — the PRIMARY mechanism.
         # A summary/insight outlives its sources, so flag any returned narrative
@@ -5002,8 +5039,14 @@ class MemoryCoordinator:
                     "record_type": rtype,
                     "ref": make_ref(rtype, pg_id),
                     "content": contents[idx],
+                    # `ranked` says whether these positions mean anything. When
+                    # the reranker is unreachable the rows are in VECTOR order
+                    # and carry NO score — a fabricated 1.0 made a dead reranker
+                    # indistinguishable from a confident one.
+                    "ranked": reranked,
                     "score": raw_score,
-                    "score_normalized": _sigmoid(raw_score),
+                    "score_normalized": (_sigmoid(raw_score)
+                                         if raw_score is not None else None),
                     "matched_entities": _matched_entities(query, metas[idx]),
                     "metadata": metas[idx],
                     "created_at": (createds[idx].isoformat()

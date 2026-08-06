@@ -119,6 +119,61 @@ def embed_ceiling(input_chars: int) -> float:
                est_tokens / EMBED_MIN_TOK_S * EMBED_SAFETY_FACTOR)
 
 
+# ── Reranking call sizing ────────────────────────────────────────────────────
+# The SAME lesson as the embedder above, on the third backend — and the one it
+# was never applied to. The reranker scores each (query, document) pair, so its
+# cost tracks the TOTAL text handed to it, not the number of documents. It ran
+# for an unknown period behind a CONSTANT 5 s timeout while a real 20-candidate
+# set measured 64 s, so every search silently fell back to unranked cosine order
+# and the failure was invisible: the fallback emitted a plausible score and
+# /health only ever pinged for liveness.
+#
+# ANCHOR THE FLOOR AT THE LARGEST PAYLOAD, exactly as for the embedder. Measured
+# on BGE-Reranker-v2-m3 (568M Q8_0, llama.cpp, CPU, 4 threads): 1447 char/s on a
+# 20k-char set falling to 887 char/s on a 129k-char one — throughput DROPS as the
+# payload grows, so a floor taken from the average would under-provision the
+# large calls that need it most. The default sits below the worst observation.
+# A GPU-backed reranker should raise it; a slower box must lower it.
+RERANK_MIN_CHARS_S = float(os.environ.get("RERANK_MIN_CHARS_S", "800"))
+# Longest text ever SENT PER DOCUMENT. This is a relevance window, not a
+# truncation of the record: the full text is always kept in Tier 1 and still
+# returned by search — only the text the reranker SCORES is bounded. It is the
+# dominant lever on cost, far more than thread count: at a fixed 4 threads,
+# capping a real 20-candidate set at 2000 chars took it from 64 s to 30 s, and
+# char/s IMPROVES as documents shorten because the attention term is quadratic.
+RERANK_MAX_DOC_CHARS = int(os.environ.get("RERANK_MAX_DOC_CHARS", "2000"))
+# Same role as EMBED_SAFETY_FACTOR — headroom over the derived time, because
+# throughput falls with size and a ceiling fitted exactly to the floor leaves
+# nothing for the slowest run at the largest payload.
+RERANK_SAFETY_FACTOR = float(os.environ.get("RERANK_SAFETY_FACTOR", "1.5"))
+# Floor for small payloads — connection setup, and queueing behind another
+# request, because the reranker serialises across its slots.
+RERANK_TIMEOUT_FLOOR_S = float(os.environ.get("RERANK_TIMEOUT_FLOOR_S", "10"))
+
+
+def clamp_rerank_doc(text: str) -> str:
+    """The slice of one record the reranker SCORES. Bounding this is what makes
+    the ceiling below a known, fixed quantity rather than a guess — the same
+    relationship EMBED_MAX_CHARS has with embed_ceiling. Pure."""
+    return (text or "")[:RERANK_MAX_DOC_CHARS]
+
+
+def rerank_ceiling(docs) -> float:
+    """Per-request rerank timeout in seconds, derived from the TOTAL size of the
+    payload against a throughput floor.
+
+    Bounded by construction: every document is clamped to RERANK_MAX_DOC_CHARS,
+    so the ceiling can never exceed the full-candidate-set time — at the shipped
+    defaults 20 x 2000 / 800 * 1.5 = 75 s, against a measured true cost of ~30 s
+    for that payload on the reference CPU deployment. Pure → unit-testable
+    without a reranker."""
+    if RERANK_MIN_CHARS_S <= 0:
+        return RERANK_TIMEOUT_FLOOR_S
+    total = sum(len(clamp_rerank_doc(d)) for d in (docs or []))
+    return max(RERANK_TIMEOUT_FLOOR_S,
+               total / RERANK_MIN_CHARS_S * RERANK_SAFETY_FACTOR)
+
+
 def adaptive_ceiling(prompt_chars: int, units: int = 0,
                      max_tokens: int = 0) -> float:
     """Per-call hard ceiling in seconds, scaled to the work. `prompt_chars` = len

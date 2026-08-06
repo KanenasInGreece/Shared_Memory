@@ -34,7 +34,16 @@ PG_DATA_DIR="$(ask 'Postgres data dir'             "$HOME/databases/postgres")"
 LLM_MODELS_DIR="$(ask 'GGUF models dir (blank if using LM Studio)' '')"
 NEO4J_PASSWORD="$(ask_secret 'Neo4j password')"
 PG_PASSWORD="$(ask_secret 'Postgres password')"
+# CPU thread budget for the two encoder containers, DERIVED from this host
+# rather than assumed: about half its threads plus one, so reranking cannot
+# starve Postgres, Neo4j, the gateway and the desktop. Portable across the
+# three ways a machine reports its CPU count; falls back to the compose default.
+_ncpu="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null \
+         || sysctl -n hw.ncpu 2>/dev/null || echo 8)"
+LLAMA_CPU_THREADS="$(( _ncpu / 2 + 1 ))"
+[ "$LLAMA_CPU_THREADS" -lt 1 ] && LLAMA_CPU_THREADS=1
 export NEO4J_HOST_DIR PG_DATA_DIR LLM_MODELS_DIR NEO4J_PASSWORD PG_PASSWORD
+export LLAMA_CPU_THREADS
 
 # Render: copy the template, replacing only the value lines (ENVIRON avoids any
 # escaping pitfalls with slashes/special chars in paths or passwords).
@@ -45,6 +54,7 @@ awk '
   /^LLM_MODELS_DIR=/ { put("LLM_MODELS_DIR"); next }
   /^NEO4J_PASSWORD=/ { put("NEO4J_PASSWORD"); next }
   /^PG_PASSWORD=/    { put("PG_PASSWORD");    next }
+  /^LLAMA_CPU_THREADS=/ { put("LLAMA_CPU_THREADS"); next }
   { print }
 ' "$EXAMPLE" > "$ENV_FILE"
 chmod 600 "$ENV_FILE"
@@ -53,6 +63,7 @@ mkdir -p "$NEO4J_HOST_DIR"/{data,logs,import,plugins} "$PG_DATA_DIR"
 
 echo
 echo "✓ Wrote $ENV_FILE (chmod 600) and created data dirs."
+echo "  Encoder CPU budget:         LLAMA_CPU_THREADS=$LLAMA_CPU_THREADS (of $_ncpu host threads)"
 echo "  Confirm it is gitignored:   git -C \"$REPO_DIR\" check-ignore shared-memory/.env"
 echo "  Bring up the stack:         docker compose -f \"$REPO_DIR/postgres_neo4j_limits.yaml\" --env-file \"$ENV_FILE\" up -d"
 echo "  Then mint client tokens:    uv run python shared-memory/scripts/generate_tokens.py"
