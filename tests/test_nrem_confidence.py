@@ -642,12 +642,22 @@ async def test_grounding_excluded_edges_leave_log_line(monkeypatch, caplog):
 def _thematic_conn_script(insert_id=90):
     d = datetime.date(2026, 7, 11)
     return [
-        # 1. _fetch_records (id, domain, type, source_ref, created_at::date)
+        # 1. _fetch_records — PR 7 shape:
+        #    (id, project, type, source_ref, created_at::date, metadata)
+        #    The trailing metadata blob is what the SECTION axis is resolved
+        #    from (domain_axis.resolve_domains); the second column is the
+        #    PROJECT, which this query always returned even when the variable
+        #    holding it was called `domain`.
         {"rowcount": 2, "rows": [
-            (1, "general", "fact", "tests/test_x.py", d),
-            (2, "general", "fact", None, d),
+            (1, "general", "fact", "tests/test_x.py", d, {}),
+            (2, "general", "fact", None, d, {}),
         ]},
-        # 2. coverage census — _fetch_outbox_created_at over the work items'
+        # 2. registered sections (PR 7) — (project, section) pairs from the
+        #    domain registry. EMPTY here on purpose: with no registered section
+        #    no domain-level cluster can form (P16), so these tests keep
+        #    exercising the entity-level preservation gate they were written for.
+        {"rowcount": 0, "rows": []},
+        # 3. coverage census — _fetch_outbox_created_at over the work items'
         #    pg_ids (own-conn SELECT, so it lands on this same stub)
         {"rowcount": 2, "rows": []},
         # 3. fold dead-letter counts (own-conn SELECT; empty → no dead-lettering)

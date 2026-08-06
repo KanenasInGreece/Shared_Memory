@@ -257,19 +257,33 @@ def _supersession_conn(old_rows):
 def test_equal_source_set_supersedes_prior_insight():
     # A re-fold writes the SAME source_pg_ids — the equal set must ride the
     # covered-subset rule and replace its predecessor.
-    conn = _supersession_conn([(70, [245, 267])])
+    # Row shape after PR 7: (id, source_pg_ids, level, kind)
+    conn = _supersession_conn([(70, [245, 267], "entity", "insight")])
     assert supersede_covered_summaries(conn, 77, [245, 267]) == [70]
 
 
 def test_strict_subset_supersedes():
-    conn = _supersession_conn([(70, [245])])
+    conn = _supersession_conn([(70, [245], "entity", "insight")])
     assert supersede_covered_summaries(conn, 77, [245, 267]) == [70]
 
 
 def test_disjoint_and_superset_sources_survive():
-    conn = _supersession_conn([(70, [1, 2, 3]), (71, [245, 267, 999])])
+    conn = _supersession_conn([
+        (70, [1, 2, 3], "entity", "insight"),
+        (71, [245, 267, 999], "entity", "insight"),
+    ])
     assert supersede_covered_summaries(conn, 77, [245, 267]) == []
     assert conn.commits == 0
+
+
+def test_p12_same_level_only_when_level_passed():
+    """Entity-level fold must not retire a domain-level summary (P12)."""
+    conn = _supersession_conn([
+        (70, [1, 2], "domain", "thematic"),   # coarser — different level
+        (71, [1], "entity", "thematic"),      # same level, subset
+    ])
+    assert supersede_covered_summaries(
+        conn, 99, [1, 2, 3], level="entity") == [71]
 
 
 # ── close_ledger_rows_by_id ───────────────────────────────────────────────────
@@ -371,8 +385,8 @@ def _fold_script():
         {"rowcount": 1, "rows": [(77,)]},
         # 4. write_insight_summary ledger flip
         {"rowcount": 2, "rows": []},
-        # 5. supersession SELECT (one prior insight, same set)
-        {"rowcount": 1, "rows": [(70, [245, 267])]},
+        # 5. supersession SELECT (id, source_pg_ids, level, kind) — PR 7 shape
+        {"rowcount": 1, "rows": [(70, [245, 267], "entity", "insight")]},
         # 6. supersession UPDATE
         {"rowcount": 1, "rows": []},
         # 7. close_ledger_rows_by_id DELETE

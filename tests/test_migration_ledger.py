@@ -82,9 +82,17 @@ def test_the_destructive_dedup_is_guarded_against_the_later_key():
                             "migrations", "002_concurrency_hardening.sql"),
                encoding="utf-8").read()
     guard = sql.split("DELETE FROM community_summaries")[0]
-    assert "community_summaries_entity_domain_unique" in guard, (
-        "the entity-level dedup is not guarded by the presence of the later "
-        "(entity, domain) index")
+    # Guard names the historical (entity, domain) index from migration 007/009.
+    # Migration 029 replaces that index with community_summaries_axis_level_unique;
+    # 002 still guards on the old name so a re-run of 002 refuses against any DB
+    # that ever had the intermediate key. Both names are acceptable evidence
+    # that a later unique index on community_summaries is required.
+    assert (
+        "community_summaries_entity_domain_unique" in guard
+        or "community_summaries_axis_level_unique" in guard
+    ), (
+        "the entity-level dedup is not guarded by the presence of a later "
+        "community_summaries unique index")
     assert "IF to_regclass" in guard
 
 
