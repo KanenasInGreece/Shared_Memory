@@ -29,7 +29,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.8.56"
+VERSION = "0.8.57"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v3: review-edges / label-edges require the gateway's /memory/relations/* routes.
@@ -86,6 +86,28 @@ except ImportError:
 
 COORDINATOR_BASE = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
 AGENT_ID         = os.environ.get("AGENT_ID", "memory_bridge")
+
+# ── Search timeout sizing ────────────────────────────────────────────────────
+# The SAME lesson as the server's rerank_ceiling(), on the side it was never
+# applied to. A search costs what the RERANKER costs, and that tracks the total
+# candidate payload — not the caller's `limit`, which barely moves it. Both
+# clients shipped a CONSTANT ceiling (CLI 30 s, MCP 60 s) while the gateway sized
+# its own rerank call from measured throughput and published the result on
+# /health. The constants straddled the real cost, so searches failed
+# intermittently and blamed a gateway that had answered /health 3 ms earlier.
+# Measured 2026-08-06 at v0.8.56: real searches 19-35 s against a client ceiling
+# of 30 s, while /health projected 127 s for a full payload (fact:1112).
+#
+# So the ceiling is DERIVED from the gateway's own published sizing instead of
+# guessed at. The client then needs no re-tuning when the server's text window,
+# hardware or model changes: the number it uses is the server's own number.
+HEALTH_PROBE_TIMEOUT_S    = float(os.environ.get("HEALTH_PROBE_TIMEOUT_S", "3"))
+SEARCH_TIMEOUT_S          = float(os.environ.get("SEARCH_TIMEOUT_S", "0") or 0)
+SEARCH_TIMEOUT_FLOOR_S    = float(os.environ.get("SEARCH_TIMEOUT_FLOOR_S", "30"))
+SEARCH_TIMEOUT_MAX_S      = float(os.environ.get("SEARCH_TIMEOUT_MAX_S", "300"))
+SEARCH_TIMEOUT_FALLBACK_S = float(os.environ.get("SEARCH_TIMEOUT_FALLBACK_S", "120"))
+SEARCH_SAFETY_FACTOR      = float(os.environ.get("SEARCH_SAFETY_FACTOR", "1.5"))
+SEARCH_OVERHEAD_S         = float(os.environ.get("SEARCH_OVERHEAD_S", "15"))
 
 # Markers that identify a project root, in priority order. `.git` first because a
 # repository root is the least ambiguous boundary; the agent-instruction files are
@@ -167,6 +189,69 @@ def _sync_client(timeout: float) -> "httpx.Client":
     return httpx.Client(timeout=timeout)
 
 
+def search_ceiling(capability: dict | None) -> float:
+    """Client-side search timeout in seconds, derived from the gateway's own
+    published backend sizing (``backend_capability`` on GET /health).
+
+    Pure → unit-testable with no gateway present. Both probed backends contribute:
+    the reranker dominates, but the query is embedded on the same path, and the
+    two run on hardware that may or may not be shared.
+
+    A missing, malformed or unprobed capability block yields
+    ``SEARCH_TIMEOUT_FALLBACK_S``, which is deliberately well ABOVE the constant it
+    replaces — the failure being fixed is a ceiling *below* the real cost, so an
+    unknown cost must not fall back to the number already known to be too small.
+
+    ``SEARCH_TIMEOUT_S`` wins outright when set: the operator's escape hatch, and
+    the only way to get a constant back.
+    """
+    if SEARCH_TIMEOUT_S > 0:
+        return SEARCH_TIMEOUT_S
+
+    projected, probed = 0.0, False
+    for backend in ("reranker", "embedder"):
+        block = (capability or {}).get(backend)
+        if not isinstance(block, dict):
+            continue
+        try:
+            value = float(block.get("projected_full_payload_s") or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            projected += value
+            probed = True
+    if not probed:
+        return SEARCH_TIMEOUT_FALLBACK_S
+
+    # Postgres vector search, the graph traversal and response assembly sit
+    # outside both probes, so they are ADDED rather than scaled — they do not
+    # grow with encoder throughput.
+    derived = projected * SEARCH_SAFETY_FACTOR + SEARCH_OVERHEAD_S
+    return max(SEARCH_TIMEOUT_FLOOR_S, min(derived, SEARCH_TIMEOUT_MAX_S))
+
+
+_CAPABILITY_CACHE: dict | None = None
+
+
+async def _gateway_capability() -> dict | None:
+    """GET /health once per process and return its ``backend_capability`` block.
+
+    Never raises. An unreachable or slow gateway yields None and the caller falls
+    back to a constant ceiling — sizing the search must never be the thing that
+    fails the search. The gateway caches its own probe, so this costs a few ms.
+    """
+    global _CAPABILITY_CACHE
+    if _CAPABILITY_CACHE is None:
+        try:
+            async with _async_client(HEALTH_PROBE_TIMEOUT_S) as client:
+                health = (await client.get(f"{COORDINATOR_BASE}/health")).json()
+            block = health.get("backend_capability")
+            _CAPABILITY_CACHE = block if isinstance(block, dict) else {}
+        except Exception:
+            _CAPABILITY_CACHE = {}      # tried and got nothing; do not retry
+    return _CAPABILITY_CACHE or None
+
+
 def _request_headers() -> dict:
     """Headers attached to every coordinator request.
 
@@ -222,7 +307,26 @@ def _append_log(tool: str, min_level: int, event: str, data: dict, content: str 
 
 # ── Coordinator HTTP helpers ──────────────────────────────────────────────────
 
-def _coordinator_unavailable(exc: Exception) -> dict:
+def _coordinator_unavailable(exc: Exception, ceiling: float | None = None) -> dict:
+    """Map a transport failure to a message that names the RIGHT cause.
+
+    A read timeout and a dead gateway are different faults with different fixes,
+    and httpx's ReadTimeout stringifies to the empty string — so reporting both as
+    "unreachable — is hive_mind_proxy.py running? ()" sent readers to inspect a
+    daemon that had answered /health 3 ms earlier (fact:1112). The same shape as
+    the v0.8.45 verifiers reporting a credentials error for a missing dependency.
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        waited = f"{ceiling:.0f}s" if ceiling else "the client timeout"
+        return {
+            "status": "error",
+            "message": (
+                f"Gateway did not answer within {waited} — it is most likely UP and "
+                f"SLOW, not down. A search costs what the reranker costs. Read "
+                f"`backend_capability` on {COORDINATOR_BASE}/health, and raise "
+                f"SEARCH_TIMEOUT_S if its projection exceeds that ceiling."
+            ),
+        }
     return {
         "status": "error",
         "message": (
@@ -542,8 +646,11 @@ def format_label_outcomes(payload: dict) -> str:
 
 
 async def search_and_rerank(query: str, limit: int = 5) -> list | dict:
+    # Sized from the gateway's own published cost, never from a constant — the
+    # reranker dominates this call and its cost tracks the candidate payload.
+    ceiling = search_ceiling(await _gateway_capability())
     try:
-        async with _async_client(30.0) as client:
+        async with _async_client(ceiling) as client:
             r = await client.post(
                 f"{COORDINATOR_BASE}/memory/search",
                 json={"query": query, "limit": limit, "agent_id": AGENT_ID},
@@ -556,7 +663,7 @@ async def search_and_rerank(query: str, limit: int = 5) -> list | dict:
                         "message": "Coordinator rejected token. Set AGENT_TOKEN in this agent's .env."}
             result = r.json()
     except Exception as exc:
-        return await _warn_on_skew(_coordinator_unavailable(exc))
+        return await _warn_on_skew(_coordinator_unavailable(exc, ceiling))
 
     return result.get("results", result)
 

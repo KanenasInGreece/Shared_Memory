@@ -152,6 +152,8 @@ The Tier-3 community summary now carries `source_pg_ids` (and its `metadata`) �
 
 If all results score below −3.0, an entity-graph fallback runs automatically and appears as a supplementary section in the output.
 
+⏱ **A search takes as long as reranking takes — tens of seconds is normal, not a hang.** The cost tracks the total text being ranked, so asking for a smaller `limit` does not make it faster. The client sizes its own wait from the gateway's published capability rather than a constant, so it does not need re-tuning when the hardware or model changes. **If a search reports that the gateway did not answer in time, the gateway is up and slow — not down**: read `backend_capability` on `/health`, and pin `SEARCH_TIMEOUT_S` only if that projection exceeds the ceiling.
+
 ### 2. Artifact Persistence (Save)
 Commit findings, decisions, and technical facts to long-term shared memory.
 - **Trigger:** At the conclusion of any significant task or decision.
@@ -558,7 +560,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness:
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":4,"version":"0.8.56","daemon":"running","rem_daemon":"running",...}
+# → {"status":"ok","api_version":4,"version":"0.8.57","daemon":"running","rem_daemon":"running",...}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -614,7 +616,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.8.56", "api_version": 4, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.8.57", "api_version": 4, "tool": "shared-memory-framework"}`
 
 ### Updating This Skill
 
