@@ -38,6 +38,16 @@ PG_PASSWORD="$(ask_secret 'Postgres password')"
 # rather than assumed: about half its threads plus one, so reranking cannot
 # starve Postgres, Neo4j, the gateway and the desktop. Portable across the
 # three ways a machine reports its CPU count; falls back to the compose default.
+# `--threads` counts THREADS, so this counts threads — matching the unit of the
+# flag it feeds. (Deriving it from physical cores and passing it to a thread
+# flag mixes two units and silently halves the budget.) Half the machine plus
+# one leaves room for Postgres, Neo4j, the gateway and the desktop.
+#
+# ⚠ This is a PER-CONTAINER default and there are two encoders. They can run at
+# once (a search reranks while a save embeds), so on a machine where that
+# overlap is sustained, halve it again or pin each to its own cores — the
+# framework cannot know which, so it ships the simple derivation and leaves the
+# tuning to the operator.
 _ncpu="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null \
          || sysctl -n hw.ncpu 2>/dev/null || echo 8)"
 LLAMA_CPU_THREADS="$(( _ncpu / 2 + 1 ))"

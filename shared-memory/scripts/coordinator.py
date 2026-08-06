@@ -123,7 +123,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.52"
+FRAMEWORK_VERSION = "0.8.53"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -806,6 +806,13 @@ from dream_telemetry import (EMBED_MAX_CHARS, EMBED_TIMEOUT_FLOOR_S,  # noqa: E4
 # MENTIONS, so the highest-signal context survives the cap — context without
 # relation properties is noise disguised as fact.
 GRAPH_EXPANSION_LIMIT = _env_int("GRAPH_EXPANSION_LIMIT", 15)
+
+# Tier-1 candidates fetched for the reranker when the caller asks for few. A
+# FLOOR, not a cap: the effective pool is max(this, the caller's limit), so a
+# request for 100 results retrieves 100 candidates rather than silently
+# collapsing to this number. Retrieve-then-rerank depends on the pool being
+# wider than the result set — the reranker can only reorder what it is handed.
+SEARCH_CANDIDATE_FLOOR = _env_int("SEARCH_CANDIDATE_FLOOR", 20)
 
 # ── Relation-adjudication review/label surface (migration 020; decisions 726/727)
 # These constants MUST mirror relation_confidence.py (the psycopg2 foundation the
@@ -4820,10 +4827,22 @@ class MemoryCoordinator:
                         str(q_vec), *vis_t3_params,
                     )
 
-                # Tier 1 — vector search, 20 candidates for reranker.
+                # Tier 1 — vector search. The pool handed to the reranker is a
+                # DEFAULT FLOOR, never a ceiling on what the caller may ask for:
+                # it was a hardcoded 20, so a caller requesting more than 20
+                # silently received 20 while the endpoint advertised up to 100.
+                # A default the caller can exceed is configuration; a limit the
+                # caller cannot see is a defect.
+                #
+                # Retrieve-then-rerank also needs the pool to be at least as
+                # large as the result set — reranking can only reorder what it
+                # was given, so a pool equal to the limit makes the stage
+                # pointless. The floor keeps small searches reranking from a
+                # genuinely wider pool.
+                pool = max(SEARCH_CANDIDATE_FLOOR, limit)
                 # Reversed decisions (superseded=true, migration 009) are
                 # excluded; the fallback keeps pre-migration schemas working.
-                args: list = [str(q_vec), 20]
+                args: list = [str(q_vec), pool]
                 scope_sql = ""
                 if scope:
                     args.append(scope)
