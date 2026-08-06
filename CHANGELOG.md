@@ -5,6 +5,45 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.57] — 2026-08-06
+
+### Fixed
+
+- **Both clients waited on a constant while the gateway sized its own work — so
+  searches failed intermittently and blamed a gateway that was running.**
+  v0.8.51 established that a timeout must be derived from the work being asked
+  for, and applied it to the server's rerank call; neither front door was brought
+  under the rule. The CLI kept a constant 30 s and the MCP server 60 s, while a
+  real search measured 19–35 s and `/health` projected 127 s for a full payload.
+  The CLI ceiling therefore *straddled* the real cost: the same query passed or
+  failed depending on how much text its candidates carried. Nothing in the suite
+  could see it, because every search test stubs the HTTP client and the timeout
+  argument was never a value any assertion looked at.
+
+  Both clients now read `backend_capability` from `GET /health` once per process
+  and derive their ceiling from the gateway's own projection, clamped at both
+  ends. The client needs no re-tuning when the server's text window, hardware or
+  model changes, because the number it uses is the server's number.
+
+- **A read timeout no longer reports itself as an unreachable gateway.** httpx's
+  `ReadTimeout` stringifies to the empty string, so both clients printed
+  *"unreachable … is hive_mind_proxy.py running? ()"* — sending the reader to
+  inspect a daemon that had answered `/health` three milliseconds earlier. A
+  timeout now says the gateway is up and slow, names the ceiling that was hit,
+  and points at the capability block and the override.
+
+### Added
+
+- `SEARCH_TIMEOUT_S` (pin a constant, the escape hatch), `SEARCH_TIMEOUT_FLOOR_S`,
+  `SEARCH_TIMEOUT_MAX_S`, `SEARCH_TIMEOUT_FALLBACK_S`, `SEARCH_SAFETY_FACTOR`,
+  `SEARCH_OVERHEAD_S` and `HEALTH_PROBE_TIMEOUT_S` — all client-side, all
+  documented in the **client** `.env.example`, none normally needing to be set.
+- `tests/test_search_ceiling.py` — six invariants, including a **parity test
+  holding the two front doors in step**: they never import each other, so the
+  sizing rule is stated twice and only a test can keep the copies honest.
+
+---
+
 ## [0.8.56] — 2026-08-06
 
 ### Added

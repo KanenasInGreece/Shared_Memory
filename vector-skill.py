@@ -117,7 +117,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.8.56"
+VERSION = "0.8.57"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server
@@ -132,8 +132,73 @@ RETRO_RATINGS = ("validated", "mixed", "refined", "pending", "reversed")
 # and returns a confident, unrelated record (decision 822).
 RECORD_TYPES = ("fact", "decision", "retrospective", "summary", "insight")
 
-SEARCH_TIMEOUT = httpx.Timeout(60.0, connect=5.0)
 CALL_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
+
+# ── Search timeout sizing ────────────────────────────────────────────────────
+# Mirrors memory_bridge.search_ceiling() exactly — a thin client never imports
+# server modules, and the two front doors never import each other, so the rule is
+# restated here and held in step by a parity test. A search costs what the
+# RERANKER costs, which tracks the candidate payload rather than `limit`. This
+# door shipped a constant 60 s against a gateway that projected 127 s for a full
+# payload and permits far more; the CLI door shipped 30 s and was already failing
+# intermittently, blaming a gateway that was up (fact:1112).
+HEALTH_PROBE_TIMEOUT_S    = float(os.environ.get("HEALTH_PROBE_TIMEOUT_S", "3"))
+SEARCH_TIMEOUT_S          = float(os.environ.get("SEARCH_TIMEOUT_S", "0") or 0)
+SEARCH_TIMEOUT_FLOOR_S    = float(os.environ.get("SEARCH_TIMEOUT_FLOOR_S", "30"))
+SEARCH_TIMEOUT_MAX_S      = float(os.environ.get("SEARCH_TIMEOUT_MAX_S", "300"))
+SEARCH_TIMEOUT_FALLBACK_S = float(os.environ.get("SEARCH_TIMEOUT_FALLBACK_S", "120"))
+SEARCH_SAFETY_FACTOR      = float(os.environ.get("SEARCH_SAFETY_FACTOR", "1.5"))
+SEARCH_OVERHEAD_S         = float(os.environ.get("SEARCH_OVERHEAD_S", "15"))
+
+
+def search_ceiling(capability: dict | None) -> float:
+    """Client-side search timeout in seconds, derived from the gateway's own
+    published backend sizing (``backend_capability`` on GET /health).
+
+    Pure → unit-testable with no gateway present. MUST stay behaviourally
+    identical to ``memory_bridge.search_ceiling``; a parity test compares the two
+    across the shipped defaults, the fallback, and both clamps.
+    """
+    if SEARCH_TIMEOUT_S > 0:
+        return SEARCH_TIMEOUT_S
+
+    projected, probed = 0.0, False
+    for backend in ("reranker", "embedder"):
+        block = (capability or {}).get(backend)
+        if not isinstance(block, dict):
+            continue
+        try:
+            value = float(block.get("projected_full_payload_s") or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            projected += value
+            probed = True
+    if not probed:
+        return SEARCH_TIMEOUT_FALLBACK_S
+
+    # Postgres vector search, the graph traversal and response assembly sit
+    # outside both probes, so they are ADDED rather than scaled.
+    derived = projected * SEARCH_SAFETY_FACTOR + SEARCH_OVERHEAD_S
+    return max(SEARCH_TIMEOUT_FLOOR_S, min(derived, SEARCH_TIMEOUT_MAX_S))
+
+
+_CAPABILITY_CACHE: dict | None = None
+
+
+async def _gateway_capability() -> dict | None:
+    """GET /health once per process and return its ``backend_capability`` block.
+    Never raises: sizing the search must never be the thing that fails it."""
+    global _CAPABILITY_CACHE
+    if _CAPABILITY_CACHE is None:
+        try:
+            async with httpx.AsyncClient(timeout=HEALTH_PROBE_TIMEOUT_S) as client:
+                health = (await client.get(f"{COORDINATOR_BASE}/health")).json()
+            block = health.get("backend_capability")
+            _CAPABILITY_CACHE = block if isinstance(block, dict) else {}
+        except Exception:
+            _CAPABILITY_CACHE = {}      # tried and got nothing; do not retry
+    return _CAPABILITY_CACHE or None
 
 
 def _auth_headers() -> dict:
@@ -172,10 +237,21 @@ def _append_log(tool: str, min_level: int, event: str, data: dict, content: str 
         pass  # logging must never break the save path
 
 
-def _unavailable(exc: Exception) -> str:
+def _unavailable(exc: Exception, ceiling: float | None = None) -> str:
     """Uniform message when the gateway cannot be reached. The gateway is the
     only path to memory now, so this is a hard failure rather than a degraded
-    mode — saying so plainly beats silently returning nothing."""
+    mode — saying so plainly beats silently returning nothing.
+
+    A read timeout is a DIFFERENT fault and gets its own message: httpx's
+    ReadTimeout stringifies to nothing, so folding it in here told the reader to
+    start a service that was already running (fact:1112).
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        waited = f"{ceiling:.0f}s" if ceiling else "the client timeout"
+        return (f"Error: gateway did not answer within {waited} — it is most likely "
+                f"UP and SLOW, not down. A search costs what the reranker costs. "
+                f"Read `backend_capability` on {COORDINATOR_BASE}/health, and raise "
+                f"SEARCH_TIMEOUT_S if its projection exceeds that ceiling.")
     return (f"Error: memory gateway unreachable at {COORDINATOR_BASE} ({exc}). "
             "Start it with: systemctl --user start hive-mind-gateway.service")
 
@@ -275,8 +351,12 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5) -> str:
     """
     logger.info(f"Search: {query[:50]}...")
     start = datetime.now()
+    # Sized from the gateway's own published cost, never from a constant.
+    ceiling = search_ceiling(await _gateway_capability())
     try:
-        async with httpx.AsyncClient(timeout=SEARCH_TIMEOUT) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(ceiling, connect=5.0)
+        ) as client:
             r = await client.post(
                 f"{COORDINATOR_BASE}/memory/search",
                 json={"query": query, "limit": limit, "agent_id": AGENT_ID},
@@ -288,7 +368,7 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5) -> str:
             payload = r.json()
     except Exception as exc:
         logger.error(f"Search failed: {exc}")
-        return _unavailable(exc)
+        return _unavailable(exc, ceiling)
 
     results = payload.get("results", payload)
     if isinstance(results, dict) and results.get("status") == "error":
