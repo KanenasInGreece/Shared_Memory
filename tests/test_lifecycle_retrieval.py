@@ -126,3 +126,62 @@ def test_asserted_by_still_breaks_ties_below_type():
     pos = SRC.index("ORDER BY CASE WHEN type(r) IN [")
     frag = SRC[pos:pos + 320]
     assert "r.asserted_by IS NOT NULL THEN 1 ELSE 2 END" in frag
+
+
+# ── the reranked set is an ENTRY POINT: decisions resolve to current state ──
+
+def test_lifecycle_is_ordered_by_pg_id_not_date():
+    """A Retrospective node carries `rating` and `pg_id` but no `created_at`.
+    Its only temporal property is `date` — the OPERATOR-SUPPLIED outcome date,
+    not a write time — and 19 of 27 multi-verdict decisions have duplicate
+    dates, one holding a `mixed` and a `validated` on the same day. Ordering on
+    it is non-deterministic; pg_id is monotonic and already present."""
+    # Anchor on the QUERY, not the docstring — the docstring names
+    # `ORDER BY r.date` precisely to explain why it is wrong.
+    i = SRC.index("async def _resolve_decision_lifecycle")
+    q = SRC.index("session.run(", i)
+    frag = SRC[q:q + 900]
+    assert "ORDER BY r.pg_id DESC LIMIT 1" in frag
+    assert "r.date" not in frag, "date must never order verdicts in the query"
+
+
+def test_lifecycle_takes_only_the_latest_verdict():
+    """Lifecycle is NOT monotonic — measured sequences run
+    validated → refined → validated. A rule keyed on 'has a refined
+    retrospective' would retire decisions that were later re-validated."""
+    i = SRC.index("async def _resolve_decision_lifecycle")
+    frag = SRC[i:i + 2200]
+    assert "LIMIT 1" in frag, "exactly one verdict — the latest — may be used"
+
+
+def test_lifecycle_attaches_and_does_not_add_rows():
+    """The caller's limit is a contract (v0.8.51). Resolution must ENRICH the
+    decision row, never append a companion record that inflates the result set
+    past what was asked for."""
+    i = SRC.index("# ── LIFECYCLE RESOLUTION")
+    frag = SRC[i:i + 3000]
+    assert 'r["lifecycle"] = entry' in frag
+    assert "final.append" not in frag, (
+        "lifecycle resolution must not append rows to the result set"
+    )
+
+
+def test_qualifying_ratings_carry_the_verdict_text():
+    """`refined`/`mixed`/`reversed` mean the reader has to weigh the verdict, and
+    a rating word alone does not carry the reasoning — so the retrospective's own
+    text travels with the decision. `validated`/`pending` need only the rating."""
+    assert '_QUALIFYING_RATINGS = ("refined", "mixed", "reversed")' in SRC
+    i = SRC.index("# ── LIFECYCLE RESOLUTION")
+    frag = SRC[i:i + 3000]
+    assert "_QUALIFYING_RATINGS" in frag
+    assert "retrospective_content" in frag
+
+
+def test_lifecycle_failure_never_fails_the_search():
+    """Enrichment, not a dependency: a Neo4j or Postgres fault degrades to no
+    lifecycle rather than to no search — the FAILURE != IDLE rule."""
+    i = SRC.index("async def _resolve_decision_lifecycle")
+    assert "return {}" in SRC[i:i + 2200]
+    j = SRC.index("# ── LIFECYCLE RESOLUTION")
+    frag = SRC[j:j + 3000]
+    assert frag.count("except Exception:") >= 2

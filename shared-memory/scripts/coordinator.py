@@ -123,7 +123,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.55"
+FRAMEWORK_VERSION = "0.8.56"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -4645,6 +4645,53 @@ class MemoryCoordinator:
         await self._attach_decision_payload(ctx)
         return ctx
 
+    # Ratings that QUALIFY a decision — the reader needs the verdict's reasoning,
+    # not just its name. `validated`/`pending` say the decision stands as written,
+    # so the rating alone is enough.
+    _QUALIFYING_RATINGS = ("refined", "mixed", "reversed")
+
+    async def _resolve_decision_lifecycle(self, session, pg_ids: list[int]) -> dict:
+        """Current lifecycle state of each decision, resolved in the GRAPH.
+
+        ⛔ ORDERED BY pg_id, NEVER BY date. A Retrospective node carries `rating`
+        and `pg_id` but NO `created_at`; its only temporal property is `date`,
+        which is the OPERATOR-SUPPLIED outcome date, not a write time. Measured:
+        19 of 27 multi-verdict decisions have DUPLICATE dates among their
+        retrospectives — one holds a `mixed` and a `validated` on the same day —
+        so `ORDER BY r.date` is non-deterministic. `pg_id` is a monotonic
+        sequence already on the node, needs no join and no schema change, and
+        reproduces the Postgres census exactly.
+
+        ⚠ AND ONLY THE LATEST COUNTS, because lifecycle is NOT monotonic:
+        measured sequences run `validated → refined → validated` and
+        `refined → validated → validated`. A rule of "has a refined
+        retrospective" would retire decisions that were later re-validated.
+
+        Degrades to {} on any failure — this enriches a search, it never fails
+        one."""
+        if not pg_ids:
+            return {}
+        try:
+            result = await session.run(
+                "UNWIND $pg_ids AS pid"
+                " CALL (pid) {"
+                f"   MATCH (d:{ONT.decision} {{pg_id: pid}})"
+                f"        -[:{ONT.had_outcome}]->(r:{ONT.retrospective})"
+                "   RETURN r ORDER BY r.pg_id DESC LIMIT 1"
+                " }"
+                " RETURN pid AS pg_id, r.rating AS rating, r.pg_id AS retro_pg_id",
+                pg_ids=pg_ids,
+            )
+            out: dict[int, dict] = {}
+            async for rec in result:
+                if rec["rating"] is None:
+                    continue
+                out[rec["pg_id"]] = {"rating": rec["rating"],
+                                     "retrospective_pg_id": rec["retro_pg_id"]}
+            return out
+        except Exception:
+            return {}
+
     async def _expand_graph_context_batch(
         self, session, pg_ids: list[int], anchor_labels: tuple[str, ...],
     ) -> dict[int, list[dict]]:
@@ -5136,6 +5183,59 @@ class MemoryCoordinator:
                                    if createds[idx] is not None else None),
                     "graph_context": ctx,
                 })
+
+        # ── LIFECYCLE RESOLUTION (decision 1109) ────────────────────────────
+        # The reranked set is an ENTRY POINT into the graph, not the answer. Each
+        # returned decision is walked to its current verdict so the reader is
+        # never handed an ADR that has since been judged without being told.
+        #
+        # It ATTACHES rather than adding rows: the caller's limit is a contract
+        # (v0.8.51), so a companion record must not silently inflate the result
+        # set. The verdict's reasoning travels with the decision it qualifies.
+        decision_ids = [r["pg_id"] for r in final
+                        if r.get("record_type") == "decision"
+                        and r.get("pg_id") is not None]
+        if decision_ids:
+            try:
+                async with self._neo4j.session() as session:
+                    lifecycle = await self._resolve_decision_lifecycle(
+                        session, decision_ids)
+            except Exception:
+                lifecycle = {}
+            # Pull the retrospective's OWN TEXT for the ratings that qualify the
+            # decision — `refined`/`mixed`/`reversed` mean the reader must weigh
+            # the verdict, and a rating word alone does not carry the reasoning.
+            wanted = [v["retrospective_pg_id"] for v in lifecycle.values()
+                      if v["rating"] in self._QUALIFYING_RATINGS
+                      and v.get("retrospective_pg_id") is not None]
+            notes: dict[int, str] = {}
+            if wanted:
+                try:
+                    async with self._acquire() as conn:
+                        for row in await conn.fetch(
+                            "SELECT id, content FROM technical_docs"
+                            " WHERE id = ANY($1::bigint[])", wanted,
+                        ):
+                            notes[row["id"]] = row["content"]
+                except Exception:
+                    notes = {}
+            for r in final:
+                state = lifecycle.get(r.get("pg_id")) if \
+                    r.get("record_type") == "decision" else None
+                if not state:
+                    continue
+                entry = {
+                    "rating": state["rating"],
+                    # A record reference the caller can fetch directly — the same
+                    # qualified form used everywhere else, because a bare integer
+                    # resolves against the wrong table (decision 822).
+                    "ref": make_ref("retrospective", state["retrospective_pg_id"]),
+                    "retrospective_pg_id": state["retrospective_pg_id"],
+                }
+                text = notes.get(state["retrospective_pg_id"])
+                if text is not None:
+                    entry["retrospective_content"] = text
+                r["lifecycle"] = entry
 
         # Latest-retro-as-verdict: same-decision retrospectives newest-first.
         final = _order_retros_latest_first(final)
