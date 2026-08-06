@@ -616,7 +616,32 @@ llama-server -m /path/to/bge-m3-Q8_0.gguf --port 8070 --embedding -c 8192 -b 819
 llama-server -m /path/to/bge-reranker-v2-m3-Q8_0.gguf --port 8071 --rerank -c 8192 -b 8192 -ub 8192
 ```
 
+### CPU or GPU — both work, and the difference is time
+
+**As packaged, both encoders run on CPU.** That is deliberate: it means the stack comes up on any machine with no GPU, no driver and no vendor branch. It costs time, and the cost is worth knowing before you decide.
+
+Measured on the reference rig (AMD Ryzen 9 5900X, both containers CPU-only at 4 threads, BGE-M3 and BGE-Reranker-v2-m3 at Q8_0):
+
+| Work | Cost on CPU |
+|---|---|
+| Embed one 8,000-char record | ~20 s |
+| Rerank a typical 20-candidate search (73k chars) | **~64 s** |
+| Rerank a worst-case 20-candidate search (129k chars) | **~146 s** |
+| Rerank the same typical search, each document capped to 2,000 chars | ~30 s |
+
+Two things follow. First, **the reranking timeout must be derived from the payload, never fixed** — the framework does this (`rerank_ceiling`, `RERANK_MIN_CHARS_S`), and a constant timeout is how reranking silently stops happening at all. Second, **throwing CPU threads at it barely helps**: on the same payload, 4 threads took 63.8 s, 10 threads 36.7 s and 20 threads 32.3 s — five times the threads for twice the speed, because these models saturate memory bandwidth (and, on multi-die CPUs, the die-to-die fabric) long before they saturate cores.
+
+So on CPU the practical lever is `RERANK_MAX_DOC_CHARS`, which bounds the text the reranker *scores*. **Treat it as a concession rather than a free win.** Retrieval selects candidates using the embedding window; if ranking then sees a much narrower slice, a record can be demoted for lacking the very text it was selected for. Measured on this corpus, capping at 2,000 chars kept only about half of reranking's improvement over plain vector order.
+
+**To run them on a GPU instead, see `compose.gpu-encoders.yaml`** — a Vulkan overlay we ship as a worked example, because one image covers Intel, AMD and NVIDIA. Both models are small (~600 MB each), so the pair sits on one card and leaves another free for the reasoning LLM. Once they are on a GPU, raise `RERANK_MAX_DOC_CHARS` to match `EMBED_MAX_CHARS`: the reason to narrow it was latency, and that reason is gone.
+
+**The framework's actual requirement is only this:** an embedding endpoint and a reranking endpoint it can reach, at `EMBEDDER_URL` and `RERANKER_URL` (defaulting to `:8070` and `:8071`). Docker, bare `llama-server`, a GPU, another machine — **run them however you please.** The compose files are a convenience, not the contract.
+
+One thing worth keeping whatever you choose: **run the two as separate processes.** The embedder is on the critical write path — a save is refused with 503 rather than stored without a vector — while the reranker degrades gracefully to vector order. Coupling their lifecycles lets a reranker crash take all writes down with it.
+
 > **Never call ports 8070 or 8071 directly.** All agents must go through the Hive-Mind Gateway on port 8888. The gateway is what enforces the shared embedding space — if any agent bypasses it, the 1024-dim consistency guarantee is broken in operational practice.
+>
+> **And do not point `EMBEDDER_URL` at the reranker.** The ports are one digit apart and the failure is silent: asked to embed, the reranker answers HTTP 200 with a 1024-dimension vector — the right shape, essentially all zeros. It passes a dimension check and a null check while carrying no meaning. The embedder, asked to rerank, correctly refuses with HTTP 501.
 
 ---
 
