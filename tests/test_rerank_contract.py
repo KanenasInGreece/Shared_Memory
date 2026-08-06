@@ -273,3 +273,60 @@ def test_rerank_throughput_floor_is_env_overridable():
     assert slower > baseline, (
         "a lower throughput floor must produce a longer timeout"
     )
+
+
+# ── The relevance window is COHERENT with the embedding window by default ────
+
+def test_rerank_window_defaults_to_the_embedding_window():
+    """Retrieval selects a candidate on its embedding, computed over up to
+    EMBED_MAX_CHARS. If ranking then sees a narrower slice, a record can be
+    demoted for lacking the text it was selected for — ranking undoing
+    retrieval. So the two windows are derived from ONE value, and any divergence
+    has to be a deliberate override rather than a default."""
+    import dream_telemetry
+
+    assert dream_telemetry.RERANK_MAX_DOC_CHARS == dream_telemetry.EMBED_MAX_CHARS
+
+
+def test_rerank_window_can_still_be_narrowed_deliberately():
+    """The coherent default must remain overridable — narrowing it is the
+    dominant latency lever on a CPU deployment."""
+    import dream_telemetry
+
+    with patch.dict(os.environ, {"RERANK_MAX_DOC_CHARS": "1500"}):
+        importlib.reload(dream_telemetry)
+        assert dream_telemetry.RERANK_MAX_DOC_CHARS == 1500
+        assert len(dream_telemetry.clamp_rerank_doc("x" * 9999)) == 1500
+    importlib.reload(dream_telemetry)
+
+
+# ── The candidate pool is a FLOOR, never a ceiling on the caller's limit ─────
+
+@pytest.mark.asyncio
+async def test_candidate_pool_grows_to_meet_a_large_limit():
+    """The pool was a hardcoded 20 while the endpoint advertised limits up to
+    100, so a caller asking for 50 silently received 20. A default the caller
+    can exceed is configuration; a ceiling the caller cannot see is a defect."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+    mock_conn.fetch = AsyncMock(return_value=_candidates(50))
+
+    await _search(c, _reranker_returning(50), limit=50)
+
+    # The vector-search call carries the pool size as its second bound arg.
+    vector_call = mock_conn.fetch.await_args_list[0]
+    assert 50 in vector_call.args, (
+        f"the pool must reach the caller's limit; got args {vector_call.args[1:]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_candidate_pool_keeps_its_floor_for_small_limits():
+    """Reranking can only reorder what it is handed, so a small search must
+    still draw from a wider pool than it returns."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+    mock_conn.fetch = AsyncMock(return_value=_candidates(20))
+
+    await _search(c, _reranker_returning(20), limit=3)
+
+    vector_call = mock_conn.fetch.await_args_list[0]
+    assert 20 in vector_call.args, "the floor must survive a small limit"

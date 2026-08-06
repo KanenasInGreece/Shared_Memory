@@ -73,7 +73,8 @@ services:
   #
   # THREAD BUDGET. Both encoders are CPU-bound and can run at the same time (a
   # search reranks while a daemon or a save embeds), so they share one machine.
-  # LLAMA_CPU_THREADS is a BUDGET: about HALF the host's threads plus one,
+  # LLAMA_CPU_THREADS is a BUDGET: half the host's threads plus one — counted in
+  # threads because that is the unit `--threads` takes,
   # leaving the rest for Postgres, Neo4j, the gateway and the operator's
   # desktop. install_framework.sh derives it from the host and writes it to
   # .env; the 4 below is only the fallback for a hand-rolled deploy.

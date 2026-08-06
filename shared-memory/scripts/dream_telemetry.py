@@ -137,11 +137,24 @@ def embed_ceiling(input_chars: int) -> float:
 RERANK_MIN_CHARS_S = float(os.environ.get("RERANK_MIN_CHARS_S", "800"))
 # Longest text ever SENT PER DOCUMENT. This is a relevance window, not a
 # truncation of the record: the full text is always kept in Tier 1 and still
-# returned by search — only the text the reranker SCORES is bounded. It is the
-# dominant lever on cost, far more than thread count: at a fixed 4 threads,
-# capping a real 20-candidate set at 2000 chars took it from 64 s to 30 s, and
-# char/s IMPROVES as documents shorten because the attention term is quadratic.
-RERANK_MAX_DOC_CHARS = int(os.environ.get("RERANK_MAX_DOC_CHARS", "2000"))
+# returned by search — only the text the reranker SCORES is bounded.
+#
+# ⛔ IT DEFAULTS TO THE EMBEDDING WINDOW, AND THAT DEFAULT IS THE CORRECTNESS
+# ONE. Retrieval SELECTS a candidate using the embedding of up to
+# EMBED_MAX_CHARS; if ranking then sees a narrower slice, a record can be
+# demoted for lacking the very text it was selected for — ranking undoing
+# retrieval. Measured on the reference corpus, narrowing to 2000 chars kept only
+# about half of reranking's improvement over plain vector order. So the two
+# windows are DERIVED FROM ONE VALUE rather than set independently, and any
+# divergence between them is a deliberate act with a cost, not a default.
+#
+# Lowering it is the dominant latency lever, far more than thread count: at a
+# fixed 4 threads, narrowing a real 20-candidate set to 2000 chars took it from
+# 64 s to 30 s, and char/s IMPROVES as documents shorten because the attention
+# term is quadratic. Lower it when latency forces the trade — knowing what the
+# trade is.
+RERANK_MAX_DOC_CHARS = int(os.environ.get(
+    "RERANK_MAX_DOC_CHARS", str(EMBED_MAX_CHARS)))
 # Same role as EMBED_SAFETY_FACTOR — headroom over the derived time, because
 # throughput falls with size and a ceiling fitted exactly to the floor leaves
 # nothing for the slowest run at the largest payload.

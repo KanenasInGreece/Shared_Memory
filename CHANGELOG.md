@@ -5,6 +5,38 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.53] — 2026-08-06
+
+### Fixed
+
+- **The candidate pool was a hidden ceiling, not a default.** `handle_search`
+  accepted a `limit` of up to 100 but always fetched exactly **20** Tier-1
+  candidates, so a caller asking for 50 silently received 20 while the endpoint
+  advertised otherwise. The pool is now `max(SEARCH_CANDIDATE_FLOOR, limit)` —
+  a **floor the caller can exceed**, never a cap they cannot see. The floor
+  matters in its own right: reranking can only reorder what it is handed, so a
+  small search must still draw from a wider pool than it returns.
+
+### Changed
+
+- **The reranking window now defaults to the embedding window.**
+  `RERANK_MAX_DOC_CHARS` derives from `EMBED_MAX_CHARS` instead of carrying its
+  own literal, so **ranking and retrieval see the same text by default**.
+  Retrieval selects a candidate on an embedding computed over up to
+  `EMBED_MAX_CHARS`; ranking on a narrower slice can demote a record for lacking
+  the very text it was selected for — ranking undoing retrieval. Measured on the
+  reference corpus, narrowing to 2000 chars kept only about half of reranking's
+  improvement over plain vector order.
+
+  Narrowing it remains the dominant latency lever and remains one env var away —
+  but it is now a **deliberate divergence with a known cost**, not a default.
+
+- **The derived CPU-thread budget is counted in threads.** `--threads` takes a
+  thread count, so `install_framework.sh` derives it from the host's threads
+  rather than its physical cores; feeding a core count to a thread flag mixes
+  two units. Documented alongside it: the value is **per container**, and there
+  are two encoders that can run at once.
+
 ## [0.8.52] — 2026-08-06
 
 ### Added
