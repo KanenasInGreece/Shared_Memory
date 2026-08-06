@@ -635,7 +635,9 @@ So on CPU the practical lever is `RERANK_MAX_DOC_CHARS`, which bounds the text t
 
 **To run them on a GPU instead, see `compose.gpu-encoders.yaml`** — a Vulkan overlay we ship as a worked example, because one image covers Intel, AMD and NVIDIA. Both models are small (~600 MB each), so the pair sits on one card and leaves another free for the reasoning LLM. Once they are on a GPU, raise `RERANK_MAX_DOC_CHARS` to match `EMBED_MAX_CHARS`: the reason to narrow it was latency, and that reason is gone.
 
-**The framework's actual requirement is only this:** an embedding endpoint and a reranking endpoint it can reach, at `EMBEDDER_URL` and `RERANKER_URL` (defaulting to `:8070` and `:8071`). Docker, bare `llama-server`, a GPU, another machine — **run them however you please.** The compose files are a convenience, not the contract.
+**The contract is that what cannot be configured exists where the gateway is looking.** Nearly everything here *is* configurable — the ports, the URLs, the runtime, the hardware. `EMBEDDER_URL` and `RERANKER_URL` (defaulting to `:8070` and `:8071`) say where to look; Docker, bare `llama-server`, a GPU, another machine entirely — **run them however you please.** What is not negotiable is that an embedder is actually at the embedder's address and a reranker at the reranker's, both answering the shape the gateway expects. The compose files are a convenience; that correspondence is the contract.
+
+It is worth stating because it is the one thing here that can be broken silently — see the warning below on pointing `EMBEDDER_URL` at the reranker.
 
 One thing worth keeping whatever you choose: **run the two as separate processes.** The embedder is on the critical write path — a save is refused with 503 rather than stored without a vector — while the reranker degrades gracefully to vector order. Coupling their lifecycles lets a reranker crash take all writes down with it.
 
