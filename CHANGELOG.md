@@ -5,6 +5,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.59] — 2026-08-06
+
+### Fixed
+
+- **`verify_schema_init.py` reported `tables 14/15` — one table apparently
+  missing — from a tool whose entire job is to prove nothing is missing.** The
+  fifteenth table is `schema_migrations`, `apply.py`'s own migration ledger,
+  which `schema_init.sql` is correct never to carry. It was already in
+  `EXPECTED_ABSENT_TABLES` and already excluded from the comparison; only the
+  summary line printed raw totals, so the number contradicted the verdict
+  printed directly beneath it. The line now counts what was **checked** and
+  names the expected-absent table inline. The `missing_tables` comparison is
+  unchanged, so a genuine gap still fails.
+
+  *A number that has to be explained every time is a defect in the instrument,
+  not a fact about the system — this one cost the same investigation twice.*
+
+---
+
 ## [0.8.58] — 2026-08-06
 
 ### Changed

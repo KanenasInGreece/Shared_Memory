@@ -282,9 +282,24 @@ def main() -> int:
         if missing_triggers:
             problems.append(f"TRIGGERS missing: {sorted(missing_triggers)}")
 
-        print(f"\ntables {len(_tables(fresh))}/{len(_tables(live))} · "
+        # ⚠ COUNT WHAT WAS CHECKED, NOT WHAT EXISTS. Printing the raw totals
+        # rendered as "tables 14/15" — which reads as ONE MISSING TABLE from a
+        # tool whose whole job is to prove nothing is missing. It cost an
+        # investigation twice, both times ending at the same answer: the
+        # fifteenth table is `schema_migrations`, apply.py's own ledger, which
+        # schema_init.sql is CORRECT never to carry (see EXPECTED_ABSENT_TABLES).
+        # The comparison already excluded it; only this line did not, so the
+        # summary contradicted the verdict directly beneath it. A number that
+        # has to be explained every time is a defect in the instrument.
+        live_tables    = _tables(live) - EXPECTED_ABSENT_TABLES
+        fresh_tables   = _tables(fresh) - EXPECTED_ABSENT_TABLES
+        absent_note    = (f"  (+{len(EXPECTED_ABSENT_TABLES)} expected-absent: "
+                          f"{', '.join(sorted(EXPECTED_ABSENT_TABLES))} — apply.py's "
+                          f"ledger, never dumped)") if EXPECTED_ABSENT_TABLES else ""
+        print(f"\ntables {len(fresh_tables)}/{len(live_tables)} · "
               f"functions {len(_routines(fresh))}/{len(_routines(live))} · "
-              f"triggers {len(_triggers(fresh))}/{len(_triggers(live))} (fresh/live)")
+              f"triggers {len(_triggers(fresh))}/{len(_triggers(live))} (fresh/live)"
+              f"{absent_note}")
 
         if problems:
             print("\n❌ A FRESH INSTALL WOULD DIFFER FROM THIS DATABASE:\n")
