@@ -12,6 +12,7 @@ memory/
 MEMORY.md
 shared-memory-skill/*.skill
 CLAUDE.md
+GEMINI.md
 Local_Documentation/
 research/
 .claude/

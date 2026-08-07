@@ -39,6 +39,8 @@ The invariants:
 """
 
 import importlib.util
+import pytest
+pytest.importorskip("fastmcp")
 import os
 import sys
 

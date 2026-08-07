@@ -280,7 +280,7 @@ async def test_write_neo4j_rem_stamps_provenance_on_create_only():
 
     from rem_loop import ONT
     props = {"asserted_by": "rem", "confidence": 0.83, "model": "m1", "run_id": "cycle-1"}
-    edges = [_edge("Neo4j", ONT.entity, ONT.entity_link, props)]
+    edges = [_edge("PriorDecision", ONT.decision, ONT.informed_by, props)]
 
     await daemon._write_neo4j_rem(42, "", edges, original_content="orig")
 
@@ -292,7 +292,7 @@ async def test_write_neo4j_rem_stamps_provenance_on_create_only():
     # no unconditional SET on the relationship (would downgrade operator edges)
     after_merge_rel = cypher.split("MERGE (a)-[r:")[1]
     assert " SET r" not in after_merge_rel.replace("ON CREATE SET", "")
-    assert merge_call.kwargs["rows"] == [{"name": "Neo4j", "props": props}]
+    assert merge_call.kwargs["rows"] == [{"name": "PriorDecision", "props": props}]
 
 
 @pytest.mark.asyncio
@@ -366,9 +366,7 @@ async def test_write_neo4j_rem_decision_anchors_on_decision_and_keeps_rationale(
 
     from rem_loop import ONT
     edges = [
-        _edge("BGE-M3", ONT.entity, ONT.entity_link),
-        _edge("OutboxPattern", ONT.entity, ONT.considered),
-        _edge("WritePathInsight", ONT.entity, ONT.produces_insight),
+        _edge("PriorDecision", ONT.decision, ONT.informed_by),
     ]
 
     await daemon._write_neo4j_rem(
@@ -377,12 +375,9 @@ async def test_write_neo4j_rem_decision_anchors_on_decision_and_keeps_rationale(
     )
 
     cyphers = [c.args[0] for c in mock_session.run.call_args_list]
-    # Step 1 — entity edges anchored on the Decision node, never on a Fact
+    # Step 1 — evidential edges anchored on the Decision node, never on a Fact
     assert any(f"(a:{ONT.decision}" in c and "MERGE (a)-[" in c for c in cyphers)
     assert not any(f"MATCH (f:{ONT.fact}" in c for c in cyphers)
-    # Step 2 — decision extras written as ordinary provenance-stamped edges
-    assert any(ONT.considered in c for c in cyphers)
-    assert any(ONT.produces_insight in c for c in cyphers)
     # Step 3 (last) — mark on Decision; rationale/content untouched
     last = cyphers[-1]
     assert f"MATCH (a:{ONT.decision}" in last
@@ -445,13 +440,13 @@ async def test_write_neo4j_rem_long_fact_verbatim_plus_summary():
 
 @pytest.mark.asyncio
 async def test_write_neo4j_rem_retrospective_anchor_non_destructive():
-    """A Retrospective anchor gets entity edges + rem_summary, never a content
+    """A Retrospective anchor gets evidential edges + rem_summary, never a content
     overwrite — the notes are the record."""
     daemon, mock_session = _make_daemon()
     mock_session.run = AsyncMock()
 
     from rem_loop import ONT
-    edges = [_edge("OutboxPattern", ONT.entity, ONT.entity_link)]
+    edges = [_edge("PriorDecision", ONT.decision, ONT.informed_by)]
     await daemon._write_neo4j_rem(99, "retro summary", edges,
                                   kind=rem_mod.KIND_RETRO,
                                   original_content="the retro notes")

@@ -153,6 +153,15 @@ CREATE TABLE IF NOT EXISTS entity_embeddings (
 
 CREATE INDEX IF NOT EXISTS entity_embeddings_embedding_idx ON public.entity_embeddings USING hnsw (embedding vector_cosine_ops);
 
+-- ─── entity_registry ────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS entity_registry (
+    name             TEXT PRIMARY KEY,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    registered_by    TEXT NOT NULL DEFAULT 'system'::character varying
+);
+
+CREATE INDEX IF NOT EXISTS entity_registry_created_at_idx ON public.entity_registry USING btree (created_at);
+
 -- ─── neo4j_outbox ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS neo4j_outbox (
     id               BIGSERIAL PRIMARY KEY,

@@ -368,17 +368,15 @@ def test_plan_edges_evidential_only_for_decision_or_retro_anchor():
 
 
 def test_plan_edges_extras_gate_registry_known_only():
-    """718: decision-extras targets are minted ONLY when already registry-known;
-    unknown free phrases are counted as drops, never minted."""
+    """Under E5, decision-extras targeting :Entity nodes are retired; candidate names drop to extras_dropped."""
     result = {"relationships": [],
               "considered": ["Neo4j", "some free phrase nobody registered"],
               "rejected": [], "under_conditions": [],
               "produces_insight": ["another loose thought"]}
     plan = rem_mod.plan_edges(result, _registry(), rem_mod.KIND_DECISION, {})
-    assert [e["name"] for e in plan["edges"]] == ["Neo4j"]
-    assert plan["edges"][0]["rel_type"] == ONT.considered
+    assert plan["edges"] == []
     assert sorted(plan["extras_dropped"]) == [
-        "another loose thought", "some free phrase nobody registered"]
+        "Neo4j", "another loose thought", "some free phrase nobody registered"]
 
 
 def test_plan_edges_sanitize_gate_still_applies():
@@ -450,6 +448,12 @@ def _known(*names):
                 "typed": True, "pg_id": None} for n in names}
 
 
+def _known_humans(*names):
+    """Registry in which each name is an already-existing :Human node for non-Entity edge writing tests."""
+    return {n: {"label": ONT.human, "default_rel": ONT.was_attributed_to,
+                "typed": True, "pg_id": None} for n in names}
+
+
 def _apply(daemon, conn, kind, result, registry, manifest, monkeypatch=None,
            original="the decision rationale", model="test-model", run_id="run-1"):
     loop = asyncio.new_event_loop()
@@ -469,9 +473,9 @@ def test_apply_stamps_rem_provenance_with_vote_confidence(monkeypatch):
     daemon, mock_session = _make_daemon()
     conn, _ = _make_conn()
     manifest = {"fact_kind": "tested", "entities": [], "existing_edges": []}
-    result = {"relationships": [{"name": "BGE-M3", "rel_type": ONT.entity_link}]}
+    result = {"relationships": [{"name": "MyHuman", "rel_type": ONT.was_attributed_to}]}
 
-    ok = _apply(daemon, conn, rem_mod.KIND_DECISION, result, _known("BGE-M3"), manifest)
+    ok = _apply(daemon, conn, rem_mod.KIND_DECISION, result, _known_humans("MyHuman"), manifest)
 
     assert ok is True
     merge_calls = [c for c in mock_session.run.call_args_list
@@ -553,9 +557,9 @@ def test_write_floor_admits_a_majority_only_for_cited_sources(monkeypatch, fact_
     daemon._verify_novel_edges = _fake_verify
 
     manifest = {"fact_kind": fact_kind, "entities": [], "existing_edges": []}
-    result = {"relationships": [{"name": "MajorityTarget", "rel_type": ONT.entity_link}]}
+    result = {"relationships": [{"name": "MajorityTarget", "rel_type": ONT.was_attributed_to}]}
 
-    _apply(daemon, conn, rem_mod.KIND_DECISION, result, _known("MajorityTarget"), manifest)
+    _apply(daemon, conn, rem_mod.KIND_DECISION, result, _known_humans("MajorityTarget"), manifest)
 
     minted = any("ON CREATE SET" in c.args[0] for c in mock_session.run.call_args_list)
     assert minted is admitted
@@ -848,26 +852,14 @@ def test_accept_set_reports_what_it_withheld():
     assert "NOT EXISTS" in withheld_q
 
 
-def test_decision_extras_refuse_a_non_entity_target():
-    """Domain-range (978). CONSIDERED/REJECTED/UNDER_CONDITIONS/PRODUCES_INSIGHT
-    describe what a decision weighed; their range is a CONCEPT. This branch never
-    passes through _resolve_rel, so without the label check REM could assert
-    CONSIDERED onto the Human node that made the decision."""
+def test_decision_extras_retired_under_e5():
+    """Under E5 (Human-Only Fact Entities), decision-extras (CONSIDERED/REJECTED/UNDER_CONDITIONS/PRODUCES_INSIGHT)
+    targeting :Entity nodes are retired. Candidate names drop to extras_dropped."""
     plan = rem_mod.plan_edges(
         {"considered": ["Xenofon"], "rejected": ["prior-dec"], "under_conditions": ["Neo4j"]},
         _registry(), rem_mod.KIND_DECISION, {})
-    kept = {(e["name"], e["rel_type"]) for e in plan["edges"]}
-    assert kept == {("Neo4j", ONT.under_conditions)}      # the only :Entity target
-    assert sorted(plan["extras_dropped"]) == ["Xenofon", "prior-dec"]
-
-
-def test_decision_extras_still_link_a_known_entity():
-    """The domain-range gate must not cost the legitimate case its edge."""
-    plan = rem_mod.plan_edges(
-        {"considered": ["Neo4j"]}, _registry(), rem_mod.KIND_DECISION, {})
-    (e,) = plan["edges"]
-    assert (e["name"], e["label"], e["rel_type"]) == ("Neo4j", ONT.entity, ONT.considered)
-    assert plan["extras_dropped"] == []
+    assert plan["edges"] == []
+    assert sorted(plan["extras_dropped"]) == ["Neo4j", "Xenofon", "prior-dec"]
 
 
 def test_accept_set_survives_a_failing_withheld_count():

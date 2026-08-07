@@ -5,6 +5,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.60] — 2026-08-07
+
+### Added
+
+- **Entity Culling, Containment, and Canonical Traversal (Phase A & B)**:
+  - **E1 (Fact Anchor Exclusivity)**: `:Entity` nodes in Neo4j exist strictly on Facts via `(f:Fact)-[:MENTIONS]->(e:Entity)`. Only Human-asserted entities on Fact ingress mint/connect `:Entity` nodes.
+  - **E2 (Zero Judgement Entity Edges)**: `Decision` and `Retrospective` carry 0 entity edges in Neo4j.
+  - **E3 (Postgres `entity_registry`)**: Migration `030_entity_registry.sql` creates Postgres `entity_registry` table (`name VARCHAR PRIMARY KEY`) seeded with clean Fact entities.
+  - **E4 (REM De-scoping)**: REM performs 0 entity minting and 0 entity `MENTIONS` edge writing to `:Entity` nodes (`if label == ONT.entity: continue`). Evidential record-to-record edges (`INFORMED_BY`) and sub-labeling are retained.
+  - **E5 (Decision-Extras Retirement)**: Retired graph decision-extras targeting `:Entity` nodes (`CONSIDERED`, `REJECTED`, `UNDER_CONDITIONS`, `PRODUCES_INSIGHT`); decision alternatives live in Postgres `decision_alternatives`.
+  - **Canonical Fixpoint Traversal**: Symmetrical query helper `canonical_fixpoint_entity_cypher` walking `GROUNDED_IN | INFORMED_BY | HAD_OUTCOME` fixpoint path to live Facts to read human-asserted entities.
+  - **ADR-017 Alias System Retirement**: Retired `alias_writer.py`, `alias_graph.py`, `entity_resolution_eval.py`, `test_alias_writer.py`; inlined DB helpers into `relation_sweep.py`.
+  - **Live Cypher Sweep**: Purged 3,695 non-Fact entity edges and 1,049 orphan entities on live graph; 1,118 clean entities remaining.
+
 ## [0.8.59] — 2026-08-06
 
 ### Fixed

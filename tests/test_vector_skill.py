@@ -1,4 +1,5 @@
 import pytest
+pytest.importorskip("fastmcp")
 import json
 import asyncio
 import importlib.util

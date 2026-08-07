@@ -123,7 +123,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.59"
+FRAMEWORK_VERSION = "0.8.60"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -1607,6 +1607,7 @@ class MemoryCoordinator:
             project_id = await self._project_identity(params.get("project"))
             domain_ids = await self._domain_identities(
                 pg_id, project_id, params.get("domains"))
+            clean_entities = self._gate_graph_entities(pg_id, params.get("entities", []))
             async with self._neo4j.session() as session:
                 await session.run(
                     f"MERGE (f:{ONT.fact} {{pg_id: $pg_id}})"
@@ -1670,9 +1671,15 @@ class MemoryCoordinator:
                     project_id=project_id,
                     domains=domain_ids,
                     fact_kind=fact_kind,
-                    entities=self._gate_graph_entities(pg_id, params.get("entities", [])),
+                    entities=clean_entities,
                     **( {"source_ref": source_ref} if source_ref else {} ),
                 )
+                if clean_entities:
+                    async with self._acquire() as conn:
+                        await conn.executemany(
+                            "INSERT INTO entity_registry (name, registered_by) VALUES ($1, 'fact_ingress') ON CONFLICT (name) DO NOTHING",
+                            [(e,) for e in clean_entities],
+                        )
                 # Fact supersession mirror (decision 381/384), piggybacked on this
                 # fact's row: flag the old Fact node so REM/NREM exclude it, and
                 # link (new)-[:SUPERSEDES]->(old) — same relationship + direction
@@ -2009,162 +2016,6 @@ class MemoryCoordinator:
             pg_id=pg_id, grounded=grounded,
         )
 
-    @staticmethod
-    async def _inherit_entities_from_facts(
-        session, pg_id: int, anchor_label: str = None
-    ) -> int:
-        """Give a judgement record its topics by TRAVERSING TO ITS FACTS — never
-        by minting. Shared by Decision and Retrospective so the two can never
-        drift (the failure shape _write_typed_grounding already guards against).
-
-        Both record types rest on facts, and those facts already carry the
-        operator-vetted entity vocabulary. So a record's join keys are the union
-        of its evidence's join keys. This LINKS ONLY: every Entity is MATCHed,
-        never MERGEd, so neither record type can introduce a name that no fact
-        ever justified (the first-write half of "link, never mint" — decision
-        937 closed the same faucet on REM).
-
-        Three tiers, first non-empty wins:
-          1. Grounding edges the OPERATOR asserted — the hard basis.
-          2. Grounding edges the system defaulted from fact_kind, plus legacy
-             edges carrying no asserted_by stamp.
-          3. The facts of the record on the OTHER SIDE of the HAD_OUTCOME edge —
-             for a decision, its LATEST live retrospective that actually reaches
-             topics; for a retrospective, the decision it judges. The rescue path
-             for a record that cites no evidence of its own, and what can make a
-             decision eligible for consolidation despite grounding nothing itself.
-
-        Tier 1 outranks tier 2 on WHO asserted the edge, never on which role word
-        was typed: every relationship in ONT GROUNDING_RELATIONS is walked, not
-        GROUNDED_IN alone. Four of the six role words (considered, rejected,
-        under_conditions, informed_by) produce a different relationship, and
-        INFORMED_BY is what a discussion-kind fact defaults to when the operator
-        names no role — the bare-pg_id path the skill documents. Matching one
-        relationship made a decision that cited its evidence inherit nothing.
-
-        The walk ends on a FACT, one or two hops out: `*0..1` means the grounding
-        target is either the fact itself, or a judgement whose OWN facts are then
-        read. Provenance allows a decision to be grounded on an earlier decision
-        or retrospective, so that citation must still reach topics — through the
-        cited record's facts, never by copying the labels it carries (which REM
-        may have added). Facts mint; judgements only ever pass through.
-
-        The superseded filter sits on the FACT and nowhere else. A retracted fact
-        must stop being a cluster key for everything that cited it — that is the
-        topic source going away. A superseded JUDGEMENT is a different thing: a
-        decision is overturned by a reversing retrospective, and grounding a
-        successor on the decision it replaces (or on the retrospective that
-        overturned it) is first-class lineage, so the pass-through hop is
-        deliberately unfiltered — the successor is still ABOUT what the reversed
-        decision was about. Filtering there would also blank the reversing
-        verdict's own topics, since the reversal marks its target superseded
-        moments earlier in the same projection. In the zero-length case the
-        target IS the fact, so one filter covers both shapes.
-
-        "Latest" orders by date then pg_id — the RETROSPECTIVE's own id, never
-        the decision's — so a decision holding several retros dated the same day
-        resolves deterministically instead of arbitrarily. Ordering happens AFTER
-        the topic match, so an ungrounded newest retrospective yields to the
-        newest one that has facts instead of blanking the tier. `coalesce(date,
-        '')` keeps a dateless retro last rather than first, which is where null
-        would sort under DESC.
-
-        Returns the number of entities linked (0 when the record reaches no
-        facts by any route — a real state, not an error: it means nothing yet
-        grounds it).
-        """
-        anchor = anchor_label or ONT.decision
-        is_decision = anchor == ONT.decision
-        rels = "|".join(GROUNDING_RELATIONS)
-        # From a grounding target to the facts that carry the topics: the target
-        # itself when it is a Fact, otherwise the facts IT grounds in.
-        to_facts = (
-            f"-[:{rels}*0..1]->(f:{ONT.fact})"
-            f" WHERE coalesce(f.superseded, false) = false"
-            f" MATCH (f)-[fe:{ONT.entity_link}|{ONT.entity_link_alias}]->(e:{ONT.entity})"
-        )
-        # The inherited edge is STAMPED (989). It used to be written bare, and a
-        # bare MENTIONS is precisely the signature first write leaves when the
-        # OPERATOR names a concept on a fact — so a copy was indistinguishable
-        # from a naming. That is not a cosmetic confusion: the accept set once
-        # read these copies as first-write namings and let the enrichment pass
-        # link to names it had itself produced (the v0.8.28 cycle). Stamping
-        # removes the ambiguity at the source instead of guarding against it
-        # downstream.
-        #
-        # Standing carries across rather than being re-derived: if ANY source
-        # edge for this entity was an operator naming (bare, no confidence) the
-        # copy is operator-grade and carries no confidence; otherwise it takes
-        # the STRONGEST machine confidence among its sources. consumable()
-        # reads exactly that convention.
-        #
-        # Forward only — no backfill. The bare edges already in the graph mix
-        # fact projection, inheritance, and pre-0.8.26 judgement minting, and
-        # for older judgement rows those are not separable after the fact; a
-        # backfill would be a guess written down as provenance.
-        link = (
-            f" WITH a, pairs UNWIND pairs AS p"
-            f" WITH a, p[0] AS e, p[1] AS c"
-            # `collect()` DISCARDS nulls, so an all-operator source set collects
-            # to an EMPTY list rather than a list of nulls — testing the list
-            # for a null member therefore never fires, and every operator naming
-            # would inherit as confidence 0.0: numeric, machine-grade, and BELOW
-            # every threshold, i.e. the exact opposite of operator standing.
-            # Count the rows instead and compare: fewer collected than seen
-            # means at least one source carried no confidence.
-            f" WITH a, e, count(*) AS srcs, collect(c) AS cs"
-            f" WITH a, e, CASE WHEN size(cs) < srcs THEN null"
-            f"                 ELSE reduce(mx = 0.0, z IN cs |"
-            f"                             CASE WHEN z > mx THEN z ELSE mx END) END AS conf"
-            f" MERGE (a)-[m:{ONT.entity_link}]->(e)"
-            f"   ON CREATE SET m.asserted_by = '{RELATION_ASSERTED_INHERITED}',"
-            f"                 m.confidence  = conf"
-            f" WITH count(e) AS n RETURN n"
-        )
-        for tier in ("operator", "system", "outcome"):
-            if tier == "outcome":
-                # Hop the HAD_OUTCOME edge to the counterpart record, then read
-                # ITS grounding facts. Direction and ordering differ by anchor:
-                # a decision may hold many retrospectives (pick the live latest
-                # that reaches topics); a retrospective judges exactly one
-                # decision — and must read it even when the reversal it carries
-                # has just marked that decision superseded.
-                if is_decision:
-                    cypher = (
-                        f"MATCH (a:{anchor} {{pg_id: $pg_id}})"
-                        f"-[:{ONT.had_outcome}]->(o:{ONT.retrospective})"
-                        f" WHERE coalesce(o.superseded, false) = false"
-                        f" MATCH (o)-[:{rels}]->(t){to_facts}"
-                        f" WITH a, o, collect(DISTINCT [e, fe.confidence]) AS pairs"
-                        f" ORDER BY coalesce(o.date, '') DESC, o.pg_id DESC LIMIT 1"
-                        + link
-                    )
-                else:
-                    cypher = (
-                        f"MATCH (a:{anchor} {{pg_id: $pg_id}})"
-                        f"<-[:{ONT.had_outcome}]-(o:{ONT.decision})"
-                        f" MATCH (o)-[:{rels}]->(t){to_facts}"
-                        f" WITH a, collect(DISTINCT [e, fe.confidence]) AS pairs"
-                        + link
-                    )
-            else:
-                where = ("g.asserted_by = 'operator'" if tier == "operator"
-                         else "coalesce(g.asserted_by, '') <> 'operator'")
-                cypher = (
-                    f"MATCH (a:{anchor} {{pg_id: $pg_id}})-[g:{rels}]->(t)"
-                    f" WHERE {where}"
-                    f" MATCH (t){to_facts}"
-                    f" WITH a, collect(DISTINCT [e, fe.confidence]) AS pairs"
-                    + link
-                )
-            rec = await (await session.run(cypher, pg_id=pg_id)).single()
-            n = (rec["n"] if rec else 0) or 0
-            if n:
-                log.debug("%s pg_id=%d inherited %d entities via %s grounding",
-                          anchor, pg_id, n, tier)
-                return n
-        return 0
-
     async def _inherit_domains(self, session, pg_id: int,
                                anchor_label: str = None) -> int:
         """A judgement's DEFAULT sections, when it asserted none of its own.
@@ -2366,12 +2217,6 @@ class MemoryCoordinator:
                     f"   MERGE (d)-[:{ONT.grounded_in}]->(existing) )",
                     pg_id=pg_id, grounded_in=grounded_in_flat,
                 )
-            # Topics come from the evidence, so this runs AFTER grounding exists.
-            # At first write the retrospective tier cannot fire — no retro exists
-            # yet — so a decision grounded in nothing starts with no entities and
-            # acquires them when its first retrospective lands (see the
-            # retrospective projection, which re-runs this for its target).
-            await self._inherit_entities_from_facts(session, pg_id)
             # Sections, AFTER grounding exists — and unconditionally, because the
             # call guards itself: a decision that asserted its own sections above
             # already carries a bare DOMAIN_OF edge and this declines. One that
@@ -2444,25 +2289,7 @@ class MemoryCoordinator:
                 await self._write_typed_grounding(
                     session, ONT.retrospective, pg_id, params.get("grounded") or []
                 )
-                # A retrospective MINTS NO ENTITIES either — same rule, same
-                # writer. Its topics are its evidence's topics, falling back to
-                # the decision it judges when it grounds nothing itself. Runs
-                # after its grounding AND after HAD_OUTCOME, since both tiers
-                # read those edges.
-                await self._inherit_entities_from_facts(
-                    session, pg_id, ONT.retrospective
-                )
-                # Then re-run the TARGET decision's inheritance now that a
-                # retrospective (and its grounding) exists: this is the only
-                # moment the decision's outcome tier can fire, and it is what
-                # lets a decision that cites no evidence of its own still reach
-                # facts — and so become eligible for consolidation — through the
-                # retrospective that judged it. A decision already carrying
-                # operator or system grounding is unaffected: earlier tiers win.
                 if target_pg_id is not None:
-                    await self._inherit_entities_from_facts(
-                        session, target_pg_id, ONT.decision
-                    )
                     # The decision's own default may also have become reachable:
                     # a decision that asserted no section takes its evidence's,
                     # and this is the moment that evidence can first exist (an
