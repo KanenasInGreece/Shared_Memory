@@ -558,3 +558,17 @@ def is_allowed_relation(rel: str, src_label: str, tgt_label: str) -> bool:
     `tgt_label` per the domain-range map. Pure. MENTIONS (and any rel not in the
     map) returns False here — callers use MENTIONS as the explicit fallback."""
     return tgt_label in DOMAIN_RANGE.get(rel, {}).get(src_label, frozenset())
+
+
+def canonical_fixpoint_entity_cypher() -> str:
+    """Canonical Fixpoint Entity Traversal Cypher for non-Fact nodes.
+    Walks GROUNDED_IN | INFORMED_BY | HAD_OUTCOME fixpoint path to live Facts to read human-asserted entities.
+    """
+    return (
+        f"MATCH (start {{pg_id: $pg_id}})"
+        f" WHERE start:{ONT.decision} OR start:{ONT.retrospective} OR start:{ONT.community_summary}"
+        f" MATCH (start)-[:{ONT.grounded_in}|{ONT.informed_by}|{ONT.had_outcome}*0..5]-(f:{ONT.fact})"
+        f" WHERE coalesce(f.superseded, false) = false"
+        f" MATCH (f)-[:{ONT.entity_link}]->(e:{ONT.entity})"
+        f" RETURN DISTINCT e.name AS name, elementId(e) AS element_id"
+    )

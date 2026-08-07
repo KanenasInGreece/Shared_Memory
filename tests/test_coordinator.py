@@ -345,12 +345,9 @@ async def test_apply_decision_outbox_row_writes_correct_nodes():
 
     await c._apply_decision_outbox_row(outbox_id=1, pg_id=42, params=params)
 
-    # Three statements now: the Decision projection, then entity INHERITANCE,
-    # then the DEFAULT-SECTION pass (028). The third runs unconditionally and
-    # guards itself — a decision that asserted its own sections already carries
-    # a bare DOMAIN_OF edge and the query declines; this one asserted none, so
-    # it takes its grounding facts'.
-    assert mock_session.run.await_count == 3
+    # Two statements now: the Decision projection, then the DEFAULT-SECTION pass (028).
+    # (Entity inheritance is retired under Human-Only Fact Entities architecture).
+    assert mock_session.run.await_count == 2
     cypher_call = mock_session.run.call_args_list[0]
     cypher = cypher_call.args[0]
     assert "Decision" in cypher
@@ -434,8 +431,8 @@ async def test_apply_decision_outbox_row_handles_empty_assisted_by():
     }
 
     await c._apply_decision_outbox_row(outbox_id=2, pg_id=50, params=params)
-    # projection + entity inheritance + default-section pass (028)
-    assert mock_session.run.await_count == 3
+    # projection + default-section pass (028)
+    assert mock_session.run.await_count == 2
     mock_conn.execute.assert_awaited()
 
 
@@ -591,218 +588,16 @@ class _TieredSession:
 
 
 @pytest.mark.asyncio
-async def test_inheritance_prefers_operator_grounding_and_stops_there():
-    """Tier 1 (operator-asserted GROUNDED_IN) wins outright — the weaker tiers
-    must not even be queried, or a system_default edge could dilute the topics
-    an operator explicitly grounded the decision in."""
-    session = _TieredSession([4])
-    n = await MemoryCoordinator._inherit_entities_from_facts(session, 42)
-
-    assert n == 4
-    assert len(session.cyphers) == 1
-    assert "g.asserted_by = 'operator'" in session.cyphers[0]
-
-
-@pytest.mark.asyncio
-async def test_inheritance_falls_back_to_system_then_retrospective():
-    """A decision with no operator grounding falls to system_default/legacy
-    edges; one with neither reaches facts only through its retrospective."""
-    session = _TieredSession([0, 3])
-    assert await MemoryCoordinator._inherit_entities_from_facts(session, 42) == 3
-    assert len(session.cyphers) == 2
-    assert "coalesce(g.asserted_by, '') <> 'operator'" in session.cyphers[1]
-
-    session = _TieredSession([0, 0, 2])
-    assert await MemoryCoordinator._inherit_entities_from_facts(session, 42) == 2
-    assert len(session.cyphers) == 3
-    retro_cypher = session.cyphers[2]
-    assert ONT.had_outcome in retro_cypher
-    assert ONT.retrospective in retro_cypher
-    # Ties break on the retro's OWN id — the decision's id cannot disambiguate
-    # its own retrospectives — and a dateless retro must sort LAST, which is not
-    # where a bare `o.date DESC` would put null.
-    assert "ORDER BY coalesce(o.date, '') DESC, o.pg_id DESC" in retro_cypher
-    # The ordering runs AFTER the topic match, so the newest retrospective that
-    # actually reaches facts wins. Ordering first would let an ungrounded newest
-    # verdict be picked and blank the tier while a grounded sibling sat there.
-    assert retro_cypher.index("collect(DISTINCT [e,") < retro_cypher.index("ORDER BY")
-    # Forward guard only: nothing sets `superseded` on a :Retrospective today
-    # (the reversal marks the DECISION), so this filter is currently inert — it
-    # is not evidence that a retracted verdict is excluded.
-    assert "coalesce(o.superseded, false) = false" in retro_cypher
-
-
-@pytest.mark.asyncio
-async def test_retrospective_inherits_by_the_same_rule_hopping_the_other_way():
-    """Retrospectives mint no entities either, and share the writer. Their
-    outcome tier traverses HAD_OUTCOME BACKWARDS — a retrospective judges one
-    decision, so there is nothing to order or supersede-filter on that hop."""
-    session = _TieredSession([0, 0, 5])
-    n = await MemoryCoordinator._inherit_entities_from_facts(
-        session, 900, ONT.retrospective)
-
-    assert n == 5
-    for cypher in session.cyphers:
-        assert f"MATCH (a:{ONT.retrospective} {{pg_id: $pg_id}})" in cypher
-        assert f"MERGE (e:{ONT.entity}" not in cypher
-    outcome_cypher = session.cyphers[2]
-    assert f"<-[:{ONT.had_outcome}]-(o:{ONT.decision})" in outcome_cypher
-    # the decision-only ordering must NOT leak onto this hop
-    assert "ORDER BY" not in outcome_cypher
-    # A reversing verdict marks its target decision superseded moments earlier in
-    # the same projection. Filtering the judgement here would blank the topics of
-    # the very record doing the reversing, so this hop is deliberately unfiltered.
-    assert "o.superseded" not in outcome_cypher
-
-
-@pytest.mark.asyncio
-async def test_inheritance_stamps_the_copy_it_writes():
-    """A judgement's copy of its evidence's topic is STAMPED (989). It used to
-    be written bare — and a bare MENTIONS is exactly the signature first write
-    leaves when the OPERATOR names a concept on a fact. The two were therefore
-    indistinguishable, which is how machine-added names came to read as
-    first-write namings and re-qualified themselves as link targets.
-
-    Standing carries across rather than being re-derived: any operator source
-    (null confidence) makes the copy operator-grade; otherwise it takes the
-    strongest machine confidence among its sources."""
-    session = _TieredSession([0, 0, 0])
-    await MemoryCoordinator._inherit_entities_from_facts(session, 42)
-
-    for cypher in session.cyphers:
-        assert f"asserted_by = '{coordinator_mod.RELATION_ASSERTED_INHERITED}'" in cypher
-        # the source edge is bound and its confidence collected per entity
-        assert "fe.confidence" in cypher
-        # ⚠ Found on the LIVE graph, not here: `collect()` DISCARDS nulls, so an
-        # all-operator source set collects EMPTY and a null-member test never
-        # fires — every operator naming then inherited confidence 0.0, which is
-        # numeric, machine-grade and below every threshold. The null signal must
-        # come from comparing counts, never from inspecting the collected list.
-        assert "count(*) AS srcs" in cypher and "size(cs) < srcs THEN null" in cypher
-        assert "IN cs WHERE z IS NULL" not in cypher
-        # ON CREATE only — an edge already there (an operator's own, or one from
-        # an earlier projection) is never rewritten or downgraded
-        assert "ON CREATE SET" in cypher
-
-
-@pytest.mark.asyncio
-async def test_inheritance_walks_every_grounding_role_not_just_grounded_in():
-    """The defect this closes: four of the six role words produce a relationship
-    that is NOT GROUNDED_IN, and INFORMED_BY is what a discussion-kind fact
-    defaults to when the operator names no role at all — the bare-pg_id path the
-    skill documents. Matching GROUNDED_IN alone made a decision that cited its
-    evidence inherit nothing and never reach consolidation."""
-    from ontology import GROUNDING_ROLES, GROUNDING_RELATIONS
-
-    session = _TieredSession([0, 0, 0])
-    await MemoryCoordinator._inherit_entities_from_facts(session, 42)
-
-    # every relationship any role can produce must appear in every tier
-    assert set(GROUNDING_RELATIONS) >= set(GROUNDING_ROLES.values())
-    for cypher in session.cyphers:
-        for rel in GROUNDING_RELATIONS:
-            assert rel in cypher, f"{rel} missing — a {rel} grounding donates nothing"
-    for rel in ("CONSIDERED", "REJECTED", "UNDER_CONDITIONS", "INFORMED_BY"):
-        assert rel in GROUNDING_RELATIONS
-
-
-@pytest.mark.asyncio
-async def test_inheritance_passes_through_a_cited_judgement_to_its_facts():
-    """Provenance allows grounding a decision on an earlier decision or on the
-    retrospective that overturned it. That citation must still reach topics —
-    through the cited record's OWN facts, never by copying the labels it carries
-    (REM may have added those). `*0..1` is the whole mechanism: zero hops when
-    the target is the fact itself, one when it is a judgement."""
-    session = _TieredSession([0, 0, 0])
-    await MemoryCoordinator._inherit_entities_from_facts(session, 42)
-
-    for cypher in session.cyphers:
-        assert "*0..1" in cypher
-        # the walk always TERMINATES on a fact — judgements only pass through
-        assert f"(f:{ONT.fact})" in cypher
-
-
-@pytest.mark.asyncio
-async def test_inheritance_filters_superseded_facts_but_not_judgements():
-    """A retracted FACT must stop being a cluster key for everything that cited
-    it. A superseded JUDGEMENT is different: a decision is overturned by a
-    reversing retrospective, and a successor grounded on the decision it replaces
-    is still ABOUT what that decision was about."""
-    session = _TieredSession([0, 0, 0])
-    await MemoryCoordinator._inherit_entities_from_facts(session, 42)
-
-    for cypher in session.cyphers:
-        assert "coalesce(f.superseded, false) = false" in cypher
-        # no filter on the pass-through target
-        assert "coalesce(t.superseded" not in cypher
-
-
-@pytest.mark.asyncio
-async def test_inheritance_never_mints_an_entity_on_any_tier():
-    """The whole point of the rule: every tier MATCHes existing Entity nodes and
-    MERGEs only the relationship. A `MERGE (e:Entity {name: ...})` on any tier
-    would reopen the free-text faucet this change closed."""
-    session = _TieredSession([0, 0, 0])
-    assert await MemoryCoordinator._inherit_entities_from_facts(session, 42) == 0
-    assert len(session.cyphers) == 3
-    for cypher in session.cyphers:
-        assert f"MERGE (e:{ONT.entity}" not in cypher
-        assert f"MERGE (x:{ONT.entity}" not in cypher
-        assert f"({ONT.entity} {{name:" not in cypher
-        # topics are only ever read off facts
-        assert f"(f:{ONT.fact})" in cypher
-
-
-@pytest.mark.asyncio
-async def test_decision_inheritance_runs_after_grounding_is_written():
-    """Order matters: the traversal reads GROUNDED_IN edges, so it must run
-    after _write_typed_grounding — otherwise a first write inherits nothing."""
-    c, _, mock_session = _coordinator_with_mocks()
-    calls = []
-    with patch.object(c, "_write_typed_grounding",
-                      new=AsyncMock(side_effect=lambda *a, **k: calls.append("grounding"))), \
-         patch.object(c, "_inherit_entities_from_facts",
-                      new=AsyncMock(side_effect=lambda *a, **k: calls.append("inherit"))):
-        await c._apply_decision_outbox_row(
-            outbox_id=1, pg_id=42,
-            params={"decision": {"decided_by": "X", "project": "p"},
-                    "grounded": [{"pg_id": 7, "rel": ONT.grounded_in,
-                                  "asserted_by": "operator", "label": ONT.fact}]},
-        )
-    assert calls == ["grounding", "inherit"]
-
-
-@pytest.mark.asyncio
-async def test_retrospective_projection_inherits_for_itself_and_its_target():
-    """The outcome tier can never fire at decision first write — no
-    retrospective exists yet. The retrospective projection is the moment it
-    becomes possible, so it must run inheritance twice: once for itself, once
-    for the decision it judges."""
-    c, _, mock_session = _coordinator_with_mocks()
-    with patch.object(c, "_inherit_entities_from_facts", new=AsyncMock()) as inherit:
-        await c._apply_retrospective_outbox_row(
-            outbox_id=1, pg_id=900,
-            params={"v": 2, "target_pg_id": 42, "entities": ["Ignored"],
-                    "retrospective": {"rating": "held", "date": "2026-07-30"}},
-        )
-    assert [(call.args[1], call.args[2]) for call in inherit.await_args_list] == [
-        (900, ONT.retrospective),   # itself, from its own grounding
-        (42,  ONT.decision),        # then the decision it judges
-    ]
-
-
-@pytest.mark.asyncio
 async def test_retrospective_projection_mints_no_entities():
     """The caller may still send `entities` (older clients do); the graph must
     ignore them exactly as the decision path now does."""
     c, _, mock_session = _coordinator_with_mocks()
-    with patch.object(c, "_inherit_entities_from_facts", new=AsyncMock()):
-        await c._apply_retrospective_outbox_row(
-            outbox_id=1, pg_id=900,
-            params={"v": 2, "target_pg_id": 42,
-                    "entities": ["FreeTextName", "AnotherOne"],
-                    "retrospective": {"rating": "held", "date": "2026-07-30"}},
-        )
+    await c._apply_retrospective_outbox_row(
+        outbox_id=1, pg_id=900,
+        params={"v": 2, "target_pg_id": 42,
+                "entities": ["FreeTextName", "AnotherOne"],
+                "retrospective": {"rating": "held", "date": "2026-07-30"}},
+    )
     node_call = mock_session.run.call_args_list[0]
     assert f"MERGE (r:{ONT.retrospective}" in node_call.args[0]
     assert f"MERGE (e:{ONT.entity}" not in node_call.args[0]

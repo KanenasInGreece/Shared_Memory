@@ -1056,22 +1056,7 @@ def plan_edges(result: dict, registry: dict[str, dict], kind: str,
     if kind == KIND_DECISION:
         for rel_type, key in _EXTRA_RESULT_KEYS.items():
             for name in sanitize_entity_names(result.get(key) or []):
-                if name not in registry:
-                    extras_dropped.append(name)   # 718: unknown free phrase → not minted
-                    continue
-                # DOMAIN-RANGE gate (978). These four relations describe what a
-                # decision weighed — alternatives, conditions, insights — and
-                # their range is a CONCEPT. The registry also holds Human,
-                # AIAgent, Project and Decision nodes, and this branch (unlike
-                # the relationships branch) never passes through _resolve_rel,
-                # so without this check REM could assert CONSIDERED onto a
-                # person. Live at the time of writing: every machine-asserted
-                # extra already pointed at an :Entity — the door was open, not
-                # walked through.
-                if registry[name]["label"] != ONT.entity:
-                    extras_dropped.append(name)
-                    continue
-                _add(name, ONT.entity, rel_type, evidential=False)
+                extras_dropped.append(name)   # E5: decision-extras targeting :Entity nodes retired
 
     return {"edges": edges, "dropped_names": dropped_names,
             "extras_dropped": extras_dropped, "mint_dropped": mint_dropped,
@@ -2082,6 +2067,9 @@ class REMDaemon:
         async with self.driver.session() as session:
             # Step 1 — provenance-stamped edges on the anchor node.
             for (label, rel_type), rows in groups.items():
+                if label == ONT.entity:
+                    # E4: REM performs zero entity linking to :Entity nodes
+                    continue
                 await session.run(
                     f"MATCH (a:{anchor} {{pg_id: $pg_id}})"
                     f" UNWIND $rows AS row"

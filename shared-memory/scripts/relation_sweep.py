@@ -86,11 +86,43 @@ def _load_env() -> None:
 
 _load_env()
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from entity_resolution_eval import (          # noqa: E402  (shared harness helpers)
-    fetch_domains, real_domains, PG_CONN,
-    NEO4J_URI, NEO4J_USER, NEO4J_PASS, _auth_headers,
+NEO4J_URI  = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
+NEO4J_PASS = os.environ.get("NEO4J_PASSWORD", "")
+_pg_pass   = os.environ.get("PG_PASSWORD", "")
+PG_CONN    = os.environ.get(
+    "PG_CONN", f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
 )
+_AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "").strip() or None
+_UNDETERMINED = "general"
+
+
+def _auth_headers() -> dict:
+    return {"Authorization": f"Bearer {_AGENT_TOKEN}"} if _AGENT_TOKEN else {}
+
+
+def real_domains(pg_ids: list[int] | set[int] | list, dom_map: dict[int, str]) -> set[str]:
+    return {dom_map[p] for p in pg_ids if p in dom_map and dom_map[p] != _UNDETERMINED}
+
+
+def fetch_domains(pg_ids: list[int]) -> dict[int, str]:
+    if not pg_ids:
+        return {}
+    import psycopg2
+    from project_axis import PROJECT_SQL
+    conn = psycopg2.connect(PG_CONN, connect_timeout=5)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT id, COALESCE({PROJECT_SQL}, %s) "
+                "FROM technical_docs WHERE id = ANY(%s)",
+                (_UNDETERMINED, pg_ids),
+            )
+            return {row[0]: row[1] for row in cur.fetchall()}
+    finally:
+        conn.close()
+
+
 from ontology import (                        # noqa: E402
     ONT, DOMAIN_RANGE, KNOWN_RELATIONSHIPS, is_allowed_relation,
 )
