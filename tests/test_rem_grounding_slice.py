@@ -47,7 +47,7 @@ class _async_ctx:
 
 
 def _rows(*names):
-    return [{"name": n, "labels": [ONT.entity], "pg_id": None} for n in names]
+    return [{"name": n, "labels": [ONT.activity], "pg_id": None} for n in names]
 
 
 def _make_daemon():

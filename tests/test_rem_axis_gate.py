@@ -116,7 +116,7 @@ def _registry_with_a_project():
     supposed to prevent, used here to prove the SECOND gate holds on its own."""
     return rem_loop._build_entity_registry([
         {"name": "shared-memory-monitor", "labels": [ONT.project], "pg_id": None},
-        {"name": "Coordinator", "labels": [ONT.entity], "pg_id": None},
+        {"name": "Coordinator", "labels": [ONT.activity], "pg_id": None},
     ])
 
 

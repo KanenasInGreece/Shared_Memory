@@ -562,12 +562,12 @@ def is_allowed_relation(rel: str, src_label: str, tgt_label: str) -> bool:
 
 def canonical_fixpoint_entity_cypher() -> str:
     """Canonical Fixpoint Entity Traversal Cypher for non-Fact nodes.
-    Walks GROUNDED_IN | INFORMED_BY | HAD_OUTCOME fixpoint path to live Facts to read human-asserted entities.
+    Walks HAD_OUTCOME to Decision, then outgoing GROUNDED_IN | INFORMED_BY path to live Facts to read human-asserted entities.
     """
     return (
         f"MATCH (start {{pg_id: $pg_id}})"
         f" WHERE start:{ONT.decision} OR start:{ONT.retrospective} OR start:{ONT.community_summary}"
-        f" MATCH (start)-[:{ONT.grounded_in}|{ONT.informed_by}|{ONT.had_outcome}*0..5]-(f:{ONT.fact})"
+        f" MATCH (start)-[:{ONT.had_outcome}*0..1]-(d)-[:{ONT.grounded_in}|{ONT.informed_by}*0..4]->(f:{ONT.fact})"
         f" WHERE coalesce(f.superseded, false) = false"
         f" MATCH (f)-[:{ONT.entity_link}]->(e:{ONT.entity})"
         f" RETURN DISTINCT e.name AS name, elementId(e) AS element_id"

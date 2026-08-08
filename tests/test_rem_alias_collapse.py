@@ -51,13 +51,13 @@ def _lm_studio_component():
     """The live component 146, verbatim from the graph: four spellings, one
     concept, one of them sub-typed and most-named."""
     return [
-        {"labels": [ONT.entity], "name": "LM Studio", "pg_id": None,
+        {"labels": [ONT.activity], "name": "LM Studio", "pg_id": None,
          "alias_component": 146, "namings": 6},
-        {"labels": [ONT.entity], "name": "LMStudio", "pg_id": None,
+        {"labels": [ONT.activity], "name": "LMStudio", "pg_id": None,
          "alias_component": 146, "namings": 1},
-        {"labels": [ONT.entity, ONT.system], "name": "LM_Studio", "pg_id": None,
+        {"labels": [ONT.activity, ONT.system], "name": "LM_Studio", "pg_id": None,
          "alias_component": 146, "namings": 14},
-        {"labels": [ONT.entity], "name": "lm_studio", "pg_id": None,
+        {"labels": [ONT.activity], "name": "lm_studio", "pg_id": None,
          "alias_component": 146, "namings": 1},
     ]
 
@@ -247,7 +247,7 @@ def test_four_spellings_consume_one_slot_not_four():
 def _collapsed_registry():
     return rem_mod._build_entity_registry(
         collapse(_lm_studio_component())
-        + [{"labels": [ONT.entity], "name": "Neo4j", "aliases": []}])
+        + [{"labels": [ONT.activity], "name": "Neo4j", "aliases": []}])
 
 
 def test_a_proposal_is_written_to_the_canonical_node():
