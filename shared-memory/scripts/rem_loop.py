@@ -1046,6 +1046,10 @@ def plan_edges(result: dict, registry: dict[str, dict], kind: str,
             continue
         suggested = rel.get("rel_type", ONT.entity_link)
         label, rel_type = _resolve_rel(name, suggested, registry)
+        if label == ONT.entity:
+            # E4: REM performs zero entity linking to :Entity nodes
+            dropped_names.append(name)
+            continue
         if isinstance(suggested, str) and suggested.strip().upper() == ONT.grounded_in:
             remaps.append(name)   # GROUNDED_IN never machine-mintable → resolved away
         evidential = (kind in (KIND_DECISION, KIND_RETRO)

@@ -5,6 +5,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.61] — 2026-08-08
+
+### Fixed
+
+- **Entity Planning & Traversal Consistency**:
+  - **REM Manifest Consistency (E4)**: `rem_loop.py` `plan_edges` drops `label == ONT.entity` proposals during planning time, eliminating state mismatch between Postgres `rem_records` manifest and Neo4j graph state.
+  - **Directed Canonical Fixpoint Traversal**: `canonical_fixpoint_entity_cypher` in `ontology.py` uses directed evidence traversal (`-[:GROUNDED_IN|INFORMED_BY*0..4]->`) to prevent cross-decision context scope leaks over shared foundational facts.
+  - **Ingress Payload Size Bounding**: `coordinator.py` `_gate_graph_entities` caps `clean_entities` at 50 to prevent unbounded payload spikes during outbox projection and registry registration.
+
 ## [0.8.60] — 2026-08-07
 
 ### Added

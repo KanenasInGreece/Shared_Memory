@@ -123,7 +123,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.60"
+FRAMEWORK_VERSION = "0.8.61"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -1574,6 +1574,8 @@ class MemoryCoordinator:
             if dropped:
                 log.info("outbox->graph gate rejected %d name(s) for pg_id=%s: %s",
                          len(dropped), pg_id, dropped)
+        if len(clean) > 50:
+            clean = clean[:50]
         return clean
 
     async def _apply_outbox_row(

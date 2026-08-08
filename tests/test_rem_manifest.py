@@ -264,7 +264,7 @@ def test_single_prompt_decision_includes_extras_tasks():
 
 def _registry():
     return {
-        "Neo4j":     {"label": ONT.entity,   "default_rel": ONT.entity_link,
+        "Neo4j":     {"label": ONT.activity, "default_rel": ONT.entity_link,
                       "typed": True,  "pg_id": None},
         "Xenofon":   {"label": ONT.human,    "default_rel": ONT.was_attributed_to,
                       "typed": True,  "pg_id": None},
@@ -278,9 +278,9 @@ def test_plan_edges_novelty_excludes_manifest_existing():
     # before novelty is ever scored, so novelty is a question about EXISTING
     # nodes only.
     registry = _registry() | {
-        "coordinator": {"label": ONT.entity, "default_rel": ONT.entity_link,
+        "coordinator": {"label": ONT.activity, "default_rel": ONT.entity_link,
                         "typed": True, "pg_id": None},
-        "BGE-M3":      {"label": ONT.entity, "default_rel": ONT.entity_link,
+        "BGE-M3":      {"label": ONT.activity, "default_rel": ONT.entity_link,
                         "typed": True, "pg_id": None},
     }
     manifest = {"entities": ["coordinator"],
