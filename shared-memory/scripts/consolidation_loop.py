@@ -105,13 +105,16 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "local-model")
 IDLE_THRESHOLD_SEC = int(os.environ.get("NREM_IDLE_THRESHOLD_SEC", "900"))
 MAX_DEFERRAL_SEC = IDLE_THRESHOLD_SEC * 3
 DENSITY_THRESHOLD = ONT.density_threshold
-# ⛔ LEGACY (pre-v2). The v2 FACT GATE (plan §2.1) has ONE density knob —
-# ONT.density_threshold, used directly by ``_consolidate_clusters`` — not a
-# second env-tunable one. Kept only because coordinator.py's
-# ``_nrem_cycle_counts`` still imports it for the pre-v2 telemetry split (see
-# the block comment above ``eligible_entity_level_clusters``).
-NREM_DOMAIN_THRESHOLD = int(os.environ.get("NREM_DOMAIN_THRESHOLD",
-                                           str(DENSITY_THRESHOLD)))
+# ⛔ REMOVED (C1b): NREM_DOMAIN_THRESHOLD, a SECOND env-tunable density knob
+# that duplicated ONT.density_threshold, used to exist here. The v2 FACT GATE
+# (plan §2.1) has ONE density knob — ONT.density_threshold (DENSITY_THRESHOLD
+# above), used directly by both ``_consolidate_clusters`` (the fold) and
+# ``coordinator._nrem_cycle_counts`` (its telemetry) as of this release.
+# Keeping two numbers that were SUPPOSED to track together, tunable
+# independently via two different env vars, is exactly a future-drift risk —
+# an operator setting NREM_DOMAIN_THRESHOLD expecting it to change the gate
+# would silently do nothing, since the fold had already stopped reading it in
+# C1. Deleted rather than left as a second, unread knob.
 # Fold summary levels — also the P12 supersession scope and metadata.level
 # values. LEVEL_ENTITY is no longer PRODUCED by any fold (v2, C1) but stays
 # defined: legacy 'entity'-level community_summaries rows (Xenofon's ruling —
@@ -905,78 +908,33 @@ def evidential_kind_for_record(rtype, source_ref, grounding_kinds=None):
     return fact_kind_from_source_ref(source_ref)
 
 
-# ── ⛔ LEGACY — ORPHANED FROM THE FOLD as of the v2 FACT GATE (Dreaming Cycle
-# Plan to v2, §2.1; C1) ─────────────────────────────────────────────────────
-# The four functions below (`eligible_entity_level_clusters`,
-# `eligible_domain_level_clusters`, `eligible_domain_clusters`,
-# `count_entity_level_cycles`, `count_domain_level_cycles`) implemented the
-# PRE-v2 two-level design: an entity-hub (MENTIONS) level and a project-only
-# level (the historical `domain_map` == PROJECT squat this module's own
-# docstrings warn about). §2.1 is explicit — "There is NO project level and NO
-# entity level" — so `_consolidate_clusters` no longer calls
-# `eligible_entity_level_clusters` or `eligible_domain_clusters` AT ALL; the
-# fold now discovers its population via `_find_grounded_fact_groups` (graph-
-# native PROJECT_OF/DOMAIN_OF walk from GROUNDED_IN) and partitions it with
-# `eligible_domain_level_clusters` ONLY — see `_consolidate_clusters` below.
+# ── ✅ THE v2 FACT GATE PARTITIONER (Dreaming Cycle Plan to v2, §2.1; C1/C1b) ──
+# The pre-v2 two-level design (an entity-hub/MENTIONS level, and a
+# project-only level — the historical `domain_map` == PROJECT squat this
+# module's docstrings used to warn about) is GONE. `eligible_entity_level_clusters`,
+# `eligible_domain_clusters` (its project-only wrapper), `count_entity_level_cycles`
+# and their sole remaining caller, `coordinator._count_domain_cycles`, are
+# DELETED — the escalation raised when C1 shipped is now closed: `main` moved
+# past the parallel builder that held `coordinator.py`, so both the fold AND
+# its telemetry (`coordinator._nrem_cycle_counts`) now describe ONLY the v2
+# gate. `tests/test_domain_clusters.py` (which tested those two removed
+# functions and nothing else) is deleted with them.
 #
-# ⛔ THESE FOUR NAMES ARE KEPT, UNCHANGED, SOLELY BECAUSE `coordinator.py` still
-# imports them: `_count_domain_cycles` (coordinator.py:1035-1044, itself dead —
-# no caller besides its own test) and `_nrem_cycle_counts`
-# (coordinator.py:6039-6158, LIVE — feeds `GET /memory/telemetry`'s `nrem` key
-# and the I7 stall-verdict read at coordinator.py:5757) both still describe the
-# pre-v2 two-level rule and report `entity_level_cycles`/`domain_level_cycles`
-# that the fold can no longer produce. `coordinator.py` is out of scope for
-# this branch (owned by a parallel Track B/C builder this cycle) — deleting
-# these names would break that file's imports and its own tests
-# (`tests/test_domain_clusters.py`). ESCALATED to Opus; see HANDOFF.md.
-def eligible_entity_level_clusters(contents, pg_ids, project_map, domains_map,
-                                   threshold):
-    """Partition one entity hub's facts by (project, section) for entity-level folds.
-
-    Pure. ``project_map``: pg_id → project name (PROJECT_SQL).
-    ``domains_map``: pg_id → list of section names (may be empty).
-
-    * **P2** — unresolvable project is skipped, never bucketed.
-    * **P15** — no sections → one bucket with section ``SECTION_NONE`` ("").
-    * **Fan-out** — a fact with several sections counts in each (not a partition).
-
-    Returns list of ``((project, section), contents, pg_ids)`` meeting threshold.
-    """
-    buckets: dict = {}
-    for content, pid in zip(contents, pg_ids):
-        project = project_map.get(pid)
-        if not fold_eligible(project):
-            continue
-        sections = domains_map.get(pid) or []
-        # Normalise: strip, drop blanks, de-dupe; empty → P15 sentinel.
-        cleaned = []
-        seen = set()
-        for s in sections:
-            if not isinstance(s, str):
-                continue
-            name = s.strip()
-            if name and name not in seen:
-                seen.add(name)
-                cleaned.append(name)
-        if not cleaned:
-            cleaned = [SECTION_NONE]
-        for section in cleaned:
-            key = (project, section)
-            bucket = buckets.setdefault(key, ([], []))
-            bucket[0].append(content)
-            bucket[1].append(pid)
-    return [
-        (key, c, p)
-        for key, (c, p) in buckets.items()
-        if len(p) >= threshold
-    ]
-
-
+# `eligible_domain_level_clusters` / `count_domain_level_cycles` are KEPT and
+# their name is KEPT too — deliberately, not by omission. "domain-level" was
+# never a leftover half of a two-level distinction; it describes the
+# mechanism itself (folds are keyed at (project, domain) granularity, never
+# per-project, never per-entity — neither of those exists any more to
+# contrast it with). Renaming a name that already says the true thing would
+# only cost every caller a diff for no clarity gained.
 def eligible_domain_level_clusters(contents, pg_ids, project_map, domains_map,
                                    threshold, registered_sections):
-    """✅ THE v2 FACT GATE PARTITIONER (plan §2.1) — the only one
-    ``_consolidate_clusters`` calls. (project, section) with **no** entity —
-    exactly the plan's anchor: "(project, domain), and nothing else."
+    """THE v2 FACT GATE PARTITIONER (plan §2.1) — the only one
+    ``_consolidate_clusters`` calls, and (as of C1b) the only one
+    ``coordinator._nrem_cycle_counts`` counts against for its `fact_cycles`
+    census, so the fold and its telemetry can never again disagree.
+    (project, section) with **no** entity — exactly the plan's anchor:
+    "(project, domain), and nothing else."
 
     Pure. Only **registered** non-empty sections form buckets — an unregistered
     or blank section never qualifies. ``registered_sections`` is a set of
@@ -1016,42 +974,12 @@ def eligible_domain_level_clusters(contents, pg_ids, project_map, domains_map,
     ]
 
 
-def eligible_domain_clusters(contents, pg_ids, domain_map, threshold):
-    """⛔ LEGACY — this is the PROJECT-ONLY level §2.1 forbids ("There is NO
-    project level"). ``domain_map`` historically held the PROJECT (the naming
-    trap this module's docstrings warn about). Not called by the fold; kept
-    only because ``tests/test_domain_clusters.py`` and coordinator.py's
-    ``_count_domain_cycles`` still exercise it — see the block comment above
-    ``eligible_entity_level_clusters``.
-    """
-    project_map = domain_map
-    domains_map = {pid: [] for pid in pg_ids}
-    return [
-        (project, c, p)
-        for (project, _section), c, p in eligible_entity_level_clusters(
-            contents, pg_ids, project_map, domains_map, threshold
-        )
-    ]
-
-
-def count_entity_level_cycles(pg_ids, project_map, domains_map, threshold):
-    """⛔ LEGACY telemetry twin of the removed entity level — see the block
-    comment above ``eligible_entity_level_clusters``. Not called by the fold;
-    kept only for coordinator.py's ``_nrem_cycle_counts``/``_count_domain_cycles``."""
-    # Reuse the partitioner with dummy contents so the rule cannot drift.
-    contents = [""] * len(pg_ids)
-    return len(eligible_entity_level_clusters(
-        contents, pg_ids, project_map, domains_map, threshold))
-
-
 def count_domain_level_cycles(pg_ids, project_map, domains_map, threshold,
                               registered_sections):
-    """⛔ LEGACY telemetry twin — same partitioner the v2 fold still uses, but
-    THIS caller (coordinator.py's ``_nrem_cycle_counts``) still runs it against
-    a Postgres-metadata-derived population, not the graph-native GROUNDED_IN
-    walk ``_find_grounded_fact_groups`` now uses. The fold itself no longer
-    calls this counting wrapper — see the block comment above
-    ``eligible_entity_level_clusters``."""
+    """Telemetry twin of ``eligible_domain_level_clusters`` — count only,
+    same partitioner, so the gauge and the fold can never again describe
+    different populations. Used by ``coordinator._nrem_cycle_counts`` for the
+    `fact_cycles` census in ``GET /memory/telemetry``."""
     contents = [""] * len(pg_ids)
     return len(eligible_domain_level_clusters(
         contents, pg_ids, project_map, domains_map, threshold,

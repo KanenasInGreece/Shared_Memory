@@ -1,9 +1,16 @@
-"""Plan PR 7 — multi-level NREM fold pure rules (no DB).
+"""v2 FACT GATE (Dreaming Cycle Plan to v2, §2.1) pure rules (no DB).
 
-Covers entity-level (project, section) partition, domain-level (registered
-sections only), P12 same-level subset supersession helper behaviour via the
-partitioners, and decision 1080 evidential kind. Trust the functions, not
-docstrings — every assertion is against return values.
+Covers the (project, domain) partition — registered sections only, no entity,
+no project-only level (both removed, C1/C1b) — P12 same-level subset
+supersession helper behaviour via the partitioner, and decision 1080
+evidential kind. Trust the functions, not docstrings — every assertion is
+against return values.
+
+⛔ The former entity-level test block (`eligible_entity_level_clusters`,
+`count_entity_level_cycles`) is REMOVED with the functions it tested — see
+the block comment above `eligible_domain_level_clusters` in
+consolidation_loop.py. `tests/test_v2_fact_gate.py` covers the v2 gate's
+invariants (I1/I2/I8) directly against the real discovery Cypher.
 """
 import os
 import sys
@@ -11,75 +18,13 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
 from consolidation_loop import (  # noqa: E402
-    eligible_entity_level_clusters,
     eligible_domain_level_clusters,
-    count_entity_level_cycles,
     count_domain_level_cycles,
     evidential_kind_for_record,
     SECTION_NONE,
     LEVEL_ENTITY,
     LEVEL_DOMAIN,
 )
-
-
-# ── Entity-level (project, section) ──────────────────────────────────────────
-
-def test_entity_level_groups_by_project_and_section():
-    contents = ["a", "b", "c", "d"]
-    pg_ids = [1, 2, 3, 4]
-    project_map = {1: "smg", 2: "smg", 3: "smg", 4: "other"}
-    domains_map = {1: ["architecture"], 2: ["architecture"],
-                   3: ["operations"], 4: ["architecture"]}
-    result = eligible_entity_level_clusters(
-        contents, pg_ids, project_map, domains_map, threshold=2)
-    keys = {k for k, _c, _p in result}
-    assert ("smg", "architecture") in keys
-    assert ("smg", "operations") not in keys  # only 1
-    assert ("other", "architecture") not in keys
-
-
-def test_p15_domainless_facts_still_fold_on_project():
-    contents = ["a", "b", "c"]
-    pg_ids = [1, 2, 3]
-    project_map = {1: "smg", 2: "smg", 3: "smg"}
-    domains_map = {1: [], 2: [], 3: ["architecture"]}
-    result = eligible_entity_level_clusters(
-        contents, pg_ids, project_map, domains_map, threshold=2)
-    by_key = {k: p for k, _c, p in result}
-    assert by_key[("smg", SECTION_NONE)] == [1, 2]
-    # single architecture fact below threshold
-    assert ("smg", "architecture") not in by_key
-
-
-def test_multi_domain_fanout_counts_fact_in_each_section():
-    contents = ["shared"]
-    pg_ids = [1]
-    project_map = {1: "smg"}
-    domains_map = {1: ["architecture", "operations"]}
-    # threshold 1 so both buckets form
-    result = eligible_entity_level_clusters(
-        contents, pg_ids, project_map, domains_map, threshold=1)
-    keys = {k for k, _c, _p in result}
-    assert keys == {("smg", "architecture"), ("smg", "operations")}
-
-
-def test_p2_unresolvable_project_skipped():
-    contents = ["a", "b"]
-    pg_ids = [1, 2]
-    project_map = {1: None, 2: ""}
-    domains_map = {1: ["x"], 2: ["x"]}
-    assert eligible_entity_level_clusters(
-        contents, pg_ids, project_map, domains_map, threshold=1) == []
-
-
-def test_count_entity_level_matches_partitioner():
-    pg_ids = [1, 2, 3, 4]
-    project_map = {1: "smg", 2: "smg", 3: "smg", 4: "smg"}
-    domains_map = {1: ["a"], 2: ["a"], 3: ["b"], 4: ["b"]}
-    n = count_entity_level_cycles(pg_ids, project_map, domains_map, threshold=2)
-    items = eligible_entity_level_clusters(
-        [""] * 4, pg_ids, project_map, domains_map, threshold=2)
-    assert n == len(items) == 2
 
 
 # ── Domain-level (no entity; registered sections only) ───────────────────────
