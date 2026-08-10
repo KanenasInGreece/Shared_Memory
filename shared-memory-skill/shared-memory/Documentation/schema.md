@@ -50,6 +50,8 @@ Written exclusively by the consolidation daemon. Each row is an LLM-synthesised 
 | `source_pg_ids` | `INTEGER[]` | IDs of `technical_docs` rows that contributed to this summary. Added by migration 003; back-filled from `metadata` for existing rows. Enables `WHERE $fact_id = ANY(source_pg_ids)` provenance queries without JSON parsing. |
 | `summary_history` | `JSONB NOT NULL DEFAULT '[]'` | Append-only array of previous summaries, capped at 20. Written by the daemon on every `DO UPDATE` — the outgoing content, `source_pg_ids`, and `timestamp` are pushed to the array before the row is overwritten. Enables drift auditing without a temporal schema. Added by migration 004. |
 | `superseded` | `BOOLEAN NOT NULL DEFAULT false` | Set to `true` when another summary's `source_pg_ids` is a strict superset of this row's `source_pg_ids` — the newer summary subsumes this one. Retrieval (`coordinator.py`) always filters `WHERE NOT superseded`. Partial index `community_summaries_active_idx` keeps this scan fast. Added by migration 006. |
+| `superseded_at` | `TIMESTAMPTZ` | When this row was retired. `NULL` for every row superseded before migration 031 — honest: its reason/timestamp was never recorded, not backfilled. |
+| `superseded_reason` | `TEXT` | `'coverage'` — Mechanism A, `supersede_covered_summaries` (subset/equal `source_pg_ids`). `'lineage'` — Mechanism B, `retire_invalidated_summaries` (Dreaming Cycle Plan to v2 §5): a source fact was superseded, a source decision was reversed, or (insight only) a thematic summary this insight rested on was itself lineage-retired. `NULL` for rows superseded before migration 031. |
 | `agent_id` | `TEXT NOT NULL DEFAULT 'legacy'` | Agent that triggered consolidation; `'legacy'` for pre-coordinator rows |
 | `scope` | `TEXT NOT NULL DEFAULT 'global'` | Inherited from the source `Fact` cluster's scope |
 | `visibility` | `TEXT NOT NULL DEFAULT 'global'` | Read policy, same semantics as `technical_docs.visibility` — enforced on Tier-3 reads (v0.6.2) so a scoped/private source fact's synthesis inherits the same gate. |
@@ -66,7 +68,7 @@ Written exclusively by the consolidation daemon. Each row is an LLM-synthesised 
 }
 ```
 
-**Insight rows (`kind: "insight"`, decision pg_id 276):** the second consolidation path folds cross-project *decision* clusters. Same table, distinguished by metadata — `kind: "insight"`, `domain: "insight"`, a `projects` array, and `source_pg_ids` containing **decision** ids (disjoint from fact ids, so the two kinds can never supersede each other). Insight rows are **always-INSERT**: they are exempt from the `(entity, domain)` unique upsert (partial index, migration 009) and rely on supersession for dedup — a re-fold on the same source set writes a fresh row that supersedes the old one.
+**Insight rows (`kind: "insight"`, decision pg_id 276):** the second consolidation path folds cross-project *decision* clusters. Same table, distinguished by metadata — `kind: "insight"`, `domain: "insight"`, a `projects` array, and `source_pg_ids` containing **decision** ids. Insight rows are **always-INSERT**: they are exempt from the `(entity, domain)` unique upsert (partial index, migration 009) and rely on supersession for dedup — a re-fold on the same source set writes a fresh row that supersedes the old one. ⚠ Facts, decisions and retrospectives all share the **single** `technical_docs` id sequence — they are **not** disjoint (a stale claim `supersede_covered_summaries`' docstring carried before C3 fixed it (U5)); kind isolation is enforced explicitly (an unconditional `kind` check), never assumed from the id space.
 
 > **Note:** `source_pg_ids` is stored both as the dedicated column above and inside `metadata` JSONB. The column is the authoritative query path; the JSONB key is retained for backwards compatibility with tooling that reads raw metadata.
 
@@ -78,7 +80,12 @@ Written exclusively by the consolidation daemon. Each row is an LLM-synthesised 
 
 **Growth behaviour (thematic rows):** one row per `(entity, domain)`, keyed by `metadata->>'entity'` + `metadata->>'domain'` (partial unique index `community_summaries_entity_domain_unique`, migrations 007 + 009 — insight rows exempt). Each consolidation cycle replaces the existing row via `ON CONFLICT DO UPDATE` — the new LLM synthesis overwrites `content` and `embedding`, while the previous `content` is appended to `summary_history` (capped at 20 entries). The row ID (`id`) is stable across updates. Insight rows instead accumulate as inserts and retire via supersession. Retrieval surfaces the embedding-closest `WHERE NOT superseded` match per kind — insight first, then thematic.
 
-**Supersession rule:** if summary A's `source_pg_ids` is **covered by** (subset of, or equal to) summary B's `source_pg_ids`, A is superseded by B. The equal-set case is how an insight re-fold replaces its predecessor. The consolidation daemon sets `A.superseded = true` in Postgres and writes `(B)-[:SUPERSEDES]->(A)` in Neo4j. Cross-entity supersession is supported — an "Outbox" summary can supersede a "Neo4j" summary if it absorbed all the same source facts; insight and thematic rows never collide because their source id spaces (decisions vs facts) are disjoint.
+**Supersession rule — TWO mechanisms, both needed (Dreaming Cycle Plan to v2 §5.1):**
+
+* **Mechanism A — subset coverage (identity-driven).** If summary A's `source_pg_ids` is **covered by** (subset of, or equal to) summary B's `source_pg_ids`, A is superseded by B (`superseded_reason='coverage'`). The equal-set case is how an insight re-fold replaces its predecessor. `supersede_covered_summaries` — kind-isolated **unconditionally** (an explicit `kind` check, never inferred from the id space: facts, decisions and retrospectives share one `technical_docs` sequence, so a thematic and an insight summary's `source_pg_ids` CAN coincidentally overlap) and level-isolated when a level is given (P12).
+* **Mechanism B — lineage (invalidation-driven, migration 031).** A summary is retired because a member it was built from is no longer valid — found by **reverse lookup** on `source_pg_ids`/`metadata->'summary_ids'`, never by set comparison (a reversal makes the covered set *smaller*, which Mechanism A structurally cannot express: `retire_invalidated_summaries`, `superseded_reason='lineage'`; the ledger clock is `refold_ledger`, above).
+
+The consolidation daemon sets `A.superseded = true` in Postgres and writes `(B)-[:SUPERSEDES]->(A)` in Neo4j for Mechanism A refolds; Mechanism B retirements do not write a `SUPERSEDES` edge (there is no successor summary at retirement time — only a future re-fold, which supersedes normally when it lands). Cross-entity supersession is supported — an "Outbox" summary can supersede a "Neo4j" summary if it absorbed all the same source facts.
 
 ---
 
@@ -102,6 +109,30 @@ Written by the coordinator on every save, in the same Postgres transaction as `t
 **Decision and retrospective rows are exempt from the ledger tail** (`consolidated`/deletion): their lifecycle ends at `applied`/`rem_reviewed` until the decision-NREM design (insight consolidation, reversal cascade) is ratified. Note that a retrospective row shares its **target decision's** `pg_id`; because REM's outbox mark targets the latest `applied` row for a `pg_id`, retro rows can sit at `rem_reviewed` — they are identified by `cypher_params->>'type'`, never by status.
 
 **Consistency note:** after a save returns success (Postgres committed), the corresponding Neo4j `Fact` node may not yet exist — the outbox worker applies it asynchronously. `graph` queries immediately after a save use `?consistency=neo4j` to block until the outbox row is applied.
+
+### `refold_ledger` — lineage-invalidation clock (migration 031, Dreaming Cycle Plan to v2 §5)
+
+The durable attribution trail for **Mechanism B** (cascading/lineage supersession, as distinct from Mechanism A's ordinary subset-coverage retirement above): when a source fact is superseded or a source decision is reversed, every ACTIVE `community_summaries` row holding it is retired (`superseded_reason = 'lineage'`), and its still-eligible constituents need to rejoin a future fold. **The ledger is only the clock** — re-gating itself is always re-derived from the graph (`_find_grounded_fact_groups` / `_find_fresh_insight_clusters`), never from this table's contents; its one job is to widen the durable backlog count so a cycle actually fires. Follows the `project_promotions` model: rows are **closed, never deleted** — the row itself is the record that an invalidation happened and what it raised.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `BIGSERIAL PRIMARY KEY` | |
+| `pg_id` | `BIGINT NOT NULL` | The `technical_docs.id` now eligible to rejoin a fold — resolved through `superseded_by` to the record that STANDS (`resolve_standing_ids`), never the invalidating record itself. |
+| `summary_id` | `BIGINT NOT NULL` | The retired `community_summaries.id` this row's eligibility traces back to. |
+| `summary_kind` | `TEXT NOT NULL` | `'thematic'` \| `'insight'` — which fold path `pg_id` re-enters. |
+| `trigger_kind` | `TEXT NOT NULL` | `'technical_docs'` (a superseded fact, or a reversed decision) \| `'community_summaries'` (a retired thematic summary whose retirement cascaded to an insight resting on it). Two typed shapes, deliberately never collapsed into one untyped id column — `technical_docs` and `community_summaries` are separate id sequences that can overlap numerically. |
+| `trigger_id` | `BIGINT NOT NULL` | The id in the sequence `trigger_kind` names. |
+| `status` | `TEXT NOT NULL DEFAULT 'open'` | `open` → `refolded` \| `dropped`. `refolded`: `pg_id` now appears in an ACTIVE summary of the matching kind. `dropped`: `closed_reason='below_density'` (I7 — the row's group was evaluated and did not meet `density_threshold`; not backlog, not a stall) or `'constituent_superseded'` (defensive — the record became superseded again after the row opened). |
+| `closed_at` / `closed_reason` | `TIMESTAMPTZ` / `TEXT` | Set together, on the terminal transition. `NULL`/`NULL` while `status='open'`. |
+| `created_at` | `TIMESTAMPTZ NOT NULL DEFAULT now()` | |
+
+**Indexes:** partial btree `refold_ledger_open_pgid_idx` on `pg_id WHERE status = 'open'` — the due-ness read (`fetch_refold_backlog`: `SELECT DISTINCT pg_id ... WHERE status='open'`); btree `refold_ledger_summary_idx` on `summary_id` — attribution lookups ("what did summary X's retirement raise?").
+
+**No uniqueness constraint.** Duplicate rows for the same `pg_id` are legitimate — two different summaries invalidated at different times can both raise the same constituent, and a single retirement can carry more than one trigger. Due-ness always counts `DISTINCT pg_id`, never a row count.
+
+**Read by:** `fetch_combined_fact_backlog` (`fetch_ledger_backlog` UNION `fetch_refold_backlog`, deduped) — this is the WIDENED input to `consolidation_due` / `run_ledger_sweep`'s density gate; the gate's own predicate (`len(backlog) >= DENSITY_THRESHOLD`) is unchanged, only what feeds it grew a second source.
+
+**Written by:** `retire_invalidated_summaries` (opens rows, atomically with the `community_summaries` retirement — one Postgres transaction) and `close_refold_ledger_rows` / `drop_below_density_refold_rows` (close them). `run_lineage_invalidation_pass` (`consolidation_loop.py`) is the async driver: Postgres retirement first, then — **insight retirements only** — `d.consolidated = false` is cleared on the retired insight's `Decision`/`Retrospective` graph nodes (gate-critical, `insight_gate.py`'s G3 freshness check). A retired **thematic** summary never touches the graph: a `Fact` node's own `consolidated` property has no reader (`_find_grounded_fact_groups`'s full-scan discovery never reads it).
 
 ### `consolidation_runs` — dream-cycle liveness/coverage ledger (ADR-018, migration 012)
 
