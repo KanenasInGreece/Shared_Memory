@@ -5,6 +5,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.68] — 2026-08-11
+
+### Fixed — three defects in the lineage-supersession close paths, caught before their first live firing
+
+- **A lineage-retired summary could be resurrected in place — and stay retired forever** (migration 032). The axis unique index did not exclude `superseded` rows, so the thematic fold's `ON CONFLICT … DO UPDATE` matched a retired row on the same `(project, domain)` key and updated its content while never touching the retirement columns: the group's summary would refresh forever yet remain invisible to retrieval, and the ledger rows opened at its retirement could never close, because the close requires an *active* covering summary. The index now carries `AND NOT superseded` and the fold's arbiter matches it — a re-fold after retirement lands a **fresh active row**, and the retired row stays behind, unmodified, as history. A new summary supersedes the old; nothing is ever resurrected in place.
+- **A ledger row for a constituent invisible to the fact scan could never close** — permanent zombie backlog. The below-density close only reaches constituents the grounded+domained scan produced; a constituent that is ungrounded or carries no domain never enters that scan at all, so its open row would inflate the fact clock indefinitely — the same latch shape the insight-kind filter fixed one level up. Such rows now close `dropped` with their own `closed_reason` (`out_of_scan`), distinct from `below_density`, so the two classes stay tellable apart in telemetry. Nothing is lost: re-gating never reads the ledger, so a constituent that later gains grounding and a domain folds on its own right regardless.
+- **A close could be attributed to a summary that predates the invalidation.** The 'refolded' close matched *any* active summary containing the constituent, including one untouched since long before the retirement — recording `constituent_folded` when nothing had folded. The covering summary must now be **no older than the ledger row it closes**; every real re-fold stamps `updated_at`, so the bound only ever excludes a summary that could not have been the awaited re-fold.
+
+---
+
 ## [0.8.67] — 2026-08-11
 
 ### Added — cascading (lineage) supersession
