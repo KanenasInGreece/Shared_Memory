@@ -40,12 +40,15 @@ Pipeline per record (anchor kinds: Fact, Decision, Retrospective):
   8. Zero judgement/evidential minting (Dreaming Cycle v2 plan §1, B1): REM
      proposes no CONSIDERED / REJECTED / UNDER_CONDITIONS / PRODUCES_INSIGHT /
      INFORMED_BY edge. Those are first-write-only properties. A Decision node
-     referenced by content resolves to MENTIONS like any other known node —
-     INFORMED_BY is not in that label's allowed relation set, so it cannot be
-     produced. GROUNDED_IN is NEVER machine-mintable: an LLM suggestion of it
-     is resolved away (to the target's default relation) and logged. MENTIONS
-     is demoted to the explicit fallback for unknown names (727 §1) — still
-     minted, now with full rem provenance like every edge.
+     referenced by content is DROPPED outright, symmetric with the Entity
+     drop (E4) — never any edge, not even MENTIONS: MENTIONS is E1's
+     Fact→Entity relation, and falling back to it for a Decision target would
+     mint a graph shape REM has never produced. GROUNDED_IN is NEVER
+     machine-mintable: an LLM suggestion of it against a non-Decision,
+     non-Entity target is resolved away (to the target's default relation)
+     and logged. MENTIONS is demoted to the explicit fallback for unknown
+     names (727 §1) — still minted, now with full rem provenance like every
+     edge.
   9. Decision-extras gate (718, retired further by E5/B1): CONSIDERED/
      REJECTED/UNDER_CONDITIONS/PRODUCES_INSIGHT targets are NEVER minted —
      candidate names are logged (extras_dropped) and stay decision properties
@@ -448,10 +451,15 @@ _LABEL_DEFAULT_REL: dict[str, str] = {
     # No ONT.project entry: REM cannot reference a :Project at all (see
     # _KNOWN_LABELS), so a default relation for one would be unreachable code
     # that documents a capability the gate has removed.
-    # ONT.decision defaults to MENTIONS, not INFORMED_BY: INFORMED_BY is a
-    # judgement relation, first-write-only since REM's judgement-relation
-    # decommissioning (Dreaming Cycle v2 plan §1, B1) — a Decision node is
-    # still linkable, just never with that semantic.
+    # ONT.decision has no INFORMED_BY default: INFORMED_BY is a judgement
+    # relation, first-write-only since REM's judgement-relation decommissioning
+    # (Dreaming Cycle v2 plan §1, B1). This entry is defence in depth, not the
+    # thing that stops a Decision proposal — plan_edges drops EVERY proposal
+    # targeting a Decision outright (symmetric with E4's Entity drop), so this
+    # default is never actually consumed for that label; it exists so that IF
+    # the drop in plan_edges were ever removed by mistake, the fallback would
+    # still be the harmless MENTIONS default rather than a resurrected
+    # INFORMED_BY.
     ONT.decision: ONT.entity_link,
     ONT.entity:   ONT.entity_link,
 }
@@ -474,9 +482,15 @@ _LABEL_ALLOWED_RELS: dict[str, frozenset[str]] = {
     # :Project — the first made REM a second writer of the project axis, the
     # second made the axis a topic. Both are now impossible upstream.
     # No INFORMED_BY in the Decision set (B1): it is a judgement relation,
-    # first-write-only. An LLM suggestion of it now falls back to the label's
-    # default (MENTIONS) — structurally, not by a runtime flag, so REM cannot
-    # produce that edge type regardless of what a prompt result proposes.
+    # first-write-only, so an LLM suggestion of it can never resolve to one —
+    # structurally, not by a runtime flag. This is layer one of two: it stops
+    # INFORMED_BY specifically. Layer two is in plan_edges itself, which drops
+    # EVERY proposal targeting a Decision outright (symmetric with its Entity
+    # drop, E4) — so no fallback relation (MENTIONS included) is ever written
+    # for one either. MENTIONS is E1's Fact→Entity relation, not a
+    # general-purpose record link, and the live graph has never contained
+    # MENTIONS targeting a Decision; a fallback that produced one would trade
+    # a retired judgement edge for a graph shape REM has equally never made.
     ONT.decision: frozenset({ONT.entity_link}),
     ONT.entity:   frozenset({ONT.entity_link,         ONT.entity_link_alias}),
 }
@@ -992,12 +1006,15 @@ def plan_edges(result: dict, registry: dict[str, dict], kind: str,
                    (existing edges + operator entities). Only novel edges are
                    written (delta principle) and verified (k=3).
       Zero judgement/evidential minting (Dreaming Cycle v2 plan §1, B1): a
-                   Decision node's only allowed relation is MENTIONS — a
-                   suggestion of INFORMED_BY (or of any other judgement
-                   relation) can never resolve to one, structurally, because
-                   the label's allowed-relation set does not contain it. GROUNDED_IN
-                   suggestions are likewise resolved away (never machine-
-                   mintable) and reported in grounded_in_remaps.
+                   proposal that resolves to a Decision node is DROPPED
+                   entirely, symmetric with the Entity drop (E4) — never
+                   written, not even as MENTIONS. Falling back to MENTIONS
+                   would still mint a graph shape REM has never produced:
+                   MENTIONS is E1's Fact→Entity relation, not a general
+                   record link, and the live graph has zero MENTIONS edges
+                   targeting a Decision. GROUNDED_IN suggestions are likewise
+                   never machine-mintable and reported in grounded_in_remaps
+                   when they resolve to a non-Decision, non-Entity target.
       Decision extras (718): targets linked ONLY when already registry-known AND
                    the known node is an :Entity (domain-range, 978); anything
                    else lands in extras_dropped.
@@ -1057,6 +1074,21 @@ def plan_edges(result: dict, registry: dict[str, dict], kind: str,
         label, rel_type = _resolve_rel(name, suggested, registry)
         if label == ONT.entity:
             # E4: REM performs zero entity linking to :Entity nodes
+            dropped_names.append(name)
+            continue
+        if label == ONT.decision:
+            # B1 (Dreaming Cycle v2 plan §1): REM performs zero linking to
+            # :Decision nodes, full stop — symmetric with E4's Entity drop,
+            # not a downgrade to some other relation. INFORMED_BY is a
+            # judgement relation, first-write-only; falling back to MENTIONS
+            # would still mint a graph shape REM has never produced (E1:
+            # MENTIONS is the Fact→Entity relation, not a general-purpose
+            # record link — the live graph has 0 MENTIONS targeting a
+            # Decision). Two layers, deliberately: _LABEL_ALLOWED_RELS /
+            # _LABEL_DEFAULT_REL above already make INFORMED_BY unreachable
+            # for this label (so a suggestion of it can only resolve to the
+            # fallback); THIS drop is what stops that fallback from being
+            # written as an edge at all.
             dropped_names.append(name)
             continue
         if isinstance(suggested, str) and suggested.strip().upper() == ONT.grounded_in:
