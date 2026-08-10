@@ -256,13 +256,15 @@ def test_equal_source_set_supersedes_prior_insight():
     # A re-fold writes the SAME source_pg_ids — the equal set must ride the
     # covered-subset rule and replace its predecessor.
     # Row shape after PR 7: (id, source_pg_ids, level, kind)
+    # U5: the insight call site passes kind="insight" explicitly (kind
+    # isolation is now unconditional, never a side effect of `level`).
     conn = _supersession_conn([(70, [245, 267], "entity", "insight")])
-    assert supersede_covered_summaries(conn, 77, [245, 267]) == [70]
+    assert supersede_covered_summaries(conn, 77, [245, 267], kind="insight") == [70]
 
 
 def test_strict_subset_supersedes():
     conn = _supersession_conn([(70, [245], "entity", "insight")])
-    assert supersede_covered_summaries(conn, 77, [245, 267]) == [70]
+    assert supersede_covered_summaries(conn, 77, [245, 267], kind="insight") == [70]
 
 
 def test_disjoint_and_superset_sources_survive():
@@ -270,7 +272,28 @@ def test_disjoint_and_superset_sources_survive():
         (70, [1, 2, 3], "entity", "insight"),
         (71, [245, 267, 999], "entity", "insight"),
     ])
-    assert supersede_covered_summaries(conn, 77, [245, 267]) == []
+    assert supersede_covered_summaries(conn, 77, [245, 267], kind="insight") == []
+    assert conn.commits == 0
+
+
+# ── U5: kind isolation is UNCONDITIONAL, not a side effect of `level` ─────────
+
+def test_kind_isolation_applies_even_with_no_level():
+    # I13 / §5's "still unfixed" note: an insight fold (level=None, the real
+    # call site's shape) must NEVER supersede a THEMATIC row, even when its
+    # source_pg_ids happens to be a covered subset — `technical_docs` is one
+    # shared id sequence across facts/decisions/retrospectives, so this is a
+    # real collision risk, not a hypothetical one.
+    conn = _supersession_conn([(70, [245, 267], "entity", "thematic")])
+    assert supersede_covered_summaries(conn, 77, [245, 267], kind="insight") == []
+    assert conn.commits == 0
+
+
+def test_kind_isolation_default_is_thematic():
+    # The fact-fold call site relies on the default kind="thematic" — an
+    # insight row must never be swept up by it even at the same level name.
+    conn = _supersession_conn([(70, [245, 267], "domain", "insight")])
+    assert supersede_covered_summaries(conn, 77, [245, 267], level="domain") == []
     assert conn.commits == 0
 
 

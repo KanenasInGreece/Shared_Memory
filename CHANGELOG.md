@@ -5,6 +5,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.67] — 2026-08-11
+
+### Added — cascading (lineage) supersession
+
+- **A summary is now retired because a record it was built from is no longer valid**, found by **reverse lookup** on its own stored id lists — never by comparing sets. This is a *second* supersession mechanism sitting beside subset coverage, not a replacement for it: a reversal makes the covered set **smaller**, so subset coverage can never express it and the stale summary would otherwise survive forever, still asserting an overturned decision.
+  - **One predicate covers both triggers.** `technical_docs.superseded` is set on a superseded fact and on a reversed decision alike — same column, same test, nothing to keep in sync.
+  - **Three legs, in cascade order:** a thematic summary holding a superseded fact; an insight holding a reversed decision directly; and an insight resting on a thematic summary retired by *this* pass. The third is scoped deliberately — an insight resting on a summary that was retired by ordinary growth is **not** stale, because a live fold path already covers it.
+  - **Retirement is one atomic pass.** A retirement without a ledger row for an eligible constituent is the failure this design exists to prevent, so the two cannot be separated by a commit boundary.
+- **`refold_ledger` — a durable attribution trail for re-consolidation** (migration 031). It is the mirror image of the outbox: the outbox covers a record from save until first consolidation and then **deletes** the row, because presence *is* the state; this table covers a record from invalidation until re-consolidation and **never deletes**, because the row *is* the record of what ran and why. One row per record, transitioned to a terminal status rather than removed.
+  - **A constituent is resolved to the record that stands** before a row is opened, by walking `superseded_by` forward. Without it, a retired summary whose constituents are *all* superseded would raise no work at all.
+  - **`community_summaries.superseded_at` / `superseded_reason`** distinguish a `coverage` retirement from a `lineage` one. Nullable, no backfill — a row retired before this release keeps both null, which is honest: its reason was never recorded.
+
+### Fixed
+
+- **An insight could retire a thematic summary.** Kind isolation in `supersede_covered_summaries` was applied only when `level` was set, and the insight path passes no level. The docstring blamed "disjoint id spaces" — false: facts, decisions and retrospectives all share the one `technical_docs` sequence, so one kind's source set can coincidentally be a subset of the other's. The check is now unconditional and the caller states its own kind.
+- **The fact-side clock no longer counts a row it can never clear.** Re-consolidation work raised for an *insight* carries a decision id; the fact backlog can neither satisfy it nor drop it, so it would have inflated that count indefinitely. Attribution rows and clock entries are now distinguished at the read.
+
+### Note
+
+- **Re-consolidation is deliberately scoped.** Supersession still resolves *lazily at retrieval* wherever a live fold path exists — that behaviour is unchanged and remains correct. Eager cascading applies only where no fold can regenerate a summary, so "re-fold on demand" has nothing left to call.
+
+---
+
 ## [0.8.66] — 2026-08-10
 
 ### Changed

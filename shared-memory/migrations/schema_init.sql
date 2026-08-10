@@ -74,7 +74,9 @@ CREATE TABLE IF NOT EXISTS community_summaries (
     superseded       BOOLEAN NOT NULL DEFAULT false,
     created_at       TIMESTAMPTZ DEFAULT now(),
     updated_at       TIMESTAMPTZ DEFAULT now(),
-    run_id           BIGINT
+    run_id           BIGINT,
+    superseded_at    TIMESTAMPTZ,
+    superseded_reason TEXT
 );
 
 CREATE INDEX IF NOT EXISTS community_summaries_active_idx ON public.community_summaries USING btree (id) WHERE (NOT superseded);
@@ -241,6 +243,23 @@ CREATE TABLE IF NOT EXISTS projects (
 
 CREATE INDEX IF NOT EXISTS idx_projects_name_trgm ON public.projects USING gin (name gin_trgm_ops);
 CREATE UNIQUE INDEX IF NOT EXISTS projects_name_key ON public.projects USING btree (name);
+
+-- ─── refold_ledger ──────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS refold_ledger (
+    id               BIGSERIAL PRIMARY KEY,
+    pg_id            BIGINT NOT NULL,
+    summary_id       BIGINT NOT NULL,
+    summary_kind     TEXT NOT NULL,
+    trigger_kind     TEXT NOT NULL,
+    trigger_id       BIGINT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'open'::text,
+    closed_at        TIMESTAMPTZ,
+    closed_reason    TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS refold_ledger_open_pgid_idx ON public.refold_ledger USING btree (pg_id) WHERE (status = 'open'::text);
+CREATE INDEX IF NOT EXISTS refold_ledger_summary_idx ON public.refold_ledger USING btree (summary_id);
 
 -- ─── relation_adjudications ─────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS relation_adjudications (

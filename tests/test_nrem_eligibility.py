@@ -92,7 +92,12 @@ def _daemon(monkeypatch, backlogs):
             raise nxt
         return nxt
 
-    monkeypatch.setattr(cl, "fetch_ledger_backlog", _fetch)
+    # C3 widened the read `_refresh_backlog` actually calls to
+    # fetch_combined_fact_backlog (outbox UNION lineage-invalidation ledger,
+    # deduped) — patch that entry point rather than the outbox-only half, so
+    # these tests keep exercising the RECHECK_SEC cache / eligibility clock /
+    # failure handling unchanged by which backlog SOURCE feeds them.
+    monkeypatch.setattr(cl, "fetch_combined_fact_backlog", _fetch)
     return d, calls
 
 
