@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.62] — 2026-08-10
+
+### Fixed
+
+- **A cycle that never gated is no longer reported as a stall (invariant I7).** `_consolidation_backlog` fell back to the looser NREM *density* count whenever a cycle type had not recorded its own gate census (`eligible_clusters IS NULL`). Density answers *"does raw candidate material exist"*; the stall verdict asks *"did anything gate and then fail to fold"*. Conflating them let a deployment that had never reached the gate report a backlog the strict gate would have rejected — and therefore a stall that was not one.
+  - The fallback is **removed**, not bypassed: `_compute_consolidation_health` no longer calls `_nrem_cycle_counts` at all, and `_consolidation_backlog` now takes a single argument, returning `0` when no census exists. Absence of a census is absence of evidence, not evidence of backlog.
+  - `_consolidation_stall_verdict` is **unchanged** — it was already correct. The defect was one level up, in what the caller passed as `has_backlog`.
+  - The NREM density count remains a separate, purely informational gauge in the telemetry snapshot. It simply may never stand in for "the gate fired".
+  - Consolidation is **selective by design**: a cycle that folds nothing because nothing gated is a correct outcome. Docstrings now cite the governing decision so the two functions' contracts are read together.
+  - Covered by a **composition** test that drives the whole path from the `consolidation_runs` roll-up into the verdict — a unit test on the pure function alone could not have caught this — asserting the density count is never consulted.
+
+### Changed
+
+- **Client surface re-synced.** `SKILL.md`'s worked examples reported `0.8.60` against a `0.8.61` client. A version bump changes the client surface, so the examples move with it.
+
 ## [0.8.61] — 2026-08-08
 
 ### Fixed

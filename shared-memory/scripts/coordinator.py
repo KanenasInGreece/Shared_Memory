@@ -123,7 +123,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.61"
+FRAMEWORK_VERSION = "0.8.62"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -938,20 +938,39 @@ CONSOLIDATION_HEALTH_REFRESH_SEC = int(os.environ.get("CONSOLIDATION_HEALTH_REFR
 CONSOLIDATION_ORPHAN_TIMEOUT_SEC = int(os.environ.get("CONSOLIDATION_ORPHAN_TIMEOUT_SEC", "1800"))
 
 
-def _consolidation_backlog(eligible_clusters, nrem_count) -> int:
-    """Backlog for the stall verdict = the cycle's OWN gate census
-    (eligible_clusters, the strict insight gate) when the daemon has recorded
-    one; else the looser nrem density count as a fresh-deploy fallback. Using
-    nrem alone falsely flags a stall when nrem sees a dense cluster the insight
-    gate rejects (≥2 projects / HAD_OUTCOME / non-mega-hub). Pure → testable."""
-    return eligible_clusters if eligible_clusters is not None else nrem_count
+def _consolidation_backlog(eligible_clusters) -> int:
+    """Backlog for the stall verdict = the cycle's OWN recorded gate census
+    (``eligible_clusters``) and NOTHING else.
+
+    I7 contract (Dreaming_Cycle_Plan_to_v2.md §2.6, `decision:1121`):
+    consolidation is SELECTIVE BY DESIGN — a cycle that folds nothing because
+    nothing GATED is a correct outcome, not a stall. "Stall" means GATED BUT
+    NOT FOLDING; a candidate that never gated is not backlog. So when no cycle
+    has yet recorded its own census (``eligible_clusters is None`` — e.g. a
+    fresh deploy, or every run so far crashed before reaching the gate), that
+    is an ABSENCE OF EVIDENCE, not evidence of backlog: report 0, not a looser
+    substitute count.
+
+    Previously this fell back to the NREM density count
+    (``_nrem_cycle_counts``) when no census had been recorded, which answers
+    "does raw candidate material exist" rather than "did it gate" — the two
+    are exactly the distinction I7 draws, and conflating them let a cycle that
+    had never run report a stall the strict gate would never have agreed to.
+    The fallback is removed; it must not be reintroduced. Pure → testable."""
+    return eligible_clusters if eligible_clusters is not None else 0
 
 
 def _consolidation_stall_verdict(last_success_age, in_flight, has_backlog, threshold) -> bool:
     """Pure stall rule (ADR-018): a cycle is stalled when an eligible backlog
     exists, no successful fold landed within the threshold (or none ever), and
     nothing is currently in-flight. Extracted so the verdict is unit-testable
-    without a database."""
+    without a database.
+
+    I7 (`decision:1121`): this function was already correct — ``has_backlog``
+    is trusted as given, so the guarantee that it means GATING backlog (not
+    raw density) lives entirely in what the caller passes as ``has_backlog``,
+    i.e. in ``_consolidation_backlog`` above. Not changed by this fix; cited
+    here so the two functions' contracts are read together."""
     if not has_backlog or in_flight:
         return False
     return last_success_age is None or last_success_age > threshold
@@ -5686,9 +5705,17 @@ class MemoryCoordinator:
 
     async def _compute_consolidation_health(self) -> dict:
         """Roll up consolidation_runs into per-cycle-type liveness + the stall
-        verdict. One windowed query (last-success per partition) plus the live
-        backlog from _nrem_cycle_counts. stalled = backlog present AND no
-        successful fold within STALL_THRESHOLD AND nothing in-flight."""
+        verdict. One windowed query (last-success per partition); backlog is
+        the cycle's OWN recorded ``eligible_clusters`` census, nothing else
+        (I7, `decision:1121` — see `_consolidation_backlog`). stalled =
+        backlog present AND no successful fold within STALL_THRESHOLD AND
+        nothing in-flight.
+
+        ⚠ No longer calls ``_nrem_cycle_counts`` here: that density count used
+        to be the no-census fallback and is not any more (I7). It remains a
+        SEPARATE, purely informational gauge elsewhere (``snap["nrem"]`` in
+        the telemetry snapshot) — "raw candidate material exists" is still
+        worth reporting, it just must never stand in for "the gate fired"."""
         query = """
             WITH ranked AS (
               SELECT cycle_type, started_at, finished_at, outcome, error_class, error_msg,
@@ -5753,12 +5780,6 @@ class MemoryCoordinator:
         async with self._acquire() as conn:
             rows = await conn.fetch(query, CONSOLIDATION_ORPHAN_TIMEOUT_SEC)
         by_type = {r["cycle_type"]: r for r in rows}
-        try:
-            nrem = await self._nrem_cycle_counts()
-        except Exception:
-            nrem = {}
-        backlog = {"insight": nrem.get("decision_cycles", 0) or 0,
-                   "fact_consolidation": nrem.get("fact_cycles", 0) or 0}
 
         out: dict = {"stall_threshold_seconds": CONSOLIDATION_STALL_THRESHOLD_SEC}
         any_stalled = False
@@ -5768,10 +5789,12 @@ class MemoryCoordinator:
             age = r["last_success_age"] if r else None
             in_flight = bool(r["inflight"]) if r else False
             elig = r["eligible_clusters"] if r else None
-            # Backlog must match the gate the cycle ACTUALLY folds on (see
-            # _consolidation_backlog): the recorded eligible_clusters, not nrem.
+            # I7 (decision:1121): backlog must match the gate the cycle
+            # ACTUALLY folds on — the recorded eligible_clusters, and NOTHING
+            # else. No fallback to a looser density count when no census has
+            # been recorded; see _consolidation_backlog's docstring.
             started_at[ct] = r["last_started"] if r else None
-            backlog_count = _consolidation_backlog(elig, backlog.get(ct, 0))
+            backlog_count = _consolidation_backlog(elig)
             has_backlog = backlog_count > 0
             stalled = _consolidation_stall_verdict(
                 age, in_flight, has_backlog, CONSOLIDATION_STALL_THRESHOLD_SEC)

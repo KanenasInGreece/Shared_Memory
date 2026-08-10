@@ -11,7 +11,7 @@ All Postgres I/O is stubbed — no live infrastructure required.
 import asyncio
 import os
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -52,17 +52,81 @@ def test_stall_verdict():
     assert co._consolidation_stall_verdict(None, False, False, T) is False
 
 
-def test_backlog_prefers_gate_census_over_nrem():
-    """Regression: the insight stall backlog must come from the cycle's own gate
-    census (eligible_clusters), not the looser nrem density count — else a dense
-    cluster the strict insight gate rejects falsely reads as a stall (caught live
-    on first deploy)."""
-    # gate found 0 foldable clusters even though nrem density count is 1 → no backlog
-    assert co._consolidation_backlog(0, 1) == 0
-    # gate found work → that is the backlog
-    assert co._consolidation_backlog(3, 1) == 3
-    # fresh deploy, no census recorded yet → fall back to nrem (never blind)
-    assert co._consolidation_backlog(None, 2) == 2
+def test_backlog_is_the_gate_census_only():
+    """I7 (decision:1121): backlog = the cycle's OWN recorded gate census
+    (eligible_clusters) and NOTHING else. Consolidation is SELECTIVE BY
+    DESIGN — a cycle that folds nothing because nothing GATED is a correct
+    outcome, not a stall. So absence of a recorded census is NOT evidence of
+    backlog; it must read as 0, never as a substitute count from anywhere
+    else. (This supersedes the old nrem-fallback contract, which the plan
+    ruled must be removed, not preserved.)"""
+    # gate found 0 foldable clusters → no backlog.
+    assert co._consolidation_backlog(0) == 0
+    # gate found work → that is the backlog.
+    assert co._consolidation_backlog(3) == 3
+    # fresh deploy / no census ever recorded → 0, not "unknown", not a
+    # substitute count. This is the I7 line: not-gating is not backlog.
+    assert co._consolidation_backlog(None) == 0
+
+
+def _no_census_row(cycle_type):
+    """A consolidation_runs roll-up row for a cycle type that has never
+    recorded a gate census — every ``eligible_clusters`` value on its rows was
+    NULL (fresh deploy, or every run so far crashed before reaching the gate).
+    Column set matches _compute_consolidation_health's SELECT exactly."""
+    return {
+        "cycle_type": cycle_type, "last_success": None, "last_outcome": None,
+        "last_success_age": None, "last_started": None, "cycle_seconds_avg": None,
+        "runs_24h": 0, "deferred_24h": 0, "idle_24h": 0,
+        "folds_succeeded_24h": 0, "folds_attempted_24h": 0,
+        "inflight": 0, "consec_fail": 0, "last_error_class": None,
+        "last_error_msg": None, "eligible_clusters": None,
+        "eligible_oldest_age": None, "last_deferred_reason": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_no_census_is_not_reported_as_a_stall_composition():
+    """I7 COMPOSITION test (`decision:1121`) — bites the whole path from the
+    consolidation_runs roll-up into the stall verdict, not just the pure
+    _consolidation_backlog function (the plan's explicit instruction: a unit
+    test on the pure function alone is insufficient, because the original
+    defect was in how the census flows from the roll-up into the verdict).
+
+    Scenario: a cycle type has never recorded its own gate census
+    (eligible_clusters IS NULL on every consolidation_runs row — e.g. before
+    the daemon's first pass through the gate). Per I7, that must NOT be
+    reported as a stall, and it must not become one just because a looser
+    density count elsewhere happens to be nonzero.
+
+    Mutation-checked: reintroducing the old nrem-fallback (calling
+    _nrem_cycle_counts() inside _compute_consolidation_health and using its
+    count when eligible_clusters is None) makes this test fail two ways —
+    (a) the assertion that _nrem_cycle_counts is never even consulted by this
+    composition, and (b) with the fallback restored, a nonzero nrem count
+    plus no recorded success flips `stalled` to True. See HANDOFF.md for the
+    exact mutation applied and confirmation this test was the one that died."""
+    coord = co.MemoryCoordinator()
+
+    conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[_no_census_row("insight")])
+    acq = MagicMock()
+    acq.__aenter__ = AsyncMock(return_value=conn)
+    acq.__aexit__ = AsyncMock(return_value=False)
+    coord._acquire = MagicMock(return_value=acq)
+
+    # A looser density count DOES exist and IS nonzero. If the composition
+    # ever falls back to it, this is exactly what would wrongly manufacture
+    # a stall out of "no census recorded yet".
+    nrem_spy = AsyncMock(return_value={"decision_cycles": 5, "fact_cycles": 5})
+    coord._nrem_cycle_counts = nrem_spy
+
+    out = await coord._compute_consolidation_health()
+
+    assert out["insight"]["eligible_clusters"] is None   # no census recorded
+    assert out["insight"]["backlog"] == 0                 # I7: not-gating ≠ backlog
+    assert out["insight"]["stalled"] is False              # therefore: not a stall
+    nrem_spy.assert_not_called()                           # composition never consults it
 
 
 # ── _record_cycle context manager ────────────────────────────────────────────
