@@ -70,9 +70,7 @@ from domain_axis import (
     DOMAIN_NAMES_SQL,
     domain_merge_cypher, names_a_domain, resolve_domains,
 )
-from insight_gate import (
-    INSIGHT_THRESHOLD, INSIGHT_HUB_DEGREE_CAP, insight_cluster_cypher,
-)
+from insight_gate import walk_group_reached_set, passes_insight_gate
 from project_promotion import (
     promote_record, sole_project, METHOD_GROUNDING,
 )
@@ -6056,13 +6054,20 @@ class MemoryCoordinator:
     async def _nrem_cycle_counts(self) -> dict:
         """Pending NREM consolidation cycles for facts and decisions.
 
-        v2 (C1b): reproduces consolidation_loop's v2 FACT GATE (Dreaming Cycle
-        Plan to v2, §2.1) exactly — there is no more entity-hub gate and no
-        more project-only gate to sum against it. Facts are the grounded,
+        v2 (C1b/C2): reproduces consolidation_loop's v2 FACT GATE (Dreaming
+        Cycle Plan to v2, §2.1) exactly — there is no more entity-hub gate and
+        no more project-only gate to sum against it. Facts are the grounded,
         non-superseded Facts of each registered (project, domain) group,
-        counted where a group meets ONT.density_threshold; decisions run
-        insight_gate.insight_cluster_cypher count-only, the same query the
-        daemon folds on.
+        counted where a group meets ONT.density_threshold; `decision_cycles`
+        (C2) now counts GATING (project, domain) groups — G1 (the fact gate)
+        passed AND `insight_gate.passes_insight_gate` (G2 >=1 Retrospective,
+        G3 >=1 fresh judgement) true on the group's full walked reach — the
+        SAME predicate `consolidation_loop._find_fresh_insight_clusters`
+        folds on, via the SAME `insight_gate.walk_group_reached_set`/
+        `passes_insight_gate` this module imports at the top (never
+        `consolidation_loop` itself — that module imports psycopg2 at its own
+        top level and the shipped gateway service does not carry psycopg2;
+        see the v0.8.65 nrem-telemetry-gauge fix this pattern follows).
         """
         # Neo4j: the SAME graph-native walk consolidation_loop's
         # _find_grounded_fact_groups folds on — GROUNDED_IN -> DOMAIN_OF ->
@@ -6082,33 +6087,21 @@ class MemoryCoordinator:
                 f" RETURN f.pg_id AS pg_id, project, domain",
             )
             fact_rows = await fres.data()
-            # The insight gate, count-only — the SAME Cypher the daemon folds on
-            # (insight_gate.insight_cluster_cypher), not a Postgres partition of
-            # every eligible Decision node. The old chain collected decisions
-            # flat and bucketed them by project: no shared grounded entity, no
-            # ≥2-distinct-projects rule, no HAD_OUTCOME. It reported a backlog
-            # the daemon could not fold, and re-chaining its project resolution
-            # would only have made a meaningless number better-sourced.
-            ires = await session.run(
-                insight_cluster_cypher(count_only=True),
-                hub_cap=INSIGHT_HUB_DEGREE_CAP, threshold=INSIGHT_THRESHOLD,
-            )
-            irows = await ires.data()
-        decision_cycles = int(irows[0]["cycles"]) if irows else 0
 
         # SAME pure partitioner the fold uses (eligible_domain_level_clusters,
-        # via its count-only twin) — sourced from nrem_gate, a module that
-        # imports no DB driver. NEVER reach back into the daemon module that
-        # owns the fold itself: that module imports psycopg2 at its own top
-        # level (its own sync DB work) and the shipped gateway service does
-        # not carry psycopg2, so an import of this function that reached
-        # into the daemon module used to raise ModuleNotFoundError on every
-        # call — silently killing this gauge in production while every unit
-        # test (fully stubbed) stayed green. nrem_gate.py holds only these
-        # two functions and imports no DB driver — see its docstring. Never
-        # invent a second rule, and never route this import back through the
-        # daemon module again.
+        # here used for its GROUPS, not just its count-only twin) — sourced
+        # from nrem_gate, a module that imports no DB driver. NEVER reach back
+        # into the daemon module that owns the fold itself: that module
+        # imports psycopg2 at its own top level and the shipped gateway
+        # service does not carry psycopg2, so an import of this function that
+        # reached into the daemon module used to raise ModuleNotFoundError on
+        # every call — silently killing this gauge in production while every
+        # unit test (fully stubbed) stayed green. nrem_gate.py holds only
+        # these two functions and imports no DB driver — see its docstring.
+        # Never invent a second rule, and never route this import back
+        # through the daemon module again.
         from nrem_gate import count_domain_level_cycles
+        from nrem_gate import eligible_domain_level_clusters
         project_map: dict[int, str] = {}
         domains_map: dict[int, list] = {}
         registered_sections: set = set()
@@ -6130,12 +6123,36 @@ class MemoryCoordinator:
             pg_ids_all, project_map, domains_map,
             ONT.density_threshold, registered_sections,
         ) if pg_ids_all else 0
+
+        # decision_cycles (v2, C2): count GATING groups, not decisions. G1's
+        # groups (density >= ONT.density_threshold) are the same call
+        # fact_cycles makes; each is then walked (I3: undirected, unbounded,
+        # over the closed relation set) and G2+G3 checked on its full reach —
+        # one small Neo4j round-trip per candidate group (order 1-5 groups on
+        # this corpus), acceptable for a periodic health-refresh gauge.
+        groups = eligible_domain_level_clusters(
+            [""] * len(pg_ids_all), pg_ids_all, project_map, domains_map,
+            ONT.density_threshold, registered_sections,
+        ) if pg_ids_all else []
+        decision_cycles = 0
+        for _key, _contents, fact_ids in groups:
+            labels, consolidated, _components = await walk_group_reached_set(
+                self._neo4j, fact_ids)
+            if passes_insight_gate(labels, consolidated):
+                decision_cycles += 1
+
         return {
             "fact_cycles": fact_cycles,
             "decision_cycles": decision_cycles,
             "total_cycles": fact_cycles + decision_cycles,
             "fact_threshold": ONT.density_threshold,
-            "decision_threshold": INSIGHT_THRESHOLD,
+            # v2 (C2): no longer a decision COUNT — G2/G3 are each "at least
+            # one" conditions (>=1 Retrospective reached, >=1 fresh
+            # judgement reached), not a tunable volume. Kept as 1 rather than
+            # removed so an existing monitor field does not silently vanish;
+            # ⚠ Group 3/monitor consumer-contract review is still owed (see
+            # HANDOFF.md) — this is a meaning change under an unchanged name.
+            "decision_threshold": 1,
         }
 
     async def _metadata_breakdown(self) -> dict:

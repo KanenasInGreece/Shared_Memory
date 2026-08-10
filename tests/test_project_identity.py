@@ -24,7 +24,6 @@ from unittest.mock import AsyncMock, MagicMock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
 from project_axis import project_merge_cypher  # noqa: E402
-from insight_gate import insight_cluster_cypher  # noqa: E402
 from project_promotion import promote_record, METHOD_GROUNDING  # noqa: E402
 
 
@@ -63,56 +62,24 @@ def test_the_merge_variable_is_caller_chosen():
     assert project_merge_cypher(None, var="canon") == "MERGE (canon:Project {name: $project})"
 
 
-# ── P22 — the gate counts identities, and fails closed without one ───────────
-
-def test_the_gate_discriminates_on_identity_not_name():
-    q = insight_cluster_cypher(count_only=True)
-    assert "collect(DISTINCT p.project_id) AS project_ids" in q
-    assert "size(project_ids) >= 2" in q
-    # The name must NOT be the discriminator any more. This is the assertion
-    # that dies if the gate is reverted, and the reason it is written as an
-    # absence: the name is still collected for the payload, so a positive check
-    # on "p.name" would pass either way.
-    assert "size(projects) >= 2" not in q
-
-
-def test_the_gate_still_reports_names_to_its_reader():
-    """Identity is the DISCRIMINATOR; names remain the payload, because what a
-    log line and a fold prompt render is a name. Dereference what the reader
-    renders — the fold reaches everything else through the pg_ids it carries."""
-    q = insight_cluster_cypher()
-    assert "collect(DISTINCT p.name) AS projects" in q
-    assert q.rstrip().endswith("projects")
-
-
-def test_the_gate_never_falls_back_to_the_name_for_an_unidentified_project():
-    """FAIL CLOSED, expressed the way Cypher expresses it: `collect` DISCARDS
-    nulls, so a node with no project_id contributes nothing to the count. A
-    coalesce onto the name would be the fallback this must not have — it would
-    keep the defect live for the whole upgrade window and permanently for any
-    node the registry does not know."""
-    q = insight_cluster_cypher(count_only=True)
-    assert "coalesce(p.project_id" not in q
-    assert "coalesce(p.name" not in q
-
-
-def test_the_gate_never_discriminates_on_an_internal_node_id():
-    """Recorded because it was proposed and is WORSE than the name it would
-    replace: without a uniqueness constraint two nodes sharing one name collapse
-    correctly under DISTINCT p.name and would count as TWO under elementId."""
-    q = insight_cluster_cypher(count_only=True)
-    assert "elementId(p)" not in q
-    assert "id(p)" not in q
-
-
-def test_count_and_fold_still_share_one_predicate():
-    """The two projections must not drift — the whole reason the gate is one
-    function. Re-asserted here because this release changed the shared part."""
-    full = insight_cluster_cypher()
-    counting = insight_cluster_cypher(count_only=True)
-    tail = " RETURN count(*) AS cycles"
-    assert counting.endswith(tail)
-    assert full.startswith(counting[: -len(tail)])
+# ── P22 — RETIRED (Dreaming Cycle Plan to v2, §2.2; C2) ──────────────────────
+#
+# P22 protected `insight_cluster_cypher`'s project-IDENTITY discrimination for
+# the pre-v2 insight gate's ≥2-distinct-projects rule (registry `project_id`,
+# never the mutable `name`, per migration 027). The v2 insight gate drops the
+# ≥2-projects requirement outright (plan §2.2: "Deliberately NOT in the gate:
+# ... a count of distinct projects") — a gating group is exactly one
+# `(project, domain)` pair by construction (`nrem_gate.eligible_domain_level_
+# clusters`), so there is no cross-project count left to discriminate on,
+# correctly or otherwise. `insight_cluster_cypher` itself is deleted
+# (`insight_gate.py` now holds the v2 walk/component/gate functions — see
+# `tests/test_insight_gate.py`), so the six tests that pinned its Cypher text
+# are removed with it rather than rewritten against nothing. The ruling this
+# reverses is `decision:245`; a `refined` retrospective against it is owed by
+# the merger (not built here — see the brief's explicit scope boundary).
+#
+# P21 (above) is UNCHANGED: `project_merge_cypher`'s identity-over-name
+# keying is orthogonal to the insight gate and still holds.
 
 
 # ── The ledger keeps the name AND gains the pointer ──────────────────────────
