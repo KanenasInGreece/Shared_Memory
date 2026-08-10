@@ -31,25 +31,25 @@ Pipeline per record (anchor kinds: Fact, Decision, Retrospective):
      confidence >= the entity-family floor, and k > 1 so an edge no verification
      call could reach is never written at the maximum score. The floor is
      kind-INDEPENDENT: fact_kind still moves the score, it no longer moves the
-     gate. The evidential family is exempt from the floor by design (its
-     proposals are born capped below consumption; rung 1 of the 727 ladder).
+     gate.
   7. Universal edge provenance (726 §2): every minted edge carries
      edge_properties(asserted_by='rem', confidence, model, run_id) applied via
      MERGE … ON CREATE SET — an EXISTING edge (e.g. operator grounding) is
      never overwritten or downgraded. Operator-asserted edges are never
      re-scored (they sit in the manifest's existing-edge set → never novel).
-  8. Evidential proposals, rung 1 (727 §2): a Decision/Retrospective anchor
-     linking INFORMED_BY to a registry-known Decision is an EVIDENTIAL proposal
-     — confidence capped below the consumption threshold (born-below rule) and
-     a relation_adjudications ledger row (family=evidential, method=rem_k3) is
-     written on the cycle's shared AUTOCOMMIT conn. GROUNDED_IN is NEVER
-     machine-mintable: an LLM suggestion of it is remapped to INFORMED_BY and
-     logged. MENTIONS is demoted to the explicit fallback for unknown names
-     (727 §1) — still minted, now with full rem provenance like every edge.
-  9. Decision-extras gate (718): CONSIDERED/REJECTED/UNDER_CONDITIONS/
-     PRODUCES_INSIGHT targets are minted ONLY when already registry-known;
-     unknown free phrases stay as decision properties from first-write (drops
-     are counted and logged).
+  8. Zero judgement/evidential minting (Dreaming Cycle v2 plan §1, B1): REM
+     proposes no CONSIDERED / REJECTED / UNDER_CONDITIONS / PRODUCES_INSIGHT /
+     INFORMED_BY edge. Those are first-write-only properties. A Decision node
+     referenced by content resolves to MENTIONS like any other known node —
+     INFORMED_BY is not in that label's allowed relation set, so it cannot be
+     produced. GROUNDED_IN is NEVER machine-mintable: an LLM suggestion of it
+     is resolved away (to the target's default relation) and logged. MENTIONS
+     is demoted to the explicit fallback for unknown names (727 §1) — still
+     minted, now with full rem provenance like every edge.
+  9. Decision-extras gate (718, retired further by E5/B1): CONSIDERED/
+     REJECTED/UNDER_CONDITIONS/PRODUCES_INSIGHT targets are NEVER minted —
+     candidate names are logged (extras_dropped) and stay decision properties
+     from first-write.
  10. Write to Neo4j in ONE session: edges first, then sub-labels, then the
      NON-DESTRUCTIVE content policy and rem_processed = true LAST (never set on
      a partially-written record):
@@ -66,7 +66,7 @@ Pipeline per record (anchor kinds: Fact, Decision, Retrospective):
 
 Postgres connections:
   One AUTOCOMMIT connection is opened per REM cycle and shared across all
-  helpers (including the evidential ledger writes).
+  helpers.
 
 Configuration env vars (beyond PG_CONN / NEO4J_PASSWORD):
   AUDIT_LOG_PATH  — if set, each reviewed outbox row is appended as JSON-lines before
@@ -77,7 +77,6 @@ Configuration env vars (beyond PG_CONN / NEO4J_PASSWORD):
 """
 
 import asyncio
-import functools
 import json
 import logging
 import os
@@ -449,7 +448,11 @@ _LABEL_DEFAULT_REL: dict[str, str] = {
     # No ONT.project entry: REM cannot reference a :Project at all (see
     # _KNOWN_LABELS), so a default relation for one would be unreachable code
     # that documents a capability the gate has removed.
-    ONT.decision: ONT.informed_by,
+    # ONT.decision defaults to MENTIONS, not INFORMED_BY: INFORMED_BY is a
+    # judgement relation, first-write-only since REM's judgement-relation
+    # decommissioning (Dreaming Cycle v2 plan §1, B1) — a Decision node is
+    # still linkable, just never with that semantic.
+    ONT.decision: ONT.entity_link,
     ONT.entity:   ONT.entity_link,
 }
 
@@ -470,7 +473,11 @@ _LABEL_ALLOWED_RELS: dict[str, frozenset[str]] = {
     # No ONT.project entry. It used to permit PROJECT_OF *and* MENTIONS at a
     # :Project — the first made REM a second writer of the project axis, the
     # second made the axis a topic. Both are now impossible upstream.
-    ONT.decision: frozenset({ONT.informed_by,         ONT.entity_link}),
+    # No INFORMED_BY in the Decision set (B1): it is a judgement relation,
+    # first-write-only. An LLM suggestion of it now falls back to the label's
+    # default (MENTIONS) — structurally, not by a runtime flag, so REM cannot
+    # produce that edge type regardless of what a prompt result proposes.
+    ONT.decision: frozenset({ONT.entity_link}),
     ONT.entity:   frozenset({ONT.entity_link,         ONT.entity_link_alias}),
 }
 
@@ -677,8 +684,9 @@ def _build_entity_registry(closed_set: list[dict]) -> dict[str, dict]:
 
     `typed` — whether the node already carries a sub-label (or is a non-Entity
     node that never needs one): sub-type classification is asked ONLY for
-    untyped entities (delta principle). `pg_id` — carried for Decision nodes so
-    evidential proposals can write their ledger row (727 rung 1).
+    untyped entities (delta principle). `pg_id` — carried for Decision nodes;
+    no longer consumed by REM itself since judgement-relation decommissioning
+    (B1) retired the evidential ledger write it used to feed.
 
     `canonical` — the name an accepted proposal is actually WRITTEN to. Every
     alias of a collapsed concept is registered as its own key pointing at the
@@ -978,14 +986,17 @@ def plan_edges(result: dict, registry: dict[str, dict], kind: str,
 
     Returns {"edges": [...], "dropped_names": [...], "extras_dropped": [...],
              "mint_dropped": [...], "grounded_in_remaps": [...]} where each edge
-    is {"name", "label", "rel_type", "novel", "evidential", "tgt_pg_id"}.
+    is {"name", "label", "rel_type", "novel"}.
 
       novel      — (name, rel_type) not already captured per the manifest
                    (existing edges + operator entities). Only novel edges are
                    written (delta principle) and verified (k=3).
-      evidential — Decision/Retrospective anchor INFORMED_BY a registry-known
-                   Decision (727 rung 1) → born-below cap + ledger row.
-      GROUNDED_IN suggestions are remapped by resolution (never machine-
+      Zero judgement/evidential minting (Dreaming Cycle v2 plan §1, B1): a
+                   Decision node's only allowed relation is MENTIONS — a
+                   suggestion of INFORMED_BY (or of any other judgement
+                   relation) can never resolve to one, structurally, because
+                   the label's allowed-relation set does not contain it. GROUNDED_IN
+                   suggestions are likewise resolved away (never machine-
                    mintable) and reported in grounded_in_remaps.
       Decision extras (718): targets linked ONLY when already registry-known AND
                    the known node is an :Entity (domain-range, 978); anything
@@ -1010,7 +1021,7 @@ def plan_edges(result: dict, registry: dict[str, dict], kind: str,
     remaps: list[str] = []
     seen: set[tuple[str, str]] = set()
 
-    def _add(name: str, label: str, rel_type: str, evidential: bool) -> None:
+    def _add(name: str, label: str, rel_type: str) -> None:
         canon = canonical_name(name, registry)
         if (canon, rel_type) in seen:
             return
@@ -1018,8 +1029,6 @@ def plan_edges(result: dict, registry: dict[str, dict], kind: str,
         edges.append({
             "name": canon, "label": label, "rel_type": rel_type,
             "novel": (canon, rel_type) not in existing,
-            "evidential": evidential,
-            "tgt_pg_id": registry.get(name, {}).get("pg_id") if evidential else None,
         })
 
     relationships = result.get("relationships") or []
@@ -1052,9 +1061,7 @@ def plan_edges(result: dict, registry: dict[str, dict], kind: str,
             continue
         if isinstance(suggested, str) and suggested.strip().upper() == ONT.grounded_in:
             remaps.append(name)   # GROUNDED_IN never machine-mintable → resolved away
-        evidential = (kind in (KIND_DECISION, KIND_RETRO)
-                      and label == ONT.decision and rel_type == ONT.informed_by)
-        _add(name, label, rel_type, evidential)
+        _add(name, label, rel_type)
 
     extras_dropped: list[str] = []
     if kind == KIND_DECISION:
@@ -1509,10 +1516,11 @@ class REMDaemon:
         from free text, so the provenance question does not arise for them.
         (Decision is unfiltered here but is discarded one step later regardless:
         decisions carry `title`, not `name`, and _build_entity_registry skips
-        nameless rows — so the evidential rung of 727 has never been plannable.
-        Recorded as a measured defect, deliberately NOT fixed here because making
-        it fire means REM proposing decision-to-decision links, which is the
-        node-to-node relation capability still awaiting traversal rules.)
+        nameless rows — so a decision-to-decision link has never been plannable
+        via this path. Recorded as a measured defect, deliberately NOT fixed
+        here because making it fire would mean REM proposing decision-to-decision
+        links — which judgement-relation decommissioning (B1) forecloses anyway:
+        REM proposes zero judgement/evidential relations, INFORMED_BY included.)
 
         A SUPERSEDED naming record NO LONGER QUALIFIES its entities. The rule
         used to exempt them, reasoning that supersession retracts a CLAIM and not
@@ -1538,10 +1546,11 @@ class REMDaemon:
         rather than argued: no live Fact anywhere holds its only operator-named
         topic through an entity that leaves the set.
 
-        Carries pg_id (Decision nodes: the evidential ledger endpoint, 727) and
-        the full label list (so untyped Entity nodes can be marked for the
-        delta sub-typing task). ORDER BY name keeps the slice deterministic
-        across restarts, which is what makes the fallback path reproducible.
+        Carries pg_id (Decision nodes; no longer consumed by REM itself since
+        B1 retired the evidential ledger write it used to feed) and the full
+        label list (so untyped Entity nodes can be marked for the delta
+        sub-typing task). ORDER BY name keeps the slice deterministic across
+        restarts, which is what makes the fallback path reproducible.
 
         Also carries `alias_component` and `namings`, the two inputs
         collapse_alias_components needs: the component is the alias layer's own
@@ -2627,8 +2636,7 @@ class REMDaemon:
         grounding: tuple[int, str] | None = None,
     ) -> bool:
         """Write one enrichment result (from the single OR batched LLM call) to
-        Neo4j + evidential ledger + outbox + NREM notify. Shared by both paths.
-        True on success.
+        Neo4j + outbox + NREM notify. Shared by both paths. True on success.
 
         `grounding` is (slice_size, mode) for the prompt this result came from —
         telemetry only, so a caller that has not computed it may omit it.
@@ -2636,8 +2644,7 @@ class REMDaemon:
         Sequence: plan the DELTA edges against the manifest (novelty, gates,
         GROUNDED_IN remap) → verify novel edges (k=3 self-consistency) → stamp
         per-edge provenance/confidence → single-session Neo4j write
-        (rem_processed last) → evidential ledger rows (rem_k3) → consistency
-        check → outbox mark → NREM notify."""
+        (rem_processed last) → consistency check → outbox mark → NREM notify."""
         manifest  = manifest or {}
         fact_kind = manifest.get("fact_kind") or "observation"
         want_summary = len(original_content) > REM_SUMMARY_THRESHOLD
@@ -2670,9 +2677,9 @@ class REMDaemon:
             logger.info("REM gate rejected %d LLM-extracted name(s) for pg_id=%s: %s",
                         len(plan["dropped_names"]), pg_id, plan["dropped_names"])
         if plan["grounded_in_remaps"]:
-            logger.info("REM: pg_id=%d GROUNDED_IN is never machine-mintable — remapped "
-                        "to %s for: %s", pg_id, ONT.informed_by,
-                        plan["grounded_in_remaps"])
+            logger.info("REM: pg_id=%d GROUNDED_IN is never machine-mintable — resolved "
+                        "away to the target's default relation for: %s",
+                        pg_id, plan["grounded_in_remaps"])
         if plan["extras_dropped"]:
             logger.info("REM extras gate (718): pg_id=%d dropped %d non-registry "
                         "target(s): %s", pg_id, len(plan["extras_dropped"]),
@@ -2756,19 +2763,15 @@ class REMDaemon:
         votes, k = await self._verify_novel_edges(original_content, novel, pg_id)
 
         kept: list[dict] = []
-        ledger_rows: list[dict] = []
         floor_dropped = 0
         for e, v in zip(novel, votes):
-            family = rc.FAMILY_EVIDENTIAL if e["evidential"] else rc.FAMILY_ENTITY
             try:
-                conf = rc.vote_confidence(v, k, fact_kind, family=family)
+                conf = rc.vote_confidence(v, k, fact_kind, family=rc.FAMILY_ENTITY)
             except ValueError as exc:
                 logger.error("REM: pg_id=%d confidence error for %r: %s",
                              pg_id, e["name"], exc)
                 continue
-            if e["evidential"]:
-                conf = min(conf, rc.EVIDENTIAL_BORN_BELOW_CAP)   # born-below rule (727 rung 1)
-            if not rc.write_admitted(family, v, k, conf):
+            if not rc.write_admitted(rc.FAMILY_ENTITY, v, k, conf):
                 # The WRITE floor (989), replacing the fact_kind-conditional
                 # skip that stood here. That rule dropped an unverified edge
                 # ONLY on 'discussion' sources, so a record carrying a real
@@ -2785,12 +2788,6 @@ class REMDaemon:
                 asserted_by=rc.ASSERTED_REM, confidence=conf,
                 model=model, run_id=run_id)
             kept.append(e)
-            if e["evidential"]:
-                ledger_rows.append({
-                    "name": e["name"], "tgt_pg_id": e["tgt_pg_id"],
-                    "rel_type": e["rel_type"], "confidence": conf,
-                    "votes": v, "k": k,
-                })
 
         self._floor_dropped_total += floor_dropped
 
@@ -2805,30 +2802,6 @@ class REMDaemon:
             logger.error("REM: pg_id=%d Neo4j write failed: %s", pg_id, exc)
             await self._bump_rem_attempts([pg_id])
             return False
-
-        # Evidential ledger rows (727 rung 1, method=rem_k3) — on the cycle's
-        # shared AUTOCOMMIT conn. Best-effort: a ledger failure must never
-        # unwind an already-written enrichment.
-        for row in ledger_rows:
-            if row["tgt_pg_id"] is None:
-                logger.info("REM: pg_id=%d evidential target %r has no pg_id in the "
-                            "registry — graph edge minted, ledger row skipped",
-                            pg_id, row["name"])
-                continue
-            try:
-                await loop.run_in_executor(None, functools.partial(
-                    rc.upsert_adjudication, conn,
-                    family=rc.FAMILY_EVIDENTIAL, rel_type=row["rel_type"],
-                    verdict="accept", method="rem_k3",
-                    confidence=row["confidence"],
-                    src_pg_id=pg_id, tgt_pg_id=row["tgt_pg_id"],
-                    signals={"votes": row["votes"], "k": row["k"],
-                             "fact_kind": fact_kind},
-                    model=model, run_id=run_id,
-                ))
-            except Exception as exc:
-                logger.warning("REM: pg_id=%d evidential ledger write failed for %r: %s",
-                               pg_id, row["name"], exc)
 
         # Verify consistency — full string comparison (not prefix) against the
         # value actually written (the ORIGINAL content verbatim, capped at 2000).
@@ -2889,9 +2862,9 @@ class REMDaemon:
 
         logger.info(
             "REM: pg_id=%d done (kind=%s, novel_edges=%d, already_captured=%d, "
-            "floor_withheld=%d, k=%d, evidential=%d, outbox_marked=%s)",
+            "floor_withheld=%d, k=%d, outbox_marked=%s)",
             pg_id, kind, len(kept), already, floor_dropped, k,
-            len(ledger_rows), outbox_marked,
+            outbox_marked,
         )
         return True
 
