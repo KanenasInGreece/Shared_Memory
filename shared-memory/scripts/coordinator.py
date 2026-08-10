@@ -6141,18 +6141,25 @@ class MemoryCoordinator:
             if passes_insight_gate(labels, consolidated):
                 decision_cycles += 1
 
+        # v2 (C2): `decision_threshold` is REMOVED, not repurposed — same
+        # precedent v0.8.64 set for `domain_threshold` (removed outright with
+        # NREM_DOMAIN_THRESHOLD, never repointed at a different number).
+        # There is no decision COUNT any more to report a threshold for: G2
+        # and G3 are each "at least one" conditions (>=1 Retrospective
+        # reached, >=1 fresh judgement reached), not a tunable volume. A bare
+        # number under the old name would read as "the threshold was lowered
+        # to 1", which is false — nothing was lowered, the concept a decision
+        # THRESHOLD named no longer exists for this gate. No replacement
+        # field: G2/G3 are not "a threshold under a new name", they are a
+        # different kind of condition, and inventing a field that still reads
+        # as a number would recreate the exact trap. Consumers of this
+        # endpoint (including the monitor dashboard) must be updated — see
+        # HANDOFF.md's monitor-effect list, carried into the release notes.
         return {
             "fact_cycles": fact_cycles,
             "decision_cycles": decision_cycles,
             "total_cycles": fact_cycles + decision_cycles,
             "fact_threshold": ONT.density_threshold,
-            # v2 (C2): no longer a decision COUNT — G2/G3 are each "at least
-            # one" conditions (>=1 Retrospective reached, >=1 fresh
-            # judgement reached), not a tunable volume. Kept as 1 rather than
-            # removed so an existing monitor field does not silently vanish;
-            # ⚠ Group 3/monitor consumer-contract review is still owed (see
-            # HANDOFF.md) — this is a meaning change under an unchanged name.
-            "decision_threshold": 1,
         }
 
     async def _metadata_breakdown(self) -> dict:

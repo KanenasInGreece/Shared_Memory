@@ -350,9 +350,17 @@ def test_the_four_legacy_names_and_the_dead_wrapper_are_gone():
 @pytest.mark.asyncio
 async def test_nrem_cycle_counts_returned_dict_has_exactly_the_new_shape():
     """The wire contract of `GET /memory/telemetry`'s `nrem` key, pinned by
-    return value rather than source text."""
+    return value rather than source text.
+
+    v2 (C2): `decision_threshold` is REMOVED, not repurposed — the same
+    precedent this release already set for `domain_threshold` (removed
+    outright with `NREM_DOMAIN_THRESHOLD`, above). G2/G3 are each 'at least
+    one' conditions, not a tunable count, so there is no threshold value left
+    to report; a bare number under the old field name would read as "the
+    threshold was lowered", which is false. Consumers of this endpoint
+    (including the monitor dashboard) must be updated."""
     counts, _queries = await _run_nrem_cycle_counts_capturing_queries()
     assert set(counts) == {
-        "fact_cycles", "decision_cycles", "total_cycles",
-        "fact_threshold", "decision_threshold",
+        "fact_cycles", "decision_cycles", "total_cycles", "fact_threshold",
     }
+    assert "decision_threshold" not in counts

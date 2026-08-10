@@ -3,9 +3,13 @@
 **Task:** C2 (Track C, serial chain C1→C2→C3→C4).
 **Branch:** `feat/nrem-insight-gate-v2`, based on `main` @ `f2f33cb` (v0.8.65, rebased
 from the original `57de695` base after `fix/nrem-telemetry-gauge-dead` landed).
-**Status:** ✅ Gate/walk/components/ordering/identity-resolution DONE and verified live.
+**Status:** ✅ **ACCEPTED by Opus (independent re-verification against the live graph —
+walk counts, the `CommunitySummary` pg_id collision guard, the 2/13/5 census, suite,
+private-name audit).** One fix requested post-review and applied — see the
+`decision_threshold` note in **What is done, §3** and the **Monitor effect** section.
+Both escalations RULED — see **ESCALATIONS** (now closed, not open questions for C3/C4).
 ⛔ Payload synthesis (C4) and supersession cascade (C3) deliberately NOT built — see
-**SEAM** below. Two items escalated to Opus, not resolved unilaterally — see **ESCALATIONS**.
+**SEAM** below.
 
 ---
 
@@ -72,28 +76,36 @@ from the original `57de695` base after `fix/nrem-telemetry-gauge-dead` landed).
      `nrem_gate` import kept as two separate `from nrem_gate import X` lines (not combined)
      so the pre-existing `test_nrem_cycle_counts_reuses_the_folds_own_partitioner`
      source-substring check still matches.
-   - `decision_threshold` in the returned dict is now `1` (G2/G3 are "at least one"
-     conditions, not a tunable count) — kept as a field so an existing monitor consumer
-     does not see it silently vanish. **⚠ Group 3/monitor consumer-contract review is
-     still owed** — this is a meaning change under an unchanged field name; I did not
-     reach into the separate `shared-memory-monitor` repo (out of scope for this
-     worktree/task).
+   - ✅ **CORRECTED per Opus's review: `decision_threshold` is REMOVED from the returned
+     dict, not repurposed.** My first pass kept the field name and set it to `1`,
+     reasoning that an existing monitor consumer should not see a field silently vanish
+     — Opus ruled that backwards: I had already applied "rename, don't repurpose" one
+     level down (`INSIGHT_THRESHOLD` → `INSIGHT_AGE_CENSUS_K`) but not to this
+     outward-facing field, where it matters *more* because the monitor is a separate repo
+     with no visibility into my reasoning. `decision_threshold: 1` would read as "the
+     threshold was lowered from 2 to 1" — false; there is no decision threshold any more
+     (G2/G3 are each "at least one" conditions, not a tunable count), and a replacement
+     field that still reads as a bare number would recreate the same trap. **Same
+     precedent v0.8.64 already set for `domain_threshold`** (removed outright with
+     `NREM_DOMAIN_THRESHOLD`, never repointed at a new number) — see the monitor-effect
+     list below, written to be carried into the release notes verbatim alongside it.
 
 4. **Tests:**
    - New `tests/test_insight_gate.py` (31 tests) — pure walk/gate/component/identity
      functions in isolation, no real Neo4j.
    - Rewrote the fresh-cluster integration tests in `tests/test_insight_consolidation.py`
      (2 tests, end-to-end through `_find_fresh_insight_clusters`).
-   - Rewrote the `decision_cycles` tests in `tests/test_project_axis.py` (3 tests) and
-     retired the P22 section of `tests/test_project_identity.py` (6 tests removed — they
-     pinned `insight_cluster_cypher`'s Cypher text, which no longer exists; noted why in
-     a comment rather than silently deleting).
+   - Rewrote the `decision_cycles` tests in `tests/test_project_axis.py` (4 tests, one
+     added for the `decision_threshold` removal) and retired the P22 section of
+     `tests/test_project_identity.py` (6 tests removed — they pinned
+     `insight_cluster_cypher`'s Cypher text, which no longer exists; noted why in a
+     comment rather than silently deleting).
    - Fixed `tests/test_v2_fact_gate.py`'s `_nrem_cycle_counts` query-capture helper to
      dispatch on the fact-discovery-query marker instead of excluding the now-gone
-     `"count(*) AS cycles"` insight-count query (2 tests, unrelated to my invariants,
-     were failing purely because the fake dispatch didn't know about the new walk-step
-     query type — fixed the fixture, not the invariant it protects).
-   - **Test count: 1264 passing (baseline `main` = 1236; net +28).**
+     `"count(*) AS cycles"` insight-count query, and updated its returned-dict
+     wire-contract pin (`test_nrem_cycle_counts_returned_dict_has_exactly_the_new_shape`)
+     to the 4-key shape with `decision_threshold` explicitly asserted absent.
+   - **Test count: 1265 passing (baseline `main` = 1236; net +29).**
 
 ---
 
@@ -140,13 +152,42 @@ assumes them; `fetch_active_insight_judgement_sets` is a pure read.
 
 ---
 
+## ⚠ Monitor effect — `GET /memory/telemetry`'s `nrem` key changed shape again
+
+For the release notes, alongside v0.8.64's own list (same endpoint, same key, two
+releases in a row — a monitor author reading both should see one consistent rule, not
+two different ones):
+
+- **Removed:** `decision_threshold`. There is no decision threshold any more — G2
+  (>=1 Retrospective reached) and G3 (>=1 fresh judgement reached) are each "at least
+  one" conditions, not a tunable count, so there is no number left to report under that
+  name. **Not repurposed** — a bare `1` under the old name would read as "the threshold
+  was lowered from 2 to 1", which is false. No replacement field: G2/G3 are not "a
+  threshold with a new name," so a field that still reads as a number would recreate the
+  exact meaning-inversion trap this removal exists to avoid.
+- **`decision_cycles` keeps its name but is not a continuation of the old series** — same
+  framing v0.8.64 used for `fact_cycles`. It used to count entity-hub clusters spanning
+  >=2 distinct projects; it now counts **gating `(project, domain)` groups whose full
+  walked reach passes G1+G2+G3** (`insight_gate.passes_insight_gate`, the exact predicate
+  the fold folds on). **This is a step change on deploy, not an anomaly.**
+- Unchanged: `fact_cycles`, `fact_threshold`, `total_cycles`.
+- The gauge now runs the SAME walk and the SAME gate predicate the fold runs
+  (`insight_gate.walk_group_reached_set` / `passes_insight_gate`), so telemetry can no
+  longer drift from the gate it claims to measure — covered by
+  `tests/test_project_axis.py`'s `test_decision_cycles_counts_a_group_whose_walk_reaches_a_retrospective`
+  and the wire-contract pin in `tests/test_v2_fact_gate.py`.
+
+---
+
 ## Invariants — mutation-checked (all confirmed against the real source, then reverted)
 
 Every mutation below was performed by editing `shared-memory/scripts/insight_gate.py`
 directly, running `uv run --with pytest --with pytest-asyncio pytest tests/test_insight_gate.py -q`,
 observing the failure, then `git checkout -- shared-memory/scripts/insight_gate.py` to
 restore. Confirmed clean (`git diff --stat` empty) after every restore, and the full
-suite (1264) reconfirmed green at the end.
+suite (1264 at the time these were run, before the `decision_threshold` fix below added
+one more test — 1265 now) reconfirmed green at the end. `insight_gate.py` itself is
+untouched by the `decision_threshold` fix, so these results still hold as-is.
 
 | Inv. | Mutation performed | Result |
 |---|---|---|
@@ -229,50 +270,35 @@ same **19**, confirmed by `[3]`'s own count above.
 
 ---
 
-## ⏭ ESCALATIONS — for Opus, not resolved here
+## ✅ ESCALATIONS — RULED BY OPUS, not C2's to resolve or revisit
 
 ### A. `ontology.py:568` `canonical_fixpoint_entity_cypher` (shipped v0.8.60)
 
-**Finding: it has ZERO callers anywhere in this repository** (`grep -rln
-"canonical_fixpoint_entity_cypher"` across `shared-memory/scripts/`, `tests/`, and every
-`.py` file returns only `ontology.py`'s own definition). It is documented in `README.md`
-(lines ~1908, ~1962) as shipped v0.8.60 functionality — "decisions and retrospectives
-traverse canonical fixpoint paths, saving REM cycle time and LLM effort" — but no code
-path invokes it. The actual 1-hop graph-context expansion used at read time
-(`coordinator._expand_graph_context`) is a plain `OPTIONAL MATCH (n)-[r]-(related)`, not
-this function or anything resembling its multi-hop shape.
+**RULING: AGAINST RETIREMENT. Left untouched — do not delete or re-scope it.**
 
-It genuinely **disagrees** with the v2 walk on three axes: **directed**
-(`(start)-[...]->(f:Fact)`, not undirected), **hop-capped at 4** (`*0..4`), and **missing
-three of the six closed-relation-set edges** (`CONSIDERED`, `REJECTED`,
-`UNDER_CONDITIONS` — it has only `GROUNDED_IN`/`INFORMED_BY` plus one `HAD_OUTCOME` hop).
+I found it has zero callers anywhere in the repo and recommended retiring it. Opus
+applied "cite the decision that created it before removing it," found `fact:1141` (the
+v0.8.60 E1–E5 specification), and ruled that the function defines **how a non-Fact node
+reads its own entities** — walk to live Facts, read `MENTIONS`. That is a **different
+job** from the v2 insight walk (which reaches judgements, not entities), so "it disagrees
+with the v2 walk" was comparing two things with different purposes, not a real conflict.
+Its zero-caller status is real and still unresolved — a specified capability that was
+never wired — but Opus is surfacing that to the operator directly, not through C3/C4.
+**`ontology.py` remains untouched by this branch.**
 
-**My recommendation:** retire it. It is dead code (zero callers, zero test coverage)
-documenting a capability the codebase does not currently exercise anywhere, and its
-continued presence is what makes the v2 walk's design look like a "disagreement" rather
-than simply "the only fixpoint traversal that exists." If Xenofon intends
-`_expand_graph_context` (or some future endpoint) to eventually USE a fixpoint entity
-lookup, my second-choice recommendation is to make it call `insight_gate.walk_group_reached_set`
-plus a thin "reached facts -> their MENTIONS entities" projection, rather than
-maintaining two independently-drifting fixpoint definitions under different names and
-different rules — but that is new work, not this escalation's to decide. **I did not
-touch `ontology.py` or delete this function** — Track C's plan explicitly reserves this
-decision for Opus ("Retiring or re-scoping it is a deliberate v0.8.60 behaviour change to
-land deliberately, not a side effect").
+### B. The two §2.2a edge cases (reversing retrospective without its decision)
 
-### B. The two §2.2a edge cases (not blocking, main rule fully built and live-verified)
+**RULING: goes to the operator, not C3/C4.** Leave the current (unintended,
+un-special-cased) behaviour exactly as built and documented — do not add handling for
+either case pre-emptively:
 
-1. **Does a *reversing* retrospective still satisfy G2?** Not encountered live today (no
-   `rating='reversed'` retrospective currently sits in either gating group's reach), so I
-   have no live case to point at. My reading of the current implementation:
-   `passes_insight_gate` reads `labels.values()` for `== Retrospective`, and a reversing
-   retrospective IS a live, non-superseded Retrospective node itself (only the DECISION
-   it evaluates gets excluded, per I10's Decision-only scope) — so **today's code answers
-   "yes"** without any special-casing, simply because nothing excludes a retrospective by
-   its rating. I have not verified this is the INTENDED answer; flagging it precisely so
-   Opus can rule rather than inherit an accidental default.
-2. **Does that reversing retrospective still appear in the payload?** Genuinely C4's
-   question (payload/`generate_insight` territory) — not answered here.
+1. Does a reversing retrospective still satisfy G2? **Current code answers "yes"** —
+   `passes_insight_gate` only checks `labels.values()` for `== Retrospective`, and I10
+   only excludes the DECISION a reversing retrospective evaluates, never the retrospective
+   itself. Not verified as the intended answer; stated precisely so it isn't silently
+   inherited as a default by whoever builds C3/C4.
+2. Does it still appear in the payload? Unanswered — C4's territory, and now the
+   operator's ruling to make first.
 
 ---
 
@@ -302,6 +328,8 @@ land deliberately, not a side effect").
   presumably superseded by C3's proper re-enqueue mechanics.
 - `supersede_covered_summaries`'s `level=None` kind-isolation gap on the insight path —
   explicitly named as C3's job in the plan (§5.3's closing note).
-- Group 3/monitor consumer-contract review for `decision_threshold`'s meaning change —
-  named above, not resolved (out of scope: separate repo).
-- `ontology.py`'s `canonical_fixpoint_entity_cypher` — escalated (A), not touched.
+- `decision_threshold` removal is DONE (see the Monitor effect section above), but the
+  `shared-memory-monitor` repo itself is out of scope for both of us to edit — Opus
+  carries the removal into the release notes so the monitor's own author can update it.
+- `ontology.py`'s `canonical_fixpoint_entity_cypher` — RULED against retirement by Opus
+  (A above). Not touched, and not to be touched by C3/C4 either.

@@ -255,6 +255,31 @@ def test_decision_threshold_no_longer_a_duplicate_tunable():
     assert not hasattr(coordinator, "NREM_DECISION_THRESHOLD")
 
 
+@pytest.mark.asyncio
+async def test_nrem_cycle_counts_no_longer_reports_a_decision_threshold():
+    """REMOVED, not repurposed (same precedent v0.8.64 set for
+    `domain_threshold`) — see test_v2_fact_gate.py's wire-contract pin for
+    the full returned-dict shape."""
+    from coordinator import MemoryCoordinator
+
+    coord = MemoryCoordinator()
+
+    async def fake_run(query, **params):
+        result = MagicMock()
+        result.data = AsyncMock(return_value=[])
+        return result
+
+    session = MagicMock()
+    session.run = fake_run
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=False)
+    coord._neo4j = MagicMock()
+    coord._neo4j.session = MagicMock(return_value=session)
+
+    counts = await coord._nrem_cycle_counts()
+    assert "decision_threshold" not in counts
+
+
 # ── P2/P3 — an unresolvable project folds nothing (v0.8.32) ──────────────────
 
 def test_fold_eligible_rejects_every_shape_of_absence():
