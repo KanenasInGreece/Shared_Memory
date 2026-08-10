@@ -609,6 +609,12 @@ def _thematic_conn_script(insert_id=90):
         #    proved registration before these rows ever reached Python), so
         #    there is one fewer round-trip in this script than before.
         {"rowcount": 2, "rows": []},
+        # below_density_ids is empty here (both facts gate — pg_ids_all ==
+        # all_member_ids), so drop_below_density_refold_rows short-circuits
+        # with NO query (its own `if not pg_ids` guard). drop_out_of_scan_
+        # refold_rows (C3.1 F1) has no such guard — it always runs, closing
+        # 0 rows in this fixture (pg_ids_all is fully in-scan by construction).
+        {"rowcount": 0, "rows": []},
         # 3. fold dead-letter counts (own-conn SELECT; empty → no dead-lettering)
         {"rowcount": 0, "rows": []},
         # 4. previous summary fetch
