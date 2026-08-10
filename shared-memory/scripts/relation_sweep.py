@@ -49,7 +49,8 @@ preferred) so the full pipeline is testable without inference.
     ... relation_sweep.py --review 15            # first-batch operator labeling
     ... relation_sweep.py --label "12=correct,13=incorrect"
     ... relation_sweep.py --evidential [--limit N]   # rung-2 re-scoring of REM's
-                                                 # record→record proposals
+                                                 # record→record proposals —
+                                                 # DORMANT: see §1.1 note below
 """
 import os
 import sys
@@ -658,11 +659,31 @@ def run_sweep(limit: int | None = None) -> dict:
             "already_adjudicated_pairs": cand_result["already_adjudicated_pairs"]}
 
 
-# ── Rung-2 evidential re-scoring (decision 727 ladder) ────────────────────────
+# ── Rung-2 evidential re-scoring (decision 727 ladder) ─────────────────────────
 #
-# REM proposes record→record evidential edges cheaply (asserted_by='rem', BORN
-# below the consumption threshold, ledger method='rem_k3'). This pass is rung 2:
-# it re-scores those proposals with a batched LLM adjudication over BOTH records'
+# ⛔ DORMANT BY DESIGN since the Dreaming Cycle v2 plan (§1.1, task B1) — READ
+# THIS BEFORE "FIXING" AN EMPTY QUEUE. REM's judgement-relation decommissioning
+# stopped REM proposing record→record INFORMED_BY/evidential edges (rung 1,
+# method='rem_k3') — that was the ONLY writer of the queue this pass reads.
+# Measured before the ruling: relation_adjudications held ZERO evidential rows,
+# of ANY method, and this script is invoked from no daemon, no service and no
+# other script — so the pass has never actually run against a filled queue in
+# production, and after B1 it structurally cannot: fetch_unlabeled_evidential()
+# below will keep returning [].
+#
+# Kept intact anyway, on purpose: relation_confidence.FAMILY_EVIDENTIAL and this
+# whole rung-2 pipeline are the operator-invoked surface a CUSTOM (non-spine)
+# ontology would turn back on — REM minting record→record evidence again is a
+# future ontology decision, not a rebuild, and this is the only place in the
+# framework where a non-spine ontology matters. Spend no inference on it until
+# that decision is made: do not wire it to a daemon, do not re-add REM's writer,
+# do not delete it "because it's unreachable."
+#
+# The paragraph below describes what the pass DOES, on the (currently
+# hypothetical) rows a future minting path would produce — REM proposes
+# record→record evidential edges cheaply (asserted_by='rem', BORN below the
+# consumption threshold, ledger method='rem_k3'). This pass is rung 2: it
+# re-scores those proposals with a batched LLM adjudication over BOTH records'
 # content and upserts method='llm_sweep' (the foundation upsert preserves the
 # prior rung inside signals.prior_rungs). On accept it updates the LIVE edge's
 # confidence — NOT asserted_by, which stays 'rem' until operator promotion — and
@@ -952,11 +973,14 @@ def main() -> None:
     ap.add_argument("--label", metavar='"id=correct,id=incorrect"',
                     help="apply operator labels to ledger rows")
     ap.add_argument("--evidential", action="store_true",
-                    help="rung-2 re-scoring of REM's evidential (record→record) "
-                    "proposals: LLM adjudication of unlabeled method='rem_k3' "
-                    "ledger rows over both records' content; accept re-scores the "
-                    "live edge's confidence (asserted_by stays 'rem'), reject "
-                    "deletes the machine edge (ledger row stays); --limit caps rows")
+                    help="DORMANT BY DESIGN (Dreaming Cycle v2 plan §1.1, B1): "
+                    "rung-2 re-scoring of record->record evidential proposals — "
+                    "LLM adjudication of unlabeled method='rem_k3' ledger rows "
+                    "over both records' content; accept re-scores the live "
+                    "edge's confidence (asserted_by stays 'rem'), reject deletes "
+                    "the machine edge (ledger row stays); --limit caps rows. "
+                    "REM no longer writes rem_k3 rows, so this currently finds "
+                    "nothing to do — kept for a future non-spine ontology.")
     args = ap.parse_args()
 
     if args.stats:

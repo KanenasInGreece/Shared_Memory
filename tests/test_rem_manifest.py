@@ -1,7 +1,12 @@
 """
 REM rebuild Stage ③ tests — capture-manifest input, delta prompting, k=3
-self-consistency confidence, universal edge provenance, evidential proposals
-(decisions 718 / 726 / 727).
+self-consistency confidence, universal edge provenance (decisions 718 / 726 /
+727). Judgement/evidential minting (the old 727 rung-1 proposals) was retired
+by B1 (Dreaming Cycle v2 plan §1) — a Decision target is DROPPED outright, not
+downgraded to MENTIONS (E1: MENTIONS is the Fact→Entity relation). See
+test_plan_edges_never_proposes_informed_by_or_any_decision_edge,
+test_plan_edges_never_mentions_a_non_entity_target, and
+test_apply_never_writes_evidential_ledger_row for that boundary.
 
 All Neo4j / Postgres / LLM I/O is mocked; no live infrastructure required.
 """
@@ -214,7 +219,7 @@ def test_registry_carries_typed_flag_and_decision_pg_id():
     assert reg["coordinator"]["typed"] is True        # already sub-labelled
     assert reg["loose-idea"]["typed"] is False        # still untyped
     assert reg["Xenofon"]["typed"] is True            # non-Entity → never sub-typed
-    assert reg["Route embeddings"]["pg_id"] == 550    # evidential ledger endpoint
+    assert reg["Route embeddings"]["pg_id"] == 550    # carried, unconsumed by REM (B1)
 
 
 def test_entity_lines_marks_untyped_only():
@@ -268,7 +273,10 @@ def _registry():
                       "typed": True,  "pg_id": None},
         "Xenofon":   {"label": ONT.human,    "default_rel": ONT.was_attributed_to,
                       "typed": True,  "pg_id": None},
-        "prior-dec": {"label": ONT.decision, "default_rel": ONT.informed_by,
+        # default_rel = entity_link (MENTIONS), not informed_by: judgement-relation
+        # decommissioning (Dreaming Cycle v2 plan §1, B1) removed INFORMED_BY from
+        # both the Decision label's allowed set and its default.
+        "prior-dec": {"label": ONT.decision, "default_rel": ONT.entity_link,
                       "typed": True,  "pg_id": 550},
     }
 
@@ -346,25 +354,71 @@ def test_plan_edges_mint_gate_is_per_name_not_all_or_nothing():
     assert plan["mint_dropped"] == ["BrandNewThing"]
 
 
-def test_plan_edges_grounded_in_remapped_to_informed_by():
-    """GROUNDED_IN is never machine-mintable — a suggestion of it resolves to
-    INFORMED_BY (for a Decision target) and is reported for logging."""
+def test_plan_edges_grounded_in_at_a_decision_is_dropped_not_downgraded():
+    """GROUNDED_IN is never machine-mintable. A Decision target is fully
+    DROPPED (B1), never downgraded to any other relation — downgrading to
+    MENTIONS would still mint a graph shape REM has never produced (E1:
+    MENTIONS is the Fact→Entity relation; the live graph has zero MENTIONS
+    edges targeting a Decision). Symmetric with the Entity drop (E4): the
+    proposal never reaches `_add`, so it does not reach `grounded_in_remaps`
+    either — that list is for suggestions that survive to resolution against
+    a non-Decision, non-Entity target (see test_plan_edges_grounded_in_remapped_away_from_the_suggested_relation)."""
     plan = rem_mod.plan_edges(
         {"relationships": [{"name": "prior-dec", "rel_type": ONT.grounded_in}]},
         _registry(), rem_mod.KIND_DECISION, {})
+    assert plan["edges"] == []
+    assert plan["dropped_names"] == ["prior-dec"]
+    assert plan["grounded_in_remaps"] == []
+
+
+def test_plan_edges_grounded_in_remapped_away_from_the_suggested_relation():
+    """GROUNDED_IN suggested against a non-Decision, non-Entity target (a
+    Human here) IS resolved to the label's default relation and reported in
+    grounded_in_remaps — the remap path this repo's tests already covered
+    before B1, unaffected by the Decision-specific drop above."""
+    plan = rem_mod.plan_edges(
+        {"relationships": [{"name": "Xenofon", "rel_type": ONT.grounded_in}]},
+        _registry(), rem_mod.KIND_DECISION, {})
     (e,) = plan["edges"]
-    assert e["rel_type"] == ONT.informed_by
-    assert e["evidential"] is True and e["tgt_pg_id"] == 550
-    assert plan["grounded_in_remaps"] == ["prior-dec"]
+    assert e["rel_type"] == ONT.was_attributed_to
+    assert plan["grounded_in_remaps"] == ["Xenofon"]
     assert not any(x["rel_type"] == ONT.grounded_in for x in plan["edges"])
 
 
-def test_plan_edges_evidential_only_for_decision_or_retro_anchor():
+def test_plan_edges_never_proposes_informed_by_or_any_decision_edge():
+    """Zero judgement/evidential minting (Dreaming Cycle v2 plan §1, B1): REM
+    must never propose INFORMED_BY, for ANY anchor kind, however the LLM
+    labels its suggestion — and it must not propose ANY OTHER edge for a
+    Decision target either. Downgrading to MENTIONS would still mint a graph
+    shape REM has never produced (E1: MENTIONS is the Fact→Entity relation).
+    This is the test that would have caught a downgrade-to-MENTIONS defect:
+    an assertion of `rel_type == ONT.entity_link` alone is NOT sufficient —
+    the target must not be linked at all."""
     rel = {"relationships": [{"name": "prior-dec", "rel_type": ONT.informed_by}]}
-    fact_plan  = rem_mod.plan_edges(rel, _registry(), rem_mod.KIND_FACT, {})
-    retro_plan = rem_mod.plan_edges(rel, _registry(), rem_mod.KIND_RETRO, {})
-    assert fact_plan["edges"][0]["evidential"] is False
-    assert retro_plan["edges"][0]["evidential"] is True
+    for kind in (rem_mod.KIND_FACT, rem_mod.KIND_DECISION, rem_mod.KIND_RETRO):
+        plan = rem_mod.plan_edges(rel, _registry(), kind, {})
+        assert plan["edges"] == [], (
+            f"kind={kind}: REM must propose NO edge for a Decision target, "
+            f"got {plan['edges']}")
+        assert plan["dropped_names"] == ["prior-dec"]
+
+
+def test_plan_edges_never_mentions_a_non_entity_target():
+    """Global invariant, not just an INFORMED_BY-shaped one: MENTIONS (E1) is
+    the Fact→Entity relation. No proposal `plan_edges` ever returns may pair
+    ONT.entity_link with a label other than ONT.entity — a Human/AIAgent/
+    Decision target that falls through to the generic default must still
+    never be written as MENTIONS just because nothing more specific applied."""
+    for target_name, kind in (
+        ("prior-dec", rem_mod.KIND_FACT), ("prior-dec", rem_mod.KIND_DECISION),
+        ("prior-dec", rem_mod.KIND_RETRO),
+    ):
+        rel = {"relationships": [{"name": target_name, "rel_type": "BOGUS_REL"}]}
+        plan = rem_mod.plan_edges(rel, _registry(), kind, {})
+        assert not any(
+            e["rel_type"] == ONT.entity_link and e["label"] != ONT.entity
+            for e in plan["edges"]
+        ), f"kind={kind}: MENTIONS written against a non-Entity label: {plan['edges']}"
 
 
 def test_plan_edges_extras_gate_registry_known_only():
@@ -591,44 +645,14 @@ def test_apply_is_fail_closed_when_no_verification_call_succeeded(monkeypatch):
     assert "rem_processed" in cyphers[-1]
 
 
-def test_apply_evidential_ledger_row_rem_k3_and_cap(monkeypatch):
-    """A Decision anchor INFORMED_BY a registry-known Decision → edge capped
-    below the evidential consumption threshold + ledger row (method rem_k3)."""
-    monkeypatch.setenv("MOCK_LLM", "1")
-    daemon, mock_session = _make_daemon()
-    conn, _ = _make_conn()
-
-    captured = {}
-    def _fake_upsert(c, **kwargs):
-        captured.update(kwargs)
-        return 1
-    monkeypatch.setattr(rem_mod.rc, "upsert_adjudication", _fake_upsert)
-
-    registry = _registry()
-    manifest = {"fact_kind": "tested", "entities": [], "existing_edges": []}
-    result = {"relationships": [{"name": "prior-dec", "rel_type": ONT.informed_by}]}
-
-    ok = _apply(daemon, conn, rem_mod.KIND_DECISION, result, registry, manifest)
-
-    assert ok is True
-    assert captured["family"] == rc.FAMILY_EVIDENTIAL
-    assert captured["method"] == "rem_k3"
-    assert captured["verdict"] == "accept"
-    assert captured["rel_type"] == ONT.informed_by
-    assert captured["src_pg_id"] == 42 and captured["tgt_pg_id"] == 550
-    assert captured["signals"] == {"votes": 3, "k": 3, "fact_kind": "tested"}
-    assert captured["run_id"] == "run-1"
-    # born-below rule: edge + ledger confidence never reach the consumption threshold
-    assert captured["confidence"] <= rc.EVIDENTIAL_BORN_BELOW_CAP
-    merge_calls = [c for c in mock_session.run.call_args_list
-                   if "ON CREATE SET" in c.args[0]]
-    assert merge_calls[0].kwargs["rows"][0]["props"]["confidence"] \
-        <= rc.EVIDENTIAL_BORN_BELOW_CAP
-
-
-def test_apply_evidential_without_pg_id_skips_ledger(monkeypatch):
-    """Target Decision with no pg_id in the registry: graph edge minted,
-    ledger row skipped (logged)."""
+def test_apply_never_writes_evidential_ledger_row(monkeypatch):
+    """Zero judgement/evidential minting (Dreaming Cycle v2 plan §1, B1): a
+    Decision anchor suggesting INFORMED_BY at a registry-known Decision writes
+    NO relation_adjudications row — the evidential ledger path was retired
+    along with the flag — AND no edge at all, INFORMED_BY or otherwise: the
+    proposal is dropped in plan_edges (symmetric with E4's Entity drop), not
+    downgraded to MENTIONS, which would mint a graph shape (MENTIONS
+    targeting a Decision) REM has never produced."""
     monkeypatch.setenv("MOCK_LLM", "1")
     daemon, mock_session = _make_daemon()
     conn, _ = _make_conn()
@@ -637,17 +661,42 @@ def test_apply_evidential_without_pg_id_skips_ledger(monkeypatch):
     monkeypatch.setattr(rem_mod.rc, "upsert_adjudication",
                         lambda c, **kw: called.append(kw) or 1)
 
-    registry = {"legacy-dec": {"label": ONT.decision, "default_rel": ONT.informed_by,
-                               "typed": True, "pg_id": None}}
-    manifest = {"fact_kind": "observation", "entities": [], "existing_edges": []}
-    result = {"relationships": [{"name": "legacy-dec", "rel_type": ONT.informed_by}]}
+    registry = _registry()
+    manifest = {"fact_kind": "tested", "entities": [], "existing_edges": []}
+    result = {"relationships": [{"name": "prior-dec", "rel_type": ONT.informed_by}]}
 
     ok = _apply(daemon, conn, rem_mod.KIND_DECISION, result, registry, manifest)
 
     assert ok is True
-    assert called == []                                       # no ledger row
-    assert any("ON CREATE SET" in c.args[0]
-               for c in mock_session.run.call_args_list)      # edge still minted
+    assert called == []                                        # ledger never touched
+    merge_calls = [c for c in mock_session.run.call_args_list
+                   if "ON CREATE SET" in c.args[0]]
+    assert merge_calls == [], (
+        "no edge should be written for a Decision target at all — got "
+        f"{[c.args[0] for c in merge_calls]}")
+
+
+def test_apply_human_and_aiagent_proposals_are_unaffected_by_the_decision_drop(monkeypatch):
+    """Confirms the B1 Decision-drop is scoped to the Decision label only —
+    Human/AIAgent proposals still mint their existing MENTIONS-adjacent edges
+    (WAS_ATTRIBUTED_TO / WAS_ASSISTED_BY) exactly as before, at ordinary
+    entity-family confidence. Pre-existing capability, not touched by B1."""
+    monkeypatch.setenv("MOCK_LLM", "1")
+    daemon, mock_session = _make_daemon()
+    conn, _ = _make_conn()
+
+    manifest = {"fact_kind": "tested", "entities": [], "existing_edges": []}
+    result = {"relationships": [{"name": "Xenofon", "rel_type": ONT.was_attributed_to}]}
+
+    ok = _apply(daemon, conn, rem_mod.KIND_DECISION, result, _registry(), manifest)
+
+    assert ok is True
+    merge_calls = [c for c in mock_session.run.call_args_list
+                   if "ON CREATE SET" in c.args[0]]
+    assert merge_calls, "a Human proposal must still land as an edge"
+    assert f"[r:{ONT.was_attributed_to}]" in merge_calls[0].args[0]
+    assert merge_calls[0].kwargs["rows"][0]["props"]["confidence"] == \
+        rc.vote_confidence(3, 3, "tested", family=rc.FAMILY_ENTITY)
 
 
 def test_apply_existing_edges_not_rewritten(monkeypatch):
