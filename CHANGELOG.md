@@ -5,6 +5,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.63] — 2026-08-10
+
+### Changed
+
+- **REM's judgement-relation decommissioning is complete: REM performs zero linking to `:Decision` nodes.** Judgement relations (`CONSIDERED`, `REJECTED`, `UNDER_CONDITIONS`, `PRODUCES_INSIGHT`, `INFORMED_BY`) are first-write properties established at capture. REM no longer proposes, creates or changes any of them.
+  - A Decision-labelled proposal is now **dropped outright** in `plan_edges`, symmetric with the existing Entity drop — **never downgraded to another relation**. Falling back to `MENTIONS` would have stopped one edge class by minting another: `MENTIONS` is the Fact→Entity relation, and a `MENTIONS` edge targeting a `Decision` is a shape this graph has never contained.
+  - Two deliberate layers: `INFORMED_BY` is also removed from the Decision label's allowed-relations and default-relation maps, so a model suggestion of it cannot survive resolution even if the drop were later removed by mistake.
+  - Dead code removed with it: the evidential ledger write path, the `evidential`/`tgt_pg_id` proposal keys, the born-below cap and the evidential log counter.
+  - `Human`/`AIAgent` proposals are unaffected and keep `WAS_ATTRIBUTED_TO`/`WAS_ASSISTED_BY`, with a test pinning that.
+- **Retained unchanged:** `rem_reviewed` outbox transitions, record sub-typing, `rem_summary` generation, and Fact `MENTIONS` edges to entities.
+
+### Documentation
+
+- **The rung-2 evidential relation-filtering pipeline is documented as DORMANT BY DESIGN, not deleted.** `relation_sweep.py --evidential` and `relation_confidence.py` are kept intact as the operator-invoked surface a custom, non-spine ontology would turn on. REM no longer fills its queue, so it cannot begin running by itself. Turning it on is a future ontology decision, not a rebuild.
+- **`schema.md` overclaim corrected** (both tracked copies): it stated REM writes `PRODUCES_INSIGHT`/`UNDER_CONDITIONS`/`CONSIDERED`/`REJECTED` edges to `:Entity` nodes. Those were retired in v0.8.60 and are never minted by REM; that section is retitled accordingly.
+- **`SKILL.md` now elicits `informed_by` as a proposable grounding role** (both copies). It was previously reachable only as the silent default for `discussion`-kind facts, never offered for the operator to pick or override — leaving a capture path the graph depends on effectively unprompted.
+
 ## [0.8.62] — 2026-08-10
 
 ### Fixed
