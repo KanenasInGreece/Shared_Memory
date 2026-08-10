@@ -172,6 +172,15 @@ a re-score updates the row in place and preserves the prior rung inside
 `signals.prior_rungs` (the evidential ladder: `rem_k3` proposal → `llm_sweep`
 re-score → operator label/promotion).
 
+⛔ **The `evidential` family is DORMANT since the Dreaming Cycle v2 plan (§1.1,
+task B1).** REM's judgement-relation decommissioning stopped REM proposing
+record→record `INFORMED_BY`/evidential edges — the only writer of `method='rem_k3'`
+rows — so this table currently holds zero `evidential` rows and `relation_sweep.py
+--evidential` (rung 2) finds nothing to re-score. `relation_confidence.
+FAMILY_EVIDENTIAL` and the rung-2 re-scoring pipeline are kept intact
+deliberately, as the operator-invoked surface a future non-spine ontology would
+turn back on — not wired to anything, not deleted.
+
 | Column | Type | Notes |
 |---|---|---|
 | `family` | `TEXT` | `entity_relation` \| `evidential` (CHECK-enforced endpoint encoding per family) |
@@ -466,16 +475,28 @@ Written by the outbox worker for `type:decision` saves.
 | `SUPERSEDES` | `(:CommunitySummary)-[:SUPERSEDES]->(:CommunitySummary)` | Also written between CommunitySummary nodes when supersession rule fires (v0.4.0) |
 | `SUPERSEDES` | `(:Fact)-[:SUPERSEDES]->(:Fact)` | A correction supersedes an older fact (decision 381); the old `:Fact` also gets `superseded = true` so REM/NREM skip it |
 
-### REM-enrichment relationships (v0.4.0 — written by `rem_loop.py`)
+### Judgement relations targeting `:Entity` — RETIRED, never minted by REM (v0.4.0 → retired E5/B1)
 
-Written by the REM daemon during idle-time fact enrichment. These relationships are **never** written by the save path — they require full Postgres content and the closed typed-node set.
+⛔ **These four relation types are judgement relations and are NEVER minted by
+`rem_loop.py`, or by anything else, as of E5 (v0.8.60) and confirmed permanent
+by the Dreaming Cycle v2 plan (§1, task B1).** They are first-write-only
+properties on the `Decision` record (`metadata.decision.considered` /
+`.rejected` / `.under_conditions` / `.produces_insight`, free text) and are
+**never** materialized as a graph edge to an `:Entity` node — a candidate name
+REM's decision-extras task proposes is unconditionally logged to
+`extras_dropped` and discarded, registry-known or not. Kept here as a record of
+a retired mechanism, not a current capability:
 
-| Relationship | Pattern | Meaning |
+| Relationship | Pattern | Meaning (historical — never written since E5/B1) |
 |---|---|---|
 | `PRODUCES_INSIGHT` | `(:Fact\|:Decision)-[:PRODUCES_INSIGHT]->(:Entity)` | Insight or knowledge this fact/decision generates |
 | `UNDER_CONDITIONS` | `(:Decision)-[:UNDER_CONDITIONS]->(:Entity)` | Constraints or conditions that bound the decision |
 | `CONSIDERED` | `(:Decision)-[:CONSIDERED]->(:Entity)` | Alternatives evaluated for the decision |
 | `REJECTED` | `(:Decision)-[:REJECTED]->(:Entity)` | Alternatives explicitly ruled out |
+
+For the role-typed grounding edges these relation NAMES also appear on
+(`(:Decision)-[:CONSIDERED\|REJECTED\|UNDER_CONDITIONS]->(:Fact\|:Decision)`,
+written at first write, never by REM) — see "Typed decision grounding" below.
 
 **Typed decision grounding (v0.6.4):** the grounding edges that link a `Decision` to the *records it rests on* are role-typed — `GROUNDED_IN` (basis), `CONSIDERED`, `REJECTED`, `UNDER_CONDITIONS`, or `INFORMED_BY`, targeting `(:Fact\|:Decision)`. First write picks the relation from the operator-supplied role (`--grounded-in "42:considered"`) or, when omitted, from the grounded fact's `fact_kind` — a `discussion` defaults to `INFORMED_BY`, other kinds to `GROUNDED_IN` (advisory, never enforced). Each edge carries an **`asserted_by`** property (`operator` \| `system_default`). The target is matched by `pg_id` **across labels**, so grounding a decision in another decision links the real node rather than an empty placeholder.
 
