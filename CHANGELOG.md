@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.65] — 2026-08-10
+
+### Fixed
+
+- **`GET /memory/telemetry`'s `nrem` gauge was dead in every deployment, silently.** It returned `{"error": "No module named 'psycopg2'"}` instead of counts, and had done so for a long time — this is a pre-existing defect, not a regression from the recent gate work (reproduced identically at `v0.8.63`).
+  - **Cause:** `coordinator._nrem_cycle_counts` reached the pure gate helpers through `from consolidation_loop import …`, and `consolidation_loop.py` imports `psycopg2` at module level for the daemon's own work. The gateway does not run with psycopg2 — correctly, since it uses `asyncpg`. Because that import is **lazy**, the gateway started cleanly and the failure appeared only when the gauge was called, where it was caught and rendered as an error object rather than crashing. **A metric that fails into a dashboard as data is worse than one that fails loudly.**
+  - **Fix:** the pure gate helpers (`eligible_domain_level_clusters`, `count_domain_level_cycles`) move to a new **driver-free** module, `nrem_gate.py`, which imports nothing but stdlib and one pure helper. `coordinator` imports from it directly and never reaches into the daemon module. `consolidation_loop` re-exports them, so existing callers and tests are unaffected.
+  - ⛔ **Deliberately NOT fixed by adding `--with psycopg2-binary` to the service unit.** That would import the entire consolidation daemon module into the gateway process — executing its module-level code there — to reach two pure functions. The dependency was the defect. **The shipped `ops/hive-mind-gateway.service` needs no change.**
+  - Swept `coordinator.py` and `hive_mind_proxy.py` for every other lazy or module-level import reaching any of the twelve psycopg2-importing scripts. **This was the only one.**
+
+### Testing
+
+- **A green suite could not see this, and that is the point.** 1236 tests passed while the gauge was dead, because stubbed imports never exercise the gateway's real dependency set. The new guard is functional rather than cosmetic: it blocks `psycopg2` at import time and proves `nrem_gate` still computes, proves `consolidation_loop` genuinely cannot be imported under the same block (the before/after control), scans `coordinator.py` for any reach back into the daemon module, and checks `nrem_gate.py`'s actual import statements for any DB or network driver.
+- Both mutations verified: restoring the old import path kills exactly the two tests that should die; adding a driver import to `nrem_gate.py` kills exactly the two purity guards.
+
 ## [0.8.64] — 2026-08-10
 
 ### Changed

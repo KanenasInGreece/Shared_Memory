@@ -71,6 +71,7 @@ from insight_gate import (
     INSIGHT_THRESHOLD, INSIGHT_HUB_DEGREE_CAP, insight_cluster_cypher,
 )
 from project_axis import PROJECT_SQL, fold_eligible
+from nrem_gate import eligible_domain_level_clusters, count_domain_level_cycles  # noqa: F401 — re-exported, see below
 from domain_axis import resolve_domains
 from pool_status import pool_has_free_slot
 from dream_telemetry import (record_llm_call, adaptive_ceiling, embed_ceiling,
@@ -927,63 +928,20 @@ def evidential_kind_for_record(rtype, source_ref, grounding_kinds=None):
 # per-project, never per-entity — neither of those exists any more to
 # contrast it with). Renaming a name that already says the true thing would
 # only cost every caller a diff for no clarity gained.
-def eligible_domain_level_clusters(contents, pg_ids, project_map, domains_map,
-                                   threshold, registered_sections):
-    """THE v2 FACT GATE PARTITIONER (plan §2.1) — the only one
-    ``_consolidate_clusters`` calls, and (as of C1b) the only one
-    ``coordinator._nrem_cycle_counts`` counts against for its `fact_cycles`
-    census, so the fold and its telemetry can never again disagree.
-    (project, section) with **no** entity — exactly the plan's anchor:
-    "(project, domain), and nothing else."
-
-    Pure. Only **registered** non-empty sections form buckets — an unregistered
-    or blank section never qualifies. ``registered_sections`` is a set of
-    ``(project_name, section_name)`` pairs. ``_consolidate_clusters`` derives
-    it from the SAME graph rows ``_find_grounded_fact_groups`` already proved
-    registered (a DOMAIN_OF/PROJECT_OF edge only exists for a registered
-    section — coordinator.py's ``_domain_identities`` never writes one
-    otherwise), so this is a second, cheap confirmation rather than a second
-    source of truth. Fan-out: a fact tagged with several sections counts in
-    each bucket, not just one.
-
-    Returns list of ``((project, section), contents, pg_ids)``.
-    """
-    registered = registered_sections or set()
-    buckets: dict = {}
-    for content, pid in zip(contents, pg_ids):
-        project = project_map.get(pid)
-        if not fold_eligible(project):
-            continue
-        sections = domains_map.get(pid) or []
-        for s in sections:
-            if not isinstance(s, str):
-                continue
-            section = s.strip()
-            if not section:
-                continue
-            if (project, section) not in registered:
-                continue
-            key = (project, section)
-            bucket = buckets.setdefault(key, ([], []))
-            bucket[0].append(content)
-            bucket[1].append(pid)
-    return [
-        (key, c, p)
-        for key, (c, p) in buckets.items()
-        if len(p) >= threshold
-    ]
-
-
-def count_domain_level_cycles(pg_ids, project_map, domains_map, threshold,
-                              registered_sections):
-    """Telemetry twin of ``eligible_domain_level_clusters`` — count only,
-    same partitioner, so the gauge and the fold can never again describe
-    different populations. Used by ``coordinator._nrem_cycle_counts`` for the
-    `fact_cycles` census in ``GET /memory/telemetry``."""
-    contents = [""] * len(pg_ids)
-    return len(eligible_domain_level_clusters(
-        contents, pg_ids, project_map, domains_map, threshold,
-        registered_sections))
+#
+# ⛔ MOVED to ``nrem_gate.py`` (fix wave, 2026-08) — this module imports
+# psycopg2 at module level (line ~56), so any caller reaching these two PURE
+# functions through `from consolidation_loop import ...` pulls in that whole
+# import chain. `coordinator._nrem_cycle_counts` did exactly that behind a
+# lazy import, and the shipped gateway service never carries psycopg2 — so
+# `GET /memory/telemetry`'s `nrem` gauge failed on every call in production
+# while every unit test (DB access fully stubbed) stayed green. See
+# `nrem_gate.py`'s module docstring for the full account. Both names are
+# imported back in above and re-exported here — this module's own fold code
+# (`_consolidate_clusters` etc.) and every existing caller/test that does
+# `from consolidation_loop import eligible_domain_level_clusters` /
+# `count_domain_level_cycles` keep working unchanged. `coordinator.py` now
+# imports straight from `nrem_gate`, never from here.
 
 
 def sweep_due(now, last_sweep_time, last_activity, has_pending,
