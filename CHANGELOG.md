@@ -5,6 +5,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.66] — 2026-08-10
+
+### Changed
+
+- **The insight gate is rebuilt on the walk, replacing the 1-hop shared-entity match.** `insight_gate.py` is rewritten; the old `insight_cluster_cypher`, `INSIGHT_THRESHOLD` and `INSIGHT_HUB_DEGREE_CAP` are **deleted, not deprecated**.
+  - **The gate is two conditions plus freshness.** **G1** — the group must pass the thematic fact gate (reused from the previous release, never re-derived). **G2** — at least one `Retrospective` in the reached judgement set: a retrospective is the experiment result, the thing that proves a decision has had time to be tested. **G3** — at least one reached judgement still unconsolidated, so a gating group cannot re-fold an identical insight every cycle. **Freshness is read only from judgements, never from facts.**
+  - **The ≥2-distinct-projects requirement is gone.** A count of projects is a computed label, not a gate.
+  - **The walk** is undirected and unbounded over the closed relation set (`GROUNDED_IN`, `INFORMED_BY`, `CONSIDERED`, `REJECTED`, `UNDER_CONDITIONS`, `HAD_OUTCOME`), passing **through** facts so two judgements sharing a fact are connected. It terminates by **fixpoint** — each layer queries only newly discovered nodes — with no hop cap, edge cap or hub cap. It never follows `SUPERSEDES`.
+  - **Components group, they do not gate.** Every component in a gating group folds into one insight; components determine the payload's structure, not admission. Ordering is deterministic: components containing a retrospective first by smallest retrospective id, then the rest by smallest decision id, ascending id within each component.
+  - **Insight identity is the set of judgement ids it covers.** A group yielding an identical set no longer folds a duplicate.
+- **Reversed decisions are excluded on both ends of the walk**, so an overturned decision can neither enter a reached set nor act as a bridge between two live judgements. A superseded **fact**, by contrast, remains a valid pass-through connectivity node — two judgements sharing a since-superseded fact are still one component. An insight states proven principles; presenting an overturned decision as one is a false statement the reader cannot detect.
+
+### ⚠ Removed — `GET /memory/telemetry` contract change
+
+- **`decision_threshold` is removed, not repurposed.** There is no decision threshold any more — G2 and G3 are each "at least one" conditions, not tunable counts. Setting the old field to `1` would have read as "the threshold was lowered", which is false. This follows the precedent set one release earlier for `domain_threshold`.
+- **`decision_cycles` keeps its name and now counts gating groups** under the same predicate the fold uses, rather than the retired entity-cluster count — one definition, so the gauge and the gate cannot describe different populations.
+- Unchanged: `fact_cycles`, `fact_threshold`, `total_cycles`.
+
+### Notes
+
+- **Verified read-only against the live graph.** The walk from the gating group's seeds reaches its fixpoint by hop 5 and is stable from there through hop 15 — demonstrated by re-running under increasing hop caps rather than asserted. Two groups gate corpus-wide, both passing G1+G2+G3. Both currently reach an identical component, which is a real live exercise of the identity rule.
+- **Operator rulings recorded** for the two reversal edge cases: a reversing retrospective **does** satisfy G2, while the decision it overturned counts toward nothing; and a retrospective alone does **not** gate, since an ordinary search already returns it.
+- Mutation-checked tests cover every invariant the gate rests on. One guard is shared infrastructure and kills three tests rather than one — documented as shared rather than falsely reported as isolated.
+
 ## [0.8.65] — 2026-08-10
 
 ### Fixed
