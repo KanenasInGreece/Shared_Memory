@@ -509,13 +509,29 @@ cons_mod = load_consolidation()
 ConsolidationDaemon = cons_mod.ConsolidationDaemon
 
 
-def test_nrem_cluster_query_requires_rem_processed():
-    """The NREM cluster query must filter on rem_processed=true so raw
-    (non-REM-processed) facts are never consolidated directly."""
+def test_nrem_fact_gate_is_grounded_non_superseded_not_rem_processed():
+    """⛔ SUPERSEDES the pre-v2 rule this test used to assert (raw,
+    non-REM-processed facts could never be consolidated directly, enforced by
+    an entity-hub Cypher's `rem_processed=true` filter). That gate is REMOVED
+    (Dreaming Cycle Plan to v2, C1): the v2 FACT GATE's membership rule
+    (§2.1) is "the grounded, non-superseded facts in the group" — full stop,
+    no REM-processing precondition. This is deliberate, not an oversight:
+    REM's `rem_summary` is optional prep (§4.1.2) the fold PREFERS when
+    present and falls back to raw `content` otherwise
+    (`coalesce(f.rem_summary, f.content)` in `_find_grounded_fact_groups`) —
+    a fact freshly GROUNDED_IN by a Decision before REM ever reaches it is a
+    legitimate group member.
+
+    So the invariant this test protects is now the OPPOSITE shape: the
+    discovery Cypher must still gate on GROUNDED_IN + non-superseded, and
+    must NOT reintroduce a rem_processed precondition."""
     import inspect
-    source = inspect.getsource(ConsolidationDaemon.run_consolidation_cycle)
-    assert "rem_processed" in source, (
-        "consolidation cluster query must include rem_processed guard"
+    source = inspect.getsource(ConsolidationDaemon._find_grounded_fact_groups)
+    assert "GROUNDED_IN" in source, "the v2 fact gate must require a GROUNDED_IN edge"
+    assert "superseded" in source, "the v2 fact gate must exclude superseded facts"
+    assert "rem_processed" not in source, (
+        "the v2 fact gate must not reintroduce a rem_processed precondition — "
+        "membership is grounded + non-superseded only (plan Dreaming_Cycle_Plan_to_v2 §2.1)"
     )
 
 

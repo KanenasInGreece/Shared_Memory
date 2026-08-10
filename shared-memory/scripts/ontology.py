@@ -86,8 +86,13 @@ class OntologyConfig:
     configures: str = "CONFIGURES"   # controls / parametrises / governs
     describes: str = "DESCRIBES"     # documents / specifies (Document→X)
     validates: str = "VALIDATES"     # quality-gate / test / telemetry validates X
-    # Consolidation tuning
-    density_threshold: int = 5
+    # Consolidation tuning. density_threshold recalibrated 5 -> 3 for the v2
+    # FACT GATE (Dreaming Cycle Plan to v2, §2.1) — the population it measures
+    # changed from "facts on an entity hub" to "facts GROUNDED_IN by a
+    # judgement, grouped by (project, domain)", a structurally smaller and
+    # sparser count on this corpus (measured live: two groups gate at 13 and 5
+    # grounded facts). See consolidation_loop.py's DENSITY_THRESHOLD.
+    density_threshold: int = 3
     insight_threshold: int = 2
     alias_max_hops: int = 2
 

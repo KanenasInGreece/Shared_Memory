@@ -286,11 +286,16 @@ def test_the_fold_key_query_no_longer_invents_a_bucket():
     assert "f\"SELECT id, {PROJECT_SQL},\"" in src
     assert "COALESCE({PROJECT_SQL}, 'general')" not in src
 
-    # ⚠ The alias is `AS project`, not `AS domain`. It always HELD the project;
-    # calling it `domain` was the naming trap PR 7 exists to untangle, and a
-    # test asserting the old spelling would pin the confusion in place.
+    # ⚠ The alias is `AS project`, never `AS domain` — the naming trap PR 7
+    # exists to untangle, and a test asserting the old spelling would pin the
+    # confusion in place. v2 (C1b): coordinator._nrem_cycle_counts no longer
+    # resolves project via Postgres PROJECT_SQL at all — it reads
+    # `proj.name AS project` straight off the graph's PROJECT_OF edge (the
+    # SAME chain the fold walks), so the guard moves to the Cypher form.
     coord = open(os.path.join(_SCRIPTS, "coordinator.py"), encoding="utf-8").read()
-    assert "f\"SELECT id, {PROJECT_SQL} AS project" in coord
+    assert "proj.name AS project" in coord
+    assert "proj.name AS domain" not in coord
+    assert "dom.name AS project" not in coord
     assert "{PROJECT_SQL} AS domain" not in coord
     assert "DEFAULT_DOMAIN" not in coord.split("# NREM dream-cycle backlog gauge")[0]
 

@@ -123,7 +123,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.63"
+FRAMEWORK_VERSION = "0.8.64"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -909,13 +909,17 @@ GATEWAY_AUDIT_LOG_PATH = os.environ.get("GATEWAY_AUDIT_LOG_PATH", "").strip()
 _audit_writer = AsyncLineWriter(GATEWAY_AUDIT_LOG_PATH) if GATEWAY_AUDIT_LOG_PATH else None
 
 # NREM dream-cycle backlog gauge (GET /memory/telemetry). A "cycle" is one
-# cluster that meets the gate NREM actually fires on, NOT a raw unconsolidated
-# record count. Fact clusters reuse ONT.density_threshold (the same value
-# consolidation_loop.py gates on) partitioned by project_axis.PROJECT_SQL, with
-# unresolvable-project records excluded rather than pooled (P2). Decision cycles
-# run the insight gate itself, count-only, from insight_gate.py — its own
-# threshold travels with it, so a deployment that tunes insight_threshold sees
-# the tuned number here rather than a hardcoded twin.
+# (project, domain) group that meets the v2 FACT GATE NREM actually fires on
+# (Dreaming Cycle Plan to v2, §2.1; C1/C1b) — NOT a raw unconsolidated record
+# count, and NOT a per-entity or project-only count (neither level exists any
+# more). Fact groups reuse ONT.density_threshold, the SAME value
+# consolidation_loop.py gates on, over facts resolved straight off the graph's
+# GROUNDED_IN/DOMAIN_OF/PROJECT_OF edges — no project_axis.PROJECT_SQL
+# involved here, since a DOMAIN_OF/PROJECT_OF edge only exists for an already-
+# registered (project, domain) pair. Decision cycles run the insight gate
+# itself, count-only, from insight_gate.py — its own threshold travels with
+# it, so a deployment that tunes insight_threshold sees the tuned number here
+# rather than a hardcoded twin.
 #
 # There is deliberately no default-project constant here any more: the gauge
 # never invents a key. consolidation_loop keeps DEFAULT_DOMAIN for a summary's
@@ -1051,16 +1055,6 @@ def _normalize_project(name):
     return PROJECT_ALIASES.get(name, name) if isinstance(name, str) else name
 
 
-def _count_domain_cycles(pg_ids: list[int], domain_map: dict[int, str], threshold: int) -> int:
-    """Legacy name: ``domain_map`` is the PROJECT map (historical squat).
-
-    Delegates to consolidation_loop.count_entity_level_cycles with empty
-    sections (P15 only) so the gauge cannot invent a second partition rule.
-    Prefer count_entity_level_cycles + domains_map when sections are available.
-    """
-    from consolidation_loop import count_entity_level_cycles
-    domains_map = {pid: [] for pid in pg_ids}
-    return count_entity_level_cycles(pg_ids, domain_map, domains_map, threshold)
 
 # Cypher write-operation guard — reject queries containing mutating keywords.
 # Defence-in-depth: blocks obvious destructive ops while a deeper Neo4j RBAC
@@ -6062,46 +6056,32 @@ class MemoryCoordinator:
     async def _nrem_cycle_counts(self) -> dict:
         """Pending NREM consolidation cycles for facts and decisions.
 
-        Reproduces consolidation_loop's gating, and for decisions it now IS that
-        gating: facts are entity clusters of rem_processed, unconsolidated nodes
-        re-partitioned per (entity, project) and counted where a bucket meets its
-        density threshold; decisions run insight_gate.insight_cluster_cypher
-        count-only, the same query the daemon folds on.
+        v2 (C1b): reproduces consolidation_loop's v2 FACT GATE (Dreaming Cycle
+        Plan to v2, §2.1) exactly — there is no more entity-hub gate and no
+        more project-only gate to sum against it. Facts are the grounded,
+        non-superseded Facts of each registered (project, domain) group,
+        counted where a group meets ONT.density_threshold; decisions run
+        insight_gate.insight_cluster_cypher count-only, the same query the
+        daemon folds on.
         """
-        # Neo4j: clusters of eligible facts (global, not just pending ids).
-        # ADR-017: grouped by ALIAS COMPONENT, identical to the gate
-        # consolidation_loop._find_anchored_clusters actually folds on — so this
-        # census (which drives the ADR-018 stall/coverage signal) never disagrees
-        # with what NREM does. No-op-safe: null alias_component → per-entity, as before.
-        rels = f"{ONT.entity_link_alias}|{ONT.entity_link}"
+        # Neo4j: the SAME graph-native walk consolidation_loop's
+        # _find_grounded_fact_groups folds on — GROUNDED_IN -> DOMAIN_OF ->
+        # PROJECT_OF, never MENTIONS/Entity. project/domain now come straight
+        # off these graph edges, so no separate Postgres round-trip is needed
+        # to resolve them (a DOMAIN_OF/PROJECT_OF edge only exists for a
+        # REGISTERED section — coordinator._domain_identities never writes one
+        # otherwise — so edge presence already proves registration).
         async with self._neo4j.session() as session:
             fres = await session.run(
-                f"MATCH (f:{ONT.fact}) WHERE f.pg_id IS NOT NULL"
-                f" MATCH (f)-[:{rels}]->(e0:{ONT.entity})"
-                f" WITH DISTINCT e0"
-                f" CALL (e0) {{"
-                f"   OPTIONAL MATCH (sib:{ONT.entity})"
-                f"     WHERE e0.alias_component IS NOT NULL"
-                f"       AND sib.alias_component = e0.alias_component"
-                f"   WITH e0, collect(sib) AS sibs"
-                f"   RETURN CASE WHEN e0.alias_component IS NULL"
-                f"               THEN [e0] ELSE sibs END AS members"
-                f" }}"
-                f" WITH coalesce(e0.alias_component, elementId(e0)) AS comp, members"
-                f" WITH comp, head(collect(members)) AS members"
-                f" UNWIND members AS m"
-                f" MATCH (m)<-[:{rels}]-(n:{ONT.fact})"
-                f" WHERE coalesce(n.consolidated,false) = false"
-                f"   AND coalesce(n.rem_processed,false) = true"
-                f"   AND coalesce(n.superseded,false) = false"
-                f" WITH comp, members, collect(DISTINCT n.pg_id) AS pg_ids"
-                f" WHERE size(pg_ids) >= $threshold"
-                f" RETURN reduce(c = null, nm IN [x IN members | x.name] |"
-                f"          CASE WHEN c IS NULL OR nm < c THEN nm ELSE c END) AS entity,"
-                f"        pg_ids",
-                threshold=ONT.density_threshold,
+                f"MATCH (j) WHERE j:{ONT.decision} OR j:{ONT.retrospective}"
+                f" MATCH (j)-[:{ONT.grounded_in}]->(f:{ONT.fact})"
+                f" WHERE coalesce(f.superseded, false) = false"
+                f" MATCH (f)-[:{ONT.domain_of}]->(dom:{ONT.domain})"
+                f"           -[:{ONT.project_of}]->(proj:{ONT.project})"
+                f" WITH DISTINCT f, proj.name AS project, dom.name AS domain"
+                f" RETURN f.pg_id AS pg_id, project, domain",
             )
-            fact_clusters = await fres.data()
+            fact_rows = await fres.data()
             # The insight gate, count-only — the SAME Cypher the daemon folds on
             # (insight_gate.insight_cluster_cypher), not a Postgres partition of
             # every eligible Decision node. The old chain collected decisions
@@ -6116,67 +6096,36 @@ class MemoryCoordinator:
             irows = await ires.data()
         decision_cycles = int(irows[0]["cycles"]) if irows else 0
 
-        # Postgres: project + sections per pg_id — SAME pure partitioners as
-        # the fold (entity-level + domain-level). Never invent a second rule.
-        from consolidation_loop import (
-            count_entity_level_cycles, count_domain_level_cycles,
-            NREM_DOMAIN_THRESHOLD,
-        )
-        from domain_axis import resolve_domains as _resolve_domains
-        all_ids = sorted(
-            {int(pid) for c in fact_clusters for pid in (c["pg_ids"] or []) if pid is not None}
-        )
+        # SAME pure partitioner the fold uses (consolidation_loop's
+        # eligible_domain_level_clusters, via its count-only twin). Never
+        # invent a second rule.
+        from consolidation_loop import count_domain_level_cycles
         project_map: dict[int, str] = {}
         domains_map: dict[int, list] = {}
         registered_sections: set = set()
-        if all_ids:
-            async with self._acquire() as conn:
-                rows = await conn.fetch(
-                    f"SELECT id, {PROJECT_SQL} AS project, metadata"
-                    f" FROM technical_docs WHERE id = ANY($1)",
-                    all_ids,
-                )
-                reg = await conn.fetch(
-                    "SELECT p.name AS project, d.name AS section"
-                    "  FROM project_domains d"
-                    "  JOIN projects p ON p.id = d.project_id"
-                )
-            for r in rows:
-                project_map[r["id"]] = r["project"]
-                meta = r["metadata"]
-                if isinstance(meta, str):
-                    import json as _json
-                    try:
-                        meta = _json.loads(meta)
-                    except (ValueError, TypeError):
-                        meta = {}
-                domains_map[r["id"]] = _resolve_domains(
-                    meta if isinstance(meta, dict) else {})
-            registered_sections = {
-                (r["project"], r["section"]) for r in reg
-            }
+        for r in fact_rows:
+            pid = r["pg_id"]
+            project_map[pid] = r["project"]
+            doms = domains_map.setdefault(pid, [])
+            if r["domain"] not in doms:
+                doms.append(r["domain"])
+            registered_sections.add((r["project"], r["domain"]))
+        pg_ids_all = list(project_map)
 
-        entity_cycles = sum(
-            count_entity_level_cycles(
-                [int(pid) for pid in (c["pg_ids"] or []) if pid is not None],
-                project_map, domains_map, ONT.density_threshold,
-            )
-            for c in fact_clusters
-        )
-        # Domain-level: one count over the union of all eligible fact ids.
-        domain_cycles = count_domain_level_cycles(
-            all_ids, project_map, domains_map,
-            NREM_DOMAIN_THRESHOLD, registered_sections,
-        ) if all_ids else 0
-        fact_cycles = entity_cycles + domain_cycles
+        # `fact_cycles` IS the fact gate now — there is no second level to sum
+        # it against (v2, C1/C1b). A separate, always-equal
+        # "domain_level_cycles" field would be a duplicate a future reader
+        # could wrongly assume differs; one number, named for what it
+        # measures.
+        fact_cycles = count_domain_level_cycles(
+            pg_ids_all, project_map, domains_map,
+            ONT.density_threshold, registered_sections,
+        ) if pg_ids_all else 0
         return {
             "fact_cycles": fact_cycles,
-            "entity_level_cycles": entity_cycles,
-            "domain_level_cycles": domain_cycles,
             "decision_cycles": decision_cycles,
             "total_cycles": fact_cycles + decision_cycles,
             "fact_threshold": ONT.density_threshold,
-            "domain_threshold": NREM_DOMAIN_THRESHOLD,
             "decision_threshold": INSIGHT_THRESHOLD,
         }
 

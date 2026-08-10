@@ -284,21 +284,31 @@ async def test_pool_probe_is_rate_limited(monkeypatch):
 
 # ── the cycle no longer eats its own entry points ────────────────────────────
 
-def _cycle_daemon(monkeypatch, clusters):
-    """Daemon wired for run_consolidation_cycle: the cluster finder returns
-    `clusters`, and the idle-record + fold body are captured, not executed."""
+def _cycle_daemon(monkeypatch, rows):
+    """Daemon wired for run_consolidation_cycle: the (project, domain)
+    discovery step (`_find_grounded_fact_groups`) returns `rows`, and the
+    idle-record + fold body are captured, not executed.
+
+    v2 (C1): discovery takes NO ids any more — it is always an unrestricted
+    scan of the whole grounded-fact population (see
+    `_find_grounded_fact_groups`'s docstring: a group's density must be judged
+    on its WHOLE current membership, not on whichever facts triggered this
+    pass). So what is observable here is WHETHER discovery ran
+    (`seen["discovery_calls"]`), not which ids it was handed — that entire
+    class of assertion (`test_cycle_anchors_on_the_durable_backlog` /
+    `test_cycle_unions_requeued_ids_with_the_ledger`, below) moved from
+    "which ids reached the query" to "did the durable-backlog gate still let
+    the cycle proceed to discovery at all"."""
     d = ConsolidationDaemon()
-    seen = {"anchored": [], "idle": [], "folded": []}
+    seen = {"discovery_calls": 0, "idle": [], "folded": []}
 
-    monkeypatch.setattr(cl, "fetch_calibration_gate", lambda: {})
+    async def _find():
+        seen["discovery_calls"] += 1
+        return rows
+    d._find_grounded_fact_groups = _find
 
-    async def _find(ids, gate=None):
-        seen["anchored"].append(list(ids))
-        return (clusters, {})
-    d._find_anchored_clusters = _find
-
-    async def _consolidate(cs, gate=None, edge_stats=None):
-        seen["folded"].append(cs)
+    async def _consolidate(rs):
+        seen["folded"].append(rs)
     d._consolidate_clusters = _consolidate
 
     monkeypatch.setattr(cl, "_crun_record_idle",
@@ -307,20 +317,24 @@ def _cycle_daemon(monkeypatch, clusters):
 
 
 @pytest.mark.asyncio
-async def test_cycle_anchors_on_the_durable_backlog(monkeypatch):
-    d, seen = _cycle_daemon(monkeypatch, clusters=[])
+async def test_cycle_calls_discovery_when_the_durable_backlog_is_non_empty(monkeypatch):
+    d, seen = _cycle_daemon(monkeypatch, rows=[])
     d._backlog = [11, 12, 13]
     await d.run_consolidation_cycle()
-    assert seen["anchored"] == [[11, 12, 13]]
+    assert seen["discovery_calls"] == 1
 
 
 @pytest.mark.asyncio
-async def test_cycle_unions_requeued_ids_with_the_ledger(monkeypatch):
-    d, seen = _cycle_daemon(monkeypatch, clusters=[])
-    d._backlog = [11, 12]
+async def test_cycle_still_runs_when_only_requeued_ids_are_pending(monkeypatch):
+    """Requeued ids (from a fold that failed last cycle) still count toward
+    "is there anything to look at" even with an empty ledger backlog — the
+    union with pending_pg_ids that used to be threaded into the cluster-finder
+    query (pre-v2) now only ever feeds this go/no-go decision."""
+    d, seen = _cycle_daemon(monkeypatch, rows=[])
+    d._backlog = []
     d._requeue([12, 99])
     await d.run_consolidation_cycle()
-    assert seen["anchored"] == [[11, 12, 99]]
+    assert seen["discovery_calls"] == 1
 
 
 @pytest.mark.asyncio
@@ -329,14 +343,15 @@ async def test_no_cluster_run_does_not_consume_its_entry_points(monkeypatch):
     no-cluster path returned without requeueing (`_requeue` was exception-only),
     so a no-op run threw its entry points away and the facts behind them went
     unconsidered until some unrelated save happened to re-trigger the cycle.
-    The durable backlog cannot be consumed by a run that folded nothing."""
-    d, seen = _cycle_daemon(monkeypatch, clusters=[])
+    The durable backlog cannot be consumed by a run that folded nothing —
+    still true post-v2: a second empty pass still re-runs discovery."""
+    d, seen = _cycle_daemon(monkeypatch, rows=[])
     d._backlog = [11, 12, 13]
 
     await d.run_consolidation_cycle()
     await d.run_consolidation_cycle()
 
-    assert seen["anchored"] == [[11, 12, 13], [11, 12, 13]]
+    assert seen["discovery_calls"] == 2
     assert seen["folded"] == []
 
 
@@ -346,7 +361,7 @@ async def test_no_cluster_run_records_itself_as_idle(monkeypatch):
     only ever opened a run row when it had clusters to fold, so it recorded
     eligible_clusters=NULL forever; the health surface reads NULL as "no census"
     and falls back to a looser count, which reported the idle cycle as STALLED."""
-    d, seen = _cycle_daemon(monkeypatch, clusters=[])
+    d, seen = _cycle_daemon(monkeypatch, rows=[])
     d._backlog = [11, 12, 13]
     await d.run_consolidation_cycle()
     assert seen["idle"] == [("fact_consolidation", 0)]
@@ -354,16 +369,17 @@ async def test_no_cluster_run_records_itself_as_idle(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_folding_run_records_no_idle_row(monkeypatch):
-    d, seen = _cycle_daemon(monkeypatch, clusters=[{"entity": "E"}])
+    row = {"pg_id": 1, "content": "c", "project": "p", "domain": "d"}
+    d, seen = _cycle_daemon(monkeypatch, rows=[row])
     d._backlog = [11, 12, 13]
     await d.run_consolidation_cycle()
     assert seen["idle"] == []
-    assert seen["folded"] == [[{"entity": "E"}]]
+    assert seen["folded"] == [[row]]
 
 
 @pytest.mark.asyncio
 async def test_cycle_with_nothing_anchored_does_no_work(monkeypatch):
-    d, seen = _cycle_daemon(monkeypatch, clusters=[])
+    d, seen = _cycle_daemon(monkeypatch, rows=[])
     d._backlog = []
     await d.run_consolidation_cycle()
-    assert seen["anchored"] == [] and seen["idle"] == []
+    assert seen["discovery_calls"] == 0 and seen["idle"] == []
