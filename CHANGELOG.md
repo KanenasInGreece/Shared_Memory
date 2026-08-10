@@ -5,6 +5,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.69] — 2026-08-11
+
+### Changed — the payload stage (C4): what a summary actually carries
+
+- **A thematic summary is now a Zettelkasten index, not an LLM narrative.** Its content is a deterministic, zero-inference concatenation mapping each constituent fact to its tight summary text (REM's `rem_summary` where one exists, the fact's own content otherwise), embedded as one vector — a token-compressed key that retrieval hits to pull a dense context block. The thematic fold no longer calls the LLM at all; `generate_summary()` is removed with it.
+- **An insight is the causal chain over its ordered components — decisions AND retrospectives.** The synthesis input is strictly each judgement's own Title and Rationale, in the §2.4 deterministic order; confidence, alternatives, grounding edges and outcome renderings are excluded from the text and deferred to the graph walk via a stored, verbatim-runnable `cypher_query`. The dead rendering machinery for those excluded lines is removed.
+- **`summary_ids` — new, separate metadata field on insights**, holding the thematic-summary ids the insight rests on. It must never share `source_pg_ids` (the two id sequences overlap, and a summary id resolved against `technical_docs` renders a wrong provenance record silently); `source_pg_ids` remains judgement ids only. This is also the field the lineage cascade's third leg reads, which until now nothing wrote.
+- **`domains` on an insight is multi-valued** — the walk legitimately crosses domains, so an insight names every domain its judgements own. Read surfaces expose `domains` alongside a backward-compatible singular `domain`.
+- **An insight refold after a decision reversal now states what was reverted and why**, sourced from the ledger's own trigger provenance (the reversing retrospective's verdict), independent of the walk and gate.
+
+### Fixed
+
+- **A retrospective in an insight's reach was never marked `consolidated` in the graph.** The marking matched `Decision` nodes only, so feeding the full judgement reach through would have left every retrospective permanently "fresh" — re-gating the same insight forever. The marking now covers both labels, and the fold consumes the full ordered judgement reach the v0.8.66 gate already produced.
+- **The §2.5 'same' identity case now appends** the triggering thematic summary id and domain to the existing insight instead of silently skipping, so an unchanged judgement set still accumulates its references.
+
+---
+
 ## [0.8.68] — 2026-08-11
 
 ### Fixed — three defects in the lineage-supersession close paths, caught before their first live firing

@@ -182,6 +182,96 @@ def test_leg3_cascades_from_leg1_retired_summary_ids():
     assert leg3_params == ([50],)
 
 
+@pytest.mark.asyncio
+async def test_leg3_cascades_using_the_real_summary_ids_c4s_fold_actually_writes():
+    """Criterion F, end to end across BOTH modules — never exercised until
+    C4, because `summary_ids` did not exist as a written field before it.
+
+    Step 1: run the REAL `ConsolidationDaemon._fold_insight` (from
+    `test_insight_consolidation`'s own stub conventions) with
+    `summary_ids=[173]` and capture the ACTUAL JSON string it writes to
+    `community_summaries.metadata`.
+    Step 2: feed the `summary_ids` value FROM THAT REAL OUTPUT into a
+    StubConn simulating `fetch_invalidated_summaries`'s leg 3 (which reads
+    `jsonb_array_elements_text(metadata->'summary_ids')`), proving the exact
+    thing the fold writes is the exact thing leg 3 can find — not a
+    hand-typed approximation of either side.
+    """
+    import json as _json
+    from unittest.mock import AsyncMock, MagicMock
+
+    class _StubCursor:
+        def __init__(self, script, executed):
+            self._script, self.executed = script, executed
+            self._current = {"rowcount": 0, "rows": []}
+        def execute(self, sql, params=None):
+            self.executed.append((" ".join(sql.split()), params))
+            self._current = self._script.pop(0) if self._script else {"rowcount": 0, "rows": []}
+        def fetchall(self): return self._current["rows"]
+        def fetchone(self):
+            rows = self._current["rows"]
+            return rows[0] if rows else None
+        def __enter__(self): return self
+        def __exit__(self, *exc): return False
+
+    class _StubConn:
+        def __init__(self, script=None):
+            self._script, self.executed = script or [], []
+            self.commits = 0
+        def cursor(self): return _StubCursor(self._script, self.executed)
+        def commit(self): self.commits += 1
+        def rollback(self): pass
+
+    class _AsyncCtx:
+        def __init__(self, val): self._val = val
+        async def __aenter__(self): return self._val
+        async def __aexit__(self, *_): pass
+
+    daemon = ConsolidationDaemon()
+    daemon.driver = MagicMock()
+    daemon.driver.session = MagicMock(return_value=_AsyncCtx(MagicMock(
+        run=AsyncMock(return_value=MagicMock()))))
+    daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
+
+    fold_conn = _StubConn(script=[
+        {"rowcount": 2, "rows": [
+            (245, "Decision A\n\nrationale", "shared-memory-GitHub", "decision", {}),
+            (267, "Decision B\n\nrationale", "shared-memory-GitHub", "decision", {}),
+        ]},
+        {"rowcount": 0, "rows": []},                          # reversal leg 1
+        {"rowcount": 2, "rows": [(101,), (102,)]},             # outbox snapshot
+        {"rowcount": 1, "rows": [(77,)]},                      # INSERT
+        {"rowcount": 2, "rows": []},                           # outbox flip
+        {"rowcount": 0, "rows": []},                           # supersession SELECT
+        {"rowcount": 2, "rows": [(101, 245), (102, 267)]},     # close
+    ])
+    import os
+    os.environ["MOCK_LLM"] = "1"
+    try:
+        ok = await daemon._fold_insight(
+            fold_conn, "OutboxPattern", [245, 267], summary_ids=[173])
+    finally:
+        os.environ.pop("MOCK_LLM", None)
+    assert ok is True
+
+    insert_sql, insert_params = next(
+        (s, p) for s, p in fold_conn.executed if s.startswith("INSERT INTO community_summaries"))
+    written_meta = _json.loads(insert_params[1])
+    assert written_meta["summary_ids"] == [173]      # what the fold ACTUALLY wrote
+
+    # Step 2 — leg 3 with that REAL value as its trigger-match input. The
+    # fold wrote summary_ids=[173]; leg 1 must retire thematic summary 173
+    # specifically for leg 3 to fire on THIS insight.
+    leg_conn = StubConn(script=[
+        {"rowcount": 1, "rows": [(173, [900, 901], 3)]},                      # leg1 retires summary 173
+        {"rowcount": 0, "rows": []},                                            # leg2
+        {"rowcount": 1, "rows": [(77, written_meta["source_pg_ids"], 173)]}, # leg3 — insight 77 cites 173
+    ])
+    out = fetch_invalidated_summaries(leg_conn)
+    assert {"summary_id": 77, "source_pg_ids": [245, 267], "kind": "insight",
+           "trigger_kind": "community_summaries", "trigger_id": 173} in out
+
+
 # ── resolve_standing_ids ───────────────────────────────────────────────────────
 
 def test_resolve_standing_ids_empty_short_circuits():

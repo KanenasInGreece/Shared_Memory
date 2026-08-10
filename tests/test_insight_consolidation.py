@@ -1,11 +1,22 @@
-"""Unit tests for Phase 3a insight consolidation (decision pg_id 276).
+"""Unit tests for the insight fold (Dreaming Cycle Plan to v2, §2.2-§2.5,
+§3.2, §4.3 Path B — C2/C3/C4).
 
-NREM's second cluster path: decision clusters spanning ≥2 projects, grounded
-in a shared Fact via a non-mega-hub Entity, with at least one HAD_OUTCOME
-edge (existence — never rating valence). Insights are always-INSERT
-kind='insight' community_summaries; supersession is the dedup; the ledger's
-decision and retrospective rows flip to 'consolidated' transactionally with
-the insight and close (by row id) after the graph marking.
+C4 (this file's main subject): the fold is now JUDGEMENT-INCLUSIVE — a
+component's FULL ordered reach (decisions AND retrospectives), never
+decision-only. `source_pg_ids` on the written insight is exactly that
+judgement set (I9); the thematic summary(ies) it rests on live in the
+SEPARATE `summary_ids` field (§3.2); `domains`/`entities` are derived from
+the judgement rows themselves (multi-valued domains — the walk can cross
+domains); `cypher_query` defers graph depth to read time. The embedded TEXT
+is restricted to STRICTLY each judgement's own Title+Rationale (its `content`
+verbatim) — no confidence, no alternatives, no retrospective-evidence line,
+no grounding-edge line; all of that is deferred to the graph walk.
+
+Insights are always-INSERT kind='insight' community_summaries; supersession
+is the dedup; the ledger's decision and retrospective rows flip to
+'consolidated' transactionally with the insight and close (by row id) after
+the graph marking (now Decision OR Retrospective — criterion C, the PR #226
+seam fix).
 
 All Postgres/Neo4j/LLM I/O is stubbed — no live infrastructure required.
 """
@@ -17,15 +28,30 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
+# ⚠ Module reference captured HERE, at COLLECTION time — `test_rem_loop.py`
+# dynamically re-execs consolidation_loop.py and OVERWRITES
+# `sys.modules["consolidation_loop"]` at ITS OWN collection time (never
+# restored). A LOCAL `import consolidation_loop as cl` done later, inside a
+# test function body, would silently rebind to that swapped-in copy — a
+# DIFFERENT module object than the one `ConsolidationDaemon` below was
+# defined in, so monkeypatching it would patch the wrong module and the
+# daemon would fall through to REAL (module-global) functions / a REAL
+# `psycopg2.connect`. Every test in this file that needs to patch
+# module-level names uses THIS `cl`, never a fresh runtime import.
+import consolidation_loop as cl
 from consolidation_loop import (
     ConsolidationDaemon,
+    append_insight_references,
     close_ledger_rows_by_id,
+    fetch_active_insight_rows,
+    fetch_active_thematic_summary_id,
     fetch_insight_outbox_rows,
+    fetch_judgement_types,
     fetch_open_retro_decision_ids,
     fetch_refold_insights,
-    fetch_retro_records,
+    fetch_reversal_context,
     fetch_unreconciled_insights,
-    render_alternative_lines,
+    insight_cypher_query,
     supersede_covered_summaries,
     write_insight_summary,
 )
@@ -133,16 +159,18 @@ def test_open_retro_ids_excludes_pending_and_failed_rows():
     assert "status IN ('applied', 'rem_reviewed')" in sql
 
 
-# ── fetch_refold_insights ─────────────────────────────────────────────────────
+# ── fetch_refold_insights (C4: carries `metadata` for summary_ids/project) ────
 
 def test_refold_targets_active_insights_overlapping_retro_ids():
-    row = (70, "OutboxPattern", [245, 267], "old insight text")
+    row = (70, "OutboxPattern", [245, 267], "old insight text",
+           {"summary_ids": [12], "project": "shared-memory-GitHub"})
     conn = StubConn(script=[{"rowcount": 1, "rows": [row]}])
     assert fetch_refold_insights(conn, [245]) == [row]
     sql, params = conn.executed[0]
     assert "metadata->>'kind' = 'insight'" in sql
     assert "NOT superseded" in sql
     assert "source_pg_ids &&" in sql
+    assert "content, metadata" in sql
     assert params == ([245],)
 
 
@@ -171,49 +199,129 @@ def test_consumable_rows_empty_pg_ids_runs_no_query():
     assert conn.executed == []
 
 
-# ── fetch_retro_records (v2 authoritative content + grounding) ────────────────
+# ── fetch_judgement_types (C4 — per-id type for dead-letter key parity) ───────
 
-def test_fetch_retro_records_content_roles_and_kinds():
-    """Full notes come from Postgres; the reported role is the RELATION the
-    graph actually carries — an operator role maps through GROUNDING_ROLES
-    (based_on → GROUNDED_IN), a bare id gets the same fact_kind default the
-    write path used (a discussion grounds softly as INFORMED_BY) — so the
-    evidence line can never contradict the edge."""
-    conn = StubConn(script=[
-        {"rowcount": 1, "rows": [
-            (900, "full retro notes", [573, 574], {"573": "based_on"}),
-        ]},
-        {"rowcount": 2, "rows": [
-            (573, "tests/test_typed_grounding.py"),
-            (574, "discussion_context"),
-        ]},
-    ])
-    out = fetch_retro_records(conn, [900])
-    assert out[900]["content"] == "full retro notes"
-    assert (573, "grounded_in", "tested") in out[900]["grounded"]
-    assert (574, "informed_by", "discussion") in out[900]["grounded"]
+def test_fetch_judgement_types_maps_ids_to_declared_type():
+    conn = StubConn(script=[{"rowcount": 2, "rows": [(245, "decision"), (900, "retrospective")]}])
+    assert fetch_judgement_types(conn, [245, 900]) == {245: "decision", 900: "retrospective"}
 
 
-def test_fetch_retro_records_empty_ids_runs_no_query():
+def test_fetch_judgement_types_empty_runs_no_query():
     conn = StubConn()
-    assert fetch_retro_records(conn, []) == {}
+    assert fetch_judgement_types(conn, []) == {}
     assert conn.executed == []
 
 
-# ── _fetch_outcome_edges (dual-shape transition contract) ─────────────────────
+# ── fetch_active_insight_rows (C4 — id + set + metadata for §2.5) ────────────
 
-@pytest.mark.asyncio
-async def test_fetch_outcome_edges_reads_both_shapes():
-    """Legacy self-loop retros carry rating/date/notes as EDGE props; v2 edges
-    point at a :Retrospective node carrying them as NODE props. One query must
-    serve both during the transition, exposing retro_pg_id for v2 rows."""
-    daemon, session = daemon_with_fake_graph([FakeResult([])])
-    await daemon._fetch_outcome_edges([245])
-    query, _ = session.calls[0]
-    assert "CASE WHEN t:Retrospective" in query
-    assert "o.rating" in query and "t.rating" in query
-    assert "retro_pg_id" in query
-    assert "coalesce(t.rem_summary, t.content)" in query
+def test_active_insight_rows_returns_id_set_and_metadata():
+    conn = StubConn(script=[{"rowcount": 1, "rows": [
+        (70, [245, 267], {"summary_ids": [12], "domains": ["architecture"]}),
+    ]}])
+    out = fetch_active_insight_rows(conn)
+    assert out == [(70, {245, 267}, {"summary_ids": [12], "domains": ["architecture"]})]
+    sql, _ = conn.executed[0]
+    assert "metadata->>'kind' = 'insight'" in sql
+    assert "NOT superseded" in sql
+
+
+def test_active_insight_rows_null_metadata_defaults_to_empty_dict():
+    conn = StubConn(script=[{"rowcount": 1, "rows": [(70, [245], None)]}])
+    assert fetch_active_insight_rows(conn) == [(70, {245}, {})]
+
+
+# ── fetch_active_thematic_summary_id (C4) ─────────────────────────────────────
+
+def test_active_thematic_summary_id_query_contract():
+    conn = StubConn(script=[{"rowcount": 1, "rows": [(173,)]}])
+    assert fetch_active_thematic_summary_id(conn, "shared-memory-GitHub", "architecture") == 173
+    sql, params = conn.executed[0]
+    assert "kind', 'thematic') <> 'insight'" in sql
+    assert "NOT superseded" in sql
+    assert "level', 'entity') = %s" in sql
+    assert params == ("shared-memory-GitHub", "architecture", "domain")
+
+
+def test_active_thematic_summary_id_none_when_no_active_row():
+    conn = StubConn(script=[{"rowcount": 0, "rows": []}])
+    assert fetch_active_thematic_summary_id(conn, "p", "d") is None
+
+
+# ── append_insight_references (C4 — §2.5 identity 'same' case) ───────────────
+
+def test_append_insight_references_adds_new_summary_and_domain():
+    conn = StubConn(script=[
+        {"rowcount": 1, "rows": [({"summary_ids": [12], "domains": ["architecture"]},)]},
+        {"rowcount": 1, "rows": []},
+    ])
+    assert append_insight_references(conn, 70, 44, "infrastructure") is True
+    update_sql, params = conn.executed[1]
+    assert update_sql.startswith("UPDATE community_summaries SET metadata")
+    written = json.loads(params[0])
+    assert written["summary_ids"] == [12, 44]
+    assert written["domains"] == ["architecture", "infrastructure"]
+    assert params[1] == 70
+
+
+def test_append_insight_references_deduplicates():
+    conn = StubConn(script=[
+        {"rowcount": 1, "rows": [({"summary_ids": [12], "domains": ["architecture"]},)]},
+        {"rowcount": 1, "rows": []},
+    ])
+    append_insight_references(conn, 70, 12, "architecture")
+    _, params = conn.executed[1]
+    written = json.loads(params[0])
+    assert written["summary_ids"] == [12]
+    assert written["domains"] == ["architecture"]
+
+
+def test_append_insight_references_none_summary_id_only_appends_domain():
+    conn = StubConn(script=[
+        {"rowcount": 1, "rows": [({"summary_ids": [], "domains": []},)]},
+        {"rowcount": 1, "rows": []},
+    ])
+    append_insight_references(conn, 70, None, "infrastructure")
+    _, params = conn.executed[1]
+    written = json.loads(params[0])
+    assert written["summary_ids"] == []
+    assert written["domains"] == ["infrastructure"]
+
+
+def test_append_insight_references_returns_false_when_retired_meanwhile():
+    conn = StubConn(script=[{"rowcount": 0, "rows": []}])
+    assert append_insight_references(conn, 70, 12, "architecture") is False
+    assert len(conn.executed) == 1   # no UPDATE issued
+
+
+# ── fetch_reversal_context (criterion D) ──────────────────────────────────────
+
+def test_reversal_context_empty_when_no_open_ledger_row():
+    conn = StubConn(script=[{"rowcount": 0, "rows": []}])
+    assert fetch_reversal_context(conn, [201, 202]) == []
+    assert len(conn.executed) == 1   # second query short-circuits
+
+
+def test_reversal_context_finds_reverted_decision_and_its_retrospective():
+    conn = StubConn(script=[
+        {"rowcount": 1, "rows": [(199,)]},
+        {"rowcount": 1, "rows": [(199, "Old decision title", 900, "It failed under load")]},
+    ])
+    out = fetch_reversal_context(conn, [201, 202])
+    assert out == [{"decision_id": 199, "decision_title": "Old decision title",
+                    "retro_id": 900, "retro_content": "It failed under load"}]
+    sql1, params1 = conn.executed[0]
+    assert "status = 'open'" in sql1 and "summary_kind = 'insight'" in sql1
+    assert "trigger_kind = 'technical_docs'" in sql1
+    assert params1 == ([201, 202],)
+    sql2, _ = conn.executed[1]
+    assert "rating' = 'reversed'" in sql2
+    assert "COALESCE(d.superseded, false) = true" in sql2
+
+
+def test_reversal_context_empty_judgement_ids_runs_no_query():
+    conn = StubConn()
+    assert fetch_reversal_context(conn, []) == []
+    assert conn.executed == []
 
 
 # ── write_insight_summary ─────────────────────────────────────────────────────
@@ -361,9 +469,9 @@ _GATING_GROUP_ROWS = [
 async def test_fresh_insight_clusters_returns_shape_for_a_gating_group():
     """A (project, domain) group with 3 grounded facts (G1, DENSITY_THRESHOLD)
     whose walk reaches one fresh Decision and one fresh Retrospective (G2+G3)
-    yields exactly one component — returned with no entity anchor (I1) and
-    the decision-only ids `_fold_insight` can consume today (see the SEAM
-    note on `_find_fresh_insight_clusters`), plus the full judgement reach."""
+    yields exactly one component — returned with no entity anchor (I1),
+    both the decision-only view AND (C4) the full judgement reach plus a
+    per-id type map for the caller's dead-letter key."""
     daemon, session = daemon_with_fake_graph([
         FakeResult(_GATING_GROUP_ROWS),          # _find_grounded_fact_groups
         FakeResult([                              # walk layer 1 (the 3 facts)
@@ -381,6 +489,7 @@ async def test_fresh_insight_clusters_returns_shape_for_a_gating_group():
     assert cluster["projects"] == ["proj"]
     assert cluster["domain"] == "dom"
     assert cluster["judgement_ids"] == [201, 202]
+    assert cluster["judgement_types"] == {201: "Decision", 202: "Retrospective"}
     assert cluster["has_retrospective"] is True
     # The walk step query itself carries the closed relation set and the I10
     # exclusion — not the old entity/HAD_OUTCOME-existence gate.
@@ -415,27 +524,41 @@ async def test_generate_insight_mock_mode(monkeypatch):
     assert "OutboxPattern" in out and "2" in out
 
 
-# ── _fold_insight (stubbed end-to-end) ────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_generate_insight_mock_mode_echoes_reversal_lines(monkeypatch):
+    monkeypatch.setenv("MOCK_LLM", "1")
+    daemon, _ = daemon_with_fake_graph()
+    out = await daemon.generate_insight(
+        "OutboxPattern", ["[DECISION] a"],
+        reversal_lines=["Decision pg_id=199 (\"Old title\") was REVERTED. Reversing "
+                        "retrospective pg_id=900: it failed"])
+    assert "was REVERTED" in out and "it failed" in out
+
+
+# ── _fold_insight (stubbed end-to-end) — C4 judgement-inclusive rewrite ───────
 
 def _fold_script():
-    """Postgres responses in _fold_insight's execution order."""
+    """Postgres responses in _fold_insight's execution order (C4 shape)."""
     return [
-        # 1. decision content fetch
+        # 1. judgement content fetch — (id, content, project, type, metadata)
         {"rowcount": 2, "rows": [
-            (245, "Decision A\n\nrationale A", "shared-memory-GitHub", "high", ["alt A1", "alt A2"]),
-            (267, "Decision B\n\nrationale B", "tier3-cloe", None, None),
+            (245, "Decision A\n\nrationale A", "shared-memory-GitHub", "decision",
+             {"entities": ["OutboxPattern"]}),
+            (267, "Decision B\n\nrationale B", "shared-memory-GitHub", "decision", {}),
         ]},
-        # 2. fetch_insight_outbox_rows snapshot
+        # 2. fetch_reversal_context leg 1 (open ledger rows) — none
+        {"rowcount": 0, "rows": []},
+        # 3. fetch_insight_outbox_rows snapshot
         {"rowcount": 2, "rows": [(101,), (102,)]},
-        # 3. write_insight_summary INSERT
+        # 4. write_insight_summary INSERT
         {"rowcount": 1, "rows": [(77,)]},
-        # 4. write_insight_summary ledger flip
+        # 5. write_insight_summary ledger flip
         {"rowcount": 2, "rows": []},
-        # 5. supersession SELECT (id, source_pg_ids, level, kind) — PR 7 shape
+        # 6. supersession SELECT (id, source_pg_ids, level, kind) — PR 7 shape
         {"rowcount": 1, "rows": [(70, [245, 267], "entity", "insight")]},
-        # 6. supersession UPDATE
+        # 7. supersession UPDATE
         {"rowcount": 1, "rows": []},
-        # 7. close_ledger_rows_by_id DELETE
+        # 8. close_ledger_rows_by_id DELETE
         {"rowcount": 2, "rows": [(101, 245), (102, 267)]},
     ]
 
@@ -443,62 +566,117 @@ def _fold_script():
 @pytest.mark.asyncio
 async def test_fold_insight_full_path(monkeypatch):
     monkeypatch.setenv("MOCK_LLM", "1")
-    outcome = {"pg_id": 245, "rating": "good", "date": "2026-06-10",
-               "notes": "held under load"}
-    daemon, session = daemon_with_fake_graph([FakeResult([outcome])])
+    daemon, session = daemon_with_fake_graph()
+    daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
+    conn = StubConn(script=_fold_script())
+
+    assert await daemon._fold_insight(
+        conn, "OutboxPattern", [245, 267], summary_ids=[173],
+        project="shared-memory-GitHub") is True
+
+    sqls = [s for s, _ in conn.executed]
+    insert = next(s for s in sqls if s.startswith("INSERT INTO community_summaries"))
+    assert "ON CONFLICT" not in insert
+    # metadata carries the §3.2 contract
+    meta = json.loads(conn.executed[3][1][1])
+    assert meta["kind"] == "insight"
+    assert meta["project"] == "shared-memory-GitHub"           # singular, per §3.2
+    assert "projects" not in meta                                # old field is GONE
+    assert meta["domains"] == []                                  # no domain metadata on either row here
+    assert meta["entities"] == ["OutboxPattern"]
+    # ⛔ I9 — judgement pg_ids ONLY.
+    assert meta["source_pg_ids"] == [245, 267]
+    # ⛔ §3.2 — summary_ids is a SEPARATE field, caller-supplied here.
+    assert meta["summary_ids"] == [173]
+    assert "cypher_query" in meta and "245" in meta["cypher_query"]
+    # The ONLY Neo4j calls are the WRITE-side graph marking + SUPERSEDES edge
+    # after the Postgres commit (C4 removed the READ-side
+    # `_fetch_outcome_edges`/`_fetch_grounding_edges` the pre-C4 prompt
+    # used) — and the marking now matches EITHER label (criterion C, the
+    # PR #226 seam fix).
+    assert len(session.calls) == 2
+    mark_query, mark_params = session.calls[0]
+    assert "(d:Decision OR d:Retrospective)" in mark_query
+    assert mark_params["judgement_ids"] == [245, 267]
+    assert conn.commits == 3
+
+
+@pytest.mark.asyncio
+async def test_fold_insight_blocks_are_strictly_title_and_rationale(monkeypatch):
+    """§3.2 — the block for each judgement is its own content VERBATIM, with
+    NO confidence line, NO alternatives line, NO retrospective-outcome line,
+    NO grounding-edge line — all of that is gone from the pre-C4 prompt."""
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    daemon, session = daemon_with_fake_graph()
+    daemon.generate_insight = AsyncMock(
+        return_value="Decision A rationale A; Decision B rationale B.")
     daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
     conn = StubConn(script=_fold_script())
 
     assert await daemon._fold_insight(conn, "OutboxPattern", [245, 267]) is True
 
-    sqls = [s for s, _ in conn.executed]
-    insert = next(s for s in sqls if s.startswith("INSERT INTO community_summaries"))
-    assert "ON CONFLICT" not in insert
-    # metadata carries the insight contract
-    meta = json.loads(conn.executed[2][1][1])
-    assert meta["kind"] == "insight"
-    assert meta["source_pg_ids"] == [245, 267]
-    assert sorted(meta["projects"]) == ["shared-memory-GitHub", "tier3-cloe"]
-    # three commits: the read-tx close before the LLM call, the insight write
-    # tx, and the one inside close_ledger_rows_by_id.
-    assert conn.commits == 3
-    # graph marking ran: consolidated flags + kind='insight' summary node
-    mark_query = session.calls[-1][0]
-    assert "SET d.consolidated = true" in mark_query or "SUPERSEDES" in mark_query
+    blocks = daemon.generate_insight.call_args.args[1]
+    d245 = next(b for b in blocks if b.startswith("[DECISION pg_id=245"))
+    assert d245 == "[DECISION pg_id=245 project=shared-memory-GitHub]\nDecision A\n\nrationale A"
+    assert "CONFIDENCE" not in d245
+    assert "ALTERNATIVE" not in d245
+    assert "RETROSPECTIVE" not in d245
+    assert "GROUNDING" not in d245
+    # No Neo4j READ ran to build the blocks (C4 removed the outcome/
+    # grounding-edge fetches the pre-C4 prompt used) — only the write-side
+    # marking + SUPERSEDES edge after commit.
+    assert not any(
+        rel in q for q in (c[0] for c in session.calls)
+        for rel in ("HAD_OUTCOME", "GROUNDED_IN", "CONSIDERED", "REJECTED"))
 
 
 @pytest.mark.asyncio
-async def test_fold_insight_v2_retro_latest_full_older_compressed(monkeypatch):
-    """Latest-retrospective-as-current-verdict: the newest retro enters in FULL
-    (v2: authoritative notes from Postgres + an EVIDENCE line naming grounding
-    facts with role and derived kind); older retros compress to rating+date
-    history lines."""
+async def test_fold_insight_retrospective_block_labelled_and_ordered(monkeypatch):
+    """A retrospective in the judgement set gets its own [RETROSPECTIVE] block
+    (its content verbatim — retro-as-record), in ascending pg_id order
+    alongside the decision it evaluates — never folded into the decision's
+    own block."""
     monkeypatch.delenv("MOCK_LLM", raising=False)
-    outcomes = [
-        {"pg_id": 245, "rating": "pending", "date": "2026-06-01",
-         "notes": "older note", "retro_pg_id": None},          # legacy edge
-        {"pg_id": 245, "rating": "validated", "date": "2026-07-14",
-         "notes": "node snippet", "retro_pg_id": 900},         # v2 record
-    ]
-    daemon, session = daemon_with_fake_graph([FakeResult(outcomes)])
-    # The stubbed insight must carry the preservation anchors (decision title
-    # word + latest rating) or the stage-5 preservation gate rightly blocks it.
+    daemon, session = daemon_with_fake_graph()
     daemon.generate_insight = AsyncMock(
-        return_value="INSIGHT TEXT: Decision A/B validated under load.")
+        return_value="Decision A held under load; validated by the retrospective.")
     daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
     conn = StubConn(script=[
-        # 1. decision content fetch
         {"rowcount": 2, "rows": [
-            (245, "Decision A", "shared-memory-GitHub", None, None),
-            (267, "Decision B", "tier3-cloe", None, None),
+            (245, "Decision A\n\nrationale A", "shared-memory-GitHub", "decision", {}),
+            (900, "held under load", "shared-memory-GitHub", "retrospective", {}),
         ]},
-        # 2. fetch_retro_records — retro rows
-        {"rowcount": 1, "rows": [
-            (900, "full retro notes from postgres", [573], {"573": "based_on"}),
+        {"rowcount": 0, "rows": []},                       # reversal leg 1
+        {"rowcount": 2, "rows": [(101,), (102,)]},
+        {"rowcount": 1, "rows": [(77,)]},
+        {"rowcount": 2, "rows": []},
+        {"rowcount": 0, "rows": []},
+        {"rowcount": 2, "rows": [(101, 245), (102, 900)]},
+    ])
+
+    assert await daemon._fold_insight(conn, "OutboxPattern", [245, 900]) is True
+
+    blocks = daemon.generate_insight.call_args.args[1]
+    assert blocks[0].startswith("[DECISION pg_id=245")
+    assert blocks[1] == "[RETROSPECTIVE pg_id=900 project=shared-memory-GitHub]\nheld under load"
+
+
+@pytest.mark.asyncio
+async def test_fold_insight_domains_and_entities_union_across_judgements(monkeypatch):
+    """§3.2 domains — MULTI-VALUED: a judgement grounded in a different
+    domain than another still contributes its own domain to the union.
+    entities similarly union across every judgement's own list."""
+    monkeypatch.setenv("MOCK_LLM", "1")
+    daemon, _ = daemon_with_fake_graph()
+    daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
+    conn = StubConn(script=[
+        {"rowcount": 2, "rows": [
+            (245, "Decision A", "shared-memory-GitHub", "decision",
+             {"domain": "architecture", "entities": ["OutboxPattern"]}),
+            (267, "Decision B", "shared-memory-GitHub", "decision",
+             {"domain": "infrastructure", "entities": ["GPUPool"]}),
         ]},
-        # 3. fetch_retro_records — grounding facts' source_ref
-        {"rowcount": 1, "rows": [(573, "tests/test_typed_grounding.py")]},
-        # 4. snapshot, 5. insert, 6. flip, 7. supersession, 8. close
+        {"rowcount": 0, "rows": []},
         {"rowcount": 2, "rows": [(101,), (102,)]},
         {"rowcount": 1, "rows": [(77,)]},
         {"rowcount": 2, "rows": []},
@@ -507,24 +685,71 @@ async def test_fold_insight_v2_retro_latest_full_older_compressed(monkeypatch):
     ])
 
     assert await daemon._fold_insight(conn, "OutboxPattern", [245, 267]) is True
+    meta = json.loads(conn.executed[3][1][1])
+    assert meta["domains"] == ["architecture", "infrastructure"]
+    assert meta["entities"] == ["GPUPool", "OutboxPattern"]
 
-    blocks = daemon.generate_insight.call_args.args[1]
-    d245 = next(b for b in blocks if "pg_id=245" in b)
-    # Latest (v2): full authoritative notes + evidence, marked LATEST.
-    assert "LATEST] full retro notes from postgres" in d245
-    assert "[RETROSPECTIVE EVIDENCE] based on: fact 573 (tested, grounded_in)" in d245
-    assert "node snippet" not in d245           # capped node copy never used
-    # Older legacy retro: compressed to rating+date history.
-    assert "rating=pending date=2026-06-01] (earlier outcome" in d245
-    assert "older note" not in d245
+
+@pytest.mark.asyncio
+async def test_fold_insight_summary_ids_never_mixed_with_source_pg_ids(monkeypatch):
+    """⛔ I9 / §3.2 — the two id sequences must never be conflated: a
+    thematic summary id sitting inside source_pg_ids would resolve, e.g.,
+    summary 173 against technical_docs row 173 and render a WRONG
+    provenance record, silently."""
+    monkeypatch.setenv("MOCK_LLM", "1")
+    daemon, _ = daemon_with_fake_graph()
+    daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
+    conn = StubConn(script=_fold_script())
+
+    await daemon._fold_insight(conn, "OutboxPattern", [245, 267], summary_ids=[173])
+    meta = json.loads(conn.executed[3][1][1])
+    assert 173 not in meta["source_pg_ids"]
+    assert meta["source_pg_ids"] == [245, 267]
+    assert meta["summary_ids"] == [173]
+
+
+@pytest.mark.asyncio
+async def test_fold_insight_reversal_note_injected_and_anchored(monkeypatch):
+    """Criterion D — when this fold's constituents close an OPEN
+    refold_ledger row whose trigger was a reversed decision, the payload
+    must state what was reverted and why. Independent of the walk/gate."""
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    daemon, _ = daemon_with_fake_graph()
+    captured = {}
+    async def fake_generate_insight(entity, blocks, previous_insight=None,
+                                    corrective=None, reversal_lines=None):
+        captured["reversal_lines"] = reversal_lines
+        return ("Decision A holds. This supersedes the reverted decision "
+                "(\"Old decision title\") because it failed under load.")
+    daemon.generate_insight = fake_generate_insight
+    daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
+    conn = StubConn(script=[
+        {"rowcount": 2, "rows": [
+            (245, "Decision A\n\nrationale A", "shared-memory-GitHub", "decision", {}),
+            (267, "Decision B\n\nrationale B", "shared-memory-GitHub", "decision", {}),
+        ]},
+        {"rowcount": 1, "rows": [(199,)]},                                     # reversal leg 1
+        {"rowcount": 1, "rows": [(199, "Old decision title", 900,
+                                  "it failed under load")]},                  # reversal leg 2
+        {"rowcount": 2, "rows": [(101,), (102,)]},
+        {"rowcount": 1, "rows": [(77,)]},
+        {"rowcount": 2, "rows": []},
+        {"rowcount": 0, "rows": []},
+        {"rowcount": 2, "rows": [(101, 245), (102, 267)]},
+    ])
+
+    assert await daemon._fold_insight(conn, "OutboxPattern", [245, 267]) is True
+    assert captured["reversal_lines"]
+    assert "199" in captured["reversal_lines"][0]
+    assert "Old decision title" in captured["reversal_lines"][0]
+    assert "it failed under load" in captured["reversal_lines"][0]
 
 
 @pytest.mark.asyncio
 async def test_fold_insight_aborts_when_llm_fails(monkeypatch):
     # No insight → no Postgres write, ledger rows stay open (durable retry).
     monkeypatch.delenv("MOCK_LLM", raising=False)
-    outcome = {"pg_id": 245, "rating": "good", "date": "d", "notes": "n"}
-    daemon, _ = daemon_with_fake_graph([FakeResult([outcome])])
+    daemon, _ = daemon_with_fake_graph()
     daemon.generate_insight = AsyncMock(return_value=None)
     daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
     conn = StubConn(script=_fold_script())
@@ -533,21 +758,48 @@ async def test_fold_insight_aborts_when_llm_fails(monkeypatch):
 
     assert not any(s.startswith("INSERT INTO community_summaries")
                    for s, _ in conn.executed)
-    # Only the read-transaction close ran before the LLM aborted the fold.
+    # judgement fetch + reversal-context leg1 + outbox snapshot ran; the
+    # read-transaction commit is the only commit before the LLM aborted.
     assert conn.commits == 1
 
 
 @pytest.mark.asyncio
 async def test_fold_insight_skips_singleton_cluster(monkeypatch):
-    # Fewer than two source decisions found in Postgres → no fold (a solitary
-    # decision round-trip is pure duplication — decision 245).
+    # Fewer than two source judgements found in Postgres → no fold (a
+    # solitary judgement round-trip is pure duplication — decision 245).
     monkeypatch.setenv("MOCK_LLM", "1")
     daemon, _ = daemon_with_fake_graph()
-    conn = StubConn(script=[{"rowcount": 1, "rows": [(245, "Decision A", "p1")]}])
+    conn = StubConn(script=[{"rowcount": 1, "rows": [
+        (245, "Decision A", "p1", "decision", {})]}])
 
     assert await daemon._fold_insight(conn, "OutboxPattern", [245, 999]) is False
     assert len(conn.executed) == 1  # only the content fetch ran
     assert conn.commits == 0
+
+
+@pytest.mark.asyncio
+async def test_fold_insight_project_falls_back_to_mode_of_judgement_rows(monkeypatch):
+    """When the caller does not pass `project` explicitly (e.g. a re-fold
+    whose previous metadata carried none), fall back to the most common
+    project among the fetched judgement rows rather than leaving it blank."""
+    monkeypatch.setenv("MOCK_LLM", "1")
+    daemon, _ = daemon_with_fake_graph()
+    daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
+    conn = StubConn(script=[
+        {"rowcount": 2, "rows": [
+            (245, "Decision A", "shared-memory-GitHub", "decision", {}),
+            (267, "Decision B", "shared-memory-GitHub", "decision", {}),
+        ]},
+        {"rowcount": 0, "rows": []},
+        {"rowcount": 2, "rows": [(101,), (102,)]},
+        {"rowcount": 1, "rows": [(77,)]},
+        {"rowcount": 2, "rows": []},
+        {"rowcount": 0, "rows": []},
+        {"rowcount": 2, "rows": [(101, 245), (102, 267)]},
+    ])
+    await daemon._fold_insight(conn, "OutboxPattern", [245, 267])
+    meta = json.loads(conn.executed[3][1][1])
+    assert meta["project"] == "shared-memory-GitHub"
 
 
 # ── run_insight_cycle wiring (regression for the fresh-cluster call site) ──────
@@ -565,7 +817,6 @@ async def test_run_insight_cycle_calls_fold_with_compatible_signature(monkeypatc
     call site is wired. create_autospec enforces the real signature, so
     reintroducing an unexpected kwarg makes the call raise (swallowed),
     dropping await_count to 0 and failing this test."""
-    import consolidation_loop as cl
     from unittest.mock import create_autospec
 
     class _Conn(StubConn):
@@ -576,11 +827,14 @@ async def test_run_insight_cycle_calls_fold_with_compatible_signature(monkeypatc
     monkeypatch.setattr(cl, "fetch_unreconciled_insights", lambda conn: [])
     monkeypatch.setattr(cl, "fetch_open_retro_decision_ids", lambda conn: [])
     monkeypatch.setattr(cl, "fetch_refold_insights", lambda conn, ids: [])
+    monkeypatch.setattr(cl, "fetch_active_insight_rows", lambda conn: [])
+    monkeypatch.setattr(cl, "fetch_active_thematic_summary_id", lambda conn, p, d: None)
 
     daemon, _ = daemon_with_fake_graph()
     daemon._find_fresh_insight_clusters = AsyncMock(return_value=[
         {"entity": "OutboxPattern", "decision_ids": [245, 267],
-         "projects": ["shared-memory-GitHub", "tier3-cloe"]},
+         "judgement_ids": [245, 267], "judgement_types": {245: "Decision", 267: "Decision"},
+         "projects": ["shared-memory-GitHub"], "domain": "architecture"},
     ])
     daemon._fold_insight = create_autospec(daemon._fold_insight, return_value=True)
 
@@ -588,33 +842,103 @@ async def test_run_insight_cycle_calls_fold_with_compatible_signature(monkeypatc
 
     assert daemon._fold_insight.await_count == 1
     assert "projects" not in daemon._fold_insight.await_args.kwargs
+    assert daemon._fold_insight.await_args.args[2] == [245, 267]   # judgement_ids, not decision_ids
 
 
-# ── The fold prompt must not re-ambiguate what the capture surface preserved ──
-#
-# The write side stopped splitting alternatives on commas (v0.8.38). That is
-# only half the round trip: the fold prompt joined them back together with
-# "; ", and 138 of the 530 alternative entries in the corpus contain a
-# semicolon — so the model saw an entry boundary that was not one. Changing how
-# a value is WRITTEN is not finished until retrieval semantics are checked.
+@pytest.mark.asyncio
+async def test_run_insight_cycle_same_identity_appends_reference_not_a_new_fold(monkeypatch):
+    """§2.5 / criterion G — a fresh cluster whose judgement set exactly
+    matches an existing active insight's is NOT folded again; the
+    triggering thematic summary id and domain are appended to the existing
+    insight instead."""
 
-def test_each_alternative_gets_its_own_line():
-    out = render_alternative_lines(["first option", "second option"])
-    assert out.count("[DECISION ALTERNATIVE ") == 2
-    assert "1 of 2" in out and "2 of 2" in out
+    class _Conn(StubConn):
+        def close(self):
+            pass
+
+    # The main insight-cycle conn (the SELECT+UPDATE inside
+    # append_insight_references run against it, since run_insight_cycle
+    # calls that helper with its own outer `conn`). `_crun_start`/
+    # `_crun_finish`/`fetch_calibration_gate` each open their OWN throwaway
+    # connection (real code: a fresh `psycopg2.connect` per call) — give
+    # those an empty-scripted stub so they never consume THIS conn's script.
+    conn = _Conn(script=[
+        {"rowcount": 1, "rows": [({"summary_ids": [], "domains": ["architecture"]},)]},
+        {"rowcount": 1, "rows": []},   # UPDATE metadata
+    ])
+    first_connect = {"done": False}
+    def _connect(*a, **k):
+        if not first_connect["done"]:
+            first_connect["done"] = True
+            return conn
+        return _Conn()
+    monkeypatch.setattr(cl.psycopg2, "connect", _connect)
+    monkeypatch.setattr(cl, "fetch_unreconciled_insights", lambda c: [])
+    monkeypatch.setattr(cl, "fetch_open_retro_decision_ids", lambda c: [])
+    monkeypatch.setattr(cl, "fetch_refold_insights", lambda c, ids: [])
+    monkeypatch.setattr(cl, "fetch_active_insight_rows",
+                        lambda c: [(70, {245, 267}, {"summary_ids": [], "domains": []})])
+    monkeypatch.setattr(cl, "fetch_active_thematic_summary_id", lambda c, p, d: 44)
+
+    daemon, _ = daemon_with_fake_graph()
+    daemon._find_fresh_insight_clusters = AsyncMock(return_value=[
+        {"entity": "OutboxPattern", "decision_ids": [245, 267],
+         "judgement_ids": [245, 267], "judgement_types": {245: "Decision", 267: "Decision"},
+         "projects": ["shared-memory-GitHub"], "domain": "infrastructure"},
+    ])
+    daemon._fold_insight = AsyncMock(return_value=True)
+
+    await daemon.run_insight_cycle()
+
+    daemon._fold_insight.assert_not_awaited()
+    update_sql, params = next(
+        (s, p) for s, p in conn.executed
+        if s.startswith("UPDATE community_summaries SET metadata"))
+    written = json.loads(params[0])
+    assert written["summary_ids"] == [44]
+    assert written["domains"] == ["architecture", "infrastructure"]
 
 
-def test_an_alternative_containing_a_semicolon_is_not_split_by_the_render():
-    """The live shape: a real entry carrying its own semicolons must still
-    render as ONE line, or the fold reads it as several options."""
-    alt = "keep memory_bridge import (rejected: false coupling); keep direct psycopg2"
-    out = render_alternative_lines([alt])
-    assert out.count("[DECISION ALTERNATIVE ") == 1
-    assert alt in out
-    assert "1 of 1" in out
+@pytest.mark.asyncio
+async def test_run_insight_cycle_covered_identity_skips_without_appending(monkeypatch):
+    """A freshly-walked reach that is a STRICT SUBSET of an existing active
+    insight's reach ('covered', not in §2.5's LOCKED table — the walk only
+    ever grows in the documented scenario) is skipped with no write at
+    all — nothing new to add, and folding it would create a redundant
+    duplicate insight."""
+
+    class _Conn(StubConn):
+        def close(self):
+            pass
+
+    conn = _Conn()
+    monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: conn)
+    monkeypatch.setattr(cl, "fetch_unreconciled_insights", lambda c: [])
+    monkeypatch.setattr(cl, "fetch_open_retro_decision_ids", lambda c: [])
+    monkeypatch.setattr(cl, "fetch_refold_insights", lambda c, ids: [])
+    monkeypatch.setattr(cl, "fetch_active_insight_rows",
+                        lambda c: [(70, {245, 267, 999}, {})])
+
+    daemon, _ = daemon_with_fake_graph()
+    daemon._find_fresh_insight_clusters = AsyncMock(return_value=[
+        {"entity": "OutboxPattern", "decision_ids": [245],
+         "judgement_ids": [245], "judgement_types": {245: "Decision"},
+         "projects": ["shared-memory-GitHub"], "domain": "architecture"},
+    ])
+    daemon._fold_insight = AsyncMock(return_value=True)
+
+    await daemon.run_insight_cycle()
+
+    daemon._fold_insight.assert_not_awaited()
+    assert not any(s.startswith("UPDATE community_summaries") for s, _ in conn.executed)
 
 
-def test_absent_or_empty_alternatives_render_nothing():
-    assert render_alternative_lines(None) == ""
-    assert render_alternative_lines([]) == ""
-    assert render_alternative_lines(["", "  "]) == ""
+# ── insight_cypher_query (§3.2, pure) ─────────────────────────────────────────
+
+def test_insight_cypher_query_is_self_contained_and_deterministic():
+    q1 = insight_cypher_query([267, 245])
+    q2 = insight_cypher_query([245, 267])
+    assert q1 == q2                       # sorted — order-independent
+    assert "245" in q1 and "267" in q1
+    assert "Decision" in q1 and "Retrospective" in q1
+    assert "CONSIDERED" in q1 and "REJECTED" in q1 and "UNDER_CONDITIONS" in q1

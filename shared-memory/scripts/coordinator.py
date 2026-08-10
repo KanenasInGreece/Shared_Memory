@@ -121,7 +121,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.68"
+FRAMEWORK_VERSION = "0.8.69"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -5267,11 +5267,24 @@ class MemoryCoordinator:
             "ref": make_ref(actual, pg_id),
             "exists": True,
             "entity": meta.get("entity"),
-            "domain": meta.get("domain"),
+            # A thematic summary carries a single `domain`; an insight (C4,
+            # §3.2) carries MULTI-VALUED `domains` instead (the walk can
+            # legitimately cross domains). Expose both keys always — a
+            # thematic row's `domains` degrades to a one-element list built
+            # from its own `domain` so a caller can read either field
+            # uniformly regardless of record kind, and an insight row's
+            # `domain` stays present (its first `domains` entry, or None for
+            # an insight with none) rather than silently disappearing for a
+            # client that has not been updated to read the new field yet.
+            "domain": meta.get("domain") or (
+                (meta.get("domains") or [None])[0] if meta.get("domains") else None),
+            "domains": meta.get("domains") or (
+                [meta["domain"]] if meta.get("domain") else []),
             "created_at": row["created_at"].isoformat() if row["created_at"] else None,
             "superseded": row["superseded"],
             "run_id": row["run_id"],
             "source_pg_ids": list(row["source_pg_ids"] or []),
+            "summary_ids": meta.get("summary_ids") or [],
             "sources": [
                 {"pg_id": sid,
                  "record_type": src_types.get(sid),

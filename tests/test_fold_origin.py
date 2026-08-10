@@ -1,4 +1,5 @@
-"""fold_record_line — the per-record line the NREM thematic fold feeds the LLM,
+"""fold_record_line — the per-record line the NREM thematic fold concatenates
+into the §3.1 Zettelkasten index (C4: zero/low inference — no LLM call),
 differentiating each record by TYPE / evidential KIND / ORIGIN locus (decision
 916) / capture date. Pure; no infra. The origin locus threads through as a
 PROPERTY (decision 916), never a graph edge — so the fold can cite where a fact
