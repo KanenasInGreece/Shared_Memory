@@ -63,6 +63,11 @@ relationships:
 # Framework consolidation tuning (mechanism parameters, NOT domain vocabulary).
 # Operator-tunable, but they parametrise the immutable dream cycle — not the schema.
 consolidation:
-  density_threshold: 5           # min unconsolidated Facts per Entity hub to trigger synthesis
+  # v2 FACT GATE (Dreaming Cycle Plan to v2, §2.1): min grounded (GROUNDED_IN
+  # from a Decision/Retrospective), non-superseded Facts in one registered
+  # (project, domain) group to trigger a thematic synthesis. Recalibrated
+  # 5 -> 3 when the gate moved off entity hubs onto this axis (a smaller,
+  # sparser population by construction).
+  density_threshold: 3
   insight_threshold: 2           # min unconsolidated Decisions per shared grounded Entity to fold an insight
   alias_max_hops: 2              # bound on ALIASES component traversal

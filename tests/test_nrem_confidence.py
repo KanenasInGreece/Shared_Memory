@@ -212,72 +212,21 @@ def test_default_gate_is_fail_closed():
     assert OPERATOR_ASSERTED == ["operator", "system_default"]
 
 
-# ── Cluster finder Cypher carries the edge predicate + parameters ─────────────
-
-@pytest.mark.asyncio
-async def test_anchored_finder_edge_predicate_and_params_uncalibrated():
-    daemon, session = daemon_with_fake_graph(
-        [FakeResult([]), FakeResult([{"consumed": 0, "excluded": 3}])])
-    clusters, stats = await daemon._find_anchored_clusters([1, 2], _gate(entity=False))
-    assert clusters == []
-    query, params = session.calls[0]
-    # The consumable() mirror, parameterised — never literals.
-    assert ("(r.asserted_by IS NULL OR r.asserted_by IN $operator_asserted"
-            " OR ($entity_calibrated AND r.confidence >= $entity_threshold))") in query
-    assert params["operator_asserted"] == ["operator", "system_default"]
-    assert params["entity_calibrated"] is False          # uncalibrated → machine edges out
-    assert params["entity_threshold"] == rc.CONSUME_THRESHOLD[rc.FAMILY_ENTITY]
-    # The predicate gates the NEIGHBOR traversal (edges), never the component logic.
-    assert "MATCH (m)<-[r:" in query
-    assert "alias_component" in query                    # clustering semantics intact
-    # Follow-up cheap aggregate counts consumed vs excluded machine edges.
-    cquery, cparams = session.calls[1]
-    assert cparams["machine_asserted"] == ["rem", "rem_sweep"]
-    assert "sum(CASE WHEN $entity_calibrated AND r.confidence >= $entity_threshold" in cquery
-    assert stats == {"machine_edges_consumed": 0, "edges_awaiting_calibration": 3}
-
-
-@pytest.mark.asyncio
-async def test_anchored_finder_calibrated_params_pass_through():
-    daemon, session = daemon_with_fake_graph(
-        [FakeResult([]), FakeResult([{"consumed": 2, "excluded": 1}])])
-    gate = _gate(entity=True)
-    gate[rc.FAMILY_ENTITY]["threshold"] = 0.6
-    _clusters, stats = await daemon._find_anchored_clusters([1], gate)
-    _q, params = session.calls[0]
-    assert params["entity_calibrated"] is True
-    assert params["entity_threshold"] == 0.6
-    assert stats["machine_edges_consumed"] == 2
-    assert stats["edges_awaiting_calibration"] == 1
-
-
-@pytest.mark.asyncio
-async def test_anchored_finder_excluded_count_leaves_log_line(caplog):
-    daemon, _ = daemon_with_fake_graph(
-        [FakeResult([]), FakeResult([{"consumed": 0, "excluded": 5}])])
-    with caplog.at_level("INFO"):
-        await daemon._find_anchored_clusters([1], _gate())
-    assert any("5 machine-asserted edge(s) excluded" in m for m in caplog.messages)
-
-
-@pytest.mark.asyncio
-async def test_global_sweep_query_carries_edge_predicate(monkeypatch, caplog):
-    monkeypatch.setattr(cl, "fetch_calibration_gate", lambda: _gate(entity=False))
-    daemon, session = daemon_with_fake_graph(
-        [FakeResult([]), FakeResult([{"consumed": 0, "excluded": 4}])])
-    with caplog.at_level("INFO"):
-        await daemon.run_global_sweep()
-    query, params = session.calls[0]
-    assert ("(r.asserted_by IS NULL OR r.asserted_by IN $operator_asserted"
-            " OR ($entity_calibrated AND r.confidence >= $entity_threshold))") in query
-    assert params["operator_asserted"] == ["operator", "system_default"]
-    assert params["entity_calibrated"] is False
-    # non-destructive read + rem_processed guard unchanged
-    assert "coalesce(fact.rem_summary, fact.content)" in query
-    assert "rem_processed" in query
-    _cq, cparams = session.calls[1]
-    assert cparams["machine_asserted"] == ["rem", "rem_sweep"]
-    assert any("4 machine-asserted edge(s) excluded" in m for m in caplog.messages)
+# ── ⛔ REMOVED (v2, C1): the entity-hub/MENTIONS calibration-gated cluster
+# finder (`_find_anchored_clusters`) and `run_global_sweep`'s matching entity
+# Cypher no longer exist — the v2 FACT GATE (Dreaming Cycle Plan to v2, §2.1)
+# discovers on (project, domain) via GROUNDED_IN/DOMAIN_OF/PROJECT_OF, never
+# on an entity/MENTIONS hub, so there is no more entity-link edge predicate to
+# calibrate for this run type. The four tests that lived here
+# (`test_anchored_finder_edge_predicate_and_params_uncalibrated`,
+# `test_anchored_finder_calibrated_params_pass_through`,
+# `test_anchored_finder_excluded_count_leaves_log_line`,
+# `test_global_sweep_query_carries_edge_predicate`) asserted on that removed
+# Cypher and are removed with it. `_find_grounded_fact_groups` (the v2
+# discovery method) and I1/I2/I8 are covered in test_nrem_axis_levels.py.
+# `relation_confidence`'s own semantics (consumable/write_admitted, tested
+# above) are untouched — they still gate the INSIGHT path's grounding-edge
+# rendering (`_fold_insight`, tested below).
 
 
 # ── preservation_anchor / summary_preserves (pure) ────────────────────────────
@@ -642,45 +591,51 @@ async def test_grounding_excluded_edges_leave_log_line(monkeypatch, caplog):
 def _thematic_conn_script(insert_id=90):
     d = datetime.date(2026, 7, 11)
     return [
-        # 1. _fetch_records — PR 7 shape:
-        #    (id, project, type, source_ref, created_at::date, metadata)
-        #    The trailing metadata blob is what the SECTION axis is resolved
-        #    from (domain_axis.resolve_domains); the second column is the
-        #    PROJECT, which this query always returned even when the variable
-        #    holding it was called `domain`.
+        # 1. _fetch_records — (id, project, type, source_ref, created_at::date,
+        #    metadata). The trailing metadata blob is what the SECTION axis
+        #    used to be resolved from for record kind/date bookkeeping; project/
+        #    domain for GATE PARTITIONING now come from `_ROWS` itself (v2, C1)
+        #    — this query only feeds `record_map` (kind/rtype/date), never the
+        #    (project, domain) grouping.
         {"rowcount": 2, "rows": [
             (1, "general", "fact", "tests/test_x.py", d, {}),
             (2, "general", "fact", None, d, {}),
         ]},
-        # 2. registered sections (PR 7) — (project, section) pairs from the
-        #    domain registry. EMPTY here on purpose: with no registered section
-        #    no domain-level cluster can form (P16), so these tests keep
-        #    exercising the entity-level preservation gate they were written for.
-        {"rowcount": 0, "rows": []},
-        # 3. coverage census — _fetch_outbox_created_at over the work items'
-        #    pg_ids (own-conn SELECT, so it lands on this same stub)
+        # 2. coverage census — _fetch_outbox_created_at over the work items'
+        #    pg_ids (own-conn SELECT, so it lands on this same stub). ⛔ v2, C1:
+        #    the OLD "registered sections" Postgres query that used to sit here
+        #    is GONE — `registered_sections` is now derived from `_ROWS` itself
+        #    (the graph-native GROUNDED_IN/DOMAIN_OF/PROJECT_OF walk already
+        #    proved registration before these rows ever reached Python), so
+        #    there is one fewer round-trip in this script than before.
         {"rowcount": 2, "rows": []},
         # 3. fold dead-letter counts (own-conn SELECT; empty → no dead-lettering)
         {"rowcount": 0, "rows": []},
-        # 3. previous summary fetch
+        # 4. previous summary fetch
         {"rowcount": 0, "rows": []},
-        # 4. summary INSERT  5. outbox flip  6. supersession SELECT
+        # 5. summary INSERT  6. outbox flip  7. supersession SELECT
         {"rowcount": 1, "rows": [(insert_id,)]},
         {"rowcount": 2, "rows": []},
         {"rowcount": 0, "rows": []},
-        # 7. close_ledger_rows DELETE  8. superseded-predecessor purge
+        # 8. close_ledger_rows DELETE  9. superseded-predecessor purge
         {"rowcount": 2, "rows": [(11, 1), (12, 2)]},
         {"rowcount": 0, "rows": []},
     ]
 
 
-_CLUSTER = {
-    "entity": "TestEntity",
-    "aliases": ["TestEntity"],
-    "contents": ["The consolidation daemon writes summaries",
-                 "The outbox worker applies rows"],
-    "pg_ids": [1, 2],
-}
+# v2 FACT GATE (C1): _consolidate_clusters now takes the FLAT rows
+# `_find_grounded_fact_groups` returns — no more entity-cluster shape
+# (`{"entity":, "aliases":, "contents":, "pg_ids":}`). project="general",
+# domain="ops" is an arbitrary REGISTERED-looking (project, domain) pair —
+# `eligible_domain_level_clusters` no longer needs a separate registry stub
+# to accept it, because `_consolidate_clusters` derives `registered_sections`
+# from these SAME rows.
+_ROWS = [
+    {"pg_id": 1, "content": "The consolidation daemon writes summaries",
+     "project": "general", "domain": "ops"},
+    {"pg_id": 2, "content": "The outbox worker applies rows",
+     "project": "general", "domain": "ops"},
+]
 
 
 def _wire_thematic(monkeypatch, daemon, conn, finish):
@@ -708,7 +663,7 @@ async def test_preservation_retry_succeeds_with_corrective_prompt(monkeypatch):
         "The consolidation daemon; the outbox worker applies rows.",   # corrective pass
     ])
 
-    await daemon._consolidate_clusters([_CLUSTER], gate=_gate())
+    await daemon._consolidate_clusters(_ROWS)
 
     assert daemon.generate_summary.await_count == 2
     retry_kwargs = daemon.generate_summary.call_args_list[1].kwargs
@@ -746,7 +701,7 @@ async def test_preservation_second_retry_recovers_what_first_missed(monkeypatch)
         "The consolidation daemon; the outbox worker applies rows.",  # retry 2 — recovers
     ])
 
-    await daemon._consolidate_clusters([_CLUSTER], gate=_gate())
+    await daemon._consolidate_clusters(_ROWS)
 
     assert daemon.generate_summary.await_count == 3
     assert any(s.startswith("INSERT INTO community_summaries") for s, _ in conn.executed)
@@ -769,9 +724,7 @@ async def test_preservation_double_failure_requeues_and_blocks_tier3(monkeypatch
         "Nothing relevant at all.", "Still nothing relevant.", "Still nothing at all."])
 
     with caplog.at_level("INFO"):
-        await daemon._consolidate_clusters([_CLUSTER], gate=_gate(),
-                                           edge_stats={"machine_edges_consumed": 1,
-                                                       "edges_awaiting_calibration": 3})
+        await daemon._consolidate_clusters(_ROWS)
 
     # no Tier-3 write, no graph marking
     assert not any(s.startswith("INSERT INTO community_summaries") for s, _ in conn.executed)
@@ -787,11 +740,13 @@ async def test_preservation_double_failure_requeues_and_blocks_tier3(monkeypatch
     # Content-derived dead-letter key (decision 882), not the display label —
     # sorted qualified refs over the cluster's own pg_ids ([1, 2]).
     assert extra["preservation_failed"] == ["fact:1,fact:2"]
-    assert extra["edges_awaiting_calibration"] == 3
-    assert extra["machine_edges_consumed"] == 1
-    assert extra["calibration"] == {"entity_relation": False, "evidential": False}
+    # v2, C1: the fact gate no longer traverses MENTIONS/entity-link edges, so
+    # there is no calibration snapshot for this run type any more — the two
+    # counters default to 0 and the `calibration` key is absent (never set).
+    assert extra["edges_awaiting_calibration"] == 0
+    assert extra["machine_edges_consumed"] == 0
+    assert "calibration" not in extra
     assert any("Preservation gate FAILED after 2 corrective retries" in m for m in caplog.messages)
-    assert any("edges_awaiting_calibration=3" in m for m in caplog.messages)
 
 
 @pytest.mark.asyncio
@@ -835,23 +790,25 @@ async def test_mock_llm_thematic_fold_passes_preservation_gate(monkeypatch):
     finish = {}
     _wire_thematic(monkeypatch, daemon, conn, finish)
 
-    await daemon._consolidate_clusters(
-        [_CLUSTER], gate=_gate(),
-        edge_stats={"machine_edges_consumed": 0, "edges_awaiting_calibration": 0})
+    await daemon._consolidate_clusters(_ROWS)
 
     insert = next(p for s, p in conn.executed
                   if s.startswith("INSERT INTO community_summaries"))
-    assert "Mocked Summary for TestEntity" in insert[0]
-    # anchors echoed → the gate passed with zero retries
-    extra = finish["kwargs"]["extra"]
-    assert extra["preservation_retries"] == 0
-    assert extra["preservation_failures"] == 0
+    # v2, C1: topic is f"{project}/{section}" — there is no more entity, so
+    # MOCK_LLM's echo names the (project, domain) axis instead.
+    assert "Mocked Summary for general/ops" in insert[0]
+    # anchors echoed → the gate passed with zero retries. v2, C1: the fact
+    # gate no longer fetches a calibration gate, so a clean run (nothing
+    # retried, nothing failed) leaves EVERY Stage-5 counter at its zero
+    # default — _CycleRec.extra()'s own contract is None in that case ("byte-
+    # identical to pre-stage-5 ledger"), not an empty dict.
+    assert finish["kwargs"]["extra"] is None
     assert finish["args"][2:5] == (1, 1, 0)
     # Coverage census: the fact path recorded eligible_clusters=NULL on EVERY
     # run, and NULL is not "no data" to the health surface — it is the trigger
     # for a looser fallback backlog, so a correctly-idle fact_consolidation was
     # reported STALLED against a predicate it does not fold on. The count is the
-    # post-(entity,domain)-split work items, i.e. the gate actually folded.
+    # post-(project,domain)-gate work items, i.e. the gate actually folded.
     assert finish["kwargs"]["eligible_clusters"] == 1
     # graph marking ran
     assert any("consolidated = true" in q for q, _ in session.calls)
@@ -993,7 +950,7 @@ async def test_thematic_truncated_summary_off_gate_not_written(monkeypatch):
         return ""     # falsy draft on a length-finish
     daemon.generate_summary = _truncated_summary
 
-    await daemon._consolidate_clusters([_CLUSTER], gate=_gate())
+    await daemon._consolidate_clusters(_ROWS)
 
     assert not any(s.startswith("INSERT INTO community_summaries") for s, _ in conn.executed)
     extra = finish["kwargs"]["extra"]
@@ -1025,7 +982,7 @@ async def test_fold_key_counted_once_when_corrective_retry_truncates(monkeypatch
         return ""
     daemon.generate_summary = _summary
 
-    await daemon._consolidate_clusters([_CLUSTER], gate=_gate())
+    await daemon._consolidate_clusters(_ROWS)
 
     extra = finish["kwargs"]["extra"]
     # fetch_fold_dead_letter_counts sums these two arrays, so their combined

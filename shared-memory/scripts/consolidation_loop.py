@@ -105,15 +105,23 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "local-model")
 IDLE_THRESHOLD_SEC = int(os.environ.get("NREM_IDLE_THRESHOLD_SEC", "900"))
 MAX_DEFERRAL_SEC = IDLE_THRESHOLD_SEC * 3
 DENSITY_THRESHOLD = ONT.density_threshold
-# Domain-level fold (plan PR 7): (project, section) with no entity required.
-# Defaults to the same density as entity-level so one knobs stays coherent;
-# lower temporarily for a live one-shot verification, then restore.
+# ⛔ LEGACY (pre-v2). The v2 FACT GATE (plan §2.1) has ONE density knob —
+# ONT.density_threshold, used directly by ``_consolidate_clusters`` — not a
+# second env-tunable one. Kept only because coordinator.py's
+# ``_nrem_cycle_counts`` still imports it for the pre-v2 telemetry split (see
+# the block comment above ``eligible_entity_level_clusters``).
 NREM_DOMAIN_THRESHOLD = int(os.environ.get("NREM_DOMAIN_THRESHOLD",
                                            str(DENSITY_THRESHOLD)))
-# Fold summary levels — also the P12 supersession scope and metadata.level values.
+# Fold summary levels — also the P12 supersession scope and metadata.level
+# values. LEVEL_ENTITY is no longer PRODUCED by any fold (v2, C1) but stays
+# defined: legacy 'entity'-level community_summaries rows (Xenofon's ruling —
+# left as archive, untouched, see HANDOFF.md) still need it for ledger
+# reconciliation (`fetch_unreconciled`'s COALESCE default) and generic
+# graph-marking defaults (`_mark_consolidated_in_graph`).
 LEVEL_ENTITY = "entity"
 LEVEL_DOMAIN = "domain"
-# Empty section key for P15 (domain-less facts still fold on project + entity).
+# Empty section key — used as a display/graph-property fallback wherever a
+# section name could be blank (legacy rows; SECTION_NONE display fallback).
 SECTION_NONE = ""
 # How often the daemon re-reads the DURABLE eligibility predicate (the
 # rem_reviewed outbox backlog). Due-ness is a property of that ledger, not of
@@ -897,6 +905,30 @@ def evidential_kind_for_record(rtype, source_ref, grounding_kinds=None):
     return fact_kind_from_source_ref(source_ref)
 
 
+# ── ⛔ LEGACY — ORPHANED FROM THE FOLD as of the v2 FACT GATE (Dreaming Cycle
+# Plan to v2, §2.1; C1) ─────────────────────────────────────────────────────
+# The four functions below (`eligible_entity_level_clusters`,
+# `eligible_domain_level_clusters`, `eligible_domain_clusters`,
+# `count_entity_level_cycles`, `count_domain_level_cycles`) implemented the
+# PRE-v2 two-level design: an entity-hub (MENTIONS) level and a project-only
+# level (the historical `domain_map` == PROJECT squat this module's own
+# docstrings warn about). §2.1 is explicit — "There is NO project level and NO
+# entity level" — so `_consolidate_clusters` no longer calls
+# `eligible_entity_level_clusters` or `eligible_domain_clusters` AT ALL; the
+# fold now discovers its population via `_find_grounded_fact_groups` (graph-
+# native PROJECT_OF/DOMAIN_OF walk from GROUNDED_IN) and partitions it with
+# `eligible_domain_level_clusters` ONLY — see `_consolidate_clusters` below.
+#
+# ⛔ THESE FOUR NAMES ARE KEPT, UNCHANGED, SOLELY BECAUSE `coordinator.py` still
+# imports them: `_count_domain_cycles` (coordinator.py:1035-1044, itself dead —
+# no caller besides its own test) and `_nrem_cycle_counts`
+# (coordinator.py:6039-6158, LIVE — feeds `GET /memory/telemetry`'s `nrem` key
+# and the I7 stall-verdict read at coordinator.py:5757) both still describe the
+# pre-v2 two-level rule and report `entity_level_cycles`/`domain_level_cycles`
+# that the fold can no longer produce. `coordinator.py` is out of scope for
+# this branch (owned by a parallel Track B/C builder this cycle) — deleting
+# these names would break that file's imports and its own tests
+# (`tests/test_domain_clusters.py`). ESCALATED to Opus; see HANDOFF.md.
 def eligible_entity_level_clusters(contents, pg_ids, project_map, domains_map,
                                    threshold):
     """Partition one entity hub's facts by (project, section) for entity-level folds.
@@ -942,12 +974,19 @@ def eligible_entity_level_clusters(contents, pg_ids, project_map, domains_map,
 
 def eligible_domain_level_clusters(contents, pg_ids, project_map, domains_map,
                                    threshold, registered_sections):
-    """Domain-level folds: (project, section) with **no** entity (P16).
+    """✅ THE v2 FACT GATE PARTITIONER (plan §2.1) — the only one
+    ``_consolidate_clusters`` calls. (project, section) with **no** entity —
+    exactly the plan's anchor: "(project, domain), and nothing else."
 
     Pure. Only **registered** non-empty sections form buckets — an unregistered
     or blank section never qualifies. ``registered_sections`` is a set of
-    ``(project_name, section_name)`` pairs from the project_domains registry
-    (joined to projects.name). Fan-out as entity-level.
+    ``(project_name, section_name)`` pairs. ``_consolidate_clusters`` derives
+    it from the SAME graph rows ``_find_grounded_fact_groups`` already proved
+    registered (a DOMAIN_OF/PROJECT_OF edge only exists for a registered
+    section — coordinator.py's ``_domain_identities`` never writes one
+    otherwise), so this is a second, cheap confirmation rather than a second
+    source of truth. Fan-out: a fact tagged with several sections counts in
+    each bucket, not just one.
 
     Returns list of ``((project, section), contents, pg_ids)``.
     """
@@ -978,11 +1017,12 @@ def eligible_domain_level_clusters(contents, pg_ids, project_map, domains_map,
 
 
 def eligible_domain_clusters(contents, pg_ids, domain_map, threshold):
-    """Backward-compatible wrapper: ``domain_map`` historically held the PROJECT.
-
-    New code should call ``eligible_entity_level_clusters`` with an explicit
-    domains_map. This wrapper treats every fact as domain-less (P15 only) so
-    existing tests that only exercised the project half keep a clear meaning.
+    """⛔ LEGACY — this is the PROJECT-ONLY level §2.1 forbids ("There is NO
+    project level"). ``domain_map`` historically held the PROJECT (the naming
+    trap this module's docstrings warn about). Not called by the fold; kept
+    only because ``tests/test_domain_clusters.py`` and coordinator.py's
+    ``_count_domain_cycles`` still exercise it — see the block comment above
+    ``eligible_entity_level_clusters``.
     """
     project_map = domain_map
     domains_map = {pid: [] for pid in pg_ids}
@@ -995,7 +1035,9 @@ def eligible_domain_clusters(contents, pg_ids, domain_map, threshold):
 
 
 def count_entity_level_cycles(pg_ids, project_map, domains_map, threshold):
-    """Telemetry twin of eligible_entity_level_clusters — count only. Pure."""
+    """⛔ LEGACY telemetry twin of the removed entity level — see the block
+    comment above ``eligible_entity_level_clusters``. Not called by the fold;
+    kept only for coordinator.py's ``_nrem_cycle_counts``/``_count_domain_cycles``."""
     # Reuse the partitioner with dummy contents so the rule cannot drift.
     contents = [""] * len(pg_ids)
     return len(eligible_entity_level_clusters(
@@ -1004,7 +1046,12 @@ def count_entity_level_cycles(pg_ids, project_map, domains_map, threshold):
 
 def count_domain_level_cycles(pg_ids, project_map, domains_map, threshold,
                               registered_sections):
-    """Telemetry twin of eligible_domain_level_clusters — count only. Pure."""
+    """⛔ LEGACY telemetry twin — same partitioner the v2 fold still uses, but
+    THIS caller (coordinator.py's ``_nrem_cycle_counts``) still runs it against
+    a Postgres-metadata-derived population, not the graph-native GROUNDED_IN
+    walk ``_find_grounded_fact_groups`` now uses. The fold itself no longer
+    calls this counting wrapper — see the block comment above
+    ``eligible_entity_level_clusters``."""
     contents = [""] * len(pg_ids)
     return len(eligible_domain_level_clusters(
         contents, pg_ids, project_map, domains_map, threshold,
@@ -2068,134 +2115,89 @@ class ConsolidationDaemon:
         self.first_notification_time = None
 
         try:
-            # Calibration BEFORE cluster assessment (stage 5): one ledger fetch
-            # per pass, threaded into the cluster finder's edge predicate.
-            loop = asyncio.get_running_loop()
-            gate = await loop.run_in_executor(None, fetch_calibration_gate)
-            clusters, edge_stats = await self._find_anchored_clusters(ids_to_process, gate)
+            rows = await self._find_grounded_fact_groups()
 
-            if not clusters:
+            if not rows:
                 logger.info(
-                    "No rem_processed clusters found among %d rem_reviewed facts "
-                    "(density_threshold=%d). NREM waits for REM enrichment — "
-                    "expected on fresh install or upgrade. "
-                    "REM processes %d facts every ~120s; check 'rem_daemon' in /health.",
-                    len(ids_to_process), DENSITY_THRESHOLD, 5,
+                    "No grounded (project, domain) group meets density_threshold=%d "
+                    "among the current backlog of %d rem_reviewed fact(s). NREM waits "
+                    "for a Decision/Retrospective to GROUND_IN enough facts of one "
+                    "registered section — check 'rem_daemon' in /health for REM "
+                    "enrichment progress.",
+                    DENSITY_THRESHOLD, len(ids_to_process),
                 )
                 # Say so on the record: an unrecorded idle run is read as a
                 # stall by the health surface (see _crun_record_idle).
+                loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     None, lambda: _crun_record_idle("fact_consolidation"))
                 return
 
-            await self._consolidate_clusters(clusters, gate=gate, edge_stats=edge_stats)
+            await self._consolidate_clusters(rows)
 
         except Exception as e:
             # Nothing to re-queue — the entry points came from the durable
             # ledger and are still there for the next pass.
             logger.error(f"Consolidation cycle failed: {str(e)}")
 
-    async def _find_anchored_clusters(self, ids, gate=None):
-        """Entity clusters reachable from the given fact pg_ids that meet the
-        density gate — shared by the event-driven cycle and the ledger sweep.
-        Returns (clusters, edge_stats) where edge_stats counts the machine-
-        asserted entity-link edges the calibration gate consumed vs excluded.
+    async def _find_grounded_fact_groups(self):
+        """✅ THE v2 FACT GATE'S DISCOVERY STEP (plan §2.1, §4.2 NREM Path A).
 
-        ADR-017: clusters are keyed on the ALIAS COMPONENT, not the bare entity.
-        Entities sharing an `alias_component` (stamped by REM via gds.wcc over the
-        soft ALIASES edges) fold as ONE cluster, so fragmented surface forms
-        (coordinator/Coordinator) clear the density threshold together instead of
-        each falling short. The canonical (cluster key) is the lexicographically
-        smallest member name — deterministic, so the (entity,domain) summary key is
-        stable across cycles; `aliases` carries every surface form for the summary's
-        JSON record + lexical match. No-op-safe: with no ALIASES edges every entity
-        has a null alias_component → it is its own component (keyed by elementId) →
-        identical to the prior exact-name behaviour.
+        Replaces the old entity-hub (MENTIONS) traversal — there is no more
+        entity level and no more project-only level (§2.1: "NO project level
+        and NO entity level"). Discovery is now graph-native on the SPINE axis
+        chain the plan names explicitly:
 
-        Stage 5: the entity-link traversal carries an EDGE PREDICATE — the Cypher
-        mirror of relation_confidence.consumable() (the Python function is the
-        SOURCE OF TRUTH; keep the two in agreement). Legacy edges (no asserted_by,
-        era-gated, never purged) and operator/system_default edges always
-        traverse; machine-asserted edges only when the entity family is
-        calibrated AND confidence clears the family threshold (null confidence
-        never passes — `>=` on null is not true). The gate filters EDGES only;
-        alias-component clustering semantics are unchanged.
+            (:Decision|:Retrospective)-[:GROUNDED_IN]->(:Fact)
+                -[:DOMAIN_OF]->(:Domain)-[:PROJECT_OF]->(:Project)
+
+        A fact counts once it is the target of >=1 GROUNDED_IN edge from any
+        judgement (§0's "grounded fact") and is itself non-superseded — the
+        exact §2.1 MEMBERSHIP rule. A fact's own `consolidated` flag plays NO
+        part here (also §2.1): a `community_summaries` row for a (project,
+        domain) group is a single upserted key, so every re-fold must see the
+        group's FULL current membership, never a delta — an already-folded
+        fact must keep counting toward the next re-fold of its group.
+
+        `Domain`/`Project` nodes and their edges exist ONLY for a REGISTERED
+        section: coordinator.py's `_domain_identities` never writes a
+        DOMAIN_OF edge for a name the registry cannot resolve. So edge
+        presence alone already proves BOTH axes registered — no separate
+        Postgres registry lookup is needed to satisfy that half of §2.1.
+
+        Unlike the old per-call `ids` restriction, this is always a full scan:
+        a group's density must be judged on its WHOLE population, not on
+        whichever facts happened to trigger this pass, so partial-population
+        discovery would silently under- or over-count. The corpus this scan
+        runs over is small (order 10^2 grounded facts) and this is a single
+        cheap read query — the event cycle, the ledger sweep and the global
+        sweep all now call this SAME method (see run_ledger_sweep /
+        run_global_sweep below), collapsing what used to be three
+        semi-duplicated entity Cypher blocks into one.
+
+        Returns a flat list of rows — one per (fact, domain) pair (a fact
+        tagged with several registered sections fans out, matching
+        `eligible_domain_level_clusters`' existing fan-out rule):
+        ``{"pg_id", "content", "project", "domain"}``. `_consolidate_clusters`
+        aggregates these into project/domain maps and calls
+        `eligible_domain_level_clusters` — the SAME partitioner already proven
+        for the (project, section) gate — to apply the density threshold.
         """
-        gate = gate or _default_calibration_gate()
-        egate = gate[rc_conf.FAMILY_ENTITY]
-        rels = f"{ONT.entity_link_alias}|{ONT.entity_link}"
-        # Cypher mirror of relation_confidence.consumable() — source of truth is
-        # the Python function; see the module-level calibration-gate section.
-        edge_pred = (
-            "(r.asserted_by IS NULL OR r.asserted_by IN $operator_asserted"
-            " OR ($entity_calibrated AND r.confidence >= $entity_threshold))"
-        )
         async with self.driver.session() as session:
             result = await session.run(
-                f"MATCH (f:{ONT.fact}) WHERE f.pg_id IN $ids"
-                f" MATCH (f)-[:{rels}]->(e0:{ONT.entity})"
-                f" WITH DISTINCT e0"
-                # CALL (e0) variable-scope form (Neo4j 5.23+; our GDS 2.13 dep
-                # already implies a recent 5.x). Aggregate sibs first, then branch —
-                # collect() can't sit beside non-grouped e0 inside a CASE.
-                f" CALL (e0) {{"
-                f"   OPTIONAL MATCH (sib:{ONT.entity})"
-                f"     WHERE e0.alias_component IS NOT NULL"
-                f"       AND sib.alias_component = e0.alias_component"
-                f"   WITH e0, collect(sib) AS sibs"
-                f"   RETURN CASE WHEN e0.alias_component IS NULL"
-                f"               THEN [e0] ELSE sibs END AS members"
-                f" }}"
-                f" WITH coalesce(e0.alias_component, elementId(e0)) AS comp, members"
-                f" WITH comp, head(collect(members)) AS members"   # dedup anchors → 1 row/component
-                f" UNWIND members AS m"
-                f" MATCH (m)<-[r:{rels}]-(neighbor:{ONT.fact})"
-                f" WHERE {edge_pred}"
-                f"   AND coalesce(neighbor.consolidated, false) = false"
-                f"   AND coalesce(neighbor.rem_processed, false) = true"
-                f"   AND coalesce(neighbor.superseded, false) = false"
-                f" WITH comp, members, collect(DISTINCT neighbor) as unflagged_facts"
-                f" WHERE size(unflagged_facts) >= $threshold"
-                f" RETURN reduce(c = null, nm IN [x IN members | x.name] |"
-                f"          CASE WHEN c IS NULL OR nm < c THEN nm ELSE c END) as entity,"
-                f"        [x IN members | x.name] as aliases,"
+                f"MATCH (j) WHERE j:{ONT.decision} OR j:{ONT.retrospective}"
+                f" MATCH (j)-[:{ONT.grounded_in}]->(f:{ONT.fact})"
+                f" WHERE coalesce(f.superseded, false) = false"
+                f" MATCH (f)-[:{ONT.domain_of}]->(dom:{ONT.domain})"
+                f"           -[:{ONT.project_of}]->(proj:{ONT.project})"
+                f" WITH DISTINCT f, proj.name AS project, dom.name AS domain"
                 # rem_summary wins when present (long facts REM condensed); short
                 # facts carry their curated text verbatim (non-destructive REM).
-                f"        [fact IN unflagged_facts | coalesce(fact.rem_summary, fact.content)] as contents,"
-                f"        [fact IN unflagged_facts | fact.pg_id] as pg_ids",
-                ids=ids, threshold=DENSITY_THRESHOLD,
-                operator_asserted=OPERATOR_ASSERTED,
-                entity_calibrated=egate["calibrated"],
-                entity_threshold=egate["threshold"])
-            clusters = await result.data()
-            # Follow-up cheap aggregate over the SAME anchor entities: how many
-            # machine-asserted edges the gate consumed vs excluded. The excluded
-            # ones are the rows "filtered back" to the adjudication/review queue
-            # — that queue already exists in the relation_adjudications ledger.
-            count_result = await session.run(
-                f"MATCH (f:{ONT.fact}) WHERE f.pg_id IN $ids"
-                f" MATCH (f)-[:{rels}]->(e0:{ONT.entity})"
-                f" WITH DISTINCT e0"
-                f" MATCH (e0)<-[r:{rels}]-(:{ONT.fact})"
-                f" WHERE r.asserted_by IN $machine_asserted"
-                f" RETURN sum(CASE WHEN $entity_calibrated AND r.confidence >= $entity_threshold"
-                f"                 THEN 1 ELSE 0 END) AS consumed,"
-                f"        sum(CASE WHEN $entity_calibrated AND r.confidence >= $entity_threshold"
-                f"                 THEN 0 ELSE 1 END) AS excluded",
-                ids=ids, machine_asserted=sorted(rc_conf.MACHINE_ASSERTED),
-                entity_calibrated=egate["calibrated"],
-                entity_threshold=egate["threshold"])
-            counts = await count_result.data()
-        edge_stats = {
-            "machine_edges_consumed": int((counts[0] or {}).get("consumed") or 0) if counts else 0,
-            "edges_awaiting_calibration": int((counts[0] or {}).get("excluded") or 0) if counts else 0,
-        }
-        if edge_stats["edges_awaiting_calibration"]:
-            logger.info(
-                "Calibration gate [anchored]: %d machine-asserted edge(s) excluded from "
-                "cluster traversal (awaiting calibration/adjudication in the ledger review "
-                "queue); %d consumed.",
-                edge_stats["edges_awaiting_calibration"], edge_stats["machine_edges_consumed"])
+                f" RETURN f.pg_id AS pg_id,"
+                f"        coalesce(f.rem_summary, f.content) AS content,"
+                f"        project, domain"
+            )
+            return await result.data()
         return clusters, edge_stats
 
     async def run_ledger_sweep(self):
@@ -2212,8 +2214,6 @@ class ConsolidationDaemon:
         """
         loop = asyncio.get_running_loop()
         try:
-            # Calibration BEFORE cluster assessment (stage 5) — one fetch per pass.
-            gate = await loop.run_in_executor(None, fetch_calibration_gate)
             conn = await loop.run_in_executor(
                 None, lambda: psycopg2.connect(PG_CONN, connect_timeout=5)
             )
@@ -2253,121 +2253,80 @@ class ConsolidationDaemon:
                     None, lambda: _crun_record_idle("fact_consolidation"))
                 return
 
-            clusters, edge_stats = await self._find_anchored_clusters(backlog, gate)
-            if not clusters:
+            rows = await self._find_grounded_fact_groups()
+            if not rows:
                 logger.info(
-                    "Ledger sweep: %d-fact backlog forms no eligible cluster yet "
-                    "(density_threshold=%d per entity+domain).",
+                    "Ledger sweep: %d-fact backlog, but no (project, domain) group "
+                    "meets density_threshold=%d yet.",
                     len(backlog), DENSITY_THRESHOLD,
                 )
                 await loop.run_in_executor(
                     None, lambda: _crun_record_idle("fact_consolidation"))
                 return
 
-            logger.info("Ledger sweep: backlog of %d facts → %d eligible cluster(s).",
-                        len(backlog), len(clusters))
-            await self._consolidate_clusters(clusters, gate=gate, edge_stats=edge_stats)
+            logger.info("Ledger sweep: backlog of %d facts → %d grounded row(s) to re-gate.",
+                        len(backlog), len(rows))
+            await self._consolidate_clusters(rows)
 
         except Exception as e:
             # Nothing to re-queue — the ledger is durable; the next sweep retries.
             logger.error(f"Ledger sweep failed: {str(e)}")
 
     async def run_global_sweep(self):
-        """Unanchored global density sweep — same cluster rule as the
-        event-driven cycle but scanning every entity hub. Runs once per
-        process start: it is the only pass that reaches pre-coordinator facts
-        with no outbox rows. Recurring coverage is the outbox-anchored
-        run_ledger_sweep. (Retrospective on decision pg_id 214; ledger:
-        decision pg_id 267.)"""
-        try:
-            # Calibration BEFORE cluster assessment (stage 5) — one fetch per pass.
-            loop = asyncio.get_running_loop()
-            gate = await loop.run_in_executor(None, fetch_calibration_gate)
-            egate = gate[rc_conf.FAMILY_ENTITY]
-            rels = f"{ONT.entity_link_alias}|{ONT.entity_link}"
-            async with self.driver.session() as session:
-                result = await session.run(
-                    f"MATCH (e:{ONT.entity})<-[r:{rels}]-(neighbor:{ONT.fact})"
-                    # Cypher mirror of relation_confidence.consumable() — the
-                    # Python function is the SOURCE OF TRUTH; keep in agreement.
-                    f" WHERE (r.asserted_by IS NULL OR r.asserted_by IN $operator_asserted"
-                    f"        OR ($entity_calibrated AND r.confidence >= $entity_threshold))"
-                    f"   AND coalesce(neighbor.consolidated, false) = false"
-                    f"   AND coalesce(neighbor.rem_processed, false) = true"
-                    f" WITH e, collect(neighbor) as unflagged_facts"
-                    f" WHERE size(unflagged_facts) >= $threshold"
-                    f" RETURN e.name as entity,"
-                    # Same non-destructive read as the anchored path: summary if
-                    # REM condensed a long fact, verbatim curated text otherwise.
-                    f"        [fact IN unflagged_facts | coalesce(fact.rem_summary, fact.content)] as contents,"
-                    f"        [fact IN unflagged_facts | fact.pg_id] as pg_ids",
-                    threshold=DENSITY_THRESHOLD,
-                    operator_asserted=OPERATOR_ASSERTED,
-                    entity_calibrated=egate["calibrated"],
-                    entity_threshold=egate["threshold"])
-                clusters = await result.data()
-                # Follow-up cheap aggregate: machine edges the gate consumed vs
-                # excluded graph-wide — the excluded rows are already queued for
-                # adjudication in the relation_adjudications ledger.
-                count_result = await session.run(
-                    f"MATCH (:{ONT.entity})<-[r:{rels}]-(:{ONT.fact})"
-                    f" WHERE r.asserted_by IN $machine_asserted"
-                    f" RETURN sum(CASE WHEN $entity_calibrated AND r.confidence >= $entity_threshold"
-                    f"                 THEN 1 ELSE 0 END) AS consumed,"
-                    f"        sum(CASE WHEN $entity_calibrated AND r.confidence >= $entity_threshold"
-                    f"                 THEN 0 ELSE 1 END) AS excluded",
-                    machine_asserted=sorted(rc_conf.MACHINE_ASSERTED),
-                    entity_calibrated=egate["calibrated"],
-                    entity_threshold=egate["threshold"])
-                counts = await count_result.data()
-            edge_stats = {
-                "machine_edges_consumed": int((counts[0] or {}).get("consumed") or 0) if counts else 0,
-                "edges_awaiting_calibration": int((counts[0] or {}).get("excluded") or 0) if counts else 0,
-            }
-            if edge_stats["edges_awaiting_calibration"]:
-                logger.info(
-                    "Calibration gate [global sweep]: %d machine-asserted edge(s) excluded "
-                    "from cluster traversal (awaiting calibration/adjudication in the ledger "
-                    "review queue); %d consumed.",
-                    edge_stats["edges_awaiting_calibration"], edge_stats["machine_edges_consumed"])
+        """Unanchored global density sweep — the SAME (project, domain) gate as
+        the event-driven cycle, scanning the whole graph rather than a
+        triggered subset. Runs once per process start: it is the only pass
+        that reaches pre-coordinator facts with no outbox rows. Recurring
+        coverage is the outbox-anchored run_ledger_sweep. (Retrospective on
+        decision pg_id 214; ledger: decision pg_id 267.)
 
-            if not clusters:
-                logger.info("Global sweep: no eligible clusters (density_threshold=%d).", DENSITY_THRESHOLD)
+        v2 (C1): `_find_grounded_fact_groups` is ALREADY an unrestricted full
+        scan (see its docstring), so this method is now a thin wrapper around
+        the same discovery+fold the other two entry points use — there is no
+        more "anchored vs unanchored" distinction to draw once entity-hub
+        discovery is gone."""
+        try:
+            rows = await self._find_grounded_fact_groups()
+
+            if not rows:
+                logger.info("Global sweep: no (project, domain) group meets "
+                            "density_threshold=%d.", DENSITY_THRESHOLD)
+                loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     None, lambda: _crun_record_idle("fact_consolidation"))
                 return
 
             logger.info(
-                "Global sweep: %d eligible entity cluster(s) found without a triggering save.",
-                len(clusters),
+                "Global sweep: %d grounded fact row(s) found without a triggering save.",
+                len(rows),
             )
-            await self._consolidate_clusters(clusters, gate=gate, edge_stats=edge_stats)
+            await self._consolidate_clusters(rows)
 
         except Exception as e:
             # Nothing to re-queue — the next sweep re-evaluates the whole graph.
             logger.error(f"Global sweep failed: {str(e)}")
 
-    async def _consolidate_clusters(self, clusters, gate=None, edge_stats=None):
-        """Shared consolidation body: domain re-gating, LLM synthesis, the
-        deterministic PRESERVATION GATE, and the atomic Postgres + Neo4j write
-        for a list of entity clusters. Recorded as one 'fact_consolidation'
-        consolidation_runs row (ADR-018) — the single instrumentation point for
-        all three fact schedulers (event cycle, ledger sweep, global sweep) that
-        call it; every outcome also leaves a log line. ``gate`` is the pass's
-        calibration snapshot (recorded in extra); ``edge_stats`` the cluster
-        finder's machine-edge consumed/excluded counts."""
+    async def _consolidate_clusters(self, rows):
+        """Shared consolidation body: (project, domain) re-gating, LLM
+        synthesis, the deterministic PRESERVATION GATE, and the atomic
+        Postgres + Neo4j write. Recorded as one 'fact_consolidation'
+        consolidation_runs row (ADR-018) — the single instrumentation point
+        for all three fact schedulers (event cycle, ledger sweep, global
+        sweep) that call it; every outcome also leaves a log line.
+
+        ``rows`` is the flat output of `_find_grounded_fact_groups`:
+        ``{"pg_id", "content", "project", "domain"}`` — one row per (fact,
+        domain) pair. No ``gate``/``edge_stats`` params any more (v2, C1): the
+        v2 fact gate does not traverse MENTIONS/entity-link edges at all, so
+        the relation_confidence calibration snapshot has nothing to report for
+        this run type — a `fact_consolidation` run's `extra` therefore no
+        longer carries `calibration`/`edges_awaiting_calibration`/
+        `machine_edges_consumed` (those stay meaningful for the INSIGHT path,
+        `_fold_insight`, unaffected by this change). Monitor consumers of the
+        `fact_consolidation` run type should stop expecting those three keys.
+        """
         loop = asyncio.get_running_loop()
         rec = _CycleRec()
-        if gate is not None:
-            rec.calibration = {fam: gate[fam]["calibrated"] for fam in gate}
-        if edge_stats:
-            rec.edges_awaiting_calibration = edge_stats.get("edges_awaiting_calibration", 0)
-            rec.machine_edges_consumed = edge_stats.get("machine_edges_consumed", 0)
-            # Lifecycle rule: the extra fields below also leave this log line.
-            logger.info(
-                "Consolidation run [fact_consolidation] calibration gate: "
-                "machine_edges_consumed=%d edges_awaiting_calibration=%d calibration=%s",
-                rec.machine_edges_consumed, rec.edges_awaiting_calibration, rec.calibration)
         run_id = await loop.run_in_executor(None, lambda: _crun_start("fact_consolidation"))
         conn = await loop.run_in_executor(
             None, lambda: psycopg2.connect(PG_CONN, connect_timeout=5)
@@ -2378,7 +2337,7 @@ class ConsolidationDaemon:
             # via domain_axis.resolve_domains over the same metadata blob —
             # never the historical squat where metadata.domain held the project.
             # Kind: facts from source_ref; judgements via decision 1080.
-            all_ids = sorted({pid for c in clusters for pid in c['pg_ids']})
+            all_ids = sorted({r["pg_id"] for r in rows})
             def _fetch_records(ids=all_ids):
                 if not ids:
                     return {}
@@ -2446,61 +2405,46 @@ class ConsolidationDaemon:
                     }
                 return out
             record_map = await loop.run_in_executor(None, _fetch_records)
-            project_map = {pid: r["project"] for pid, r in record_map.items()}
-            domains_map = {pid: r["domains"] for pid, r in record_map.items()}
 
-            # Registered (project_name, section_name) pairs for P16 domain-level.
-            def _fetch_registered():
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT p.name, d.name"
-                        "  FROM project_domains d"
-                        "  JOIN projects p ON p.id = d.project_id"
-                    )
-                    return {(r[0], r[1]) for r in cur.fetchall()}
-            registered_sections = await loop.run_in_executor(None, _fetch_registered)
+            # ✅ v2 FACT GATE (plan §2.1) — the ONLY level. project/domain/
+            # registered-ness all come from `rows` — the graph-native
+            # GROUNDED_IN/DOMAIN_OF/PROJECT_OF walk `_find_grounded_fact_groups`
+            # already ran — not from Postgres metadata, so there is no second
+            # source of truth for "which axis pair a fact belongs to" to drift
+            # against the first. A DOMAIN_OF/PROJECT_OF edge only exists for a
+            # REGISTERED section (coordinator.py's `_domain_identities`), so
+            # `registered_sections` built from these SAME rows is a correctness
+            # confirmation for `eligible_domain_level_clusters`, not a second
+            # Postgres registry lookup.
+            content_by_pid: dict = {}
+            project_map: dict = {}
+            domains_map: dict = {}
+            registered_sections: set = set()
+            for r in rows:
+                pid = r["pg_id"]
+                content_by_pid[pid] = r["content"]
+                project_map[pid] = r["project"]
+                doms = domains_map.setdefault(pid, [])
+                if r["domain"] not in doms:
+                    doms.append(r["domain"])
+                registered_sections.add((r["project"], r["domain"]))
+            pg_ids_all = list(content_by_pid)
+            contents_all = [content_by_pid[pid] for pid in pg_ids_all]
 
-            # Entity-level work items: re-gate per (entity, project, section).
-            # Domain-level work items: (project, section) across the pass's facts,
-            # no entity — so sections dense across entities still fold (P16).
-            work_items = []  # (entity, project, section, level, contents, pg_ids, aliases)
-            for cluster in clusters:
-                aliases = cluster.get('aliases') or [cluster['entity']]
-                for (project, section), c, p in eligible_entity_level_clusters(
-                    cluster['contents'], cluster['pg_ids'],
-                    project_map, domains_map, DENSITY_THRESHOLD,
-                ):
-                    work_items.append((
-                        cluster['entity'], project, section, LEVEL_ENTITY,
-                        c, p, aliases,
-                    ))
-
-            # Domain-level: union of contents/ids from every cluster in this pass.
-            # Facts only reach here if some entity hub already listed them; a
-            # fully sparse graph with no entity hubs still cannot domain-fold —
-            # that needs a separate backlog path (carried, not invented mid-PR).
-            if clusters:
-                all_contents = []
-                all_pg = []
-                seen_pid = set()
-                for cluster in clusters:
-                    for content, pid in zip(cluster['contents'], cluster['pg_ids']):
-                        if pid in seen_pid:
-                            continue
-                        seen_pid.add(pid)
-                        all_contents.append(content)
-                        all_pg.append(pid)
+            # work_items: (project, section, contents, pg_ids) — no entity, no
+            # project-only level (§2.1: "There is NO project level and NO
+            # entity level"). `eligible_domain_level_clusters` is the SAME
+            # partitioner already proven for the (project, section) gate.
+            work_items = [
+                (project, section, c, p)
                 for (project, section), c, p in eligible_domain_level_clusters(
-                    all_contents, all_pg, project_map, domains_map,
-                    NREM_DOMAIN_THRESHOLD, registered_sections,
-                ):
-                    work_items.append((
-                        "", project, section, LEVEL_DOMAIN,
-                        c, p, [],
-                    ))
+                    contents_all, pg_ids_all, project_map, domains_map,
+                    DENSITY_THRESHOLD, registered_sections,
+                )
+            ]
 
-            # Coverage census — AFTER both level splits (the gate this cycle folds).
-            member_id_lists = [list(w[5]) for w in work_items]
+            # Coverage census — AFTER the gate (the gate this cycle folds).
+            member_id_lists = [list(w[3]) for w in work_items]
             all_member_ids = [pid for ids in member_id_lists for pid in ids]
             ts_map = await loop.run_in_executor(
                 None, lambda: _fetch_outbox_created_at(all_member_ids))
@@ -2514,15 +2458,19 @@ class ConsolidationDaemon:
             # failsafe {} — a broken ledger never dead-letters healthy clusters.
             dead_letter = await loop.run_in_executor(None, fetch_fold_dead_letter_counts)
 
-            for entity, project, section, level, contents, pg_ids, aliases in work_items:
+            # No entity, no project-only level (§2.1) — every work item folds
+            # at LEVEL_DOMAIN with an empty entity/aliases. Constants, not
+            # per-item fields, so the loop body below still reads naturally.
+            entity = ""
+            level = LEVEL_DOMAIN
+            aliases: list = []
+
+            for project, section, contents, pg_ids in work_items:
 
                 # label is the human-readable display name (telemetry/logs);
                 # fold_key is the content-derived dead-letter identity — see
                 # _fold_identity (decision 882).
-                if level == LEVEL_DOMAIN:
-                    label = f"domain:{project}/{section or SECTION_NONE}"
-                else:
-                    label = f"{entity}/{project}/{section or SECTION_NONE}"
+                label = f"domain:{project}/{section or SECTION_NONE}"
                 fold_key = _fold_identity("fact", pg_ids)
                 if dead_letter.get(fold_key, 0) >= NREM_FOLD_FAIL_CAP:
                     rec.fold_dead_letter.append(label)
@@ -2572,7 +2520,7 @@ class ConsolidationDaemon:
                      r["rtype"] in ("decision", "retrospective"))
                     for content, r in zip(contents, recs)
                 ]
-                topic = entity if level == LEVEL_ENTITY else f"{project}/{section}"
+                topic = f"{project}/{section}"
                 logger.info(
                     "Distilling cluster for '%s' [project=%s section=%s level=%s] "
                     "(%d facts)...",
