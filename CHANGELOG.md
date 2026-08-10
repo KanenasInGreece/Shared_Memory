@@ -5,6 +5,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.64] — 2026-08-10
+
+### Changed
+
+- **The thematic fact gate is now keyed on `(project, domain)` and nothing else.** Discovery is graph-native — `(:Decision|:Retrospective)-[:GROUNDED_IN]->(:Fact)-[:DOMAIN_OF]->(:Domain)-[:PROJECT_OF]->(:Project)` — replacing entity-hub (`MENTIONS`) traversal. `_find_grounded_fact_groups` collapses what were three semi-duplicated Cypher blocks (event cycle, ledger sweep, global sweep) into one method they all call.
+  - ⛔ **There is no more entity level and no more project-only level.** A fact carrying a project but no domain is no longer folded thematically at all. A project-level roll-up would be a single summary over every grounded fact in the project, growing monotonically and re-folded forever — the "everything summary", which is the opposite of a sharp retrieval key.
+  - **Membership** is the grounded (`GROUNDED_IN`), non-superseded facts of the group. A fact's own `consolidated` flag never excludes it: a summary row is a single upserted key per group, so every re-fold must see the group's full current membership, never a delta.
+  - **Both axes must be registered.** `Domain`/`Project` nodes and their edges exist only for a registered section, so edge presence alone proves registration — no separate registry lookup is needed.
+  - **Density threshold recalibrated 5 → 3** (`ontology.py` and `ontology.yaml`).
+  - **Entities do not gate.** They are payload only.
+- **Consolidated on one partitioner.** `eligible_domain_level_clusters` is now the only one; the entity-level and project-only partitioners and their telemetry twins are deleted rather than left dead.
+
+### ⚠ Removed — `GET /memory/telemetry` contract change
+
+The `nrem` key no longer reports a level that cannot exist. **Consumers of this endpoint (including the monitor dashboard) must be updated:**
+
+- **Removed:** `entity_level_cycles`, `domain_level_cycles`, `domain_threshold`. The `NREM_DOMAIN_THRESHOLD` knob is deleted with them — two independently tunable numbers meant to track together are a guaranteed future drift.
+- **`fact_cycles` keeps its name but is not a continuation of the old series.** It drops from "entity-hub clusters + domain groups" to "the `(project, domain)` gate alone". **This is a step change on deploy, not an anomaly, and not a regression to investigate.**
+- Unchanged: `fact_threshold`, `decision_cycles`, `decision_threshold`, `total_cycles`.
+- The gauge now runs the **same** Cypher and the **same** partitioner the fold runs, so telemetry can no longer drift from the gate it claims to measure — covered by a mutation-checked test that fails if the shared partitioner is re-implemented inline.
+
+### Notes
+
+- **No migration.** The unique index already `COALESCE`s `entity` to `''`, so entity-free level summaries already worked. No existing row is modified.
+- **The 45 existing `level='entity'` summaries are deliberately left as archive** (operator's ruling). Tier-3 retrieval will keep returning summaries the current code can no longer produce. That is intended, not residue.
+- **Verified live, read-only, against the running stores:** the shipped discovery returns exactly **2 gating groups** (13 and 5 grounded facts), with 3 further candidates correctly below threshold. The binding constraint on Tier-3 population is **section capture, not the gate** — most grounded facts carry no domain and therefore never fold. This is correct behaviour and must not be "fixed" by loosening a gate.
+
 ## [0.8.63] — 2026-08-10
 
 ### Changed
