@@ -6096,10 +6096,19 @@ class MemoryCoordinator:
             irows = await ires.data()
         decision_cycles = int(irows[0]["cycles"]) if irows else 0
 
-        # SAME pure partitioner the fold uses (consolidation_loop's
-        # eligible_domain_level_clusters, via its count-only twin). Never
-        # invent a second rule.
-        from consolidation_loop import count_domain_level_cycles
+        # SAME pure partitioner the fold uses (eligible_domain_level_clusters,
+        # via its count-only twin) — sourced from nrem_gate, a module that
+        # imports no DB driver. NEVER reach back into the daemon module that
+        # owns the fold itself: that module imports psycopg2 at its own top
+        # level (its own sync DB work) and the shipped gateway service does
+        # not carry psycopg2, so an import of this function that reached
+        # into the daemon module used to raise ModuleNotFoundError on every
+        # call — silently killing this gauge in production while every unit
+        # test (fully stubbed) stayed green. nrem_gate.py holds only these
+        # two functions and imports no DB driver — see its docstring. Never
+        # invent a second rule, and never route this import back through the
+        # daemon module again.
+        from nrem_gate import count_domain_level_cycles
         project_map: dict[int, str] = {}
         domains_map: dict[int, list] = {}
         registered_sections: set = set()
