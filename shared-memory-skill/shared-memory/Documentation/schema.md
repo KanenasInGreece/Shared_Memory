@@ -39,12 +39,23 @@ Query example: `MATCH (f:Fact) WHERE f.source_ref IS NOT NULL RETURN f.pg_id, f.
 
 ### `community_summaries` — Tier 3 (Semantic)
 
-Written exclusively by the consolidation daemon. Each row is an LLM-synthesised narrative that distils a dense cluster of facts grouped around a shared `Entity` hub in Neo4j. Never written directly by agents.
+Written exclusively by the consolidation daemon. Never written directly by agents.
+
+⚠ **Two rows are NOT the same shape any more (Dreaming Cycle Plan to v2 §3, C4).**
+A **thematic** row's `content` is a **Zettelkasten index** — a deterministic,
+zero/low-inference concatenation of each constituent fact's own tight text
+(`fold_record_line` over `coalesce(rem_summary, content)`); it is **never**
+LLM-synthesised. An **insight** row's `content` **is** LLM-synthesised — the
+causal chain over its ordered judgements, extracting strictly each
+judgement's own Title and Rationale (its `content` verbatim), excluding
+`CONSIDERED`/`REJECTED`/`UNDER_CONDITIONS` and everything else (confidence,
+alternatives, grounding-edge detail) from the embedded text — all of that is
+deferred to the graph walk via `metadata.cypher_query` below.
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | `SERIAL PRIMARY KEY` | Referenced as `pg_id` on the matching `CommunitySummary` node in Neo4j |
-| `content` | `TEXT NOT NULL` | LLM-generated cumulative narrative for the entity cluster |
+| `content` | `TEXT NOT NULL` | Thematic: a deterministic Zettelkasten index (§3.1, zero/low inference — never LLM output). Insight: an LLM-synthesised causal chain (§3.2) over the ordered judgement component. |
 | `metadata` | `JSONB` | Written by the daemon — see structure below |
 | `embedding` | `vector(1024)` | BGE-M3 embedding of the synthesised `content`; used for top-1 retrieval |
 | `source_pg_ids` | `INTEGER[]` | IDs of `technical_docs` rows that contributed to this summary. Added by migration 003; back-filled from `metadata` for existing rows. Enables `WHERE $fact_id = ANY(source_pg_ids)` provenance queries without JSON parsing. |
@@ -56,19 +67,45 @@ Written exclusively by the consolidation daemon. Each row is an LLM-synthesised 
 | `scope` | `TEXT NOT NULL DEFAULT 'global'` | Inherited from the source `Fact` cluster's scope |
 | `visibility` | `TEXT NOT NULL DEFAULT 'global'` | Read policy, same semantics as `technical_docs.visibility` — enforced on Tier-3 reads (v0.6.2) so a scoped/private source fact's synthesis inherits the same gate. |
 
-**`metadata` structure (written by `consolidation_loop.py`):**
+**`metadata` structure — THEMATIC rows (§3.1, written by `_consolidate_clusters`):**
 ```json
 {
   "type": "community_summary",
   "kind": "thematic",
-  "entity": "<Entity.name that anchors the cluster>",
-  "domain": "<COALESCE(project, domain, scope, 'general')>",
-  "source_pg_ids": [<list of technical_docs.id values that were consolidated>],
+  "entity": "",
+  "project": "<the gating project axis>",
+  "domain": "<the gating domain axis>",
+  "level": "domain",
+  "aliases": [],
+  "source_pg_ids": [<technical_docs.id of every constituent FACT>],
+  "entities": ["<human-asserted entity names of the constituent facts — payload, never a gate key>"],
+  "cypher_query": "<self-contained Cypher rebuilding this group's provenance neighbourhood at READ time>",
   "timestamp": "<ISO-8601 datetime of this consolidation run>"
 }
 ```
 
-**Insight rows (`kind: "insight"`, decision pg_id 276):** the second consolidation path folds cross-project *decision* clusters. Same table, distinguished by metadata — `kind: "insight"`, `domain: "insight"`, a `projects` array, and `source_pg_ids` containing **decision** ids. Insight rows are **always-INSERT**: they are exempt from the `(entity, domain)` unique upsert (partial index, migration 009) and rely on supersession for dedup — a re-fold on the same source set writes a fresh row that supersedes the old one. ⚠ Facts, decisions and retrospectives all share the **single** `technical_docs` id sequence — they are **not** disjoint (a stale claim `supersede_covered_summaries`' docstring carried before C3 fixed it (U5)); kind isolation is enforced explicitly (an unconditional `kind` check), never assumed from the id space.
+**`metadata` structure — INSIGHT rows (§3.2, `kind: "insight"`, written by `_fold_insight`):** the second consolidation path folds a walked component of judgements (decisions **and** retrospectives — criterion C / the C4 payload rewrite; the pre-C4 fold was decision-only, a seam that silently never marked a Retrospective node `consolidated`).
+```json
+{
+  "type": "community_summary",
+  "kind": "insight",
+  "entity": "<always \"\" — I1, no entity anchor>",
+  "project": "<the seeding group's project — singular, unlike domains>",
+  "domains": ["<every domain the walk actually touched — MULTI-VALUED: the walk can legitimately cross domains>"],
+  "entities": ["<union of the constituent judgements' own human-asserted entities>"],
+  "source_pg_ids": [<technical_docs.id of every JUDGEMENT the fold covers — decisions AND retrospectives, never a fact id — I9>],
+  "summary_ids": [<community_summaries.id of the thematic summar(ies) this insight rests on — a SEPARATE field from source_pg_ids; the two id sequences overlap, so mixing them resolves a summary id against a technical_docs row silently>],
+  "cypher_query": "<self-contained Cypher re-deriving the §2.3 walk from these judgement ids>",
+  "timestamp": "<ISO-8601 datetime of this consolidation run>"
+}
+```
+⛔ **`source_pg_ids` on an insight row is a WIRE CONTRACT** — `coordinator.py`'s `_status_of_summary` (`GET /memory/status/insight:N`) joins it straight to `technical_docs`, and readers must be able to assume every element resolves there. `summary_ids` exists precisely so a thematic summary id never has to be smuggled into that array.
+
+⚠ **Pre-C4 rows still carry the OLD shape** — `domain: "insight"` (a fixed placeholder, not a real domain) and a `projects` array (plural). No backfill: a reader distinguishes the two shapes by checking `metadata ? 'domains'` (C4+) vs `metadata ? 'projects'` (pre-C4). `GET /memory/status/{ref}` (`coordinator.py`) exposes **both** `domain` and `domains` keys on every response so an older client reading the singular key still gets a sensible value (the first `domains` entry) rather than a silent `null`.
+
+Insight rows are **always-INSERT**: they are exempt from the `(entity, domain)` unique upsert (partial index, migration 009) and rely on supersession for dedup — a re-fold on the same source set writes a fresh row that supersedes the old one. ⚠ Facts, decisions and retrospectives all share the **single** `technical_docs` id sequence — they are **not** disjoint (a stale claim `supersede_covered_summaries`' docstring carried before C3 fixed it (U5)); kind isolation is enforced explicitly (an unconditional `kind` check), never assumed from the id space.
+
+**§2.5 identity — an insight's identity is the SET of judgement pg_ids it covers.** A freshly-walked component whose judgement set exactly matches an ACTIVE insight's `source_pg_ids` does **not** fold again: `append_insight_references` (`consolidation_loop.py`) instead appends the triggering thematic summary id to that insight's `summary_ids` and the triggering domain to its `domains`, in place, deduplicated. A strict-subset match ('covered' — not in the plan's LOCKED table, `insight_gate.classify_identity`'s own defensive extra case) is skipped with no write at all.
 
 > **Note:** `source_pg_ids` is stored both as the dedicated column above and inside `metadata` JSONB. The column is the authoritative query path; the JSONB key is retained for backwards compatibility with tooling that reads raw metadata.
 
@@ -78,7 +115,7 @@ Written exclusively by the consolidation daemon. Each row is an LLM-synthesised 
 
 **Retrieval role:** queried first on every search — top-1 cosine match is prepended to results as "Global Context Summary" to orient the response before the Tier 1 vector search runs.
 
-**Growth behaviour (thematic rows):** one row per `(entity, project, domain, level)`, keyed by the partial unique index `community_summaries_axis_level_unique` (migration 029, `COALESCE`d on all four axis expressions — `WHERE COALESCE(metadata->>'kind','thematic') <> 'insight' AND NOT superseded` as of **migration 032**). Each consolidation cycle upserts via `ON CONFLICT (...) WHERE ... DO UPDATE` — the new LLM synthesis overwrites `content` and `embedding`, while the previous `content` is appended to `summary_history` (capped at 20 entries). The row ID (`id`) is stable across updates **of an ACTIVE row on that axis key**. ⚠ **Migration 032 (Dreaming Cycle Plan to v2 §6 C3.1, defect F0):** before it, the index and the `ON CONFLICT` arbiter did not exclude `superseded` rows, so re-folding a lineage-retired `(project, domain)` group UPDATED the retired row IN PLACE and it stayed superseded forever — permanently invisible to retrieval, and unclosable by `close_refold_ledger_rows`'s `NOT cs.superseded` check. With `AND NOT superseded` on both the index and the arbiter, a retired row no longer conflicts; the next fold on that axis key INSERTs a fresh ACTIVE row instead, and the retired row remains, unmodified, as history (per §4.2 Path A step 4 — a new summary supersedes the old, never resurrected in place). Insight rows instead accumulate as inserts and retire via supersession, exempt from this index entirely. Retrieval surfaces the embedding-closest `WHERE NOT superseded` match per kind — insight first, then thematic.
+**Growth behaviour (thematic rows):** one row per `(entity, project, domain, level)`, keyed by the partial unique index `community_summaries_axis_level_unique` (migration 029, `COALESCE`d on all four axis expressions — `WHERE COALESCE(metadata->>'kind','thematic') <> 'insight' AND NOT superseded` as of **migration 032**). Each consolidation cycle upserts via `ON CONFLICT (...) WHERE ... DO UPDATE` — the freshly-recomputed Zettelkasten index (§3.1 — deterministic, not LLM output) overwrites `content` and `embedding`, while the previous `content` is appended to `summary_history` (capped at 20 entries). The row ID (`id`) is stable across updates **of an ACTIVE row on that axis key**. ⚠ **Migration 032 (Dreaming Cycle Plan to v2 §6 C3.1, defect F0):** before it, the index and the `ON CONFLICT` arbiter did not exclude `superseded` rows, so re-folding a lineage-retired `(project, domain)` group UPDATED the retired row IN PLACE and it stayed superseded forever — permanently invisible to retrieval, and unclosable by `close_refold_ledger_rows`'s `NOT cs.superseded` check. With `AND NOT superseded` on both the index and the arbiter, a retired row no longer conflicts; the next fold on that axis key INSERTs a fresh ACTIVE row instead, and the retired row remains, unmodified, as history (per §4.2 Path A step 4 — a new summary supersedes the old, never resurrected in place). Insight rows instead accumulate as inserts and retire via supersession, exempt from this index entirely. Retrieval surfaces the embedding-closest `WHERE NOT superseded` match per kind — insight first, then thematic.
 
 **Supersession rule — TWO mechanisms, both needed (Dreaming Cycle Plan to v2 §5.1):**
 
