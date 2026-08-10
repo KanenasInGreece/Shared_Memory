@@ -1384,8 +1384,15 @@ def supersede_covered_summaries(conn, summary_id, src_ids, level=None, kind="the
                 continue
             if old_src and set(old_src) <= new_src_set:
                 cur.execute(
+                    # Both columns, always. Migration 031 defines the pair as
+                    # ONE stamp — `superseded_at` says a reason was recorded at
+                    # all, `superseded_reason` says which. Writing the reason
+                    # without the timestamp makes every coverage retirement
+                    # indistinguishable from a pre-031 row to the obvious query
+                    # ("what has been retired since the stamp existed?"), which
+                    # is the only question the pair exists to answer.
                     "UPDATE community_summaries SET superseded = true,"
-                    "  superseded_reason = 'coverage'"
+                    "  superseded_at = now(), superseded_reason = 'coverage'"
                     " WHERE id = %s",
                     (old_id,),
                 )
@@ -1643,14 +1650,39 @@ def retire_invalidated_summaries(conn):
 
 
 def fetch_refold_backlog(conn):
-    """U4 due-ness — DISTINCT `pg_id` of OPEN `refold_ledger` rows. The
-    lineage-invalidation twin of `fetch_ledger_backlog`, unioned with it
-    (never replacing it) wherever the fact backlog is read — see
-    `fetch_combined_fact_backlog`. Duplicated pg_ids across two different
-    retired summaries are legitimate (no uniqueness constraint on the
-    table); DISTINCT is what makes counting them once due-ness's job."""
+    """U4 due-ness — DISTINCT `pg_id` of OPEN `refold_ledger` rows **of
+    `summary_kind = 'thematic'` only**. The lineage-invalidation twin of
+    `fetch_ledger_backlog`, unioned with it (never replacing it) wherever the
+    fact backlog is read — see `fetch_combined_fact_backlog`. Duplicated
+    pg_ids across two different retired summaries are legitimate (no
+    uniqueness constraint on the table); DISTINCT is what makes counting them
+    once due-ness's job.
+
+    ⛔ **I17 — THE KIND FILTER IS LOAD-BEARING, NOT AN OPTIMISATION.** §5's
+    amendment says the ledger is the clock *for the fact path*, and that "the
+    insight path needs no clock work at all" — insight re-folds are driven by
+    `sweep_due` (time-based hygiene) re-deriving from the graph, made fresh by
+    `run_lineage_invalidation_pass` clearing `consolidated` on the member
+    nodes. An insight-kind row therefore carries a **decision/retrospective**
+    pg_id, and this is the FACT clock: such a row is a value no reader on this
+    path can consume, drop, or ever satisfy —
+
+      * `consolidation_due` / `run_ledger_sweep` would count it toward the
+        fact density threshold, where it means nothing;
+      * `drop_below_density_refold_rows` can never close it, because its
+        `pg_ids_all` comes from `_find_grounded_fact_groups`\' **fact** scan,
+        which never yields a decision id — so I7\'s "a candidate that does not
+        gate is not backlog" has no reach over it;
+      * it closes only if some later insight fold happens to cover it.
+
+    An insight-kind row is an ATTRIBUTION TRAIL (migration 031\'s stated
+    purpose), never a clock entry. Keeping it out of this read is what stops
+    it inflating a count it can never leave."""
     with conn.cursor() as cur:
-        cur.execute("SELECT DISTINCT pg_id FROM refold_ledger WHERE status = 'open'")
+        cur.execute(
+            "SELECT DISTINCT pg_id FROM refold_ledger"
+            " WHERE status = \'open\' AND summary_kind = \'thematic\'"
+        )
         return [r[0] for r in cur.fetchall()]
 
 

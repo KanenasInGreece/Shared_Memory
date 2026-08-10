@@ -442,3 +442,46 @@ def test_fetch_combined_fact_backlog_dedupes_across_both_sources(monkeypatch):
     monkeypatch.setattr(cl, "fetch_ledger_backlog", lambda conn: [1, 2, 3])
     monkeypatch.setattr(cl, "fetch_refold_backlog", lambda conn: [3, 4])
     assert fetch_combined_fact_backlog(None) == [1, 2, 3, 4]
+
+
+# ── I17 — the FACT clock never counts an insight-kind ledger row ──────────────
+# Found in review of the C3 delivery, not by the build. §5's amendment says the
+# ledger is the clock FOR THE FACT PATH and that "the insight path needs no
+# clock work at all". An insight-kind row carries a decision/retrospective
+# pg_id; on the fact path that value can never be consumed (the density check
+# means nothing for it), never be dropped (drop_below_density_refold_rows reads
+# _find_grounded_fact_groups' FACT scan, which never yields a decision id), and
+# only ever closes if a later insight fold happens to cover it. It is an
+# attribution row, not a clock entry.
+
+def test_i17_fact_backlog_excludes_insight_kind_refold_rows():
+    conn = StubConn(script=[{"rowcount": 1, "rows": [(7,)]}])
+    assert fetch_refold_backlog(conn) == [7]
+    sql, _ = conn.executed[0]
+    assert "summary_kind = 'thematic'" in sql, (
+        "an insight-kind row carries a decision pg_id and would inflate the "
+        "FACT density clock forever — nothing on that path can ever close it"
+    )
+    assert "status = 'open'" in sql
+    assert "DISTINCT pg_id" in sql
+
+
+# ── The retirement stamp is a PAIR — both columns, on BOTH mechanisms ─────────
+
+def test_coverage_retirement_stamps_superseded_at_not_only_the_reason():
+    # Mechanism A (subset coverage). Migration 031 defines superseded_at +
+    # superseded_reason as one stamp; writing the reason alone makes a coverage
+    # retirement indistinguishable from a pre-031 row to "what was retired
+    # since the stamp existed?" — the only question the pair answers.
+    conn = StubConn(script=[
+        {"rowcount": 1, "rows": [(9, [1], None, "thematic")]},   # candidate scan
+        {"rowcount": 1, "rows": []},                              # UPDATE
+    ])
+    assert supersede_covered_summaries(conn, 10, [1, 2]) == [9]
+    update_sql, params = conn.executed[1]
+    assert "superseded_reason = 'coverage'" in update_sql
+    assert "superseded_at = now()" in update_sql, (
+        "the lineage path stamps both columns; coverage must too, or the pair "
+        "reports only half the retirements it exists to explain"
+    )
+    assert params == (9,)
