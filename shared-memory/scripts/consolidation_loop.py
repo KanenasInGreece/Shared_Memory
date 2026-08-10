@@ -1707,7 +1707,16 @@ def close_refold_ledger_rows(conn, context="consolidation"):
     `community_summaries` row of the MATCHING kind (thematic rows check
     non-insight summaries, insight rows check insight summaries — mirrors
     `mark_covered_rows_consolidated`'s covering-summary join shape, kind-
-    scoped the way U5 requires `supersede_covered_summaries` to be).
+    scoped the way U5 requires `supersede_covered_summaries` to be), AND
+    that covering summary is no older than the ledger row itself
+    (C3.1 F2 — ``COALESCE(cs.updated_at, cs.created_at) >= o.created_at``).
+    Without the recency bound, a `pg_id` sitting in some OTHER active summary
+    that merely predates the invalidation (measured live: fact 1149 sits in
+    a third, untouched summary) closes the row 'constituent_folded' with
+    nothing having actually folded — the UPSERT sets `updated_at = now()` on
+    every real fold, and a fresh INSERT defaults both columns together, so
+    the bound only ever excludes a summary that could not have been the
+    re-fold this row is waiting for.
 
     'dropped'/'constituent_superseded' — defensive: the row's own `pg_id`
     became superseded again after the row opened. Should not occur given
@@ -1729,6 +1738,7 @@ def close_refold_ledger_rows(conn, context="consolidation"):
             "     SELECT 1 FROM community_summaries cs"
             "      WHERE NOT cs.superseded"
             "        AND o.pg_id = ANY(cs.source_pg_ids)"
+            "        AND COALESCE(cs.updated_at, cs.created_at) >= o.created_at"
             "        AND ((o.summary_kind = 'thematic'"
             "              AND COALESCE(cs.metadata->>'kind', 'thematic') <> 'insight')"
             "             OR (o.summary_kind = 'insight'"
@@ -1784,6 +1794,47 @@ def drop_below_density_refold_rows(conn, pg_ids, context="consolidation"):
     conn.commit()
     logger.info(
         "Refold ledger close [%s]: %d row(s) dropped (below_density).", context, dropped)
+    return dropped
+
+
+def drop_out_of_scan_refold_rows(conn, scanned_pg_ids, context="consolidation"):
+    """C3.1 F1 — companion to `drop_below_density_refold_rows`, closing the
+    class it structurally cannot reach. `below_density_ids` is computed as
+    `pg_ids_all - all_member_ids`, so it can only ever close a constituent
+    that was ALREADY IN `pg_ids_all` — the `_find_grounded_fact_groups` scan
+    over grounded, domained facts. A constituent that is ungrounded or
+    domainless never enters `pg_ids_all` in the first place (measured live
+    2026-08-11: ~14 of the ~18 standing constituents the first firing will
+    open rows for) and so can never close 'below_density' — permanent zombie
+    backlog, the exact I7 latch shape I17 fixed one level up for insight-kind
+    rows.
+
+    ``scanned_pg_ids`` is the caller's full ``pg_ids_all`` for this cycle
+    (every fact the grounded+domained scan produced, regardless of density).
+    Any OPEN thematic-kind row whose ``pg_id`` is not even a member of that
+    set closes 'dropped'/'out_of_scan' — a distinct reason from
+    'below_density' so the two classes stay tellable apart in telemetry
+    (in-scan-but-sparse vs never-scanned-at-all).
+
+    Loses nothing: re-gating never reads the ledger
+    (`fetch_invalidated_summaries` re-derives from the graph every time), so
+    if the constituent later becomes grounded/domained it re-enters
+    `pg_ids_all` and its group folds on its own right, ledger row or not.
+
+    Logged unconditionally, including the zero case, so a quiet pass is
+    visibly distinct from a pass that never ran this check."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE refold_ledger SET status = 'dropped', closed_at = now(),"
+            "  closed_reason = 'out_of_scan'"
+            " WHERE status = 'open' AND summary_kind = 'thematic'"
+            "   AND NOT (pg_id = ANY(%s))",
+            (list(scanned_pg_ids),),
+        )
+        dropped = cur.rowcount
+    conn.commit()
+    logger.info(
+        "Refold ledger close [%s]: %d row(s) dropped (out_of_scan).", context, dropped)
     return dropped
 
 
@@ -2820,6 +2871,15 @@ class ConsolidationDaemon:
                 None, lambda: drop_below_density_refold_rows(
                     conn, below_density_ids, context="fact_consolidation"))
 
+            # C3.1 F1: a ledger row whose pg_id never entered pg_ids_all at
+            # all (ungrounded or domainless — outside this scan entirely)
+            # cannot be reached by the below_density close above, which only
+            # sees pg_ids_all's own members. Close those separately, with a
+            # distinct reason, so the two zombie classes stay distinguishable.
+            await loop.run_in_executor(
+                None, lambda: drop_out_of_scan_refold_rows(
+                    conn, pg_ids_all, context="fact_consolidation"))
+
             # Fold dead-letter cap (see module docstring): keys that failed the
             # preservation/truncation gates NREM_FOLD_FAIL_CAP times within the
             # window are skipped, not re-folded every cycle. Own-conn fetch,
@@ -2983,7 +3043,15 @@ class ConsolidationDaemon:
                     _level = level
                     def _write_summary():
                         with conn.cursor() as cur:
-                            # ON CONFLICT matches migration 029 partial unique index.
+                            # ON CONFLICT matches migration 032's partial unique
+                            # index (rebuilds 029 with "AND NOT superseded" —
+                            # C3.1 F0). Without the added predicate here this
+                            # arbiter would still match a lineage-RETIRED row on
+                            # the same axis key and UPDATE it in place, and the
+                            # UPDATE branch below never clears `superseded` — the
+                            # row would stay retired forever. With it, a retired
+                            # row no longer conflicts and the INSERT below lands
+                            # a fresh ACTIVE row instead.
                             cur.execute("""
                                 INSERT INTO community_summaries (content, metadata, embedding, source_pg_ids, run_id)
                                 VALUES (%s, %s, %s, %s, %s)
@@ -2994,6 +3062,7 @@ class ConsolidationDaemon:
                                     (COALESCE(metadata->>'level', 'entity'))
                                 )
                                     WHERE COALESCE(metadata->>'kind', 'thematic') <> 'insight'
+                                          AND NOT superseded
                                     DO UPDATE
                                     SET content         = EXCLUDED.content,
                                         embedding       = EXCLUDED.embedding,

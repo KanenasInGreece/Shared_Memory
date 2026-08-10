@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS community_summaries (
 
 CREATE INDEX IF NOT EXISTS community_summaries_active_idx ON public.community_summaries USING btree (id) WHERE (NOT superseded);
 CREATE INDEX IF NOT EXISTS community_summaries_agent_id_idx ON public.community_summaries USING btree (agent_id);
-CREATE UNIQUE INDEX IF NOT EXISTS community_summaries_axis_level_unique ON public.community_summaries USING btree (COALESCE((metadata ->> 'entity'::text), ''::text), COALESCE((metadata ->> 'project'::text), ''::text), COALESCE((metadata ->> 'domain'::text), ''::text), COALESCE((metadata ->> 'level'::text), 'entity'::text)) WHERE (COALESCE((metadata ->> 'kind'::text), 'thematic'::text) <> 'insight'::text);
+CREATE UNIQUE INDEX IF NOT EXISTS community_summaries_axis_level_unique ON public.community_summaries USING btree (COALESCE((metadata ->> 'entity'::text), ''::text), COALESCE((metadata ->> 'project'::text), ''::text), COALESCE((metadata ->> 'domain'::text), ''::text), COALESCE((metadata ->> 'level'::text), 'entity'::text)) WHERE ((COALESCE((metadata ->> 'kind'::text), 'thematic'::text) <> 'insight'::text) AND (NOT superseded));
 CREATE INDEX IF NOT EXISTS community_summaries_embedding_idx ON public.community_summaries USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS community_summaries_scope_idx ON public.community_summaries USING btree (scope);
 CREATE INDEX IF NOT EXISTS community_summaries_updated_at_idx ON public.community_summaries USING btree (updated_at);

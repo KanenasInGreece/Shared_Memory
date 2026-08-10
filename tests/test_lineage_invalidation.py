@@ -24,6 +24,7 @@ new/changed SQL string here was ALSO run verbatim against the live database
 (see the C3 build report) — a green suite proves nothing about a query on
 its own (CLAUDE.md).
 """
+import inspect
 import os
 import sys
 from unittest.mock import MagicMock
@@ -36,6 +37,7 @@ from consolidation_loop import (
     ConsolidationDaemon,
     close_refold_ledger_rows,
     drop_below_density_refold_rows,
+    drop_out_of_scan_refold_rows,
     fetch_combined_fact_backlog,
     fetch_invalidated_summaries,
     fetch_refold_backlog,
@@ -43,6 +45,9 @@ from consolidation_loop import (
     retire_invalidated_summaries,
     supersede_covered_summaries,
 )
+
+_MIGRATIONS_DIR = os.path.join(
+    os.path.dirname(__file__), "..", "shared-memory", "migrations")
 
 
 # ── Stubs (same shape as test_outbox_ledger.py / test_insight_consolidation.py) ─
@@ -485,3 +490,148 @@ def test_coverage_retirement_stamps_superseded_at_not_only_the_reason():
         "reports only half the retirements it exists to explain"
     )
     assert params == (9,)
+
+
+# ── C3.1 F0 — the resurrection gap: migration 032 + the ON CONFLICT arbiter ──
+#
+# Migration 029's axis unique index does not exclude superseded rows, and the
+# thematic fold's INSERT ... ON CONFLICT ... DO UPDATE never touches
+# superseded/superseded_at/superseded_reason. A lineage-retired (project,
+# domain) row is therefore UPDATED IN PLACE by the next fold on that axis key
+# and stays superseded forever. Migration 032 rebuilds the index with
+# "AND NOT superseded"; the ON CONFLICT arbiter in _write_summary
+# (`ConsolidationDaemon._consolidate_clusters`) must carry the SAME added
+# predicate, or the index and the arbiter disagree and the INSERT raises a
+# "no unique or exclusion constraint matching the ON CONFLICT specification"
+# error the moment a fold hits a retired row on that axis key.
+
+def test_f0_migration_032_rebuilds_the_axis_index_excluding_superseded():
+    """MUTATION-CHECKED: removing "AND NOT superseded" from the CREATE UNIQUE
+    INDEX statement below (restoring migration 029's predicate verbatim)
+    makes this test fail. Restored after."""
+    with open(os.path.join(_MIGRATIONS_DIR,
+                            "032_axis_index_excludes_superseded.sql"),
+              encoding="utf-8") as f:
+        sql = " ".join(f.read().split())
+
+    assert "BEGIN;" in sql and "COMMIT;" in sql, (
+        "the drop + recreate must be one transaction — a crash between them "
+        "would leave the axis key with NO unique index at all"
+    )
+    assert "DROP INDEX IF EXISTS community_summaries_axis_level_unique" in sql
+    assert "CREATE UNIQUE INDEX IF NOT EXISTS community_summaries_axis_level_unique" in sql
+    # Idempotent — safe to re-run against a database that already has it.
+    create_clause = sql.split("CREATE UNIQUE INDEX IF NOT EXISTS", 1)[1]
+    assert "COALESCE(metadata->>'kind', 'thematic') <> 'insight'" in create_clause
+    assert "AND NOT superseded" in create_clause, (
+        "the index must exclude superseded rows or a retired row on the same "
+        "axis key keeps blocking a fresh INSERT from ever landing"
+    )
+
+
+def test_f0_write_summary_on_conflict_arbiter_excludes_superseded():
+    """MUTATION-CHECKED: deleting the "AND NOT superseded" line from the
+    ON CONFLICT WHERE clause in `_consolidate_clusters` (reverting to the
+    v0.8.67 predicate) makes this test fail. Restored after.
+
+    The index (migration 032) and the ON CONFLICT arbiter must name the
+    IDENTICAL predicate — Postgres matches an ON CONFLICT target against an
+    existing index definition exactly; a mismatch either fails to match (raising
+    "no unique or exclusion constraint matching") or, worse, silently matches
+    the WRONG index if one without the predicate still existed."""
+    source = inspect.getsource(ConsolidationDaemon._consolidate_clusters)
+    on_conflict = source.split("ON CONFLICT (", 1)[1]
+    on_conflict_where = on_conflict.split("DO UPDATE", 1)[0]
+    assert "COALESCE(metadata->>'kind', 'thematic') <> 'insight'" in on_conflict_where
+    assert "AND NOT superseded" in on_conflict_where, (
+        "the arbiter must match migration 032's index predicate exactly, or "
+        "a retired row on the same axis key still blocks the fresh INSERT"
+    )
+
+
+# ── C3.1 F1 — unclosable clock rows: out-of-scan close ───────────────────────
+#
+# below_density_ids = pg_ids_all - all_member_ids can only ever name a pg_id
+# that was ALREADY a member of pg_ids_all (the grounded+domained scan). A
+# constituent that is ungrounded or domainless never enters pg_ids_all at
+# all, so drop_below_density_refold_rows structurally cannot reach it — its
+# open thematic-kind ledger row is a permanent zombie. drop_out_of_scan_
+# refold_rows closes that class separately, with a distinct closed_reason.
+
+def test_f1_drop_out_of_scan_closes_rows_never_seen_by_the_scan():
+    conn = StubConn(script=[{"rowcount": 2, "rows": []}])
+    dropped = drop_out_of_scan_refold_rows(conn, [1, 2, 3], context="test")
+    assert dropped == 2
+    sql, params = conn.executed[0]
+    assert "closed_reason = 'out_of_scan'" in sql
+    assert "summary_kind = 'thematic'" in sql, (
+        "out-of-scan closing is a FACT-path concept only — an insight-kind "
+        "row is never scanned by _find_grounded_fact_groups in the first "
+        "place, so it must never be touched here (I17)"
+    )
+    assert "DELETE" not in sql, "close, never delete (migration 031's model)"
+    assert params == ([1, 2, 3],)
+    assert conn.commits == 1
+
+
+def test_f1_drop_out_of_scan_reason_is_distinct_from_below_density():
+    """The two zombie classes must stay tellable apart in telemetry —
+    same-shaped closes with different closed_reason strings."""
+    conn_a = StubConn(script=[{"rowcount": 1, "rows": []}])
+    drop_below_density_refold_rows(conn_a, [7], context="test")
+    below_sql, _ = conn_a.executed[0]
+
+    conn_b = StubConn(script=[{"rowcount": 1, "rows": []}])
+    drop_out_of_scan_refold_rows(conn_b, [7], context="test")
+    scan_sql, _ = conn_b.executed[0]
+
+    assert "closed_reason = 'below_density'" in below_sql
+    assert "closed_reason = 'out_of_scan'" in scan_sql
+    assert below_sql != scan_sql
+
+
+def test_f1_consolidate_clusters_calls_out_of_scan_close_with_full_scan_set():
+    """MUTATION-CHECKED: deleting the `drop_out_of_scan_refold_rows` call
+    from `_consolidate_clusters` makes this test fail. Restored after.
+
+    Composition check, not just the unit above: the call site must exist and
+    must pass `pg_ids_all` — the full cycle scan — never `all_member_ids`
+    (the already-gating subset `below_density_ids` is drawn from), or the
+    out-of-scan close would just re-derive the below-density set instead of
+    reaching the population it exists to cover."""
+    source = inspect.getsource(ConsolidationDaemon._consolidate_clusters)
+    assert "drop_out_of_scan_refold_rows(" in source
+    call = source.split("drop_out_of_scan_refold_rows(", 1)[1].split(")", 1)[0]
+    assert "pg_ids_all" in call
+    assert "all_member_ids" not in call
+    assert "below_density_ids" not in call
+
+
+# ── C3.1 F2 — false 'refolded' attribution: the recency predicate ───────────
+#
+# close_refold_ledger_rows' 'refolded' branch matched ANY active summary
+# containing the pg_id, including one that PREDATES the ledger row — closing
+# it 'constituent_folded' when nothing was actually folded. The UPSERT sets
+# updated_at = now() on every real fold and a fresh INSERT defaults both
+# columns together, so requiring the covering summary's
+# COALESCE(updated_at, created_at) >= the ledger row's created_at excludes
+# exactly the summaries that could not have been the re-fold being waited on.
+
+def test_f2_refolded_close_requires_covering_summary_no_older_than_the_row():
+    conn = StubConn(script=[
+        {"rowcount": 1, "rows": []},   # refolded UPDATE
+        {"rowcount": 0, "rows": []},   # dropped/constituent_superseded UPDATE
+    ])
+    close_refold_ledger_rows(conn, context="test")
+    refolded_sql, _ = conn.executed[0]
+    assert "COALESCE(cs.updated_at, cs.created_at) >= o.created_at" in refolded_sql, (
+        "MUTATION-CHECKED: removing this predicate (reverting to the shipped "
+        "v0.8.67 query) makes this test fail — restored after. Without it a "
+        "summary that predates the ledger row can close it 'constituent_folded' "
+        "with nothing having actually folded (measured: fact 1149)"
+    )
+    # Still kind-scoped (I13/U5) and still checks non-superseded — the new
+    # predicate is additive, not a replacement of the existing guards.
+    assert "NOT cs.superseded" in refolded_sql
+    assert "o.summary_kind = 'thematic'" in refolded_sql
+    assert "o.summary_kind = 'insight'" in refolded_sql
