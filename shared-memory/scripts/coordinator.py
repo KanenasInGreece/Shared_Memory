@@ -5267,11 +5267,24 @@ class MemoryCoordinator:
             "ref": make_ref(actual, pg_id),
             "exists": True,
             "entity": meta.get("entity"),
-            "domain": meta.get("domain"),
+            # A thematic summary carries a single `domain`; an insight (C4,
+            # §3.2) carries MULTI-VALUED `domains` instead (the walk can
+            # legitimately cross domains). Expose both keys always — a
+            # thematic row's `domains` degrades to a one-element list built
+            # from its own `domain` so a caller can read either field
+            # uniformly regardless of record kind, and an insight row's
+            # `domain` stays present (its first `domains` entry, or None for
+            # an insight with none) rather than silently disappearing for a
+            # client that has not been updated to read the new field yet.
+            "domain": meta.get("domain") or (
+                (meta.get("domains") or [None])[0] if meta.get("domains") else None),
+            "domains": meta.get("domains") or (
+                [meta["domain"]] if meta.get("domain") else []),
             "created_at": row["created_at"].isoformat() if row["created_at"] else None,
             "superseded": row["superseded"],
             "run_id": row["run_id"],
             "source_pg_ids": list(row["source_pg_ids"] or []),
+            "summary_ids": meta.get("summary_ids") or [],
             "sources": [
                 {"pg_id": sid,
                  "record_type": src_types.get(sid),
