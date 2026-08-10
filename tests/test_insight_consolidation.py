@@ -19,8 +19,6 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 from consolidation_loop import (
     ConsolidationDaemon,
-    INSIGHT_THRESHOLD,
-    INSIGHT_HUB_DEGREE_CAP,
     close_ledger_rows_by_id,
     fetch_insight_outbox_rows,
     fetch_open_retro_decision_ids,
@@ -318,47 +316,72 @@ def test_unreconciled_insights_query_contract():
     assert "NOT cs.superseded" in sql
 
 
-# ── Fresh-cluster gate (Cypher contract) ──────────────────────────────────────
+# ── v2 insight gate (Dreaming Cycle Plan to v2, §2.2-§2.4; C2) ────────────────
+#
+# insight_cluster_cypher's 1-hop shared-Entity match (with its ≥2-projects
+# rule and hub-degree cap) is GONE — see test_project_identity.py's retired-
+# P22 note and test_project_axis.py's decision_cycles rewrite. The pure walk/
+# gate/component/identity functions themselves (I1-I10) are unit-tested in
+# tests/test_insight_gate.py; these two tests cover the INTEGRATION —
+# `_find_fresh_insight_clusters` wiring `_find_grounded_fact_groups`
+# (G1, reused) to `insight_gate.walk_group_reached_set` /
+# `passes_insight_gate` (G2+G3) end to end.
+
+_GATING_GROUP_ROWS = [
+    {"pg_id": 101, "content": "f101", "project": "proj", "domain": "dom"},
+    {"pg_id": 102, "content": "f102", "project": "proj", "domain": "dom"},
+    {"pg_id": 103, "content": "f103", "project": "proj", "domain": "dom"},
+]
+
 
 @pytest.mark.asyncio
-async def test_fresh_cluster_gate_encodes_ratified_rules():
-    daemon, session = daemon_with_fake_graph([FakeResult([])])
+async def test_fresh_insight_clusters_returns_shape_for_a_gating_group():
+    """A (project, domain) group with 3 grounded facts (G1, DENSITY_THRESHOLD)
+    whose walk reaches one fresh Decision and one fresh Retrospective (G2+G3)
+    yields exactly one component — returned with no entity anchor (I1) and
+    the decision-only ids `_fold_insight` can consume today (see the SEAM
+    note on `_find_fresh_insight_clusters`), plus the full judgement reach."""
+    daemon, session = daemon_with_fake_graph([
+        FakeResult(_GATING_GROUP_ROWS),          # _find_grounded_fact_groups
+        FakeResult([                              # walk layer 1 (the 3 facts)
+            # Both ground on fact 101 (I5: shared fact -> same component).
+            {"src": 101, "dst": 201, "dst_label": "Decision", "dst_consolidated": False},
+            {"src": 101, "dst": 202, "dst_label": "Retrospective", "dst_consolidated": False},
+        ]),
+        FakeResult([]),                            # walk layer 2 — fixpoint
+    ])
+    out = await daemon._find_fresh_insight_clusters()
+    assert len(out) == 1
+    cluster = out[0]
+    assert cluster["entity"] == ""            # I1 — no entity anchor
+    assert cluster["decision_ids"] == [201]
+    assert cluster["projects"] == ["proj"]
+    assert cluster["domain"] == "dom"
+    assert cluster["judgement_ids"] == [201, 202]
+    assert cluster["has_retrospective"] is True
+    # The walk step query itself carries the closed relation set and the I10
+    # exclusion — not the old entity/HAD_OUTCOME-existence gate.
+    walk_query, _ = session.calls[1]
+    assert "GROUNDED_IN" in walk_query and "HAD_OUTCOME" in walk_query
+    assert "coalesce(m.superseded, false) = true" in walk_query
+    assert "project_ids" not in walk_query   # I2 — no project count anywhere
+
+
+@pytest.mark.asyncio
+async def test_fresh_insight_clusters_skips_a_group_with_no_retrospective_reached():
+    """G2: a gating group whose walk reaches only Decisions yields nothing —
+    however many decisions it has (I6, exercised end-to-end here; the pure
+    predicate itself is mutation-checked in test_insight_gate.py)."""
+    daemon, _session = daemon_with_fake_graph([
+        FakeResult(_GATING_GROUP_ROWS),
+        FakeResult([
+            {"src": 101, "dst": 201, "dst_label": "Decision", "dst_consolidated": False},
+            {"src": 102, "dst": 203, "dst_label": "Decision", "dst_consolidated": False},
+        ]),
+        FakeResult([]),
+    ])
     out = await daemon._find_fresh_insight_clusters()
     assert out == []
-    query, params = session.calls[0]
-    # Existence of a HAD_OUTCOME edge — never its rating.
-    assert "HAD_OUTCOME" in query
-    assert "rating" not in query
-    # ≥2 distinct projects; threshold and mega-hub cap parameterised.
-    assert "size(project_ids) >= 2" in query
-    assert params["threshold"] == INSIGHT_THRESHOLD
-    assert params["hub_cap"] == INSIGHT_HUB_DEGREE_CAP
-    # Reversed decisions never seed a fresh cluster; re-folds keep them
-    # (boundary evidence) by keying on the insight's source_pg_ids instead.
-    assert "coalesce(d.superseded, false) = false" in query
-    # Grounding: the shared entity must carry at least one Fact.
-    assert "(f:Fact)" in query.replace("`", "")
-
-
-@pytest.mark.asyncio
-async def test_fresh_cluster_gate_joins_alias_component():
-    """ADR-017: insight clustering must merge alias-linked entity variants
-    (e.g. 'Cloe VM'/'CloeVM') the same way _find_anchored_clusters already
-    does for facts — previously this query grouped on the bare e.name and
-    never saw the alias_component property at all."""
-    daemon, session = daemon_with_fake_graph([FakeResult([])])
-    await daemon._find_fresh_insight_clusters()
-    query, _params = session.calls[0]
-    assert "alias_component" in query
-    assert "CALL (e0)" in query
-    # Canonical name = lexicographically smallest member — same rule as the
-    # fact-fold path, so the (entity) cluster key stays stable across cycles.
-    assert "reduce(c = null, nm IN [x IN members | x.name]" in query
-    # Decisions are re-gathered from EVERY alias member, not just the anchor
-    # entity that matched first — otherwise a decision linked only to the
-    # second surface form would still be missed.
-    assert "UNWIND members AS m" in query
-    assert "MATCH (m)<-[:" in query
 
 
 @pytest.mark.asyncio

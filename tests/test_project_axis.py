@@ -23,7 +23,6 @@ _SCRIPTS = os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scrip
 sys.path.insert(0, _SCRIPTS)
 
 from project_axis import PROJECT_SQL, PROJECT_MATCH_SQL, SENTINEL, resolve_project
-from insight_gate import insight_cluster_cypher
 
 
 # ── The resolution itself ────────────────────────────────────────────────────
@@ -156,51 +155,41 @@ def test_the_migration_tool_matches_both_fields_not_the_resolution():
     assert " OR " in predicate
 
 
-# ── decision_cycles now runs the daemon's own gate ───────────────────────────
+# ── decision_cycles now counts v2 GATING GROUPS (Dreaming Cycle Plan to v2,
+#    §2.2; C2) — insight_cluster_cypher and its ≥2-projects rule are gone
+#    (see test_project_identity.py's retired-P22 note). `_nrem_cycle_counts`
+#    now walks each fact-gating (project, domain) group via
+#    `insight_gate.walk_group_reached_set` and checks
+#    `insight_gate.passes_insight_gate` (G2 + G3) — the SAME predicate
+#    `consolidation_loop._find_fresh_insight_clusters` folds on. ─────────────
 
-def test_count_only_differs_from_the_fold_query_by_projection_alone():
-    """One predicate, two projections. If they can drift, telemetry can once
-    again report a backlog the daemon cannot fold."""
-    full = insight_cluster_cypher()
-    counting = insight_cluster_cypher(count_only=True)
-    tail = " RETURN count(*) AS cycles"
-    assert counting.endswith(tail)
-    shared = counting[: -len(tail)]
-    assert full.startswith(shared)
-
-
-def test_the_gate_carries_all_three_conditions():
-    """The conditions a Postgres partition could not express — and the reason
-    the old gauge said 2 where the daemon folds 0."""
-    q = insight_cluster_cypher(count_only=True)
-    assert "size(project_ids) >= 2" in q
-    assert "HAD_OUTCOME" in q
-    assert "$hub_cap" in q
-    assert "$threshold" in q
+_FACT_ROWS_MARKER = "RETURN f.pg_id AS pg_id, project, domain"
+_THREE_FACT_ROWS = [
+    {"pg_id": 101, "project": "proj", "domain": "dom"},
+    {"pg_id": 102, "project": "proj", "domain": "dom"},
+    {"pg_id": 103, "project": "proj", "domain": "dom"},
+]
 
 
 @pytest.mark.asyncio
-async def test_decision_cycles_reflects_the_insight_gate_not_a_partition():
-    """Eligible decisions that share no entity yield 0 cycles.
-
-    The old chain collected them flat and bucketed by project, so two decisions
-    in one project counted as a cycle even with nothing in common. The stub
-    graph here returns no insight cluster — which is what the real gate returns
-    for decisions sharing no grounded entity — so the gauge must read 0.
-    """
+async def test_decision_cycles_reflects_the_walk_not_a_partition():
+    """A gating (project, domain) group whose walk reaches NO judgement at all
+    (empty neighbour response) must count as 0 — G2/G3 vacuously fail. The old
+    chain collected decisions flat and bucketed by Postgres project, so two
+    decisions in one project counted as a cycle even with nothing connecting
+    them; this proves the gauge asks the graph, not Postgres."""
     from coordinator import MemoryCoordinator
 
     coord = MemoryCoordinator()
-
     captured = []
 
     async def fake_run(query, **params):
-        captured.append(query)
+        captured.append((query, params))
         result = MagicMock()
-        if "count(*) AS cycles" in query:
-            result.data = AsyncMock(return_value=[{"cycles": 0}])
-        else:  # the fact-cluster query
-            result.data = AsyncMock(return_value=[])
+        if _FACT_ROWS_MARKER in query:
+            result.data = AsyncMock(return_value=_THREE_FACT_ROWS)
+        else:
+            result.data = AsyncMock(return_value=[])  # walk step — nothing reached
         return result
 
     session = MagicMock()
@@ -213,26 +202,35 @@ async def test_decision_cycles_reflects_the_insight_gate_not_a_partition():
     counts = await coord._nrem_cycle_counts()
 
     assert counts["decision_cycles"] == 0
-    assert counts["total_cycles"] == 0
-    # It must have ASKED the graph the insight question — a partition of
-    # Postgres project values would never issue this query.
-    assert any("count(*) AS cycles" in q for q in captured)
-    assert any("size(project_ids) >= 2" in q for q in captured)
+    # It must have ASKED the graph the walk question (I3's one-hop query) —
+    # a partition of Postgres project values would never issue this.
+    assert any("UNWIND $ids AS pid" in q for q, _ in captured)
 
 
 @pytest.mark.asyncio
-async def test_decision_cycles_reports_what_the_gate_returns():
-    """The counterpart: when the gate does find clusters, the gauge is theirs."""
+async def test_decision_cycles_counts_a_group_whose_walk_reaches_a_retrospective():
+    """The counterpart: the gating group's walk reaches one fresh Decision and
+    one fresh Retrospective (G2 + G3 both satisfied) — one gating group, one
+    cycle."""
     from coordinator import MemoryCoordinator
 
     coord = MemoryCoordinator()
 
     async def fake_run(query, **params):
         result = MagicMock()
-        if "count(*) AS cycles" in query:
-            result.data = AsyncMock(return_value=[{"cycles": 3}])
+        if _FACT_ROWS_MARKER in query:
+            result.data = AsyncMock(return_value=_THREE_FACT_ROWS)
         else:
-            result.data = AsyncMock(return_value=[])
+            ids = set(params.get("ids") or [])
+            if ids == {101, 102, 103}:
+                result.data = AsyncMock(return_value=[
+                    {"src": 101, "dst": 201, "dst_label": "Decision",
+                     "dst_consolidated": False},
+                    {"src": 102, "dst": 202, "dst_label": "Retrospective",
+                     "dst_consolidated": False},
+                ])
+            else:
+                result.data = AsyncMock(return_value=[])  # fixpoint — nothing new
         return result
 
     session = MagicMock()
@@ -243,17 +241,43 @@ async def test_decision_cycles_reports_what_the_gate_returns():
     coord._neo4j.session = MagicMock(return_value=session)
 
     counts = await coord._nrem_cycle_counts()
-    assert counts["decision_cycles"] == 3
+    assert counts["decision_cycles"] == 1
+    assert counts["total_cycles"] == counts["fact_cycles"] + 1
 
 
-def test_reported_decision_threshold_tracks_the_real_gate():
-    """A deployment tuning insight_threshold must see the tuned value, not a
-    hardcoded twin that used to sit beside it in coordinator.py."""
+def test_decision_threshold_no_longer_a_duplicate_tunable():
+    """v2: G2/G3 are 'at least one' conditions, not a tunable decision COUNT —
+    the pre-v2 hardcoded twin of insight_threshold that used to sit beside it
+    in coordinator.py is gone outright, not renamed."""
     import coordinator
-    from insight_gate import INSIGHT_THRESHOLD
 
-    assert coordinator.INSIGHT_THRESHOLD is INSIGHT_THRESHOLD
+    assert not hasattr(coordinator, "INSIGHT_THRESHOLD")
     assert not hasattr(coordinator, "NREM_DECISION_THRESHOLD")
+
+
+@pytest.mark.asyncio
+async def test_nrem_cycle_counts_no_longer_reports_a_decision_threshold():
+    """REMOVED, not repurposed (same precedent v0.8.64 set for
+    `domain_threshold`) — see test_v2_fact_gate.py's wire-contract pin for
+    the full returned-dict shape."""
+    from coordinator import MemoryCoordinator
+
+    coord = MemoryCoordinator()
+
+    async def fake_run(query, **params):
+        result = MagicMock()
+        result.data = AsyncMock(return_value=[])
+        return result
+
+    session = MagicMock()
+    session.run = fake_run
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=False)
+    coord._neo4j = MagicMock()
+    coord._neo4j.session = MagicMock(return_value=session)
+
+    counts = await coord._nrem_cycle_counts()
+    assert "decision_threshold" not in counts
 
 
 # ── P2/P3 — an unresolvable project folds nothing (v0.8.32) ──────────────────

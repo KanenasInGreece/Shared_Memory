@@ -68,7 +68,8 @@ from ontology import (
 )
 import relation_confidence as rc_conf
 from insight_gate import (
-    INSIGHT_THRESHOLD, INSIGHT_HUB_DEGREE_CAP, insight_cluster_cypher,
+    INSIGHT_AGE_CENSUS_K, walk_group_reached_set, passes_insight_gate,
+    order_components, classify_identity,
 )
 from project_axis import PROJECT_SQL, fold_eligible
 from nrem_gate import eligible_domain_level_clusters, count_domain_level_cycles  # noqa: F401 — re-exported, see below
@@ -1226,6 +1227,23 @@ def fetch_refold_insights(conn, retro_pg_ids):
             (list(retro_pg_ids),),
         )
         return cur.fetchall()
+
+
+def fetch_active_insight_judgement_sets(conn):
+    """§2.5 identity resolution's read side — every ACTIVE insight's current
+    ``source_pg_ids``, as sets, for ``insight_gate.classify_identity`` to
+    compare a freshly-walked component's reach against. Pure read, no
+    interpretation: today's rows are decision-only (the seam noted on
+    ``_find_fresh_insight_clusters`` — C4 makes this judgement-inclusive per
+    §3.2), tomorrow's will be judgement-only; this function just returns
+    whatever is there."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT source_pg_ids FROM community_summaries"
+            " WHERE NOT superseded"
+            "   AND metadata->>'kind' = 'insight'"
+        )
+        return [set(r[0] or []) for r in cur.fetchall()]
 
 
 def fetch_retro_records(conn, retro_ids):
@@ -2655,15 +2673,115 @@ class ConsolidationDaemon:
     # ── Insight consolidation (decision pg_id 276) ────────────────────────────
 
     async def _find_fresh_insight_clusters(self):
-        """The work items behind the eligibility gate — see
-        insight_gate.insight_cluster_cypher for the predicate itself, which the
-        coordinator's telemetry runs count-only so the gauge and the fold can
-        never again describe different populations."""
-        async with self.driver.session() as session:
-            result = await session.run(
-                insight_cluster_cypher(),
-                hub_cap=INSIGHT_HUB_DEGREE_CAP, threshold=INSIGHT_THRESHOLD)
-            return await result.data()
+        """✅ THE v2 INSIGHT GATE (plan §2.2-§2.4) — replaces the pre-v2 1-hop
+        shared-Entity match wholesale. No entity anchor (I1), no
+        ≥2-distinct-projects rule (I2), no hub-degree cap.
+
+        G1 is NOT re-derived here — it is ``_find_grounded_fact_groups`` (the
+        SAME graph-native discovery the fact-fold path uses) fed through
+        ``nrem_gate.eligible_domain_level_clusters`` (the SAME partitioner,
+        identical to ``_consolidate_clusters``'s own use of it just above).
+        For every gating (project, domain) group this walks (§2.3, I3) from
+        its grounded, non-superseded fact pg_ids over the closed relation
+        set, checks G2+G3 (``insight_gate.passes_insight_gate`` — the exact
+        predicate ``coordinator._nrem_cycle_counts`` counts for its telemetry
+        gauge, one definition for both), and — only for a passing group —
+        partitions the reached judgements into components and orders them
+        (§2.4, ``insight_gate.order_components``).
+
+        Every component in a passing group folds (components group, they do
+        not gate). Returns ONE ROW PER COMPONENT, in fold order, shaped like
+        the pre-v2 return (``entity``/``decision_ids``/``projects``) so
+        ``run_insight_cycle``'s existing fold loop needs no change:
+
+          ``entity``       -- always '' (I1 — no entity anchor; retained only
+                               as `_fold_insight`'s human-readable log/
+                               dead-letter label, never a gate predicate).
+          ``decision_ids`` -- the component's DECISION pg_ids only, ascending.
+                               ⛔ SEAM: `_fold_insight` / `_mark_insight_in_graph`
+                               / `generate_insight` are decision-only by
+                               contract today (`_mark_insight_in_graph` sets
+                               `d.consolidated` on `:Decision` nodes
+                               specifically; feeding it a Retrospective pg_id
+                               would silently never mark it consolidated,
+                               keeping G3 permanently "fresh" for that node).
+                               Making the fold judgement-inclusive — labelling
+                               Retrospective blocks correctly, marking both
+                               labels consolidated, writing
+                               judgement-only `source_pg_ids` — is §3.2/§4.3
+                               step 4-5, i.e. C4's payload rewrite. C2 stops
+                               here and reports the full reach separately.
+          ``projects``      -- ``[project]`` (single — a v2 group is one
+                               (project, domain) pair, never cross-project by
+                               construction).
+          ``domain``         -- the group's domain, new field, payload-only
+                               (no consumer reads it yet; C4's metadata
+                               assembly will).
+          ``judgement_ids``  -- the FULL ordered component (decisions AND
+                               retrospectives) — the honest §2.3 reach, for a
+                               caller doing real identity resolution (§2.5)
+                               or logging, never fed to today's fold.
+          ``has_retrospective`` -- whether this SPECIFIC component contains a
+                               Retrospective (G2 is evaluated on the GROUP's
+                               full reach, not per component — a component
+                               can legitimately have none, e.g. a lone
+                               judgement with no neighbours, and still folds).
+
+        A component with ZERO decision ids after the retrospective-only
+        filter is skipped (logged) rather than folded with nothing for
+        `_fold_insight` to read — this is the §2.2a edge case escalated to
+        Opus (does a reversing retrospective, now the sole member of its
+        component because the decision it evaluates was excluded by I10,
+        still deserve to appear in a payload with no decision left to name).
+        """
+        rows = await self._find_grounded_fact_groups()
+        if not rows:
+            return []
+
+        project_map: dict = {}
+        domains_map: dict = {}
+        registered_sections: set = set()
+        for r in rows:
+            pid = r["pg_id"]
+            project_map[pid] = r["project"]
+            doms = domains_map.setdefault(pid, [])
+            if r["domain"] not in doms:
+                doms.append(r["domain"])
+            registered_sections.add((r["project"], r["domain"]))
+        pg_ids_all = list(project_map)
+
+        # G1 — reused, not re-derived (same call `_consolidate_clusters` makes).
+        groups = eligible_domain_level_clusters(
+            [""] * len(pg_ids_all), pg_ids_all, project_map, domains_map,
+            DENSITY_THRESHOLD, registered_sections,
+        )
+
+        clusters = []
+        for (project, section), _contents, fact_ids in groups:
+            labels, consolidated, components = await walk_group_reached_set(
+                self.driver, fact_ids)
+            if not passes_insight_gate(labels, consolidated):  # G2 + G3
+                continue
+            for comp in order_components(components, labels):  # §2.4
+                decision_ids = [i for i in comp if labels.get(i) == ONT.decision]
+                has_retro = any(labels.get(i) == ONT.retrospective for i in comp)
+                if not decision_ids:
+                    logger.warning(
+                        "Insight gate: component %s in %s/%s reached with no "
+                        "Decision member (retrospective-only, §2.2a edge case) "
+                        "— skipped; nothing for the fold to write today.",
+                        comp, project, section,
+                    )
+                    continue
+                clusters.append({
+                    "entity": "",
+                    "decision_ids": decision_ids,
+                    "projects": [project],
+                    "domain": section,
+                    "judgement_ids": comp,
+                    "has_retrospective": has_retro,
+                })
+        return clusters
 
     async def _fetch_outcome_edges(self, pg_ids):
         """All retrospective outcomes for the fold prompt, BOTH shapes
@@ -2802,6 +2920,31 @@ class ConsolidationDaemon:
 
                 # 2. Fresh clusters from the graph gate.
                 clusters = await self._find_fresh_insight_clusters()
+
+                # §2.5 identity resolution — LOCKED: an insight's identity is
+                # the SET of judgement pg_ids it covers. A component whose
+                # FULL reach (judgement_ids: decisions + retrospectives)
+                # exactly matches an existing active insight's source_pg_ids
+                # is not a new insight — C3 owns actually appending the
+                # triggering reference to that existing row; C2 only avoids
+                # proposing a redundant fold here. Compared against the
+                # judgement-only definition per §3.2/§2.5 even though today's
+                # `_fold_insight` still WRITES decision-only source_pg_ids
+                # (the seam noted on `_find_fresh_insight_clusters`) — so an
+                # exact 'same' match cannot occur until C4 makes
+                # `source_pg_ids` judgement-inclusive. Implementing the
+                # LOCKED definition now, correctly, rather than a transitional
+                # decision-only approximation that C4 would have to revisit.
+                existing_insight_sets = await loop.run_in_executor(
+                    None, lambda: fetch_active_insight_judgement_sets(conn))
+                clusters = [
+                    c for c in clusters
+                    if not any(
+                        classify_identity(c["judgement_ids"], ex) == "same"
+                        for ex in existing_insight_sets
+                    )
+                ]
+
                 # Coverage census (PR-2) — captured BEFORE folding so a crash
                 # mid-fold still records what was eligible. eligible_clusters =
                 # uncovered insight opportunities; oldest age = the K-th-oldest
@@ -2815,7 +2958,7 @@ class ConsolidationDaemon:
                     None, lambda: _fetch_outbox_created_at(all_member_ids))
                 rec.eligible_clusters = len(clusters)
                 rec.eligible_oldest_age = _kth_oldest_age_seconds(
-                    cluster_id_lists, ts_map, INSIGHT_THRESHOLD)
+                    cluster_id_lists, ts_map, INSIGHT_AGE_CENSUS_K)
                 for c in clusters:
                     ids = [int(i) for i in c["decision_ids"] if i is not None]
                     if not ids or any(i in folded for i in ids):

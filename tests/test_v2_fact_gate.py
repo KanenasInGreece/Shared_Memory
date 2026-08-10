@@ -247,10 +247,22 @@ def test_nrem_cycle_counts_reuses_the_folds_own_partitioner():
     assert "alias_component" not in source
 
 
-async def _run_nrem_cycle_counts_capturing_queries(fact_rows=None, insight_cycles=0):
+_FACT_ROWS_MARKER = "RETURN f.pg_id AS pg_id, project, domain"
+
+
+async def _run_nrem_cycle_counts_capturing_queries(fact_rows=None, walk_rows=None):
     """Runs the REAL `_nrem_cycle_counts` against a fake Neo4j session (no DB)
     and returns (counts, [captured query strings]) — mirrors the fake_run
-    dispatch pattern already established in test_project_axis.py."""
+    dispatch pattern already established in test_project_axis.py.
+
+    C2: the pre-v2 `insight_cluster_cypher(count_only=True)` ("count(*) AS
+    cycles") query is GONE — `decision_cycles` now walks each gating group
+    (`insight_gate.WALK_STEP_CYPHER`, dispatched here by its own marker) and
+    checks `insight_gate.passes_insight_gate`. `walk_rows` feeds every walk
+    layer for every group the SAME response (empty by default — a decision
+    it does not affect what this file actually asserts on: fact_cycles and
+    the fact-discovery Cypher shape); test_project_axis.py covers
+    decision_cycles' own correctness in depth."""
     from unittest.mock import AsyncMock, MagicMock
 
     captured = []
@@ -258,10 +270,10 @@ async def _run_nrem_cycle_counts_capturing_queries(fact_rows=None, insight_cycle
     async def fake_run(query, **params):
         captured.append(" ".join(query.split()))
         result = MagicMock()
-        if "count(*) AS cycles" in query:
-            result.data = AsyncMock(return_value=[{"cycles": insight_cycles}])
-        else:  # the fact discovery query
+        if _FACT_ROWS_MARKER in query:
             result.data = AsyncMock(return_value=fact_rows or [])
+        else:  # a walk-step layer
+            result.data = AsyncMock(return_value=walk_rows or [])
         return result
 
     session = MagicMock()
@@ -282,7 +294,7 @@ async def test_nrem_cycle_counts_walks_the_same_grounded_in_domain_of_project_of
     project/domain is the SAME chain `_find_grounded_fact_groups` folds on —
     not a Postgres PROJECT_SQL resolution that could disagree with the graph."""
     _counts, queries = await _run_nrem_cycle_counts_capturing_queries()
-    fact_query = next(q for q in queries if "count(*) AS cycles" not in q)
+    fact_query = next(q for q in queries if _FACT_ROWS_MARKER in q)
     assert f"-[:{cl.ONT.grounded_in}]->" in fact_query
     assert f"-[:{cl.ONT.domain_of}]->" in fact_query
     assert f"-[:{cl.ONT.project_of}]->" in fact_query
@@ -338,9 +350,17 @@ def test_the_four_legacy_names_and_the_dead_wrapper_are_gone():
 @pytest.mark.asyncio
 async def test_nrem_cycle_counts_returned_dict_has_exactly_the_new_shape():
     """The wire contract of `GET /memory/telemetry`'s `nrem` key, pinned by
-    return value rather than source text."""
+    return value rather than source text.
+
+    v2 (C2): `decision_threshold` is REMOVED, not repurposed — the same
+    precedent this release already set for `domain_threshold` (removed
+    outright with `NREM_DOMAIN_THRESHOLD`, above). G2/G3 are each 'at least
+    one' conditions, not a tunable count, so there is no threshold value left
+    to report; a bare number under the old field name would read as "the
+    threshold was lowered", which is false. Consumers of this endpoint
+    (including the monitor dashboard) must be updated."""
     counts, _queries = await _run_nrem_cycle_counts_capturing_queries()
     assert set(counts) == {
-        "fact_cycles", "decision_cycles", "total_cycles",
-        "fact_threshold", "decision_threshold",
+        "fact_cycles", "decision_cycles", "total_cycles", "fact_threshold",
     }
+    assert "decision_threshold" not in counts
