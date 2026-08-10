@@ -1339,16 +1339,29 @@ def write_insight_summary(conn, content, metadata_json, embedding, src_ids, outb
     return summary_id
 
 
-def supersede_covered_summaries(conn, summary_id, src_ids, level=None):
+def supersede_covered_summaries(conn, summary_id, src_ids, level=None, kind="thematic"):
     """Mark active summaries whose source_pg_ids the new summary covers
     (subset OR equal — an exact-set re-fold supersedes its predecessor).
 
-    **P12:** when ``level`` is set, only summaries at the **same** level are
-    candidates. Without that, a domain-level fold's source set always covers
-    every entity-level subset beneath it and would retire fine summaries every
-    cycle. Insight path passes ``level=None`` (kind isolation already keeps
-    fact ids vs decision ids apart). Commit is the caller's job.
-    Returns the superseded summary ids.
+    **U5 (§5, plan's "still unfixed" note): kind isolation is now
+    UNCONDITIONAL, never a side effect of ``level`` being set.** It used to
+    apply only when ``level is not None``, and the insight path calls this
+    with ``level=None`` (kind isolation was never actually keeping insight
+    and thematic apart on that path) — the docstring blamed "disjoint id
+    spaces", which is FALSE: facts, decisions and retrospectives all share
+    the single `technical_docs` sequence, so an insight's decision-id source
+    set CAN coincidentally be a subset of a thematic summary's fact-id
+    source set, and vice versa. Pass the caller's own kind explicitly
+    (default ``'thematic'`` — the fact-fold caller's kind) and it is checked
+    on EVERY call, level or no level.
+
+    **P12 (still level-gated, deliberately):** when ``level`` is set, only
+    summaries at the **same** level are additionally required — without
+    that, a domain-level fold's source set always covers every entity-level
+    subset beneath it and would retire fine summaries every cycle. When
+    ``level`` is ``None`` (the insight caller), level is not compared at
+    all — kind isolation is what protects it now, not the level check.
+    Commit is the caller's job. Returns the superseded summary ids.
     """
     new_src_set = set(src_ids)
     superseded = []
@@ -1363,15 +1376,16 @@ def supersede_covered_summaries(conn, summary_id, src_ids, level=None):
             (LEVEL_ENTITY, summary_id),
         )
         for old_id, old_src, old_level, old_kind in cur.fetchall():
-            # Insights never cover thematic rows and vice versa — kept by
-            # disjoint id spaces; skip insight rows when we are thematic.
-            if level is not None and old_kind == "insight":
+            # U5: kind isolation applies UNCONDITIONALLY — never gated on
+            # whether `level` was passed.
+            if old_kind != kind:
                 continue
             if level is not None and old_level != level:
                 continue
             if old_src and set(old_src) <= new_src_set:
                 cur.execute(
-                    "UPDATE community_summaries SET superseded = true"
+                    "UPDATE community_summaries SET superseded = true,"
+                    "  superseded_reason = 'coverage'"
                     " WHERE id = %s",
                     (old_id,),
                 )
@@ -1403,6 +1417,342 @@ def close_ledger_rows_by_id(conn, row_ids, context="insight"):
             ", ".join(f"outbox_id={oid}→pg_id={pid}" for oid, pid in sorted(deleted)),
         )
     return len(deleted)
+
+
+# ── C3 — cascading (lineage) supersession, migration 031 ─────────────────────
+# Dreaming Cycle Plan to v2, §5 (AMENDED 2026-08-10 block) + `retrospective:1178`
+# refining `decision:384`. THE RULE:
+#
+#   Invalidation is identified from the stored lists. Re-gating is re-derived
+#   from the graph. The ledger is only the clock.
+#
+# Mechanism A (supersede_covered_summaries, subset coverage) and Mechanism B
+# (this section, lineage) are SEPARATE and both needed — a reversal makes the
+# covered set SMALLER, so Mechanism A can never retire the old row (§5.2).
+# Mechanism B never fabricates neo4j_outbox rows: `_find_grounded_fact_groups`
+# is a full graph scan that never reads the outbox, and a thematic fold
+# UPSERTs on (entity, project, domain, level), so re-gating needs no work
+# list — the outbox's only surviving role in the fact path is the CLOCK
+# (`consolidation_due`, `run_ledger_sweep`'s density gate), which is what
+# `refold_ledger` extends.
+
+def fetch_invalidated_summaries(conn):
+    """U2 — identify ACTIVE summaries holding an invalid member, by REVERSE
+    LOOKUP on their own stored id lists — NEVER by set comparison (§5.2: a
+    reversal makes the covered set SMALLER, so subset coverage, Mechanism A,
+    structurally cannot express this).
+
+    ONE predicate covers BOTH triggers: `technical_docs.superseded = true`
+    is set on a superseded FACT (the `supersedes` ingress path) and on a
+    REVERSED decision (`rating='reversed'`, coordinator.py's retrospective
+    handler) alike — same column, same test, nothing to keep in sync (§2.2a).
+
+    THREE LEGS, in cascade order — leg 3 depends on leg 1's output from THIS
+    call, not on the general population of superseded thematic rows:
+
+      1. THEMATIC summaries (`kind != 'insight'`) whose `source_pg_ids`
+         holds a superseded fact.
+      2. INSIGHT summaries whose `source_pg_ids` holds a reversed decision
+         directly (§2.2a / I10) — membership, not via a thematic summary.
+      3. INSIGHT summaries whose `metadata->'summary_ids'` overlaps the
+         THEMATIC summary ids retired in LEG 1 of this same call. Scoped
+         this way deliberately: an insight resting on a thematic summary
+         that was superseded by ordinary growth (Mechanism A, subset
+         coverage) is NOT stale — its constituents are all still valid, a
+         live fold path already covers it (`decision:384`, unchanged) — so
+         only a lineage-caused (this leg-1 pass) retirement cascades.
+         `summary_ids` is C4's field; 0 rows carry it on the corpus this was
+         written against, so this leg is exercised only by a seeded test
+         until C4 ships (do not read "0 matches" as "leg 3 works" — it is
+         merely untriggered).
+
+    Returns a list of dicts, one per (summary, invalidating member) pair —
+    a summary with more than one invalid member yields more than one dict,
+    which is fine: `retire_invalidated_summaries` retires each summary_id
+    once and may open ledger rows tagged with more than one trigger, which
+    the ledger's own no-uniqueness-constraint design already tolerates
+    (migration 031's comment: "duplicates ... are legitimate"). Keys:
+    ``summary_id``, ``source_pg_ids``, ``kind`` ('thematic'|'insight'),
+    ``trigger_kind`` ('technical_docs'|'community_summaries'), ``trigger_id``.
+    """
+    out = []
+    with conn.cursor() as cur:
+        # Leg 1 — thematic summary holding a superseded fact.
+        cur.execute(
+            "SELECT DISTINCT cs.id, cs.source_pg_ids, t.id"
+            "  FROM community_summaries cs"
+            "  JOIN technical_docs t ON t.id = ANY(cs.source_pg_ids)"
+            " WHERE NOT cs.superseded"
+            "   AND COALESCE(cs.metadata->>'kind', 'thematic') <> 'insight'"
+            "   AND COALESCE(t.superseded, false) = true"
+        )
+        leg1 = cur.fetchall()
+        for sid, src, trig in leg1:
+            out.append({"summary_id": sid, "source_pg_ids": list(src or []),
+                       "kind": "thematic", "trigger_kind": "technical_docs",
+                       "trigger_id": trig})
+        leg1_summary_ids = sorted({sid for sid, _src, _trig in leg1})
+
+        # Leg 2 — insight summary holding a reversed decision directly.
+        cur.execute(
+            "SELECT DISTINCT cs.id, cs.source_pg_ids, t.id"
+            "  FROM community_summaries cs"
+            "  JOIN technical_docs t ON t.id = ANY(cs.source_pg_ids)"
+            " WHERE NOT cs.superseded"
+            "   AND cs.metadata->>'kind' = 'insight'"
+            "   AND COALESCE(t.superseded, false) = true"
+        )
+        for sid, src, trig in cur.fetchall():
+            out.append({"summary_id": sid, "source_pg_ids": list(src or []),
+                       "kind": "insight", "trigger_kind": "technical_docs",
+                       "trigger_id": trig})
+
+        # Leg 3 — insight whose summary_ids names a leg-1-retired thematic row.
+        if leg1_summary_ids:
+            cur.execute(
+                "SELECT DISTINCT cs.id, cs.source_pg_ids, elem::bigint"
+                "  FROM community_summaries cs,"
+                "       jsonb_array_elements_text("
+                "           COALESCE(cs.metadata->'summary_ids', '[]'::jsonb)) AS elem"
+                " WHERE NOT cs.superseded"
+                "   AND cs.metadata->>'kind' = 'insight'"
+                "   AND elem::bigint = ANY(%s)",
+                (leg1_summary_ids,),
+            )
+            for sid, src, trig in cur.fetchall():
+                out.append({"summary_id": sid, "source_pg_ids": list(src or []),
+                           "kind": "insight", "trigger_kind": "community_summaries",
+                           "trigger_id": trig})
+    return out
+
+
+def resolve_standing_ids(conn, pg_ids):
+    """Walk `technical_docs.superseded_by` FORWARD from each id in ``pg_ids``
+    to the record that STANDS — `decision:389`'s ride-along pattern
+    (`close_ledger_rows`'s recursive predecessor purge), generalised to a
+    batch read instead of a single-direction purge.
+
+    A chain terminates either on a record that is NOT superseded (the live
+    standing record — a fresh fold should pick this one up) or on one that
+    IS superseded with no further `superseded_by` (a dead end — e.g. a
+    reversed decision, which coordinator.py's reversal path never gives a
+    successor). Depth-capped at 50 hops as a defensive guard against a
+    malformed cycle; real chains here are short.
+
+    Returns ``{start_id: (standing_id, still_superseded)}`` for every id in
+    ``pg_ids`` that exists in `technical_docs` (a missing id is silently
+    omitted — defensive, matches `fetch_ledger_backlog`'s LEFT JOIN
+    stance elsewhere in this module).
+    """
+    if not pg_ids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            "WITH RECURSIVE chain AS ("
+            "  SELECT id AS start_id, id AS cur_id, COALESCE(superseded, false) AS sup,"
+            "         superseded_by, 1 AS depth"
+            "    FROM technical_docs WHERE id = ANY(%s)"
+            "  UNION ALL"
+            "  SELECT chain.start_id, t.id, COALESCE(t.superseded, false), t.superseded_by,"
+            "         chain.depth + 1"
+            "    FROM chain JOIN technical_docs t ON t.id = chain.superseded_by"
+            "   WHERE chain.sup AND chain.superseded_by IS NOT NULL AND chain.depth < 50"
+            ")"
+            " SELECT DISTINCT ON (start_id) start_id, cur_id, sup"
+            "   FROM chain ORDER BY start_id, depth DESC",
+            (list(dict.fromkeys(pg_ids)),),
+        )
+        return {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+
+
+def retire_invalidated_summaries(conn):
+    """U3 + U4 — retire every summary `fetch_invalidated_summaries` finds and
+    open the `refold_ledger` clock for its still-eligible constituents,
+    ATOMICALLY: one Postgres transaction for the whole pass (a retirement
+    with no ledger row for an eligible constituent is the failure §5's
+    defect #1/#2 describe, and this function is how it stays impossible).
+
+    Postgres-only. Two-store split is deliberate (§ U3): a Fact's own
+    `consolidated` flag is NEVER cleared here — `_find_grounded_fact_
+    groups` never reads it, so clearing it would be a write with no reader.
+    An INSIGHT's `consolidated` flag on its Decision/Retrospective graph
+    nodes IS gate-critical (G3, `insight_gate.py:96`) but lives in Neo4j;
+    the caller (`ConsolidationDaemon.run_lineage_invalidation_pass`) clears
+    it after this commits, using the ``retired`` list this function returns.
+
+    For each retired summary, its OWN constituents (`source_pg_ids`) are
+    resolved via `resolve_standing_ids`; a constituent whose chain dead-ends
+    still superseded — this always includes the triggering record itself,
+    which by construction has no live successor when it has none, and NEVER
+    gets a row (§5 defect: "the trigger record NEVER gets a row — it is
+    superseded and can never be re-folded") — is dropped from the ledger
+    write. This is also how §5's defect #4 is handled: a retired summary
+    whose constituents are ALL superseded still raises a ledger row, for
+    whichever constituent's chain resolves to a live successor.
+
+    Returns ``(retired, opened)`` — ``retired`` is
+    ``[(summary_id, kind, source_pg_ids)]`` (drives the caller's Neo4j
+    pass); ``opened`` is the total refold_ledger row count, for the log line.
+    """
+    matches = fetch_invalidated_summaries(conn)
+    if not matches:
+        return [], 0
+
+    by_summary: dict = {}
+    for m in matches:
+        entry = by_summary.setdefault(
+            m["summary_id"],
+            {"kind": m["kind"], "source_pg_ids": m["source_pg_ids"], "triggers": []},
+        )
+        trig = (m["trigger_kind"], m["trigger_id"])
+        if trig not in entry["triggers"]:
+            entry["triggers"].append(trig)
+
+    retired = []
+    opened = 0
+    with conn.cursor() as cur:
+        for summary_id, info in by_summary.items():
+            cur.execute(
+                "UPDATE community_summaries SET superseded = true,"
+                "  superseded_at = now(), superseded_reason = 'lineage'"
+                " WHERE id = %s AND NOT superseded",
+                (summary_id,),
+            )
+            if cur.rowcount == 0:
+                # Already retired (concurrent pass, or already superseded by
+                # Mechanism A between the SELECT above and here) — no ledger
+                # write either; whatever retired it owns that ledger entry.
+                continue
+            retired.append((summary_id, info["kind"], info["source_pg_ids"]))
+
+            standing = resolve_standing_ids(conn, info["source_pg_ids"])
+            eligible_ids = sorted({
+                sid for sid, still_sup in standing.values() if not still_sup
+            })
+            for trigger_kind, trigger_id in info["triggers"]:
+                for pg_id in eligible_ids:
+                    cur.execute(
+                        "INSERT INTO refold_ledger"
+                        "  (pg_id, summary_id, summary_kind, trigger_kind, trigger_id)"
+                        " VALUES (%s, %s, %s, %s, %s)",
+                        (pg_id, summary_id, info["kind"], trigger_kind, trigger_id),
+                    )
+                    opened += 1
+    conn.commit()
+    return retired, opened
+
+
+def fetch_refold_backlog(conn):
+    """U4 due-ness — DISTINCT `pg_id` of OPEN `refold_ledger` rows. The
+    lineage-invalidation twin of `fetch_ledger_backlog`, unioned with it
+    (never replacing it) wherever the fact backlog is read — see
+    `fetch_combined_fact_backlog`. Duplicated pg_ids across two different
+    retired summaries are legitimate (no uniqueness constraint on the
+    table); DISTINCT is what makes counting them once due-ness's job."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT DISTINCT pg_id FROM refold_ledger WHERE status = 'open'")
+        return [r[0] for r in cur.fetchall()]
+
+
+def fetch_combined_fact_backlog(conn):
+    """The WIDENED input set §5's amendment specifies: `fetch_ledger_backlog`
+    (outbox) UNION `fetch_refold_backlog` (lineage), deduped. `consolidation_
+    due` and `run_ledger_sweep`'s density check are UNCHANGED — they still
+    just compare `len(backlog) >= DENSITY_THRESHOLD` — only what feeds them
+    grows a second source. I16: due-ness counts DISTINCT pg_id, which this
+    preserves (a `set` union of two already-distinct lists)."""
+    return sorted(set(fetch_ledger_backlog(conn)) | set(fetch_refold_backlog(conn)))
+
+
+def close_refold_ledger_rows(conn, context="consolidation"):
+    """U4 close — the `refold_ledger` twin of `close_ledger_rows` /
+    `close_ledger_rows_by_id`, with the one deliberate difference migration
+    031 states: CLOSE, never DELETE — this table IS the attribution trail
+    (the `project_promotions` model), so a row transitions to a terminal
+    status and is kept, not removed.
+
+    'refolded' — the row's `pg_id` now appears in an ACTIVE
+    `community_summaries` row of the MATCHING kind (thematic rows check
+    non-insight summaries, insight rows check insight summaries — mirrors
+    `mark_covered_rows_consolidated`'s covering-summary join shape, kind-
+    scoped the way U5 requires `supersede_covered_summaries` to be).
+
+    'dropped'/'constituent_superseded' — defensive: the row's own `pg_id`
+    became superseded again after the row opened. Should not occur given
+    `resolve_standing_ids` already filters at open time, but I15 requires
+    that a superseded record is never left sitting open, so this is checked
+    every close pass rather than assumed.
+
+    Every close is logged unconditionally (this function is always invoked
+    at the end of a sweep, whether or not anything closed) in the same
+    ``Ledger close [context]: ...`` shape `close_ledger_rows` uses. Returns
+    ``(refolded_count, dropped_count)``.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE refold_ledger o SET status = 'refolded', closed_at = now(),"
+            "  closed_reason = 'constituent_folded'"
+            " WHERE o.status = 'open'"
+            "   AND EXISTS ("
+            "     SELECT 1 FROM community_summaries cs"
+            "      WHERE NOT cs.superseded"
+            "        AND o.pg_id = ANY(cs.source_pg_ids)"
+            "        AND ((o.summary_kind = 'thematic'"
+            "              AND COALESCE(cs.metadata->>'kind', 'thematic') <> 'insight')"
+            "             OR (o.summary_kind = 'insight'"
+            "                 AND cs.metadata->>'kind' = 'insight')))"
+        )
+        refolded = cur.rowcount
+
+        cur.execute(
+            "UPDATE refold_ledger o SET status = 'dropped', closed_at = now(),"
+            "  closed_reason = 'constituent_superseded'"
+            " WHERE o.status = 'open'"
+            "   AND EXISTS ("
+            "     SELECT 1 FROM technical_docs t"
+            "      WHERE t.id = o.pg_id AND COALESCE(t.superseded, false) = true)"
+        )
+        dropped = cur.rowcount
+    conn.commit()
+    logger.info(
+        "Refold ledger close [%s]: %d row(s) refolded, %d row(s) dropped "
+        "(constituent superseded).", context, refolded, dropped,
+    )
+    return refolded, dropped
+
+
+def drop_below_density_refold_rows(conn, pg_ids, context="consolidation"):
+    """I7, applied to the refold_ledger clock: **a candidate that does not
+    gate is NOT backlog.** ``pg_ids`` is the caller-computed set of OPEN
+    rows' constituents whose (project, domain) group was evaluated THIS
+    cycle (`_find_grounded_fact_groups`'s full scan already ran) and did
+    NOT meet `DENSITY_THRESHOLD` — closes them 'dropped'/'below_density'.
+
+    This must not read as a stall (I7) and does not lose anything: re-
+    gating never depends on the ledger (`fetch_invalidated_summaries` re-
+    derives from the graph every time), so the group still folds normally
+    the moment enough NEW facts push it over the threshold — closing the
+    ledger row only stops it inflating the due-ness count for a group that
+    structurally cannot fold on its own right now.
+
+    Logged unconditionally, including the zero case, so a quiet pass is
+    visibly distinct from a pass that never ran this check."""
+    if not pg_ids:
+        logger.info(
+            "Refold ledger close [%s]: 0 row(s) dropped (below_density).", context)
+        return 0
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE refold_ledger SET status = 'dropped', closed_at = now(),"
+            "  closed_reason = 'below_density'"
+            " WHERE status = 'open' AND pg_id = ANY(%s)",
+            (list(pg_ids),),
+        )
+        dropped = cur.rowcount
+    conn.commit()
+    logger.info(
+        "Refold ledger close [%s]: %d row(s) dropped (below_density).", context, dropped)
+    return dropped
 
 
 def fetch_unreconciled_insights(conn):
@@ -1600,7 +1950,10 @@ class ConsolidationDaemon:
         def _read():
             conn = psycopg2.connect(PG_CONN, connect_timeout=5)
             try:
-                return fetch_ledger_backlog(conn)
+                # C3: the widened input set (§5 amendment) — outbox backlog
+                # UNION lineage-invalidation backlog, deduped. The density
+                # predicate below is unchanged; only what feeds it grows.
+                return fetch_combined_fact_backlog(conn)
             finally:
                 conn.close()
         try:
@@ -2104,6 +2457,72 @@ class ConsolidationDaemon:
             return await result.data()
         return clusters, edge_stats
 
+    async def run_lineage_invalidation_pass(self, context="consolidation"):
+        """C3 — Mechanism B (Dreaming Cycle Plan to v2, §5 AMENDED block):
+        identify (U2), retire (U3), and open the refold_ledger clock (U4)
+        for every ACTIVE summary a superseded fact or a reversed decision has
+        invalidated. Runs BEFORE the fold passes in the same sweep tick
+        (`listen_for_events`), so a summary retired here is already gone by
+        the time `_find_grounded_fact_groups` / `_find_fresh_insight_clusters`
+        re-derive groups from the graph this same tick — no reader ever sees
+        a stale summary and its just-opened ledger row at once.
+
+        Postgres retirement (`retire_invalidated_summaries`) is one atomic
+        pass. The Neo4j half is this method's own job: a retired INSIGHT's
+        member Decision/Retrospective nodes have `consolidated` cleared —
+        gate-critical (G3, `insight_gate.py:96`) — so they read as fresh on
+        the very next walk. A retired THEMATIC summary needs no graph write
+        at all (`_find_grounded_fact_groups` never reads `f.consolidated`).
+
+        Postgres commits first; the graph write follows the same best-effort
+        contract as every other two-store marking here (`_mark_insight_in_
+        graph` et al.) — on failure this logs and returns, because there is
+        currently no reconciliation query for "retired but not yet cleared
+        in the graph" (see the C3 report's recommendation on this gap)."""
+        loop = asyncio.get_running_loop()
+        try:
+            conn = await loop.run_in_executor(
+                None, lambda: psycopg2.connect(PG_CONN, connect_timeout=5)
+            )
+        except Exception as e:
+            logger.error(f"Lineage invalidation [{context}]: Postgres unavailable: {str(e)}")
+            return
+        try:
+            retired, opened = await loop.run_in_executor(
+                None, lambda: retire_invalidated_summaries(conn))
+            if not retired:
+                return
+            logger.info(
+                "Lineage invalidation [%s]: retired %d summary(ies) (%s), "
+                "opened %d refold_ledger row(s).",
+                context, len(retired),
+                ", ".join(f"{sid}/{kind}" for sid, kind, _src in retired),
+                opened,
+            )
+            for summary_id, kind, src_ids in retired:
+                if kind != "insight" or not src_ids:
+                    continue
+                try:
+                    async with self.driver.session() as session:
+                        await session.run(
+                            f"UNWIND $ids AS did"
+                            f" MATCH (d) WHERE (d:{ONT.decision} OR d:{ONT.retrospective})"
+                            f"                  AND d.pg_id = did"
+                            f" SET d.consolidated = false",
+                            ids=src_ids,
+                        )
+                except Exception as e:
+                    logger.error(
+                        "Lineage invalidation [%s]: failed to clear consolidated on "
+                        "graph nodes for retired insight %d (%s) — G3 freshness may "
+                        "stay stale for these until a manual retry: %s",
+                        context, summary_id, src_ids, e,
+                    )
+        except Exception as e:
+            logger.error(f"Lineage invalidation [{context}] failed: {str(e)}")
+        finally:
+            await loop.run_in_executor(None, conn.close)
+
     async def run_ledger_sweep(self):
         """Recurring sweep driven by the durable outbox ledger (decision 267).
 
@@ -2143,7 +2562,8 @@ class ConsolidationDaemon:
                     )
                     logger.info("Ledger sweep: reconciled summary %d, closed %d rows.", summary_id, closed)
 
-                backlog = await loop.run_in_executor(None, lambda: fetch_ledger_backlog(conn))
+                # C3: widened input set — see fetch_combined_fact_backlog.
+                backlog = await loop.run_in_executor(None, lambda: fetch_combined_fact_backlog(conn))
             finally:
                 await loop.run_in_executor(None, conn.close)
 
@@ -2355,6 +2775,18 @@ class ConsolidationDaemon:
             rec.eligible_clusters = len(work_items)
             rec.eligible_oldest_age = _kth_oldest_age_seconds(
                 member_id_lists, ts_map, DENSITY_THRESHOLD)
+
+            # I7 (refold_ledger clock): every fact this pass evaluated
+            # (pg_ids_all, the full _find_grounded_fact_groups scan) but
+            # which did NOT land in an eligible (>= density) cluster
+            # (all_member_ids) is a candidate that does not gate — close any
+            # OPEN refold_ledger row citing it as dropped/below_density
+            # rather than let it sit open forever inflating the backlog
+            # count for a group that cannot fold on its own right now.
+            below_density_ids = sorted(set(pg_ids_all) - set(all_member_ids))
+            await loop.run_in_executor(
+                None, lambda: drop_below_density_refold_rows(
+                    conn, below_density_ids, context="fact_consolidation"))
 
             # Fold dead-letter cap (see module docstring): keys that failed the
             # preservation/truncation gates NREM_FOLD_FAIL_CAP times within the
@@ -2605,6 +3037,11 @@ class ConsolidationDaemon:
                         "ledger reconciliation will retry: %s",
                         label, summary_pg_id, e,
                     )
+
+            # U4 close, beside the outbox close above: any refold_ledger row
+            # a fold in THIS pass just covered transitions to 'refolded'.
+            await loop.run_in_executor(
+                None, lambda: close_refold_ledger_rows(conn, context="fact_consolidation"))
         except Exception as e:
             # Cycle-level crash (e.g. domain fetch / cluster iteration) — record
             # 'crashed' + log, then re-raise to the caller's existing handler.
@@ -2973,6 +3410,14 @@ class ConsolidationDaemon:
                     rec.fold(ok)
                     if ok:
                         folded.update(ids)
+
+                # U4 close, beside the outbox closes above: any refold_ledger
+                # row a fold in THIS pass just covered transitions to
+                # 'refolded' (both kinds — cheap, and correct regardless of
+                # whether this particular pass folded thematic or insight
+                # rows, since close_refold_ledger_rows checks both).
+                await loop.run_in_executor(
+                    None, lambda: close_refold_ledger_rows(conn, context="insight"))
         except Exception as e:
             logger.error(f"Insight cycle failed: {str(e)}")
         finally:
@@ -3237,7 +3682,7 @@ class ConsolidationDaemon:
                 sid = write_insight_summary(
                     conn, insight, metadata_json, embedding, src_ids, row_ids, run_id=run_id
                 )
-                sup = supersede_covered_summaries(conn, sid, src_ids)
+                sup = supersede_covered_summaries(conn, sid, src_ids, kind="insight")
                 return sid, sup
             summary_id, superseded_ids = await loop.run_in_executor(None, _write)
             await loop.run_in_executor(None, conn.commit)
@@ -3477,6 +3922,14 @@ class ConsolidationDaemon:
                                 await loop.run_in_executor(None, lambda: _crun_record_deferred("insight", "backup_in_progress"))
                             else:
                                 try:
+                                    # C3 — Mechanism B, BEFORE either fold pass
+                                    # re-derives groups from the graph this
+                                    # tick, so a summary retired here is
+                                    # already gone (and its constituents
+                                    # already back in the widened backlog) by
+                                    # the time run_ledger_sweep/run_insight_
+                                    # cycle look.
+                                    await self.run_lineage_invalidation_pass()
                                     if not self._startup_sweep_done:
                                         # Once per process start: the unanchored graph
                                         # sweep covers pre-coordinator facts that have
