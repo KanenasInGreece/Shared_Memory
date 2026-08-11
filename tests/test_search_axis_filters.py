@@ -505,6 +505,58 @@ async def test_domains_list_with_non_string_element_rejected_400():
 
 
 @pytest.mark.asyncio
+async def test_domains_at_cap_passes():
+    """Exactly `SEARCH_DOMAINS_FILTER_CAP` (16) entries is allowed — the cap
+    rejects OVER the limit, it does not shrink the limit itself."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+    domains = [f"section-{i}" for i in range(coordinator_mod.SEARCH_DOMAINS_FILTER_CAP)]
+    mock_conn.fetch = AsyncMock(return_value=[])
+    reranker = _reranker_mock(0)
+    result = await _run_search(c, reranker,
+                               {"query": "status", "limit": 5, "domains": domains})
+    assert result == {"status": "success", "results": []}
+    call = _fetch_calls_matching(mock_conn, "FROM technical_docs")[0]
+    assert "metadata->'domains' ?| $" in call.args[0]
+
+
+@pytest.mark.asyncio
+async def test_domains_over_cap_rejected_400_filters_invalid():
+    """Security (PR 235): `domains` binds straight into the jsonb `?|` scan —
+    an authenticated caller sending an unbounded list is a DoS vector. Over
+    the cap is a clean 400 `filters_invalid`, never a silent truncation (a
+    silently truncated filter's empty result would read as authoritative)."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+    domains = [f"section-{i}"
+              for i in range(coordinator_mod.SEARCH_DOMAINS_FILTER_CAP + 1)]
+    resp = await c.handle_search(_make_request(
+        {"query": "status", "limit": 5, "domains": domains}))
+    assert resp.status == 400
+    body = json.loads(resp.text)
+    assert body["error"] == "filters_invalid"
+    assert str(coordinator_mod.SEARCH_DOMAINS_FILTER_CAP) in body["message"]
+    # Fail-fast: rejected at ingress, before any DB work (no embed, no fetch).
+    mock_conn.fetch.assert_not_called()
+    mock_conn.fetchrow.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_domains_over_cap_400_does_not_leak_into_honest_empty_shape():
+    """The cap rejection and the honest-empty-match shape must stay visibly
+    distinct — a caller must be able to tell "your filter was rejected" from
+    "your filter matched nothing"; conflating them would make a rejected,
+    over-cap request look like a normal empty search result."""
+    c, _mock_conn, _ = _coordinator_with_mocks()
+    domains = [f"section-{i}"
+              for i in range(coordinator_mod.SEARCH_DOMAINS_FILTER_CAP + 1)]
+    resp = await c.handle_search(_make_request(
+        {"query": "status", "limit": 5, "domains": domains}))
+    body = json.loads(resp.text)
+    assert resp.status != 200
+    assert body != {"status": "success", "results": []}
+    assert body.get("status") == "error"
+
+
+@pytest.mark.asyncio
 async def test_since_invalid_format_rejected_400():
     c, _, _s = _coordinator_with_mocks()
     resp = await c.handle_search(_make_request({"query": "x", "since": "not-a-date"}))

@@ -833,6 +833,14 @@ GRAPH_EXPANSION_LIMIT = _env_int("GRAPH_EXPANSION_LIMIT", 15)
 # wider than the result set — the reranker can only reorder what it is handed.
 SEARCH_CANDIDATE_FLOOR = _env_int("SEARCH_CANDIDATE_FLOOR", 20)
 
+# Security review, PR 235: the `domains` search filter binds straight into a
+# jsonb `?|` operator with a caller-controlled array — an authenticated caller
+# sending thousands of entries per request is a DoS vector (unbounded work per
+# row scanned). Capped, not silently truncated: a search that silently dropped
+# entries past the cap would still return 200 with an incomplete filter, and an
+# empty result would then read as authoritative when it was really partial.
+SEARCH_DOMAINS_FILTER_CAP = _env_int("SEARCH_DOMAINS_FILTER_CAP", 16)
+
 # ── Relation-adjudication review/label surface (migration 020; decisions 726/727)
 # These constants MUST mirror relation_confidence.py (the psycopg2 foundation the
 # sweep/REM daemons use). The coordinator reimplements the ledger queries
@@ -1193,6 +1201,13 @@ def _axis_filter_predicate(start: int, project: str | None,
 
     Read path never blocks on registry state: an unknown project/domain name is
     not refused here, it simply matches nothing (a searcher may probe).
+
+    ⚠ `domains` is CALLER-BOUND before it ever reaches here: `handle_search`
+    rejects more than `SEARCH_DOMAINS_FILTER_CAP` (16) entries with a 400
+    `filters_invalid` at ingress, never truncates silently — an unbounded list
+    binds straight into the `?|` scan (a DoS vector), and a silent drop would
+    let a partial filter's empty result read as authoritative. This function
+    does not re-check the cap; it trusts its caller.
 
     `start` is the next free asyncpg positional index (`$N`).
     """
@@ -4827,6 +4842,18 @@ class MemoryCoordinator:
                 return web.json_response(
                     {"status": "error",
                      "message": "domains must be a list of strings"},
+                    status=400,
+                )
+            # Security (PR 235): capped at ingress, not silently truncated — a
+            # caller sending thousands of entries binds straight into the `?|`
+            # operator (DoS vector), and a silent drop would let a partial
+            # filter's empty result read as authoritative.
+            if len(domains_filter) > SEARCH_DOMAINS_FILTER_CAP:
+                return web.json_response(
+                    {"status": "error", "error": "filters_invalid",
+                     "message": (
+                         f"domains carries {len(domains_filter)} entries, over "
+                         f"the {SEARCH_DOMAINS_FILTER_CAP}-entry cap")},
                     status=400,
                 )
             domains_filter = [d.strip() for d in domains_filter if d and d.strip()]

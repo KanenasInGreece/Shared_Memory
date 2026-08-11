@@ -48,6 +48,23 @@ a FILTER, not query text*. Worked-example version strings bumped to `0.8.74`.
 No telemetry, `/health`, or monitor-visible shape changed. Search's response shape is unchanged when
 no filter is supplied (regression-pinned).
 
+### Fixed — security review (PR 235): `domains` filter capped at ingress
+
+The `domains` filter list bound straight into the Postgres `?|` operator with no bound on caller
+input — an authenticated caller could send an unbounded array per search request, unbounded work
+scanned per candidate row (a DoS vector). `handle_search` now rejects more than
+`SEARCH_DOMAINS_FILTER_CAP` (16, env-overridable) domains with a clean `400 filters_invalid` stating
+the cap, at ingress, before any embedding or DB work runs. **Never a silent truncation** — dropping
+the excess entries quietly would let a partial filter's empty result read as authoritative, exactly
+the failure mode `since`/`project`'s "no unfiltered fallback" rule already guards against. The cap
+lives beside `SEARCH_CANDIDATE_FLOOR` in `coordinator.py`; `_axis_filter_predicate`'s docstring notes
+it trusts its caller rather than re-checking. Mirrored client-side as documentation only (SKILL.md,
+both copies — one line; the gateway is the enforcement point, clients stay thin).
+
+Mutation-checked: removing the cap check makes `test_domains_over_cap_rejected_400_filters_invalid`
+and `test_domains_over_cap_400_does_not_leak_into_honest_empty_shape` fail (verified live); a request
+at exactly the cap (16) still passes (`test_domains_at_cap_passes`).
+
 ## [0.8.73] — 2026-08-11
 
 ### Changed — canonical top-level axis key for decisions (decision:1214)
