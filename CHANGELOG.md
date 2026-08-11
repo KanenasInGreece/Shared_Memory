@@ -62,6 +62,26 @@ classes dead-letter a repeatedly-failing cluster identically (see the dead-lette
 No new operator-facing field; the worked-example version strings in both `SKILL.md` copies were
 bumped to `0.8.71` (enforced by `test_capture_surface_documented.py`).
 
+### Fixed — multi-role review of the insight-slot protocol (CQR-01, F2)
+
+- **Slot-marker forgery hardening (CQR-01, Code Quality).** `parse_insight_slots` is now
+  FIRST-occurrence-wins for both a SLOT id and PRINCIPLE — a LATER marker occurrence (e.g. a
+  judgement's own content echoing back a marker-shaped line, accidentally or adversarially) can no
+  longer silently overwrite a genuine earlier slot/principle. Independently, `_insight_slot_items`
+  now runs a judgement's BODY text through a new `_neutralize_marker_lines`: any line shaped like
+  `SLOT <digits>:` / `PRINCIPLE:` is prefixed `"> "` before it ever reaches the prompt, so record
+  content cannot teach the model the forgery pattern in the first place. TITLE is never touched (it
+  is rendered verbatim into the assembled content by construction and must not be altered).
+- **MOCK_LLM now exercises the real parse/retry/assembly path end to end (F2, Test &
+  Verification).** The MOCK_LLM check moved DOWN one layer, from `generate_insight_slots` into
+  `_call_insight_llm` (the raw LLM-call helper): under `MOCK_LLM=1` it fabricates a well-formed raw
+  `SLOT`/`PRINCIPLE` protocol TEXT for exactly what the calling prompt asked for
+  (`_select_insight_items`, shared with `_build_insight_prompt`'s own selection), and returns it
+  without touching the network. `generate_insight_slots` itself no longer special-cases mocks at
+  all — its one code path (build prompt → call → parse → retry-if-missing → fail-if-still-missing)
+  now runs identically whether mocked or live, so a mocked cycle can no longer bypass
+  `parse_insight_slots` or the missing-slot retry logic the way it previously could.
+
 ## [0.8.70] — 2026-08-11
 
 ### Fixed — NREM truth & observability: the census stops lying, the ledger becomes visible

@@ -894,6 +894,28 @@ _INSIGHT_SLOT_MARKER_RE = re.compile(
     r"(?m)^[ \t]*(SLOT[ \t]+\d+|PRINCIPLE)[ \t]*:", re.IGNORECASE)
 
 
+def _neutralize_marker_lines(text):
+    """Pure — defensive hardening (multi-role review CQR-01): a judgement's
+    own BODY text is RETRIEVED DATA reaching the prompt, and could contain
+    a line shaped like the SLOT/PRINCIPLE protocol marker — an accidental
+    quotation, or an adversarial attempt to teach the model to echo a
+    forged marker in its OUTPUT (which `parse_insight_slots`'s
+    first-occurrence-wins rule then also guards). Any line matching
+    `_INSIGHT_SLOT_MARKER_RE` is prefixed with ``"> "`` — still fully
+    visible to the model as CONTEXT, but no longer a line starting with
+    ``SLOT <digits>:`` / ``PRINCIPLE:``, so it can no longer be mistaken
+    for (or copied verbatim as) a real protocol marker. Applied to BODY
+    only, never TITLE: a decision's title is rendered VERBATIM into the
+    assembled content (`_assemble_insight_content`) and must not be
+    altered."""
+    if not text:
+        return text
+    return "\n".join(
+        f"> {line}" if _INSIGHT_SLOT_MARKER_RE.match(line) else line
+        for line in text.splitlines()
+    )
+
+
 def _insight_slot_items(rows):
     """Pure — the per-judgement (pg_id, type, title, body) input to the
     insight-slot LLM call (decision:1205). ``rows`` is `_fold_insight`'s own
@@ -902,8 +924,9 @@ def _insight_slot_items(rows):
     `_assemble_insight_content` renders (never capped, never dependent on
     the LLM); the BODY fed to the LLM (decision: content minus that title
     line; retrospective: the full notes — retrospectives have no title) is
-    capped to NREM_INSIGHT_SLOT_INPUT_CHARS (head of the text) so one
-    oversized judgement cannot blow out the prompt on its own."""
+    marker-neutralized (`_neutralize_marker_lines`, CQR-01) THEN capped to
+    NREM_INSIGHT_SLOT_INPUT_CHARS (head of the text) so one oversized
+    judgement cannot blow out the prompt on its own."""
     items = []
     for pg_id, content, _project, rtype, _meta in rows:
         content = content or ""
@@ -918,9 +941,19 @@ def _insight_slot_items(rows):
             "pg_id": int(pg_id),
             "type": rtype,
             "title": title,
-            "body": body[:NREM_INSIGHT_SLOT_INPUT_CHARS],
+            "body": _neutralize_marker_lines(body)[:NREM_INSIGHT_SLOT_INPUT_CHARS],
         })
     return items
+
+
+def _select_insight_items(items, only_ids=None):
+    """Pure — the JUDGEMENT-selection rule shared by `_build_insight_prompt`
+    (what the REAL prompt lists) and `_call_insight_llm`'s MOCK_LLM
+    fabrication (multi-role review F2) — so a mocked reply always matches
+    exactly what the corresponding real prompt would have asked for, for
+    both the initial call (``only_ids=None`` — everything) and a
+    missing-slot retry (``only_ids`` — only what is missing)."""
+    return [it for it in items if only_ids is None or it["pg_id"] in only_ids]
 
 
 def _build_insight_prompt(entity, items, previous_insight=None,
@@ -930,10 +963,8 @@ def _build_insight_prompt(entity, items, previous_insight=None,
     (decision:1205). ``only_ids`` (a set of pg_ids, or None) restricts the
     JUDGEMENT blocks listed to a missing-slot retry — never re-lists a slot
     that already parsed cleanly; ``need_principle`` gates whether the
-    PRINCIPLE line is (re)requested. Never invoked under MOCK_LLM (that path
-    fabricates its own well-formed reply directly, in
-    ``generate_insight_slots``)."""
-    selected = [it for it in items if only_ids is None or it["pg_id"] in only_ids]
+    PRINCIPLE line is (re)requested."""
+    selected = _select_insight_items(items, only_ids)
     blocks = []
     for it in selected:
         lines = [f"[JUDGEMENT pg_id={it['pg_id']} type={it['type']}]"]
@@ -994,7 +1025,19 @@ def parse_insight_slots(text):
     (decision:1205). Pure. Returns ({pg_id:int -> text:str}, principle:
     str|None). A marker with empty/whitespace-only text after it is treated
     as ABSENT — never an empty-string 'found' slot — so a caller's
-    missing-slot check needs no separate blank test."""
+    missing-slot check needs no separate blank test.
+
+    FIRST-occurrence-wins per pg_id / for PRINCIPLE (multi-role review
+    CQR-01, hardening against slot-marker forgery): a judgement's own
+    content is RETRIEVED DATA and may itself contain a line shaped like a
+    protocol marker (accidental quotation, or an adversarial attempt to
+    have a LATER, attacker-controlled occurrence overwrite the genuine
+    slot the LLM wrote earlier). `_neutralize_marker_lines` defangs such
+    lines before they ever reach the prompt (see `_insight_slot_items`),
+    but this parser does not trust that alone — it never lets a later
+    match for the same key replace an earlier one, so even a marker that
+    reached the model's own OUTPUT (echoed, not neutralized-away) cannot
+    clobber the real value."""
     if not text:
         return {}, None
     matches = list(_INSIGHT_SLOT_MARKER_RE.finditer(text))
@@ -1006,12 +1049,14 @@ def parse_insight_slots(text):
         value = text[start:end].strip()
         marker = m.group(1).strip()
         if marker.upper() == "PRINCIPLE":
-            if value:
+            if value and principle is None:
                 principle = value
         else:
             digits = re.search(r"\d+", marker)
             if digits and value:
-                slots[int(digits.group())] = value
+                pg_id = int(digits.group())
+                if pg_id not in slots:
+                    slots[pg_id] = value
     return slots, principle
 
 
@@ -2439,7 +2484,8 @@ class ConsolidationDaemon:
     # distillates, not written whole by the LLM — see
     # `generate_insight_slots` / `_assemble_insight_content` below.
 
-    async def _call_insight_llm(self, prompt, entity, units):
+    async def _call_insight_llm(self, prompt, entity, units, items=None,
+                                only_ids=None, need_principle=True):
         """One truncation-bounded LLM call for the insight-slot protocol
         (decision:1205) — the same widen-once-then-fail semantics the
         pre-v0.8.71 free-prose ``generate_insight`` used. Returns the raw
@@ -2447,7 +2493,28 @@ class ConsolidationDaemon:
         self._last_llm_truncated is set True; on a non-200 status or a
         network/parse exception it stays False — a GENERIC call failure,
         distinct from a capacity failure (see _fold_insight's three-way
-        branch on a falsy ``generate_insight_slots`` return)."""
+        branch on a falsy ``generate_insight_slots`` return).
+
+        Under MOCK_LLM=1 (multi-role review F2): fabricates a well-formed
+        raw SLOT/PRINCIPLE protocol TEXT for exactly the judgements THIS
+        prompt asked for (``_select_insight_items`` mirrors
+        ``_build_insight_prompt``'s own ``only_ids``/``need_principle``
+        selection, so a mocked reply matches a real one's shape) and
+        returns it WITHOUT touching the network. This is the ONLY place
+        MOCK_LLM is checked on the insight-fold path — the caller
+        (``generate_insight_slots``) runs its REAL parse/missing-slot-retry/
+        assembly logic on the result exactly as it would on a live
+        response, so a mocked cycle exercises the identical code path
+        (never a shortcut around ``parse_insight_slots`` or the retry
+        logic)."""
+        if os.getenv("MOCK_LLM") == "1":
+            selected = _select_insight_items(items or [], only_ids)
+            lines = [f"SLOT {it['pg_id']}: Mocked distillate for {it['pg_id']} ({it['type']})."
+                     for it in selected]
+            if need_principle:
+                lines.append(f"PRINCIPLE: Mocked principle for {entity} "
+                             f"over {len(selected)} judgement(s).")
+            return "\n".join(lines)
         bounds = [NREM_MAX_TOKENS_INSIGHT,
                   int(NREM_MAX_TOKENS_INSIGHT * NREM_TRUNCATION_RETRY_FACTOR)]
         _ceiling = adaptive_ceiling(len(prompt), units=units, max_tokens=bounds[-1])
@@ -2512,21 +2579,15 @@ class ConsolidationDaemon:
         items = _insight_slot_items(rows)
         expected_ids = {it["pg_id"] for it in items}
 
-        if os.getenv("MOCK_LLM") == "1":
-            # Fabricate a well-formed SLOT/PRINCIPLE reply and run it
-            # through the SAME parser real calls use — only the raw LLM
-            # text is faked here; assembly is NEVER special-cased for mocks.
-            lines = [f"SLOT {it['pg_id']}: Mocked distillate for {it['pg_id']} ({it['type']})."
-                     for it in items]
-            lines.append(f"PRINCIPLE: Mocked principle for {entity} "
-                         f"over {len(items)} judgement(s).")
-            slots, principle = parse_insight_slots("\n".join(lines))
-            slots["PRINCIPLE"] = principle
-            return slots
-
+        # F2 (multi-role review): MOCK_LLM is checked ONLY inside
+        # `_call_insight_llm` now — this method's own code path (build
+        # prompt, call, parse, retry-if-missing, fail-if-still-missing) is
+        # IDENTICAL whether mocked or live, so a mocked cycle exercises the
+        # real parser and the real retry logic, never a shortcut around them.
         prompt = _build_insight_prompt(entity, items, previous_insight=previous_insight,
                                        reversal_lines=reversal_lines)
-        text = await self._call_insight_llm(prompt, entity, units=max(1, len(items)))
+        text = await self._call_insight_llm(prompt, entity, units=max(1, len(items)),
+                                            items=items)
         if text is None:
             return None
         slots, principle = parse_insight_slots(text)
@@ -2543,7 +2604,8 @@ class ConsolidationDaemon:
                 reversal_lines=reversal_lines,
                 only_ids=set(missing_ids), need_principle=missing_principle)
             retry_text = await self._call_insight_llm(
-                retry_prompt, entity, units=max(1, len(missing_ids)))
+                retry_prompt, entity, units=max(1, len(missing_ids)),
+                items=items, only_ids=set(missing_ids), need_principle=missing_principle)
             if retry_text is None:
                 return None
             r_slots, r_principle = parse_insight_slots(retry_text)
