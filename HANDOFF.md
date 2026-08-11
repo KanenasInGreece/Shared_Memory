@@ -1,248 +1,328 @@
-# HANDOFF — C4: payload (Zettelkasten thematic index, insight causal chain, summary_ids)
+# HANDOFF — fix/nrem-truth-observability: D1–D4 code-review fixes + O1/O2 observability
 
-**Task id:** C4, per `Local_Documentation/Dreaming_Cycle_Plan_to_v2.md` §6 "C4 — payload (AFTER
-C3.1 merges — same file)". Base: `main` `962b6b4` (v0.8.68, PR #228 merged). Branch:
-`feat/c4-payload`. **Not merged. No version bump. No CHANGELOG entry.**
+**Task id:** the six-item remit in the build-cycle brief (plan §7, `Local_Documentation/
+Dreaming_Cycle_Plan_to_v2.md`). Base: `main` `01b72c9` (v0.8.69, PR #229 merged — the C4 payload
+work). Branch: `fix/nrem-truth-observability`. **Not merged. Not pushed. No PR opened. No version
+bump. No CHANGELOG entry. No `sync_skills.sh` run.**
 
-This file replaces the STALE `HANDOFF.md` this worktree inherited from C3.1 (PR #228 — that PR's
-own handoff was apparently never cleaned up at merge and shipped to `main`; flagging that as a
-minor process gap, not fixing it here). Everything below is C4-scoped only.
+This file **replaces** the stale `HANDOFF.md` this worktree inherited from the C4 PR (branch
+`feat/c4-payload`, base `962b6b4`) — that PR's own handoff was never cleaned up at merge and
+shipped to `main` as part of commit `01b72c9`, the same process gap that PR's own handoff flagged
+about *its* inherited stale file. Everything below is this task's six items only (D1–D4, O1, O2).
 
-## Status: DONE — all criteria A–G implemented, tested (mutation-checked on the highest-value
-guards), live-verified against the running Postgres/Neo4j. One item under criterion D is a
-DELIBERATE SCOPE BOUNDARY, not an escalation — see "Criterion D" below.
+## Status: DONE — all six items implemented, tested, mutation-checked, live-verified.
 
-## What shipped, per criterion
+## What shipped, per item
 
-### A — Thematic payload (§3.1)
-`_consolidate_clusters` (`consolidation_loop.py`) no longer calls an LLM for the thematic fold.
-`content` is now a **deterministic Zettelkasten index**: `fold_record_line` over each constituent
-fact's own tight text (`coalesce(rem_summary, content)`, already what `_find_grounded_fact_groups`
-returns), concatenated with `\n`. Zero/low inference, as §3.1 mandates — not a paraphrase.
-`metadata` gained `entities` (union of the constituent facts' own human-asserted entities) and
-`cypher_query` (`thematic_cypher_query()` — a self-contained Cypher statement rebuilding the
-group's Fact→judgement provenance neighbourhood at read time).
+### D1 — HIGH: census counted dead-lettered clusters as eligible backlog forever
+`consolidation_loop.py`: in **both** `_consolidate_clusters` (the fact cycle) and
+`run_insight_cycle` (the insight cycle), `rec.eligible_clusters`/`rec.eligible_oldest_age` were
+computed over **every** density-gated cluster/group **before** the `NREM_FOLD_FAIL_CAP`
+dead-letter filter ran. A cluster that fails permanently (3 preservation/truncation failures within
+the window, by default) therefore counted as eligible backlog **forever**, because
+`coordinator.py`'s `_consolidation_stall_verdict` reads backlog from **exactly this recorded
+census and nothing else** (`decision:1121`, I7: *"backlog is the cycle's OWN gate census — no
+looser fallback"*). One dead-lettered cluster meant the stall flag could never clear again.
 
-**Consequence, stated plainly: `generate_summary()` is REMOVED.** It was the thematic fold's only
-caller. Its whole LLM+preservation-gate+truncation-retry apparatus is gone from the thematic path —
-correct, per §4.2 Path A step 2 ("Build the Zettelkasten index (zero/low inference)"), and per
-`decision:1032`'s dereference principle (the design explicitly moved detail OUT of the vector and
-INTO the graph walk). `render_alternative_lines` is removed too (it was only ever called from the
-pre-C4 insight fold — see B). The insight path (§3.2) is unaffected — it still synthesises.
+**Fix — same shape in both cycles:** partition dead-lettered clusters out **before** the census
+runs, not inside the fold loop. The excluded count is a **new** `_CycleRec` field/telemetry key,
+`dead_lettered_clusters`, reported inside `extra()` — **never folded into `eligible_clusters`'
+existing meaning** (CLAUDE.md Group 3: a metric whose meaning changes must change name).
 
-### B — Insight payload (§3.2)
-`_fold_insight` is rewritten. It fetches each judgement's own row
-(`id, content, project, type, metadata`) from `technical_docs` — **decisions AND retrospectives
-alike** (criterion C). Each block is `[DECISION|RETROSPECTIVE pg_id=N project=P]\n<content>` —
-**strictly** the judgement's own content (Title+Rationale, verbatim — `save_decision`/
-`handle_retrospective` both set `content` that way already). No confidence line, no alternatives
-line, no retrospective-outcome line, no grounding-edge line. `generate_insight`'s prompt was
-rewritten to match: it no longer mentions GROUNDING/CONFIDENCE/ALTERNATIVE instructions at all.
-`insight_cypher_query()` is the deferral instrument — CONSIDERED/REJECTED/UNDER_CONDITIONS (and
-everything else) are reachable there, never duplicated into the text.
+- **Fact cycle** (`_consolidate_clusters`, ~line 2860 onward): `fetch_fold_dead_letter_counts()`
+  moved up to run **before** the census; a new partition loop builds `eligible_work_items` (only
+  the non-dead-lettered work items) and `dead_lettered_count`; the census (`rec.eligible_clusters`,
+  `rec.eligible_oldest_age`) now runs over `eligible_work_items` only; the fold loop iterates
+  `eligible_work_items` (the old in-loop dead-letter check/`continue` is gone — the list is already
+  filtered). The **I7 `refold_ledger` below_density-close logic is deliberately kept scoped to ALL
+  density-gated members** (`all_gated_member_ids`, built from the *unfiltered* `work_items`) —
+  a dead-lettered cluster's members **did** meet density; they are simply not folding again right
+  now, which is a different fact from never having gated, and must not be reported as
+  `dropped/below_density`.
+- **Insight cycle** (`run_insight_cycle`, the fresh-cluster block): the same partition pattern —
+  `_dead_lettered(...)` is now called exactly **once** per fresh cluster, before the census, and
+  its logging/`rec.fold_dead_letter` side effect fires exactly once (the fold loop no longer
+  re-checks it). `clusters` is reassigned to the filtered list so the census and the fold loop share
+  one filtered view.
 
-Within-component order is ascending `pg_id` (`ORDER BY id` in the fetch) — this is both §2.4's rule
-and the causal order (a retrospective's pg_id always postdates the decision it evaluates). Between-
-component order was already correct pre-C4 (`insight_gate.order_components`, C2's work) and each
-component still folds as its own, separate insight — C4 did not need to touch that.
+Both cite `decision:1121`/I7 in their new comments.
 
-### C — The PR #226 seam, fixed BEFORE widening the payload
-`_mark_insight_in_graph` used to `MATCH (d:Decision {pg_id: did})` only. Widened to
-`MATCH (d) WHERE (d:Decision OR d:Retrospective) AND d.pg_id = jid` — mirrors the exact pattern
-`run_lineage_invalidation_pass` already uses to CLEAR the same flag on retirement. Proven live (see
-"Live verification" below): both labels resolve correctly by `pg_id`. `run_insight_cycle` now feeds
-`judgement_ids` (the full ordered reach) to `_fold_insight`, not `decision_ids`.
+### D2 — LOW: the retry log printed the CYCLE-GLOBAL counter, not the per-fold one
+`_fold_insight`'s preservation-gate corrective-retry log printed `cyc.preservation_retries`
+(a counter that accumulates across **every** fold the cycle attempts) against
+`NREM_PRESERVATION_MAX_RETRIES` (the **per-fold** cap) — "attempt 8/2" observed live. The loop
+itself was always correctly bounded (`for _ in range(NREM_PRESERVATION_MAX_RETRIES)`); only the
+log lied about which attempt it was on.
 
-### D — Reversal payload obligation (carried, not in §3) — IMPLEMENTED, scoped deliberately
-`fetch_reversal_context(conn, judgement_ids)` (new): when this fold's own constituents are about to
-close an OPEN `refold_ledger` row whose trigger was a **reversed decision**
-(`trigger_kind='technical_docs'`, `summary_kind='insight'`, `status='open'`), this fold is the
-DIRECT SUCCESSOR of that reversal. It looks up the reverted decision's title and its reversing
-retrospective's content, and `_fold_insight` builds `reversal_lines` from that, passed into
-`generate_insight` as a distinguished `[BEGIN REVERSALS]...[END REVERSALS]` block with an explicit
-instruction to state what was reverted and why. The reversing retrospective's own content is a HARD
-preservation anchor (must survive synthesis, same rule as every judgement anchor).
+**Fix:** a local, 1-based `attempt` counter inside `_fold_insight`, incremented alongside
+`cyc.preservation_retries` (unchanged, still the cycle-global telemetry total) but logged instead
+of it.
 
-**Why this needed no escalation despite the plan's two open §2.2a edge cases:** it is driven
-entirely by `refold_ledger` TRIGGER PROVENANCE (a Postgres table), never by walk/gate/component
-membership. It never asks "is the reversing retrospective walked into the reach" (edge case #1) or
-"does it appear in the payload AS A MEMBER" (edge case #2) — it treats the reversal as external,
-out-of-band context about a DIFFERENT (excluded) judgement, sourced from the ledger's own record of
-why re-folding was triggered. **The two edge cases remain genuinely open** — this does not resolve
-them, it sidesteps needing them resolved. Still owed to Xenofon per the plan's own text.
+**No fact-cycle equivalent exists to fix.** Confirmed by grep: `generate_summary` (the fact-fold's
+old LLM+preservation-gate path) was **removed** in the C4 PR (§3.1 replaced it with a
+zero/low-inference Zettelkasten index — no LLM call, no preservation gate, no corrective retry).
+There is exactly one `summary_preserves` call site left in the whole file, inside `_fold_insight`.
 
-### E — `decision:1032` field-by-field ruling
+### D3 — MEDIUM: every insight logged/stored `entity:""`
+`_find_fresh_insight_clusters` hardcoded `"entity": ""` for every cluster, so every insight fold
+logged `Folding insight for ''`, stored `entity:""` in both Postgres and Neo4j metadata, and fed
+`'distilling a causal chain of judgements around ''.'` into the LLM synthesis prompt itself.
 
-| Field | Who reads the STORED copy (cannot walk instead) | Ruling |
-|---|---|---|
-| `source_pg_ids` | `supersede_covered_summaries` (subset compare, Mechanism A); `fetch_active_insight_rows`→`classify_identity` (§2.5, every insight cycle); `fetch_refold_insights` (re-fold trigger source); `fetch_invalidated_summaries` leg 2 (reversed-decision membership); `coordinator.py:_status_of_summary` — **wire contract**, joins straight to `technical_docs` | **STORE.** Consumed by the walk (supersession/identity) AND read Postgres-side with no graph access (the API). |
-| `summary_ids` | `fetch_invalidated_summaries` leg 3 (cascade); `append_insight_references` (§2.5 'same'-case merge target) | **STORE.** This IS the mechanism §3.2 mandates — the reason it's a separate field is precisely to avoid the id-space collision a walk-only design would still need solved. |
-| `project` | `fetch_active_thematic_summary_id` (pure Postgres `WHERE`, no graph access, called every insight cycle for the §2.5 same-case lookup) | **STORE.** Postgres-side filtering with no graph access — the stated exception. |
-| `domains` | Same Postgres-side reasons (`coordinator.py:_status_of_summary` API response; a future dashboard) | **STORE**, with the caveat stated explicitly: this is a materialised UNION of each judgement's own OWNED domain (not independently asserted on the insight) — legitimate under the OWNS/DERIVES split because the consumer is Postgres-only. |
-| `entities` | Same reasoning as `domains` | **STORE**, same caveat. |
-| `cypher_query` | N/A — this is not consumed BY a walk, it IS the walk-deferral instrument `decision:1032` asks for | **STORE** (this is what "dereference what the reader renders" produces, not what it forbids). |
+**Traced every reader before changing anything** (write-side rule: the read side usually carries
+the defect one level up):
+- **Fold identity (dead-letter key) never used `entity`** — `_dead_lettered`'s dead-letter *key* is
+  `_judgement_fold_identity(judgement_ids, types)`, computed from the cluster's own member ids;
+  `entity` is used only to build the human-readable `label` for logging (`decision:882`'s
+  fold-key/display-label split — confirmed unaffected by this change).
+- **`write_insight_summary` is always-INSERT, no `ON CONFLICT`** for `kind='insight'` (migration
+  009 exempts insight rows from the `(entity, project, domain, level)` unique index) — so there is
+  **no upsert key `entity` could be part of**, proven from the code, not assumed.
+- **Every Postgres reader of insight rows filters on `kind='insight'` + `source_pg_ids`, never on
+  `entity`**: `fetch_refold_insights`, `fetch_active_insight_rows`, `append_insight_references`,
+  `fetch_active_thematic_summary_id` (thematic rows only, excludes `kind='insight'` explicitly).
+- **`coordinator.py`'s two readers of the field** (`/memory/status/{pg_id}`'s `consolidated_into`,
+  `/memory/status/insight:{id}`'s `entity` key) are pure pass-through display fields — no filter,
+  no join key.
+- I1 ("no gate predicate reads an entity name" — `Dreaming_Cycle_Plan_to_v2.md` §2.6) is about
+  **gating**, never about this string's value; nothing gates on it before or after this change.
 
-No §3.2-listed field was dropped; nothing is stored without a stated consuming reason.
+No reader depended on the empty string. **Fix:** `entity` is now `f"{project}/{section or
+SECTION_NONE}"`, matching the fact cycle's own `label = f"domain:{project}/{section or
+SECTION_NONE}"` convention. Multiple components from the same (project, domain) group legitimately
+share this label — it is a display value, never a key.
 
-### F — C3 leg 3 gets its first real coverage
-`tests/test_lineage_invalidation.py::test_leg3_cascades_using_the_real_summary_ids_c4s_fold_actually_writes`
-runs the REAL `ConsolidationDaemon._fold_insight` (with `summary_ids=[173]`), captures the ACTUAL
-JSON it writes to `community_summaries.metadata`, then feeds that real value into a StubConn shaped
-like `fetch_invalidated_summaries`'s leg 3 and proves it cascades. This is the missing half of the
-pre-existing `test_leg3_cascades_from_leg1_retired_summary_ids` (which proved the SQL contract with
-a hand-typed fixture) — this one proves the WRITER (C4) and the READER (C3) agree on the JSON shape.
-Mutation-checked: reverting `_fold_insight`'s `"summary_ids": summary_ids` to `"summary_ids": []`
-kills exactly this test.
+### D4 — MEDIUM: the corrective-retry instruction was stricter than the gate it serves
+`corrective_block`'s retry instruction told the LLM each dropped anchor fragment must appear as
+**one EXACT, character-for-character substring** — same spelling, hyphenation, punctuation, as one
+phrase. `summary_preserves` (the actual gate) checks **token-level** containment: every
+whitespace-separated **word** of the fragment must appear **somewhere** in the text, independently,
+in any order, not required to stay adjacent (`all(tok in text for tok in anchor.lower().split())`).
+The instruction was strictly harder than the check, forcing the LLM to weave constructed multi-word
+fragments (`preservation_anchor`'s output — e.g. a decision's longest word plus its first
+significant title words) in verbatim as one phrase, often ungrammatical word-salad.
 
-### G — Identity (§2.5)
-`fetch_active_insight_rows` (replaces `fetch_active_insight_judgement_sets` — now returns
-`(id, judgement_set, metadata)` triples, not bare sets) + `append_insight_references` (new): a fresh
-cluster whose judgement set exactly matches ('same') an existing active insight's no longer just
-gets filtered out silently — the triggering thematic summary id (via
-`fetch_active_thematic_summary_id`) and domain are APPENDED to the existing insight's
-`summary_ids`/`domains`, deduplicated, in one Postgres UPDATE. A 'covered' match (the existing
-insight's reach is a strict SUPERSET — `insight_gate.classify_identity`'s own defensive extra case,
-not in §2.5's LOCKED table) is skipped with **no write at all** — nothing new to add, and folding it
-would create a redundant duplicate. 'supersedes'/'overlap'/'disjoint' fold as normal (Mechanism A
-resolves 'supersedes' at write time, unchanged).
+**Fix:** rewrote the instruction text only, to state the real per-word requirement. Did **not**
+touch: `summary_preserves`' semantics (still token-level, still the same coverage math); the hard/
+zero-tolerance rule for required (judgement) anchors; `preservation_anchor`'s fragment
+*construction* (explicitly flagged in the brief as a separate, out-of-scope design question — not
+"improved" here).
+
+### O1 — refold_ledger telemetry breakdown
+New `coordinator.py` method `_refold_ledger_telemetry()`, wired into `GET /memory/telemetry` as
+`snap["refold_ledger"]`. Two breakdowns over the ledger's own columns (confirmed live — see
+"Live verification" below):
+
+- **`by_status_reason`** — `[{"status", "closed_reason", "count"}, ...]`, grouped straight off
+  `refold_ledger`'s `(status, closed_reason)`. Distinguishes `dropped/below_density` and
+  `dropped/out_of_scan` (I7, `decision:1121` — a candidate the cycle scanned and correctly did
+  **not** gate this pass) from a genuinely `open` row, which is what an actual stall looks like.
+- **`by_trigger_kind`** — `{trigger_kind: count}`. `trigger_kind='technical_docs'` means a
+  superseded fact or reversed decision triggered this row **directly**; `'community_summaries'`
+  means a **retired summary's own retirement cascaded** to this row (C3's cascading/lineage
+  supersession — one summary's retirement raising another).
+
+**A judgement call on wording, flagged for the reviewer rather than silently decided:** the brief
+asked for a breakdown "by trigger source — outbox-triggered vs lineage-triggered rows." There is no
+literal "outbox" column on `refold_ledger` (that table is `run_lineage_invalidation_pass`'s own
+ledger, distinct from `neo4j_outbox`). I read this as asking for `trigger_kind` — its two values are
+exactly "the record itself was the trigger" (`technical_docs`, which normally enters via the
+outbox) vs "a cascade from another summary's retirement was the trigger" (`community_summaries`,
+the lineage mechanism) — which satisfies "use the ledger's own columns" literally. If the intended
+meaning was something else, the fix is a one-line rename of the output key, not a new query.
+
+### O2 — insight-kind reconciliation read
+Same method, `insight_reconciliation_stuck` key. Per I17/`decision:1181`: an insight-kind
+`refold_ledger` row is an **attribution row**, never a clock entry — nothing in this codebase reads
+insight-kind rows for due-ness (the insight re-fold trigger is the graph's own `consolidated` clear,
+not this ledger). `run_lineage_invalidation_pass`'s Neo4j half (clearing `consolidated=false` on the
+retired insight's judgement nodes, **after** the Postgres commit, best-effort) can silently fail with
+no other visibility — this read is that visibility.
+
+**Implementation:** (1) Postgres — `DISTINCT pg_id` of `refold_ledger` rows where
+`status='open' AND summary_kind='insight'`. (2) If non-empty, one Neo4j `UNWIND`/`MATCH` for
+`(Decision OR Retrospective)` nodes among those pg_ids still reading `consolidated = true` — meaning
+the graph-side clear never landed, so G3 (`insight_gate.py`'s freshness check) can never re-gate
+that insight. (3) A final Postgres count of `refold_ledger` **rows** (not distinct pg_ids — a pg_id
+can carry more than one open row) scoped to exactly those stuck pg_ids. Currently reads `0` live —
+the open-insight-kind-row population is empty right now (no C3 cascade has fired against an insight
+yet), which is the honest current state, not a defect; the query and path are exercised and correct.
 
 ## Files changed
 ```
-shared-memory/scripts/consolidation_loop.py          (thematic + insight fold rewrite; see above)
-shared-memory/scripts/coordinator.py                 (_status_of_summary exposes domain+domains+summary_ids)
-shared-memory/Documentation/schema.md                (community_summaries metadata contract, both shapes)
-shared-memory-skill/shared-memory/Documentation/schema.md   (synced copy — MANIFEST parity)
-tests/test_insight_consolidation.py                  (near-total rewrite — judgement-inclusive fold)
-tests/test_nrem_confidence.py                        (thematic preservation-gate tests removed —
-                                                        structurally impossible now; insight coverage kept)
-tests/test_lineage_invalidation.py                   (+1 end-to-end leg-3 test)
-tests/test_fold_origin.py                             (docstring only — "feeds the LLM" → "feeds the index")
+shared-memory/scripts/consolidation_loop.py   D1 (both cycles), D2, D3, D4
+shared-memory/scripts/coordinator.py          D1 (surfacing), O1, O2
+tests/test_insight_consolidation.py           D1 (insight), D3
+tests/test_nrem_confidence.py                 D1 (fact), D2, D3 (extra() shape), D4
+tests/test_consolidation_signal.py            D1 (coordinator surfacing)
+tests/test_coordinator.py                     O1, O2
 ```
+No migrations, no schema changes, no version/CHANGELOG/sync_skills.sh touches, no Documentation/
+schema.md changes (the `consolidation_runs.extra` JSONB column is already documented as a free-form
+bag — `preservation_retries`/`truncation_failures`/`fold_dead_letter` etc. are not individually
+enumerated there either, so `dead_lettered_clusters` joining them does not create new drift).
 
 ## Tests
 
-Full suite: `MOCK_LLM=1 uv run --with pytest --with pytest-asyncio --with fastmcp --with
-psycopg2-binary --with httpx --with neo4j --with asyncpg --with aiohttp --with json-repair --with
-numpy pytest tests/ -q` → **1303 passed** (this PR's own tests) **+ 1 pre-existing standing red**
-(`test_rem_grounding_slice.py::test_grounding_slice_merges_batch_round_robin`, confirmed failing in
-isolation against unmodified `main` — not touched by this branch; it is also visibly FLAKY when run
-inside the full suite depending on interleaving, passing sometimes — this is a pre-existing property
-of that test, not something this PR introduced or should paper over).
+**Full suite** (from worktree root):
+```
+uv run --with pytest --with pytest-asyncio --with fastmcp --with psycopg2-binary --with httpx \
+  --with neo4j --with asyncpg --with aiohttp --with json-repair --with numpy pytest tests/ -q
+```
+→ **1310 passed** (base was 1304; +6 new tests, all green).
 
-### Mutation checks performed (backup → mutate → run → confirm exact test dies → restore → diff clean)
+**Isolation** — every changed/new-test file run alone:
+```
+uv run --with pytest --with pytest-asyncio --with fastmcp --with psycopg2-binary --with httpx \
+  --with neo4j --with asyncpg --with aiohttp --with json-repair --with numpy \
+  pytest tests/test_insight_consolidation.py -q   # 49 passed
+  pytest tests/test_nrem_confidence.py -q          # 39 passed
+  pytest tests/test_consolidation_signal.py -q     # 21 passed
+  pytest tests/test_coordinator.py -q              # 93 passed
+```
+All four green in isolation, matching their full-suite verdicts.
 
-| Guard reverted | Test that died |
-|---|---|
-| `_mark_insight_in_graph`'s widened `(d:Decision OR d:Retrospective)` reverted to `(d:Decision {pg_id: jid})` | `test_fold_insight_full_path` |
-| `source_pg_ids` mutated to include `summary_ids` (`sorted(set(src_ids) \| set(summary_ids))`) | `test_fold_insight_full_path`, `test_fold_insight_summary_ids_never_mixed_with_source_pg_ids` (both) |
-| §2.5 'same'/'covered' append branch short-circuited to a bare `continue` (pre-C4 skip-only behaviour) | `test_run_insight_cycle_same_identity_appends_reference_not_a_new_fold` |
-| `fetch_reversal_context` call replaced with `reversals = []` | `test_fold_insight_reversal_note_injected_and_anchored` |
-| `_fold_insight`'s written `summary_ids` replaced with `[]` | `test_leg3_cascades_using_the_real_summary_ids_c4s_fold_actually_writes` |
+### Mutation checks — one per fix, applied to the live file, run, confirmed the exact test died, reverted, `git diff` confirmed byte-identical before the next
 
-Each mutation was applied to a full backup copy of `consolidation_loop.py`, the targeted test(s)
-re-run to confirm the EXACT expected failure (not a different, unrelated one), then the file was
-restored and `diff`-confirmed byte-identical before the next mutation.
+| Fix | Mutation applied | Test that died |
+|---|---|---|
+| D1 (fact cycle) | `rec.eligible_clusters = len(eligible_work_items)` → `len(work_items)` (pre-filter count restored) | `test_fact_cycle_dead_lettered_cluster_excluded_from_eligible_census` — `eligible_clusters` read 2, not 1 |
+| D1 (insight cycle) | Dropped the `clusters = eligible_clusters` reassignment (post-partition list never takes effect) | `test_run_insight_cycle_dead_lettered_cluster_excluded_from_eligible_census` — `await_count` was 2, not 1 (the fold loop ALSO regressed, since it no longer re-checks dead-letter status once the census filters) |
+| D1 (coordinator surfacing) | Hardcoded `"dead_lettered_clusters": None` in `_compute_consolidation_health`'s output dict | `test_dead_lettered_clusters_surfaced_per_cycle_type` — read `None`, not `2` |
+| D2 | Logged `cyc.preservation_retries` instead of the new per-fold `attempt` counter | `test_insight_preservation_retry_log_uses_per_fold_attempt_number` — fold 2's own first retry logged "attempt 2/2" instead of "attempt 1/2" |
+| D3 | `"entity": f"{project}/{section or SECTION_NONE}"` → `"entity": ""` | `test_fresh_insight_clusters_returns_shape_for_a_gating_group` — read `''`, not `'proj/dom'` |
+| D4 | Restored the old "EXACT, literal, character-for-character substring" wording | `test_corrective_block_demands_per_word_verbatim_not_whole_phrase` AND `test_generate_insight_corrective_paragraph_names_dropped_anchors` — both died |
+| O1 | `"by_status_reason": []` hardcoded | `test_refold_ledger_telemetry_breakdowns_with_no_open_insight_rows` |
+| O2 | Final PG count query scoped to the full open `pg_ids` list instead of the graph-filtered `stuck_ids` | `test_refold_ledger_telemetry_o2_counts_only_rows_still_consolidated_in_graph` — `fetchval_params` was `[10,20,30]`, not `[10,30]` |
 
-### A test-isolation trap found and fixed along the way (not a mutation, a real pre-existing bug class)
+Every mutation was hand-applied via a targeted Python string-replace against the working tree
+(never a backup-and-restore across the whole file — each mutation touched exactly the one line
+under test), the targeted test re-run to confirm the EXACT predicted failure, then reverted and
+`git diff --stat` confirmed empty before moving to the next.
 
-`tests/test_rem_loop.py` dynamically re-execs `consolidation_loop.py` at COLLECTION time and
-overwrites `sys.modules["consolidation_loop"]` (never restored). Two of my new
-`test_insight_consolidation.py` tests did a LOCAL `import consolidation_loop as cl` inside the test
-function body (copying a pattern the pre-existing `test_run_insight_cycle_calls_fold_with_compatible_signature`
-already used) — at TEST-RUNTIME this resolves against whatever `sys.modules` currently holds, which
-by then is `test_rem_loop.py`'s swapped-in copy, a DIFFERENT module object than the one
-`ConsolidationDaemon` (imported at file-collection time) was defined in. Monkeypatching `cl.X` then
-patches the wrong module, and the daemon falls through to REAL module-global functions and a REAL
-`psycopg2.connect` against the LIVE local Postgres — which is why this only reproduced in the FULL
-suite, never in isolation, and why the failure mode was a `ValueError` about unpacking, not an
-obviously-related assertion. **Fixed** by capturing `import consolidation_loop as cl` ONCE at
-`test_insight_consolidation.py`'s own module (collection) scope and removing all three in-function
-local imports (mine and the pre-existing one) in favour of that single reference. Flagging because
-this class of bug is NOT specific to my tests — any future test in this file (or a sibling file
-collected before `test_rem_loop.py`) that does a local `import consolidation_loop as cl` inside a
-function body is at risk of the same silent mis-patch. Worth a standing note somewhere if this
-recurs.
+## Live verification (read-only, no writes) — every new/changed SQL and Cypher string, run verbatim
 
-## Live verification (read-only — no writes)
+Credentials: `shared-memory/.env` in the sibling non-worktree checkout
+(`~/claude-labs/projects/shared-memory-GitHub/shared-memory/.env`, gitignored, read-only — this
+worktree has no `.env` of its own). Postgres via `asyncpg` (matching the coordinator's own driver,
+so `$1`-style placeholders match reality exactly, not psycopg2's `%s`); Neo4j via the `neo4j` driver
+at `bolt://localhost:7687`, `auth=("neo4j", NEO4J_PASSWORD)` (matching `coordinator.py`'s own
+`NEO4J_AUTH`).
 
-All against the running `agent_data` Postgres + Neo4j (see `shared-memory/.env` for creds, read from
-the sibling non-worktree checkout since `.env` is gitignored and worktrees don't share untracked
-files):
+**`refold_ledger` schema, confirmed against the live table** (columns exactly match
+`Documentation/schema.md`'s table): `id, pg_id, summary_id, summary_kind, trigger_kind, trigger_id,
+status, closed_at, closed_reason, created_at`.
 
-- `fetch_judgement_types`'s exact SQL — ran, 2 rows, correct types.
-- `fetch_active_insight_rows`'s exact SQL — ran, 2 live insight rows returned with real metadata
-  (both still pre-C4 shape: `domain: "insight"` placeholder + `projects` array — confirms the
-  "pre-C4 rows keep the old shape" note in schema.md is accurate, not hypothetical).
-- `fetch_active_thematic_summary_id`'s exact SQL, seeded with `("shared-memory-GitHub",
-  "architecture", "domain")` — returned `173`, a real active thematic row.
-- `append_insight_references`'s `SELECT ... FOR UPDATE` — ran (0 rows for a throwaway id, as
-  expected — no live write attempted).
-- `fetch_reversal_context`'s both legs — ran, 0 rows (consistent: `refold_ledger` is empty on the
-  live corpus, as `fact:1180`/the C3.1 report already established — the lineage pass has not fired
-  live yet).
-- `_fold_insight`'s exact judgement-content SELECT (with the real `PROJECT_SQL` macro from
-  `project_axis.py`, not an approximation) — ran against real decision pg_ids `[245, 267, 1095,
-  1098]`, correct project/type values returned.
-- `fetch_refold_insights`'s widened SELECT (now includes `metadata`) — ran, 0 rows (no open retros
-  right now), query parses.
-- `thematic_cypher_query([6,7,16,54,55])` and `insight_cypher_query([245,267,1095,1107])` — both
-  CALLED FOR REAL (not just string-inspected) against the live Neo4j: the thematic query returned 5
-  Fact rows with correctly-empty judgement arrays (none of these particular facts are grounded-in by
-  anything yet); the insight query returned 16 rows spanning the real grounding/outcome edges of
-  those 4 judgement ids.
-- Criterion C's widened Cypher predicate, run read-only (`MATCH` only, no `SET`) against real pg_ids
-  spanning both labels — `245/267/1095/1098` (Decision) and `1107` (Retrospective) all resolved
-  correctly with the right label.
-- `SELECT elem::bigint FROM jsonb_array_elements_text('[173,179]'::jsonb) AS elem` — the exact
-  expression leg 3 uses, run against a literal matching `_fold_insight`'s write shape — returned
-  `[(173,), (179,)]`. Proves the round-trip without touching any table.
+**O1's two breakdown queries**, run verbatim:
+```sql
+SELECT status, closed_reason, count(*) AS n FROM refold_ledger GROUP BY status, closed_reason;
+-- → [('refolded','constituent_folded',6), ('dropped','out_of_scan',37)]
+SELECT trigger_kind, count(*) AS n FROM refold_ledger GROUP BY trigger_kind;
+-- → [('technical_docs', 43)]
+```
 
-No live writes were made anywhere in this verification.
+**O2's three-step read**, run verbatim:
+```sql
+SELECT DISTINCT pg_id FROM refold_ledger WHERE status = 'open' AND summary_kind = 'insight';
+-- → [] (0 rows — no open insight-kind row exists on the live corpus right now)
+SELECT count(*) FROM refold_ledger WHERE status = 'open' AND summary_kind = 'insight'
+  AND pg_id = ANY($1::bigint[]);  -- exercised with dummy ids [1,2,3] → 0
+```
+The Neo4j half (`UNWIND $ids AS pid MATCH (d) WHERE (d:Decision OR d:Retrospective) AND
+d.pg_id = pid AND d.consolidated = true RETURN collect(DISTINCT pid) AS stuck_ids`) was run with
+dummy ids `[1, 2, 3]` (since live has no open insight-kind rows to seed real ids from) and returned
+`stuck_ids=[]` — proves the Cypher syntax/shape is valid against the live graph; the real population
+it will act on is currently empty.
 
-## Judgement calls the diff doesn't show
+**D1's modified `_compute_consolidation_health` roll-up query** — the full query with its new
+`dead_lettered_clusters` CTE column, run verbatim via `asyncpg.connect(...).fetch(qtext, 600)`
+(the same `CONSOLIDATION_ORPHAN_TIMEOUT_SEC` value the coordinator passes):
+```
+fact_consolidation: {..., 'eligible_clusters': 2, 'eligible_oldest_age': 2193,
+                      'dead_lettered_clusters': None, ...}
+insight:            {..., 'eligible_clusters': 7, 'eligible_oldest_age': 3649990,
+                      'dead_lettered_clusters': None, ...}
+```
+`dead_lettered_clusters` reads `None` for both cycle types — expected and correct: no
+`consolidation_runs` row yet carries the new `extra.dead_lettered_clusters` key, because the fix
+has not been deployed to the running gateway (this worktree never restarts or writes to the live
+system, per the builder's remit). It will start populating on the daemon's first pass after this
+branch is merged and the gateway is restarted (the merger/reviewer's job, not this builder's).
 
-- **The insight `content` prompt no longer includes ANY of confidence, alternatives, retrospective-
-  rating, or grounding-edge detail** — a deliberate, large narrowing from the pre-C4 prompt, read
-  from §3.2's "extracting strictly the Title and Rationale" plus the explicit CONSIDERED/REJECTED/
-  UNDER_CONDITIONS exclusion. This also makes the entire "stage 5" calibration-gated grounding-edge
-  rendering apparatus (`_fetch_outcome_edges`, `_fetch_grounding_edges`, `fetch_retro_records`,
-  `render_alternative_lines`) DEAD inside this module and they are REMOVED. `relation_confidence.py`
-  itself is untouched (still used by `relation_sweep.py`/`rem_loop.py`) — only its consumption
-  INSIDE the insight fold is gone. `run_insight_cycle` still fetches and records the general
-  family-calibration snapshot (`rec.calibration`) once per cycle — kept as harmless standalone
-  telemetry — but `machine_edges_consumed`/`edges_awaiting_calibration` will now always read 0 for
-  insight runs, since nothing renders a grounding edge any more. This is not a metric MEANING
-  inversion (0 correctly means "zero rendered", which is now permanently true) but the counter is
-  now permanently inert — flagging for the monitor's own awareness (Group 3).
-- **`project` on an insight row is SINGULAR**, matching §3.2's literal text, even though the walk
-  can in principle cross projects (not just domains — nothing in the walk mechanism itself respects
-  project boundaries any more than domain ones). §3.2 does not make `project` multi-valued the way
-  it does `domains`; I implemented exactly what is written, not what would be "more consistent". If
-  cross-project walks turn out to be common enough to matter, `project` becoming a list is a
-  follow-up, not a defect in this PR.
-- **`summary_ids` on a FRESH insight fold is a single-element list from ONE Postgres lookup**
-  (`fetch_active_thematic_summary_id` on the SEEDING group's own project/domain) — not an attempt to
-  resolve a thematic summary for every domain the walk happened to touch. Cross-domain/cross-project
-  judgements the walk pulled in are represented via `domains`/`entities`/`cypher_query` (all
-  graph-walkable), but a full "which thematic summary does each touched domain currently have
-  active" resolution was judged out of scope for one payload PR — flagging explicitly rather than
-  silently under-delivering. A RE-FOLD carries the previous insight's `summary_ids` FORWARD
-  unchanged (a re-fold is triggered by a new retrospective, not a change in which thematic summaries
-  it rests on).
-- **README.md's Phase 2b/3a insight-consolidation section is now further stale** (it describes the
-  pre-v2, pre-C1 entity-hub design in detail) — this predates C4 (C1/C2/C3 apparently left it too)
-  and is a large, separate documentation debt across the whole Dreaming Cycle v2 track, not something
-  owed uniquely by this PR. Flagging rather than attempting a partial rewrite of Xenofon's-voice prose.
-- **`INSIGHT_DOMAIN = "insight"` and `render_alternative_lines` are REMOVED**, not deprecated —
-  confirmed zero other callers/tests before removing (grepped).
+No live writes were made anywhere in this verification — every statement above is a `SELECT` (or a
+read-only `MATCH`, no `SET`/`CREATE`/`MERGE`).
 
-## Owed at release (NOT done here — explicitly out of scope for a builder)
-1. Version bump (+0.0.1), CHANGELOG entry, `sync_skills.sh` (this branch already manually synced the
-   one drifted tracked-copy file, `Documentation/schema.md`, to keep the suite green — a real
-   `sync_skills.sh` run at release time is still the authoritative step).
-2. Restart `hive-mind-gateway.service`, verify `/health`.
-3. The two §2.2a edge cases the plan leaves open (does a reversing retrospective satisfy G2; does it
-   appear in the payload as a member) — still owed to Xenofon, unaffected by this PR's ledger-driven
-   reversal-note mechanism.
-4. The `summary_ids`-for-every-touched-domain question flagged above, if it turns out to matter on
-   real cross-domain walks.
+## Group obligations cleared (CLAUDE.md "Change groups")
+
+- **Group 3 (daemon/observability)** — the group this whole task lives in, and the one CLAUDE.md
+  names as having **no mechanical tie**. Explicitly checked here: D1's new `dead_lettered_clusters`
+  key is verified as a genuinely NEW name (not a repurposed old one — `_CycleRec.extra()`'s existing
+  keys are untouched), and its absence-vs-zero distinction is preserved end to end (daemon `None`
+  default only once a census runs → coordinator `None` when no row carries the key → tests assert
+  both states explicitly). O1/O2's `snap["refold_ledger"]` key is additive to `/memory/telemetry`'s
+  existing JSON shape — no existing key renamed, moved, or reinterpreted.
+- **Group 4 (storage/schema)** — touched **read-only**. No migration, no new table/column, no
+  `schema_init.sql` change. `refold_ledger`'s existing columns are read as-is.
+- **Group 1/2/5** — not applicable; no client-surface, capture-surface, or install-surface files
+  were touched.
+
+## Monitor contract — new keys, one-line meaning each (owed to shared-memory-monitor)
+
+`GET /memory/telemetry`'s `consolidation.<cycle_type>` block gains:
+- **`dead_lettered_clusters`** (int or `null`) — clusters this cycle type's latest gate census
+  excluded because `NREM_FOLD_FAIL_CAP` dead-lettered them; `null` means no census has recorded this
+  yet (pre-deploy / fresh install), never "zero dead-lettered."
+
+`GET /memory/telemetry` gains a new top-level section, `refold_ledger`:
+- **`refold_ledger.by_status_reason`** — `[{status, closed_reason, count}]`, every
+  `(status, closed_reason)` pair on the ledger. `closed_reason` is `null` for open rows.
+- **`refold_ledger.by_trigger_kind`** — `{trigger_kind: count}`; `technical_docs` = a superseded
+  fact/reversed decision triggered the row directly, `community_summaries` = a cascaded retirement
+  (C3's lineage mechanism).
+- **`refold_ledger.insight_reconciliation_stuck`** (int) — open insight-kind ledger rows whose
+  judgement node still reads `consolidated=true` in Neo4j, meaning the graph-side clear that would
+  let the insight re-gate never landed. Non-zero is worth alerting on; zero is the healthy steady
+  state (also the entire current population).
+
+None of these change the meaning of any existing key. `snap["consolidation"]` and
+`snap["refold_ledger"]` are independent top-level keys in the telemetry payload.
+
+## Escalations
+
+None. No genuine design ambiguity blocked implementation. The one interpretive call (O1's
+"outbox-triggered vs lineage-triggered" wording vs the literal `trigger_kind` column values) is
+documented above under O1, with the reasoning and the one-line fix if the reviewer disagrees — it
+did not block shipping because both readings are the same underlying data, differing only in the
+output key's English label.
+
+## Commands run (exact, for re-verification)
+
+```bash
+# Full suite
+cd ~/claude-labs/worktrees/nrem-truth-observability
+uv run --with pytest --with pytest-asyncio --with fastmcp --with psycopg2-binary --with httpx \
+  --with neo4j --with asyncpg --with aiohttp --with json-repair --with numpy pytest tests/ -q
+
+# Live SQL/Cypher verification (read-only)
+uv run --with asyncpg --with neo4j --with python-dotenv python - <<'EOF'
+import os, asyncio, asyncpg
+from dotenv import load_dotenv
+load_dotenv(os.path.expanduser("~/claude-labs/projects/shared-memory-GitHub/shared-memory/.env"))
+async def main():
+    conn = await asyncpg.connect(f"postgresql://postgres:{os.environ['PG_PASSWORD']}@localhost:5432/agent_data")
+    print(await conn.fetch("SELECT status, closed_reason, count(*) AS n FROM refold_ledger GROUP BY status, closed_reason"))
+    await conn.close()
+asyncio.run(main())
+EOF
+```
+
+## What to do next (the reviewer/merger's job, not this builder's)
+1. Review the diff; rule on O1's `trigger_kind`-naming interpretive call if it needs a different key
+   name.
+2. Merge via PR (never direct to `main`).
+3. Bump version `+0.0.1`, CHANGELOG entry, tag + GitHub Release, `sync_skills.sh` if the capture
+   surface changed (it did not — this is a pure daemon/coordinator/observability change; no
+   client-facing skill file was touched).
+4. Restart `hive-mind-gateway.service`, verify `/health` and `/memory/telemetry` show the new
+   `dead_lettered_clusters`/`refold_ledger` keys on the next consolidation pass.
+5. Notify `shared-memory-monitor` of the new `refold_ledger` telemetry section (Monitor contract
+   above) so the dashboard can render it.
