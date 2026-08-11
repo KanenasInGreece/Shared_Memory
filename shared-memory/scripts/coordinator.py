@@ -121,7 +121,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.69"
+FRAMEWORK_VERSION = "0.8.70"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -5465,6 +5465,17 @@ class MemoryCoordinator:
         except Exception as exc:
             snap["consolidation"] = {"error": str(exc)}
 
+        # refold_ledger breakdown (O1, fact:1189) — a lone backlog number
+        # misleads: dropped/below_density and dropped/out_of_scan (I7,
+        # decision:1121) must be distinguishable from a genuinely open row.
+        # Also the insight-kind reconciliation read (O2, I17, decision:1181)
+        # — the durable record's only visibility, since nothing else reads
+        # insight-kind rows.
+        try:
+            snap["refold_ledger"] = await self._refold_ledger_telemetry()
+        except Exception as exc:
+            snap["refold_ledger"] = {"error": str(exc)}
+
         # Spine coverage (decision 559) — required-field completeness + the elicited
         # rate + emergent (captured-but-unprojected) fields + alias-adjudication
         # volume. The data behind the first-write-quality push; the monitor samples
@@ -5779,7 +5790,14 @@ class MemoryCoordinator:
               -- written to consolidation_runs.extra by the daemon. Lets the monitor
               -- show "deferred — inference GPU busy" instead of a bare "deferred".
               (array_agg(extra->>'reason' ORDER BY started_at DESC)
-                  FILTER (WHERE outcome = 'deferred' AND extra ? 'reason'))[1] AS last_deferred_reason
+                  FILTER (WHERE outcome = 'deferred' AND extra ? 'reason'))[1] AS last_deferred_reason,
+              -- D1 (fact:1189, decision:1121/I7) — the latest count of
+              -- clusters this cycle EXCLUDED from eligible_clusters because
+              -- NREM_FOLD_FAIL_CAP dead-lettered them. Written to
+              -- consolidation_runs.extra by the daemon (_CycleRec.extra()).
+              -- A NEW key — never an alias for eligible_clusters.
+              (array_agg((extra->>'dead_lettered_clusters')::int ORDER BY started_at DESC)
+                  FILTER (WHERE extra ? 'dead_lettered_clusters'))[1] AS dead_lettered_clusters
             FROM ranked GROUP BY cycle_type
         """
         async with self._acquire() as conn:
@@ -5818,6 +5836,13 @@ class MemoryCoordinator:
                 # Coverage census (PR-2): latest gate snapshot the daemon recorded.
                 "eligible_clusters": elig,
                 "eligible_oldest_age_seconds": (r["eligible_oldest_age"] if r else None),
+                # D1 (fact:1189, decision:1121/I7) — clusters this cycle
+                # excluded from `eligible_clusters` because they were
+                # dead-lettered (NREM_FOLD_FAIL_CAP). NEW key; None means no
+                # census has recorded this yet (pre-D1 rows), NOT zero.
+                "dead_lettered_clusters": (
+                    int(r["dead_lettered_clusters"])
+                    if r and r["dead_lettered_clusters"] is not None else None),
                 # Why the most-recent deferral happened (None if never deferred);
                 # only meaningful when last_outcome == "deferred".
                 "last_deferred_reason": (r["last_deferred_reason"] if r else None),
@@ -5987,6 +6012,85 @@ class MemoryCoordinator:
     async def _consolidation_telemetry(self) -> dict:
         """Full consolidation section for /memory/telemetry (computed fresh)."""
         return await self._compute_consolidation_health()
+
+    async def _refold_ledger_telemetry(self) -> dict:
+        """O1/O2 (fact:1189) — refold_ledger visibility. A lone backlog
+        number misleads: `dropped/below_density` and `dropped/out_of_scan`
+        (I7, `decision:1121` — a candidate the cycle scanned and correctly
+        did not gate THIS pass) must be distinguishable from a genuinely
+        open row, which is what a real stall looks like. Two breakdowns
+        over the ledger's own columns:
+
+          ``by_status_reason`` -- (status, closed_reason) counts. An open
+              row has ``closed_reason IS NULL``.
+          ``by_trigger_kind``  -- counts by ``trigger_kind``:
+              'technical_docs' = a superseded fact or reversed decision
+              triggered this row directly; 'community_summaries' = a
+              retired summary's own retirement cascaded to this row (C3's
+              lineage mechanism, one summary's retirement raising another).
+
+        O2's reconciliation read (I17, `decision:1181`): an insight-kind
+        row is an ATTRIBUTION row, never a clock entry (nothing reads
+        insight-kind rows for due-ness — the insight re-fold trigger is the
+        graph's own ``consolidated`` clear, not this ledger). So a
+        best-effort graph write that silently failed
+        (`run_lineage_invalidation_pass`'s Neo4j half, after the Postgres
+        commit) has NO OTHER visibility. ``insight_reconciliation_stuck``
+        counts OPEN insight-kind LEDGER ROWS whose judgement's Decision/
+        Retrospective node STILL reads ``consolidated = true`` in Neo4j —
+        meaning the graph never got the clear that would let G3
+        (`insight_gate.py`) re-gate it. Read-only PG + Neo4j join, gateway-
+        side (a read-scoped client has no direct access to either store)."""
+        async with self._acquire() as conn:
+            by_status_reason = await conn.fetch(
+                "SELECT status, closed_reason, count(*) AS n"
+                "  FROM refold_ledger GROUP BY status, closed_reason"
+            )
+            by_trigger = await conn.fetch(
+                "SELECT trigger_kind, count(*) AS n"
+                "  FROM refold_ledger GROUP BY trigger_kind"
+            )
+            open_insight_pg_ids = await conn.fetch(
+                "SELECT DISTINCT pg_id FROM refold_ledger"
+                " WHERE status = 'open' AND summary_kind = 'insight'"
+            )
+        pg_ids = [r["pg_id"] for r in open_insight_pg_ids]
+
+        stuck_ids: set = set()
+        if pg_ids:
+            async with self._neo4j.session() as session:
+                res = await session.run(
+                    f"UNWIND $ids AS pid"
+                    f" MATCH (d) WHERE (d:{ONT.decision} OR d:{ONT.retrospective})"
+                    f"                  AND d.pg_id = pid AND d.consolidated = true"
+                    f" RETURN collect(DISTINCT pid) AS stuck_ids",
+                    ids=pg_ids,
+                )
+                rec = await res.single()
+                stuck_ids = set((rec["stuck_ids"] if rec else None) or [])
+
+        # O2 counts LEDGER ROWS (decision:1181: "open insight-kind ledger
+        # rows whose judgement nodes are still consolidated=true"), not
+        # distinct pg_ids — a pg_id can carry more than one open row.
+        stuck_row_count = 0
+        if stuck_ids:
+            async with self._acquire() as conn:
+                stuck_row_count = await conn.fetchval(
+                    "SELECT count(*) FROM refold_ledger"
+                    " WHERE status = 'open' AND summary_kind = 'insight'"
+                    "   AND pg_id = ANY($1::bigint[])",
+                    list(stuck_ids),
+                )
+
+        return {
+            "by_status_reason": [
+                {"status": r["status"], "closed_reason": r["closed_reason"],
+                 "count": r["n"]}
+                for r in by_status_reason
+            ],
+            "by_trigger_kind": {r["trigger_kind"]: r["n"] for r in by_trigger},
+            "insight_reconciliation_stuck": stuck_row_count,
+        }
 
     def consolidation_health(self) -> dict:
         """Cached compact snapshot for /health (DB-free, refreshed in background).

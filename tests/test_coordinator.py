@@ -1445,6 +1445,66 @@ async def test_graph_integrity_tolerates_null_reason_and_label():
     assert out["by_label"] == {"unlabelled": 3}
 
 
+# ── refold_ledger telemetry (O1/O2, fact:1189) ────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_refold_ledger_telemetry_breakdowns_with_no_open_insight_rows():
+    """O1 — the two ledger breakdowns read straight off its own columns; O2's
+    reconciliation read short-circuits (no Neo4j call at all) when there are
+    no open insight-kind rows to check — the common case."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+    mock_conn.fetch = AsyncMock(side_effect=[
+        [{"status": "dropped", "closed_reason": "out_of_scan", "n": 37},
+         {"status": "refolded", "closed_reason": "constituent_folded", "n": 6}],
+        [{"trigger_kind": "technical_docs", "n": 43}],
+        [],  # open insight-kind pg_ids — none
+    ])
+
+    out = await c._refold_ledger_telemetry()
+
+    assert out["by_status_reason"] == [
+        {"status": "dropped", "closed_reason": "out_of_scan", "count": 37},
+        {"status": "refolded", "closed_reason": "constituent_folded", "count": 6},
+    ]
+    assert out["by_trigger_kind"] == {"technical_docs": 43}
+    assert out["insight_reconciliation_stuck"] == 0
+    mock_session.run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_refold_ledger_telemetry_o2_counts_only_rows_still_consolidated_in_graph():
+    """O2 (I17, decision:1181) — the reconciliation read must FILTER by the
+    graph's own consolidated flag, not just echo the open pg_id count: a
+    pg_id whose graph-side clear DID land must not be reported as stuck.
+    Three open insight-kind pg_ids (10, 20, 30); Neo4j reports only 10 and
+    30 as still consolidated=true (20's clear landed). The final count is
+    the LEDGER ROW count for exactly those two pg_ids — a deliberately
+    different number (5) than len(stuck ids) (2), so the test cannot pass
+    by accident on a "count distinct pg_ids" shortcut."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+    mock_conn.fetch = AsyncMock(side_effect=[
+        [{"status": "dropped", "closed_reason": "out_of_scan", "n": 1}],
+        [{"trigger_kind": "technical_docs", "n": 1}],
+        [{"pg_id": 10}, {"pg_id": 20}, {"pg_id": 30}],
+    ])
+    mock_conn.fetchval = AsyncMock(return_value=5)
+
+    result = AsyncMock()
+    result.single = AsyncMock(return_value={"stuck_ids": [10, 30]})
+    mock_session.run = AsyncMock(return_value=result)
+
+    out = await c._refold_ledger_telemetry()
+
+    assert out["insight_reconciliation_stuck"] == 5
+    cypher, kwargs = mock_session.run.call_args
+    assert "d.consolidated = true" in cypher[0]
+    assert sorted(kwargs["ids"]) == [10, 20, 30]
+    # the follow-up PG count is scoped to exactly the STUCK ids, not all
+    # three open pg_ids.
+    fetchval_sql, fetchval_params = mock_conn.fetchval.call_args[0]
+    assert sorted(fetchval_params) == [10, 30]
+
+
 # ── Grounding-target label resolution (bug 578's shape, for every record type) ─
 
 @pytest.mark.asyncio

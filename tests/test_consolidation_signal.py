@@ -82,6 +82,9 @@ def _no_census_row(cycle_type):
         "inflight": 0, "consec_fail": 0, "last_error_class": None,
         "last_error_msg": None, "eligible_clusters": None,
         "eligible_oldest_age": None, "last_deferred_reason": None,
+        # D1 (fact:1189) — dead_lettered_clusters, like eligible_clusters,
+        # is NULL when no census has ever recorded it.
+        "dead_lettered_clusters": None,
     }
 
 
@@ -127,6 +130,33 @@ async def test_no_census_is_not_reported_as_a_stall_composition():
     assert out["insight"]["backlog"] == 0                 # I7: not-gating ≠ backlog
     assert out["insight"]["stalled"] is False              # therefore: not a stall
     nrem_spy.assert_not_called()                           # composition never consults it
+
+
+@pytest.mark.asyncio
+async def test_dead_lettered_clusters_surfaced_per_cycle_type():
+    """D1 (fact:1189) — dead_lettered_clusters (written by the daemon into
+    consolidation_runs.extra via _CycleRec.extra()) must be read back and
+    surfaced per cycle type — a NEW key, distinct from eligible_clusters,
+    read from the latest row that actually carries it (`extra ?
+    'dead_lettered_clusters'`). A cycle type with no row this pass reads
+    None (absence), never 0 — the same "no census recorded" discipline
+    eligible_clusters already follows."""
+    coord = co.MemoryCoordinator()
+    row = dict(_no_census_row("insight"), eligible_clusters=5,
+               dead_lettered_clusters=2)
+    conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[row])
+    acq = MagicMock()
+    acq.__aenter__ = AsyncMock(return_value=conn)
+    acq.__aexit__ = AsyncMock(return_value=False)
+    coord._acquire = MagicMock(return_value=acq)
+
+    out = await coord._compute_consolidation_health()
+
+    assert out["insight"]["eligible_clusters"] == 5
+    assert out["insight"]["dead_lettered_clusters"] == 2
+    # fact_consolidation got no row at all this pass — None, not 0.
+    assert out["fact_consolidation"]["dead_lettered_clusters"] is None
 
 
 # ── _record_cycle context manager ────────────────────────────────────────────
