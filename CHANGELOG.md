@@ -5,6 +5,83 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.71] — 2026-08-11
+
+### Changed — insight payload BY CONSTRUCTION, the preservation-anchor gate retired (decision:1205)
+
+Implements operator ruling `decision:1205`, grounded on `fact:1204` (measured live: the anchor gate
+caused a retry lottery and forced fabricated quoted titles into insight prose). The thematic fold
+(`§3.1`, zero-inference Zettelkasten) is untouched by this release — it never called the retired
+machinery.
+
+- **An insight's `content` is now ASSEMBLED BY CODE, never emitted whole by the LLM.** Per DECISION:
+  `[decision:N] «<title, verbatim>»` then an LLM-filled one-sentence rationale. Per RETROSPECTIVE: no
+  title (never fabricated — retrospectives have none), `[retrospective:M → decision:N] rating:
+  <rating> — <LLM-filled summary>`, `N` read from `metadata->>'target_pg_id'` (no graph call). A
+  retrospective whose target decision is outside the fetched judgement set (defensive edge) renders
+  at the END of the scaffold instead of being dropped. Reversal lines (`fetch_reversal_context`) are
+  already machine-built strings and are included verbatim — the WHAT/WHY obligation is now satisfied
+  by construction, no LLM compliance or anchor needed to keep it intact.
+- **ONE LLM call fills every slot**, via a strictly-parsed `SLOT <pg_id>: <text>` / `PRINCIPLE:
+  <text>` protocol (`generate_insight_slots` / `_build_insight_prompt` / `parse_insight_slots`).
+  Per-judgement prompt input (pg_id, type, title, body) is capped by the new
+  `NREM_INSIGHT_SLOT_INPUT_CHARS` (default 2000, head of the text). A slot or PRINCIPLE still empty
+  after parsing gets ONE bounded retry asking only for what is missing; still missing FAILS THE UNIT
+  with the same no-partial-write semantics truncation already used — no partial insight is ever
+  written, and the failure is counted through `extra.slot_failures`/`extra.slot_failed`, a NEW pair
+  kept separate from `extra.truncation_failures`/`extra.truncation_failed` (see Group 3 below).
+- **`preservation_anchor` / `summary_preserves` / `corrective_block` are RETIRED and deleted**, along
+  with the corrective-retry loop and `NREM_PRESERVATION_MAX_RETRIES`, `PRESERVATION_COVERAGE`,
+  `PRESERVATION_SLACK_MIN_UNITS` — no remaining caller (the thematic path stopped using them in C4;
+  verified by grep before deletion).
+- **The fold dead-letter query (`fetch_fold_dead_letter_counts`) now unions `truncation_failed` OR
+  `slot_failed`** — both are live insight-fold failure classes and both must dead-letter a
+  repeatedly-failing cluster. It used to also union `preservation_failed`; that read is REMOVED.
+  Historical pre-v0.8.71 rows may still carry `preservation_failed`; counting them would let a stale,
+  pre-redesign failure keep dead-lettering a cluster the new construction-based path would now
+  succeed at on the first try.
+- **MOCK_LLM fabricates a well-formed `SLOT`/`PRINCIPLE` reply and parses it through the SAME parser
+  a real call uses** — assembly is never special-cased for mocks.
+
+### Group 3 (daemon/observability) — deliberate telemetry shape change
+
+`extra.preservation_retries` / `extra.preservation_failures` / `extra.preservation_failed` STOP being
+written on insight runs — `_CycleRec` no longer has those fields at all. `extra.truncation_failures` /
+`extra.truncation_failed` go back to meaning ONLY real truncation (`finish_reason=length` capacity
+failures) — unchanged from before this release for the fact-fold path.
+
+**A new, ADDITIVE pair, `extra.slot_failures` / `extra.slot_failed`, is monitor-visible as of this
+release**: it counts a SLOT/PRINCIPLE still missing after its one bounded retry — a PROTOCOL failure
+(fix the prompt/model), kept separate from truncation (a CAPACITY failure, fixed by raising
+`NREM_MAX_TOKENS_INSIGHT`) so the two causes stay diagnosable apart from the `extra` JSONB alone. Both
+classes dead-letter a repeatedly-failing cluster identically (see the dead-letter query change above)
+— the split is for diagnosis, never for which failure gets capped.
+
+### Group 2 (capture/ontology) — no capture-surface change, version-only SKILL.md edits
+
+No new operator-facing field; the worked-example version strings in both `SKILL.md` copies were
+bumped to `0.8.71` (enforced by `test_capture_surface_documented.py`).
+
+### Fixed — multi-role review of the insight-slot protocol (CQR-01, F2)
+
+- **Slot-marker forgery hardening (CQR-01, Code Quality).** `parse_insight_slots` is now
+  FIRST-occurrence-wins for both a SLOT id and PRINCIPLE — a LATER marker occurrence (e.g. a
+  judgement's own content echoing back a marker-shaped line, accidentally or adversarially) can no
+  longer silently overwrite a genuine earlier slot/principle. Independently, `_insight_slot_items`
+  now runs a judgement's BODY text through a new `_neutralize_marker_lines`: any line shaped like
+  `SLOT <digits>:` / `PRINCIPLE:` is prefixed `"> "` before it ever reaches the prompt, so record
+  content cannot teach the model the forgery pattern in the first place. TITLE is never touched (it
+  is rendered verbatim into the assembled content by construction and must not be altered).
+- **MOCK_LLM now exercises the real parse/retry/assembly path end to end (F2, Test &
+  Verification).** The MOCK_LLM check moved DOWN one layer, from `generate_insight_slots` into
+  `_call_insight_llm` (the raw LLM-call helper): under `MOCK_LLM=1` it fabricates a well-formed raw
+  `SLOT`/`PRINCIPLE` protocol TEXT for exactly what the calling prompt asked for
+  (`_select_insight_items`, shared with `_build_insight_prompt`'s own selection), and returns it
+  without touching the network. `generate_insight_slots` itself no longer special-cases mocks at
+  all — its one code path (build prompt → call → parse → retry-if-missing → fail-if-still-missing)
+  now runs identically whether mocked or live, so a mocked cycle can no longer bypass
+  `parse_insight_slots` or the missing-slot retry logic the way it previously could.
+
 ## [0.8.70] — 2026-08-11
 
 ### Fixed — NREM truth & observability: the census stops lying, the ledger becomes visible
