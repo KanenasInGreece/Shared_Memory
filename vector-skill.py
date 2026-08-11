@@ -117,7 +117,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.8.73"
+VERSION = "0.8.74"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server
@@ -340,7 +340,9 @@ def _render_results(results: list, elapsed: float) -> str:
 # ── Retrieval ────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-async def hybrid_search_and_rerank(query: str, limit: int = 5) -> str:
+async def hybrid_search_and_rerank(query: str, limit: int = 5, project: str = "",
+                                   domains: list[str] | str = "",
+                                   since: str = "") -> str:
     """
     Search the shared memory: Tier-3 thematic/insight narratives for orientation,
     Tier-1 facts for precision, expanded through the entity graph.
@@ -348,18 +350,39 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5) -> str:
     Delegates the whole retrieval chain — embedding, vector search, reranking,
     graph expansion, and READ AUTHORIZATION — to the gateway, so this host sees
     exactly what every other agent sees, and only what it is permitted to see.
+
+    `project`/`domains`/`since` are optional AXIS FILTERS applied to the
+    candidate set BEFORE reranking — a named place (project/domain) or time
+    (since) is a FILTER, not query text: folding a project name into the query
+    text instead ranks records that merely MENTION it above records that
+    BELONG to it. `domains` is a list, or one name ("domains" is also accepted
+    as a comma-free single string — pass a list for several; OR semantics, any
+    match qualifies). `since` is an ISO date/datetime
+    (e.g. "2026-08-01T00:00:00") — records created at/after it. An unknown
+    project/domain name is not refused, it simply matches nothing (the read
+    path never blocks on registry state).
     """
     logger.info(f"Search: {query[:50]}...")
     start = datetime.now()
     # Sized from the gateway's own published cost, never from a constant.
     ceiling = search_ceiling(await _gateway_capability())
+    body = {"query": query, "limit": limit, "agent_id": AGENT_ID}
+    if project:
+        body["project"] = project
+    _domains = ([d.strip() for d in domains if isinstance(d, str) and d.strip()]
+                if isinstance(domains, list)
+                else [d.strip() for d in (domains or "").split(",") if d.strip()])
+    if _domains:
+        body["domains"] = _domains
+    if since:
+        body["since"] = since
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(ceiling, connect=5.0)
         ) as client:
             r = await client.post(
                 f"{COORDINATOR_BASE}/memory/search",
-                json={"query": query, "limit": limit, "agent_id": AGENT_ID},
+                json=body,
                 headers=_auth_headers(),
             )
             if r.status_code == 401:
