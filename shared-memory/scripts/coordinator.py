@@ -4930,7 +4930,20 @@ class MemoryCoordinator:
                         list(insight_summary_ids),
                     )
                 stale_summary_map = {r["id"]: r["superseded_reason"] for r in ssrows}
-            except Exception:
+            except Exception as e:
+                # FAILURE != IDLE — a transient DB fault must not read as "no
+                # superseded summaries" with zero trace. Search still degrades
+                # (the annotation is advisory, never load-bearing for the
+                # result itself), but the degrade is now visible in the log.
+                # ⚠ PARITY NOTE: `stale_map` just above (`_stale_sources`'s
+                # equivalent failure path) still swallows silently — that
+                # asymmetry is known and out of scope for this change; fix it
+                # there separately if it is ever warranted.
+                log.warning(
+                    "stale_summaries annotation degraded (%s: %s) — "
+                    "%d summary_ids unchecked",
+                    type(e).__name__, e, len(insight_summary_ids),
+                )
                 stale_summary_map = {}  # degrade to no annotation
 
         def _stale_summaries(meta) -> list[dict]:

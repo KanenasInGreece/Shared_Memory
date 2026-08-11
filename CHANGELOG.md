@@ -50,7 +50,15 @@ response field, no breaking wire-contract change.
 An insight search result can now carry `stale_summaries`, a NEW additive key absent from the
 response shape before this release. Nothing else in `/memory/telemetry` or `/health` changes.
 
+### Fixed — CQ-1, multi-role review of PR #232 (Code Quality, Required)
 
+The `stale_summaries` annotation's DB-failure path (`coordinator.py`, the `except Exception` around
+its `community_summaries` fetch) used to swallow a transient fault silently, degrading to "no
+superseded summaries" with zero trace — the FAILURE ≠ IDLE class. It now logs a warning naming the
+exception class/message and the count of `summary_ids` left unchecked before degrading; the degrade
+behaviour itself (annotation absent, search unaffected) is unchanged. `stale_sources`'s equivalent
+failure path still swallows silently — a known, deliberately out-of-scope asymmetry, noted inline
+where the fix lives.
 
 ### Changed — insight payload BY CONSTRUCTION, the preservation-anchor gate retired (decision:1205)
 
