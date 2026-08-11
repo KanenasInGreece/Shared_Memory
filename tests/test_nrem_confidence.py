@@ -690,6 +690,11 @@ def _thematic_conn_script(insert_id=90):
         {"rowcount": 0, "rows": []},
         # 3. fold dead-letter counts (own-conn SELECT; empty → no dead-lettering)
         {"rowcount": 0, "rows": []},
+        # 3b. fetch_active_thematic_rows (output-identity partition,
+        #     operator ruling 2026-08-11) — no active summary for the key,
+        #     so nothing is skipped and the fold below proceeds exactly as
+        #     it always did.
+        {"rowcount": 0, "rows": []},
         # ⛔ REMOVED (C4): the "previous summary fetch" step — the thematic
         # fold is now zero/low-inference (§3.1) and recomputes the group's
         # FULL current membership fresh every time; there is no cumulative
@@ -832,6 +837,9 @@ async def test_fact_cycle_dead_lettered_cluster_excluded_from_eligible_census(mo
         # 2. fold dead-letter counts (D1 — moved BEFORE the census): "infra"
         # is at cap, "ops" is not mentioned (defaults to 0).
         {"rowcount": 1, "rows": [(dead_key, 1)]},
+        # 2b. fetch_active_thematic_rows (output-identity partition) — no
+        # active summaries, so nothing is skipped as unchanged.
+        {"rowcount": 0, "rows": []},
         # 3. coverage census (_fetch_outbox_created_at) — over the ELIGIBLE
         # ("ops") group's members only; content irrelevant here.
         {"rowcount": 0, "rows": []},
@@ -1004,6 +1012,10 @@ def test_cyclerec_extra_carries_stage5_fields_no_preservation_keys():
         # D1 (fact:1189) — always present once extra() is non-None; 0 when
         # this cycle dead-lettered nothing.
         "dead_lettered_clusters": 0,
+        # Output-identity skip (operator ruling 2026-08-11) — same contract:
+        # always present once extra() is non-None; 0 when nothing was
+        # skipped as unchanged.
+        "unchanged_clusters": 0,
         "calibration": {"entity_relation": True, "evidential": False},
         "truncation_failed": ["decision:1,decision:2"],
         "slot_failed": ["decision:3,decision:4"],

@@ -6160,7 +6160,17 @@ class MemoryCoordinator:
               (array_agg((extra->>'truncation_failures')::int ORDER BY started_at DESC)
                   FILTER (WHERE extra ? 'truncation_failures'))[1] AS truncation_failures,
               (array_agg((extra->>'slot_failures')::int ORDER BY started_at DESC)
-                  FILTER (WHERE extra ? 'slot_failures'))[1] AS slot_failures
+                  FILTER (WHERE extra ? 'slot_failures'))[1] AS slot_failures,
+              -- Output-identity skips (operator ruling 2026-08-11) — latest
+              -- count of clusters whose re-fold would have been byte-identical
+              -- and was skipped without embedding or write. Same shape as
+              -- dead_lettered_clusters: a NEW key, never an alias for
+              -- eligible_clusters (those clusters are deliberately NOT
+              -- eligible backlog, so the stall verdict cannot read a
+              -- fully-current corpus as stalled). None = no cycle has written
+              -- the key yet (pre-fix rows), not zero.
+              (array_agg((extra->>'unchanged_clusters')::int ORDER BY started_at DESC)
+                  FILTER (WHERE extra ? 'unchanged_clusters'))[1] AS unchanged_clusters
             FROM ranked GROUP BY cycle_type
         """
         async with self._acquire() as conn:
@@ -6206,6 +6216,14 @@ class MemoryCoordinator:
                 "dead_lettered_clusters": (
                     int(r["dead_lettered_clusters"])
                     if r and r["dead_lettered_clusters"] is not None else None),
+                # Output-identity skips (operator ruling 2026-08-11) — latest
+                # count of clusters whose re-fold would have rewritten the
+                # active summary byte-identically and was skipped without
+                # embedding or write. Same None-means-not-yet-recorded
+                # contract as dead_lettered_clusters above.
+                "unchanged_clusters": (
+                    int(r["unchanged_clusters"])
+                    if r and r["unchanged_clusters"] is not None else None),
                 # AR-01 (v0.8.75): latest recorded truncation_failures/
                 # slot_failures, same None-means-not-yet-recorded contract as
                 # dead_lettered_clusters above — a protocol failure (slot_failed)
