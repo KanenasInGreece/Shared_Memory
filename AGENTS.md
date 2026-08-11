@@ -134,11 +134,9 @@ Expect `"status":"ok"`, `"auth_required":true`, `"embedder":"ok"`, `"daemon":"ru
 Then make it survive logout/reboot with the shipped `systemd --user` unit — a terminal-launched gateway dies with its session:
 
 ```bash
-cp shared-memory/ops/hive-mind-gateway.service ~/.config/systemd/user/
-# edit WorkingDirectory in the unit to this repo's absolute path
-loginctl enable-linger "$USER"
-systemctl --user daemon-reload
-systemctl --user enable --now hive-mind-gateway.service
+bash shared-memory/ops/install_service.sh   # substitutes the repo path into the unit,
+                                            # enables linger, enables + starts the service;
+                                            # degrades with a clear message on non-systemd hosts
 curl -s http://localhost:8888/health
 ```
 

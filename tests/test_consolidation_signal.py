@@ -90,6 +90,9 @@ def _no_census_row(cycle_type):
         # follow folds_succeeded_24h/folds_attempted_24h's 0-means-none shape.
         "truncation_failures": None, "slot_failures": None,
         "truncation_failures_24h": 0, "slot_failures_24h": 0,
+        # Output-identity skip (operator ruling 2026-08-11) — same
+        # NULL-until-recorded contract as dead_lettered_clusters.
+        "unchanged_clusters": None,
     }
 
 

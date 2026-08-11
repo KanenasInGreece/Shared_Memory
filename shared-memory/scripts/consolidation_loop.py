@@ -645,7 +645,14 @@ class _CycleRec:
                  # fold_dead_letter = keys skipped by the fold-failure cap
                  # this cycle.
                  "truncation_failures", "truncation_failed",
-                 "slot_failures", "slot_failed", "fold_dead_letter")
+                 "slot_failures", "slot_failed", "fold_dead_letter",
+                 # Output-identity skip (operator ruling 2026-08-11) —
+                 # clusters whose re-fold would have rewritten the ACTIVE
+                 # summary byte-identically, so nothing was embedded or
+                 # written. A NEW key, mirroring dead_lettered_clusters'
+                 # shape: excluded from eligible_clusters (the census counts
+                 # what this pass actually folds — I7), reported separately.
+                 "unchanged_clusters")
 
     def __init__(self):
         self.attempted = self.succeeded = self.failed = 0
@@ -674,6 +681,7 @@ class _CycleRec:
         self.slot_failures = 0
         self.slot_failed = []
         self.fold_dead_letter = []
+        self.unchanged_clusters = 0
 
     def fold(self, ok):
         self.attempted += 1
@@ -697,6 +705,7 @@ class _CycleRec:
             or self.truncation_failed or self.slot_failed
             or self.fold_dead_letter
             or self.dead_lettered_clusters
+            or self.unchanged_clusters
         ):
             return None
         out = {
@@ -711,6 +720,12 @@ class _CycleRec:
             # eligible_clusters: a cluster excluded here is one the census
             # above deliberately does NOT count as eligible backlog.
             "dead_lettered_clusters": self.dead_lettered_clusters,
+            # Output-identity skips (operator ruling 2026-08-11) — clusters
+            # whose re-fold was a byte-identical no-op this cycle. NEVER an
+            # alias for eligible_clusters: a cluster counted here is one the
+            # census deliberately does NOT count as eligible backlog, so the
+            # stall verdict cannot read a fully-current corpus as stalled.
+            "unchanged_clusters": self.unchanged_clusters,
         }
         if self.calibration is not None:
             out["calibration"] = self.calibration
@@ -862,6 +877,67 @@ def thematic_cypher_query(pg_ids) -> str:
         f" WHERE j:{ONT.decision} OR j:{ONT.retrospective}"
         f" RETURN f, collect(DISTINCT j) AS judgements"
     )
+
+
+def fetch_active_thematic_rows(conn, keys):
+    """The ACTIVE thematic summary per (project, section) axis key, for the
+    output-identity check below — `{(project, section): (content,
+    source_pg_ids, entities)}`. Superseded rows are deliberately invisible
+    here: a summary Mechanism B retired MUST read as "no current row" so its
+    group re-folds on the next pass (C3.1 F0's arbiter makes the same
+    exclusion on the write side). Kind- and level-scoped exactly like the
+    upsert's unique key (migration 032), entity always '' at domain level."""
+    keys = [k for k in keys or [] if k]
+    if not keys:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COALESCE(metadata->>'project', ''),"
+            "       COALESCE(metadata->>'domain', ''),"
+            "       content, source_pg_ids, metadata->'entities'"
+            "  FROM community_summaries"
+            " WHERE NOT superseded"
+            "   AND COALESCE(metadata->>'kind', 'thematic') <> 'insight'"
+            "   AND COALESCE(metadata->>'level', %s) = %s"
+            "   AND COALESCE(metadata->>'entity', '') = ''"
+            "   AND (COALESCE(metadata->>'project', ''),"
+            "        COALESCE(metadata->>'domain', '')) IN %s",
+            (LEVEL_ENTITY, LEVEL_DOMAIN, tuple(keys)),
+        )
+        return {(p, d): (content, src, ents)
+                for p, d, content, src, ents in cur.fetchall()}
+
+
+def thematic_fold_is_current(active_row, summary, pg_ids, entities):
+    """True iff re-folding would rewrite the ACTIVE row byte-identically —
+    the content comparison the plan's deterministic-ordering rationale
+    promised ("the summary is upserted and its content compared across
+    re-folds") and the thematic twin of the insight path's G3 freshness
+    gate (§2.2: without it "a gating group re-folds an identical insight
+    every cycle"). Operator ruling 2026-08-11: already-folded thematic
+    summaries are not re-folded unless something changed — supersession
+    included, which needs no case here because Mechanism B RETIRES the
+    invalidated row and a retired row never reaches this check.
+
+    Every comparison failure fails OPEN to folding, so no subset-triggered
+    refold (P12 subset supersession, a superseded constituent shrinking
+    membership, REM re-condensation, a line-order change) can ever be
+    suppressed — each of those changes the computed output or the member
+    set, and the only thing skipped is an exact rewrite. `content` is the
+    authoritative check (membership, kind, origin and ordering all land in
+    it); `source_pg_ids`/`entities` are compared as SETS, the two metadata
+    fields that could in principle move without the text moving. The
+    stored `timestamp` is deliberately NOT compared — it changes on every
+    write, which is exactly the churn this check exists to stop. Pure."""
+    if not active_row:
+        return False
+    stored_content, stored_src, stored_entities = active_row
+    if stored_content != summary:
+        return False
+    if set(stored_src or []) != set(pg_ids or []):
+        return False
+    stored_ents = stored_entities if isinstance(stored_entities, list) else []
+    return set(stored_ents) == set(entities or [])
 
 
 def insight_cypher_query(judgement_ids) -> str:
@@ -2909,12 +2985,16 @@ class ConsolidationDaemon:
             logger.error(f"Global sweep failed: {str(e)}")
 
     async def _consolidate_clusters(self, rows):
-        """Shared consolidation body: (project, domain) re-gating, LLM
-        synthesis, the deterministic PRESERVATION GATE, and the atomic
-        Postgres + Neo4j write. Recorded as one 'fact_consolidation'
-        consolidation_runs row (ADR-018) — the single instrumentation point
-        for all three fact schedulers (event cycle, ledger sweep, global
-        sweep) that call it; every outcome also leaves a log line.
+        """Shared consolidation body: (project, domain) re-gating, the
+        OUTPUT-IDENTITY partition (operator ruling 2026-08-11: an
+        already-folded thematic summary is not re-folded unless something
+        changed — a byte-identical re-fold is skipped without embedding or
+        write, counted as `unchanged_clusters`), zero-inference index build,
+        and the atomic Postgres + Neo4j write. Recorded as one
+        'fact_consolidation' consolidation_runs row (ADR-018) — the single
+        instrumentation point for all three fact schedulers (event cycle,
+        ledger sweep, global sweep) that call it; every outcome also leaves
+        a log line.
 
         ``rows`` is the flat output of `_find_grounded_fact_groups`:
         ``{"pg_id", "content", "project", "domain"}`` — one row per (fact,
@@ -3092,18 +3172,71 @@ class ConsolidationDaemon:
                     continue
                 eligible_work_items.append((project, section, contents, pg_ids))
 
-            # Coverage census — AFTER the gate (the gate this cycle folds)
-            # AND after dead-letter exclusion (D1): a permanently-failing
-            # cluster is not eligible backlog. dead_lettered_count is
-            # reported separately (rec.dead_lettered_clusters, a NEW
-            # telemetry key) — never folded into eligible_clusters' existing
-            # meaning (CLAUDE.md Group 3: a metric whose meaning changes must
-            # change name).
-            member_id_lists = [list(w[3]) for w in eligible_work_items]
+            # ── OUTPUT-IDENTITY PARTITION (operator ruling 2026-08-11) ──
+            # The plan's deterministic ordering exists so "the summary is
+            # upserted and its content compared across re-folds" — this is
+            # that comparison, previously never implemented: without it every
+            # sweep re-embedded and rewrote every eligible group forever
+            # (measured live: the same two summaries rewritten every ~15 min
+            # for a full afternoon after the last save, their 20-entry
+            # summary_history rings churned to identical snapshots). The
+            # fold output is zero-inference and therefore free to compute;
+            # compute it FIRST, compare against the ACTIVE row, and only
+            # embed + write when something actually changed. A superseded
+            # constituent, P12 subset supersession, or Mechanism B
+            # retirement all still refold: they change the computed output,
+            # the member set, or remove the active row entirely — the check
+            # fails open to folding on every divergence.
+            active_rows = await loop.run_in_executor(
+                None, lambda: fetch_active_thematic_rows(
+                    conn, [(p or "", s or SECTION_NONE)
+                           for p, s, _c, _i in eligible_work_items]))
+            fold_work_items = []
+            for project, section, contents, pg_ids in eligible_work_items:
+                recs = [
+                    dict(record_map.get(pid) or
+                         {"rtype": "fact", "kind": "observation", "recorded": "unknown"},
+                         pg_id=pid)
+                    for pid in pg_ids
+                ]
+                summary = "\n".join(
+                    fold_record_line(r, content) for content, r in zip(contents, recs)
+                )
+                # §3.1 `entities` — union of the constituents' own
+                # human-asserted entities. Payload only, never a gate key
+                # (§2.1: "entities do NOT gate").
+                entities = sorted({
+                    e for pid in pg_ids
+                    for e in (record_map.get(pid) or {}).get("entities") or []
+                })
+                key = (project or "", section or SECTION_NONE)
+                if thematic_fold_is_current(
+                        active_rows.get(key), summary, pg_ids, entities):
+                    rec.unchanged_clusters += 1
+                    continue
+                fold_work_items.append(
+                    (project, section, summary, pg_ids, entities))
+            if rec.unchanged_clusters:
+                logger.info(
+                    "NREM fold: %d cluster(s) already current — re-fold would "
+                    "be byte-identical, skipped without embedding or write "
+                    "(unchanged_clusters).", rec.unchanged_clusters)
+
+            # Coverage census — AFTER the gate (the gate this cycle folds),
+            # after dead-letter exclusion (D1: a permanently-failing cluster
+            # is not eligible backlog), AND after the output-identity
+            # partition above (an already-current cluster is not backlog
+            # either — counting it would leave the ADR-018 stall verdict
+            # reading "eligible backlog present, no fold succeeded" forever
+            # on a fully-current corpus). dead_lettered_count and
+            # unchanged_clusters are each reported separately — never folded
+            # into eligible_clusters' existing meaning (CLAUDE.md Group 3: a
+            # metric whose meaning changes must change name).
+            member_id_lists = [list(w[3]) for w in fold_work_items]
             all_member_ids = [pid for ids in member_id_lists for pid in ids]
             ts_map = await loop.run_in_executor(
                 None, lambda: _fetch_outbox_created_at(all_member_ids))
-            rec.eligible_clusters = len(eligible_work_items)
+            rec.eligible_clusters = len(fold_work_items)
             rec.eligible_oldest_age = _kth_oldest_age_seconds(
                 member_id_lists, ts_map, DENSITY_THRESHOLD)
             rec.dead_lettered_clusters = dead_lettered_count
@@ -3140,48 +3273,35 @@ class ConsolidationDaemon:
             level = LEVEL_DOMAIN
             aliases: list = []
 
-            for project, section, contents, pg_ids in eligible_work_items:
+            for project, section, summary, pg_ids, entities in fold_work_items:
                 label = f"domain:{project}/{section or SECTION_NONE}"
 
                 # §3.1/§4.2 Path A step 2 — THE ZETTELKASTEN INDEX: a
                 # structured concatenation mapping each constituent pg_id to
-                # its own tight text (`contents`, aligned with `pg_ids`, is
-                # already `coalesce(rem_summary, content)` per
-                # `_find_grounded_fact_groups`). ZERO/LOW INFERENCE — no LLM
-                # call, no preservation gate, no dead-letter-producing
-                # failure mode, and no "previous + new" cumulative merge:
-                # every re-fold recomputes the group's FULL current
-                # membership fresh (`_find_grounded_fact_groups`' own
-                # docstring: "an already-folded fact must keep counting
-                # toward the next re-fold"), which is why there is no more
-                # "previous summary" fetch here — a delta-merge concept that
-                # only ever made sense for a narrative. This REPLACES the
-                # LLM-narrative path the removed `generate_summary` method
-                # used to run for facts; see this PR's HANDOFF.md for the
-                # removal rationale (Path B / insight fold still synthesises
-                # — §3.2 says "synthesised natural language", §3.1 does not).
-                recs = [
-                    dict(record_map.get(pid) or
-                         {"rtype": "fact", "kind": "observation", "recorded": "unknown"},
-                         pg_id=pid)
-                    for pid in pg_ids
-                ]
-                summary = "\n".join(
-                    fold_record_line(r, content) for content, r in zip(contents, recs)
-                )
+                # its own tight text (already `coalesce(rem_summary,
+                # content)` per `_find_grounded_fact_groups`). ZERO/LOW
+                # INFERENCE — no LLM call, no preservation gate, no
+                # dead-letter-producing failure mode, and no "previous +
+                # new" cumulative merge: every re-fold recomputes the
+                # group's FULL current membership fresh (`_find_grounded_
+                # fact_groups`' own docstring: "an already-folded fact must
+                # keep counting toward the next re-fold"), which is why
+                # there is no "previous summary" fetch here — a delta-merge
+                # concept that only ever made sense for a narrative. The
+                # `summary` text and `entities` union were computed in the
+                # output-identity partition above (the same zero-inference
+                # build, done once); a work item reaching this loop is one
+                # whose output DIFFERS from the active row (or has no
+                # active row), so the embedding below is never spent on a
+                # byte-identical rewrite. This REPLACES the LLM-narrative
+                # path the removed `generate_summary` method used to run
+                # for facts (Path B / insight fold still synthesises —
+                # §3.2 says "synthesised natural language", §3.1 does not).
                 topic = f"{project}/{section}"
                 logger.info(
                     "Building Zettelkasten index for '%s' [project=%s section=%s "
                     "level=%s] (%d facts)...",
-                    topic, project, section or SECTION_NONE, level, len(contents))
-
-                # §3.1 `entities` — union of the constituents' own
-                # human-asserted entities. Payload only, never a gate key
-                # (§2.1: "entities do NOT gate").
-                entities = sorted({
-                    e for pid in pg_ids
-                    for e in (record_map.get(pid) or {}).get("entities") or []
-                })
+                    topic, project, section or SECTION_NONE, level, len(pg_ids))
 
                 # 3. Vectorize
                 embedding = await self.get_embedding(summary)

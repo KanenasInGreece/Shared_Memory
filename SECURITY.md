@@ -324,6 +324,46 @@ All new database access is parameterised (psycopg2 `%s` / asyncpg `$n`); the `_F
 
 ---
 
+## Security & Quality Reviews — v0.4.12 → v0.9.0 (2026-06 → 2026-08)
+
+From v0.4.12 onward, security work moved from standalone audits to a standing practice: reviews
+run at every `x.y.5` release and on demand, and since v0.8.73 they run as one role inside a
+**multi-role review framework** — six independent reviewer roles (Architecture & Release, Code
+Quality, Security, Test & Verification, Ops & Release Integrity, Adversarial), each producing
+findings with explicit severity. Reviewers find; the operator rules — a finding becomes a change
+only by an operator decision, and shipped fixes are documented in the
+[CHANGELOG](CHANGELOG.md) release that carries them. Per-version record:
+
+- **v0.4.12 (2026-06-12) — observability before stronger auth.** Opt-in per-request gateway
+  audit log (`GATEWAY_AUDIT_LOG_PATH`): every authenticated search/graph/status access recorded
+  with agent identity and timestamp, off the event-loop hot path. Concurrent-load hardening
+  (bounded connection pools, acquire-timeout load shedding, keyed locks) and a pluggable
+  auth/audit seam (`auth_scheme` surfaced on `/health`). Deliberate sequence: harden → thin
+  audit → proof-of-possession (upcoming) → full audit — so auditability landed ahead of, not
+  gated on, the larger auth work.
+- **v0.8.50 (2026-08) — trust-boundary pass.** Four boundaries evaluated: HTTP API
+  authentication, header-stripping proxy guards, parameterised SQL/Cypher with the read-only
+  graph guard, and the REM/NREM dreaming pipeline's handling of stored content.
+- **v0.8.60 (2026-08) — ingress boundary.** SQL/Cypher injection safety re-verified; the
+  human-asserted entity ingress boundary (gates E1–E5: agent-proposed entity and judgement
+  labels are dropped, never written) reviewed together with the live graph hygiene sweep.
+- **v0.8.74 audit → fixed in v0.8.75 (2026-08-11) — full six-role pre-milestone audit.**
+  Security verdict: four boundaries clean. Ruled **Required** and shipped: **SEC-03** — every
+  400-path error message that echoes caller-supplied input is now bounded (200-char cap via a
+  single helper), closing a response-amplification vector; mutation-checked against 5000-char
+  probes. The Adversarial role's **AR-01 (Critical)**: two failure-mode counters written to the
+  consolidation ledger were never rolled up into `/memory/telemetry`, so a first live failure
+  would have been invisible — both now served, verified live. Queued, tracked openly: **SEC-04**
+  (neutralising protocol-shaped markers in REM prompt input, the same class the insight builder
+  already neutralises).
+
+The standing items from these reviews that are posture, not defects — raw facts return verbatim
+from search, ingestion-boundary sanitisation is planned, bearer tokens until proof-of-possession
+lands — are kept current in the *Known Security Considerations* section above and in README
+§25 (*Honest state*).
+
+---
+
 ## Supported Versions
 
 This project is in active development. Security fixes are applied to the latest commit on `main` only.

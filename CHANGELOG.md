@@ -5,6 +5,63 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.0] — 2026-08-11
+
+**The Dreaming Cycle v2 milestone.** The one authorised minor bump (operator ruling): Track B +
+Track C of the Dreaming Cycle v2 plan are complete and audited (six-role pre-milestone audit at
+v0.8.74/75), and this is the **first release published without the pre-release mark** — from here
+every release is `+0.0.1` again. No wire-contract change (`API_VERSION` stays 4).
+
+### Fixed — thematic re-fold churn: the output-identity comparison the v2 design promised
+
+The thematic fold embedded and upserted every eligible `(project, domain)` group on **every**
+sweep tick, unconditionally. The v2 plan's own rationale for deterministic ordering — "the summary
+is upserted and its content compared across re-folds" — promised a comparison that was never
+implemented, and the insight path's G3 freshness gate (added precisely because "a gating group
+re-folds an identical insight every cycle") never got its thematic twin. Because the outbox
+backlog legitimately never drains to zero (facts that never ground stay in it), the sweep clock
+fires indefinitely — so unchanged groups were re-embedded and rewritten every ~15 minutes,
+churning their bounded `summary_history` rings into identical snapshots and making activity
+telemetry indistinguishable from progress.
+
+Now the zero-inference fold output is computed first and compared against the ACTIVE summary row
+(`content` byte-exact; `source_pg_ids`/`entities` as sets). An identical result is **skipped
+without embedding or write** and counted under the new `unchanged_clusters` key; every divergence
+fails open to folding, so supersession-triggered refolds are never suppressed (a Mechanism-B
+retired row is invisible to the check and always re-folds; membership and REM re-condensation
+changes alter the computed output). Skipped clusters are **excluded from the `eligible_clusters`
+census**, so the ADR-018 stall verdict cannot read a fully-current corpus as stalled.
+
+**Monitor note (additive):** `consolidation_runs.extra` and the `/memory/telemetry` consolidation
+roll-up gain `unchanged_clusters` (latest value; `None` = no cycle has recorded the key yet,
+mirroring `dead_lettered_clusters`). Existing keys unchanged. Mutation-checked (comparison drop,
+census widening, and whole-skip removal each kill their test); both new SQL strings verified
+against the live database.
+
+### Changed — README rewritten wholesale
+
+The README is a new document: problem → value → Quick Start → concepts (records, axes, grounding,
+supersession, dreaming, retrieval, provenance, diagnostics, lifecycle) → operations → pointers.
+It carries a real agent's account of what shared memory gave it beyond the repo (§2), the
+companion dashboard's live rendering of the architecture (§18,
+[shared-memory-monitor](https://github.com/KanenasInGreece/Shared_Memory_Monitor)), and frames the
+MCP surface with LM Studio as the exercised example (§21). Screenshots ship under `assets/`.
+
+### Changed — SECURITY.md carries the review history through the milestone
+
+New section covering v0.4.12 → v0.9.0: the standing review practice (six independent reviewer
+roles since v0.8.73; reviewers find, the operator rules), the per-version security record
+(v0.4.12 audit log & load hardening · v0.8.50 trust boundaries · v0.8.60 ingress boundary ·
+v0.8.74→75 six-role audit with SEC-03/AR-01 shipped and SEC-04 tracked).
+
+### Fixed — install surface: defensive presence checks (sister-project findings)
+
+Applying the companion dashboard repo's installation-review lessons: `init_db.sh` now checks for
+`docker` before first use (a missing docker previously misreported as "container not found"),
+`bootstrap_tokens.sh` checks for `uv`, and `AGENTS.md` Phase 7 now calls
+`shared-memory/ops/install_service.sh` (path substitution, linger, non-systemd degrade) instead
+of a hand-rolled unit copy that asked the agent to edit `WorkingDirectory` manually.
+
 ## [0.8.75] — 2026-08-11
 
 Pre-0.9.0 audit fix batch — four findings from the six-role milestone audit (Security, Adversarial,

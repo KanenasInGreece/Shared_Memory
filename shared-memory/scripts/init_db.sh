@@ -34,6 +34,12 @@ grn() { printf '\033[32m%s\033[0m\n' "$*"; }
 ylw() { printf '\033[33m%s\033[0m\n' "$*"; }
 
 [[ -f "$ENV_FILE" ]] || { red "✗ .env not found at $ENV_FILE — run preflight.sh first."; exit 1; }
+
+# Presence check before first use — without it a missing docker would surface
+# below as "container not found", sending the reader to compose instead of to
+# the actual cause (the sister project's install review found exactly this
+# misdiagnosis class: a script that dies for a reason it misreports).
+command -v docker >/dev/null 2>&1 || { red "✗ docker not found on PATH — install Docker first (preflight.sh checks this)."; exit 1; }
 # Read keys without sourcing — .env values may contain spaces (e.g.
 # PROJECT_ALIASES) that bash `source` would mis-parse. Postgres needs no
 # password here: docker exec runs as the in-container postgres superuser

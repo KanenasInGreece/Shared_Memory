@@ -692,8 +692,14 @@ def test_readme_mcp_config_block_carries_the_token():
     following it built a client with no AGENT_TOKEN — auth has been mandatory
     since v0.3.5, so every call would 401. Broken on arrival, not merely stale."""
     readme = open(_repo("README.md"), encoding="utf-8").read()
-    section = readme.split("## 16. LM Studio MCP Configuration")[1].split("\n## ")[0]
-    block = section.split('"rag-orchestrator"')[1].split('"tavily-mcp"')[0]
+    # Anchor on the example itself, not a numbered heading — the 0.9.0 README
+    # rewrite renumbered every section (the old pin was "## 16. LM Studio MCP
+    # Configuration"), and the contract is about the example's content, which
+    # must hold wherever the section lands.
+    assert '"rag-orchestrator"' in readme, (
+        "the README no longer shows a rag-orchestrator MCP example at all"
+    )
+    block = readme.split('"rag-orchestrator"')[1].split("```")[0]
     assert '"AGENT_TOKEN"' in block, (
         "the rag-orchestrator example omits AGENT_TOKEN — following it yields a "
         "client that 401s on every call"
