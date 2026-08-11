@@ -926,27 +926,35 @@ def summary_preserves(summary, anchors, coverage=PRESERVATION_COVERAGE,
 
 
 def corrective_block(missing):
-    """The one preservation-gate retry's correction text — shared by
-    generate_summary and generate_insight. Pure, no I/O.
+    """The one preservation-gate retry's correction text — used by
+    generate_insight (the only remaining LLM-backed fold path; §3.1 removed
+    generate_summary's thematic use of this). Pure, no I/O.
 
-    ``missing`` entries are ANCHOR FRAGMENTS (preservation_anchor's output),
-    not full sentences — e.g. a hyphenated compound title token. The first
-    version of this text just listed them ("integrate each of them"), which
-    let the LLM paraphrase on retry — exactly what breaks the deterministic
-    case-insensitive SUBSTRING check in summary_preserves (a token's
-    hyphenation/spelling must match character-for-character). Naming the
-    exact-substring requirement explicitly, one fragment per line in quotes,
-    is what actually gives the retry a chance to pass."""
+    ``missing`` entries are ANCHOR FRAGMENTS (preservation_anchor's output) —
+    often several words, e.g. a decision's longest word plus its first
+    significant title words. D4 (fact:1189): this text used to instruct the
+    LLM that each fragment must appear as ONE EXACT, character-for-character
+    SUBSTRING — stricter than what ``summary_preserves`` (above) actually
+    checks, which is TOKEN-LEVEL containment: each whitespace-separated WORD
+    of the fragment must appear somewhere in the text, independently, in any
+    order, not required to stay adjacent. The old wording forced the LLM to
+    weave a constructed multi-word fragment in verbatim as one phrase — often
+    ungrammatical word-salad — to satisfy a bar the gate was never actually
+    enforcing. Stating the real per-word requirement gives the retry a
+    legitimate, satisfiable target. The gate's own strictness (zero
+    tolerance for a required/hard anchor, ``preservation_anchor``'s fragment
+    construction) is UNCHANGED — only this instruction's wording."""
     if not missing:
         return ""
     lines = "\n".join(f'  - "{a}"' for a in missing)
     return (
         "\nCORRECTION: the previous draft dropped the following required "
-        "phrases. Each one must appear in your revised text as an EXACT, "
-        "literal, character-for-character substring — same spelling, same "
-        "punctuation, same hyphenation. Do not reword, paraphrase, split, or "
-        "rejoin them; weave each one in verbatim, naturally, at whatever "
-        "point in the narrative it belongs. None may be omitted:\n"
+        "phrases. Each is checked WORD BY WORD, not as one exact phrase: "
+        "every individual word in a listed phrase (split on whitespace) "
+        "must appear somewhere in your revised text, spelled and hyphenated "
+        "exactly as shown. The words do NOT need to stay together, stay in "
+        "order, or be adjacent — weave each one in naturally, wherever it "
+        "fits the narrative. None of the words may be omitted:\n"
         f"{lines}\n"
     )
 
@@ -3214,9 +3222,19 @@ class ConsolidationDaemon:
         Every component in a passing group folds (components group, they do
         not gate). Returns ONE ROW PER COMPONENT, in fold order:
 
-          ``entity``       -- always '' (I1 — no entity anchor; retained only
-                               as `_fold_insight`'s human-readable log/
-                               dead-letter label, never a gate predicate).
+          ``entity``       -- a "{project}/{domain}" DISPLAY label (D3,
+                               fact:1189) — never a gate predicate (I1: "no
+                               gate predicate reads an entity name" is about
+                               GATING, not this string's value; traced every
+                               reader before this changed — dead-letter
+                               identity keys on `_judgement_fold_identity`,
+                               never on `entity`, decision 882's fold-key/
+                               display-label split — and the insight write
+                               is always-INSERT with no upsert key at all,
+                               so no reader depends on this being empty).
+                               Was hardcoded '' pre-D3, which logged every
+                               fold as "Folding insight for ''" and stored
+                               an unreadable `entity:""` in metadata.
           ``decision_ids`` -- the component's DECISION pg_ids only, ascending
                                (kept for the §2.2a-edge-case skip check below
                                and telemetry; the fold itself now consumes
@@ -3291,7 +3309,16 @@ class ConsolidationDaemon:
                     )
                     continue
                 clusters.append({
-                    "entity": "",
+                    # D3 (fact:1189) — an honest project/domain-derived
+                    # DISPLAY label, matching the fact cycle's own `label`
+                    # convention (`f"domain:{project}/{section or
+                    # SECTION_NONE}"`, above). This is NOT the fold identity
+                    # (decision 882) — that stays `_judgement_fold_identity`
+                    # (comp's own member ids), untouched. Multiple components
+                    # from the same (project, domain) group legitimately
+                    # share this label; it is a log/metadata display value,
+                    # never a key.
+                    "entity": f"{project}/{section or SECTION_NONE}",
                     "decision_ids": decision_ids,
                     "projects": [project],
                     "domain": section,
@@ -3714,15 +3741,25 @@ class ConsolidationDaemon:
         # this exact fold).
         ok, missing = summary_preserves(insight, anchors)
         corrective_truncated = False
+        # D2 (fact:1189): `attempt` is THIS FOLD's own retry number —
+        # distinct from cyc.preservation_retries, a CYCLE-GLOBAL counter
+        # that keeps accumulating across every fold the cycle attempts.
+        # Logging the cycle-global counter against the per-fold cap
+        # (NREM_PRESERVATION_MAX_RETRIES) produced "attempt 8/2" live: the
+        # loop itself was always correctly bounded (the `for` below never
+        # exceeds NREM_PRESERVATION_MAX_RETRIES iterations) — only the
+        # instrument lied about which attempt it was on.
+        attempt = 0
         for _ in range(NREM_PRESERVATION_MAX_RETRIES):
             if ok:
                 break
+            attempt += 1
             cyc.preservation_retries += 1
             logger.warning(
                 "Preservation gate: insight for '%s' dropped %d captured anchor(s) "
                 "(%s) — corrective retry (attempt %d/%d).",
                 entity, len(missing), missing,
-                cyc.preservation_retries, NREM_PRESERVATION_MAX_RETRIES)
+                attempt, NREM_PRESERVATION_MAX_RETRIES)
             self._last_llm_truncated = False
             insight = await self.generate_insight(entity, blocks, previous_insight,
                                                   corrective=missing,

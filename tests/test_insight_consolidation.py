@@ -484,7 +484,10 @@ async def test_fresh_insight_clusters_returns_shape_for_a_gating_group():
     out = await daemon._find_fresh_insight_clusters()
     assert len(out) == 1
     cluster = out[0]
-    assert cluster["entity"] == ""            # I1 — no entity anchor
+    # D3 (fact:1189): an honest project/domain DISPLAY label — never a gate
+    # predicate (I1 is about GATING, not this string; the walk/gate/identity
+    # assertions below are untouched by it).
+    assert cluster["entity"] == "proj/dom"
     assert cluster["decision_ids"] == [201]
     assert cluster["projects"] == ["proj"]
     assert cluster["domain"] == "dom"

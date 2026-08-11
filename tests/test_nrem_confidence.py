@@ -273,17 +273,24 @@ def test_corrective_block_empty_is_noop():
     assert corrective_block(None) == ""
 
 
-def test_corrective_block_demands_verbatim_substring():
+def test_corrective_block_demands_per_word_verbatim_not_whole_phrase():
+    """D4 (fact:1189): summary_preserves checks TOKEN-LEVEL containment —
+    each whitespace-separated word of an anchor fragment, independently,
+    anywhere in the text. The instruction used to claim a stricter bar (the
+    WHOLE fragment as one exact, character-for-character substring), which
+    forced the LLM to embed constructed multi-word fragments verbatim as one
+    phrase to satisfy a rule the gate was never actually enforcing. The text
+    must now state the real per-word requirement, not the old whole-phrase
+    one — and still name each fragment, still forbid omission."""
     text = corrective_block(["Outbox-to-Ingest Adopt Gated Promotion", "refined"])
-    # The bug this fixes: the old wording just said "integrate each of them",
-    # which let the LLM paraphrase — exactly what breaks summary_preserves's
-    # exact-substring check on a hyphenated compound token. The retry must
-    # say verbatim/character-for-character explicitly, and quote each
-    # fragment so hyphenation/spelling survives copy-through.
-    assert "EXACT, literal, character-for-character substring" in text
+    assert "WORD BY WORD, not as one exact phrase" in text
+    assert "do NOT need to stay together, stay in order, or be adjacent" in text
+    # ⛔ The old, over-strict claim must be GONE — its presence is exactly
+    # the D4 defect (instruction stricter than the check it corrects for).
+    assert "EXACT, literal, character-for-character substring" not in text
     assert '"Outbox-to-Ingest Adopt Gated Promotion"' in text
     assert '"refined"' in text
-    assert "none may be omitted" in text.lower()
+    assert "none of the words may be omitted" in text.lower()
 
 
 def test_summary_preserves_fact_slack_ten_percent():
@@ -411,7 +418,7 @@ async def test_generate_insight_corrective_paragraph_names_dropped_anchors(monke
                                   corrective=["consolidation", "outbox"])
     prompt = captured["prompt"]
     assert "CORRECTION: the previous draft dropped" in prompt
-    assert "EXACT, literal, character-for-character substring" in prompt
+    assert "WORD BY WORD, not as one exact phrase" in prompt
     assert '"consolidation"' in prompt and '"outbox"' in prompt
 
 
@@ -678,6 +685,9 @@ def test_cyclerec_extra_carries_all_stage5_fields():
         "preservation_retries": 1,
         "preservation_failures": 1,
         "truncation_failures": 0,
+        # D1 (fact:1189) — always present once extra() is non-None; 0 when
+        # this cycle dead-lettered nothing.
+        "dead_lettered_clusters": 0,
         "calibration": {"entity_relation": True, "evidential": False},
         "preservation_failed": ["E/general"],
     }
