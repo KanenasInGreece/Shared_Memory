@@ -60,6 +60,8 @@ behaviour itself (annotation absent, search unaffected) is unchanged. `stale_sou
 failure path still swallows silently — a known, deliberately out-of-scope asymmetry, noted inline
 where the fix lives.
 
+## [0.8.71] — 2026-08-11
+
 ### Changed — insight payload BY CONSTRUCTION, the preservation-anchor gate retired (decision:1205)
 
 Implements operator ruling `decision:1205`, grounded on `fact:1204` (measured live: the anchor gate
