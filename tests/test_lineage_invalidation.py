@@ -131,7 +131,6 @@ def test_leg1_thematic_holding_superseded_fact():
     conn = StubConn(script=[
         {"rowcount": 1, "rows": [(50, [1, 2, 3], 3)]},   # leg 1
         {"rowcount": 0, "rows": []},                       # leg 2
-        {"rowcount": 0, "rows": []},                       # leg 3 (leg1 non-empty)
     ])
     out = fetch_invalidated_summaries(conn)
     assert out == [{"summary_id": 50, "source_pg_ids": [1, 2, 3], "kind": "thematic",
@@ -139,20 +138,40 @@ def test_leg1_thematic_holding_superseded_fact():
     leg1_sql, _ = conn.executed[0]
     assert "kind', 'thematic') <> 'insight'" in leg1_sql
     assert "COALESCE(t.superseded, false) = true" in leg1_sql
-    leg3_sql, leg3_params = conn.executed[2]
-    assert leg3_params == ([50],)
+    assert len(conn.executed) == 2, (
+        "only leg1 + leg2 must run — a third query means the lineage cascade "
+        "(former leg 3) was reinstated, which decision:1207 disables"
+    )
 
 
-def test_leg3_never_runs_when_leg1_found_nothing():
+# ── decision:1207 — the thematic→insight LINEAGE cascade (former leg 3) is
+#    DISABLED. Mutation-checked test (a): re-enabling that query makes an
+#    insight naming a leg-1-retired thematic summary in its `summary_ids`
+#    reappear in `fetch_invalidated_summaries`' output — this test fails the
+#    moment it does. The staleness is now judged lazily, at retrieval, via
+#    coordinator.py's `stale_summaries` annotation (see test_coordinator.py).
+
+def test_leg3_lineage_cascade_is_disabled_decision_1207():
     conn = StubConn(script=[
-        {"rowcount": 0, "rows": []},   # leg1
-        {"rowcount": 0, "rows": []},   # leg2
+        {"rowcount": 1, "rows": [(50, [1, 2, 3], 3)]},   # leg1 retires thematic 50
+        {"rowcount": 0, "rows": []},                       # leg2 — nothing
     ])
-    assert fetch_invalidated_summaries(conn) == []
-    assert len(conn.executed) == 2   # leg 3 never ran — nothing to cascade from
+    out = fetch_invalidated_summaries(conn)
+    # Only the thematic retirement itself comes back — NO insight-kind entry
+    # triggered by a community_summaries id, which is what the disabled leg
+    # used to produce whenever an insight's summary_ids named summary 50.
+    assert out == [{"summary_id": 50, "source_pg_ids": [1, 2, 3], "kind": "thematic",
+                    "trigger_kind": "technical_docs", "trigger_id": 3}]
+    assert not any(m["trigger_kind"] == "community_summaries" for m in out)
+    assert len(conn.executed) == 2
 
 
 def test_leg2_insight_holding_reversed_decision_directly():
+    """(b) — reversal→insight stays EAGER, unchanged (§2.2a / I10).
+    MUTATION-CHECKED: disabling this leg (removing its query) makes
+    `fetch_invalidated_summaries` return `[]` instead of the row below,
+    because the StubConn's second script entry (the leg2 result) would never
+    be consumed."""
     conn = StubConn(script=[
         {"rowcount": 0, "rows": []},                         # leg1
         {"rowcount": 1, "rows": [(80, [10, 11, 12], 12)]},   # leg2
@@ -162,40 +181,22 @@ def test_leg2_insight_holding_reversed_decision_directly():
                     "trigger_kind": "technical_docs", "trigger_id": 12}]
     leg2_sql, _ = conn.executed[1]
     assert "cs.metadata->>'kind' = 'insight'" in leg2_sql
-
-
-def test_leg3_cascades_from_leg1_retired_summary_ids():
-    # summary_ids is C4's field — 0 rows carry it on the live corpus, so this
-    # leg is exercised only by this seeded fixture until C4 ships. "0 matches
-    # on live data" is NOT proof this leg works — this test is the proof.
-    conn = StubConn(script=[
-        {"rowcount": 1, "rows": [(50, [1, 2, 3], 3)]},        # leg1
-        {"rowcount": 0, "rows": []},                            # leg2
-        {"rowcount": 1, "rows": [(90, [20, 21], 50)]},        # leg3
-    ])
-    out = fetch_invalidated_summaries(conn)
-    assert {"summary_id": 90, "source_pg_ids": [20, 21], "kind": "insight",
-           "trigger_kind": "community_summaries", "trigger_id": 50} in out
-    leg3_sql, leg3_params = conn.executed[2]
-    assert "jsonb_array_elements_text" in leg3_sql
-    assert "summary_ids" in leg3_sql
-    assert leg3_params == ([50],)
+    assert len(conn.executed) == 2
 
 
 @pytest.mark.asyncio
-async def test_leg3_cascades_using_the_real_summary_ids_c4s_fold_actually_writes():
-    """Criterion F, end to end across BOTH modules — never exercised until
-    C4, because `summary_ids` did not exist as a written field before it.
+async def test_lineage_leg3_disabled_using_the_real_summary_ids_c4s_fold_actually_writes():
+    """Criterion (a), end to end across BOTH modules — proves the disabled
+    leg using the REAL shape C4's fold writes, not a hand-typed approximation.
 
     Step 1: run the REAL `ConsolidationDaemon._fold_insight` (from
     `test_insight_consolidation`'s own stub conventions) with
     `summary_ids=[173]` and capture the ACTUAL JSON string it writes to
     `community_summaries.metadata`.
-    Step 2: feed the `summary_ids` value FROM THAT REAL OUTPUT into a
-    StubConn simulating `fetch_invalidated_summaries`'s leg 3 (which reads
-    `jsonb_array_elements_text(metadata->'summary_ids')`), proving the exact
-    thing the fold writes is the exact thing leg 3 can find — not a
-    hand-typed approximation of either side.
+    Step 2: feed the `summary_ids` value FROM THAT REAL OUTPUT as leg1's own
+    retirement of thematic summary 173, and prove `fetch_invalidated_
+    summaries` does NOT retire the insight that names it — decision:1207
+    disabled the former leg 3, which used to cascade exactly this shape.
     """
     import json as _json
     from unittest.mock import AsyncMock, MagicMock
@@ -259,17 +260,21 @@ async def test_leg3_cascades_using_the_real_summary_ids_c4s_fold_actually_writes
     written_meta = _json.loads(insert_params[1])
     assert written_meta["summary_ids"] == [173]      # what the fold ACTUALLY wrote
 
-    # Step 2 — leg 3 with that REAL value as its trigger-match input. The
-    # fold wrote summary_ids=[173]; leg 1 must retire thematic summary 173
-    # specifically for leg 3 to fire on THIS insight.
+    # Step 2 — leg 1 retires thematic summary 173, the EXACT summary_ids
+    # value the fold just wrote. Before decision:1207 this would have
+    # cascaded (former leg 3) to retire insight 77 here at write time; now it
+    # must NOT — only leg1's own thematic retirement comes back, and the
+    # insight stays active until a reader hits it and gets the lazy
+    # `stale_summaries` annotation instead (coordinator.py, test_coordinator.py).
     leg_conn = StubConn(script=[
-        {"rowcount": 1, "rows": [(173, [900, 901], 3)]},                      # leg1 retires summary 173
-        {"rowcount": 0, "rows": []},                                            # leg2
-        {"rowcount": 1, "rows": [(77, written_meta["source_pg_ids"], 173)]}, # leg3 — insight 77 cites 173
+        {"rowcount": 1, "rows": [(173, [900, 901], 3)]},   # leg1 retires summary 173
+        {"rowcount": 0, "rows": []},                         # leg2
     ])
     out = fetch_invalidated_summaries(leg_conn)
-    assert {"summary_id": 77, "source_pg_ids": [245, 267], "kind": "insight",
-           "trigger_kind": "community_summaries", "trigger_id": 173} in out
+    assert out == [{"summary_id": 173, "source_pg_ids": [900, 901], "kind": "thematic",
+                    "trigger_kind": "technical_docs", "trigger_id": 3}]
+    assert not any(m["kind"] == "insight" for m in out)
+    assert len(leg_conn.executed) == 2
 
 
 # ── resolve_standing_ids ───────────────────────────────────────────────────────
@@ -310,7 +315,6 @@ def test_retire_thematic_summary_opens_row_for_live_constituent_only():
     conn = StubConn(script=[
         {"rowcount": 1, "rows": [(50, [1, 2], 2)]},               # leg1
         {"rowcount": 0, "rows": []},                                # leg2
-        {"rowcount": 0, "rows": []},                                # leg3
         {"rowcount": 1, "rows": []},                                # UPDATE community_summaries
         {"rowcount": 2, "rows": [(1, 1, False), (2, 2, True)]},   # resolve_standing_ids
         {"rowcount": 1, "rows": []},                                # INSERT refold_ledger
@@ -320,12 +324,12 @@ def test_retire_thematic_summary_opens_row_for_live_constituent_only():
     assert opened == 1
     assert conn.commits == 1
 
-    update_sql, update_params = conn.executed[3]
+    update_sql, update_params = conn.executed[2]
     assert "SET superseded = true" in update_sql
     assert "superseded_reason = 'lineage'" in update_sql
     assert update_params == (50,)
 
-    insert_sql, insert_params = conn.executed[5]
+    insert_sql, insert_params = conn.executed[4]
     assert insert_sql.startswith("INSERT INTO refold_ledger")
     assert insert_params == (1, 50, "thematic", "technical_docs", 2)
 
@@ -338,21 +342,19 @@ def test_retire_all_constituents_superseded_still_opens_row_for_standing_success
     conn = StubConn(script=[
         {"rowcount": 1, "rows": [(60, [5], 5)]},   # leg1 — 5 is both constituent and trigger
         {"rowcount": 0, "rows": []},                 # leg2
-        {"rowcount": 0, "rows": []},                 # leg3
         {"rowcount": 1, "rows": []},                 # UPDATE
         {"rowcount": 1, "rows": [(5, 7, False)]},   # resolve: 5 stands as 7
         {"rowcount": 1, "rows": []},                 # INSERT
     ])
     retired, opened = retire_invalidated_summaries(conn)
     assert opened == 1
-    insert_sql, insert_params = conn.executed[5]
+    insert_sql, insert_params = conn.executed[4]
     assert insert_params[0] == 7   # the STANDING successor, never 5 itself
 
 
 def test_retire_with_no_eligible_constituents_still_retires_opens_zero_rows():
     conn = StubConn(script=[
         {"rowcount": 1, "rows": [(70, [9], 9)]},
-        {"rowcount": 0, "rows": []},
         {"rowcount": 0, "rows": []},
         {"rowcount": 1, "rows": []},               # UPDATE
         {"rowcount": 1, "rows": [(9, 9, True)]},  # dead end, no successor
@@ -367,12 +369,11 @@ def test_retire_skips_ledger_write_when_already_retired_concurrently():
     conn = StubConn(script=[
         {"rowcount": 1, "rows": [(80, [1], 1)]},
         {"rowcount": 0, "rows": []},
-        {"rowcount": 0, "rows": []},
         {"rowcount": 0, "rows": []},   # UPDATE affected 0 rows — already retired
     ])
     retired, opened = retire_invalidated_summaries(conn)
     assert (retired, opened) == ([], 0)
-    assert len(conn.executed) == 4   # no resolve_standing_ids call, no insert
+    assert len(conn.executed) == 3   # no resolve_standing_ids call, no insert
 
 
 def test_retire_multiple_summaries_commit_once_not_per_summary():
@@ -381,7 +382,6 @@ def test_retire_multiple_summaries_commit_once_not_per_summary():
     conn = StubConn(script=[
         {"rowcount": 2, "rows": [(50, [1], 1), (60, [2], 2)]},   # leg1: two summaries
         {"rowcount": 0, "rows": []},                               # leg2
-        {"rowcount": 0, "rows": []},                               # leg3
         {"rowcount": 1, "rows": []},                               # UPDATE 50
         {"rowcount": 1, "rows": [(1, 1, True)]},                 # resolve 50 -> dead end
         {"rowcount": 1, "rows": []},                               # UPDATE 60

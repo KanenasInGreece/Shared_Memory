@@ -121,7 +121,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.71"
+FRAMEWORK_VERSION = "0.8.72"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -4902,6 +4902,46 @@ class MemoryCoordinator:
                 if pid in stale_map and pid not in acked
             ]
 
+        # Lazy thematic→insight LINEAGE annotation (decision:1207). §2.5/§5.2
+        # AMENDED: a superseded thematic summary no longer eagerly supersedes
+        # an insight resting on it (consolidation_loop.py's lineage leg 3 is
+        # disabled). Same philosophy as `stale_sources` above — annotate at
+        # READ time, let the consumer judge materiality — but keyed on the
+        # insight's OWN `summary_ids` (C4's field: the thematic summaries the
+        # insight rests on), never on `source_pg_ids`.
+        # ⚠ `summary_ids` holds `community_summaries` ids — a DIFFERENT,
+        # OVERLAPPING sequence from `technical_docs` (§3.2's documented trap).
+        # This MUST query `community_summaries`, never `technical_docs`, or a
+        # `technical_docs` row sharing the same integer id would silently
+        # produce a wrong-provenance false positive.
+        insight_summary_ids: set[int] = set()
+        if insight:
+            insight_meta = insight.get("metadata")
+            insight_meta = (_coerce_jsonb_obj(insight_meta)
+                             if not isinstance(insight_meta, dict) else insight_meta)
+            insight_summary_ids.update((insight_meta or {}).get("summary_ids") or [])
+        stale_summary_map: dict[int, str | None] = {}
+        if insight_summary_ids:
+            try:
+                async with self._acquire() as conn:
+                    ssrows = await conn.fetch(
+                        "SELECT id, superseded_reason FROM community_summaries"
+                        " WHERE id = ANY($1) AND superseded",
+                        list(insight_summary_ids),
+                    )
+                stale_summary_map = {r["id"]: r["superseded_reason"] for r in ssrows}
+            except Exception:
+                stale_summary_map = {}  # degrade to no annotation
+
+        def _stale_summaries(meta) -> list[dict]:
+            m = _coerce_jsonb_obj(meta) if not isinstance(meta, dict) else meta
+            sids = (m or {}).get("summary_ids") or []
+            return [
+                {"summary_id": sid, "superseded_reason": stale_summary_map.get(sid)}
+                for sid in sids
+                if sid in stale_summary_map
+            ]
+
         # Neo4j relational expansion. `final` is built in the RERANKER'S ORDER,
         # summaries and facts interleaved — no tier is inserted ahead of the
         # ranking and none is appended after it.
@@ -4980,6 +5020,10 @@ class MemoryCoordinator:
                     stale = _stale_sources(row["source_pg_ids"], meta)
                     if stale:
                         res["stale_sources"] = stale
+                    if rtype == "insight":
+                        stale_sum = _stale_summaries(meta)
+                        if stale_sum:
+                            res["stale_summaries"] = stale_sum
                     final.append(res)
                     continue
 

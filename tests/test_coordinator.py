@@ -1110,6 +1110,169 @@ async def test_search_community_summary_surfaces_traceback_pointers():
     assert cs["metadata"]["domain"] == "shared-memory"
 
 
+# ── stale_summaries — lazy thematic→insight lineage annotation (decision:1207) ─
+#
+# §2.5/§5.2 AMENDED: the eager lineage cascade (consolidation_loop.py's former
+# leg 3) is disabled — a superseded thematic summary no longer eagerly
+# supersedes an insight resting on it. Instead the insight's search result
+# gains an ADDITIVE `stale_summaries` key at READ time, keyed on the
+# insight's own `summary_ids`, mirroring `stale_sources`'s philosophy.
+
+@pytest.mark.asyncio
+async def test_search_insight_result_carries_stale_summaries_when_thematic_superseded():
+    """(d) — MUTATION-CHECKED: dropping the `stale_summaries` assignment in
+    coordinator.py's search path (the `if rtype == "insight": ...` block)
+    makes this test fail."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+
+    mock_conn.fetchrow = AsyncMock(side_effect=[
+        {   # nearest active insight
+            "id": 900,
+            "content": "Insight: the outbox pattern holds",
+            "metadata": {"kind": "insight", "summary_ids": [501],
+                         "project": "shared-memory-GitHub", "domains": ["architecture"]},
+            "source_pg_ids": [],
+        },
+        None,   # no thematic summary
+    ])
+    mock_conn.fetch = AsyncMock(side_effect=[
+        [{"id": 1, "content": "fact content", "metadata": {"entities": [], "source": "claude-code"}}],
+        [{"id": 501, "superseded_reason": "lineage"}],   # stale_summary_map
+    ])
+    mock_session.run = AsyncMock(return_value=_AsyncIter())
+
+    mock_reranker = MagicMock()
+    mock_reranker.raise_for_status = MagicMock()
+    mock_reranker.json = MagicMock(return_value={
+        "results": [{"index": 0, "relevance_score": 2.0},
+                    {"index": 1, "relevance_score": 1.0}]
+    })
+
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        with patch("httpx.AsyncClient") as mock_cls:
+            mock_http = AsyncMock()
+            mock_http.post = AsyncMock(return_value=mock_reranker)
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_http)
+            mock_cls.return_value.__aexit__  = AsyncMock(return_value=None)
+
+            req = _make_request({"query": "outbox pattern", "limit": 5})
+            resp = await c.handle_search(req)
+
+    assert resp.status == 200
+    results = json.loads(resp.text)["results"]
+    insight_result = next(r for r in results if r["tier"] == "insight_summary")
+    assert insight_result["stale_summaries"] == [
+        {"summary_id": 501, "superseded_reason": "lineage"}]
+
+    # (d), second half — the query that produced this MUST target
+    # community_summaries, NEVER technical_docs: the two id sequences
+    # overlap (§3.2's documented trap), so joining the wrong table would
+    # silently mis-annotate.
+    stale_summary_call = mock_conn.fetch.call_args_list[1]
+    sql = stale_summary_call.args[0]
+    assert "community_summaries" in sql
+    assert "technical_docs" not in sql
+
+
+@pytest.mark.asyncio
+async def test_search_insight_result_omits_stale_summaries_when_thematic_live():
+    """(d) — the companion case: an insight over LIVE (non-superseded)
+    thematic summaries must NOT carry the key at all (additive, not a
+    default-present field)."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+
+    mock_conn.fetchrow = AsyncMock(side_effect=[
+        {
+            "id": 900,
+            "content": "Insight: the outbox pattern holds",
+            "metadata": {"kind": "insight", "summary_ids": [501],
+                         "project": "shared-memory-GitHub", "domains": ["architecture"]},
+            "source_pg_ids": [],
+        },
+        None,
+    ])
+    mock_conn.fetch = AsyncMock(side_effect=[
+        [{"id": 1, "content": "fact content", "metadata": {"entities": [], "source": "claude-code"}}],
+        [],   # stale_summary_map — summary 501 is NOT superseded
+    ])
+    mock_session.run = AsyncMock(return_value=_AsyncIter())
+
+    mock_reranker = MagicMock()
+    mock_reranker.raise_for_status = MagicMock()
+    mock_reranker.json = MagicMock(return_value={
+        "results": [{"index": 0, "relevance_score": 2.0},
+                    {"index": 1, "relevance_score": 1.0}]
+    })
+
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        with patch("httpx.AsyncClient") as mock_cls:
+            mock_http = AsyncMock()
+            mock_http.post = AsyncMock(return_value=mock_reranker)
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_http)
+            mock_cls.return_value.__aexit__  = AsyncMock(return_value=None)
+
+            req = _make_request({"query": "outbox pattern", "limit": 5})
+            resp = await c.handle_search(req)
+
+    assert resp.status == 200
+    results = json.loads(resp.text)["results"]
+    insight_result = next(r for r in results if r["tier"] == "insight_summary")
+    assert "stale_summaries" not in insight_result
+
+
+@pytest.mark.asyncio
+async def test_search_stale_summaries_never_reads_from_a_colliding_technical_docs_id():
+    """§3.2's documented trap: `community_summaries.id` and `technical_docs.id`
+    are different, OVERLAPPING sequences. An insight whose `source_pg_ids`
+    happens to share the integer 501 with a SUPERSEDED `technical_docs` row
+    (triggering `stale_sources`, the pre-existing mechanism), while its own
+    `summary_ids` also names 501 — a DIFFERENT, LIVE `community_summaries`
+    row — must get `stale_sources` from the first and must NOT get
+    `stale_summaries` from the collision. The two annotations are read from
+    different tables and must never cross-contaminate."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+
+    mock_conn.fetchrow = AsyncMock(side_effect=[
+        {
+            "id": 900,
+            "content": "Insight: the outbox pattern holds",
+            "metadata": {"kind": "insight", "summary_ids": [501],
+                         "project": "shared-memory-GitHub", "domains": ["architecture"]},
+            "source_pg_ids": [501],   # collides on the SAME integer, different table
+        },
+        None,
+    ])
+    mock_conn.fetch = AsyncMock(side_effect=[
+        [{"id": 1, "content": "fact content", "metadata": {"entities": [], "source": "claude-code"}}],
+        [{"id": 501, "superseded_by": 900}],   # stale_map — technical_docs id 501 IS superseded
+        [],                                       # stale_summary_map — community_summaries id 501 is LIVE
+    ])
+    mock_session.run = AsyncMock(return_value=_AsyncIter())
+
+    mock_reranker = MagicMock()
+    mock_reranker.raise_for_status = MagicMock()
+    mock_reranker.json = MagicMock(return_value={
+        "results": [{"index": 0, "relevance_score": 2.0},
+                    {"index": 1, "relevance_score": 1.0}]
+    })
+
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        with patch("httpx.AsyncClient") as mock_cls:
+            mock_http = AsyncMock()
+            mock_http.post = AsyncMock(return_value=mock_reranker)
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_http)
+            mock_cls.return_value.__aexit__  = AsyncMock(return_value=None)
+
+            req = _make_request({"query": "outbox pattern", "limit": 5})
+            resp = await c.handle_search(req)
+
+    assert resp.status == 200
+    results = json.loads(resp.text)["results"]
+    insight_result = next(r for r in results if r["tier"] == "insight_summary")
+    assert insight_result["stale_sources"] == [{"old": 501, "superseded_by": 900}]
+    assert "stale_summaries" not in insight_result
+
+
 # ── Auth source overwrite — Phase 2C ─────────────────────────────────────────
 
 @pytest.mark.asyncio

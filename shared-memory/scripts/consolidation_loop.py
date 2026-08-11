@@ -1739,24 +1739,26 @@ def fetch_invalidated_summaries(conn):
     REVERSED decision (`rating='reversed'`, coordinator.py's retrospective
     handler) alike — same column, same test, nothing to keep in sync (§2.2a).
 
-    THREE LEGS, in cascade order — leg 3 depends on leg 1's output from THIS
-    call, not on the general population of superseded thematic rows:
+    ⛔ **AMENDED 2026-08-11 (`decision:1207`): TWO LEGS, not three.** The
+    former leg 3 (an INSIGHT summary whose `metadata->'summary_ids'` overlaps
+    a leg-1-retired THEMATIC summary — the thematic→insight LINEAGE cascade,
+    §2.5/§5.2) is **disabled**, not merely untriggered. §5.2 now splits
+    propagation BY TIER: the thematic tier still retires eagerly (leg 1,
+    unchanged), but a superseded thematic summary no longer eagerly
+    supersedes an insight resting on it. That staleness is judged LAZILY, at
+    retrieval, via the ADDITIVE `stale_summaries` annotation coordinator.py's
+    search path adds to an insight result (mirroring `stale_sources`,
+    `decision:384`) — never re-derived here at write time. Reversal→insight
+    (leg 2, §2.2a / I10) is UNCHANGED and stays eager: it is a different
+    trigger (a decision the insight directly names being reversed), refined
+    by `decision:1207` in name only.
+
+    The two legs that remain:
 
       1. THEMATIC summaries (`kind != 'insight'`) whose `source_pg_ids`
          holds a superseded fact.
       2. INSIGHT summaries whose `source_pg_ids` holds a reversed decision
          directly (§2.2a / I10) — membership, not via a thematic summary.
-      3. INSIGHT summaries whose `metadata->'summary_ids'` overlaps the
-         THEMATIC summary ids retired in LEG 1 of this same call. Scoped
-         this way deliberately: an insight resting on a thematic summary
-         that was superseded by ordinary growth (Mechanism A, subset
-         coverage) is NOT stale — its constituents are all still valid, a
-         live fold path already covers it (`decision:384`, unchanged) — so
-         only a lineage-caused (this leg-1 pass) retirement cascades.
-         `summary_ids` is C4's field; 0 rows carry it on the corpus this was
-         written against, so this leg is exercised only by a seeded test
-         until C4 ships (do not read "0 matches" as "leg 3 works" — it is
-         merely untriggered).
 
     Returns a list of dicts, one per (summary, invalidating member) pair —
     a summary with more than one invalid member yields more than one dict,
@@ -1769,7 +1771,7 @@ def fetch_invalidated_summaries(conn):
     """
     out = []
     with conn.cursor() as cur:
-        # Leg 1 — thematic summary holding a superseded fact.
+        # Leg 1 — thematic summary holding a superseded fact. EAGER, unchanged.
         cur.execute(
             "SELECT DISTINCT cs.id, cs.source_pg_ids, t.id"
             "  FROM community_summaries cs"
@@ -1778,14 +1780,15 @@ def fetch_invalidated_summaries(conn):
             "   AND COALESCE(cs.metadata->>'kind', 'thematic') <> 'insight'"
             "   AND COALESCE(t.superseded, false) = true"
         )
-        leg1 = cur.fetchall()
-        for sid, src, trig in leg1:
+        for sid, src, trig in cur.fetchall():
             out.append({"summary_id": sid, "source_pg_ids": list(src or []),
                        "kind": "thematic", "trigger_kind": "technical_docs",
                        "trigger_id": trig})
-        leg1_summary_ids = sorted({sid for sid, _src, _trig in leg1})
 
         # Leg 2 — insight summary holding a reversed decision directly.
+        # EAGER, unchanged (§2.2a / I10) — a different trigger from the
+        # disabled lineage leg: the invalidated record is a MEMBER of the
+        # insight's own `source_pg_ids`, not a thematic summary beneath it.
         cur.execute(
             "SELECT DISTINCT cs.id, cs.source_pg_ids, t.id"
             "  FROM community_summaries cs"
@@ -1799,22 +1802,9 @@ def fetch_invalidated_summaries(conn):
                        "kind": "insight", "trigger_kind": "technical_docs",
                        "trigger_id": trig})
 
-        # Leg 3 — insight whose summary_ids names a leg-1-retired thematic row.
-        if leg1_summary_ids:
-            cur.execute(
-                "SELECT DISTINCT cs.id, cs.source_pg_ids, elem::bigint"
-                "  FROM community_summaries cs,"
-                "       jsonb_array_elements_text("
-                "           COALESCE(cs.metadata->'summary_ids', '[]'::jsonb)) AS elem"
-                " WHERE NOT cs.superseded"
-                "   AND cs.metadata->>'kind' = 'insight'"
-                "   AND elem::bigint = ANY(%s)",
-                (leg1_summary_ids,),
-            )
-            for sid, src, trig in cur.fetchall():
-                out.append({"summary_id": sid, "source_pg_ids": list(src or []),
-                           "kind": "insight", "trigger_kind": "community_summaries",
-                           "trigger_id": trig})
+        # Leg 3 (thematic→insight lineage cascade) is DISABLED — decision:1207.
+        # Do NOT reinstate a query here; the read-side annotation lives in
+        # coordinator.py's search path (`stale_summaries`).
     return out
 
 
