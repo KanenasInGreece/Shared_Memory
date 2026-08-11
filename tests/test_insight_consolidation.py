@@ -849,6 +849,62 @@ async def test_run_insight_cycle_calls_fold_with_compatible_signature(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_run_insight_cycle_dead_lettered_cluster_excluded_from_eligible_census(monkeypatch):
+    """D1 (fact:1189, decision:1121/I7) — the insight cycle's own copy of
+    the same defect: rec.eligible_clusters used to be computed over ALL
+    fresh clusters BEFORE the NREM_FOLD_FAIL_CAP dead-letter filter, so a
+    permanently dead-lettered cluster counted as eligible backlog forever
+    and _consolidation_stall_verdict (coordinator.py) could never clear.
+    Two fresh clusters this pass; one is dead-lettered. eligible_clusters
+    must report 1 (not 2), and the exclusion is visible separately as
+    dead_lettered_clusters=1 — a NEW key, not folded into eligible_clusters'
+    own meaning."""
+    monkeypatch.setattr(cl, "NREM_FOLD_FAIL_CAP", 1)
+
+    class _Conn(StubConn):
+        def close(self):
+            pass
+
+    monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: _Conn())
+    monkeypatch.setattr(cl, "fetch_unreconciled_insights", lambda conn: [])
+    monkeypatch.setattr(cl, "fetch_open_retro_decision_ids", lambda conn: [])
+    monkeypatch.setattr(cl, "fetch_refold_insights", lambda conn, ids: [])
+    monkeypatch.setattr(cl, "fetch_active_insight_rows", lambda conn: [])
+    monkeypatch.setattr(cl, "fetch_active_thematic_summary_id", lambda conn, p, d: None)
+
+    dead_ids = [345, 367]
+    dead_types = {345: "Decision", 367: "Decision"}
+    # The dead-lettered cluster's own content-derived identity (C4's
+    # per-judgement-type key — decision 882's fold-key/label split).
+    dead_key = cl._judgement_fold_identity(dead_ids, dead_types)
+    monkeypatch.setattr(cl, "fetch_fold_dead_letter_counts", lambda: {dead_key: 1})
+
+    daemon, _ = daemon_with_fake_graph()
+    daemon._find_fresh_insight_clusters = AsyncMock(return_value=[
+        {"entity": "shared-memory-GitHub/architecture", "decision_ids": [245, 267],
+         "judgement_ids": [245, 267], "judgement_types": {245: "Decision", 267: "Decision"},
+         "projects": ["shared-memory-GitHub"], "domain": "architecture"},
+        {"entity": "shared-memory-GitHub/infrastructure", "decision_ids": dead_ids,
+         "judgement_ids": dead_ids, "judgement_types": dead_types,
+         "projects": ["shared-memory-GitHub"], "domain": "infrastructure"},
+    ])
+    daemon._fold_insight = AsyncMock(return_value=True)
+
+    finish = {}
+    monkeypatch.setattr(cl, "_crun_start", lambda ct: 42)
+    monkeypatch.setattr(cl, "_crun_finish",
+                        lambda *a, **k: finish.update(args=a, kwargs=k))
+
+    await daemon.run_insight_cycle()
+
+    # Only the non-dead-lettered cluster ([245, 267]) actually folded.
+    assert daemon._fold_insight.await_count == 1
+    assert daemon._fold_insight.await_args.args[2] == [245, 267]
+    assert finish["kwargs"]["eligible_clusters"] == 1
+    assert finish["kwargs"]["extra"]["dead_lettered_clusters"] == 1
+
+
+@pytest.mark.asyncio
 async def test_run_insight_cycle_same_identity_appends_reference_not_a_new_fold(monkeypatch):
     """§2.5 / criterion G — a fresh cluster whose judgement set exactly
     matches an existing active insight's is NOT folded again; the

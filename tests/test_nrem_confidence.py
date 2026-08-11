@@ -618,6 +618,139 @@ async def test_thematic_fold_embedding_failure_requeues(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_fact_cycle_dead_lettered_cluster_excluded_from_eligible_census(monkeypatch):
+    """D1 (fact:1189, decision:1121/I7): rec.eligible_clusters/extra used to
+    be computed over ALL density-gated work_items BEFORE the dead-letter
+    filter, so a permanently dead-lettered cluster counted as eligible
+    backlog forever and _consolidation_stall_verdict (coordinator.py) could
+    never clear. Two (project, domain) groups gate this pass ("ops": pg_ids
+    1,2 and "infra": pg_ids 3,4); "infra" is dead-lettered
+    (NREM_FOLD_FAIL_CAP reached). eligible_clusters must report 1 (only
+    "ops"), and the exclusion is visible separately as
+    dead_lettered_clusters=1 — a NEW key, not folded into eligible_clusters'
+    own meaning."""
+    monkeypatch.setattr(cl, "DENSITY_THRESHOLD", 2)
+    monkeypatch.setattr(cl, "NREM_FOLD_FAIL_CAP", 1)
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    d = datetime.date(2026, 7, 11)
+    rows = [
+        {"pg_id": 1, "content": "fact one", "project": "general", "domain": "ops"},
+        {"pg_id": 2, "content": "fact two", "project": "general", "domain": "ops"},
+        {"pg_id": 3, "content": "fact three", "project": "general", "domain": "infra"},
+        {"pg_id": 4, "content": "fact four", "project": "general", "domain": "infra"},
+    ]
+    # The "infra" group's own content-derived dead-letter identity (decision
+    # 882) — computed the same way the code does, so the fixture is exactly
+    # what a real ledger row would key on.
+    dead_key = cl._fold_identity("fact", [3, 4])
+
+    daemon, session = daemon_with_fake_graph()
+    conn = StubConn(script=[
+        # 1. _fetch_records — all 4 facts.
+        {"rowcount": 4, "rows": [
+            (1, "general", "fact", None, d, {}),
+            (2, "general", "fact", None, d, {}),
+            (3, "general", "fact", None, d, {}),
+            (4, "general", "fact", None, d, {}),
+        ]},
+        # 2. fold dead-letter counts (D1 — moved BEFORE the census): "infra"
+        # is at cap, "ops" is not mentioned (defaults to 0).
+        {"rowcount": 1, "rows": [(dead_key, 1)]},
+        # 3. coverage census (_fetch_outbox_created_at) — over the ELIGIBLE
+        # ("ops") group's members only; content irrelevant here.
+        {"rowcount": 0, "rows": []},
+        # 4. drop_out_of_scan_refold_rows — always runs.
+        {"rowcount": 0, "rows": []},
+        # 5. INSERT community_summaries — the surviving "ops" group only.
+        {"rowcount": 1, "rows": [(90,)]},
+        # 6. outbox flip UPDATE
+        {"rowcount": 2, "rows": []},
+        # 7. supersession SELECT — no old rows to retire.
+        {"rowcount": 0, "rows": []},
+        # 8. close_ledger_rows DELETE — empty so its purge sub-query never runs.
+        {"rowcount": 0, "rows": []},
+    ])
+    finish = {}
+    _wire_thematic(monkeypatch, daemon, conn, finish)
+    # _wire_thematic already set DENSITY_THRESHOLD=2; re-assert the cap here
+    # is redundant but harmless — keep the fixture self-contained regardless
+    # of call order.
+
+    await daemon._consolidate_clusters(rows)
+
+    # Only ONE fold attempted — "infra" was skipped before it ever reached
+    # the fold loop.
+    assert finish["args"][2:5] == (1, 1, 0)          # attempted, succeeded, failed
+    assert finish["kwargs"]["eligible_clusters"] == 1
+    assert finish["kwargs"]["extra"]["dead_lettered_clusters"] == 1
+    # Both clusters' members DID meet density — dead-lettering is not a
+    # below_density drop, so no refold_ledger row should be touched as such.
+    assert not any(
+        "below_density" in s for s, _ in conn.executed if "UPDATE refold_ledger" in s)
+
+
+@pytest.mark.asyncio
+async def test_insight_preservation_retry_log_uses_per_fold_attempt_number(monkeypatch, caplog):
+    """D2 (fact:1189): the preservation-retry log must print THIS FOLD's own
+    retry attempt against the per-fold cap (NREM_PRESERVATION_MAX_RETRIES)
+    — never cyc.preservation_retries, a CYCLE-GLOBAL counter that keeps
+    accumulating across every fold the cycle attempts ('attempt 8/2'
+    observed live). Two folds share one _CycleRec, as run_insight_cycle's
+    loop does: each fold's OWN first retry must log 'attempt 1/2',
+    regardless of how many retries earlier folds in the same cycle already
+    burned."""
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    daemon, _ = daemon_with_fake_graph()
+    daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
+    cyc = _CycleRec()
+
+    def _script(id_a, id_b, word_a, word_b):
+        return [
+            {"rowcount": 2, "rows": [
+                (id_a, f"{word_a}\n\nrationale", "shared-memory-GitHub", "decision", {}),
+                (id_b, f"{word_b}\n\nrationale", "shared-memory-GitHub", "decision", {}),
+            ]},
+            {"rowcount": 0, "rows": []},                       # reversal leg 1
+            {"rowcount": 2, "rows": [(101,), (102,)]},          # outbox snapshot
+            {"rowcount": 1, "rows": [(77,)]},                   # INSERT
+            {"rowcount": 2, "rows": []},                        # ledger flip
+            {"rowcount": 0, "rows": []},                        # supersession SELECT
+            {"rowcount": 2, "rows": [(101, id_a), (102, id_b)]},  # close DELETE
+        ]
+
+    # Fold 1 — burns ONE retry (cyc.preservation_retries: 0 -> 1).
+    daemon.generate_insight = AsyncMock(side_effect=[
+        "This insight discusses pool contention.",              # missing both anchors
+        "This insight discusses Zorbex and Quixotic together.",  # both present
+    ])
+    conn1 = StubConn(script=_script(245, 267, "Zorbex", "Quixotic"))
+    with caplog.at_level("WARNING"):
+        ok1 = await daemon._fold_insight(conn1, "OutboxPattern", [245, 267], cyc=cyc)
+    assert ok1 is True
+    assert cyc.preservation_retries == 1
+
+    # Fold 2 — a SEPARATE fold in the SAME cycle. Also burns ONE retry of
+    # its own (cyc.preservation_retries: 1 -> 2), but its OWN attempt count
+    # is 1, not 2.
+    daemon.generate_insight = AsyncMock(side_effect=[
+        "This insight discusses pool contention.",
+        "This insight discusses Umbrose and Velvex together.",
+    ])
+    conn2 = StubConn(script=_script(345, 367, "Umbrose", "Velvex"))
+    with caplog.at_level("WARNING"):
+        ok2 = await daemon._fold_insight(conn2, "OutboxPattern", [345, 367], cyc=cyc)
+    assert ok2 is True
+    assert cyc.preservation_retries == 2   # cycle-global total — unchanged meaning
+
+    retry_lines = [m for m in caplog.messages if "corrective retry" in m]
+    assert len(retry_lines) == 2
+    # ⛔ Both folds' OWN first retry — never the cycle-global running count
+    # (which would print "attempt 1/2" then "attempt 2/2").
+    assert "attempt 1/2" in retry_lines[0]
+    assert "attempt 1/2" in retry_lines[1]
+
+
+@pytest.mark.asyncio
 async def test_insight_preservation_double_failure_no_write(monkeypatch, caplog):
     """The same gate guards generate_insight: two failing drafts → no Postgres
     write, False returned (open ledger rows are the durable requeue)."""
