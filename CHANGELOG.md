@@ -5,7 +5,60 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [0.8.71] — 2026-08-11
+## [0.8.72] — 2026-08-11
+
+### Changed — supersession propagation splits BY TIER (decision:1207)
+
+Implements operator ruling `decision:1207`, grounded on `fact:1177`/`retrospective:1178` (which
+refined `decision:384`) and the post-C4 scope question raised in the Dreaming Cycle plan §5.2. §5.2
+now reads: thematic-tier retirement stays eager (leg 1, shipped C3, ratified unscoped), the
+thematic→insight LINEAGE cascade (former leg 3) is disabled and becomes lazy, and reversal→insight
+(leg 2, §2.2a / I10) is unchanged and stays eager.
+
+- **`consolidation_loop.py`'s `fetch_invalidated_summaries` — leg 3 removed.** The query that found
+  an INSIGHT summary whose `metadata->'summary_ids'` overlapped a leg-1-retired THEMATIC summary id
+  no longer runs. Leg 1 (thematic summary holding a superseded fact) and leg 2 (insight summary
+  holding a reversed decision directly) are byte-for-byte unchanged — same SQL, same order, same
+  eager write-time behaviour. A superseded thematic summary therefore no longer eagerly supersedes
+  an insight resting on it; that staleness is now judged **lazily, at retrieval**.
+- **`coordinator.py`'s search path — new ADDITIVE `stale_summaries` key on insight results.**
+  Mirrors the existing `stale_sources` mechanism (`decision:384`): for the nearest active insight
+  returned by a search, its own `summary_ids` are checked against `community_summaries` for
+  superseded rows; any hit annotates the result with
+  `stale_summaries: [{"summary_id": Y, "superseded_reason": ...}]`. The consumer judges materiality
+  at the point of use, same as `stale_sources`. ⚠ **Queries `community_summaries` only, never
+  `technical_docs`** — the two id sequences overlap, and joining the wrong table would silently
+  mis-annotate (§3.2's documented trap; a mutation-checked test in `test_coordinator.py` pins this).
+- **Ledger interaction — no orphaned rows, nothing to migrate.** The disabled leg never wrote
+  `refold_ledger` rows of its own (only `retire_invalidated_summaries` opens ledger rows, driven
+  entirely by whatever `fetch_invalidated_summaries` returns); with leg 3 gone, no insight-kind
+  attribution row is opened for the lineage trigger going forward, and none needs closing —
+  `fetch_refold_backlog` already excludes `summary_kind='insight'` rows from due-ness (I17), so
+  nothing was ever waiting on them as a clock. Leg 2's reversal-triggered insight-kind rows are
+  unaffected and continue exactly as before.
+
+### Group 1+2 (client/delivery, capture/ontology) — SKILL.md, both copies
+
+`stale_summaries` documented alongside `stale_sources` with the same act-on-it guidance (fetch the
+named thematic summary, compare, `review-hold` if immaterial). No new capture flag — this is a
+read-side annotation, not something a caller elicits. Worked-example version strings bumped to
+`0.8.72` (enforced by `test_capture_surface_documented.py`). `API_VERSION` is unchanged — additive
+response field, no breaking wire-contract change.
+
+### Group 3 (daemon/observability) — monitor-visible
+
+An insight search result can now carry `stale_summaries`, a NEW additive key absent from the
+response shape before this release. Nothing else in `/memory/telemetry` or `/health` changes.
+
+### Fixed — CQ-1, multi-role review of PR #232 (Code Quality, Required)
+
+The `stale_summaries` annotation's DB-failure path (`coordinator.py`, the `except Exception` around
+its `community_summaries` fetch) used to swallow a transient fault silently, degrading to "no
+superseded summaries" with zero trace — the FAILURE ≠ IDLE class. It now logs a warning naming the
+exception class/message and the count of `summary_ids` left unchecked before degrading; the degrade
+behaviour itself (annotation absent, search unaffected) is unchanged. `stale_sources`'s equivalent
+failure path still swallows silently — a known, deliberately out-of-scope asymmetry, noted inline
+where the fix lives.
 
 ### Changed — insight payload BY CONSTRUCTION, the preservation-anchor gate retired (decision:1205)
 

@@ -150,6 +150,8 @@ The Tier-3 community summary now carries `source_pg_ids` (and its `metadata`) �
 
 **`stale_sources` — act on it.** A returned summary or insight may carry `stale_sources: [{"old": X, "superseded_by": X′}]`, meaning it was synthesised from a fact that has since been **superseded** (corrected/retracted). The narrative may be stale. Fetch the successor (`status X′`) and compare before relying on that part. If the change is immaterial, run `review-hold` (below) so it stops re-flagging; if it matters, save the corrected understanding. A null `superseded_by` means the source was retracted (or a reversed decision) with no replacement.
 
+**`stale_summaries` — act on it, same way.** An **insight** result may separately carry `stale_summaries: [{"summary_id": Y, "superseded_reason": "..."}]`, meaning one of the **thematic summaries it rests on** (its `summary_ids`) has since been superseded. This is a different signal from `stale_sources` — the insight's own facts/decisions may still be fine, but the narrative context under it has moved. Fetch the thematic summary (`summary:Y`) to see what changed before relying on that part; a null `superseded_reason` means no reason was recorded.
+
 If all results score below −3.0, an entity-graph fallback runs automatically and appears as a supplementary section in the output.
 
 ⏱ **A search takes as long as reranking takes — tens of seconds is normal, not a hang.** The cost tracks the total text being ranked, so asking for a smaller `limit` does not make it faster. The client sizes its own wait from the gateway's published capability rather than a constant, so it does not need re-tuning when the hardware or model changes. **If a search reports that the gateway did not answer in time, the gateway is up and slow — not down**: read `backend_capability` on `/health`, and pin `SEARCH_TIMEOUT_S` only if that projection exceeds the ceiling.
@@ -560,7 +562,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness:
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":4,"version":"0.8.71","daemon":"running","rem_daemon":"running",...}
+# → {"status":"ok","api_version":4,"version":"0.8.72","daemon":"running","rem_daemon":"running",...}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -616,7 +618,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.8.71", "api_version": 4, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.8.72", "api_version": 4, "tool": "shared-memory-framework"}`
 
 ### Updating This Skill
 
