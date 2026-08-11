@@ -121,7 +121,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.73"
+FRAMEWORK_VERSION = "0.8.74"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -833,6 +833,14 @@ GRAPH_EXPANSION_LIMIT = _env_int("GRAPH_EXPANSION_LIMIT", 15)
 # wider than the result set — the reranker can only reorder what it is handed.
 SEARCH_CANDIDATE_FLOOR = _env_int("SEARCH_CANDIDATE_FLOOR", 20)
 
+# Security review, PR 235: the `domains` search filter binds straight into a
+# jsonb `?|` operator with a caller-controlled array — an authenticated caller
+# sending thousands of entries per request is a DoS vector (unbounded work per
+# row scanned). Capped, not silently truncated: a search that silently dropped
+# entries past the cap would still return 200 with an incomplete filter, and an
+# empty result would then read as authoritative when it was really partial.
+SEARCH_DOMAINS_FILTER_CAP = _env_int("SEARCH_DOMAINS_FILTER_CAP", 16)
+
 # ── Relation-adjudication review/label surface (migration 020; decisions 726/727)
 # These constants MUST mirror relation_confidence.py (the psycopg2 foundation the
 # sweep/REM daemons use). The coordinator reimplements the ledger queries
@@ -1163,6 +1171,64 @@ def _visibility_filter(viewer: str | None, viewer_scope: str | None,
         clauses.append(f"(visibility = 'scope' AND scope = ${start + 1})")
         params.append(viewer_scope)
     return "(" + " OR ".join(clauses) + ")", params
+
+
+def _axis_filter_predicate(start: int, project: str | None,
+                            domains: list[str] | None,
+                            since: datetime | None) -> tuple[str, list]:
+    """Build the optional project/domains/since AND-predicate `handle_search`
+    adds to a candidate query — Tier-1 `technical_docs` and Tier-3
+    `community_summaries` alike. Applied to the CANDIDATE SET the reranker
+    scores, never as a post-hoc filter on already-ranked results: a named
+    place/time is a FILTER, not query text (the motivating measured failure —
+    folding a project name into query text ranked records that merely MENTION
+    the project above records that BELONG to it, and the genuinely relevant
+    facts landed below the limit cut on their weakest signal).
+
+    All three are optional and additive. No filter requested returns `("", [])`
+    — an unfiltered search's query text and arg list are byte-for-byte
+    unchanged from before this predicate existed.
+
+    `project` matches the canonical top-level `metadata->>'project'` string.
+    `domains` matches the canonical top-level `metadata->'domains'` JSON array
+    with OR semantics (`?|` — true when ANY named domain is present) — the
+    CANONICAL KEY ONLY (decision:1214), never the older singular `domain`
+    string or the `decision` blob. A pre-1214 thematic community_summaries row
+    (still written with singular `domain`) legitimately does not match a
+    domains filter rather than being silently reached through a second key —
+    the canonical key is the contract now. `since` matches `created_at >=` a
+    parsed, tz-aware datetime.
+
+    Read path never blocks on registry state: an unknown project/domain name is
+    not refused here, it simply matches nothing (a searcher may probe).
+
+    ⚠ `domains` is CALLER-BOUND before it ever reaches here: `handle_search`
+    rejects more than `SEARCH_DOMAINS_FILTER_CAP` (16) entries with a 400
+    `filters_invalid` at ingress, never truncates silently — an unbounded list
+    binds straight into the `?|` scan (a DoS vector), and a silent drop would
+    let a partial filter's empty result read as authoritative. This function
+    does not re-check the cap; it trusts its caller.
+
+    `start` is the next free asyncpg positional index (`$N`).
+    """
+    clauses: list[str] = []
+    params: list = []
+    idx = start
+    if project:
+        clauses.append(f"metadata->>'project' = ${idx}")
+        params.append(project)
+        idx += 1
+    if domains:
+        clauses.append(f"metadata->'domains' ?| ${idx}::text[]")
+        params.append(list(domains))
+        idx += 1
+    if since is not None:
+        clauses.append(f"created_at >= ${idx}::timestamptz")
+        params.append(since)
+        idx += 1
+    if not clauses:
+        return "", []
+    return " AND " + " AND ".join(clauses), params
 
 
 def _coerce_jsonb_obj(value):
@@ -4756,6 +4822,62 @@ class MemoryCoordinator:
                 {"status": "error", "message": "query is required"}, status=400
             )
 
+        # Axis filters (v0.8.74) — a named place/time is a FILTER, not query
+        # text. All three optional and additive; validated lightly (shape
+        # only) — an unknown project/domain name is NOT refused here (the
+        # read path never blocks on registry state), it simply matches
+        # nothing via `_axis_filter_predicate` below.
+        project = body.get("project")
+        if project is not None and not isinstance(project, str):
+            return web.json_response(
+                {"status": "error", "message": "project must be a string"},
+                status=400,
+            )
+        project = project.strip() if project else None
+
+        domains_filter = body.get("domains")
+        if domains_filter is not None:
+            if not isinstance(domains_filter, list) or not all(
+                    isinstance(d, str) for d in domains_filter):
+                return web.json_response(
+                    {"status": "error",
+                     "message": "domains must be a list of strings"},
+                    status=400,
+                )
+            # Security (PR 235): capped at ingress, not silently truncated — a
+            # caller sending thousands of entries binds straight into the `?|`
+            # operator (DoS vector), and a silent drop would let a partial
+            # filter's empty result read as authoritative.
+            if len(domains_filter) > SEARCH_DOMAINS_FILTER_CAP:
+                return web.json_response(
+                    {"status": "error", "error": "filters_invalid",
+                     "message": (
+                         f"domains carries {len(domains_filter)} entries, over "
+                         f"the {SEARCH_DOMAINS_FILTER_CAP}-entry cap")},
+                    status=400,
+                )
+            domains_filter = [d.strip() for d in domains_filter if d and d.strip()]
+            if not domains_filter:
+                domains_filter = None
+
+        since_raw = body.get("since")
+        since_dt = None
+        if since_raw is not None:
+            if not isinstance(since_raw, str):
+                return web.json_response(
+                    {"status": "error",
+                     "message": "since must be an ISO date/datetime string"},
+                    status=400,
+                )
+            try:
+                since_dt = datetime.fromisoformat(since_raw.replace("Z", "+00:00"))
+            except ValueError:
+                return web.json_response(
+                    {"status": "error",
+                     "message": f"since is not a valid ISO date/datetime: {since_raw!r}"},
+                    status=400,
+                )
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             try:
                 q_vec = await self._embed(query, client)
@@ -4763,18 +4885,22 @@ class MemoryCoordinator:
                 q_vec = None
 
             if q_vec is None:
-                # Keyword fallback when the embedding service is unavailable
+                # Keyword fallback when the embedding service is unavailable.
+                # Axis filters apply here too — a filtered search must not
+                # silently drop its filter just because the embedder is down.
                 vis_sql, vis_params = _visibility_filter(viewer, scope, 3)
+                axis_sql, axis_params = _axis_filter_predicate(
+                    3 + len(vis_params), project, domains_filter, since_dt)
                 async with self._acquire() as conn:
                     rows = await conn.fetch(
                         f"""
                         SELECT id, content, metadata FROM technical_docs
                         WHERE NOT superseded
                           AND (content ILIKE $1 OR metadata::text ILIKE $1)
-                          AND {vis_sql}
+                          AND {vis_sql} {axis_sql}
                         LIMIT $2
                         """,
-                        f"%{query}%", limit, *vis_params,
+                        f"%{query}%", limit, *vis_params, *axis_params,
                     )
                 return web.json_response({
                     "status": "success",
@@ -4801,15 +4927,21 @@ class MemoryCoordinator:
                 # fact's synthesized narrative must not leak where the fact itself
                 # is filtered. Params start at $2 ($1 is the query vector).
                 vis_t3, vis_t3_params = _visibility_filter(viewer, scope, 2)
+                # Same axis predicate as Tier-1, computed once and reused by
+                # every Tier-3 variant below (insight, thematic, and the
+                # pre-006 fallback) — each is an independent query starting
+                # its own $1, so the same fragment/params apply to all three.
+                t3_axis_sql, t3_axis_params = _axis_filter_predicate(
+                    2 + len(vis_t3_params), project, domains_filter, since_dt)
                 insight = None
                 try:
                     insight = await conn.fetchrow(
                         "SELECT id, content, metadata, source_pg_ids FROM community_summaries"
                         " WHERE NOT superseded"
                         "   AND metadata->>'kind' = 'insight'"
-                        f"   AND {vis_t3}"
+                        f"   AND {vis_t3} {t3_axis_sql}"
                         " ORDER BY embedding <=> $1::vector LIMIT 1",
-                        str(q_vec), *vis_t3_params,
+                        str(q_vec), *vis_t3_params, *t3_axis_params,
                     )
                 except Exception:
                     insight = None  # pre-006 schema — thematic guard below warns
@@ -4822,9 +4954,9 @@ class MemoryCoordinator:
                         "SELECT id, content, metadata, source_pg_ids FROM community_summaries"
                         " WHERE NOT superseded"
                         "   AND COALESCE(metadata->>'kind', 'thematic') <> 'insight'"
-                        f"   AND {vis_t3}"
+                        f"   AND {vis_t3} {t3_axis_sql}"
                         " ORDER BY embedding <=> $1::vector LIMIT 1",
-                        str(q_vec), *vis_t3_params,
+                        str(q_vec), *vis_t3_params, *t3_axis_params,
                     )
                 except Exception:
                     log.warning(
@@ -4839,9 +4971,9 @@ class MemoryCoordinator:
                     # while the guarded query correctly returned a live one.
                     summary = await conn.fetchrow(
                         "SELECT id, content, metadata, source_pg_ids FROM community_summaries"
-                        f" WHERE NOT superseded AND {vis_t3}"
+                        f" WHERE NOT superseded AND {vis_t3} {t3_axis_sql}"
                         " ORDER BY embedding <=> $1::vector LIMIT 1",
-                        str(q_vec), *vis_t3_params,
+                        str(q_vec), *vis_t3_params, *t3_axis_params,
                     )
 
                 # Tier 1 — vector search. The pool handed to the reranker is a
@@ -4866,11 +4998,16 @@ class MemoryCoordinator:
                     scope_sql = f"AND scope = ${len(args)}"
                 vis_sql, vis_params = _visibility_filter(viewer, scope, len(args) + 1)
                 args.extend(vis_params)
+                # Axis filters applied to the CANDIDATE SET before reranking —
+                # the reranker never sees a candidate that failed the filter.
+                axis_sql, axis_params = _axis_filter_predicate(
+                    len(args) + 1, project, domains_filter, since_dt)
+                args.extend(axis_params)
                 try:
                     candidates = await conn.fetch(
                         f"""
                         SELECT id, content, metadata, created_at FROM technical_docs
-                        WHERE NOT superseded AND {vis_sql} {scope_sql}
+                        WHERE NOT superseded AND {vis_sql} {scope_sql} {axis_sql}
                         ORDER BY embedding <=> $1::vector LIMIT $2
                         """,
                         *args,
@@ -4886,11 +5023,17 @@ class MemoryCoordinator:
                     candidates = await conn.fetch(
                         f"""
                         SELECT id, content, metadata FROM technical_docs
-                        WHERE NOT superseded AND {vis_sql} {scope_sql}
+                        WHERE NOT superseded AND {vis_sql} {scope_sql} {axis_sql}
                         ORDER BY embedding <=> $1::vector LIMIT $2
                         """,
                         *args,
                     )
+                    # ⚠ Known gap, out of scope: a `since` filter needs
+                    # `created_at` too, so it raises the same
+                    # UndefinedColumnError a second time here, uncaught, on a
+                    # schema this old. `since` is a brand-new v0.8.74 filter
+                    # and migration 015 predates the whole axis system it
+                    # filters on.
 
             if not candidates:
                 return web.json_response({"status": "success", "results": []})

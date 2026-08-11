@@ -5,6 +5,66 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.74] — 2026-08-11
+
+### Added — search axis filters: `project`, `domains`, `since` (both clients + MCP + gateway)
+
+The write/fold side of the framework keys everything on operator-asserted axes (`project`,
+`domains`, `entities` — canonical top-level metadata keys since v0.8.73/decision:1214), but the read
+side collected none of it: `search` accepted only query text + limit. Measured motivating failure: a
+human ask naming WHERE + WHEN + WHAT could only be searched by WHAT — its weakest signal — landing the
+right facts at ranks 4/7/8 below the `limit` cut, while adding the project name as query TEXT ranked
+records that MENTION the project above records that BELONG to it. **A named place/time is a FILTER,
+not query text.**
+
+- **`coordinator.py`'s `handle_search`** — three new optional, additive body params: `project`
+  (string), `domains` (list of strings, OR semantics), `since` (ISO date/datetime — records created
+  at/after). Applied to the CANDIDATE SET before reranking, on both Tier-1 (`technical_docs`) and
+  Tier-3 (`community_summaries`) queries, and on the keyword-fallback path (embedder unavailable) for
+  the same reason — a filtered search must not silently drop its filter. A filtered search that
+  matches nothing returns the existing honest empty shape; there is no unfiltered fallback. Values are
+  validated for SHAPE only (string / list-of-strings / parseable ISO datetime) — an unregistered
+  project/domain name is **not refused** (the read path never blocks on registry state; a searcher may
+  probe), it simply matches nothing. New helper `_axis_filter_predicate` builds the SQL fragment
+  shared by every candidate query.
+- **Canonical key only (decision:1214), no blob fallback.** `domains` filtering targets the top-level
+  `metadata->'domains'` JSON array (`?| ` — OR semantics) exclusively — never the older singular
+  `domain` string or a `decision` blob. A pre-1214 thematic `community_summaries` row (still written
+  with singular `domain`) legitimately does not match a `domains` filter.
+- **`memory_bridge.py` (both tracked copies)** — `search` gains `--project NAME`, `--domain NAME`
+  (repeatable, same pattern as `save`'s), `--since ISO_DATE`, passed through to the gateway.
+- **`vector-skill.py`** — `hybrid_search_and_rerank` gains the same three optional params, for parity
+  between the two front doors.
+- **`API_VERSION` unchanged (stays 4).** All three params are optional and additive — the wire
+  contract gains fields only, nothing existing changed shape.
+
+### Group 1+2 (client/delivery, capture/ontology) — SKILL.md, both copies
+
+Task 1 documents the three new flags and states the design directive verbatim: *a named place/time is
+a FILTER, not query text*. Worked-example version strings bumped to `0.8.74`.
+
+### Group 3 (daemon/observability) — none
+
+No telemetry, `/health`, or monitor-visible shape changed. Search's response shape is unchanged when
+no filter is supplied (regression-pinned).
+
+### Fixed — security review (PR 235): `domains` filter capped at ingress
+
+The `domains` filter list bound straight into the Postgres `?|` operator with no bound on caller
+input — an authenticated caller could send an unbounded array per search request, unbounded work
+scanned per candidate row (a DoS vector). `handle_search` now rejects more than
+`SEARCH_DOMAINS_FILTER_CAP` (16, env-overridable) domains with a clean `400 filters_invalid` stating
+the cap, at ingress, before any embedding or DB work runs. **Never a silent truncation** — dropping
+the excess entries quietly would let a partial filter's empty result read as authoritative, exactly
+the failure mode `since`/`project`'s "no unfiltered fallback" rule already guards against. The cap
+lives beside `SEARCH_CANDIDATE_FLOOR` in `coordinator.py`; `_axis_filter_predicate`'s docstring notes
+it trusts its caller rather than re-checking. Mirrored client-side as documentation only (SKILL.md,
+both copies — one line; the gateway is the enforcement point, clients stay thin).
+
+Mutation-checked: removing the cap check makes `test_domains_over_cap_rejected_400_filters_invalid`
+and `test_domains_over_cap_400_does_not_leak_into_honest_empty_shape` fail (verified live); a request
+at exactly the cap (16) still passes (`test_domains_at_cap_passes`).
+
 ## [0.8.73] — 2026-08-11
 
 ### Changed — canonical top-level axis key for decisions (decision:1214)

@@ -29,7 +29,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.8.73"
+VERSION = "0.8.74"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v3: review-edges / label-edges require the gateway's /memory/relations/* routes.
@@ -645,15 +645,25 @@ def format_label_outcomes(payload: dict) -> str:
     return "\n".join(lines) if lines else "(no outcomes)"
 
 
-async def search_and_rerank(query: str, limit: int = 5) -> list | dict:
+async def search_and_rerank(query: str, limit: int = 5, project: str = None,
+                             domains: list = None, since: str = None) -> list | dict:
     # Sized from the gateway's own published cost, never from a constant — the
     # reranker dominates this call and its cost tracks the candidate payload.
     ceiling = search_ceiling(await _gateway_capability())
+    body = {"query": query, "limit": limit, "agent_id": AGENT_ID}
+    # Additive only — an unfiltered call sends exactly what it always sent.
+    # A named place/time is a FILTER, not query text.
+    if project:
+        body["project"] = project
+    if domains:
+        body["domains"] = domains
+    if since:
+        body["since"] = since
     try:
         async with _async_client(ceiling) as client:
             r = await client.post(
                 f"{COORDINATOR_BASE}/memory/search",
-                json={"query": query, "limit": limit, "agent_id": AGENT_ID},
+                json=body,
                 headers=_request_headers(),
             )
             if r.status_code == 401:
@@ -1243,10 +1253,38 @@ async def main() -> None:
         print(json.dumps(query_graph(sys.argv[2]), indent=2))
     elif action == "search":
         if len(sys.argv) < 3:
-            print(json.dumps({"error": "Usage: memory_bridge.py search <query> [limit]"}))
+            print(json.dumps({
+                "error": "Usage: memory_bridge.py search <query> [limit] "
+                         "[--project NAME] [--domain NAME ...] [--since ISO_DATE]"
+            }))
             sys.exit(1)
-        limit = int(sys.argv[3]) if len(sys.argv) > 3 else 5
-        print(json.dumps(await search_and_rerank(sys.argv[2], limit), indent=2))
+        query = sys.argv[2]
+        p = argparse.ArgumentParser(prog="memory_bridge.py search", add_help=False)
+        p.add_argument("limit", nargs="?", type=int, default=5)
+        # Same flag pattern as save's --domain: repeatable, never comma-split,
+        # OR semantics at the gateway.
+        p.add_argument("--project", default=None, metavar="NAME",
+                       help="restrict to records BELONGING to this project — a "
+                            "named place is a FILTER, not query text. An "
+                            "unregistered name is not refused, it simply "
+                            "matches nothing.")
+        p.add_argument("--domain", action="append", default=None, metavar="NAME",
+                       dest="domains",
+                       help="restrict to records in this SECTION of the "
+                            "project. REPEAT for several (OR semantics — any "
+                            "match qualifies). Same 'filter, not query text' "
+                            "rule as --project.")
+        p.add_argument("--since", default=None, metavar="ISO_DATE",
+                       help="restrict to records created at/after this ISO "
+                            "date or datetime, e.g. 2026-08-01 or "
+                            "2026-08-01T00:00:00. A named time is a FILTER, "
+                            "not query text.")
+        sargs = p.parse_args(sys.argv[3:])
+        print(json.dumps(
+            await search_and_rerank(query, sargs.limit, project=sargs.project,
+                                     domains=sargs.domains, since=sargs.since),
+            indent=2,
+        ))
     elif action == "save":
         p = argparse.ArgumentParser(
             prog="memory_bridge.py save",

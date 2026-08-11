@@ -144,6 +144,11 @@ Search the shared memory with semantic similarity, reranking, and Neo4j relation
   ```
 - **MCP (LM Studio):** Use the `hybrid_search_and_rerank` tool from the `rag-orchestrator` MCP server.
 
+**⭐ A named place or time is a FILTER, not query text.** When the operator names WHERE (project/domain) or WHEN (since), pass it as a filter and keep the query text for the WHAT — folding a project name into the query text instead ranks records that merely *mention* it above records that *belong* to it, and the genuinely relevant records can fall below the `limit` cut on their weakest signal. Filters restrict the candidate set the reranker scores; they never widen it and never fall back to unfiltered on an empty match. `--project NAME` restricts to records belonging to that project; `--domain NAME` (repeatable — OR semantics, any match qualifies) restricts to those SECTIONS; `--since ISO_DATE` restricts to records created at/after it (`2026-08-01` or `2026-08-01T00:00:00`). All three optional, additive, combinable. An unregistered project/domain name is **not refused** here (the read path never blocks on registry state) — it simply matches nothing. **`--domain` is capped at 16 entries per search** — the gateway is the enforcement point (over the cap returns 400 `filters_invalid`), this is a client-side heads-up, not a client-side check.
+  ```
+  uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py search "<query>" 5 --project myproject --domain operations --since 2026-08-01
+  ```
+
 Returns: Tier 1 semantic hits and Tier 3 narratives **ranked together on one scale**, plus Neo4j relational expansion. No tier holds a reserved position — a community summary or insight appears where its relevance to *your query* puts it, which may be first, last, or not at all.
 
 The Tier-3 community summary now carries `source_pg_ids` (and its `metadata`) — the exact Tier-1 facts it was synthesised from. Those are **facts-table** ids: trace a narrative to its sources with `lineage` on them, or `lineage summary:<id>` to get them already qualified (see the record-reference note under Task 3).
@@ -566,7 +571,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness:
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":4,"version":"0.8.73","daemon":"running","rem_daemon":"running",...}
+# → {"status":"ok","api_version":4,"version":"0.8.74","daemon":"running","rem_daemon":"running",...}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -622,7 +627,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.8.73", "api_version": 4, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.8.74", "api_version": 4, "tool": "shared-memory-framework"}`
 
 ### Updating This Skill
 
