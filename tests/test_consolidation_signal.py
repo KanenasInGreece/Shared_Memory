@@ -85,6 +85,11 @@ def _no_census_row(cycle_type):
         # D1 (fact:1189) — dead_lettered_clusters, like eligible_clusters,
         # is NULL when no census has ever recorded it.
         "dead_lettered_clusters": None,
+        # AR-01 (v0.8.75) — same NULL-until-recorded contract as
+        # dead_lettered_clusters for the latest-value pair; the 24h sums
+        # follow folds_succeeded_24h/folds_attempted_24h's 0-means-none shape.
+        "truncation_failures": None, "slot_failures": None,
+        "truncation_failures_24h": 0, "slot_failures_24h": 0,
     }
 
 
@@ -157,6 +162,51 @@ async def test_dead_lettered_clusters_surfaced_per_cycle_type():
     assert out["insight"]["dead_lettered_clusters"] == 2
     # fact_consolidation got no row at all this pass — None, not 0.
     assert out["fact_consolidation"]["dead_lettered_clusters"] is None
+
+
+@pytest.mark.asyncio
+async def test_truncation_and_slot_failures_surfaced_per_cycle_type():
+    """AR-01 (v0.8.75, six-role milestone audit, Critical) — truncation_failures
+    and slot_failures (written by the daemon into consolidation_runs.extra via
+    _CycleRec.extra(), same shape as dead_lettered_clusters) must be read back
+    and surfaced per cycle type, both as the latest recorded value (None when
+    no row this pass carried the key — the same discipline dead_lettered_clusters
+    follows) and as a 24h sum (0 when none occurred — the same discipline
+    folds_succeeded_24h/folds_attempted_24h follow).
+
+    Before this fix, slot_failed — the PROTOCOL-failure class (a scaffold slot
+    still missing after its one bounded retry) — was written to the ledger and
+    never read back anywhere: the first live occurrence would have been
+    invisible to any monitor. truncation_failures had the identical gap and is
+    fixed alongside it rather than shipping a half-fix that leaves an
+    analogous blind spot.
+
+    Mutation check: drop either extraction (the array_agg/sum column, or the
+    dict key below it) and this test dies."""
+    coord = co.MemoryCoordinator()
+    row = dict(_no_census_row("insight"), eligible_clusters=5,
+               truncation_failures=3, slot_failures=1,
+               truncation_failures_24h=7, slot_failures_24h=2)
+    conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[row])
+    acq = MagicMock()
+    acq.__aenter__ = AsyncMock(return_value=conn)
+    acq.__aexit__ = AsyncMock(return_value=False)
+    coord._acquire = MagicMock(return_value=acq)
+
+    out = await coord._compute_consolidation_health()
+
+    assert out["insight"]["truncation_failures"] == 3
+    assert out["insight"]["slot_failures"] == 1
+    assert out["insight"]["truncation_failures_24h"] == 7
+    assert out["insight"]["slot_failures_24h"] == 2
+    # fact_consolidation got no row at all this pass — None for the
+    # latest-value pair (no census recorded it), 0 for the 24h sums (a real
+    # window with nothing in it).
+    assert out["fact_consolidation"]["truncation_failures"] is None
+    assert out["fact_consolidation"]["slot_failures"] is None
+    assert out["fact_consolidation"]["truncation_failures_24h"] == 0
+    assert out["fact_consolidation"]["slot_failures_24h"] == 0
 
 
 # ── _record_cycle context manager ────────────────────────────────────────────

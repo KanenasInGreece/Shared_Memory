@@ -294,6 +294,38 @@ async def test_entities_provenance_with_a_bad_value_is_refused():
 
 
 @pytest.mark.asyncio
+async def test_entities_provenance_overlong_key_yields_a_bounded_400_message():
+    """SEC-03 (six-role milestone audit, Required) — 400 error messages must
+    not echo a caller-supplied value unbounded: an unbounded echo turns a
+    validation error into an amplification vector. `_short()` caps the repr
+    of any interpolated value at 200 chars (plus an ellipsis marker).
+
+    MUTATION CHECK: replace `_short(name)` back with `name!r` at the
+    entities_provenance[...] interpolation site and this test's length
+    assertion fails — the message balloons to the full 5000-char key."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+    overlong = "X" * 5000
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)) as mock_embed:
+        req = _make_request({
+            "content": "a fact",
+            "metadata": {
+                "source": "claude-code",
+                "project": "shared_memory",
+                "entities": [overlong],
+                "entities_provenance": {overlong: "guessed"},
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 400
+    body = json.loads(resp.text)
+    # Still names the error code — bounding the echo must not lose the
+    # machine-readable classification.
+    assert body["error"] == "entities_provenance_invalid"
+    assert len(body["message"]) < 300
+    mock_embed.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_entities_provenance_non_dict_is_refused():
     c, mock_conn, _ = _coordinator_with_mocks()
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)) as mock_embed:

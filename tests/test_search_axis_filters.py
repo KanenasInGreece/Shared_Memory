@@ -571,6 +571,25 @@ async def test_since_wrong_type_rejected_400():
     assert resp.status == 400
 
 
+@pytest.mark.asyncio
+async def test_since_overlong_value_yields_a_bounded_400_message():
+    """SEC-03 (six-role milestone audit, Required) — an invalid `since` value
+    is echoed into the 400 message for the caller's benefit, but must not be
+    echoed UNBOUNDED: that turns a validation error into an amplification
+    vector. `_short()` caps the repr at 200 chars (+ ellipsis marker).
+
+    MUTATION CHECK: replace `_short(since_raw)` back with `since_raw!r` at
+    the `since` parse-failure site and this test's length assertion fails —
+    the message balloons to the full 5000-char value."""
+    c, _, _s = _coordinator_with_mocks()
+    overlong = "not-a-date-" + "X" * 5000
+    resp = await c.handle_search(_make_request({"query": "x", "since": overlong}))
+    assert resp.status == 400
+    body = json.loads(resp.text)
+    assert "since" in body["message"]
+    assert len(body["message"]) < 300
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # (d) client surface — CLI passthrough, copy parity, MCP parity
 # ══════════════════════════════════════════════════════════════════════════
