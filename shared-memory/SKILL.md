@@ -84,12 +84,12 @@ domain; `domain_not_allowed_on_judgement` — a retrospective may not name one, 
 axes from the decision it judges.
 
 **`entities` — the concepts a FACT is about, and the only place a concept can enter the graph.**
-These become the cluster keys consolidation groups on. **What breaks if you omit one:** that concept
-never becomes a cluster key for this fact, for anything later grounded in it, or for anything
-enrichment might link later — and a phrase you type here becomes a permanent node, where the only
-way back is to supersede the fact. Name concepts, not sentences (`OutboxPattern`, not `must be done
-on the VM`). Judgements do **not** take these: a decision's topics are whatever its evidence is
-about, reached by walking its grounding.
+Tier 3 consolidation folds on **project+domain**, not entities (fact 1215) — an entity-less fact still
+consolidates. **What entities buy instead:** cluster keys for graph navigation and REM/entity-relation
+linking, for this fact and anything later grounded in or enriched against it. Name concepts, not
+sentences (`OutboxPattern`, not `must be done on the VM`); a phrase you type here becomes a permanent
+node, where the only way back is to supersede the fact. Judgements do **not** take these: a decision's
+topics are whatever its evidence is about, reached by walking its grounding.
 
 **`source_ref` — a citation, and it answers a DIFFERENT question on each record type.** On a **fact**
 it is where the knowledge CAME FROM, and it silently sets that fact's evidential weight
@@ -172,7 +172,11 @@ Commit findings, decisions, and technical facts to long-term shared memory.
 
 **`source`** — the gateway stamps this with the authenticated token identity (`claude`, `gemini`, `lm_studio`, etc.); any client-supplied value is overridden. Pass any non-empty string to satisfy the schema — `entities` and `project` matter more. For non-authenticated (legacy) installs, pass the agent name explicitly.
 
-**`entities` is required for Tier 3 consolidation — and a FACT is now the only place a new concept can enter the graph at all.** Supply 1–4 named concepts the fact is about. Facts saved without `entities` are stored and searchable but never synthesised into community summaries. Name each one as a **concept, not a sentence** (`OutboxPattern`, not `must be performed on the VM`): the enrichment pass links only to concepts a fact's `entities` list already named — never inventing one, and never reaching a name it introduced itself — and decisions and retrospectives no longer name their own, inheriting from the facts they rest on. So a concept you omit here never becomes a cluster key for the fact, for anything later grounded in it, *or* for anything the enrichment pass may link later; and a phrase you type here becomes one for good — the one way back is to **supersede the fact**, which retires the concepts only that fact named from the enrichment pass's reach (nothing is deleted; existing links stay). Spelling binds the node you create, but not the links that follow: the enrichment pass groups known spellings of one concept and attaches to the form already most used.
+**`entities` is NOT required for Tier 3 consolidation — the fold keys on `project`+`domain` (fact 1215), so an entity-less fact is an honest, fully-consolidatable state, not a defect.** A FACT is still the only place a new concept can enter the graph at all, and entities still drive graph navigation and REM/entity-relation linking for this fact and anything later grounded in or enriched against it — that is what makes naming them worth doing, not a Tier 3 requirement.
+
+**Capture discipline (ruled, fact 1215): entities the operator did not name are NEVER added by the agent.** When none are given, ask once and accept none as the answer — do not keep asking, and do not infer one from the content to fill the field. One is enough when one is given. Name each as a **concept, not a sentence** (`OutboxPattern`, not `must be performed on the VM`) — and never as the project or section it belongs to: that is asking *where the record belongs*, and an entity answers *what the record is about* (the subject-vs-axis test). Stamp each entity's origin in `entities_provenance`, e.g. `'{"entities":["OutboxPattern"],"entities_provenance":{"OutboxPattern":"operator"}}'` in the metadata JSON — a value of `"operator"` or `"agent"` per named entity. Omitting it still saves; the response's `entities_provenance_note` names the gap so it is seen at capture time, not just on inspection. A mapping naming an entity outside the save's `entities` list, or a value that is not `operator`/`agent`, is refused (400 `entities_provenance_invalid`) — fix the mapping and re-send.
+
+The enrichment pass links only to concepts a fact's `entities` list already named — never inventing one, and never reaching a name it introduced itself — and decisions and retrospectives no longer name their own, inheriting from the facts they rest on. A phrase you type here becomes a node for good — the one way back is to **supersede the fact**, which retires the concepts only that fact named from the enrichment pass's reach (nothing is deleted; existing links stay). Spelling binds the node you create, but not the links that follow: the enrichment pass groups known spellings of one concept and attaches to the form already most used.
 
 **`project` is REQUIRED on a fact AND on a decision, and checked against a registry — a save with none is REJECTED (400).** (A retrospective supplies none: it inherits the project of the decision it judges.) NREM keys community summaries on **(entity, project)**; facts sharing an entity but carrying different projects are never fused into one summary, and a fact whose project does not resolve is not folded at all — it is skipped, never pooled with other untagged facts, because an absence is not a subject. **Omit `project` and the client derives it from the project folder name** (walking up to the nearest `.git`/`CLAUDE.md`/`AGENTS.md`; `SHARED_MEMORY_PROJECT` overrides; failing that, from an **absolute** `source_ref`'s directory). An explicit value always wins, so **do not hand-type a project that differs from the folder** — state the derived tag when saving work belonging to a *different* project than the current directory.
 
@@ -192,7 +196,7 @@ Commit findings, decisions, and technical facts to long-term shared memory.
 
 **Involve the operator before you save — this is what makes the memory high-signal (decisions 553/559).** Saving is *not* a silent pass-through, and the two record types get different weight:
 - **Decision saves — the operator gets a say.** Before any `save_decision`, ask (one short batched prompt) for the fields that carry the signal, proposing defaults they confirm or adjust: `grounded_in` (pg_ids of the facts it rests on — **always include at least the conversation fact**; propose 2–3 recent facts, and **for each propose its ROLE** so the operator confirms or overrides — `based_on` (the evidence/basis), `considered`, `rejected`, `under_conditions` (a constraint), or `informed_by` (soft input, not a hard basis) — defaulting to what the fact's kind implies: a `discussion` → `informed_by`, any other kind → `based_on`. Pass the confirmed role — `--grounded-in "42:considered,43:based_on"` — so it is recorded as **operator-asserted** (`asserted_by=operator`); a **bare id silently falls to the system default** (`asserted_by=system_default`), so name the role whenever the operator has a view), `alternatives` (auto-fill options you already generated — **one `--alternatives` flag per option**, written as full prose with its reason; never pack several into one flag), `confidence` (`high`/`medium`/`low`). Phrase the `rationale` as a **Y-statement** — *"In the context of X, we chose Y over Z, accepting W"* — which captures the choice, the rejected alternatives, and the accepted trade-off in one line (our compact stand-in for anticipated consequences; the real consequences arrive later as a retrospective — decision 562).
-- **Fact saves — a mention is enough.** State what you are about to store and the `source_ref` you inferred (it sets `fact_kind`); the operator can OK it or adjust — no full questionnaire. Default `source_ref` to `"discussion_context"` for a conversation-derived fact.
+- **Fact saves — a mention is enough.** State what you are about to store and the `source_ref` you inferred (it sets `fact_kind`); the operator can OK it or adjust — no full questionnaire. If the fact names no `entities` yet, ask once and accept none as the answer (never mint one yourself — see `entities` above). Default `source_ref` to `"discussion_context"` for a conversation-derived fact.
 - **Null is allowed only as an explicit answer.** "No source" / "no alternatives" is a deliberate choice — record it and move on; never *skip* involving the operator.
 - Stamp `"elicited": true` when the operator was involved (had a say, or OK'd the mention) so coverage telemetry counts it. Trigger on decisions and significant facts, never on retrieval/summarising turns.
 
@@ -562,7 +566,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness:
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":4,"version":"0.8.72","daemon":"running","rem_daemon":"running",...}
+# → {"status":"ok","api_version":4,"version":"0.8.73","daemon":"running","rem_daemon":"running",...}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -618,7 +622,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.8.72", "api_version": 4, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.8.73", "api_version": 4, "tool": "shared-memory-framework"}`
 
 ### Updating This Skill
 

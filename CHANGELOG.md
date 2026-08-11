@@ -5,6 +5,73 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.73] — 2026-08-11
+
+### Changed — canonical top-level axis key for decisions (decision:1214)
+
+Implements the axis-persistence half of operator ruling `decision:1214`: every operator-asserted
+axis lives at metadata TOP LEVEL on every record type. A fact already complied; a decision's
+asserted domains have only ever lived inside the `decision` blob (the client shape
+`memory_bridge.py`'s `build_decision_metadata` has always used), so `resolve_domains(metadata)`
+never reached the canonical key for a decision even though the blob was resolved correctly at every
+call site that mattered.
+
+- **`coordinator.py`'s `handle_save`** — after domain ingress validation passes (any alias rewrite
+  already landed on the blob) and before the row is persisted, a decision save with asserted
+  `decision.domains` now materialises the SAME list into top-level `metadata["domains"]`. Additive
+  only: the blob is left untouched (payload fidelity, no client change required), and only decisions
+  gain the key — a retrospective is refused before this point if it names a domain at all (P17) and
+  never carries a `decision` blob, so it can never reach this branch with a value.
+- **No gate needed on the outbox path, and here is why.** `resolve_domains` (`domain_axis.py`) reads
+  the `decision` blob FIRST and only falls back to the top level when the blob is empty — same
+  precedence `PROJECT_SQL` uses. Since the blob already carries the asserted list, adding it at the
+  top level changes nothing `resolve_domains` returns for a decision: the outbox row's
+  `cypher_params["domains"]` (written from `resolve_domains(metadata)` a few lines below the
+  materialisation) is unaffected, not doubled, and the graph write path is unchanged. Pinned by
+  `test_decision_domain_materialisation_does_not_change_the_outbox_row`.
+
+### Added — per-entity provenance stamping (fact:1215)
+
+Optional, additive metadata field `entities_provenance`: `{"<entity name>": "operator"|"agent"}`.
+Coordinator ingress validates the shape when present — every key must be in the save's `entities`
+list, every value must be `"operator"` or `"agent"`; a mismatch is a 400
+`entities_provenance_invalid`. The mapping is stored verbatim (as it already was) — the ingress
+change is the validation, not the storage. When `entities` is present without
+`entities_provenance`, the save still succeeds; the response carries a new, separate
+`entities_provenance_note` field naming the gap, so an unstamped entity is seen at capture time
+rather than only on inspection. No `API_VERSION` bump — both additions are additive response/request
+fields.
+
+### Fixed — the stale Tier-3-consolidation-requires-entities contract (fact:1215)
+
+`fact:1215` established, code-verified, that entities no longer gate Tier 3 consolidation: the
+NREM fold walks the `DOMAIN_OF`→`PROJECT_OF` spine (project+domain), not an entity level. The
+save-response warning and its docstring in `coordinator.py`'s `save_response_warning` still claimed
+"no 'entities' in metadata — fact ineligible for Tier 3 consolidation", which was true before
+fact:1215 and is false now. Replaced with an honest `NOTE:` — no entities is fine for consolidation;
+entities feed graph navigation and REM/entity-relation linking only. `SKILL.md` (both copies) carried
+the same stale claim in three places (the skill frontmatter description, the record-model `entities`
+field summary, and Task 2's save-elicitation paragraph) — all three corrected, and the Task 2
+paragraph additionally states the ruled capture discipline: entities the operator did not name are
+never added by the agent; ask once when none are given and accept none; one is enough when one is
+given; each named entity should be stamped in `entities_provenance`; and an entity is never the
+project/section a record belongs to (the subject-vs-axis test) — that is an axis, not a topic.
+
+### Group 1+2 (client/delivery, capture/ontology) — SKILL.md, both copies
+
+`entities_provenance` documented as an elicitable, optional capture field with its shape and the
+`entities_provenance_note` advisory it produces when absent. The entities/consolidation contract
+correction is itself a Group 2 (capture surface) fix — the prior text actively mis-taught agents to
+add entities for a reason (Tier 3 eligibility) that no longer holds. Worked-example version strings
+bumped to `0.8.73` (enforced by `test_capture_surface_documented.py`). `API_VERSION` unchanged.
+The same stale claim ("Facts saved without entities are ... never eligible for consolidation") was
+also corrected in `Documentation/schema.md` (both copies, shipped via `MANIFEST.txt`).
+
+### Group 3 (daemon/observability) — none
+
+No telemetry, `/health`, or monitor-visible shape changed. The two response additions
+(`entities_provenance_note`, the materialised `domains` key in stored metadata) are save-path only.
+
 ## [0.8.72] — 2026-08-11
 
 ### Changed — supersession propagation splits BY TIER (decision:1207)
