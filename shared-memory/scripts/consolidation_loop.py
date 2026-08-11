@@ -578,7 +578,8 @@ def _kth_oldest_age_seconds(cluster_id_lists, ts_map, k):
 class _CycleRec:
     """Mutable fold tally + coverage census threaded through a recorded cycle."""
     __slots__ = ("attempted", "succeeded", "failed",
-                 "eligible_clusters", "eligible_oldest_age", "run_id",
+                 "eligible_clusters", "eligible_oldest_age",
+                 "dead_lettered_clusters", "run_id",
                  # Stage-5 confidence/preservation telemetry (extends the
                  # accounting shape — the original fields are untouched).
                  "edges_awaiting_calibration", "machine_edges_consumed",
@@ -595,6 +596,12 @@ class _CycleRec:
         # crash mid-fold still records what was eligible. None until set.
         self.eligible_clusters = None
         self.eligible_oldest_age = None
+        # D1 (fact:1189, decision:1121/I7): clusters excluded from the
+        # census above because NREM_FOLD_FAIL_CAP dead-lettered them this
+        # pass — a NEW, separate count, never folded into eligible_clusters'
+        # existing meaning. 0 (not None) once a census has run this cycle,
+        # so a cycle that dead-lettered nothing reports 0, not absence.
+        self.dead_lettered_clusters = 0
         # consolidation_runs.id of THIS cycle — stamped onto each summary it writes
         # (community_summaries.run_id) for fact→summary→cycle lineage (Stage 2b).
         self.run_id = None
@@ -634,6 +641,7 @@ class _CycleRec:
             or self.preservation_retries or self.preservation_failures
             or self.preservation_failed or self.truncation_failures
             or self.truncation_failed or self.fold_dead_letter
+            or self.dead_lettered_clusters
         ):
             return None
         out = {
@@ -642,6 +650,10 @@ class _CycleRec:
             "preservation_retries": self.preservation_retries,
             "preservation_failures": self.preservation_failures,
             "truncation_failures": self.truncation_failures,
+            # D1 (fact:1189, decision:1121/I7) — NEW key, never an alias for
+            # eligible_clusters: a cluster excluded here is one the census
+            # above deliberately does NOT count as eligible backlog.
+            "dead_lettered_clusters": self.dead_lettered_clusters,
         }
         if self.calibration is not None:
             out["calibration"] = self.calibration
@@ -2849,23 +2861,72 @@ class ConsolidationDaemon:
                 )
             ]
 
-            # Coverage census — AFTER the gate (the gate this cycle folds).
-            member_id_lists = [list(w[3]) for w in work_items]
+            # Fold dead-letter cap (see module docstring): keys that failed the
+            # preservation/truncation gates NREM_FOLD_FAIL_CAP times within the
+            # window are skipped, not re-folded every cycle. Own-conn fetch,
+            # failsafe {} — a broken ledger never dead-letters healthy clusters.
+            # Fetched BEFORE the coverage census (D1, fact:1189/decision:1121
+            # I7 — moved up from just above the fold loop): a permanently
+            # dead-lettered cluster must not count as eligible backlog, or the
+            # backlog this cycle reports (and _consolidation_stall_verdict,
+            # coordinator.py, reads) can never clear once one exists.
+            dead_letter = await loop.run_in_executor(None, fetch_fold_dead_letter_counts)
+
+            # D1 — partition BEFORE the census, not inside the fold loop, so
+            # the census below only ever sees clusters actually eligible to
+            # fold this pass. label is the human-readable display name
+            # (telemetry/logs); fold_key is the content-derived dead-letter
+            # identity — see _fold_identity (decision 882). Kept as a
+            # defensive check even though nothing on THIS path can populate
+            # it any more (§3.1 — see the note below): a dead-letter row
+            # written by code that predates this release can still
+            # legitimately skip a cluster until it ages out of
+            # NREM_FOLD_FAIL_WINDOW.
+            eligible_work_items = []
+            dead_lettered_count = 0
+            for project, section, contents, pg_ids in work_items:
+                label = f"domain:{project}/{section or SECTION_NONE}"
+                fold_key = _fold_identity("fact", pg_ids)
+                if dead_letter.get(fold_key, 0) >= NREM_FOLD_FAIL_CAP:
+                    dead_lettered_count += 1
+                    rec.fold_dead_letter.append(label)
+                    logger.error(
+                        "NREM fold dead-letter: '%s' failed preservation/truncation "
+                        "%d time(s) within %dd (cap %d) — SKIPPING this cluster. "
+                        "Operator reset = window expiry or consolidation_runs cleanup.",
+                        label, dead_letter[fold_key], NREM_FOLD_FAIL_WINDOW,
+                        NREM_FOLD_FAIL_CAP)
+                    continue
+                eligible_work_items.append((project, section, contents, pg_ids))
+
+            # Coverage census — AFTER the gate (the gate this cycle folds)
+            # AND after dead-letter exclusion (D1): a permanently-failing
+            # cluster is not eligible backlog. dead_lettered_count is
+            # reported separately (rec.dead_lettered_clusters, a NEW
+            # telemetry key) — never folded into eligible_clusters' existing
+            # meaning (CLAUDE.md Group 3: a metric whose meaning changes must
+            # change name).
+            member_id_lists = [list(w[3]) for w in eligible_work_items]
             all_member_ids = [pid for ids in member_id_lists for pid in ids]
             ts_map = await loop.run_in_executor(
                 None, lambda: _fetch_outbox_created_at(all_member_ids))
-            rec.eligible_clusters = len(work_items)
+            rec.eligible_clusters = len(eligible_work_items)
             rec.eligible_oldest_age = _kth_oldest_age_seconds(
                 member_id_lists, ts_map, DENSITY_THRESHOLD)
+            rec.dead_lettered_clusters = dead_lettered_count
 
             # I7 (refold_ledger clock): every fact this pass evaluated
             # (pg_ids_all, the full _find_grounded_fact_groups scan) but
-            # which did NOT land in an eligible (>= density) cluster
-            # (all_member_ids) is a candidate that does not gate — close any
-            # OPEN refold_ledger row citing it as dropped/below_density
-            # rather than let it sit open forever inflating the backlog
-            # count for a group that cannot fold on its own right now.
-            below_density_ids = sorted(set(pg_ids_all) - set(all_member_ids))
+            # which did NOT land in ANY density-gated cluster — regardless of
+            # dead-letter status; a dead-lettered cluster's members DID gate
+            # (they met density), they are simply not folding again right
+            # now, which is a different fact from never having gated at all
+            # — is a candidate that does not gate — close any OPEN
+            # refold_ledger row citing it as dropped/below_density rather
+            # than let it sit open forever inflating the backlog count for a
+            # group that cannot fold on its own right now.
+            all_gated_member_ids = [pid for w in work_items for pid in w[3]]
+            below_density_ids = sorted(set(pg_ids_all) - set(all_gated_member_ids))
             await loop.run_in_executor(
                 None, lambda: drop_below_density_refold_rows(
                     conn, below_density_ids, context="fact_consolidation"))
@@ -2879,12 +2940,6 @@ class ConsolidationDaemon:
                 None, lambda: drop_out_of_scan_refold_rows(
                     conn, pg_ids_all, context="fact_consolidation"))
 
-            # Fold dead-letter cap (see module docstring): keys that failed the
-            # preservation/truncation gates NREM_FOLD_FAIL_CAP times within the
-            # window are skipped, not re-folded every cycle. Own-conn fetch,
-            # failsafe {} — a broken ledger never dead-letters healthy clusters.
-            dead_letter = await loop.run_in_executor(None, fetch_fold_dead_letter_counts)
-
             # No entity, no project-only level (§2.1) — every work item folds
             # at LEVEL_DOMAIN with an empty entity/aliases. Constants, not
             # per-item fields, so the loop body below still reads naturally.
@@ -2892,26 +2947,8 @@ class ConsolidationDaemon:
             level = LEVEL_DOMAIN
             aliases: list = []
 
-            for project, section, contents, pg_ids in work_items:
-
-                # label is the human-readable display name (telemetry/logs);
-                # fold_key is the content-derived dead-letter identity — see
-                # _fold_identity (decision 882). Kept as a defensive check
-                # even though nothing on THIS path can populate it any more
-                # (§3.1 — see the note below): a dead-letter row written by
-                # code that predates this release can still legitimately
-                # skip a cluster until it ages out of NREM_FOLD_FAIL_WINDOW.
+            for project, section, contents, pg_ids in eligible_work_items:
                 label = f"domain:{project}/{section or SECTION_NONE}"
-                fold_key = _fold_identity("fact", pg_ids)
-                if dead_letter.get(fold_key, 0) >= NREM_FOLD_FAIL_CAP:
-                    rec.fold_dead_letter.append(label)
-                    logger.error(
-                        "NREM fold dead-letter: '%s' failed preservation/truncation "
-                        "%d time(s) within %dd (cap %d) — SKIPPING this cluster. "
-                        "Operator reset = window expiry or consolidation_runs cleanup.",
-                        label, dead_letter[fold_key], NREM_FOLD_FAIL_WINDOW,
-                        NREM_FOLD_FAIL_CAP)
-                    continue
 
                 # §3.1/§4.2 Path A step 2 — THE ZETTELKASTEN INDEX: a
                 # structured concatenation mapping each constituent pg_id to
@@ -3444,13 +3481,38 @@ class ConsolidationDaemon:
                     )
                 clusters = surviving
 
+                # D1 (fact:1189, decision:1121/I7): partition dead-lettered
+                # clusters out BEFORE the census, not inside the fold loop —
+                # a cluster NREM_FOLD_FAIL_CAP has permanently skipped must
+                # not count as eligible backlog, or the backlog this cycle
+                # reports (and _consolidation_stall_verdict, coordinator.py,
+                # reads) can never clear once one exists. dead_lettered_now
+                # is reported separately (rec.dead_lettered_clusters, a NEW
+                # telemetry key) — never folded into eligible_clusters'
+                # existing meaning (CLAUDE.md Group 3: a metric whose meaning
+                # changes must change name). This is the ONE place
+                # `_dead_lettered` is called for a fresh cluster — its
+                # logging/rec.fold_dead_letter side effect must fire exactly
+                # once per dead-lettered cluster, so the fold loop below no
+                # longer re-checks it.
+                eligible_clusters = []
+                dead_lettered_now = 0
+                for c in clusters:
+                    ids = [int(i) for i in c["judgement_ids"] if i is not None]
+                    if ids and _dead_lettered(c["entity"], ids, c.get("judgement_types") or {}):
+                        dead_lettered_now += 1
+                        continue
+                    eligible_clusters.append(c)
+                clusters = eligible_clusters
+
                 # Coverage census (PR-2) — captured BEFORE folding so a crash
                 # mid-fold still records what was eligible. eligible_clusters =
-                # uncovered insight opportunities; oldest age = the K-th-oldest
-                # member's outbox write-time (eligibility onset) of the most
-                # neglected cluster. Uses the FULL judgement reach (C4) — a
-                # component whose only new member is a retrospective must
-                # still be visible to the staleness census.
+                # uncovered insight opportunities NOT already dead-lettered;
+                # oldest age = the K-th-oldest member's outbox write-time
+                # (eligibility onset) of the most neglected cluster. Uses the
+                # FULL judgement reach (C4) — a component whose only new
+                # member is a retrospective must still be visible to the
+                # staleness census.
                 cluster_id_lists = [
                     [int(i) for i in c["judgement_ids"] if i is not None] for c in clusters
                 ]
@@ -3460,12 +3522,11 @@ class ConsolidationDaemon:
                 rec.eligible_clusters = len(clusters)
                 rec.eligible_oldest_age = _kth_oldest_age_seconds(
                     cluster_id_lists, ts_map, INSIGHT_AGE_CENSUS_K)
+                rec.dead_lettered_clusters = dead_lettered_now
                 for c in clusters:
                     ids = [int(i) for i in c["judgement_ids"] if i is not None]
                     if not ids or any(i in folded for i in ids):
                         continue  # already folded as a re-fold this pass
-                    if _dead_lettered(c["entity"], ids, c.get("judgement_types") or {}):
-                        continue
                     logger.info(
                         "Insight cycle: fresh cluster on '%s/%s' — %d judgements.",
                         c["projects"][0] if c["projects"] else "?", c["domain"], len(ids),
