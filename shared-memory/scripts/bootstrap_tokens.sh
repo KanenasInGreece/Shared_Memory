@@ -31,6 +31,11 @@ force=0
 
 [[ -f "$ENV_FILE" ]] || { red "✗ .env not found at $ENV_FILE — run: bash shared-memory/scripts/install_framework.sh"; exit 1; }
 
+# Presence check before first use (defensive-bash rule from the sister
+# project's install review) — a curated message beats bash's bare
+# "uv: command not found" halfway through the run.
+command -v uv >/dev/null 2>&1 || { red "✗ uv not found on PATH — install uv first (preflight.sh checks this)."; exit 1; }
+
 # Guard: never silently overwrite a live token registry.
 if grep -qE '^[[:space:]]*AGENT_TOKENS=.+' "$ENV_FILE" && [[ "$force" -eq 0 ]]; then
     ylw "AGENT_TOKENS is already set in $ENV_FILE — refusing to regenerate."
