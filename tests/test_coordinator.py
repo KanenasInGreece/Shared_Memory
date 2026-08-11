@@ -1340,6 +1340,77 @@ async def test_search_stale_summaries_db_failure_degrades_with_a_logged_warning(
     assert "1" in msg   # count of summary_ids left unchecked
 
 
+@pytest.mark.asyncio
+async def test_search_stale_sources_db_failure_degrades_with_a_logged_warning(caplog):
+    """CQ-02 (six-role milestone audit, Optional) — log parity with
+    `stale_summaries` above. Before this fix `stale_map`'s except path
+    (`_stale_sources`'s equivalent failure path, on the `technical_docs`
+    query) swallowed silently while `stale_summary_map`'s degraded loudly —
+    an asymmetry a code comment in coordinator.py flagged as known and
+    deferred. A transient DB fault on the `stale_map` fetch must not read as
+    "no superseded sources" with zero trace: the search still succeeds and
+    the annotation is simply absent (advisory, never load-bearing), but the
+    degrade is now logged, in the same shape as the stale_summaries warning.
+    MUTATION-CHECKED: removing the `log.warning(...)` call in coordinator.py's
+    `stale_map` except path makes this test fail on the log assertions while
+    the degrade-to-no-annotation behaviour still passes."""
+    c, mock_conn, mock_session = _coordinator_with_mocks()
+
+    mock_conn.fetchrow = AsyncMock(side_effect=[
+        {
+            "id": 900,
+            "content": "Insight: the outbox pattern holds",
+            # No summary_ids — keeps the (unrelated) stale_summaries query out
+            # of this test entirely, isolating the stale_map failure path.
+            "metadata": {"kind": "insight",
+                         "project": "shared-memory-GitHub", "domains": ["architecture"]},
+            "source_pg_ids": [501],
+        },
+        None,
+    ])
+
+    async def _fetch_side_effect(sql, *params):
+        if "technical_docs" in sql and "superseded_by" in sql:
+            raise RuntimeError("connection reset by peer")
+        return [{"id": 1, "content": "fact content",
+                  "metadata": {"entities": [], "source": "claude-code"}}]
+
+    mock_conn.fetch = AsyncMock(side_effect=_fetch_side_effect)
+    mock_session.run = AsyncMock(return_value=_AsyncIter())
+
+    mock_reranker = MagicMock()
+    mock_reranker.raise_for_status = MagicMock()
+    mock_reranker.json = MagicMock(return_value={
+        "results": [{"index": 0, "relevance_score": 2.0},
+                    {"index": 1, "relevance_score": 1.0}]
+    })
+
+    with caplog.at_level(logging.WARNING, logger="coordinator"):
+        with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+            with patch("httpx.AsyncClient") as mock_cls:
+                mock_http = AsyncMock()
+                mock_http.post = AsyncMock(return_value=mock_reranker)
+                mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_http)
+                mock_cls.return_value.__aexit__  = AsyncMock(return_value=None)
+
+                req = _make_request({"query": "outbox pattern", "limit": 5})
+                resp = await c.handle_search(req)
+
+    # Search itself is unaffected — the annotation is advisory, not load-bearing.
+    assert resp.status == 200
+    results = json.loads(resp.text)["results"]
+    insight_result = next(r for r in results if r["tier"] == "insight_summary")
+    assert "stale_sources" not in insight_result
+
+    # The degrade was LOGGED, not silent.
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    msg = " ".join(r.getMessage() for r in warnings)
+    assert "stale_sources" in msg
+    assert "RuntimeError" in msg
+    assert "connection reset by peer" in msg
+    assert "1" in msg   # count of source ids left unchecked
+
+
 # ── Auth source overwrite — Phase 2C ─────────────────────────────────────────
 
 @pytest.mark.asyncio

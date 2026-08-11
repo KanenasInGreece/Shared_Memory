@@ -115,13 +115,30 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _short(value: Any, cap: int = 200) -> str:
+    """repr(value), truncated so a caller-supplied string can never blow up a
+    400 response body. Every 400 error message that echoes a request value
+    (a project/domain name, an entities_provenance key, a `since` filter, …)
+    must route through this rather than interpolating the raw value — an
+    unbounded echo turns a validation error into an amplification vector and,
+    against a large-enough payload, a proto-DoS.
+
+    Pure and total: any input that `repr()` accepts is safe here, including
+    non-strings (ints, None, dicts) passed through the same validators.
+    """
+    text = repr(value)
+    if len(text) <= cap:
+        return text
+    return text[:cap] + "…[truncated]"
+
+
 # ── Version contract ────────────────────────────────────────────────────────────
 # FRAMEWORK_VERSION is the informational build/semver — it changes every release.
 # API_VERSION is the wire contract between memory_bridge.py (the thin client that
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.74"
+FRAMEWORK_VERSION = "0.8.75"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -2773,9 +2790,9 @@ class MemoryCoordinator:
                 "status": "error",
                 "error": "project_spelling_variant",
                 "message": (
-                    f"project {supplied!r} differs from the registered project "
-                    f"{variant!r} only in separators or capitalisation, so it is a "
-                    f"SPELLING of it and not a new project. Save under {variant!r}. "
+                    f"project {_short(supplied)} differs from the registered project "
+                    f"{_short(variant)} only in separators or capitalisation, so it is a "
+                    f"SPELLING of it and not a new project. Save under {_short(variant)}. "
                     "If the project genuinely needs to be renamed, that is a "
                     "deliberate operation with its own tool and ledger, never a "
                     "side effect of a save."
@@ -2792,7 +2809,7 @@ class MemoryCoordinator:
                 "status": "error",
                 "error": "project_confusable",
                 "message": (
-                    f"project {supplied!r} is close enough to an existing project to "
+                    f"project {_short(supplied)} is close enough to an existing project to "
                     f"be a typo for it: {unconfirmed}. ASK THE OPERATOR whether this "
                     "is genuinely a separate project. If it is, re-send with "
                     "metadata.confirm_distinct_from listing the projects above; if it "
@@ -2958,9 +2975,9 @@ class MemoryCoordinator:
                 "status": "error",
                 "error": "domain_spelling_variant",
                 "message": (
-                    f"domain {name!r} differs from {variant!r}, already a section of "
-                    f"{project!r}, only in separators or capitalisation — so it is a "
-                    f"SPELLING of it and not a new section. Save under {variant!r}."
+                    f"domain {_short(name)} differs from {_short(variant)}, already a section of "
+                    f"{_short(project)}, only in separators or capitalisation — so it is a "
+                    f"SPELLING of it and not a new section. Save under {_short(variant)}."
                 ),
                 "proposals": near,
             }
@@ -2974,7 +2991,7 @@ class MemoryCoordinator:
                 "status": "error",
                 "error": "domain_confusable",
                 "message": (
-                    f"domain {name!r} is close enough to a section {project!r} "
+                    f"domain {_short(name)} is close enough to a section {_short(project)} "
                     f"already has to be a typo for it: {unconfirmed}. ASK THE "
                     "OPERATOR whether this is genuinely a separate section. If it "
                     "is, re-send with metadata.confirm_distinct_from listing the "
@@ -3148,7 +3165,7 @@ class MemoryCoordinator:
             "status": "error",
             "error": "domain_unknown",
             "message": (
-                f"domain {name!r} is not a registered section of project {project!r}. "
+                f"domain {_short(name)} is not a registered section of project {_short(project)}. "
                 "Either it is a typo for one of the proposals, or it is a new "
                 "section, in which case re-send with metadata.new_domain = true to "
                 "register it. ASK THE OPERATOR which, rather than picking for them. "
@@ -3268,7 +3285,7 @@ class MemoryCoordinator:
             )
         else:
             message = (
-                f"project {supplied!r} is not registered. Either it is a typo for an "
+                f"project {_short(supplied)} is not registered. Either it is a typo for an "
                 "existing project — the proposals list near matches — or it is a new "
                 "project, in which case re-send with metadata.new_project = true to "
                 "register it. ASK THE OPERATOR which, rather than picking for them. "
@@ -3530,7 +3547,7 @@ class MemoryCoordinator:
                             "status": "error",
                             "error": "entities_provenance_invalid",
                             "message": (
-                                f"entities_provenance names {name!r}, which is not "
+                                f"entities_provenance names {_short(name)}, which is not "
                                 "in this save's entities list."
                             ),
                         },
@@ -3542,7 +3559,7 @@ class MemoryCoordinator:
                             "status": "error",
                             "error": "entities_provenance_invalid",
                             "message": (
-                                f"entities_provenance[{name!r}] = {value!r} — must be "
+                                f"entities_provenance[{_short(name)}] = {_short(value)} — must be "
                                 f"one of {sorted(ENTITIES_PROVENANCE_VALUES)}."
                             ),
                         },
@@ -4411,7 +4428,7 @@ class MemoryCoordinator:
                 if lab not in ("correct", "incorrect"):
                     return web.json_response(
                         {"status": "error",
-                         "message": f"invalid operator label {lab!r} — "
+                         "message": f"invalid operator label {_short(lab)} — "
                                     "must be 'correct' or 'incorrect'"},
                         status=400,
                     )
@@ -4874,7 +4891,7 @@ class MemoryCoordinator:
             except ValueError:
                 return web.json_response(
                     {"status": "error",
-                     "message": f"since is not a valid ISO date/datetime: {since_raw!r}"},
+                     "message": f"since is not a valid ISO date/datetime: {_short(since_raw)}"},
                     status=400,
                 )
 
@@ -5146,7 +5163,18 @@ class MemoryCoordinator:
                         list(prov_ids),
                     )
                 stale_map = {r["id"]: r["superseded_by"] for r in srows}
-            except Exception:
+            except Exception as e:
+                # FAILURE != IDLE — same reasoning as `stale_summaries` below:
+                # a transient DB fault must not read as "no superseded
+                # sources" with zero trace. Search still degrades (the
+                # annotation is advisory, never load-bearing for the result
+                # itself), but the degrade is now visible in the log — CQ-02
+                # (v0.8.75) closed the asymmetry the parity note used to flag.
+                log.warning(
+                    "stale_sources annotation degraded (%s: %s) — "
+                    "%d source ids unchecked",
+                    type(e).__name__, e, len(prov_ids),
+                )
                 stale_map = {}  # column missing (pre-013) — degrade to no annotation
 
         def _stale_sources(source_pg_ids, meta) -> list[dict]:
@@ -5197,10 +5225,6 @@ class MemoryCoordinator:
                 # superseded summaries" with zero trace. Search still degrades
                 # (the annotation is advisory, never load-bearing for the
                 # result itself), but the degrade is now visible in the log.
-                # ⚠ PARITY NOTE: `stale_map` just above (`_stale_sources`'s
-                # equivalent failure path) still swallows silently — that
-                # asymmetry is known and out of scope for this change; fix it
-                # there separately if it is ever warranted.
                 log.warning(
                     "stale_summaries annotation degraded (%s: %s) — "
                     "%d summary_ids unchecked",
@@ -5443,7 +5467,7 @@ class MemoryCoordinator:
         except ValueError as exc:
             return web.json_response(
                 {"status": "error",
-                 "message": f"reference must be an integer or <type>:<id> ({exc})"},
+                 "message": f"reference must be an integer or <type>:<id> ({_short(exc)})"},
                 status=400,
             )
 
@@ -6093,6 +6117,19 @@ class MemoryCoordinator:
                   AS folds_succeeded_24h,
               sum(folds_attempted) FILTER (WHERE started_at > now() - interval '24 hours')
                   AS folds_attempted_24h,
+              -- AR-01 (v0.8.75): truncation_failures/slot_failures are written
+              -- into consolidation_runs.extra by _CycleRec.extra() (same shape
+              -- as dead_lettered_clusters below) but were never rolled up here
+              -- — so the FIRST scaffold-fold protocol failure (slot_failed) was
+              -- invisible to any monitor. Additive keys only; mirrors the
+              -- dead_lettered_clusters extraction pattern for the latest value,
+              -- and folds_succeeded_24h's sum-FILTER shape for the 24h total.
+              sum((extra->>'truncation_failures')::int)
+                  FILTER (WHERE started_at > now() - interval '24 hours'
+                          AND extra ? 'truncation_failures') AS truncation_failures_24h,
+              sum((extra->>'slot_failures')::int)
+                  FILTER (WHERE started_at > now() - interval '24 hours'
+                          AND extra ? 'slot_failures') AS slot_failures_24h,
               count(*) FILTER (WHERE finished_at IS NULL
                   AND started_at > now() - make_interval(secs => $1)) AS inflight,
               count(*) FILTER (WHERE outcome = 'crashed'
@@ -6116,7 +6153,14 @@ class MemoryCoordinator:
               -- consolidation_runs.extra by the daemon (_CycleRec.extra()).
               -- A NEW key — never an alias for eligible_clusters.
               (array_agg((extra->>'dead_lettered_clusters')::int ORDER BY started_at DESC)
-                  FILTER (WHERE extra ? 'dead_lettered_clusters'))[1] AS dead_lettered_clusters
+                  FILTER (WHERE extra ? 'dead_lettered_clusters'))[1] AS dead_lettered_clusters,
+              -- AR-01: latest recorded value of each, same shape as
+              -- dead_lettered_clusters above — None means no cycle has yet
+              -- written this key (pre-fix rows), not zero.
+              (array_agg((extra->>'truncation_failures')::int ORDER BY started_at DESC)
+                  FILTER (WHERE extra ? 'truncation_failures'))[1] AS truncation_failures,
+              (array_agg((extra->>'slot_failures')::int ORDER BY started_at DESC)
+                  FILTER (WHERE extra ? 'slot_failures'))[1] AS slot_failures
             FROM ranked GROUP BY cycle_type
         """
         async with self._acquire() as conn:
@@ -6162,6 +6206,17 @@ class MemoryCoordinator:
                 "dead_lettered_clusters": (
                     int(r["dead_lettered_clusters"])
                     if r and r["dead_lettered_clusters"] is not None else None),
+                # AR-01 (v0.8.75): latest recorded truncation_failures/
+                # slot_failures, same None-means-not-yet-recorded contract as
+                # dead_lettered_clusters above — a protocol failure (slot_failed)
+                # is now as visible as a capacity one (truncation_failed) always
+                # should have been.
+                "truncation_failures": (
+                    int(r["truncation_failures"])
+                    if r and r["truncation_failures"] is not None else None),
+                "slot_failures": (
+                    int(r["slot_failures"])
+                    if r and r["slot_failures"] is not None else None),
                 # Why the most-recent deferral happened (None if never deferred);
                 # only meaningful when last_outcome == "deferred".
                 "last_deferred_reason": (r["last_deferred_reason"] if r else None),
@@ -6184,6 +6239,15 @@ class MemoryCoordinator:
                 "folds_attempted_24h": (
                     int(r["folds_attempted_24h"])
                     if r and r["folds_attempted_24h"] is not None else 0),
+                # AR-01: 24h sums, same zero-means-none-occurred contract as the
+                # folds_* pair above (unlike the latest-value keys, absence over
+                # a real window is a true zero, not missing evidence).
+                "truncation_failures_24h": (
+                    int(r["truncation_failures_24h"])
+                    if r and r["truncation_failures_24h"] is not None else 0),
+                "slot_failures_24h": (
+                    int(r["slot_failures_24h"])
+                    if r and r["slot_failures_24h"] is not None else 0),
                 "last_started": (
                     r["last_started"].isoformat()
                     if r and r["last_started"] is not None else None),

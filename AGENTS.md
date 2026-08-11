@@ -262,7 +262,9 @@ uv run --with neo4j python shared-memory/migrations/verify_neo4j_init.py # Neo4j
 systemctl --user restart hive-mind-gateway.service
 curl -s http://localhost:8888/health                                     # api_version, status ok
 uv run --with psycopg2-binary python \
-    shared-memory/scripts/backfill_domain_of.py                          # AFTER restart — see below
+    shared-memory/scripts/backfill_domain_of.py                          # AFTER restart, dry-run first — see below
+uv run --with psycopg2-binary python \
+    shared-memory/scripts/backfill_domain_of.py --apply                  # then APPLY — dry-run alone enqueues nothing
 bash shared-memory/scripts/sync_skills.sh                                # refresh installed skills
 ```
 
@@ -271,7 +273,9 @@ preference.** It enqueues a narrow repair row that only a gateway from v0.8.47 u
 worker does not recognise the row type, falls through to its ordinary fact branch, and blanks the
 content of every record it touches. The script refuses to enqueue against a gateway that is too old —
 including one it cannot reach, because an unknown version is not permission to write — so running it
-early is safe but pointless. It is **dry-run by default**; nothing is enqueued without `--apply`.
+early is safe but pointless. It is **dry-run by default**; nothing is enqueued without `--apply` —
+the upgrade snippet above runs it once without the flag to show what WOULD be enqueued, then again
+with `--apply` to actually enqueue it, because the upgrade flow needs the row applied, not previewed.
 It is also only needed on a deployment whose records already carry a `domain` in their metadata: a
 new install has none, and every save from here on writes its own edge.
 

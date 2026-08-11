@@ -5,6 +5,79 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.75] — 2026-08-11
+
+Pre-0.9.0 audit fix batch — four findings from the six-role milestone audit (Security, Adversarial,
+Code Quality, Ops), all additive/observability-only. No wire-contract change (`API_VERSION` stays 4).
+
+### Fixed — SEC-03 (Security, Required): cap echoed input in 400 messages
+
+Several `coordinator.py` 400 error messages interpolated caller-supplied strings unbounded into the
+response body (project/domain name validators, `entities_provenance` keys/values, `since` parse
+failures, the operator-label check, the qualified-reference parser) — an unbounded echo turns a
+validation error into an amplification vector against a large-enough payload. New pure helper
+`_short(value, cap=200)` (repr, truncated with an ellipsis marker) now sits between every such
+interpolation and the caller-supplied value; every 400-message site that echoes request content was
+swept and routed through it. Registry-internal values (already-registered project/domain names,
+`SENTINEL`) are left as plain `!r}` — they are bounded by construction, not caller-supplied.
+
+Mutation-checked: reverting either of the two new tests' target sites (`since` parse failure,
+`entities_provenance` key/value) back to bare `!r}` interpolation makes the corresponding test's
+length assertion fail against a 5000-char probe value (verified live).
+
+### Fixed — AR-01 (Adversarial, Critical): `slot_failed` invisible to telemetry
+
+`truncation_failures`/`truncation_failed` (capacity failures) and `slot_failures`/`slot_failed`
+(protocol failures — a scaffold slot still missing after its one bounded retry) are written
+identically into `consolidation_runs.extra` by `_CycleRec.extra()`, but neither was ever read back by
+`_compute_consolidation_health`'s roll-up — so the FIRST live `slot_failed` occurrence would have been
+invisible to `/memory/telemetry` and the monitor. Both are now extracted, mirroring the existing
+`dead_lettered_clusters` pattern: a latest-recorded-value pair per cycle type (`truncation_failures`,
+`slot_failures` — `None` means no row this pass carried the key, not zero) plus a 24h sum pair
+(`truncation_failures_24h`, `slot_failures_24h` — `0` means a real window with nothing in it, mirroring
+`folds_succeeded_24h`/`folds_attempted_24h`). Additive keys only; existing keys unchanged.
+
+`truncation_failures` had the identical gap despite the audit's framing assuming it already reached
+telemetry (it did not, on inspection) — fixed alongside `slot_failures` rather than shipping a
+half-fix that leaves an analogous blind spot on the capacity-failure side.
+
+Mutation-checked: dropping either extraction (the SQL column or the response dict key) makes
+`test_truncation_and_slot_failures_surfaced_per_cycle_type` fail (verified live).
+
+### Fixed — CQ-02 (Code Quality, Optional): log parity on stale annotations
+
+`handle_search`'s `stale_map` fetch (the `technical_docs`/`superseded_by` lookup behind
+`_stale_sources`) swallowed a DB failure silently, while the sibling `stale_summary_map` fetch (behind
+`_stale_summaries`) logged a `WARNING` naming the exception class/message and the count of unchecked
+ids — an asymmetry a code comment from v0.8.72 flagged as known and deferred. `_stale_sources`'
+failure path now logs in the same shape; the parity-note comment is removed since the asymmetry it
+described no longer exists.
+
+Mutation-checked: removing the new `log.warning(...)` call makes
+`test_search_stale_sources_db_failure_degrades_with_a_logged_warning` fail on the log assertions while
+the degrade-to-no-annotation behaviour still passes (verified live).
+
+### Fixed — OR-1/OR-2 (Ops, High/Medium): documented commands were wrong
+
+- **README.md §17 Testing** — the three published pytest command lines (full suite, single file,
+  single test case) were missing `--with asyncpg --with aiohttp --with json-repair --with numpy`,
+  dependencies the suite imports; a reader following the docs verbatim hit `ModuleNotFoundError`. All
+  four command blocks (including the `MOCK_LLM=1` one) now match the canonical line in `AGENTS.md`/
+  `CLAUDE.md`. Verified by running the corrected full-suite line exactly as written: 1378 passed.
+- **AGENTS.md upgrade snippet** — `backfill_domain_of.py` ran without `--apply`, silently dry-running a
+  step the upgrade flow needs applied (nothing was actually enqueued). The snippet now shows both
+  invocations — the dry-run preview, then `--apply` — with a clarifying half-line on why both appear.
+  Spot-checked the other three upgrade-path scripts (`apply.py`, `reconcile_project_identity.py`,
+  `verify_neo4j_init.py`) against their actual top-level imports: no other missing-dependency class
+  found in the sections touched.
+
+### Not included — findings triaged out of this batch
+
+- **AR-03** — a design question referred to the operator, not a fix.
+- **AR-05** — accepted posture; no change warranted.
+- **CQ-01** — a queued convention, deferred to a later pass.
+- **CQ-03, CQ-04, SEC-04** — post-milestone; not part of this batch.
+
 ## [0.8.74] — 2026-08-11
 
 ### Added — search axis filters: `project`, `domains`, `since` (both clients + MCP + gateway)

@@ -1855,21 +1855,25 @@ All tests are fully mocked — no live database or gateway required. Run from th
 # Full suite
 uv run --with pytest --with pytest-asyncio --with fastmcp \
        --with psycopg2-binary --with httpx --with neo4j \
+       --with asyncpg --with aiohttp --with json-repair --with numpy \
        pytest tests/ -v
 
 # Single file
 uv run --with pytest --with pytest-asyncio --with fastmcp \
        --with psycopg2-binary --with httpx --with neo4j \
+       --with asyncpg --with aiohttp --with json-repair --with numpy \
        pytest tests/test_vector_skill.py
 
 # Single test case
 uv run --with pytest --with pytest-asyncio --with fastmcp \
        --with psycopg2-binary --with httpx --with neo4j \
+       --with asyncpg --with aiohttp --with json-repair --with numpy \
        pytest tests/test_vector_skill.py::test_mcp_save_artifact_success
 
 # Skip LLM calls in consolidation tests
 MOCK_LLM=1 uv run --with pytest --with pytest-asyncio --with fastmcp \
            --with psycopg2-binary --with httpx --with neo4j \
+           --with asyncpg --with aiohttp --with json-repair --with numpy \
            pytest tests/test_consolidation_e2e.py
 ```
 
