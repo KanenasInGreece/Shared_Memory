@@ -5,6 +5,51 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.70] — 2026-08-11
+
+### Fixed — NREM truth & observability: the census stops lying, the ledger becomes visible
+
+Post-first-firing review fixes (findings D1–D4, shared-memory `fact:1189`, independently verified
+`fact:1190`; full multi-role pre-merge review `fact:1198`/`fact:1199`).
+
+- **The eligibility census no longer counts dead-lettered clusters (D1, HIGH).** In both the fact
+  and insight cycles, `eligible_clusters`/`eligible_oldest_age` were computed before the
+  `NREM_FOLD_FAIL_CAP` dead-letter filter, so one permanently-failing cluster inflated eligible
+  backlog forever and the `stalled` verdict could never clear (I7). The census now runs over
+  genuinely eligible clusters only; the excluded count ships as a NEW per-cycle telemetry key,
+  `dead_lettered_clusters` — never an alias for `eligible_clusters`. The below-density ledger close
+  deliberately still scopes to ALL density-gated members: a dead-lettered cluster's members did
+  gate, which is a different fact from never gating.
+- **The preservation-gate retry log prints the per-fold attempt (D2).** It printed the cycle-global
+  retry counter against the per-fold cap — "attempt 8/2" observed live; the loop itself was always
+  correctly bounded.
+- **Insight clusters carry an honest display label (D3).** The walk-built clusters hardcoded
+  `entity:""`, logging every fold as `Folding insight for ''`. Now `{project}/{domain}`; the
+  dead-letter fold identity (member refs) is untouched, and the insight write path has no upsert
+  key, so no reader depended on the empty string.
+- **The corrective-retry instruction states the check that is actually enforced (D4).** It demanded
+  each dropped anchor as an exact character-for-character substring while the gate checks token-level
+  containment — forcing constructed word-salad fragments verbatim into insight prose to satisfy a bar
+  the gate never enforced. Gate semantics and the hard-anchor rule are unchanged.
+
+### Added — `refold_ledger` telemetry (O1/O2)
+
+- **`GET /memory/telemetry` gains a top-level `refold_ledger` section**: `by_status_reason`
+  (every `(status, closed_reason)` pair — `dropped/below_density` and `dropped/out_of_scan` are now
+  distinguishable from a genuine stall), `by_trigger_kind` (direct supersession vs C3 lineage
+  cascade), and `insight_reconciliation_stuck` — open insight-kind ledger rows whose judgement node
+  still reads `consolidated=true` in the graph, the previously-invisible failure of the best-effort
+  graph write (I17). All reads are guarded: a ledger error can never break the endpoint.
+- **Monitor contract**: four new keys, no existing key changes meaning
+  (`shared-memory-monitor` is owed a dashboard update).
+
+### Removed
+
+- **`HANDOFF.md`** — a builder-worktree artifact accidentally shipped to `main` by PR #229; per the
+  build workflow a handoff dies with its worktree (leak-audited clean before removal).
+
+---
+
 ## [0.8.69] — 2026-08-11
 
 ### Changed — the payload stage (C4): what a summary actually carries
