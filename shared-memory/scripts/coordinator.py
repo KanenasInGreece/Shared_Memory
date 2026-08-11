@@ -121,7 +121,7 @@ def _env_float(name: str, default: float) -> float:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.8.72"
+FRAMEWORK_VERSION = "0.8.73"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -525,18 +525,24 @@ def _supersession_target_error(pg_id: int, record_type: object) -> str | None:
     return None
 
 
+# entities_provenance (fact:1215): who named each entity — "operator" (an
+# explicit, human-chosen concept) or "agent" (proposed without that
+# confirmation). Closed enum; a value outside it is a shape error, not a new
+# spelling to accommodate.
+ENTITIES_PROVENANCE_VALUES = ("operator", "agent")
+
+
 def save_response_warning(record_type: object, entities, grounded_in) -> str:
     """The save response's advisory suffix — WHICH omission leaves this record
     unreachable by synthesis, stated per record type.
 
     "Unreachable" means something different for each type, so one message
-    cannot serve both. A FACT mints the entity vocabulary; an empty `entities`
-    is therefore the defect it has always been, and the record will never reach
-    Tier 3. A DECISION mints nothing by design — since v0.8.26 it inherits its
-    topics by walking to the facts it rests on — so warning it about `entities`
-    fires on every decision saved exactly as instructed and teaches the operator
-    the opposite of the shipped rule. The client-side twin of this message was
-    already made type-aware; this is the server half of the same edit.
+    cannot serve both. A DECISION mints nothing by design — since v0.8.26 it
+    inherits its topics by walking to the facts it rests on — so warning it
+    about `entities` fires on every decision saved exactly as instructed and
+    teaches the operator the opposite of the shipped rule. The client-side
+    twin of this message was already made type-aware; this is the server half
+    of the same edit.
 
     A decision that rests on no fact is NOT an error. The greenfield case is
     real and supported: a project with no facts yet, where the operator decides
@@ -545,6 +551,17 @@ def save_response_warning(record_type: object, entities, grounded_in) -> str:
     retrospective that eventually measures it, whose facts the decision then
     inherits across HAD_OUTCOME. So the note says exactly that, and does not
     pretend the record is broken.
+
+    ⛔ A FACT with no entities is NOT what this used to say. Before fact:1215,
+    consolidation gated on the (entity, project) cluster key, so an empty
+    `entities` really did mean "never reaches Tier 3" — that was true when this
+    message was written. It no longer is: the fold now walks the
+    DOMAIN_OF→PROJECT_OF spine (project+domain), not an entity level, so an
+    entity-less fact is fully consolidatable. `entities` still matters — it is
+    the only way a new concept enters the graph, and it feeds graph navigation
+    and REM/entity-relation linking — but Tier 3 eligibility is not one of the
+    things it buys. Saying otherwise trains the operator to add entities for a
+    reason that no longer holds, which is a worse outcome than an honest note.
 
     Retrospectives never reach this function: grounding is REQUIRED of them at
     ingress (an ungrounded verdict measures nothing), so the omission is a 400,
@@ -564,7 +581,11 @@ def save_response_warning(record_type: object, entities, grounded_in) -> str:
         return ""
     if entities:
         return ""
-    return " WARNING: no 'entities' in metadata — fact ineligible for Tier 3 consolidation."
+    return (
+        " NOTE: no entities — fine for Tier 3 consolidation (the fold keys on"
+        " project+domain, not entities); entities feed graph navigation and"
+        " REM/entity-relation linking only."
+    )
 
 
 def _apply_principal(target: dict[str, Any], principal: dict[str, Any] | None) -> dict[str, Any]:
@@ -3339,6 +3360,38 @@ class MemoryCoordinator:
         if domain_error is not None:
             return web.json_response(domain_error, status=400)
 
+        # Canonical top-level axis key (decision:1214): every OPERATOR-ASSERTED
+        # axis lives at metadata TOP LEVEL on every record type — that is
+        # already how a fact carries its `project`/`domain`, and it is the key
+        # every reader that inspects Postgres directly (rather than resolving
+        # through `resolve_domains`) should be able to trust. A decision's
+        # asserted domains have only ever lived in the `decision` blob (the
+        # client shape memory_bridge.py's build_decision_metadata has always
+        # used), so materialise the SAME list to the top level here — after
+        # ingress validation, so any alias rewrite has already landed on the
+        # blob, and before the row is persisted.
+        #
+        # ⚠ ADDITIVE, NOT A REWRITE: the blob is left exactly as sent (payload
+        # fidelity for existing clients — nothing threads a new field through
+        # the CLI/MCP surface for this). Only decisions gain the top-level key;
+        # a retrospective is refused before this point if it names a domain at
+        # all (P17) and never populates a `decision` blob of its own, so it can
+        # never reach this branch with a value.
+        #
+        # ⛔ WHY NO GATE WAS NEEDED FOR THE OUTBOX: `resolve_domains` (used to
+        # build the outbox row's cypher_params["domains"] a few lines below)
+        # reads the `decision` blob FIRST and only falls back to the top level
+        # when the blob is empty (domain_axis.py). Since the blob already
+        # carries this exact list, adding it at the top level changes nothing
+        # `resolve_domains` returns for a decision — the outbox row is
+        # unaffected, not double-written, and a judgement still never reaches
+        # the graph write with a top-level-ONLY value. See
+        # test_decision_domain_materialisation_does_not_change_the_outbox_row.
+        if metadata.get("type") == "decision":
+            decision_domains = resolve_domains(metadata)
+            if decision_domains:
+                metadata["domains"] = decision_domains
+
         # Fact supersession (decision 381, refined by 384): an optional
         # `supersedes` pointer marks an existing fact superseded by THIS save.
         # Validated at ingress — target must exist and not already be superseded —
@@ -3380,6 +3433,60 @@ class MemoryCoordinator:
                 {"status": "error", "message": "metadata.entities must be a list"},
                 status=400,
             )
+
+        # Per-entity provenance stamping (fact:1215) — additive, no api_version
+        # bump. `entities_provenance` is an optional {name: "operator"|"agent"}
+        # mapping saying, for each named entity, WHO named it: the operator
+        # (an explicit, human-chosen concept) or the agent (proposed without
+        # that confirmation). Validated at ingress so a malformed mapping fails
+        # loudly rather than being stored verbatim and silently ignored; the
+        # shape check is the whole job here — the values themselves are never
+        # second-guessed against the record's content.
+        entities_provenance = metadata.get("entities_provenance")
+        if entities_provenance is not None:
+            if not isinstance(entities_provenance, dict):
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "error": "entities_provenance_invalid",
+                        "message": (
+                            "metadata.entities_provenance must be an object mapping "
+                            "each named entity to 'operator' or 'agent'."
+                        ),
+                    },
+                    status=400,
+                )
+            entity_set = set(entities)
+            for name, value in entities_provenance.items():
+                if name not in entity_set:
+                    return web.json_response(
+                        {
+                            "status": "error",
+                            "error": "entities_provenance_invalid",
+                            "message": (
+                                f"entities_provenance names {name!r}, which is not "
+                                "in this save's entities list."
+                            ),
+                        },
+                        status=400,
+                    )
+                if value not in ENTITIES_PROVENANCE_VALUES:
+                    return web.json_response(
+                        {
+                            "status": "error",
+                            "error": "entities_provenance_invalid",
+                            "message": (
+                                f"entities_provenance[{name!r}] = {value!r} — must be "
+                                f"one of {sorted(ENTITIES_PROVENANCE_VALUES)}."
+                            ),
+                        },
+                        status=400,
+                    )
+        # An entity named with no stated provenance is not an error — it is an
+        # honest gap the response surfaces (see `entities_provenance_note`
+        # below) so it is seen at capture time rather than only on inspection.
+        entities_provenance_missing = bool(entities) and entities_provenance is None
+
         content_hash = hashlib.sha256(content.encode()).hexdigest()
 
         # Embedding — hard mandate; no save without a vector
@@ -3569,12 +3676,24 @@ class MemoryCoordinator:
         sup_msg = (
             f" Superseded fact {superseded_pg_id}." if superseded_pg_id is not None else ""
         )
+        # entities_provenance_note (fact:1215): a separate advisory field, not
+        # folded into `warn`/`message` — it answers a different question ("who
+        # named these entities?") from the consolidation-eligibility note above,
+        # and conflating the two would put a Tier-3 question and a provenance
+        # question behind the same string. Present (non-null) only when the
+        # save named entities but stated no provenance for any of them.
+        entities_provenance_note = (
+            "no entities_provenance stated — each named entity's origin"
+            " (operator-named vs agent-added) is unknown."
+            if entities_provenance_missing else None
+        )
         return web.json_response({
             "status": "success",
             "pg_id": pg_id,
             "neo4j": neo4j_status,
             "superseded": superseded_pg_id,
             "message": f"Artifact stored with ID {pg_id}.{sup_msg}{warn}",
+            "entities_provenance_note": entities_provenance_note,
         })
 
     # ── POST /memory/supersede ────────────────────────────────────────────────
