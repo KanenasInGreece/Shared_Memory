@@ -5,6 +5,55 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.71] — 2026-08-11
+
+### Changed — insight payload BY CONSTRUCTION, the preservation-anchor gate retired (decision:1205)
+
+Implements operator ruling `decision:1205`, grounded on `fact:1204` (measured live: the anchor gate
+caused a retry lottery and forced fabricated quoted titles into insight prose). The thematic fold
+(`§3.1`, zero-inference Zettelkasten) is untouched by this release — it never called the retired
+machinery.
+
+- **An insight's `content` is now ASSEMBLED BY CODE, never emitted whole by the LLM.** Per DECISION:
+  `[decision:N] «<title, verbatim>»` then an LLM-filled one-sentence rationale. Per RETROSPECTIVE: no
+  title (never fabricated — retrospectives have none), `[retrospective:M → decision:N] rating:
+  <rating> — <LLM-filled summary>`, `N` read from `metadata->>'target_pg_id'` (no graph call). A
+  retrospective whose target decision is outside the fetched judgement set (defensive edge) renders
+  at the END of the scaffold instead of being dropped. Reversal lines (`fetch_reversal_context`) are
+  already machine-built strings and are included verbatim — the WHAT/WHY obligation is now satisfied
+  by construction, no LLM compliance or anchor needed to keep it intact.
+- **ONE LLM call fills every slot**, via a strictly-parsed `SLOT <pg_id>: <text>` / `PRINCIPLE:
+  <text>` protocol (`generate_insight_slots` / `_build_insight_prompt` / `parse_insight_slots`).
+  Per-judgement prompt input (pg_id, type, title, body) is capped by the new
+  `NREM_INSIGHT_SLOT_INPUT_CHARS` (default 2000, head of the text). A slot or PRINCIPLE still empty
+  after parsing gets ONE bounded retry asking only for what is missing; still missing FAILS THE UNIT
+  with the same no-partial-write semantics truncation already used — no partial insight is ever
+  written.
+- **`preservation_anchor` / `summary_preserves` / `corrective_block` are RETIRED and deleted**, along
+  with the corrective-retry loop and `NREM_PRESERVATION_MAX_RETRIES`, `PRESERVATION_COVERAGE`,
+  `PRESERVATION_SLACK_MIN_UNITS` — no remaining caller (the thematic path stopped using them in C4;
+  verified by grep before deletion).
+- **The fold dead-letter query (`fetch_fold_dead_letter_counts`) now reads `truncation_failed`
+  ONLY** — it used to also union `preservation_failed`. Historical pre-v0.8.71 rows may still carry
+  `preservation_failed`; counting them would let a stale, pre-redesign failure keep dead-lettering a
+  cluster the new construction-based path would now succeed at on the first try.
+- **MOCK_LLM fabricates a well-formed `SLOT`/`PRINCIPLE` reply and parses it through the SAME parser
+  a real call uses** — assembly is never special-cased for mocks.
+
+### Group 3 (daemon/observability) — deliberate telemetry shape change
+
+`extra.preservation_retries` / `extra.preservation_failures` / `extra.preservation_failed` STOP being
+written on insight runs — `_CycleRec` no longer has those fields at all. Every insight-fold failure
+(real truncation AND a slot still missing after its bounded retry) now lands in the pre-existing
+`extra.truncation_failures` / `extra.truncation_failed` instead — there is no longer a separate
+content-preservation failure class to keep apart from it. Truncation counters/semantics for the
+fact-fold path are unchanged.
+
+### Group 2 (capture/ontology) — no capture-surface change, version-only SKILL.md edits
+
+No new operator-facing field; the worked-example version strings in both `SKILL.md` copies were
+bumped to `0.8.71` (enforced by `test_capture_surface_documented.py`).
+
 ## [0.8.70] — 2026-08-11
 
 ### Fixed — NREM truth & observability: the census stops lying, the ledger becomes visible

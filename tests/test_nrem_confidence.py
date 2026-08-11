@@ -1,14 +1,17 @@
 """Unit tests for NREM stage 5 of the REM rebuild — calibration-gated cluster
-assessment + the deterministic preservation gate (decisions 718/726/727).
+assessment + the insight-slot payload-BY-CONSTRUCTION protocol
+(decision:1205, v0.8.71, retiring decisions 718/726/727's anchor gate).
 
 Covers: the edge predicate the cluster finders carry (the Cypher mirror of
 relation_confidence.consumable — the Python function is the source of truth),
 the fail-closed uncalibrated gate, the excluded-machine-edge telemetry
 ("filtered back" to the relation_adjudications review queue), type/kind
 differentiated fold blocks, grounding-edge evidence lines (operator vs
-MACHINE-PROPOSED, consumable-gated), the preservation_anchor/summary_preserves
-pure functions, the retry-then-requeue flow, and the MOCK_LLM anchor-echoing
-end-to-end pass.
+MACHINE-PROPOSED, consumable-gated), the SLOT/PRINCIPLE parser and prompt
+builder (`parse_insight_slots` / `_build_insight_prompt` /
+`_insight_slot_items`), the missing-slot bounded-retry-then-fail-the-unit
+flow, the narrowed fold dead-letter query (truncation_failed only), and the
+MOCK_LLM end-to-end pass.
 
 All Postgres/Neo4j/LLM I/O is stubbed — no live infrastructure required.
 """
@@ -29,9 +32,10 @@ from consolidation_loop import (
     OPERATOR_ASSERTED,
     _CycleRec,
     _default_calibration_gate,
-    corrective_block,
-    preservation_anchor,
-    summary_preserves,
+    _assemble_insight_content,
+    _build_insight_prompt,
+    _insight_slot_items,
+    parse_insight_slots,
 )
 
 
@@ -229,177 +233,209 @@ def test_default_gate_is_fail_closed():
 # rendering (`_fold_insight`, tested below).
 
 
-# ── preservation_anchor / summary_preserves (pure) ────────────────────────────
+# ── decision:1205 — insight payload BY CONSTRUCTION (pure helpers) ────────────
 
-def test_preservation_anchor_fact_longest_distinctive_word():
-    assert preservation_anchor("The consolidation daemon writes summaries. More.") \
-        == "consolidation"
-
-
-def test_preservation_anchor_falls_back_when_no_long_words():
-    assert preservation_anchor("ab cde fg") == "cde"
-
-
-def test_preservation_anchor_empty_and_non_string():
-    assert preservation_anchor("") == ""
-    assert preservation_anchor(None) == ""
-    assert preservation_anchor("   ") == ""
+def test_insight_slot_items_decision_title_is_first_line_body_is_the_rest():
+    rows = [(245, "Adopt outbox pattern\n\nrationale here, quite long",
+             "p", "decision", {})]
+    items = _insight_slot_items(rows)
+    assert items == [{"pg_id": 245, "type": "decision",
+                      "title": "Adopt outbox pattern",
+                      "body": "rationale here, quite long"}]
 
 
-def test_preservation_anchor_decision_adds_title_words():
-    a = preservation_anchor("Adopt outbox pattern for atomic writes\n\nrationale here",
-                            "decision")
-    toks = a.split()
-    # longest word + first 4 significant title words, de-duplicated
-    assert "pattern" in toks and "Adopt" in toks and "outbox" in toks and "atomic" in toks
-    assert len(toks) == len({t.lower() for t in toks})   # deterministic dedup
+def test_insight_slot_items_retrospective_has_no_title_full_notes_as_body():
+    rows = [(900, "held under load across three incidents",
+             "p", "retrospective", {})]
+    items = _insight_slot_items(rows)
+    assert items[0]["title"] is None
+    assert items[0]["body"] == "held under load across three incidents"
 
 
-def test_preservation_anchor_is_deterministic():
-    c = "Measured latency dropped after the reranker deploy"
-    assert preservation_anchor(c) == preservation_anchor(c)
+def test_insight_slot_items_body_capped_at_input_chars(monkeypatch):
+    monkeypatch.setattr(cl, "NREM_INSIGHT_SLOT_INPUT_CHARS", 10)
+    rows = [(1, "Title\n\n" + ("x" * 50), "p", "decision", {})]
+    items = _insight_slot_items(rows)
+    assert items[0]["body"] == "x" * 10
 
 
-def test_summary_preserves_pass_and_missing():
-    anchors = [("consolidation", False), ("outbox", False)]
-    ok, missing = summary_preserves("The consolidation daemon and the outbox worker.", anchors)
-    assert ok and missing == []
-    ok, missing = summary_preserves("The consolidation daemon only.", anchors)
-    assert not ok and missing == ["outbox"]
+def test_build_insight_prompt_lists_every_slot_and_principle():
+    items = _insight_slot_items([
+        (1, "Decision A\n\nrationale", "p", "decision", {}),
+        (2, "held under load", "p", "retrospective", {}),
+    ])
+    prompt = _build_insight_prompt("E", items)
+    assert "SLOT 1: <one-sentence text>" in prompt
+    assert "SLOT 2: <one-sentence text>" in prompt
+    assert "PRINCIPLE: <text>" in prompt
+    assert "[JUDGEMENT pg_id=1 type=decision]" in prompt
+    assert "Title: Decision A" in prompt
+    assert "[JUDGEMENT pg_id=2 type=retrospective]" in prompt
+    assert "Title:" not in prompt.split("[JUDGEMENT pg_id=2")[1].split("\n")[1]
 
 
-def test_corrective_block_empty_is_noop():
-    assert corrective_block([]) == ""
-    assert corrective_block(None) == ""
+def test_build_insight_prompt_only_ids_restricts_judgement_blocks():
+    items = _insight_slot_items([
+        (1, "Decision A", "p", "decision", {}),
+        (2, "Decision B", "p", "decision", {}),
+    ])
+    prompt = _build_insight_prompt("E", items, only_ids={2}, need_principle=False)
+    assert "pg_id=2" in prompt
+    assert "pg_id=1" not in prompt
+    assert "SLOT 2:" in prompt and "SLOT 1:" not in prompt
+    assert "PRINCIPLE" not in prompt
+    assert "Your previous reply was missing" in prompt
 
 
-def test_corrective_block_demands_per_word_verbatim_not_whole_phrase():
-    """D4 (fact:1189): summary_preserves checks TOKEN-LEVEL containment —
-    each whitespace-separated word of an anchor fragment, independently,
-    anywhere in the text. The instruction used to claim a stricter bar (the
-    WHOLE fragment as one exact, character-for-character substring), which
-    forced the LLM to embed constructed multi-word fragments verbatim as one
-    phrase to satisfy a rule the gate was never actually enforcing. The text
-    must now state the real per-word requirement, not the old whole-phrase
-    one — and still name each fragment, still forbid omission."""
-    text = corrective_block(["Outbox-to-Ingest Adopt Gated Promotion", "refined"])
-    assert "WORD BY WORD, not as one exact phrase" in text
-    assert "do NOT need to stay together, stay in order, or be adjacent" in text
-    # ⛔ The old, over-strict claim must be GONE — its presence is exactly
-    # the D4 defect (instruction stricter than the check it corrects for).
-    assert "EXACT, literal, character-for-character substring" not in text
-    assert '"Outbox-to-Ingest Adopt Gated Promotion"' in text
-    assert '"refined"' in text
-    assert "none of the words may be omitted" in text.lower()
+def test_build_insight_prompt_reversal_block_present_only_when_given():
+    items = _insight_slot_items([(1, "Decision A", "p", "decision", {})])
+    prompt = _build_insight_prompt("E", items)
+    assert "REVERSALS" not in prompt
+
+    prompt2 = _build_insight_prompt(
+        "E", items,
+        reversal_lines=["Decision pg_id=9 (\"Old\") was REVERTED. Reversing "
+                        "retrospective pg_id=10: because it failed"])
+    assert "[BEGIN REVERSALS]" in prompt2
+    assert "was REVERTED" in prompt2
 
 
-def test_summary_preserves_fact_slack_ten_percent():
-    # 10 plain-fact anchors, 1 missing → 90% coverage → PASS (paraphrase slack).
-    anchors = [(f"anchorword{i}", False) for i in range(10)]
-    text = " ".join(f"anchorword{i}" for i in range(9))
-    ok, missing = summary_preserves(text, anchors)
-    assert ok and missing == ["anchorword9"]
-    # 2 missing → 80% → FAIL.
-    text = " ".join(f"anchorword{i}" for i in range(8))
-    ok, _ = summary_preserves(text, anchors)
-    assert not ok
+def test_build_insight_prompt_previous_insight_present_only_when_given():
+    items = _insight_slot_items([(1, "Decision A", "p", "decision", {})])
+    assert "PREVIOUS INSIGHT" not in _build_insight_prompt("E", items)
+    prompt2 = _build_insight_prompt("E", items, previous_insight="prior narrative")
+    assert "[BEGIN PREVIOUS INSIGHT]\nprior narrative" in prompt2
 
 
-def test_summary_preserves_slack_reaches_the_ordinary_cluster_band():
-    """The ratio alone quantises to zero slack below 10 anchors — and
-    DENSITY_THRESHOLD makes 5-9 the ordinary band, so the advertised
-    paraphrase tolerance never reached the common case. One dropped soft
-    anchor must be survivable at every size from the slack floor upward."""
-    for n in range(5, 12):
-        anchors = [(f"anchorword{i}", False) for i in range(n)]
-        text = " ".join(f"anchorword{i}" for i in range(n - 1))   # 1 dropped
-        ok, missing = summary_preserves(text, anchors)
-        assert ok, f"one dropped soft anchor must survive at cluster size {n}"
-        assert missing == [f"anchorword{n - 1}"]
+# ── parse_insight_slots (pure) ─────────────────────────────────────────────────
+
+def test_parse_insight_slots_basic():
+    text = "SLOT 1: rationale one.\nSLOT 2: summary two.\nPRINCIPLE: the shared principle."
+    slots, principle = parse_insight_slots(text)
+    assert slots == {1: "rationale one.", 2: "summary two."}
+    assert principle == "the shared principle."
 
 
-def test_summary_preserves_slack_is_monotone_no_cliff_at_ten():
-    """No discontinuity: a 9-record cluster must not be gated harder than a
-    10-record one. Before the count-based budget, 9 tolerated zero drops and
-    10 tolerated one — neighbouring sizes with materially different gates."""
-    def tolerated(n):
-        anchors = [(f"anchorword{i}", False) for i in range(n)]
-        drops = 0
-        while drops < n:
-            text = " ".join(f"anchorword{i}" for i in range(n - drops - 1))
-            ok, _ = summary_preserves(text, anchors)
-            if not ok:
-                break
-            drops += 1
-        return drops
-    budgets = [tolerated(n) for n in range(2, 22)]
-    assert budgets == sorted(budgets), f"slack must not shrink as n grows: {budgets}"
-    assert tolerated(9) == tolerated(10) == 1
+def test_parse_insight_slots_multiline_value_captured_until_next_marker():
+    text = "SLOT 1: line one\nstill line one.\nSLOT 2: line two.\nPRINCIPLE: p."
+    slots, _ = parse_insight_slots(text)
+    assert slots[1] == "line one\nstill line one."
 
 
-def test_summary_preserves_tiny_clusters_stay_all_or_nothing():
-    """Below the slack floor the gate stays absolute — a 2-record cluster
-    must not get a 50%-loss allowance out of the rounding fix."""
-    for n in (2, 3, 4):
-        anchors = [(f"anchorword{i}", False) for i in range(n)]
-        text = " ".join(f"anchorword{i}" for i in range(n - 1))
-        ok, _ = summary_preserves(text, anchors)
-        assert not ok, f"cluster size {n} is below the slack floor — no drops"
+def test_parse_insight_slots_empty_marker_is_treated_as_missing():
+    text = "SLOT 1:   \nSLOT 2: present.\nPRINCIPLE:   "
+    slots, principle = parse_insight_slots(text)
+    assert 1 not in slots
+    assert slots[2] == "present."
+    assert principle is None
 
 
-def test_summary_preserves_slack_floor_is_tunable():
-    anchors = [(f"anchorword{i}", False) for i in range(6)]
-    text = " ".join(f"anchorword{i}" for i in range(5))           # 1 dropped
-    assert summary_preserves(text, anchors, slack_min_units=5)[0]
-    assert not summary_preserves(text, anchors, slack_min_units=9)[0]
+def test_parse_insight_slots_case_insensitive_marker():
+    text = "slot 1: rationale.\nprinciple: p."
+    slots, principle = parse_insight_slots(text)
+    assert slots == {1: "rationale."}
+    assert principle == "p."
 
 
-def test_summary_preserves_hard_anchor_ignores_the_slack_floor():
-    """The slack budget must never rescue a decision/retrospective anchor —
-    the operator's core demand is untouched by the rounding fix."""
-    anchors = [(f"anchorword{i}", False) for i in range(8)] + [("decisiontitle", True)]
-    text = " ".join(f"anchorword{i}" for i in range(8))           # only the hard one missing
-    ok, missing = summary_preserves(text, anchors)
-    assert not ok and missing == ["decisiontitle"]
+def test_parse_insight_slots_empty_and_none_text():
+    assert parse_insight_slots("") == ({}, None)
+    assert parse_insight_slots(None) == ({}, None)
 
 
-def test_summary_preserves_decision_anchor_never_droppable():
-    # Same 90% coverage, but the missing anchor is a DECISION anchor → hard fail.
-    anchors = [(f"anchorword{i}", False) for i in range(9)] + [("decisiontitle", True)]
-    text = " ".join(f"anchorword{i}" for i in range(9))
-    ok, missing = summary_preserves(text, anchors)
-    assert not ok and missing == ["decisiontitle"]
+def test_parse_insight_slots_ignores_prose_before_first_marker():
+    text = "Sure, here is my answer:\nSLOT 1: rationale.\nPRINCIPLE: p."
+    slots, principle = parse_insight_slots(text)
+    assert slots == {1: "rationale."}
+    assert principle == "p."
 
 
-def test_summary_preserves_multiword_anchor_token_level_case_insensitive():
-    ok, _ = summary_preserves("The OUTBOX pattern was adopted; writes stayed atomic.",
-                              [("Adopt outbox atomic", True)])
-    assert ok                                            # re-ordering absorbed
-    ok, missing = summary_preserves("The outbox pattern.", [("Adopt outbox atomic", True)])
-    assert not ok and missing == ["Adopt outbox atomic"]
+# ── _assemble_insight_content — the payload-BY-CONSTRUCTION scaffold ──────────
+
+def test_assemble_insight_content_contains_every_decision_title_and_pg_id():
+    """(a) mutate the assembly to drop a title and this test dies."""
+    rows = [
+        (245, "Adopt outbox pattern\n\nrationale", "p", "decision", {}),
+        (267, "Adopt listen notify triggers\n\nrationale", "p", "decision", {}),
+    ]
+    slots = {245: "why A.", 267: "why B.", "PRINCIPLE": "shared principle."}
+    content = _assemble_insight_content(rows, [], slots)
+    assert "[decision:245]" in content and "«Adopt outbox pattern»" in content
+    assert "[decision:267]" in content and "«Adopt listen notify triggers»" in content
+    assert "why A." in content and "why B." in content
+    assert "PRINCIPLE: shared principle." in content
 
 
-def test_summary_preserves_empty_anchor_set_passes():
-    assert summary_preserves("anything", []) == (True, [])
-    assert summary_preserves("anything", [("", True)]) == (True, [])
+def test_assemble_insight_content_ascending_pg_id_order():
+    """(b) invert the sort key in _assemble_insight_content and this test dies."""
+    rows = [
+        (267, "Decision B", "p", "decision", {}),
+        (245, "Decision A", "p", "decision", {}),
+    ]
+    slots = {245: "a", 267: "b", "PRINCIPLE": "p"}
+    content = _assemble_insight_content(rows, [], slots)
+    assert content.index("[decision:245]") < content.index("[decision:267]")
 
 
-# ⛔ REMOVED (C4): `generate_summary`'s differentiated-block-line /
-# corrective-paragraph tests, and the GROUNDING-instruction test on
-# `generate_insight`'s prompt. `generate_summary` itself is gone (§3.1's
-# thematic fold is zero/low-inference — a deterministic concatenation via
-# `fold_record_line`, tested directly in `test_fold_origin.py`; the
-# preservation-gate retry loop it used to drive is gone with it, tested
-# below only for the still-LLM-backed insight path). `generate_insight`'s
-# prompt no longer instructs on GROUNDING lines — see
-# `test_insight_consolidation.py`'s
-# `test_fold_insight_blocks_are_strictly_title_and_rationale` for the
-# positive assertion that those lines never reach the prompt at all.
+def test_assemble_insight_content_retrospective_renders_under_its_target():
+    """(c) normal case — target decision present in the fold."""
+    rows = [
+        (245, "Decision A\n\nrationale", "p", "decision", {}),
+        (900, "held under load", "p", "retrospective",
+         {"rating": "validated", "target_pg_id": 245}),
+    ]
+    slots = {245: "why.", 900: "it held.", "PRINCIPLE": "p"}
+    content = _assemble_insight_content(rows, [], slots)
+    assert "[retrospective:900 → decision:245] rating: validated — it held." in content
+    assert content.index("[decision:245]") < content.index("[retrospective:900")
 
-def _capture_nrem(monkeypatch, reply="synth"):
-    captured = {}
+
+def test_assemble_insight_content_retrospective_defensive_edge_missing_target():
+    """(c) defensive edge — target decision NOT in the fetched judgement set:
+    the retrospective is rendered at the END (never dropped), pointer
+    intact. pg_id=150 sorts BEFORE pg_id=700 — if the retrospective were
+    merely left in its natural ascending position (no deferral), it would
+    render BEFORE decision:700, not after; this proves the deferral moved
+    it, not just that ascending order happened to put it there."""
+    rows = [
+        (100, "Decision X", "p", "decision", {}),
+        (150, "held under load", "p", "retrospective",
+         {"rating": "validated", "target_pg_id": 999}),
+        (700, "Decision Y", "p", "decision", {}),
+    ]
+    slots = {100: "why x.", 150: "it held.", 700: "why y.", "PRINCIPLE": "p"}
+    content = _assemble_insight_content(rows, [], slots)
+    assert "[retrospective:150 → decision:999] rating: validated — it held." in content
+    assert content.index("[decision:700]") < content.index("[retrospective:150")
+
+
+def test_assemble_insight_content_retrospective_never_gets_a_fabricated_title():
+    """(f) — retrospectives have no title; the gate must never invent one."""
+    rows = [
+        (245, "Decision A", "p", "decision", {}),
+        (900, "held under load", "p", "retrospective",
+         {"rating": "validated", "target_pg_id": 245}),
+    ]
+    slots = {245: "why.", 900: "it held.", "PRINCIPLE": "p"}
+    content = _assemble_insight_content(rows, [], slots)
+    retro_line = next(l for l in content.splitlines() if l.startswith("[retrospective:900"))
+    assert "«" not in retro_line and "»" not in retro_line
+
+
+def test_assemble_insight_content_includes_reversal_lines_verbatim():
+    rows = [(245, "Decision A", "p", "decision", {})]
+    slots = {245: "why.", "PRINCIPLE": "p"}
+    reversal = ("Decision pg_id=9 (\"Old\") was REVERTED. Reversing "
+                "retrospective pg_id=10: because it failed")
+    content = _assemble_insight_content(rows, [reversal], slots)
+    assert reversal in content
+
+
+# ── generate_insight_slots — the ONE LLM call + missing-slot retry ────────────
+
+def _capture_nrem(monkeypatch, reply="SLOT 1: rationale.\nPRINCIPLE: p."):
+    captured = {"prompts": []}
     async def fake_post(client, payload, ceiling_s=None):
-        captured["prompt"] = payload["messages"][1]["content"]
+        captured["prompts"].append(payload["messages"][1]["content"])
         class R:
             status_code = 200
             def json(self):
@@ -410,49 +446,76 @@ def _capture_nrem(monkeypatch, reply="synth"):
 
 
 @pytest.mark.asyncio
-async def test_generate_insight_corrective_paragraph_names_dropped_anchors(monkeypatch):
+async def test_generate_insight_slots_single_call_when_first_pass_complete(monkeypatch):
     monkeypatch.delenv("MOCK_LLM", raising=False)
-    captured = _capture_nrem(monkeypatch)
+    captured = _capture_nrem(monkeypatch, "SLOT 1: rationale one.\nPRINCIPLE: the principle.")
     daemon, _ = daemon_with_fake_graph()
-    await daemon.generate_insight("E", ["[DECISION pg_id=1]\nf1"],
-                                  corrective=["consolidation", "outbox"])
-    prompt = captured["prompt"]
-    assert "CORRECTION: the previous draft dropped" in prompt
-    assert "WORD BY WORD, not as one exact phrase" in prompt
-    assert '"consolidation"' in prompt and '"outbox"' in prompt
+    rows = [(1, "Decision A\n\nrationale", "p", "decision", {})]
+    slots = await daemon.generate_insight_slots("E", rows)
+    assert slots == {1: "rationale one.", "PRINCIPLE": "the principle."}
+    assert len(captured["prompts"]) == 1
 
 
 @pytest.mark.asyncio
-async def test_generate_insight_reversal_block_present_only_when_given(monkeypatch):
+async def test_generate_insight_slots_missing_slot_gets_one_bounded_retry(monkeypatch):
+    """(d) missing-slot → bounded retry → success once the retry supplies it."""
     monkeypatch.delenv("MOCK_LLM", raising=False)
-    captured = _capture_nrem(monkeypatch)
     daemon, _ = daemon_with_fake_graph()
-    await daemon.generate_insight("E", ["[DECISION pg_id=1]\nf1"])
-    assert "REVERSALS" not in captured["prompt"]
+    replies = iter([
+        "SLOT 1: rationale one.\nPRINCIPLE: the principle.",   # slot 2 missing
+        "SLOT 2: rationale two.",                               # retry supplies it
+    ])
+    captured = {"prompts": []}
+    async def fake_post(client, payload, ceiling_s=None):
+        captured["prompts"].append(payload["messages"][1]["content"])
+        reply = next(replies)
+        class R:
+            status_code = 200
+            def json(self):
+                return {"choices": [{"message": {"content": reply}}]}
+        return R()
+    monkeypatch.setattr(cl, "_post_nrem", fake_post)
+    rows = [(1, "Decision A\n\nra", "p", "decision", {}),
+            (2, "Decision B\n\nrb", "p", "decision", {})]
+    slots = await daemon.generate_insight_slots("E", rows)
+    assert slots == {1: "rationale one.", 2: "rationale two.",
+                     "PRINCIPLE": "the principle."}
+    assert len(captured["prompts"]) == 2
+    assert "pg_id=2" in captured["prompts"][1]
+    assert "pg_id=1" not in captured["prompts"][1]
 
-    captured2 = _capture_nrem(monkeypatch)
-    await daemon.generate_insight(
-        "E", ["[DECISION pg_id=1]\nf1"],
-        reversal_lines=["Decision pg_id=9 (\"Old\") was REVERTED. Reversing "
-                        "retrospective pg_id=10: because it failed"])
-    assert "[BEGIN REVERSALS]" in captured2["prompt"]
-    assert "was REVERTED" in captured2["prompt"]
-    assert "explicitly state WHAT was reverted and WHY" in captured2["prompt"]
-
-
-# ── MOCK_LLM stubs echo the anchors (gate passes honestly, no special-casing) ─
 
 @pytest.mark.asyncio
-async def test_mock_insight_echoes_blocks(monkeypatch):
+async def test_generate_insight_slots_still_missing_after_retry_fails_the_unit(monkeypatch):
+    """(d) missing-slot → bounded retry → STILL missing → FAIL THE UNIT (None,
+    no partial insight ever written), same shape truncation already uses."""
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    daemon, _ = daemon_with_fake_graph()
+    _capture_nrem(monkeypatch, "SLOT 1: rationale one.\nPRINCIPLE: the principle.")
+    rows = [(1, "Decision A\n\nra", "p", "decision", {}),
+            (2, "Decision B\n\nrb", "p", "decision", {})]
+    slots = await daemon.generate_insight_slots("E", rows)
+    assert slots is None
+    assert daemon._last_llm_missing_slots is True
+    assert daemon._last_llm_truncated is False
+
+
+# ── MOCK_LLM produces well-formed slots for every pg_id + PRINCIPLE ───────────
+# decision:1205 — the mock fabricates only the RAW LLM text; it is parsed by
+# the SAME `parse_insight_slots` a real call uses. Assembly is never
+# special-cased for mocks.
+
+@pytest.mark.asyncio
+async def test_mock_llm_insight_slots_cover_every_pg_id_and_principle(monkeypatch):
     monkeypatch.setenv("MOCK_LLM", "1")
     daemon, _ = daemon_with_fake_graph()
-    blocks = ["[DECISION pg_id=1 project=p]\nAdopt outbox pattern",
-              "[RETROSPECTIVE pg_id=2 project=p]\nvalidated under load"]
-    out = await daemon.generate_insight("E", blocks)
-    ok, missing = summary_preserves(
-        out, [(preservation_anchor("Adopt outbox pattern", "decision"), True),
-              (preservation_anchor("validated under load", "retrospective"), True)])
-    assert ok and missing == []
+    rows = [
+        (1, "Adopt outbox pattern\n\nrationale", "p", "decision", {}),
+        (2, "held under load", "p", "retrospective", {"rating": "validated", "target_pg_id": 1}),
+    ]
+    slots = await daemon.generate_insight_slots("E", rows)
+    assert set(slots) == {1, 2, "PRINCIPLE"}
+    assert all(slots.values())
 
 
 # ── _fold_insight — Postgres-only fetch shape (C4) ────────────────────────────
@@ -489,7 +552,7 @@ def _fold_script_two_decisions():
 # `rem_loop.py` still consume them directly.
 
 
-# ── Preservation gate: retry-then-requeue (insight path — still LLM-backed) ──
+# ── Thematic-fold fixtures (§3.1 — zero/low-inference, unrelated to insight) ──
 
 def _thematic_conn_script(insert_id=90):
     d = datetime.date(2026, 7, 11)
@@ -690,100 +753,67 @@ async def test_fact_cycle_dead_lettered_cluster_excluded_from_eligible_census(mo
 
 
 @pytest.mark.asyncio
-async def test_insight_preservation_retry_log_uses_per_fold_attempt_number(monkeypatch, caplog):
-    """D2 (fact:1189): the preservation-retry log must print THIS FOLD's own
-    retry attempt against the per-fold cap (NREM_PRESERVATION_MAX_RETRIES)
-    — never cyc.preservation_retries, a CYCLE-GLOBAL counter that keeps
-    accumulating across every fold the cycle attempts ('attempt 8/2'
-    observed live). Two folds share one _CycleRec, as run_insight_cycle's
-    loop does: each fold's OWN first retry must log 'attempt 1/2',
-    regardless of how many retries earlier folds in the same cycle already
-    burned."""
+async def test_fold_insight_writes_the_assembled_scaffold_not_llm_prose(monkeypatch):
+    """decision:1205 — `_fold_insight` writes `_assemble_insight_content`'s
+    output, never `generate_insight_slots`'s raw return, and needs no
+    preservation gate to do it (there is none left to call)."""
     monkeypatch.delenv("MOCK_LLM", raising=False)
     daemon, _ = daemon_with_fake_graph()
-    daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
-    cyc = _CycleRec()
-
-    def _script(id_a, id_b, word_a, word_b):
-        return [
-            {"rowcount": 2, "rows": [
-                (id_a, f"{word_a}\n\nrationale", "shared-memory-GitHub", "decision", {}),
-                (id_b, f"{word_b}\n\nrationale", "shared-memory-GitHub", "decision", {}),
-            ]},
-            {"rowcount": 0, "rows": []},                       # reversal leg 1
-            {"rowcount": 2, "rows": [(101,), (102,)]},          # outbox snapshot
-            {"rowcount": 1, "rows": [(77,)]},                   # INSERT
-            {"rowcount": 2, "rows": []},                        # ledger flip
-            {"rowcount": 0, "rows": []},                        # supersession SELECT
-            {"rowcount": 2, "rows": [(101, id_a), (102, id_b)]},  # close DELETE
-        ]
-
-    # Fold 1 — burns ONE retry (cyc.preservation_retries: 0 -> 1).
-    daemon.generate_insight = AsyncMock(side_effect=[
-        "This insight discusses pool contention.",              # missing both anchors
-        "This insight discusses Zorbex and Quixotic together.",  # both present
-    ])
-    conn1 = StubConn(script=_script(245, 267, "Zorbex", "Quixotic"))
-    with caplog.at_level("WARNING"):
-        ok1 = await daemon._fold_insight(conn1, "OutboxPattern", [245, 267], cyc=cyc)
-    assert ok1 is True
-    assert cyc.preservation_retries == 1
-
-    # Fold 2 — a SEPARATE fold in the SAME cycle. Also burns ONE retry of
-    # its own (cyc.preservation_retries: 1 -> 2), but its OWN attempt count
-    # is 1, not 2.
-    daemon.generate_insight = AsyncMock(side_effect=[
-        "This insight discusses pool contention.",
-        "This insight discusses Umbrose and Velvex together.",
-    ])
-    conn2 = StubConn(script=_script(345, 367, "Umbrose", "Velvex"))
-    with caplog.at_level("WARNING"):
-        ok2 = await daemon._fold_insight(conn2, "OutboxPattern", [345, 367], cyc=cyc)
-    assert ok2 is True
-    assert cyc.preservation_retries == 2   # cycle-global total — unchanged meaning
-
-    retry_lines = [m for m in caplog.messages if "corrective retry" in m]
-    assert len(retry_lines) == 2
-    # ⛔ Both folds' OWN first retry — never the cycle-global running count
-    # (which would print "attempt 1/2" then "attempt 2/2").
-    assert "attempt 1/2" in retry_lines[0]
-    assert "attempt 1/2" in retry_lines[1]
-
-
-@pytest.mark.asyncio
-async def test_insight_preservation_double_failure_no_write(monkeypatch, caplog):
-    """The same gate guards generate_insight: two failing drafts → no Postgres
-    write, False returned (open ledger rows are the durable requeue)."""
-    monkeypatch.delenv("MOCK_LLM", raising=False)
-    daemon, _ = daemon_with_fake_graph()
-    daemon.generate_insight = AsyncMock(side_effect=[
-        "irrelevant", "still irrelevant", "still irrelevant again"])
+    daemon.generate_insight_slots = AsyncMock(
+        return_value={245: "why A.", 267: "why B.", "PRINCIPLE": "the principle."})
     daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
     conn = StubConn(script=_fold_script_two_decisions())
     cyc = _CycleRec()
 
-    with caplog.at_level("WARNING"):
+    ok = await daemon._fold_insight(conn, "OutboxPattern", [245, 267], cyc=cyc)
+
+    assert ok is True
+    insert = next(p for s, p in conn.executed
+                  if s.startswith("INSERT INTO community_summaries"))
+    content = insert[0]
+    assert "[decision:245]" in content and "why A." in content
+    assert "[decision:267]" in content and "why B." in content
+    assert "PRINCIPLE: the principle." in content
+    assert cyc.truncation_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_fold_insight_missing_slots_after_retry_fails_no_write(monkeypatch, caplog):
+    """(d) generate_insight_slots exhausts its own bounded retry and returns
+    None with self._last_llm_missing_slots=True → _fold_insight FAILS THE
+    UNIT: no Postgres write, False returned, and the failure is counted
+    through truncation_failures/truncation_failed — decision:1205 retired
+    the separate preservation-failure counters, so this is now the ONLY
+    extras pair an insight-fold failure can land in (see item 5's dead-letter
+    query, which only ever reads truncation_failed)."""
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    daemon, _ = daemon_with_fake_graph()
+    daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
+    conn = StubConn(script=_fold_script_two_decisions())
+    cyc = _CycleRec()
+
+    async def _missing_slots(*a, **k):
+        daemon._last_llm_truncated = False
+        daemon._last_llm_missing_slots = True
+        return None
+    daemon.generate_insight_slots = _missing_slots
+
+    with caplog.at_level("ERROR"):
         ok = await daemon._fold_insight(conn, "OutboxPattern", [245, 267], cyc=cyc)
 
     assert ok is False
-    # NREM_PRESERVATION_MAX_RETRIES=2 — initial attempt + 2 corrective retries.
-    assert daemon.generate_insight.await_count == 3
-    assert daemon.generate_insight.call_args_list[1].kwargs["corrective"]
-    assert daemon.generate_insight.call_args_list[2].kwargs["corrective"]
     assert not any(s.startswith("INSERT INTO community_summaries") for s, _ in conn.executed)
-    assert cyc.preservation_retries == 2
-    assert cyc.preservation_failures == 1
+    assert cyc.truncation_failures == 1
     # Content-derived dead-letter key — sorted qualified refs over the
     # fold's own judgement ids ([245, 267]), both typed 'decision' here.
-    assert cyc.preservation_failed == ["decision:245,decision:267"]
-    assert any("Preservation gate FAILED after 2 corrective retries for insight" in m
-               for m in caplog.messages)
+    assert cyc.truncation_failed == ["decision:245,decision:267"]
+    assert any("incomplete after retry" in m for m in caplog.messages)
 
 
-# ── MOCK_LLM end-to-end passes the gate honestly (insight path) ──────────────
+# ── MOCK_LLM end-to-end writes honestly (insight path) ────────────────────────
 
 @pytest.mark.asyncio
-async def test_mock_llm_insight_fold_passes_preservation_gate(monkeypatch):
+async def test_mock_llm_insight_fold_writes_without_any_gate(monkeypatch):
     monkeypatch.setenv("MOCK_LLM", "1")
     daemon, _ = daemon_with_fake_graph()
     daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
@@ -793,7 +823,7 @@ async def test_mock_llm_insight_fold_passes_preservation_gate(monkeypatch):
     ok = await daemon._fold_insight(conn, "OutboxPattern", [245, 267], cyc=cyc)
 
     assert ok is True
-    assert cyc.preservation_retries == 0 and cyc.preservation_failures == 0
+    assert cyc.truncation_failures == 0
     assert any(s.startswith("INSERT INTO community_summaries") for s, _ in conn.executed)
 
 
@@ -804,26 +834,35 @@ def test_cyclerec_extra_none_when_untouched():
     assert _CycleRec().extra() is None
 
 
-def test_cyclerec_extra_carries_all_stage5_fields():
+def test_cyclerec_extra_carries_stage5_fields_no_preservation_keys():
+    """decision:1205 (v0.8.71) — preservation_retries/preservation_failures/
+    preservation_failed are RETIRED (no field, no key): the insight path no
+    longer has a content-preservation failure mode to count. A cycle that
+    hit the insight-fold missing-slot/truncation path reports it through
+    truncation_failures/truncation_failed only."""
     r = _CycleRec()
     r.calibration = {"entity_relation": True, "evidential": False}
     r.edges_awaiting_calibration = 4
     r.machine_edges_consumed = 2
-    r.preservation_retries = 1
-    r.preservation_failures = 1
-    r.preservation_failed = ["E/general"]
-    assert r.extra() == {
+    r.truncation_failures = 1
+    r.truncation_failed = ["decision:1,decision:2"]
+    extra = r.extra()
+    assert "preservation_retries" not in extra
+    assert "preservation_failures" not in extra
+    assert "preservation_failed" not in extra
+    assert extra == {
         "edges_awaiting_calibration": 4,
         "machine_edges_consumed": 2,
-        "preservation_retries": 1,
-        "preservation_failures": 1,
-        "truncation_failures": 0,
+        "truncation_failures": 1,
         # D1 (fact:1189) — always present once extra() is non-None; 0 when
         # this cycle dead-lettered nothing.
         "dead_lettered_clusters": 0,
         "calibration": {"entity_relation": True, "evidential": False},
-        "preservation_failed": ["E/general"],
+        "truncation_failed": ["decision:1,decision:2"],
     }
+    assert not hasattr(r, "preservation_retries")
+    assert not hasattr(r, "preservation_failures")
+    assert not hasattr(r, "preservation_failed")
 
 
 # ── fetch_calibration_gate (stubbed ledger) ───────────────────────────────────
@@ -851,10 +890,10 @@ def test_fetch_calibration_gate_reads_ledger(monkeypatch):
     assert conn.closed
 
 
-# ── Fix-wave: NREM truncation is a capacity failure, NOT a preservation miss ───
-# A length-finish draft can PASS the anchor check (the gate detects omission, not
-# truncation), so it must be discarded BEFORE the gate, counted separately, and
-# never persisted / never spend the corrective retry.
+# ── Fix-wave: NREM truncation is a capacity failure, discarded before parsing ──
+# A length-finish draft never reaches the slot parser at all, so it is
+# counted separately from a parsed-but-incomplete (missing-slot) draft, and
+# never persisted / never spends the missing-slot retry.
 #
 # ⛔ REMOVED (C4): `test_generate_summary_truncated_sets_flag_and_bounds_tokens`,
 # `_generate_summary_truncation_retry_succeeds_at_wider_bound`,
@@ -865,23 +904,55 @@ def test_fetch_calibration_gate_reads_ledger(monkeypatch):
 # insight path (§3.2, still LLM-backed) keeps its own truncation coverage.
 
 @pytest.mark.asyncio
-async def test_insight_truncated_off_gate_not_written(monkeypatch):
+async def test_insight_truncated_never_reaches_assembly_not_written(monkeypatch):
     monkeypatch.delenv("MOCK_LLM", raising=False)
     daemon, _ = daemon_with_fake_graph()
     daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
     conn = StubConn(script=_fold_script_two_decisions())
     cyc = _CycleRec()
 
-    async def _truncated_insight(*a, **k):
+    async def _truncated_slots(*a, **k):
         daemon._last_llm_truncated = True
-        return ""
-    daemon.generate_insight = _truncated_insight
+        daemon._last_llm_missing_slots = False
+        return None
+    daemon.generate_insight_slots = _truncated_slots
 
     ok = await daemon._fold_insight(conn, "OutboxPattern", [245, 267], cyc=cyc)
 
     assert ok is False
     assert cyc.truncation_failures == 1
-    assert cyc.preservation_retries == 0 and cyc.preservation_failures == 0
+    assert not any(s.startswith("INSERT INTO community_summaries") for s, _ in conn.executed)
+
+
+# ── Fold dead-letter query: truncation_failed ONLY (decision:1205) ────────────
+
+def test_fold_dead_letter_query_never_reads_preservation_failed(monkeypatch):
+    """(e) — the query text itself must not union preservation_failed any
+    more; mutate `fetch_fold_dead_letter_counts` back to unioning it and this
+    test dies. A pre-v0.8.71 row's preservation_failed extra must never
+    suppress a fold the new construction-based path would now succeed at."""
+    conn = StubConn(script=[{"rowcount": 0, "rows": []}])
+    monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: conn)
+
+    cl.fetch_fold_dead_letter_counts()
+
+    sql, params = conn.executed[0]
+    assert "preservation_failed" not in sql
+    assert "truncation_failed" in sql
+
+
+def test_fold_dead_letter_counts_still_reads_truncation_failed(monkeypatch):
+    """Positive path — the narrowed query still counts a live
+    truncation_failed key; the narrowing removed ONE input, not the whole
+    mechanism."""
+    conn = StubConn(script=[
+        {"rowcount": 1, "rows": [("decision:245,decision:267", 2)]},
+    ])
+    monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: conn)
+
+    counts = cl.fetch_fold_dead_letter_counts()
+
+    assert counts == {"decision:245,decision:267": 2}
 
 
 # ── Fold dead-letter identity is content-derived, not label-derived (882) ────

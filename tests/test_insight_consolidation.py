@@ -520,22 +520,46 @@ async def test_fresh_insight_clusters_skips_a_group_with_no_retrospective_reache
 
 
 @pytest.mark.asyncio
-async def test_generate_insight_mock_mode(monkeypatch):
+async def test_generate_insight_slots_mock_mode(monkeypatch):
+    """decision:1205 — MOCK_LLM produces a well-formed slot dict covering
+    every pg_id in `rows` plus PRINCIPLE, parsed through the SAME
+    `parse_insight_slots` a real call uses (never special-cased)."""
     monkeypatch.setenv("MOCK_LLM", "1")
     daemon, _ = daemon_with_fake_graph()
-    out = await daemon.generate_insight("OutboxPattern", ["[DECISION] a", "[DECISION] b"])
-    assert "OutboxPattern" in out and "2" in out
+    rows = [(1, "Decision A", "p", "decision", {}),
+            (2, "Decision B", "p", "decision", {})]
+    slots = await daemon.generate_insight_slots("OutboxPattern", rows)
+    assert set(slots) == {1, 2, "PRINCIPLE"}
+    assert "OutboxPattern" in slots["PRINCIPLE"]
 
 
 @pytest.mark.asyncio
-async def test_generate_insight_mock_mode_echoes_reversal_lines(monkeypatch):
+async def test_fold_insight_mock_mode_reversal_lines_land_in_assembled_content(monkeypatch):
+    """decision:1205 — reversal lines are no longer an LLM-compliance
+    instruction; they are machine-built strings included VERBATIM in the
+    scaffold `_fold_insight` assembles. Exercised via `_fold_insight`
+    (the only place reversal_lines reach `_assemble_insight_content`)."""
     monkeypatch.setenv("MOCK_LLM", "1")
     daemon, _ = daemon_with_fake_graph()
-    out = await daemon.generate_insight(
-        "OutboxPattern", ["[DECISION] a"],
-        reversal_lines=["Decision pg_id=199 (\"Old title\") was REVERTED. Reversing "
-                        "retrospective pg_id=900: it failed"])
-    assert "was REVERTED" in out and "it failed" in out
+    daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
+    conn = StubConn(script=[
+        {"rowcount": 2, "rows": [
+            (245, "Decision A\n\nrationale A", "shared-memory-GitHub", "decision", {}),
+            (267, "Decision B\n\nrationale B", "shared-memory-GitHub", "decision", {}),
+        ]},
+        {"rowcount": 1, "rows": [(199,)]},                                     # reversal leg 1
+        {"rowcount": 1, "rows": [(199, "Old title", 900, "it failed")]},        # reversal leg 2
+        {"rowcount": 2, "rows": [(101,), (102,)]},
+        {"rowcount": 1, "rows": [(77,)]},
+        {"rowcount": 2, "rows": []},
+        {"rowcount": 0, "rows": []},
+        {"rowcount": 2, "rows": [(101, 245), (102, 267)]},
+    ])
+    assert await daemon._fold_insight(conn, "OutboxPattern", [245, 267]) is True
+    insert = next(p for s, p in conn.executed
+                  if s.startswith("INSERT INTO community_summaries"))
+    content = insert[0]
+    assert "was REVERTED" in content and "it failed" in content and "199" in content
 
 
 # ── _fold_insight (stubbed end-to-end) — C4 judgement-inclusive rewrite ───────
@@ -605,27 +629,26 @@ async def test_fold_insight_full_path(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_fold_insight_blocks_are_strictly_title_and_rationale(monkeypatch):
-    """§3.2 — the block for each judgement is its own content VERBATIM, with
-    NO confidence line, NO alternatives line, NO retrospective-outcome line,
-    NO grounding-edge line — all of that is gone from the pre-C4 prompt."""
+async def test_fold_insight_passes_rows_verbatim_to_slot_generation(monkeypatch):
+    """decision:1205 — `_fold_insight` hands `generate_insight_slots` the raw
+    fetched `rows` (ascending pg_id, Postgres shape), never a pre-built prose
+    block; there is no confidence/alternatives/grounding-edge line anywhere
+    in that path any more (§3.2, unchanged by this rewrite) since the LLM
+    only ever sees per-judgement pg_id/type/title/body via
+    `_insight_slot_items`/`_build_insight_prompt`."""
     monkeypatch.delenv("MOCK_LLM", raising=False)
     daemon, session = daemon_with_fake_graph()
-    daemon.generate_insight = AsyncMock(
-        return_value="Decision A rationale A; Decision B rationale B.")
+    daemon.generate_insight_slots = AsyncMock(
+        return_value={245: "why A.", 267: "why B.", "PRINCIPLE": "the principle."})
     daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
     conn = StubConn(script=_fold_script())
 
     assert await daemon._fold_insight(conn, "OutboxPattern", [245, 267]) is True
 
-    blocks = daemon.generate_insight.call_args.args[1]
-    d245 = next(b for b in blocks if b.startswith("[DECISION pg_id=245"))
-    assert d245 == "[DECISION pg_id=245 project=shared-memory-GitHub]\nDecision A\n\nrationale A"
-    assert "CONFIDENCE" not in d245
-    assert "ALTERNATIVE" not in d245
-    assert "RETROSPECTIVE" not in d245
-    assert "GROUNDING" not in d245
-    # No Neo4j READ ran to build the blocks (C4 removed the outcome/
+    rows = daemon.generate_insight_slots.call_args.args[1]
+    assert [r[0] for r in rows] == [245, 267]           # ascending pg_id
+    assert rows[0][1] == "Decision A\n\nrationale A"     # content VERBATIM
+    # No Neo4j READ ran to build the prompt (C4 removed the outcome/
     # grounding-edge fetches the pre-C4 prompt used) — only the write-side
     # marking + SUPERSEDES edge after commit.
     assert not any(
@@ -634,20 +657,21 @@ async def test_fold_insight_blocks_are_strictly_title_and_rationale(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_fold_insight_retrospective_block_labelled_and_ordered(monkeypatch):
-    """A retrospective in the judgement set gets its own [RETROSPECTIVE] block
-    (its content verbatim — retro-as-record), in ascending pg_id order
-    alongside the decision it evaluates — never folded into the decision's
-    own block."""
+async def test_fold_insight_retrospective_rendered_under_decision_no_title(monkeypatch):
+    """A retrospective in the judgement set gets its own
+    `[retrospective:M -> decision:N]` line in the ASSEMBLED content (never
+    folded into the decision's own block, never given a fabricated title —
+    decision:1205), rendered after the decision it evaluates."""
     monkeypatch.delenv("MOCK_LLM", raising=False)
     daemon, session = daemon_with_fake_graph()
-    daemon.generate_insight = AsyncMock(
-        return_value="Decision A held under load; validated by the retrospective.")
+    daemon.generate_insight_slots = AsyncMock(
+        return_value={245: "why A.", 900: "it held.", "PRINCIPLE": "the principle."})
     daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
     conn = StubConn(script=[
         {"rowcount": 2, "rows": [
             (245, "Decision A\n\nrationale A", "shared-memory-GitHub", "decision", {}),
-            (900, "held under load", "shared-memory-GitHub", "retrospective", {}),
+            (900, "held under load", "shared-memory-GitHub", "retrospective",
+             {"rating": "validated", "target_pg_id": 245}),
         ]},
         {"rowcount": 0, "rows": []},                       # reversal leg 1
         {"rowcount": 2, "rows": [(101,), (102,)]},
@@ -659,9 +683,13 @@ async def test_fold_insight_retrospective_block_labelled_and_ordered(monkeypatch
 
     assert await daemon._fold_insight(conn, "OutboxPattern", [245, 900]) is True
 
-    blocks = daemon.generate_insight.call_args.args[1]
-    assert blocks[0].startswith("[DECISION pg_id=245")
-    assert blocks[1] == "[RETROSPECTIVE pg_id=900 project=shared-memory-GitHub]\nheld under load"
+    insert = next(p for s, p in conn.executed
+                  if s.startswith("INSERT INTO community_summaries"))
+    content = insert[0]
+    assert content.index("[decision:245]") < content.index("[retrospective:900")
+    assert "[retrospective:900 → decision:245] rating: validated — it held." in content
+    retro_line = next(l for l in content.splitlines() if l.startswith("[retrospective:900"))
+    assert "«" not in retro_line
 
 
 @pytest.mark.asyncio
@@ -712,19 +740,22 @@ async def test_fold_insight_summary_ids_never_mixed_with_source_pg_ids(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_fold_insight_reversal_note_injected_and_anchored(monkeypatch):
+async def test_fold_insight_reversal_note_reaches_slot_generation_and_assembly(monkeypatch):
     """Criterion D — when this fold's constituents close an OPEN
     refold_ledger row whose trigger was a reversed decision, the payload
-    must state what was reverted and why. Independent of the walk/gate."""
+    must state what was reverted and why. decision:1205: this obligation is
+    now satisfied BY CONSTRUCTION (the reversal line is a machine-built
+    string included verbatim in the assembled content, not an LLM
+    instruction) — but `generate_insight_slots` still receives it as
+    context. Independent of the walk/gate."""
     monkeypatch.delenv("MOCK_LLM", raising=False)
     daemon, _ = daemon_with_fake_graph()
     captured = {}
-    async def fake_generate_insight(entity, blocks, previous_insight=None,
-                                    corrective=None, reversal_lines=None):
+    async def fake_generate_insight_slots(entity, rows, previous_insight=None,
+                                          reversal_lines=None):
         captured["reversal_lines"] = reversal_lines
-        return ("Decision A holds. This supersedes the reverted decision "
-                "(\"Old decision title\") because it failed under load.")
-    daemon.generate_insight = fake_generate_insight
+        return {245: "why A.", 267: "why B.", "PRINCIPLE": "the principle."}
+    daemon.generate_insight_slots = fake_generate_insight_slots
     daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
     conn = StubConn(script=[
         {"rowcount": 2, "rows": [
@@ -746,6 +777,11 @@ async def test_fold_insight_reversal_note_injected_and_anchored(monkeypatch):
     assert "199" in captured["reversal_lines"][0]
     assert "Old decision title" in captured["reversal_lines"][0]
     assert "it failed under load" in captured["reversal_lines"][0]
+    insert = next(p for s, p in conn.executed
+                  if s.startswith("INSERT INTO community_summaries"))
+    content = insert[0]
+    assert "199" in content and "Old decision title" in content
+    assert "it failed under load" in content
 
 
 @pytest.mark.asyncio
@@ -753,7 +789,7 @@ async def test_fold_insight_aborts_when_llm_fails(monkeypatch):
     # No insight → no Postgres write, ledger rows stay open (durable retry).
     monkeypatch.delenv("MOCK_LLM", raising=False)
     daemon, _ = daemon_with_fake_graph()
-    daemon.generate_insight = AsyncMock(return_value=None)
+    daemon.generate_insight_slots = AsyncMock(return_value=None)
     daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
     conn = StubConn(script=_fold_script())
 
