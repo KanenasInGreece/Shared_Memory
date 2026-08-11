@@ -28,26 +28,34 @@ machinery.
   `NREM_INSIGHT_SLOT_INPUT_CHARS` (default 2000, head of the text). A slot or PRINCIPLE still empty
   after parsing gets ONE bounded retry asking only for what is missing; still missing FAILS THE UNIT
   with the same no-partial-write semantics truncation already used — no partial insight is ever
-  written.
+  written, and the failure is counted through `extra.slot_failures`/`extra.slot_failed`, a NEW pair
+  kept separate from `extra.truncation_failures`/`extra.truncation_failed` (see Group 3 below).
 - **`preservation_anchor` / `summary_preserves` / `corrective_block` are RETIRED and deleted**, along
   with the corrective-retry loop and `NREM_PRESERVATION_MAX_RETRIES`, `PRESERVATION_COVERAGE`,
   `PRESERVATION_SLACK_MIN_UNITS` — no remaining caller (the thematic path stopped using them in C4;
   verified by grep before deletion).
-- **The fold dead-letter query (`fetch_fold_dead_letter_counts`) now reads `truncation_failed`
-  ONLY** — it used to also union `preservation_failed`. Historical pre-v0.8.71 rows may still carry
-  `preservation_failed`; counting them would let a stale, pre-redesign failure keep dead-lettering a
-  cluster the new construction-based path would now succeed at on the first try.
+- **The fold dead-letter query (`fetch_fold_dead_letter_counts`) now unions `truncation_failed` OR
+  `slot_failed`** — both are live insight-fold failure classes and both must dead-letter a
+  repeatedly-failing cluster. It used to also union `preservation_failed`; that read is REMOVED.
+  Historical pre-v0.8.71 rows may still carry `preservation_failed`; counting them would let a stale,
+  pre-redesign failure keep dead-lettering a cluster the new construction-based path would now
+  succeed at on the first try.
 - **MOCK_LLM fabricates a well-formed `SLOT`/`PRINCIPLE` reply and parses it through the SAME parser
   a real call uses** — assembly is never special-cased for mocks.
 
 ### Group 3 (daemon/observability) — deliberate telemetry shape change
 
 `extra.preservation_retries` / `extra.preservation_failures` / `extra.preservation_failed` STOP being
-written on insight runs — `_CycleRec` no longer has those fields at all. Every insight-fold failure
-(real truncation AND a slot still missing after its bounded retry) now lands in the pre-existing
-`extra.truncation_failures` / `extra.truncation_failed` instead — there is no longer a separate
-content-preservation failure class to keep apart from it. Truncation counters/semantics for the
-fact-fold path are unchanged.
+written on insight runs — `_CycleRec` no longer has those fields at all. `extra.truncation_failures` /
+`extra.truncation_failed` go back to meaning ONLY real truncation (`finish_reason=length` capacity
+failures) — unchanged from before this release for the fact-fold path.
+
+**A new, ADDITIVE pair, `extra.slot_failures` / `extra.slot_failed`, is monitor-visible as of this
+release**: it counts a SLOT/PRINCIPLE still missing after its one bounded retry — a PROTOCOL failure
+(fix the prompt/model), kept separate from truncation (a CAPACITY failure, fixed by raising
+`NREM_MAX_TOKENS_INSIGHT`) so the two causes stay diagnosable apart from the `extra` JSONB alone. Both
+classes dead-letter a repeatedly-failing cluster identically (see the dead-letter query change above)
+— the split is for diagnosis, never for which failure gets capped.
 
 ### Group 2 (capture/ontology) — no capture-surface change, version-only SKILL.md edits
 

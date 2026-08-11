@@ -16,36 +16,43 @@ Loop discipline (fix wave, 2026-07):
   the LLM never emits the final document. One LLM call fills bounded
   per-judgement "SLOT <pg_id>: ..." distillates plus a closing
   "PRINCIPLE: ..." paragraph, via a strictly-parsed delimited protocol
-  (`_parse_insight_slots`); this REPLACES the old free-prose synthesis +
+  (`parse_insight_slots`); this REPLACES the old free-prose synthesis +
   post-hoc preservation-anchor gate (preservation_anchor/summary_preserves/
   corrective_block — retired, see git history before this version: the gate
   caused a retry lottery and forced fabricated quoted titles into insight
   prose). A slot still empty after parsing gets ONE bounded retry asking
   only for the missing slot(s); still missing FAILS THE UNIT with the same
-  no-partial-write semantics truncation already uses, and is counted through
-  the SAME truncation_failures/truncation_failed extras — there is no
-  separate "preservation failure" class left to keep apart from it.
+  no-partial-write semantics truncation already uses — but it is counted
+  through its OWN extras (operator ruling, same PR): `extra.slot_failures` /
+  `extra.slot_failed`, kept separate from `extra.truncation_failures` /
+  `extra.truncation_failed` because the two name different causes — a
+  capacity problem (raise `NREM_MAX_TOKENS_INSIGHT`) versus a protocol
+  problem (fix the prompt/model) — and conflating them would hide which one
+  a repeat-failing cluster actually has.
 
 * Fold dead-letter cap: before folding a cluster, a CONTENT-DERIVED key —
   the cluster's own member records as sorted qualified refs (decision 822's
   fact:N / decision:N form; see record_ref.py and _fold_identity()) — is
   checked against the consolidation_runs ledger. If it appears in
-  truncation_failed extras NREM_FOLD_FAIL_CAP times (default 3) within the
-  last NREM_FOLD_FAIL_WINDOW days (default 7), the cluster is SKIPPED and a
-  human-readable label (entity/domain or insight/entity) is recorded in
-  extra.fold_dead_letter for telemetry. Operator reset = time passing beyond
-  the window, or manual consolidation_runs cleanup (delete/backdate the
-  failing rows). Keying on member refs rather than the display label is
-  deliberate (decision 882): the label is a lexicographic-min alias chosen
-  to stay STABLE across cycles even as cluster membership grows (correct for
-  the community_summaries upsert key) — the opposite of what a failure
-  ledger needs, which is to recognise a genuinely different (e.g.
-  alias-merged) candidate as new rather than inherit a smaller pre-merge
-  candidate's failure history.
+  truncation_failed OR slot_failed extras NREM_FOLD_FAIL_CAP times (default
+  3) within the last NREM_FOLD_FAIL_WINDOW days (default 7), the cluster is
+  SKIPPED and a human-readable label (entity/domain or insight/entity) is
+  recorded in extra.fold_dead_letter for telemetry — BOTH live failure
+  classes dead-letter, the split above is for diagnosis, not for who gets
+  capped. Operator reset = time passing beyond the window, or manual
+  consolidation_runs cleanup (delete/backdate the failing rows). Keying on
+  member refs rather than the display label is deliberate (decision 882):
+  the label is a lexicographic-min alias chosen to stay STABLE across
+  cycles even as cluster membership grows (correct for the
+  community_summaries upsert key) — the opposite of what a failure ledger
+  needs, which is to recognise a genuinely different (e.g. alias-merged)
+  candidate as new rather than inherit a smaller pre-merge candidate's
+  failure history.
   ⚠ Pre-v0.8.71 rows may still carry a `preservation_failed` extra from the
   retired gate — deliberately NOT counted here (decision:1205); only
-  `truncation_failed` is read, so historical preservation failures never
-  suppress a fold the new construction-based path would otherwise succeed at.
+  `truncation_failed`/`slot_failed` (both still-live failure modes) are
+  read, so historical preservation failures never suppress a fold the new
+  construction-based path would otherwise succeed at.
 
 * Slot arbitration with REM: consolidation never fires INTO a busy serial LLM
   slot, but it must not defer forever either — REM re-arms faster and its solo
@@ -168,13 +175,15 @@ NREM_POOL_PROBE_SEC = int(os.environ.get("NREM_POOL_PROBE_SEC", "15"))
 # distillates plus one PRINCIPLE paragraph.
 #
 # Set below that floor, the fold cannot succeed by ANY path — obey the bound
-# and a required SLOT/PRINCIPLE never arrives, so parsing FAILS THE UNIT;
-# widen it and generation itself risks TRUNCATION. Both land in the SAME
-# truncation_failures/truncation_failed counters (decision:1205 — see
-# `_CycleRec`), and after NREM_FOLD_FAIL_CAP occurrences the dead-letter cap
-# removes the cluster from Tier 3 entirely. The most-consolidated domains
-# cross the floor first, so the failure lands on exactly the clusters
-# carrying the most history.
+# and a required SLOT/PRINCIPLE never arrives, so parsing FAILS THE UNIT
+# (counted as slot_failures/slot_failed — a protocol failure); widen it and
+# generation itself risks TRUNCATION (counted as truncation_failures/
+# truncation_failed — a capacity failure; the two are kept apart precisely
+# so this floor problem is diagnosable, see `_CycleRec`). Either way, after
+# NREM_FOLD_FAIL_CAP occurrences (of either kind, summed — see
+# `fetch_fold_dead_letter_counts`) the dead-letter cap removes the cluster
+# from Tier 3 entirely. The most-consolidated domains cross the floor first,
+# so the failure lands on exactly the clusters carrying the most history.
 #
 # That is not hypothetical: the shipped 2048 was 0.62x the floor for this
 # framework's own busiest cluster (a 3315-token summary), which stalled fact
@@ -203,7 +212,7 @@ NREM_TRUNCATION_RETRY_FACTOR = float(
 # the old preservation gate's multi-attempt probabilistic content-match loop.
 
 # Fold dead-letter cap (see module docstring): key occurrences in
-# truncation_failed extras within the window → skip.
+# truncation_failed OR slot_failed extras within the window → skip.
 NREM_FOLD_FAIL_WINDOW = int(os.environ.get("NREM_FOLD_FAIL_WINDOW", "7"))   # days
 NREM_FOLD_FAIL_CAP    = int(os.environ.get("NREM_FOLD_FAIL_CAP", "3"))
 # Per-judgement input cap for the insight-fold LLM call (decision:1205): each
@@ -469,13 +478,17 @@ def _crun_recover_and_prune():
 def fetch_fold_dead_letter_counts():
     """Fold dead-letter gauge: {fold_key: n} — how many times each fold key
     (a candidate's content-derived identity, _fold_identity()'s sorted
-    qualified refs — decision 882) appears in the truncation_failed extras of
-    consolidation_runs rows started within the last NREM_FOLD_FAIL_WINDOW
-    days. At NREM_FOLD_FAIL_CAP the callers SKIP the cluster (fold
-    dead-letter) instead of burning an LLM fold on it every cycle. Own short
-    conn (instrumentation never shares the cycle's conn); failsafe → {} on
-    any DB error (fail open toward folding — a broken ledger must not
-    dead-letter healthy clusters).
+    qualified refs — decision 882) appears in the truncation_failed OR
+    slot_failed extras of consolidation_runs rows started within the last
+    NREM_FOLD_FAIL_WINDOW days — BOTH live insight-fold failure classes
+    dead-letter; the split between them (operator ruling, same PR as
+    decision:1205) is for DIAGNOSIS — telling a capacity problem (raise
+    NREM_MAX_TOKENS_INSIGHT) apart from a protocol one (fix prompt/model) —
+    never for which one gets capped. At NREM_FOLD_FAIL_CAP the callers SKIP
+    the cluster (fold dead-letter) instead of burning an LLM fold on it
+    every cycle. Own short conn (instrumentation never shares the cycle's
+    conn); failsafe → {} on any DB error (fail open toward folding — a
+    broken ledger must not dead-letter healthy clusters).
 
     ⛔ decision:1205 (v0.8.71) — this used to ALSO union `preservation_failed`
     extras (the retired anchor-gate's failure list). That list is no longer
@@ -484,8 +497,11 @@ def fetch_fold_dead_letter_counts():
     version may still carry it. Counting it here would let PRE-v0.8.71
     failures keep dead-lettering a cluster the NEW construction-based fold
     would now succeed at on the very first try — a stale rejection with no
-    live cause. Only `truncation_failed` (a still-live failure mode) is
-    read."""
+    live cause. Only `truncation_failed`/`slot_failed` (both still-live
+    failure modes) are read. `slot_failed` is the PROTOCOL-failure class,
+    split out of `truncation_failed` per the same operator ruling — kept
+    separate so the instrument distinguishes a capacity problem from a
+    protocol one, not because either one alone should dead-letter."""
     try:
         c = psycopg2.connect(PG_CONN, connect_timeout=5)
         try:
@@ -493,7 +509,8 @@ def fetch_fold_dead_letter_counts():
                 cur.execute(
                     "SELECT k, count(*) FROM consolidation_runs,"
                     " LATERAL jsonb_array_elements_text("
-                    "   COALESCE(extra->'truncation_failed', '[]'::jsonb)) AS k"
+                    "   COALESCE(extra->'truncation_failed', '[]'::jsonb)"
+                    "   || COALESCE(extra->'slot_failed', '[]'::jsonb)) AS k"
                     " WHERE started_at > now() - make_interval(days => %s)"
                     " GROUP BY k",
                     (NREM_FOLD_FAIL_WINDOW,))
@@ -617,12 +634,18 @@ class _CycleRec:
                  # ⛔ decision:1205 (v0.8.71) — preservation_retries/
                  # preservation_failures/preservation_failed RETIRED with the
                  # anchor-gate they counted; the insight path no longer has a
-                 # content-preservation failure mode to distinguish from
-                 # truncation. truncation_failures/truncation_failed now
-                 # cover every insight-fold failure (real truncation AND a
-                 # slot still missing after its one retry); fold_dead_letter
-                 # = keys skipped by the fold-failure cap this cycle.
-                 "truncation_failures", "truncation_failed", "fold_dead_letter")
+                 # content-preservation failure mode. truncation_failures/
+                 # truncation_failed count ONLY real truncation
+                 # (finish_reason=length capacity failures) again.
+                 # slot_failures/slot_failed (operator ruling, same PR) are a
+                 # SEPARATE class: a SLOT/PRINCIPLE still missing after its
+                 # one bounded retry — a PROTOCOL failure (fix prompt/model),
+                 # not a capacity one (raise max_tokens); keeping them apart
+                 # is what lets the instrument tell the two causes apart.
+                 # fold_dead_letter = keys skipped by the fold-failure cap
+                 # this cycle.
+                 "truncation_failures", "truncation_failed",
+                 "slot_failures", "slot_failed", "fold_dead_letter")
 
     def __init__(self):
         self.attempted = self.succeeded = self.failed = 0
@@ -648,6 +671,8 @@ class _CycleRec:
         self.calibration = None
         self.truncation_failures = 0
         self.truncation_failed = []
+        self.slot_failures = 0
+        self.slot_failed = []
         self.fold_dead_letter = []
 
     def fold(self, ok):
@@ -668,8 +693,9 @@ class _CycleRec:
         callers stay byte-identical in the ledger)."""
         if self.calibration is None and not (
             self.edges_awaiting_calibration or self.machine_edges_consumed
-            or self.truncation_failures
-            or self.truncation_failed or self.fold_dead_letter
+            or self.truncation_failures or self.slot_failures
+            or self.truncation_failed or self.slot_failed
+            or self.fold_dead_letter
             or self.dead_lettered_clusters
         ):
             return None
@@ -677,6 +703,10 @@ class _CycleRec:
             "edges_awaiting_calibration": self.edges_awaiting_calibration,
             "machine_edges_consumed": self.machine_edges_consumed,
             "truncation_failures": self.truncation_failures,
+            # Operator ruling (same PR as decision:1205) — SEPARATE from
+            # truncation_failures: a SLOT/PRINCIPLE missing after its one
+            # bounded retry is a PROTOCOL failure, not a capacity one.
+            "slot_failures": self.slot_failures,
             # D1 (fact:1189, decision:1121/I7) — NEW key, never an alias for
             # eligible_clusters: a cluster excluded here is one the census
             # above deliberately does NOT count as eligible backlog.
@@ -686,6 +716,8 @@ class _CycleRec:
             out["calibration"] = self.calibration
         if self.truncation_failed:
             out["truncation_failed"] = self.truncation_failed
+        if self.slot_failed:
+            out["slot_failed"] = self.slot_failed
         if self.fold_dead_letter:
             out["fold_dead_letter"] = self.fold_dead_letter
         return out
@@ -3712,10 +3744,10 @@ class ConsolidationDaemon:
         re-fold; when omitted it falls back to the judgement rows' own
         project (mode of what was actually fetched).
 
-        ``cyc`` is the cycle's _CycleRec for the truncation telemetry
-        counter (still populated — insight synthesis is still an LLM call,
-        §3.2; there is no separate preservation counter any more — see
-        `_CycleRec`)."""
+        ``cyc`` is the cycle's _CycleRec for the truncation_failures/
+        slot_failures telemetry counters (still populated — insight
+        synthesis is still an LLM call, §3.2; there is no separate
+        preservation counter any more — see `_CycleRec`)."""
         loop = asyncio.get_running_loop()
         cyc = cyc if cyc is not None else _CycleRec()
         src_ids = sorted({int(i) for i in judgement_ids})
@@ -3821,18 +3853,20 @@ class ConsolidationDaemon:
                     "assembly, nothing persisted); ledger rows stay open. "
                     "(truncation_failures=%d)", entity, cyc.truncation_failures)
             elif self._last_llm_missing_slots:
-                # decision:1205 — a SLOT/PRINCIPLE still missing after its
-                # one bounded retry FAILS THE UNIT with the same
-                # no-partial-write semantics truncation already uses, and is
-                # counted through the SAME extras: there is no separate
-                # preservation-gate failure mode left to keep apart from it.
-                cyc.truncation_failures += 1
-                cyc.truncation_failed.append(fold_key)
+                # decision:1205 + operator ruling (same PR): a SLOT/PRINCIPLE
+                # still missing after its one bounded retry FAILS THE UNIT
+                # with the same no-partial-write semantics truncation
+                # already uses — but it is a PROTOCOL failure (fix
+                # prompt/model), not a capacity one (raise max_tokens), so
+                # it is counted SEPARATELY: slot_failures/slot_failed, never
+                # truncation_failures/truncation_failed.
+                cyc.slot_failures += 1
+                cyc.slot_failed.append(fold_key)
                 logger.error(
                     "Insight slot generation for '%s' incomplete after retry "
                     "— fold fails (no partial insight ever written); ledger "
-                    "rows stay open. (truncation_failures=%d)",
-                    entity, cyc.truncation_failures)
+                    "rows stay open. (slot_failures=%d)",
+                    entity, cyc.slot_failures)
             else:
                 logger.error(f"Failed to synthesise insight for '{entity}' — ledger rows stay open; next sweep retries.")
             return False

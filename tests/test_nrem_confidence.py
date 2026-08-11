@@ -18,6 +18,7 @@ All Postgres/Neo4j/LLM I/O is stubbed — no live infrastructure required.
 import datetime
 import json
 import os
+import re
 import sys
 from unittest.mock import AsyncMock, MagicMock
 
@@ -781,11 +782,14 @@ async def test_fold_insight_writes_the_assembled_scaffold_not_llm_prose(monkeypa
 async def test_fold_insight_missing_slots_after_retry_fails_no_write(monkeypatch, caplog):
     """(d) generate_insight_slots exhausts its own bounded retry and returns
     None with self._last_llm_missing_slots=True → _fold_insight FAILS THE
-    UNIT: no Postgres write, False returned, and the failure is counted
-    through truncation_failures/truncation_failed — decision:1205 retired
-    the separate preservation-failure counters, so this is now the ONLY
-    extras pair an insight-fold failure can land in (see item 5's dead-letter
-    query, which only ever reads truncation_failed)."""
+    UNIT: no Postgres write, False returned. Operator ruling (same PR as
+    decision:1205): this is a PROTOCOL failure, counted through
+    slot_failures/slot_failed — SEPARATE from truncation_failures/
+    truncation_failed (a capacity failure), so the two causes stay
+    diagnosable apart. Mutation check: swap `cyc.slot_failures`/
+    `cyc.slot_failed` back to `cyc.truncation_failures`/
+    `cyc.truncation_failed` at the call site and this test dies (asserting
+    truncation_failures stayed 0 while slot_failures is 1)."""
     monkeypatch.delenv("MOCK_LLM", raising=False)
     daemon, _ = daemon_with_fake_graph()
     daemon.get_embedding = AsyncMock(return_value=[0.1] * 4)
@@ -803,10 +807,12 @@ async def test_fold_insight_missing_slots_after_retry_fails_no_write(monkeypatch
 
     assert ok is False
     assert not any(s.startswith("INSERT INTO community_summaries") for s, _ in conn.executed)
-    assert cyc.truncation_failures == 1
+    assert cyc.slot_failures == 1
+    assert cyc.truncation_failures == 0
     # Content-derived dead-letter key — sorted qualified refs over the
     # fold's own judgement ids ([245, 267]), both typed 'decision' here.
-    assert cyc.truncation_failed == ["decision:245,decision:267"]
+    assert cyc.slot_failed == ["decision:245,decision:267"]
+    assert cyc.truncation_failed == []
     assert any("incomplete after retry" in m for m in caplog.messages)
 
 
@@ -837,15 +843,19 @@ def test_cyclerec_extra_none_when_untouched():
 def test_cyclerec_extra_carries_stage5_fields_no_preservation_keys():
     """decision:1205 (v0.8.71) — preservation_retries/preservation_failures/
     preservation_failed are RETIRED (no field, no key): the insight path no
-    longer has a content-preservation failure mode to count. A cycle that
-    hit the insight-fold missing-slot/truncation path reports it through
-    truncation_failures/truncation_failed only."""
+    longer has a content-preservation failure mode to count. Operator ruling
+    (same PR): truncation_failures/truncation_failed count ONLY real
+    truncation; slot_failures/slot_failed (a SEPARATE, ADDITIVE pair) count
+    a SLOT/PRINCIPLE missing after its bounded retry — a protocol failure,
+    not a capacity one."""
     r = _CycleRec()
     r.calibration = {"entity_relation": True, "evidential": False}
     r.edges_awaiting_calibration = 4
     r.machine_edges_consumed = 2
     r.truncation_failures = 1
     r.truncation_failed = ["decision:1,decision:2"]
+    r.slot_failures = 1
+    r.slot_failed = ["decision:3,decision:4"]
     extra = r.extra()
     assert "preservation_retries" not in extra
     assert "preservation_failures" not in extra
@@ -854,11 +864,13 @@ def test_cyclerec_extra_carries_stage5_fields_no_preservation_keys():
         "edges_awaiting_calibration": 4,
         "machine_edges_consumed": 2,
         "truncation_failures": 1,
+        "slot_failures": 1,
         # D1 (fact:1189) — always present once extra() is non-None; 0 when
         # this cycle dead-lettered nothing.
         "dead_lettered_clusters": 0,
         "calibration": {"entity_relation": True, "evidential": False},
         "truncation_failed": ["decision:1,decision:2"],
+        "slot_failed": ["decision:3,decision:4"],
     }
     assert not hasattr(r, "preservation_retries")
     assert not hasattr(r, "preservation_failures")
@@ -926,11 +938,16 @@ async def test_insight_truncated_never_reaches_assembly_not_written(monkeypatch)
 
 # ── Fold dead-letter query: truncation_failed ONLY (decision:1205) ────────────
 
-def test_fold_dead_letter_query_never_reads_preservation_failed(monkeypatch):
-    """(e) — the query text itself must not union preservation_failed any
-    more; mutate `fetch_fold_dead_letter_counts` back to unioning it and this
-    test dies. A pre-v0.8.71 row's preservation_failed extra must never
-    suppress a fold the new construction-based path would now succeed at."""
+def test_fold_dead_letter_query_unions_truncation_and_slot_never_preservation(monkeypatch):
+    """(e) — operator ruling (same PR as decision:1205): the query must union
+    BOTH live failure classes — truncation_failed (capacity) AND slot_failed
+    (protocol) — and must NEVER read preservation_failed (retired gate,
+    historical rows only). Two independent mutation checks:
+      * re-add `preservation_failed` to the union -> `preservation_failed
+        not in sql` dies.
+      * drop `slot_failed` back out of the union -> `slot_failed" in sql and
+        "||" ... ` dies (a slot_failed row would then never dead-letter,
+        which is exactly what the operator ruled must not happen)."""
     conn = StubConn(script=[{"rowcount": 0, "rows": []}])
     monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: conn)
 
@@ -939,20 +956,40 @@ def test_fold_dead_letter_query_never_reads_preservation_failed(monkeypatch):
     sql, params = conn.executed[0]
     assert "preservation_failed" not in sql
     assert "truncation_failed" in sql
+    assert "slot_failed" in sql
+    # Both COALESCEs are combined into ONE set the GROUP BY sees together —
+    # not two separate reads.
+    assert re.search(
+        r"COALESCE\(extra->'truncation_failed'.*?\)\s*\|\|\s*"
+        r"COALESCE\(extra->'slot_failed'.*?\)", sql)
 
 
-def test_fold_dead_letter_counts_still_reads_truncation_failed(monkeypatch):
-    """Positive path — the narrowed query still counts a live
-    truncation_failed key; the narrowing removed ONE input, not the whole
-    mechanism."""
+def test_fold_dead_letter_counts_reads_whatever_the_unioned_query_returns(monkeypatch):
+    """Positive path — once Postgres has unioned the two live columns, a key
+    that came from ONLY `slot_failed` (e.g. `bravo`) counts identically to
+    one that came from ONLY `truncation_failed` (`alpha`) — the return dict
+    carries no provenance, by design (both are equally live failure
+    classes; the split is for diagnosis via the `extra` JSONB itself, not
+    for which one this gauge honours). A key that only ever appeared under
+    the retired `preservation_failed` (never migrated into either live
+    column) never reaches this dict at all — simulated here by its simple
+    absence from the stubbed row set, since the narrowed query would never
+    select it."""
     conn = StubConn(script=[
-        {"rowcount": 1, "rows": [("decision:245,decision:267", 2)]},
+        {"rowcount": 2, "rows": [
+            ("decision:245,decision:267", 2),   # e.g. sourced from truncation_failed
+            ("decision:345,decision:367", 3),   # e.g. sourced from slot_failed
+        ]},
     ])
     monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: conn)
 
     counts = cl.fetch_fold_dead_letter_counts()
 
-    assert counts == {"decision:245,decision:267": 2}
+    assert counts == {
+        "decision:245,decision:267": 2,
+        "decision:345,decision:367": 3,
+    }
+    assert "decision:not,seeded" not in counts
 
 
 # ── Fold dead-letter identity is content-derived, not label-derived (882) ────
