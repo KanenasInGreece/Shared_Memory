@@ -73,7 +73,7 @@ def load_memory_bridge():
 
 
 def load_vector_skill():
-    path = os.path.join(_ROOT, "vector-skill.py")
+    path = os.path.join(_ROOT, "mcp", "vector-skill.py")
     spec = importlib.util.spec_from_file_location("vector_skill", path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["vector_skill"] = mod

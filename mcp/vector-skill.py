@@ -48,12 +48,14 @@ from fastmcp import FastMCP
 # of per-agent tokens is that each origin is separately identifiable and
 # separately revocable.
 #
-# The two collide by default: this script lives at the repo root, so "the .env
-# beside me" is exactly where a pre-0.6 install still keeps the server env. So
-# load the file beside this script — which is what makes a per-install copy work,
-# the same shape as each CLI agent owning its own skill .env — but REFUSE one that
-# is recognisably the server's, and say why. Any MCP host can install its own copy
-# in its own directory with its own token; nothing here assumes LM Studio.
+# The two used to collide by default: this script lived at the repo root, where
+# a pre-0.6 install keeps the server env. It now lives in mcp/, so "the .env
+# beside me" is mcp/.env — a client-only location — and loading the file beside
+# this script is what makes a per-install copy work, the same shape as each CLI
+# agent owning its own skill .env. The guard stays: a server env copied here is
+# still recognisably the server's, gets REFUSED, and the refusal says why. Any
+# MCP host can install its own copy in its own directory with its own token;
+# nothing here assumes LM Studio.
 #
 # VECTOR_SKILL_ENV overrides the path outright, for an install that keeps its
 # client env somewhere else. An MCP host that injects AGENT_TOKEN through its own
@@ -117,7 +119,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server

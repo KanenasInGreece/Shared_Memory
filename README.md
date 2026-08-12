@@ -628,7 +628,7 @@ Installing a client is copying two files into the agent's skills directory:
 | Grok | `~/.grok/skills/shared-memory/` | `/shared-memory` |
 | Codex CLI | `~/.codex/skills/shared-memory/` | `$shared-memory` |
 | Antigravity CLI | `~/.gemini/skills/shared-memory/` | `/activate shared-memory` |
-| LM Studio / MCP hosts | `mcp.json` → `vector-skill.py` | MCP tools |
+| LM Studio / MCP hosts | `mcp/mcp.json` → `mcp/vector-skill.py` | MCP tools |
 
 Put the agent's `AGENT_TOKEN` in the skill's `.env`, then verify from any shell:
 
@@ -657,9 +657,14 @@ The identity is the token: the graph knows which machine contributed which fact.
 ## 21. LM Studio and MCP hosts
 
 The MCP surface is the second front door to the same gateway: any MCP host can mount the memory
-this way, and LM Studio is the example we have exercised end to end.
+this way, and the connector is client-deployable like the CLI skill — install a copy where the
+MCP host runs, give it a token and a route to the gateway. LM Studio is the example we have
+exercised end to end, not a default the surface assumes. The connector lives in the
+[`mcp/`](mcp/) folder — server, system prompt and config template together, with its own
+[`mcp/README.md`](mcp/README.md) covering what it exposes, how it deploys and how it
+authenticates.
 
-Register `vector-skill.py` in `mcp.json` with the coordinator URL and the `lm_studio` token in
+Register `mcp/vector-skill.py` in `mcp.json` with the coordinator URL and the `lm_studio` token in
 the `env` block — the token is not optional; without it every call 401s. Restart LM Studio
 completely after any token change (MCP servers read their environment once, at spawn).
 
@@ -667,7 +672,7 @@ completely after any token change (MCP servers read their environment once, at s
 "rag-orchestrator": {
   "command": "uv",
   "args": ["run", "--with", "fastmcp", "--with", "httpx", "--with", "python-dotenv",
-           "python", "/path/to/vector-skill.py"],
+           "python", "/path/to/shared_mem/mcp/vector-skill.py"],
   "env": { "COORDINATOR_URL": "http://localhost:8888", "AGENT_TOKEN": "YOUR_LM_STUDIO_TOKEN" }
 }
 ```
@@ -677,7 +682,7 @@ SQL connection bypasses read authorization, locking, atomicity and deduplication
 every private record and write rows invisible to search. `rag-orchestrator` already covers
 retrieval and writes through the authorized path; a database MCP adds no capability, only an
 unguarded route to the same data. Web search is a pluggable second MCP slot (Tavily and Brave
-examples ship in `mcp.json`).
+examples ship in `mcp/mcp.json`).
 
 ## 22. Backups and restore
 

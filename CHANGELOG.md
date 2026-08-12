@@ -5,6 +5,44 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.1] — 2026-08-12
+
+**Housekeeping: the MCP connector now lives in a folder of its own.** The three files that form
+the MCP front door — `vector-skill.py` (the FastMCP stdio server, a thin HTTP client to the
+gateway), `system-prompt.md` (the memory protocol handed to the MCP host's model), and the
+`mcp.json` config template — sat indistinguishably at the repo root, where nothing in the tree
+said they belong together or what deployment they serve. They moved as one unit into `mcp/`,
+joined by a new `mcp/README.md` that finally documents the connector in one place: its
+thin-client posture (no ports opened, no database drivers, everything enforced server-side),
+the thirteen tools it exposes at parity with the CLI skill, and the three ways an install can
+supply its `AGENT_TOKEN` — the host's own `env` block, a `VECTOR_SKILL_ENV` path, or a
+script-adjacent `mcp/.env`. The docs also stop treating LM Studio as the connector's default:
+the surface is client-deployable exactly like the CLI skill — install a copy where the MCP host
+runs, give it a token and a route to the gateway — and LM Studio is the host we happen to have
+exercised end to end, not an assumption the connector makes.
+
+The move also made the env-guard comment in `mcp/vector-skill.py` true again: the refusal to
+load a server `.env` was explained in terms of the script's old repo-root location, where "the
+file beside me" was exactly where a pre-0.6 install keeps the framework env. The note is
+rewritten for the new location; the guard's behaviour is unchanged — a file carrying
+`AGENT_TOKENS`, `PG_PASSWORD` or `NEO4J_PASSWORD` is still recognised as the server's and
+refused with an explanation. The template's internal example path, the README client table
+(§9) and MCP section (§21), and `AGENTS.md` (Phase 8, Configuration) now point at `mcp/`, and
+five test files load the moved files from the new location (`test_vector_skill.py`,
+`test_search_ceiling.py`, `test_search_axis_filters.py`, `test_project_registry.py`, and the
+Group-1 version-pin contract in `test_change_group_contracts.py`). The version moved to 0.9.1
+in all four pins and both `SKILL.md` worked examples; `API_VERSION` stays 4 — no wire-contract
+change, and no tool behaves differently.
+
+⚠ **Upgrade note for existing MCP deployments:** your MCP host's live config (LM Studio's
+`mcp.json` or equivalent) holds an **absolute path** to `vector-skill.py`, and the old
+repo-root path no longer exists after this release — update it to
+`.../shared_mem/mcp/vector-skill.py` and restart the host fully, since MCP servers read their
+environment once at spawn. If you use a script-adjacent client `.env` (rare; most installs
+inject the token through the host's `env` block), it moves to `mcp/.env`.
+
+---
+
 ## [0.9.0] — 2026-08-11
 
 **The Dreaming Cycle v2 milestone.** The one authorised minor bump (operator ruling): Track B +

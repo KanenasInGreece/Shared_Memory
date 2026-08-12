@@ -22,7 +22,7 @@
         "--with",
         "python-dotenv",
         "python",
-        "/path/to/your/shared_mem/vector-skill.py"
+        "/path/to/your/shared_mem/mcp/vector-skill.py"
       ],
       "env": {
         "COORDINATOR_URL": "http://localhost:8888",
