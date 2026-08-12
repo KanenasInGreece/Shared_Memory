@@ -657,9 +657,12 @@ The identity is the token: the graph knows which machine contributed which fact.
 ## 21. LM Studio and MCP hosts
 
 The MCP surface is the second front door to the same gateway: any MCP host can mount the memory
-this way, and LM Studio is the example we have exercised end to end. The connector lives in the
+this way, and the connector is client-deployable like the CLI skill — install a copy where the
+MCP host runs, give it a token and a route to the gateway. LM Studio is the example we have
+exercised end to end, not a default the surface assumes. The connector lives in the
 [`mcp/`](mcp/) folder — server, system prompt and config template together, with its own
-[`mcp/README.md`](mcp/README.md) covering what it exposes and how it authenticates.
+[`mcp/README.md`](mcp/README.md) covering what it exposes, how it deploys and how it
+authenticates.
 
 Register `mcp/vector-skill.py` in `mcp.json` with the coordinator URL and the `lm_studio` token in
 the `env` block — the token is not optional; without it every call 401s. Restart LM Studio

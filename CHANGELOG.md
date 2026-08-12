@@ -16,7 +16,10 @@ joined by a new `mcp/README.md` that finally documents the connector in one plac
 thin-client posture (no ports opened, no database drivers, everything enforced server-side),
 the thirteen tools it exposes at parity with the CLI skill, and the three ways an install can
 supply its `AGENT_TOKEN` — the host's own `env` block, a `VECTOR_SKILL_ENV` path, or a
-script-adjacent `mcp/.env`.
+script-adjacent `mcp/.env`. The docs also stop treating LM Studio as the connector's default:
+the surface is client-deployable exactly like the CLI skill — install a copy where the MCP host
+runs, give it a token and a route to the gateway — and LM Studio is the host we happen to have
+exercised end to end, not an assumption the connector makes.
 
 The move also made the env-guard comment in `mcp/vector-skill.py` true again: the refusal to
 load a server `.env` was explained in terms of the script's old repo-root location, where "the

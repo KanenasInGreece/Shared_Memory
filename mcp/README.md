@@ -21,8 +21,13 @@ authorization, locking, idempotency and consolidation all live server-side. That
 a direct database MCP registered alongside it would bypass all of those, which is why
 `system-prompt.md` forbids one and the shipped template contains none.
 
-LM Studio is the host exercised end to end (README §21), but nothing here assumes it — any MCP
-host that can spawn a stdio server and inject environment variables can mount the memory.
+**It is client-deployable, exactly like the CLI skill.** The connector does not have to run
+from a repo checkout on the gateway host: an installing agent can place a copy of this folder
+on whatever machine the MCP host runs on — the file, a token, and a route to the gateway
+(directly, or over a tunnel/VPN) are the whole requirement. Point the host's config at the
+deployed copy's path. Any MCP host that can spawn a stdio server and inject environment
+variables can mount the memory this way; LM Studio is simply the host we have exercised end to
+end (README §21), not a default this surface assumes.
 
 ## Tools (13, at parity with the CLI skill)
 
