@@ -417,7 +417,7 @@ def test_a_reasoning_trace_carries_a_project_like_any_other_record():
     it, and exempting it would quietly rebuild the untagged population. It is
     also not DEFAULTED to the sentinel — that would park records without anyone
     deciding to."""
-    src = open(os.path.join(os.path.dirname(__file__), "..", "vector-skill.py"),
+    src = open(os.path.join(os.path.dirname(__file__), "..", "mcp", "vector-skill.py"),
                encoding="utf-8").read()
     body = src.split("async def archive_reasoning_trace")[1].split("\n@mcp.tool()")[0]
     signature = body.split(")")[0]

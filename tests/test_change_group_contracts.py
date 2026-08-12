@@ -31,7 +31,7 @@ _VERSION_PINS = {
     ("shared-memory", "scripts", "memory_bridge.py"): r'^VERSION = "([\d.]+)"',
     ("shared-memory-skill", "shared-memory", "scripts", "memory_bridge.py"):
         r'^VERSION = "([\d.]+)"',
-    ("vector-skill.py",): r'^VERSION = "([\d.]+)"',
+    ("mcp", "vector-skill.py"): r'^VERSION = "([\d.]+)"',
 }
 
 

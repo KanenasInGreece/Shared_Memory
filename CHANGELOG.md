@@ -5,6 +5,41 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.1] — 2026-08-12
+
+**Housekeeping: the MCP connector gets its own folder.** No wire-contract change
+(`API_VERSION` stays 4); no behaviour change in any tool.
+
+### Changed — MCP connector surface moved to `mcp/`
+
+The three files that form the MCP front door lived indistinguishably at the repo root —
+nothing in the tree said they belong together or what deployment they serve. They now live in
+`mcp/` as one declared unit, with a README stating what the connector is, who consumes it, the
+full 13-tool surface, and how the token reaches it:
+
+- `vector-skill.py` → `mcp/vector-skill.py` (the FastMCP stdio server, a thin gateway client)
+- `system-prompt.md` → `mcp/system-prompt.md` (the MCP host's memory protocol)
+- `mcp.json` → `mcp/mcp.json` (the host config template; its example path updated to match)
+- **New: `mcp/README.md`** — what/how/why for the connector, including the three
+  token-resolution paths (host `env` block · `VECTOR_SKILL_ENV` · script-adjacent `mcp/.env`)
+  and the client-env-is-never-the-server-env guard.
+
+The stale note in `vector-skill.py` explaining its env guard by its old repo-root location was
+rewritten for the new one — the guard itself is unchanged and still refuses a server env.
+README §9/§21 and `AGENTS.md` Phase 8 / Configuration now point at the new paths; tests load
+the moved files from `mcp/`.
+
+### ⚠ Upgrade note for existing MCP deployments
+
+Your MCP host's live config (LM Studio's `mcp.json` or equivalent) holds an **absolute path**
+to `vector-skill.py`. After pulling this release, update that path to
+`.../shared_mem/mcp/vector-skill.py` and restart the host fully — the old root path no longer
+exists, and the host will otherwise fail to spawn the server. If you use a script-adjacent
+client `.env` (rare; most installs inject the token via the host's `env` block), move it to
+`mcp/.env`.
+
+---
+
 ## [0.9.0] — 2026-08-11
 
 **The Dreaming Cycle v2 milestone.** The one authorised minor bump (operator ruling): Track B +

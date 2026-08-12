@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch, AsyncMock
 
 # Dynamic load of vector-skill.py
 def load_vector_skill():
-    path = os.path.join(os.path.dirname(__file__), "..", "vector-skill.py")
+    path = os.path.join(os.path.dirname(__file__), "..", "mcp", "vector-skill.py")
     spec = importlib.util.spec_from_file_location("vector_skill", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules["vector_skill"] = module
@@ -43,7 +43,7 @@ async def test_thin_client_owns_no_database_handles():
             f"{name} is back — vector-skill must reach memory only through the gateway")
     # Scan CODE only — the module docstring narrates the removed design on
     # purpose, and a prose mention of it is the opposite of a regression.
-    src = open(os.path.join(os.path.dirname(__file__), "..", "vector-skill.py")).read()
+    src = open(os.path.join(os.path.dirname(__file__), "..", "mcp", "vector-skill.py")).read()
     code = "\n".join(l for l in src.splitlines()
                      if l.strip() and not l.startswith(("#", " ", "\t")) or
                      l.lstrip().startswith(("import ", "from ", "sys.path")))
@@ -499,7 +499,7 @@ async def test_mcp_review_hold():
 def _vs_module():
     """Load vector-skill.py fresh (module name has a dash, so import by path)."""
     import importlib.util
-    path = os.path.join(os.path.dirname(__file__), "..", "vector-skill.py")
+    path = os.path.join(os.path.dirname(__file__), "..", "mcp", "vector-skill.py")
     spec = importlib.util.spec_from_file_location("vector_skill_env", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -558,7 +558,7 @@ def test_agent_id_is_read_in_exactly_one_place():
     "lm_studio" at three call sites, so logs and the search agent_id field
     disagreed within a single process depending on which tool ran.
     """
-    src = open(os.path.join(os.path.dirname(__file__), "..", "vector-skill.py"),
+    src = open(os.path.join(os.path.dirname(__file__), "..", "mcp", "vector-skill.py"),
                encoding="utf-8").read()
     assert src.count('os.environ.get("AGENT_ID"') == 1, (
         "AGENT_ID is read in more than one place — a second default can diverge "
@@ -573,7 +573,7 @@ def test_every_401_routes_through_the_auth_helper():
     now owns the response, and it is the single place the token-source guidance
     lives, so it cannot go stale in five copies again.
     """
-    path = os.path.join(os.path.dirname(__file__), "..", "vector-skill.py")
+    path = os.path.join(os.path.dirname(__file__), "..", "mcp", "vector-skill.py")
     src = open(path, encoding="utf-8").read()
     lines = src.split("\n")
 
@@ -595,7 +595,7 @@ def test_every_401_routes_through_the_auth_helper():
 def test_auth_helper_is_called_with_the_calling_tool_name():
     """The log's `tool` field was the literal "vector_skill" at every site, so it
     never said which call was rejected."""
-    path = os.path.join(os.path.dirname(__file__), "..", "vector-skill.py")
+    path = os.path.join(os.path.dirname(__file__), "..", "mcp", "vector-skill.py")
     src = open(path, encoding="utf-8").read()
     assert '_auth_rejected("vector_skill")' not in src, (
         "the helper is being passed the client name instead of the tool name"
@@ -611,7 +611,7 @@ def _repo(*parts):
 def _registered_tools() -> list:
     """Tool names actually registered with @mcp.tool, read from the source."""
     import ast
-    tree = ast.parse(open(_repo("vector-skill.py"), encoding="utf-8").read())
+    tree = ast.parse(open(_repo("mcp", "vector-skill.py"), encoding="utf-8").read())
     names = []
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -629,7 +629,7 @@ def test_system_prompt_names_every_registered_mcp_tool():
     tool unreachable in practice."""
     tools = _registered_tools()
     assert len(tools) >= 13, f"expected the full tool surface, found {tools}"
-    prompt = open(_repo("system-prompt.md"), encoding="utf-8").read()
+    prompt = open(_repo("mcp", "system-prompt.md"), encoding="utf-8").read()
     missing = [t for t in tools if t not in prompt]
     assert not missing, f"system-prompt.md does not mention MCP tool(s): {missing}"
 
@@ -639,7 +639,7 @@ def test_system_prompt_does_not_send_the_model_to_a_database_mcp():
     connects past the gateway, and the gateway is what applies the read-visibility
     predicate — so that fallback pointed at the exact unauthorized path removed
     from this client in v0.8.0."""
-    prompt = open(_repo("system-prompt.md"), encoding="utf-8").read()
+    prompt = open(_repo("mcp", "system-prompt.md"), encoding="utf-8").read()
     assert "Never register or reach for a database MCP" in prompt, (
         "the prohibition on database MCPs is missing"
     )
@@ -675,7 +675,7 @@ def test_shipped_mcp_config_registers_no_database_server():
     other side: the gateway filters every read on `visibility`, a raw SQL or Bolt
     connection filters on nothing."""
     import json as _json
-    cfg = _json.load(open(_repo("mcp.json"), encoding="utf-8"))
+    cfg = _json.load(open(_repo("mcp", "mcp.json"), encoding="utf-8"))
     servers = cfg.get("mcpServers") or cfg
     for name, entry in servers.items():
         blob = (name + " " + _json.dumps(entry)).lower()

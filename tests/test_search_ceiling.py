@@ -66,7 +66,7 @@ memory_bridge = _load(
     "memory_bridge",
     "shared-memory-skill", "shared-memory", "scripts", "memory_bridge.py",
 )
-vector_skill = _load("vector_skill", "vector-skill.py")
+vector_skill = _load("vector_skill", "mcp", "vector-skill.py")
 
 CLIENTS = [
     pytest.param(memory_bridge, id="cli"),
