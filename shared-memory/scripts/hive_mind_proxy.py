@@ -42,6 +42,10 @@ from coordinator import (
     FRAMEWORK_VERSION,
     API_VERSION,
     require_no_plaintext_agent_tokens,
+    record_daemon_token_issued,
+    record_llm_gateway_fault,
+    record_llm_upstream_fault,
+    _parse_upstream_error_type,
 )
 
 # Unified Hive-Mind Async Proxy v7
@@ -376,6 +380,19 @@ HOP_BY_HOP = frozenset({
     "te", "trailers", "transfer-encoding", "upgrade", "content-length",
 })
 
+
+def _safe_request_id(request) -> "str | None":
+    """Best-effort read of the request_id auth_middleware stashes on the
+    request (PR A3), used to correlate a credential-audit line with the same
+    request's gateway audit line. None for a request never routed through
+    the middleware (auth disabled, or a lightweight stand-in without a
+    mapping interface — every direct handle_proxy() caller in this repo's
+    own tests)."""
+    try:
+        return request.get("request_id")
+    except AttributeError:
+        return None
+
 # Upstream mid-stream disconnect — abrupt reset from the upstream server
 # (llama-server, BGE-M3) while we are reading via iter_any(). This is a
 # ClientError subclass raised by aiohttp's HTTP *client* — NOT a downstream
@@ -478,10 +495,23 @@ class AsyncHiveMindProxy:
         # Authorization was just stripped above (see _filter_headers) — add it
         # back ONLY for a backend that has its own configured credential. Every
         # other backend (local, or one with no token_env) gets none, same as today.
+        backend_token = None
         if llm_backend is not None:
             backend_token = LLM_BACKEND_TOKENS.get(llm_backend)
             if backend_token:
                 upstream_headers["Authorization"] = f"Bearer {backend_token}"
+            # Surface for the gateway's own per-request audit line (PR A3,
+            # coordinator._audit's additive backend/key_attached fields) —
+            # auth_middleware reads these back off the request after this
+            # handler returns. Best-effort: request may be a lightweight
+            # stand-in (tests, direct handle_proxy callers) without a
+            # mapping interface.
+            try:
+                request["backend"] = llm_backend
+                if backend_token:
+                    request["key_attached"] = True
+            except (TypeError, AttributeError):
+                pass
 
         # Stream the request body directly to the upstream without buffering it
         # into a single byte array first, UNLESS it's small enough that buffering
@@ -551,12 +581,36 @@ class AsyncHiveMindProxy:
                         # telemetry (obs tok/s) without learning routing — observability only.
                         if llm_backend is not None:
                             proxy_resp.headers["X-SM-LLM-Backend"] = llm_backend
+                        # Client-facing standard messaging (PR A3): a fault status
+                        # from ANY upstream (LLM, embedder, reranker) is an upstream-
+                        # origin error — the body still passes through verbatim below,
+                        # unchanged. This header is additive and never set on success.
+                        if upstream.status >= 400:
+                            proxy_resp.headers["X-SM-Fault-Origin"] = "upstream"
                         await proxy_resp.prepare(request)
+
+                        # Best-effort credential-fault classification (PR A3): only for
+                        # the LLM pool (embeddings/reranking never carry a provider key)
+                        # and only on a fault status. Peeks the FIRST streamed chunk —
+                        # error bodies are small JSON that arrive in one chunk in
+                        # practice; classification never buffers or reorders anything,
+                        # so the passthrough below is untouched even when the peek
+                        # can't parse a split/foreign body (falls through to
+                        # "transient" — see _classify_llm_fault).
+                        fault_classified = llm_backend is None or upstream.status < 400
 
                         # write_eof() lives inside the same try as the chunk loop so that
                         # an EOF-time disconnect is handled by the same except clauses.
                         try:
                             async for chunk in upstream.content.iter_any():
+                                if not fault_classified:
+                                    fault_classified = True
+                                    error_type = _parse_upstream_error_type(chunk)
+                                    record_llm_upstream_fault(
+                                        llm_backend, upstream.status, error_type,
+                                        credentialed=bool(backend_token),
+                                        request_id=_safe_request_id(request),
+                                    )
                                 await proxy_resp.write(chunk)
                             await proxy_resp.write_eof()
 
@@ -578,6 +632,19 @@ class AsyncHiveMindProxy:
                             # OS-level socket reset from the downstream client.
                             # Nothing more can be sent; log and return.
                             log.warning("Client disconnected mid-stream: %s — %s", target_url, e)
+
+                        # Fallback classification (PR A3): the loop above never ran its
+                        # body — an empty-bodied fault response, or a disconnect before
+                        # the first chunk arrived. Still worth recording: the status
+                        # alone is enough to classify 401/403, and an unparseable/absent
+                        # body classifies as transient either way.
+                        if not fault_classified:
+                            fault_classified = True
+                            record_llm_upstream_fault(
+                                llm_backend, upstream.status, None,
+                                credentialed=bool(backend_token),
+                                request_id=_safe_request_id(request),
+                            )
 
                         if llm_backend is not None:
                             _llm_mark_ok(llm_backend)   # connected + served — clear fail streak
@@ -619,24 +686,41 @@ class AsyncHiveMindProxy:
             log.error("Upstream unreachable %s: %s", target_url, ce)
             if llm_backend is not None:
                 _llm_mark_fail(llm_backend)
+                # Gateway-origin fault (PR A3) — the gateway itself observed this
+                # (a connect/refuse failure), never what the upstream said, so it
+                # counts in the `gateway` group only, and is logged only when the
+                # call was credentialed (see record_llm_gateway_fault docstring).
+                record_llm_gateway_fault(llm_backend, type(ce).__name__,
+                                          credentialed=bool(backend_token),
+                                          request_id=_safe_request_id(request))
             if proxy_resp and proxy_resp.prepared:
                 return proxy_resp
-            return web.json_response({"error": f"Backend unreachable: {ce}"}, status=503)
+            return web.json_response({"error": f"Backend unreachable: {ce}"}, status=503,
+                                      headers={"X-SM-Fault-Origin": "gateway"})
 
         except asyncio.TimeoutError:
             # Connect timeout to upstream — correct status is 504, not 500.
             log.warning("Upstream connect timeout: %s", target_url)
             if llm_backend is not None:
                 _llm_mark_fail(llm_backend)
+                record_llm_gateway_fault(llm_backend, "TimeoutError",
+                                          credentialed=bool(backend_token),
+                                          request_id=_safe_request_id(request))
             if proxy_resp and proxy_resp.prepared:
                 return proxy_resp
-            return web.json_response({"error": "Upstream connect timeout"}, status=504)
+            return web.json_response({"error": "Upstream connect timeout"}, status=504,
+                                      headers={"X-SM-Fault-Origin": "gateway"})
 
         except Exception as e:
             log.error("Unexpected proxy error for %s: %s", target_url, e, exc_info=True)
+            if llm_backend is not None:
+                record_llm_gateway_fault(llm_backend, type(e).__name__,
+                                          credentialed=bool(backend_token),
+                                          request_id=_safe_request_id(request))
             if proxy_resp and proxy_resp.prepared:
                 return proxy_resp
-            return web.json_response({"error": f"Proxy error: {e}"}, status=500)
+            return web.json_response({"error": f"Proxy error: {e}"}, status=500,
+                                      headers={"X-SM-Fault-Origin": "gateway"})
 
         finally:
             # Release the in-flight slot so least-busy selection stays accurate,
@@ -708,6 +792,7 @@ def _mint_daemon_token(agent_name: str) -> str:
     digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
     _AGENT_TOKENS[digest] = agent_name
     _ephemeral_daemon_token_digests[agent_name] = digest
+    record_daemon_token_issued(agent_name)  # PR A3: counter + credential-audit line
     return token
 
 

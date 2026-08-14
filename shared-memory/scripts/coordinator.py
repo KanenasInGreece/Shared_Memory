@@ -140,7 +140,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.3"
+FRAMEWORK_VERSION = "0.9.4"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -508,12 +508,23 @@ def _read_role_permits(request: web.Request) -> bool:
 AUTH_SCHEME = "bearer"
 
 
-def _resolve_bearer(request: web.Request) -> str | None:
-    """Map ``Authorization: Bearer <token>`` to a verified agent name, or None."""
+def _extract_bearer_token(request: web.Request) -> str | None:
+    """Return the raw ``Authorization: Bearer <token>`` value, or None if no
+    such header/scheme is present — regardless of whether the token verifies.
+    Shared by identity resolution and, on a verify failure, by the RFC 6750
+    WWW-Authenticate choice + the credential-audit digest (PR A3): a token
+    that was PRESENTED but rejected gets ``error="invalid_token"`` and a
+    digest_prefix; no token at all gets the bare challenge and no digest."""
     parts = request.headers.get("Authorization", "").split(maxsplit=1)
     if len(parts) != 2 or parts[0] != "Bearer":
         return None
-    return _lookup_agent_by_token(parts[1])
+    return parts[1]
+
+
+def _resolve_bearer(request: web.Request) -> str | None:
+    """Map ``Authorization: Bearer <token>`` to a verified agent name, or None."""
+    token = _extract_bearer_token(request)
+    return _lookup_agent_by_token(token) if token is not None else None
 
 
 _IDENTITY_RESOLVERS = [_resolve_bearer]
@@ -816,7 +827,8 @@ def backup_quiesce_active() -> bool:
 # ── Thin per-request audit hook ─────────────────────────────────────────────────
 def _audit(agent: str, method: str, path: str, status: int,
            latency_ms: float, request_id: str,
-           principal: dict[str, Any] | None = None) -> None:
+           principal: dict[str, Any] | None = None,
+           backend: str | None = None, key_attached: bool = False) -> None:
     """Append one JSON line recording a completed request. Best-effort and OFF the
     DB hot path: it never touches Postgres (so audit volume can't steal the pool's
     connection budget) and a logging failure never surfaces into the request.
@@ -826,6 +838,13 @@ def _audit(agent: str, method: str, path: str, status: int,
     The write goes through _audit_writer (an AsyncLineWriter): the line is enqueued
     O(1) and a background task does the disk append in an executor, so the write
     never blocks the event loop. Rotation/gzip is handled by logrotate(8).
+
+    `backend`/`key_attached` (PR A3, additive — existing fields unchanged) are set
+    only when the request was proxied to an LLM backend / a provider key was
+    attached to it (hive_mind_proxy.handle_proxy stashes them on the request for
+    this hook to read back — see request["backend"]/request["key_attached"]).
+    Per-request USE auditing stops here; the credential-events log (a separate
+    stream, see _write_credential_audit_line) carries only high-signal faults.
     """
     if _audit_writer is None:
         return
@@ -850,10 +869,196 @@ def _audit(agent: str, method: str, path: str, status: int,
                 ("uid", "gid", "pid", "login_uid", "login_user", "session")
                 if k in principal
             }
+        if backend:
+            record["backend"] = backend
+        if key_attached:
+            record["key_attached"] = True
         line = json.dumps(record, separators=(",", ":"))
         _audit_writer.write(line)
     except Exception as exc:  # never break a request because auditing failed
         log.warning("audit write failed: %s", exc)
+
+
+# ── Credential-use audit trail (ISO 27001 A.5.17 property 4, PR A3) ─────────────
+#
+# Governing split: telemetry (below, served on GET /memory/telemetry) surfaces
+# SIGNAL — operator-attention counters plus the last event's context. The
+# credential-audit log (_credential_audit_writer, a SEPARATE stream from the
+# per-request _audit_writer above) carries the DETAIL, and only for HIGH-SIGNAL
+# events — never a mirror of request volume. Per-request use-auditing (every
+# proxied call) stays in the existing gateway audit line via _audit()'s
+# additive backend/key_attached fields; this log is for faults and credential
+# lifecycle events only.
+#
+# Origin-ownership invariant: `gateway` = what the gateway itself decided or
+# observed (routing, shed, connect/timeout, retries, own-door auth, key
+# attach). `llm` = what the upstream SAID (status class, typed error body).
+# A retried request counts per-attempt in `llm`, once in `gateway`. Nothing is
+# ever counted in both groups for the same cause.
+_llm_fault_counters: dict[str, dict] = {}
+_credential_counters: dict[str, int] = {
+    "token_verify_failed": 0,
+    "daemon_tokens_issued": 0,
+}
+
+
+def _fault_entry(backend: str) -> dict:
+    """Lazily create (and return) the per-backend fault counter shape."""
+    return _llm_fault_counters.setdefault(backend, {
+        "gateway": {"count": 0, "last": None},
+        "llm": {
+            "credential": {"count": 0, "last": None},
+            "transient":  {"count": 0, "last": None},
+        },
+    })
+
+
+def _classify_llm_fault(status: int, error_type: str | None) -> str:
+    """credential = 401/403 always, or 429 whose upstream body names OpenAI's
+    error.code == 'insufficient_quota' (never-retry, fix-the-key class).
+    Everything else — including an unparseable/foreign 429, and 5xx/529 — is
+    transient (retry-with-backoff class): a false quiet beats a false alarm
+    when the body can't be read."""
+    if status in (401, 403):
+        return "credential"
+    if status == 429 and error_type == "insufficient_quota":
+        return "credential"
+    return "transient"
+
+
+def _parse_upstream_error_type(body: bytes) -> str | None:
+    """Best-effort extraction of the upstream error's own type/code label
+    (OpenAI-compatible {"error": {"code"|"type": ...}} shape) — used for
+    classification and for the telemetry/audit `error_type` field. Never
+    raises: a foreign shape, a truncated peek of a chunked body, or plain
+    non-JSON all just yield None, which classifies as transient rather than
+    guessing at a credential fault it can't actually name."""
+    try:
+        payload = json.loads(body)
+        err = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(err, dict):
+            return err.get("code") or err.get("type")
+    except Exception:
+        pass
+    return None
+
+
+CREDENTIAL_AUDIT_LOG_PATH = os.environ.get(
+    "CREDENTIAL_AUDIT_LOG_PATH", "~/.shared-memory/logs/credential-audit.jsonl",
+)
+# ON by default (unlike GATEWAY_AUDIT_LOG_PATH above) — credential-use
+# auditing is a baseline control, not an opt-in diagnostic. Set the env var
+# to an empty string to disable it explicitly. Rotation is already handled —
+# the shipped logrotate config globs *-audit.jsonl, which this filename
+# matches (see shared-memory/ops/README.md).
+_credential_audit_writer = (
+    AsyncLineWriter(os.path.expanduser(CREDENTIAL_AUDIT_LOG_PATH))
+    if CREDENTIAL_AUDIT_LOG_PATH.strip() else None
+)
+
+
+def _write_credential_audit_line(event: str, *, origin: str, **fields) -> None:
+    """Append one high-signal line to the credential-events log. Best-effort,
+    off the DB hot path, and never lets a logging failure surface into the
+    request — same contract as _audit() above. No-op when the writer is
+    disabled (CREDENTIAL_AUDIT_LOG_PATH set to an empty string)."""
+    if _credential_audit_writer is None:
+        return
+    try:
+        record = {"ts": datetime.now(timezone.utc).isoformat(), "event": event,
+                   "origin": origin, **fields}
+        _credential_audit_writer.write(json.dumps(record, separators=(",", ":")))
+    except Exception as exc:  # never break a request because auditing failed
+        log.warning("credential-audit write failed: %s", exc)
+
+
+def _record_token_verify_failed(presented_token: str | None) -> None:
+    """A client's bearer token failed to verify. `claimed_agent` is always
+    None today: the bearer scheme carries no separate name claim to disagree
+    with (unlike the planned PoP resolver, whose handshake will) — the field
+    exists now so that lands with no shape change. The presented token's own
+    value NEVER appears (SEC-08); only the first 8 hex chars of its SHA-256
+    digest, enough to correlate repeat offenders without recovering the
+    secret. `digest_prefix` is None when no token was presented at all."""
+    _credential_counters["token_verify_failed"] += 1
+    _write_credential_audit_line(
+        "token_verify_failed", origin="gateway", claimed_agent=None,
+        digest_prefix=_token_digest(presented_token)[:8] if presented_token else None,
+    )
+
+
+def record_daemon_token_issued(agent_name: str) -> None:
+    """Bump the daemon-tokens-issued counter and log the mint — daemon name
+    and timestamp only, never token material. Called by
+    hive_mind_proxy._mint_daemon_token() (SEC-10, PR A2) on every mint,
+    including re-mints on daemon respawn."""
+    _credential_counters["daemon_tokens_issued"] += 1
+    _write_credential_audit_line("daemon_token_issued", origin="gateway", daemon=agent_name)
+
+
+def record_llm_gateway_fault(backend: str, error_class: str, *,
+                              credentialed: bool = False,
+                              request_id: str | None = None) -> None:
+    """Record a gateway-origin failure on an LLM-pool call (connect/timeout/
+    shed/proxy error — `error_class` is the exception's class name, a string,
+    never the exception's own text). Telemetry counts every backend; the
+    credential-audit log line is written only when the call was credentialed
+    (a provider key was attached) — this log is about credential USE, and an
+    uncredentialed local backend's connection hiccup isn't that."""
+    entry = _fault_entry(backend)["gateway"]
+    entry["count"] += 1
+    entry["last"] = {"ts": datetime.now(timezone.utc).isoformat(), "class": error_class}
+    if credentialed:
+        extra = {"request_id": request_id} if request_id else {}
+        _write_credential_audit_line("gateway_fault", origin="gateway",
+                                      backend=backend, error_class=error_class, **extra)
+
+
+def record_llm_upstream_fault(backend: str, status: int, error_type: str | None, *,
+                               credentialed: bool = False,
+                               request_id: str | None = None) -> str:
+    """Record an upstream-origin fault (the backend itself returned a fault
+    status) on an LLM-pool call; returns the classification ("credential" |
+    "transient") so the caller can log alongside it if it wants to. Telemetry
+    counts every backend regardless of credential status; the
+    upstream_credential_fault audit line is written only for the credential
+    class AND only on a credentialed call — it exists to answer "did a
+    request using OUR provider key get rejected", not to mirror every 5xx."""
+    cls = _classify_llm_fault(status, error_type)
+    entry = _fault_entry(backend)["llm"][cls]
+    entry["count"] += 1
+    entry["last"] = {"ts": datetime.now(timezone.utc).isoformat(),
+                      "status": status, "error_type": error_type}
+    if cls == "credential" and credentialed:
+        extra = {"request_id": request_id} if request_id else {}
+        _write_credential_audit_line("upstream_credential_fault", origin="llm",
+                                      backend=backend, status=status,
+                                      error_type=error_type, **extra)
+    return cls
+
+
+def _llm_faults_snapshot() -> dict:
+    """Read-only render of the in-process per-backend fault counters for
+    GET /memory/telemetry. In-process only (reset on restart) — same
+    contract as the existing _llm_routed counters this section mirrors."""
+    return {
+        backend: {
+            "gateway": dict(entry["gateway"]),
+            "llm": {cls: dict(sub) for cls, sub in entry["llm"].items()},
+        }
+        for backend, entry in _llm_fault_counters.items()
+    }
+
+
+def _credentials_snapshot() -> dict:
+    """Read-only render of the credential counters for GET /memory/telemetry.
+    audit_log_dropped surfaces the credential log's own AsyncLineWriter.dropped
+    (0 when auditing is disabled or nothing was ever dropped)."""
+    return {
+        "token_verify_failed": _credential_counters["token_verify_failed"],
+        "daemon_tokens_issued": _credential_counters["daemon_tokens_issued"],
+        "audit_log_dropped": _credential_audit_writer.dropped if _credential_audit_writer else 0,
+    }
 
 
 @web.middleware
@@ -878,7 +1083,17 @@ async def auth_middleware(request: web.Request, handler):
 
     agent_name = resolve_identity(request)
     if not agent_name:
-        raise web.HTTPUnauthorized(reason="Authorization: a valid Bearer token is required")
+        # RFC 6750 §3: a token was PRESENTED but rejected gets
+        # error="invalid_token"; no token at all gets the bare challenge —
+        # and only the former has a digest worth logging (PR A3). This is
+        # the gateway's OWN 401 (its own door), never an upstream one.
+        presented = _extract_bearer_token(request)
+        _record_token_verify_failed(presented)
+        www_authenticate = 'Bearer error="invalid_token"' if presented else "Bearer"
+        raise web.HTTPUnauthorized(
+            reason="Authorization: a valid Bearer token is required",
+            headers={"WWW-Authenticate": www_authenticate},
+        )
     request["authenticated_agent"] = agent_name
     # Person axis: stamp the kernel-attested principal (OS account + connection
     # fingerprint) from SO_PEERCRED. None on the TCP transport — never inferred from
@@ -926,6 +1141,11 @@ async def auth_middleware(request: web.Request, handler):
     request_id = uuid.uuid4().hex[:12]
     status     = 500
     _inflight += 1
+    # Stashed so a downstream handler (hive_mind_proxy.handle_proxy) can
+    # correlate its own gateway_fault/upstream_credential_fault credential-
+    # audit lines with this same request (PR A3) — mirrors request["principal"]
+    # above.
+    request["request_id"] = request_id
     try:
         resp = await handler(request)
         status = resp.status
@@ -943,7 +1163,9 @@ async def auth_middleware(request: web.Request, handler):
         _inflight -= 1
         latency_ms = (asyncio.get_running_loop().time() - started) * 1000
         _audit(agent_name, request.method, request.path, status, latency_ms,
-               request_id, request.get("principal"))
+               request_id, request.get("principal"),
+               backend=request.get("backend"),
+               key_attached=bool(request.get("key_attached")))
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # PG_PASSWORD/NEO4J_PASSWORD/PG_CONN are secrets (SEC-05/SEC-09, PR A1; PG_CONN
@@ -1672,6 +1894,11 @@ class MemoryCoordinator:
         if _audit_writer is not None:
             try:
                 await _audit_writer.aclose()   # flush queued audit lines, stop drain
+            except Exception:
+                pass
+        if _credential_audit_writer is not None:
+            try:
+                await _credential_audit_writer.aclose()
             except Exception:
                 pass
         if self._pool:
@@ -5999,6 +6226,13 @@ class MemoryCoordinator:
         # shells out to nvtop itself. "unknown" (nvtop absent) is surfaced verbatim
         # so the monitor never shows a false "idle".
         snap["inference_busy"] = self._consolidation_health.get("inference_busy", "unknown")
+
+        # Credential-use audit trail signal (PR A3) — in-process counters, no
+        # I/O, so no try/except: same reset-on-restart contract as the
+        # existing _llm_routed counters. Detail lives in the separate
+        # credential-events log; this is the operator-attention SIGNAL only.
+        snap["llm_faults"] = _llm_faults_snapshot()
+        snap["credentials"] = _credentials_snapshot()
 
         return web.json_response({"status": "success", "telemetry": snap})
 
