@@ -5,6 +5,47 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.2] — 2026-08-14
+
+**Credential custody, PR A1: secrets stop riding in the process environment.** Every long-running
+framework process — the gateway, and the REM/NREM daemons it spawns — used to dump the whole
+framework `.env` into `os.environ` at import time, secrets included, and the gateway then handed
+each daemon a *full copy* of its own environment (`os.environ.copy()`) to spawn it with. That
+meant `PG_PASSWORD`, `NEO4J_PASSWORD`, `AGENT_TOKENS`, and any configured provider API key sat
+readable in `/proc/<pid>/environ` for the whole lifetime of every one of those processes, and
+crossed into each daemon's exec environment on every restart — visible to anything sharing this
+account's uid.
+
+A new shared loader (`shared-memory/scripts/secure_env.py`) replaces the three separate
+`_load_env()` implementations this family had drifted into: `hive_mind_proxy.py`'s, `rem_loop.py`'s
+(whose own comment called re-importing secrets "harmless while the daemon is spawned by the
+gateway" — an assumption this release inverts, since the proxy no longer hands a daemon's child
+process any secrets at all), and `consolidation_loop.py`'s missing one (it had read
+`PG_PASSWORD`/`NEO4J_PASSWORD` straight off the ambient environment with no loader of its own).
+The new loader splits every key it reads: ordinary config still lands in `os.environ`, unchanged;
+a secret — classified by both an explicit known-name list (`PG_PASSWORD`, `NEO4J_PASSWORD`,
+`TAVILY_API_KEY`, `AGENT_TOKENS`, `BACKUP_ADMIN_TOKEN`, and every `token_env` name a configured LLM
+backend references) and a `*_PASSWORD`/`*_TOKEN`/`*_API_KEY` suffix pattern, so a new secret key is
+caught even when nobody remembers to extend the list — goes only into an in-process store, read
+back exclusively through `get_secret()`. `coordinator.py` and `hive_mind_proxy.py`'s own
+`token_env` resolution now read secrets that way instead of via `os.environ`. The proxy's
+`_daemon_env()` stopped copying `os.environ` wholesale; a spawned daemon's child environment now
+carries only non-secret config plus that daemon's own `AGENT_TOKEN` — a deliberate, named interim
+step, since ephemeral daemon-token delivery moves off the child environment entirely in a later PR
+of this workstream. Each daemon self-loads its own database credentials through the shared loader
+rather than depending on what the proxy hands it.
+
+A new invariant is now enforced by a mutation-checked test: no framework process ever exports a
+secret value into `os.environ` or passes one into a child process's environment. Every existing
+regression tripwire around this path — inbound `Authorization` stripping, `log_hygiene` redaction,
+the 401/auth-disabled fallback behaviour — was re-verified before and after and is unchanged. No
+wire-contract change; `API_VERSION` stays 4. This is PR A1 of five in the credential-custody
+workstream; the token-registry digest work, the credential-use audit trail, deployer file-based
+secret delivery, and chokepoint governance on the credentialed proxy branch follow in later
+releases.
+
+---
+
 ## [0.9.1] — 2026-08-12
 
 **Housekeeping: the MCP connector now lives in a folder of its own.** The three files that form

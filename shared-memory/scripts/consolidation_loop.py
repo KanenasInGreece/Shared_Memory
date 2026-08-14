@@ -97,16 +97,28 @@ from pool_status import pool_has_free_slot
 from dream_telemetry import (record_llm_call, adaptive_ceiling, embed_ceiling,
                              EMBED_MAX_CHARS)
 from record_ref import make_ref
+from secure_env import load_split_env, get_secret
 
 # Configuration — set via environment variables or .env file
+#
+# SEC-05/S-03 (Credential_Custody_Plan_2026-08-14, PR A1): this daemon had NO
+# loader of its own — it read PG_PASSWORD/NEO4J_PASSWORD straight off the
+# ambient environment, relying entirely on the gateway (which spawns it) to
+# have already populated os.environ. A1's proxy no longer copies its own
+# os.environ into a daemon's child env (hive_mind_proxy._daemon_env stopped
+# doing `os.environ.copy()`), so that assumption broke — this call is what
+# keeps NREM able to connect at all, self-loading its own credentials from
+# the framework .env rather than depending on inherited env.
+load_split_env()
+
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_USER = "neo4j"
-NEO4J_PASS = os.environ.get("NEO4J_PASSWORD", "")
+NEO4J_PASS = get_secret("NEO4J_PASSWORD", "")
 # Bound the driver pool — this daemon shares Neo4j with live gateway traffic;
 # an unbounded default pool can queue indefinitely under contention.
 NEO4J_MAX_POOL = int(os.environ.get("NEO4J_MAX_POOL", "50"))
 NEO4J_ACQUIRE_TIMEOUT = float(os.environ.get("NEO4J_ACQUIRE_TIMEOUT", "30"))
-_pg_pass = os.environ.get("PG_PASSWORD", "")
+_pg_pass = get_secret("PG_PASSWORD", "")
 PG_CONN = os.environ.get(
     "PG_CONN",
     f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"

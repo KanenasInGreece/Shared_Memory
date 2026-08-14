@@ -88,7 +88,6 @@ import time
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
-from pathlib import Path
 
 import httpx
 import psycopg2
@@ -107,38 +106,29 @@ from log_hygiene import append_secure
 from dream_telemetry import (
     record_llm_call, adaptive_ceiling, record_grounding, call_timing_summary,
 )
+from secure_env import load_split_env, get_secret
 
 
 # ── Environment ───────────────────────────────────────────────────────────────
 
-def _load_env() -> None:
-    # The framework env is shared-memory/.env; the repo root is the FALLBACK.
-    # Same candidate order as hive_mind_proxy.py and apply.py. Reading the root
-    # alone is harmless while the daemon is spawned by the gateway (which has
-    # already populated the environment), and silently wrong the moment this
-    # file is run on its own — which is exactly how it is debugged.
-    here = Path(__file__).resolve().parent
-    candidates = [here.parent / ".env", here.parent.parent / ".env"]
-    env_path = next((p for p in candidates if p.exists()), None)
-    if env_path is None:
-        return
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        os.environ.setdefault(key.strip(), val.strip())
-
-_load_env()
+# SEC-05/S-03 (Credential_Custody_Plan_2026-08-14, PR A1): this daemon used to
+# have its own private _load_env() that dumped the whole .env — secrets
+# included — into os.environ. Its own comment called that "harmless while the
+# daemon is spawned by the gateway", an assumption A1 inverts: the proxy no
+# longer hands this process' child env any secrets (hive_mind_proxy._daemon_env
+# stopped copying os.environ), so a loader that re-imported them here would be
+# the leak path. Now the shared split loader — secrets go to secure_env's
+# in-process store, read back via get_secret(), never os.environ.
+load_split_env()
 
 NEO4J_URI    = "bolt://localhost:7687"
 NEO4J_USER   = "neo4j"
-NEO4J_PASS   = os.environ.get("NEO4J_PASSWORD", "")
+NEO4J_PASS   = get_secret("NEO4J_PASSWORD", "")
 # Bound the driver pool — this daemon shares Neo4j with live gateway traffic;
 # an unbounded default pool can queue indefinitely under contention.
 NEO4J_MAX_POOL        = int(os.environ.get("NEO4J_MAX_POOL", "50"))
 NEO4J_ACQUIRE_TIMEOUT = float(os.environ.get("NEO4J_ACQUIRE_TIMEOUT", "30"))
-_pg_pass     = os.environ.get("PG_PASSWORD", "")
+_pg_pass     = get_secret("PG_PASSWORD", "")
 PG_CONN      = os.environ.get(
     "PG_CONN", f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
 )

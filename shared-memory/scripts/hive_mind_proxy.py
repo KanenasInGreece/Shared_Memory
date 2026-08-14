@@ -16,25 +16,18 @@ from aiohttp.client_exceptions import (
     ServerDisconnectedError,
 )
 
-# Load .env BEFORE importing coordinator — coordinator reads env vars at module
-# level, so credentials must be in os.environ by the time that import runs.
-def _load_env() -> None:
-    # Framework env now lives in the framework folder (shared-memory/.env);
-    # the repo-root path is kept as a fallback so pre-0.6 installs don't break.
-    # __file__ = shared-memory/scripts/hive_mind_proxy.py → parent.parent = shared-memory/
-    here = Path(__file__).resolve()
-    candidates = [here.parent.parent / ".env", here.parent.parent.parent / ".env"]
-    env_path = next((p for p in candidates if p.exists()), None)
-    if env_path is None:
-        return
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        os.environ.setdefault(key.strip(), val.strip())
+# Load .env BEFORE importing coordinator — coordinator reads config vars at
+# module level, so config must be in os.environ by the time that import runs
+# (and secrets must be in secure_env's in-process store — coordinator reads
+# those via get_secret(), never os.environ).
+#
+# SEC-05/S-03 (Credential_Custody_Plan_2026-08-14, PR A1): this used to be a
+# private _load_env() that dumped the whole .env into os.environ, including
+# every secret it held. It is now the shared split loader also used by
+# rem_loop.py and consolidation_loop.py — see secure_env.py.
+from secure_env import load_split_env, get_secret, is_secret_key  # noqa: E402
 
-_load_env()
+load_split_env()
 
 from coordinator import (
     MemoryCoordinator,
@@ -178,7 +171,12 @@ def _load_llm_backends() -> tuple[list[str], dict[str, float], dict[str, "str | 
             token_env = entry.get("token_env")
             token = None
             if token_env:
-                token = os.environ.get(token_env)
+                # secure_env classifies every token_env name as a secret
+                # (SEC-09) — read it via the accessor, not os.environ; the
+                # accessor still falls back to os.environ for a value the
+                # deployer supplied through the process's own exec-time
+                # environment rather than the framework .env.
+                token = get_secret(token_env)
                 if not token:
                     log.warning(
                         "LLM backend %s configured with token_env=%s but that "
@@ -656,19 +654,30 @@ class AsyncHiveMindProxy:
 # --------------------------------------------------------------------------- #
 
 def _daemon_env(agent_name: str) -> dict:
-    """Build a subprocess environment that includes AGENT_TOKEN for the named daemon.
+    """Build a subprocess environment for the named daemon: non-secret config
+    the proxy must pin, plus that daemon's AGENT_TOKEN — and NOTHING ELSE.
 
-    The daemon uses this token to authenticate its outbound calls through the
-    proxy (embeddings, LLM).  The token identifies the daemon as a trusted
-    internal caller — it does NOT change the source attribution of the facts
-    it enriches.  Fact.source always reflects the original saving agent.
+    SEC-05/SEC-10 (Credential_Custody_Plan_2026-08-14, PR A1): this used to be
+    `os.environ.copy()`, which handed every secret the gateway process held
+    (PG_PASSWORD, NEO4J_PASSWORD, AGENT_TOKENS, provider keys) to the child's
+    exec-time environment — visible for the child's whole lifetime via
+    `/proc/<pid>/environ`. Daemons self-load their own DB credentials through
+    secure_env.load_split_env() (each has its own copy of the framework .env
+    to read); they never receive one via this env dict.
+
+    The daemon's own AGENT_TOKEN is the one deliberate, interim exception:
+    it still crosses via the child environment here (PR A2 moves it to fd/
+    $XDG_RUNTIME_DIR delivery per SEC-10 — out of scope for A1). It matches
+    the *_TOKEN suffix secure_env classifies as secret, so it is added AFTER
+    the filter below, explicitly, not because it stopped being one.
 
     If no token is registered for the daemon, AGENT_TOKEN is omitted and the
     daemon's calls will be rejected 401 when auth is active — this surfaces
     a misconfiguration rather than silently bypassing auth.
     """
-    env = os.environ.copy()
-    for pair in env.get("AGENT_TOKENS", "").split(","):
+    env = {k: v for k, v in os.environ.items() if not is_secret_key(k)}
+    agent_tokens = get_secret("AGENT_TOKENS", "")
+    for pair in agent_tokens.split(","):
         pair = pair.strip()
         if ":" not in pair:
             continue
