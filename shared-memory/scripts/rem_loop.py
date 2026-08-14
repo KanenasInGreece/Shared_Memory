@@ -106,7 +106,9 @@ from log_hygiene import append_secure
 from dream_telemetry import (
     record_llm_call, adaptive_ceiling, record_grounding, call_timing_summary,
 )
-from secure_env import load_split_env, get_secret, require_db_credentials
+from secure_env import (
+    load_split_env, get_secret, require_db_credentials, read_daemon_token_from_fd,
+)
 
 
 # ── Environment ───────────────────────────────────────────────────────────────
@@ -159,12 +161,18 @@ AUDIT_LOG_PATH = os.environ.get("AUDIT_LOG_PATH", "").strip() or None
 # the source field on the Fact nodes being enriched.  Fact.source always
 # reflects the original saving agent (e.g. "claude", "gemini").
 #
-# Review fix #7: read via get_secret(), not os.environ directly — with fix
-# #1's corrected precedence the proxy-injected child-env value still wins
-# (that's the mainline path), but a standalone debug run of this daemon with
-# AGENT_TOKEN set only in shared-memory/.env now also works instead of
-# silently 401ing.
-_AGENT_TOKEN = get_secret("AGENT_TOKEN", "").strip() or None
+# SEC-10 (Credential_Custody_Plan_2026-08-14, PR A2): the mainline path is
+# now the pipe fd hive_mind_proxy._daemon_env_and_token_fd() hands this
+# process at spawn — read_daemon_token_from_fd() drains it once, here, at
+# import time. AGENT_TOKEN never crosses via this process's own child (it
+# has none) or its own environment as of A2; the fd is the ONLY way the
+# proxy-spawned mainline path sets this.
+#
+# get_secret("AGENT_TOKEN") is the fallback for a standalone debug run of
+# this daemon (`python rem_loop.py`, no proxy in between, so no fd exists) —
+# a value set only in shared-memory/.env, or via an operator's own export,
+# still works instead of silently 401ing (review fix #7 from PR A1).
+_AGENT_TOKEN = read_daemon_token_from_fd() or get_secret("AGENT_TOKEN", "").strip() or None
 
 
 def _auth_headers() -> dict:

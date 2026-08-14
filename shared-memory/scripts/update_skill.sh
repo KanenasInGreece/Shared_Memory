@@ -188,6 +188,19 @@ elif [ -n "$ENV_EXAMPLE_STAGE" ] && [ ! -f "$ENV_FILE" ]; then
     echo "  (skipping .env merge — no .env exists yet, see token warning above)"
 fi
 
+# S-01 (Credential_Custody_Plan_2026-08-14, PR A2): the client .env holds
+# this agent's bearer token — mode 600, always. Enforced here regardless of
+# whether the merge above actually touched the file, so a pre-existing 644
+# install (measured live: all four were 644 before this PR) self-heals on
+# its next routine update, not only on first creation.
+if [ -f "$ENV_FILE" ]; then
+    current_mode="$(stat -c %a "$ENV_FILE" 2>/dev/null || stat -f %Lp "$ENV_FILE" 2>/dev/null || echo "")"
+    if [ "$current_mode" != "600" ]; then
+        chmod 600 "$ENV_FILE"
+        echo "✓ .env mode tightened to 600 (was ${current_mode:-unknown})"
+    fi
+fi
+
 # ── 6. Apply every staged file whose CONTENT differs — everything fetched
 #    cleanly, so this is the only step that touches a real destination.
 #

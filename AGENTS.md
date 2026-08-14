@@ -117,7 +117,7 @@ uv run --with neo4j python shared-memory/migrations/verify_neo4j_init.py
 bash shared-memory/scripts/bootstrap_tokens.sh
 ```
 
-Appends `AGENT_TOKENS` (and a read-only `AGENT_ROLES` line for `monitor`) to the framework `.env`, and prints one `AGENT_TOKEN` per agent. Save the per-agent lines — Phase 8 distributes them. One distinct token per agent, never shared. The script refuses to overwrite an existing registry; `--force` rotates **all** tokens (destructive — rule 2).
+Appends `AGENT_TOKENS` (digest form) and a read-only `AGENT_ROLES` line for `monitor` to the framework `.env`. generate_tokens.py's write-through mint flow (PR A2) writes each LOCAL agent's token straight into that agent's own skill `.env` (mode 600) — nothing is printed here to save. A REMOTE agent's token needs `--reveal <name>` passed to `bootstrap_tokens.sh` itself on this SAME invocation (a later, separate reveal mints a fresh token for every agent — a full rotation, not a free peek). One distinct token per agent, never shared. The script refuses to overwrite an existing registry; `--force` rotates **all** tokens (destructive — rule 2).
 
 ### Phase 7 — Start the gateway and verify
 
@@ -195,11 +195,23 @@ been offered and fall back to Phase 8b.
 ### Add an agent later (no token rotation)
 
 `bootstrap_tokens.sh` refuses to touch an existing registry and `--force` rotates **everyone** —
-neither is what you want for one new agent. Instead: generate one token (`openssl rand -hex 32`),
-append `,<agent>:<token>` to the existing `AGENT_TOKENS=` line in `shared-memory/.env` (and to
-`AGENT_ROLES=` only if it needs a restricted role), restart the gateway
+neither is what you want for one new agent. Instead: choose one token yourself
+(`openssl rand -hex 32`), get its **digest** entry with `generate_tokens.py --digest` (reads the
+raw token from STDIN, never argv — argv is visible via `ps` and shell history), append the printed
+`<agent>:sha256:<hex>` to the existing `AGENT_TOKENS=` line in `shared-memory/.env` (and to
+`AGENT_ROLES=` only if it needs a restricted role), write the SAME raw token into that agent's own
+skill `.env` yourself (mode 600 — `chmod 600` it), restart the gateway
 (`systemctl --user restart hive-mind-gateway.service`), then run Phase 8 (+ 8b) for that agent
-alone. Verify with the agent's own `doctor`.
+alone. Verify with the agent's own `doctor`. **A plaintext `<agent>:<token>` entry is refused
+outright as of v0.9.3** — the gateway will not start with one, so the digest step above is not
+optional.
+
+```bash
+tok=$(openssl rand -hex 32)
+printf '%s' "$tok" | uv run python shared-memory/scripts/generate_tokens.py --digest <agent>
+# → prints <agent>:sha256:<hex> — append that to AGENT_TOKENS= in shared-memory/.env
+echo "AGENT_TOKEN=$tok" >> <skill-dir>/.env && chmod 600 <skill-dir>/.env
+```
 
 ### Start (e.g. after reboot)
 

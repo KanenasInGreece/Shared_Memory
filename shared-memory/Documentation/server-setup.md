@@ -57,10 +57,19 @@ docker compose -f postgres_neo4j_limits.yaml up -d
 # 4. Apply all schema migrations (idempotent — safe to re-run).
 uv run --with psycopg2-binary python shared-memory/migrations/apply.py
 
-# 5. Mint agent tokens (one-time auth setup).
+# 5. Mint agent tokens (one-time auth setup). No secret value is ever
+#    printed: the AGENT_TOKENS line printed below is DIGEST form
+#    (name:sha256:<hex> — safe to paste), and each LOCAL agent's own
+#    AGENT_TOKEN is written straight into its skill .env (mode 600) —
+#    nothing to copy by hand. A REMOTE agent (no local skill install found
+#    on this machine) needs an explicit, human-run reveal — pass --reveal
+#    on THIS SAME invocation (running it again LATER, as a separate
+#    command, mints a FRESH set of tokens for every agent — a full
+#    rotation, not a free peek at the one you already have):
+#      uv run python shared-memory/scripts/generate_tokens.py --reveal <name>
+#    No remote agent to reveal? Just:
 uv run python shared-memory/scripts/generate_tokens.py
-#    → add the AGENT_TOKENS=... line to this host's .env
-#    → give each agent its own AGENT_TOKEN in its skill .env (never share tokens)
+#    → add the printed AGENT_TOKENS=... line to this host's .env
 
 # 6. Start the gateway (also spawns the REM + NREM daemons).
 uv run --with aiohttp --with asyncpg --with neo4j --with httpx --with json-repair \
@@ -89,7 +98,7 @@ All live in `shared-memory/scripts/` and run on the gateway host only.
 | `consolidation_loop.py` | NREM daemon — synthesises Tier‑3 community summaries once 5+ enriched facts share an entity hub. |
 | `gpu_load.py` | GPU‑busy probe (`nvtop --snapshot`) so dreaming yields to active inference. |
 | `ontology.py` | Loads `ontology.yaml`; supplies Neo4j labels/relationship types. |
-| `generate_tokens.py` | One-time token minting helper. |
+| `generate_tokens.py` | Token minting helper (write-through mint flow, `--reveal`, `--convert-digests` — see below). |
 
 None of these ship with the skill. See [`sync_skills.sh`](../scripts/sync_skills.sh).
 
@@ -109,6 +118,15 @@ uv run --with psycopg2-binary python shared-memory/migrations/apply.py   # apply
 Migrations are idempotent and run "all pending" when invoked with no argument, so
 re-running after a pull is always safe. Updating an agent's **skill** never runs a
 migration — the client does not own the schema.
+
+**Upgrading through v0.9.3 (PR A2 — digest registry):** if your gateway `.env`
+predates this release, run `generate_tokens.py --convert-digests` once to rewrite
+`AGENT_TOKENS` to digest form — a plaintext entry now refuses gateway startup
+outright. While you're editing that line: a pre-A2 registry may still carry entries
+named `consolidation` or `rem_daemon` — those were how the two framework daemons
+authenticated before A2. They are now dead weight; the daemons mint their own token
+fresh, in-memory, on every boot instead, so delete any such entries rather than
+converting them.
 
 ---
 

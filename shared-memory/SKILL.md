@@ -524,16 +524,26 @@ token from `AGENT_TOKEN` in its own skill `.env` (e.g. `~/.claude/skills/shared-
 
 ```bash
 echo "AGENT_TOKEN=tok_abc..." >> ~/.claude/skills/shared-memory/.env
+chmod 600 ~/.claude/skills/shared-memory/.env
 ```
 
 Tokens are **minted on the gateway host** (`generate_tokens.py`) and added to the
-gateway's `AGENT_TOKENS` — that is an operations task, see
-[Documentation/server-setup.md](Documentation/server-setup.md#first-time-install).
-Each agent uses its own distinct token; never share tokens across agents.
+gateway's `AGENT_TOKENS` as a digest (`name:sha256:<hex>`) — that is an operations
+task, see [Documentation/server-setup.md](Documentation/server-setup.md#first-time-install).
+For a *local* agent, minting also writes this agent's own `AGENT_TOKEN` line
+straight into its skill `.env` (mode 600) — nothing is printed to a terminal, so
+there is nothing to paste. A *remote* agent's raw token is never printed by
+default either; the operator reveals it with `generate_tokens.py --reveal <name>`
+**on the same invocation that mints it**, run directly by a human, never through
+an agent — a separate, later invocation of `generate_tokens.py` (with or without
+`--reveal`) mints a fresh token for every agent, rotating the whole registry, not
+a free peek at the one already registered. Each agent uses its own distinct
+token; never share tokens across agents.
 
-The dotenv search order for CLI agents (first match wins):
-1. `find_dotenv()` — searches parent directories from the script's location (requires absolute-path invocation — see path note above)
-2. `~/.{agent}/skills/shared-memory/.env` — found via parent-dir walk from `scripts/` (also requires absolute-path invocation)
+The dotenv search for CLI agents is scoped to exactly this skill directory (first
+match wins, never a parent-directory walk up toward `$HOME`):
+1. `scripts/.env` — co-located with `memory_bridge.py` (requires absolute-path invocation — see path note above)
+2. `~/.{agent}/skills/shared-memory/.env` — the skill root, one level up from `scripts/`
 
 Each token maps to a verified agent identity. All agents on a multi-agent machine must use separate skill `.env` files with distinct tokens — tokens must never be shared across agents.
 
@@ -547,7 +557,7 @@ curl http://localhost:8888/health
 ```
 Coordinator rejected token. Set AGENT_TOKEN in this agent's .env.
 ```
-Check that `AGENT_TOKEN` in the agent's `.env` matches one of the `name:token` pairs in the gateway's `AGENT_TOKENS`.
+Check that `AGENT_TOKEN` in the agent's `.env` hashes to one of the digest entries in the gateway's `AGENT_TOKENS` (`name:sha256:<hex>` — required as of v0.9.3; a plaintext entry makes the gateway refuse to start, see server-setup.md).
 
 **Sub-agent identity:** All Claude Code instances (including spawned sub-agents) share one token. Use `metadata.subagent` to record the sub-role — the server stamps `source` with the verified tool name:
 ```json
@@ -571,7 +581,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness:
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":4,"version":"0.9.2","daemon":"running","rem_daemon":"running",...}
+# → {"status":"ok","api_version":4,"version":"0.9.3","daemon":"running","rem_daemon":"running",...}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -627,7 +637,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.2", "api_version": 4, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.3", "api_version": 4, "tool": "shared-memory-framework"}`
 
 ### Updating This Skill
 

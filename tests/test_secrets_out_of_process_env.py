@@ -16,9 +16,11 @@ composed symptom:
      into os.environ (it goes into the in-process store instead).
   2. hive_mind_proxy._daemon_env() must never include a secret-classified
      key in the dict handed to a spawned daemon's exec environment.
-     AGENT_TOKEN is the one deliberate, interim exception (SEC-10 says
-     delivery moves to a pipe fd / $XDG_RUNTIME_DIR file in PR A2; A1 still
-     hands it across via the child env).
+     AGENT_TOKEN was PR A1's one deliberate, interim exception; PR A2
+     (SEC-10) closed it — AGENT_TOKEN no longer crosses via the child env
+     at all, delivery moved to a pipe fd (see test_token_registry_digests_
+     and_daemon_fd.py for that PR's own coverage). The test below now
+     asserts the ABSENCE this PR's exception used to require.
 
 Also covers SEC-09 (classification is BOTH a known-name list and a suffix
 pattern), the S-15 regression tripwires this PR must not break
@@ -121,8 +123,11 @@ def test_known_config_names_are_not_misclassified_by_the_suffix_pattern():
 def test_agent_token_singular_is_still_classified_secret_not_allowlisted():
     """AGENT_TOKEN (singular) also matches the _TOKEN suffix, but unlike the
     item-5 names it IS a real secret — it's on KNOWN_CONFIG_NAMES's sibling
-    exclusion list only in the sense that it's NOT there. Delivered via a
-    daemon's child env as one deliberate, named exception (_daemon_env)."""
+    exclusion list only in the sense that it's NOT there. As of PR A2 it
+    never crosses via a daemon's child env at all (pipe-fd delivery,
+    hive_mind_proxy._daemon_env_and_token_fd()) — staying classified secret
+    is what keeps it out of os.environ (and _daemon_env()'s output) in the
+    first place."""
     assert secure_env.is_secret_key("AGENT_TOKEN")
     assert "AGENT_TOKEN" not in secure_env.KNOWN_CONFIG_NAMES
 
@@ -226,7 +231,12 @@ def test_pg_conn_never_reaches_os_environ_from_the_file(monkeypatch, tmp_path):
 
 # ── THE INVARIANT, part 2: _daemon_env() never forwards a secret ────────────
 
-def test_daemon_env_excludes_every_secret_key_except_the_interim_agent_token(monkeypatch):
+def test_daemon_env_never_includes_agent_token(monkeypatch):
+    """PR A2 (SEC-10): the interim exception PR A1 carved out for AGENT_TOKEN
+    is now closed — _daemon_env()'s output never carries it, under any
+    AGENT_TOKENS configuration. Delivery moved to a pipe fd (see
+    hive_mind_proxy._daemon_env_and_token_fd(), covered in
+    test_token_registry_digests_and_daemon_fd.py)."""
     monkeypatch.setenv("PG_PASSWORD", "super-secret-pg")
     monkeypatch.setenv("NEO4J_PASSWORD", "super-secret-neo4j")
     monkeypatch.setenv("TAVILY_API_KEY", "tv-secret")
@@ -242,17 +252,15 @@ def test_daemon_env_excludes_every_secret_key_except_the_interim_agent_token(mon
     env = g._daemon_env("consolidation")
 
     for key in ("PG_PASSWORD", "NEO4J_PASSWORD", "TAVILY_API_KEY",
-                "BACKUP_ADMIN_TOKEN", "DEEPSEEK_API_KEY", "AGENT_TOKENS", "PG_CONN"):
+                "BACKUP_ADMIN_TOKEN", "DEEPSEEK_API_KEY", "AGENT_TOKENS", "PG_CONN",
+                "AGENT_TOKEN"):
         assert key not in env, f"{key} leaked into the daemon's child environment"
 
     leaked_values = {"super-secret-pg", "super-secret-neo4j", "tv-secret",
-                      "backup-secret", "sk-provider-secret",
+                      "backup-secret", "sk-provider-secret", "tok_nrem", "tok_rem",
                       "postgresql://postgres:embedded-secret@localhost:5432/agent_data"}
     assert not (leaked_values & set(env.values())), \
         "a secret VALUE (not just its key name) reached the daemon's child environment"
-
-    # the one deliberate, interim exception: this daemon's own AGENT_TOKEN
-    assert env.get("AGENT_TOKEN") == "tok_nrem"
 
 
 def test_daemon_env_still_forwards_non_secret_config(monkeypatch):

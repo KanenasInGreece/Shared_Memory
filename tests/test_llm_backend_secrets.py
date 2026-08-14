@@ -3,6 +3,7 @@ backend, and a backend that DOES need its own credential (a paid cloud API)
 gets it from LLM_BACKENDS_JSON's token_env — never a literal secret in env,
 never the client's header. See shared-memory/ops/README.md."""
 import asyncio
+import hashlib
 import importlib
 import json
 import os
@@ -219,7 +220,9 @@ def test_health_config_shows_bool_and_model_for_authenticated_caller_never_the_t
     importlib.reload(g)
     import coordinator
     coordinator._AGENT_TOKENS.clear()
-    coordinator._AGENT_TOKENS["tok_valid_test"] = "claude"
+    # PR A2: the registry is digest-keyed — store the SHA-256 digest of the
+    # presented token, never the raw value (coordinator._token_digest()).
+    coordinator._AGENT_TOKENS[hashlib.sha256(b"tok_valid_test").hexdigest()] = "claude"
     try:
         proxy = g.AsyncHiveMindProxy()
         proxy.session = _HealthProbeSession()

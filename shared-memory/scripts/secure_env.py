@@ -22,6 +22,11 @@ remembers to extend the list.
 
 Security-review fix round (2026-08-14, same-day re-review of this PR) folded
 in below — each fix is flagged where it lands.
+
+PR A2 (SEC-10) adds `read_daemon_token_from_fd()`: the daemon's own
+AGENT_TOKEN, which PR A1 still passed via the child environment as one
+named interim exception, now crosses only through an inherited pipe fd —
+see hive_mind_proxy._daemon_env_and_token_fd() for the write side.
 """
 import json
 import os
@@ -53,9 +58,13 @@ KNOWN_SECRET_NAMES = {
 #   BACKUP_ADVISORY_LOCK_KEY         — a Postgres advisory-lock integer id
 #   NREM_PRIORITY_ADVISORY_LOCK_KEY  — same, NREM's priority-wait lock id
 # (AGENT_TOKEN, singular, also matches "_TOKEN" but is deliberately NOT on
-# this list — it IS a secret, delivered to a daemon's child env as the one
-# named interim exception in hive_mind_proxy._daemon_env(); see review fix
-# #7. Putting it here would be the misclassification in the other direction.)
+# this list — it IS a secret. PR A1 delivered it to a daemon's child env as
+# one named interim exception in hive_mind_proxy._daemon_env(); PR A2
+# (SEC-10) closes that: a freshly-minted, per-boot daemon token now crosses
+# only through an inherited pipe fd (see read_daemon_token_from_fd() below),
+# never through the child environment at all. Putting AGENT_TOKEN on this
+# list would still be the misclassification in the other direction — it
+# stays classified secret so it can never be exported to os.environ either.)
 KNOWN_CONFIG_NAMES = {
     "EMBED_CHARS_PER_TOKEN",
     "BACKUP_ADVISORY_LOCK_KEY",
@@ -191,6 +200,49 @@ def get_secret(name: str, default: "str | None" = None) -> "str | None":
     if name in _secrets:
         return _secrets[name]
     return default
+
+
+def read_daemon_token_from_fd(env_var: str = "AGENT_TOKEN_FD") -> "str | None":
+    """Read this daemon's per-boot AGENT_TOKEN from the pipe fd the proxy
+    handed it at spawn (SEC-10, Credential_Custody_Plan_2026-08-14 PR A2).
+
+    Delivery shape: the fd NUMBER travels via `env_var`, a plain (non-secret)
+    env var — a file descriptor number is meaningless off this process tree,
+    so naming it costs nothing. The token VALUE itself crosses only through
+    the pipe's kernel buffer: it appears in no `/proc/<pid>/environ`, no
+    argv, and no file. See hive_mind_proxy._daemon_env_and_token_fd(), the
+    write side of this same pipe.
+
+    Returns None — never raises — when `env_var` is unset, not a valid
+    integer, or the fd cannot be read (already closed, or this process was
+    not actually spawned with one). That covers a standalone debug run of a
+    daemon started directly (`python rem_loop.py`, no proxy in between): the
+    caller's own fallback (`get_secret("AGENT_TOKEN")`, reading the
+    framework .env or an operator's own export) is what makes that case work
+    instead of a silent 401.
+
+    Reads at most 4096 bytes in one call — token_urlsafe(32) is far under
+    that, and the write side writes-then-closes before this ever runs, so a
+    single read drains the whole buffered value.
+    """
+    raw_fd = os.environ.get(env_var, "").strip()
+    if not raw_fd:
+        return None
+    try:
+        fd = int(raw_fd)
+    except ValueError:
+        return None
+    try:
+        data = os.read(fd, 4096)
+    except OSError:
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    token = data.decode("utf-8", errors="replace").strip()
+    return token or None
 
 
 def require_db_credentials(*, pg_password: str, pg_conn: str, neo4j_password: str,

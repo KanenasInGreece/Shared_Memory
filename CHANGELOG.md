@@ -5,6 +5,67 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.3] — 2026-08-14
+
+**Credential custody, PR A2: the token registry stops storing tokens.** `AGENT_TOKENS`
+now stores a SHA-256 digest per agent (`name:sha256:<hex>`) rather than the token
+itself — verification hashes the presented bearer token and looks it up by digest, a
+design that is timing-safe by construction (hashing first means there is no raw secret
+left for a response-timing side channel to compare byte-by-byte against). A plaintext
+`name:token` entry is no longer accepted at all: the gateway refuses to start with one
+present, naming the one-command fix (`generate_tokens.py --convert-digests`) in a
+single line — there is no deprecation window. Existing client tokens are completely
+unaffected by this migration; only how the gateway stores them on disk changes.
+
+The two framework daemons (REM, NREM) now receive their own bearer token through an
+inherited pipe file descriptor, minted fresh by the gateway on every boot and never
+written to any file. This closes the one interim exception the previous release
+carried forward: `AGENT_TOKEN` no longer crosses into a daemon's child process
+environment at all, so it can never appear in that process's own `/proc/<pid>/environ`.
+A daemon started standalone for debugging, without the gateway in between, still falls
+back to reading its token from the framework `.env`.
+
+`generate_tokens.py`'s mint flow no longer prints a single token value to the terminal.
+For every agent with a local skill install on the machine, it writes that agent's token
+straight into the skill's own `.env` file (mode 600 from the first byte) and prints only
+names, digests, and destination paths. A remote agent's token is revealed only via an
+explicit `--reveal <name>` flag, documented as a human-run command — never through an
+agent, since an agent's transcript is a durable record and turns "shown once" into
+"stored forever". Every writer of a client skill `.env` (`update_skill.sh`,
+`sync_skills.sh`) now enforces mode 600 on that file as a matter of course.
+
+The client skill's own `.env` search is now scoped to exactly its own install
+directory — no more walking parent directories toward `$HOME` looking for a stray
+`.env` that happens to define `AGENT_TOKEN`. And the client no longer copies its own
+bearer token into its process's `os.environ`, closing the same "secret sitting in a
+long-lived process's own environment" class of exposure PR A1 closed on the gateway
+side, now on the client side too. The client also no longer copies the *gateway's*
+secrets (`PG_PASSWORD`, `NEO4J_PASSWORD`, `AGENT_TOKENS`, provider keys) into its own
+`os.environ` when run in admin mode from the repo root, where its second `.env`
+candidate is the gateway's own file.
+
+**Security-review fix round (same day):** an auth-unset install now stays
+unauthenticated even after the REM/NREM watchdogs mint their per-boot daemon tokens —
+the auth middleware and `/health`'s `auth_required` gate on whether auth was
+*configured at startup*, not on whether the token registry happens to be non-empty at
+request time, closing a window where every unauthenticated client would have started
+401-ing seconds after boot. `generate_tokens.py --convert-digests` now writes the
+gateway `.env` atomically (temp file, `fchmod 600` before content, `fsync`, rename)
+and aborts without writing anything on a malformed `AGENT_TOKENS` entry rather than
+silently dropping it; per-agent token files are `fchmod`'d 600 *before* the token is
+written (closing a world-readable window on a pre-existing file) and writes refuse to
+follow a symlink. A new `--digest <name>` mode prints a digest entry for an
+operator-chosen token (e.g. the backup admin token) read from stdin, never argv.
+`bootstrap_tokens.sh` now accepts `--reveal <name>` itself, forwarding it to the same
+mint invocation, so revealing a remote agent's token never means a silent full
+rotation. `AGENTS.md`, `SECURITY.md` and `SKILL.md` no longer describe the deleted
+plaintext-append flow.
+
+**Upgrade note:** a persisted `AGENT_TOKENS` entry for `consolidation` or `rem_daemon`
+from a pre-A2 install is now dead weight — nothing presents those names anymore, since
+daemon tokens are minted fresh in-memory on every boot. Delete any such entries when
+converting an existing registry with `--convert-digests`.
+
 ## [0.9.2] — 2026-08-14
 
 **Credential custody, PR A1: secrets stop riding in the process environment.** Every long-running

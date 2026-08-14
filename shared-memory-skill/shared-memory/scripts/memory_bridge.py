@@ -29,7 +29,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.9.2"
+VERSION = "0.9.3"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v3: review-edges / label-edges require the gateway's /memory/relations/* routes.
@@ -51,23 +51,90 @@ RELATION_FAMILIES = ("entity_relation", "evidential")
 RETRO_RATINGS = ("validated", "mixed", "refined", "pending", "reversed")
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
-# Two-source dotenv search — both sources tried; first definition wins.
-# Always invoke memory_bridge.py by absolute path so __file__ resolves
-# to the skill directory (e.g. ~/.gemini/skills/shared-memory/scripts/).
-#   1. find_dotenv() — searches parent dirs from the script's location
-#   2. script-adjacent .env — covers ~/.{agent}/skills/shared-memory/.env
+# Skill-directory-scoped dotenv search (S-18, Credential_Custody_Plan
+# PR A2) — exactly two candidates, in order, first definition wins:
+#   1. script-adjacent .env — scripts/.env, co-located with this file
+#   2. skill root .env — ../.env from here, e.g.
+#      ~/.gemini/skills/shared-memory/.env (the documented install location)
+# NEVER a parent-directory walk. python-dotenv's find_dotenv(usecwd=False)
+# used to walk from this file up toward $HOME looking for the first ".env"
+# it found anywhere on the way, so a stray $HOME/.env (some other tool's,
+# or a leftover from a different agent's install) could silently supply
+# AGENT_TOKEN/COORDINATOR_URL before this skill's own .env was ever
+# consulted. Always invoke memory_bridge.py by absolute path so __file__
+# resolves correctly (e.g. ~/.gemini/skills/shared-memory/scripts/).
+_ENV_CANDIDATES = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"),
+]
+
+# AGENT_TOKEN is read into a private variable and NEVER exported into this
+# process's own os.environ (A1-deferred, S-18 follow-up): the client used to
+# load its whole .env — AGENT_TOKEN included — into os.environ, the same
+# "secret sitting in a long-lived process's own environment" class PR A1
+# closed server-side (visible via this process's own /proc/<pid>/environ
+# and to any child it might exec). An operator's own real
+# `export AGENT_TOKEN=...` still wins — checked FIRST, before any file is
+# parsed, mirroring secure_env.get_secret()'s precedence on the gateway.
+# _AGENT_TOKEN_FROM_FILE is populated once below, from the file only, and
+# is the seam tests use to neutralise a real on-disk .env during isolated
+# runs (monkeypatch.setattr(memory_bridge, "_AGENT_TOKEN_FROM_FILE", "")).
+_AGENT_TOKEN_FROM_FILE = ""
+
+# Required fix (A2 security review, finding 7): a small, standalone mirror
+# of secure_env.is_secret_key() (the GATEWAY's classification) -- duplicated
+# rather than imported, because this client ships alone and must never
+# depend on a server-only module (Group 1: the client/server surface
+# split). Candidate 2 (_ENV_CANDIDATES[1], the skill root .env) IS the
+# gateway .env when this same file is invoked in admin mode from the repo
+# root, so without this predicate PG_PASSWORD/NEO4J_PASSWORD/AGENT_TOKENS/
+# every provider key would land in setdefault() below and leak into this
+# client process's own os.environ -- the identical class of leak S-18
+# already closed for AGENT_TOKEN specifically, one level broader. AGENT_TOKEN
+# itself is exempt here: it keeps its own dedicated _AGENT_TOKEN_FROM_FILE
+# path above, never routed through os.environ either way. Everything else
+# this predicate catches is simply skipped -- the client has no use for any
+# of these values, so unlike the server there is no config-name allowlist
+# carve-out and no dynamic token_env discovery to widen it.
+_CLIENT_KNOWN_SECRET_NAMES = {
+    "PG_PASSWORD", "NEO4J_PASSWORD", "TAVILY_API_KEY", "AGENT_TOKENS",
+    "BACKUP_ADMIN_TOKEN",
+}
+_CLIENT_SECRET_SUFFIXES = ("_PASSWORD", "_TOKEN", "_API_KEY")
+
+
+def _is_client_secret_key(name: str) -> bool:
+    """True if `name` must never be exported into this client's own
+    os.environ (mirrors secure_env.is_secret_key(), narrowed to what this
+    client can ever encounter). AGENT_TOKEN is excluded -- it has its own
+    private-variable path and is never routed through this predicate."""
+    if name == "AGENT_TOKEN":
+        return False
+    if name in _CLIENT_KNOWN_SECRET_NAMES:
+        return True
+    return name.upper().endswith(_CLIENT_SECRET_SUFFIXES)
+
+
 try:
-    from dotenv import find_dotenv, load_dotenv
-    for _env in (
-        find_dotenv(usecwd=False),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
-    ):
-        if _env and os.path.exists(_env):
-            load_dotenv(_env, override=False)
+    from dotenv import dotenv_values  # parses without touching os.environ
+    for _env in _ENV_CANDIDATES:
+        if not (_env and os.path.exists(_env)):
+            continue
+        for _k, _v in dotenv_values(_env).items():
+            if _v is None or not _k:
+                continue
+            if _k == "AGENT_TOKEN":
+                if not _AGENT_TOKEN_FROM_FILE:
+                    _AGENT_TOKEN_FROM_FILE = _v.strip()
+                continue
+            if _is_client_secret_key(_k):
+                continue
+            os.environ.setdefault(_k, _v)
 except ImportError:
     # python-dotenv not installed — manually parse skill-adjacent .env files
-    # so auth tokens are found when running bare `python` or `uv run --with httpx`
+    # so config/token are found when running bare `python` or `uv run --with httpx`.
     def _read_env_file(path: str) -> None:
+        global _AGENT_TOKEN_FROM_FILE
         try:
             with open(path) as _f:
                 for _line in _f:
@@ -76,13 +143,21 @@ except ImportError:
                         continue
                     _k, _, _v = _line.partition("=")
                     _k = _k.strip()
-                    if _k and _k not in os.environ:   # first definition wins
-                        os.environ[_k] = _v.strip()
+                    _v = _v.strip()
+                    if not _k:
+                        continue
+                    if _k == "AGENT_TOKEN":
+                        if not _AGENT_TOKEN_FROM_FILE:
+                            _AGENT_TOKEN_FROM_FILE = _v
+                        continue
+                    if _is_client_secret_key(_k):
+                        continue
+                    if _k not in os.environ:   # first definition wins
+                        os.environ[_k] = _v
         except OSError:
             pass
-    # covers ~/.{agent}/skills/shared-memory/scripts/.env and the parent dir
-    _read_env_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
-    _read_env_file(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+    for _env in _ENV_CANDIDATES:
+        _read_env_file(_env)
 
 COORDINATOR_BASE = os.environ.get("COORDINATOR_URL", "http://localhost:8888")
 AGENT_ID         = os.environ.get("AGENT_ID", "memory_bridge")
@@ -257,10 +332,13 @@ def _request_headers() -> dict:
 
     Always advertises this client's API_VERSION so the gateway can log skew
     (see coordinator._check_client_version). Adds the Bearer token when
-    AGENT_TOKEN is set.
+    AGENT_TOKEN is set — checked fresh on every call so an operator export
+    or a test's monkeypatch.setenv always wins, falling back to the value
+    this module parsed out of its own .env at import time (never itself
+    exported to os.environ — see _AGENT_TOKEN_FROM_FILE above).
     """
     headers = {CLIENT_VERSION_HEADER: str(API_VERSION)}
-    token = os.environ.get("AGENT_TOKEN", "").strip()
+    token = os.environ.get("AGENT_TOKEN", "").strip() or _AGENT_TOKEN_FROM_FILE
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return headers

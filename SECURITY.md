@@ -45,13 +45,12 @@ To opt into all-interfaces binding (e.g. inside a Docker or VM network), set `PR
 
 `Authorization: Bearer <token>` middleware is now enforced on all coordinator routes. Unregistered callers receive HTTP 401. The verified agent identity is stamped server-side onto every saved artifact — `agent_id` from the request body is no longer trusted.
 
-**Setup:**
-1. Run `uv run python shared-memory/scripts/generate_tokens.py` to generate tokens
-2. Add `AGENT_TOKENS=claude:tok_...,gemini:tok_...,...` to the gateway `.env`
-3. Add `AGENT_TOKEN=<your-token>` to each agent's own skill `.env` — a distinct token per agent, never a shared file
-4. Restart the gateway; LM Studio requires a full application restart
+**Setup (`bootstrap_tokens.sh` / `generate_tokens.py`, PR A2 — digest registry + write-through mint):**
+1. Run `bash shared-memory/scripts/bootstrap_tokens.sh` (or `uv run python shared-memory/scripts/generate_tokens.py` directly) — it mints a fresh token for every agent, appends `AGENT_TOKENS=claude:sha256:<hex>,gemini:sha256:<hex>,...` (**digest form** — no token value is ever printed) to the gateway `.env`, and writes each LOCAL agent's own token straight into that agent's skill `.env` (mode 600) — nothing to copy by hand.
+2. A REMOTE agent's token needs an explicit, human-run reveal on the SAME mint invocation: `--reveal <name>` (never through an agent — a later, separate run mints a fresh token for every agent, rotating the whole registry).
+3. Restart the gateway; LM Studio requires a full application restart
 
-**Backward compatible:** `AGENT_TOKENS` unset → auth disabled (no-op for existing installs).
+**As of v0.9.3 a plaintext `name:token` entry in `AGENT_TOKENS` makes the gateway refuse to start** — convert an older registry in place with `generate_tokens.py --convert-digests`. **Backward compatible on the auth-off axis:** `AGENT_TOKENS` unset → auth disabled (no-op for existing installs).
 
 **Read-only roles (`AGENT_ROLES`).** A registered token can be confined to read-only access with `AGENT_ROLES=name:read` in the gateway `.env`. A `read` token may reach only `GET /health`, `GET /memory/telemetry`, and `POST /memory/graph` (read-only-Cypher-guarded); `save`, `retrospective`, `search`, and the proxy passthrough return **403**. Roles only narrow access — the token must still be registered in `AGENT_TOKENS`; unset/`name:full` keeps full read/write. This lets read-only ops clients (e.g. the companion Shared Memory Monitor) hold a dedicated, non-write-capable identity rather than borrowing a full-access agent token — so a leaked monitor token cannot write to memory, and agent-token rotation cannot break telemetry.
 

@@ -97,7 +97,9 @@ from pool_status import pool_has_free_slot
 from dream_telemetry import (record_llm_call, adaptive_ceiling, embed_ceiling,
                              EMBED_MAX_CHARS)
 from record_ref import make_ref
-from secure_env import load_split_env, get_secret, require_db_credentials
+from secure_env import (
+    load_split_env, get_secret, require_db_credentials, read_daemon_token_from_fd,
+)
 
 # Configuration — set via environment variables or .env file
 #
@@ -755,13 +757,19 @@ class _CycleRec:
 # AGENT_TOKEN authenticates daemon outbound calls through the proxy.
 # It identifies the daemon as a trusted internal caller — it does NOT affect
 # the source field on any saved artifact.  Fact.source always reflects the
-# original saving agent.  Injected by hive_mind_proxy.py via subprocess env.
+# original saving agent.
 #
-# Review fix #7: read via get_secret(), not os.environ directly — with fix
-# #1's corrected precedence the proxy-injected child-env value still wins
-# (the mainline path), but a standalone debug run with AGENT_TOKEN set only
-# in shared-memory/.env now also works instead of silently 401ing.
-_AGENT_TOKEN = get_secret("AGENT_TOKEN", "").strip() or None
+# SEC-10 (Credential_Custody_Plan_2026-08-14, PR A2): the mainline path is
+# now the pipe fd hive_mind_proxy._daemon_env_and_token_fd() hands this
+# process at spawn — read_daemon_token_from_fd() drains it once, here, at
+# import time. AGENT_TOKEN never crosses via this process's own environment
+# as of A2; the fd is the ONLY way the proxy-spawned mainline path sets this.
+#
+# get_secret("AGENT_TOKEN") is the fallback for a standalone debug run of
+# this daemon (`python consolidation_loop.py`, no proxy in between, so no fd
+# exists) — a value set only in shared-memory/.env, or via an operator's own
+# export, still works instead of silently 401ing (review fix #7 from PR A1).
+_AGENT_TOKEN = read_daemon_token_from_fd() or get_secret("AGENT_TOKEN", "").strip() or None
 
 
 def _require_db_credentials() -> None:
