@@ -106,7 +106,7 @@ from log_hygiene import append_secure
 from dream_telemetry import (
     record_llm_call, adaptive_ceiling, record_grounding, call_timing_summary,
 )
-from secure_env import load_split_env, get_secret
+from secure_env import load_split_env, get_secret, require_db_credentials
 
 
 # ── Environment ───────────────────────────────────────────────────────────────
@@ -129,9 +129,14 @@ NEO4J_PASS   = get_secret("NEO4J_PASSWORD", "")
 NEO4J_MAX_POOL        = int(os.environ.get("NEO4J_MAX_POOL", "50"))
 NEO4J_ACQUIRE_TIMEOUT = float(os.environ.get("NEO4J_ACQUIRE_TIMEOUT", "30"))
 _pg_pass     = get_secret("PG_PASSWORD", "")
-PG_CONN      = os.environ.get(
-    "PG_CONN", f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
-)
+# Review fix #3: PG_CONN is a secret (a DSN embeds the password verbatim) —
+# read via get_secret(), never os.environ. _pg_conn_explicit is the RAW
+# value (empty string if unset) so _require_db_credentials() below can tell
+# "operator supplied a full DSN" apart from "nothing was supplied and this
+# fell back to the constructed default" — the constructed default always
+# looks non-empty even when it embeds an empty password.
+_pg_conn_explicit = get_secret("PG_CONN", "")
+PG_CONN      = _pg_conn_explicit or f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
 # The daemons' ONE way in is the hive-mind gateway — never a raw LLM. Pointing this
 # at a backend directly would bypass pooling, cache-affinity, wedge detection and
 # telemetry, so it is deliberately NOT an env knob: the shipped compose fixes the
@@ -153,7 +158,13 @@ AUDIT_LOG_PATH = os.environ.get("AUDIT_LOG_PATH", "").strip() or None
 # It identifies the daemon as a trusted internal caller — it does NOT affect
 # the source field on the Fact nodes being enriched.  Fact.source always
 # reflects the original saving agent (e.g. "claude", "gemini").
-_AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "").strip() or None
+#
+# Review fix #7: read via get_secret(), not os.environ directly — with fix
+# #1's corrected precedence the proxy-injected child-env value still wins
+# (that's the mainline path), but a standalone debug run of this daemon with
+# AGENT_TOKEN set only in shared-memory/.env now also works instead of
+# silently 401ing.
+_AGENT_TOKEN = get_secret("AGENT_TOKEN", "").strip() or None
 
 
 def _auth_headers() -> dict:
@@ -161,6 +172,17 @@ def _auth_headers() -> dict:
     if _AGENT_TOKEN:
         return {"Authorization": f"Bearer {_AGENT_TOKEN}"}
     return {}
+
+
+def _require_db_credentials() -> None:
+    """Wraps secure_env.require_db_credentials() with this daemon's own
+    resolved values — called ONLY from the __main__ guard below (review fix
+    #4). See that function's docstring for why this must never run at bare
+    import time."""
+    require_db_credentials(
+        pg_password=_pg_pass, pg_conn=_pg_conn_explicit,
+        neo4j_password=NEO4J_PASS, daemon_name="rem_loop",
+    )
 
 # Adaptive scan cadence (ADR-021) — replaces the fixed 120s POLL_INTERVAL magic
 # number. Fast when there is work to drain, exponential backoff to a cap when idle,
@@ -3189,4 +3211,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    _require_db_credentials()
     asyncio.run(main())

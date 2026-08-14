@@ -803,15 +803,17 @@ async def auth_middleware(request: web.Request, handler):
                request_id, request.get("principal"))
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# PG_PASSWORD/NEO4J_PASSWORD are secrets (SEC-05/SEC-09, PR A1) — read via
-# secure_env.get_secret(), never os.environ directly. hive_mind_proxy calls
+# PG_PASSWORD/NEO4J_PASSWORD/PG_CONN are secrets (SEC-05/SEC-09, PR A1; PG_CONN
+# added in the review fix round — a DSN embeds the password verbatim) — read
+# via secure_env.get_secret(), never os.environ directly. hive_mind_proxy calls
 # secure_env.load_split_env() before importing this module, so by the time
 # these run the framework .env's secret keys are already in secure_env's
-# in-process store; get_secret() falls back to os.environ regardless, so a
-# direct module load (tests, a standalone run) still works off an exported var.
+# in-process store; get_secret() checks os.environ first regardless (an
+# operator-exported value always wins), so a direct module load (tests, a
+# standalone run) still works off an exported var.
 
 _pg_pass = get_secret("PG_PASSWORD", "")
-PG_DSN   = os.environ.get(
+PG_DSN   = get_secret(
     "PG_CONN", f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
 )
 NEO4J_URI  = "bolt://localhost:7687"
