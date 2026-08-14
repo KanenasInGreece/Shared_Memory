@@ -713,25 +713,6 @@ uv run --with pytest --with pytest-asyncio --with fastmcp \
        pytest tests/ -v
 ```
 
-### How changes are built and reviewed
-
-Development here is AI-assisted with tiered roles, and every change lands through a pull
-request. A **builder** agent (a fast coding model, currently Claude Sonnet) implements one PR
-at a time against a written plan, in an isolated git worktree — tests, mutation checks on every
-new invariant, nothing pushed. The **orchestrating** agent (a stronger model) then reviews the
-diff for plan fidelity, invariant preservation, and the coupled files the change group demands,
-and audits it before anything reaches the public repository. Security-sensitive changes
-**escalate to an independent security reviewer** on a stronger model (currently Claude Opus),
-which reviews the built diff read-only and reports findings with severity — reviewers find,
-the operator rules. Fix rounds go back to the same builder; the PR merges only when the
-reviews are clean, and each release is then verified on the running system, not just in the
-harness. The escalation earns its cost: on its first run the security pass caught a critical
-defect that the builder's green test suite had structurally concealed.
-
-This is the lightweight day-to-day tier. Larger design cycles use a fuller multi-role review:
-several independent reviewer roles with a coverage matrix, and a head reviewer who merges
-findings into one report before the operator rules on them.
-
 ---
 
 # Part III — Under the hood
