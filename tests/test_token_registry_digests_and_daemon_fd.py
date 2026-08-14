@@ -108,14 +108,28 @@ def test_read_daemon_token_from_fd_respects_custom_env_var_name(monkeypatch):
 
 
 # ── 2. hive_mind_proxy: mint + pipe-fd delivery ──────────────────────────────
+#
+# _daemon_env_and_token_fd() only mints (and hands back a real fd) when auth
+# is CONFIGURED at startup (finding 1, A2 security review) -- an auth-unset
+# install must not flip to authenticating just because a daemon watchdog
+# fired. These two tests exercise the pipe-delivery mechanism itself, which
+# only exists when auth is on, so they force that state deterministically
+# by reloading `coordinator` with a real AGENT_TOKENS entry first (rather
+# than relying on whatever an earlier-imported copy of the module happened
+# to be left at), and restore it to unset afterward so later tests in this
+# session see the same "auth off" baseline they did before.
 
 def test_daemon_env_and_token_fd_delivers_token_via_pipe_not_env(monkeypatch):
-    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    monkeypatch.setenv("AGENT_TOKENS", f"placeholder:sha256:{_digest('tok_placeholder')}")
+    import coordinator
+    importlib.reload(coordinator)
     import hive_mind_proxy as g
     importlib.reload(g)
+    assert g.AUTH_CONFIGURED_AT_STARTUP is True  # sanity: minting will actually happen
 
     env, read_fd = g._daemon_env_and_token_fd("consolidation")
     try:
+        assert read_fd is not None
         assert "AGENT_TOKEN" not in env, "the raw token must never sit in the child env dict"
         assert env.get("AGENT_TOKEN_FD") == str(read_fd)
         data = os.read(read_fd, 200)
@@ -123,6 +137,8 @@ def test_daemon_env_and_token_fd_delivers_token_via_pipe_not_env(monkeypatch):
         assert len(data) > 20  # token_urlsafe(32) is well over 20 chars
     finally:
         os.close(read_fd)
+        monkeypatch.delenv("AGENT_TOKENS", raising=False)
+        importlib.reload(coordinator)
 
 
 def test_mint_daemon_token_registers_in_coordinator_agent_tokens(monkeypatch):
@@ -176,20 +192,30 @@ def test_mint_daemon_token_for_two_agents_does_not_collide(monkeypatch):
 def test_daemon_env_and_token_fd_verifies_through_the_real_registry_lookup(monkeypatch):
     """End to end: mint via the proxy helper, read the token back off the
     pipe as the daemon would, and confirm THAT value authenticates through
-    coordinator's own lookup -- not a separately-asserted digest."""
-    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    coordinator's own lookup -- not a separately-asserted digest.
+
+    Requires auth CONFIGURED at startup (finding 1) -- forced deterministically
+    the same way as the sibling test above, and restored to unset afterward."""
+    monkeypatch.setenv("AGENT_TOKENS", f"placeholder:sha256:{_digest('tok_placeholder')}")
+    import coordinator
+    importlib.reload(coordinator)
     import hive_mind_proxy as g
     importlib.reload(g)
-    import coordinator
+    assert g.AUTH_CONFIGURED_AT_STARTUP is True
 
     env, read_fd = g._daemon_env_and_token_fd("rem_daemon")
     try:
+        assert read_fd is not None
         presented = os.read(read_fd, 200).decode("utf-8")
     finally:
         os.close(read_fd)
+        monkeypatch.delenv("AGENT_TOKENS", raising=False)
 
-    assert coordinator._lookup_agent_by_token(presented) == "rem_daemon"
-    assert coordinator._lookup_agent_by_token(presented + "x") is None
+    try:
+        assert coordinator._lookup_agent_by_token(presented) == "rem_daemon"
+        assert coordinator._lookup_agent_by_token(presented + "x") is None
+    finally:
+        importlib.reload(coordinator)
 
 
 # ── 3. rem_loop.py / consolidation_loop.py read from the fd at import time ──

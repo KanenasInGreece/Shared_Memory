@@ -195,6 +195,33 @@ def test_dotenv_load_never_exports_agent_token_to_os_environ(tmp_path, monkeypat
     assert mod.COORDINATOR_BASE == "http://example.invalid:9999"
 
 
+def test_dotenv_load_never_exports_gateway_secrets_to_os_environ(tmp_path, monkeypatch):
+    """Required fix (A2 security review, finding 7): candidate 2 (the skill
+    root .env) IS the gateway .env when this client is invoked from the
+    repo root in admin mode -- so PG_PASSWORD/NEO4J_PASSWORD/AGENT_TOKENS/
+    provider keys must never reach this client process's own os.environ,
+    the same leak class S-18 already closed for AGENT_TOKEN specifically,
+    one level broader."""
+    for _k in ("PG_PASSWORD", "NEO4J_PASSWORD", "SOME_PROVIDER_API_KEY"):
+        monkeypatch.delenv(_k, raising=False)
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / ".env").write_text(
+        "PG_PASSWORD=super_secret_pg\n"
+        "NEO4J_PASSWORD=super_secret_neo4j\n"
+        "SOME_PROVIDER_API_KEY=super_secret_key\n"
+        "COORDINATOR_URL=http://example.invalid:9999\n"
+    )
+
+    mod = _load_memory_bridge_from(str(skill_dir))
+
+    assert "PG_PASSWORD" not in os.environ
+    assert "NEO4J_PASSWORD" not in os.environ
+    assert "SOME_PROVIDER_API_KEY" not in os.environ
+    # Non-secret config keeps flowing through, unaffected.
+    assert mod.COORDINATOR_BASE == "http://example.invalid:9999"
+
+
 def test_dotenv_scope_operator_export_still_wins_over_file(tmp_path, monkeypatch):
     """An operator's own real `export AGENT_TOKEN=...` (or a test's
     monkeypatch.setenv) must still take precedence over the file value --

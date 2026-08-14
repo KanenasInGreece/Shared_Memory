@@ -39,7 +39,32 @@ directory — no more walking parent directories toward `$HOME` looking for a st
 `.env` that happens to define `AGENT_TOKEN`. And the client no longer copies its own
 bearer token into its process's `os.environ`, closing the same "secret sitting in a
 long-lived process's own environment" class of exposure PR A1 closed on the gateway
-side, now on the client side too.
+side, now on the client side too. The client also no longer copies the *gateway's*
+secrets (`PG_PASSWORD`, `NEO4J_PASSWORD`, `AGENT_TOKENS`, provider keys) into its own
+`os.environ` when run in admin mode from the repo root, where its second `.env`
+candidate is the gateway's own file.
+
+**Security-review fix round (same day):** an auth-unset install now stays
+unauthenticated even after the REM/NREM watchdogs mint their per-boot daemon tokens —
+the auth middleware and `/health`'s `auth_required` gate on whether auth was
+*configured at startup*, not on whether the token registry happens to be non-empty at
+request time, closing a window where every unauthenticated client would have started
+401-ing seconds after boot. `generate_tokens.py --convert-digests` now writes the
+gateway `.env` atomically (temp file, `fchmod 600` before content, `fsync`, rename)
+and aborts without writing anything on a malformed `AGENT_TOKENS` entry rather than
+silently dropping it; per-agent token files are `fchmod`'d 600 *before* the token is
+written (closing a world-readable window on a pre-existing file) and writes refuse to
+follow a symlink. A new `--digest <name>` mode prints a digest entry for an
+operator-chosen token (e.g. the backup admin token) read from stdin, never argv.
+`bootstrap_tokens.sh` now accepts `--reveal <name>` itself, forwarding it to the same
+mint invocation, so revealing a remote agent's token never means a silent full
+rotation. `AGENTS.md`, `SECURITY.md` and `SKILL.md` no longer describe the deleted
+plaintext-append flow.
+
+**Upgrade note:** a persisted `AGENT_TOKENS` entry for `consolidation` or `rem_daemon`
+from a pre-A2 install is now dead weight — nothing presents those names anymore, since
+daemon tokens are minted fresh in-memory on every boot. Delete any such entries when
+converting an existing registry with `--convert-digests`.
 
 ## [0.9.2] — 2026-08-14
 

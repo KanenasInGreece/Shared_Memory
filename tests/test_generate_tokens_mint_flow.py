@@ -110,6 +110,98 @@ def test_mint_preserves_other_keys_in_existing_env_file(tmp_path):
     assert f"AGENT_TOKEN={tokens['claude']}" in content
 
 
+# ── finding 4: mode tightened BEFORE write; symlinks refused ────────────────
+
+def test_write_agent_token_file_tightens_mode_before_writing_content(tmp_path, monkeypatch):
+    """The entire measured population at review time was a pre-existing 0644
+    skill .env -- os.open()'s mode argument only applies at CREATE, so the
+    old code wrote the token first and chmod'd 600 after, leaving it
+    world-readable for the whole write. fchmod must happen before the first
+    byte of content."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    env_path.write_text("")
+    os.chmod(env_path, 0o644)
+
+    call_order: list[str] = []
+    real_fchmod = os.fchmod
+
+    def _tracking_fchmod(fd, mode):
+        call_order.append("fchmod")
+        return real_fchmod(fd, mode)
+
+    monkeypatch.setattr(os, "fchmod", _tracking_fchmod)
+
+    real_fdopen = os.fdopen
+
+    def _tracking_fdopen(fd, *a, **kw):
+        f = real_fdopen(fd, *a, **kw)
+        real_write = f.write
+
+        def _tracking_write(data):
+            call_order.append("write")
+            return real_write(data)
+
+        f.write = _tracking_write
+        return f
+
+    monkeypatch.setattr(os, "fdopen", _tracking_fdopen)
+
+    ok = gt._write_agent_token_file(str(env_path), "tok_new")
+
+    assert ok is True
+    assert call_order == ["fchmod", "write"], (
+        "mode must be tightened to 600 BEFORE any content is written"
+    )
+    mode = stat.S_IMODE(os.stat(env_path).st_mode)
+    assert mode == 0o600
+
+
+def test_write_agent_token_file_refuses_symlink(tmp_path):
+    """Same-uid agents are adversarial in this framework's threat model
+    (S-01/S-10) -- writing a live bearer token through a symlink, which
+    could point anywhere another process placed it, must be refused, not
+    followed."""
+    gt = load_generate_tokens()
+    target = tmp_path / "real_target.env"
+    target.write_text("SOME=1\n")
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    link_path = skill_dir / ".env"
+    os.symlink(target, link_path)
+
+    with pytest.raises(gt.AgentEnvIsSymlink):
+        gt._write_agent_token_file(str(link_path), "tok_x")
+
+    assert "AGENT_TOKEN" not in target.read_text()
+
+
+def test_mint_refuses_symlinked_local_env_and_continues_other_agents(tmp_path):
+    gt = load_generate_tokens()
+    claude_target = tmp_path / "claude_real.env"
+    claude_target.write_text("")
+    claude_skill_dir = tmp_path / "claude_skill"
+    claude_skill_dir.mkdir()
+    os.symlink(claude_target, claude_skill_dir / ".env")
+
+    codex_dir = tmp_path / "codex_skill"
+    codex_dir.mkdir()
+
+    gt.LOCAL_SKILL_ENV_PATHS = {
+        "claude": str(claude_skill_dir / ".env"),
+        "codex": str(codex_dir / ".env"),
+    }
+
+    (tokens, _digests), out = _capture(gt.mint)
+
+    refused_lines = [l for l in out.splitlines() if "REFUSED" in l]
+    assert len(refused_lines) == 1
+    assert "claude" in refused_lines[0]
+    assert "AGENT_TOKEN" not in claude_target.read_text()
+    # The refusal must not stop the rest of the mint -- codex still gets written.
+    assert f"AGENT_TOKEN={tokens['codex']}" in (codex_dir / ".env").read_text()
+
+
 # ── --reveal: prints only when invoked, and only the named agent ────────────
 
 def test_main_without_reveal_prints_no_token_value(tmp_path):
@@ -201,3 +293,121 @@ def test_convert_digests_no_agent_tokens_line_returns_error(tmp_path):
     env_path.write_text("OTHER=1\n")
     rc, _out = _capture(gt.convert_digests, str(env_path))
     assert rc == 1
+
+
+# ── finding 3: atomic write + abort-on-malformed ─────────────────────────────
+
+def test_convert_digests_malformed_entry_aborts_without_writing_anything(tmp_path):
+    """Required fix (finding 3): a malformed AGENT_TOKENS entry must abort
+    the WHOLE operation before a single byte is written -- this file also
+    holds PG_PASSWORD/NEO4J_PASSWORD/every provider key, so a "converted"
+    file that silently dropped a registry entry would lock that agent out
+    with no record of why."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    original = "AGENT_TOKENS=claude:tok_abc,bad_entry_no_colon\nOTHER=1\n"
+    env_path.write_text(original)
+
+    rc, err = _capture(gt.convert_digests, str(env_path))
+
+    assert rc == 1
+    assert env_path.read_text() == original, "an aborted conversion must not touch the file"
+
+
+def test_convert_digests_result_file_is_mode_600_regardless_of_original_mode(tmp_path):
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    env_path.write_text("AGENT_TOKENS=claude:tok_abc\n")
+    os.chmod(env_path, 0o644)
+
+    gt.convert_digests(str(env_path))
+
+    mode = stat.S_IMODE(os.stat(env_path).st_mode)
+    assert mode == 0o600
+
+
+def test_convert_digests_writes_through_a_temp_file_in_the_same_directory(tmp_path, monkeypatch):
+    """Atomicity means: temp file, same dir (same filesystem, so the final
+    rename is atomic), fsync'd, then renamed over the original -- never a
+    truncate-in-place on the live file."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    env_path.write_text("AGENT_TOKENS=claude:tok_abc\n")
+
+    seen_tmp_dirs = []
+    real_mkstemp = gt.tempfile.mkstemp
+
+    def _tracking_mkstemp(*a, **kw):
+        seen_tmp_dirs.append(kw.get("dir"))
+        return real_mkstemp(*a, **kw)
+
+    monkeypatch.setattr(gt.tempfile, "mkstemp", _tracking_mkstemp)
+
+    rc = gt.convert_digests(str(env_path))
+
+    assert rc == 0
+    assert seen_tmp_dirs == [str(tmp_path)]
+
+
+# ── finding 12: match AGENT_TOKENS= after a full strip, like the gateway ────
+
+def test_convert_digests_matches_leading_whitespace_agent_tokens_line(tmp_path):
+    """The gateway's own loader (secure_env.load_split_env) full-strips each
+    line before matching a key, so a leading-whitespace AGENT_TOKENS= line
+    still refuses startup on a plaintext entry. convert_digests used to
+    right-strip only, so it reported "no AGENT_TOKENS= line found" on
+    exactly the line the gateway would refuse to start on."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    env_path.write_text("  AGENT_TOKENS=claude:tok_abc123\nOTHER=1\n")
+
+    rc, _out = _capture(gt.convert_digests, str(env_path))
+
+    assert rc == 0
+    content = env_path.read_text()
+    assert f"AGENT_TOKENS=claude:sha256:{_digest('tok_abc123')}" in content
+    assert "OTHER=1" in content
+
+
+# ── --digest: operator-supplied token, from stdin, mints/writes nothing ─────
+
+def test_digest_flag_prints_only_the_digest_entry(monkeypatch):
+    gt = load_generate_tokens()
+    monkeypatch.setattr(gt.sys, "stdin", io.StringIO("tok_operator_chosen"))
+
+    rc, out = _capture(gt.main, ["--digest", "backup"])
+
+    assert rc == 0
+    assert out.strip() == f"backup:sha256:{_digest('tok_operator_chosen')}"
+
+
+def test_digest_flag_strips_surrounding_whitespace_from_stdin(monkeypatch):
+    gt = load_generate_tokens()
+    monkeypatch.setattr(gt.sys, "stdin", io.StringIO("  tok_operator_chosen  \n"))
+
+    rc, out = _capture(gt.main, ["--digest", "backup"])
+
+    assert rc == 0
+    assert out.strip() == f"backup:sha256:{_digest('tok_operator_chosen')}"
+
+
+def test_digest_flag_mints_nothing_and_writes_nothing(monkeypatch, tmp_path):
+    gt = load_generate_tokens()
+    claude_dir = tmp_path / "claude_skill"
+    claude_dir.mkdir()
+    gt.LOCAL_SKILL_ENV_PATHS = {"claude": str(claude_dir / ".env")}
+    monkeypatch.setattr(gt.sys, "stdin", io.StringIO("tok_x"))
+
+    _capture(gt.main, ["--digest", "backup"])
+
+    assert not (claude_dir / ".env").exists(), "--digest must never write through to a skill .env"
+
+
+def test_digest_flag_empty_stdin_errors_without_printing_a_digest(monkeypatch):
+    gt = load_generate_tokens()
+    monkeypatch.setattr(gt.sys, "stdin", io.StringIO(""))
+
+    rc, out = _capture(gt.main, ["--digest", "backup"])
+
+    assert rc == 1
+    assert "sha256" not in out

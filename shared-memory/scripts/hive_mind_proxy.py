@@ -37,6 +37,7 @@ from coordinator import (
     backup_quiesce_active,
     resolve_identity,
     _AGENT_TOKENS,
+    AUTH_CONFIGURED_AT_STARTUP,
     AUTH_SCHEME,
     FRAMEWORK_VERSION,
     API_VERSION,
@@ -710,7 +711,18 @@ def _mint_daemon_token(agent_name: str) -> str:
     return token
 
 
-def _daemon_env_and_token_fd(agent_name: str) -> "tuple[dict, int]":
+def _revoke_daemon_token(agent_name: str) -> None:
+    """Deregister `agent_name`'s ephemeral daemon token (nit fix, A2 security
+    review, finding 10). Used when the daemon process failed to spawn AFTER
+    its token was already minted and registered — no process holds it, so it
+    must not linger in coordinator._AGENT_TOKENS as a still-valid credential
+    with nothing behind it."""
+    digest = _ephemeral_daemon_token_digests.pop(agent_name, None)
+    if digest is not None:
+        _AGENT_TOKENS.pop(digest, None)
+
+
+def _daemon_env_and_token_fd(agent_name: str) -> "tuple[dict, int | None]":
     """Build a daemon's child environment plus a pipe fd carrying its
     freshly-minted AGENT_TOKEN (SEC-10) — never via the child environment,
     argv, or any file.
@@ -723,21 +735,33 @@ def _daemon_env_and_token_fd(agent_name: str) -> "tuple[dict, int]":
     never blocks, and the bytes are already sitting in the pipe's kernel
     buffer by the time exec() runs.
 
-    Returns (env, read_fd). The caller passes `read_fd` via `pass_fds=` to
-    asyncio.create_subprocess_exec (which — like the underlying
-    subprocess.Popen — makes it inheritable across the fork/exec on its
-    own; no manual os.set_inheritable() needed) and closes it in the parent
-    once the child has been spawned. The child holds its own duplicate of
-    the same pipe end, created by fork() independently of the parent's
-    reference, so closing the parent's copy does not affect the child's.
+    Returns (env, read_fd) — read_fd is None when auth is disabled for this
+    install (coordinator.AUTH_CONFIGURED_AT_STARTUP is False, fix for
+    finding 1): no token is minted, AGENT_TOKEN_FD is not set, and the
+    caller must not pass_fds. Minting a token for a disabled-auth install
+    would flip coordinator._AGENT_TOKENS from empty to non-empty — exactly
+    the state AUTH_CONFIGURED_AT_STARTUP exists to stop the auth middleware
+    from misreading as "auth is now configured". Skipping the mint keeps
+    pre-A2 behaviour byte for byte: daemons' unauthenticated calls pass
+    exactly as before.
     """
     env = _daemon_env(agent_name)
+    if not AUTH_CONFIGURED_AT_STARTUP:
+        return env, None
     token = _mint_daemon_token(agent_name)
     read_fd, write_fd = os.pipe()
     try:
-        os.write(write_fd, token.encode("utf-8"))
-    finally:
-        os.close(write_fd)
+        try:
+            os.write(write_fd, token.encode("utf-8"))
+        finally:
+            os.close(write_fd)
+    except Exception:
+        # Nit fix (finding 10): if the write itself raised, read_fd would
+        # otherwise leak -- nothing else in this function's error path
+        # closes it, and the caller never receives it to close either.
+        os.close(read_fd)
+        _revoke_daemon_token(agent_name)
+        raise
     env["AGENT_TOKEN_FD"] = str(read_fd)
     return env, read_fd
 
@@ -763,10 +787,19 @@ async def _start_daemon() -> "asyncio.subprocess.Process | None":
             "--with", "neo4j",
             "python", str(daemon_path),
             env=env,
-            pass_fds=(read_fd,),
+            pass_fds=(read_fd,) if read_fd is not None else (),
         )
+    except Exception:
+        # Nit fix (finding 10): the token was already minted and registered
+        # before spawn was attempted -- if spawn itself failed, nothing
+        # holds that token, so revoke it rather than leaving it valid with
+        # no daemon behind it.
+        if read_fd is not None:
+            _revoke_daemon_token("consolidation")
+        raise
     finally:
-        os.close(read_fd)
+        if read_fd is not None:
+            os.close(read_fd)
     log.info("Consolidation daemon started (pid %d)", proc.pid)
     return proc
 
@@ -789,10 +822,15 @@ async def _start_rem_daemon() -> "asyncio.subprocess.Process | None":
             "--with", "neo4j",
             "python", str(rem_path),
             env=env,
-            pass_fds=(read_fd,),
+            pass_fds=(read_fd,) if read_fd is not None else (),
         )
+    except Exception:
+        if read_fd is not None:
+            _revoke_daemon_token("rem_daemon")
+        raise
     finally:
-        os.close(read_fd)
+        if read_fd is not None:
+            os.close(read_fd)
     log.info("REM daemon started (pid %d)", proc.pid)
     return proc
 
@@ -1269,7 +1307,11 @@ async def handle_health(request: web.Request) -> web.Response:
     # fail the health check so agents can still read/write memory.
     critical_ok = checks["embedder"] == "ok" and checks["reranker"] == "ok"
     checks["status"] = "ok" if critical_ok else "degraded"
-    checks["auth_required"] = bool(_AGENT_TOKENS)
+    # The STARTUP truth (finding 1), not live _AGENT_TOKENS emptiness -- a
+    # daemon token minted after boot must not flip this to True for an
+    # install that never configured auth. See coordinator.
+    # AUTH_CONFIGURED_AT_STARTUP's docstring.
+    checks["auth_required"] = AUTH_CONFIGURED_AT_STARTUP
     # Advertise the active auth scheme so clients can detect when the gateway
     # moves from bearer tokens to PoP (asymmetric-key proof-of-possession).
     checks["auth_scheme"] = AUTH_SCHEME

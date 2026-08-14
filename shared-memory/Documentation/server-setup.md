@@ -62,8 +62,12 @@ uv run --with psycopg2-binary python shared-memory/migrations/apply.py
 #    (name:sha256:<hex> — safe to paste), and each LOCAL agent's own
 #    AGENT_TOKEN is written straight into its skill .env (mode 600) —
 #    nothing to copy by hand. A REMOTE agent (no local skill install found
-#    on this machine) needs an explicit, human-run reveal:
+#    on this machine) needs an explicit, human-run reveal — pass --reveal
+#    on THIS SAME invocation (running it again LATER, as a separate
+#    command, mints a FRESH set of tokens for every agent — a full
+#    rotation, not a free peek at the one you already have):
 #      uv run python shared-memory/scripts/generate_tokens.py --reveal <name>
+#    No remote agent to reveal? Just:
 uv run python shared-memory/scripts/generate_tokens.py
 #    → add the printed AGENT_TOKENS=... line to this host's .env
 
@@ -114,6 +118,15 @@ uv run --with psycopg2-binary python shared-memory/migrations/apply.py   # apply
 Migrations are idempotent and run "all pending" when invoked with no argument, so
 re-running after a pull is always safe. Updating an agent's **skill** never runs a
 migration — the client does not own the schema.
+
+**Upgrading through v0.9.3 (PR A2 — digest registry):** if your gateway `.env`
+predates this release, run `generate_tokens.py --convert-digests` once to rewrite
+`AGENT_TOKENS` to digest form — a plaintext entry now refuses gateway startup
+outright. While you're editing that line: a pre-A2 registry may still carry entries
+named `consolidation` or `rem_daemon` — those were how the two framework daemons
+authenticated before A2. They are now dead weight; the daemons mint their own token
+fresh, in-memory, on every boot instead, so delete any such entries rather than
+converting them.
 
 ---
 

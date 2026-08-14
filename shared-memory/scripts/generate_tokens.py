@@ -27,6 +27,12 @@ them and prints only names, digests, and destination paths.
     labelled with a loud warning. Run this yourself; NEVER pipe it through
     an agent (agent transcripts are durable, so "shown once" becomes
     "stored forever"). Repeatable: --reveal codex --reveal grok.
+    IMPORTANT: --reveal only ever shows a token from the SAME mint this
+    invocation performs. There is no way to reveal a token minted by an
+    EARLIER invocation — every invocation of this script (with or without
+    --reveal) mints a fresh set of tokens for every agent, so running
+    `--reveal <name>` later, as a separate command, is a FULL ROTATION of
+    every agent's token, not a free peek at one already registered.
 
   uv run python shared-memory/scripts/generate_tokens.py --convert-digests
     Rewrites the GATEWAY .env's existing AGENT_TOKENS line from plaintext
@@ -36,12 +42,22 @@ them and prints only names, digests, and destination paths.
     with even one plaintext AGENT_TOKENS entry present (SEC-11) — this is
     the one-command fix. Existing client tokens are unaffected; only the
     gateway's own storage format changes.
+
+  uv run python shared-memory/scripts/generate_tokens.py --digest backup
+    Prints ONLY a digest entry (name:sha256:<hex>) for an OPERATOR-SUPPLIED
+    token you already chose yourself — e.g. the BACKUP_ADMIN_TOKEN in
+    .env.example — read from STDIN, never argv (argv is visible to `ps`
+    and shell history). Mints nothing, writes nothing:
+      printf '%s' tok_backup_xxx | uv run python \\
+        shared-memory/scripts/generate_tokens.py --digest backup
 """
 import argparse
+import errno
 import hashlib
 import os
 import secrets
 import sys
+import tempfile
 
 AGENTS = ["claude", "gemini", "grok", "codex", "lm_studio", "antigravity", "monitor"]
 
@@ -88,11 +104,32 @@ def _mint_all() -> dict:
     return {a: f"tok_{secrets.token_urlsafe(24)}" for a in AGENTS}
 
 
+class AgentEnvIsSymlink(Exception):
+    """Raised by _write_agent_token_file when `path` is a symlink. This
+    framework's threat model treats other same-uid agent processes as
+    adversarial (S-01/S-10's whole premise), so writing a live bearer token
+    through a symlink -- which could point anywhere another process placed
+    it -- is refused outright rather than followed."""
+
+
 def _write_agent_token_file(path: str, token: str) -> bool:
     """Write-through: set AGENT_TOKEN=<token> in the skill .env at `path`,
-    mode 600 from the first byte (S-01) — no create-then-chmod window.
-    Preserves every other line already in the file; replaces only an
-    existing AGENT_TOKEN= line (or appends one).
+    mode 600 BEFORE any content is written (S-01, tightened per finding 4
+    of the A2 security review) — no create-then-chmod window and no
+    write-then-chmod window either. Preserves every other line already in
+    the file; replaces only an existing AGENT_TOKEN= line (or appends one).
+
+    `os.open()`'s mode argument only takes effect when the file is CREATED
+    — for a PRE-EXISTING file (the entire measured population at review
+    time: every installed skill .env was already 0644) the old mode governs
+    until something changes it. Writing the token first and `chmod`ing
+    after therefore left it world-readable for the whole write; this now
+    calls `os.fchmod()` on the open fd immediately, before the first byte
+    of content, closing that window.
+
+    Refuses (raises AgentEnvIsSymlink) rather than following a symlink at
+    `path` — `os.O_NOFOLLOW` makes the kernel enforce this atomically, with
+    no check-then-open race for another same-uid process to win.
 
     Returns False without writing anything when the skill directory itself
     doesn't exist — nothing to write through to; this agent is treated as
@@ -101,6 +138,8 @@ def _write_agent_token_file(path: str, token: str) -> bool:
     skill_dir = os.path.dirname(path)
     if not os.path.isdir(skill_dir):
         return False
+    if os.path.islink(path):
+        raise AgentEnvIsSymlink(path)
     lines: list[str] = []
     if os.path.exists(path):
         with open(path) as f:
@@ -109,10 +148,17 @@ def _write_agent_token_file(path: str, token: str) -> bool:
                     continue
                 lines.append(line.rstrip("\n"))
     lines.append(f"AGENT_TOKEN={token}")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        fd = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600,
+        )
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise AgentEnvIsSymlink(path) from exc
+        raise
+    os.fchmod(fd, 0o600)  # BEFORE any write — closes the world-readable window
     with os.fdopen(fd, "w") as f:
         f.write("\n".join(lines) + "\n")
-    os.chmod(path, 0o600)  # belt-and-braces if the file pre-existed with a wider mode
     return True
 
 
@@ -136,7 +182,17 @@ def mint() -> "tuple[dict, dict]":
     print("=== Per-agent tokens — written through, never printed ===")
     for a in AGENTS:
         path = LOCAL_SKILL_ENV_PATHS.get(a)
-        if path and _write_agent_token_file(path, tokens[a]):
+        written = False
+        if path:
+            try:
+                written = _write_agent_token_file(path, tokens[a])
+            except AgentEnvIsSymlink:
+                print(f"  {a:15}  REFUSED — {path} is a symlink; not following it")
+                print("                   (same-uid agents are treated as adversarial —")
+                print("                   replace it with a real file and re-run, or reveal:")
+                print(f"                   generate_tokens.py --reveal {a}")
+                continue
+        if written:
             print(f"  {a:15}  written → {path}  (mode 600)")
         else:
             print(f"  {a:15}  REMOTE / no local install found — reveal with:")
@@ -151,7 +207,28 @@ def convert_digests(env_path: str) -> int:
     """Rewrite the gateway .env's AGENT_TOKENS line from plaintext (or
     mixed) form to pure digest form (name:sha256:<hex>), in place.
     Idempotent — an entry already in digest form is left unchanged. Prints
-    only names + digests, never a token value."""
+    only names + digests, never a token value.
+
+    Two fixes from the A2 security review:
+
+    Finding 3 — this file also holds PG_PASSWORD, NEO4J_PASSWORD, and every
+    provider key, so it is written ATOMICALLY: a temp file in the SAME
+    directory (same filesystem, so the final `os.rename()` is atomic — no
+    reader ever observes a partially-written .env), `fchmod`'d 600 before
+    any content is written, `fsync`'d, then renamed over the original. And
+    ANY malformed AGENT_TOKENS entry ABORTS the whole operation before a
+    single byte is written — silently dropping a registry entry here would
+    lock that agent out with no record of why, on the file that decides
+    who the gateway trusts.
+
+    Finding 12 — matches (and rebuilds) the AGENT_TOKENS line after a full
+    `.strip()`, the same normalisation secure_env.load_split_env() applies
+    when the gateway itself parses this file. The old right-strip-only
+    match disagreed with the gateway on a leading-whitespace line: the
+    gateway would parse and (correctly) refuse to start on a plaintext
+    entry there, while this function reported "no AGENT_TOKENS= line
+    found" — the one-command fix the refusal names would not have worked.
+    """
     if not os.path.isfile(env_path):
         print(f"✗ {env_path} not found", file=sys.stderr)
         return 1
@@ -162,7 +239,7 @@ def convert_digests(env_path: str) -> int:
     converted: list[tuple[str, str]] = []
     found = False
     for line in lines:
-        stripped = line.rstrip("\n")
+        stripped = line.strip()
         if stripped.startswith("AGENT_TOKENS="):
             found = True
             raw = stripped[len("AGENT_TOKENS="):]
@@ -182,17 +259,35 @@ def convert_digests(env_path: str) -> int:
                     new_pairs.append(f"{name}:sha256:{digest}")
                     converted.append((name, digest))
                 else:
-                    print(f"⚠ skipping malformed AGENT_TOKENS entry: {pair!r}", file=sys.stderr)
+                    print(
+                        f"✗ malformed AGENT_TOKENS entry: {pair!r} — aborting, "
+                        "nothing was written. Fix or remove this entry and re-run.",
+                        file=sys.stderr,
+                    )
+                    return 1
             out_lines.append("AGENT_TOKENS=" + ",".join(new_pairs))
         else:
-            out_lines.append(stripped)
+            out_lines.append(line.rstrip("\n"))
 
     if not found:
         print(f"✗ no AGENT_TOKENS= line found in {env_path}", file=sys.stderr)
         return 1
 
-    with open(env_path, "w") as f:
-        f.write("\n".join(out_lines) + "\n")
+    content = "\n".join(out_lines) + "\n"
+    env_dir = os.path.dirname(os.path.abspath(env_path)) or "."
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=env_dir, prefix=".agent_tokens_convert_")
+        os.fchmod(fd, 0o600)  # before any content -- no world-readable window
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(tmp_path, env_path)  # atomic on the same filesystem
+        tmp_path = None
+    finally:
+        if tmp_path is not None and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
     print(f"✓ AGENT_TOKENS in {env_path} converted to digest form:")
     for name, digest in converted:
@@ -206,8 +301,13 @@ def main(argv=None) -> int:
     )
     ap.add_argument(
         "--reveal", action="append", default=[], metavar="NAME",
-        help="Print this agent's raw token to stdout after minting. Run this "
-             "yourself — NEVER through an agent. Repeatable.",
+        help="Print this agent's raw token to stdout after minting -- on THIS "
+             "invocation ONLY. Run it yourself, NEVER through an agent. "
+             "Repeatable (--reveal codex --reveal grok). NOTE: every "
+             "invocation of this script mints a FRESH set of tokens for "
+             "every agent -- running --reveal NAME later, as a separate "
+             "command, is a FULL ROTATION of every agent's token, not a "
+             "free peek at one already registered.",
     )
     ap.add_argument(
         "--convert-digests", nargs="?", const=_DEFAULT_GATEWAY_ENV,
@@ -216,7 +316,24 @@ def main(argv=None) -> int:
              "in place, instead of minting new tokens. Defaults to the "
              "gateway .env this script resolves the same way apply.py does.",
     )
+    ap.add_argument(
+        "--digest", metavar="NAME",
+        help="Print a digest entry (NAME:sha256:<hex>) for an OPERATOR-"
+             "SUPPLIED token read from STDIN -- never argv (argv is visible "
+             "via `ps` and shell history). Mints nothing, writes nothing. "
+             "Use for a token you chose yourself (e.g. the backup admin "
+             "token in .env.example), not one this script minted. Usage: "
+             "printf '%s' <token> | generate_tokens.py --digest <name>",
+    )
     args = ap.parse_args(argv)
+
+    if args.digest is not None:
+        raw_token = sys.stdin.read().strip()
+        if not raw_token:
+            print("✗ no token read from stdin", file=sys.stderr)
+            return 1
+        print(f"{args.digest}:sha256:{_digest(raw_token)}")
+        return 0
 
     if args.convert_digests is not None:
         return convert_digests(args.convert_digests)

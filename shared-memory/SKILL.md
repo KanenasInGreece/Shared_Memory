@@ -524,6 +524,7 @@ token from `AGENT_TOKEN` in its own skill `.env` (e.g. `~/.claude/skills/shared-
 
 ```bash
 echo "AGENT_TOKEN=tok_abc..." >> ~/.claude/skills/shared-memory/.env
+chmod 600 ~/.claude/skills/shared-memory/.env
 ```
 
 Tokens are **minted on the gateway host** (`generate_tokens.py`) and added to the
@@ -532,8 +533,11 @@ task, see [Documentation/server-setup.md](Documentation/server-setup.md#first-ti
 For a *local* agent, minting also writes this agent's own `AGENT_TOKEN` line
 straight into its skill `.env` (mode 600) — nothing is printed to a terminal, so
 there is nothing to paste. A *remote* agent's raw token is never printed by
-default either; the operator reveals it with `generate_tokens.py --reveal <name>`,
-run directly by a human, never through an agent. Each agent uses its own distinct
+default either; the operator reveals it with `generate_tokens.py --reveal <name>`
+**on the same invocation that mints it**, run directly by a human, never through
+an agent — a separate, later invocation of `generate_tokens.py` (with or without
+`--reveal`) mints a fresh token for every agent, rotating the whole registry, not
+a free peek at the one already registered. Each agent uses its own distinct
 token; never share tokens across agents.
 
 The dotenv search for CLI agents is scoped to exactly this skill directory (first

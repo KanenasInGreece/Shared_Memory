@@ -151,6 +151,23 @@ def test_load_agent_tokens_plaintext_entry_still_parses_and_verifies():
     assert mod._lookup_agent_by_token("tok_abc") == "claude"
 
 
+def test_load_agent_tokens_plaintext_token_containing_a_colon_is_recorded_as_plaintext():
+    """Required fix (A2 security review, finding 6): a plaintext token that
+    itself contains a colon (e.g. "tok:with:colons") makes split(":", 2)
+    produce 3 parts, the same shape as a genuine digest entry -- the middle
+    segment just isn't "sha256". This must be treated as PLAINTEXT (name =
+    part 0, token = everything after the first colon, colons included),
+    not dropped as malformed -- a dropped entry never reaches
+    _PLAINTEXT_AGENT_TOKENS_SEEN, so the startup refusal never names it and
+    the operator gets an unexplained 401 instead of the one-line fix."""
+    mod = load_coordinator("claude:tok:with:colons")
+    assert mod._AGENT_TOKENS == {_digest("tok:with:colons"): "claude"}
+    assert mod._lookup_agent_by_token("tok:with:colons") == "claude"
+    assert mod._PLAINTEXT_AGENT_TOKENS_SEEN == ["claude"]
+    with pytest.raises(SystemExit, match="plaintext"):
+        mod.require_no_plaintext_agent_tokens()
+
+
 def test_load_agent_tokens_records_plaintext_names_seen():
     mod = load_coordinator("claude:tok_abc,gemini:tok_xyz")
     assert sorted(mod._PLAINTEXT_AGENT_TOKENS_SEEN) == ["claude", "gemini"]
@@ -229,6 +246,42 @@ async def test_auth_middleware_passes_all_when_no_tokens():
     req = _make_request("/memory/save")
     resp = await mod.auth_middleware(req, _noop_handler)
     assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_stays_disabled_after_daemon_token_mint():
+    """CRITICAL fix (A2 security review, finding 1): an auth-unset install
+    must stay UNAUTHENTICATED even after hive_mind_proxy._mint_daemon_token()
+    mutates coordinator._AGENT_TOKENS in place, seconds after boot, when the
+    REM/NREM watchdogs first spawn their daemons (SEC-10). The middleware's
+    bypass must gate on AUTH_CONFIGURED_AT_STARTUP -- captured once, before
+    any daemon token exists -- never on whether _AGENT_TOKENS happens to be
+    non-empty right now.
+
+    This mutates _AGENT_TOKENS directly (exactly what _mint_daemon_token()
+    does) rather than importing hive_mind_proxy, so the assertion is about
+    the middleware's gate in isolation, not the daemon-spawn plumbing
+    (covered in tests/test_token_registry_digests_and_daemon_fd.py) -- and,
+    unlike that file's autouse fixture, this test does NOT clear
+    _AGENT_TOKENS around itself, because clearing it is exactly what masked
+    this defect."""
+    mod = load_coordinator("")  # auth unset at startup
+    assert mod.AUTH_CONFIGURED_AT_STARTUP is False
+    assert mod._AGENT_TOKENS == {}
+
+    # Simulate what hive_mind_proxy._mint_daemon_token() does when a daemon
+    # watchdog first spawns its subprocess.
+    mod._AGENT_TOKENS[_digest("ephemeral-daemon-token")] = "consolidation"
+    assert mod._AGENT_TOKENS, "sanity: the registry really is non-empty now"
+
+    req = _make_request("/memory/save")  # no Authorization header at all
+    resp = await mod.auth_middleware(req, _noop_handler)
+    assert resp.status == 200, (
+        "an auth-unset install must stay unauthenticated after daemon "
+        "minting -- gating the bypass on _AGENT_TOKENS emptiness instead "
+        "of AUTH_CONFIGURED_AT_STARTUP breaks every unauthenticated "
+        "client the instant a daemon watchdog fires"
+    )
 
 
 # ── auth_middleware — allowlisted paths ───────────────────────────────────────
@@ -320,8 +373,11 @@ async def test_auth_middleware_digest_entry_wrong_token_401s():
 @pytest.mark.asyncio
 async def test_auth_middleware_mixed_registry_both_forms_authenticate():
     """A registry with one digest-form and one plaintext-legacy entry
-    authenticates correctly through BOTH forms (SEC-11: plaintext is
-    accepted, not refused, in A2)."""
+    authenticates correctly through BOTH forms. SEC-11: plaintext is
+    accepted at PARSE level (so require_no_plaintext_agent_tokens() can
+    name exactly which agents need converting) — the refusal itself is a
+    separate, startup-time check at the gateway entrypoint, not something
+    _load_agent_tokens()/auth_middleware() enforce."""
     mod = load_coordinator(f"claude:sha256:{_digest('tok_abc')},gemini:tok_xyz")
     req1 = _make_request("/memory/save", auth_header="Bearer tok_abc")
     resp1 = await mod.auth_middleware(req1, _noop_handler)

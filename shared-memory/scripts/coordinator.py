@@ -247,7 +247,9 @@ def _load_agent_tokens() -> dict[str, str]:
 
     Two accepted entry shapes, comma-separated:
       - digest form (required from v0.9.3): name:sha256:<64-hex-digest>
-      - legacy plaintext:                   name:token
+      - legacy plaintext:                   name:token  (token MAY itself
+        contain one or more colons — everything after the first colon is
+        the token, unless it takes the digest shape above)
 
     A legacy plaintext entry is hashed once, here, at load time and stored
     exactly like a digest entry — from this point on in the process, the raw
@@ -286,6 +288,27 @@ def _load_agent_tokens() -> dict[str, str]:
                     "name:sha256:<64-hex-digest>)", pair,
                 )
                 continue
+        elif len(parts) == 3:
+            # Finding 6 (A2 security review): a 3-part split whose middle
+            # segment ISN'T "sha256" is not malformed -- split(":", 2) only
+            # ever produces 3 parts when the raw value has 2+ colons, which
+            # a PLAINTEXT token containing a colon of its own triggers just
+            # as easily as a genuine digest entry. Falling through to
+            # "malformed, drop it" here used to mean this entry never
+            # reached _PLAINTEXT_AGENT_TOKENS_SEEN, so
+            # require_no_plaintext_agent_tokens() never named it and a
+            # gateway with this entry started up "clean" while the agent's
+            # real token silently verified nothing -- an unexplained 401
+            # instead of the one-line startup refusal. Reassemble the
+            # colon(s) the split consumed: the token is everything after
+            # the FIRST colon, verbatim.
+            name  = parts[0].strip()
+            token = f"{parts[1]}:{parts[2]}".strip()
+            if not name or not token:
+                log.warning("AGENT_TOKENS: malformed entry %r (expected name:token)", pair)
+                continue
+            digest = _token_digest(token)
+            _PLAINTEXT_AGENT_TOKENS_SEEN.append(name)
         elif len(parts) == 2:
             name, token = parts[0].strip(), parts[1].strip()
             if not name or not token:
@@ -311,6 +334,24 @@ def _load_agent_tokens() -> dict[str, str]:
 
 
 _AGENT_TOKENS: dict[str, str] = _load_agent_tokens()
+
+# Captured ONCE, immediately after the line above, before any daemon token
+# has ever been minted (CRITICAL fix, A2 security review, finding 1). The
+# auth middleware's backward-compat bypass and /health's `auth_required`
+# MUST gate on this flag, never on `bool(_AGENT_TOKENS)` at request time:
+# hive_mind_proxy._mint_daemon_token() mutates this same dict in place, a
+# few seconds after boot, when the REM/NREM watchdogs first spawn their
+# daemons (SEC-10, PR A2) -- registering an ephemeral entry even on an
+# install that never configured AGENT_TOKENS at all. A bypass keyed on live
+# emptiness would therefore flip an auth-unset install to "authenticating"
+# moments after startup, 401-ing every unauthenticated client -- exactly
+# the seamlessness invariant ("clients: zero action required") this
+# workstream is not allowed to break. This flag never changes for the life
+# of the process; hive_mind_proxy skips minting entirely when it is False
+# (see _daemon_env_and_token_fd()), so _AGENT_TOKENS in fact stays empty
+# too in that case -- but the gate reads this flag explicitly rather than
+# relying on that as an invariant to keep proving forever.
+AUTH_CONFIGURED_AT_STARTUP: bool = bool(_AGENT_TOKENS)
 
 
 def require_no_plaintext_agent_tokens() -> None:
@@ -827,7 +868,10 @@ async def auth_middleware(request: web.Request, handler):
     """
     global _inflight
     _check_client_version(request)  # logs API skew to the gateway log; never raises
-    if not _AGENT_TOKENS:
+    # Gate on the STARTUP truth (finding 1), not on whether _AGENT_TOKENS
+    # happens to be non-empty right now -- see AUTH_CONFIGURED_AT_STARTUP's
+    # docstring above for why the two diverge after a daemon token is minted.
+    if not AUTH_CONFIGURED_AT_STARTUP:
         return await handler(request)
     if request.path.rstrip("/") in _UNPROTECTED_PATHS or request.path in _UNPROTECTED_PATHS:
         return await handler(request)

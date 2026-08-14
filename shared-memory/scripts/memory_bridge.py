@@ -81,6 +81,40 @@ _ENV_CANDIDATES = [
 # runs (monkeypatch.setattr(memory_bridge, "_AGENT_TOKEN_FROM_FILE", "")).
 _AGENT_TOKEN_FROM_FILE = ""
 
+# Required fix (A2 security review, finding 7): a small, standalone mirror
+# of secure_env.is_secret_key() (the GATEWAY's classification) -- duplicated
+# rather than imported, because this client ships alone and must never
+# depend on a server-only module (Group 1: the client/server surface
+# split). Candidate 2 (_ENV_CANDIDATES[1], the skill root .env) IS the
+# gateway .env when this same file is invoked in admin mode from the repo
+# root, so without this predicate PG_PASSWORD/NEO4J_PASSWORD/AGENT_TOKENS/
+# every provider key would land in setdefault() below and leak into this
+# client process's own os.environ -- the identical class of leak S-18
+# already closed for AGENT_TOKEN specifically, one level broader. AGENT_TOKEN
+# itself is exempt here: it keeps its own dedicated _AGENT_TOKEN_FROM_FILE
+# path above, never routed through os.environ either way. Everything else
+# this predicate catches is simply skipped -- the client has no use for any
+# of these values, so unlike the server there is no config-name allowlist
+# carve-out and no dynamic token_env discovery to widen it.
+_CLIENT_KNOWN_SECRET_NAMES = {
+    "PG_PASSWORD", "NEO4J_PASSWORD", "TAVILY_API_KEY", "AGENT_TOKENS",
+    "BACKUP_ADMIN_TOKEN",
+}
+_CLIENT_SECRET_SUFFIXES = ("_PASSWORD", "_TOKEN", "_API_KEY")
+
+
+def _is_client_secret_key(name: str) -> bool:
+    """True if `name` must never be exported into this client's own
+    os.environ (mirrors secure_env.is_secret_key(), narrowed to what this
+    client can ever encounter). AGENT_TOKEN is excluded -- it has its own
+    private-variable path and is never routed through this predicate."""
+    if name == "AGENT_TOKEN":
+        return False
+    if name in _CLIENT_KNOWN_SECRET_NAMES:
+        return True
+    return name.upper().endswith(_CLIENT_SECRET_SUFFIXES)
+
+
 try:
     from dotenv import dotenv_values  # parses without touching os.environ
     for _env in _ENV_CANDIDATES:
@@ -92,6 +126,8 @@ try:
             if _k == "AGENT_TOKEN":
                 if not _AGENT_TOKEN_FROM_FILE:
                     _AGENT_TOKEN_FROM_FILE = _v.strip()
+                continue
+            if _is_client_secret_key(_k):
                 continue
             os.environ.setdefault(_k, _v)
 except ImportError:
@@ -113,6 +149,8 @@ except ImportError:
                     if _k == "AGENT_TOKEN":
                         if not _AGENT_TOKEN_FROM_FILE:
                             _AGENT_TOKEN_FROM_FILE = _v
+                        continue
+                    if _is_client_secret_key(_k):
                         continue
                     if _k not in os.environ:   # first definition wins
                         os.environ[_k] = _v
