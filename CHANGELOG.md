@@ -5,6 +5,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.4] — 2026-08-15
+
+**Credential custody, PR A3: a credential-use audit trail for the gateway.** The
+gateway plays two credential roles — it authenticates clients at its own door, and it
+holds/attaches provider keys to upstream LLM API calls — and this release makes both
+sides of that split legible. A new, separate credential-events log
+(`~/.shared-memory/logs/credential-audit.jsonl`, on by default, `CREDENTIAL_AUDIT_LOG_PATH`
+to relocate or an empty value to disable) records only high-signal events: an upstream
+backend rejecting our own provider key, a gateway-side connect/timeout/proxy failure on
+a credentialed call, a client presenting a bad bearer token (claimed identity plus an
+8-hex-char digest prefix of the presented token — never the token itself), and every
+daemon-token mint. The existing per-request gateway audit line gains two additive
+fields, `backend` and `key_attached`, when a request was proxied to an LLM backend with
+a provider key attached — existing fields are unchanged.
+
+`GET /memory/telemetry` gains two new sections: `llm_faults`, a per-backend breakdown of
+gateway-origin vs. upstream-origin faults (the latter further split into `credential` —
+401/403, or a 429 whose body names OpenAI's `insufficient_quota` — vs. `transient` —
+rate limits, 5xx, an unparseable 429), each carrying a count and its last occurrence;
+and `credentials`, three running counters (token-verify failures, daemon tokens issued,
+and the credential log's own dropped-line count). Telemetry stays counts-and-last-event
+only — the log carries the detail, never the other way around. `/health` is untouched.
+
+Clients now get standard fault signalling: an additive `X-SM-Fault-Origin` response
+header (`upstream` when a proxied backend itself returned the fault, `gateway` when the
+gateway constructed the error response) on every fault status, never on success, and
+the gateway's own 401s for a missing or invalid bearer token now carry the RFC 6750
+`WWW-Authenticate: Bearer` challenge (with `error="invalid_token"` when a token was
+presented but did not verify). Upstream error bodies continue to pass through verbatim,
+now backed by a regression test.
+
 ## [0.9.3] — 2026-08-14
 
 **Credential custody, PR A2: the token registry stops storing tokens.** `AGENT_TOKENS`
