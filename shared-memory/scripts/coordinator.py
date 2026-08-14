@@ -75,6 +75,7 @@ from project_promotion import (
     promote_record, sole_project, METHOD_GROUNDING,
 )
 from project_alias import ALIAS_RESOLVE_SQL
+from secure_env import get_secret
 
 log = logging.getLogger("coordinator")
 
@@ -138,7 +139,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.1"
+FRAMEWORK_VERSION = "0.9.2"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -222,8 +223,14 @@ def _load_agent_tokens() -> dict[str, str]:
 
     Format: AGENT_TOKENS=claude:tok_abc,gemini:tok_xyz,...
     Returns empty dict if AGENT_TOKENS is not set (auth disabled, backward compat).
+
+    Read via secure_env.get_secret(), never os.environ directly (SEC-05/
+    SEC-09, PR A1) — AGENT_TOKENS is a secret key, so hive_mind_proxy's split
+    loader never exports it to os.environ; get_secret() still falls back to
+    os.environ for a value set through the process's own exec-time
+    environment (a test's monkeypatch.setenv, an operator's `export`).
     """
-    raw = os.environ.get("AGENT_TOKENS", "").strip()
+    raw = get_secret("AGENT_TOKENS", "").strip()
     if not raw:
         return {}
     result: dict[str, str] = {}
@@ -796,13 +803,21 @@ async def auth_middleware(request: web.Request, handler):
                request_id, request.get("principal"))
 
 # ── Config ────────────────────────────────────────────────────────────────────
+# PG_PASSWORD/NEO4J_PASSWORD/PG_CONN are secrets (SEC-05/SEC-09, PR A1; PG_CONN
+# added in the review fix round — a DSN embeds the password verbatim) — read
+# via secure_env.get_secret(), never os.environ directly. hive_mind_proxy calls
+# secure_env.load_split_env() before importing this module, so by the time
+# these run the framework .env's secret keys are already in secure_env's
+# in-process store; get_secret() checks os.environ first regardless (an
+# operator-exported value always wins), so a direct module load (tests, a
+# standalone run) still works off an exported var.
 
-_pg_pass = os.environ.get("PG_PASSWORD", "")
-PG_DSN   = os.environ.get(
+_pg_pass = get_secret("PG_PASSWORD", "")
+PG_DSN   = get_secret(
     "PG_CONN", f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
 )
 NEO4J_URI  = "bolt://localhost:7687"
-NEO4J_AUTH = ("neo4j", os.environ.get("NEO4J_PASSWORD", ""))
+NEO4J_AUTH = ("neo4j", get_secret("NEO4J_PASSWORD", ""))
 
 # Bound the Neo4j driver pool so a burst of concurrent searches (or daemon
 # traffic sharing this driver) cannot queue indefinitely. acquisition_timeout

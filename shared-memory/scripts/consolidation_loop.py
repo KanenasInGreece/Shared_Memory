@@ -97,20 +97,35 @@ from pool_status import pool_has_free_slot
 from dream_telemetry import (record_llm_call, adaptive_ceiling, embed_ceiling,
                              EMBED_MAX_CHARS)
 from record_ref import make_ref
+from secure_env import load_split_env, get_secret, require_db_credentials
 
 # Configuration — set via environment variables or .env file
+#
+# SEC-05/S-03 (Credential_Custody_Plan_2026-08-14, PR A1): this daemon had NO
+# loader of its own — it read PG_PASSWORD/NEO4J_PASSWORD straight off the
+# ambient environment, relying entirely on the gateway (which spawns it) to
+# have already populated os.environ. A1's proxy no longer copies its own
+# os.environ into a daemon's child env (hive_mind_proxy._daemon_env stopped
+# doing `os.environ.copy()`), so that assumption broke — this call is what
+# keeps NREM able to connect at all, self-loading its own credentials from
+# the framework .env rather than depending on inherited env.
+load_split_env()
+
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_USER = "neo4j"
-NEO4J_PASS = os.environ.get("NEO4J_PASSWORD", "")
+NEO4J_PASS = get_secret("NEO4J_PASSWORD", "")
 # Bound the driver pool — this daemon shares Neo4j with live gateway traffic;
 # an unbounded default pool can queue indefinitely under contention.
 NEO4J_MAX_POOL = int(os.environ.get("NEO4J_MAX_POOL", "50"))
 NEO4J_ACQUIRE_TIMEOUT = float(os.environ.get("NEO4J_ACQUIRE_TIMEOUT", "30"))
-_pg_pass = os.environ.get("PG_PASSWORD", "")
-PG_CONN = os.environ.get(
-    "PG_CONN",
-    f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
-)
+_pg_pass = get_secret("PG_PASSWORD", "")
+# Review fix #3: PG_CONN is a secret (a DSN embeds the password verbatim) —
+# read via get_secret(), never os.environ. _pg_conn_explicit is the RAW
+# value (empty string if unset) so _require_db_credentials() below can tell
+# "operator supplied a full DSN" apart from "nothing was supplied and this
+# fell back to the constructed default".
+_pg_conn_explicit = get_secret("PG_CONN", "")
+PG_CONN = _pg_conn_explicit or f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
 RETRIEVER_URL = "http://localhost:8888/v1/embeddings"
 # The daemons' ONE way in is the hive-mind gateway — never a raw LLM. Deliberately
 # NOT an env knob: the shipped compose fixes the topology, and pointing this at a
@@ -741,7 +756,23 @@ class _CycleRec:
 # It identifies the daemon as a trusted internal caller — it does NOT affect
 # the source field on any saved artifact.  Fact.source always reflects the
 # original saving agent.  Injected by hive_mind_proxy.py via subprocess env.
-_AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "").strip() or None
+#
+# Review fix #7: read via get_secret(), not os.environ directly — with fix
+# #1's corrected precedence the proxy-injected child-env value still wins
+# (the mainline path), but a standalone debug run with AGENT_TOKEN set only
+# in shared-memory/.env now also works instead of silently 401ing.
+_AGENT_TOKEN = get_secret("AGENT_TOKEN", "").strip() or None
+
+
+def _require_db_credentials() -> None:
+    """Wraps secure_env.require_db_credentials() with this daemon's own
+    resolved values — called ONLY from the __main__ guard below (review fix
+    #4). See that function's docstring for why this must never run at bare
+    import time."""
+    require_db_credentials(
+        pg_password=_pg_pass, pg_conn=_pg_conn_explicit,
+        neo4j_password=NEO4J_PASS, daemon_name="consolidation_loop",
+    )
 
 
 def _auth_headers() -> dict:
@@ -4412,4 +4443,5 @@ async def main():
         await daemon.stop()
 
 if __name__ == "__main__":
+    _require_db_credentials()
     asyncio.run(main())

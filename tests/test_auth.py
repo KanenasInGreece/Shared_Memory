@@ -24,12 +24,26 @@ def load_coordinator(agent_tokens: str = "", agent_roles: str = ""):
     """Import coordinator.py with AGENT_TOKENS / AGENT_ROLES pre-set in the env.
 
     Each call produces a fresh module so token/role state is isolated per test.
+
+    coordinator.py reads AGENT_TOKENS via secure_env.get_secret() (PR A1),
+    which checks os.environ first, then secure_env's in-process secrets
+    cache. That cache is a process-lifetime module global: once anything in
+    this test session has called secure_env.load_split_env() against a real
+    shared-memory/.env that happens to define AGENT_TOKENS (a fake one used
+    to prove the deployed shape, or a real one on a developer's machine),
+    the value is cached there for the rest of the process — os.environ.pop()
+    alone can no longer simulate "AGENT_TOKENS is unset" once that has
+    happened. Clear the cache entry too, so "unset" here means what it says
+    regardless of what else this session has already imported.
     """
     scripts_dir = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts")
     )
     if scripts_dir not in sys.path:
         sys.path.insert(0, scripts_dir)
+
+    import secure_env
+    secure_env._secrets.pop("AGENT_TOKENS", None)
 
     # Set env BEFORE loading so _load_agent_tokens()/_load_agent_roles() pick it
     # up at module level
