@@ -57,10 +57,15 @@ docker compose -f postgres_neo4j_limits.yaml up -d
 # 4. Apply all schema migrations (idempotent — safe to re-run).
 uv run --with psycopg2-binary python shared-memory/migrations/apply.py
 
-# 5. Mint agent tokens (one-time auth setup).
+# 5. Mint agent tokens (one-time auth setup). No secret value is ever
+#    printed: the AGENT_TOKENS line printed below is DIGEST form
+#    (name:sha256:<hex> — safe to paste), and each LOCAL agent's own
+#    AGENT_TOKEN is written straight into its skill .env (mode 600) —
+#    nothing to copy by hand. A REMOTE agent (no local skill install found
+#    on this machine) needs an explicit, human-run reveal:
+#      uv run python shared-memory/scripts/generate_tokens.py --reveal <name>
 uv run python shared-memory/scripts/generate_tokens.py
-#    → add the AGENT_TOKENS=... line to this host's .env
-#    → give each agent its own AGENT_TOKEN in its skill .env (never share tokens)
+#    → add the printed AGENT_TOKENS=... line to this host's .env
 
 # 6. Start the gateway (also spawns the REM + NREM daemons).
 uv run --with aiohttp --with asyncpg --with neo4j --with httpx --with json-repair \
@@ -89,7 +94,7 @@ All live in `shared-memory/scripts/` and run on the gateway host only.
 | `consolidation_loop.py` | NREM daemon — synthesises Tier‑3 community summaries once 5+ enriched facts share an entity hub. |
 | `gpu_load.py` | GPU‑busy probe (`nvtop --snapshot`) so dreaming yields to active inference. |
 | `ontology.py` | Loads `ontology.yaml`; supplies Neo4j labels/relationship types. |
-| `generate_tokens.py` | One-time token minting helper. |
+| `generate_tokens.py` | Token minting helper (write-through mint flow, `--reveal`, `--convert-digests` — see below). |
 
 None of these ship with the skill. See [`sync_skills.sh`](../scripts/sync_skills.sh).
 

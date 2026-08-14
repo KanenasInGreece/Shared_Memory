@@ -207,6 +207,19 @@ for dir in "${AGENTS[@]}"; do
   else
     echo "  ⚠ update_skill.sh reported a problem for $dir — see output above."
   fi
+
+  # S-01 (Credential_Custody_Plan_2026-08-14, PR A2), belt-and-braces: the
+  # invoked update_skill.sh above already tightens $dir/.env to 600 as part
+  # of its own merge step. This is a second, cheap check after it returns —
+  # catches a .env this run's update_skill.sh never touched (e.g. it exited
+  # early on a network hiccup) without depending on that script's internals.
+  if [ -f "$dir/.env" ]; then
+    mode="$(stat -c %a "$dir/.env" 2>/dev/null || stat -f %Lp "$dir/.env" 2>/dev/null || echo "")"
+    if [ "$mode" != "600" ]; then
+      chmod 600 "$dir/.env"
+      echo "  ✓ .env mode tightened to 600 (was ${mode:-unknown}): $dir"
+    fi
+  fi
   echo ""
 done
 

@@ -30,6 +30,7 @@ Routes registered by attach()
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import math
@@ -139,7 +140,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.2"
+FRAMEWORK_VERSION = "0.9.3"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -198,7 +199,7 @@ def _check_client_version(request: web.Request) -> None:
         return
     # Attribute the skew to an agent when the bearer token resolves one.
     token = request.headers.get("Authorization", "").split(maxsplit=1)
-    agent = _AGENT_TOKENS.get(token[1]) if len(token) == 2 else None
+    agent = _lookup_agent_by_token(token[1]) if len(token) == 2 else None
     agent = agent or "unknown"
     key = (agent, client_api)
     if key in _seen_version_skews:
@@ -218,11 +219,47 @@ def _check_client_version(request: web.Request) -> None:
 _UNPROTECTED_PATHS = {"/health", "/pool/status"}
 
 
-def _load_agent_tokens() -> dict[str, str]:
-    """Parse AGENT_TOKENS env var into a token→agent_name mapping.
+# Plaintext AGENT_TOKENS entries are REFUSED outright, as of v0.9.3 (RULED,
+# Xenofon, 2026-08-14, superseding this PR's own original accept+warn draft —
+# there is no deprecation window). A plaintext entry is a standing downgrade
+# vector: a stale on-disk registry that still verifies exactly as strong as
+# a live one is not a convenience worth keeping, even temporarily. Parsing
+# still ACCEPTS the shape below (so the refusal can name exactly which
+# agents need converting) — the refusal itself is a startup-time check,
+# `require_no_plaintext_agent_tokens()`, called ONLY from
+# hive_mind_proxy.main() (the real gateway entrypoint), never at bare
+# import time — merely importing coordinator.py (every test in this repo
+# does) must not crash on a plaintext-configured checkout.
+_PLAINTEXT_AGENT_TOKENS_SEEN: list[str] = []
 
-    Format: AGENT_TOKENS=claude:tok_abc,gemini:tok_xyz,...
-    Returns empty dict if AGENT_TOKENS is not set (auth disabled, backward compat).
+# Digest-form AGENT_TOKENS entries: name:sha256:<64-hex-char digest>.
+_DIGEST_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _token_digest(token: str) -> str:
+    """SHA-256 hex digest of a bearer token — the only form ever stored in
+    _AGENT_TOKENS or compared against a presented credential (SEC-07)."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _load_agent_tokens() -> dict[str, str]:
+    """Parse AGENT_TOKENS env var into a digest(sha256 hex) → agent_name mapping.
+
+    Two accepted entry shapes, comma-separated:
+      - digest form (required from v0.9.3): name:sha256:<64-hex-digest>
+      - legacy plaintext:                   name:token
+
+    A legacy plaintext entry is hashed once, here, at load time and stored
+    exactly like a digest entry — from this point on in the process, the raw
+    token value is retained nowhere. Parsing still ACCEPTS a plaintext entry
+    (so the gateway can name it precisely when refusing to start — see
+    require_no_plaintext_agent_tokens() below); every plaintext agent name
+    seen is recorded in _PLAINTEXT_AGENT_TOKENS_SEEN. `generate_tokens.py
+    --convert-digests` rewrites an existing gateway .env's plaintext entries
+    to digest form in place, in one command.
+
+    Returns empty dict if AGENT_TOKENS is not set (auth disabled, backward
+    compat) — unchanged by the format change.
 
     Read via secure_env.get_secret(), never os.environ directly (SEC-05/
     SEC-09, PR A1) — AGENT_TOKENS is a secret key, so hive_mind_proxy's split
@@ -231,6 +268,7 @@ def _load_agent_tokens() -> dict[str, str]:
     environment (a test's monkeypatch.setenv, an operator's `export`).
     """
     raw = get_secret("AGENT_TOKENS", "").strip()
+    _PLAINTEXT_AGENT_TOKENS_SEEN.clear()
     if not raw:
         return {}
     result: dict[str, str] = {}
@@ -238,24 +276,85 @@ def _load_agent_tokens() -> dict[str, str]:
         pair = pair.strip()
         if not pair:
             continue
-        if ":" not in pair:
-            log.warning("AGENT_TOKENS: malformed entry %r (expected name:token)", pair)
-            continue
-        name, token = pair.split(":", 1)
-        name  = name.strip()
-        token = token.strip()
-        if token in result:
+        parts = pair.split(":", 2)
+        if len(parts) == 3 and parts[1].strip().lower() == "sha256":
+            name   = parts[0].strip()
+            digest = parts[2].strip().lower()
+            if not name or not _DIGEST_HEX_RE.match(digest):
+                log.warning(
+                    "AGENT_TOKENS: malformed digest entry %r (expected "
+                    "name:sha256:<64-hex-digest>)", pair,
+                )
+                continue
+        elif len(parts) == 2:
+            name, token = parts[0].strip(), parts[1].strip()
+            if not name or not token:
+                log.warning("AGENT_TOKENS: malformed entry %r (expected name:token)", pair)
+                continue
+            digest = _token_digest(token)
+            _PLAINTEXT_AGENT_TOKENS_SEEN.append(name)
+        else:
             log.warning(
-                "AGENT_TOKENS: token for %r is already assigned to %r — "
-                "ignoring duplicate; fix .env to prevent misattribution",
-                name, result[token],
+                "AGENT_TOKENS: malformed entry %r (expected name:token or "
+                "name:sha256:<hex>)", pair,
             )
             continue
-        result[token] = name
+        if digest in result:
+            log.warning(
+                "AGENT_TOKENS: digest for %r collides with an existing entry "
+                "already assigned to %r — ignoring duplicate; fix .env to "
+                "prevent misattribution", name, result[digest],
+            )
+            continue
+        result[digest] = name
     return result
 
 
 _AGENT_TOKENS: dict[str, str] = _load_agent_tokens()
+
+
+def require_no_plaintext_agent_tokens() -> None:
+    """FATAL, one line, naming the fix (RULED, Xenofon, 2026-08-14): from
+    v0.9.3 the gateway refuses to start when AGENT_TOKENS carries even one
+    legacy plaintext entry. Call this from hive_mind_proxy.main() ONLY —
+    the actual gateway entrypoint — never at bare import time, matching
+    secure_env.require_db_credentials()'s established pattern: every test
+    in this repo imports coordinator.py, and many do so against a
+    plaintext-configured AGENT_TOKENS on purpose (test_auth.py's whole
+    suite), so an unconditional check here would kill test collection
+    itself, not just a genuinely misconfigured gateway.
+    """
+    if _PLAINTEXT_AGENT_TOKENS_SEEN:
+        names = ", ".join(sorted(_PLAINTEXT_AGENT_TOKENS_SEEN))
+        raise SystemExit(
+            f"FATAL: AGENT_TOKENS has plaintext entries for: {names} — plaintext "
+            "tokens are refused as of v0.9.3. Convert with: uv run python "
+            "shared-memory/scripts/generate_tokens.py --convert-digests"
+        )
+
+
+def _lookup_agent_by_token(token: str) -> "str | None":
+    """Resolve a presented bearer token to its registered agent name.
+
+    Hashes the presented token FIRST (SEC-07): the only thing ever compared
+    against a stored value is the token's own SHA-256 digest, never the
+    token itself — an attacker who can only observe response timing cannot
+    steer a byte-by-byte comparison against a secret, because no code path
+    here performs one. `hmac.compare_digest` is used for the digest
+    comparison itself too (belt-and-braces: every place a value derived from
+    the presented token is compared against a stored one uses the
+    constant-time primitive, not `==`, even though the digest is not itself
+    secret).
+
+    Includes ephemeral, in-memory-only daemon tokens (SEC-10, PR A2) — they
+    are registered into this same dict by hive_mind_proxy._mint_daemon_token()
+    and look, to this function, exactly like any other registry entry.
+    """
+    digest = _token_digest(token)
+    for stored_digest, name in _AGENT_TOKENS.items():
+        if hmac.compare_digest(digest, stored_digest):
+            return name
+    return None
 
 
 # ── Read-only roles (e.g. the telemetry monitor) ────────────────────────────────
@@ -373,7 +472,7 @@ def _resolve_bearer(request: web.Request) -> str | None:
     parts = request.headers.get("Authorization", "").split(maxsplit=1)
     if len(parts) != 2 or parts[0] != "Bearer":
         return None
-    return _AGENT_TOKENS.get(parts[1])
+    return _lookup_agent_by_token(parts[1])
 
 
 _IDENTITY_RESOLVERS = [_resolve_bearer]

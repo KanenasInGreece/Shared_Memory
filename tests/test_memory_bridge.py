@@ -80,6 +80,11 @@ _VER = {memory_bridge.CLIENT_VERSION_HEADER: str(memory_bridge.API_VERSION)}
 
 def test_request_headers_version_only_when_no_token(monkeypatch):
     monkeypatch.delenv("AGENT_TOKEN", raising=False)
+    # Neutralise whatever this module parsed out of a real on-disk .env at
+    # import time (S-18: no longer exported to os.environ, so delenv alone
+    # can't clear it) -- a dev machine's real skill install must not make
+    # this test's "no token configured" premise flaky.
+    monkeypatch.setattr(memory_bridge, "_AGENT_TOKEN_FROM_FILE", "")
     assert memory_bridge._request_headers() == _VER
 
 
@@ -97,7 +102,111 @@ def test_request_headers_strips_whitespace(monkeypatch):
 
 def test_request_headers_empty_token_is_version_only(monkeypatch):
     monkeypatch.setenv("AGENT_TOKEN", "")
+    monkeypatch.setattr(memory_bridge, "_AGENT_TOKEN_FROM_FILE", "")
     assert memory_bridge._request_headers() == _VER
+
+
+# ── S-18: dotenv scope + never exported to os.environ (PR A2) ────────────────
+# These import a FRESH copy of memory_bridge.py from a controlled tmp skill
+# layout, because _ENV_CANDIDATES is computed from __file__ at import time --
+# the already-imported `memory_bridge` module above can't be re-pointed at a
+# different directory tree after the fact.
+
+def _load_memory_bridge_from(skill_dir: str):
+    import shutil
+    import uuid
+    scripts_dir = os.path.join(skill_dir, "scripts")
+    os.makedirs(scripts_dir, exist_ok=True)
+    src = os.path.join(
+        os.path.dirname(__file__), "..", "shared-memory-skill", "shared-memory",
+        "scripts", "memory_bridge.py",
+    )
+    dest = os.path.join(scripts_dir, "memory_bridge.py")
+    shutil.copy(src, dest)
+    mod_name = f"memory_bridge_isolated_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(mod_name, dest)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_dotenv_scope_stray_home_level_env_is_not_picked_up(tmp_path, monkeypatch):
+    """A .env ABOVE the skill root (the $HOME-walk find_dotenv() used to
+    reach) must be invisible -- S-18's whole point."""
+    monkeypatch.delenv("AGENT_TOKEN", raising=False)
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (tmp_path / ".env").write_text("AGENT_TOKEN=tok_from_stray_home_env\n")
+
+    mod = _load_memory_bridge_from(str(skill_dir))
+
+    assert mod._AGENT_TOKEN_FROM_FILE == ""
+    assert os.environ.get("AGENT_TOKEN") != "tok_from_stray_home_env"
+
+
+def test_dotenv_scope_skill_root_env_is_picked_up(tmp_path, monkeypatch):
+    # A real AGENT_TOKEN sitting in this SESSION's os.environ (e.g. a
+    # pre-existing, unrelated script's own naive env loader having already
+    # run at collection time) must not shadow the value this test is
+    # actually exercising -- os.environ is checked first by design, so an
+    # ambient leak from elsewhere would silently pass this test for the
+    # wrong reason. See the class of bug CLAUDE.md's "run the suite twice,
+    # once with a real .env present" rule exists to catch.
+    monkeypatch.delenv("AGENT_TOKEN", raising=False)
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / ".env").write_text("AGENT_TOKEN=tok_from_skill_root\n")
+
+    mod = _load_memory_bridge_from(str(skill_dir))
+
+    assert mod._AGENT_TOKEN_FROM_FILE == "tok_from_skill_root"
+    assert mod._request_headers().get("Authorization") == "Bearer tok_from_skill_root"
+
+
+def test_dotenv_scope_scripts_adjacent_env_is_picked_up(tmp_path, monkeypatch):
+    """The other documented candidate: an .env living beside memory_bridge.py
+    itself (scripts/.env), not just the skill root."""
+    monkeypatch.delenv("AGENT_TOKEN", raising=False)
+    skill_dir = tmp_path / "skill"
+    scripts_dir = skill_dir / "scripts"
+    scripts_dir.mkdir(parents=True)
+    (scripts_dir / ".env").write_text("AGENT_TOKEN=tok_from_scripts_dir\n")
+
+    mod = _load_memory_bridge_from(str(skill_dir))
+
+    assert mod._AGENT_TOKEN_FROM_FILE == "tok_from_scripts_dir"
+
+
+def test_dotenv_load_never_exports_agent_token_to_os_environ(tmp_path, monkeypatch):
+    """The core A1-deferred fix: AGENT_TOKEN sourced from the .env file must
+    never land in this process's own os.environ, even though it IS used for
+    this client's own outbound requests."""
+    monkeypatch.delenv("AGENT_TOKEN", raising=False)
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / ".env").write_text(
+        "AGENT_TOKEN=tok_from_skill_root\nCOORDINATOR_URL=http://example.invalid:9999\n"
+    )
+
+    mod = _load_memory_bridge_from(str(skill_dir))
+
+    assert "AGENT_TOKEN" not in os.environ
+    # Other (non-secret) config keys still flow through as before.
+    assert mod.COORDINATOR_BASE == "http://example.invalid:9999"
+
+
+def test_dotenv_scope_operator_export_still_wins_over_file(tmp_path, monkeypatch):
+    """An operator's own real `export AGENT_TOKEN=...` (or a test's
+    monkeypatch.setenv) must still take precedence over the file value --
+    the client never becomes LESS configurable than before."""
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / ".env").write_text("AGENT_TOKEN=tok_from_file\n")
+    monkeypatch.setenv("AGENT_TOKEN", "tok_from_operator_export")
+
+    mod = _load_memory_bridge_from(str(skill_dir))
+
+    assert mod._request_headers().get("Authorization") == "Bearer tok_from_operator_export"
 
 
 # ── Version contract — check_gateway_compat ───────────────────────────────────

@@ -9,6 +9,7 @@ Coverage:
   - source overwrite via authenticated_agent on request
 """
 
+import hashlib
 import importlib.util
 import logging
 import os
@@ -16,6 +17,13 @@ import sys
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+
+def _digest(token: str) -> str:
+    """Matches coordinator._token_digest() — used by these tests to assert
+    against the digest-keyed _AGENT_TOKENS shape (PR A2) without importing
+    the module-under-test's private helper directly."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 # ── Dynamic import ────────────────────────────────────────────────────────────
@@ -73,21 +81,21 @@ def test_load_agent_tokens_empty_env():
 
 def test_load_agent_tokens_single_pair():
     mod = load_coordinator("claude:tok_abc")
-    assert mod._AGENT_TOKENS == {"tok_abc": "claude"}
+    assert mod._AGENT_TOKENS == {_digest("tok_abc"): "claude"}
 
 
 def test_load_agent_tokens_multiple_pairs():
     mod = load_coordinator("claude:tok_abc,gemini:tok_xyz")
-    assert mod._AGENT_TOKENS["tok_abc"] == "claude"
-    assert mod._AGENT_TOKENS["tok_xyz"] == "gemini"
+    assert mod._AGENT_TOKENS[_digest("tok_abc")] == "claude"
+    assert mod._AGENT_TOKENS[_digest("tok_xyz")] == "gemini"
 
 
 def test_load_agent_tokens_skips_malformed_entry(caplog):
     with caplog.at_level(logging.WARNING, logger="coordinator"):
         mod = load_coordinator("claude:tok_abc,no_colon_here,gemini:tok_xyz")
-    assert mod._AGENT_TOKENS["tok_abc"] == "claude"
-    assert mod._AGENT_TOKENS["tok_xyz"] == "gemini"
-    assert "no_colon_here" not in str(mod._AGENT_TOKENS)
+    assert mod._AGENT_TOKENS[_digest("tok_abc")] == "claude"
+    assert mod._AGENT_TOKENS[_digest("tok_xyz")] == "gemini"
+    assert len(mod._AGENT_TOKENS) == 2
     assert "malformed" in caplog.text
 
 
@@ -99,10 +107,97 @@ def test_load_agent_tokens_skips_empty_entries():
 def test_load_agent_tokens_duplicate_token_logs_warning_first_wins(caplog):
     with caplog.at_level(logging.WARNING, logger="coordinator"):
         mod = load_coordinator("claude:tok_dup,gemini:tok_dup")
-    # First mapping (claude) wins; gemini is discarded
-    assert mod._AGENT_TOKENS["tok_dup"] == "claude"
+    # Same plaintext token -> same digest -> first mapping (claude) wins,
+    # gemini is discarded as a digest collision.
+    assert mod._AGENT_TOKENS[_digest("tok_dup")] == "claude"
     assert len(mod._AGENT_TOKENS) == 1
     assert "duplicate" in caplog.text.lower() or "ignoring" in caplog.text.lower()
+
+
+# ── PR A2: digest-form entries, mixed registry, plaintext HARD REFUSAL ──────
+# RULED (Xenofon, 2026-08-14): there is no accept+warn window — a plaintext
+# AGENT_TOKENS entry makes the gateway refuse to START (require_no_plaintext_
+# agent_tokens(), called from hive_mind_proxy.main() only). Parsing itself
+# still ACCEPTS the shape (so the refusal can name exactly which agents need
+# converting) — see coordinator._PLAINTEXT_AGENT_TOKENS_SEEN.
+
+def test_load_agent_tokens_accepts_digest_form_entry():
+    mod = load_coordinator(f"claude:sha256:{_digest('tok_abc')}")
+    assert mod._AGENT_TOKENS == {_digest("tok_abc"): "claude"}
+
+
+def test_load_agent_tokens_mixed_digest_and_plaintext():
+    mod = load_coordinator(f"claude:sha256:{_digest('tok_abc')},gemini:tok_xyz")
+    assert mod._AGENT_TOKENS[_digest("tok_abc")] == "claude"
+    assert mod._AGENT_TOKENS[_digest("tok_xyz")] == "gemini"
+    assert len(mod._AGENT_TOKENS) == 2
+
+
+def test_load_agent_tokens_malformed_digest_entry_skipped(caplog):
+    with caplog.at_level(logging.WARNING, logger="coordinator"):
+        mod = load_coordinator("claude:sha256:not-64-hex,gemini:tok_xyz")
+    assert _digest("tok_xyz") in mod._AGENT_TOKENS
+    assert len(mod._AGENT_TOKENS) == 1
+    assert "malformed digest" in caplog.text.lower()
+
+
+def test_load_agent_tokens_plaintext_entry_still_parses_and_verifies():
+    """Parsing a plaintext entry still succeeds (and still authenticates) —
+    only STARTING the real gateway with one present is refused. A bare
+    `import coordinator` (every test in this repo) must never crash on a
+    plaintext-configured checkout."""
+    mod = load_coordinator("claude:tok_abc")
+    assert mod._AGENT_TOKENS == {_digest("tok_abc"): "claude"}
+    assert mod._lookup_agent_by_token("tok_abc") == "claude"
+
+
+def test_load_agent_tokens_records_plaintext_names_seen():
+    mod = load_coordinator("claude:tok_abc,gemini:tok_xyz")
+    assert sorted(mod._PLAINTEXT_AGENT_TOKENS_SEEN) == ["claude", "gemini"]
+
+
+def test_load_agent_tokens_digest_only_entry_records_no_plaintext_names():
+    mod = load_coordinator(f"claude:sha256:{_digest('tok_abc')}")
+    assert mod._PLAINTEXT_AGENT_TOKENS_SEEN == []
+
+
+def test_require_no_plaintext_agent_tokens_refuses_with_plaintext_present():
+    mod = load_coordinator("claude:tok_abc")
+    with pytest.raises(SystemExit, match="plaintext"):
+        mod.require_no_plaintext_agent_tokens()
+
+
+def test_require_no_plaintext_agent_tokens_names_the_conversion_command():
+    mod = load_coordinator("claude:tok_abc")
+    with pytest.raises(SystemExit, match="generate_tokens.py --convert-digests"):
+        mod.require_no_plaintext_agent_tokens()
+
+
+def test_require_no_plaintext_agent_tokens_names_every_offending_agent():
+    mod = load_coordinator("claude:tok_abc,gemini:tok_xyz")
+    with pytest.raises(SystemExit) as exc_info:
+        mod.require_no_plaintext_agent_tokens()
+    assert "claude" in str(exc_info.value)
+    assert "gemini" in str(exc_info.value)
+
+
+def test_require_no_plaintext_agent_tokens_passes_with_digest_only_registry():
+    mod = load_coordinator(f"claude:sha256:{_digest('tok_abc')}")
+    mod.require_no_plaintext_agent_tokens()  # must not raise
+
+
+def test_require_no_plaintext_agent_tokens_passes_when_auth_disabled():
+    mod = load_coordinator("")
+    mod.require_no_plaintext_agent_tokens()  # must not raise — nothing to refuse
+
+
+def test_require_no_plaintext_agent_tokens_passes_with_mixed_registry_all_digest_after_conversion():
+    """Sanity: a fully-converted registry (every entry digest form) starts
+    clean even when it once had multiple agents."""
+    mod = load_coordinator(
+        f"claude:sha256:{_digest('tok_abc')},gemini:sha256:{_digest('tok_xyz')}"
+    )
+    mod.require_no_plaintext_agent_tokens()  # must not raise
 
 
 # ── auth_middleware — helpers ─────────────────────────────────────────────────
@@ -201,6 +296,58 @@ async def test_auth_middleware_unknown_token_returns_401():
     req = _make_request("/memory/save", auth_header="Bearer tok_wrong")
     with pytest.raises(HTTPUnauthorized):
         await mod.auth_middleware(req, _noop_handler)
+
+
+# ── PR A2: digest-registry verification end to end (right token / wrong token) ─
+
+@pytest.mark.asyncio
+async def test_auth_middleware_digest_entry_right_token_passes():
+    mod = load_coordinator(f"claude:sha256:{_digest('tok_abc')}")
+    req = _make_request("/memory/save", auth_header="Bearer tok_abc")
+    resp = await mod.auth_middleware(req, _noop_handler)
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_digest_entry_wrong_token_401s():
+    from aiohttp.web_exceptions import HTTPUnauthorized
+    mod = load_coordinator(f"claude:sha256:{_digest('tok_abc')}")
+    req = _make_request("/memory/save", auth_header="Bearer tok_wrong")
+    with pytest.raises(HTTPUnauthorized):
+        await mod.auth_middleware(req, _noop_handler)
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_mixed_registry_both_forms_authenticate():
+    """A registry with one digest-form and one plaintext-legacy entry
+    authenticates correctly through BOTH forms (SEC-11: plaintext is
+    accepted, not refused, in A2)."""
+    mod = load_coordinator(f"claude:sha256:{_digest('tok_abc')},gemini:tok_xyz")
+    req1 = _make_request("/memory/save", auth_header="Bearer tok_abc")
+    resp1 = await mod.auth_middleware(req1, _noop_handler)
+    assert resp1.status == 200
+
+    req2 = _make_request("/memory/save", auth_header="Bearer tok_xyz")
+    resp2 = await mod.auth_middleware(req2, _noop_handler)
+    assert resp2.status == 200
+
+
+def test_lookup_agent_by_token_uses_hmac_compare_digest(monkeypatch):
+    """Belt-and-braces (SEC-07): the digest comparison itself goes through
+    hmac.compare_digest, not `==` — patch it to a spy and confirm it is
+    actually invoked on a lookup, not bypassed by some other comparison."""
+    mod = load_coordinator("claude:tok_abc")
+    calls = []
+    import hmac as hmac_module
+    real_compare = hmac_module.compare_digest
+
+    def _spy(a, b):
+        calls.append((a, b))
+        return real_compare(a, b)
+
+    monkeypatch.setattr(mod.hmac, "compare_digest", _spy)
+    assert mod._lookup_agent_by_token("tok_abc") == "claude"
+    assert len(calls) >= 1
 
 
 @pytest.mark.asyncio

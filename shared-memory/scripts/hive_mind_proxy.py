@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import shutil
 import signal
 import sys
@@ -39,6 +40,7 @@ from coordinator import (
     AUTH_SCHEME,
     FRAMEWORK_VERSION,
     API_VERSION,
+    require_no_plaintext_agent_tokens,
 )
 
 # Unified Hive-Mind Async Proxy v7
@@ -655,9 +657,9 @@ class AsyncHiveMindProxy:
 
 def _daemon_env(agent_name: str) -> dict:
     """Build a subprocess environment for the named daemon: non-secret config
-    the proxy must pin, plus that daemon's AGENT_TOKEN — and NOTHING ELSE.
+    the proxy must pin, and NOTHING ELSE.
 
-    SEC-05/SEC-10 (Credential_Custody_Plan_2026-08-14, PR A1): this used to be
+    SEC-05 (Credential_Custody_Plan_2026-08-14, PR A1): this used to be
     `os.environ.copy()`, which handed every secret the gateway process held
     (PG_PASSWORD, NEO4J_PASSWORD, AGENT_TOKENS, provider keys) to the child's
     exec-time environment — visible for the child's whole lifetime via
@@ -665,32 +667,79 @@ def _daemon_env(agent_name: str) -> dict:
     secure_env.load_split_env() (each has its own copy of the framework .env
     to read); they never receive one via this env dict.
 
-    The daemon's own AGENT_TOKEN is the one deliberate, interim exception:
-    it still crosses via the child environment here (PR A2 moves it to fd/
-    $XDG_RUNTIME_DIR delivery per SEC-10 — out of scope for A1). It matches
-    the *_TOKEN suffix secure_env classifies as secret, so it is added AFTER
-    the filter below, explicitly, not because it stopped being one.
-
-    If no token is registered for the daemon, AGENT_TOKEN is omitted and the
-    daemon's calls will be rejected 401 when auth is active — this surfaces
-    a misconfiguration rather than silently bypassing auth.
+    PR A1 still had one deliberate exception here: the daemon's own
+    AGENT_TOKEN crossed via this dict. PR A2 (SEC-10) closes it — see
+    `_daemon_env_and_token_fd()` below, which delivers a freshly-minted,
+    per-boot token through an inherited pipe fd instead. `agent_name` is
+    kept as a parameter for call-site symmetry with that function and
+    because every caller already has it at hand, even though this function
+    itself no longer branches on it.
     """
-    env = {k: v for k, v in os.environ.items() if not is_secret_key(k)}
-    agent_tokens = get_secret("AGENT_TOKENS", "")
-    for pair in agent_tokens.split(","):
-        pair = pair.strip()
-        if ":" not in pair:
-            continue
-        name, token = pair.split(":", 1)
-        if name.strip() == agent_name:
-            env["AGENT_TOKEN"] = token.strip()
-            break
-    else:
-        log.warning(
-            "No token registered for daemon %r — add %s:<token> to AGENT_TOKENS",
-            agent_name, agent_name,
-        )
-    return env
+    return {k: v for k, v in os.environ.items() if not is_secret_key(k)}
+
+
+# Agent name -> the digest currently registered in coordinator._AGENT_TOKENS
+# for that agent's EPHEMERAL daemon token (as opposed to a persisted
+# AGENT_TOKENS registry entry). Lets a re-mint on daemon restart revoke the
+# PREVIOUS ephemeral token rather than leaving it valid forever alongside
+# the new one — a crash-restart rotates and invalidates in the same step.
+_ephemeral_daemon_token_digests: dict[str, str] = {}
+
+
+def _mint_daemon_token(agent_name: str) -> str:
+    """Mint a fresh, random, per-boot bearer token for one of the two
+    framework daemons (SEC-10, Credential_Custody_Plan_2026-08-14 PR A2) and
+    register it in-memory in coordinator._AGENT_TOKENS, keyed by its digest
+    exactly like every other registry entry — `_lookup_agent_by_token()`
+    does not need to know an entry is ephemeral.
+
+    Never written to any file, never logged, and never persisted anywhere:
+    a gateway restart mints a fresh token for both daemons, which is the
+    whole migration (the plan's 'Daemons: transparent on restart'
+    seamlessness criterion). Any PREVIOUS ephemeral token this function
+    registered for `agent_name` is revoked first, so a daemon respawn does
+    not accumulate stale-but-still-valid tokens in the registry.
+    """
+    old_digest = _ephemeral_daemon_token_digests.pop(agent_name, None)
+    if old_digest is not None:
+        _AGENT_TOKENS.pop(old_digest, None)
+    token = secrets.token_urlsafe(32)
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    _AGENT_TOKENS[digest] = agent_name
+    _ephemeral_daemon_token_digests[agent_name] = digest
+    return token
+
+
+def _daemon_env_and_token_fd(agent_name: str) -> "tuple[dict, int]":
+    """Build a daemon's child environment plus a pipe fd carrying its
+    freshly-minted AGENT_TOKEN (SEC-10) — never via the child environment,
+    argv, or any file.
+
+    The read end's fd NUMBER is named by the AGENT_TOKEN_FD env var (a
+    number is meaningless off this process tree, so it is not itself
+    secret); the token VALUE crosses only through the pipe's kernel buffer.
+    The token is written and the write end closed HERE, before the caller
+    spawns the child: token_urlsafe(32) is far under PIPE_BUF, so the write
+    never blocks, and the bytes are already sitting in the pipe's kernel
+    buffer by the time exec() runs.
+
+    Returns (env, read_fd). The caller passes `read_fd` via `pass_fds=` to
+    asyncio.create_subprocess_exec (which — like the underlying
+    subprocess.Popen — makes it inheritable across the fork/exec on its
+    own; no manual os.set_inheritable() needed) and closes it in the parent
+    once the child has been spawned. The child holds its own duplicate of
+    the same pipe end, created by fork() independently of the parent's
+    reference, so closing the parent's copy does not affect the child's.
+    """
+    env = _daemon_env(agent_name)
+    token = _mint_daemon_token(agent_name)
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, token.encode("utf-8"))
+    finally:
+        os.close(write_fd)
+    env["AGENT_TOKEN_FD"] = str(read_fd)
+    return env, read_fd
 
 
 # --------------------------------------------------------------------------- #
@@ -705,14 +754,19 @@ async def _start_daemon() -> "asyncio.subprocess.Process | None":
     if not uv:
         log.warning("uv not in PATH — cannot start consolidation daemon")
         return None
-    proc = await asyncio.create_subprocess_exec(
-        uv, "run",
-        "--with", "httpx",
-        "--with", "psycopg2-binary",
-        "--with", "neo4j",
-        "python", str(daemon_path),
-        env=_daemon_env("consolidation"),
-    )
+    env, read_fd = _daemon_env_and_token_fd("consolidation")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            uv, "run",
+            "--with", "httpx",
+            "--with", "psycopg2-binary",
+            "--with", "neo4j",
+            "python", str(daemon_path),
+            env=env,
+            pass_fds=(read_fd,),
+        )
+    finally:
+        os.close(read_fd)
     log.info("Consolidation daemon started (pid %d)", proc.pid)
     return proc
 
@@ -726,14 +780,19 @@ async def _start_rem_daemon() -> "asyncio.subprocess.Process | None":
     if not uv:
         log.warning("uv not in PATH — cannot start REM daemon")
         return None
-    proc = await asyncio.create_subprocess_exec(
-        uv, "run",
-        "--with", "httpx",
-        "--with", "psycopg2-binary",
-        "--with", "neo4j",
-        "python", str(rem_path),
-        env=_daemon_env("rem_daemon"),
-    )
+    env, read_fd = _daemon_env_and_token_fd("rem_daemon")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            uv, "run",
+            "--with", "httpx",
+            "--with", "psycopg2-binary",
+            "--with", "neo4j",
+            "python", str(rem_path),
+            env=env,
+            pass_fds=(read_fd,),
+        )
+    finally:
+        os.close(read_fd)
     log.info("REM daemon started (pid %d)", proc.pid)
     return proc
 
@@ -1275,6 +1334,12 @@ def _default_uds_path() -> str:
 
 
 async def main() -> None:
+    # RULED (Xenofon, 2026-08-14): a plaintext AGENT_TOKENS entry refuses
+    # gateway startup outright, from v0.9.3 — before anything else stands
+    # up. See coordinator.require_no_plaintext_agent_tokens()'s docstring
+    # for why this call lives here (the real entrypoint) and nowhere else.
+    require_no_plaintext_agent_tokens()
+
     PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8888
 
     proxy = AsyncHiveMindProxy()

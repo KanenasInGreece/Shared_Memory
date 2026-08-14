@@ -2,15 +2,19 @@
 #
 # bootstrap_tokens.sh — mint agent tokens and wire them into the gateway .env.
 #
-# Runs generate_tokens.py, appends the AGENT_TOKENS (and AGENT_ROLES) line to
-# the gateway .env, and prints the per-agent token table so you can paste each
-# agent's own AGENT_TOKEN into its skill .env.
+# Runs generate_tokens.py and appends the AGENT_TOKENS (digest form) + AGENT_ROLES
+# line to the gateway .env. generate_tokens.py's mint flow (Credential_Custody_Plan
+# PR A2) writes each LOCAL agent's token straight into that agent's own skill .env
+# (mode 600) — nothing is printed to this terminal. A REMOTE agent (no local skill
+# install found on this machine) needs an explicit, human-run reveal — see the
+# reminder this script prints at the end.
 #
 #   bash shared-memory/scripts/bootstrap_tokens.sh
 #
 # SAFETY: if AGENT_TOKENS is already set in .env this refuses to run — minting
 # new tokens would invalidate every agent's existing token. Use --force only if
-# you intend to rotate all tokens (and will redistribute them).
+# you intend to rotate all tokens (local agents are redistributed automatically
+# by the write-through mint flow; remote agents still need a manual --reveal).
 
 set -euo pipefail
 
@@ -67,13 +71,17 @@ fi
     [[ -n "$roles_line" ]] && echo "$roles_line"
 } >> "$ENV_FILE"
 
-grn "✓ AGENT_TOKENS appended to $ENV_FILE"
+grn "✓ AGENT_TOKENS appended to $ENV_FILE (digest form)"
 [[ -n "$roles_line" ]] && grn "✓ AGENT_ROLES (read-only monitor) appended"
 
 echo
-echo "Distribute each agent's own AGENT_TOKEN into its skill .env"
-echo "(e.g. ~/.claude/skills/shared-memory/.env). Never share a token across agents:"
+echo "Per-agent tokens were written straight into each LOCAL agent's skill .env"
+echo "(S-01: mode 600, enforced from the first byte) by generate_tokens.py's"
+echo "mint flow — nothing was printed here. If you ever paste a token into a"
+echo "skill .env by hand instead, chmod 600 it yourself afterward."
+echo "For a REMOTE agent (no local install found on this machine), reveal its"
+echo "token yourself — run this command directly, NEVER through an agent:"
 echo
-grep -E 'AGENT_TOKEN=' <<<"$out" | grep -vE '^AGENT_TOKENS='
+echo "  uv run python shared-memory/scripts/generate_tokens.py --reveal <name>"
 echo
 ylw "Restart the gateway to load the new AGENT_TOKENS."
