@@ -178,6 +178,18 @@ cleanup_secrets_dir() {
   [[ -n "$_SECRETS_DIR" ]] && rm -rf "$_SECRETS_DIR"
   _SECRETS_DIR=""; _AUTH_HEADER_FILE=""; _NEO4J_ENV_FILE=""; _PG_ENV_FILE=""
 }
+
+# NEW-5 (fix round 2, probe-confirmed): QUIESCED must be defined BEFORE the
+# trap is installed below, not after. Under `set -u` (line 28), a signal
+# landing in the window between `trap on_exit …` and a later `QUIESCED=0`
+# would make on_exit()'s call to resume() read an UNBOUND variable
+# (`[[ "$QUIESCED" -eq 1 ]]`) and abort — inside a trap handler, on the
+# exact path meant to release the gateway's quiesce fence. Every other
+# variable on_exit()'s path reads (GATEWAY_URL, BACKUP_ADMIN_TOKEN, and
+# _SECRETS_DIR/_AUTH_HEADER_FILE/_NEO4J_ENV_FILE/_PG_ENV_FILE above) is
+# already defined earlier in the script — QUIESCED was the one gap.
+QUIESCED=0
+
 # One trap, active for the whole script (not just do_backup): resume() is a
 # no-op unless quiesce() actually succeeded (QUIESCED guard), and
 # cleanup_secrets_dir is a no-op unless init_secrets_dir ever ran — so this
@@ -187,7 +199,6 @@ on_exit() { resume; cleanup_secrets_dir; }
 trap on_exit EXIT INT TERM
 
 # ── Quiesce handshake ────────────────────────────────────────────────────────
-QUIESCED=0
 quiesce() {
   [[ -z "$BACKUP_ADMIN_TOKEN" ]] && return 1
   local resp code body
