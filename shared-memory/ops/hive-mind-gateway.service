@@ -54,10 +54,16 @@ NoNewPrivileges=yes
 # $HOME/.local/lib/credstore/, in that order (verified live via `systemd-path
 # user-search-credential-store`) — put the file at
 # $XDG_CONFIG_HOME/credstore/pg_password (typically ~/.config/credstore/pg_password),
-# mode 600, owned by the account this unit runs as:
+# mode 600 from the FIRST BYTE, owned by the account this unit runs as — NOT
+# create-then-chmod (NEW-2, fix round 2: this recipe used to write the file
+# with `printf … > path` at the process umask, THEN chmod 600 it after —
+# the exact window this PR closes in install_framework.sh/install_llm_
+# backends.sh's own scripts. Fixed the same way: a `umask 077` subshell
+# around the write, so the file is 600 from the moment it exists, never
+# briefly at the default umask (often 0644):
 #   mkdir -p ~/.config/credstore && chmod 700 ~/.config/credstore
-#   printf '%s' 'your-postgres-password' > ~/.config/credstore/pg_password
-#   chmod 600 ~/.config/credstore/pg_password
+#   ( umask 077; printf '%s' 'your-postgres-password' > ~/.config/credstore/pg_password )
+#   chmod 600 ~/.config/credstore/pg_password   # belt-and-suspenders — umask above already made it 600
 # ⚠ See server-setup.md, "Credential delivery" — for a `--user` unit this
 # tier does NOT isolate the credential from your OWN account (the account
 # IS the "user associated with the unit" per man systemd.exec); it removes
