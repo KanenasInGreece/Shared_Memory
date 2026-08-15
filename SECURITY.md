@@ -56,6 +56,14 @@ To opt into all-interfaces binding (e.g. inside a Docker or VM network), set `PR
 
 **Token rotation** requires: edit gateway `.env`, restart gateway, update agent `.env` files (CLI agents take effect on next invocation; LM Studio requires full restart).
 
+### Credential-use audit trail (PR A3, v0.9.4)
+
+A separate, on-by-default log (`~/.shared-memory/logs/credential-audit.jsonl`, `CREDENTIAL_AUDIT_LOG_PATH` to relocate or disable — see `.env.example`) records credential-USE events distinct from the per-request `GATEWAY_AUDIT_LOG_PATH` above: an upstream LLM backend rejecting our own provider key, a gateway-side connect/timeout/proxy failure on a credentialed call, a client's bearer token failing to verify, and every daemon-token mint. Never the token/key value itself — only an 8-hex-char digest prefix of a presented (and rejected) token, where applicable.
+
+**Hardened against an anonymous caller before release.** A same-day internal security review found the first cut let any unauthenticated client drive unbounded disk writes (a loop of `POST /memory/save` with no `Authorization` header). Fixed: a no-token request writes no line at all (only the `credentials.token_verify_failed` counter — the complete, unthrottled signal — moves); a presented-but-invalid token is rate-limited (a token bucket, default ~60 lines/minute, both knobs env-overridable) with one summary line recording how many were suppressed; and the event's own lines evict themselves under a full write queue rather than displacing genuine security events queued ahead of them.
+
+**Qualification (F-8, matches the raw-facts-return-verbatim / bearer-tokens-until-PoP posture items below): this is a detective control against *external* credential misuse, not a tamper-evident one against a local same-uid actor.** The log is a plain, append-only JSONL file with 0600 permissions — no hash chain, no append-only filesystem attribute, no off-host shipping. A process running as the same OS user as the gateway (already inside this framework's trust boundary — see the *localhost-trusted-deployment* stance elsewhere in this document) can rewrite or truncate it at will. Treat it as evidence of what a remote/unprivileged caller attempted, not as a record that survives a compromise of the gateway's own account.
+
 ### Network transport — tokens require an encrypted channel
 
 Bearer tokens are sent in plaintext over HTTP. `PROXY_BIND=0.0.0.0` is only safe when the network between gateway and agents is encrypted end-to-end:

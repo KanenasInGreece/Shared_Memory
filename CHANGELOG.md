@@ -5,6 +5,57 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.4] — 2026-08-15
+
+**Credential custody, PR A3: a credential-use audit trail for the gateway.** The
+gateway plays two credential roles — it authenticates clients at its own door, and it
+holds/attaches provider keys to upstream LLM API calls — and this release makes both
+sides of that split legible. A new, separate credential-events log
+(`~/.shared-memory/logs/credential-audit.jsonl`, on by default, `CREDENTIAL_AUDIT_LOG_PATH`
+to relocate or an empty value to disable, documented in `.env.example`) records only
+high-signal events: an upstream backend rejecting our own provider key, a gateway-side
+connect/timeout/proxy failure on a credentialed call, a client presenting a bad bearer
+token, and every daemon-token mint. The existing per-request gateway audit line gains
+two additive fields, `backend` and `key_attached`, when a request was proxied to an LLM
+backend with a provider key attached — existing fields are unchanged.
+
+A same-day security review found the initial cut let an unauthenticated caller drive
+unbounded disk writes, so the token-verify-failure event was hardened before release: a
+request presenting **no** bearer token at all writes no line — only the
+`credentials.token_verify_failed` counter moves, which is the complete signal for that
+case — and a request presenting one (even a fresh random one every attempt) is
+rate-limited (a token bucket, ~60 lines/minute by default, both knobs env-overridable),
+with one summary line recording how many were suppressed once the bucket has room again.
+Surviving lines carry an 8-hex-char digest prefix of the presented token (never the token
+itself), plus the request path, transport, and kernel-attested peer identity when
+available. The event's own log lines evict themselves under a full queue rather than
+displacing genuine security events queued ahead of them.
+
+`GET /memory/telemetry` gains two new sections: `llm_faults`, a per-backend breakdown of
+gateway-origin vs. upstream-origin faults (the latter further split into `credential` —
+401/403, or a 429 whose body names OpenAI's `insufficient_quota` — vs. `transient` —
+rate limits, 5xx, an unparseable 429), each carrying a count and its last occurrence;
+and `credentials`, three running counters (token-verify failures, daemon tokens issued,
+and the credential log's own dropped-line count). Telemetry stays counts-and-last-event
+only — the log carries the detail, never the other way around. `/health` is untouched.
+The `error_type` an upstream body supplies is now bounded and type-checked before it can
+reach either surface, and a compressed error body (gzip/deflate) is decompressed for
+classification only — the bytes sent to the client are never touched.
+
+Clients now get standard fault signalling: an additive `X-SM-Fault-Origin` response
+header (`upstream` when a proxied backend itself returned the fault, `gateway` when the
+gateway constructed the error response, including the gateway's own 401s) on every fault
+status, never on success — and an upstream response can no longer spoof this header (or
+`WWW-Authenticate`, or the pre-existing `X-SM-LLM-Backend`) on the way back to the
+client, since the `X-SM-` namespace and the RFC 6750 challenge are now stripped from
+every upstream response before the gateway applies its own values. The gateway's own
+401s for a missing or invalid bearer token carry the RFC 6750 `WWW-Authenticate: Bearer`
+challenge (`error="invalid_token"` when a token was presented but did not verify).
+Upstream error bodies continue to pass through verbatim, now backed by a regression test;
+a pre-existing gap nearby was closed too — the three proxy error responses (and the
+matching gateway log lines) no longer echo a raw exception's text, which could carry a
+credential embedded in a backend URL.
+
 ## [0.9.3] — 2026-08-14
 
 **Credential custody, PR A2: the token registry stops storing tokens.** `AGENT_TOKENS`

@@ -179,9 +179,11 @@ idempotent and safe to re-run.
    > does.
 
 5. **Generate agent tokens.** `bash shared-memory/scripts/bootstrap_tokens.sh` mints one token
-   per agent, appends `AGENT_TOKENS` to the gateway `.env`, and prints each agent's own
-   `AGENT_TOKEN` to paste into its skill `.env` ([§19](#19-tokens-and-agents)). One distinct
-   token per agent — never shared.
+   per agent, appends `AGENT_TOKENS` (digest form) to the gateway `.env`, and writes each LOCAL
+   agent's token straight into its own skill `.env` (mode 600) — nothing is printed here to
+   save. A REMOTE agent's token needs `--reveal <name>` on this same invocation (a later,
+   separate run is a full rotation) ([§19](#19-tokens-and-agents)). One distinct token per
+   agent — never shared.
 
 6. **Start the reasoning LLM** on `:5000` — LM Studio or any OpenAI-compatible server
    ([§17](#17-inference-the-encoders-and-the-reasoning-llm)).
@@ -612,8 +614,10 @@ Identity is the foundation of provenance, so it is set up once and enforced alwa
 bash shared-memory/scripts/bootstrap_tokens.sh
 ```
 
-mints one token per agent, writes the registry (`AGENT_TOKENS`) into the gateway `.env`, and
-prints each agent's own `AGENT_TOKEN` for its skill `.env`. One token per agent, never shared —
+mints one token per agent, writes the registry (`AGENT_TOKENS`, digest form) into the gateway
+`.env`, and writes each LOCAL agent's token straight into its own skill `.env` (mode 600) —
+nothing is printed here to save. A REMOTE agent's token needs `--reveal <name>` on this same
+invocation (a later, separate run is a full rotation). One token per agent, never shared —
 the gateway stamps every record's `source` from the token, and that stamp is the only thing that
 distinguishes one origin from another. Roles can narrow a token: `AGENT_ROLES=monitor:read`
 confines the companion dashboard to reading; a `backup:admin` token is confined to `/admin/*`.

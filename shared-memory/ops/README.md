@@ -56,6 +56,14 @@ journalctl --user -u hive-mind-gateway.service -f
 `Restart=on-failure` brings it back after a genuine crash; the `enable-linger`
 step is what makes it survive logout and reboot.
 
+### Audit-log rotation
+
+`shared-memory-logrotate.{service,timer}` + `shared-memory.logrotate` (install steps
+in that file's own header comment) rotate every `*-audit.jsonl` in the log directory —
+the gateway audit log, the REM audit log, and the credential-events log
+(`credential-audit.jsonl`, `CREDENTIAL_AUDIT_LOG_PATH`) are all covered by that one glob,
+with nothing further to configure per file.
+
 ## Reasoning-LLM backends (`LLM_BACKENDS_JSON`) — credentials, never in a file
 
 ```bash
