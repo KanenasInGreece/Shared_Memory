@@ -114,6 +114,7 @@ def _isolated_secure_env_state(monkeypatch):
     monkeypatch.setattr(secure_env, "_secrets", {})
     monkeypatch.setattr(secure_env, "_dynamic_secret_names", set())
     monkeypatch.setattr(secure_env, "_advised_exec_env_names", set())
+    monkeypatch.setattr(secure_env, "_advised_ignored_file_pointer_names", set())
 
 
 @pytest.fixture(autouse=True)

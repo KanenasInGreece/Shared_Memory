@@ -165,6 +165,11 @@ _secrets: dict[str, str] = {}
 # _dynamic_secret_names above.
 _advised_exec_env_names: set[str] = set()
 
+# NEW-1 (fix round 2): the same de-duplication for _derive_file_pointer_
+# candidates()'s "non-secret _FILE pointer ignored" warning — see that
+# function's docstring.
+_advised_ignored_file_pointer_names: set[str] = set()
+
 
 def is_secret_key(name: str) -> bool:
     """True if `name` must never be exported to os.environ or forwarded into
@@ -246,11 +251,21 @@ def _read_secret_file(path: Path, *, source: str) -> "str | None":
          character device, block device, directory, or socket is refused
          BEFORE a single byte is read. This alone is what stops the
          `/dev/zero` scenario: the read call is never reached.
-      4. Read capped at `_SECRET_FILE_MAX_BYTES + 1` — the `+1` only ever
-         detects an over-cap file (its presence in the result means "more
-         than the cap," never a byte that gets returned); an over-cap file
-         WARNS and is treated as unset rather than partially/silently
-         truncated.
+      4. Over-cap decided from `st.st_size` (already in hand from the same
+         `fstat`) FIRST, before a single byte is read — NEW-3 (fix round 2):
+         the original cut decided over-cap from `len(os.read(fd, cap + 1))`
+         alone, a SINGLE read call. `read(2)` is permitted to return FEWER
+         bytes than requested (a signal, a network filesystem, a pipe) — a
+         short first read on a file genuinely over the cap would have been
+         silently accepted as the WHOLE secret, truncated, with no warning
+         at all. The read itself is now a LOOP that continues until EOF (an
+         empty read) or the running total exceeds the cap, so a short
+         individual `read()` can never be mistaken for end-of-file. The
+         length-based check (`len(raw_bytes) > _SECRET_FILE_MAX_BYTES`)
+         stays as a BACKSTOP after the loop, for a file whose `st_size` lies
+         (a procfs-style pseudo-file reporting 0 while still yielding
+         content). Either path WARNS and is treated as unset rather than
+         partially/silently truncated.
 
     Deliberately NO `O_NOFOLLOW`. A `_FILE` pointer is the Docker/Kubernetes
     convention this function exists to serve, and Kubernetes mounts a
@@ -301,8 +316,33 @@ def _read_secret_file(path: Path, *, source: str) -> "str | None":
                   f"(mode {oct(stat.S_IMODE(st.st_mode))}) — reading it anyway (a "
                   f"Docker secrets mount is commonly 0444 by design); tighten it "
                   f"if this is not a container mount", file=sys.stderr)
+        # NEW-3 (fix round 2, probe-confirmed reasoning): st_size from the
+        # SAME fstat call above is the PRIMARY over-cap decision, checked
+        # before any byte is read — no reason to touch the file at all once
+        # its own reported size already exceeds the cap.
+        if st.st_size > _SECRET_FILE_MAX_BYTES:
+            print(f"[secure_env] WARNING: {source} ({path}) is {st.st_size} "
+                  f"bytes, over the {_SECRET_FILE_MAX_BYTES}-byte cap "
+                  f"(SECURE_ENV_SECRET_FILE_MAX_BYTES) — refusing to read, "
+                  f"treating as unset", file=sys.stderr)
+            return None
         try:
-            raw_bytes = os.read(fd, _SECRET_FILE_MAX_BYTES + 1)
+            # Loop until EOF or the running total exceeds the cap — a
+            # SINGLE os.read() call may legitimately return fewer bytes than
+            # requested (signal, network filesystem, pipe), and treating
+            # that short read as "the whole file" would silently truncate a
+            # legitimate secret instead of refusing it.
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(fd, _SECRET_FILE_MAX_BYTES + 1 - total)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > _SECRET_FILE_MAX_BYTES:
+                    break  # backstop trip — st_size lied; stop reading now
+            raw_bytes = b"".join(chunks)
         except OSError as exc:
             print(f"[secure_env] WARNING: {source} ({path}) could not be read "
                   f"({exc}) — falling through to the next credential source",
@@ -311,6 +351,10 @@ def _read_secret_file(path: Path, *, source: str) -> "str | None":
     finally:
         os.close(fd)
 
+    # Backstop only: st.st_size already refused an over-cap file above for
+    # every NORMAL regular file. This catches the rare case where st_size
+    # does not reflect the true readable content (a procfs-style pseudo-file
+    # reporting 0 while still yielding bytes).
     if len(raw_bytes) > _SECRET_FILE_MAX_BYTES:
         print(f"[secure_env] WARNING: {source} ({path}) exceeds "
               f"{_SECRET_FILE_MAX_BYTES} bytes (SECURE_ENV_SECRET_FILE_MAX_BYTES) "
@@ -427,10 +471,19 @@ def _derive_file_pointer_candidates(file_values: dict) -> set[str]:
     `None` before this fix even with the secret file present, readable, and
     correctly formatted.
 
-    A `K` that is present but NOT secret-classified gets one WARNING that its
-    `_FILE` pointer is being ignored (only a secret-classified key can be
-    delivered this way — a non-secret `_FILE` pointer is very likely a typo
-    for the config value itself)."""
+    NEW-1 (fix round 2, Opus review, probe-confirmed): CANDIDATE DERIVATION
+    still scans BOTH sources — os.environ (an operator's own
+    `export PG_PASSWORD_FILE=...` must still work) and the parsed .env file
+    — but the "non-secret pointer ignored" WARNING below is now emitted
+    ONLY for a name sourced from the PARSED .ENV FILE. A line in
+    shared-memory/.env is addressed to this framework; an ambient env var
+    ending in `_FILE` (`SSL_CERT_FILE`, `GIT_INDEX_FILE`, and any number of
+    others a shell can already be carrying) is not this framework's
+    business at all. Before this fix the warning fired for every such
+    ambient name on EVERY `load_split_env()` call, un-deduplicated — probe-
+    confirmed live on `SSL_CERT_FILE`/`GIT_INDEX_FILE`. De-duplicated per
+    process via `_advised_ignored_file_pointer_names`, the same pattern
+    `_advised_exec_env_names` already uses for the SEC-06 (ii) advisory."""
     candidates: set[str] = set()
     for name in set(os.environ) | set(file_values):
         if not name.endswith("_FILE"):
@@ -440,7 +493,8 @@ def _derive_file_pointer_candidates(file_values: dict) -> set[str]:
             continue
         if is_secret_key(key):
             candidates.add(key)
-        else:
+        elif name in file_values and name not in _advised_ignored_file_pointer_names:
+            _advised_ignored_file_pointer_names.add(name)
             print(f"[secure_env] WARNING: {name} is set, but {key!r} is not "
                   f"classified as a secret — its _FILE pointer is ignored "
                   f"(only a secret-classified key can be delivered this way)",

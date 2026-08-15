@@ -65,6 +65,7 @@ def _isolated_secure_env_state(monkeypatch):
     monkeypatch.setattr(secure_env, "_secrets", {})
     monkeypatch.setattr(secure_env, "_dynamic_secret_names", set())
     monkeypatch.setattr(secure_env, "_advised_exec_env_names", set())
+    monkeypatch.setattr(secure_env, "_advised_ignored_file_pointer_names", set())
     yield
 
 
@@ -458,11 +459,85 @@ def test_directory_is_refused(tmp_path):
 
 
 def test_oversized_secret_file_is_refused_and_warns(tmp_path, capsys):
+    """NEW-3 (fix round 2): over-cap is now decided from st.st_size FIRST,
+    before any read — this file is refused on that path, not the length-
+    based backstop (see test_oversized_by_st_size_never_reads_a_byte and
+    test_backstop_length_check_catches_a_lying_st_size below for each path
+    tested in isolation)."""
     big = tmp_path / "big_secret"
     big.write_bytes(b"x" * (secure_env._SECRET_FILE_MAX_BYTES + 1))
     result = secure_env._read_secret_file(big, source="TEST_BIG")
     assert result is None
-    assert "exceeds" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "over the" in err and "byte cap" in err
+
+
+# ── NEW-3 (fix round 2, probe-confirmed reasoning): over-cap decided from ───
+# st.st_size (the primary check, before any read) rather than from
+# len(os.read(...)) alone (a single read() may legitimately return fewer
+# bytes than requested — a short first read on a genuinely over-cap file
+# would have been silently accepted as the whole, truncated secret).
+
+def test_oversized_by_st_size_never_reads_a_byte(monkeypatch, tmp_path):
+    """The st_size check must refuse BEFORE any os.read() call — mock
+    os.read to raise if it's ever invoked, so this test fails loudly if the
+    primary check regresses to reading first."""
+    big = tmp_path / "big_secret_never_read"
+    big.write_bytes(b"x" * (secure_env._SECRET_FILE_MAX_BYTES + 1))
+
+    def _read_should_not_be_called(fd, n):
+        raise AssertionError("os.read() was called — st_size check did not refuse first")
+
+    monkeypatch.setattr(os, "read", _read_should_not_be_called)
+
+    result = secure_env._read_secret_file(big, source="TEST_NEVER_READ")
+    assert result is None
+
+
+def test_backstop_length_check_catches_a_lying_st_size(monkeypatch, tmp_path):
+    """The rare case st_size does NOT reflect the true readable content
+    (mocked here, since a real procfs-style pseudo-file isn't portably
+    reproducible in a test) — the length-based backstop after the read loop
+    must still catch it."""
+    big = tmp_path / "lying_st_size_secret"
+    big.write_bytes(b"x" * (secure_env._SECRET_FILE_MAX_BYTES + 1))
+
+    real_fstat = os.fstat
+
+    def _fake_fstat(fd):
+        st = real_fstat(fd)
+        import types
+        return types.SimpleNamespace(st_mode=st.st_mode, st_size=0)  # lies: reports empty
+
+    monkeypatch.setattr(os, "fstat", _fake_fstat)
+
+    result = secure_env._read_secret_file(big, source="TEST_LYING_SIZE")
+    assert result is None
+
+
+def test_short_reads_are_not_mistaken_for_a_truncated_secret(monkeypatch, tmp_path):
+    """A single os.read() call returning fewer bytes than requested (a
+    signal, a network filesystem) must not be accepted as the whole file —
+    the read loop must keep reading until EOF. Mocks os.read to return the
+    content one byte at a time, well under the cap, and confirms the FULL
+    content survives rather than being truncated to whatever the first
+    short read happened to return."""
+    secret_content = "full-secret-value-not-truncated"
+    f = tmp_path / "short_read_secret"
+    f.write_text(secret_content)
+
+    real_read = os.read
+    call_count = {"n": 0}
+
+    def _one_byte_at_a_time(fd, n):
+        call_count["n"] += 1
+        return real_read(fd, 1)  # always returns at most 1 byte, regardless of n
+
+    monkeypatch.setattr(os, "read", _one_byte_at_a_time)
+
+    result = secure_env._read_secret_file(f, source="TEST_SHORT_READS")
+    assert result == secret_content
+    assert call_count["n"] > 1  # confirms the loop actually iterated
 
 
 def test_secret_file_at_exactly_the_cap_is_accepted(tmp_path):
@@ -592,15 +667,18 @@ def test_creddir_derived_candidate_outside_known_names(monkeypatch, tmp_path):
 
 
 def test_non_secret_key_file_pointer_is_ignored_and_warns(monkeypatch, tmp_path, capsys):
-    """A _FILE pointer for a NON-secret key (e.g. a typo'd config var) must
-    be ignored, not silently treated as a secret, and must warn."""
+    """A _FILE pointer for a NON-secret key (e.g. a typo'd config var), set
+    in the .env FILE, must be ignored, not silently treated as a secret,
+    and must warn — the pointer is a line in shared-memory/.env, addressed
+    to this framework (NEW-1: the source-split condition for the warning)."""
     pointless_file = tmp_path / "not_a_secret"
     pointless_file.write_text("irrelevant")
-    monkeypatch.setenv("EMBEDDER_URL_FILE", str(pointless_file))
-    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
-
-    fake_file = tmp_path / "shared-memory" / "scripts" / "secure_env.py"
+    fake_file = _write_env_file(
+        tmp_path, f"EMBEDDER_URL_FILE={pointless_file}\n"
+    )
     monkeypatch.setattr(secure_env, "__file__", str(fake_file))
+    monkeypatch.delenv("EMBEDDER_URL_FILE", raising=False)
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
 
     secure_env.load_split_env()
 
@@ -608,6 +686,74 @@ def test_non_secret_key_file_pointer_is_ignored_and_warns(monkeypatch, tmp_path,
     err = capsys.readouterr().err
     assert "EMBEDDER_URL_FILE" in err
     assert "not classified as a secret" in err
+
+
+# ── NEW-1 (fix round 2, Opus review, probe-confirmed): the warning above ────
+# fired for EVERY unrelated ambient env var ending in _FILE (SSL_CERT_FILE,
+# GIT_INDEX_FILE probe-confirmed live), un-deduplicated, on every
+# load_split_env() call. Candidates are still DERIVED from both os.environ
+# and the .env file; only the WARNING is now restricted to the .env file
+# source, and de-duplicated per process.
+
+def test_ambient_non_secret_file_pointer_produces_no_warning(monkeypatch, tmp_path, capsys):
+    """An unrelated ambient env var ending in _FILE (SSL_CERT_FILE is the
+    live probe case — every Python process using `requests`/`httpx` with a
+    custom CA bundle can be carrying this) is not this framework's business
+    and must never warn, no matter how many times load_split_env() runs."""
+    fake_file = _write_env_file(tmp_path, "")
+    monkeypatch.setattr(secure_env, "__file__", str(fake_file))
+    monkeypatch.setenv("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt")
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+
+    secure_env.load_split_env()
+    secure_env.load_split_env()  # twice — must still never warn
+
+    err = capsys.readouterr().err
+    assert "SSL_CERT_FILE" not in err
+
+
+def test_file_sourced_non_secret_pointer_warns_exactly_once_across_two_calls(
+    monkeypatch, tmp_path, capsys
+):
+    """A non-secret _FILE pointer that IS a line in shared-memory/.env still
+    warns (it's addressed to this framework) — but only ONCE across
+    multiple load_split_env() calls in the same process, mirroring
+    _advised_exec_env_names' own de-duplication."""
+    pointless_file = tmp_path / "not_a_secret_2"
+    pointless_file.write_text("irrelevant")
+    fake_file = _write_env_file(
+        tmp_path, f"EMBEDDER_URL_FILE={pointless_file}\n"
+    )
+    monkeypatch.setattr(secure_env, "__file__", str(fake_file))
+    monkeypatch.delenv("EMBEDDER_URL_FILE", raising=False)
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+
+    secure_env.load_split_env()
+    capsys.readouterr()  # drain the first warning
+    secure_env.load_split_env()
+
+    err = capsys.readouterr().err
+    assert "EMBEDDER_URL_FILE" not in err  # not repeated on the second call
+
+
+def test_ambient_pointer_for_a_secret_key_still_resolves_despite_no_warning(
+    monkeypatch, tmp_path
+):
+    """The other half of NEW-1's split: an operator's own ambient export of
+    a SECRET-shaped _FILE pointer must still resolve the secret — only the
+    WARNING is restricted to the .env-file source, never the candidate
+    derivation itself."""
+    secret_file = tmp_path / "ambient_secret_file"
+    secret_file.write_text("ambient-exported-secret")
+    fake_file = _write_env_file(tmp_path, "")
+    monkeypatch.setattr(secure_env, "__file__", str(fake_file))
+    monkeypatch.setenv("DEEPSEEK_API_KEY_FILE", str(secret_file))
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+
+    secure_env.load_split_env()
+
+    assert secure_env.get_secret("DEEPSEEK_API_KEY") == "ambient-exported-secret"
 
 
 def test_hostile_key_name_traversal_is_skipped_via_credentials_directory(monkeypatch, tmp_path):
