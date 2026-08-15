@@ -104,6 +104,53 @@ None of these ship with the skill. See [`sync_skills.sh`](../scripts/sync_skills
 
 ---
 
+## Credential delivery — the default tier, and the hardened tier
+
+**The default tier — `shared-memory/.env`, mode 600 — is fine for a
+single-user dev box**, and is what `install_framework.sh` sets up. It is
+**hygiene and detection, not isolation**: every secret in that file is
+readable by anything running as the same OS user, and SEC-06 (ii) below only
+*advises*, it does not block.
+
+**If you are pointing this deployment at a paid provider key**
+(`LLM_BACKENDS_JSON`'s `token_env`, or any of `NEO4J_PASSWORD`/
+`PG_PASSWORD`/`TAVILY_API_KEY`/`AGENT_TOKENS`/`BACKUP_ADMIN_TOKEN`), use the
+hardened tier instead — same-uid processes on this host still cannot read
+the credential material at rest, and with `sysctl
+kernel.yama.ptrace_scope=1` (the common distro default) they cannot pull it
+out of the gateway process's memory either:
+
+1. **systemd `LoadCredential=`** (preferred) — uncomment and adapt the
+   commented example in [`ops/hive-mind-gateway.service`](../ops/hive-mind-gateway.service).
+   systemd delivers the file root-mediated, typically mode 0400, owned by
+   the service — the tightest of the three tiers. `secure_env.py` (this
+   process's credential accessor) reads it from
+   `$CREDENTIALS_DIRECTORY/<key, lowercased>` automatically; nothing else to
+   configure.
+2. **`<KEY>_FILE`** (Docker official-images convention) — set e.g.
+   `PG_PASSWORD_FILE=/run/secrets/pg_password` in `shared-memory/.env`, or
+   export it directly. Works with any secret store that can hand you a file
+   (`pass`, a mounted Docker/Kubernetes secret, a vault-agent template).
+3. **The plaintext `.env` value** — the default tier above, always the
+   fallback.
+
+Full precedence statement (and why): the module docstring in
+[`shared-memory/scripts/secure_env.py`](../scripts/secure_env.py). None of
+these three tiers, nor an operator's own direct `os.environ` export, is ever
+copied into a daemon's child process environment — `hive_mind_proxy.py`'s
+`_daemon_env()` builds each spawned daemon's environment by exclusion, not
+by copying this process's own.
+
+**`systemctl --user import-environment` and unit-level `EnvironmentFile=`
+for a secret key are both deprecated anti-patterns**, not because they fail
+to work, but because they land the value in this process's OWN exec
+environment — readable via `systemctl --user show-environment` by any
+same-uid process, and inherited by every user unit started afterward, not
+just this one. `ops/README.md`, "Reasoning-LLM backends" has the worked
+example and the reasoning in full.
+
+---
+
 ## Upgrading the gateway
 
 Daemon and schema changes reach a hive through **git**, not through a skill download:
