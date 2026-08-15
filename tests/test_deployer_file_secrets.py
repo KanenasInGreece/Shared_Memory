@@ -26,15 +26,38 @@ Also covers:
     empty secret files (never raises; always falls through instead).
   - Exactly one trailing newline stripped, never a full .strip()/.rstrip().
 """
+import importlib
 import os
+import signal
 import stat
 import sys
+from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
 import secure_env  # noqa: E402
+
+
+class _Timeout(Exception):
+    pass
+
+
+def _with_timeout(seconds, fn, *a, **kw):
+    """Run fn under a SIGALRM timeout — used only for the FIFO regression
+    test, so a reintroduced R1 hang fails that ONE test loudly instead of
+    hanging the whole suite forever (mirrors the Opus probe's own
+    `timeout 10` methodology)."""
+    def _handler(signum, frame):
+        raise _Timeout()
+    old = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(seconds)
+    try:
+        return fn(*a, **kw)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
 
 
 @pytest.fixture(autouse=True)
@@ -401,3 +424,251 @@ def test_unreadable_secret_file_falls_through_without_raising(monkeypatch, tmp_p
         assert secure_env.get_secret("PG_PASSWORD") == "fallback-plaintext"
     finally:
         unreadable.chmod(0o600)
+
+
+# ── R1 (fix round 1): fd-safe file type + size guard, probe-confirmed ───────
+
+def test_fifo_does_not_hang_and_is_refused(tmp_path):
+    """The Opus probe: `timeout 10` against `_read_secret_file()` on a
+    scratch FIFO exited 124 (still blocked) before this fix. Guarded here
+    with a SIGALRM so a regression fails loudly instead of hanging the
+    suite."""
+    fifo_path = tmp_path / "pg_password_fifo"
+    os.mkfifo(fifo_path)
+    try:
+        result = _with_timeout(5, secure_env._read_secret_file, fifo_path, source="TEST_FIFO")
+    except _Timeout:
+        pytest.fail("_read_secret_file() hung on a FIFO — R1 regression")
+    assert result is None
+
+
+def test_character_device_is_refused_not_read_unbounded():
+    """The Opus probe: /dev/zero read unbounded into memory, exiting 124
+    after only the loose-mode warning. Now refused before any read call."""
+    dev_zero = Path("/dev/zero")
+    if not dev_zero.exists():
+        pytest.skip("/dev/zero not present on this platform")
+    result = _with_timeout(5, secure_env._read_secret_file, dev_zero, source="TEST_DEV_ZERO")
+    assert result is None
+
+
+def test_directory_is_refused(tmp_path):
+    result = secure_env._read_secret_file(tmp_path, source="TEST_DIR")
+    assert result is None
+
+
+def test_oversized_secret_file_is_refused_and_warns(tmp_path, capsys):
+    big = tmp_path / "big_secret"
+    big.write_bytes(b"x" * (secure_env._SECRET_FILE_MAX_BYTES + 1))
+    result = secure_env._read_secret_file(big, source="TEST_BIG")
+    assert result is None
+    assert "exceeds" in capsys.readouterr().err
+
+
+def test_secret_file_at_exactly_the_cap_is_accepted(tmp_path):
+    """The cap is inclusive — a file of EXACTLY _SECRET_FILE_MAX_BYTES bytes
+    is a legitimate secret, not an over-cap one. The +1 read only ever
+    detects going PAST the cap."""
+    exact = tmp_path / "exact_secret"
+    content = "x" * secure_env._SECRET_FILE_MAX_BYTES
+    exact.write_text(content)
+    result = secure_env._read_secret_file(exact, source="TEST_EXACT")
+    assert result == content
+
+
+def test_secret_file_max_bytes_env_overridable(monkeypatch, tmp_path):
+    monkeypatch.setenv("SECURE_ENV_SECRET_FILE_MAX_BYTES", "10")
+    importlib.reload(secure_env)
+    try:
+        small = tmp_path / "small_cap_secret"
+        small.write_text("12345678901")  # 11 bytes, over the 10-byte cap
+        assert secure_env._read_secret_file(small, source="TEST_CAP") is None
+    finally:
+        monkeypatch.delenv("SECURE_ENV_SECRET_FILE_MAX_BYTES", raising=False)
+        importlib.reload(secure_env)
+
+
+def test_symlink_to_regular_file_is_still_followed_no_nofollow(tmp_path):
+    """Deliberately NO O_NOFOLLOW — Kubernetes mounts a Secret as a symlink
+    chain through an atomically-swapped ..data directory (its rotation
+    mechanism); this shape must keep resolving."""
+    real_dir = tmp_path / "..2024_01_01_00_00_00.000000000"
+    real_dir.mkdir()
+    real_secret = real_dir / "pg_password"
+    real_secret.write_text("k8s-style-secret")
+    data_link = tmp_path / "..data"
+    data_link.symlink_to(real_dir, target_is_directory=True)
+    mount_point = tmp_path / "pg_password"
+    mount_point.symlink_to(Path("..data") / "pg_password")
+
+    result = secure_env._read_secret_file(mount_point, source="TEST_K8S_SYMLINK")
+    assert result == "k8s-style-secret"
+
+
+def test_s_isreg_guard_isolated_via_mocked_fstat(monkeypatch, tmp_path):
+    """Isolates the S_ISREG check from the size-cap/OSError paths the
+    FIFO/device/directory tests above can incidentally trip too (a FIFO with
+    no writer raises EAGAIN; a directory raises EISDIR on read(); both
+    return None via a DIFFERENT branch even without the type check). A REAL
+    regular file, well under the cap, WOULD read fine and return its content
+    if S_ISREG were removed — mock os.fstat to report a non-regular mode on
+    the same fd so only that one guard is exercised."""
+    f = tmp_path / "small_secret_but_wrong_type"
+    f.write_text("should-never-surface")
+
+    import types
+    real_fstat = os.fstat
+
+    def _fake_fstat(fd):
+        st = real_fstat(fd)
+        fake_mode = stat.S_IFCHR | stat.S_IMODE(st.st_mode)
+        return types.SimpleNamespace(st_mode=fake_mode)
+
+    monkeypatch.setattr(os, "fstat", _fake_fstat)
+
+    result = secure_env._read_secret_file(f, source="TEST_MOCKED_TYPE")
+    assert result is None
+
+
+# ── R4 / QF-3 (fix round 1): candidate keys derived from the pointers ───────
+
+def test_file_derived_candidate_with_no_env_at_all(monkeypatch, tmp_path):
+    """AGENT_TOKEN_FILE alone, with NO shared-memory/.env, NO KNOWN_SECRET_NAMES
+    membership required beforehand (AGENT_TOKEN now IS on that list too, but
+    this specifically proves the DERIVATION path — a name outside the fixed
+    list, e.g. a provider key, must also resolve). Opus probe-confirmed this
+    resolved to None before the fix."""
+    secret_file = tmp_path / "deepseek_key_secret"
+    secret_file.write_text("sk-derived-from-file-pointer")
+    monkeypatch.setenv("DEEPSEEK_API_KEY_FILE", str(secret_file))
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+
+    fake_file = tmp_path / "shared-memory" / "scripts" / "secure_env.py"
+    monkeypatch.setattr(secure_env, "__file__", str(fake_file))
+
+    secure_env.load_split_env()
+
+    assert secure_env.get_secret("DEEPSEEK_API_KEY") == "sk-derived-from-file-pointer"
+    assert "DEEPSEEK_API_KEY" not in os.environ
+
+
+def test_agent_token_file_resolves_with_no_env_at_all(monkeypatch, tmp_path):
+    """The specific casualty Opus named: AGENT_TOKEN is never written to
+    shared-memory/.env by design, so it depended entirely on this fix."""
+    secret_file = tmp_path / "agent_token_secret"
+    secret_file.write_text("tok_from_file_delivery")
+    monkeypatch.setenv("AGENT_TOKEN_FILE", str(secret_file))
+    monkeypatch.delenv("AGENT_TOKEN", raising=False)
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+
+    fake_file = tmp_path / "shared-memory" / "scripts" / "secure_env.py"
+    monkeypatch.setattr(secure_env, "__file__", str(fake_file))
+
+    secure_env.load_split_env()
+
+    assert secure_env.get_secret("AGENT_TOKEN") == "tok_from_file_delivery"
+    assert "AGENT_TOKEN" not in os.environ
+
+
+def test_creddir_derived_candidate_outside_known_names(monkeypatch, tmp_path):
+    """$CREDENTIALS_DIRECTORY containing an entry for a key outside
+    KNOWN_SECRET_NAMES (e.g. a provider key) must still resolve — proves the
+    _derive_credentials_directory_candidates() path specifically."""
+    cred_dir = tmp_path / "creds"
+    cred_dir.mkdir()
+    (cred_dir / "deepseek_api_key").write_text("sk-from-creddir")
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(cred_dir))
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY_FILE", raising=False)
+
+    fake_file = tmp_path / "shared-memory" / "scripts" / "secure_env.py"
+    monkeypatch.setattr(secure_env, "__file__", str(fake_file))
+
+    secure_env.load_split_env()
+
+    assert secure_env.get_secret("DEEPSEEK_API_KEY") == "sk-from-creddir"
+    assert "DEEPSEEK_API_KEY" not in os.environ
+
+
+def test_non_secret_key_file_pointer_is_ignored_and_warns(monkeypatch, tmp_path, capsys):
+    """A _FILE pointer for a NON-secret key (e.g. a typo'd config var) must
+    be ignored, not silently treated as a secret, and must warn."""
+    pointless_file = tmp_path / "not_a_secret"
+    pointless_file.write_text("irrelevant")
+    monkeypatch.setenv("EMBEDDER_URL_FILE", str(pointless_file))
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+
+    fake_file = tmp_path / "shared-memory" / "scripts" / "secure_env.py"
+    monkeypatch.setattr(secure_env, "__file__", str(fake_file))
+
+    secure_env.load_split_env()
+
+    assert secure_env.get_secret("EMBEDDER_URL") is None
+    err = capsys.readouterr().err
+    assert "EMBEDDER_URL_FILE" in err
+    assert "not classified as a secret" in err
+
+
+def test_hostile_key_name_traversal_is_skipped_via_credentials_directory(monkeypatch, tmp_path):
+    """O7: a hostile candidate key (path-traversal-shaped) must never become
+    a path component. A REAL file is planted exactly ONE level above
+    cred_dir (matching the traversal depth) so that, if the O7 guard were
+    ever removed, this test would observe the LEAKED content instead of
+    None — not merely a path that happens not to exist."""
+    outside_target = tmp_path / "outside_secret"
+    outside_target.write_text("should-never-be-read")
+    cred_dir = tmp_path / "creds"
+    cred_dir.mkdir()
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(cred_dir))
+
+    hostile_key = f"../{outside_target.name}"
+    result = secure_env._credentials_directory_secret(hostile_key)
+    assert result is None
+
+
+def test_hostile_key_name_traversal_is_skipped_via_file_indirection(monkeypatch, tmp_path):
+    """O7: same gate, the other path-building function. The _FILE pointer
+    for the hostile key name is wired to a REAL file (a real shell couldn't
+    name an env var this way, but LLM_BACKENDS_JSON's token_env is arbitrary
+    JSON string content flowing through as a Python string, exactly this
+    shape) so a removed guard would return its content, not None by luck."""
+    outside_target = tmp_path / "outside_secret_via_file"
+    outside_target.write_text("should-never-be-read-via-file")
+    hostile_key = "../../etc/passwd"
+    monkeypatch.setenv(f"{hostile_key}_FILE", str(outside_target))
+
+    result = secure_env._file_indirection_secret(hostile_key, {})
+    assert result is None
+
+
+def test_hostile_token_env_name_never_reaches_the_filesystem(monkeypatch, tmp_path, capsys):
+    """End-to-end: a hostile token_env name from LLM_BACKENDS_JSON is
+    classified secret (SEC-09's third clause) and therefore lands in
+    candidate_secret_keys, but the O7 gate refuses it before it becomes a
+    path — proven by planting a file at the WOULD-BE traversal target and
+    confirming it never gets read."""
+    import json as _json
+
+    outside_target = tmp_path / "outside_credentials_directory_secret"
+    outside_target.write_text("should-never-be-read")
+
+    cred_dir = tmp_path / "creds"
+    cred_dir.mkdir()
+    hostile_name = f"../{outside_target.name}"
+
+    fake_file = _write_env_file(
+        tmp_path,
+        'LLM_BACKENDS_JSON=' + _json.dumps([
+            {"url": "https://x", "token_env": hostile_name}
+        ]) + "\n",
+    )
+    monkeypatch.setattr(secure_env, "__file__", str(fake_file))
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(cred_dir))
+    monkeypatch.delenv(hostile_name, raising=False)
+
+    secure_env.load_split_env()
+
+    assert secure_env.get_secret(hostile_name) is None
+    err = capsys.readouterr().err
+    assert "safe-name check" in err
