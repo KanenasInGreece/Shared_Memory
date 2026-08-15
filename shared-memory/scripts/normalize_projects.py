@@ -67,6 +67,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from ontology import ONT  # noqa: E402
 from project_alias import ALIAS_UPSERT_SQL  # noqa: E402
 from project_axis import PROJECT_MATCH_SQL  # noqa: E402
+import secure_env  # noqa: E402
 
 
 def _load_env() -> None:
@@ -75,39 +76,37 @@ def _load_env() -> None:
     (credentials are read from .env, never hardcoded).
 
     ⚠ THE FRAMEWORK ENV IS ``shared-memory/.env``; the repo root is the
-    FALLBACK. This used to read the repo-root path only, and its docstring
-    claimed that matched ``migrations/apply.py`` — which tries the framework
-    path first. On an install that keeps credentials only where the documented
-    setup puts them, this script therefore connected with an empty password and
-    died on `fe_sendauth: no password supplied`: a shipped tool that could not
-    run at all, reported by nothing until someone tried to use it. Same
-    candidate order as apply.py, so there is one answer to "where does the
-    password live" rather than one per script.
+    FALLBACK — unchanged from the fix that made this script runnable at all
+    (see history below). Credential_Custody_Plan PR A4 (SEC-05-class sweep)
+    changes WHERE the parsed values land: delegates to secure_env's split
+    loader, so config keys still reach os.environ via setdefault exactly as
+    before, but every secret-classified key (PG_PASSWORD, PG_CONN,
+    NEO4J_PASSWORD) is held only in secure_env's in-process store — never
+    os.environ — and is read back via secure_env.get_secret().
+
+    This used to read the repo-root path only, and its docstring claimed that
+    matched ``migrations/apply.py`` — which tries the framework path first. On
+    an install that keeps credentials only where the documented setup puts
+    them, this script therefore connected with an empty password and died on
+    `fe_sendauth: no password supplied`: a shipped tool that could not run at
+    all, reported by nothing until someone tried to use it. Same candidate
+    order as apply.py, so there is one answer to "where does the password
+    live" rather than one per script.
     """
-    here = Path(__file__).resolve().parent
-    candidates = [here.parent / ".env", here.parent.parent / ".env"]
-    env_path = next((p for p in candidates if p.exists()), None)
-    if env_path is None:
-        return
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        os.environ.setdefault(key.strip(), val.strip())
+    secure_env.load_split_env()
 
 
 _load_env()
 
-_pg_pass = os.environ.get("PG_PASSWORD", "")
-PG_CONN = os.environ.get(
+_pg_pass = secure_env.get_secret("PG_PASSWORD", "")
+PG_CONN = secure_env.get_secret(
     "PG_CONN", f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
 )
 # Env-overridable, never a baked-in literal: our bolt port is one valid
 # configuration, not the configuration. Matches backfill_project_of.py.
 NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_AUTH = (os.environ.get("NEO4J_USER", "neo4j"),
-              os.environ.get("NEO4J_PASSWORD", ""))
+              secure_env.get_secret("NEO4J_PASSWORD", ""))
 
 
 def parse_alias_map(raw: str) -> dict:

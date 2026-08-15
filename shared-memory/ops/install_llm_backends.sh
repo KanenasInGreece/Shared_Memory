@@ -68,10 +68,11 @@ while true; do
             ylw "  That doesn't look like an env var name (expected e.g. DEEPSEEK_API_KEY)."
             ylw "  If you just pasted a real key by mistake, enter its variable name instead."
         done
-        echo "  Reminder: export $token_env=\$(...) in your shell (e.g. from 'pass', GPG-backed)."
-        echo "  For the gateway's systemd service to see it too:"
-        echo "    systemctl --user import-environment $token_env"
-        echo "    systemctl --user try-restart hive-mind-gateway.service"
+        echo "  Reminder: this framework never stores the literal key. Get it to the"
+        echo "  gateway via (preferred, highest to lowest — SEC-06, PR A4):"
+        echo "    1. systemd LoadCredential=  (see hive-mind-gateway.service's commented example)"
+        echo "    2. ${token_env}_FILE=/path/to/secret  in shared-memory/.env"
+        echo "    3. export $token_env=\$(...) + systemctl --user import-environment (DEPRECATED)"
         echo "  Full convention: shared-memory/ops/README.md, \"Reasoning-LLM backends\"."
     fi
 
@@ -122,11 +123,39 @@ json_array=$(printf '%s\n' "${entries[@]}" | jq -s -c '.')
 
 # awk (not sed) for the same reason install_framework.sh uses it: the JSON value
 # contains slashes and quotes that would need fragile escaping as a sed replacement.
+#
+# R5 (fix round 1, Opus review, probe-confirmed): the PREVIOUS comment here
+# claimed "no window where the secrets-bearing file sits at default
+# permissions" — false. `chmod --reference` runs only AFTER the awk write
+# completes, so $ENV_FILE.tmp held every secret in shared-memory/.env
+# (PG_PASSWORD, NEO4J_PASSWORD, AGENT_TOKENS, BACKUP_ADMIN_TOKEN, …) at the
+# process umask (0644 under a common 022 umask) for the ENTIRE write — probe
+# reproduced this live: "MODE OF TMP RIGHT AFTER awk: 644". `chmod
+# --reference ... || true` also FAILED OPEN: a non-GNU chmod (busybox,
+# non-coreutils) errors silently and the 0644 file gets `mv`'d into place
+# with the script still printing its success banner.
+#
+# Fixed the same way S-07 fixed install_framework.sh one file over: `umask
+# 077` wraps the write in a subshell so $ENV_FILE.tmp is 600 from the byte it
+# is created, never 644 even for an instant. `chmod --reference` still runs
+# afterward for MODE FIDELITY (matching whatever $ENV_FILE's own mode
+# actually is, in case an operator widened it deliberately) — but a failed
+# chmod is now FATAL, aborting before the mv, rather than silently shipping
+# a wrongly-permissioned file.
 if grep -q '^LLM_BACKENDS_JSON=' "$ENV_FILE"; then
-    awk -v new="LLM_BACKENDS_JSON=$json_array" '
-        /^LLM_BACKENDS_JSON=/ { print new; next }
-        { print }
-    ' "$ENV_FILE" > "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"
+    (
+      umask 077
+      awk -v new="LLM_BACKENDS_JSON=$json_array" '
+          /^LLM_BACKENDS_JSON=/ { print new; next }
+          { print }
+      ' "$ENV_FILE" > "$ENV_FILE.tmp"
+    )
+    if ! chmod --reference="$ENV_FILE" "$ENV_FILE.tmp"; then
+        rm -f "$ENV_FILE.tmp"
+        red "✗ chmod --reference failed — aborting before the file was replaced (nothing written)"
+        exit 1
+    fi
+    mv "$ENV_FILE.tmp" "$ENV_FILE"
 else
     {
         echo ""

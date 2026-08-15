@@ -56,38 +56,32 @@ from neo4j import GraphDatabase
 MIN_GATEWAY_VERSION = (0, 8, 36)
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://localhost:8888")
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import secure_env  # noqa: E402
+
 
 def _load_env() -> None:
     """The framework env is shared-memory/.env; the repo root is the fallback.
     Same candidate order as apply.py — a standalone CLI in a fresh shell has no
     PG_PASSWORD otherwise, and reading the wrong file fails with an empty
-    password rather than a missing one."""
-    here = Path(__file__).resolve().parent
-    env_path = next((p for p in (here.parent / ".env", here.parent.parent / ".env")
-                     if p.exists()), None)
-    if env_path is None:
-        return
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        os.environ.setdefault(key.strip(), val.strip())
+    password rather than a missing one. Credential_Custody_Plan PR A4
+    (SEC-05-class sweep): delegates to secure_env's split loader, so every
+    secret-classified key lands in its in-process store, never os.environ."""
+    secure_env.load_split_env()
 
 
 _load_env()
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ontology import ONT  # noqa: E402
 from project_axis import PROJECT_SQL  # noqa: E402
 from project_promotion import is_parked  # noqa: E402
 
 NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_AUTH = (os.environ.get("NEO4J_USER", "neo4j"),
-              os.environ.get("NEO4J_PASSWORD", ""))
+              secure_env.get_secret("NEO4J_PASSWORD", ""))
 PG_CONN = (
     f"postgresql://{os.environ.get('PG_USER', 'postgres')}:"
-    f"{os.environ.get('PG_PASSWORD', '')}@{os.environ.get('PG_HOST', 'localhost')}:"
+    f"{secure_env.get_secret('PG_PASSWORD', '')}@{os.environ.get('PG_HOST', 'localhost')}:"
     f"{os.environ.get('PG_PORT', '5432')}/{os.environ.get('PG_DATABASE', 'agent_data')}"
 )
 

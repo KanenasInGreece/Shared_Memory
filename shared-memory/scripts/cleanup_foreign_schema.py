@@ -36,6 +36,7 @@ from neo4j import GraphDatabase
 
 sys.path.insert(0, os.path.dirname(__file__))
 from ontology import KNOWN_LABELS, KNOWN_RELATIONSHIPS  # noqa: E402
+import secure_env  # noqa: E402
 
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_USER = "neo4j"
@@ -43,16 +44,11 @@ _VALID_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _load_env() -> None:
-    """Credentials from the framework .env (shared-memory/.env first, root fallback)."""
-    here = Path(__file__).resolve()
-    for cand in (here.parent.parent / ".env", here.parent.parent.parent / ".env"):
-        if cand.exists():
-            for line in cand.read_text().splitlines():
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, _, v = line.partition("=")
-                    os.environ.setdefault(k.strip(), v.strip())
-            return
+    """Delegates to secure_env's split loader (Credential_Custody_Plan PR A4,
+    SEC-05-class sweep) — same shared-memory/.env-first, root-fallback
+    candidate order, but NEO4J_PASSWORD lands in secure_env's in-process
+    store, never os.environ; read it back via secure_env.get_secret()."""
+    secure_env.load_split_env()
 
 
 def survey(session, preserve_rels: set[str]) -> dict:
@@ -129,7 +125,7 @@ def main() -> int:
     preserve = set(args.preserve_rel)
 
     _load_env()
-    pw = os.environ.get("NEO4J_PASSWORD", "")
+    pw = secure_env.get_secret("NEO4J_PASSWORD", "")
     if not pw:
         print("ERROR: NEO4J_PASSWORD not set (shared-memory/.env).", file=sys.stderr)
         return 2

@@ -47,34 +47,29 @@ from neo4j import GraphDatabase
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ontology import ONT, RETRO_RATINGS  # noqa: E402
 from project_axis import PROJECT_SQL  # noqa: E402
+import secure_env  # noqa: E402
 
 
 def _load_env() -> None:
-    # The live deployment keeps .env at shared-memory/.env; older layouts used
-    # the repo root. Try both — setdefault means the first found wins.
-    for env_path in (Path(__file__).parent.parent / ".env",
-                     Path(__file__).parent.parent.parent / ".env"):
-        if not env_path.exists():
-            continue
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            os.environ.setdefault(key.strip(), val.strip())
+    # Delegates to secure_env's split loader (Credential_Custody_Plan PR A4,
+    # SEC-05-class sweep): same shared-memory/.env-first, repo-root-fallback
+    # candidate order, but every secret-classified key (NEO4J_PASSWORD,
+    # PG_PASSWORD, PG_CONN, AGENT_TOKEN) lands in secure_env's in-process
+    # store, never os.environ — read them back via secure_env.get_secret().
+    secure_env.load_split_env()
 
 
 _load_env()
 
 NEO4J_URI  = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
-NEO4J_PASS = os.environ.get("NEO4J_PASSWORD", "")
-_pg_pass   = os.environ.get("PG_PASSWORD", "")
-PG_CONN    = os.environ.get(
+NEO4J_PASS = secure_env.get_secret("NEO4J_PASSWORD", "")
+_pg_pass   = secure_env.get_secret("PG_PASSWORD", "")
+PG_CONN    = secure_env.get_secret(
     "PG_CONN", f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
 )
 EMBED_URL = os.environ.get("EMBED_URL", "http://localhost:8888/v1/embeddings")
-_AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "").strip() or None
+_AGENT_TOKEN = secure_env.get_secret("AGENT_TOKEN", "").strip() or None
 BACKUP_ADVISORY_LOCK_KEY = int(os.environ.get("BACKUP_ADVISORY_LOCK_KEY", "8765309"))
 
 # Legacy free-text rating → outcome-state enum. Deterministic; the original

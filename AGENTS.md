@@ -63,17 +63,20 @@ Verify both files exist before Phase 4. If the user substitutes a different embe
 
 ### Phase 1 — Write the framework `.env`
 
-`bash shared-memory/scripts/install_framework.sh` does this interactively for a human. As an agent, write the file directly instead: copy `shared-memory/.env.example` → `shared-memory/.env`, replace the values for `NEO4J_HOST_DIR`, `PG_DATA_DIR`, `LLM_MODELS_DIR`, `NEO4J_PASSWORD`, `PG_PASSWORD` (leave every other line as shipped — the commented defaults are correct), then:
+`bash shared-memory/scripts/install_framework.sh` does this interactively for a human. As an agent, write the file directly instead — **under `umask 077` before the copy**, the same fix item 3/S-07 applied to the script itself, so the file holding two DB passwords is never even briefly world/group-readable (create-then-chmod leaves exactly that window): copy `shared-memory/.env.example` → `shared-memory/.env`, replace the values for `NEO4J_HOST_DIR`, `PG_DATA_DIR`, `LLM_MODELS_DIR`, `NEO4J_PASSWORD`, `PG_PASSWORD` (leave every other line as shipped — the commented defaults are correct), then:
 
 ```bash
-chmod 600 shared-memory/.env
+umask 077
+cp shared-memory/.env.example shared-memory/.env
+# … edit shared-memory/.env in place: NEO4J_HOST_DIR, PG_DATA_DIR, LLM_MODELS_DIR, NEO4J_PASSWORD, PG_PASSWORD …
+chmod 600 shared-memory/.env          # belt-and-suspenders — umask above already made it 600
 git check-ignore shared-memory/.env          # MUST print the path
 mkdir -p "$NEO4J_HOST_DIR"/{data,logs,import,plugins} "$PG_DATA_DIR"
 ```
 
 Uncomment/set `DREAM_TEMPERATURE` (Q4) and, for multiple LLM backends, `LLM_BACKENDS` (Q3). If the user's reasoning server **validates model names** (a named-model server, a routing proxy, a hosted OpenAI-compatible endpoint, or a desktop app with several models loaded), also set `LLM_MODEL` to the real id — the shipped default only suits servers that ignore the field. A single backend on a non-default port is `LLM_DEFAULT_TARGET`. All framework and helper tooling reads `shared-memory/.env` first, with a repo-root `.env` honoured as a pre-0.6 fallback.
 
-**If Q3 turned up a backend needing a credential, use `LLM_BACKENDS_JSON` instead of `LLM_BACKENDS`** — see the block already commented in `.env.example` for the exact shape. Write only `{"url": ..., "token_env": "<VAR_NAME>", "model": ...}` — the literal key never goes in this file. The gateway resolves `token_env` from its own process environment at startup; getting the real value into that environment (shell export + `systemctl --user import-environment` for the gateway's systemd unit — never a file) is the user's own task, walked through in `shared-memory/ops/README.md`, "Reasoning-LLM backends". Point them there rather than improvising a storage location yourself.
+**If Q3 turned up a backend needing a credential, use `LLM_BACKENDS_JSON` instead of `LLM_BACKENDS`** — see the block already commented in `.env.example` for the exact shape. Write only `{"url": ..., "token_env": "<VAR_NAME>", "model": ...}` — the literal key never goes in this file. The gateway resolves `token_env` from its own process environment at startup; getting the real value there is the user's own task, walked through in `shared-memory/ops/README.md`, "Reasoning-LLM backends" — **prefer `<VAR_NAME>_FILE` or systemd `LoadCredential=`** (SEC-06, PR A4) over `systemctl --user import-environment`, which is deprecated (readable by any same-uid process via `show-environment`, and inherited by every user unit, not just the gateway's). Point them there rather than improvising a storage location yourself.
 
 ### Phase 2 — Preflight
 

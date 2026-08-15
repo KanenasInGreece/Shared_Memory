@@ -16,5 +16,62 @@ TimeoutStopSec=30
 Restart=on-failure
 RestartSec=5
 
+# S-17 (Credential_Custody_Plan PR A4) — cheap, verified-compatible hardening.
+# UMask=0077: any file this process (or a spawned daemon) creates defaults to
+# 0600/0700 — belt-and-suspenders alongside the umask calls already in
+# install_framework.sh/backup.sh, covers anything that doesn't set its own.
+UMask=0077
+# NoNewPrivileges=yes: this process never needs setuid/setgid/capabilities —
+# refuses to gain any it does not already have.
+NoNewPrivileges=yes
+
+# ProtectHome (read-only or tmpfs) was evaluated and left OUT: WorkingDirectory
+# is a checkout under $HOME (deployer-chosen path, so it cannot be named as a
+# ReadWritePaths= exception here), and the audit/REM/telemetry logs default to
+# ~/.shared-memory/logs (MEMORY_LOG_PATH, .env.example) — also under $HOME.
+# ProtectHome=read-only would make the log directory unwritable; ProtectHome=yes
+# hides $HOME entirely and would break WorkingDirectory itself. Revisit if a
+# future release moves state to a fixed, non-$HOME path this unit can pin.
+
+# LoadCredential= example (SEC-06, PR A4; corrected fix round 1, R3, Opus
+# review, verified against `man systemd.exec` and `systemd-path` on the
+# reference host) — uncomment to deliver a secret without ever touching
+# shared-memory/.env or this process's own EnvironmentFile=. secure_env.py
+# reads it from $CREDENTIALS_DIRECTORY/<name>, where <name> is the
+# credential ID below (systemd convention: lowercase). The corresponding
+# framework key is the uppercase form (pg_password -> PG_PASSWORD).
+#
+# THIS IS THE BARE-ID FORM — no ":PATH" — DELIBERATELY. This unit is a
+# `systemd --user` unit (see the top-level docs for why: a session-launched
+# gateway dies with the session). The originally-shipped example here used
+# an ABSOLUTE path into /etc/credstore — the SYSTEM manager's store, mode
+# 0700 root:root on a stock install, unreadable by any --user unit and
+# unconditionally FATAL to the unit start once the path can't be opened
+# (`man systemd.exec`: "a missing credential is not considered fatal" holds
+# ONLY when the path is omitted or a bare identifier — an absolute path that
+# can't be read is fatal). The bare-ID form below instead has the PER-USER
+# service manager search $XDG_CONFIG_HOME/credstore/, $XDG_RUNTIME_DIR/credstore/,
+# $HOME/.local/lib/credstore/, in that order (verified live via `systemd-path
+# user-search-credential-store`) — put the file at
+# $XDG_CONFIG_HOME/credstore/pg_password (typically ~/.config/credstore/pg_password),
+# mode 600 from the FIRST BYTE, owned by the account this unit runs as — NOT
+# create-then-chmod (NEW-2, fix round 2: this recipe used to write the file
+# with `printf … > path` at the process umask, THEN chmod 600 it after —
+# the exact window this PR closes in install_framework.sh/install_llm_
+# backends.sh's own scripts. Fixed the same way: a `umask 077` subshell
+# around the write, so the file is 600 from the moment it exists, never
+# briefly at the default umask (often 0644):
+#   mkdir -p ~/.config/credstore && chmod 700 ~/.config/credstore
+#   ( umask 077; printf '%s' 'your-postgres-password' > ~/.config/credstore/pg_password )
+#   chmod 600 ~/.config/credstore/pg_password   # belt-and-suspenders — umask above already made it 600
+# ⚠ See server-setup.md, "Credential delivery" — for a `--user` unit this
+# tier does NOT isolate the credential from your OWN account (the account
+# IS the "user associated with the unit" per man systemd.exec); it removes
+# the value from shared-memory/.env and from every OTHER user unit's
+# environment, which is real hardening against a different account, not
+# against this one.
+#LoadCredential=pg_password
+#LoadCredential=neo4j_password
+
 [Install]
 WantedBy=default.target

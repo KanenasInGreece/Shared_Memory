@@ -62,39 +62,32 @@ import httpx
 import psycopg2
 from neo4j import GraphDatabase
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import secure_env  # noqa: E402
+
 
 def _load_env() -> None:
     """Standalone-script env bootstrap (same contract as the daemons):
-    shared-memory/.env first, repo-root .env as the pre-0.6 fallback —
-    setdefault semantics, so an already-exported variable always wins.
-    Must run BEFORE entity_resolution_eval is imported (it reads os.environ
-    at module load)."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    for env_path in (os.path.join(here, "..", ".env"),
-                     os.path.join(here, "..", "..", ".env")):
-        try:
-            with open(os.path.normpath(env_path)) as f:
-                lines = f.read().splitlines()
-        except OSError:
-            continue
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            os.environ.setdefault(key.strip(), val.strip())
+    delegates to secure_env's split loader (Credential_Custody_Plan PR A4,
+    SEC-05-class sweep) — shared-memory/.env first, repo-root .env as the
+    pre-0.6 fallback, setdefault semantics for config keys (an
+    already-exported variable always wins), but every secret-classified key
+    (NEO4J_PASSWORD, PG_PASSWORD, PG_CONN, AGENT_TOKEN) lands in secure_env's
+    in-process store, never os.environ. Must run BEFORE entity_resolution_eval
+    is imported (it reads os.environ at module load)."""
+    secure_env.load_split_env()
 
 
 _load_env()
 
 NEO4J_URI  = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
-NEO4J_PASS = os.environ.get("NEO4J_PASSWORD", "")
-_pg_pass   = os.environ.get("PG_PASSWORD", "")
-PG_CONN    = os.environ.get(
+NEO4J_PASS = secure_env.get_secret("NEO4J_PASSWORD", "")
+_pg_pass   = secure_env.get_secret("PG_PASSWORD", "")
+PG_CONN    = secure_env.get_secret(
     "PG_CONN", f"postgresql://postgres:{_pg_pass}@localhost:5432/agent_data"
 )
-_AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "").strip() or None
+_AGENT_TOKEN = secure_env.get_secret("AGENT_TOKEN", "").strip() or None
 _UNDETERMINED = "general"
 
 

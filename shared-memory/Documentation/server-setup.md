@@ -104,6 +104,86 @@ None of these ship with the skill. See [`sync_skills.sh`](../scripts/sync_skills
 
 ---
 
+## Credential delivery — the default tier, and the hardened tier
+
+**The default tier — `shared-memory/.env`, mode 600 — is fine for a
+single-user dev box**, and is what `install_framework.sh` sets up. It is
+**hygiene and detection, not isolation**: every secret in that file is
+readable by anything running as the same OS user, and SEC-06 (ii) below only
+*advises*, it does not block.
+
+**⚠ Corrected (fix round 1, Opus review, verified against `man
+systemd.exec`): for the `systemd --user` unit this project ships
+(`hive-mind-gateway.service`), the file-based tiers below do NOT isolate the
+credential from a same-uid compromise.** `man systemd.exec`, `LoadCredential=`:
+*"The data is only accessible to **the user associated with the unit**, via
+the `User=`/`DynamicUser=` settings (as well as the superuser)."* For a
+`--user` unit, the user associated with it **is your own login uid** — the
+exact identity this threat model treats as hostile. Verified directly on the
+reference host: `systemd-path user-credential-store` →
+`~/.config/credstore` — owned by, and readable by, the same account that can
+already read a 600-mode `.env`. `<KEY>_FILE` has the identical property:
+whatever file the pointer names is just as readable by that uid as the
+`.env` it replaces.
+
+**What the tiers below genuinely buy, even for a `--user` unit:** no
+plaintext credential committed to the repo checkout or sitting in
+`shared-memory/.env`; no value in `/proc/<pid>/environ` (SEC-06 (i)'s own
+invariant — neither tier is ever copied into `os.environ`); no inheritance
+by another user unit (unlike `import-environment`/`EnvironmentFile=`); a
+non-swappable backing for `LoadCredential=` specifically; and a credential
+that survives a headless boot. **What they do NOT buy on a `--user` unit is
+isolation from the operator's own account** — a same-uid attacker who could
+already read your `.env` can read `~/.config/credstore/pg_password` just as
+easily. Genuine same-uid isolation needs a **system** unit with a dedicated
+`User=` (a service account distinct from the operator's login) — a
+different, more involved deployment shape this project does not set up for
+you. The `kernel.yama.ptrace_scope=1` mitigation some hosts run has the same
+caveat: it raises the bar on reading another uid's process memory, which
+buys nothing here since the credential is readable at rest by the SAME uid
+regardless.
+
+If your threat model is "protect the credential from a process running as a
+**different** account" (a multi-tenant box, a compromised unrelated
+service), the tiers below are real hardening. If it is "protect the
+credential from a compromise of my own account," none of the three tiers
+changes that — only a dedicated system-unit service account does, and that
+is out of scope for what this document walks you through:
+
+1. **systemd `LoadCredential=`** — uncomment and adapt the commented example
+   in [`ops/hive-mind-gateway.service`](../ops/hive-mind-gateway.service),
+   using the **bare-ID form** (`LoadCredential=pg_password`, no `:PATH`) —
+   see that file's own comment for why an absolute path fails a `--user`
+   unit outright. `secure_env.py` (this process's credential accessor) reads
+   it from `$CREDENTIALS_DIRECTORY/<key, lowercased>` automatically; nothing
+   else to configure. Next tier up: `LoadCredentialEncrypted=` /
+   `systemd-creds` (`man systemd-creds`) encrypts the file at rest, bound to
+   TPM2 and/or a machine-local secret — worth it if the credential store
+   itself might be copied off the host.
+2. **`<KEY>_FILE`** (Docker official-images convention) — set e.g.
+   `PG_PASSWORD_FILE=/run/secrets/pg_password` in `shared-memory/.env`, or
+   export it directly. Works with any secret store that can hand you a file
+   (`pass`, a mounted Docker/Kubernetes secret, a vault-agent template).
+3. **The plaintext `.env` value** — the default tier above, always the
+   fallback.
+
+Full precedence statement (and why): the module docstring in
+[`shared-memory/scripts/secure_env.py`](../scripts/secure_env.py). None of
+these three tiers, nor an operator's own direct `os.environ` export, is ever
+copied into a daemon's child process environment — `hive_mind_proxy.py`'s
+`_daemon_env()` builds each spawned daemon's environment by exclusion, not
+by copying this process's own.
+
+**`systemctl --user import-environment` and unit-level `EnvironmentFile=`
+for a secret key are both deprecated anti-patterns**, not because they fail
+to work, but because they land the value in this process's OWN exec
+environment — readable via `systemctl --user show-environment` by any
+same-uid process, and inherited by every user unit started afterward, not
+just this one. `ops/README.md`, "Reasoning-LLM backends" has the worked
+example and the reasoning in full.
+
+---
+
 ## Upgrading the gateway
 
 Daemon and schema changes reach a hive through **git**, not through a skill download:

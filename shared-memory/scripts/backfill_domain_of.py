@@ -58,6 +58,7 @@ sys.path.insert(0, str(HERE))
 
 from domain_axis import resolve_domains  # noqa: E402
 from project_axis import SENTINEL, resolve_project  # noqa: E402
+import secure_env  # noqa: E402
 
 # The first version whose outbox worker handles a 'domain_of' row.
 MIN_GATEWAY_VERSION = (0, 8, 47)
@@ -87,27 +88,21 @@ RETRO_SQL = """
 
 
 def _load_env() -> None:
-    # The framework env is shared-memory/.env; the repo root is the pre-0.6
-    # FALLBACK. Parsed here rather than imported from a library: an ops script
-    # must run with the dependencies its own documentation names, and a loader
-    # that returns silently when a parser is absent reports a CREDENTIALS error
-    # for a missing dependency.
-    candidates = [HERE.parent / ".env", HERE.parent.parent / ".env"]
-    env_path = next((p for p in candidates if p.exists()), None)
-    if env_path is None:
-        return
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        os.environ.setdefault(key.strip(), val.strip())
+    # Delegates to secure_env's split loader (Credential_Custody_Plan PR A4,
+    # SEC-05-class sweep) instead of parsing shared-memory/.env by hand: config
+    # keys still reach os.environ via setdefault, exactly as before, but
+    # PG_PASSWORD/PG_CONN/NEO4J_PASSWORD (and anything else secret-classified)
+    # are held only in secure_env's in-process store — never os.environ — and
+    # must be read back through secure_env.get_secret(). Same candidate order
+    # (shared-memory/.env, then the pre-0.6 repo-root fallback), no library
+    # dependency (secure_env parses the file itself).
+    secure_env.load_split_env()
 
 
 def _pg_dsn() -> str:
     return (
         f"postgresql://{os.environ.get('PG_USER', 'postgres')}:"
-        f"{os.environ.get('PG_PASSWORD', '')}@"
+        f"{secure_env.get_secret('PG_PASSWORD', '')}@"
         f"{os.environ.get('PG_HOST', 'localhost')}:"
         f"{os.environ.get('PG_PORT', '5432')}/"
         f"{os.environ.get('PG_DATABASE', 'agent_data')}"

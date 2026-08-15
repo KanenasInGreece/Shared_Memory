@@ -69,6 +69,8 @@ def _isolated_secure_env_state(monkeypatch):
     loaded into secure_env)."""
     monkeypatch.setattr(secure_env, "_secrets", {})
     monkeypatch.setattr(secure_env, "_dynamic_secret_names", set())
+    monkeypatch.setattr(secure_env, "_advised_exec_env_names", set())
+    monkeypatch.setattr(secure_env, "_advised_ignored_file_pointer_names", set())
     yield
 
 

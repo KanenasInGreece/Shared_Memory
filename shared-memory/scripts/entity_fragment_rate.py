@@ -7,7 +7,7 @@ of guessed. Also reports ALIASES edges where either endpoint would be
 rejected — the "bad alias rate" fact 889 is actually about.
 
 Usage (on the gateway host):
-    uv run --with neo4j --with python-dotenv python shared-memory/scripts/entity_fragment_rate.py [max_words]
+    uv run --with neo4j python shared-memory/scripts/entity_fragment_rate.py [max_words]
 """
 import os
 import sys
@@ -17,20 +17,14 @@ from neo4j import GraphDatabase
 
 sys.path.insert(0, os.path.dirname(__file__))
 from ontology import sanitize_entity_name, ONT  # noqa: E402
+import secure_env  # noqa: E402
 
 
 def _load_env() -> None:
-    here = Path(__file__).resolve()
-    candidates = [here.parent.parent / ".env", here.parent.parent.parent / ".env"]
-    env_path = next((p for p in candidates if p.exists()), None)
-    if env_path is None:
-        return
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        os.environ.setdefault(key.strip(), val.strip())
+    """Delegates to secure_env's split loader (Credential_Custody_Plan PR A4,
+    SEC-05-class sweep) — NEO4J_PASSWORD lands in secure_env's in-process
+    store, never os.environ; read it back via secure_env.get_secret()."""
+    secure_env.load_split_env()
 
 
 def word_count(name: str) -> int:
@@ -42,7 +36,7 @@ def main() -> int:
         os.environ.get("MAX_ENTITY_NAME_WORDS", "4"))
 
     _load_env()
-    password = os.environ.get("NEO4J_PASSWORD", "")
+    password = secure_env.get_secret("NEO4J_PASSWORD", "")
     if not password:
         print("ERROR: NEO4J_PASSWORD not set (shared-memory/.env).", file=sys.stderr)
         return 2

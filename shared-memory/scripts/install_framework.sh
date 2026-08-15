@@ -52,21 +52,37 @@ _ncpu="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null \
          || sysctl -n hw.ncpu 2>/dev/null || echo 8)"
 LLAMA_CPU_THREADS="$(( _ncpu / 2 + 1 ))"
 [ "$LLAMA_CPU_THREADS" -lt 1 ] && LLAMA_CPU_THREADS=1
-export NEO4J_HOST_DIR PG_DATA_DIR LLM_MODELS_DIR NEO4J_PASSWORD PG_PASSWORD
-export LLAMA_CPU_THREADS
+# S-07: NEO4J_HOST_DIR/PG_DATA_DIR/LLM_MODELS_DIR/LLAMA_CPU_THREADS are plain
+# config — safe to export at the top level, and install_service.sh /
+# install_llm_backends.sh (spawned below, neither of which needs a DB
+# password) inheriting them costs nothing. NEO4J_PASSWORD/PG_PASSWORD are
+# exported ONLY inside this subshell, scoped to the one awk invocation that
+# needs them via ENVIRON — they never reach the outer script's environment,
+# so a later `bash "$FRAMEWORK_DIR/ops/install_service.sh"` or
+# `install_llm_backends.sh` cannot inherit a DB password neither one needs.
+export NEO4J_HOST_DIR PG_DATA_DIR LLM_MODELS_DIR LLAMA_CPU_THREADS
 
-# Render: copy the template, replacing only the value lines (ENVIRON avoids any
-# escaping pitfalls with slashes/special chars in paths or passwords).
-awk '
-  function put(k) { print k "=" ENVIRON[k]; }
-  /^NEO4J_HOST_DIR=/ { put("NEO4J_HOST_DIR"); next }
-  /^PG_DATA_DIR=/    { put("PG_DATA_DIR");    next }
-  /^LLM_MODELS_DIR=/ { put("LLM_MODELS_DIR"); next }
-  /^NEO4J_PASSWORD=/ { put("NEO4J_PASSWORD"); next }
-  /^PG_PASSWORD=/    { put("PG_PASSWORD");    next }
-  /^LLAMA_CPU_THREADS=/ { put("LLAMA_CPU_THREADS"); next }
-  { print }
-' "$EXAMPLE" > "$ENV_FILE"
+# S-07: umask 077 so $ENV_FILE is created 600 from the FIRST byte — never
+# create-then-chmod, which leaves a window at the process umask (often 0644,
+# world-readable) between the file's creation and the chmod below. The
+# trailing chmod stays as a belt-and-suspenders no-op for an inherited umask
+# that already happened to be tighter.
+(
+  export NEO4J_PASSWORD PG_PASSWORD
+  umask 077
+  # Render: copy the template, replacing only the value lines (ENVIRON avoids
+  # any escaping pitfalls with slashes/special chars in paths or passwords).
+  awk '
+    function put(k) { print k "=" ENVIRON[k]; }
+    /^NEO4J_HOST_DIR=/ { put("NEO4J_HOST_DIR"); next }
+    /^PG_DATA_DIR=/    { put("PG_DATA_DIR");    next }
+    /^LLM_MODELS_DIR=/ { put("LLM_MODELS_DIR"); next }
+    /^NEO4J_PASSWORD=/ { put("NEO4J_PASSWORD"); next }
+    /^PG_PASSWORD=/    { put("PG_PASSWORD");    next }
+    /^LLAMA_CPU_THREADS=/ { put("LLAMA_CPU_THREADS"); next }
+    { print }
+  ' "$EXAMPLE" > "$ENV_FILE"
+)
 chmod 600 "$ENV_FILE"
 
 mkdir -p "$NEO4J_HOST_DIR"/{data,logs,import,plugins} "$PG_DATA_DIR"
