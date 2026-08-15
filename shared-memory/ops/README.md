@@ -104,12 +104,20 @@ that var through three tiers, **RECOMMENDED for a systemd deployment, highest
 precedence first:**
 
 ```bash
-# 1. systemd LoadCredential= (PREFERRED) — root-mediated delivery, file
-#    typically 0400 and owned by the service, never in argv/environ for any
-#    OTHER process. Uncomment + adapt the commented example already in
-#    hive-mind-gateway.service. No <VAR_NAME>_FILE line needed alongside it —
-#    secure_env reads $CREDENTIALS_DIRECTORY/<var_name, lowercased> directly.
-#    LoadCredential=deepseek_api_key:/etc/credstore/deepseek_api_key
+# 1. systemd LoadCredential= — never in argv/environ for any OTHER process,
+#    never inherited by another user unit, and survives a headless boot.
+#    ⚠ Corrected (fix round 1, R3): NOT root-mediated for a --user unit —
+#    the per-user service manager reads $XDG_CONFIG_HOME/credstore/ etc.,
+#    owned by YOUR OWN account (verified: `systemd-path
+#    user-credential-store`). See server-setup.md, "Credential delivery",
+#    for exactly what this tier does and does not isolate. Uncomment + adapt
+#    the commented BARE-ID example already in hive-mind-gateway.service (no
+#    ":PATH" — an absolute path into /etc/credstore is the SYSTEM store and
+#    fails a --user unit's start outright). No <VAR_NAME>_FILE line needed
+#    alongside it — secure_env reads $CREDENTIALS_DIRECTORY/<var_name,
+#    lowercased> directly. Put the file at
+#    ~/.config/credstore/deepseek_api_key, mode 600:
+#    LoadCredential=deepseek_api_key
 
 # 2. <VAR_NAME>_FILE (Docker official-images convention) — point the var at
 #    a file instead of a literal value. Works with any secret store that can
