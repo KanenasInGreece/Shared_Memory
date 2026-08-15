@@ -128,28 +128,63 @@ dcurl() { curl -s --max-time 15 "$@"; }
 # token grounding prompt, is most of the time).
 qcurl() { curl -s --max-time "$(( BACKUP_QUIESCE_MAX_SECONDS + 30 ))" "$@"; }
 
-# S-08: BACKUP_ADMIN_TOKEN off argv. A literal `-H "Authorization: Bearer
-# $TOKEN"` is visible in `ps aux` for the lifetime of the curl child process
-# — anyone on the box can read it. `curl -H @file` (supported since curl
-# 7.55) reads the header line from a file instead; the file lives 600 in a
-# private mktemp -d directory and is removed on any exit via the trap
-# do_backup() already installs (extended below to also clean this up).
-_AUTH_HEADER_DIR=""
+# C1 + QF-1 (fix round 1): BACKUP_ADMIN_TOKEN and BOTH database passwords off
+# argv AND off the docker CLIENT's own argv on the GATEWAY HOST.
+#
+# QF-1 (why this is no longer a function called from inside $(...)): the
+# original cut called `auth_header_file()` only as `-H "@$(auth_header_file)"`
+# — command substitution runs in a SUBSHELL, so the function's variable
+# assignments (_AUTH_HEADER_DIR/_AUTH_HEADER_FILE) never reached the PARENT
+# shell. Every call therefore minted a NEW tmpdir holding the token, the
+# parent's own copies of those variables stayed empty forever, and the exit
+# trap — which only ever saw the parent's empty variables — cleaned up
+# NOTHING. Token files leaked into /tmp indefinitely after every run. Fixed
+# by creating everything EAGERLY, as a plain statement (never inside
+# `$(...)`), so the assignment lands in the shell that will later run the
+# cleanup trap.
+#
+# C1 (why docker exec -e is gone): `-e KEY=VALUE` is an argument to the
+# `docker` CLIENT process running on the GATEWAY HOST — `ps aux` (or
+# /proc/<pid>/cmdline, world-readable on a host with no hidepid) shows it to
+# every same-uid process, and on this host to every user, for the whole
+# `docker exec` lifetime (minutes, for pg_dump). `docker exec --env-file
+# <file>` reads KEY=VALUE lines from a file instead — confirmed present on
+# this host's docker (`docker exec --help` → "--env-file list  Read in a
+# file of environment variables"). It carries NEO4J_PASSWORD/PGPASSWORD
+# straight into the container's env with no host-side argv exposure at all.
+#
+# ONE private 0700 mktemp -d directory holds all three files (the curl auth
+# header, and one --env-file each for Postgres/Neo4j) — one dir, one trap
+# cleanup, created once per run. init_secrets_dir() is idempotent (a second
+# call is a no-op) and MUST be called as a bare statement, never inside
+# `$(...)`, or QF-1 recurs.
+_SECRETS_DIR=""
 _AUTH_HEADER_FILE=""
-auth_header_file() {
-  if [[ -z "$_AUTH_HEADER_FILE" ]]; then
-    _AUTH_HEADER_DIR="$(mktemp -d)"
-    chmod 700 "$_AUTH_HEADER_DIR"
-    _AUTH_HEADER_FILE="$_AUTH_HEADER_DIR/auth-header"
-    printf 'Authorization: Bearer %s\n' "$BACKUP_ADMIN_TOKEN" > "$_AUTH_HEADER_FILE"
-    chmod 600 "$_AUTH_HEADER_FILE"
-  fi
-  printf '%s' "$_AUTH_HEADER_FILE"
+_NEO4J_ENV_FILE=""
+_PG_ENV_FILE=""
+init_secrets_dir() {
+  [[ -n "$_SECRETS_DIR" ]] && return 0
+  _SECRETS_DIR="$(mktemp -d)"
+  chmod 700 "$_SECRETS_DIR"
+  _AUTH_HEADER_FILE="$_SECRETS_DIR/auth-header"
+  _NEO4J_ENV_FILE="$_SECRETS_DIR/neo4j.env"
+  _PG_ENV_FILE="$_SECRETS_DIR/pg.env"
+  printf 'Authorization: Bearer %s\n' "$BACKUP_ADMIN_TOKEN" > "$_AUTH_HEADER_FILE"
+  printf 'NEO4J_PASSWORD=%s\n' "$NEO4J_PASSWORD" > "$_NEO4J_ENV_FILE"
+  printf 'PGPASSWORD=%s\n' "$PG_PASSWORD" > "$_PG_ENV_FILE"
+  chmod 600 "$_AUTH_HEADER_FILE" "$_NEO4J_ENV_FILE" "$_PG_ENV_FILE"
 }
-cleanup_auth_header_file() {
-  [[ -n "$_AUTH_HEADER_DIR" ]] && rm -rf "$_AUTH_HEADER_DIR"
-  _AUTH_HEADER_DIR=""; _AUTH_HEADER_FILE=""
+cleanup_secrets_dir() {
+  [[ -n "$_SECRETS_DIR" ]] && rm -rf "$_SECRETS_DIR"
+  _SECRETS_DIR=""; _AUTH_HEADER_FILE=""; _NEO4J_ENV_FILE=""; _PG_ENV_FILE=""
 }
+# One trap, active for the whole script (not just do_backup): resume() is a
+# no-op unless quiesce() actually succeeded (QUIESCED guard), and
+# cleanup_secrets_dir is a no-op unless init_secrets_dir ever ran — so this
+# is safe to install unconditionally, before mode dispatch, and covers
+# --dry-run too (which also touches docker).
+on_exit() { resume; cleanup_secrets_dir; }
+trap on_exit EXIT INT TERM
 
 # ── Quiesce handshake ────────────────────────────────────────────────────────
 QUIESCED=0
@@ -157,7 +192,7 @@ quiesce() {
   [[ -z "$BACKUP_ADMIN_TOKEN" ]] && return 1
   local resp code body
   resp="$(qcurl -w $'\n%{http_code}' -X POST "$GATEWAY_URL/admin/backup" \
-    -H "@$(auth_header_file)" -H 'Content-Type: application/json' \
+    -H "@$_AUTH_HEADER_FILE" -H 'Content-Type: application/json' \
     -d "{\"state\":\"quiesce\",\"max_seconds\":$BACKUP_QUIESCE_MAX_SECONDS}")" || return 1
   code="$(tail -n1 <<<"$resp")"; body="$(sed '$d' <<<"$resp")"
   case "$code" in
@@ -170,7 +205,7 @@ quiesce() {
 resume() {
   [[ "$QUIESCED" -eq 1 ]] || return 0
   dcurl -X POST "$GATEWAY_URL/admin/backup" \
-    -H "@$(auth_header_file)" -H 'Content-Type: application/json' \
+    -H "@$_AUTH_HEADER_FILE" -H 'Content-Type: application/json' \
     -d '{"state":"resume"}' >/dev/null 2>&1
   QUIESCED=0
 }
@@ -181,7 +216,7 @@ drain_outbox() {
   local waited=0 pend prog
   while (( waited < BACKUP_DRAIN_MAX_SECONDS )); do
     local tel; tel="$(dcurl "$GATEWAY_URL/memory/telemetry" \
-      -H "@$(auth_header_file)")" || break
+      -H "@$_AUTH_HEADER_FILE")" || break
     pend="$(json_get telemetry.postgres.outbox.pending     <<<"$tel")"; pend="${pend:-0}"
     prog="$(json_get telemetry.postgres.outbox.in_progress <<<"$tel")"; prog="${prog:-0}"
     [[ "$pend" == "0" && "$prog" == "0" ]] && { grn "  ✓ outbox drained"; return 0; }
@@ -191,21 +226,25 @@ drain_outbox() {
 }
 
 # ── Dump primitives ──────────────────────────────────────────────────────────
-# S-08: no `-p "$NEO4J_PASSWORD"` on any cypher-shell invocation below —
-# verified live (docker exec neo4j-memory cypher-shell --help): "-p PASSWORD
-# ... Can also be specified using the environment variable NEO4J_PASSWORD."
-# The password already reaches the container via `-e NEO4J_PASSWORD=`
-# (docker exec's own -e, not argv); cypher-shell picks it up from ITS
-# process environment once `-p` is absent, so the value never appears in
-# `ps aux` inside the container. `-u`/NEO4J_USER stays on argv — a
-# username is not a secret.
+# C1 (fix round 1): NEITHER password is on the docker CLIENT's own argv.
+# `docker exec -e KEY=VALUE` (the PR's original "fix") is an argument to the
+# `docker` process running on the GATEWAY HOST — that IS argv, visible to
+# `ps aux` for the whole `docker exec` lifetime, regardless of what
+# cypher-shell/pg_dump themselves do with it once inside the container. Every
+# site below now uses `--env-file "$_NEO4J_ENV_FILE"` /
+# `--env-file "$_PG_ENV_FILE"` instead — a 600-mode file under the private
+# secrets dir `init_secrets_dir()` creates, read by the docker CLIENT itself,
+# never placed on its own command line. `-u`/NEO4J_USER stays on argv — a
+# username is not a secret. (Still true, unaffected by this fix: cypher-shell
+# itself takes no `-p`, reading NEO4J_PASSWORD from the CONTAINER's env,
+# which --env-file populates exactly like -e did.)
 neo4j_count() {  # $1 = cypher count query → integer (or empty)
-  $DOCKER exec -e NEO4J_PASSWORD="$NEO4J_PASSWORD" "$NEO4J_CONTAINER" \
+  $DOCKER exec --env-file "$_NEO4J_ENV_FILE" "$NEO4J_CONTAINER" \
     cypher-shell -u "$NEO4J_USER" --format plain "$1" 2>/dev/null | tail -n1
 }
 
 dump_postgres() {  # $1 = dest path
-  $DOCKER exec -e PGPASSWORD="$PG_PASSWORD" "$PG_CONTAINER" \
+  $DOCKER exec --env-file "$_PG_ENV_FILE" "$PG_CONTAINER" \
     pg_dump -U "$PG_USER" -Fc "$PG_DB" > "$1.tmp" 2>/dev/null \
     && mv "$1.tmp" "$1" || { rm -f "$1.tmp"; return 1; }
 }
@@ -214,7 +253,7 @@ dump_postgres() {  # $1 = dest path
 # from the right place regardless of the deployment's server.directories.import.
 resolve_import_dir() {
   local d
-  d="$($DOCKER exec -e NEO4J_PASSWORD="$NEO4J_PASSWORD" "$NEO4J_CONTAINER" \
+  d="$($DOCKER exec --env-file "$_NEO4J_ENV_FILE" "$NEO4J_CONTAINER" \
     cypher-shell -u "$NEO4J_USER" --format plain \
     "SHOW SETTINGS YIELD name,value WHERE name='server.directories.import' RETURN value" \
     2>/dev/null | tail -n +2 | tr -d '"' | tail -1)"
@@ -227,7 +266,7 @@ dump_neo4j() {  # $1 = dest path (.cypher.gz)
   local fname="${PREFIX}-export.cypher" idir
   idir="$(resolve_import_dir)"
   # APOC writes into the container's import dir; stream it out and gzip, then clean up.
-  $DOCKER exec -e NEO4J_PASSWORD="$NEO4J_PASSWORD" "$NEO4J_CONTAINER" \
+  $DOCKER exec --env-file "$_NEO4J_ENV_FILE" "$NEO4J_CONTAINER" \
     cypher-shell -u "$NEO4J_USER" --format plain \
     "CALL apoc.export.cypher.all('$fname', {format:'cypher-shell'}) YIELD file RETURN file" \
     >/dev/null 2>&1 || return 1
@@ -239,9 +278,10 @@ dump_neo4j() {  # $1 = dest path (.cypher.gz)
 
 # ── Modes ────────────────────────────────────────────────────────────────────
 do_dry_run() {
+  init_secrets_dir   # bare statement, not $(...) — see the QF-1 comment above
   echo "Shared Memory — backup DRY RUN (no writes, no quiesce)"; echo
   local pgsize nodes rels
-  pgsize="$($DOCKER exec -e PGPASSWORD="$PG_PASSWORD" "$PG_CONTAINER" \
+  pgsize="$($DOCKER exec --env-file "$_PG_ENV_FILE" "$PG_CONTAINER" \
     psql -U "$PG_USER" -d "$PG_DB" -tAc "SELECT pg_size_pretty(pg_database_size('$PG_DB'))" 2>/dev/null)"
   nodes="$(neo4j_count 'MATCH (n) RETURN count(n)')"
   rels="$(neo4j_count 'MATCH ()-[r]->() RETURN count(r)')"
@@ -292,15 +332,15 @@ do_verify() {
 }
 
 do_backup() {
+  init_secrets_dir   # bare statement, not $(...) — see the QF-1 comment above;
+                     # the script-wide `trap on_exit` already installed covers
+                     # cleanup, nothing further to install here.
   mkdir -p "$BACKUP_DIR"
   local ts name base
   ts="$(date +%Y%m%d-%H%M%S)"; name="${PREFIX}-${ts}"; base="$BACKUP_DIR/$name"
   echo "Shared Memory — backup → $base.*"
 
-  # Quiesce (best-effort unless required). Trap guarantees resume on any exit
-  # AND cleans up the private auth-header tmpdir (S-08) — resume still needs
-  # the header file, so it runs first, cleanup second.
-  trap 'resume; cleanup_auth_header_file' EXIT INT TERM
+  # Quiesce (best-effort unless required).
   if quiesce; then drain_outbox
   else
     if [[ "$BACKUP_QUIESCE_REQUIRED" == "1" ]]; then die "quiesce required but unavailable (set BACKUP_ADMIN_TOKEN / check gateway)"; fi
