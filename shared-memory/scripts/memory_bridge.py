@@ -96,11 +96,29 @@ _AGENT_TOKEN_FROM_FILE = ""
 # this predicate catches is simply skipped -- the client has no use for any
 # of these values, so unlike the server there is no config-name allowlist
 # carve-out and no dynamic token_env discovery to widen it.
+#
+# R6 (fix round 1, Opus review, probe-confirmed): this "mirror" had drifted
+# from what it mirrors. secure_env.KNOWN_SECRET_NAMES gained PG_CONN in
+# secure_env's OWN review round (a full DSN embeds the Postgres password
+# verbatim -- postgresql://postgres:<pw>@host/db) and _SECRET_SUFFIXES was
+# widened past _PASSWORD/_TOKEN/_API_KEY to also catch _SECRET/_KEY/
+# _CREDENTIAL(S) -- neither change was ever brought over here. Probe-
+# confirmed live: PG_CONN, a DEEPSEEK_SECRET-suffixed name, and an
+# OPENROUTER_CREDENTIAL-suffixed name all landed in THIS client's own
+# os.environ from a scratch shared-memory/.env with the environment
+# pre-cleared -- exactly the class S-18/A2 finding 7 closed, reopened by
+# drift. Both sets below are now IN SYNC with secure_env.py's own
+# KNOWN_SECRET_NAMES / _SECRET_SUFFIXES; keep them that way (a contract test
+# -- test_client_secret_mirror_parity.py -- pins the two lists against each
+# other so the next drift fails loudly instead of needing a probe to find).
 _CLIENT_KNOWN_SECRET_NAMES = {
     "PG_PASSWORD", "NEO4J_PASSWORD", "TAVILY_API_KEY", "AGENT_TOKENS",
-    "BACKUP_ADMIN_TOKEN",
+    "BACKUP_ADMIN_TOKEN", "PG_CONN",
 }
-_CLIENT_SECRET_SUFFIXES = ("_PASSWORD", "_TOKEN", "_API_KEY")
+_CLIENT_SECRET_SUFFIXES = (
+    "_PASSWORD", "_TOKEN", "_API_KEY", "_SECRET", "_KEY",
+    "_CREDENTIAL", "_CREDENTIALS",
+)
 
 
 def _is_client_secret_key(name: str) -> bool:
