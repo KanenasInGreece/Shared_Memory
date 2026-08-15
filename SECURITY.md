@@ -64,6 +64,112 @@ A separate, on-by-default log (`~/.shared-memory/logs/credential-audit.jsonl`, `
 
 **Qualification (F-8, matches the raw-facts-return-verbatim / bearer-tokens-until-PoP posture items below): this is a detective control against *external* credential misuse, not a tamper-evident one against a local same-uid actor.** The log is a plain, append-only JSONL file with 0600 permissions — no hash chain, no append-only filesystem attribute, no off-host shipping. A process running as the same OS user as the gateway (already inside this framework's trust boundary — see the *localhost-trusted-deployment* stance elsewhere in this document) can rewrite or truncate it at will. Treat it as evidence of what a remote/unprivileged caller attempted, not as a record that survives a compromise of the gateway's own account.
 
+### Credential custody — secrets out of the environment, file-based delivery (v0.9.2 → v0.9.5)
+
+The gateway is the framework's credential custodian twice over: it verifies client bearer
+tokens at its own door, and it holds provider API keys that it attaches to upstream LLM
+calls on the daemons' behalf. Four releases in August 2026 rebuilt how those secrets are
+stored, delivered, and observed, working from a threat model stated plainly: the TCP
+surface must be treated as the internet, and on a single-user machine **other processes
+running as the same OS user cannot be excluded by any storage scheme** — so the goal of
+this work is exfiltration resistance, least exposure, and detection, and this document
+says so rather than implying a boundary that does not exist.
+
+**v0.9.2 — secrets never touch the process environment.** Historically every secret in
+`shared-memory/.env` was loaded into `os.environ`, which meant it appeared in
+`/proc/<pid>/environ` and was inherited by every child process any daemon ever spawned. A
+split loader (`secure_env.py`) now sends config keys to the environment and secret keys —
+classified by an explicit name list *plus* a suffix pattern (`*_PASSWORD`, `*_TOKEN`,
+`*_API_KEY`, …), so a newly added secret is caught even if nobody extends the list — to an
+in-process store read through one accessor. Daemons are spawned with a filtered
+environment. This is a standing invariant with a mutation-checked test: *no framework
+process ever exports a secret into `os.environ` or a child environment.*
+
+**v0.9.3 — the token registry stops holding tokens.** `AGENT_TOKENS` now stores SHA-256
+digests only; verification is timing-safe; a plaintext entry refuses gateway startup
+outright (convert with `generate_tokens.py --convert-digests`). Unsalted SHA-256 is the
+NIST SP 800-63B-prescribed treatment for look-up secrets at or above 112 bits of entropy —
+these tokens carry 192. Minting is write-through: token values land directly in each local
+agent's own 600-mode skill `.env` and are never printed to a transcript; a remote agent's
+value requires an explicit human-run `--reveal` on the same invocation. The daemons' own
+tokens became per-boot ephemeral, delivered over an inherited pipe file descriptor —
+present in no file and no environment at all.
+
+**v0.9.4 — the audit trail** (previous section) made credential *use* observable: every
+provider-key rejection, gateway-side fault on a credentialed call, failed client token,
+and daemon-token mint leaves a log line that never contains token material.
+
+**v0.9.5 — file-based delivery and the operational surface.** Every secret-classified key
+can now be delivered without ever writing its value into `shared-memory/.env`:
+
+- **systemd `LoadCredential=`** — the gateway reads `$CREDENTIALS_DIRECTORY/<key,
+  lowercased>`; the shipped unit carries a working commented example for user units.
+- **`<KEY>_FILE=/path/to/secret`** — the Docker official-images convention, compatible
+  with mounted container secrets, `pass`-style stores, and vault-agent templates.
+
+Setting a `_FILE` pointer or placing a file in the credentials directory is itself what
+makes a key a candidate — there is no fixed list to extend. Both paths feed the in-process
+store directly, extending the v0.9.2 invariant. The file reads are deliberately paranoid:
+the file descriptor is opened non-blocking and `fstat`-checked so a FIFO or device node is
+refused instead of hanging startup, size is capped before a byte is read
+(`SECURE_ENV_SECRET_FILE_MAX_BYTES`), and a candidate key name must parse as an ordinary
+identifier before it becomes part of a filesystem path — closing a traversal class
+reachable through attacker-influenced backend configuration. Symlinks are followed on
+purpose: Kubernetes delivers mounted secrets through a `..data` symlink chain, and
+refusing them would break the convention this path exists to serve. A startup advisory
+(key name only, never the value) fires when a known-secret key is found already sitting in
+the process's inherited environment — the `EnvironmentFile=` / exported-shell-var pattern,
+which this document now names as an anti-pattern for secrets since it re-opens the exact
+`/proc/<pid>/environ` exposure v0.9.2 closed.
+
+The same release cleaned the operational surface: `ops/backup.sh` and `restore.sh` no
+longer place any credential on host-visible process argv (`docker exec --env-file` and
+`curl -H @file`, staged in a single 0700 temp directory that is created once per run and
+removed by the exit trap); the installers create and rewrite secret-bearing files at mode
+600 from the first byte, with no window at the default umask, and fail closed if they
+cannot; thirteen standalone maintenance scripts that each hand-rolled an `.env` loader —
+dumping every key, tokens included, into their environment — now delegate to the split
+loader; `systemctl --user import-environment` for provider keys is deprecated in the docs
+(readable by any same-uid process via `show-environment`, inherited by every later user
+unit); and the shipped units gained `UMask=0077` and `NoNewPrivileges=yes` (measured
+effect: `systemd-analyze security` exposure 9.4 → 9.2 — an honest small step; the
+remaining score is capability-bounding and syscall-filter work that needs case-by-case
+evaluation against a networked Python service).
+
+**What each tier honestly buys.** The default plain-`.env` install (600-mode file) is
+*hygiene plus detection*: the key exists in exactly two places — the file and the
+gateway's process memory — and every use is audit-logged, but any same-uid process can
+still read the file. The file-based tiers remove the key from the `.env` entirely; under a
+**system** unit with a root-owned credential store, same-uid processes cannot read the key
+at rest at all. Under a `systemd --user` unit the credential remains readable by the
+owning account — `man systemd.exec` is explicit that credentials are accessible to the
+user associated with the unit — so for a user-unit deployment these tiers reduce exposure
+and accident surface but are **not** isolation from the account itself. Deployments using
+paid provider keys should prefer the hardened shape.
+
+**Verified live, not only in the suite.** Each of these releases was verified on the
+running system after deploy: `/proc/<pid>/environ` scans of every framework process (zero
+secret-classified keys); a real backup run under continuous `ps` argv sampling (zero
+occurrences of any secret value on host argv for the entire run, exactly one secrets
+temp directory created and none surviving exit); the documented `LoadCredential=` form
+proven to start — and the wrong form proven to fail — in disposable transient units; and
+hostile-input probes (FIFOs, oversized files, traversal-shaped names) against the deployed
+loader.
+
+**Named open items, tracked deliberately rather than implied closed:**
+
+- The ops shell scripts (`backup.sh`, `restore.sh`) still source the `.env` into their own
+  shell environment, which their child processes inherit — the argv fix does not close
+  this, and the environment-invariant does not yet hold for the shell surface.
+- The secret-file size cap is read at import time, so it cannot itself be set from the
+  `.env` file.
+- Chokepoint governance is the planned next step: a method-and-path allowlist on the
+  credentialed proxy branch (today the catch-all route forwards any path with the provider
+  key attached), a startup refusal when auth is disabled while provider keys are
+  configured, and a slimmer anonymous `/health`.
+- Transport security (TLS, proof-of-possession) remains a separate, later workstream —
+  see the section below.
+
 ### Network transport — tokens require an encrypted channel
 
 Bearer tokens are sent in plaintext over HTTP. `PROXY_BIND=0.0.0.0` is only safe when the network between gateway and agents is encrypted end-to-end:
@@ -331,7 +437,7 @@ All new database access is parameterised (psycopg2 `%s` / asyncpg `$n`); the `_F
 
 ---
 
-## Security & Quality Reviews — v0.4.12 → v0.9.0 (2026-06 → 2026-08)
+## Security & Quality Reviews — v0.4.12 → v0.9.5 (2026-06 → 2026-08)
 
 From v0.4.12 onward, security work moved from standalone audits to a standing practice: reviews
 run at every `x.y.5` release and on demand, and since v0.8.73 they run as one role inside a
@@ -363,6 +469,26 @@ only by an operator decision, and shipped fixes are documented in the
   would have been invisible — both now served, verified live. Queued, tracked openly: **SEC-04**
   (neutralising protocol-shaped markers in REM prompt input, the same class the insight builder
   already neutralises).
+- **v0.9.2 → v0.9.5 (2026-08-14/15) — the credential-custody series.** The plan itself was
+  security-reviewed twice before any code (a plan review and an independent current-code
+  review, eighteen findings ruled on by the operator), and every release then passed a
+  dedicated pre-merge security review of the actual diff, with findings probe-confirmed
+  against running code rather than argued from reading. That process earned its keep each
+  time. At v0.9.2 it caught an inverted precedence in the new secrets accessor that made 36
+  tests fail on any checkout with a real `.env` — invisible in the clean build environment.
+  At v0.9.3 it caught a critical where minting tokens silently flipped an auth-disabled
+  install to auth-enabled, locking out every client. At v0.9.4 it confirmed the audit log
+  could be driven by an anonymous writer and the fix landed before release. At v0.9.5 review
+  found — and live probes confirmed — that the first cut of the argv fix had moved passwords
+  off a *container* process's argv while leaving them on the *host* docker client's argv,
+  and that the auth-header temp directory was created inside command substitutions, so its
+  cleanup trap removed nothing and token-bearing files outlived the script. Both were fixed
+  and re-probed before merge, and the post-deploy verification exercised the whole surface
+  end-to-end on the live system, including a real backup under continuous argv sampling.
+  The recurring lesson written into this series: the *mechanism* being right is not enough —
+  every claim a comment or document makes about the mechanism gets checked against what the
+  platform actually does, because a confident wrong statement is what stops the next reader
+  from looking.
 
 The standing items from these reviews that are posture, not defects — raw facts return verbatim
 from search, ingestion-boundary sanitisation is planned, bearer tokens until proof-of-possession
