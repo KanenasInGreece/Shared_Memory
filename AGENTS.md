@@ -63,10 +63,13 @@ Verify both files exist before Phase 4. If the user substitutes a different embe
 
 ### Phase 1 — Write the framework `.env`
 
-`bash shared-memory/scripts/install_framework.sh` does this interactively for a human. As an agent, write the file directly instead: copy `shared-memory/.env.example` → `shared-memory/.env`, replace the values for `NEO4J_HOST_DIR`, `PG_DATA_DIR`, `LLM_MODELS_DIR`, `NEO4J_PASSWORD`, `PG_PASSWORD` (leave every other line as shipped — the commented defaults are correct), then:
+`bash shared-memory/scripts/install_framework.sh` does this interactively for a human. As an agent, write the file directly instead — **under `umask 077` before the copy**, the same fix item 3/S-07 applied to the script itself, so the file holding two DB passwords is never even briefly world/group-readable (create-then-chmod leaves exactly that window): copy `shared-memory/.env.example` → `shared-memory/.env`, replace the values for `NEO4J_HOST_DIR`, `PG_DATA_DIR`, `LLM_MODELS_DIR`, `NEO4J_PASSWORD`, `PG_PASSWORD` (leave every other line as shipped — the commented defaults are correct), then:
 
 ```bash
-chmod 600 shared-memory/.env
+umask 077
+cp shared-memory/.env.example shared-memory/.env
+# … edit shared-memory/.env in place: NEO4J_HOST_DIR, PG_DATA_DIR, LLM_MODELS_DIR, NEO4J_PASSWORD, PG_PASSWORD …
+chmod 600 shared-memory/.env          # belt-and-suspenders — umask above already made it 600
 git check-ignore shared-memory/.env          # MUST print the path
 mkdir -p "$NEO4J_HOST_DIR"/{data,logs,import,plugins} "$PG_DATA_DIR"
 ```

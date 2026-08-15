@@ -9,14 +9,25 @@ to `secure_env.load_split_env()` / `secure_env.get_secret()` instead, so a
 secret-classified key never lands in os.environ regardless of which
 standalone script parses it.
 
+`backfill_project_of.py` (fix round 1, item 9(a); Opus O4) was a thirteenth,
+different-shaped case: it had NO `.env`-parsing loader at all — it read
+NEO4J_PASSWORD/PG_PASSWORD via a bare `os.environ.get(...)`, so it never
+itself leaked a secret into os.environ, but it also got none of the
+file-based delivery its twelve siblings gained in this same PR, and it kept
+teaching the deprecated "export a secret in your shell" pattern. It now
+gets its own `_load_env()` delegating to `secure_env.load_split_env()`
+too, joining the structural check below.
+
 Two layers of coverage:
 
-  1. STRUCTURAL (all twelve) — the fix is "delegate to secure_env", so the
+  1. STRUCTURAL (all thirteen) — the fix is "delegate to secure_env", so the
      regression this guards against is someone re-inlining a hand-rolled
-     `os.environ.setdefault(key, val)` loop over parsed .env lines. A static
-     source check catches that cheaply across all twelve without importing
-     each one (several have real import-time side effects / hard
-     dependencies that make importing all twelve in one process fragile).
+     `os.environ.setdefault(key, val)` loop over parsed .env lines, OR (for
+     backfill_project_of.py specifically) a direct os.environ.get() of a
+     secret name with no loader at all. A static source check catches this
+     cheaply across all thirteen without importing each one (several have
+     real import-time side effects / hard dependencies that make importing
+     all of them in one process fragile).
   2. BEHAVIOURAL (sync_project_registry.py, the file item 7 names
      explicitly, as one representative) — actually imports the module with a
      fake shared-memory/.env and asserts PG_PASSWORD never reaches
@@ -44,6 +55,7 @@ SCRIPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "shared-memory", "sc
 
 SWEPT_SCRIPTS = [
     "backfill_domain_of.py",
+    "backfill_project_of.py",
     "backfill_promote_grounded.py",
     "cleanup_entity_noise.py",
     "cleanup_foreign_schema.py",

@@ -73,13 +73,30 @@ def gateway_handles_project_of(parsed) -> bool:
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ontology import ONT  # noqa: E402
 from project_axis import PROJECT_SQL  # noqa: E402
+import secure_env  # noqa: E402
+
+
+def _load_env() -> None:
+    # Item 9(a), fix round 1: this was the one sibling of the twelve-script
+    # SEC-05 sweep left teaching the deprecated pattern (Opus O4) — it read
+    # NEO4J_PASSWORD/PG_PASSWORD directly from a bare os.environ with NO
+    # .env-parsing loader of its own at all, so its only working invocation
+    # was an already-exported-secret shell (never the file-based delivery
+    # its eleven siblings gained in this same PR). Delegates to secure_env's
+    # split loader — same shared-memory/.env-first, repo-root-fallback
+    # candidate order as every sibling, and now gets $CREDENTIALS_DIRECTORY/
+    # <KEY>_FILE for free too.
+    secure_env.load_split_env()
+
+
+_load_env()
 
 NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
-NEO4J_PASS = os.environ.get("NEO4J_PASSWORD", "")
+NEO4J_PASS = secure_env.get_secret("NEO4J_PASSWORD", "")
 PG_CONN = (
     f"postgresql://{os.environ.get('PG_USER', 'postgres')}:"
-    f"{os.environ.get('PG_PASSWORD', '')}@{os.environ.get('PG_HOST', 'localhost')}:"
+    f"{secure_env.get_secret('PG_PASSWORD', '')}@{os.environ.get('PG_HOST', 'localhost')}:"
     f"{os.environ.get('PG_PORT', '5432')}/{os.environ.get('PG_DATABASE', 'agent_data')}"
 )
 

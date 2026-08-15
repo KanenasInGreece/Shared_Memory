@@ -7,7 +7,7 @@ of guessed. Also reports ALIASES edges where either endpoint would be
 rejected — the "bad alias rate" fact 889 is actually about.
 
 Usage (on the gateway host):
-    uv run --with neo4j --with python-dotenv python shared-memory/scripts/entity_fragment_rate.py [max_words]
+    uv run --with neo4j python shared-memory/scripts/entity_fragment_rate.py [max_words]
 """
 import os
 import sys
