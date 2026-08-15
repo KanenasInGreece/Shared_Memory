@@ -124,18 +124,37 @@ json_array=$(printf '%s\n' "${entries[@]}" | jq -s -c '.')
 # awk (not sed) for the same reason install_framework.sh uses it: the JSON value
 # contains slashes and quotes that would need fragile escaping as a sed replacement.
 #
-# S-06: a fresh $ENV_FILE.tmp is created with the process umask (often 0644),
-# which would widen $ENV_FILE's mode for the window between the awk write and
-# the mv below. chmod --reference (the same pattern bootstrap_tokens.sh's
-# --force rewrite already uses) copies $ENV_FILE's own mode onto the temp
-# file BEFORE the mv, so there is no window where the secrets-bearing file
-# sits at default permissions.
+# R5 (fix round 1, Opus review, probe-confirmed): the PREVIOUS comment here
+# claimed "no window where the secrets-bearing file sits at default
+# permissions" — false. `chmod --reference` runs only AFTER the awk write
+# completes, so $ENV_FILE.tmp held every secret in shared-memory/.env
+# (PG_PASSWORD, NEO4J_PASSWORD, AGENT_TOKENS, BACKUP_ADMIN_TOKEN, …) at the
+# process umask (0644 under a common 022 umask) for the ENTIRE write — probe
+# reproduced this live: "MODE OF TMP RIGHT AFTER awk: 644". `chmod
+# --reference ... || true` also FAILED OPEN: a non-GNU chmod (busybox,
+# non-coreutils) errors silently and the 0644 file gets `mv`'d into place
+# with the script still printing its success banner.
+#
+# Fixed the same way S-07 fixed install_framework.sh one file over: `umask
+# 077` wraps the write in a subshell so $ENV_FILE.tmp is 600 from the byte it
+# is created, never 644 even for an instant. `chmod --reference` still runs
+# afterward for MODE FIDELITY (matching whatever $ENV_FILE's own mode
+# actually is, in case an operator widened it deliberately) — but a failed
+# chmod is now FATAL, aborting before the mv, rather than silently shipping
+# a wrongly-permissioned file.
 if grep -q '^LLM_BACKENDS_JSON=' "$ENV_FILE"; then
-    awk -v new="LLM_BACKENDS_JSON=$json_array" '
-        /^LLM_BACKENDS_JSON=/ { print new; next }
-        { print }
-    ' "$ENV_FILE" > "$ENV_FILE.tmp"
-    chmod --reference="$ENV_FILE" "$ENV_FILE.tmp" 2>/dev/null || true
+    (
+      umask 077
+      awk -v new="LLM_BACKENDS_JSON=$json_array" '
+          /^LLM_BACKENDS_JSON=/ { print new; next }
+          { print }
+      ' "$ENV_FILE" > "$ENV_FILE.tmp"
+    )
+    if ! chmod --reference="$ENV_FILE" "$ENV_FILE.tmp"; then
+        rm -f "$ENV_FILE.tmp"
+        red "✗ chmod --reference failed — aborting before the file was replaced (nothing written)"
+        exit 1
+    fi
     mv "$ENV_FILE.tmp" "$ENV_FILE"
 else
     {
