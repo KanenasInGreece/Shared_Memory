@@ -10,3 +10,11 @@ Type=oneshot
 # The script self-locks (flock) against overlap.
 WorkingDirectory=/path/to/your/shared-memory-GitHub
 ExecStart=/usr/bin/env bash shared-memory/ops/backup.sh
+# S-17 (Credential_Custody_Plan PR A4) — cheap, verified-compatible hardening,
+# same reasoning as hive-mind-gateway.service: this script creates dump files
+# (pgdump/cypher.gz — secrets-adjacent, not secrets themselves, but tightly
+# scoped by default is still the right posture) and never needs elevated
+# privileges. ProtectHome intentionally left out for the same reason as the
+# gateway unit — BACKUP_DIR defaults to ~/.shared-memory/backups, under $HOME.
+UMask=0077
+NoNewPrivileges=yes

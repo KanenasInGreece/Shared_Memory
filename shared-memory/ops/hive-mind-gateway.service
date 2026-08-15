@@ -16,5 +16,31 @@ TimeoutStopSec=30
 Restart=on-failure
 RestartSec=5
 
+# S-17 (Credential_Custody_Plan PR A4) — cheap, verified-compatible hardening.
+# UMask=0077: any file this process (or a spawned daemon) creates defaults to
+# 0600/0700 — belt-and-suspenders alongside the umask calls already in
+# install_framework.sh/backup.sh, covers anything that doesn't set its own.
+UMask=0077
+# NoNewPrivileges=yes: this process never needs setuid/setgid/capabilities —
+# refuses to gain any it does not already have.
+NoNewPrivileges=yes
+
+# ProtectHome (read-only or tmpfs) was evaluated and left OUT: WorkingDirectory
+# is a checkout under $HOME (deployer-chosen path, so it cannot be named as a
+# ReadWritePaths= exception here), and the audit/REM/telemetry logs default to
+# ~/.shared-memory/logs (MEMORY_LOG_PATH, .env.example) — also under $HOME.
+# ProtectHome=read-only would make the log directory unwritable; ProtectHome=yes
+# hides $HOME entirely and would break WorkingDirectory itself. Revisit if a
+# future release moves state to a fixed, non-$HOME path this unit can pin.
+
+# LoadCredential= example (SEC-06, PR A4) — uncomment and adapt to deliver a
+# secret without ever touching shared-memory/.env or this process's own
+# EnvironmentFile=. secure_env.py reads it from $CREDENTIALS_DIRECTORY/<name>,
+# where <name> is the credential name BELOW (systemd convention: lowercase).
+# The corresponding framework key is the uppercase form (pg_password ->
+# PG_PASSWORD) — see the module docstring in shared-memory/scripts/secure_env.py.
+#LoadCredential=pg_password:/etc/credstore/pg_password
+#LoadCredential=neo4j_password:/etc/credstore/neo4j_password
+
 [Install]
 WantedBy=default.target

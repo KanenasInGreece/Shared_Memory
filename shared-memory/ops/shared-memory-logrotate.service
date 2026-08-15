@@ -7,3 +7,11 @@ Type=oneshot
 # Per-user logrotate with a user-owned state file — no root, no /etc/logrotate.d.
 # %h is the user's home; the config is generated from ops/shared-memory.logrotate.
 ExecStart=/usr/bin/logrotate --state %h/.shared-memory/logrotate.state %h/.config/shared-memory/logrotate.conf
+# S-17 (Credential_Custody_Plan PR A4): NoNewPrivileges only — UMask is left
+# at the system default here because logrotate itself sets the rotated
+# files' mode from shared-memory.logrotate's own `create` stanza, which
+# already names an explicit mode; a unit-level UMask would be redundant, not
+# wrong, so it is omitted rather than adding a second, easily-forgotten place
+# that mode is decided. ProtectHome is not evaluated here — logrotate's whole
+# job is writing under $HOME (%h), so it is obviously incompatible.
+NoNewPrivileges=yes
