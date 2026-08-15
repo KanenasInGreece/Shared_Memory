@@ -4,10 +4,12 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import signal
 import sys
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from aiohttp import web, ClientSession, ClientTimeout, TCPConnector
@@ -46,6 +48,8 @@ from coordinator import (
     record_llm_gateway_fault,
     record_llm_upstream_fault,
     _parse_upstream_error_type,
+    _decompress_prefix_for_parse,
+    _short,
 )
 
 # Unified Hive-Mind Async Proxy v7
@@ -381,6 +385,27 @@ HOP_BY_HOP = frozenset({
 })
 
 
+def _scrub_url_credentials(text: str) -> str:
+    """Security review O-6: strip userinfo (user:pass@) and the query string
+    from any http(s) URL found in `text` before it reaches a client-visible
+    body or the gateway log. A ClientError's own __str__ can render the full
+    request URL (aiohttp's InvalidURL does), and a real provider pattern
+    puts a credential in a URL — a `?key=...` query parameter, or userinfo —
+    so echoing that text verbatim is a provider-key leakage path. Only the
+    scheme/host/port/path survive; never raises (a malformed "URL" that
+    urlsplit chokes on is replaced outright rather than echoed unscrubbed)."""
+    def _scrub(m: "re.Match") -> str:
+        try:
+            parsed = urllib.parse.urlsplit(m.group(0))
+            netloc = parsed.hostname or ""
+            if parsed.port:
+                netloc += f":{parsed.port}"
+            return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+        except Exception:
+            return "<url-redacted>"
+    return re.sub(r"https?://\S+", _scrub, text)
+
+
 def _safe_request_id(request) -> "str | None":
     """Best-effort read of the request_id auth_middleware stashes on the
     request (PR A3), used to correlate a credential-audit line with the same
@@ -438,7 +463,7 @@ class AsyncHiveMindProxy:
             await self.session.close()
             log.info("Upstream client session closed.")
 
-    def _filter_headers(self, headers) -> dict:
+    def _filter_headers(self, headers, *, strip_gateway_namespace: bool = False) -> dict:
         """Strip hop-by-hop, Host, and Authorization headers.
         Applied identically to both request (→ upstream) and response (→ client).
         Authorization is never forwarded: what a client sends here is its OWN
@@ -446,11 +471,29 @@ class AsyncHiveMindProxy:
         scoped to talking to the gateway, not to whatever sits behind it. A
         backend that needs its own credential (a paid cloud API) gets one
         added back explicitly in handle_proxy, from LLM_BACKENDS_JSON's
-        token_env — never from what the client happened to send."""
-        return {
+        token_env — never from what the client happened to send.
+
+        `strip_gateway_namespace` additionally strips `x-sm-*` and
+        `www-authenticate` — used ONLY on the RESPONSE direction (upstream →
+        client, security review O-1). Without it, a hostile/misconfigured
+        upstream can set `X-SM-Fault-Origin: gateway` (or `X-SM-LLM-Backend`)
+        on an otherwise-successful response and have it pass straight
+        through — the gateway's own header assignment only happens on a
+        FAULT status, so on success nothing overwrites an upstream-supplied
+        value. Treating the X-SM- namespace (and the RFC 6750 challenge
+        header, so a client can't be confused about which side of the
+        credential boundary wants a token) as gateway-owned means any such
+        header on the wire is always one the gateway put there."""
+        result = {
             k: v for k, v in headers.items()
             if k.lower() not in HOP_BY_HOP and k.lower() not in ("host", "authorization")
         }
+        if strip_gateway_namespace:
+            result = {
+                k: v for k, v in result.items()
+                if not k.lower().startswith("x-sm-") and k.lower() != "www-authenticate"
+            }
+        return result
 
     async def handle_proxy(self, request: web.Request) -> web.StreamResponse:
         # Route on path: embeddings/reranking have fixed targets; everything else
@@ -575,7 +618,7 @@ class AsyncHiveMindProxy:
 
                         proxy_resp = web.StreamResponse(
                             status=upstream.status,
-                            headers=self._filter_headers(upstream.headers),
+                            headers=self._filter_headers(upstream.headers, strip_gateway_namespace=True),
                         )
                         # Stamp the serving backend so daemons can attribute per-backend
                         # telemetry (obs tok/s) without learning routing — observability only.
@@ -598,6 +641,11 @@ class AsyncHiveMindProxy:
                         # can't parse a split/foreign body (falls through to
                         # "transient" — see _classify_llm_fault).
                         fault_classified = llm_backend is None or upstream.status < 400
+                        # R-3: auto_decompress=False means a compressed error body
+                        # arrives as framing bytes, not JSON — read Content-Encoding
+                        # once so the peek below can decompress a bounded prefix
+                        # before parsing. The passthrough chunk itself is untouched.
+                        content_encoding = upstream.headers.get("Content-Encoding")
 
                         # write_eof() lives inside the same try as the chunk loop so that
                         # an EOF-time disconnect is handled by the same except clauses.
@@ -605,12 +653,22 @@ class AsyncHiveMindProxy:
                             async for chunk in upstream.content.iter_any():
                                 if not fault_classified:
                                     fault_classified = True
-                                    error_type = _parse_upstream_error_type(chunk)
-                                    record_llm_upstream_fault(
-                                        llm_backend, upstream.status, error_type,
-                                        credentialed=bool(backend_token),
-                                        request_id=_safe_request_id(request),
-                                    )
+                                    try:
+                                        # O-2: the recorder call is wrapped — an
+                                        # exception here (e.g. a future edit to the
+                                        # recorder) must never truncate the
+                                        # passthrough that follows on the next line.
+                                        error_type = _parse_upstream_error_type(
+                                            _decompress_prefix_for_parse(chunk, content_encoding))
+                                        record_llm_upstream_fault(
+                                            llm_backend, upstream.status, error_type,
+                                            credentialed=bool(backend_token),
+                                            request_id=_safe_request_id(request),
+                                        )
+                                    except Exception as exc:
+                                        log.warning(
+                                            "credential-fault classification failed for %s: %s",
+                                            target_url, type(exc).__name__)
                                 await proxy_resp.write(chunk)
                             await proxy_resp.write_eof()
 
@@ -640,11 +698,16 @@ class AsyncHiveMindProxy:
                         # body classifies as transient either way.
                         if not fault_classified:
                             fault_classified = True
-                            record_llm_upstream_fault(
-                                llm_backend, upstream.status, None,
-                                credentialed=bool(backend_token),
-                                request_id=_safe_request_id(request),
-                            )
+                            try:
+                                record_llm_upstream_fault(
+                                    llm_backend, upstream.status, None,
+                                    credentialed=bool(backend_token),
+                                    request_id=_safe_request_id(request),
+                                )
+                            except Exception as exc:
+                                log.warning(
+                                    "credential-fault classification failed for %s: %s",
+                                    target_url, type(exc).__name__)
 
                         if llm_backend is not None:
                             _llm_mark_ok(llm_backend)   # connected + served — clear fail streak
@@ -683,7 +746,13 @@ class AsyncHiveMindProxy:
         except ClientError as ce:
             # Upstream is down, unreachable, or refused the connection.
             # 503: the proxy is fine; the backend is not.
-            log.error("Upstream unreachable %s: %s", target_url, ce)
+            # O-6: log the SCRUBBED, BOUNDED message text — a ClientError's own
+            # __str__ can render the full request URL (aiohttp's InvalidURL
+            # does), and a real provider pattern puts a credential in a URL
+            # (userinfo, or a `?key=...` query parameter). The client-visible
+            # body below uses the exception's CLASS NAME only, never its text.
+            log.error("Upstream unreachable %s: %s", target_url,
+                      _short(_scrub_url_credentials(str(ce))))
             if llm_backend is not None:
                 _llm_mark_fail(llm_backend)
                 # Gateway-origin fault (PR A3) — the gateway itself observed this
@@ -695,7 +764,7 @@ class AsyncHiveMindProxy:
                                           request_id=_safe_request_id(request))
             if proxy_resp and proxy_resp.prepared:
                 return proxy_resp
-            return web.json_response({"error": f"Backend unreachable: {ce}"}, status=503,
+            return web.json_response({"error": f"Backend unreachable: {type(ce).__name__}"}, status=503,
                                       headers={"X-SM-Fault-Origin": "gateway"})
 
         except asyncio.TimeoutError:
@@ -712,14 +781,30 @@ class AsyncHiveMindProxy:
                                       headers={"X-SM-Fault-Origin": "gateway"})
 
         except Exception as e:
-            log.error("Unexpected proxy error for %s: %s", target_url, e, exc_info=True)
+            # O-6: same treatment as the ClientError branch above — scrubbed/
+            # bounded text in the log, class name only in the client-visible
+            # body. `exc_info=True` alone is NOT enough here: the traceback
+            # formatter calls str() on the ORIGINAL exception object again
+            # when rendering its final line, which would re-embed the raw
+            # (unscrubbed) text regardless of what was passed as the log
+            # message — so a substitute exception carrying the SCRUBBED text
+            # is passed via an explicit exc_info tuple instead, keeping the
+            # real traceback frames (file/line — the actual debugging value)
+            # while the rendered exception message stays scrubbed.
+            scrubbed_msg = _short(_scrub_url_credentials(str(e)))
+            try:
+                scrubbed_exc = type(e)(scrubbed_msg)
+            except Exception:
+                scrubbed_exc = RuntimeError(scrubbed_msg)  # exotic __init__ signature — fall back
+            log.error("Unexpected proxy error for %s: %s", target_url, scrubbed_msg,
+                      exc_info=(type(scrubbed_exc), scrubbed_exc, e.__traceback__))
             if llm_backend is not None:
                 record_llm_gateway_fault(llm_backend, type(e).__name__,
                                           credentialed=bool(backend_token),
                                           request_id=_safe_request_id(request))
             if proxy_resp and proxy_resp.prepared:
                 return proxy_resp
-            return web.json_response({"error": f"Proxy error: {e}"}, status=500,
+            return web.json_response({"error": f"Proxy error: {type(e).__name__}"}, status=500,
                                       headers={"X-SM-Fault-Origin": "gateway"})
 
         finally:

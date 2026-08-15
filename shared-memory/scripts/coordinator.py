@@ -29,6 +29,7 @@ Routes registered by attach()
 """
 
 import asyncio
+import copy
 import hashlib
 import hmac
 import json
@@ -40,6 +41,7 @@ import random
 import re
 import socket
 import struct
+import time
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -926,65 +928,242 @@ def _classify_llm_fault(status: int, error_type: str | None) -> str:
     return "transient"
 
 
+# Security review (2026-08-15, R-2/R-4): the parse boundary is where both
+# bugs are fixed at once — refuse a chunk this large before touching
+# json.loads (removes a synchronous parse of an attacker-sized buffer from
+# the streaming hot path), and coerce+bound whatever the body claims its
+# error code/type is before it can reach telemetry or a log line.
+_ERROR_BODY_PARSE_CAP = 65536       # bytes — R-2
+_ERROR_TYPE_LABEL_CAP  = 120         # chars — R-2/R-4, matches _short()'s spirit
+
+
+def _bounded_error_label(value: Any) -> str | None:
+    """Coerce an extracted error code/type to a bounded, plain string, or
+    None. Deliberately NOT `_short()` (repr()-wrapping would quote a string
+    value and break the exact `error_type == "insufficient_quota"` match
+    `_classify_llm_fault` depends on) — this truncates the value's OWN text,
+    never its repr. Only str/int/float are accepted (R-4): a dict/list-valued
+    `code` — a hostile or malformed upstream body — becomes None rather than
+    an object landing in telemetry or the audit log."""
+    if not isinstance(value, (str, int, float)):
+        return None
+    text = str(value)
+    return text if len(text) <= _ERROR_TYPE_LABEL_CAP else text[:_ERROR_TYPE_LABEL_CAP] + "…[truncated]"
+
+
 def _parse_upstream_error_type(body: bytes) -> str | None:
     """Best-effort extraction of the upstream error's own type/code label
     (OpenAI-compatible {"error": {"code"|"type": ...}} shape) — used for
     classification and for the telemetry/audit `error_type` field. Never
-    raises: a foreign shape, a truncated peek of a chunked body, or plain
-    non-JSON all just yield None, which classifies as transient rather than
-    guessing at a credential fault it can't actually name."""
+    raises: a foreign shape, a truncated peek of a chunked body, an
+    oversized body (R-2), or a non-str/int/float value (R-4) all just yield
+    None, which classifies as transient rather than guessing at a credential
+    fault it can't actually name."""
+    if len(body) > _ERROR_BODY_PARSE_CAP:
+        return None
     try:
         payload = json.loads(body)
         err = payload.get("error") if isinstance(payload, dict) else None
         if isinstance(err, dict):
-            return err.get("code") or err.get("type")
+            return _bounded_error_label(err.get("code") or err.get("type"))
     except Exception:
         pass
     return None
 
 
+_DECOMPRESS_PREFIX_CAP = 8192  # bytes of DECOMPRESSED output — bounds a hostile expansion ratio too
+
+
+def _decompress_prefix_for_parse(body: bytes, content_encoding: str | None) -> bytes:
+    """Security review R-3: `auto_decompress=False` on the shared proxy
+    session means a gzip/deflate/br-compressed upstream error body reaches
+    `_parse_upstream_error_type` as framing bytes, `json.loads` fails, and
+    the 429→insufficient_quota→credential rule silently degrades to
+    transient for exactly the paid-provider case it exists for. Decompresses
+    a BOUNDED prefix so the parser sees JSON instead — the ORIGINAL bytes
+    handed to the client (the passthrough chunk itself) are never touched;
+    this only changes what gets fed to the parser. Never raises: an
+    unsupported/unknown encoding, a genuinely truncated prefix, or `br`
+    without the optional `brotli` package installed all just return the
+    body unchanged, which the parser already treats as unparseable → None →
+    transient (no regression versus today)."""
+    if not content_encoding:
+        return body
+    enc = content_encoding.strip().lower()
+    raw = body[:_DECOMPRESS_PREFIX_CAP]
+    try:
+        if enc == "gzip":
+            import gzip
+            import io
+            return gzip.GzipFile(fileobj=io.BytesIO(raw)).read(_DECOMPRESS_PREFIX_CAP)
+        if enc == "deflate":
+            import zlib
+            try:
+                return zlib.decompressobj(-zlib.MAX_WBITS).decompress(raw, _DECOMPRESS_PREFIX_CAP)
+            except zlib.error:
+                return zlib.decompressobj().decompress(raw, _DECOMPRESS_PREFIX_CAP)
+        if enc == "br":
+            import brotli  # optional dependency — not declared elsewhere in this repo
+            return brotli.Decompressor().decompress(raw)
+    except Exception:
+        pass
+    return body
+
+
 CREDENTIAL_AUDIT_LOG_PATH = os.environ.get(
     "CREDENTIAL_AUDIT_LOG_PATH", "~/.shared-memory/logs/credential-audit.jsonl",
 )
-# ON by default (unlike GATEWAY_AUDIT_LOG_PATH above) — credential-use
-# auditing is a baseline control, not an opt-in diagnostic. Set the env var
-# to an empty string to disable it explicitly. Rotation is already handled —
-# the shipped logrotate config globs *-audit.jsonl, which this filename
-# matches (see shared-memory/ops/README.md).
+# ON by default (unlike GATEWAY_AUDIT_LOG_PATH — see the "Config" section
+# further below in this file) — credential-use auditing is a baseline
+# control, not an opt-in diagnostic. Set the env var to an empty string to
+# disable it explicitly. Rotation is already handled — the shipped
+# logrotate config globs *-audit.jsonl, which this filename matches (see
+# shared-memory/ops/README.md and shared-memory/.env.example).
 _credential_audit_writer = (
     AsyncLineWriter(os.path.expanduser(CREDENTIAL_AUDIT_LOG_PATH))
     if CREDENTIAL_AUDIT_LOG_PATH.strip() else None
 )
+
+# Events an UNAUTHENTICATED caller fully controls the volume of (security
+# review R-5): their log lines use drop-NEWEST eviction (a flood can only
+# evict itself) instead of the writer's default drop-oldest (which would
+# otherwise let a flood evict the genuine lifecycle events queued before it
+# started).
+_ATTACKER_TRIGGERABLE_EVENTS = frozenset({
+    "token_verify_failed", "token_verify_failed_suppressed",
+})
 
 
 def _write_credential_audit_line(event: str, *, origin: str, **fields) -> None:
     """Append one high-signal line to the credential-events log. Best-effort,
     off the DB hot path, and never lets a logging failure surface into the
     request — same contract as _audit() above. No-op when the writer is
-    disabled (CREDENTIAL_AUDIT_LOG_PATH set to an empty string)."""
+    disabled (CREDENTIAL_AUDIT_LOG_PATH set to an empty string).
+
+    `ts`/`event`/`origin` are applied AFTER `**fields` in the dict literal
+    (security review N-3) so a caller-supplied field can never shadow a
+    reserved key — Python dict-literal construction lets a later key win,
+    which is what makes this safe rather than merely conventional."""
     if _credential_audit_writer is None:
         return
     try:
-        record = {"ts": datetime.now(timezone.utc).isoformat(), "event": event,
-                   "origin": origin, **fields}
-        _credential_audit_writer.write(json.dumps(record, separators=(",", ":")))
+        record = {**fields, "ts": datetime.now(timezone.utc).isoformat(),
+                  "event": event, "origin": origin}
+        _credential_audit_writer.write(
+            json.dumps(record, separators=(",", ":")),
+            drop_newest_when_full=event in _ATTACKER_TRIGGERABLE_EVENTS,
+        )
     except Exception as exc:  # never break a request because auditing failed
         log.warning("credential-audit write failed: %s", exc)
 
 
-def _record_token_verify_failed(presented_token: str | None) -> None:
-    """A client's bearer token failed to verify. `claimed_agent` is always
-    None today: the bearer scheme carries no separate name claim to disagree
-    with (unlike the planned PoP resolver, whose handshake will) — the field
-    exists now so that lands with no shape change. The presented token's own
+# Token-bucket rate limit for token_verify_failed LOG LINES (security review
+# C-1): an unauthenticated caller controls this event's volume entirely — a
+# no-token 401 in a loop, or a fresh random token every attempt — so the
+# counter (credentials.token_verify_failed, unthrottled, the complete signal)
+# and the LOG LINE (throttled, the detail) are deliberately decoupled.
+# Continuous refill: capacity TOKEN_VERIFY_FAILED_LOG_RATE tokens,
+# replenished evenly over TOKEN_VERIFY_FAILED_LOG_WINDOW seconds.
+TOKEN_VERIFY_FAILED_LOG_RATE   = _env_int("TOKEN_VERIFY_FAILED_LOG_RATE", 60)     # burst / lines per window
+TOKEN_VERIFY_FAILED_LOG_WINDOW = _env_float("TOKEN_VERIFY_FAILED_LOG_WINDOW", 60.0)  # seconds
+
+_tvf_bucket_tokens: float = float(TOKEN_VERIFY_FAILED_LOG_RATE)
+_tvf_bucket_last_refill: float = time.monotonic()
+_tvf_suppressed_count: int = 0
+_tvf_suppressed_since: float | None = None
+
+
+def _tvf_rate_limit_allow() -> bool:
+    """True if a token_verify_failed LOG LINE may be written right now,
+    consuming one token from the bucket. False means suppress (the caller
+    still bumps the counter — see _record_token_verify_failed)."""
+    global _tvf_bucket_tokens, _tvf_bucket_last_refill
+    now = time.monotonic()
+    elapsed = max(0.0, now - _tvf_bucket_last_refill)
+    _tvf_bucket_last_refill = now
+    refill_rate = TOKEN_VERIFY_FAILED_LOG_RATE / TOKEN_VERIFY_FAILED_LOG_WINDOW if TOKEN_VERIFY_FAILED_LOG_WINDOW > 0 else 0.0
+    _tvf_bucket_tokens = min(float(TOKEN_VERIFY_FAILED_LOG_RATE), _tvf_bucket_tokens + elapsed * refill_rate)
+    if _tvf_bucket_tokens >= 1.0:
+        _tvf_bucket_tokens -= 1.0
+        return True
+    return False
+
+
+def _transport_kind(request: web.Request) -> str:
+    """"uds" | "tcp" — the connection's OWN socket family, independent of
+    whether SO_PEERCRED could actually be read (_peer_identity can fail
+    closed on a UDS connection too). Used for O-3 attribution only; never
+    gates behaviour."""
+    transport = request.transport
+    if transport is None:
+        return "tcp"
+    sock = transport.get_extra_info("socket")
+    if sock is not None and getattr(sock, "family", None) == socket.AF_UNIX:
+        return "uds"
+    return "tcp"
+
+
+def _record_token_verify_failed(request: web.Request, presented_token: str | None) -> None:
+    """A client's bearer token failed to verify. The COUNTER
+    (credentials.token_verify_failed) always increments — it is the
+    complete, unthrottled signal. The LOG LINE is more selective:
+
+    - No token presented at all (security review C-1): never logged. The
+      record would be byte-identical every time
+      (`{"event":"token_verify_failed","digest_prefix":null,...}`) and
+      carries no information the counter doesn't already have — logging it
+      is a zero-cost-to-the-attacker, zero-forensic-gain disk write, exactly
+      the amplification the finding describes.
+    - A token WAS presented: rate-limited (see _tvf_rate_limit_allow). When
+      the bucket is empty the line is suppressed and counted internally;
+      the next line that IS allowed is preceded by one
+      `token_verify_failed_suppressed` summary line so the gap is visible
+      without paying per-attempt disk cost.
+
+    Surviving lines carry attribution (security review O-3): the kernel-
+    attested peer identity when available (UDS only — None on TCP, same as
+    `_audit`/`_peer_identity` everywhere else in this file), the request
+    path, and the transport kind. `claimed_agent` is always None today: the
+    bearer scheme carries no separate name claim to disagree with (unlike
+    the planned PoP resolver, whose handshake will) — kept as an explicit
+    field so that lands with no shape change. The presented token's own
     value NEVER appears (SEC-08); only the first 8 hex chars of its SHA-256
-    digest, enough to correlate repeat offenders without recovering the
-    secret. `digest_prefix` is None when no token was presented at all."""
+    digest, enough to correlate a repeat offender without recovering the
+    secret."""
+    global _tvf_suppressed_count, _tvf_suppressed_since
     _credential_counters["token_verify_failed"] += 1
-    _write_credential_audit_line(
-        "token_verify_failed", origin="gateway", claimed_agent=None,
-        digest_prefix=_token_digest(presented_token)[:8] if presented_token else None,
-    )
+    if presented_token is None:
+        return
+    if not _tvf_rate_limit_allow():
+        if _tvf_suppressed_count == 0:
+            _tvf_suppressed_since = time.monotonic()
+        _tvf_suppressed_count += 1
+        return
+    if _tvf_suppressed_count:
+        window_s = (round(time.monotonic() - _tvf_suppressed_since, 1)
+                    if _tvf_suppressed_since is not None else None)
+        _write_credential_audit_line(
+            "token_verify_failed_suppressed", origin="gateway",
+            count=_tvf_suppressed_count, window_s=window_s,
+        )
+        _tvf_suppressed_count = 0
+        _tvf_suppressed_since = None
+
+    fields: dict[str, Any] = {
+        "claimed_agent": None,
+        "digest_prefix": _token_digest(presented_token)[:8],
+        "path": request.path,
+        "transport": _transport_kind(request),
+    }
+    principal = _peer_identity(request)
+    if principal:
+        fields["principal"] = principal.get("user")
+        fields["connected_from"] = {
+            k: principal[k] for k in
+            ("uid", "gid", "pid", "login_uid", "login_user", "session")
+            if k in principal
+        }
+    _write_credential_audit_line("token_verify_failed", origin="gateway", **fields)
 
 
 def record_daemon_token_issued(agent_name: str) -> None:
@@ -1040,14 +1219,15 @@ def record_llm_upstream_fault(backend: str, status: int, error_type: str | None,
 def _llm_faults_snapshot() -> dict:
     """Read-only render of the in-process per-backend fault counters for
     GET /memory/telemetry. In-process only (reset on restart) — same
-    contract as the existing _llm_routed counters this section mirrors."""
-    return {
-        backend: {
-            "gateway": dict(entry["gateway"]),
-            "llm": {cls: dict(sub) for cls, sub in entry["llm"].items()},
-        }
-        for backend, entry in _llm_fault_counters.items()
-    }
+    contract as the existing _llm_routed counters this section mirrors.
+
+    A full `copy.deepcopy` (security review N-5): a shallow copy shares the
+    nested `last` dict by reference, which makes the docstring's "read-only"
+    claim false — a caller mutating the returned structure would corrupt
+    live counter state. Harmless today (the caller only ever serialises it
+    immediately) but the claim should be true regardless of what a future
+    caller does with it."""
+    return copy.deepcopy(_llm_fault_counters)
 
 
 def _credentials_snapshot() -> dict:
@@ -1088,11 +1268,16 @@ async def auth_middleware(request: web.Request, handler):
         # and only the former has a digest worth logging (PR A3). This is
         # the gateway's OWN 401 (its own door), never an upstream one.
         presented = _extract_bearer_token(request)
-        _record_token_verify_failed(presented)
+        _record_token_verify_failed(request, presented)
         www_authenticate = 'Bearer error="invalid_token"' if presented else "Bearer"
         raise web.HTTPUnauthorized(
             reason="Authorization: a valid Bearer token is required",
-            headers={"WWW-Authenticate": www_authenticate},
+            # X-SM-Fault-Origin alongside the RFC 6750 challenge (security
+            # review O-5): the header is otherwise set only on the three
+            # LLM-path gateway errors, so a client distinguished a gateway-
+            # origin 401 from an upstream one only by the header's ABSENCE —
+            # and absence is exactly what a stripping intermediary produces.
+            headers={"WWW-Authenticate": www_authenticate, "X-SM-Fault-Origin": "gateway"},
         )
     request["authenticated_agent"] = agent_name
     # Person axis: stamp the kernel-attested principal (OS account + connection
