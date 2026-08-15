@@ -161,7 +161,18 @@ def _isolated_fault_counters():
     tests exercise through the real proxy code path — clear them before and
     after every test so one test's faults never leak into the next (mirrors
     tests/test_token_registry_digests_and_daemon_fd.py's
-    _isolated_agent_tokens_registry fixture)."""
+    _isolated_agent_tokens_registry fixture).
+
+    Also unconditionally disarms coordinator._credential_audit_writer at
+    teardown (security review R-1 fix round): several tests here reload the
+    SHARED coordinator singleton with CREDENTIAL_AUDIT_LOG_PATH pointed at a
+    tmp_path to inspect a real file write, and — unlike test_credential_
+    audit_trail.py's independently-loaded modules — that reload mutates the
+    ONE coordinator module every other test in this session also imports.
+    Setting the writer to None here (never re-arming it against any path,
+    real or not) is a stronger guarantee than restoring "whatever it was
+    before", and doesn't depend on any individual test remembering its own
+    cleanup."""
     import coordinator
     coordinator._llm_fault_counters.clear()
     coordinator._credential_counters["token_verify_failed"] = 0
@@ -170,6 +181,7 @@ def _isolated_fault_counters():
     coordinator._llm_fault_counters.clear()
     coordinator._credential_counters["token_verify_failed"] = 0
     coordinator._credential_counters["daemon_tokens_issued"] = 0
+    coordinator._credential_audit_writer = None
 
 
 def _credentialed_backend(monkeypatch, url="http://a:5000", token_var="SM_TEST_TOKEN"):
@@ -314,8 +326,10 @@ def test_credentialed_401_records_upstream_credential_fault(monkeypatch, tmp_pat
     line = json.loads(log_path.read_text().strip())
     assert line["event"] == "upstream_credential_fault"
     assert line["backend"] == "http://a:5000"
-    monkeypatch.delenv("CREDENTIAL_AUDIT_LOG_PATH", raising=False)
-    importlib.reload(coordinator)
+    # cleanup: the autouse fixture disarms coordinator._credential_audit_writer
+    # at teardown regardless — no manual delenv+reload needed (and a manual
+    # reload here would itself re-arm the writer against the real default
+    # path for whatever runs between here and teardown; see R-1 fix round).
 
 
 def test_uncredentialed_401_still_counted_but_not_logged(monkeypatch, tmp_path):
@@ -338,8 +352,6 @@ def test_uncredentialed_401_still_counted_but_not_logged(monkeypatch, tmp_path):
     assert coordinator._llm_fault_counters["http://a:5000"]["llm"]["credential"]["count"] == 1
     asyncio.run(coordinator._credential_audit_writer.flush())
     assert not log_path.exists(), "an uncredentialed call's fault must not reach the credential-events log"
-    monkeypatch.delenv("CREDENTIAL_AUDIT_LOG_PATH", raising=False)
-    importlib.reload(coordinator)
 
 
 def test_gateway_connect_failure_on_credentialed_call_records_gateway_fault(monkeypatch, tmp_path):
@@ -361,8 +373,6 @@ def test_gateway_connect_failure_on_credentialed_call_records_gateway_fault(monk
     asyncio.run(coordinator._credential_audit_writer.flush())
     line = json.loads(log_path.read_text().strip())
     assert line["event"] == "gateway_fault"
-    monkeypatch.delenv("CREDENTIAL_AUDIT_LOG_PATH", raising=False)
-    importlib.reload(coordinator)
 
 
 def test_empty_body_fault_response_still_classified(monkeypatch):
@@ -426,3 +436,268 @@ def test_backend_stash_is_best_effort_on_a_mapping_less_request(monkeypatch):
     proxy.session = _FailSession(RuntimeError("stop before any real call"))
     resp = asyncio.run(proxy.handle_proxy(_FakeReq()))   # _FakeReq has no __setitem__
     assert resp.status == 500   # reached the generic-exception branch, did not raise TypeError
+
+
+# ── 5. O-1: the X-SM- namespace + WWW-Authenticate are gateway-owned on the
+#           RESPONSE direction — a hostile/misconfigured upstream cannot
+#           spoof either on a passthrough response ──────────────────────────
+
+def test_upstream_success_cannot_spoof_fault_origin_header(monkeypatch):
+    """⚑ Security review O-1, empirically confirmed by the reviewer's own
+    probe: an upstream 200 carrying X-SM-Fault-Origin: gateway reached the
+    client with the header intact, because the gateway only ever ASSIGNS
+    the header on a fault status — on success nothing overwrites an
+    upstream-supplied value. MUTATION TARGET: drop strip_gateway_namespace
+    from the response-direction _filter_headers call and this fails."""
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    written = _patch_stream_response(monkeypatch)
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _StatusBodySession(200, b'{"choices":[]}', headers={
+        "Content-Type": "application/json",
+        "X-SM-Fault-Origin": "gateway",
+        "X-SM-LLM-Backend": "http://attacker-controlled:9999",
+        "WWW-Authenticate": 'Bearer realm="provider"',
+    })
+    resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
+
+    assert resp.status == 200
+    assert "X-SM-Fault-Origin" not in written["headers"]
+    assert "WWW-Authenticate" not in written["headers"]
+    # The gateway's OWN assignment (observability, not spoofable via this
+    # path since it's set unconditionally right after the strip) still wins:
+    assert written["headers"]["X-SM-LLM-Backend"] == "http://a:5000"
+
+
+def test_upstream_fault_cannot_spoof_a_different_backend_label(monkeypatch):
+    """Same property on the fault path — the gateway's own
+    X-SM-Fault-Origin: upstream assignment must not be pre-empted by
+    whatever the upstream itself sent under that name."""
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    written = _patch_stream_response(monkeypatch)
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _StatusBodySession(401, b'{"error":{"code":"x"}}', headers={
+        "Content-Type": "application/json",
+        "X-SM-Fault-Origin": "gateway",  # upstream tries to claim it's the gateway
+    })
+    asyncio.run(proxy.handle_proxy(_FakeReq()))
+
+    assert written["headers"]["X-SM-Fault-Origin"] == "upstream"
+
+
+def test_request_direction_headers_unaffected_by_gateway_namespace_strip(monkeypatch):
+    """The stricter filtering is RESPONSE-direction only — a client sending
+    an X-SM-* header upstream (unusual, but must not silently vanish and
+    break some future legitimate use) is unaffected."""
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    import hive_mind_proxy as g
+    importlib.reload(g)
+
+    proxy = g.AsyncHiveMindProxy()
+    filtered = proxy._filter_headers({"X-SM-Custom": "client-value", "Content-Type": "application/json"})
+    assert filtered["X-SM-Custom"] == "client-value"
+
+
+# ── 6. O-2: the classification call must never truncate the passthrough ─────
+
+def test_classification_exception_never_truncates_the_passthrough(monkeypatch):
+    """⚑ Security review O-2, mutation-checked in the review itself: make
+    the recorder raise and confirm the body still arrives byte-for-byte.
+    MUTATION TARGET: remove the try/except around either
+    record_llm_upstream_fault call site and this fails with a truncated
+    body (today: only the in-loop site is exercised here, since a body-
+    bearing response always hits that site, never the fallback)."""
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    monkeypatch.setattr(g, "record_llm_upstream_fault",
+                         lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("recorder boom")))
+    written = _patch_stream_response(monkeypatch)
+
+    body = b'{"error":{"code":"invalid_api_key"}}'
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _StatusBodySession(401, body)
+    resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
+
+    assert resp.status == 401
+    assert b"".join(written["chunks"]) == body, (
+        "a raising recorder must never truncate the passthrough — "
+        "classification is best-effort, the response is not"
+    )
+
+
+def test_classification_exception_on_empty_body_fallback_never_breaks_the_response(monkeypatch):
+    """Same property for the FALLBACK call site (empty-bodied fault)."""
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    monkeypatch.setattr(g, "record_llm_upstream_fault",
+                         lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("recorder boom")))
+    _patch_stream_response(monkeypatch)
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _StatusBodySession(403, b"")
+    resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
+
+    assert resp.status == 403  # did not raise out to the generic exception handler
+
+
+# ── 7. R-3: compressed error bodies still classify correctly end to end ─────
+
+def test_gzip_compressed_429_body_classifies_as_credential_end_to_end(monkeypatch):
+    """⚑ Security review R-3, end to end through the real proxy path
+    (test_credential_audit_trail.py covers the decompression helper in
+    isolation): a gzip-compressed insufficient_quota body on a 429, with
+    Content-Encoding: gzip on the upstream response, must still classify as
+    "credential" — the exact case the reviewer's probe showed silently
+    degrading to "transient" (auto_decompress=False means the peek would
+    otherwise see gzip framing bytes, not JSON). MUTATION TARGET: remove the
+    _decompress_prefix_for_parse call in handle_proxy and this fails."""
+    import gzip
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    import coordinator
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    _patch_stream_response(monkeypatch)
+
+    body = json.dumps({"error": {"code": "insufficient_quota"}}).encode()
+    compressed = gzip.compress(body)
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _StatusBodySession(429, compressed, headers={
+        "Content-Type": "application/json", "Content-Encoding": "gzip",
+    })
+    resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
+
+    assert resp.status == 429
+    entry = coordinator._llm_fault_counters["http://a:5000"]["llm"]
+    assert entry["credential"]["count"] == 1
+    assert entry["transient"]["count"] == 0
+
+
+def test_gzip_compressed_body_passthrough_stays_compressed_bytes(monkeypatch):
+    """The decompression is for CLASSIFICATION only — the client must still
+    receive the original compressed bytes, unchanged, with the original
+    Content-Encoding header (the client, not the gateway, decompresses)."""
+    import gzip
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    written = _patch_stream_response(monkeypatch)
+
+    body = json.dumps({"error": {"code": "insufficient_quota"}}).encode()
+    compressed = gzip.compress(body)
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _StatusBodySession(429, compressed, headers={
+        "Content-Type": "application/json", "Content-Encoding": "gzip",
+    })
+    asyncio.run(proxy.handle_proxy(_FakeReq()))
+
+    assert b"".join(written["chunks"]) == compressed
+    assert written["headers"]["Content-Encoding"] == "gzip"
+
+
+# ── 8. O-6: proxy error bodies/logs never echo raw exception text ───────────
+
+class _InvalidURLLikeSession:
+    """Raises a ClientError whose __str__ renders a full URL carrying a
+    credential in userinfo AND in a query parameter — mirrors what aiohttp's
+    real InvalidURL renders for a malformed/credentialed configured URL."""
+    closed = False
+
+    def __init__(self, exc_cls, credentialed_url: str):
+        self._exc_cls = exc_cls
+        self._url = credentialed_url
+
+    def request(self, *a, **kw):
+        raise self._exc_cls(f"Invalid URL: {self._url}")
+
+
+def test_client_error_body_never_echoes_exception_text(monkeypatch):
+    """O-6: the client-visible body uses the exception's CLASS NAME only."""
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    import hive_mind_proxy as g
+    importlib.reload(g)
+
+    credentialed_url = "https://user:sk-provider-secret-abc123@evil.example.com/v1/x?key=sk-query-secret-xyz789"
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _InvalidURLLikeSession(g.ClientError, credentialed_url)
+    resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
+
+    assert resp.status == 503
+    body = json.loads(resp.body.decode())
+    assert body["error"] == "Backend unreachable: ClientError"
+    assert "sk-provider-secret-abc123" not in body["error"]
+    assert "sk-query-secret-xyz789" not in body["error"]
+
+
+def test_client_error_log_line_scrubs_url_credentials(monkeypatch, caplog):
+    """O-6: the gateway LOG line (not the client body) still carries some
+    diagnostic text, but userinfo/query are stripped from any URL in it —
+    ⚑ security review scenario: a credentialed LLM_BACKENDS_JSON URL must
+    never reach the journal via an exception's rendered text. MUTATION
+    TARGET: remove the _scrub_url_credentials wrapping and this fails."""
+    import logging
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    import hive_mind_proxy as g
+    importlib.reload(g)
+
+    credentialed_url = "https://user:sk-provider-secret-abc123@evil.example.com/v1/x?key=sk-query-secret-xyz789"
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _InvalidURLLikeSession(g.ClientError, credentialed_url)
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(proxy.handle_proxy(_FakeReq()))
+
+    assert "sk-provider-secret-abc123" not in caplog.text
+    assert "sk-query-secret-xyz789" not in caplog.text
+    assert "evil.example.com" in caplog.text  # host survives — still useful for debugging
+
+
+def test_generic_exception_body_and_log_never_echo_text(monkeypatch, caplog):
+    import logging
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    import hive_mind_proxy as g
+    importlib.reload(g)
+
+    credentialed_url = "https://user:sk-provider-secret-abc123@evil.example.com/v1/x?key=sk-query-secret-xyz789"
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _InvalidURLLikeSession(RuntimeError, credentialed_url)
+    with caplog.at_level(logging.ERROR):
+        resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
+
+    assert resp.status == 500
+    body = json.loads(resp.body.decode())
+    assert body["error"] == "Proxy error: RuntimeError"
+    assert "sk-provider-secret-abc123" not in body["error"]
+    assert "sk-provider-secret-abc123" not in caplog.text
+    assert "sk-query-secret-xyz789" not in caplog.text
+
+
+def test_scrub_url_credentials_strips_userinfo_and_query():
+    monkeypatch_free_url = "https://user:sk-secret@example.com:8443/v1/path?key=sk-other-secret&x=1"
+    import hive_mind_proxy as g
+    scrubbed = g._scrub_url_credentials(monkeypatch_free_url)
+    assert "sk-secret" not in scrubbed
+    assert "sk-other-secret" not in scrubbed
+    assert "example.com" in scrubbed
+    assert "8443" in scrubbed
+
+
+def test_scrub_url_credentials_leaves_non_url_text_alone():
+    import hive_mind_proxy as g
+    assert g._scrub_url_credentials("plain connection refused, no url here") == \
+        "plain connection refused, no url here"

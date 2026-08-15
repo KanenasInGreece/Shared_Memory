@@ -627,3 +627,66 @@ async def test_token_verify_failure_logs_digest_prefix_never_the_raw_token(tmp_p
         assert f'"digest_prefix":"{_digest("tok_super_secret_presented_value")[:8]}"' in content
     finally:
         os.environ.pop("CREDENTIAL_AUDIT_LOG_PATH", None)
+
+
+@pytest.mark.asyncio
+async def test_missing_token_writes_no_credential_audit_line(tmp_path):
+    """⚑ Security review C-1, end to end through the real middleware: a
+    no-token 401 (the fully anonymous, zero-cost-to-repeat case) must never
+    write a credential-audit line — only the counter moves. MUTATION
+    TARGET: this is the disk-fill DoS finding; removing the no-token gate
+    makes this test fail."""
+    log_path = tmp_path / "credential-audit.jsonl"
+    os.environ["CREDENTIAL_AUDIT_LOG_PATH"] = str(log_path)
+    try:
+        mod = load_coordinator("claude:tok_abc")
+        req = _make_request("/memory/save")  # no Authorization header at all
+        with pytest.raises(mod.web.HTTPUnauthorized):
+            await mod.auth_middleware(req, _noop_handler)
+        await mod._credential_audit_writer.flush()
+        assert not log_path.exists()
+        assert mod._credential_counters["token_verify_failed"] == 1
+    finally:
+        os.environ.pop("CREDENTIAL_AUDIT_LOG_PATH", None)
+
+
+@pytest.mark.asyncio
+async def test_repeated_no_token_requests_never_write_any_credential_audit_line(tmp_path):
+    """Same property under a flood — the scenario the finding actually
+    describes (a loop of anonymous 401s)."""
+    log_path = tmp_path / "credential-audit.jsonl"
+    os.environ["CREDENTIAL_AUDIT_LOG_PATH"] = str(log_path)
+    try:
+        mod = load_coordinator("claude:tok_abc")
+        for _ in range(50):
+            req = _make_request("/memory/save")
+            with pytest.raises(mod.web.HTTPUnauthorized):
+                await mod.auth_middleware(req, _noop_handler)
+        await mod._credential_audit_writer.flush()
+        assert not log_path.exists()
+        assert mod._credential_counters["token_verify_failed"] == 50
+    finally:
+        os.environ.pop("CREDENTIAL_AUDIT_LOG_PATH", None)
+
+
+# ── O-5: the gateway's own 401 also carries X-SM-Fault-Origin: gateway ──────
+
+@pytest.mark.asyncio
+async def test_missing_token_401_carries_gateway_fault_origin_header():
+    mod = load_coordinator("claude:tok_abc")
+    req = _make_request("/memory/save")
+    with pytest.raises(mod.web.HTTPUnauthorized) as exc_info:
+        await mod.auth_middleware(req, _noop_handler)
+    assert exc_info.value.headers.get("X-SM-Fault-Origin") == "gateway"
+
+
+@pytest.mark.asyncio
+async def test_unknown_token_401_carries_gateway_fault_origin_header():
+    """MUTATION TARGET: both the WWW-Authenticate header AND
+    X-SM-Fault-Origin must be present together, not one or the other."""
+    mod = load_coordinator("claude:tok_abc")
+    req = _make_request("/memory/save", auth_header="Bearer tok_wrong")
+    with pytest.raises(mod.web.HTTPUnauthorized) as exc_info:
+        await mod.auth_middleware(req, _noop_handler)
+    assert exc_info.value.headers.get("X-SM-Fault-Origin") == "gateway"
+    assert exc_info.value.headers.get("WWW-Authenticate") == 'Bearer error="invalid_token"'
