@@ -5,6 +5,53 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.5] — 2026-08-15
+
+**Credential custody, PR A4: deployer file-based secrets + ops-surface hygiene.**
+Every secret-classified key the gateway/daemons read (`PG_PASSWORD`, `NEO4J_PASSWORD`,
+a provider `token_env`, and any future one the existing name-list-plus-suffix
+classification catches) can now be delivered without ever writing the literal value to
+`shared-memory/.env`: `$CREDENTIALS_DIRECTORY/<key, lowercased>` (systemd
+`LoadCredential=`) or `<KEY>_FILE=/path/to/secret` (the Docker official-images
+convention), in that precedence, both below an operator's own direct export and above
+the plaintext `.env` value — the fallback of last resort, and still the default. Neither
+new path ever reaches `os.environ` or a spawned daemon's child environment, extending PR
+A1's invariant to both. A new startup advisory (key name only, never the value) fires
+when a known-secret key is found already sitting in the process's own exec environment
+(`EnvironmentFile=`, an exported shell var), pointing at the two safer tiers instead —
+advisory, not a refusal.
+
+The rest of this release is ops-surface hygiene, closing gaps the credential-custody
+review surfaced along the way. `ops/backup.sh` and `restore.sh` no longer put a
+password or a bearer token on argv: `cypher-shell` reads `NEO4J_PASSWORD` from its own
+process environment once `-p` is dropped (already supplied via `docker exec -e`), and
+the backup's admin-token `Authorization` header now goes through `curl -H @file` — a
+600-mode file in a private, trap-cleaned temp directory — instead of a literal string a
+`ps aux` on the host could read. `install_framework.sh` creates the framework `.env`
+600 from the first byte (`umask 077`, never create-then-chmod) and no longer exports
+the DB passwords into the child processes it spawns (`install_service.sh`,
+`install_llm_backends.sh`) that never needed them. `ops/install_llm_backends.sh`
+preserves a rewritten `.env`'s mode across its awk-based rewrite (`chmod --reference`,
+the same pattern `bootstrap_tokens.sh` already used). `systemctl --user
+import-environment` for a provider key is now documented as deprecated (readable by any
+same-uid process via `show-environment`, inherited by every user unit) in favour of the
+two file-based tiers, with `EnvironmentFile=` for a secret key named as the same class
+of anti-pattern; `hive-mind-gateway.service` gains `UMask=0077`, `NoNewPrivileges=yes`,
+and a commented `LoadCredential=` example, with the same cheap wins applied to the
+backup and logrotate units.
+
+Finally, a sweep closes a class of one-off script the credential-custody work had not
+yet reached: `sync_project_registry.py` and eleven siblings (`backfill_domain_of.py`,
+`backfill_promote_grounded.py`, `cleanup_entity_noise.py`, `cleanup_foreign_schema.py`,
+`entity_fragment_rate.py`, `migrate_retro_edges.py`, `normalize_projects.py`,
+`reconcile_project_edges.py`, `reconcile_project_identity.py`, `relation_sweep.py`,
+`resolve_references.py`) each carried their own hand-rolled `.env` loader that dumped
+every key — secrets included — into `os.environ` via `setdefault`, the exact class PR
+A1 closed for the three long-running daemons. All twelve now delegate to
+`secure_env.load_split_env()` / `get_secret()` instead.
+
+---
+
 ## [0.9.4] — 2026-08-15
 
 **Credential custody, PR A3: a credential-use audit trail for the gateway.** The
