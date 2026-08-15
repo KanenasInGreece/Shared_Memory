@@ -98,30 +98,68 @@ silently sent a doomed request.
 
 **Never put the raw key in `.env`, in the unit file, or in any file this
 framework writes for you** — that defeats the point of keeping it in an
-encrypted store in the first place. The recommended pattern mirrors keeping it
-in your shell already (e.g. `pass`, GPG-backed):
+encrypted store in the first place. `token_env` names an env var the gateway
+process reads at startup; `secure_env.get_secret()` (SEC-06, PR A4) resolves
+that var through three tiers, **RECOMMENDED for a systemd deployment, highest
+precedence first:**
+
+```bash
+# 1. systemd LoadCredential= (PREFERRED) — root-mediated delivery, file
+#    typically 0400 and owned by the service, never in argv/environ for any
+#    OTHER process. Uncomment + adapt the commented example already in
+#    hive-mind-gateway.service. No <VAR_NAME>_FILE line needed alongside it —
+#    secure_env reads $CREDENTIALS_DIRECTORY/<var_name, lowercased> directly.
+#    LoadCredential=deepseek_api_key:/etc/credstore/deepseek_api_key
+
+# 2. <VAR_NAME>_FILE (Docker official-images convention) — point the var at
+#    a file instead of a literal value. Works with any secret store that can
+#    write a file (pass, a mounted Docker/K8s secret, vault agent template).
+echo "DEEPSEEK_API_KEY_FILE=/run/secrets/deepseek_api_key" >> shared-memory/.env
+systemctl --user restart hive-mind-gateway.service
+```
+
+**Deprecated: `systemctl --user import-environment`.** It still works — a
+value it lands in the gateway's own exec environment is honoured (an
+operator-exported value always wins, ahead of `LoadCredential=`/`_FILE`; see
+`secure_env.py`'s precedence statement) and SEC-06 (ii) logs one advisory
+line naming the key, never the value, when it detects this — but it is no
+longer the recommended path, precisely BECAUSE it wins unconditionally and is
+the most exposed of the three (`/proc/<pid>/environ`, `show-environment`,
+every later user unit):
 
 ```bash
 # ~/.bashrc — decrypt once per login, never touches disk in plaintext
 export DEEPSEEK_API_KEY=$(pass show api/deepseek)
-export XAI_API_KEY=$(pass show api/xai)
 
-# Bridge into the systemd --user MANAGER's environment — a service does NOT
-# inherit an interactive shell's exports on its own. No file involved: the
-# value only ever lives in process memory (yours, then systemd's).
-systemctl --user import-environment DEEPSEEK_API_KEY XAI_API_KEY
-systemctl --user try-restart hive-mind-gateway.service   # picks up the newly-imported tokens
+# DEPRECATED — readable by ANY same-uid process via `systemctl --user
+# show-environment` (not just the gateway) and inherited by EVERY user unit
+# started afterward, not only this one. Prefer the two tiers above.
+systemctl --user import-environment DEEPSEEK_API_KEY
+systemctl --user try-restart hive-mind-gateway.service
 ```
 
-**Known tradeoff, by design:** `hive-mind-gateway.service` survives a headless
-reboot via `loginctl enable-linger` (see above) with **no login required** — but
-`import-environment` only ever runs from an interactive shell. So on a headless
-boot, any backend with a `token_env` is dropped (logged, not fatal) until you
-next log in and re-export/re-import. **Backends with no `token_env` (local
-hardware) are unaffected and come up fully unattended, same as always** — this
-tradeoff only applies to paid/cloud backends, and requiring a live unlock of
-the secret store before a cost-bearing API key becomes reachable is the
-intended behaviour, not a bug to route around.
+**`EnvironmentFile=` in the unit is likewise an anti-pattern for a secret
+key** — the same class of exposure as `import-environment` (the whole file's
+contents land in the unit's exec environment, visible to
+`/proc/<pid>/environ` and to a child that inherits the environment
+wholesale), for a mechanism designed for cleartext config, not credentials.
+Use `LoadCredential=` for a secret; `EnvironmentFile=` is fine for a
+`shared-memory/.env` containing ONLY non-secret keys, but this framework's
+`.env` mixes both, so in practice `EnvironmentFile=` should not point at it
+at all — the gateway reads `shared-memory/.env` itself via `secure_env`,
+which is the whole reason `ExecStart=` needs no `EnvironmentFile=` line
+today.
+
+**Known tradeoff of the `import-environment` path, by design (unchanged
+since it is still a supported fallback):** `hive-mind-gateway.service`
+survives a headless reboot via `loginctl enable-linger` (see above) with **no
+login required** — but `import-environment` only ever runs from an
+interactive shell. So on a headless boot, a backend whose `token_env` is
+ONLY ever delivered that way is dropped (logged, not fatal) until you next
+log in and re-export/re-import. **A `token_env` delivered via
+`LoadCredential=` or `_FILE` has no such gap — it survives a headless boot
+like any other systemd-managed secret.** Backends with no `token_env` (local
+hardware) are unaffected either way.
 
 ## `backup.sh` / `restore.sh` (+ `shared-memory-backup.{service,timer}`)
 
