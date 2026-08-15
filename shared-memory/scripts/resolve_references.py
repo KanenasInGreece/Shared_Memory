@@ -28,21 +28,18 @@ from neo4j import GraphDatabase
 sys.path.insert(0, os.path.dirname(__file__))
 from ontology import ONT  # noqa: E402
 import reference_resolver as rr  # noqa: E402
+import secure_env  # noqa: E402
 
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_USER = "neo4j"
 
 
 def _load_env() -> None:
-    here = Path(__file__).resolve()
-    for cand in (here.parent.parent / ".env", here.parent.parent.parent / ".env"):
-        if cand.exists():
-            for line in cand.read_text().splitlines():
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, _, v = line.partition("=")
-                    os.environ.setdefault(k.strip(), v.strip())
-            return
+    """Delegates to secure_env's split loader (Credential_Custody_Plan PR A4,
+    SEC-05-class sweep) — PG_PASSWORD/NEO4J_PASSWORD land in secure_env's
+    in-process store, never os.environ; read them back via
+    secure_env.get_secret()."""
+    secure_env.load_split_env()
 
 
 def main() -> int:
@@ -51,8 +48,8 @@ def main() -> int:
     args = ap.parse_args()
     _load_env()
 
-    pg_pw = os.environ.get("PG_PASSWORD", "")
-    neo_pw = os.environ.get("NEO4J_PASSWORD", "")
+    pg_pw = secure_env.get_secret("PG_PASSWORD", "")
+    neo_pw = secure_env.get_secret("NEO4J_PASSWORD", "")
     if not pg_pw or not neo_pw:
         print("ERROR: PG_PASSWORD / NEO4J_PASSWORD not set (shared-memory/.env).", file=sys.stderr)
         return 2

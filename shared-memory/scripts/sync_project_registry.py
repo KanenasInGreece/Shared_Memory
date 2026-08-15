@@ -49,30 +49,29 @@ import psycopg2
 
 CLOSE_MATCH_CUTOFF = float(os.environ.get("PROJECT_CLOSE_MATCH_CUTOFF", "0.6"))
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import secure_env  # noqa: E402
+
 
 def _load_env() -> None:
-    here = Path(__file__).resolve().parent
-    env_path = next((p for p in (here.parent / ".env", here.parent.parent / ".env")
-                     if p.exists()), None)
-    if env_path is None:
-        return
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        os.environ.setdefault(key.strip(), val.strip())
+    """Delegates to secure_env's split loader (Credential_Custody_Plan PR A4,
+    SEC-05-class sweep). This function used to dump every key from
+    shared-memory/.env into os.environ via setdefault — AGENT_TOKEN included —
+    which is exactly the defect A1 closed for the daemons. Config keys still
+    reach os.environ; PG_PASSWORD (and any other secret-classified key) is
+    held only in secure_env's in-process store and read back via
+    secure_env.get_secret()."""
+    secure_env.load_split_env()
 
 
 _load_env()
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from project_axis import PROJECT_SQL, SENTINEL  # noqa: E402
 from project_alias import ACTIVE_ALIASES_SQL  # noqa: E402
 
 PG_CONN = (
     f"postgresql://{os.environ.get('PG_USER', 'postgres')}:"
-    f"{os.environ.get('PG_PASSWORD', '')}@{os.environ.get('PG_HOST', 'localhost')}:"
+    f"{secure_env.get_secret('PG_PASSWORD', '')}@{os.environ.get('PG_HOST', 'localhost')}:"
     f"{os.environ.get('PG_PORT', '5432')}/{os.environ.get('PG_DATABASE', 'agent_data')}"
 )
 

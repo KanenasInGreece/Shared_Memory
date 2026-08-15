@@ -53,6 +53,8 @@ import psycopg2
 from neo4j import GraphDatabase
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import secure_env  # noqa: E402
 
 # MATCH, never MERGE. This tool identifies nodes that already exist and must
 # never be the thing that creates one: a name with no node is a project with no
@@ -69,25 +71,19 @@ STAMP_CYPHER = (
 
 
 def _load_env() -> None:
-    # The framework env is shared-memory/.env; the repo root is the pre-0.6
-    # FALLBACK. Copied as a candidate list on purpose — three scripts once read
-    # the root alone and died with "no password supplied" on a correct install.
-    candidates = [HERE.parent / ".env", HERE.parent.parent / ".env"]
-    env_path = next((p for p in candidates if p.exists()), None)
-    if env_path is None:
-        return
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        os.environ.setdefault(key.strip(), val.strip())
+    # Delegates to secure_env's split loader (Credential_Custody_Plan PR A4,
+    # SEC-05-class sweep) — same shared-memory/.env-first, pre-0.6-root-fallback
+    # candidate list three scripts once got wrong (died on "no password
+    # supplied"), but PG_PASSWORD/NEO4J_PASSWORD now land in secure_env's
+    # in-process store, never os.environ; read them back via
+    # secure_env.get_secret().
+    secure_env.load_split_env()
 
 
 def _pg_dsn() -> str:
     return (
         f"postgresql://{os.environ.get('PG_USER', 'postgres')}:"
-        f"{os.environ.get('PG_PASSWORD', '')}@"
+        f"{secure_env.get_secret('PG_PASSWORD', '')}@"
         f"{os.environ.get('PG_HOST', 'localhost')}:"
         f"{os.environ.get('PG_PORT', '5432')}/"
         f"{os.environ.get('PG_DATABASE', 'agent_data')}"
@@ -138,7 +134,7 @@ def main() -> int:
     driver = GraphDatabase.driver(
         os.environ.get("NEO4J_URI", "bolt://localhost:7687"),
         auth=(os.environ.get("NEO4J_USER", "neo4j"),
-              os.environ.get("NEO4J_PASSWORD", "")),
+              secure_env.get_secret("NEO4J_PASSWORD", "")),
     )
     try:
         with driver.session() as session:
