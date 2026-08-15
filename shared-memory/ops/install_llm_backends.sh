@@ -68,10 +68,11 @@ while true; do
             ylw "  That doesn't look like an env var name (expected e.g. DEEPSEEK_API_KEY)."
             ylw "  If you just pasted a real key by mistake, enter its variable name instead."
         done
-        echo "  Reminder: export $token_env=\$(...) in your shell (e.g. from 'pass', GPG-backed)."
-        echo "  For the gateway's systemd service to see it too:"
-        echo "    systemctl --user import-environment $token_env"
-        echo "    systemctl --user try-restart hive-mind-gateway.service"
+        echo "  Reminder: this framework never stores the literal key. Get it to the"
+        echo "  gateway via (preferred, highest to lowest — SEC-06, PR A4):"
+        echo "    1. systemd LoadCredential=  (see hive-mind-gateway.service's commented example)"
+        echo "    2. ${token_env}_FILE=/path/to/secret  in shared-memory/.env"
+        echo "    3. export $token_env=\$(...) + systemctl --user import-environment (DEPRECATED)"
         echo "  Full convention: shared-memory/ops/README.md, \"Reasoning-LLM backends\"."
     fi
 
@@ -122,11 +123,20 @@ json_array=$(printf '%s\n' "${entries[@]}" | jq -s -c '.')
 
 # awk (not sed) for the same reason install_framework.sh uses it: the JSON value
 # contains slashes and quotes that would need fragile escaping as a sed replacement.
+#
+# S-06: a fresh $ENV_FILE.tmp is created with the process umask (often 0644),
+# which would widen $ENV_FILE's mode for the window between the awk write and
+# the mv below. chmod --reference (the same pattern bootstrap_tokens.sh's
+# --force rewrite already uses) copies $ENV_FILE's own mode onto the temp
+# file BEFORE the mv, so there is no window where the secrets-bearing file
+# sits at default permissions.
 if grep -q '^LLM_BACKENDS_JSON=' "$ENV_FILE"; then
     awk -v new="LLM_BACKENDS_JSON=$json_array" '
         /^LLM_BACKENDS_JSON=/ { print new; next }
         { print }
-    ' "$ENV_FILE" > "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"
+    ' "$ENV_FILE" > "$ENV_FILE.tmp"
+    chmod --reference="$ENV_FILE" "$ENV_FILE.tmp" 2>/dev/null || true
+    mv "$ENV_FILE.tmp" "$ENV_FILE"
 else
     {
         echo ""

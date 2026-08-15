@@ -88,9 +88,13 @@ try:
 except Exception:
     print("")' "$1" 2>/dev/null; }
 
+# S-08: no `-p "$NEO4J_PASSWORD"` on argv (same fix as backup.sh) — verified
+# live (docker exec neo4j-memory cypher-shell --help): `-p` "Can also be
+# specified using the environment variable NEO4J_PASSWORD", which `-e
+# NEO4J_PASSWORD=` (docker exec's own -e, not argv) already supplies.
 neo4j_q() {
   $DOCKER exec -e NEO4J_PASSWORD="$NEO4J_PASSWORD" "$NEO4J_CONTAINER" \
-    cypher-shell -u "$NEO4J_USER" -p "$NEO4J_PASSWORD" --format plain "$1" 2>/dev/null | tail -n1
+    cypher-shell -u "$NEO4J_USER" --format plain "$1" 2>/dev/null | tail -n1
 }
 
 # ── Locate the set ───────────────────────────────────────────────────────────
@@ -130,7 +134,7 @@ $DOCKER exec -i -e PGPASSWORD="$PG_PASSWORD" "$PG_CONTAINER" \
 
 echo "Restoring Neo4j (replaying cypher export) ..."
 gunzip -c "$BASE.cypher.gz" | $DOCKER exec -i -e NEO4J_PASSWORD="$NEO4J_PASSWORD" "$NEO4J_CONTAINER" \
-  cypher-shell -u "$NEO4J_USER" -p "$NEO4J_PASSWORD" \
+  cypher-shell -u "$NEO4J_USER" \
   && grn "  ✓ neo4j restored" || die "cypher-shell replay failed"
 
 # ── Report post-restore counts vs the manifest ───────────────────────────────
