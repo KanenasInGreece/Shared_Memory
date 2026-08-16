@@ -3926,14 +3926,13 @@ class ConsolidationDaemon:
                 # fold ever runs. Partitioned out HERE, before the census,
                 # exactly like the dead-letter partition above — never inside
                 # the fold loop, so it is captured even on a mid-fold crash.
-                # Reported under
-                # rec.singleton_clusters, a NEW additive telemetry key —
-                # never folded into eligible_clusters' existing meaning
-                # (CLAUDE.md Group 3: a metric whose meaning changes must
-                # change name; here eligible_clusters narrows consistently
-                # with its two prior exclusions, and the excluded
-                # population gets its own name, same as dead-lettered and
-                # unchanged clusters before it).
+                # Reported under rec.singleton_clusters, a NEW additive
+                # telemetry key — never folded into eligible_clusters'
+                # existing meaning (CLAUDE.md Group 3: a metric whose
+                # meaning changes must change name; here eligible_clusters
+                # narrows consistently with its two prior exclusions, and
+                # the excluded population gets its own name, same as
+                # dead-lettered and unchanged clusters before it).
                 non_singleton_clusters = []
                 singleton_now = 0
                 for c in clusters:
