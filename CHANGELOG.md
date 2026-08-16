@@ -45,6 +45,24 @@ when non-zero: routine daemon-token mints stay silent, matching the enrichment a
 action ("fix the key"), `transient` is reported without a flag because it retries on its own.
 `SKILL.md` documents both lines.
 
+### Fixed — `status` no longer crashes on a malformed telemetry payload
+
+Found by the pre-merge review round, in the new rendering code:
+
+- **A truthy non-dict inside `llm_faults` raised `AttributeError` and took the entire `status`
+  report down.** `(x or {}).get(...)` guards against a *falsy* value but passes a string straight
+  through to `.get()`. Every nesting level of the fault payload is now type-checked rather than
+  falsy-checked, so a drifted or hostile gateway degrades one line instead of denying the operator
+  the whole health report.
+- **`_age_phrase` caught `ValueError` but not `TypeError`**, so a non-string timestamp (an epoch
+  number, a nested object) crashed the same way. It now renders the raw value instead.
+- **A backward clock jump rendered as `last -15s ago`**, which reads as a framework bug; skew is
+  now named explicitly.
+- **`_credentials_snapshot` read the audit writer from the module global twice**, so a disable
+  landing between the two reads could emit a non-zero `audit_log_dropped` beside a null
+  `audit_log_dropped_last_ts` — the pair disagreement the section exists to rule out. The writer is
+  bound once.
+
 ---
 
 ## [0.9.7] — 2026-08-16

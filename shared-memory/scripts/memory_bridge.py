@@ -821,10 +821,20 @@ def _age_phrase(ts: str | None) -> str:
         return "—"
     try:
         when = datetime.fromisoformat(ts)
-    except ValueError:
-        return ts
+    except (ValueError, TypeError):
+        # TypeError, not just ValueError: a gateway that ever sends a non-string
+        # here (an epoch number, a nested object) must not take the whole status
+        # report down with it. This renderer is the operator's health dashboard —
+        # degrading one field beats denying the page. (Security review REV-04.)
+        return str(ts)
     now = datetime.now(when.tzinfo) if when.tzinfo else datetime.now()
-    return f"{int((now - when).total_seconds())}s ago"
+    delta = int((now - when).total_seconds())
+    if delta < 0:
+        # Clock skew between gateway and client, or a backward time jump on the
+        # gateway after stamping. "-15s ago" reads as a bug in the framework;
+        # naming the cause is more useful than a negative number.
+        return f"{ts} (clock skew: stamp is {abs(delta)}s in the future)"
+    return f"{delta}s ago"
 
 
 def format_status(payload: dict) -> str:
@@ -998,18 +1008,25 @@ def format_status(payload: dict) -> str:
             if not isinstance(f, dict):
                 continue
             parts = []
-            for label, sub in (("credential", (f.get("llm") or {}).get("credential")),
-                               ("transient", (f.get("llm") or {}).get("transient")),
+            # `or {}` is not enough to make .get() safe — a non-dict truthy value
+            # (a bare string from a drifted or hostile gateway) passes straight
+            # through it and then raises AttributeError, taking the whole status
+            # report down. Type-check instead. (Code-quality review C1.)
+            _llm = f.get("llm")
+            _llm = _llm if isinstance(_llm, dict) else {}
+            for label, sub in (("credential", _llm.get("credential")),
+                               ("transient", _llm.get("transient")),
                                ("gateway", f.get("gateway"))):
                 if isinstance(sub, dict) and (sub.get("count") or 0):
                     seg = f"{label} {sub['count']}"
-                    last = sub.get("last") or {}
-                    if last.get("ts"):
+                    last = sub.get("last")
+                    if isinstance(last, dict) and last.get("ts"):
                         seg += f" (last {_age_phrase(last['ts'])})"
                     parts.append(seg)
             if parts:
-                _cred = (f.get("llm") or {}).get("credential") or {}
-                _flag = " ⚠ fix the key" if _cred.get("count") else ""
+                _cred = _llm.get("credential")
+                _flag = " ⚠ fix the key" if (
+                    isinstance(_cred, dict) and _cred.get("count")) else ""
                 lines.append(f"  llm faults [{backend}]: " + ", ".join(parts) + _flag)
     return "\n".join(lines)
 

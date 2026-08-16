@@ -587,6 +587,41 @@ def test_audit_log_dropped_last_ts_none_when_writer_disabled():
     assert mod._credentials_snapshot()["audit_log_dropped_last_ts"] is None
 
 
+def test_audit_log_dropped_count_and_ts_come_from_the_same_writer(tmp_path):
+    """MUTATION TARGET (code-quality review I1): the snapshot must bind the
+    writer ONCE. Reading the module global separately per entry lets a swap
+    land between the two reads and emit a non-zero count beside a null stamp —
+    a pair that disagrees is exactly what the section exists to prevent.
+
+    Simulated with a writer whose second attribute access swaps the global,
+    which is what a real disable/reconfigure between the reads would do."""
+    from datetime import datetime, timezone
+    target = tmp_path / "credential-audit.jsonl"
+    mod = load_coordinator(credential_audit_log_path=str(target))
+
+    class _SwapsItselfAwayOnRead:
+        def __init__(self):
+            self._ts = datetime.now(timezone.utc).isoformat()
+        @property
+        def dropped(self):
+            # The disable lands on the FIRST read. It has to be this one: the
+            # unfixed code guards each entry with `if _credential_audit_writer`
+            # BEFORE touching the attribute, so a swap during the second read
+            # is still seen by that entry's own guard and nothing diverges.
+            mod._credential_audit_writer = None
+            return 4
+        @property
+        def last_dropped_ts(self):
+            return self._ts
+
+    mod._credential_audit_writer = _SwapsItselfAwayOnRead()
+    snap = mod._credentials_snapshot()
+    assert snap["audit_log_dropped"] == 4
+    assert snap["audit_log_dropped_last_ts"] is not None, (
+        "count came from the writer but the stamp was read after it vanished — "
+        "the snapshot re-read the global instead of binding it once")
+
+
 # ── 8. token_verify_failed ────────────────────────────────────────────────────
 
 def test_token_verify_failed_bumps_counter_when_token_presented():

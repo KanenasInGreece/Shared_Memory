@@ -433,6 +433,37 @@ def test_format_status_does_not_say_fix_the_key_for_transient_only_faults():
     assert "fix the key" not in out
 
 
+def test_age_phrase_survives_a_non_string_timestamp(): # security review REV-04
+    """MUTATION TARGET: `or {}`-style leniency does not cover a wrong TYPE.
+    fromisoformat raises TypeError (not ValueError) on a number, which would
+    propagate out of format_status and deny the operator the whole report."""
+    assert memory_bridge._age_phrase(1755380000) == "1755380000"
+    assert memory_bridge._age_phrase({"ts": "nested"})  # must not raise
+
+
+def test_age_phrase_names_clock_skew_rather_than_printing_a_negative_age():
+    from datetime import datetime, timedelta, timezone
+    future = (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat()
+    out = memory_bridge._age_phrase(future)
+    assert "clock skew" in out
+    assert "-" not in out.split("clock skew")[1]
+
+
+def test_format_status_survives_a_malformed_llm_faults_payload():  # review C1
+    """MUTATION TARGET: a truthy NON-DICT passes straight through `or {}` and
+    then raises AttributeError on .get(), taking `status` down entirely. Every
+    nesting level has to be type-checked, not just falsy-checked."""
+    for broken in (
+        {"b": {"llm": "unexpected", "gateway": None}},
+        {"b": {"llm": {"credential": "not-a-dict"}, "gateway": None}},
+        {"b": {"llm": {"credential": {"count": 2, "last": "not-a-dict"}}}},
+        {"b": "entirely-wrong"},
+        {"b": {"gateway": {"count": 1, "last": {"ts": 12345}}}},
+    ):
+        out = _status({"llm_faults": broken})   # must not raise
+        assert isinstance(out, str)
+
+
 def test_format_status_unchanged_against_a_gateway_that_predates_these_keys():
     """Backward compat: a pre-0.9.4 gateway sends neither section, and an
     older 0.9.4-0.9.7 gateway sends counts with no *_last_ts partner."""

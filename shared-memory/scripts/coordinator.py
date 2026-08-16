@@ -1267,14 +1267,19 @@ def _credentials_snapshot() -> dict:
     that it happened at an unknown time — which is what makes the pair usable
     as an age (`now - last_ts`) instead of a poll-delta that inverts on
     restart."""
+    # Bound ONCE, not read twice off the global: the count and its timestamp
+    # must come from the same writer. Reading the global per entry lets a swap
+    # or a disable land between them and produce a non-zero count beside a null
+    # stamp — the exact pair-disagreement this section exists to rule out.
+    # (Code-quality review I1.)
+    writer = _credential_audit_writer
     return {
         "token_verify_failed": _credential_counters["token_verify_failed"],
         "token_verify_failed_last_ts": _credential_last_ts["token_verify_failed"],
         "daemon_tokens_issued": _credential_counters["daemon_tokens_issued"],
         "daemon_tokens_issued_last_ts": _credential_last_ts["daemon_tokens_issued"],
-        "audit_log_dropped": _credential_audit_writer.dropped if _credential_audit_writer else 0,
-        "audit_log_dropped_last_ts": (
-            _credential_audit_writer.last_dropped_ts if _credential_audit_writer else None),
+        "audit_log_dropped": writer.dropped if writer else 0,
+        "audit_log_dropped_last_ts": writer.last_dropped_ts if writer else None,
     }
 
 
