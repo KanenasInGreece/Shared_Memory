@@ -5,6 +5,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.7] — 2026-08-16
+
+### Tests — the consolidation-telemetry pairing test now pins the anchor column
+
+`test_eligible_oldest_age_paired_with_same_row_as_census` (v0.9.6, R1) asserted that the roll-up
+query's two `FILTER` predicates matched each other, but never pinned which column they anchored
+on. A mutation that flips BOTH predicates from `eligible_clusters IS NOT NULL` to
+`eligible_oldest_age_seconds IS NOT NULL` in lockstep still leaves them identical and pairing the
+same row, so it stayed green under the old assertion — while silently excluding every zero-census
+row from both arrays, which freezes `eligible_clusters` at its last non-zero census — the same
+phantom-backlog stall-verdict defect v0.9.6 shipped to remove. The test now additionally asserts the anchoring
+predicate is `eligible_clusters IS NOT NULL` specifically, so both that mutation and the original
+divergence mutation fail it. Test-only; no behaviour change, no wire-contract change
+(`API_VERSION` stays 4).
+
+### Fixed — orphaned comment fragment in the insight singleton partition
+
+A comment in `consolidation_loop.py`'s singleton-cluster partition (introduced in v0.9.6) was
+reflowed by an earlier commit and left a fragment breaking mid-sentence. Reflowed into complete
+sentences; comment text only, no logic touched.
+
+---
+
 ## [0.9.6] — 2026-08-16
 
 ### Fixed — insight-cycle singleton components no longer read as a stall

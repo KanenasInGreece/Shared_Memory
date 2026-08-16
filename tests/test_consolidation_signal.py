@@ -161,8 +161,16 @@ def test_eligible_oldest_age_paired_with_same_row_as_census():
     (`eligible_clusters IS NOT NULL`) — not `eligible_oldest_age_seconds IS
     NOT NULL`, which lets array_agg's [1] pick a value from a DIFFERENT row
     than eligible_clusters' own [1], silently pairing two unrelated rows.
-    Mutation-checked: reverting the FILTER predicate back to
-    `eligible_oldest_age_seconds IS NOT NULL` makes this assertion fail.
+    This pins the ANCHOR COLUMN, not merely the equality of the two
+    predicates: both predicates must equal `eligible_clusters IS NOT NULL`
+    specifically, so a mutation that flips BOTH predicates to
+    `eligible_oldest_age_seconds IS NOT NULL` in lockstep (still identical
+    to each other, still pairing the same row) is caught too — that
+    mutation excludes every zero-census row from both arrays, freezing
+    eligible_clusters at its last non-zero value (a permanent phantom
+    backlog / stall-verdict defect). Mutation-checked: reverting either
+    FILTER predicate to `eligible_oldest_age_seconds IS NOT NULL` (alone or
+    both together) makes this assertion fail.
 
     Composition check: feeding _compute_consolidation_health() a row shaped
     exactly as the FIXED query now produces it (eligible_clusters=0 paired
@@ -182,6 +190,15 @@ def test_eligible_oldest_age_paired_with_same_row_as_census():
         "eligible_oldest_age must be FILTERed on the SAME predicate as "
         f"eligible_clusters (paired to the same row); got age={m.group('age_pred')!r} "
         f"vs clusters={m.group('clusters_pred')!r}"
+    )
+    # Pin WHICH column anchors the pair — equality alone would still pass if
+    # both predicates were flipped in lockstep to eligible_oldest_age_seconds
+    # IS NOT NULL, which silently excludes zero-census rows from both arrays
+    # and freezes eligible_clusters at the last non-zero census (the
+    # phantom-backlog stall this fix exists to prevent).
+    assert m.group("clusters_pred").strip() == "eligible_clusters IS NOT NULL", (
+        "the pair must anchor on eligible_clusters IS NOT NULL specifically "
+        f"(not merely on matching each other); got clusters={m.group('clusters_pred')!r}"
     )
 
     coord = co.MemoryCoordinator()
