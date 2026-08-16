@@ -27,11 +27,20 @@ unchanged in behaviour and now means purely what its log message says — a Post
 divergence (a requested judgement id missing from `technical_docs`) — since singletons never reach
 it any more.
 
-**Monitor note (additive):** `consolidation_runs.extra` and the `/memory/telemetry` consolidation
-roll-up gain `singleton_clusters` (latest value; `None` = no cycle has recorded the key yet, same
-contract as `dead_lettered_clusters`/`unchanged_clusters`). Existing keys unchanged. No wire-contract
-change (`API_VERSION` stays 4) — additive telemetry only. Mutation-checked; the modified SQL
-roll-up was verified against the live database.
+**Monitor note (additive, plus two existing-metric effects):** `consolidation_runs.extra` and the
+`/memory/telemetry` consolidation roll-up gain `singleton_clusters` (latest value; `None` = no cycle
+has recorded the key yet, same contract as `dead_lettered_clusters`/`unchanged_clusters`). Two
+existing surfaces change population, not shape: `folds_attempted`/`folds_failed` drop for the
+insight cycle — previously a singleton component reached the fold, aborted at `_fold_insight`'s
+`len(rows) < 2` guard, and counted one attempted+failed per cluster per run; singletons now never
+reach the fold, so on a corpus whose only pending components are singletons these go to 0/0. Any
+consumer alerting on "attempts with no successes" goes quiet — that silence is the fix working, but
+it is a real change to what those two counters report. The recurring WARNING log line `Insight fold
+for '<entity>' skipped: only 1 of 1 source judgements found in Postgres` — which was misreporting a
+non-existent Postgres divergence — no longer fires for singletons; the deferral now appears as an
+INFO singleton-deferral line plus the `singleton_clusters` count. No wire-contract change
+(`API_VERSION` stays 4) — additive telemetry only. Mutation-checked; the modified SQL roll-up was
+verified against the live database.
 
 ---
 

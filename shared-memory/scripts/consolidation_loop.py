@@ -759,11 +759,14 @@ class _CycleRec:
             # Operator ruling 2026-08-16 (third application of the
             # I7/decision:1121 class) — NEW key, never an alias for
             # eligible_clusters: a singleton component (judgement reach of
-            # exactly 1) cannot fold an insight and is deliberately never
-            # attempted, so the census above must not count it as eligible
-            # backlog — otherwise the stall verdict reads a deliberate skip
-            # as a stall (live: 48 fold attempts/0 successes in 24h against
-            # 2 permanent singleton clusters).
+            # exactly 1) cannot fold an insight. Before this partition it WAS
+            # attempted every cycle and aborted at `_fold_insight`'s
+            # `len(rows) < 2` guard (live: 48 fold attempts/0 successes in
+            # 24h against 2 permanent singleton clusters) — this ruling stops
+            # that doomed attempt before it reaches the fold, so the census
+            # above must not count the component as eligible backlog,
+            # otherwise the stall verdict reads a deliberate skip as a
+            # stall.
             "singleton_clusters": self.singleton_clusters,
         }
         if self.calibration is not None:
@@ -3913,13 +3916,17 @@ class ConsolidationDaemon:
                 # dead_lettered_clusters (fact:1189) and unchanged_clusters
                 # (fact:1240): a component whose judgement reach is exactly
                 # 1 record cannot fold an insight — there is nothing to
-                # relate yet — and the fold code has never attempted such a
-                # component. Left inside eligible_clusters, a permanent
-                # singleton reads every cycle as backlog the fold "failed"
-                # to clear, when it is in fact deliberately never attempted.
-                # Partitioned out HERE, before the census, exactly like the
-                # dead-letter partition above — never inside the fold loop,
-                # so it is captured even on a mid-fold crash. Reported under
+                # relate yet — and the fold code has never SUCCEEDED on such
+                # a component: it WAS attempted every cycle and aborted at
+                # `_fold_insight`'s `len(rows) < 2` guard (the measured 48
+                # attempts/0 successes in 24h cited in `extra()` above). Left
+                # inside eligible_clusters, a permanent singleton reads every
+                # cycle as backlog the fold "failed" to clear, when it is in
+                # fact a doomed attempt this partition now stops before the
+                # fold ever runs. Partitioned out HERE, before the census,
+                # exactly like the dead-letter partition above — never inside
+                # the fold loop, so it is captured even on a mid-fold crash.
+                # Reported under
                 # rec.singleton_clusters, a NEW additive telemetry key —
                 # never folded into eligible_clusters' existing meaning
                 # (CLAUDE.md Group 3: a metric whose meaning changes must
