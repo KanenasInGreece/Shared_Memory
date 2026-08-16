@@ -330,6 +330,149 @@ def test_format_status_passes_through_errors():
     assert "rejected token" in memory_bridge.format_status(err)
 
 
+# ── credential custody rendering (PR A3 surface, shipped v0.9.4) ─────────────
+# The gap these guard: the gateway attached `credentials` and `llm_faults` at
+# v0.9.4 and the human formatter rendered NEITHER, so an operator running
+# `status` could not see a credential fault or a lost audit line without
+# reading raw --json.
+
+def _status(telemetry: dict) -> str:
+    return memory_bridge.format_status({"status": "success", "telemetry": telemetry})
+
+
+def test_age_phrase_renders_absence_honestly_not_as_zero():
+    """MUTATION TARGET: a null last_ts means "not in this process", which is a
+    different claim from "happened just now". Rendering it as 0s would make a
+    gateway that has never seen a failure look like one failing continuously."""
+    assert memory_bridge._age_phrase(None) == "—"
+    assert memory_bridge._age_phrase("") == "—"
+
+
+def test_age_phrase_computes_seconds_from_an_iso_timestamp():
+    from datetime import datetime, timedelta, timezone
+    ts = (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat()
+    out = memory_bridge._age_phrase(ts)
+    assert out.endswith("s ago")
+    assert 88 <= int(out.split("s")[0]) <= 95
+
+
+def test_format_status_renders_credential_failures_with_their_own_age():
+    from datetime import datetime, timedelta, timezone
+    ts = (datetime.now(timezone.utc) - timedelta(seconds=42)).isoformat()
+    out = _status({
+        "credentials": {
+            "token_verify_failed": 3, "token_verify_failed_last_ts": ts,
+            "daemon_tokens_issued": 2, "daemon_tokens_issued_last_ts": ts,
+            "audit_log_dropped": 0, "audit_log_dropped_last_ts": None,
+        },
+    })
+    assert "3 token verification failure(s)" in out
+    assert "s ago" in out
+
+
+def test_format_status_silent_on_a_clean_credential_section():
+    """Routine daemon mints are not an operator signal — a healthy run must
+    not grow a line, matching the enrichment/fairness idiom above it."""
+    out = _status({
+        "credentials": {
+            "token_verify_failed": 0, "token_verify_failed_last_ts": None,
+            "daemon_tokens_issued": 2, "daemon_tokens_issued_last_ts": "2026-08-16T10:00:00+00:00",
+            "audit_log_dropped": 0, "audit_log_dropped_last_ts": None,
+        },
+    })
+    assert "credentials:" not in out
+    assert "credential audit:" not in out
+
+
+def test_format_status_flags_dropped_audit_lines_as_an_incomplete_trail():
+    out = _status({
+        "credentials": {
+            "token_verify_failed": 0, "token_verify_failed_last_ts": None,
+            "daemon_tokens_issued": 0, "daemon_tokens_issued_last_ts": None,
+            "audit_log_dropped": 7, "audit_log_dropped_last_ts": "2026-08-16T10:00:00+00:00",
+        },
+    })
+    assert "7 LINE(S) DROPPED" in out
+    assert "incomplete" in out
+
+
+def test_format_status_renders_llm_credential_faults_and_says_fix_the_key():
+    out = _status({
+        "llm_faults": {
+            "http://backend:5000": {
+                "gateway": {"count": 0, "last": None},
+                "llm": {
+                    "credential": {"count": 4,
+                                   "last": {"ts": "2026-08-16T10:00:00+00:00", "status": 401}},
+                    "transient": {"count": 0, "last": None},
+                },
+            },
+        },
+    })
+    assert "http://backend:5000" in out
+    assert "credential 4" in out
+    assert "fix the key" in out
+
+
+def test_format_status_does_not_say_fix_the_key_for_transient_only_faults():
+    """The credential/transient split is the whole point of the taxonomy:
+    transient retries on its own and must not be dressed as operator work."""
+    out = _status({
+        "llm_faults": {
+            "http://backend:5000": {
+                "gateway": {"count": 0, "last": None},
+                "llm": {
+                    "credential": {"count": 0, "last": None},
+                    "transient": {"count": 9,
+                                  "last": {"ts": "2026-08-16T10:00:00+00:00", "status": 429}},
+                },
+            },
+        },
+    })
+    assert "transient 9" in out
+    assert "fix the key" not in out
+
+
+def test_age_phrase_survives_a_non_string_timestamp(): # security review REV-04
+    """MUTATION TARGET: `or {}`-style leniency does not cover a wrong TYPE.
+    fromisoformat raises TypeError (not ValueError) on a number, which would
+    propagate out of format_status and deny the operator the whole report."""
+    assert memory_bridge._age_phrase(1755380000) == "1755380000"
+    assert memory_bridge._age_phrase({"ts": "nested"})  # must not raise
+
+
+def test_age_phrase_names_clock_skew_rather_than_printing_a_negative_age():
+    from datetime import datetime, timedelta, timezone
+    future = (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat()
+    out = memory_bridge._age_phrase(future)
+    assert "clock skew" in out
+    assert "-" not in out.split("clock skew")[1]
+
+
+def test_format_status_survives_a_malformed_llm_faults_payload():  # review C1
+    """MUTATION TARGET: a truthy NON-DICT passes straight through `or {}` and
+    then raises AttributeError on .get(), taking `status` down entirely. Every
+    nesting level has to be type-checked, not just falsy-checked."""
+    for broken in (
+        {"b": {"llm": "unexpected", "gateway": None}},
+        {"b": {"llm": {"credential": "not-a-dict"}, "gateway": None}},
+        {"b": {"llm": {"credential": {"count": 2, "last": "not-a-dict"}}}},
+        {"b": "entirely-wrong"},
+        {"b": {"gateway": {"count": 1, "last": {"ts": 12345}}}},
+    ):
+        out = _status({"llm_faults": broken})   # must not raise
+        assert isinstance(out, str)
+
+
+def test_format_status_unchanged_against_a_gateway_that_predates_these_keys():
+    """Backward compat: a pre-0.9.4 gateway sends neither section, and an
+    older 0.9.4-0.9.7 gateway sends counts with no *_last_ts partner."""
+    assert "credentials:" not in _status({"inference_busy": "idle"})
+    out = _status({"credentials": {"token_verify_failed": 2, "audit_log_dropped": 0}})
+    assert "2 token verification failure(s)" in out
+    assert "last —" in out
+
+
 def test_format_status_names_the_stalled_type_and_the_successful_one():
     """The reporting defect this guards: a headline reading "STALLED, last
     success 456107s ago" while a sibling cycle type folded 4 hours ago. The

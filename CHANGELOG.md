@@ -5,6 +5,66 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.8] — 2026-08-17
+
+### Added — credential telemetry now says WHEN, not only how many
+
+`GET /memory/telemetry`'s `credentials` section shipped in v0.9.4 as three bare counters
+(`token_verify_failed`, `daemon_tokens_issued`, `audit_log_dropped`). A counter answers "how
+many" but not "is this still happening?", and for these events there was nowhere else to get the
+answer:
+
+- the no-token 401 is deliberately never logged (its line would be byte-identical every time), so
+  that entire class had no timestamp anywhere;
+- a rate-limited verification failure emits its suppression summary only lazily, piggybacked on
+  the next allowed line — if the failures stop, that summary is never written;
+- the counters are in-process and reset with the gateway, so a consumer deriving age by diffing
+  polls reads a restart as "never failed" while a real failure was minutes ago.
+
+Each counter is now paired with a `<name>_last_ts` on the same snapshot —
+`token_verify_failed_last_ts`, `daemon_tokens_issued_last_ts`, `audit_log_dropped_last_ts` —
+ISO-8601 UTC, the format the sibling `llm_faults[…].last.ts` already uses, and `null` until the
+counter first moves. The stamp is taken at the increment, next to the counter, so the pair cannot
+disagree; the drop stamp belongs to `AsyncLineWriter` where the drop happens rather than being
+recomputed at poll time. A null timestamp means "not in this process", which is a different
+statement from "just now" — the distinction that makes the pair usable as an age.
+
+**Additive and flat, not nested.** The keys are siblings of the existing counters rather than a
+restructure into `{count, last: {…}}`, because consumers read those counters as integers today and
+the additive form leaves every existing read valid. `API_VERSION` stays **4** — no wire-contract
+change, and no `/health` change.
+
+### Added — the client `status` report finally renders credential custody
+
+`format_status` had never rendered `credentials` or `llm_faults`, though the gateway has attached
+both since v0.9.4 — so an operator running `status` could not see a credential fault or a lost
+audit line without reading raw `--json`, on what the A3 design called the only non-monitor surface
+clients see. Both sections now render, each count beside the age of its own last event, and only
+when non-zero: routine daemon-token mints stay silent, matching the enrichment and fairness lines.
+`llm faults` keeps the credential/transient split visible — `credential` is flagged as operator
+action ("fix the key"), `transient` is reported without a flag because it retries on its own.
+`SKILL.md` documents both lines.
+
+### Fixed — `status` no longer crashes on a malformed telemetry payload
+
+Found by the pre-merge review round, in the new rendering code:
+
+- **A truthy non-dict inside `llm_faults` raised `AttributeError` and took the entire `status`
+  report down.** `(x or {}).get(...)` guards against a *falsy* value but passes a string straight
+  through to `.get()`. Every nesting level of the fault payload is now type-checked rather than
+  falsy-checked, so a drifted or hostile gateway degrades one line instead of denying the operator
+  the whole health report.
+- **`_age_phrase` caught `ValueError` but not `TypeError`**, so a non-string timestamp (an epoch
+  number, a nested object) crashed the same way. It now renders the raw value instead.
+- **A backward clock jump rendered as `last -15s ago`**, which reads as a framework bug; skew is
+  now named explicitly.
+- **`_credentials_snapshot` read the audit writer from the module global twice**, so a disable
+  landing between the two reads could emit a non-zero `audit_log_dropped` beside a null
+  `audit_log_dropped_last_ts` — the pair disagreement the section exists to rule out. The writer is
+  bound once.
+
+---
+
 ## [0.9.7] — 2026-08-16
 
 ### Tests — the consolidation-telemetry pairing test now pins the anchor column

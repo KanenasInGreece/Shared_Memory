@@ -490,6 +490,138 @@ def test_credentials_snapshot_zero_when_writer_disabled():
     assert mod._credentials_snapshot()["audit_log_dropped"] == 0
 
 
+# ── 7b. counter ↔ last_ts pairing ────────────────────────────────────────────
+# The counters reset with the gateway process and two of the three event
+# classes produce no log line at all (the no-token 401 by C-1, a rate-limited
+# failure until its lazy summary flushes), so the snapshot is the ONLY place
+# an age can come from. Each assertion below pins the TIMESTAMP'S OWN VALUE —
+# never `count > 0 == (ts is not None)`, which is the half-guard shape
+# `fact:1309` records: both sides can move together to a wrong answer (a
+# snapshot that stamped nothing and counted nothing would satisfy it).
+
+def _parse_iso_utc(value):
+    """Parse and require a tz-aware ISO-8601 stamp — the format the sibling
+    llm_faults `last.ts` already uses."""
+    from datetime import datetime, timezone
+    parsed = datetime.fromisoformat(value)
+    assert parsed.tzinfo is not None, f"last_ts must be tz-aware, got {value!r}"
+    return parsed.astimezone(timezone.utc)
+
+
+def test_credentials_snapshot_last_ts_keys_are_none_before_any_event():
+    """Absence is the honest state, and it is distinguishable from 'just now'."""
+    mod = load_coordinator()
+    snap = mod._credentials_snapshot()
+    assert snap["token_verify_failed"] == 0
+    assert snap["token_verify_failed_last_ts"] is None
+    assert snap["daemon_tokens_issued_last_ts"] is None
+    assert snap["audit_log_dropped_last_ts"] is None
+
+
+def test_token_verify_failed_last_ts_is_a_real_timestamp_bounded_by_the_call():
+    from datetime import datetime, timezone
+    mod = load_coordinator()
+    before = datetime.now(timezone.utc)
+    mod._record_token_verify_failed(_FakeRequest(), "some_bad_token")
+    after = datetime.now(timezone.utc)
+    snap = mod._credentials_snapshot()
+    assert snap["token_verify_failed"] == 1
+    stamped = _parse_iso_utc(snap["token_verify_failed_last_ts"])
+    assert before <= stamped <= after, (
+        f"{stamped} not inside [{before}, {after}] — the stamp is not the event's own time")
+
+
+def test_token_verify_failed_last_ts_stamped_even_when_no_token_presented():
+    """C-1's no-token class writes no log line, so the snapshot is the only
+    record that it happened at all. If this ever regresses, the one class an
+    unauthenticated caller can trigger becomes the one with no timing."""
+    mod = load_coordinator()
+    mod._record_token_verify_failed(_FakeRequest(), None)
+    snap = mod._credentials_snapshot()
+    assert snap["token_verify_failed"] == 1
+    _parse_iso_utc(snap["token_verify_failed_last_ts"])
+
+
+def test_token_verify_failed_last_ts_advances_on_a_later_failure():
+    """Pins that the stamp tracks the LATEST event, not the first — a
+    write-once stamp would age forever while failures kept arriving."""
+    mod = load_coordinator()
+    mod._record_token_verify_failed(_FakeRequest(), "bad_one")
+    first = _parse_iso_utc(mod._credentials_snapshot()["token_verify_failed_last_ts"])
+    mod._record_token_verify_failed(_FakeRequest(), "bad_two")
+    second = _parse_iso_utc(mod._credentials_snapshot()["token_verify_failed_last_ts"])
+    assert second >= first
+    assert mod._credentials_snapshot()["token_verify_failed"] == 2
+
+
+def test_daemon_tokens_issued_last_ts_is_a_real_timestamp_bounded_by_the_call():
+    from datetime import datetime, timezone
+    mod = load_coordinator()
+    before = datetime.now(timezone.utc)
+    mod.record_daemon_token_issued("rem_daemon")
+    after = datetime.now(timezone.utc)
+    snap = mod._credentials_snapshot()
+    assert snap["daemon_tokens_issued"] == 1
+    stamped = _parse_iso_utc(snap["daemon_tokens_issued_last_ts"])
+    assert before <= stamped <= after
+
+
+def test_audit_log_dropped_last_ts_comes_from_the_writer_drop_site(tmp_path):
+    """The drop stamp is owned by AsyncLineWriter, where the drop happens —
+    not recomputed by the snapshot, which would only know polling time."""
+    from datetime import datetime, timezone
+    target = tmp_path / "credential-audit.jsonl"
+    mod = load_coordinator(credential_audit_log_path=str(target))
+    assert mod._credentials_snapshot()["audit_log_dropped_last_ts"] is None
+    before = datetime.now(timezone.utc)
+    mod._credential_audit_writer.dropped += 1
+    mod._credential_audit_writer.last_dropped_ts = datetime.now(timezone.utc).isoformat()
+    after = datetime.now(timezone.utc)
+    snap = mod._credentials_snapshot()
+    assert snap["audit_log_dropped"] == 1
+    assert before <= _parse_iso_utc(snap["audit_log_dropped_last_ts"]) <= after
+
+
+def test_audit_log_dropped_last_ts_none_when_writer_disabled():
+    mod = load_coordinator(credential_audit_log_path="")
+    assert mod._credentials_snapshot()["audit_log_dropped_last_ts"] is None
+
+
+def test_audit_log_dropped_count_and_ts_come_from_the_same_writer(tmp_path):
+    """MUTATION TARGET (code-quality review I1): the snapshot must bind the
+    writer ONCE. Reading the module global separately per entry lets a swap
+    land between the two reads and emit a non-zero count beside a null stamp —
+    a pair that disagrees is exactly what the section exists to prevent.
+
+    Simulated with a writer whose second attribute access swaps the global,
+    which is what a real disable/reconfigure between the reads would do."""
+    from datetime import datetime, timezone
+    target = tmp_path / "credential-audit.jsonl"
+    mod = load_coordinator(credential_audit_log_path=str(target))
+
+    class _SwapsItselfAwayOnRead:
+        def __init__(self):
+            self._ts = datetime.now(timezone.utc).isoformat()
+        @property
+        def dropped(self):
+            # The disable lands on the FIRST read. It has to be this one: the
+            # unfixed code guards each entry with `if _credential_audit_writer`
+            # BEFORE touching the attribute, so a swap during the second read
+            # is still seen by that entry's own guard and nothing diverges.
+            mod._credential_audit_writer = None
+            return 4
+        @property
+        def last_dropped_ts(self):
+            return self._ts
+
+    mod._credential_audit_writer = _SwapsItselfAwayOnRead()
+    snap = mod._credentials_snapshot()
+    assert snap["audit_log_dropped"] == 4
+    assert snap["audit_log_dropped_last_ts"] is not None, (
+        "count came from the writer but the stamp was read after it vanished — "
+        "the snapshot re-read the global instead of binding it once")
+
+
 # ── 8. token_verify_failed ────────────────────────────────────────────────────
 
 def test_token_verify_failed_bumps_counter_when_token_presented():

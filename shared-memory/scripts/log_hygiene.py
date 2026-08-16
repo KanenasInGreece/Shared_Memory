@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 FILE_MODE = 0o600
@@ -114,6 +115,14 @@ class AsyncLineWriter:
         self._q: asyncio.Queue[str] = asyncio.Queue(maxsize=maxsize)
         self._task: asyncio.Task | None = None
         self.dropped = 0
+        # When the most recent drop happened. `dropped` alone answers "have we
+        # lost audit lines?" but not "is this still happening?" — and the count
+        # resets with the process, so a consumer cannot recover the timing by
+        # diffing polls (a restart makes the delta read as "never dropped").
+        # Stamped at the drop site for the same reason the insight census pairs
+        # its age with the row that produced it: an age derived somewhere other
+        # than where the event happened goes stale silently.
+        self.last_dropped_ts: str | None = None
 
     def _ensure_task(self) -> None:
         if self._task is None or self._task.done():
@@ -131,6 +140,7 @@ class AsyncLineWriter:
         except asyncio.QueueFull:
             if drop_newest_when_full:
                 self.dropped += 1  # THIS line never enqueues — the queue is untouched
+                self.last_dropped_ts = datetime.now(timezone.utc).isoformat()
                 return
             try:
                 self._q.get_nowait()          # drop oldest, keep the newest
@@ -138,6 +148,7 @@ class AsyncLineWriter:
             except Exception:
                 pass
             self.dropped += 1
+            self.last_dropped_ts = datetime.now(timezone.utc).isoformat()
 
     async def _drain(self) -> None:
         loop = asyncio.get_running_loop()

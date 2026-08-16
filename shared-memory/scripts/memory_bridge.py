@@ -29,7 +29,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.9.7"
+VERSION = "0.9.8"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v3: review-edges / label-edges require the gateway's /memory/relations/* routes.
@@ -810,6 +810,33 @@ def get_telemetry() -> dict:
         return _coordinator_unavailable(exc)
 
 
+def _age_phrase(ts: str | None) -> str:
+    """Render an ISO-8601 telemetry timestamp as an age, or '—' when absent.
+
+    Kept a pure function so a mutation check can bite it. Absence is rendered
+    honestly rather than as "0s ago": a null last_ts means the event has not
+    happened in the gateway's current process, which is a different statement
+    from "it happened just now"."""
+    if not ts:
+        return "—"
+    try:
+        when = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        # TypeError, not just ValueError: a gateway that ever sends a non-string
+        # here (an epoch number, a nested object) must not take the whole status
+        # report down with it. This renderer is the operator's health dashboard —
+        # degrading one field beats denying the page. (Security review REV-04.)
+        return str(ts)
+    now = datetime.now(when.tzinfo) if when.tzinfo else datetime.now()
+    delta = int((now - when).total_seconds())
+    if delta < 0:
+        # Clock skew between gateway and client, or a backward time jump on the
+        # gateway after stamping. "-15s ago" reads as a bug in the framework;
+        # naming the cause is more useful than a negative number.
+        return f"{ts} (clock skew: stamp is {abs(delta)}s in the future)"
+    return f"{delta}s ago"
+
+
 def format_status(payload: dict) -> str:
     """Render the telemetry snapshot as a compact human-readable report."""
     if payload.get("status") != "success":
@@ -948,6 +975,59 @@ def format_status(payload: dict) -> str:
             lines.append(f"    {ct}: " + ", ".join(parts))
     elif "error" in cn:
         lines.append(f"  consolidation: ERROR {cn['error']}")
+    # Credential custody (PR A3). The gateway has attached this section since
+    # v0.9.4 and nothing rendered it — telemetry is the only non-monitor
+    # surface a client sees, so an operator running `status` could not see a
+    # credential fault or a lost audit line without reading raw --json.
+    # Shown only when an attention signal is non-zero, matching the enrichment
+    # and fairness lines above: daemon token mints are routine (one per daemon
+    # per boot) and would be noise on every healthy run. Each count is printed
+    # with the age of its OWN last event — the counters reset with the gateway
+    # process, so a reader diffing polls instead would read a restart as "no
+    # failures ever".
+    cr = t.get("credentials", {})
+    if cr and "error" not in cr:
+        _tvf = cr.get("token_verify_failed", 0) or 0
+        _drop = cr.get("audit_log_dropped", 0) or 0
+        if _tvf:
+            lines.append(f"  credentials: {_tvf} token verification failure(s) "
+                         f"| last {_age_phrase(cr.get('token_verify_failed_last_ts'))} "
+                         f"(since gateway start)")
+        if _drop:
+            lines.append(f"  credential audit: {_drop} LINE(S) DROPPED ⚠ "
+                         f"| last {_age_phrase(cr.get('audit_log_dropped_last_ts'))} "
+                         f"— the audit trail is incomplete")
+    elif "error" in cr:
+        lines.append(f"  credentials: ERROR {cr['error']}")
+    # Per-backend credential/transient faults (PR A3). `credential` is the
+    # fix-the-key signal (401/403/quota); `transient` retries on its own, so it
+    # is reported but not flagged.
+    lf = t.get("llm_faults", {})
+    if isinstance(lf, dict):
+        for backend, f in sorted(lf.items()):
+            if not isinstance(f, dict):
+                continue
+            parts = []
+            # `or {}` is not enough to make .get() safe — a non-dict truthy value
+            # (a bare string from a drifted or hostile gateway) passes straight
+            # through it and then raises AttributeError, taking the whole status
+            # report down. Type-check instead. (Code-quality review C1.)
+            _llm = f.get("llm")
+            _llm = _llm if isinstance(_llm, dict) else {}
+            for label, sub in (("credential", _llm.get("credential")),
+                               ("transient", _llm.get("transient")),
+                               ("gateway", f.get("gateway"))):
+                if isinstance(sub, dict) and (sub.get("count") or 0):
+                    seg = f"{label} {sub['count']}"
+                    last = sub.get("last")
+                    if isinstance(last, dict) and last.get("ts"):
+                        seg += f" (last {_age_phrase(last['ts'])})"
+                    parts.append(seg)
+            if parts:
+                _cred = _llm.get("credential")
+                _flag = " ⚠ fix the key" if (
+                    isinstance(_cred, dict) and _cred.get("count")) else ""
+                lines.append(f"  llm faults [{backend}]: " + ", ".join(parts) + _flag)
     return "\n".join(lines)
 
 

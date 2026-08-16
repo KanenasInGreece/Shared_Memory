@@ -139,6 +139,71 @@ async def test_write_default_policy_still_drops_oldest_when_full(tmp_path):
     assert remaining == ['{"n":1}', '{"n":2}', '{"n":"newest"}']  # oldest (n:0) evicted
 
 
+# ── last_dropped_ts: WHEN the trail went incomplete ──────────────────────────
+# `dropped` says audit lines were lost; it cannot say whether that is still
+# happening. The count resets with the process, so a consumer diffing polls
+# reads a restart as "never dropped" — the stamp has to be taken at the drop
+# site. Both policies drop, so both must stamp.
+
+def _parse_iso_utc(value):
+    from datetime import datetime, timezone
+    parsed = datetime.fromisoformat(value)
+    assert parsed.tzinfo is not None, f"last_dropped_ts must be tz-aware, got {value!r}"
+    return parsed.astimezone(timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_last_dropped_ts_is_none_until_a_line_is_actually_dropped(tmp_path):
+    lh = _load()
+    w = lh.AsyncLineWriter(str(tmp_path / "audit.jsonl"), maxsize=3)
+    assert w.dropped == 0
+    assert w.last_dropped_ts is None
+    w._q.put_nowait('{"n":0}')          # queued, not dropped
+    assert w.last_dropped_ts is None
+
+
+@pytest.mark.asyncio
+async def test_drop_newest_policy_stamps_last_dropped_ts_with_the_drop_time(tmp_path):
+    from datetime import datetime, timezone
+    lh = _load()
+    w = lh.AsyncLineWriter(str(tmp_path / "audit.jsonl"), maxsize=3)
+    for i in range(3):
+        w._q.put_nowait(f'{{"n":{i}}}')
+    before = datetime.now(timezone.utc)
+    w.write('{"n":"newest"}', drop_newest_when_full=True)
+    after = datetime.now(timezone.utc)
+    assert w.dropped == 1
+    assert before <= _parse_iso_utc(w.last_dropped_ts) <= after
+
+
+@pytest.mark.asyncio
+async def test_drop_oldest_policy_stamps_last_dropped_ts_with_the_drop_time(tmp_path):
+    from datetime import datetime, timezone
+    lh = _load()
+    w = lh.AsyncLineWriter(str(tmp_path / "audit.jsonl"), maxsize=3)
+    for i in range(3):
+        w._q.put_nowait(f'{{"n":{i}}}')
+    before = datetime.now(timezone.utc)
+    w.write('{"n":"newest"}')            # default policy: drop oldest
+    after = datetime.now(timezone.utc)
+    assert w.dropped == 1
+    assert before <= _parse_iso_utc(w.last_dropped_ts) <= after
+
+
+@pytest.mark.asyncio
+async def test_last_dropped_ts_advances_to_the_most_recent_drop(tmp_path):
+    lh = _load()
+    w = lh.AsyncLineWriter(str(tmp_path / "audit.jsonl"), maxsize=3)
+    for i in range(3):
+        w._q.put_nowait(f'{{"n":{i}}}')
+    w.write('{"n":"first-drop"}', drop_newest_when_full=True)
+    first = _parse_iso_utc(w.last_dropped_ts)
+    w.write('{"n":"second-drop"}', drop_newest_when_full=True)
+    second = _parse_iso_utc(w.last_dropped_ts)
+    assert w.dropped == 2
+    assert second >= first
+
+
 # ── O-4: symlink refusal + fd-based chmod + ancestor chain ──────────────────
 
 def test_secure_path_refuses_a_preexisting_symlink_rather_than_following_it(tmp_path):
