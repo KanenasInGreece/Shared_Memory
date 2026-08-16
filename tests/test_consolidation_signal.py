@@ -93,6 +93,9 @@ def _no_census_row(cycle_type):
         # Output-identity skip (operator ruling 2026-08-11) — same
         # NULL-until-recorded contract as dead_lettered_clusters.
         "unchanged_clusters": None,
+        # Singleton-component deferral (operator ruling 2026-08-16) — same
+        # NULL-until-recorded contract as dead_lettered_clusters.
+        "singleton_clusters": None,
     }
 
 
@@ -165,6 +168,32 @@ async def test_dead_lettered_clusters_surfaced_per_cycle_type():
     assert out["insight"]["dead_lettered_clusters"] == 2
     # fact_consolidation got no row at all this pass — None, not 0.
     assert out["fact_consolidation"]["dead_lettered_clusters"] is None
+
+
+@pytest.mark.asyncio
+async def test_singleton_clusters_surfaced_per_cycle_type():
+    """Operator ruling 2026-08-16 — singleton_clusters (written by the daemon
+    into consolidation_runs.extra via _CycleRec.extra()) must be read back and
+    surfaced per cycle type, same shape/contract as dead_lettered_clusters: a
+    NEW key, distinct from eligible_clusters, read from the latest row that
+    actually carries it (`extra ? 'singleton_clusters'`). A cycle type with no
+    row this pass reads None (absence), never 0."""
+    coord = co.MemoryCoordinator()
+    row = dict(_no_census_row("insight"), eligible_clusters=1,
+               singleton_clusters=2)
+    conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[row])
+    acq = MagicMock()
+    acq.__aenter__ = AsyncMock(return_value=conn)
+    acq.__aexit__ = AsyncMock(return_value=False)
+    coord._acquire = MagicMock(return_value=acq)
+
+    out = await coord._compute_consolidation_health()
+
+    assert out["insight"]["eligible_clusters"] == 1
+    assert out["insight"]["singleton_clusters"] == 2
+    # fact_consolidation got no row at all this pass — None, not 0.
+    assert out["fact_consolidation"]["singleton_clusters"] is None
 
 
 @pytest.mark.asyncio

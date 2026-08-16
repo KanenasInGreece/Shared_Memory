@@ -142,7 +142,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.5"
+FRAMEWORK_VERSION = "0.9.6"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -6747,7 +6747,17 @@ class MemoryCoordinator:
               -- fully-current corpus as stalled). None = no cycle has written
               -- the key yet (pre-fix rows), not zero.
               (array_agg((extra->>'unchanged_clusters')::int ORDER BY started_at DESC)
-                  FILTER (WHERE extra ? 'unchanged_clusters'))[1] AS unchanged_clusters
+                  FILTER (WHERE extra ? 'unchanged_clusters'))[1] AS unchanged_clusters,
+              -- Singleton-component deferrals (operator ruling 2026-08-16,
+              -- third application of the I7/decision:1121 class) — latest
+              -- count of clusters excluded from `eligible_clusters` because
+              -- their judgement reach was exactly 1 (no second judgement to
+              -- fold with yet), never attempted. Same shape/contract as
+              -- dead_lettered_clusters/unchanged_clusters above: a NEW key,
+              -- never an alias for eligible_clusters. None = no cycle has
+              -- written this key yet (pre-fix rows), not zero.
+              (array_agg((extra->>'singleton_clusters')::int ORDER BY started_at DESC)
+                  FILTER (WHERE extra ? 'singleton_clusters'))[1] AS singleton_clusters
             FROM ranked GROUP BY cycle_type
         """
         async with self._acquire() as conn:
@@ -6801,6 +6811,15 @@ class MemoryCoordinator:
                 "unchanged_clusters": (
                     int(r["unchanged_clusters"])
                     if r and r["unchanged_clusters"] is not None else None),
+                # Singleton-component deferrals (operator ruling 2026-08-16) —
+                # latest count of clusters excluded from `eligible_clusters`
+                # because their judgement reach was exactly 1 (one-judgement
+                # reach cannot fold an insight) and never attempted. Same
+                # None-means-not-yet-recorded contract as dead_lettered_clusters
+                # above.
+                "singleton_clusters": (
+                    int(r["singleton_clusters"])
+                    if r and r["singleton_clusters"] is not None else None),
                 # AR-01 (v0.8.75): latest recorded truncation_failures/
                 # slot_failures, same None-means-not-yet-recorded contract as
                 # dead_lettered_clusters above — a protocol failure (slot_failed)

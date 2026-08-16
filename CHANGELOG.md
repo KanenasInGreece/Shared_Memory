@@ -5,6 +5,36 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.6] — 2026-08-16
+
+### Fixed — insight-cycle singleton components no longer read as a stall
+
+The insight consolidation cycle's eligible census counted single-judgement components the fold
+deliberately refuses to attempt (there is nothing to relate yet with only one judgement), so a
+permanent singleton read the ADR-018 stall verdict as backlog the fold "failed" to clear. This is
+the third application of the I7 principle ("a deliberate skip must not read as a stall") after
+`dead_lettered_clusters` and `unchanged_clusters` — the same pattern, mirrored exactly.
+
+A component whose judgement reach is exactly 1 is now partitioned out of `run_insight_cycle`'s
+clusters before the census, alongside the existing dead-letter partition, and never attempted. It
+is counted under the new `singleton_clusters` key and **excluded from `eligible_clusters`**, so the
+stall verdict can no longer read a deliberate skip as a stall. It folds once a second judgement
+joins its component in a later cycle.
+
+The finder's docstring (`_find_fresh_insight_clusters`) is corrected: a lone-judgement component is
+still *emitted*, but is no longer folded by the cycle. `_fold_insight`'s `len(rows) < 2` guard is
+unchanged in behaviour and now means purely what its log message says — a Postgres/graph
+divergence (a requested judgement id missing from `technical_docs`) — since singletons never reach
+it any more.
+
+**Monitor note (additive):** `consolidation_runs.extra` and the `/memory/telemetry` consolidation
+roll-up gain `singleton_clusters` (latest value; `None` = no cycle has recorded the key yet, same
+contract as `dead_lettered_clusters`/`unchanged_clusters`). Existing keys unchanged. No wire-contract
+change (`API_VERSION` stays 4) — additive telemetry only. Mutation-checked; the modified SQL
+roll-up was verified against the live database.
+
+---
+
 ## [0.9.5] — 2026-08-15
 
 **Credential custody, PR A4: deployer file-based secrets + ops-surface hygiene.**

@@ -669,7 +669,14 @@ class _CycleRec:
                  # written. A NEW key, mirroring dead_lettered_clusters'
                  # shape: excluded from eligible_clusters (the census counts
                  # what this pass actually folds — I7), reported separately.
-                 "unchanged_clusters")
+                 "unchanged_clusters",
+                 # Singleton-component deferral (operator ruling 2026-08-16,
+                 # third application of the I7/decision:1121 class after
+                 # dead_lettered_clusters and unchanged_clusters) — a
+                 # component whose judgement reach is exactly 1 cannot fold
+                 # an insight and is never attempted; excluded from
+                 # eligible_clusters, counted here instead.
+                 "singleton_clusters")
 
     def __init__(self):
         self.attempted = self.succeeded = self.failed = 0
@@ -699,6 +706,11 @@ class _CycleRec:
         self.slot_failed = []
         self.fold_dead_letter = []
         self.unchanged_clusters = 0
+        # Operator ruling 2026-08-16: singleton components (judgement reach
+        # of exactly 1) partitioned out before the census below. 0 (not
+        # None) once a census has run this cycle, mirroring
+        # dead_lettered_clusters' presence contract.
+        self.singleton_clusters = 0
 
     def fold(self, ok):
         self.attempted += 1
@@ -723,6 +735,7 @@ class _CycleRec:
             or self.fold_dead_letter
             or self.dead_lettered_clusters
             or self.unchanged_clusters
+            or self.singleton_clusters
         ):
             return None
         out = {
@@ -743,6 +756,15 @@ class _CycleRec:
             # census deliberately does NOT count as eligible backlog, so the
             # stall verdict cannot read a fully-current corpus as stalled.
             "unchanged_clusters": self.unchanged_clusters,
+            # Operator ruling 2026-08-16 (third application of the
+            # I7/decision:1121 class) — NEW key, never an alias for
+            # eligible_clusters: a singleton component (judgement reach of
+            # exactly 1) cannot fold an insight and is deliberately never
+            # attempted, so the census above must not count it as eligible
+            # backlog — otherwise the stall verdict reads a deliberate skip
+            # as a stall (live: 48 fold attempts/0 successes in 24h against
+            # 2 permanent singleton clusters).
+            "singleton_clusters": self.singleton_clusters,
         }
         if self.calibration is not None:
             out["calibration"] = self.calibration
@@ -3605,7 +3627,16 @@ class ConsolidationDaemon:
                                Retrospective (G2 is evaluated on the GROUP's
                                full reach, not per component — a component
                                can legitimately have none, e.g. a lone
-                               judgement with no neighbours, and still folds).
+                               judgement with no neighbours). ⚠ Such a
+                               singleton component (judgement reach of
+                               exactly 1) IS still emitted here by the
+                               finder, but is no longer folded — operator
+                               ruling 2026-08-16 has `run_insight_cycle`
+                               partition it out before the census
+                               (rec.singleton_clusters, never counted as
+                               eligible backlog) and never attempt it. It
+                               folds only once a second judgement joins its
+                               component in a later cycle.
 
         A component with ZERO decision ids after the retrospective-only
         filter is skipped (logged) rather than folded with nothing to name
@@ -3876,6 +3907,43 @@ class ConsolidationDaemon:
                     eligible_clusters.append(c)
                 clusters = eligible_clusters
 
+                # Operator ruling 2026-08-16 — third application of the
+                # I7/decision:1121 class ("a deliberate skip must not read
+                # as a stall"), following the exact precedent of D1's
+                # dead_lettered_clusters (fact:1189) and unchanged_clusters
+                # (fact:1240): a component whose judgement reach is exactly
+                # 1 record cannot fold an insight — there is nothing to
+                # relate yet — and the fold code has never attempted such a
+                # component. Left inside eligible_clusters, a permanent
+                # singleton reads every cycle as backlog the fold "failed"
+                # to clear, when it is in fact deliberately never attempted.
+                # Partitioned out HERE, before the census, exactly like the
+                # dead-letter partition above — never inside the fold loop,
+                # so it is captured even on a mid-fold crash. Reported under
+                # rec.singleton_clusters, a NEW additive telemetry key —
+                # never folded into eligible_clusters' existing meaning
+                # (CLAUDE.md Group 3: a metric whose meaning changes must
+                # change name; here eligible_clusters narrows consistently
+                # with its two prior exclusions, and the excluded
+                # population gets its own name, same as dead-lettered and
+                # unchanged clusters before it).
+                non_singleton_clusters = []
+                singleton_now = 0
+                for c in clusters:
+                    ids = [int(i) for i in c["judgement_ids"] if i is not None]
+                    if len(ids) < 2:
+                        singleton_now += 1
+                        continue
+                    non_singleton_clusters.append(c)
+                clusters = non_singleton_clusters
+                if singleton_now:
+                    logger.info(
+                        "Insight cycle: %d singleton component(s) deferred — "
+                        "a one-judgement reach cannot fold an insight; "
+                        "awaiting a second judgement (singleton_clusters).",
+                        singleton_now,
+                    )
+
                 # Coverage census (PR-2) — captured BEFORE folding so a crash
                 # mid-fold still records what was eligible. eligible_clusters =
                 # uncovered insight opportunities NOT already dead-lettered;
@@ -3894,6 +3962,7 @@ class ConsolidationDaemon:
                 rec.eligible_oldest_age = _kth_oldest_age_seconds(
                     cluster_id_lists, ts_map, INSIGHT_AGE_CENSUS_K)
                 rec.dead_lettered_clusters = dead_lettered_now
+                rec.singleton_clusters = singleton_now
                 for c in clusters:
                     ids = [int(i) for i in c["judgement_ids"] if i is not None]
                     if not ids or any(i in folded for i in ids):
@@ -3973,6 +4042,12 @@ class ConsolidationDaemon:
                 )
                 return cur.fetchall()
         rows = await loop.run_in_executor(None, _fetch_judgements)
+        # Singleton components (judgement reach of exactly 1) are partitioned
+        # out upstream in `run_insight_cycle` (operator ruling 2026-08-16) and
+        # never reach this call, so this guard no longer needs to cover that
+        # case — it now means purely what its log message says: a
+        # graph/Postgres divergence, some requested judgement id(s) missing
+        # from `technical_docs`.
         if len(rows) < 2:
             logger.warning(
                 "Insight fold for '%s' skipped: only %d of %d source judgements found in Postgres.",
