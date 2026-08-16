@@ -1016,6 +1016,10 @@ def test_cyclerec_extra_carries_stage5_fields_no_preservation_keys():
         # always present once extra() is non-None; 0 when nothing was
         # skipped as unchanged.
         "unchanged_clusters": 0,
+        # Singleton-component deferral (operator ruling 2026-08-16) — same
+        # contract: always present once extra() is non-None; 0 when this
+        # cycle deferred no singleton components.
+        "singleton_clusters": 0,
         "calibration": {"entity_relation": True, "evidential": False},
         "truncation_failed": ["decision:1,decision:2"],
         "slot_failed": ["decision:3,decision:4"],

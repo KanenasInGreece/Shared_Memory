@@ -9,7 +9,9 @@ is a pure, DB-free rule.
 All Postgres I/O is stubbed — no live infrastructure required.
 """
 import asyncio
+import inspect
 import os
+import re
 import sys
 from unittest.mock import AsyncMock, MagicMock
 
@@ -93,6 +95,9 @@ def _no_census_row(cycle_type):
         # Output-identity skip (operator ruling 2026-08-11) — same
         # NULL-until-recorded contract as dead_lettered_clusters.
         "unchanged_clusters": None,
+        # Singleton-component deferral (operator ruling 2026-08-16) — same
+        # NULL-until-recorded contract as dead_lettered_clusters.
+        "singleton_clusters": None,
     }
 
 
@@ -140,6 +145,64 @@ async def test_no_census_is_not_reported_as_a_stall_composition():
     nrem_spy.assert_not_called()                           # composition never consults it
 
 
+def test_eligible_oldest_age_paired_with_same_row_as_census():
+    """R1 (review finding, 2026-08-16) — eligible_oldest_age_seconds must be
+    read from the SAME row as eligible_clusters, not merely the latest row
+    where the age column itself happened to be non-null. Before the fix, a
+    cycle whose LATEST census recorded eligible_clusters=0 (no oldest
+    eligible cluster exists — that row's own eligible_oldest_age_seconds is
+    NULL) still reported the age carried over from an OLDER row whose census
+    had not yet dropped to zero, producing the impossible pair "eligible 0
+    (oldest 263684s)" — live-proven 2026-08-15 on fact_consolidation
+    (eligible_clusters=0, frozen eligible_oldest_age=80067 from a stale row).
+
+    Static check: the roll-up query's eligible_oldest_age FILTER clause must
+    use the SAME predicate as eligible_clusters' own FILTER
+    (`eligible_clusters IS NOT NULL`) — not `eligible_oldest_age_seconds IS
+    NOT NULL`, which lets array_agg's [1] pick a value from a DIFFERENT row
+    than eligible_clusters' own [1], silently pairing two unrelated rows.
+    Mutation-checked: reverting the FILTER predicate back to
+    `eligible_oldest_age_seconds IS NOT NULL` makes this assertion fail.
+
+    Composition check: feeding _compute_consolidation_health() a row shaped
+    exactly as the FIXED query now produces it (eligible_clusters=0 paired
+    with THAT row's own eligible_oldest_age=None, never a stale non-null
+    value from elsewhere) must surface eligible_oldest_age_seconds as None —
+    the stale value must not leak."""
+    src = inspect.getsource(co)
+    m = re.search(
+        r"array_agg\(eligible_clusters ORDER BY started_at DESC\)\s*"
+        r"FILTER \(WHERE (?P<clusters_pred>[^)]+)\)\)\[1\] AS eligible_clusters,\s*"
+        r".*?"
+        r"array_agg\(eligible_oldest_age_seconds ORDER BY started_at DESC\)\s*"
+        r"FILTER \(WHERE (?P<age_pred>[^)]+)\)\)\[1\] AS eligible_oldest_age,",
+        src, re.DOTALL)
+    assert m, "could not locate the eligible_clusters / eligible_oldest_age pair in the roll-up query"
+    assert m.group("age_pred").strip() == m.group("clusters_pred").strip(), (
+        "eligible_oldest_age must be FILTERed on the SAME predicate as "
+        f"eligible_clusters (paired to the same row); got age={m.group('age_pred')!r} "
+        f"vs clusters={m.group('clusters_pred')!r}"
+    )
+
+    coord = co.MemoryCoordinator()
+    # Shaped as the FIXED query would now emit it: latest census row has
+    # eligible_clusters=0, and THAT SAME row's own eligible_oldest_age is
+    # NULL — never a stale non-null value carried over from an older row.
+    row = dict(_no_census_row("fact_consolidation"), eligible_clusters=0,
+               eligible_oldest_age=None)
+    conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[row])
+    acq = MagicMock()
+    acq.__aenter__ = AsyncMock(return_value=conn)
+    acq.__aexit__ = AsyncMock(return_value=False)
+    coord._acquire = MagicMock(return_value=acq)
+
+    out = asyncio.run(coord._compute_consolidation_health())
+
+    assert out["fact_consolidation"]["eligible_clusters"] == 0
+    assert out["fact_consolidation"]["eligible_oldest_age_seconds"] is None
+
+
 @pytest.mark.asyncio
 async def test_dead_lettered_clusters_surfaced_per_cycle_type():
     """D1 (fact:1189) — dead_lettered_clusters (written by the daemon into
@@ -165,6 +228,32 @@ async def test_dead_lettered_clusters_surfaced_per_cycle_type():
     assert out["insight"]["dead_lettered_clusters"] == 2
     # fact_consolidation got no row at all this pass — None, not 0.
     assert out["fact_consolidation"]["dead_lettered_clusters"] is None
+
+
+@pytest.mark.asyncio
+async def test_singleton_clusters_surfaced_per_cycle_type():
+    """Operator ruling 2026-08-16 — singleton_clusters (written by the daemon
+    into consolidation_runs.extra via _CycleRec.extra()) must be read back and
+    surfaced per cycle type, same shape/contract as dead_lettered_clusters: a
+    NEW key, distinct from eligible_clusters, read from the latest row that
+    actually carries it (`extra ? 'singleton_clusters'`). A cycle type with no
+    row this pass reads None (absence), never 0."""
+    coord = co.MemoryCoordinator()
+    row = dict(_no_census_row("insight"), eligible_clusters=1,
+               singleton_clusters=2)
+    conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[row])
+    acq = MagicMock()
+    acq.__aenter__ = AsyncMock(return_value=conn)
+    acq.__aexit__ = AsyncMock(return_value=False)
+    coord._acquire = MagicMock(return_value=acq)
+
+    out = await coord._compute_consolidation_health()
+
+    assert out["insight"]["eligible_clusters"] == 1
+    assert out["insight"]["singleton_clusters"] == 2
+    # fact_consolidation got no row at all this pass — None, not 0.
+    assert out["fact_consolidation"]["singleton_clusters"] is None
 
 
 @pytest.mark.asyncio

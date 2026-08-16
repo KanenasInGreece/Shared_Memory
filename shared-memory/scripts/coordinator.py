@@ -142,7 +142,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.5"
+FRAMEWORK_VERSION = "0.9.6"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -6717,8 +6717,18 @@ class MemoryCoordinator:
                   FILTER (WHERE outcome = 'crashed'))[1] AS last_error_msg,
               (array_agg(eligible_clusters ORDER BY started_at DESC)
                   FILTER (WHERE eligible_clusters IS NOT NULL))[1] AS eligible_clusters,
+              -- R1 fix: paired to the SAME row as eligible_clusters above —
+              -- FILTER on eligible_clusters IS NOT NULL, not on this column's
+              -- own nullness. A row whose census recorded eligible_clusters=0
+              -- also writes eligible_oldest_age_seconds=NULL (no oldest
+              -- cluster exists); filtering on this column separately let the
+              -- age pick up an OLDER row's non-null value while the count
+              -- came from the newest row, producing an impossible pair like
+              -- "eligible 0 (oldest 263684s)". Filtering both arrays on the
+              -- same predicate keeps them on one row, so a NULL age here
+              -- means the latest census itself recorded no oldest age.
               (array_agg(eligible_oldest_age_seconds ORDER BY started_at DESC)
-                  FILTER (WHERE eligible_oldest_age_seconds IS NOT NULL))[1] AS eligible_oldest_age,
+                  FILTER (WHERE eligible_clusters IS NOT NULL))[1] AS eligible_oldest_age,
               -- Reason of the most-recent deferral (e.g. 'gpu_busy' | 'backup_drain'),
               -- written to consolidation_runs.extra by the daemon. Lets the monitor
               -- show "deferred — inference GPU busy" instead of a bare "deferred".
@@ -6747,7 +6757,17 @@ class MemoryCoordinator:
               -- fully-current corpus as stalled). None = no cycle has written
               -- the key yet (pre-fix rows), not zero.
               (array_agg((extra->>'unchanged_clusters')::int ORDER BY started_at DESC)
-                  FILTER (WHERE extra ? 'unchanged_clusters'))[1] AS unchanged_clusters
+                  FILTER (WHERE extra ? 'unchanged_clusters'))[1] AS unchanged_clusters,
+              -- Singleton-component deferrals (operator ruling 2026-08-16,
+              -- third application of the I7/decision:1121 class) — latest
+              -- count of clusters excluded from `eligible_clusters` because
+              -- their judgement reach was exactly 1 (no second judgement to
+              -- fold with yet), never attempted. Same shape/contract as
+              -- dead_lettered_clusters/unchanged_clusters above: a NEW key,
+              -- never an alias for eligible_clusters. None = no cycle has
+              -- written this key yet (pre-fix rows), not zero.
+              (array_agg((extra->>'singleton_clusters')::int ORDER BY started_at DESC)
+                  FILTER (WHERE extra ? 'singleton_clusters'))[1] AS singleton_clusters
             FROM ranked GROUP BY cycle_type
         """
         async with self._acquire() as conn:
@@ -6784,6 +6804,12 @@ class MemoryCoordinator:
                 "stalled": stalled,
                 "last_error": err,
                 # Coverage census (PR-2): latest gate snapshot the daemon recorded.
+                # R1 fix (review finding): eligible_oldest_age is pulled from
+                # the SAME row as eligible_clusters (both filtered on
+                # `eligible_clusters IS NOT NULL` in the query above), so a
+                # census that reports eligible_clusters=0 reports its own
+                # eligible_oldest_age_seconds honestly — NULL, not a stale
+                # non-null value carried over from an earlier row.
                 "eligible_clusters": elig,
                 "eligible_oldest_age_seconds": (r["eligible_oldest_age"] if r else None),
                 # D1 (fact:1189, decision:1121/I7) — clusters this cycle
@@ -6801,6 +6827,15 @@ class MemoryCoordinator:
                 "unchanged_clusters": (
                     int(r["unchanged_clusters"])
                     if r and r["unchanged_clusters"] is not None else None),
+                # Singleton-component deferrals (operator ruling 2026-08-16) —
+                # latest count of clusters excluded from `eligible_clusters`
+                # because their judgement reach was exactly 1 (one-judgement
+                # reach cannot fold an insight) and never attempted. Same
+                # None-means-not-yet-recorded contract as dead_lettered_clusters
+                # above.
+                "singleton_clusters": (
+                    int(r["singleton_clusters"])
+                    if r and r["singleton_clusters"] is not None else None),
                 # AR-01 (v0.8.75): latest recorded truncation_failures/
                 # slot_failures, same None-means-not-yet-recorded contract as
                 # dead_lettered_clusters above — a protocol failure (slot_failed)
