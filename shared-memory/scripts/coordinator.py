@@ -6717,8 +6717,18 @@ class MemoryCoordinator:
                   FILTER (WHERE outcome = 'crashed'))[1] AS last_error_msg,
               (array_agg(eligible_clusters ORDER BY started_at DESC)
                   FILTER (WHERE eligible_clusters IS NOT NULL))[1] AS eligible_clusters,
+              -- R1 fix: paired to the SAME row as eligible_clusters above —
+              -- FILTER on eligible_clusters IS NOT NULL, not on this column's
+              -- own nullness. A row whose census recorded eligible_clusters=0
+              -- also writes eligible_oldest_age_seconds=NULL (no oldest
+              -- cluster exists); filtering on this column separately let the
+              -- age pick up an OLDER row's non-null value while the count
+              -- came from the newest row, producing an impossible pair like
+              -- "eligible 0 (oldest 263684s)". Filtering both arrays on the
+              -- same predicate keeps them on one row, so a NULL age here
+              -- means the latest census itself recorded no oldest age.
               (array_agg(eligible_oldest_age_seconds ORDER BY started_at DESC)
-                  FILTER (WHERE eligible_oldest_age_seconds IS NOT NULL))[1] AS eligible_oldest_age,
+                  FILTER (WHERE eligible_clusters IS NOT NULL))[1] AS eligible_oldest_age,
               -- Reason of the most-recent deferral (e.g. 'gpu_busy' | 'backup_drain'),
               -- written to consolidation_runs.extra by the daemon. Lets the monitor
               -- show "deferred — inference GPU busy" instead of a bare "deferred".
@@ -6794,6 +6804,12 @@ class MemoryCoordinator:
                 "stalled": stalled,
                 "last_error": err,
                 # Coverage census (PR-2): latest gate snapshot the daemon recorded.
+                # R1 fix (review finding): eligible_oldest_age is pulled from
+                # the SAME row as eligible_clusters (both filtered on
+                # `eligible_clusters IS NOT NULL` in the query above), so a
+                # census that reports eligible_clusters=0 reports its own
+                # eligible_oldest_age_seconds honestly — NULL, not a stale
+                # non-null value carried over from an earlier row.
                 "eligible_clusters": elig,
                 "eligible_oldest_age_seconds": (r["eligible_oldest_age"] if r else None),
                 # D1 (fact:1189, decision:1121/I7) — clusters this cycle

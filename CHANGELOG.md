@@ -42,6 +42,25 @@ INFO singleton-deferral line plus the `singleton_clusters` count. No wire-contra
 (`API_VERSION` stays 4) — additive telemetry only. Mutation-checked; the modified SQL roll-up was
 verified against the live database.
 
+### Fixed — `eligible_oldest_age_seconds` no longer freezes on a stale row (review R1)
+
+The consolidation telemetry roll-up paired `eligible_clusters` with the latest row that *recorded a
+census*, but paired `eligible_oldest_age_seconds` with the latest row where *the age itself* was
+non-null — two different rows. When a cycle's census drops to 0 the same row's age is correctly
+NULL, so the reported age kept the last non-null value from an earlier row forever, producing the
+impossible pair "eligible 0 (oldest Ns)". Live-proven: `fact_consolidation` was reporting
+`eligible_clusters=0` alongside a frozen `eligible_oldest_age_seconds` carried over from an earlier
+row whose census had not yet dropped to zero.
+
+The roll-up query's age extraction now shares the exact same `FILTER (WHERE eligible_clusters IS NOT
+NULL)` predicate as the census extraction, so both values always come from one row and a NULL age
+propagates honestly when that row's own census recorded none. Existing key, corrected meaning —
+`eligible_oldest_age_seconds` now always means "the oldest-cluster age recorded by the SAME census
+as `eligible_clusters`," which is what every reader already assumed. No wire-contract change
+(`API_VERSION` stays 4). The client renderer already omits the age parenthetical when it is `None`,
+so no client change was needed. Mutation-checked; the modified SQL roll-up was verified against the
+live database.
+
 ---
 
 ## [0.9.5] — 2026-08-15
