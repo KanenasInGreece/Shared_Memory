@@ -142,7 +142,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.7"
+FRAMEWORK_VERSION = "0.9.8"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -902,6 +902,18 @@ _credential_counters: dict[str, int] = {
     "token_verify_failed": 0,
     "daemon_tokens_issued": 0,
 }
+# When each credential counter last moved. Counters answer "how many"; a
+# consumer asking "is this still happening?" needs "when", and for these
+# events there is nowhere else to get it: the no-token 401 is deliberately
+# never logged (C-1), the rate-limited path emits its suppression summary
+# only lazily, and both counters reset with the process — so a poll-delta
+# INVERTS across a restart (the count drops to 0 and reads as "never
+# failed" while a real failure was minutes ago). Stamped at the increment,
+# beside the counter, so the pair can never disagree.
+_credential_last_ts: dict[str, str | None] = {
+    "token_verify_failed": None,
+    "daemon_tokens_issued": None,
+}
 
 
 def _fault_entry(backend: str) -> dict:
@@ -1132,6 +1144,12 @@ def _record_token_verify_failed(request: web.Request, presented_token: str | Non
     secret."""
     global _tvf_suppressed_count, _tvf_suppressed_since
     _credential_counters["token_verify_failed"] += 1
+    # Stamped before the C-1 early return, so the no-token class — the one
+    # that never produces a log line — still carries a "when". This is the
+    # single piece of information the byte-identical line would have added,
+    # and it costs no disk write, so it does not re-open C-1's amplification
+    # argument.
+    _credential_last_ts["token_verify_failed"] = datetime.now(timezone.utc).isoformat()
     if presented_token is None:
         return
     if not _tvf_rate_limit_allow():
@@ -1172,6 +1190,7 @@ def record_daemon_token_issued(agent_name: str) -> None:
     hive_mind_proxy._mint_daemon_token() (SEC-10, PR A2) on every mint,
     including re-mints on daemon respawn."""
     _credential_counters["daemon_tokens_issued"] += 1
+    _credential_last_ts["daemon_tokens_issued"] = datetime.now(timezone.utc).isoformat()
     _write_credential_audit_line("daemon_token_issued", origin="gateway", daemon=agent_name)
 
 
@@ -1233,11 +1252,29 @@ def _llm_faults_snapshot() -> dict:
 def _credentials_snapshot() -> dict:
     """Read-only render of the credential counters for GET /memory/telemetry.
     audit_log_dropped surfaces the credential log's own AsyncLineWriter.dropped
-    (0 when auditing is disabled or nothing was ever dropped)."""
+    (0 when auditing is disabled or nothing was ever dropped).
+
+    Each counter is paired with a `<name>_last_ts` on the SAME snapshot —
+    ISO-8601 UTC, the format `llm_faults[...]["last"]["ts"]` already uses, and
+    None until the counter first moves. Flat sibling keys rather than the
+    nested `{count, last: {...}}` shape `llm_faults` carries: this section
+    shipped as bare ints at v0.9.4 and consumers read them as ints, so the
+    additive form preserves the existing contract where a restructure would
+    break it.
+
+    INVARIANT: a non-zero counter always carries a non-null partner. Absence
+    of a timestamp means the event has not happened in this process, never
+    that it happened at an unknown time — which is what makes the pair usable
+    as an age (`now - last_ts`) instead of a poll-delta that inverts on
+    restart."""
     return {
         "token_verify_failed": _credential_counters["token_verify_failed"],
+        "token_verify_failed_last_ts": _credential_last_ts["token_verify_failed"],
         "daemon_tokens_issued": _credential_counters["daemon_tokens_issued"],
+        "daemon_tokens_issued_last_ts": _credential_last_ts["daemon_tokens_issued"],
         "audit_log_dropped": _credential_audit_writer.dropped if _credential_audit_writer else 0,
+        "audit_log_dropped_last_ts": (
+            _credential_audit_writer.last_dropped_ts if _credential_audit_writer else None),
     }
 
 

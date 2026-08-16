@@ -581,7 +581,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness:
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":4,"version":"0.9.7","daemon":"running","rem_daemon":"running",...}
+# → {"status":"ok","api_version":4,"version":"0.9.8","daemon":"running","rem_daemon":"running",...}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -606,8 +606,19 @@ python ~/.claude/skills/shared-memory/scripts/memory_bridge.py status
 #   inference (LLM/GPU): busy
 #   consolidation: ok | last completed | last success 312s ago
 #     insight: deferred (gpu_busy), eligible 0
+#   credentials: 3 token verification failure(s) | last 42s ago (since gateway start)
+#   llm faults [http://backend:5000]: credential 4 (last 90s ago) ⚠ fix the key
 # add --json for machine-readable output
 ```
+The last two lines appear **only when non-zero** (v0.9.8) — a healthy run stays
+silent. `credentials` reports gateway-own credential events: failed token
+verifications, and `credential audit: N LINE(S) DROPPED` when the audit trail
+itself lost lines. `llm faults` splits per backend into `credential`
+(401/403/quota — **operator action, the key is wrong**) and `transient`
+(429-rate/5xx — retried automatically, reported but not flagged). Each count is
+paired with the age of its **own** last event, taken where the event happened;
+the counters are in-process and reset when the gateway restarts, so "since
+gateway start" is literal and a missing age renders `—`, never `0s`.
 `status` rolls up the outbox health and the REM/NREM dream-cycle backlog
 (`GET /memory/telemetry`). Use it to see whether REM/NREM have work pending or
 the system is caught up. The coordinator owns the DB connections, so the client
@@ -637,7 +648,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.7", "api_version": 4, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.8", "api_version": 4, "tool": "shared-memory-framework"}`
 
 ### Updating This Skill
 
