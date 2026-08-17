@@ -18,6 +18,7 @@ from aiohttp.client_exceptions import (
     ClientError,
     ServerDisconnectedError,
 )
+from multidict import CIMultiDict
 
 # Load .env BEFORE importing coordinator — coordinator reads config vars at
 # module level, so config must be in os.environ by the time that import runs
@@ -39,12 +40,14 @@ from coordinator import (
     backup_quiesce_active,
     resolve_identity,
     _AGENT_TOKENS,
+    _AGENT_ROLES,
     AUTH_CONFIGURED_AT_STARTUP,
     AUTH_SCHEME,
     FRAMEWORK_VERSION,
     API_VERSION,
     require_no_plaintext_agent_tokens,
     record_daemon_token_issued,
+    record_credentialed_route_denied,
     record_llm_gateway_fault,
     record_llm_upstream_fault,
     _parse_upstream_error_type,
@@ -93,6 +96,20 @@ ROUTING_MAP = {
     "/v1/embeddings": EMBEDDER_URL,
     "/v1/reranking":  RERANKER_URL,
 }
+# S-04 (Critical, Credential_Custody_Plan PR A5): the catch-all route forwards
+# request.rel_url VERBATIM to whatever backend gets selected, and a backend
+# configured with token_env has the provider key attached — so before this
+# gate, any caller with a gateway agent token could make the gateway sign an
+# arbitrary GET/PUT/DELETE to an arbitrary path on the provider. Binds ONLY
+# the credentialed branch (see handle_proxy's `backend_token` check) — a
+# local, uncredentialed backend keeps today's full pass-through, because
+# there is no key to misuse. Framework-internal (not env-overridable): this
+# is the exact, closed set of endpoints the framework itself ever calls.
+CREDENTIALED_BACKEND_ALLOWED_ROUTES = frozenset({
+    ("POST", "/v1/chat/completions"),
+    ("POST", "/v1/embeddings"),
+    ("POST", "/v1/reranking"),
+})
 # Embeddings/reranking bodies at or under this size get buffered (not streamed),
 # which is what makes the stale-connection retry possible for them. Every real
 # caller (coordinator._embed) sends one text field capped at EMBED_MAX_CHARS
@@ -418,6 +435,56 @@ def _safe_request_id(request) -> "str | None":
     except AttributeError:
         return None
 
+
+def _safe_agent_name(request) -> "str | None":
+    """Best-effort read of the authenticated_agent auth_middleware stashes on
+    the request — same fallback shape as _safe_request_id, for a lightweight
+    test stand-in without a mapping interface, or a request that never went
+    through the middleware (auth disabled)."""
+    try:
+        return request.get("authenticated_agent")
+    except AttributeError:
+        return None
+
+
+# S-14 (Credential_Custody_Plan PR A5): the two framework daemons — the only
+# identities _mint_daemon_token() ever mints for (see the two call sites
+# below) — are the sole non-admin identities allowed to steer LLM routing.
+_CONSOLIDATION_AGENT_NAME = "consolidation"
+_REM_DAEMON_AGENT_NAME    = "rem_daemon"
+DAEMON_AGENT_NAMES = frozenset({_CONSOLIDATION_AGENT_NAME, _REM_DAEMON_AGENT_NAME})
+
+
+def _may_steer_llm(request) -> bool:
+    """True if the resolved identity for this request may set X-SM-LLM-*
+    backend-steering headers (S-14): a framework daemon, or an admin-role
+    token (today unreachable in practice — auth_middleware confines admin
+    tokens to /admin/*, so one can never reach handle_proxy at all; checked
+    anyway so this stays correct if that routing ever changes). Auth-off
+    installs have no identity to check — steering stays available to
+    everyone, same backward-compat shape as every other identity-gated
+    check in this file when AUTH_CONFIGURED_AT_STARTUP is False."""
+    if not AUTH_CONFIGURED_AT_STARTUP:
+        return True
+    agent_name = _safe_agent_name(request)
+    if agent_name in DAEMON_AGENT_NAMES:
+        return True
+    return _AGENT_ROLES.get(agent_name, "full") == "admin"
+
+
+def _strip_llm_steering_headers(headers) -> "CIMultiDict[str]":
+    """Drop every X-SM-LLM-* header (backend/affinity steering signals) from
+    a client-originated request whose identity may not set them (S-14).
+    Returns a CIMultiDict — case-insensitive .get()/.items(), matching
+    aiohttp's own request.headers semantics — so every downstream reader
+    (the role lookup in handle_proxy, then _filter_headers) sees the same
+    interface whether or not stripping happened."""
+    result: CIMultiDict = CIMultiDict()
+    for k, v in headers.items():
+        if not k.lower().startswith("x-sm-llm-"):
+            result.add(k, v)
+    return result
+
 # Upstream mid-stream disconnect — abrupt reset from the upstream server
 # (llama-server, BGE-M3) while we are reading via iter_any(). This is a
 # ClientError subclass raised by aiohttp's HTTP *client* — NOT a downstream
@@ -500,6 +567,12 @@ class AsyncHiveMindProxy:
         # is a reasoning-LLM request, dispatched through the backend POOL so the
         # gateway owns parallelisation. The optional X-SM-LLM-Role header is set
         # ONLY by framework components (e.g. the v0.6.1 judge) — never by clients.
+        # S-14: backend steering is a daemon/admin capability — every X-SM-LLM-*
+        # header a non-steering caller sent is dropped from the view used below
+        # AND from what gets forwarded upstream (see upstream_headers further
+        # down), before either the role signal or the routing decision is read.
+        steer_headers = (request.headers if _may_steer_llm(request)
+                          else _strip_llm_steering_headers(request.headers))
         llm_backend: str | None = None
         target_base: str | None = None
         llm_body: bytes | None = None
@@ -513,7 +586,7 @@ class AsyncHiveMindProxy:
             # then dispatch cache-affinity-first. The key is computed as late as
             # possible, just before selection, so nothing mutates the prompt after.
             llm_body = await request.read() if request.can_read_body else b""
-            role = request.headers.get("X-SM-LLM-Role", "").strip().lower()
+            role = steer_headers.get("X-SM-LLM-Role", "").strip().lower()
             llm_backend = _select_llm_backend(role, _affinity_key(llm_body))
             target_base = llm_backend
 
@@ -534,7 +607,7 @@ class AsyncHiveMindProxy:
         target_url = f"{target_base}{request.rel_url}"
         log.debug("→ %s %s", request.method, target_url)
 
-        upstream_headers = self._filter_headers(request.headers)
+        upstream_headers = self._filter_headers(steer_headers)
         # Authorization was just stripped above (see _filter_headers) — add it
         # back ONLY for a backend that has its own configured credential. Every
         # other backend (local, or one with no token_env) gets none, same as today.
@@ -542,6 +615,23 @@ class AsyncHiveMindProxy:
         if llm_backend is not None:
             backend_token = LLM_BACKEND_TOKENS.get(llm_backend)
             if backend_token:
+                # S-04 (Critical, PR A5): a request about to carry a provider
+                # key may only be POST to a framework-owned endpoint — never
+                # an arbitrary method/path forwarded verbatim to a
+                # credentialed backend. Checked before Authorization is
+                # attached (below) and before any upstream call, so a
+                # rejected request never gets near the key.
+                route = (request.method, request.path.rstrip("/") or "/")
+                if route not in CREDENTIALED_BACKEND_ALLOWED_ROUTES:
+                    record_credentialed_route_denied(
+                        llm_backend, request.method, request.path,
+                        agent_name=_safe_agent_name(request),
+                        request_id=_safe_request_id(request),
+                    )
+                    return web.json_response(
+                        {"error": "credentialed backends accept only framework endpoints"},
+                        status=403, headers={"X-SM-Fault-Origin": "gateway"},
+                    )
                 upstream_headers["Authorization"] = f"Bearer {backend_token}"
             # Surface for the gateway's own per-request audit line (PR A3,
             # coordinator._audit's additive backend/key_attached fields) —
@@ -948,7 +1038,7 @@ async def _start_daemon() -> "asyncio.subprocess.Process | None":
     if not uv:
         log.warning("uv not in PATH — cannot start consolidation daemon")
         return None
-    env, read_fd = _daemon_env_and_token_fd("consolidation")
+    env, read_fd = _daemon_env_and_token_fd(_CONSOLIDATION_AGENT_NAME)
     try:
         proc = await asyncio.create_subprocess_exec(
             uv, "run",
@@ -965,7 +1055,7 @@ async def _start_daemon() -> "asyncio.subprocess.Process | None":
         # holds that token, so revoke it rather than leaving it valid with
         # no daemon behind it.
         if read_fd is not None:
-            _revoke_daemon_token("consolidation")
+            _revoke_daemon_token(_CONSOLIDATION_AGENT_NAME)
         raise
     finally:
         if read_fd is not None:
@@ -983,7 +1073,7 @@ async def _start_rem_daemon() -> "asyncio.subprocess.Process | None":
     if not uv:
         log.warning("uv not in PATH — cannot start REM daemon")
         return None
-    env, read_fd = _daemon_env_and_token_fd("rem_daemon")
+    env, read_fd = _daemon_env_and_token_fd(_REM_DAEMON_AGENT_NAME)
     try:
         proc = await asyncio.create_subprocess_exec(
             uv, "run",
@@ -996,7 +1086,7 @@ async def _start_rem_daemon() -> "asyncio.subprocess.Process | None":
         )
     except Exception:
         if read_fd is not None:
-            _revoke_daemon_token("rem_daemon")
+            _revoke_daemon_token(_REM_DAEMON_AGENT_NAME)
         raise
     finally:
         if read_fd is not None:
@@ -1317,16 +1407,31 @@ async def _capability_probe_daemon(proxy, stop_event) -> None:
 # --------------------------------------------------------------------------- #
 # Health endpoint
 # --------------------------------------------------------------------------- #
-async def handle_health(request: web.Request) -> web.Response:
-    """GET /health — probe all upstream backends and report daemon liveness.
+# S-11 (PR A5): short TTL cache around handle_health's own expensive fan-out
+# (2+N upstream probes per hit: embedder, reranker, every LLM backend, plus
+# the wedge probe when suspect). /health is polled frequently (the monitor,
+# `doctor`, every LLM-wedge caller) and none of that traffic needs a fresh
+# probe every single hit. Env-overridable; a few seconds by default — long
+# enough to absorb a burst, short enough that a real outage still shows up
+# fast. In-process only: a restart clears `_health_cache` along with every
+# other module global, so a cached response can never outlive the process it
+# was computed in — trivially true, not merely assumed, because the cache
+# and FRAMEWORK_VERSION/API_VERSION live in the same process memory and are
+# rebuilt together on the next probe after a restart.
+HEALTH_CACHE_TTL_S = float(os.environ.get("HEALTH_CACHE_TTL_S", "3"))
+_health_cache: dict = {"checks": None, "ts": 0.0}
 
-    HTTP 200: embedder + reranker both reachable (save/search path is healthy).
-    HTTP 503: at least one critical backend is down.
 
-    The reasoning LLM is non-critical for saves and searches — its status is reported
-    but does not affect the overall HTTP status code (it only affects consolidation).
+async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict:
+    """The full probe: every upstream backend, daemon liveness, config, and
+    the dream-cycle snapshot. Returns the SAME shape regardless of caller —
+    disclosure is handle_health's job, applied AFTER this is computed or
+    read from cache, never baked into the probe itself (S-10). has_credential/
+    model are unconditionally included here for that reason: only an
+    authenticated caller ever sees this dict at all now, so the per-field
+    gate this function used to apply is redundant — handle_health's own
+    caller_authenticated branch is the one gate that matters.
     """
-    proxy: AsyncHiveMindProxy = request.app["proxy"]
     checks: dict[str, str] = {}
 
     # The embedder and reranker are llama.cpp containers that expose /health.
@@ -1442,20 +1547,19 @@ async def handle_health(request: web.Request) -> web.Response:
     # capability (external/paid backends, LLM_BACKENDS_JSON) is monitor-visible
     # from the moment it's configured, not only once someone goes looking (fact 898).
     #
-    # has_credential/model are gated behind a VALID bearer token, unlike the rest
-    # of /health (deliberately unauthenticated so liveness probes work without a
-    # token). Confirming "this specific backend has a live paid key loaded right
-    # now" is materially more sensitive than a bare URL — a URL alone doesn't
-    # confirm a credential is actually attached, and every backend that reaches
-    # LLM_BACKENDS at all already has one iff it needed one (an unresolved
-    # token_env excludes it from the pool entirely, see _load_llm_backends). An
-    # anonymous caller gets url/weight only, same shape as before this change.
-    caller_authenticated = bool(resolve_identity(request))
+    # has_credential/model: confirming "this specific backend has a live paid
+    # key loaded right now" is materially more sensitive than a bare URL — a
+    # URL alone doesn't confirm a credential is actually attached, and every
+    # backend that reaches LLM_BACKENDS at all already has one iff it needed
+    # one (an unresolved token_env excludes it from the pool entirely, see
+    # _load_llm_backends). Unconditional here (S-10): this whole function's
+    # output is now only ever handed to an authenticated caller — see this
+    # function's own docstring.
     checks["config"] = {
         "llm_backends": [
             {"url": b, "weight": LLM_WEIGHTS.get(b, 1.0),
-             **({"has_credential": LLM_BACKEND_TOKENS.get(b) is not None,
-                 "model": LLM_BACKEND_MODELS.get(b)} if caller_authenticated else {})}
+             "has_credential": LLM_BACKEND_TOKENS.get(b) is not None,
+             "model": LLM_BACKEND_MODELS.get(b)}
             for b in LLM_BACKENDS
         ],
         "llm_pool_tuning": {
@@ -1493,7 +1597,6 @@ async def handle_health(request: web.Request) -> web.Response:
     # (refreshed ~60 s in the background) so /health stays DB-free. stalled=true
     # means an eligible backlog exists but nothing has folded within the stall
     # window and no fold is in-flight — an actionable alert, not a probe miss.
-    coordinator = request.app.get("coordinator")
     if coordinator is not None:
         try:
             consolidation = coordinator.consolidation_health()
@@ -1531,12 +1634,101 @@ async def handle_health(request: web.Request) -> web.Response:
             checks["project_identity"] = None
             checks["domain_identity"] = None
 
-    return web.json_response(checks, status=200 if critical_ok else 503)
+    return checks
+
+
+async def _health_probe_cached(proxy: "AsyncHiveMindProxy", coordinator) -> dict:
+    """TTL-cached wrapper around _build_health_checks (S-11). Anonymous and
+    authenticated callers SHARE this cache — the probe itself (embedder/
+    reranker/LLM reachability, daemon liveness, dream-cycle snapshot) costs
+    the same regardless of who's asking, and a second probe within the TTL
+    window buys nothing; only the RESPONSE SHAPE handle_health serves
+    differs per caller, and that projection is applied fresh on every call,
+    never cached itself (see _build_health_checks's docstring)."""
+    now = time.monotonic()
+    cached = _health_cache["checks"]
+    if cached is not None and now - _health_cache["ts"] < HEALTH_CACHE_TTL_S:
+        return cached
+    checks = await _build_health_checks(proxy, coordinator)
+    _health_cache["checks"] = checks
+    _health_cache["ts"] = now
+    return checks
+
+
+async def handle_health(request: web.Request) -> web.Response:
+    """GET /health — liveness for everyone; the full operational payload
+    (backend roster, per-backend pool state, capability probes, daemon/
+    dream-cycle detail) only for a caller presenting a valid agent bearer
+    token (S-10, Credential_Custody_Plan PR A5). That detail is operational
+    information about this deployment's infrastructure, not something every
+    unauthenticated network peer should learn just by asking.
+
+    Anonymous shape: {"status", "version", "api_version"} — exactly what
+    memory_bridge.py's `doctor` parses (check_gateway_compat() reads only
+    these three keys), so `doctor` and any liveness-only poller keep working
+    unchanged. Authenticated shape: today's full payload, byte-compatible.
+
+    HTTP 200: embedder + reranker both reachable (save/search path healthy).
+    HTTP 503: at least one critical backend is down — computed identically
+    for every caller; an anonymous caller learns the VERDICT, not why.
+    """
+    proxy: AsyncHiveMindProxy = request.app["proxy"]
+    checks = await _health_probe_cached(proxy, request.app.get("coordinator"))
+    critical_ok = checks["status"] == "ok"
+    status_code = 200 if critical_ok else 503
+
+    if not bool(resolve_identity(request)):
+        return web.json_response(
+            {"status": checks["status"], "version": checks["version"],
+             "api_version": checks["api_version"]},
+            status=status_code,
+        )
+    return web.json_response(checks, status=status_code)
 
 
 # --------------------------------------------------------------------------- #
 # Startup / shutdown
 # --------------------------------------------------------------------------- #
+def require_auth_when_provider_keys_configured() -> None:
+    """S-05 (Required, RULED — decision:1303, PR A5): AGENT_TOKENS unset
+    disables auth AND the in-flight cap AND the audit path (see coordinator.
+    auth_middleware's AUTH_CONFIGURED_AT_STARTUP early-return) while any
+    provider key stays attached to whatever backend it's configured for — so
+    an auth-unset install with a credentialed backend lets ANY network peer
+    that can reach the gateway sign a request with that key. Refuses to
+    start rather than run that way.
+
+    Two ways out, both named in the error: configure AGENT_TOKENS, or set
+    ALLOW_UNAUTHENTICATED_PROVIDER_KEYS=1 — an explicit, deliberate override
+    for a deployment that has decided the risk is acceptable (documented in
+    .env.example with a warning).
+
+    REFINED invariant, not a narrowed one: an auth-unset install with NO
+    provider-credentialed backend configured — the original backward-compat
+    population, e.g. a bare local llama-server — is completely unaffected;
+    this only gates the NEW combination of auth-off *and* a live provider
+    key. Call from main() ONLY (the real entrypoint), same placement
+    reasoning as require_no_plaintext_agent_tokens(): every test in this
+    repo imports this module freely, many with AUTH_CONFIGURED_AT_STARTUP
+    False on purpose, so an unconditional check here would kill test
+    collection itself, not just a genuinely misconfigured gateway.
+    """
+    if AUTH_CONFIGURED_AT_STARTUP:
+        return
+    if os.environ.get("ALLOW_UNAUTHENTICATED_PROVIDER_KEYS", "").strip().lower() in ("1", "true", "yes", "on"):
+        return
+    credentialed = sorted(b for b in LLM_BACKENDS if LLM_BACKEND_TOKENS.get(b))
+    if not credentialed:
+        return
+    raise SystemExit(
+        "FATAL: AGENT_TOKENS is unset but a provider-credentialed backend is "
+        f"configured ({', '.join(credentialed)}) — starting would let any "
+        "caller sign a request with that key. Configure AGENT_TOKENS, or set "
+        "ALLOW_UNAUTHENTICATED_PROVIDER_KEYS=1 to run anyway (see "
+        "shared-memory/.env.example)."
+    )
+
+
 def _default_uds_path() -> str:
     """Per-user runtime socket by default (0700 dir → only this user reaches it,
     which is exactly right for a single-user box). For a multi-user gateway set
@@ -1551,6 +1743,10 @@ async def main() -> None:
     # up. See coordinator.require_no_plaintext_agent_tokens()'s docstring
     # for why this call lives here (the real entrypoint) and nowhere else.
     require_no_plaintext_agent_tokens()
+    # S-05 (RULED — decision:1303): auth-off + a live provider key also
+    # refuses to start — see require_auth_when_provider_keys_configured()'s
+    # docstring for why this call lives here too.
+    require_auth_when_provider_keys_configured()
 
     PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8888
 

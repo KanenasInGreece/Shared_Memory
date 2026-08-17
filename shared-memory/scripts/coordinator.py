@@ -142,7 +142,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.8"
+FRAMEWORK_VERSION = "0.9.9"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -785,6 +785,10 @@ def _apply_principal(target: dict[str, Any], principal: dict[str, Any] | None) -
 
 
 # ── Governance: outer in-flight load-shed valve ─────────────────────────────────
+# Checked FIRST in auth_middleware, ahead of every auth exemption (S-11) — the
+# counter itself is still only incremented/decremented around the full
+# authenticated dispatch below, so an unprotected-path hit can be SHED by this
+# valve without itself counting toward tripping it.
 _inflight = 0
 
 # ── Backup quiesce: client-write shed + daemon advisory-lock gate ───────────────
@@ -901,6 +905,10 @@ _llm_fault_counters: dict[str, dict] = {}
 _credential_counters: dict[str, int] = {
     "token_verify_failed": 0,
     "daemon_tokens_issued": 0,
+    # S-04 (PR A5): a request that would have carried a provider key but
+    # whose method+path is not one of the framework's own endpoints —
+    # see hive_mind_proxy.record_credentialed_route_denied.
+    "credentialed_route_denied": 0,
 }
 # When each credential counter last moved. Counters answer "how many"; a
 # consumer asking "is this still happening?" needs "when", and for these
@@ -913,6 +921,7 @@ _credential_counters: dict[str, int] = {
 _credential_last_ts: dict[str, str | None] = {
     "token_verify_failed": None,
     "daemon_tokens_issued": None,
+    "credentialed_route_denied": None,
 }
 
 
@@ -1212,6 +1221,25 @@ def record_llm_gateway_fault(backend: str, error_class: str, *,
                                       backend=backend, error_class=error_class, **extra)
 
 
+def record_credentialed_route_denied(backend: str, method: str, path: str, *,
+                                      agent_name: str | None = None,
+                                      request_id: str | None = None) -> None:
+    """S-04 (Credential_Custody_Plan, PR A5): a request bound for a
+    credentialed backend (a provider key was about to be attached) whose
+    method+path is not one of the framework's own endpoints —
+    hive_mind_proxy.CREDENTIALED_BACKEND_ALLOWED_ROUTES. Counter + a
+    credential-audit line carrying method/path/agent — never the key
+    itself, which this rejection never even reaches (it fires before
+    Authorization is attached)."""
+    _credential_counters["credentialed_route_denied"] += 1
+    _credential_last_ts["credentialed_route_denied"] = datetime.now(timezone.utc).isoformat()
+    extra = {"request_id": request_id} if request_id else {}
+    _write_credential_audit_line(
+        "credentialed_route_denied", origin="gateway",
+        backend=backend, method=method, path=path, agent=agent_name, **extra,
+    )
+
+
 def record_llm_upstream_fault(backend: str, status: int, error_type: str | None, *,
                                credentialed: bool = False,
                                request_id: str | None = None) -> str:
@@ -1278,6 +1306,8 @@ def _credentials_snapshot() -> dict:
         "token_verify_failed_last_ts": _credential_last_ts["token_verify_failed"],
         "daemon_tokens_issued": _credential_counters["daemon_tokens_issued"],
         "daemon_tokens_issued_last_ts": _credential_last_ts["daemon_tokens_issued"],
+        "credentialed_route_denied": _credential_counters["credentialed_route_denied"],
+        "credentialed_route_denied_last_ts": _credential_last_ts["credentialed_route_denied"],
         "audit_log_dropped": writer.dropped if writer else 0,
         "audit_log_dropped_last_ts": writer.last_dropped_ts if writer else None,
     }
@@ -1287,14 +1317,34 @@ def _credentials_snapshot() -> dict:
 async def auth_middleware(request: web.Request, handler):
     """DEFAULT DENY, and the single identity → govern → audit choke point.
 
-    Order: resolve a verified identity (pluggable — bearer today, PoP later) →
-    enforce read-only role → shed if over the in-flight cap → dispatch → audit
-    the outcome. A DB pool that stays saturated past POOL_ACQUIRE_TIMEOUT surfaces
-    as asyncio.TimeoutError from a handler's _acquire(); it is mapped here to
+    Order: shed if over the in-flight cap (S-11 — ahead of every exemption,
+    unprotected paths included) → auth-disabled bypass → unprotected-path
+    exemption → resolve a verified identity (pluggable — bearer today, PoP
+    later) → enforce read-only role → dispatch → audit the outcome. A DB pool
+    that stays saturated past POOL_ACQUIRE_TIMEOUT surfaces as
+    asyncio.TimeoutError from a handler's _acquire(); it is mapped here to
     503 + Retry-After so the gateway sheds load instead of hanging a caller.
     """
     global _inflight
     _check_client_version(request)  # logs API skew to the gateway log; never raises
+
+    # S-11 (PR A5): the load-shed valve is now the FIRST gate — ahead of both
+    # the auth-disabled bypass below and the per-path _UNPROTECTED_PATHS
+    # exemption further down. It used to sit after both, so an anonymous
+    # /health or /pool/status hit (and, on an auth-unset install, EVERY
+    # request) could never be shed no matter how saturated the gateway
+    # already was. The valve exists to protect the PROCESS from an in-flight
+    # pile-up, not to gate access, so it must apply uniformly regardless of
+    # what auth decides afterward. Requests that shed here were never
+    # admitted, so they are not counted in `_inflight` themselves (that
+    # counter still tracks only the full authenticated flow below) — the
+    # short TTL cache on /health's own expensive fan-out (hive_mind_proxy.
+    # HEALTH_CACHE_TTL_S) is what bounds an anonymous-only flood's cost.
+    if GATEWAY_INFLIGHT_MAX and _inflight >= GATEWAY_INFLIGHT_MAX:
+        raise web.HTTPServiceUnavailable(
+            reason="gateway at capacity", headers={"Retry-After": "1"},
+        )
+
     # Gate on the STARTUP truth (finding 1), not on whether _AGENT_TOKENS
     # happens to be non-empty right now -- see AUTH_CONFIGURED_AT_STARTUP's
     # docstring above for why the two diverge after a daemon token is minted.
@@ -1355,14 +1405,6 @@ async def auth_middleware(request: web.Request, handler):
                 reason="writes require a kernel-attested principal — connect over the "
                        "gateway Unix socket (GATEWAY_UDS_PATH), not TCP",
             )
-
-    # Outer load-shed valve (disabled when GATEWAY_INFLIGHT_MAX == 0). Caps total
-    # concurrent requests — including ones parked on a slow embedding/LLM call
-    # that hold no DB connection — which the pool timeout alone cannot bound.
-    if GATEWAY_INFLIGHT_MAX and _inflight >= GATEWAY_INFLIGHT_MAX:
-        raise web.HTTPServiceUnavailable(
-            reason="gateway at capacity", headers={"Retry-After": "1"},
-        )
 
     started    = asyncio.get_running_loop().time()
     request_id = uuid.uuid4().hex[:12]

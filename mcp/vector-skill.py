@@ -119,7 +119,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.9.8"
+VERSION = "0.9.9"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server
@@ -190,12 +190,19 @@ _CAPABILITY_CACHE: dict | None = None
 
 async def _gateway_capability() -> dict | None:
     """GET /health once per process and return its ``backend_capability`` block.
-    Never raises: sizing the search must never be the thing that fails it."""
+    Never raises: sizing the search must never be the thing that fails it.
+
+    Sends this client's own auth headers (S-10, PR A5): ``backend_capability``
+    moved behind auth along with the rest of /health's operational detail, so
+    an unauthenticated call here would always land on the anonymous-slim
+    shape and silently fall back to the constant ceiling on every
+    authenticated install."""
     global _CAPABILITY_CACHE
     if _CAPABILITY_CACHE is None:
         try:
             async with httpx.AsyncClient(timeout=HEALTH_PROBE_TIMEOUT_S) as client:
-                health = (await client.get(f"{COORDINATOR_BASE}/health")).json()
+                health = (await client.get(f"{COORDINATOR_BASE}/health",
+                                           headers=_auth_headers())).json()
             block = health.get("backend_capability")
             _CAPABILITY_CACHE = block if isinstance(block, dict) else {}
         except Exception:
@@ -942,6 +949,12 @@ async def check_memory_health() -> str:
     database connection to count rows. The gateway is the component that knows
     whether the stack is healthy; asking it is also the only check that
     exercises the path this client actually uses.
+
+    That full detail requires AGENT_TOKEN to be set (S-10, PR A5): a
+    credential-less caller gets liveness only (status/version/api_version) —
+    the backend roster and per-backend pool state are operational
+    information about this deployment, not something every unauthenticated
+    caller should learn.
     """
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:

@@ -29,7 +29,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.9.8"
+VERSION = "0.9.9"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v3: review-edges / label-edges require the gateway's /memory/relations/* routes.
@@ -332,12 +332,21 @@ async def _gateway_capability() -> dict | None:
     Never raises. An unreachable or slow gateway yields None and the caller falls
     back to a constant ceiling — sizing the search must never be the thing that
     fails the search. The gateway caches its own probe, so this costs a few ms.
+
+    Sends this client's own auth headers (S-10, PR A5): ``backend_capability``
+    moved behind auth along with the rest of /health's operational detail, so
+    an unauthenticated call here would always land on the anonymous-slim shape
+    (no ``backend_capability`` key at all) and silently fall back to the
+    constant ceiling on every authenticated install — the exact "unknown cost"
+    case ``search_ceiling`` already degrades safely for, just permanently
+    rather than only when the gateway is genuinely old/unreachable/unprobed.
     """
     global _CAPABILITY_CACHE
     if _CAPABILITY_CACHE is None:
         try:
             async with _async_client(HEALTH_PROBE_TIMEOUT_S) as client:
-                health = (await client.get(f"{COORDINATOR_BASE}/health")).json()
+                health = (await client.get(f"{COORDINATOR_BASE}/health",
+                                           headers=_request_headers())).json()
             block = health.get("backend_capability")
             _CAPABILITY_CACHE = block if isinstance(block, dict) else {}
         except Exception:
