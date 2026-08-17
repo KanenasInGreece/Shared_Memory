@@ -447,6 +447,22 @@ def _safe_agent_name(request) -> "str | None":
         return None
 
 
+def _safe_resolve_identity(request) -> "str | None":
+    """resolve_identity(), tolerant of a lightweight/missing request double
+    — handle_health/handle_pool_status are unit-tested by calling the
+    handler directly (some callers pass None: "the session is needed only
+    for the rare suspect-wedged probe; unit tests call this handler without
+    a real request/app", per handle_pool_status's own docstring). Same
+    fallback shape as _safe_request_id/_safe_agent_name above; a genuinely
+    absent identity (no headers at all, or no request at all) is
+    indistinguishable from an anonymous caller here, which is the correct
+    reading either way."""
+    try:
+        return resolve_identity(request)
+    except AttributeError:
+        return None
+
+
 # S-14 (Credential_Custody_Plan PR A5): the two framework daemons — the only
 # identities _mint_daemon_token() ever mints for (see the two call sites
 # below) — are the sole non-admin identities allowed to steer LLM routing.
@@ -1246,7 +1262,23 @@ async def handle_pool_status(request: web.Request) -> web.Response:
     Because ALL LLM traffic (dream cycles AND user chats) flows through the
     gateway, in-flight IS the LLM-usage signal — so REM/NREM gate on this instead
     of a global nvtop check (which self-defers to our own dream work and ignores a
-    free card). Desktop/display GPU use is intentionally not considered."""
+    free card). Desktop/display GPU use is intentionally not considered.
+
+    SEC-A5-01 (PR A5 fix round): the roster/pool-state detail below (backend
+    URLs keyed to inflight/cooldown/reserved/available — an idle/busy oracle
+    for whatever provider is configured) is gated exactly like /health
+    (SEC-A5-03: ONLY when AUTH_CONFIGURED_AT_STARTUP is true — an auth-off
+    install keeps today's full payload). Every REAL internal caller sends
+    its own token: pool_status.pool_has_free_slot() (rem_loop.py,
+    consolidation_loop.py) and relation_sweep.py's direct probe both attach
+    their daemon/agent Authorization header — see those modules'
+    _auth_headers(). An anonymous caller on an auth-configured install gets
+    an empty object; pool_status.py's `.get("free_slots", 1)` default then
+    fail-opens exactly as it already does on any other unreachable/erroring
+    gateway, rather than silently and permanently losing slot-awareness."""
+    if AUTH_CONFIGURED_AT_STARTUP and not bool(_safe_resolve_identity(request)):
+        return web.json_response({})
+
     now = time.monotonic()
     # Lazy/defensive: the session is needed only for the rare suspect-wedged
     # probe; unit tests call this handler without a real request/app.
@@ -1420,6 +1452,12 @@ async def _capability_probe_daemon(proxy, stop_event) -> None:
 # rebuilt together on the next probe after a restart.
 HEALTH_CACHE_TTL_S = float(os.environ.get("HEALTH_CACHE_TTL_S", "3"))
 _health_cache: dict = {"checks": None, "ts": 0.0}
+# SEC-A5-05b (PR A5 fix round): single-flight coalescing for a cache miss —
+# see _health_probe_cached's docstring. Constructed at module import time
+# with no running loop; safe under Python's current asyncio (a Lock no
+# longer binds to a specific loop at construction, only on first use inside
+# one), which is what lets this be a plain module global like _health_cache.
+_health_probe_lock = asyncio.Lock()
 
 
 async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict:
@@ -1575,6 +1613,13 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
         },
         "embed_max_chars": int(os.environ.get("EMBED_MAX_CHARS", "24000")),
     }
+    # SEC-A5-02 (PR A5 fix round): present ONLY while the S-05 override is
+    # actually exposing a live provider key unauthenticated — additive, so
+    # a monitor that doesn't know the key renders exactly as before on
+    # every other install. See _unauthenticated_provider_keys_override_
+    # active's docstring for why this mirrors the startup log.warning.
+    if _unauthenticated_provider_keys_override_active():
+        checks["config"]["allow_unauthenticated_provider_keys"] = True
 
     # Embedder and reranker are the critical path — every save and search
     # depends on them.  LLM and daemon degradation is reported but does not
@@ -1638,35 +1683,71 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
 
 
 async def _health_probe_cached(proxy: "AsyncHiveMindProxy", coordinator) -> dict:
-    """TTL-cached wrapper around _build_health_checks (S-11). Anonymous and
-    authenticated callers SHARE this cache — the probe itself (embedder/
-    reranker/LLM reachability, daemon liveness, dream-cycle snapshot) costs
-    the same regardless of who's asking, and a second probe within the TTL
-    window buys nothing; only the RESPONSE SHAPE handle_health serves
-    differs per caller, and that projection is applied fresh on every call,
-    never cached itself (see _build_health_checks's docstring)."""
+    """TTL-cached wrapper around _build_health_checks (S-11), with
+    single-flight coalescing on a miss (SEC-A5-05b, PR A5 fix round): the
+    TTL alone bounds SEQUENTIAL cost only — N concurrent misses arriving
+    together (e.g. a burst of /health hits right as the TTL expires) would
+    each observe a stale timestamp and each run the full 2+N-probe fan-out
+    before any of them writes back. The lock below makes every concurrent
+    miss AWAIT the one probe already in flight: the second-and-later caller
+    re-checks the cache immediately after acquiring the lock and finds it
+    fresh (the first caller already populated it) — that re-check IS the
+    coalescing, not a redundant guard — so only ONE _build_health_checks()
+    call ever runs per TTL window regardless of how many callers arrive
+    concurrently.
+
+    Anonymous and authenticated callers SHARE this cache — the probe itself
+    (embedder/reranker/LLM reachability, daemon liveness, dream-cycle
+    snapshot) costs the same regardless of who's asking, and a second probe
+    within the TTL window buys nothing; only the RESPONSE SHAPE handle_
+    health serves differs per caller, and that projection is applied fresh
+    on every call, never cached itself (see _build_health_checks's
+    docstring)."""
     now = time.monotonic()
     cached = _health_cache["checks"]
     if cached is not None and now - _health_cache["ts"] < HEALTH_CACHE_TTL_S:
         return cached
-    checks = await _build_health_checks(proxy, coordinator)
-    _health_cache["checks"] = checks
-    _health_cache["ts"] = now
-    return checks
+    async with _health_probe_lock:
+        now = time.monotonic()
+        cached = _health_cache["checks"]
+        if cached is not None and now - _health_cache["ts"] < HEALTH_CACHE_TTL_S:
+            return cached
+        checks = await _build_health_checks(proxy, coordinator)
+        _health_cache["checks"] = checks
+        _health_cache["ts"] = now
+        return checks
 
 
 async def handle_health(request: web.Request) -> web.Response:
     """GET /health — liveness for everyone; the full operational payload
     (backend roster, per-backend pool state, capability probes, daemon/
     dream-cycle detail) only for a caller presenting a valid agent bearer
-    token (S-10, Credential_Custody_Plan PR A5). That detail is operational
-    information about this deployment's infrastructure, not something every
-    unauthenticated network peer should learn just by asking.
+    token ON AN AUTH-CONFIGURED INSTALL (S-10, Credential_Custody_Plan
+    PR A5). That detail is operational information about this deployment's
+    infrastructure, not something every unauthenticated network peer should
+    learn just by asking.
 
-    Anonymous shape: {"status", "version", "api_version"} — exactly what
-    memory_bridge.py's `doctor` parses (check_gateway_compat() reads only
-    these three keys), so `doctor` and any liveness-only poller keep working
-    unchanged. Authenticated shape: today's full payload, byte-compatible.
+    SEC-A5-03 (PR A5 fix round): slimming applies ONLY when
+    AUTH_CONFIGURED_AT_STARTUP is true. An auth-off install has no token
+    registry at all — `resolve_identity()` can never match ANY presented
+    token against an empty `_AGENT_TOKENS`, so gating on bare
+    `resolve_identity()` made such an install "always anonymous, with no
+    reachable alternative": its monitor, `doctor`, and every `/health`
+    triage command would have silently and PERMANENTLY lost the full
+    payload with no token able to restore it. There is also nothing on such
+    an install for the slimming to protect — S-05 guarantees an auth-off
+    install has no LIVE provider key unless it took the explicit override
+    (and that override is itself now surfaced in the full payload — see
+    `_unauthenticated_provider_keys_override_active`), so an auth-off
+    install keeps today's full payload unconditionally, exactly as before
+    this branch.
+
+    Anonymous shape on an auth-configured install: {"status", "version",
+    "api_version"} — exactly what memory_bridge.py's `doctor` parses
+    (check_gateway_compat() reads only these three keys), so `doctor` and
+    any liveness-only poller keep working unchanged. Authenticated shape
+    (or ANY caller on an auth-off install): today's full payload,
+    byte-compatible.
 
     HTTP 200: embedder + reranker both reachable (save/search path healthy).
     HTTP 503: at least one critical backend is down — computed identically
@@ -1677,7 +1758,7 @@ async def handle_health(request: web.Request) -> web.Response:
     critical_ok = checks["status"] == "ok"
     status_code = 200 if critical_ok else 503
 
-    if not bool(resolve_identity(request)):
+    if AUTH_CONFIGURED_AT_STARTUP and not bool(_safe_resolve_identity(request)):
         return web.json_response(
             {"status": checks["status"], "version": checks["version"],
              "api_version": checks["api_version"]},
@@ -1689,6 +1770,24 @@ async def handle_health(request: web.Request) -> web.Response:
 # --------------------------------------------------------------------------- #
 # Startup / shutdown
 # --------------------------------------------------------------------------- #
+def _unauthenticated_provider_keys_override_active() -> bool:
+    """True iff this process is running with the S-05 override ACTUALLY in
+    effect — auth off, a provider key attached to a configured backend, and
+    the operator set ALLOW_UNAUTHENTICATED_PROVIDER_KEYS (SEC-A5-02, PR A5
+    fix round). Read fresh every call (never cached) so it always reflects
+    the live env/config rather than a value captured once at import time.
+    Shared by require_auth_when_provider_keys_configured() below (decides
+    warn-vs-raise) and _build_health_checks() (surfaces the condition on
+    the authenticated /health payload so it stays MONITORABLE for the
+    gateway's whole lifetime, not just greppable in a boot log that
+    rotates)."""
+    if AUTH_CONFIGURED_AT_STARTUP:
+        return False
+    if not any(LLM_BACKEND_TOKENS.get(b) for b in LLM_BACKENDS):
+        return False
+    return os.environ.get("ALLOW_UNAUTHENTICATED_PROVIDER_KEYS", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def require_auth_when_provider_keys_configured() -> None:
     """S-05 (Required, RULED — decision:1303, PR A5): AGENT_TOKENS unset
     disables auth AND the in-flight cap AND the audit path (see coordinator.
@@ -1715,10 +1814,29 @@ def require_auth_when_provider_keys_configured() -> None:
     """
     if AUTH_CONFIGURED_AT_STARTUP:
         return
-    if os.environ.get("ALLOW_UNAUTHENTICATED_PROVIDER_KEYS", "").strip().lower() in ("1", "true", "yes", "on"):
-        return
     credentialed = sorted(b for b in LLM_BACKENDS if LLM_BACKEND_TOKENS.get(b))
     if not credentialed:
+        return
+    if os.environ.get("ALLOW_UNAUTHENTICATED_PROVIDER_KEYS", "").strip().lower() in ("1", "true", "yes", "on"):
+        # SEC-A5-02 (PR A5 fix round): this branch used to be a bare
+        # `return` — no log line, no telemetry, no /health field. Six
+        # months later there was no artefact anywhere that would let anyone
+        # discover the gateway was running as an unauthenticated proxy
+        # signing requests with a live provider key short of re-reading
+        # .env. Loud now: this log.warning at startup, PLUS a flat additive
+        # field on the authenticated /health config block (see
+        # _unauthenticated_provider_keys_override_active, used by
+        # _build_health_checks) so the condition stays visible for the
+        # gateway's whole lifetime, not just the moment it boots.
+        log.warning(
+            "ALLOW_UNAUTHENTICATED_PROVIDER_KEYS is set — starting UNAUTHENTICATED "
+            "with a live provider key attached to %d backend(s): %s. Any caller "
+            "that can reach this gateway can sign a request with that key. This is "
+            "the deliberate override documented in shared-memory/.env.example, not "
+            "a default — also visible on GET /health as "
+            "config.allow_unauthenticated_provider_keys once the gateway is up.",
+            len(credentialed), ", ".join(credentialed),
+        )
         return
     raise SystemExit(
         "FATAL: AGENT_TOKENS is unset but a provider-credentialed backend is "

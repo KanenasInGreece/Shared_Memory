@@ -997,10 +997,19 @@ def format_status(payload: dict) -> str:
     cr = t.get("credentials", {})
     if cr and "error" not in cr:
         _tvf = cr.get("token_verify_failed", 0) or 0
+        _crd = cr.get("credentialed_route_denied", 0) or 0
         _drop = cr.get("audit_log_dropped", 0) or 0
         if _tvf:
             lines.append(f"  credentials: {_tvf} token verification failure(s) "
                          f"| last {_age_phrase(cr.get('token_verify_failed_last_ts'))} "
+                         f"(since gateway start)")
+        if _crd:
+            # Q-1 (PR A5 fix round): S-04's allowlist gate was otherwise
+            # invisible from the client surface — an operator watching
+            # `status` had no way to see it firing (Group-3 obligation:
+            # every refusal visible working AND failing).
+            lines.append(f"  credentials: {_crd} credentialed-route denial(s) "
+                         f"| last {_age_phrase(cr.get('credentialed_route_denied_last_ts'))} "
                          f"(since gateway start)")
         if _drop:
             lines.append(f"  credential audit: {_drop} LINE(S) DROPPED ⚠ "
