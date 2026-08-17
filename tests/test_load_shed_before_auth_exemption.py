@@ -8,6 +8,7 @@ the check ever ran. It now runs FIRST, ahead of both exemptions.
 Uses tests/test_auth.py's load_coordinator() helper pattern (isolated
 per-test module via spec_from_file_location) since this only needs
 coordinator.auth_middleware, not the full gateway."""
+import asyncio
 import importlib.util
 import os
 import sys
@@ -144,10 +145,11 @@ async def test_authenticated_write_route_still_shed_as_before():
 
 @pytest.mark.asyncio
 async def test_shed_request_does_not_itself_bump_inflight_counter():
-    """A request shed by the valve was never admitted -- _inflight is
-    untouched by the shed itself (only the full authenticated dispatch
-    increments/decrements it), matching the documented design choice in
-    coordinator.py's _inflight comment block."""
+    """A request shed by the valve was never ADMITTED -- _inflight is
+    untouched by the shed itself. SEC-A5-05a (PR A5 fix round) made every
+    ADMITTED path (bypass/exemption/authenticated alike) increment it
+    uniformly; a request that never gets past the cap check above still
+    never reaches that increment at all."""
     mod = load_coordinator("claude:tok_abc", gateway_inflight_max="1")
     mod._inflight = 1
 
@@ -159,9 +161,108 @@ async def test_shed_request_does_not_itself_bump_inflight_counter():
     mod._inflight = 0
 
 
+# ── SEC-A5-05a (PR A5 fix round): uniform in-flight counting ─────────────────
+# Security review finding: the pre-fix-round code claimed the reordered valve
+# protected anonymous/auth-off traffic, but `_inflight` was only ever
+# incremented deep inside the authenticated-only branch — an anonymous flood
+# could never trip the cap regardless of its own volume, because it never
+# moved the counter it was being checked against. These tests prove the fix:
+# an anonymous request that is ADMITTED (not itself shed) now counts, so a
+# second concurrent one genuinely gets shed by it.
+
+@pytest.mark.asyncio
+async def test_concurrent_anonymous_health_flood_trips_the_valve():
+    """MUTATION TARGET (SEC-A5-05a): two concurrent anonymous /health
+    requests against a cap of 1 -- the first is admitted and, while its
+    handler is still running, increments _inflight to 1; the second must
+    observe that and shed. No auth-off/authenticated traffic is involved at
+    all, proving the valve now genuinely governs anonymous load by itself
+    rather than by accident of concurrent authenticated traffic."""
+    mod = load_coordinator("claude:tok_abc", gateway_inflight_max="1")
+
+    first_admitted = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def _slow_handler(request):
+        from aiohttp import web
+        first_admitted.set()
+        await release_first.wait()
+        return web.json_response({"ok": True})
+
+    req1 = _make_request("/health")
+    req2 = _make_request("/health")
+
+    task1 = asyncio.create_task(mod.auth_middleware(req1, _slow_handler))
+    await first_admitted.wait()
+    assert mod._inflight == 1, "the first admitted anonymous request must count"
+
+    from aiohttp.web_exceptions import HTTPServiceUnavailable
+    with pytest.raises(HTTPServiceUnavailable):
+        await mod.auth_middleware(req2, _noop_handler)
+
+    release_first.set()
+    resp1 = await task1
+    assert resp1.status == 200
+    assert mod._inflight == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_auth_off_flood_trips_the_valve():
+    """Same proof, auth-off install -- the review's other failure mode ('on
+    an auth-off install nothing ever contributes')."""
+    mod = load_coordinator("", gateway_inflight_max="1")
+    assert mod.AUTH_CONFIGURED_AT_STARTUP is False
+
+    first_admitted = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def _slow_handler(request):
+        from aiohttp import web
+        first_admitted.set()
+        await release_first.wait()
+        return web.json_response({"ok": True})
+
+    req1 = _make_request("/memory/save", method="POST")
+    req2 = _make_request("/memory/save", method="POST")
+
+    task1 = asyncio.create_task(mod.auth_middleware(req1, _slow_handler))
+    await first_admitted.wait()
+    assert mod._inflight == 1
+
+    from aiohttp.web_exceptions import HTTPServiceUnavailable
+    with pytest.raises(HTTPServiceUnavailable):
+        await mod.auth_middleware(req2, _noop_handler)
+
+    release_first.set()
+    await task1
+    assert mod._inflight == 0
+
+
+@pytest.mark.asyncio
+async def test_inflight_decrements_even_when_handler_raises():
+    """Exception safety (review: 'watch the exemption/bypass branches for
+    leaks on exception') -- the auth-disabled BYPASS branch calls the
+    handler directly with no inner try/finally of its own; confirm the
+    OUTER one still decrements when that handler raises."""
+    mod = load_coordinator("", gateway_inflight_max="5")  # auth off -> bypass branch
+
+    async def _raising_handler(request):
+        raise RuntimeError("boom")
+
+    req = _make_request("/memory/save", method="POST")
+    with pytest.raises(RuntimeError):
+        await mod.auth_middleware(req, _raising_handler)
+    assert mod._inflight == 0, "the bypass branch must not leak an in-flight slot on exception"
+
+
 # ── Mutation check target ────────────────────────────────────────────────────
 # See A5_HANDOFF.md's mutation-check table: reverting the load-shed check to
 # its old position (after both exemptions) makes
 # test_saturated_gateway_sheds_anonymous_health_hit and
 # test_saturated_gateway_sheds_even_when_auth_entirely_disabled both fail
 # (no HTTPServiceUnavailable raised -- the request passes straight through).
+# Reverting the uniform-counting fix (moving `_inflight += 1`/`-= 1` back
+# inside only the authenticated branch) makes
+# test_concurrent_anonymous_health_flood_trips_the_valve and
+# test_concurrent_auth_off_flood_trips_the_valve both fail (the second
+# concurrent request is never shed).

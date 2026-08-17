@@ -84,6 +84,62 @@ def test_allow_unauthenticated_override_permits_start(monkeypatch):
     g.require_auth_when_provider_keys_configured()  # must not raise
 
 
+# ── SEC-A5-02 (PR A5 fix round): the override must be LOUD ──────────────────
+
+def test_override_logs_a_warning_naming_the_exposed_backends(monkeypatch, caplog):
+    """MUTATION TARGET: the override used to be a bare `return` -- no log
+    line at all. Now it must name the backend(s) it's exposing."""
+    import logging
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-refusal-test")
+    g = _load(monkeypatch, agent_tokens="", backends_json=[
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+    ], allow_unauth="1")
+    with caplog.at_level(logging.WARNING, logger="hive-proxy"):
+        g.require_auth_when_provider_keys_configured()
+    assert "ALLOW_UNAUTHENTICATED_PROVIDER_KEYS" in caplog.text
+    assert "https://api.deepseek.com/v1" in caplog.text
+    assert "sk-refusal-test" not in caplog.text
+
+
+def test_no_warning_when_override_unset_and_no_credentialed_backend(monkeypatch, caplog):
+    """Sanity: the warning is conditional on the override actually mattering
+    -- an install with no provider keys never logs it."""
+    import logging
+    g = _load(monkeypatch, agent_tokens="", backends_json=None, allow_unauth="1")
+    with caplog.at_level(logging.WARNING, logger="hive-proxy"):
+        g.require_auth_when_provider_keys_configured()
+    assert "ALLOW_UNAUTHENTICATED_PROVIDER_KEYS" not in caplog.text
+
+
+def test_override_active_helper_true_only_when_all_three_conditions_hold(monkeypatch):
+    """Direct unit coverage of _unauthenticated_provider_keys_override_
+    active, the helper shared between the startup warning and the /health
+    field (SEC-A5-02)."""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-refusal-test")
+
+    # All three: auth off + credentialed backend + override set.
+    g = _load(monkeypatch, agent_tokens="", backends_json=[
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+    ], allow_unauth="1")
+    assert g._unauthenticated_provider_keys_override_active() is True
+
+    # Auth configured -> False regardless of the override.
+    g = _load(monkeypatch, agent_tokens="claude:tok_abc", backends_json=[
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+    ], allow_unauth="1")
+    assert g._unauthenticated_provider_keys_override_active() is False
+
+    # No credentialed backend -> False even with the override set.
+    g = _load(monkeypatch, agent_tokens="", backends_json=None, allow_unauth="1")
+    assert g._unauthenticated_provider_keys_override_active() is False
+
+    # Override not set -> False (this is the refusal path, not the override path).
+    g = _load(monkeypatch, agent_tokens="", backends_json=[
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+    ])
+    assert g._unauthenticated_provider_keys_override_active() is False
+
+
 def test_auth_configured_permits_start_regardless_of_provider_keys(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-refusal-test")
     g = _load(monkeypatch, agent_tokens="claude:tok_abc", backends_json=[
@@ -112,8 +168,72 @@ def test_auth_off_credentialed_embedder_reranker_never_trigger_this_gate(monkeyp
     g.require_auth_when_provider_keys_configured()  # must not raise
 
 
+# ── SEC-A5-02: the /health config field mirrors the override state ──────────
+
+class _HealthProbeResp:
+    status = 200
+
+
+class _HealthProbeCm:
+    async def __aenter__(self):
+        return _HealthProbeResp()
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _HealthProbeSession:
+    def get(self, url, timeout=None):
+        return _HealthProbeCm()
+
+
+def test_health_config_field_present_only_while_override_active(monkeypatch):
+    import asyncio
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-refusal-test")
+    g = _load(monkeypatch, agent_tokens="", backends_json=[
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+    ], allow_unauth="1")
+
+    class _Proxy:
+        session = _HealthProbeSession()
+
+    checks = asyncio.run(g._build_health_checks(_Proxy(), None))
+    assert checks["config"]["allow_unauthenticated_provider_keys"] is True
+
+
+def test_health_config_field_absent_when_auth_configured(monkeypatch):
+    """Additive: an install with auth on never carries the field at all
+    (not even `false`) -- a monitor that doesn't know it renders exactly
+    as before."""
+    import asyncio
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-refusal-test")
+    g = _load(monkeypatch, agent_tokens="claude:tok_abc", backends_json=[
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+    ])
+
+    class _Proxy:
+        session = _HealthProbeSession()
+
+    checks = asyncio.run(g._build_health_checks(_Proxy(), None))
+    assert "allow_unauthenticated_provider_keys" not in checks["config"]
+
+
+def test_health_config_field_absent_when_no_credentialed_backend(monkeypatch):
+    import asyncio
+    g = _load(monkeypatch, agent_tokens="", backends_json=None, allow_unauth="1")
+
+    class _Proxy:
+        session = _HealthProbeSession()
+
+    checks = asyncio.run(g._build_health_checks(_Proxy(), None))
+    assert "allow_unauthenticated_provider_keys" not in checks["config"]
+
+
 # ── Mutation check target ────────────────────────────────────────────────────
 # See A5_HANDOFF.md's mutation-check table: making the `if not credentialed:
 # return` unconditional (or the whole function a no-op) makes
 # test_refuses_to_start_auth_off_with_credentialed_backend fail (SystemExit
-# stops being raised).
+# stops being raised). Removing the SEC-A5-02 log.warning call makes
+# test_override_logs_a_warning_naming_the_exposed_backends fail. Making
+# _unauthenticated_provider_keys_override_active always return False makes
+# test_health_config_field_present_only_while_override_active fail.

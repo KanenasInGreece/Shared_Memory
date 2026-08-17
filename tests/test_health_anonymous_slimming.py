@@ -5,6 +5,16 @@ anonymous caller. Anonymous shape is now {"status", "version", "api_version"}
 the full payload requires a valid agent bearer token, byte-compatible with
 the pre-S-10 shape.
 
+SEC-A5-03 (PR A5 fix round): slimming applies ONLY when
+AUTH_CONFIGURED_AT_STARTUP is true — an auth-off install keeps the full
+payload for EVERY caller (there is no token that could ever restore it
+otherwise, since resolve_identity() can never match anything against an
+empty registry). Every test below reloads `coordinator` with a real
+AGENT_TOKENS env var (or explicitly unset) BEFORE reloading `hive_mind_
+proxy`, mirroring tests/test_llm_fault_origin.py's proven pattern, and
+asserts `g.AUTH_CONFIGURED_AT_STARTUP` explicitly so the condition under
+test is never implicit.
+
 Also covers S-11's TTL cache on the same handler's upstream fan-out."""
 import asyncio
 import hashlib
@@ -51,22 +61,37 @@ def _health_request(headers=None, agent_token=None):
     return req
 
 
-def _load_gateway(monkeypatch):
+def _load_gateway(monkeypatch, agent_tokens: str = ""):
+    """Reloads coordinator FIRST (test_llm_fault_origin.py's proven order)
+    so AUTH_CONFIGURED_AT_STARTUP reflects `agent_tokens` exactly — the
+    bare `_AGENT_TOKENS.clear()` this file used before the fix round left
+    AUTH_CONFIGURED_AT_STARTUP at whatever a PRIOR test in the session
+    happened to leave it, which is exactly the untested gap SEC-A5-03's
+    review found (zero references to AUTH_CONFIGURED_AT_STARTUP here)."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
     monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    import secure_env
+    secure_env._secrets.pop("AGENT_TOKENS", None)  # see test_auth.load_coordinator's docstring
+    if agent_tokens:
+        monkeypatch.setenv("AGENT_TOKENS", agent_tokens)
+    else:
+        monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    import coordinator
+    importlib.reload(coordinator)
     import hive_mind_proxy as g
     importlib.reload(g)
     return g
 
 
+# ── Auth-configured install: slimming applies ────────────────────────────────
+
 def test_anonymous_caller_gets_exactly_the_slim_shape(monkeypatch):
-    g = _load_gateway(monkeypatch)
-    import coordinator
-    coordinator._AGENT_TOKENS.clear()
+    g = _load_gateway(monkeypatch, agent_tokens="claude:tok_health_slim_test")
+    assert g.AUTH_CONFIGURED_AT_STARTUP is True
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _HealthProbeSession()
-    req = _health_request()
+    req = _health_request()  # no Authorization header at all
     req.app = {"proxy": proxy}
 
     body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
@@ -81,9 +106,8 @@ def test_doctors_three_fields_survive_anonymous_slimming(monkeypatch):
     check_gateway_compat() reads exactly status/version/api_version off
     /health -- confirm those three keys are the ones actually kept."""
     import memory_bridge
-    g = _load_gateway(monkeypatch)
-    import coordinator
-    coordinator._AGENT_TOKENS.clear()
+    g = _load_gateway(monkeypatch, agent_tokens="claude:tok_health_slim_test")
+    assert g.AUTH_CONFIGURED_AT_STARTUP is True
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _HealthProbeSession()
@@ -97,34 +121,28 @@ def test_doctors_three_fields_survive_anonymous_slimming(monkeypatch):
 
 
 def test_authenticated_caller_gets_the_full_byte_compatible_payload(monkeypatch):
-    g = _load_gateway(monkeypatch)
-    import coordinator
-    coordinator._AGENT_TOKENS.clear()
-    digest = hashlib.sha256(b"tok_health_full_test").hexdigest()
-    coordinator._AGENT_TOKENS[digest] = "claude"
-    try:
-        proxy = g.AsyncHiveMindProxy()
-        proxy.session = _HealthProbeSession()
-        req = _health_request(agent_token="tok_health_full_test")
-        req.app = {"proxy": proxy}
+    g = _load_gateway(monkeypatch, agent_tokens="claude:tok_health_full_test")
+    assert g.AUTH_CONFIGURED_AT_STARTUP is True
 
-        body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
-        # Today's full shape, unchanged (same field set the pre-S-10 handler
-        # produced): liveness + daemon/rem_daemon + config + auth_* + backup_*.
-        for field in ("status", "version", "api_version", "daemon", "rem_daemon",
-                       "auth_required", "auth_scheme", "backup_in_progress",
-                       "config", "embedder", "reranker", "llm", "backend_capability"):
-            assert field in body, f"authenticated payload missing {field!r}"
-    finally:
-        coordinator._AGENT_TOKENS.clear()
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _HealthProbeSession()
+    req = _health_request(agent_token="tok_health_full_test")
+    req.app = {"proxy": proxy}
+
+    body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
+    # Today's full shape, unchanged (same field set the pre-S-10 handler
+    # produced): liveness + daemon/rem_daemon + config + auth_* + backup_*.
+    for field in ("status", "version", "api_version", "daemon", "rem_daemon",
+                   "auth_required", "auth_scheme", "backup_in_progress",
+                   "config", "embedder", "reranker", "llm", "backend_capability"):
+        assert field in body, f"authenticated payload missing {field!r}"
 
 
 def test_invalid_token_still_gets_the_anonymous_slim_shape(monkeypatch):
     """A caller presenting a token that fails to verify is treated as
     anonymous, not error'd -- /health stays liveness-reachable regardless."""
-    g = _load_gateway(monkeypatch)
-    import coordinator
-    coordinator._AGENT_TOKENS.clear()
+    g = _load_gateway(monkeypatch, agent_tokens="claude:tok_health_slim_test")
+    assert g.AUTH_CONFIGURED_AT_STARTUP is True
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _HealthProbeSession()
@@ -140,9 +158,8 @@ def test_invalid_token_still_gets_the_anonymous_slim_shape(monkeypatch):
 def test_degraded_status_code_preserved_for_anonymous_caller(monkeypatch):
     """HTTP 503 must still surface anonymously -- an anonymous caller learns
     the VERDICT (degraded), just not why."""
-    g = _load_gateway(monkeypatch)
-    import coordinator
-    coordinator._AGENT_TOKENS.clear()
+    g = _load_gateway(monkeypatch, agent_tokens="claude:tok_health_slim_test")
+    assert g.AUTH_CONFIGURED_AT_STARTUP is True
 
     class _DownResp:
         status = 500
@@ -169,13 +186,49 @@ def test_degraded_status_code_preserved_for_anonymous_caller(monkeypatch):
     assert body["status"] == "degraded"
 
 
+# ── SEC-A5-03: auth-OFF install keeps the full payload for EVERYONE ─────────
+
+def test_auth_off_install_gets_full_payload_with_no_token_presented(monkeypatch):
+    """MUTATION TARGET (SEC-A5-03): the defect this review finding
+    describes exactly -- an auth-unset install has no token registry at
+    all, so gating on bare resolve_identity() locked such an install out
+    of its own /health permanently. AUTH_CONFIGURED_AT_STARTUP False must
+    mean the full payload, unconditionally."""
+    g = _load_gateway(monkeypatch, agent_tokens="")
+    assert g.AUTH_CONFIGURED_AT_STARTUP is False
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _HealthProbeSession()
+    req = _health_request()  # no Authorization header, no token registry either
+    req.app = {"proxy": proxy}
+
+    body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
+    assert "daemon" in body and "config" in body and "backup_in_progress" in body
+    assert set(body.keys()) != {"status", "version", "api_version"}
+
+
+def test_auth_off_install_full_payload_even_with_a_presented_token(monkeypatch):
+    """A caller that HAPPENS to present a bearer token on an auth-off
+    install still gets the full payload -- the token cannot match anything
+    (empty registry) but that must not matter here."""
+    g = _load_gateway(monkeypatch, agent_tokens="")
+    assert g.AUTH_CONFIGURED_AT_STARTUP is False
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _HealthProbeSession()
+    req = _health_request(agent_token="tok_whatever")
+    req.app = {"proxy": proxy}
+
+    body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
+    assert "daemon" in body and "config" in body
+
+
 # ── S-11: TTL cache on the fan-out ───────────────────────────────────────────
 
 def test_second_hit_within_ttl_reuses_the_cached_probe(monkeypatch):
     monkeypatch.setenv("HEALTH_CACHE_TTL_S", "60")
-    g = _load_gateway(monkeypatch)
-    import coordinator
-    coordinator._AGENT_TOKENS.clear()
+    g = _load_gateway(monkeypatch, agent_tokens="claude:tok_health_slim_test")
+    assert g.AUTH_CONFIGURED_AT_STARTUP is True
 
     proxy = g.AsyncHiveMindProxy()
     session = _HealthProbeSession()
@@ -197,39 +250,32 @@ def test_anonymous_and_authenticated_callers_share_the_cache(monkeypatch):
     """Same probe cost regardless of who asks -- only the response shape
     differs, computed fresh from the same cached checks."""
     monkeypatch.setenv("HEALTH_CACHE_TTL_S", "60")
-    g = _load_gateway(monkeypatch)
-    import coordinator
-    coordinator._AGENT_TOKENS.clear()
-    digest = hashlib.sha256(b"tok_shared_cache_test").hexdigest()
-    coordinator._AGENT_TOKENS[digest] = "claude"
-    try:
-        proxy = g.AsyncHiveMindProxy()
-        session = _HealthProbeSession()
-        proxy.session = session
+    g = _load_gateway(monkeypatch, agent_tokens="claude:tok_shared_cache_test")
+    assert g.AUTH_CONFIGURED_AT_STARTUP is True
 
-        anon_req = _health_request()
-        anon_req.app = {"proxy": proxy}
-        asyncio.run(g.handle_health(anon_req))
-        calls_after_anon = session.get_calls
+    proxy = g.AsyncHiveMindProxy()
+    session = _HealthProbeSession()
+    proxy.session = session
 
-        auth_req = _health_request(agent_token="tok_shared_cache_test")
-        auth_req.app = {"proxy": proxy}
-        body = json.loads(asyncio.run(g.handle_health(auth_req)).body.decode())
-        assert session.get_calls == calls_after_anon, (
-            "the authenticated caller's hit, inside the TTL window, must "
-            "reuse the SAME cached probe the anonymous caller triggered"
-        )
-        # And still gets the full shape despite the underlying probe being shared.
-        assert "config" in body
-    finally:
-        coordinator._AGENT_TOKENS.clear()
+    anon_req = _health_request()
+    anon_req.app = {"proxy": proxy}
+    asyncio.run(g.handle_health(anon_req))
+    calls_after_anon = session.get_calls
+
+    auth_req = _health_request(agent_token="tok_shared_cache_test")
+    auth_req.app = {"proxy": proxy}
+    body = json.loads(asyncio.run(g.handle_health(auth_req)).body.decode())
+    assert session.get_calls == calls_after_anon, (
+        "the authenticated caller's hit, inside the TTL window, must "
+        "reuse the SAME cached probe the anonymous caller triggered"
+    )
+    # And still gets the full shape despite the underlying probe being shared.
+    assert "config" in body
 
 
 def test_cache_expires_after_ttl(monkeypatch):
     monkeypatch.setenv("HEALTH_CACHE_TTL_S", "0")
-    g = _load_gateway(monkeypatch)
-    import coordinator
-    coordinator._AGENT_TOKENS.clear()
+    g = _load_gateway(monkeypatch, agent_tokens="claude:tok_health_slim_test")
 
     proxy = g.AsyncHiveMindProxy()
     session = _HealthProbeSession()
@@ -245,6 +291,78 @@ def test_cache_expires_after_ttl(monkeypatch):
     )
 
 
+class _SlowHealthProbeCm:
+    """Blocks in __aenter__ until an asyncio.Event is set -- lets a test
+    hold N concurrent probes open simultaneously to prove they coalesce."""
+    def __init__(self, gate):
+        self._gate = gate
+
+    async def __aenter__(self):
+        await self._gate.wait()
+        return _HealthProbeResp()
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _SlowHealthProbeSession:
+    """Every .get() counts itself, then blocks until released -- so several
+    concurrent _health_probe_cached() callers can be proven to have either
+    triggered their OWN fan-out (no coalescing) or shared exactly one
+    (SEC-A5-05b)."""
+    def __init__(self):
+        self.get_calls = 0
+        self.gate = asyncio.Event()
+
+    def get(self, url, timeout=None):
+        self.get_calls += 1
+        return _SlowHealthProbeCm(self.gate)
+
+
+def test_concurrent_misses_are_coalesced_into_one_probe(monkeypatch):
+    """MUTATION TARGET (SEC-A5-05b): three concurrent cache-miss callers
+    must trigger exactly ONE full upstream fan-out, not three. The
+    reference count is measured from a real single fan-out (never
+    hardcoded) so this stays correct if the probe's own call count ever
+    changes for an unrelated reason."""
+    monkeypatch.setenv("HEALTH_CACHE_TTL_S", "60")
+    g = _load_gateway(monkeypatch, agent_tokens="claude:tok_health_slim_test")
+
+    # Reference: how many session.get() calls does ONE full fan-out make?
+    async def _reference():
+        proxy = g.AsyncHiveMindProxy()
+        proxy.session = _HealthProbeSession()
+        await g._build_health_checks(proxy, None)
+        return proxy.session.get_calls
+    expected_single_fanout_calls = asyncio.run(_reference())
+    assert expected_single_fanout_calls > 0
+
+    async def _run():
+        proxy = g.AsyncHiveMindProxy()
+        session = _SlowHealthProbeSession()
+        proxy.session = session
+
+        tasks = [asyncio.create_task(g._health_probe_cached(proxy, None)) for _ in range(3)]
+        # Let all three coroutines run up to their first await (the gate)
+        # before releasing it -- this is what forces genuine concurrency
+        # rather than three sequential completions.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        session.gate.set()
+        results = await asyncio.gather(*tasks)
+        return session, results
+
+    session, results = asyncio.run(_run())
+    assert session.get_calls == expected_single_fanout_calls, (
+        f"expected exactly one fan-out's worth of probe calls "
+        f"({expected_single_fanout_calls}), got {session.get_calls} -- "
+        f"concurrent misses were not coalesced behind the lock"
+    )
+    assert all(r is results[0] for r in results), (
+        "all coalesced callers must receive the identical cached dict"
+    )
+
+
 def test_cache_never_serves_a_stale_api_version_across_a_restart(monkeypatch):
     """Trivially true in-process (stated, not assumed, per the brief): the
     module reload below is the test's stand-in for a process restart -- a
@@ -252,9 +370,7 @@ def test_cache_never_serves_a_stale_api_version_across_a_restart(monkeypatch):
     /health hit after "restart" always re-probes and picks up whatever
     FRAMEWORK_VERSION that fresh process defines."""
     monkeypatch.setenv("HEALTH_CACHE_TTL_S", "600")
-    g = _load_gateway(monkeypatch)
-    import coordinator
-    coordinator._AGENT_TOKENS.clear()
+    g = _load_gateway(monkeypatch, agent_tokens="claude:tok_health_slim_test")
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _HealthProbeSession()
@@ -270,8 +386,13 @@ def test_cache_never_serves_a_stale_api_version_across_a_restart(monkeypatch):
 
 # ── Mutation check target ────────────────────────────────────────────────────
 # See A5_HANDOFF.md's mutation-check table: making handle_health always
-# return the full `checks` dict (dropping the `caller_authenticated` branch)
+# return the full `checks` dict (dropping the caller_authenticated branch)
 # makes test_anonymous_caller_gets_exactly_the_slim_shape fail (extra keys
 # appear). Removing the TTL cache short-circuit (always calling
 # _build_health_checks) makes test_second_hit_within_ttl_reuses_the_cached_
-# probe fail (get_calls keeps climbing).
+# probe fail (get_calls keeps climbing). Dropping the `AUTH_CONFIGURED_AT_
+# STARTUP and` clause (SEC-A5-03) makes test_auth_off_install_gets_full_
+# payload_with_no_token_presented fail (slim shape appears even with auth
+# off). Removing the `async with _health_probe_lock:` coalescing (SEC-A5-
+# 05b) makes test_concurrent_misses_are_coalesced_into_one_probe fail
+# (get_calls triples instead of matching one fan-out).

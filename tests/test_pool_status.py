@@ -9,10 +9,26 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
 
-def test_pool_status_reports_free_slots(monkeypatch):
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000,http://b:4000")
+def _auth_off_gateway(monkeypatch):
+    """SEC-A5-01/03 (PR A5 fix round): /pool/status's roster/pool-state now
+    gates on AUTH_CONFIGURED_AT_STARTUP, so these tests (which pass request=
+    None and never present a token) need it reliably False regardless of
+    what an earlier test file left in os.environ/secure_env's cache --
+    mirrors tests/test_health_anonymous_slimming.py's _load_gateway."""
+    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    import secure_env
+    secure_env._secrets.pop("AGENT_TOKENS", None)
+    import coordinator
+    importlib.reload(coordinator)
     import hive_mind_proxy as g
     importlib.reload(g)
+    assert g.AUTH_CONFIGURED_AT_STARTUP is False
+    return g
+
+
+def test_pool_status_reports_free_slots(monkeypatch):
+    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000,http://b:4000")
+    g = _auth_off_gateway(monkeypatch)
     g._llm_inflight["http://a:5000"] = 1          # A busy, B free
     resp = asyncio.run(g.handle_pool_status(None))
     d = json.loads(resp.body)
@@ -23,8 +39,7 @@ def test_pool_status_reports_free_slots(monkeypatch):
 
 def test_pool_status_none_free_when_all_busy(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS", "http://a:5000,http://b:4000")
-    import hive_mind_proxy as g
-    importlib.reload(g)
+    g = _auth_off_gateway(monkeypatch)
     g._llm_inflight["http://a:5000"] = 1
     g._llm_inflight["http://b:4000"] = 2
     d = json.loads(asyncio.run(g.handle_pool_status(None)).body)
@@ -33,8 +48,7 @@ def test_pool_status_none_free_when_all_busy(monkeypatch):
 
 def test_pool_status_excludes_reserved(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS", "http://a:5000,http://b:4000")
-    import hive_mind_proxy as g
-    importlib.reload(g)
+    g = _auth_off_gateway(monkeypatch)
     g._llm_reserved.add("http://b:4000")          # reserved → not available
     d = json.loads(asyncio.run(g.handle_pool_status(None)).body)
     assert d["backends"]["http://b:4000"]["available"] is False

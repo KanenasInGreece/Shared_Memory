@@ -384,6 +384,56 @@ def test_format_status_silent_on_a_clean_credential_section():
     assert "credential audit:" not in out
 
 
+# ── Q-1 (PR A5 fix round) ─────────────────────────────────────────────────────
+# S-04's allowlist gate was otherwise invisible from the client surface: the
+# NEW credentialed_route_denied counter reached /memory/telemetry but was
+# never rendered by `status` — the same v0.9.8-lesson class this whole
+# section exists to close (a credential signal derivable from nothing shipped).
+
+def test_format_status_renders_credentialed_route_denials_with_their_own_age(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    ts = (datetime.now(timezone.utc) - timedelta(seconds=17)).isoformat()
+    out = _status({
+        "credentials": {
+            "token_verify_failed": 0, "token_verify_failed_last_ts": None,
+            "credentialed_route_denied": 4, "credentialed_route_denied_last_ts": ts,
+            "daemon_tokens_issued": 0, "daemon_tokens_issued_last_ts": None,
+            "audit_log_dropped": 0, "audit_log_dropped_last_ts": None,
+        },
+    })
+    assert "4 credentialed-route denial(s)" in out
+    assert "s ago" in out
+
+
+def test_format_status_silent_when_credentialed_route_denied_is_zero():
+    """MUTATION TARGET: the line only appears when the counter is non-zero
+    — a healthy run (no denials ever) must not grow a new line."""
+    out = _status({
+        "credentials": {
+            "token_verify_failed": 0, "token_verify_failed_last_ts": None,
+            "credentialed_route_denied": 0, "credentialed_route_denied_last_ts": None,
+            "daemon_tokens_issued": 0, "daemon_tokens_issued_last_ts": None,
+            "audit_log_dropped": 0, "audit_log_dropped_last_ts": None,
+        },
+    })
+    assert "credentialed-route denial" not in out
+
+
+def test_format_status_renders_both_token_and_route_denial_lines_together():
+    """The two credential lines are independent -- both fire together when
+    both counters are non-zero, neither suppresses the other."""
+    out = _status({
+        "credentials": {
+            "token_verify_failed": 2, "token_verify_failed_last_ts": "2026-08-16T10:00:00+00:00",
+            "credentialed_route_denied": 5, "credentialed_route_denied_last_ts": "2026-08-16T10:00:00+00:00",
+            "daemon_tokens_issued": 0, "daemon_tokens_issued_last_ts": None,
+            "audit_log_dropped": 0, "audit_log_dropped_last_ts": None,
+        },
+    })
+    assert "2 token verification failure(s)" in out
+    assert "5 credentialed-route denial(s)" in out
+
+
 def test_format_status_flags_dropped_audit_lines_as_an_incomplete_trail():
     out = _status({
         "credentials": {

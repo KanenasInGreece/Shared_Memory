@@ -211,7 +211,7 @@ async def test_busy_pool_refreshes_the_consolidation_clock(monkeypatch):
     stale = NOW - timedelta(hours=1)
     d.last_activity = d.last_busy = stale
 
-    async def _busy():
+    async def _busy(**kwargs):
         return False
     monkeypatch.setattr(cl, "pool_has_free_slot", _busy)
 
@@ -230,7 +230,7 @@ async def test_busy_pool_does_NOT_touch_the_sweep_clock(monkeypatch):
     stale = NOW - timedelta(hours=1)
     d.last_activity = d.last_busy = stale
 
-    async def _busy():
+    async def _busy(**kwargs):
         return False
     monkeypatch.setattr(cl, "pool_has_free_slot", _busy)
 
@@ -247,7 +247,7 @@ async def test_free_pool_leaves_both_clocks_running(monkeypatch):
     stale = NOW - timedelta(hours=1)
     d.last_activity = d.last_busy = stale
 
-    async def _free():
+    async def _free(**kwargs):
         return True
     monkeypatch.setattr(cl, "pool_has_free_slot", _free)
 
@@ -274,7 +274,7 @@ async def test_pool_probe_is_rate_limited(monkeypatch):
     d = ConsolidationDaemon()
     probes = []
 
-    async def _busy():
+    async def _busy(**kwargs):
         probes.append(1)
         return False
     monkeypatch.setattr(cl, "pool_has_free_slot", _busy)
