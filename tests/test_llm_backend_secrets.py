@@ -184,16 +184,24 @@ def _health_request(headers):
 
 def test_health_config_hides_credential_fields_from_unauthenticated_caller(monkeypatch):
     """/health itself stays unauthenticated (liveness must work without a token) —
-    but a caller presenting no valid bearer token must not learn which backend
-    has a live paid credential attached."""
+    but a caller presenting no valid bearer token, ON AN AUTH-CONFIGURED
+    INSTALL (SEC-A5-03, PR A5 fix round: slimming applies only when
+    AUTH_CONFIGURED_AT_STARTUP is true), gets the S-10 anonymous-slim shape
+    (status/version/api_version only), so the backend roster — and any
+    credential attached to it — never reaches them at all, not just the two
+    fields that used to be hidden inside it."""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-should-never-leak")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "model": "deepseek-chat"},
     ]))
+    monkeypatch.setenv("AGENT_TOKENS", "claude:tok_health_hide_test")
+    import secure_env
+    secure_env._secrets.pop("AGENT_TOKENS", None)  # see test_auth.load_coordinator's docstring
+    import coordinator
+    importlib.reload(coordinator)
     import hive_mind_proxy as g
     importlib.reload(g)
-    import coordinator
-    coordinator._AGENT_TOKENS.clear()          # no valid token exists at all
+    assert g.AUTH_CONFIGURED_AT_STARTUP is True
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _HealthProbeSession()
@@ -201,10 +209,8 @@ def test_health_config_hides_credential_fields_from_unauthenticated_caller(monke
     req.app = {"proxy": proxy}
 
     body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
-    entry = body["config"]["llm_backends"][0]
-    assert entry["url"] == "https://api.deepseek.com/v1"
-    assert "has_credential" not in entry
-    assert "model" not in entry
+    assert set(body.keys()) == {"status", "version", "api_version"}
+    assert "config" not in body
     assert "sk-should-never-leak" not in json.dumps(body)
 
 

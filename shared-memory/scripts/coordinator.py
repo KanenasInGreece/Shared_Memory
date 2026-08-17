@@ -142,7 +142,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.8"
+FRAMEWORK_VERSION = "0.9.9"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -785,6 +785,13 @@ def _apply_principal(target: dict[str, Any], principal: dict[str, Any] | None) -
 
 
 # ── Governance: outer in-flight load-shed valve ─────────────────────────────────
+# Checked FIRST in auth_middleware, ahead of every auth exemption (S-11).
+# SEC-A5-05a (PR A5 fix round): incremented/decremented uniformly around
+# EVERY admitted request — auth-disabled bypass, unprotected-path exemption,
+# and the authenticated dispatch alike — so an anonymous /health/pool-status
+# flood, or (on an auth-off install) any traffic at all, actually counts
+# toward the cap it can also be shed by. A request the valve sheds was never
+# admitted and never reaches the increment.
 _inflight = 0
 
 # ── Backup quiesce: client-write shed + daemon advisory-lock gate ───────────────
@@ -901,6 +908,10 @@ _llm_fault_counters: dict[str, dict] = {}
 _credential_counters: dict[str, int] = {
     "token_verify_failed": 0,
     "daemon_tokens_issued": 0,
+    # S-04 (PR A5): a request that would have carried a provider key but
+    # whose method+path is not one of the framework's own endpoints —
+    # see hive_mind_proxy.record_credentialed_route_denied.
+    "credentialed_route_denied": 0,
 }
 # When each credential counter last moved. Counters answer "how many"; a
 # consumer asking "is this still happening?" needs "when", and for these
@@ -913,6 +924,7 @@ _credential_counters: dict[str, int] = {
 _credential_last_ts: dict[str, str | None] = {
     "token_verify_failed": None,
     "daemon_tokens_issued": None,
+    "credentialed_route_denied": None,
 }
 
 
@@ -1036,13 +1048,17 @@ _credential_audit_writer = (
     if CREDENTIAL_AUDIT_LOG_PATH.strip() else None
 )
 
-# Events an UNAUTHENTICATED caller fully controls the volume of (security
-# review R-5): their log lines use drop-NEWEST eviction (a flood can only
-# evict itself) instead of the writer's default drop-oldest (which would
-# otherwise let a flood evict the genuine lifecycle events queued before it
-# started).
+# Events an attacker fully controls the volume of — either fully
+# unauthenticated (security review R-5) or, for credentialed_route_denied
+# (SEC-A5-04, PR A5 fix round), any holder of a valid-but-leaked agent
+# token in a loop. Their log lines use drop-NEWEST eviction (a flood can
+# only evict itself) instead of the writer's default drop-oldest, which
+# would otherwise let the flood evict the genuine lifecycle/compromise
+# evidence (token_verify_failed, key_attached) queued before it started —
+# exactly the audit trail this log exists to preserve.
 _ATTACKER_TRIGGERABLE_EVENTS = frozenset({
     "token_verify_failed", "token_verify_failed_suppressed",
+    "credentialed_route_denied",
 })
 
 
@@ -1212,6 +1228,25 @@ def record_llm_gateway_fault(backend: str, error_class: str, *,
                                       backend=backend, error_class=error_class, **extra)
 
 
+def record_credentialed_route_denied(backend: str, method: str, path: str, *,
+                                      agent_name: str | None = None,
+                                      request_id: str | None = None) -> None:
+    """S-04 (Credential_Custody_Plan, PR A5): a request bound for a
+    credentialed backend (a provider key was about to be attached) whose
+    method+path is not one of the framework's own endpoints —
+    hive_mind_proxy.CREDENTIALED_BACKEND_ALLOWED_ROUTES. Counter + a
+    credential-audit line carrying method/path/agent — never the key
+    itself, which this rejection never even reaches (it fires before
+    Authorization is attached)."""
+    _credential_counters["credentialed_route_denied"] += 1
+    _credential_last_ts["credentialed_route_denied"] = datetime.now(timezone.utc).isoformat()
+    extra = {"request_id": request_id} if request_id else {}
+    _write_credential_audit_line(
+        "credentialed_route_denied", origin="gateway",
+        backend=backend, method=method, path=path, agent=agent_name, **extra,
+    )
+
+
 def record_llm_upstream_fault(backend: str, status: int, error_type: str | None, *,
                                credentialed: bool = False,
                                request_id: str | None = None) -> str:
@@ -1278,6 +1313,8 @@ def _credentials_snapshot() -> dict:
         "token_verify_failed_last_ts": _credential_last_ts["token_verify_failed"],
         "daemon_tokens_issued": _credential_counters["daemon_tokens_issued"],
         "daemon_tokens_issued_last_ts": _credential_last_ts["daemon_tokens_issued"],
+        "credentialed_route_denied": _credential_counters["credentialed_route_denied"],
+        "credentialed_route_denied_last_ts": _credential_last_ts["credentialed_route_denied"],
         "audit_log_dropped": writer.dropped if writer else 0,
         "audit_log_dropped_last_ts": writer.last_dropped_ts if writer else None,
     }
@@ -1287,112 +1324,132 @@ def _credentials_snapshot() -> dict:
 async def auth_middleware(request: web.Request, handler):
     """DEFAULT DENY, and the single identity → govern → audit choke point.
 
-    Order: resolve a verified identity (pluggable — bearer today, PoP later) →
-    enforce read-only role → shed if over the in-flight cap → dispatch → audit
-    the outcome. A DB pool that stays saturated past POOL_ACQUIRE_TIMEOUT surfaces
-    as asyncio.TimeoutError from a handler's _acquire(); it is mapped here to
+    Order: shed if over the in-flight cap (S-11 — ahead of every exemption,
+    unprotected paths included) → auth-disabled bypass → unprotected-path
+    exemption → resolve a verified identity (pluggable — bearer today, PoP
+    later) → enforce read-only role → dispatch → audit the outcome. A DB pool
+    that stays saturated past POOL_ACQUIRE_TIMEOUT surfaces as
+    asyncio.TimeoutError from a handler's _acquire(); it is mapped here to
     503 + Retry-After so the gateway sheds load instead of hanging a caller.
     """
     global _inflight
     _check_client_version(request)  # logs API skew to the gateway log; never raises
-    # Gate on the STARTUP truth (finding 1), not on whether _AGENT_TOKENS
-    # happens to be non-empty right now -- see AUTH_CONFIGURED_AT_STARTUP's
-    # docstring above for why the two diverge after a daemon token is minted.
-    if not AUTH_CONFIGURED_AT_STARTUP:
-        return await handler(request)
-    if request.path.rstrip("/") in _UNPROTECTED_PATHS or request.path in _UNPROTECTED_PATHS:
-        return await handler(request)
 
-    agent_name = resolve_identity(request)
-    if not agent_name:
-        # RFC 6750 §3: a token was PRESENTED but rejected gets
-        # error="invalid_token"; no token at all gets the bare challenge —
-        # and only the former has a digest worth logging (PR A3). This is
-        # the gateway's OWN 401 (its own door), never an upstream one.
-        presented = _extract_bearer_token(request)
-        _record_token_verify_failed(request, presented)
-        www_authenticate = 'Bearer error="invalid_token"' if presented else "Bearer"
-        raise web.HTTPUnauthorized(
-            reason="Authorization: a valid Bearer token is required",
-            # X-SM-Fault-Origin alongside the RFC 6750 challenge (security
-            # review O-5): the header is otherwise set only on the three
-            # LLM-path gateway errors, so a client distinguished a gateway-
-            # origin 401 from an upstream one only by the header's ABSENCE —
-            # and absence is exactly what a stripping intermediary produces.
-            headers={"WWW-Authenticate": www_authenticate, "X-SM-Fault-Origin": "gateway"},
-        )
-    request["authenticated_agent"] = agent_name
-    # Person axis: stamp the kernel-attested principal (OS account + connection
-    # fingerprint) from SO_PEERCRED. None on the TCP transport — never inferred from
-    # the agent. Every handler and the audit hook read it from here, spoof-proof.
-    principal = _peer_identity(request)
-    request["principal"] = principal
-    # Role + governance gate. Read-only roles are confined to the telemetry/graph
-    # allowlist; admin-role tokens are confined to /admin/* (and no other role may
-    # reach an admin route); and while a backup quiesce is active the write routes
-    # shed 503 + Retry-After so the dump sees a quiet DB. Reads always flow — so a
-    # leaked monitor token cannot save/supersede/proxy, and a leaked backup token
-    # can only pause/resume backups.
-    role  = _AGENT_ROLES.get(agent_name, "full")
-    route = (request.method, request.path.rstrip("/") or "/")
-    if role == "read" and not _read_role_permits(request):
-        raise web.HTTPForbidden(
-            reason="Read-only token: this route requires a write-capable agent token",
-        )
-    if route in _ADMIN_ROUTES:
-        if role != "admin":
-            raise web.HTTPForbidden(reason="This route requires an admin-role token")
-    else:
-        if role == "admin":
-            raise web.HTTPForbidden(reason="Admin token is confined to /admin/* routes")
-        if _backup_quiesce and route in _WRITE_ROUTES:
-            raise web.HTTPServiceUnavailable(
-                reason="backup in progress — writes are briefly paused",
-                headers={"Retry-After": str(BACKUP_RETRY_AFTER)},
-            )
-        if GATEWAY_REQUIRE_PRINCIPAL and route in _WRITE_ROUTES and principal is None:
-            raise web.HTTPForbidden(
-                reason="writes require a kernel-attested principal — connect over the "
-                       "gateway Unix socket (GATEWAY_UDS_PATH), not TCP",
-            )
-
-    # Outer load-shed valve (disabled when GATEWAY_INFLIGHT_MAX == 0). Caps total
-    # concurrent requests — including ones parked on a slow embedding/LLM call
-    # that hold no DB connection — which the pool timeout alone cannot bound.
+    # S-11 (PR A5): the load-shed valve is the FIRST gate — ahead of both the
+    # auth-disabled bypass below and the per-path _UNPROTECTED_PATHS
+    # exemption further down. It used to sit after both, so an anonymous
+    # /health or /pool/status hit (and, on an auth-unset install, EVERY
+    # request) could never be shed no matter how saturated the gateway
+    # already was. The valve exists to protect the PROCESS from an in-flight
+    # pile-up, not to gate access, so it must apply uniformly regardless of
+    # what auth decides afterward.
     if GATEWAY_INFLIGHT_MAX and _inflight >= GATEWAY_INFLIGHT_MAX:
         raise web.HTTPServiceUnavailable(
             reason="gateway at capacity", headers={"Retry-After": "1"},
         )
 
-    started    = asyncio.get_running_loop().time()
-    request_id = uuid.uuid4().hex[:12]
-    status     = 500
+    # SEC-A5-05a (PR A5 fix round): a request that reaches this point WAS
+    # ADMITTED past the valve above — count it uniformly here, regardless of
+    # which branch below actually serves it, so the cap the valve enforces
+    # reflects TOTAL admitted load (anonymous /health/pool-status traffic
+    # and, on an auth-off install, every request) and not just the
+    # authenticated dispatch. The earlier version of this comment claimed
+    # this protection while `_inflight` was only ever incremented far below,
+    # inside the authenticated-only branch — that was false; this `try/
+    # finally` is what makes it true. A request that sheds at the check
+    # above was never admitted and correctly never reaches this increment.
     _inflight += 1
-    # Stashed so a downstream handler (hive_mind_proxy.handle_proxy) can
-    # correlate its own gateway_fault/upstream_credential_fault credential-
-    # audit lines with this same request (PR A3) — mirrors request["principal"]
-    # above.
-    request["request_id"] = request_id
     try:
-        resp = await handler(request)
-        status = resp.status
-        return resp
-    except asyncio.TimeoutError:
-        # DB pool stayed saturated past POOL_ACQUIRE_TIMEOUT — shed, don't hang.
-        status = 503
-        raise web.HTTPServiceUnavailable(
-            reason="database pool saturated", headers={"Retry-After": "1"},
-        )
-    except web.HTTPException as exc:
-        status = exc.status
-        raise
+        # Gate on the STARTUP truth (finding 1), not on whether _AGENT_TOKENS
+        # happens to be non-empty right now -- see AUTH_CONFIGURED_AT_STARTUP's
+        # docstring above for why the two diverge after a daemon token is minted.
+        if not AUTH_CONFIGURED_AT_STARTUP:
+            return await handler(request)
+        if request.path.rstrip("/") in _UNPROTECTED_PATHS or request.path in _UNPROTECTED_PATHS:
+            return await handler(request)
+
+        agent_name = resolve_identity(request)
+        if not agent_name:
+            # RFC 6750 §3: a token was PRESENTED but rejected gets
+            # error="invalid_token"; no token at all gets the bare challenge —
+            # and only the former has a digest worth logging (PR A3). This is
+            # the gateway's OWN 401 (its own door), never an upstream one.
+            presented = _extract_bearer_token(request)
+            _record_token_verify_failed(request, presented)
+            www_authenticate = 'Bearer error="invalid_token"' if presented else "Bearer"
+            raise web.HTTPUnauthorized(
+                reason="Authorization: a valid Bearer token is required",
+                # X-SM-Fault-Origin alongside the RFC 6750 challenge (security
+                # review O-5): the header is otherwise set only on the three
+                # LLM-path gateway errors, so a client distinguished a gateway-
+                # origin 401 from an upstream one only by the header's ABSENCE —
+                # and absence is exactly what a stripping intermediary produces.
+                headers={"WWW-Authenticate": www_authenticate, "X-SM-Fault-Origin": "gateway"},
+            )
+        request["authenticated_agent"] = agent_name
+        # Person axis: stamp the kernel-attested principal (OS account + connection
+        # fingerprint) from SO_PEERCRED. None on the TCP transport — never inferred from
+        # the agent. Every handler and the audit hook read it from here, spoof-proof.
+        principal = _peer_identity(request)
+        request["principal"] = principal
+        # Role + governance gate. Read-only roles are confined to the telemetry/graph
+        # allowlist; admin-role tokens are confined to /admin/* (and no other role may
+        # reach an admin route); and while a backup quiesce is active the write routes
+        # shed 503 + Retry-After so the dump sees a quiet DB. Reads always flow — so a
+        # leaked monitor token cannot save/supersede/proxy, and a leaked backup token
+        # can only pause/resume backups.
+        role  = _AGENT_ROLES.get(agent_name, "full")
+        route = (request.method, request.path.rstrip("/") or "/")
+        if role == "read" and not _read_role_permits(request):
+            raise web.HTTPForbidden(
+                reason="Read-only token: this route requires a write-capable agent token",
+            )
+        if route in _ADMIN_ROUTES:
+            if role != "admin":
+                raise web.HTTPForbidden(reason="This route requires an admin-role token")
+        else:
+            if role == "admin":
+                raise web.HTTPForbidden(reason="Admin token is confined to /admin/* routes")
+            if _backup_quiesce and route in _WRITE_ROUTES:
+                raise web.HTTPServiceUnavailable(
+                    reason="backup in progress — writes are briefly paused",
+                    headers={"Retry-After": str(BACKUP_RETRY_AFTER)},
+                )
+            if GATEWAY_REQUIRE_PRINCIPAL and route in _WRITE_ROUTES and principal is None:
+                raise web.HTTPForbidden(
+                    reason="writes require a kernel-attested principal — connect over the "
+                           "gateway Unix socket (GATEWAY_UDS_PATH), not TCP",
+                )
+
+        started    = asyncio.get_running_loop().time()
+        request_id = uuid.uuid4().hex[:12]
+        status     = 500
+        # Stashed so a downstream handler (hive_mind_proxy.handle_proxy) can
+        # correlate its own gateway_fault/upstream_credential_fault credential-
+        # audit lines with this same request (PR A3) — mirrors request["principal"]
+        # above.
+        request["request_id"] = request_id
+        try:
+            resp = await handler(request)
+            status = resp.status
+            return resp
+        except asyncio.TimeoutError:
+            # DB pool stayed saturated past POOL_ACQUIRE_TIMEOUT — shed, don't hang.
+            status = 503
+            raise web.HTTPServiceUnavailable(
+                reason="database pool saturated", headers={"Retry-After": "1"},
+            )
+        except web.HTTPException as exc:
+            status = exc.status
+            raise
+        finally:
+            latency_ms = (asyncio.get_running_loop().time() - started) * 1000
+            _audit(agent_name, request.method, request.path, status, latency_ms,
+                   request_id, request.get("principal"),
+                   backend=request.get("backend"),
+                   key_attached=bool(request.get("key_attached")))
     finally:
         _inflight -= 1
-        latency_ms = (asyncio.get_running_loop().time() - started) * 1000
-        _audit(agent_name, request.method, request.path, status, latency_ms,
-               request_id, request.get("principal"),
-               backend=request.get("backend"),
-               key_attached=bool(request.get("key_attached")))
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # PG_PASSWORD/NEO4J_PASSWORD/PG_CONN are secrets (SEC-05/SEC-09, PR A1; PG_CONN

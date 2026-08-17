@@ -2964,7 +2964,7 @@ class REMDaemon:
             # Yield only if the whole LLM pool is busy — the gateway routes to a
             # free card (incl. one the user isn't LLM-loading). NOT a global GPU
             # gate, which self-defers to our own dream work + ignores a free card.
-            if not await pool_has_free_slot():
+            if not await pool_has_free_slot(headers=_auth_headers()):
                 logger.warning("REM: LLM pool has no free slot — deferring enrichment cycle")
                 return 0, 0
 

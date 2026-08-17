@@ -2518,7 +2518,7 @@ class ConsolidationDaemon:
                 and (now - self._pool_probed_at).total_seconds() < NREM_POOL_PROBE_SEC):
             return
         self._pool_probed_at = now
-        if not await pool_has_free_slot():
+        if not await pool_has_free_slot(headers=_auth_headers()):
             self.last_busy = now
 
     @contextlib.asynccontextmanager
@@ -4298,7 +4298,7 @@ class ConsolidationDaemon:
         try:
             deadline = time.monotonic() + NREM_FORCED_SLOT_WAIT
             while self.is_running:
-                if await pool_has_free_slot():
+                if await pool_has_free_slot(headers=_auth_headers()):
                     return True
                 if time.monotonic() >= deadline:
                     return False
@@ -4371,7 +4371,7 @@ class ConsolidationDaemon:
                         # backstop is not starved — it may WAIT for a slot
                         # (F10) — but consolidation NEVER fires into a busy
                         # serial slot, forced or not.
-                        slot_free = await pool_has_free_slot()
+                        slot_free = await pool_has_free_slot(headers=_auth_headers())
                         if not slot_free:
                             # F2: BOTH paths queue with priority, not just the
                             # forced one. Deferring immediately on the normal
@@ -4436,7 +4436,7 @@ class ConsolidationDaemon:
                         # F2: queue with priority like the consolidation path,
                         # otherwise the sweep never wins the slot either (the
                         # insight backlog had gone 5.2 days without a fold).
-                        if not await pool_has_free_slot() and not await self._wait_for_slot():
+                        if not await pool_has_free_slot(headers=_auth_headers()) and not await self._wait_for_slot():
                             from datetime import timedelta as _td
                             self._sweep_backoff_until = now + _td(seconds=60)
                             logger.info("NREM: LLM pool has no free slot — deferring sweep "

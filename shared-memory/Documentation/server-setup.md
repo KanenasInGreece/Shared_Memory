@@ -75,8 +75,11 @@ uv run python shared-memory/scripts/generate_tokens.py
 uv run --with aiohttp --with asyncpg --with neo4j --with httpx --with json-repair \
   python shared-memory/scripts/hive_mind_proxy.py 8888
 
-# 7. Verify.
+# 7. Verify. Anonymous callers get status/version/api_version only (v0.9.9,
+#    S-10) — pass the token you just minted for the full operational detail.
 curl http://localhost:8888/health
+#    → {"status":"ok","api_version":1,"version":"0.4.6"}
+curl -H "Authorization: Bearer $AGENT_TOKEN" http://localhost:8888/health
 #    → {"status":"ok","api_version":1,"version":"0.4.6","daemon":"running",...}
 ```
 
@@ -244,13 +247,21 @@ When you bump `API_VERSION`, bump it in **both** `coordinator.py` and
 curl http://localhost:8888/health
 ```
 
-| Field | Meaning |
-|---|---|
-| `status` | `ok` (embedder + reranker reachable) or `degraded` (HTTP 503) |
-| `embedder` / `reranker` / `llm` | upstream backend reachability |
-| `daemon` / `rem_daemon` | NREM / REM liveness |
-| `auth_required` | whether `AGENT_TOKENS` is set |
-| `version` / `api_version` | build version / wire contract |
+An anonymous caller sees `status`/`version`/`api_version` only (S-10, v0.9.9)
+— every other field requires a valid agent bearer token
+(`-H "Authorization: Bearer <token>"`; any agent token works, this is not
+role-gated). The backend roster and per-backend pool state are operational
+detail about this deployment, not something every unauthenticated caller on
+the network should learn.
+
+| Field | Meaning | Anonymous? |
+|---|---|---|
+| `status` | `ok` (embedder + reranker reachable) or `degraded` (HTTP 503) | yes |
+| `version` / `api_version` | build version / wire contract | yes |
+| `embedder` / `reranker` / `llm` | upstream backend reachability | authenticated only |
+| `daemon` / `rem_daemon` | NREM / REM liveness | authenticated only |
+| `auth_required` | whether `AGENT_TOKENS` is set | authenticated only |
+| `config` | resolved LLM backend roster, pool tuning, affinity config | authenticated only |
 
 The gateway auto-restarts a crashed daemon with exponential backoff; a circuit
 breaker stops after 5 crashes in 10 minutes (restart the gateway to reset). Set

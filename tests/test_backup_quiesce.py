@@ -309,7 +309,12 @@ async def test_handle_backup_bad_state_returns_400():
 
 @pytest.mark.asyncio
 async def test_health_surfaces_backup_in_progress():
-    """hive_mind_proxy.handle_health reflects the real coordinator quiesce flag."""
+    """hive_mind_proxy.handle_health reflects the real coordinator quiesce flag.
+
+    `backup_in_progress` is authenticated-only as of S-10 (v0.9.9) — the
+    request needs a token that resolves against a real _AGENT_TOKENS entry,
+    same technique as tests/test_llm_backend_secrets.py's health tests."""
+    import hashlib
     import json as _json
 
     scripts_dir = os.path.normpath(
@@ -337,17 +342,27 @@ async def test_health_surfaces_backup_in_progress():
     proxy.session = _Session()
     req = MagicMock()
     req.app = {"proxy": proxy}
+    req.headers = {"Authorization": "Bearer tok_backup_quiesce_test"}
+    digest = hashlib.sha256(b"tok_backup_quiesce_test").hexdigest()
+    real_coord._AGENT_TOKENS[digest] = "claude"
 
-    real_coord._backup_quiesce = False
-    body = _json.loads((await proxy_mod.handle_health(req)).body.decode())
-    assert body["backup_in_progress"] is False
-
-    real_coord._backup_quiesce = True
     try:
+        # S-11's TTL cache (proxy_mod._health_cache) sits UNDER backup_in_progress
+        # too — reset it before each call so this test observes the flag flip
+        # immediately rather than a cached probe from moments earlier.
+        real_coord._backup_quiesce = False
+        proxy_mod._health_cache["checks"] = None
+        body = _json.loads((await proxy_mod.handle_health(req)).body.decode())
+        assert body["backup_in_progress"] is False
+
+        real_coord._backup_quiesce = True
+        proxy_mod._health_cache["checks"] = None
         body = _json.loads((await proxy_mod.handle_health(req)).body.decode())
         assert body["backup_in_progress"] is True
     finally:
         real_coord._backup_quiesce = False
+        real_coord._AGENT_TOKENS.pop(digest, None)
+        proxy_mod._health_cache["checks"] = None
 
 
 # ── daemon advisory-lock gate (step 3) ────────────────────────────────────────
