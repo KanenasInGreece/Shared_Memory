@@ -547,9 +547,11 @@ match wins, never a parent-directory walk up toward `$HOME`):
 
 Each token maps to a verified agent identity. All agents on a multi-agent machine must use separate skill `.env` files with distinct tokens — tokens must never be shared across agents.
 
-**Verify auth is active:**
+**Verify auth is active:** `auth_required` moved behind auth in v0.9.9 (S-10)
+along with the rest of /health's operational detail — pass the token you just
+configured to see it:
 ```bash
-curl http://localhost:8888/health
+curl -H "Authorization: Bearer $AGENT_TOKEN" http://localhost:8888/health
 # {"status":"ok",...,"auth_required":true}
 ```
 
@@ -579,9 +581,9 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 
 **Before saving, confirm the gateway is up and compatible:**
 ```bash
-# Liveness:
+# Liveness (anonymous — status/version/api_version only, v0.9.9 S-10):
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":4,"version":"0.9.8","daemon":"running","rem_daemon":"running",...}
+# → {"status":"ok","api_version":4,"version":"0.9.9"}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -590,7 +592,11 @@ python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
 
 `status: ok` means embedder and reranker are reachable; HTTP 503 means the
 save/search path is degraded. `doctor` additionally compares `api_version` —
-exit 0 when compatible, exit 1 (with a fix hint) otherwise.
+exit 0 when compatible, exit 1 (with a fix hint) otherwise. The daemon status,
+backend roster and per-backend pool detail (`daemon`, `rem_daemon`, `config`,
+`llm_pool`, …) require a valid agent bearer token — pass
+`-H "Authorization: Bearer $AGENT_TOKEN"` to see them; that operational
+detail is not disclosed to an unauthenticated caller.
 
 **Operational telemetry — one-shot snapshot of the memory system's state:**
 ```bash
@@ -648,7 +654,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.8", "api_version": 4, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.9", "api_version": 4, "tool": "shared-memory-framework"}`
 
 ### Updating This Skill
 

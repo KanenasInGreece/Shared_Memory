@@ -5,6 +5,54 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.9] — 2026-08-17
+
+### Security — chokepoint governance (PR A5, final of the credential-custody workstream)
+
+Five findings against the proxy's own choke points, closing the credential-custody series
+(decision:1282, scoped in decision:1303):
+
+- **Method+path allowlist on the credentialed proxy branch (S-04, Critical).** The catch-all
+  route forwarded `request.rel_url` verbatim to whatever backend got selected, and a backend
+  configured with a provider key (`token_env`) had that key attached — so any caller with a
+  gateway agent token could make the gateway sign an arbitrary GET/PUT/DELETE to an arbitrary
+  path on the provider. A request bound for a credentialed backend must now be a `POST` to one
+  of the three endpoints the framework itself ever calls (`/v1/chat/completions`,
+  `/v1/embeddings`, `/v1/reranking`); anything else gets 403 plus one credential-audit line
+  (method, path, agent — never the key). Backends with no `token_env` keep today's full
+  pass-through.
+- **Backend-steering headers stripped from client requests (S-14).** `X-SM-LLM-*` headers
+  (backend/affinity steering) are now a daemon/admin capability, not an any-client one — stripped
+  from a client-originated request before either the routing decision or the forward to
+  upstream. Only the framework's own consolidation/REM daemons (and, if routing ever changes,
+  an admin-role token) retain it.
+- **Auth-off + a live provider key refuses to start (S-05, RULED — decision:1303).**
+  `AGENT_TOKENS` unset disables auth *and* the in-flight cap *and* the audit path while a
+  configured provider key stays attached to whatever reaches its backend. The gateway now
+  refuses to start in that combination, naming both fixes: configure `AGENT_TOKENS`, or set
+  `ALLOW_UNAUTHENTICATED_PROVIDER_KEYS=1` as an explicit, deliberate override. An auth-unset
+  install with no provider-credentialed backend — the original backward-compat population — is
+  completely unaffected.
+- **Anonymous `/health` slims; the backend roster moves behind auth (S-10).** `/health` used to
+  disclose the full backend roster, per-backend pool state and capability probes to any
+  anonymous caller. An anonymous caller now sees `status`/`version`/`api_version` only — exactly
+  what `memory_bridge.py doctor` needs — and every other field requires a valid agent bearer
+  token. `API_VERSION` is unchanged: this is not a wire-contract break for an authenticating
+  client. (One ripple fixed alongside it: `memory_bridge.py`'s own `backend_capability` read,
+  used to size the search timeout, was itself calling `/health` unauthenticated — now sends the
+  client's own token, so search sizing keeps using the gateway's live-measured capability
+  instead of silently falling back to a constant on every authenticated install.)
+- **Load-shed valve applies before every auth exemption (S-11).** The in-flight cap
+  (`GATEWAY_INFLIGHT_MAX`) used to be checked only on the fully-authenticated request path, so
+  an anonymous `/health`/`/pool/status` hit — or, on an auth-unset install, any request at all —
+  could never be shed no matter how saturated the gateway already was. The valve now runs first,
+  ahead of both the auth-disabled bypass and the unprotected-path exemption. `/health`'s own
+  upstream fan-out (2+N probes per hit) also gained a short TTL cache
+  (`HEALTH_CACHE_TTL_S`, default a few seconds), shared by anonymous and authenticated callers —
+  only the response shape differs per caller, computed fresh from the same cached probe.
+
+---
+
 ## [0.9.8] — 2026-08-17
 
 ### Added — credential telemetry now says WHEN, not only how many
