@@ -97,6 +97,18 @@ reasoning model's thinking mode. A non-object `extra_body` excludes the
 backend from the pool (logged): for a metered backend, being reached without
 its configured overrides is exactly the misconfiguration to prevent.
 
+**Model-attributes routing** (`roles`, `n_ctx`, `private_ok`, `max_inflight`,
+`price_per_mtok_in`/`price_per_mtok_out`) — full field-by-field reference is
+in `shared-memory/.env.example`, right after the block above. Short version:
+`roles` scopes a backend to specific dream functions (`extract`/`verify`/
+`judge`); `private_ok` decides whether role-less/private traffic may land on
+it (defaults to `false` the moment `token_env` is set — a paid API opts IN,
+it never opts out by omission); `n_ctx` lets the gateway refuse a request
+that would not fit rather than send it and have it truncated upstream;
+`max_inflight` caps concurrent requests to one backend. **A credentialed
+backend configured with neither `roles` nor an explicit `private_ok` refuses
+gateway startup** — a loud, one-time choice on upgrade, not a recurring one.
+
 The gateway resolves `token_env` once at startup from its **own process
 environment** and sends it as `Authorization` only to that backend — the
 client's own gateway auth token is never forwarded anywhere past the gateway
