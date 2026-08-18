@@ -1,13 +1,21 @@
-# HANDOFF — Unit 1 (gateway), model-attributes routing
+# HANDOFF — Unit 2 (daemons), model-attributes routing
 
-Branch `feat/model-attributes-routing`, based on `main = 232f90d` (v0.9.12). Four commits on
-top, working tree clean, full suite green (1834 passed).
+**Unit 1 (gateway) summary:** descriptor schema (roles/n_ctx/private_ok/max_inflight),
+hard eligibility pre-filter, 422/503 structured refusals, steering-header hygiene,
+H-1/H-3 health fixes, routing + token telemetry, the two measurements (CHARS_PER_TOKEN_RATIO,
+H-3 probe URL) — all committed (`4e42290`..`10efc53`), full suite green (1834 passed) before
+Unit 2 started. Its own deviations/open items are unchanged below; see its commits for detail
+if needed — this file is now Unit 2's.
+
+Branch `feat/model-attributes-routing`, based on `main = 232f90d` (v0.9.12). Four Unit 2 commits
+on top of Unit 1's four, working tree clean, full suite green (**1873 passed** — 1834 baseline +
+39 new).
 
 ```
-ee9e16d test(gateway): add explicit I-4 regression — no new gateway-side retry on a plain 4xx/5xx
-dc76fc4 test(gateway): isolate M-5 startup-refusal test from P-5 (found during mutation checking)
-3099984 docs(gateway): document model-attributes routing fields, fit-check ratios, ...
-4e42290 feat(gateway): model-attributes routing — descriptor schema, eligibility pre-filter, ...
+4b62a04 test(unit2): routing-refusal recognition, role headers, no-retry, prompt_chars
+bbf9d89 feat(relsweep): X-SM-LLM-Role header, routing-refusal recognition on both adjudicators
+00c60a9 feat(nrem): X-SM-LLM-Role header, routing-refusal recognition on the insight fold
+57ce00c feat(rem): X-SM-LLM-Role headers, gateway routing-refusal recognition, prompt_chars wiring
 ```
 
 Suite command (from worktree root):
@@ -15,345 +23,217 @@ Suite command (from worktree root):
 uv run --with pytest --with pytest-asyncio --with fastmcp --with psycopg2-binary --with httpx \
   --with neo4j --with asyncpg --with aiohttp --with json-repair --with numpy pytest tests/ -v
 ```
-Result: **1834 passed, 0 failed.** 47 tests are new (`tests/test_model_attributes_routing.py`);
-4 existing test files were edited (see "Existing tests touched" below).
+Result: **1873 passed, 0 failed.**
 
-Files touched, all inside Unit 1 ownership:
-- `shared-memory/scripts/hive_mind_proxy.py` (the bulk of the work)
-- `shared-memory/scripts/dream_telemetry.py` (N-4 only — additive `prompt_chars` param)
-- `shared-memory/.env.example`, `shared-memory/ops/README.md` (docs)
-- `tests/test_model_attributes_routing.py` (new, 47 tests)
-- `tests/test_llm_steering_headers.py`, `tests/test_llm_backend_secrets.py`,
-  `tests/test_llm_fault_origin.py`, `tests/test_credentialed_route_allowlist.py` (edited —
-  see below)
+Files touched, all inside Unit 2 ownership:
+- `shared-memory/scripts/rem_loop.py`, `shared-memory/scripts/consolidation_loop.py`,
+  `shared-memory/scripts/relation_sweep.py` — the four call sites + one pure helper each.
+- `tests/test_unit2_llm_routing.py` — new, 39 tests.
+- `tests/test_nrem_confidence.py`, `tests/test_relation_sweep.py` — edited (pre-existing fixtures
+  that would otherwise break once production code reads `resp.status_code`/accepts a new kwarg
+  unconditionally; see "Existing tests touched" below).
 
-Never touched: version files, CHANGELOG, SKILL.md, sync_skills.sh, any daemon file
-(`rem_loop.py`, `consolidation_loop.py`, `relation_sweep.py`), `coordinator.py`.
+Never touched: version files, CHANGELOG, `sync_skills.sh`, SKILL.md, any gateway file
+(`hive_mind_proxy.py`, `dream_telemetry.py`, `.env.example`, `ops/README.md`), `coordinator.py`.
 
 ---
 
 ## What was built
 
-### 1. Descriptor schema (`_load_llm_backends`)
+### 1. Role headers — per-call-site table (as required)
 
-`LLM_BACKENDS_JSON` entries gained four new optional fields, all additive:
-- `roles`: list from `{extract, verify, judge}`. `summarize` is explicitly rejected with a
-  distinct "RESERVED" message (not a generic unknown-name error). Unknown names are collected
-  into module global `_LLM_BACKEND_ROLE_CONFIG_ERRORS` at parse time (never raised there —
-  every test in this repo imports the module freely) and raised as `SystemExit` only from
-  `require_valid_llm_routing_config()`, called from `main()`.
-- `n_ctx`: int. Non-int value excludes the backend (loud), same pattern as `extra_body`.
-- `private_ok`: bool. Default = `token is None` (no `token_env` resolved → `True`; a resolved
-  token → `False`). `LLM_BACKEND_PRIVATE_OK_EXPLICIT` tracks whether the value was explicit,
-  which the M-5 refusal needs.
-- `max_inflight`: int, per-backend concurrency ceiling.
-- `price_per_mtok_in` / `price_per_mtok_out`: floats, stored + surfaced on `/health`,
-  **never read by any routing function** — proved by
-  `test_price_metadata_never_read_by_selection`.
+| File | Function | Call | Role sent |
+|---|---|---|---|
+| `rem_loop.py` | `_llm_process` → inner `_attempt` | solo enrichment | `extract` |
+| `rem_loop.py` | `_llm_process_batch` | batch enrichment | `extract` |
+| `rem_loop.py` | `_llm_verify_call` | k=3 confirm/deny verification | `verify` |
+| `consolidation_loop.py` | `_post_nrem` (sole caller: `_call_insight_llm`) | insight-slot synthesis — the ONLY NREM LLM path | `judge` |
+| `relation_sweep.py` | `adjudicate_batch` | entity→entity typed-relation adjudication | `judge` |
+| `relation_sweep.py` | `adjudicate_evidential_batch` | rung-2 evidential re-scoring | `judge` |
 
-Legacy comma-form (`LLM_BACKENDS`) and the `DEFAULT_TARGET` fallback populate all four as the
-serves-all degenerate case: `roles=None`, `private_ok=True`, `private_ok_explicit=False`,
-`max_inflight=None` — byte-identical selection to v0.9.12 (I-5a).
+`rem_loop.py`'s embedding call (`_embed`, `RETRIEVER_URL`) and `consolidation_loop.py`'s
+`get_embedding` are **not** dream chat-completion calls (no role taxonomy applies) — left
+untouched, still routed through the gateway per the 1024-dim-via-:8888-only invariant.
+`summarize` is never sent anywhere (R-1: narrative folds are zero-inference, no LLM call).
 
-### 2. Startup refusals — `require_valid_llm_routing_config()`, called from `main()` only
+### 2. Gateway routing-refusal recognition (F-1/F-2, U2-I1)
 
-Same placement reasoning as the existing `require_auth_when_provider_keys_configured()`: an
-unconditional check at parse/import time would kill test collection itself.
+Each of the three files gained its **own copy** of a pure `_routing_refusal(resp)` helper
+(identical logic, duplicated — no shared module is inside Unit 2's file ownership list, so
+importing across `rem_loop.py`/`consolidation_loop.py`/`relation_sweep.py` was not an option
+without adding a fourth file outside the brief's list). It recognizes a 422
+`no_eligible_backend` or 503 `backend_at_capacity` body **and** `X-SM-Fault-Origin: gateway` —
+never status code alone, so a real provider 422/503 passed through the proxy is never misread
+as the gateway declining to place the job.
 
-1. **Unknown role name** (incl. `summarize`) → `SystemExit` naming the backend and the bad
-   name(s).
-2. **M-5 (Critical)**: a credentialed backend (`token_env` resolved) with neither `roles` nor
-   an *explicit* `private_ok` → `SystemExit` demanding the operator pick one.
-3. **P-5**: `AUTH_CONFIGURED_AT_STARTUP` False + any `private_ok=false` backend → `SystemExit`,
-   governed by the same `ALLOW_UNAUTHENTICATED_PROVIDER_KEYS=1` override S-05 uses (warns
-   instead of refusing).
+- `rem_loop.py`: new `LLM_FAIL_ROUTING_REFUSED` failure class, deliberately **absent** from
+  `LLM_FAIL_CHARGEABLE` — a refusal at the solo or batch call site logs loudly once (pg_id/batch
+  size + constraint + role), sets this failure class, and `_process_fact`/the batch caller's
+  existing chargeable-vs-not branch does the rest (unchanged logic, now fed a new class).
+  `_llm_verify_call` sets a companion instance flag (`_last_verify_refused`) so the k=3
+  self-consistency loop in `_verify_novel_edges` **breaks after the first refusal** instead of
+  making VERIFY_CALLS (2) more identical calls into an unchanged fleet.
+- `consolidation_loop.py`: `_call_insight_llm` detects the refusal, logs it (entity + constraint
+  + role), and returns `None` **without** setting `_last_llm_truncated` or
+  `_last_llm_missing_slots` — `_fold_insight`'s existing three-way branch already has a plain
+  "neither flag set → ledger rows stay open, log, next sweep retries" path (no
+  `truncation_failures`/`slot_failures` charge), so no new poisoning path had to be built, only
+  the loud, specific detection feeding into the existing one. Never widens to the
+  truncation-retry bound for a refused call.
+- `relation_sweep.py`: both adjudicators detect the refusal **before** `resp.raise_for_status()`
+  (which would otherwise raise on 422/503 and fall into the generic `except Exception` branch),
+  log it, and return `({}, "local-model")` — there is no `rem_attempts` equivalent here; "skip
+  without charging" means the candidate is simply left unresolved for a later sweep, same shape
+  as any other whole-call failure.
 
-### 3. Selection restructure (`_select_llm_backend`, `_eligible_backends`)
+**503 `backend_at_capacity` gets identical treatment to 422 `no_eligible_backend`** everywhere
+(the assigner ruling Unit 1's HANDOFF flagged as open — resolved here: both mean "the gateway
+declined to place this job right now," neither is evidence about the record).
 
-`_eligible_backends(role, est_prompt_tokens, effective_max_tokens)` computes the **hard
-pre-filter** (role+privacy+fit) first. `_select_llm_backend` restructured so every fallback
-tier — affinity hit, the protected/cold cascade, the cooldown-ignoring last resort — operates
-strictly inside that set; the final fallback tier now bottoms out at `eligible`, never
-`LLM_POOL` (this was the actual defect class P-1/P-2 named — see the mutation-check table
-below for the concrete before/after). `_ordered_llm_backends` (dead code, zero callers) is
-deleted.
+### 3. `prompt_chars` wiring (N-4)
 
-Eligibility rule implemented exactly as specified:
-- Role-carrying traffic: `(roles absent AND private_ok) OR role in roles`. Note the second
-  branch is **not** gated by `private_ok` at all — an explicit `roles` list is itself the
-  per-function privacy opt-in, so a `private_ok=false` backend that lists a role IS eligible
-  for that role's traffic.
-- Role-less traffic: `private_ok` alone; a backend's `roles` list is completely ignored.
-
-### 4. The 422 refusal (`I-2a`)
-
-Empty eligible set → `HTTP 422 {"error":"no_eligible_backend","constraint":"role"|"privacy"|
-"fit","role":<role-or-null>}` + `X-SM-Fault-Origin: gateway`, computed and returned **before**
-any inflight accounting (the increment happens later, inside the `try:` block — this refusal
-returns from a point in the code that never reaches it). `_classify_no_eligible_constraint`
-picks the constraint label:
-- `"fit"` if role+privacy alone would have left a non-empty set (size was the only problem).
-- else `"privacy"` if a serves-all (`roles` absent) candidate exists in the fleet (blocked
-  only by `private_ok=false`), or if the traffic was role-less at all (privacy is the only
-  axis role-less traffic can fail on).
-- else `"role"` (nothing in the fleet is configured to serve this function, privacy moot).
-
-This classification algorithm is **not specified verbatim in the plan** — I derived it from
-the eligibility formula and documented the reasoning in `_classify_no_eligible_constraint`'s
-docstring. Flagging it explicitly in case the merger/reviewer wants a different tie-break rule.
-
-### 5. `max_inflight` concurrency cap (I-8/I-8b)
-
-A backend at its cap is excluded from the `not_capped` candidate list computed from the
-(already eligibility/health-filtered) `cold` set; if every remaining candidate is capped,
-`_select_llm_backend` returns `None`. `handle_proxy` distinguishes the two `None` cases by
-calling `_eligible_backends()` itself first (empty → 422, no wait) — only when it's
-non-empty does it call the new async `_select_backend_waiting_on_capacity()`, a bounded poll
-loop (`LLM_MAX_INFLIGHT_WAIT_S`/`LLM_MAX_INFLIGHT_POLL_S`, default 120s/0.5s) around
-`_select_llm_backend`. If the wait is exhausted, `handle_proxy` returns
-**`HTTP 503 {"error":"backend_at_capacity"}`** — deliberately *not* `422`, because the 422
-body's `constraint` enum is fixed to `role|privacy|fit` in the plan and capacity-exhaustion is
-none of those. **This status/shape choice is my interpretation, not spelled out in the
-plan** — flag for review. Neither the eligibility 422 nor the capacity-wait/503 path ever
-touches `_llm_inflight` (I-8b) — the increment only happens after a real backend is chosen and
-dispatch begins.
-
-### 6. P-6 steering-header hygiene
-
-`X-SM-LLM-*` headers are now stripped from `upstream_headers` **unconditionally**, right
-before the upstream call — daemons included. Before this cycle, a daemon/admin identity's
-`X-SM-LLM-Role` header survived all the way to the provider; now it is read once (for the
-gateway's own routing decision, via `steer_headers`) and then stripped again
-(`_strip_llm_steering_headers(steer_headers)`) before `_filter_headers` builds the outbound
-header set. **This deliberately changes three existing pinned assertions** in
-`tests/test_llm_steering_headers.py` (see below).
-
-### 7. H-1/H-2/H-3 health display
-
-- H-1: a bare-probe 401/403 from a backend with `LLM_BACKEND_TOKENS[b] is not None` now reads
-  `"ok"` in `backend_status`/`checks["llm"]` — it answered, and no Authorization header is ever
-  attached to this probe (no per-poll key spraying). Genuinely down (connect error / 5xx)
-  unaffected.
-- H-3: new `_v1_models_probe_url()` avoids `/v1/v1/models` doubling when the configured base
-  already ends in `/v1` (`LLM_BACKENDS_JSON`'s own documented shape,
-  `"https://api.deepseek.com/v1"`). Used in both probe call sites
-  (`_probe_backend_alive` and `_build_health_checks`'s backend loop).
-  **Live-verified** (bare curl, no key): both `https://api.deepseek.com/v1/v1/models` and
-  `.../v1/models` return `401` — DeepSeek's edge auth governor rejects *any* path uniformly
-  (confirmed with a bogus path too, also 401), so the doubling bug happened to be invisible
-  for this specific provider. The fix stands anyway: it is a real URL-construction defect
-  regardless of what one provider's auth gate does with it, and a path-sensitive gate on a
-  different provider would answer the two URLs differently.
-
-### 8. Telemetry (Group 3)
-
-- `checks["llm_routing"]`: `routed_role_extract`/`_verify`/`_judge` counters + paired
-  `_last_ts`, `routing_no_eligible_backend` + `_last_ts`, `routing_fit_rejected` + `_last_ts`.
-  Surfaced unconditionally (not gated on pool size) on the authenticated `/health` payload.
-- `checks["llm_token_usage"]`: per-backend `tokens_prompt_total`/`tokens_completion_total` +
-  `tokens_last_ts`, parsed from `usage` on a **non-streaming, uncompressed** proxied response.
-  Accumulated during the existing chunk-passthrough loop (bounded by
-  `LLM_USAGE_CAPTURE_CAP_BYTES`, default 2 MiB — capture is abandoned, not attempted, past
-  that), parsed once after the loop. A compressed response (`Content-Encoding` set) skips
-  capture entirely — **out of scope this cycle**, see "Out-of-scope findings" below.
-- A2 lifecycle sum lines: `_emit_token_lifecycle_sums()` — direct synchronous write (journal
-  via `log.info`, plus `GATEWAY_AUDIT_LOG_PATH` via `log_hygiene.append_secure()` directly,
-  **never** `AsyncLineWriter`, per the explicit shutdown-flush-hang warning). Called
-  unconditionally in `main()`'s drain sequence, plus optionally on
-  `TOKEN_LIFECYCLE_SUM_INTERVAL_S` (0 = disabled, the default) via a new background task.
-- `/pool/status` F-3: `free_slots` now counts only `serves_all` (`roles absent AND
-  private_ok`) backends; the `backends` roster gained an additive `serves_all` field per entry
-  so a monitor can still see everything.
-- N-4: `dream_telemetry.record_llm_call()` gained an additive, keyword-only `prompt_chars:
-  int | None = None` parameter, written into the JSONL row. **Not yet wired into any call
-  site** — that's Unit 2's job (REM/NREM/relation_sweep all live in daemon files I don't own).
-
----
-
-## The two required measurements
-
-### 1. chars→tokens ratio (`CHARS_PER_TOKEN_RATIO`, `FIT_MARGIN`)
-
-Ran `/tokenize` against **both** configured local backends (`localhost:5000`, `localhost:4000`
-— confirmed identical model, `Qwen3-14B-Q4_K_M.gguf`, on both) with 20 varied prompt samples
-(prose, JSON-shaped dream-prompt bodies, Python/SQL code, a 120-entity grounding-prefix block,
-a 40-fact NREM-cluster block, Greek text, and three degenerate single-token samples I then
-EXCLUDED as non-representative — see below).
-
-Raw per-sample results (identical on both backends, confirming one shared tokenizer):
-
-| sample (abbreviated) | chars | tokens | ratio |
-|---|---:|---:|---:|
-| "The quick brown fox…" | 71 | 16 | 4.438 |
-| "Shared memory frameworks…" | 145 | 21 | 6.905 |
-| "In the beginning…" | 123 | 26 | 4.731 |
-| "Xenofon reviewed the pull request…" | 143 | 27 | 5.296 |
-| "A gateway that owns routing…" | 143 | 27 | 5.296 |
-| JSON `{"role":"system",…}` | 66 | 18 | 3.667 |
-| JSON `{"facts":[…]}` | 99 | 35 | 2.829 |
-| JSON `{"grounding":[…]}` | 110 | 28 | 3.929 |
-| JSON `{"messages":[…]}` | 131 | 44 | 2.977 |
-| JSON `{"decision":"adopt",…}` | 102 | 35 | 2.914 |
-| Python function def | 195 | 50 | 3.900 |
-| Python code block | 137 | 37 | 3.703 |
-| SQL query | 116 | 29 | 4.000 |
-| 120-entity grounding prefix | 1473 | 726 | 2.029 |
-| 40-fact cluster block | 2544 | 732 | 3.475 |
-| Greek text | 53 | 44 | **1.205** |
-| "Thessaloniki, Greece…" | 61 | 25 | 2.440 |
-| ~~"ok"~~ (excluded, degenerate) | 2 | 1 | 2.000 |
-| ~~"1234567890"~~ (excluded, degenerate) | 10 | 10 | 1.000 |
-| ~~"{}"~~ (excluded, degenerate) | 2 | 1 | 2.000 |
-
-**Excluded the three single/near-single-token samples** as non-representative of real dream
-call bodies (which are always hundreds+ characters, never a bare `"{}"`) — including them would
-have pulled the "most conservative" ratio down to 1.000 (every char = one token), which is
-excessively conservative for the actual traffic this estimates. Documenting the exclusion
-explicitly rather than silently cherry-picking.
-
-**RATIO = 1.2** — the measured floor (1.205, Greek text — the densest real sample), rounded
-down slightly. `CHARS_PER_TOKEN_RATIO` env default.
-
-**A second live check** measured the gap between this JSON-body-char estimate and the REAL
-chat-template-rendered prompt size (4 real `max_tokens:1` chat completions against
-`localhost:5000`, reading `timings.prompt_n`):
-
-| body_chars | est_tokens (RATIO=1.2) | real prompt_n | est/real | gap |
-|---:|---:|---:|---:|---:|
-| 332 | 276.7 | 50 | 5.53x | +453% |
-| 1633 | 1360.8 | 745 | 1.83x | +83% |
-| 2743 | 2285.8 | 752 | 3.04x | +204% |
-| 90 | 75.0 | 12 | 6.25x | +525% |
-
-The estimator **overestimates real prompt tokens by 83%–525% in every sample tried** — i.e.
-RATIO's own conservatism (not FIT_MARGIN) is what does the real protective work against
-under-counting. Given that, **FIT_MARGIN = 0.10** is a modest, deliberately non-zero residual
-buffer — flagged **unmeasured** (fact:1338 discipline) — for content denser than anything
-sampled (heavy CJK/emoji, deeply repeated JSON) and general n_ctx bookkeeping the char
-estimator doesn't model, not for correcting an under-count the measurement above didn't find.
-
-**FIT_DEFAULT_OUTPUT_TOKENS = 2048** — explicitly unmeasured (flagged in `.env.example`), only
-used when a caller's body has no `max_tokens` at all.
-
-### 2. H-3 probe URL check
-
-Done — see section 8 above. Live curl confirmed both the doubled and correct URL forms return
-401 uniformly against `api.deepseek.com` (its auth governor rejects any path, verified with a
-bogus path too). Fix applied regardless; not empirically distinguishable through this one
-provider.
-
----
-
-## Verify-at-build item: llama-server tolerance of unknown body keys
-
-Live `POST /v1/chat/completions` to `localhost:5000` with two bogus top-level keys
-(`totally_unknown_key_xyz`, `another_bogus_field`) alongside a normal chat body: **HTTP 200,
-request succeeded normally**, unknown fields silently ignored. No code change needed —
-`extra_body` dialects on a shared pool are safe against this specific backend.
+Every call site that already calls `record_llm_call` now passes `prompt_chars=len(prompt)` (the
+caller's own char-count of the prompt string it built, per the field's docstring) —
+`rem_loop.py`'s three sites (all `record_llm_call` invocations: non-200, truncated, success) and
+`consolidation_loop.py`'s `_post_nrem` (extended with a `prompt_chars` kwarg, forwarded from
+`_call_insight_llm`). `relation_sweep.py` never called `record_llm_call` before this cycle and
+still doesn't — nothing to wire there (out of scope: adding new telemetry recording was not
+asked for).
 
 ---
 
 ## Invariant → test → mutation-check table
 
-Mutation checks were run against the **actual worktree file** via scratchpad backup/restore
+Every mutation below was run against the **actual worktree file** via scratchpad backup/restore
 (`fact:1244` discipline — never `git checkout --`): copy to
-`/tmp/.../scratchpad/hive_mind_proxy.py.orig_backup`, apply a targeted mutation via a small
-Python script, run the relevant test(s), confirm the exact expected failure, `cp` the backup
-back, verify `git diff` is empty. Every mutation below was restored and the full suite
-re-confirmed green before moving to the next.
+`.../scratchpad/{rem_loop,consolidation_loop,relation_sweep}.py.orig_backup`, apply a targeted
+mutation, run `tests/test_unit2_llm_routing.py`, confirm the exact expected failure, `cp` the
+backup back, confirm `git diff` matches the pre-mutation state, full suite re-confirmed green
+before moving to the next.
 
-| Invariant | Test(s) | Mutation | Result |
-|---|---|---|---|
-| P-2 (affinity hit outside eligible = MISS) | `test_i1a_affinity_hit_outside_eligible_set_is_a_miss` | Removed the `eligible_set` gate from BOTH the outer affinity-hit condition AND `_usable()` (removing only one left the other as a redundant guard — confirmed via a first, informative no-op attempt) | Exactly that 1 test fails |
-| P-1 Critical (cold fallback bottoms at `LLM_POOL`, not `eligible`) | `test_i1a_cold_fallback_never_widens_past_eligible` | Changed the last two fallback tiers from `eligible`/`[b for b in eligible ...]` back to `LLM_POOL`/`list(LLM_POOL)` | Exactly that 1 test fails |
-| I-2a (422 refusal) | 5 tests (`test_422_*`) | `if not _eligible_backends(...)` → `if False and not _eligible_backends(...)` (with `LLM_MAX_INFLIGHT_WAIT_S=0.05` env override to keep the resulting hang bounded — first attempt at real defaults hit my own 60s command timeout, itself informative: confirms disabling the refusal makes the request WAIT instead, exactly the "never queues" property it guards) | Exactly those 5 tests fail |
-| I-3 (fit check) | `test_422_fit_constraint_when_oversized`, `test_fits_boundary_math` | `_fits()` body replaced with `return True` unconditionally | Exactly those 2 tests fail |
-| M-5 (credentialed-choice refusal) | `test_m5_credentialed_backend_with_no_choice_refuses_startup` | `if needs_explicit_choice:` → `if False and needs_explicit_choice:` | First attempt: test still passed — P-5 was independently refusing the same scenario (`private_ok` defaults False for this backend too), so the test wasn't actually isolating M-5. **Fixed the test** (auth-on, so only M-5 can fire) — re-ran the same mutation: exactly that 1 test fails. Committed as `dc76fc4`. |
-| P-5 (auth-off + private_ok=false refusal) | `test_p5_auth_off_plus_private_ok_false_refuses_startup` | `if not private_false:` → `if True:` | Exactly that 1 test fails |
-| I-8 (max_inflight cap) + I-8b (accounting) | `test_i8_cap_never_widens_eligibility`, `test_i8b_capacity_wait_exhausted_never_touches_inflight` | `_at_cap()` body replaced with `return False` | Exactly those 2 tests fail (the other two I-8 tests correctly still pass — they don't depend on the cap actually excluding anything in their specific scenario) |
-| H-1 (credentialed 401/403 = ok) | `test_h1_credentialed_backend_401_reads_ok` | Disabled the credentialed-exception branch in the probe loop | Exactly that 1 test fails |
-| H-3 (no /v1 doubling) | `test_v1_models_probe_url_avoids_doubling` | Removed the `endswith("/v1")` branch | Exactly that 1 test fails |
-| P-6 (steering headers stripped for everyone) | 4 tests (2 new + 2 updated existing) | `upstream_headers = self._filter_headers(_strip_llm_steering_headers(steer_headers))` → `self._filter_headers(steer_headers)` | Exactly those 4 tests fail (the "role still drives routing" test correctly still passes) |
-| F-3 (`/pool/status` free_slots) | `test_f3_free_slots_excludes_role_scoped_backend` | `free += 1 if (avail and serves_all) else 0` → `free += 1 if avail else 0` | Exactly that 1 test fails |
-| N-4 (`prompt_chars` additive) | `test_n4_record_llm_call_prompt_chars_additive` | Removed the `"prompt_chars": prompt_chars,` line from `record_llm_call`'s `rec` dict | Exactly that 1 test fails |
+| # | Invariant | Test(s) | Mutation | Result |
+|---|---|---|---|---|
+| M1 | U2-I1 (rem solo: refusal never charges) | `test_rem_solo_routing_refusal_does_not_charge_an_attempt`, `test_rem_backend_at_capacity_gets_the_same_no_charge_treatment` | Deleted the `if refusal: ...; return None, model, LLM_FAIL_ROUTING_REFUSED, False` block in `_attempt()` | Exactly those 2 tests fail (`_last_llm_failure` reads `transport` instead of `routing_refused`) |
+| M2 | U2-I2 (rem solo role header) | `test_rem_solo_call_sends_extract_role_header` | Changed `"extract"` → `"WRONG"` in the solo call's headers | Exactly that 1 test fails |
+| M3 | U2-I1 (rem batch: refusal never charges) | `test_rem_batch_routing_refusal_charges_no_record` | Deleted the batch call's `if refusal:` block | Exactly that 1 test fails |
+| M4 | I-4's spirit (verify k=3 loop stops after first refusal) | `test_rem_verify_loop_stops_after_the_first_refusal` | `if getattr(self, "_last_verify_refused", False):` → `if False:` | Exactly that 1 test fails (2 POSTs instead of 1) |
+| M5 | N-4 (prompt_chars wired, solo success path) | `test_rem_solo_call_wires_prompt_chars` | `prompt_chars=len(prompt)` → `prompt_chars=None` on the success-path `record_llm_call` | Exactly that 1 test fails |
+| M6 | U2-I1 (NREM: refusal detected + logged, not just non-200) | `test_nrem_insight_routing_refusal_logs_constraint_and_role` | Deleted `_call_insight_llm`'s `if refusal:` block | Exactly that 1 test fails — `test_nrem_insight_routing_refusal_no_retry_no_poison` **still passes**, because the generic non-200 fallback also stops at one call without poisoning; only the loud, entity/constraint/role-specific log line distinguishes the two paths (documented finding, not a gap — see below) |
+| M7 | U2-I2 (NREM role header) | `test_nrem_insight_call_sends_judge_role_header` | Changed `"judge"` → `"WRONG"` in `_post_nrem`'s headers | Exactly that 1 test fails |
+| M8 | U2-I1 (relation_sweep batch: refusal skips without raising) | `test_relation_sweep_batch_routing_refusal_skips_without_raising` | Deleted `adjudicate_batch`'s `if refusal:` block | Exactly that 1 test fails (falls to `raise_for_status()` → generic `except Exception` path, different stderr text) |
+| M9 | U2-I2 (relation_sweep evidential role header) | `test_relation_sweep_evidential_batch_sends_judge_role_header` | Changed `"judge"` → `"WRONG"` in `adjudicate_evidential_batch`'s headers | Exactly that 1 test fails |
+| M10 | Recognition keys on the header, not just the error string | `test_routing_refusal_requires_the_gateway_origin_header_even_with_a_matching_body[relation_sweep]` | Deleted the `X-SM-Fault-Origin` check from `relation_sweep.py`'s `_routing_refusal` | Exactly that 1 (parametrized) test fails |
 
-I-4, I-5a, I-6a, I-7 are proven by tests but were not separately mutation-checked as "new
-invariants" — they are explicitly **unchanged-behavior** claims (I-4: no new retry added at
-all — nothing to mutate; I-5a/I-6a/I-7: proven by the full existing suite continuing to pass
-plus the additive-field assertions in `test_i7_*`).
+⭐ **M10 was found the hard way and is worth recording as a process note.** The first version of
+`test_routing_refusal_never_fires_on_status_alone` used a provider-error fixture whose `error`
+field already differed from the two known refusal strings — so deleting the header check alone
+passed the whole suite silently: the error-field check was independently sufficient to reject
+that particular fixture, masking the header check's own necessity (an invariant with a test that
+doesn't actually exercise it is the "an invariant with no failing test is an intention" trap from
+a different angle — the test existed, but didn't isolate the thing it claimed to guard). Added
+`test_routing_refusal_requires_the_gateway_origin_header_even_with_a_matching_body`, which uses a
+body carrying the **exact** refusal shape (matching status + matching error string) but a
+missing/wrong origin header, specifically to isolate that one check. Re-ran M10 after adding it —
+correctly caught.
 
-⭐ **Assertion discipline applied**: every mutation-check test above asserts a concrete VALUE
-(a specific backend URL, a specific HTTP status, a specific constraint string, a specific
-count/boolean) rather than only an equality between two expressions that could move together.
+M6 is a related, deliberately-kept finding rather than a gap: the two behavioral outcomes
+(no-retry, no-poison) are **structurally identical** whether or not the refusal-specific code
+runs, because `consolidation_loop.py`'s pre-existing generic non-200 handling already never
+retries and never poisons. The only thing my new code adds there is the **loud, specific,
+entity-scoped log line** — so that is the only thing a test guarding it can assert on, and that
+is exactly what `test_nrem_insight_routing_refusal_logs_constraint_and_role` does (via `caplog`).
+This is not true for `rem_loop.py`/`relation_sweep.py`, where the routing-refusal path and the
+generic non-200 path diverge in real, chargeable-vs-not or exception-vs-not ways (M1/M3/M8).
+
+⭐ **Assertion discipline applied**: every mutation-check test asserts a concrete VALUE (an exact
+failure-class string, an exact header value, an exact POST-call count, a cross-checked
+`prompt_chars` value against the actual request body) rather than only an equality between two
+expressions that could move together (`fact:1309`).
+
+I-4 (no new daemon-side retry beyond what exists today) is otherwise proven by the unchanged
+retry-ladder tests in `test_rem_degeneration.py`/`test_nrem_confidence.py` continuing to pass —
+truncation retries are untouched; only the NEW routing-refusal path was checked for the ABSENCE
+of a retry (M4, and implicitly M1/M6/M8 since none of those show more than one POST in their
+capture lists).
 
 ---
 
 ## Existing tests touched, and why
 
-- **`tests/test_llm_steering_headers.py`** — 3 assertions **deliberately changed** (P-6): a
-  daemon/admin identity's `X-SM-LLM-Role` header used to survive to the upstream forward; it
-  no longer does, for any identity. Updated `test_daemon_identity_keeps_steering_header`,
-  `test_rem_daemon_identity_also_keeps_steering_header`, and
-  `test_auth_off_install_keeps_backward_compatible_pass_through` (this last one is the exact
-  line the plan named — `:98` in the pre-cycle file). Docstrings updated to point at the new
-  tests in `test_model_attributes_routing.py` that prove the role still drives *routing*
-  despite the strip.
-- **`tests/test_llm_backend_secrets.py`**, **`tests/test_llm_fault_origin.py`**,
-  **`tests/test_credentialed_route_allowlist.py`** — added `"private_ok": true` to every
-  credentialed-backend fixture that sends **role-less** traffic and expects it to actually
-  reach dispatch (S-04 allowlist checks, credential-fault classification, backend/key_attached
-  stash). Without it, the new eligibility pre-filter correctly 422s this traffic before any of
-  those mechanics run — these tests are about the mechanics downstream of dispatch, not about
-  M-5's startup choice (which has its own coverage), so making the explicit choice in their
-  fixtures keeps them testing what they always tested.
+- **`tests/test_nrem_confidence.py`** — two `fake_post(client, payload, ceiling_s=None)` stubs
+  that monkeypatch `consolidation_loop._post_nrem` now fail with `TypeError: unexpected keyword
+  argument 'prompt_chars'` once `_call_insight_llm` passes it. Both now accept
+  `prompt_chars=None` (and gained a `headers = {}` class attribute on their fake response, unused
+  by these specific tests but consistent with what `_routing_refusal` expects if ever reached).
+- **`tests/test_relation_sweep.py`** — `_FakeResp` and the local `_TruncResp` (inside
+  `test_adjudicate_batch_truncated_bounds_tokens_and_drops_final`) never defined `.status_code`;
+  `_routing_refusal(resp)` reads it unconditionally as its first check on every call, so both
+  needed a `status_code = 200` default. Both fixtures previously relied on `raise_for_status()`
+  being a no-op — that behavior is unchanged, so no existing assertion moved.
 
 ---
 
 ## Deviations from the brief / open interpretation calls (flag for review)
 
-1. **`_classify_no_eligible_constraint`'s role/privacy tie-break algorithm** is not specified
-   in the plan — I derived it (see section 4 above) and documented the reasoning inline.
-2. **Capacity-wait exhaustion returns `503 {"error":"backend_at_capacity"}`**, not `422` — the
-   plan's 422 body's `constraint` enum is fixed to `role|privacy|fit`, none of which fit
-   "every eligible backend is momentarily at its cap." Chose 503 to reuse the existing
-   "backend problem" status class rather than invent a fourth constraint value.
-3. **`CHARS_PER_TOKEN_RATIO` and `LLM_MAX_INFLIGHT_WAIT_S`/`LLM_MAX_INFLIGHT_POLL_S`** env var
-   names are my own choice — not named in the plan/brief.
-4. Compressed (`Content-Encoding` set) LLM responses **skip token-usage capture entirely**
-   (see out-of-scope findings) rather than attempting the bounded-prefix decompress
-   `coordinator.py`'s fault-peek helper uses — that helper caps at 8192 *decompressed* bytes,
-   which would likely truncate before reaching a trailing `usage` object on anything but a
-   small completion. Full decompression felt out of proportion to this cycle's scope; flagged
-   rather than silently accepted.
-5. `checks["llm_routing"]` and `checks["llm_token_usage"]` are surfaced **unconditionally**
-   on the authenticated `/health` payload (not gated behind `len(LLM_BACKENDS) > 1` the way
-   `llm_backends`/`llm_pool`/`llm_affinity` are) — routing/token telemetry is meaningful even
-   for a single role-scoped backend, so I didn't see a reason to withhold it for single-backend
-   installs.
+1. **No shared helper module** — `_routing_refusal` is a byte-identical copy in all three files.
+   The brief's file-ownership list is `rem_loop.py`, `consolidation_loop.py`, `relation_sweep.py`,
+   and `tests/` — adding a fourth shared module (even a small one) would be a file outside that
+   list. Flagging in case the merger prefers a shared module in a follow-up cycle; the three
+   copies are covered by the SAME parametrized test group in `test_unit2_llm_routing.py`, so a
+   future consolidation would not lose coverage.
+2. **The generic (pre-existing) non-200 log wording in `rem_loop.py`'s `_process_fact`** — changed
+   from a hardcoded `" (transport failure — attempt NOT charged)"` to `f" ({failure} — attempt NOT
+   charged)"` so it reads correctly for the new `routing_refused` class too (it previously always
+   said "transport failure" regardless of which non-chargeable class actually applied). Small,
+   in-file, not called out in the brief explicitly but a direct consequence of adding a second
+   non-chargeable class.
+3. **`_verify_novel_edges`'s early-stop optimization** (breaking the k=3 loop after the first
+   refusal) is not explicitly named as a separate invariant in the brief's I-4 pointer, but is a
+   direct reading of "No daemon-side retry of a refused call within the same cycle... hammering it
+   changes nothing." Flagging as an interpretation, not a literal instruction — the alternative
+   (looping all VERIFY_CALLS anyway, degrading to a lower vote count) would also have been
+   defensible, just less in the spirit of I-4.
+4. **`consolidation_loop.py`'s `_post_nrem`** also runs its own (redundant-looking)
+   `_routing_refusal(resp)` call purely to pick the telemetry `note` field
+   (`routing_refused_<error>` vs `http_<code>`) — a second call to the same pure function per
+   request, cheap, kept for telemetry accuracy even though the LOUD, entity-scoped log lives one
+   level up in `_call_insight_llm`.
 
 ## Out-of-scope findings (reported, not fixed)
 
-- `reference_resolver.py` calling a backend **directly**, bypassing the gateway (R-2, named in
-  the plan as its own follow-up) — did not touch it, did not re-verify it beyond what the plan
-  already states.
-- Compressed proxied LLM response bodies never get token-usage accounting (see deviation 4
-  above) — the counter is simply never incremented for that call; never breaks the proxy path.
-- The xAI reasoning-off parameter-name verify-at-build item (named in the plan's *original*
-  section, not repeated in the REVISED DESIGN or in this brief's explicit list) — not checked;
-  no grok/xAI entry is configured anywhere in this repo's tests or docs yet, so it wasn't
-  reachable to verify.
-- Per-role `/pool/status` slot accounting remains fully deferred (F-3 explicitly named this as
-  a non-goal this cycle) — only the binary `serves_all` filter was built.
+- **R-2 identity gap (relation_sweep cannot steer under auth-on) — a real, verified blocker, not
+  fixed here.** `hive_mind_proxy.py`'s `_may_steer_llm` (S-14) permits exactly two agent names —
+  `DAEMON_AGENT_NAMES = {"consolidation", "rem_daemon"}` — both minted ONLY via
+  `_mint_daemon_token()`, called only from the gateway's own child-process spawn path for the REM
+  and NREM/consolidation daemons it launches itself. `relation_sweep.py` is a **standalone**
+  script (not spawned by the gateway) that authenticates with a static `AGENT_TOKENS` entry via
+  `secure_env.get_secret("AGENT_TOKEN")` — under auth-on, its resolved agent name is whatever the
+  operator named that token, never one of the two hardcoded strings, so `X-SM-LLM-Role: judge` is
+  silently stripped by S-14 before reaching the routing logic (the request itself still succeeds —
+  it just falls back to role-less, privacy-only eligibility). The only other identity class
+  `_may_steer_llm` accepts is `role == "admin"` via `AGENT_ROLES` — but `_may_steer_llm`'s own
+  docstring notes admin tokens are confined to `/admin/*` by `auth_middleware` and can **never
+  reach `handle_proxy` at all**, so assigning `relation_sweep` an admin role would not fix
+  steering, it would 403 the LLM call outright. No fix is reachable from `relation_sweep.py`
+  itself, from any `.env`/`AGENT_ROLES` configuration, or from any other Unit 2 file — this is
+  squarely `hive_mind_proxy.py`'s `DAEMON_AGENT_NAMES` frozenset (Unit 1/gateway ownership).
+  **Under auth-off installs this is a non-issue** (`_may_steer_llm` returns `True`
+  unconditionally when `AUTH_CONFIGURED_AT_STARTUP` is `False`). The `X-SM-LLM-Role: judge` header
+  is still sent unconditionally from `relation_sweep.py` (harmless under auth-on — it is simply
+  stripped — and correct/needed under auth-off), so no code change is needed once the gateway-side
+  allowlist is widened; this is purely a report for whoever owns that file next.
+- Everything the brief named out of scope (gateway-side capacity-503 telemetry, `reference_resolver.py`'s
+  direct-backend bypass, L2 chunking, weight rework, per-role slot accounting, REM→coordinator
+  dream-counter reporting, `/pool/status`'s advisory pre-check) — untouched, not re-verified beyond
+  what the plan/brief already state.
 
-## For Unit 2 (daemons)
+## For the merger
 
-- `dream_telemetry.record_llm_call(..., prompt_chars=...)` is ready; no call site passes it
-  yet.
-- The gateway now returns **422** (not 413) on `no_eligible_backend`, and **503** on
-  `backend_at_capacity` (new, not named in the earlier draft plan) — daemon-side recognition
-  needs to handle both, per F-1/F-2's "skip without charging rem_attempts" ruling. The 503
-  capacity case probably wants the SAME treatment (loud, once, skip) since it's also "the
-  gateway declined to serve this job right now," not a record defect — but that's a call for
-  whoever builds Unit 2, not decided here.
-- `X-SM-LLM-Role` is the only header daemons need to send (A-3 simplification confirmed — the
-  gateway computes its own prompt-size estimate from the buffered body).
+- `_routing_refusal` is duplicated three times (deviation 1) — a candidate for extraction into a
+  shared module in a later cycle, not this one.
+- The R-2 gateway-side gap above blocks `relation_sweep.py` from ever actually steering under
+  auth-on until `hive_mind_proxy.py`'s `DAEMON_AGENT_NAMES` is widened (or some other steer-permit
+  mechanism is added for standalone, non-gateway-spawned daemons) — worth a security-review line
+  item and a follow-up ticket.
+- 503 `backend_at_capacity` and 422 `no_eligible_backend` are treated identically everywhere in
+  Unit 2, resolving the "open call" Unit 1's HANDOFF left for whoever built this side.
