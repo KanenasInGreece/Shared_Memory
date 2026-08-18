@@ -91,7 +91,7 @@ echo
 echo "✓ Wrote $ENV_FILE (chmod 600) and created data dirs."
 echo "  Encoder CPU budget:         LLAMA_CPU_THREADS=$LLAMA_CPU_THREADS (of $_ncpu host threads)"
 echo "  Confirm it is gitignored:   git -C \"$REPO_DIR\" check-ignore shared-memory/.env"
-echo "  Bring up the stack:         docker compose -f \"$REPO_DIR/postgres_neo4j_limits.yaml\" --env-file \"$ENV_FILE\" up -d"
+echo "  Bring up the stack:         docker compose -f \"$REPO_DIR/shared-memory/ops/shared-memory/ops/postgres_neo4j_limits.yaml\" --env-file \"$ENV_FILE\" up -d"
 echo "  Then mint client tokens:    uv run python shared-memory/scripts/generate_tokens.py"
 
 echo

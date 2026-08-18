@@ -106,16 +106,26 @@ def _load() -> OntologyConfig:
     tuning is read from ontology.yaml. Spine keys present in the file are ignored: the
     file cannot rename or redefine the framework, only extend the domain vocabulary."""
     cfg = OntologyConfig()  # all spine + domain defaults; spine is fixed from here on
-    path = os.environ.get(
-        "SMEM_ONTOLOGY_PATH",
-        os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "ontology.yaml"))
-    )
+    # Candidate list (same form as the env loaders): the file lives with the
+    # framework at shared-memory/ontology.yaml; the repo root is a FALLBACK
+    # for checkouts predating the move. SMEM_ONTOLOGY_PATH overrides both.
+    _here = os.path.dirname(__file__)
+    _override = os.environ.get("SMEM_ONTOLOGY_PATH")
+    candidates = [_override] if _override else [
+        os.path.normpath(os.path.join(_here, "..", "ontology.yaml")),
+        os.path.normpath(os.path.join(_here, "..", "..", "ontology.yaml")),
+    ]
     if not _yaml_available:
         return cfg
-    try:
-        with open(path) as f:
-            data = yaml.safe_load(f) or {}
-    except FileNotFoundError:
+    data = None
+    for path in candidates:
+        try:
+            with open(path) as f:
+                data = yaml.safe_load(f) or {}
+            break
+        except FileNotFoundError:
+            continue
+    if data is None:
         return cfg
     labels = data.get("labels", {})
     rels = data.get("relationships", {})

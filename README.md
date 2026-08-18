@@ -164,7 +164,7 @@ idempotent and safe to re-run.
 
 3. **Start the stack (databases + inference).** Put your BGE-M3 and reranker GGUF files in the
    folder the compose mounts ([§15](#15-the-stack-docker-compose)), then
-   `docker compose -f postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d` brings up
+   `docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d` brings up
    Postgres, Neo4j, the embedder (`:8070`) and the reranker (`:8071`);
    `docker compose … ps` should show all four `healthy`.
 
@@ -499,7 +499,7 @@ Keep the `:z` suffixes on the compose volume mounts — SELinux needs them.
 
 ## 15. The stack: Docker Compose
 
-`postgres_neo4j_limits.yaml` defines four services: **postgres** (pgvector), **neo4j**
+`shared-memory/ops/postgres_neo4j_limits.yaml` defines four services: **postgres** (pgvector), **neo4j**
 (with APOC + the required GDS plugin), and the two llama.cpp inference containers —
 **retriever-api** (BGE-M3 embedder, `:8070`) and **reranker-api** (BGE-Reranker-v2-m3, `:8071`).
 The file is `${VAR}`-parametrized: host paths and passwords come from `shared-memory/.env`
@@ -507,8 +507,8 @@ The file is `${VAR}`-parametrized: host paths and passwords come from `shared-me
 hand).
 
 ```bash
-docker compose -f postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d
-docker compose -f postgres_neo4j_limits.yaml --env-file shared-memory/.env ps   # all four healthy
+docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d
+docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env ps   # all four healthy
 ```
 
 Place your GGUF files where the compose mounts expect them (or edit the mount and `-m` paths).
@@ -540,13 +540,13 @@ uv run --with neo4j python shared-memory/migrations/verify_neo4j_init.py        
 
 The full schema — every table, label and relationship — is documented in
 [`shared-memory/Documentation/schema.md`](shared-memory/Documentation/schema.md). Graph label
-names are configurable in `ontology.yaml`; the machinery does not depend on your vocabulary.
+names are configurable in `shared-memory/ontology.yaml`; the machinery does not depend on your vocabulary.
 
 ## 17. Inference: the encoders and the reasoning LLM
 
 Two small encoders serve the write and search paths — BGE-M3 embeds, BGE-Reranker-v2-m3 ranks —
 and they came up with the compose stack. As packaged they run on CPU, which works everywhere and
-costs time; `compose.gpu-encoders.yaml` is a worked Vulkan overlay that puts both on one GPU
+costs time; `shared-memory/ops/compose.gpu-encoders.yaml` is a worked Vulkan overlay that puts both on one GPU
 (one image covers Intel, AMD and NVIDIA). On CPU, `RERANK_MAX_DOC_CHARS` bounds what the
 reranker scores — a concession, not a free win: capping at 2,000 chars kept about half of
 reranking's improvement in our measurements. Run the encoders however you please — Docker, bare

@@ -93,7 +93,7 @@ command -v nvtop >/dev/null 2>&1 \
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo
 if [[ "$fail" -eq 0 ]]; then
-    grn "Preflight passed. Next: docker compose -f postgres_neo4j_limits.yaml up -d"
+    grn "Preflight passed. Next: docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml up -d"
 else
     red "Preflight failed — resolve the ✗ items above, then re-run."
 fi
