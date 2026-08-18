@@ -997,6 +997,12 @@ def _parse_upstream_error_type(body: bytes) -> str | None:
 
 _DECOMPRESS_PREFIX_CAP = 8192  # bytes of DECOMPRESSED output — bounds a hostile expansion ratio too
 
+# Single source of truth for which Content-Encoding values either decompression
+# helper below understands. Referenced by hive_mind_proxy.py's usage-capture
+# gate too, so the two paths (fault-body peek, usage-body decompress) can never
+# drift apart on what "supported" means.
+SUPPORTED_CONTENT_ENCODINGS = {"gzip", "deflate", "br"}
+
 
 def _decompress_prefix_for_parse(body: bytes, content_encoding: str | None) -> bytes:
     """Security review R-3: `auto_decompress=False` on the shared proxy
@@ -1032,6 +1038,41 @@ def _decompress_prefix_for_parse(body: bytes, content_encoding: str | None) -> b
     except Exception:
         pass
     return body
+
+
+def _decompress_full_for_usage(body: bytes, content_encoding: str) -> bytes:
+    """Whole-body decompression for hive_mind_proxy.py's usage-capture path,
+    which needs the COMPLETE trailing `usage` object rather than the bounded
+    fault-body prefix `_decompress_prefix_for_parse` above peeks at. Supports
+    exactly the same encodings as that function (see
+    SUPPORTED_CONTENT_ENCODINGS — gzip/deflate/br, no new encodings added)
+    and no other truncation is applied here: LLM_USAGE_CAPTURE_CAP_BYTES
+    already bounds the COMPRESSED bytes the caller accumulates before this is
+    ever called, which is the memory bound that matters for a streamed
+    proxy path.
+
+    Unlike `_decompress_prefix_for_parse`, this RAISES on any failure
+    (unsupported encoding, corrupt/truncated body, `brotli` not installed)
+    instead of returning the input unchanged — the caller's usage capture is
+    best-effort and abandons on any exception, so a silent pass-through here
+    would hand compressed bytes to `json.loads` instead of just failing
+    cleanly at the point the trouble actually occurred.
+    """
+    enc = content_encoding.strip().lower()
+    if enc == "gzip":
+        import gzip
+        import io
+        return gzip.GzipFile(fileobj=io.BytesIO(body)).read()
+    if enc == "deflate":
+        import zlib
+        try:
+            return zlib.decompressobj(-zlib.MAX_WBITS).decompress(body)
+        except zlib.error:
+            return zlib.decompressobj().decompress(body)
+    if enc == "br":
+        import brotli  # optional dependency — not declared elsewhere in this repo
+        return brotli.Decompressor().decompress(body)
+    raise ValueError(f"unsupported content-encoding for usage capture: {content_encoding!r}")
 
 
 CREDENTIAL_AUDIT_LOG_PATH = os.environ.get(
