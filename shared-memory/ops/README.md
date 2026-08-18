@@ -80,10 +80,7 @@ offers this as a prompt at the end of first-time setup.
 
 By hand: `LLM_BACKENDS_JSON` (see `shared-memory/.env.example`) lets the
 gateway route to more than one reasoning LLM, local or remote, including a
-paid cloud API. **The numbered key-installation walkthrough — create the key
-file, set the `<NAME>_FILE` pointer, write the JSON entry, restart, verify —
-lives as a comment beside `LLM_BACKENDS_JSON` in `.env.example`, so it is at
-hand while editing.** Each entry is a URL plus an optional `token_env` — the
+paid cloud API. Each entry is a URL plus an optional `token_env` — the
 **name** of an env var, never a literal key:
 
 **Per-entry parameters** (all optional except `url`):
@@ -101,9 +98,73 @@ hand while editing.** Each entry is a URL plus an optional `token_env` — the
 | `max_inflight` | int ≥ 1 | absent = unbounded | Per-backend concurrency ceiling. At cap the backend counts busy; a sole-eligible capped backend makes requests wait (bounded), never overrides the cap. |
 | `price_per_mtok_in` / `price_per_mtok_out` | float | none | Operator-maintained prices surfaced on the authenticated `/health` for a dashboard to multiply against the per-backend token counters. Never read by routing. |
 
-Related environment knobs (fit-check ratio and margin, capacity-wait tuning,
-token-usage capture) are documented inline in `.env.example` next to the
-`LLM_BACKENDS_JSON` block.
+### Installing a provider API key, start to finish
+
+The key itself belongs in an **encrypted store** — `pass`, a GPG-encrypted
+file, or systemd's `systemd-creds encrypt`. A plaintext file on disk, even
+mode 600, is the *minimum* the framework accepts, not the recommendation —
+the framework's own files never hold the key either way.
+
+1. **Store the key encrypted.** With systemd: `systemd-creds encrypt` and a
+   `LoadCredential=`/`LoadCredentialEncrypted=` line on the gateway unit —
+   the key then appears only in `$CREDENTIALS_DIRECTORY`, never at rest in
+   plaintext. Without systemd credentials: keep it in `pass`/GPG and emit it
+   at boot to a **runtime** file (e.g. under `/run/user/<uid>/`, tmpfs), or —
+   the floor — `install -m 600 /dev/null <keyfile>` and paste the key in
+   with an editor (never `echo`; shell history keeps it).
+2. **Point the gateway at it** — one line in `shared-memory/.env`:
+   `DEEPSEEK_API_KEY_FILE=/path/to/keyfile` (skip this line entirely when
+   using `LoadCredential=` — the credentials directory is checked first;
+   resolution order is `$CREDENTIALS_DIRECTORY` > `<NAME>_FILE` > a plain
+   env var, which is advisory-warned).
+3. **Write the backend entry** in `LLM_BACKENDS_JSON` with
+   `"token_env":"DEEPSEEK_API_KEY"` — the var **name** from step 2 — plus
+   the mandatory routing choice: `"private_ok": true` (may serve everything)
+   or `"roles": [...]` (per-function opt-in). A credentialed entry with
+   neither refuses gateway startup, on purpose.
+4. **Restart and verify:** `systemctl --user restart hive-mind-gateway.service`,
+   then the authenticated `/health` — the backend reads `ok` in
+   `llm_backends` (a bare-probe 401/403 from a credentialed backend counts
+   as alive) and its roster entry shows `has_credential: true`.
+
+### Routing and sizing knobs (the long version of `.env.example`'s one-liners)
+
+**Dispatch** is cache-affinity first (a request whose large prompt prefix is
+already warm on a backend's KV cache goes back there), then least-in-flight
+among eligible backends, protecting warm cards from eviction. `weight` plays
+no part (see the table).
+
+**Fit check** (`LLM_CHARS_PER_TOKEN_RATIO`, `FIT_MARGIN`,
+`FIT_DEFAULT_OUTPUT_TOKENS`) — only active for backends declaring `n_ctx`.
+The estimate is `body_chars / RATIO`. The shipped `1.2` is the **most
+conservative measured ratio** from 20 live `/tokenize` comparisons (v0.9.13
+build, Qwen3 tokenizer, prose/JSON/code/SQL/Greek samples ranging
+1.205–6.905 chars per token); a live chat-completion check showed this floor
+already overestimates real chat-template prompt tokens by 83–525%, so the
+ratio — not the margin — does the protective work. Re-measure for a
+materially different tokenizer (denser tokenization needs a lower ratio).
+`FIT_MARGIN` (0.10) and `FIT_DEFAULT_OUTPUT_TOKENS` (2048) are deliberately
+flagged **unmeasured** conservative buffers. A fit rejection is a structured
+`422` naming the estimate, and a gateway journal line says which knob to
+retune.
+
+**Capacity wait** (`LLM_MAX_INFLIGHT_WAIT_S`, `LLM_MAX_INFLIGHT_POLL_S`,
+`LLM_MAX_CAPACITY_WAITERS`) — when every eligible backend sits at its
+`max_inflight` cap, a request waits (bounded) rather than overriding the cap
+or widening eligibility; waiting requests are themselves capped because each
+one holds an admitted request slot for up to the full window — beyond the
+waiter cap the gateway answers `503 backend_at_capacity` immediately. The
+waiter bound is shape-chosen, not measured.
+
+**Token accounting** (`LLM_USAGE_CAPTURE_CAP_BYTES`,
+`TOKEN_LIFECYCLE_SUM_INTERVAL_S`) — always on: per-backend prompt/completion
+counters with paired last-event timestamps on the authenticated `/health`.
+**Counters reset on every gateway restart** — compute dashboard deltas
+restart-aware via the timestamps. One summable lifecycle line per backend is
+written to the journal (and the gateway audit JSONL, if configured) on
+graceful shutdown; a nonzero interval adds periodic lines for bounded loss
+on a hard kill. The byte cap bounds how much of a response body is buffered
+for the `usage` parse; compressed and streaming responses skip capture.
 
 ```json
 LLM_BACKENDS_JSON=[{"url":"http://localhost:5000"},
