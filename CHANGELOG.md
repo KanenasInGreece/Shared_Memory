@@ -5,6 +5,60 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.13] — 2026-08-18
+
+### Added — requirement-declaration LLM routing: the gateway decides, per model
+
+- **Per-backend descriptors in `LLM_BACKENDS_JSON`** (all optional, all additive):
+  `roles` (which dream functions — `extract`, `verify`, `judge` — this backend may
+  serve; absent = serves all), `n_ctx` (usable context, drives a fit check that can
+  only exclude, never rewrite a request), `private_ok` (may record content land here
+  as unrestricted traffic — local backends default yes, credentialed providers default
+  no), `max_inflight` (per-backend concurrency ceiling), and operator-maintained
+  `price_per_mtok_in`/`price_per_mtok_out` surfaced for dashboards but never read by
+  routing. A fleet declaring none of these behaves identically to v0.9.12.
+- **Eligibility is a hard pre-filter.** Role, privacy and fit are computed before any
+  affinity/cooldown/fallback logic, and every selection tier operates strictly inside
+  the eligible set — no path can fall back to a backend the operator did not permit.
+  An empty eligible set is refused loudly: structured `422 no_eligible_backend` naming
+  the failed constraint (fit refusals include the estimate that failed, so the
+  measured chars-per-token ratio can be retuned against real traffic); a fleet at its
+  concurrency caps answers `503 backend_at_capacity` after a bounded, waiter-capped
+  wait. Daemons recognize both refusals and skip the affected record **without
+  charging its dead-letter budget** — a configuration gap is never evidence about a
+  record.
+- **Dream calls now declare their function.** REM enrichment routes as `extract`,
+  edge verification as `verify`, insight folds and the relation sweep as `judge`; the
+  steering headers are consumed by the gateway and stripped before any upstream
+  forward, so providers never see routing metadata. An operator can admit extra
+  steer-permitted identities (e.g. a standalone sweep tool) via
+  `LLM_STEER_EXTRA_AGENT_NAMES` — a name allowlist, never a role-class widening.
+- **Per-backend token accounting.** The gateway parses `usage` off proxied responses
+  and keeps per-backend prompt/completion counters with paired last-event timestamps
+  on the authenticated `/health` payload — **reset on every gateway restart** (the
+  timestamps make restart-aware deltas computable) — plus one summable lifecycle line
+  per backend written synchronously at graceful shutdown, and per-role routed /
+  refusal counters for the monitor.
+
+### Changed — one loud choice per credentialed backend on upgrade
+
+- **A credentialed backend with neither `roles` nor an explicit `private_ok` now
+  refuses startup**, naming the choice: `private_ok: true` keeps today's
+  serve-everything behavior, `roles: [...]` scopes it per function. One config line
+  per deployer; without it the old default would have silently sent private traffic
+  to a paid provider — or silently sent nothing. An auth-off install with any
+  `private_ok: false` backend refuses too (no identities means no enforceable
+  privacy), governed by the same documented override as the existing auth refusal.
+- **A backend's bare-probe 401/403 now displays `ok` on `/health` when the backend is
+  credentialed** — the probe deliberately carries no key, so an auth rejection proves
+  the server answered; genuine downness (connect error / 5xx) is unchanged. Cloud
+  probe URLs no longer double `/v1`. `/pool/status` `free_slots` counts any backend
+  able to take every dream role (explicitly listed or serves-all) and each entry says
+  whether it counts, so a fully role-scoped fleet gates the dreaming daemons visibly
+  rather than silently.
+
+---
+
 ## [0.9.12] — 2026-08-18
 
 ### Fixed — degenerate REM truncations stop being fed a bigger budget
