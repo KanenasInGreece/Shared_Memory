@@ -301,6 +301,60 @@ def test_sse_stream_still_skipped_for_gzip(monkeypatch):
     assert g._llm_tokens_last_ts["http://a:5000"] is None
 
 
+def test_decompress_bomb_abandons_capture_without_error(monkeypatch):
+    """Security fix round (Opus Required finding): LLM_USAGE_CAPTURE_CAP_BYTES
+    bounds only the COMPRESSED accumulation — a small compressed body can
+    inflate ~1000× (measured 1028:1 on this box). LLM_USAGE_DECOMPRESS_CAP_BYTES
+    must bound the inflation itself: over it, capture is abandoned silently
+    (counters stay 0) and the request is untouched.
+
+    MUTATION TARGET: drop the max_length/len(out) bound in
+    _decompress_full_for_usage and this fails — the bomb below carries a
+    valid trailing usage object, so an unbounded decompress would happily
+    record its tokens."""
+    monkeypatch.setenv("LLM_USAGE_DECOMPRESS_CAP_BYTES", "4096")
+    g = _fresh(monkeypatch)
+    _patch_stream_response(monkeypatch)
+
+    bomb = json.dumps({
+        "choices": [{"message": {"role": "assistant", "content": "a" * 200_000}}],
+        "usage": {"prompt_tokens": 777, "completion_tokens": 888},
+    }).encode()
+    compressed = gzip.compress(bomb)
+    assert len(compressed) < 4096 < len(bomb)  # under the compressed cap, over the decompress cap
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _StatusBodySession(200, compressed, headers={
+        "Content-Type": "application/json", "Content-Encoding": "gzip",
+    })
+    resp = asyncio.run(proxy.handle_proxy(_FakeReq()))
+
+    assert resp.status == 200
+    assert g._llm_tokens_prompt_total["http://a:5000"] == 0
+    assert g._llm_tokens_completion_total["http://a:5000"] == 0
+    assert g._llm_tokens_last_ts["http://a:5000"] is None
+
+
+def test_decompress_full_raises_over_cap_and_returns_under_cap(monkeypatch):
+    """Unit pin on the helper itself: an over-cap gzip OR deflate body raises
+    (never returns partial/compressed bytes — the caller's contract is
+    fail-clean-at-the-point-of-trouble), an under-cap body round-trips."""
+    monkeypatch.setenv("LLM_USAGE_DECOMPRESS_CAP_BYTES", "1024")
+    import coordinator
+    importlib.reload(coordinator)
+    import zlib
+    import pytest
+
+    small = b'{"usage":{"prompt_tokens":1}}'
+    assert coordinator._decompress_full_for_usage(gzip.compress(small), "gzip") == small
+    assert coordinator._decompress_full_for_usage(zlib.compress(small), "deflate") == small
+
+    big = b"x" * 100_000
+    with pytest.raises(ValueError):
+        coordinator._decompress_full_for_usage(gzip.compress(big), "gzip")
+    with pytest.raises(ValueError):
+        coordinator._decompress_full_for_usage(zlib.compress(big), "deflate")
+
+
 # ── Change 2: single-backend visibility on /health ───────────────────────────
 
 def test_single_backend_health_sections_present(monkeypatch):
