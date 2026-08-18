@@ -16,7 +16,20 @@ braces: any one of the three would have caught the contamination the review
 found (138 synthetic lines in the real ``~/.shared-memory/logs/credential-
 audit.jsonl`` from a suite run with no explicit protection at all).
 """
+import os
+
 import pytest
+
+# Hermeticity pin (module level, BEFORE any test module imports a daemon):
+# the suite must never read the deployer's live shared-memory/.env. The
+# secure_env loader re-populates os.environ from that file on every module
+# reload, and a test can defeat it only by SETTING a key — never by deleting
+# one, because setdefault re-adds what delenv removed. Measured cost of not
+# having this: a deployer whose .env used the documented LLM_BACKENDS_JSON
+# form got 15 failures from tests that delenv'd the variable and were
+# silently overruled by their own config file. Empty string = "load no env
+# file at all" (see secure_env._select_env_file).
+os.environ["SECURE_ENV_FILE"] = ""
 
 
 @pytest.fixture(autouse=True)

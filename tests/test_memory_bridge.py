@@ -113,8 +113,21 @@ def test_request_headers_empty_token_is_version_only(monkeypatch):
 # different directory tree after the fact.
 
 def _load_memory_bridge_from(skill_dir: str):
+    # These tests exercise the client's own candidate walk against a tmp
+    # skill tree — the suite-wide SECURE_ENV_FILE="" hermeticity pin must
+    # come off for the duration of this import (the copied tree is
+    # disposable, so the walk cannot reach the deployer's live .env).
     import shutil
     import uuid
+    _pin = os.environ.pop("SECURE_ENV_FILE", None)
+    try:
+        return _load_memory_bridge_from_unpinned(skill_dir, shutil, uuid)
+    finally:
+        if _pin is not None:
+            os.environ["SECURE_ENV_FILE"] = _pin
+
+
+def _load_memory_bridge_from_unpinned(skill_dir: str, shutil, uuid):
     scripts_dir = os.path.join(skill_dir, "scripts")
     os.makedirs(scripts_dir, exist_ok=True)
     src = os.path.join(
