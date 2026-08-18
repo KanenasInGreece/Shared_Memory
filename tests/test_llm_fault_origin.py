@@ -186,10 +186,19 @@ def _isolated_fault_counters():
 
 def _credentialed_backend(monkeypatch, url="http://a:5000", token_var="SM_TEST_TOKEN"):
     """Configure a single LLM backend WITH a provider key attached, via
-    LLM_BACKENDS_JSON/token_env — never a literal secret in config."""
+    LLM_BACKENDS_JSON/token_env — never a literal secret in config.
+
+    "private_ok": true (Model_Atributes_Routing_Plan_2026-08-18, M-5): a
+    credentialed backend with neither `roles` nor an explicit `private_ok`
+    now REFUSES STARTUP — this file's tests are about the credential/fault-
+    classification/route-allowlist mechanics on ROLE-LESS traffic reaching a
+    credentialed backend, not about the M-5 startup refusal itself (that has
+    its own coverage in tests/test_model_attributes_routing.py), so every
+    call site here makes the M-5 choice explicitly to keep testing what it
+    was already testing."""
     monkeypatch.setenv(token_var, "sk-test-credential")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
-        [{"url": url, "token_env": token_var}]))
+        [{"url": url, "token_env": token_var, "private_ok": True}]))
 
 
 # ── 1 + 2. X-SM-Fault-Origin header + verbatim passthrough ──────────────────
