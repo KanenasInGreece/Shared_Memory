@@ -1,3 +1,11 @@
+# Stable compose PROJECT name: without it, compose derives the project from
+# this file's parent folder (or your cwd), so moving the file — or invoking it
+# from a different directory — silently orphans the running stack from future
+# `up`/`ps`/`stop` calls while the pinned container_names then collide on the
+# next `up -d`. A fixed name keeps every invocation addressing the same stack
+# no matter where the file lives or where you stand.
+name: shared-memory
+
 services:
 #---------- STORAGE LAYER ---------
   neo4j:
