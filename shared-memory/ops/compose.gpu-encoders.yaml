@@ -11,8 +11,15 @@
 # measured numbers). This overlay moves both onto a Vulkan-capable GPU without
 # changing anything else about the stack.
 #
-#   docker compose -f postgres_neo4j_limits.yaml -f compose.gpu-encoders.yaml \
+#   docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml \
+#                  -f shared-memory/ops/compose.gpu-encoders.yaml \
 #                  --env-file shared-memory/.env up -d
+#
+# ⚠ Relative host paths in ${VAR:-default} values resolve against the FIRST
+# compose file's own folder (shared-memory/ops/), not your shell's cwd — set
+# LLM_MODELS_DIR (and the data dirs) as ABSOLUTE paths in shared-memory/.env.
+# EMBED_MODEL_SUBPATH / RERANK_MODEL_SUBPATH override the model layout under
+# LLM_MODELS_DIR without editing this file.
 #
 # Vulkan is deliberate: it is the one backend that covers Intel, AMD and NVIDIA
 # from a single image, so this overlay does not branch on GPU vendor. If you run
@@ -58,7 +65,7 @@ services:
       # it leaves the other free for a reasoning LLM.
       GGML_VK_VISIBLE_DEVICES: ${ENCODER_GPU_INDEX:-0}
     command: >
-      -m /models/gpustack/bge-m3-GGUF/bge-m3-Q8_0.gguf
+      -m /models/${EMBED_MODEL_SUBPATH:-gpustack/bge-m3-GGUF/bge-m3-Q8_0.gguf}
       --embedding --host 0.0.0.0 --port 8070
       -ngl 99 -c 8192 -b 8192 -ub 8192
 
@@ -71,6 +78,6 @@ services:
     environment:
       GGML_VK_VISIBLE_DEVICES: ${ENCODER_GPU_INDEX:-0}
     command: >
-      -m /models/gpustack/bge-reranker-v2-m3-GGUF/bge-reranker-v2-m3-Q8_0.gguf
+      -m /models/${RERANK_MODEL_SUBPATH:-gpustack/bge-reranker-v2-m3-GGUF/bge-reranker-v2-m3-Q8_0.gguf}
       --rerank --host 0.0.0.0 --port 8071
       -ngl 99 -c 8192 -b 8192 -ub 8192

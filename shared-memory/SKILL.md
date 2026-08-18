@@ -701,5 +701,5 @@ separately, on its own host — see [server-setup.md](Documentation/server-setup
 - **Operations runbook:** gateway/daemon install + upgrade — [server-setup.md](Documentation/server-setup.md)
 - **Schema:** Neo4j labels, relationship types, Postgres tables — [schema.md](Documentation/schema.md)
 - **Embedding mandate:** All calls route through the gateway (:8888). Never call port 8070 (BGE-M3) or 8071 (BGE-Reranker) directly — the gateway enforces 1024-dim consistency across all agents.
-- **Ontology:** All Neo4j labels and relationship types are configurable in `ontology.yaml` at the repo root.
+- **Ontology:** All Neo4j labels and relationship types are configurable in `shared-memory/ontology.yaml` at the repo root.
 - **Security posture:** Read-only Cypher guard active. `Authorization: Bearer <token>` auth enforced (v0.3.5). `starlette>=1.0.1` floor enforced (BadHost CVE-2026-48710).

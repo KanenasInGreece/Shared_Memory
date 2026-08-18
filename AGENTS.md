@@ -52,7 +52,7 @@ Collect these answers before touching anything. Defaults in brackets are safe to
 | 6 | DB passwords: shall I generate strong random ones? (recommended) | `NEO4J_PASSWORD`, `PG_PASSWORD` |
 | 7 | *(optional)* Tavily API key for LM Studio web search? Backups from day one? | `TAVILY_API_KEY`, §Backup runbook |
 
-For question 2, the compose file expects this layout under `LLM_MODELS_DIR` (edit the two `command:` paths in `postgres_neo4j_limits.yaml` if the user's files differ):
+For question 2, the compose file expects this layout under `LLM_MODELS_DIR` (edit the two `command:` paths in `shared-memory/ops/postgres_neo4j_limits.yaml` if the user's files differ):
 
 ```
 $LLM_MODELS_DIR/gpustack/bge-m3-GGUF/bge-m3-Q8_0.gguf
@@ -93,8 +93,8 @@ Raise inotify limits per README §4 (needs sudo — give the user the commands t
 ### Phase 4 — Databases + inference containers
 
 ```bash
-docker compose -f postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d
-docker compose -f postgres_neo4j_limits.yaml --env-file shared-memory/.env ps   # all four healthy
+docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d
+docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env ps   # all four healthy
 ```
 
 Postgres (`:5432`), Neo4j (`:7474/:7687`), embedder (`:8070`), reranker (`:8071`). An `unhealthy` inference container is almost always a wrong model path (Phase 0 Q2).
@@ -221,7 +221,7 @@ echo "AGENT_TOKEN=$tok" >> <skill-dir>/.env && chmod 600 <skill-dir>/.env
 The compose services carry `restart: always` and the systemd unit auto-starts under linger, so a healthy install largely self-starts. Verify, and repair only what's down:
 
 ```bash
-docker compose -f postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d   # no-op if running
+docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d   # no-op if running
 systemctl --user start hive-mind-gateway.service                                   # or restart
 curl -s http://localhost:8888/health                                               # status: ok
 ```
@@ -232,7 +232,7 @@ The reasoning LLM (Q3) is managed by the user's own server (LM Studio etc.) — 
 
 ```bash
 systemctl --user stop hive-mind-gateway.service        # gateway + REM/NREM daemons
-docker compose -f postgres_neo4j_limits.yaml --env-file shared-memory/.env stop   # DBs + inference
+docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env stop   # DBs + inference
 ```
 
 Stopping only the inference containers (`docker stop llama-retriever llama-reranker`) degrades saves/search (embedding mandate → 503) — stop the gateway too, or don't stop the embedder. Facts already saved are never lost by a stop; dreaming resumes where it left off.
@@ -241,7 +241,7 @@ Stopping only the inference containers (`docker stop llama-retriever llama-reran
 
 ```bash
 curl -s http://localhost:8888/health          # gateway, daemons, backends, consolidation liveness
-docker compose -f postgres_neo4j_limits.yaml --env-file shared-memory/.env ps
+docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env ps
 systemctl --user status hive-mind-gateway.service
 journalctl --user -u hive-mind-gateway.service -n 50   # daemon logs
 uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py status   # telemetry

@@ -28,7 +28,7 @@ database and cannot run or upgrade them.
 ## Prerequisites (gateway host only)
 
 - Postgres with `pgvector`, Neo4j, and the BGE‑M3 embedder (`:8070`) + reranker (`:8071`).
-  `docker compose -f postgres_neo4j_limits.yaml up -d` starts the database and
+  `docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml up -d` starts the database and
   inference layer.
 - An LLM endpoint on `:5000` (LM Studio or equivalent) for consolidation.
 - `nvtop` for GPU‑aware dreaming (optional — the daemons fall back to the time
@@ -52,7 +52,7 @@ cp .env.example .env
 #    Optional: MEMORY_LOG_LEVEL, AUDIT_LOG_PATH, PROXY_BIND, WRITE_QUIESCE_SEC
 
 # 3. Start the database + inference layer.
-docker compose -f postgres_neo4j_limits.yaml up -d
+docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml up -d
 
 # 4. Apply all schema migrations (idempotent — safe to re-run).
 uv run --with psycopg2-binary python shared-memory/migrations/apply.py
@@ -100,7 +100,7 @@ All live in `shared-memory/scripts/` and run on the gateway host only.
 | `rem_loop.py` | REM daemon — idle enrichment: full LLM summary + typed relationships per Fact. |
 | `consolidation_loop.py` | NREM daemon — synthesises Tier‑3 community summaries once 5+ enriched facts share an entity hub. |
 | `gpu_load.py` | GPU‑busy probe (`nvtop --snapshot`) so dreaming yields to active inference. |
-| `ontology.py` | Loads `ontology.yaml`; supplies Neo4j labels/relationship types. |
+| `ontology.py` | Loads `shared-memory/ontology.yaml` (repo-root fallback for older checkouts; `SMEM_ONTOLOGY_PATH` overrides); supplies Neo4j labels/relationship types. |
 | `generate_tokens.py` | Token minting helper (write-through mint flow, `--reveal`, `--convert-digests` — see below). |
 
 None of these ship with the skill. See [`sync_skills.sh`](../scripts/sync_skills.sh).
