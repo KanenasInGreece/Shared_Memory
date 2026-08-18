@@ -526,6 +526,12 @@ BEGIN
             NEW.alias, NEW.normalized_alias;
     END IF;
 
+    -- Refused if another alias ROW already claims this normalized value for
+    -- a DIFFERENT entity. `other.id <> NEW.id` excludes this row's own prior
+    -- state on UPDATE (e.g. re-pointing entity_id): on INSERT it is a no-op,
+    -- since no existing row can yet carry the id a fresh IDENTITY just
+    -- assigned — it is NOT the ambiguity check itself, which is the
+    -- `entity_id` comparison.
     IF EXISTS (
         SELECT 1 FROM entity_vocab_aliases other
          WHERE other.normalized_alias = NEW.normalized_alias

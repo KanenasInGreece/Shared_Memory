@@ -60,7 +60,12 @@
 -- FILTERS it out rather than letting it reach the vocabulary; see SEEDING.
 --
 -- Idempotent: `IF NOT EXISTS` / `ON CONFLICT DO NOTHING` throughout. Safe to
--- re-run — a re-run seeds only names/aliases that were not already recorded.
+-- re-run UNTIL the vocabulary has been curated — a re-run seeds only
+-- names/aliases not already recorded, but once an operator has PROMOTED a
+-- seeded canonical into a semantic alias of another entity, a re-run refuses:
+-- the registry still holds that spelling and the seed would re-create it as a
+-- canonical, which the unambiguity trigger correctly rejects. Re-seeding a
+-- curated vocabulary is an explicit operation, never a repeat of this file.
 -- (apply.py's ledger means this file only ever runs once in the ordinary
 -- path; idempotency is the house style regardless, and is what makes a
 -- manual re-run after a partial failure safe.)
