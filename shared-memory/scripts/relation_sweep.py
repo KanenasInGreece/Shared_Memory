@@ -95,6 +95,30 @@ def _auth_headers() -> dict:
     return {"Authorization": f"Bearer {_AGENT_TOKEN}"} if _AGENT_TOKEN else {}
 
 
+def _routing_refusal(resp) -> dict | None:
+    """Recognize a gateway routing refusal — 422 ``no_eligible_backend`` or 503
+    ``backend_at_capacity`` (Model_Attributes_Routing_Plan_2026-08-18 F-1/F-2),
+    both stamped ``X-SM-Fault-Origin: gateway``. Keys on the STRUCTURED BODY +
+    that header, never on status alone — a real provider 422/503 passed
+    through the proxy must never be misread as the gateway declining to place
+    the job. Returns ``{"error", "constraint", "role"}`` or None. (Mirrors
+    rem_loop.py's/consolidation_loop.py's helper of the same name — no shared
+    module is owned by Unit 2's file list, so this is intentionally
+    duplicated, not imported.)"""
+    if resp.status_code not in (422, 503):
+        return None
+    if resp.headers.get("X-SM-Fault-Origin") != "gateway":
+        return None
+    try:
+        body = resp.json()
+    except Exception:
+        return None
+    error = body.get("error") if isinstance(body, dict) else None
+    if error not in ("no_eligible_backend", "backend_at_capacity"):
+        return None
+    return {"error": error, "constraint": body.get("constraint"), "role": body.get("role")}
+
+
 def real_domains(pg_ids: list[int] | set[int] | list, dom_map: dict[int, str]) -> set[str]:
     return {dom_map[p] for p in pg_ids if p in dom_map and dom_map[p] != _UNDETERMINED}
 
@@ -481,13 +505,24 @@ def adjudicate_batch(candidates: list[dict],
             # Adaptive per-prompt timeout (ADR-021, same instrument as REM):
             # the dream model's long generations exceed any fixed timeout —
             # the first live sweep run lost all 4 batches to a fixed 180s.
-            REASONER_URL, headers=_auth_headers(),
+            REASONER_URL, headers={**_auth_headers(), "X-SM-LLM-Role": "judge"},
             timeout=adaptive_ceiling(len(prompt), units=len(candidates)),
             json={"model": LLM_MODEL, "temperature": LLM_TEMPERATURE,
                   "max_tokens": max_tokens,
                   "messages": [{"role": "system", "content": _ADJUDICATOR_SYSTEM},
                                {"role": "user", "content": prompt}]},
         )
+        refusal = _routing_refusal(resp)
+        if refusal:
+            # F-1/F-2: skip WITHOUT charging — no attempt counter exists for
+            # relation_sweep candidates; missing idx are simply left
+            # unresolved for a later sweep, same as any other whole-call
+            # failure, never hammered again within this run.
+            print(f"  [!] gateway routing refusal (constraint="
+                  f"{refusal['constraint']} role=judge) — batch of "
+                  f"{len(candidates)} skipped, unresolved for next sweep "
+                  f"(not charged)", file=sys.stderr)
+            return {}, "local-model"
         resp.raise_for_status()
         model = resp.headers.get("X-SM-LLM-Backend") or "local-model"
         rj = resp.json()
@@ -764,13 +799,21 @@ def adjudicate_evidential_batch(rows: list[dict],
     try:
         resp = httpx.post(
             # Adaptive per-prompt timeout (ADR-021) — see adjudicate_batch.
-            REASONER_URL, headers=_auth_headers(),
+            REASONER_URL, headers={**_auth_headers(), "X-SM-LLM-Role": "judge"},
             timeout=adaptive_ceiling(len(prompt), units=len(rows)),
             json={"model": LLM_MODEL, "temperature": LLM_TEMPERATURE,
                   "max_tokens": max_tokens,
                   "messages": [{"role": "system", "content": _EVIDENTIAL_SYSTEM},
                                {"role": "user", "content": prompt}]},
         )
+        refusal = _routing_refusal(resp)
+        if refusal:
+            # F-1/F-2: skip WITHOUT charging — see adjudicate_batch.
+            print(f"  [!] gateway routing refusal (constraint="
+                  f"{refusal['constraint']} role=judge) — evidential batch of "
+                  f"{len(rows)} skipped, unresolved for next pass (not "
+                  f"charged)", file=sys.stderr)
+            return {}, "local-model"
         resp.raise_for_status()
         model = resp.headers.get("X-SM-LLM-Backend") or "local-model"
         rj = resp.json()
