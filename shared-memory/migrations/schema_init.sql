@@ -171,12 +171,14 @@ CREATE TABLE IF NOT EXISTS entity_vocab_aliases (
     alias            TEXT NOT NULL,
     normalized_alias TEXT NOT NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    created_by       TEXT NOT NULL DEFAULT 'system'::character varying,
-    CONSTRAINT entity_vocab_aliases_not_blank CHECK ((btrim(alias) <> ''::text))
+    created_by       TEXT NOT NULL DEFAULT 'system'::text,
+    CONSTRAINT entity_vocab_aliases_not_blank CHECK ((btrim(alias) <> ''::text)),
+    CONSTRAINT entity_vocab_aliases_normalized_alias_not_empty CHECK ((normalized_alias <> ''::text))
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS entity_vocab_aliases_normalized_unique ON public.entity_vocab_aliases USING btree (normalized_alias);
+CREATE UNIQUE INDEX IF NOT EXISTS entity_vocab_aliases_alias_unique ON public.entity_vocab_aliases USING btree (alias);
 CREATE INDEX IF NOT EXISTS idx_entity_vocab_aliases_entity_id ON public.entity_vocab_aliases USING btree (entity_id);
+CREATE INDEX IF NOT EXISTS idx_entity_vocab_aliases_normalized_alias ON public.entity_vocab_aliases USING btree (normalized_alias);
 
 -- ─── entity_vocabulary ──────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS entity_vocabulary (
@@ -184,8 +186,9 @@ CREATE TABLE IF NOT EXISTS entity_vocabulary (
     name             TEXT NOT NULL,
     normalized_key   TEXT NOT NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    registered_by    TEXT NOT NULL DEFAULT 'system'::character varying,
-    CONSTRAINT entity_vocabulary_not_blank CHECK ((btrim(name) <> ''::text))
+    registered_by    TEXT NOT NULL DEFAULT 'system'::text,
+    CONSTRAINT entity_vocabulary_not_blank CHECK ((btrim(name) <> ''::text)),
+    CONSTRAINT entity_vocabulary_normalized_key_not_empty CHECK ((normalized_key <> ''::text))
 );
 
 CREATE INDEX IF NOT EXISTS idx_entity_vocabulary_created_at ON public.entity_vocabulary USING btree (created_at);
@@ -484,7 +487,7 @@ CREATE OR REPLACE FUNCTION public.entity_normalize(raw_name text)
  LANGUAGE sql
  IMMUTABLE PARALLEL SAFE
 AS $function$
-    SELECT regexp_replace(lower(raw_name), '[^a-z0-9]', '', 'g');
+    SELECT regexp_replace(lower(raw_name), '[^[:alnum:]]', '', 'g');
 $function$
 ;
 
@@ -493,26 +496,47 @@ CREATE OR REPLACE FUNCTION public.entity_vocab_aliases_before_write()
  LANGUAGE plpgsql
 AS $function$
 DECLARE
-    v_parent_key text;
+    v_parent_exists boolean;
 BEGIN
     NEW.normalized_alias := entity_normalize(NEW.alias);
 
-    SELECT normalized_key INTO v_parent_key
-      FROM entity_vocabulary
-     WHERE id = NEW.entity_id;
+    IF NEW.normalized_alias = '' THEN
+        RAISE EXCEPTION
+            'alias "%" normalizes to the empty string — every character was '
+            'stripped, so it cannot be registered', NEW.alias;
+    END IF;
 
-    IF v_parent_key IS NULL THEN
+    SELECT EXISTS (SELECT 1 FROM entity_vocabulary WHERE id = NEW.entity_id)
+      INTO v_parent_exists;
+    IF NOT v_parent_exists THEN
         RAISE EXCEPTION
             'entity_vocab_aliases.entity_id % does not reference a known '
             'entity_vocabulary row', NEW.entity_id;
     END IF;
 
-    IF NEW.normalized_alias <> v_parent_key THEN
+    IF EXISTS (
+        SELECT 1 FROM entity_vocabulary v
+         WHERE v.normalized_key = NEW.normalized_alias
+           AND v.id <> NEW.entity_id
+    ) THEN
         RAISE EXCEPTION
-            'alias "%" normalizes to "%", which does not match its canonical '
-            'entity''s normalized key "%" — an alias must normalize to the '
-            'same identity as the entity it aliases',
-            NEW.alias, NEW.normalized_alias, v_parent_key;
+            'alias "%" normalizes to "%", which is already a DIFFERENT '
+            'canonical entity''s identity — a normalized value must never '
+            'resolve to two different identities',
+            NEW.alias, NEW.normalized_alias;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM entity_vocab_aliases other
+         WHERE other.normalized_alias = NEW.normalized_alias
+           AND other.entity_id <> NEW.entity_id
+           AND other.id <> NEW.id
+    ) THEN
+        RAISE EXCEPTION
+            'alias "%" normalizes to "%", which is already an alias of a '
+            'DIFFERENT entity — a normalized value must never resolve to '
+            'two different identities',
+            NEW.alias, NEW.normalized_alias;
     END IF;
 
     RETURN NEW;
@@ -527,15 +551,25 @@ AS $function$
 BEGIN
     NEW.normalized_key := entity_normalize(NEW.name);
 
+    IF NEW.normalized_key = '' THEN
+        RAISE EXCEPTION
+            'entity "%" normalizes to the empty string — every character was '
+            'stripped, so it cannot be registered as a canonical spelling',
+            NEW.name;
+    END IF;
+
     IF EXISTS (
-        SELECT 1 FROM entity_vocab_aliases a
+        SELECT 1
+          FROM entity_vocab_aliases a
+          JOIN entity_vocabulary parent ON parent.id = a.entity_id
          WHERE a.normalized_alias = NEW.normalized_key
-           AND a.entity_id <> NEW.id
+           AND parent.normalized_key <> NEW.normalized_key
     ) THEN
         RAISE EXCEPTION
             'entity "%" normalizes to "%", which is already registered as an '
-            'alias of a different entity — a canonical spelling and an alias '
-            'must never name two different identities', NEW.name, NEW.normalized_key;
+            'alias resolving to a DIFFERENT identity — a normalized value '
+            'must never resolve to two different identities',
+            NEW.name, NEW.normalized_key;
     END IF;
 
     RETURN NEW;

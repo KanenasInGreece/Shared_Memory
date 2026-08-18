@@ -16,6 +16,15 @@ has now silently dropped three whole classes of object:
                                  asserting the schema had none while one had
                                  existed for months)
   * every FUNCTION and TRIGGER  (found later again)
+  * every COLUMN's underlying TYPE (found by the migration 033 security
+                                 review — `col_type()` in
+                                 generate_schema_init.py collapses `character
+                                 varying(n)` to unconstrained `TEXT`, so a
+                                 migration adding a genuinely length-capped
+                                 VARCHAR column would render, on a fresh
+                                 install, as a column with no cap at all:
+                                 valid DDL, no error, and a row the live
+                                 install would reject sails straight through)
 
 Each omission was invisible to the entire test suite. So the generator is not
 trusted; it is CHECKED, by building a database from its output and diffing.
@@ -212,6 +221,31 @@ def _column_generation(conn) -> dict:
     return out
 
 
+def _column_types(conn) -> dict:
+    """{(table, column): (data_type, character_maximum_length)} for every
+    column.
+
+    Diffing PRESENCE (`_column_generation`, constraints, functions, triggers)
+    is not the same as diffing the TYPE a column actually enforces.
+    `generate_schema_init.py`'s `col_type()` collapses `character varying` to
+    plain `TEXT` for every ordinary column — dropping the length — because
+    house style has never NEEDED the cap rendered before. That collapse is
+    silent and was never a problem while every VARCHAR-capped column in this
+    schema happened to get replaced by TEXT anyway; the day a migration adds
+    one that must actually cap its length, a regenerated schema_init.sql
+    would apply without error and simply not enforce it. Comparing the type
+    is what turns that into a reported divergence instead of a row a fresh
+    install silently accepts and a live one would have rejected.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT table_name, column_name, data_type, character_maximum_length
+          FROM information_schema.columns
+         WHERE table_schema = 'public'
+    """)
+    return {(t, c): (dt, length) for t, c, dt, length in cur.fetchall()}
+
+
 def main() -> int:
     _load_env()
     keep = "--keep" in sys.argv
@@ -274,6 +308,24 @@ def main() -> int:
                     f"KEY GENERATION on {tbl}.{col} missing from a fresh install: "
                     f"live is {how}, fresh is {fresh_gen.get((tbl, col)) or 'nothing'}"
                     f" — every INSERT would have to supply the key itself")
+
+        live_types, fresh_types = _column_types(live), _column_types(fresh)
+        for (tbl, col), (dtype, length) in sorted(live_types.items()):
+            if tbl in EXPECTED_ABSENT_TABLES:
+                continue
+            fresh_val = fresh_types.get((tbl, col))
+            if fresh_val is None:
+                # A column missing entirely is a different, unrelated
+                # problem — nothing in this repo diffs column SETS yet, and
+                # conflating the two would blur which fix is actually owed.
+                continue
+            if (dtype, length) != fresh_val:
+                fresh_dtype, fresh_length = fresh_val
+                live_render = f"{dtype}({length})" if length else dtype
+                fresh_render = f"{fresh_dtype}({fresh_length})" if fresh_length else fresh_dtype
+                problems.append(
+                    f"COLUMN TYPE on {tbl}.{col} differs: live is {live_render}, "
+                    f"fresh is {fresh_render}")
 
         missing_routines = _routines(live) - _routines(fresh)
         if missing_routines:
