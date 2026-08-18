@@ -815,17 +815,54 @@ def _auth_headers() -> dict:
     return {}
 
 
+def _routing_refusal(resp) -> dict | None:
+    """Recognize a gateway routing refusal — 422 ``no_eligible_backend`` or 503
+    ``backend_at_capacity`` (Model_Attributes_Routing_Plan_2026-08-18 F-1/F-2),
+    both stamped ``X-SM-Fault-Origin: gateway``. Keys on the STRUCTURED BODY +
+    that header, never on status alone — a real provider 422/503 passed
+    through the proxy must never be misread as the gateway declining to place
+    the job. Returns ``{"error", "constraint", "role"}`` or None. (Mirrors
+    rem_loop.py's helper of the same name — no shared module is owned by
+    Unit 2's file list, so this is intentionally duplicated, not imported.)"""
+    if resp.status_code not in (422, 503):
+        return None
+    if resp.headers.get("X-SM-Fault-Origin") != "gateway":
+        return None
+    try:
+        body = resp.json()
+    except Exception:
+        return None
+    error = body.get("error") if isinstance(body, dict) else None
+    if error not in ("no_eligible_backend", "backend_at_capacity"):
+        return None
+    return {"error": error, "constraint": body.get("constraint"), "role": body.get("role")}
+
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ConsolidationDaemon")
 
 
 async def _post_nrem(client: httpx.AsyncClient, payload: dict,
-                     ceiling_s: float | None = None) -> httpx.Response:
+                     ceiling_s: float | None = None,
+                     prompt_chars: int | None = None) -> httpx.Response:
     """POST an NREM completion through the gateway and record per-call telemetry
     (timings + serving backend) for the adaptive-timer work. Telemetry is
-    best-effort and never alters the call path — NREM stays agnostic to routing."""
+    best-effort and never alters the call path — NREM stays agnostic to routing.
+    `prompt_chars` (N-4) is the caller's own char-count of the prompt it built,
+    additive and optional — passed straight through to record_llm_call.
+
+    Sends `X-SM-LLM-Role: judge` (R-1: the insight fold is the ONLY NREM LLM
+    path — narrative folds are zero-inference and make no LLM call). A
+    gateway routing refusal (422/503, X-SM-Fault-Origin: gateway) is recorded
+    with a distinguishing note, same as any other non-200 — the LOUD,
+    entity-scoped log and the no-retry decision belong to the caller
+    (_call_insight_llm), which has the fold's own identity to name."""
     _start = time.monotonic()
-    resp = await client.post(REASONER_URL, headers=_auth_headers(), json=payload)
+    resp = await client.post(
+        REASONER_URL,
+        headers={**_auth_headers(), "X-SM-LLM-Role": "judge"},
+        json=payload,
+    )
     ok = resp.status_code == 200
     rj = None
     if ok:
@@ -833,9 +870,13 @@ async def _post_nrem(client: httpx.AsyncClient, payload: dict,
             rj = resp.json()
         except Exception:
             rj = None
+    note = None
+    if not ok:
+        refusal = _routing_refusal(resp)
+        note = f"routing_refused_{refusal['error']}" if refusal else f"http_{resp.status_code}"
     record_llm_call("NREM", rj, backend=resp.headers.get("X-SM-LLM-Backend"),
                     wall_s=time.monotonic() - _start, ceiling_s=ceiling_s,
-                    ok=ok, note=None if ok else f"http_{resp.status_code}")
+                    ok=ok, note=note, prompt_chars=prompt_chars)
     return resp
 
 
@@ -2659,7 +2700,26 @@ class ConsolidationDaemon:
                         ],
                         "temperature": NREM_TEMPERATURE,
                         "max_tokens": max_tokens,
-                    }, ceiling_s=_ceiling)
+                    }, ceiling_s=_ceiling, prompt_chars=len(prompt))
+                    refusal = _routing_refusal(resp)
+                    if refusal:
+                        # F-1/F-2: the gateway declined to place this job — a
+                        # config gap, never evidence about this fold. Log
+                        # loudly ONCE, fail this call WITHOUT poisoning the
+                        # fold (neither _last_llm_truncated nor
+                        # _last_llm_missing_slots is set, so _fold_insight's
+                        # three-way branch takes its plain "ledger rows stay
+                        # open, next sweep retries" path — no
+                        # truncation_failures/slot_failures charge), and
+                        # never widen to bound[1] (no retry of a refused call
+                        # within this cycle).
+                        logger.warning(
+                            "NREM: insight fold for '%s' REFUSED by gateway "
+                            "routing (constraint=%s role=%s) — fold skipped, "
+                            "ledger rows stay open for the next sweep",
+                            entity, refusal["constraint"], refusal["role"],
+                        )
+                        return None
                     if resp.status_code != 200:
                         logger.error(f"Insight slot synthesis failed with status {resp.status_code}: {resp.text}")
                         return None
