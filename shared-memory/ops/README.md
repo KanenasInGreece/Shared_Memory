@@ -86,8 +86,16 @@ of an env var, never a literal key:
 ```json
 LLM_BACKENDS_JSON=[{"url":"http://localhost:5000"},
                     {"url":"https://api.deepseek.com/v1",
-                     "token_env":"DEEPSEEK_API_KEY","model":"deepseek-chat"}]
+                     "token_env":"DEEPSEEK_API_KEY","model":"deepseek-chat",
+                     "extra_body":{"thinking":{"type":"disabled"}}}]
 ```
+
+An optional `extra_body` object is merged into every chat payload routed to
+that backend, overriding the caller's fields — the place for provider-specific
+request switches the daemons don't know to send, such as disabling a hybrid
+reasoning model's thinking mode. A non-object `extra_body` excludes the
+backend from the pool (logged): for a metered backend, being reached without
+its configured overrides is exactly the misconfiguration to prevent.
 
 The gateway resolves `token_env` once at startup from its **own process
 environment** and sends it as `Authorization` only to that backend — the
