@@ -126,6 +126,9 @@ def _isolated_process_env():
 
 
 def test_sync_project_registry_never_leaks_pg_password_to_os_environ(monkeypatch, tmp_path):
+    # Un-pin the suite-wide SECURE_ENV_FILE="" hermeticity guard: this test
+    # exercises the faked-__file__ candidate walk against its own env file.
+    monkeypatch.delenv("SECURE_ENV_FILE", raising=False)
     (tmp_path / "shared-memory").mkdir()
     (tmp_path / "shared-memory" / ".env").write_text(
         "PG_PASSWORD=super-secret-pg\n"

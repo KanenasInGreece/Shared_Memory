@@ -160,7 +160,7 @@ def _parse_backend(entry: str) -> tuple[str, float]:
     return url.rstrip("/"), max(weight, 0.1)
 
 
-def _load_llm_backends() -> tuple[list[str], dict[str, float], dict[str, "str | None"], dict[str, "str | None"]]:
+def _load_llm_backends() -> tuple[list[str], dict[str, float], dict[str, "str | None"], dict[str, "str | None"], dict[str, "dict | None"]]:
     raw_json = os.environ.get("LLM_BACKENDS_JSON", "").strip()
     if raw_json:
         try:
@@ -174,6 +174,7 @@ def _load_llm_backends() -> tuple[list[str], dict[str, float], dict[str, "str | 
         weights: dict[str, float] = {}
         tokens: dict[str, "str | None"] = {}
         models: dict[str, "str | None"] = {}
+        extras: dict[str, "dict | None"] = {}
         for entry in entries:
             url = str(entry.get("url", "")).rstrip("/")
             if not url:
@@ -211,12 +212,31 @@ def _load_llm_backends() -> tuple[list[str], dict[str, float], dict[str, "str | 
                         "variable is not set in the gateway's own environment — "
                         "excluding this backend from the pool.", url, token_env)
                     continue
+            # Per-backend request-body overrides ("extra_body", the OpenAI-SDK
+            # name for the same thing): keys merged into every chat payload
+            # routed to this backend. This is what carries provider-specific
+            # switches a caller does not know it needs — e.g. DeepSeek's
+            # {"thinking": {"type": "disabled"}}, without which a hybrid
+            # reasoning model burns metered output tokens on a think block and
+            # returns reasoning_content the daemons' JSON extraction never
+            # asked for. A malformed value excludes the backend rather than
+            # routing to it unconfigured: for a metered backend, "reached
+            # without its overrides" is exactly the misconfiguration the
+            # field exists to prevent.
+            extra_body = entry.get("extra_body")
+            if extra_body is not None and not isinstance(extra_body, dict):
+                log.error(
+                    "LLM_BACKENDS_JSON entry for %s has a non-object extra_body "
+                    "(%r) — excluding this backend from the pool.",
+                    url, type(extra_body).__name__)
+                continue
             urls.append(url)
             weights[url] = max(float(entry.get("weight", 1.0) or 1.0), 0.1)
             tokens[url] = token
             models[url] = entry.get("model") or None
+            extras[url] = extra_body or None
         if urls:
-            return urls, weights, tokens, models
+            return urls, weights, tokens, models, extras
         log.error("LLM_BACKENDS_JSON produced no usable backend — falling back to LLM_BACKENDS/LLM_DEFAULT_TARGET")
 
     _raw_backends = [_parse_backend(e) for e in os.environ.get("LLM_BACKENDS", "").split(",") if e.strip()]
@@ -224,14 +244,43 @@ def _load_llm_backends() -> tuple[list[str], dict[str, float], dict[str, "str | 
         _raw_backends = [(DEFAULT_TARGET, 1.0)]
     urls = [u for u, _ in _raw_backends]
     weights = {u: w for u, w in _raw_backends}
-    return urls, weights, {u: None for u in urls}, {u: None for u in urls}
+    return urls, weights, {u: None for u in urls}, {u: None for u in urls}, {u: None for u in urls}
 
 
 LLM_BACKENDS: list[str]
 LLM_WEIGHTS: dict[str, float]
 LLM_BACKEND_TOKENS: dict[str, "str | None"]
 LLM_BACKEND_MODELS: dict[str, "str | None"]
-LLM_BACKENDS, LLM_WEIGHTS, LLM_BACKEND_TOKENS, LLM_BACKEND_MODELS = _load_llm_backends()
+LLM_BACKENDS, LLM_WEIGHTS, LLM_BACKEND_TOKENS, LLM_BACKEND_MODELS, LLM_BACKEND_EXTRAS = _load_llm_backends()
+
+
+def _apply_backend_body_overrides(body: bytes, model: "str | None",
+                                  extra: "dict | None") -> bytes:
+    """The request body as this backend must receive it.
+
+    Pure so it can be tested (and mutation-checked) without the proxy plumbing.
+    `extra` (the backend's extra_body config) is merged first and overrides the
+    caller — it is the operator's per-backend truth, and the callers are our own
+    daemons sending one homogeneous request shape. The `model` override is
+    applied last and only when the caller sent a model field, preserving the
+    long-standing rewrite contract — so an explicit per-backend model always
+    beats an extra_body["model"] left there by mistake. Best-effort by design:
+    an unparseable or non-object body is forwarded unchanged rather than
+    dropped."""
+    if not model and not extra:
+        return body
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        log.warning("Could not parse request body for backend overrides — forwarding unchanged")
+        return body
+    if not isinstance(payload, dict):
+        return body
+    if extra:
+        payload.update(extra)
+    if model and "model" in payload:
+        payload["model"] = model
+    return json.dumps(payload).encode("utf-8")
 
 # Failure/cooldown (advisor spec): N fails within a window → cooldown; re-probed
 # (a normal request) after it elapses. A success clears the fail streak.
@@ -606,19 +655,14 @@ class AsyncHiveMindProxy:
             llm_backend = _select_llm_backend(role, _affinity_key(llm_body))
             target_base = llm_backend
 
-            # Per-backend model override (LLM_BACKENDS_JSON "model") — a cloud
-            # endpoint needs its real model id, not the local "local-model"
-            # every caller sends by default. Best-effort: an unparseable body
-            # is forwarded unchanged rather than dropped.
-            backend_model = LLM_BACKEND_MODELS.get(llm_backend)
-            if backend_model:
-                try:
-                    payload = json.loads(llm_body)
-                    if isinstance(payload, dict) and "model" in payload:
-                        payload["model"] = backend_model
-                        llm_body = json.dumps(payload).encode("utf-8")
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    log.warning("Could not apply model override for %s — forwarding body unchanged", llm_backend)
+            # Per-backend body rewrites (LLM_BACKENDS_JSON "model" +
+            # "extra_body") — a cloud endpoint needs its real model id, not the
+            # local "local-model" every caller sends by default, and its
+            # provider-specific switches (e.g. thinking disabled) that no
+            # caller knows to send. See _apply_backend_body_overrides.
+            llm_body = _apply_backend_body_overrides(
+                llm_body, LLM_BACKEND_MODELS.get(llm_backend),
+                LLM_BACKEND_EXTRAS.get(llm_backend))
 
         target_url = f"{target_base}{request.rel_url}"
         log.debug("→ %s %s", request.method, target_url)

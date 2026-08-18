@@ -5,6 +5,35 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.11] — 2026-08-18
+
+### Added — per-backend request-body overrides (`extra_body`)
+
+- **`LLM_BACKENDS_JSON` entries take an `extra_body` object**, merged into every chat
+  payload routed to that backend, overriding the caller's fields. This is the place for
+  provider-specific request switches the daemons don't know to send — the motivating case
+  is hybrid reasoning models (thinking mode on by default, disabled per request in the
+  body): without it, every routed call pays for a think block in metered output tokens
+  and returns `reasoning_content` the extraction pipeline never asked for. The explicit
+  per-backend `model` override is applied last (beats a `model` left in `extra_body`) and
+  still only rewrites a model field the caller sent. A non-object `extra_body` excludes
+  the backend from the pool loudly — for a metered backend, being reached without its
+  configured overrides is exactly the misconfiguration the field exists to prevent.
+
+### Fixed — the test suite no longer reads the deployer's live `.env`
+
+- **`SECURE_ENV_FILE`** is the one decision point for which env file a process loads, in
+  both the daemon loader (`secure_env`) and the client (`memory_bridge`): a path names
+  the exact file, the empty string loads none (pinned suite-wide in `tests/conftest.py`),
+  a set-but-missing path warns and refuses to fall through to a file the deployer did not
+  name. Before this, the loaders re-populated `os.environ` from the live
+  `shared-memory/.env` on every module reload, so a test could defeat deployer config
+  only by SETTING a key, never by deleting one — a deployer whose `.env` used the
+  documented `LLM_BACKENDS_JSON` form got 15 spurious test failures from tests silently
+  overruled by their own config file.
+
+---
+
 ## [0.9.10] — 2026-08-18
 
 ### Changed — project-name resolution has ONE path: the registry alias table

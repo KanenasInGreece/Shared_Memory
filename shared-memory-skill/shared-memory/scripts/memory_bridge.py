@@ -29,7 +29,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.9.10"
+VERSION = "0.9.11"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v3: review-edges / label-edges require the gateway's /memory/relations/* routes.
@@ -67,6 +67,15 @@ _ENV_CANDIDATES = [
     os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"),
 ]
+# SECURE_ENV_FILE — same contract as the server loader (secure_env.
+# _select_env_file): a path names the EXACT env file this process loads, the
+# empty string loads none at all (the test suite's hermeticity pin — in admin
+# mode candidate 2 IS the live gateway .env, and importing this module from a
+# test would otherwise setdefault its config, LLM_BACKENDS_JSON included,
+# into the whole process's os.environ), and unset keeps the candidate walk.
+_secure_env_file = os.environ.get("SECURE_ENV_FILE")
+if _secure_env_file is not None:
+    _ENV_CANDIDATES = [_secure_env_file.strip()] if _secure_env_file.strip() else []
 
 # AGENT_TOKEN is read into a private variable and NEVER exported into this
 # process's own os.environ (A1-deferred, S-18 follow-up): the client used to

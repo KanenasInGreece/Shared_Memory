@@ -524,6 +524,38 @@ def _derive_credentials_directory_candidates() -> set[str]:
     return candidates
 
 
+def _select_env_file() -> "Path | None":
+    """Which .env file this process loads — the ONE decision point.
+
+    ``SECURE_ENV_FILE`` overrides the candidate walk entirely: a path names
+    the exact file to load; the EMPTY string means "load no env file at all"
+    — the hermeticity contract the test suite pins in ``tests/conftest.py``,
+    because this loader re-populates ``os.environ`` from the live deployer
+    .env on every module reload, and a test can defeat that only by SETTING
+    a key, never by deleting one (setdefault re-adds what delenv removed).
+    A set-but-missing path is a deployer mistake and must be loud, not a
+    silent fall-through to a DIFFERENT file than the one they named.
+
+    Unset: the candidate walk unchanged from every prior release —
+    shared-memory/.env first, the repo-root .env as the pre-0.6 fallback.
+    """
+    override = os.environ.get("SECURE_ENV_FILE")
+    if override is not None:
+        override = override.strip()
+        if not override:
+            return None
+        p = Path(override)
+        if p.exists():
+            return p
+        print(f"[secure_env] WARNING: SECURE_ENV_FILE={override!r} does not "
+              f"exist — loading NO env file (refusing to fall through to a "
+              f"file you did not name)", file=sys.stderr)
+        return None
+    here = Path(__file__).resolve()
+    candidates = [here.parent.parent / ".env", here.parent.parent.parent / ".env"]
+    return next((p for p in candidates if p.exists()), None)
+
+
 def load_split_env() -> None:
     """Parse the framework .env and split it between os.environ (config) and
     the in-process secrets store (everything is_secret_key() catches).
@@ -553,9 +585,7 @@ def load_split_env() -> None:
     can resolve ANY secret-classified credential purely from
     LoadCredential=/_FILE — not only the ones on the fixed list.
     """
-    here = Path(__file__).resolve()
-    candidates = [here.parent.parent / ".env", here.parent.parent.parent / ".env"]
-    env_path = next((p for p in candidates if p.exists()), None)
+    env_path = _select_env_file()
 
     raw_pairs: list[tuple[str, str]] = []
     if env_path is not None:

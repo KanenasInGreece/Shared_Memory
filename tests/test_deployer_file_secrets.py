@@ -62,6 +62,11 @@ def _with_timeout(seconds, fn, *a, **kw):
 
 @pytest.fixture(autouse=True)
 def _isolated_secure_env_state(monkeypatch):
+    # The suite-wide conftest pins SECURE_ENV_FILE="" (hermeticity: never
+    # read the deployer's live .env). THIS file tests the loader itself
+    # against env files it constructs via the faked-__file__ candidate walk,
+    # so the pin must come off here — the fake walk IS the subject.
+    monkeypatch.delenv("SECURE_ENV_FILE", raising=False)
     monkeypatch.setattr(secure_env, "_secrets", {})
     monkeypatch.setattr(secure_env, "_dynamic_secret_names", set())
     monkeypatch.setattr(secure_env, "_advised_exec_env_names", set())
