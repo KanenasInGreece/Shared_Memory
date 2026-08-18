@@ -1,0 +1,272 @@
+-- 033 — the entity vocabulary: canonical + alias, seeded from entity_registry.
+--
+-- WHAT WAS WRONG. `entity_registry` (migration 030) is a flat set of exact
+-- strings — a lookup gate, but with no notion that two spellings name the same
+-- thing. "Kubernetes" and "kubernetes" and "K8s" each register as a distinct,
+-- unrelated name, so the same real-world entity fragments across several rows
+-- and nothing resolves one spelling to another. That is the same defect the
+-- project and domain axes had before their alias junctions (024, 028) — an
+-- unregistered value has nowhere to resolve TO, and a retired or off-canon
+-- spelling stays a stranger forever.
+--
+-- WHAT THIS DOES. Builds the same canonical + alias shape those axes use,
+-- for entities:
+--   1. `entity_normalize(text)` — ONE normalization definition (lowercase,
+--      strip everything that is not [a-z0-9]) that this migration's seed and
+--      every future reader/writer must share. Declared IMMUTABLE so it can
+--      back a generated identity column and a functional unique index.
+--   2. `entity_vocabulary` — the canonical identity. `id` is what a future
+--      ingress gate and the graph point at; `name` is the verbatim canonical
+--      spelling; `normalized_key` is unique, so two canonicals can never
+--      collide once normalized.
+--   3. `entity_vocab_aliases` — every OTHER spelling, pointing at the
+--      canonical it means. Mirrors `project_aliases`' junction shape:
+--      alias string kept verbatim, a unique normalized key, and an FK at the
+--      identity (`entity_id`), not the name.
+--   4. SEEDING, pure SQL, deriving the vocabulary from THIS install's own
+--      `entity_registry` + `technical_docs` — no entity name is ever written
+--      into this file, so it stays portable across every deployment. On a
+--      fresh install `entity_registry` is empty and the seed inserts nothing.
+--
+-- ⛔ THIS MIGRATION ADDS NO WRITER AND CHANGES NO RUNTIME BEHAVIOR. Nothing in
+-- the coordinator, the ingress gate, or REM consults these tables yet — that
+-- is a LATER unit's work. This migration only creates the vocabulary and
+-- seeds it from the vetted `entity_registry` the operator already produced by
+-- completing the vocabulary cull.
+--
+-- ⛔ THIS MIGRATION DOES NOT TOUCH `entity_registry`. It remains the ingress
+-- log exactly as migration 030 left it; what happens to it once this
+-- vocabulary exists is a separate, later question.
+--
+-- THE CANONICAL-PICK RULE (per normalized-key group in entity_registry):
+--   1. the spelling with the most `technical_docs` FACT records whose
+--      `metadata->'entities'` array contains that EXACT string, highest wins;
+--   2. tie → earliest `entity_registry.created_at`;
+--   3. tie → shortest `name`;
+--   4. tie → lexicographically first `name`.
+-- `entity_registry.name` is itself a PRIMARY KEY, so step 4 always resolves
+-- the ordering — the pick is fully deterministic. Every OTHER spelling in the
+-- group becomes an alias of the pick.
+--
+-- Idempotent: `IF NOT EXISTS` / `ON CONFLICT DO NOTHING` throughout. Safe to
+-- re-run — a re-run seeds only names/aliases that were not already recorded.
+-- (apply.py's ledger means this file only ever runs once in the ordinary
+-- path; idempotency is the house style regardless, and is what makes a
+-- manual re-run after a partial failure safe.)
+
+BEGIN;
+
+-- ─── entity_normalize() — THE one normalization definition ───────────────────
+--
+-- CONTRACT: lowercase, then strip every character that is not [a-z0-9]. This
+-- is the ONLY normalization this vocabulary recognises. The seed below calls
+-- it to build `normalized_key`/`normalized_alias`; the ingress gate that
+-- consults this vocabulary in a later unit MUST call this same function
+-- rather than re-implementing the rule, or the two could disagree about
+-- whether two spellings name the same entity. IMMUTABLE because it backs a
+-- trigger-maintained unique column and must give the same answer for the
+-- same input forever.
+CREATE OR REPLACE FUNCTION entity_normalize(raw_name text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+    SELECT regexp_replace(lower(raw_name), '[^a-z0-9]', '', 'g');
+$$;
+
+-- ─── entity_vocabulary — the canonical identity ───────────────────────────────
+--
+-- `normalized_key` is maintained by trigger rather than as a generated/stored
+-- column: this repository's `generate_schema_init.py` introspects columns via
+-- `information_schema.columns`, which does not report a generation
+-- expression, so a `GENERATED ALWAYS AS (...) STORED` column would silently
+-- render as a bare, unpopulated column in a regenerated `schema_init.sql` —
+-- the same class of silent drop this schema's CHECK/FK/IDENTITY history
+-- warns about. A BEFORE INSERT/UPDATE trigger uses the function-and-trigger
+-- path the generator DOES faithfully introspect.
+CREATE TABLE IF NOT EXISTS entity_vocabulary (
+    id             bigint      GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    name           VARCHAR(255) NOT NULL,
+    normalized_key TEXT        NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    registered_by  VARCHAR(64) NOT NULL DEFAULT 'system',
+
+    CONSTRAINT entity_vocabulary_not_blank CHECK (btrim(name) <> ''),
+    CONSTRAINT entity_vocabulary_normalized_key_unique UNIQUE (normalized_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entity_vocabulary_created_at
+    ON entity_vocabulary (created_at);
+
+-- ─── entity_vocab_aliases — every other spelling, resolved in one hop ────────
+--
+-- Mirrors `project_aliases`' junction shape: the alias string is kept
+-- verbatim, `normalized_alias` is unique so two aliases can never collide
+-- once normalized, and the FK points at the canonical's IDENTITY
+-- (`entity_id`), never at its name.
+CREATE TABLE IF NOT EXISTS entity_vocab_aliases (
+    id               bigint      GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    entity_id        bigint      NOT NULL REFERENCES entity_vocabulary (id) ON DELETE CASCADE,
+    alias            VARCHAR(255) NOT NULL,
+    normalized_alias TEXT        NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_by       VARCHAR(64) NOT NULL DEFAULT 'system',
+
+    CONSTRAINT entity_vocab_aliases_not_blank CHECK (btrim(alias) <> ''),
+    CONSTRAINT entity_vocab_aliases_normalized_unique UNIQUE (normalized_alias)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entity_vocab_aliases_entity_id
+    ON entity_vocab_aliases (entity_id);
+
+-- ─── Keep normalized_key / normalized_alias in step, and disjoint ────────────
+--
+-- Two rules, enforced because a plain UNIQUE constraint cannot see across
+-- these two tables:
+--
+--   A) An alias must normalize to EXACTLY its own canonical's normalized_key.
+--      Since `entity_vocabulary.normalized_key` is unique, this is what makes
+--      "an alias collides with a canonical" impossible EXCEPT with its own
+--      parent, which is not a collision — it is the definition of aliasing.
+--      An alias whose spelling normalizes to a DIFFERENT canonical's key
+--      (wrong entity_id, or a seeding bug) is refused outright.
+--   B) A canonical must not normalize to a key some OTHER entity is already
+--      registered as an alias for (checked the other direction, at write
+--      time on entity_vocabulary).
+--
+-- ⚠ WHAT SQL CANNOT ENFORCE HERE: these are BEFORE ROW triggers reading a
+-- sibling table under the default READ COMMITTED isolation the coordinator
+-- runs at, not a single atomic constraint — two concurrent transactions can
+-- each pass the check before either commits, landing a genuine collision.
+-- Serializing writes to this vocabulary (an advisory lock, or SERIALIZABLE
+-- isolation on the write path) is a matter for the ingress gate that becomes
+-- the vocabulary's write path in the later unit; not attempted here.
+CREATE OR REPLACE FUNCTION entity_vocabulary_before_write()
+RETURNS trigger AS $$
+BEGIN
+    NEW.normalized_key := entity_normalize(NEW.name);
+
+    IF EXISTS (
+        SELECT 1 FROM entity_vocab_aliases a
+         WHERE a.normalized_alias = NEW.normalized_key
+           AND a.entity_id <> NEW.id
+    ) THEN
+        RAISE EXCEPTION
+            'entity "%" normalizes to "%", which is already registered as an '
+            'alias of a different entity — a canonical spelling and an alias '
+            'must never name two different identities', NEW.name, NEW.normalized_key;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_entity_vocabulary_before_write ON entity_vocabulary;
+CREATE TRIGGER trg_entity_vocabulary_before_write
+    BEFORE INSERT OR UPDATE ON entity_vocabulary
+    FOR EACH ROW EXECUTE FUNCTION entity_vocabulary_before_write();
+
+CREATE OR REPLACE FUNCTION entity_vocab_aliases_before_write()
+RETURNS trigger AS $$
+DECLARE
+    v_parent_key text;
+BEGIN
+    NEW.normalized_alias := entity_normalize(NEW.alias);
+
+    SELECT normalized_key INTO v_parent_key
+      FROM entity_vocabulary
+     WHERE id = NEW.entity_id;
+
+    IF v_parent_key IS NULL THEN
+        RAISE EXCEPTION
+            'entity_vocab_aliases.entity_id % does not reference a known '
+            'entity_vocabulary row', NEW.entity_id;
+    END IF;
+
+    IF NEW.normalized_alias <> v_parent_key THEN
+        RAISE EXCEPTION
+            'alias "%" normalizes to "%", which does not match its canonical '
+            'entity''s normalized key "%" — an alias must normalize to the '
+            'same identity as the entity it aliases',
+            NEW.alias, NEW.normalized_alias, v_parent_key;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_entity_vocab_aliases_before_write ON entity_vocab_aliases;
+CREATE TRIGGER trg_entity_vocab_aliases_before_write
+    BEFORE INSERT OR UPDATE ON entity_vocab_aliases
+    FOR EACH ROW EXECUTE FUNCTION entity_vocab_aliases_before_write();
+
+-- ─── SEEDING — pure SQL, no entity name ever written into this file ─────────
+--
+-- On a fresh install `entity_registry` is empty, `entity_vocab_seed_ranked`
+-- computes zero rows, and both INSERTs below affect zero rows: a genuine
+-- no-op, not a special case.
+--
+-- Per normalized-key group: the CANONICAL row is the one with the highest
+-- exact-spelling occurrence count across `technical_docs` FACT records'
+-- `metadata->'entities'` arrays, tied first by earliest
+-- `entity_registry.created_at`, then shortest `name`, then lexicographic
+-- `name` — `entity_registry.name` is a PRIMARY KEY, so the final tiebreak
+-- always resolves and ROW_NUMBER()'s ordering is fully deterministic.
+CREATE TEMP TABLE entity_vocab_seed_ranked ON COMMIT DROP AS
+WITH registry_norm AS (
+    SELECT
+        r.name,
+        r.created_at,
+        r.registered_by,
+        entity_normalize(r.name) AS norm_key
+    FROM entity_registry r
+),
+occurrence_counts AS (
+    SELECT
+        rn.name,
+        rn.norm_key,
+        rn.created_at,
+        rn.registered_by,
+        (
+            SELECT count(*)
+              FROM technical_docs td
+             WHERE (td.metadata->>'kind' IS NULL OR td.metadata->>'kind' = 'fact')
+               AND td.metadata->'entities' IS NOT NULL
+               AND jsonb_typeof(td.metadata->'entities') = 'array'
+               AND td.metadata->'entities' ? rn.name
+        ) AS occurrence_count
+      FROM registry_norm rn
+)
+SELECT
+    oc.name,
+    oc.norm_key,
+    oc.created_at,
+    oc.registered_by,
+    oc.occurrence_count,
+    ROW_NUMBER() OVER (
+        PARTITION BY oc.norm_key
+        ORDER BY oc.occurrence_count DESC,
+                 oc.created_at ASC,
+                 length(oc.name) ASC,
+                 oc.name ASC
+    ) AS rnk
+FROM occurrence_counts oc;
+
+-- The canonical of each group: rnk = 1.
+INSERT INTO entity_vocabulary (name, registered_by)
+SELECT sr.name, COALESCE(sr.registered_by, 'migration_033_seed')
+  FROM entity_vocab_seed_ranked sr
+ WHERE sr.rnk = 1
+ON CONFLICT (normalized_key) DO NOTHING;
+
+-- Every other spelling in the group: an alias of the canonical that shares
+-- its normalized key.
+INSERT INTO entity_vocab_aliases (entity_id, alias, created_by)
+SELECT v.id, sr.name, 'migration_033_seed'
+  FROM entity_vocab_seed_ranked sr
+  JOIN entity_vocabulary v ON v.normalized_key = sr.norm_key
+ WHERE sr.rnk > 1
+ON CONFLICT (normalized_alias) DO NOTHING;
+
+COMMIT;
