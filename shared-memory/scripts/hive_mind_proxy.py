@@ -207,6 +207,18 @@ def _load_llm_backends() -> tuple[
             role_config_errors.append(
                 f"{url}: roles must be a JSON array, got {type(raw).__name__}")
             return frozenset()
+        if not raw:
+            # R-3 (decision:1357): an EMPTY roles list makes the backend
+            # eligible for nothing — every request 422s — and it must not
+            # sidestep the M-5 explicit-choice refusal (which tests `is
+            # None`). A backend that serves nothing is a config mistake, not
+            # a scope; refuse loudly at startup.
+            role_config_errors.append(
+                f"{url}: roles is an EMPTY list — this backend would be "
+                f"eligible for NOTHING (every request refused). Either omit "
+                f"`roles` (serves all) or list at least one of "
+                f"{sorted(ROUTING_ROLE_NAMES)}.")
+            return frozenset()
         names = {str(r).strip().lower() for r in raw}
         bad = names - ROUTING_ROLE_NAMES
         if bad:
@@ -299,19 +311,29 @@ def _load_llm_backends() -> tuple[
                     "(%r) — excluding this backend from the pool.",
                     url, type(extra_body).__name__)
                 continue
+            # R-2 + Optional (decision:1357): both int fields must be a REAL
+            # int >= 1 — bool is an int subclass in Python (True passes a
+            # bare isinstance check), and 0/negative values are traps:
+            # max_inflight=0 makes the backend permanently at-cap (every
+            # request waits the full window then 503s), n_ctx=0 silently
+            # disables the fit check via `if not n_ctx`.
             n_ctx_raw = entry.get("n_ctx")
-            if n_ctx_raw is not None and not isinstance(n_ctx_raw, int):
+            if n_ctx_raw is not None and (not isinstance(n_ctx_raw, int)
+                                          or isinstance(n_ctx_raw, bool)
+                                          or n_ctx_raw < 1):
                 log.error(
-                    "LLM_BACKENDS_JSON entry for %s has a non-integer n_ctx "
-                    "(%r) — excluding this backend from the pool.",
-                    url, n_ctx_raw)
+                    "LLM_BACKENDS_JSON entry for %s has an invalid n_ctx "
+                    "(%r — must be an integer >= 1) — excluding this backend "
+                    "from the pool.", url, n_ctx_raw)
                 continue
             max_inflight_raw = entry.get("max_inflight")
-            if max_inflight_raw is not None and not isinstance(max_inflight_raw, int):
+            if max_inflight_raw is not None and (not isinstance(max_inflight_raw, int)
+                                                 or isinstance(max_inflight_raw, bool)
+                                                 or max_inflight_raw < 1):
                 log.error(
-                    "LLM_BACKENDS_JSON entry for %s has a non-integer max_inflight "
-                    "(%r) — excluding this backend from the pool.",
-                    url, max_inflight_raw)
+                    "LLM_BACKENDS_JSON entry for %s has an invalid max_inflight "
+                    "(%r — must be an integer >= 1) — excluding this backend "
+                    "from the pool.", url, max_inflight_raw)
                 continue
             private_ok_raw = entry.get("private_ok")
             if private_ok_raw is not None and not isinstance(private_ok_raw, bool):
@@ -460,7 +482,19 @@ FIT_DEFAULT_OUTPUT_TOKENS = int(os.environ.get("FIT_DEFAULT_OUTPUT_TOKENS", "204
 # eligibility) — bounded so a permanently-saturated single-backend
 # configuration still fails eventually instead of hanging a request forever.
 LLM_MAX_INFLIGHT_WAIT_S = float(os.environ.get("LLM_MAX_INFLIGHT_WAIT_S", "120"))
-LLM_MAX_INFLIGHT_POLL_S = float(os.environ.get("LLM_MAX_INFLIGHT_POLL_S", "0.5"))
+# Floor of 0.05s: a configured 0 would busy-spin the event loop for the whole
+# wait window (Optional finding, decision:1357).
+LLM_MAX_INFLIGHT_POLL_S = max(0.05, float(os.environ.get("LLM_MAX_INFLIGHT_POLL_S", "0.5")))
+# R-4 (decision:1357): how many requests may HOLD a capacity-wait slot at
+# once. Every waiter occupies an admitted request for up to the full wait
+# window (and, with GATEWAY_INFLIGHT_MAX set, counts toward the gateway-wide
+# S-11 shed) — unbounded waiters let one capped backend starve the whole
+# gateway. Beyond this many concurrent waiters a request gets an immediate
+# 503 backend_at_capacity instead of waiting. ⚠ UNMEASURED default
+# (fact:1338 — flagged in .env.example): a small bound chosen for its shape
+# (strictly less than any plausible S-11 admission budget), not derived from
+# a live measurement.
+LLM_MAX_CAPACITY_WAITERS = int(os.environ.get("LLM_MAX_CAPACITY_WAITERS", "8"))
 
 # The whole pool parallelises. Judge/quality routing (v0.6.1) is GATEWAY-controlled
 # at runtime — NOT a user/env setting. The framework's judge will signal its role
@@ -533,6 +567,19 @@ _routing_no_eligible_backend_count = 0
 _routing_no_eligible_backend_last_ts: "str | None" = None
 _routing_fit_rejected_count = 0
 _routing_fit_rejected_last_ts: "str | None" = None
+# R-1 (decision:1357): the 503 backend_at_capacity refusal gets its OWN
+# counter + last-ts pair — without it a saturated capped backend stalls
+# every record while /health shows zero refusals (the 422 counters never
+# fire on this path).
+_routing_backend_at_capacity_count = 0
+_routing_backend_at_capacity_last_ts: "str | None" = None
+# R-4 (decision:1357): live count of requests currently holding a
+# capacity-wait slot — bounded by LLM_MAX_CAPACITY_WAITERS above.
+_capacity_waiters = 0
+# Optional (decision:1357): unknown X-SM-LLM-Role values seen from
+# steer-permitted callers, warned ONCE per distinct value — a typo'd role
+# silently degrades to role-less eligibility and is otherwise invisible.
+_warned_unknown_role_values: set[str] = set()
 # Per-backend token accounting (post-review addition A). IN-PROCESS only —
 # reset on restart, deliberate, same semantics as every other gateway
 # counter; the paired last-ts is what makes a restart-aware delta
@@ -709,6 +756,47 @@ def _record_no_eligible_backend(constraint: str) -> None:
         _routing_fit_rejected_last_ts = now_iso
 
 
+def _record_backend_at_capacity() -> None:
+    """R-1 (decision:1357): count a 503 backend_at_capacity refusal, paired
+    last-ts — same fact:1314 shape as the 422 counters."""
+    global _routing_backend_at_capacity_count, _routing_backend_at_capacity_last_ts
+    _routing_backend_at_capacity_count += 1
+    _routing_backend_at_capacity_last_ts = datetime.now(timezone.utc).isoformat()
+
+
+def _warn_unknown_role_once(role: str) -> None:
+    """Optional (decision:1357): a role value outside ROUTING_ROLE_NAMES from
+    a steer-permitted caller degrades silently to role-less eligibility —
+    warn ONCE per distinct value so a daemon-side typo is visible."""
+    if role in _warned_unknown_role_values:
+        return
+    _warned_unknown_role_values.add(role)
+    log.warning(
+        "X-SM-LLM-Role %r is not a known routing role %s — treating the "
+        "request as ROLE-LESS (private_ok backends only). If this is a "
+        "daemon-side typo, its traffic is silently degraded until fixed.",
+        role, sorted(ROUTING_ROLE_NAMES))
+
+
+def _counts_free_slot(url: str) -> bool:
+    """C-1 Critical fix (decision:1357, amending the plan's F-3 clause
+    minimally): a backend counts toward /pool/status free_slots iff it can
+    take ANY dream job — either serves-all (roles absent AND private_ok) or
+    an EXPLICIT roles list covering every dream role. Dream traffic always
+    carries a role, so a full explicit list is exactly as capable as
+    serves-all for the daemons' gating purposes; counting only the former
+    (the original F-3 reading) silently zeroed free_slots for a fleet whose
+    every backend declares roles — the very configuration M-5 steers
+    credentialed operators toward — and halted REM/NREM/relation_sweep with
+    no warning anywhere. Partial-role fleets still count 0 (per-role slot
+    accounting stays deferred) — require_valid_llm_routing_config() warns
+    LOUDLY at startup for that case instead of leaving it silent."""
+    roles = LLM_BACKEND_ROLES.get(url)
+    if roles is None:
+        return LLM_BACKEND_PRIVATE_OK.get(url, True)
+    return ROUTING_ROLE_NAMES <= roles
+
+
 def _record_backend_token_usage(backend: str, usage: dict) -> None:
     """Post-review addition A: per-backend cumulative prompt/completion token
     counters from a proxied response's `usage` object. Best-effort — never
@@ -837,6 +925,28 @@ async def _select_backend_waiting_on_capacity(
             return None
         await asyncio.sleep(LLM_MAX_INFLIGHT_POLL_S)
 
+
+async def _wait_for_capacity_slot(role: str, affinity_key: "str | None",
+                                  est_prompt_tokens: float,
+                                  effective_max_tokens: float) -> "str | None":
+    """R-4 (decision:1357): the bounded-WAITER wrapper around the bounded
+    wait. Every waiter holds an admitted request for up to the full wait
+    window (and counts toward any S-11 gateway-wide admission budget), so
+    the number of simultaneous waiters is itself capped — beyond
+    LLM_MAX_CAPACITY_WAITERS the caller gets an immediate None (→ 503)
+    instead of joining the queue. The counter has the same
+    increment-at-entry / release-on-every-exit lifetime discipline as the
+    I-8b inflight score."""
+    global _capacity_waiters
+    if _capacity_waiters >= LLM_MAX_CAPACITY_WAITERS:
+        return None
+    _capacity_waiters += 1
+    try:
+        return await _select_backend_waiting_on_capacity(
+            role, affinity_key, est_prompt_tokens, effective_max_tokens)
+    finally:
+        _capacity_waiters -= 1
+
 # --------------------------------------------------------------------------- #
 # RFC 7230 §6.1 — hop-by-hop headers must never be forwarded by a proxy.
 # Content-Length is included because we always stream (chunked TE); forwarding
@@ -917,7 +1027,19 @@ def _safe_resolve_identity(request) -> "str | None":
 # below) — are the sole non-admin identities allowed to steer LLM routing.
 _CONSOLIDATION_AGENT_NAME = "consolidation"
 _REM_DAEMON_AGENT_NAME    = "rem_daemon"
-DAEMON_AGENT_NAMES = frozenset({_CONSOLIDATION_AGENT_NAME, _REM_DAEMON_AGENT_NAME})
+# R-6 (decision:1357, closing the plan's R-2 item): standalone framework
+# tools that legitimately steer — relation_sweep sends X-SM-LLM-Role: judge
+# but runs outside the gateway process, so it can never hold a minted daemon
+# token — get in via an OPERATOR-DECLARED name allowlist, unioned here. The
+# operator mints an ordinary agent token under one of these names and points
+# the tool at it. Deliberately a NAME list, never a role-based widening and
+# never admin (auth_middleware confines admin tokens to /admin/*): each
+# entry is one explicit identity the operator chose to trust with steering.
+LLM_STEER_EXTRA_AGENT_NAMES = frozenset(
+    n.strip() for n in os.environ.get("LLM_STEER_EXTRA_AGENT_NAMES", "").split(",")
+    if n.strip())
+DAEMON_AGENT_NAMES = frozenset(
+    {_CONSOLIDATION_AGENT_NAME, _REM_DAEMON_AGENT_NAME}) | LLM_STEER_EXTRA_AGENT_NAMES
 
 
 def _may_steer_llm(request) -> bool:
@@ -1068,30 +1190,66 @@ class AsyncHiveMindProxy:
             # yet, this return is well before the try: block that reserves a
             # slot) — never silently widens, never falls back to an
             # ineligible backend, never queues.
-            if not _eligible_backends(role, est_prompt_tokens, effective_max_tokens):
+            if role and role not in ROUTING_ROLE_NAMES:
+                _warn_unknown_role_once(role)
+            eligible_pre = _eligible_backends(role, est_prompt_tokens, effective_max_tokens)
+            if not eligible_pre:
                 constraint = _classify_no_eligible_constraint(
                     role, est_prompt_tokens, effective_max_tokens)
                 _record_no_eligible_backend(constraint)
+                refusal_body = {"error": "no_eligible_backend",
+                                "constraint": constraint, "role": role or None}
+                if constraint == "fit":
+                    # R-5 disposition (decision:1357): retry-without-charge
+                    # STANDS as ruled (F-1: a config gap is not a record
+                    # defect) — observability is the mitigation. The refusal
+                    # names the estimate that failed so an operator can
+                    # retune LLM_CHARS_PER_TOKEN_RATIO / FIT_MARGIN / n_ctx
+                    # against real traffic.
+                    refusal_body["est_prompt_tokens"] = int(est_prompt_tokens)
+                    refusal_body["effective_max_tokens"] = int(effective_max_tokens)
                 return web.json_response(
-                    {"error": "no_eligible_backend", "constraint": constraint,
-                     "role": role or None},
+                    refusal_body,
                     status=422, headers={"X-SM-Fault-Origin": "gateway"},
                 )
 
-            # At least one backend IS eligible — if every eligible backend is
-            # AT its max_inflight cap right now, wait on it (I-8: the cap
-            # never widens eligibility, so this never picks an over-cap
-            # backend to avoid waiting) rather than refusing or overriding
-            # the cap. Also pre-dispatch: no inflight accounting yet.
-            llm_backend = await _select_backend_waiting_on_capacity(
+            # R-4 (decision:1357): a request that can ONLY land on a
+            # credentialed backend but is not on the S-04 allowlist is DOOMED
+            # — deny it here, BEFORE it can hold a capacity-wait slot for the
+            # full window. A mixed eligible set (any uncredentialed member)
+            # falls through: selection may legitimately pick the
+            # uncredentialed one, and the post-selection S-04 check below
+            # still guards the credentialed choice.
+            _route = (request.method, request.path.rstrip("/") or "/")
+            if (_route not in CREDENTIALED_BACKEND_ALLOWED_ROUTES
+                    and all(LLM_BACKEND_TOKENS.get(b) is not None for b in eligible_pre)):
+                record_credentialed_route_denied(
+                    eligible_pre[0], request.method, request.path,
+                    agent_name=_safe_agent_name(request),
+                    request_id=_safe_request_id(request),
+                )
+                return web.json_response(
+                    {"error": "credentialed backends accept only framework endpoints"},
+                    status=403, headers={"X-SM-Fault-Origin": "gateway"},
+                )
+
+            # At least one backend IS eligible — fast path first; only if
+            # every eligible backend is AT its max_inflight cap right now do
+            # we join the (waiter-capped, R-4) bounded wait on it (I-8: the
+            # cap never widens eligibility, so selection never picks an
+            # over-cap backend to avoid waiting) rather than refusing or
+            # overriding the cap. All pre-dispatch: no inflight accounting yet.
+            llm_backend = _select_llm_backend(
                 role, affinity_key, est_prompt_tokens, effective_max_tokens)
             if llm_backend is None:
+                llm_backend = await _wait_for_capacity_slot(
+                    role, affinity_key, est_prompt_tokens, effective_max_tokens)
+            if llm_backend is None:
+                _record_backend_at_capacity()
                 return web.json_response(
                     {"error": "backend_at_capacity"}, status=503,
                     headers={"X-SM-Fault-Origin": "gateway"},
                 )
-            if role:
-                _record_role_routed(role)
             target_base = llm_backend
 
             # Per-backend body rewrites (LLM_BACKENDS_JSON "model" +
@@ -1203,6 +1361,12 @@ class AsyncHiveMindProxy:
                 _llm_inflight[llm_backend] = _llm_inflight.get(llm_backend, 0) + 1
                 _llm_inflight_started.setdefault(llm_backend, []).append(time.monotonic())
                 _llm_routed[llm_backend] = _llm_routed.get(llm_backend, 0) + 1
+                # Optional (decision:1357): the per-role ROUTED counter
+                # increments HERE, at dispatch, beside the inflight/_llm_routed
+                # accounting it mirrors — not back at selection, where a
+                # request could still be refused (S-04) before any dispatch.
+                if role:
+                    _record_role_routed(role)
 
             for attempt in range(max_attempts):
                 try:
@@ -1256,8 +1420,13 @@ class AsyncHiveMindProxy:
                         # and bounded by LLM_USAGE_CAPTURE_CAP_BYTES so a large
                         # streamed completion is never held fully in memory
                         # just to look for a trailing `usage` object.
+                        # stream:true responses are SSE — the accumulated
+                        # bytes can never parse as a single JSON object, so
+                        # skip capture instead of buffering up to the cap for
+                        # a parse that always fails (Optional, decision:1357).
                         capture_usage = (llm_backend is not None and upstream.status < 400
-                                        and not content_encoding)
+                                        and not content_encoding
+                                        and not (body_obj or {}).get("stream"))
                         usage_chunks: "list[bytes] | None" = [] if capture_usage else None
                         usage_bytes = 0
 
@@ -1822,6 +1991,13 @@ async def handle_pool_status(request: web.Request) -> web.Response:
         # named follow-up, not built this cycle) — `serves_all` is additive
         # visibility, not a promise of finer-grained accounting.
         serves_all = _serves_all(b)
+        # C-1 (decision:1357): the free count uses _counts_free_slot — a
+        # backend with an explicit FULL dream-roles list is as capable as a
+        # serves-all one for the daemons' gating, and counting only
+        # serves-all silently zeroed free_slots (halting every dream daemon)
+        # for all-declared fleets. `counts_free_slot` is surfaced additively
+        # so a monitor can see WHY the count is what it is.
+        counts_free = _counts_free_slot(b)
         entry = {
             "inflight": _llm_inflight.get(b, 0),
             "oldest_inflight_age_s": age,
@@ -1829,6 +2005,7 @@ async def handle_pool_status(request: web.Request) -> web.Response:
             "reserved": b in _llm_reserved,
             "available": avail,
             "serves_all": serves_all,
+            "counts_free_slot": counts_free,
         }
         # Lazy wedge check (the one exception to "no upstream probes"): only
         # when a request has been in flight suspiciously long — busy-generating
@@ -1836,7 +2013,7 @@ async def handle_pool_status(request: web.Request) -> web.Response:
         if age is not None and age > LLM_WEDGE_SUSPECT_AGE and _session is not None:
             entry["suspect_wedged"] = not await _probe_backend_alive(_session, b)
         backends[b] = entry
-        free += 1 if (avail and serves_all) else 0
+        free += 1 if (avail and counts_free) else 0
     return web.json_response({"free_slots": free, "backends": backends})
 
 
@@ -2133,6 +2310,8 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
         "routing_no_eligible_backend_last_ts": _routing_no_eligible_backend_last_ts,
         "routing_fit_rejected": _routing_fit_rejected_count,
         "routing_fit_rejected_last_ts": _routing_fit_rejected_last_ts,
+        "routing_backend_at_capacity": _routing_backend_at_capacity_count,
+        "routing_backend_at_capacity_last_ts": _routing_backend_at_capacity_last_ts,
     }
     # Post-review addition A: per-backend cumulative token counters, IN-
     # PROCESS ONLY (reset on restart — deliberate, the ts pairing is what
@@ -2510,6 +2689,27 @@ def require_valid_llm_routing_config() -> None:
     )
 
 
+def warn_if_dream_slots_impossible() -> None:
+    """C-1 (decision:1357): if NO backend counts toward /pool/status
+    free_slots, every dream daemon (REM, NREM, relation_sweep) gates itself
+    off a permanent 0 and simply never runs — with no LLM call ever made, no
+    refusal counter ever fires, so without this warning the condition is
+    invisible everywhere. A partial-role fleet (e.g. every backend scoped to
+    a single function) is the remaining way to reach it; per-role slot
+    accounting stays deferred, so the honest answer today is a LOUD startup
+    line naming the fix. A warning, not a refusal — a gateway serving only
+    ad-hoc client traffic is legitimate."""
+    if any(_counts_free_slot(b) for b in LLM_BACKENDS):
+        return
+    log.warning(
+        "NO configured backend counts toward /pool/status free_slots (each "
+        "either declares a partial `roles` list or is private_ok=false with "
+        "no full roles list). The dream daemons (REM/NREM/relation_sweep) "
+        "gate on free_slots and will NEVER run against this fleet. Fix: give "
+        "at least one backend no `roles` field (with private_ok), or an "
+        "explicit roles list covering all of %s.", sorted(ROUTING_ROLE_NAMES))
+
+
 # A2 (post-review addition, operator 2026-08-18): lifecycle token-count sum
 # lines. Read independently here rather than importing coordinator's
 # _audit_writer — this write is DELIBERATELY never routed through
@@ -2585,6 +2785,7 @@ async def main() -> None:
     # require_valid_llm_routing_config()'s docstring for why this call
     # lives here too.
     require_valid_llm_routing_config()
+    warn_if_dream_slots_impossible()
 
     PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8888
 
