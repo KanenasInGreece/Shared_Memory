@@ -15,6 +15,11 @@
 --
 -- VARCHAR(n) → TEXT is binary-coercible: a metadata-only change, no table
 -- rewrite, no index rebuild. Idempotent — re-running sets the same type.
+--
+-- ⚠ If YOUR deployment added a VIEW or RULE over any of these three columns,
+-- Postgres refuses to alter the column type and this migration halts (cleanly
+-- and atomically — nothing half-applied). Drop the view, run the migration,
+-- recreate the view.
 
 BEGIN;
 
