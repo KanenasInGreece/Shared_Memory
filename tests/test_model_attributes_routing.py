@@ -798,6 +798,57 @@ def test_f3_free_slots_excludes_role_scoped_backend(monkeypatch):
     assert d["backends"]["http://b:4000"]["serves_all"] is True
 
 
+# ── I-4: the gateway performs no NEW retry on truncation or 4xx/5xx ─────────
+
+class _FixedFaultBodySession:
+    """A single 429 response, once — a second call in this test would prove
+    a retry happened."""
+    closed = False
+
+    def __init__(self):
+        self.calls = 0
+
+    def request(self, *a, **kw):
+        self.calls += 1
+
+        class _Resp:
+            status = 429
+            headers = {}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            class content:
+                @staticmethod
+                async def iter_any():
+                    if False:
+                        yield b""
+
+            async def prepare(self, request):
+                return None
+
+        return _Resp()
+
+
+def test_i4_no_gateway_retry_on_a_4xx_5xx_status(monkeypatch):
+    """I-4: a plain upstream fault status (not the stale-connection-reset
+    class the pre-existing retry exists for) must reach the client on the
+    FIRST attempt — the model-attributes routing cycle adds no new retry
+    behavior; the capacity WAIT loop never issues an upstream call at all
+    (see test_i8b_capacity_wait_exhausted_never_touches_inflight), and the
+    eligibility/fit pre-filter runs entirely before any upstream call too."""
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000"}]))
+    g = _fresh(monkeypatch)
+    proxy = g.AsyncHiveMindProxy()
+    session = _FixedFaultBodySession()
+    proxy.session = session
+    asyncio.run(proxy.handle_proxy(_req({}, _body())))
+    assert session.calls == 1
+
+
 # ── N-4: dream_telemetry prompt_chars ────────────────────────────────────────
 
 def test_n4_record_llm_call_prompt_chars_additive(monkeypatch):
