@@ -5,6 +5,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.10] — 2026-08-18
+
+### Changed — project-name resolution has ONE path: the registry alias table
+
+- **The `PROJECT_ALIASES` environment rewrite is retired.** It predated the registry's
+  `project_aliases` table and ran in series ahead of it at save ingress — a plain string
+  rewrite with no adjudication trail, bypassing the table's invariants (disjoint
+  namespaces, one active mapping per alias). When the two layers disagreed, the env layer
+  won silently. Ingress resolution now happens exactly once, in the registry: a
+  registered name passes, a retired spelling resolves through `project_aliases` in one
+  hop, anything else is refused loudly with proposals. Deployments carrying
+  `PROJECT_ALIASES` should move those mappings into the alias table; the variable is
+  inert from this release.
+
+### Fixed
+
+- **The alias rewrite moves every carrier of the retired spelling.** It rewrote only the
+  field the alias was read from (`decision.project` *or* top-level `project`), so a
+  record carrying its project in both places could keep the retired spelling in one —
+  leaving its Postgres metadata and graph axis disagreeing about which project it
+  belongs to. Every carrier equal to the resolved spelling now moves, and only those,
+  so a carrier naming a different project is never clobbered.
+
+---
+
 ## [0.9.9] — 2026-08-17
 
 ### Security — chokepoint governance (PR A5, final of the credential-custody workstream)

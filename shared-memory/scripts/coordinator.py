@@ -142,7 +142,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.9"
+FRAMEWORK_VERSION = "0.9.10"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -1739,29 +1739,6 @@ def _consolidation_rollup(by_type: dict, any_stalled: bool, started_at: dict,
         "last_deferred_reason": latest["last_deferred_reason"] if latest else None,
         "last_active_cycle_type": latest_ct,
     }
-
-# Canonical project names (decision pg_id 276): the project folder name is
-# canonical, and free-text drift ("shared_memory" vs "shared-memory") breaks
-# the insight gate's ≥2-distinct-projects rule. PROJECT_ALIASES maps legacy
-# spellings to the canonical name at ingress, e.g.
-#   PROJECT_ALIASES="shared_memory=shared-memory-GitHub,shared-memory=shared-memory-GitHub"
-# Empty (default) = no rewriting. One-time backfill of existing rows/nodes:
-# scripts/normalize_projects.py.
-def _parse_project_aliases(raw: str) -> dict[str, str]:
-    aliases = {}
-    for pair in raw.split(","):
-        old, sep, new = pair.partition("=")
-        if sep and old.strip() and new.strip():
-            aliases[old.strip()] = new.strip()
-    return aliases
-
-
-PROJECT_ALIASES = _parse_project_aliases(os.environ.get("PROJECT_ALIASES", ""))
-
-
-def _normalize_project(name):
-    return PROJECT_ALIASES.get(name, name) if isinstance(name, str) else name
-
 
 
 # Cypher write-operation guard — reject queries containing mutating keywords.
@@ -3383,11 +3360,17 @@ class MemoryCoordinator:
         if canonical is not None:
             log.info("project alias: %r → %r (record stored as the canonical name)",
                      supplied, canonical)
-            if isinstance(metadata.get("decision"), dict) and \
-                    metadata["decision"].get("project"):
-                metadata["decision"]["project"] = canonical
-            else:
+            # EVERY carrier holding the retired spelling moves — not just the
+            # field the alias was read from. Rewriting one and not the other
+            # leaves a record whose Postgres metadata and graph axis disagree
+            # about which project it belongs to. Only fields equal to the
+            # resolved spelling are touched, so a carrier naming a different
+            # project is never clobbered.
+            if metadata.get("project") == supplied:
                 metadata["project"] = canonical
+            if isinstance(metadata.get("decision"), dict) and \
+                    metadata["decision"].get("project") == supplied:
+                metadata["decision"]["project"] = canonical
             return None
 
         # P9 — the second submission is ACCEPTED, in any of its three forms: pick
@@ -3997,17 +3980,6 @@ class MemoryCoordinator:
         # _apply_principal / decision 347.
         if isinstance(metadata, dict):
             _apply_principal(metadata, request.get("principal"))
-            body["metadata"] = metadata
-
-        # Project-name normalisation (decision 276): canonical = folder name.
-        # Applied before the row and its outbox params are written so the
-        # graph Project node and the Postgres metadata never drift again.
-        if isinstance(metadata, dict):
-            if metadata.get("project"):
-                metadata["project"] = _normalize_project(metadata["project"])
-            decision_blob = metadata.get("decision")
-            if isinstance(decision_blob, dict) and decision_blob.get("project"):
-                decision_blob["project"] = _normalize_project(decision_blob["project"])
             body["metadata"] = metadata
 
         if not content:
