@@ -160,6 +160,34 @@ async def test_a_decisions_retired_spelling_is_rewritten_in_the_decision_blob():
     assert metadata["decision"]["project"] == "shared-memory-GitHub"
 
 
+@pytest.mark.asyncio
+async def test_the_alias_rewrite_moves_every_carrier_of_the_retired_spelling():
+    """A record can carry its project twice — top-level and inside the decision
+    blob. Rewriting only the field the alias was read from leaves the other one
+    holding the retired spelling, and the record's Postgres metadata and graph
+    axis then disagree about which project it belongs to."""
+    coord = _coord(registered=("shared-memory-GitHub",))
+    coord._resolve_project_alias = AsyncMock(return_value="shared-memory-GitHub")
+    metadata = {"type": "decision", "project": "shared_memory",
+                "decision": {"project": "shared_memory"}}
+    assert await coord._project_ingress_error(metadata, "c") is None
+    assert metadata["project"] == "shared-memory-GitHub"
+    assert metadata["decision"]["project"] == "shared-memory-GitHub"
+
+
+@pytest.mark.asyncio
+async def test_the_alias_rewrite_never_touches_a_carrier_naming_something_else():
+    """Only fields equal to the spelling that resolved are rewritten — a carrier
+    naming a different value is not clobbered by the alias of its neighbour."""
+    coord = _coord(registered=("shared-memory-GitHub",))
+    coord._resolve_project_alias = AsyncMock(return_value="shared-memory-GitHub")
+    metadata = {"type": "decision", "project": "something-else",
+                "decision": {"project": "shared_memory"}}
+    assert await coord._project_ingress_error(metadata, "c") is None
+    assert metadata["project"] == "something-else"
+    assert metadata["decision"]["project"] == "shared-memory-GitHub"
+
+
 # ── P9 — the second submission is accepted, in three forms ──────────────────
 
 @pytest.mark.asyncio

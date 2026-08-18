@@ -2104,34 +2104,6 @@ async def test_apply_retrospective_with_superseded_sets_graph_flag():
     assert "HAD_OUTCOME" in cypher
 
 
-@pytest.mark.asyncio
-async def test_save_normalizes_project_aliases_at_ingress():
-    """PROJECT_ALIASES rewrites metadata.project and decision.project before
-    the row and outbox params are written (decision 276: canonical = folder name)."""
-    c, mock_conn, _ = _coordinator_with_mocks()
-    mock_conn.fetchrow = AsyncMock(return_value={"id": 7})
-
-    with patch.dict(coordinator_mod.PROJECT_ALIASES,
-                    {"shared_memory": "shared-memory-GitHub"}, clear=True):
-        req = _make_request({
-            "content": "decision text",
-            "metadata": {
-                "source": "claude_code",
-                "project": "shared_memory",
-                "type": "decision",
-                "decision": {"decided_by": "X", "project": "shared_memory",
-                             "rationale": "because"},
-            },
-        })
-        with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
-            resp = await c.handle_save(req)
-
-    assert resp.status == 200
-    saved_metadata = mock_conn.fetchrow.call_args.args[2]
-    assert saved_metadata["project"] == "shared-memory-GitHub"
-    assert saved_metadata["decision"]["project"] == "shared-memory-GitHub"
-
-
 def test_embed_truncates_oversized_input():
     """BGE-M3 8192-ctx guard: embedding input over EMBED_MAX_CHARS is truncated."""
     import asyncio
