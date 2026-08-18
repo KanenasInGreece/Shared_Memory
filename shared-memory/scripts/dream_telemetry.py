@@ -290,9 +290,18 @@ def record_llm_call(
     ceiling_s: float | None = None,
     ok: bool = True,
     note: str | None = None,
+    specimen: str | None = None,
 ) -> dict:
     """Record one dream-cycle LLM call. Never raises (telemetry must not break a
-    daemon cycle). Returns the record dict for callers that want to inspect it."""
+    daemon cycle). Returns the record dict for callers that want to inspect it.
+
+    `specimen` is an additive, optional pass-through (L0-a) — a bounded tail
+    of a truncated completion body, already size-capped by the caller
+    (REM_TRUNCATION_SPECIMEN_CHARS). It is written verbatim into the JSONL
+    row when present and omitted (None) otherwise; this function does not
+    bound or validate it. `note`/`ok` keep their existing meanings — a
+    truncation classification (L0-b) is carried in `note`, it never flips `ok`
+    (N4: additive keys only, no existing key changes meaning)."""
     t = (resp_json or {}).get("timings") or {}
     usage = (resp_json or {}).get("usage") or {}
     tok_s = t.get("predicted_per_second")
@@ -313,6 +322,7 @@ def record_llm_call(
         ),
         "ok": ok,
         "note": note,
+        "specimen": specimen,
     }
     try:
         logger.info(

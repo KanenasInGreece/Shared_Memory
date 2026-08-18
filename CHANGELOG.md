@@ -5,6 +5,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.12] — 2026-08-18
+
+### Fixed — degenerate REM truncations stop being fed a bigger budget
+
+- **Truncated solo enrichments are now classified before they retry.** A month of
+  dead-letters traced not to capacity but to degenerate repetition loops — a looping
+  generation consumes whatever cap it is given, so the existing retry-at-double-the-bound
+  handed every loop twice the budget to repeat into. A truncated completion is now
+  classified by two parse-free rules over the raw body (the same flat JSON object
+  appearing ≥3 times, or the same ≥30-char string appearing ≥3 times — measured on a live
+  specimen where 120 of 123 array entries were duplicates): a **degenerate** truncation
+  retries once at the **same** bound (a fresh sampling draw, not a bigger budget), an
+  **honest** one keeps the existing widened retry, and either still fails the unit if the
+  retry truncates too. Worst case per looping attempt drops from 4,500 to 3,000 tokens.
+- **Every truncation now leaves an inspectable specimen.** A bounded, sanitised tail of
+  the completion body (`REM_TRUNCATION_SPECIMEN_CHARS`, default 500; zero disables — and
+  yields nothing, not everything) goes to the journal WARN and the dream-metrics row,
+  which also carries the classification (`degenerate` / `truncated_honest`). Previously
+  the body was discarded and the loop mechanism was invisible for a month. The truncated
+  body itself is still never parsed or persisted.
+- **SKILL.md's worked examples move with the version again** (they had stayed at an older
+  release through two bumps; the enforcing test is red on such a miss).
+
+---
+
 ## [0.9.11] — 2026-08-18
 
 ### Added — per-backend request-body overrides (`extra_body`)

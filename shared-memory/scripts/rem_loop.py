@@ -83,10 +83,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 import httpx
@@ -326,13 +327,25 @@ REM_MAX_TOKENS_PER_SUMMARY = int(os.environ.get("REM_MAX_TOKENS_PER_SUMMARY", "2
 REM_MAX_TOKENS_PER_VERIFY_EDGE = int(os.environ.get("REM_MAX_TOKENS_PER_VERIFY_EDGE", "20"))
 REM_VERIFY_MAX_TOKENS_FLOOR    = 64
 
-# On a truncated generation the bound is widened ONCE and the call retried
-# before the unit is failed. A FIXED bound plus the attempt cap below would
-# otherwise silently dead-letter any record that DETERMINISTICALLY needs more
-# output than the bound — permanent, invisible exclusion from the graph, which
-# is the very failure the truncation rule exists to prevent. Truncation still
-# fails the unit; it just gets one wider try first.
+# On a truncated generation the retry differs by CLASS (L0-b, fact:1329/1330,
+# pre-build review fact:1346). An HONEST truncation — the record legitimately
+# needs more room — gets the bound widened ONCE and the call retried before
+# the unit is failed: a FIXED bound plus the attempt cap below would otherwise
+# silently dead-letter any record that DETERMINISTICALLY needs more output
+# than the bound, permanent invisible exclusion from the graph, which is the
+# very failure this widening exists to prevent. A DEGENERATE truncation (a
+# repetition loop — see truncation_is_degenerate below) gets exactly one retry
+# at the SAME bound instead: widening only hands the loop a bigger budget to
+# repeat into, it never fixes it. Either class still fails the unit if the
+# retry also truncates.
 REM_TRUNCATION_RETRY_FACTOR = float(os.environ.get("REM_TRUNCATION_RETRY_FACTOR", "2.0"))
+
+# Bounded tail of a truncated completion body kept for diagnosis — the journal
+# WARN/ERROR line and the dream-metrics JSONL row, never the persisted record
+# (a truncated body is never parsed or saved; see truncation_is_degenerate and
+# N3 below). Same disclosure class as the raw[:300]/resp.text[:200] excerpts
+# already logged elsewhere in this file (fact:1346 F-8).
+REM_TRUNCATION_SPECIMEN_CHARS = int(os.environ.get("REM_TRUNCATION_SPECIMEN_CHARS", "500"))
 
 # Poison-record escape hatch: a record whose enrichment failed this many times
 # is DEAD-LETTERED — excluded from the fetch until the operator resets
@@ -373,7 +386,8 @@ REM_STARVED_THRESHOLD = int(os.environ.get("REM_STARVED_THRESHOLD", "3"))
 
 # LLM failure classes recorded on REMDaemon._last_llm_failure.
 LLM_FAIL_TRANSPORT = "transport"   # HTTP non-200 / connection / gateway-shape — NOT chargeable
-LLM_FAIL_TRUNCATED = "truncated"   # finish_reason=length even after the widened retry
+LLM_FAIL_TRUNCATED = "truncated"   # finish_reason=length even after the retry (widened for
+                                    # an honest truncation, same-bound for a degenerate one)
 LLM_FAIL_PARSE     = "parse"       # response arrived but its content is unusable
 
 # Failure classes that may count toward a record's dead-letter cap.
@@ -402,6 +416,91 @@ def _truncated(resp_json) -> bool:
     Semantics are FAIL-THE-UNIT: the response body must not be parsed,
     repaired, persisted, or fed to any downstream gate."""
     return _finish_reason(resp_json) == "length"
+
+
+def _completion_text(resp_json) -> str:
+    """Best-effort raw completion body — used ONLY for truncation
+    classification/specimen capture (L0-a/b), never for parsing or
+    persisting. Defensive against an unexpected envelope shape; empty string
+    on anything it can't read, which is exactly what truncation_is_degenerate
+    fails open on."""
+    try:
+        content = (resp_json.get("choices") or [{}])[0].get("message", {}).get("content")
+    except (AttributeError, IndexError, TypeError):
+        return ""
+    # A non-string content (list/dict envelope variants) must not escape: the
+    # solo call site classifies OUTSIDE any try, so a passed-through non-str
+    # would abort the whole REM cycle (fact:1347 S-2, executed).
+    return content if isinstance(content, str) else ""
+
+
+# Parse-free flat-object extractor: matches the innermost `{...}` spans (no
+# nested braces), which is exactly the shape a JSON array of relationship
+# objects degenerates into under repetition — this never attempts to parse
+# the body as JSON (N3: a truncated body is classified, never parsed).
+_FLAT_OBJECT_RE = re.compile(r"\{[^{}]*\}")
+# Quoted strings >=30 chars — Decision extras (considered/rejected/...) are
+# STRING arrays, not objects, and a summary is prose, so an object-only
+# detector calls a sentence loop honest (pre-build review F-6). The length
+# floor keeps short schema tokens (rel_types, keys) from ever counting.
+_LONG_STRING_RE = re.compile(r'"([^"]{30,})"')
+
+
+def truncation_is_degenerate(body: str) -> bool:
+    """True when a truncated completion body shows LOOP repetition rather
+    than legitimately running out of room (L0-b, fact:1329/1330, pre-build
+    review fact:1346 F-1/F-4/F-6). Either of two independent rules firing
+    calls it degenerate; empty/garbage/non-JSON text fails OPEN (False) — the
+    classifier only shortcuts an ALREADY-truncated call, it never gates one.
+
+    OBJECT rule: any flat `{...}` object (whitespace-normalised) occurring
+    >=3 times. Measured on the probe-2 specimen: 120 of 123 `relationships`
+    entries were exact duplicates of 22 distinct triples, max one triple x12.
+
+    LONG-STRING rule: any single quoted string >=30 chars occurring >=3
+    times — catches a Decision-extras / summary repetition loop the OBJECT
+    rule structurally cannot see.
+
+    Both thresholds are operator-accepted as conservative-but-unmeasured
+    (fact:1338): re-measure against the specimen corpus this change
+    accumulates (the dream-metrics `specimen` key) before tightening or
+    loosening either one.
+    """
+    if not body or not body.strip():
+        return False
+
+    objects = _FLAT_OBJECT_RE.findall(body)
+    if objects:
+        normalised = (" ".join(o.split()) for o in objects)
+        if max(Counter(normalised).values()) >= 3:
+            return True
+
+    strings = _LONG_STRING_RE.findall(body)
+    if strings:
+        if max(Counter(strings).values()) >= 3:
+            return True
+
+    return False
+
+
+def _truncation_specimen(body: str) -> str:
+    """Bounded, single-line tail of a truncated completion body for the
+    journal WARN and the dream-metrics `specimen` key — never the full body.
+    Last REM_TRUNCATION_SPECIMEN_CHARS characters (the array elements a max-
+    tokens cut lands on), newlines collapsed so it stays one log line.
+
+    Zero or negative means DISABLED and must yield the empty string — slicing
+    with `[-0:]` is `[0:]`, so without this guard the value an operator picks
+    to turn specimens OFF would log the ENTIRE body (security review
+    fact:1347 S-1, executed: a 44,000-char body logged whole at CHARS=0).
+    Non-printables beyond whitespace (ESC/CSI, NUL, BS) are replaced so
+    crafted model output cannot smuggle terminal control sequences into
+    journalctl (S-4); the JSONL sink is safe either way (json.dumps)."""
+    n = REM_TRUNCATION_SPECIMEN_CHARS
+    if n <= 0:
+        return ""
+    tail = " ".join((body or "")[-n:].split())
+    return "".join(ch if ch.isprintable() else " " for ch in tail)
 
 
 def _drop_final_nonempty_line(raw: str) -> str:
@@ -2237,8 +2336,12 @@ class REMDaemon:
         model = "local-model"
 
         async def _attempt(max_tokens: int):
-            """One round-trip → (resp_json | None, model, failure).
-            failure is None when a complete (untruncated) body came back."""
+            """One round-trip → (resp_json | None, model, failure, degenerate).
+            failure is None when a complete (untruncated) body came back.
+            `degenerate` is only meaningful when failure == LLM_FAIL_TRUNCATED
+            — classified on the RAW completion text via truncation_is_degenerate,
+            never on resp_json, so N3 holds structurally: a truncated body is
+            classified but never parsed."""
             nonlocal model
             _start = time.monotonic()
             try:
@@ -2261,7 +2364,7 @@ class REMDaemon:
                 # ("LLM error:" with nothing after it tells the next reader
                 # nothing about whether it timed out, reset, or refused).
                 logger.error("LLM error: %s: %s", type(exc).__name__, exc)
-                return None, model, LLM_FAIL_TRANSPORT
+                return None, model, LLM_FAIL_TRANSPORT, False
             _backend = resp.headers.get("X-SM-LLM-Backend")
             model = _backend or "local-model"
             if resp.status_code != 200:
@@ -2269,39 +2372,77 @@ class REMDaemon:
                                 wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
                                 ok=False, note=f"http_{resp.status_code}")
                 logger.error("LLM returned %d: %s", resp.status_code, resp.text[:200])
-                return None, model, LLM_FAIL_TRANSPORT
+                return None, model, LLM_FAIL_TRANSPORT, False
             try:
                 resp_json = resp.json()
             except Exception as exc:
                 logger.error("LLM response was not JSON (%s): %s", exc, resp.text[:200])
-                return None, model, LLM_FAIL_TRANSPORT
+                return None, model, LLM_FAIL_TRANSPORT, False
+            if _truncated(resp_json):
+                body = _completion_text(resp_json)
+                degenerate = truncation_is_degenerate(body)
+                specimen = _truncation_specimen(body)
+                note = "degenerate" if degenerate else "truncated_honest"
+                logger.warning(
+                    "REM: pg_id=%s solo LLM call TRUNCATED at max_tokens=%d "
+                    "(%s) — specimen(last %d chars): %s",
+                    pg_id, max_tokens, note, REM_TRUNCATION_SPECIMEN_CHARS, specimen,
+                )
+                record_llm_call("REM", resp_json, backend=_backend,
+                                wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
+                                note=note, specimen=specimen)
+                return None, model, LLM_FAIL_TRUNCATED, degenerate
             record_llm_call("REM", resp_json, backend=_backend,
                             wall_s=time.monotonic() - _start, ceiling_s=_ceiling)
-            if _truncated(resp_json):
-                return None, model, LLM_FAIL_TRUNCATED
-            return resp_json, model, None
+            return resp_json, model, None, False
 
-        resp_json, model, failure = await _attempt(REM_MAX_TOKENS_SOLO)
+        resp_json, model, failure, degenerate = await _attempt(REM_MAX_TOKENS_SOLO)
 
-        # Widen ONCE and retry before failing a truncated unit (F4) — a fixed
-        # bound plus the attempt cap would otherwise dead-letter, silently and
+        # The retry differs by CLASS (L0-b): an HONEST truncation gets the
+        # bound widened ONCE before the unit fails (F4) — a fixed bound plus
+        # the attempt cap would otherwise dead-letter, silently and
         # permanently, any record that simply needs more output than the
-        # default. Truncation still fails the unit if the wider try also cuts.
+        # default. A DEGENERATE truncation (repetition loop, fact:1329/1330)
+        # gets exactly one retry at the SAME bound instead — the retry is a
+        # fresh sampling draw, not a bigger budget for the loop to repeat
+        # into. Either class still fails the unit if the retry also truncates.
         if failure == LLM_FAIL_TRUNCATED:
-            wider = int(REM_MAX_TOKENS_SOLO * REM_TRUNCATION_RETRY_FACTOR)
-            logger.warning(
-                "REM: pg_id=%s solo enrichment TRUNCATED at max_tokens=%d — "
-                "retrying ONCE at %d before failing the unit",
-                pg_id, REM_MAX_TOKENS_SOLO, wider,
-            )
-            resp_json, model, failure = await _attempt(wider)
-            if failure == LLM_FAIL_TRUNCATED:
-                logger.error(
-                    "REM: pg_id=%s solo enrichment TRUNCATED again at max_tokens=%d "
-                    "(finish_reason=length) — failing the unit; no parse, no repair. "
-                    "Raise REM_MAX_TOKENS_SOLO if this record is legitimately large.",
-                    pg_id, wider,
+            if degenerate:
+                retry_bound = REM_MAX_TOKENS_SOLO
+                logger.warning(
+                    "REM: pg_id=%s solo enrichment TRUNCATED (degenerate) at "
+                    "max_tokens=%d — retrying ONCE at the SAME bound before "
+                    "failing the unit",
+                    pg_id, REM_MAX_TOKENS_SOLO,
                 )
+            else:
+                retry_bound = int(REM_MAX_TOKENS_SOLO * REM_TRUNCATION_RETRY_FACTOR)
+                logger.warning(
+                    "REM: pg_id=%s solo enrichment TRUNCATED at max_tokens=%d — "
+                    "retrying ONCE at %d before failing the unit",
+                    pg_id, REM_MAX_TOKENS_SOLO, retry_bound,
+                )
+            resp_json, model, failure, degenerate = await _attempt(retry_bound)
+            if failure == LLM_FAIL_TRUNCATED:
+                if degenerate:
+                    logger.error(
+                        "REM: pg_id=%s solo enrichment TRUNCATED again "
+                        "(degenerate) at max_tokens=%d — failing the unit; "
+                        "no parse, no repair. Raising REM_MAX_TOKENS_SOLO "
+                        "does not fix a repetition loop (fact:1329/1330); if "
+                        "this record dead-letters with DIFFERING specimens "
+                        "each attempt, suspect a classifier false positive "
+                        "instead.",
+                        pg_id, retry_bound,
+                    )
+                else:
+                    logger.error(
+                        "REM: pg_id=%s solo enrichment TRUNCATED again at "
+                        "max_tokens=%d (finish_reason=length) — failing the "
+                        "unit; no parse, no repair. Raise REM_MAX_TOKENS_SOLO "
+                        "if this record is legitimately large.",
+                        pg_id, retry_bound,
+                    )
 
         if failure is not None:
             # Fail-the-unit: the body is never handed to _parse_llm_json /
@@ -2405,26 +2546,40 @@ class REMDaemon:
                     return None, None, model
                 resp_json = resp.json()
                 _wall_s = time.monotonic() - _start
-                record_llm_call("REM", resp_json, backend=_backend,
-                                wall_s=_wall_s, ceiling_s=_ceiling,
-                                note=f"batch={len(items)}")
                 call_timing = call_timing_summary(
                     resp_json, _wall_s, backend=_backend,
                     batch_size=len(items), prompt_chars=len(prompt))
                 truncated = _truncated(resp_json)
                 raw = resp_json["choices"][0]["message"]["content"]
+                # L0-a: specimen logging extends to batch GENERATION calls
+                # (not verify — F-9, a confirm/deny tail is near-worthless).
+                # No RETRY POLICY change for batch (L0-b is solo-only); the
+                # classifier here is informational, feeding the re-measurement
+                # corpus the specimen accumulates, same as the solo call site.
+                if truncated:
+                    degenerate = truncation_is_degenerate(raw)
+                    specimen = _truncation_specimen(raw)
+                    _note = "degenerate" if degenerate else "truncated_honest"
+                    logger.warning(
+                        "REM batch: response TRUNCATED at max_tokens=%d "
+                        "(batch=%d, %s) — specimen(last %d chars): %s — "
+                        "salvaging strictly-parsed complete lines only (no "
+                        "json_repair), final line dropped; missing facts retry",
+                        _max_tokens, len(items), _note,
+                        REM_TRUNCATION_SPECIMEN_CHARS, specimen,
+                    )
+                    record_llm_call("REM", resp_json, backend=_backend,
+                                    wall_s=_wall_s, ceiling_s=_ceiling,
+                                    note=_note, specimen=specimen)
+                else:
+                    record_llm_call("REM", resp_json, backend=_backend,
+                                    wall_s=_wall_s, ceiling_s=_ceiling,
+                                    note=f"batch={len(items)}")
         except Exception as exc:
             logger.error("REM batch LLM error: %s: %s", type(exc).__name__, exc)
             self._last_llm_failure = LLM_FAIL_TRANSPORT
             return None, None, model
         self._last_llm_failure = LLM_FAIL_TRUNCATED if truncated else None
-        if truncated:
-            logger.warning(
-                "REM batch: response TRUNCATED at max_tokens=%d (batch=%d) — "
-                "salvaging strictly-parsed complete lines only (no json_repair), "
-                "final line dropped; missing facts retry",
-                _max_tokens, len(items),
-            )
         return (self._parse_jsonl_batch(raw, idx_to_pg, require_summary,
                                         truncated=truncated),
                 call_timing, model)
