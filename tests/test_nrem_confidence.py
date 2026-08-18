@@ -547,10 +547,11 @@ def test_assemble_insight_content_includes_reversal_lines_verbatim():
 
 def _capture_nrem(monkeypatch, reply="SLOT 1: rationale.\nPRINCIPLE: p."):
     captured = {"prompts": []}
-    async def fake_post(client, payload, ceiling_s=None):
+    async def fake_post(client, payload, ceiling_s=None, prompt_chars=None):
         captured["prompts"].append(payload["messages"][1]["content"])
         class R:
             status_code = 200
+            headers = {}
             def json(self):
                 return {"choices": [{"message": {"content": reply}}]}
         return R()
@@ -579,11 +580,12 @@ async def test_generate_insight_slots_missing_slot_gets_one_bounded_retry(monkey
         "SLOT 2: rationale two.",                               # retry supplies it
     ])
     captured = {"prompts": []}
-    async def fake_post(client, payload, ceiling_s=None):
+    async def fake_post(client, payload, ceiling_s=None, prompt_chars=None):
         captured["prompts"].append(payload["messages"][1]["content"])
         reply = next(replies)
         class R:
             status_code = 200
+            headers = {}
             def json(self):
                 return {"choices": [{"message": {"content": reply}}]}
         return R()

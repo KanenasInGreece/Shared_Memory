@@ -30,6 +30,7 @@ from multidict import CIMultiDict
 # every secret it held. It is now the shared split loader also used by
 # rem_loop.py and consolidation_loop.py — see secure_env.py.
 from secure_env import load_split_env, get_secret, is_secret_key  # noqa: E402
+from log_hygiene import append_secure  # noqa: E402
 
 load_split_env()
 
@@ -160,7 +161,80 @@ def _parse_backend(entry: str) -> tuple[str, float]:
     return url.rstrip("/"), max(weight, 0.1)
 
 
-def _load_llm_backends() -> tuple[list[str], dict[str, float], dict[str, "str | None"], dict[str, "str | None"], dict[str, "dict | None"]]:
+# Model-attributes routing (Model_Attributes_Routing_Plan_2026-08-18, REVISED
+# DESIGN). Descriptor schema, additive to the existing url/weight/token_env/
+# model/extra_body fields:
+#   roles          list from {extract, verify, judge} ("summarize" is
+#                  RESERVED — NREM narrative folds are zero-inference by
+#                  construction, the only NREM LLM path is insight folds =
+#                  "judge"). Absent = serves all (homogeneous-fleet degenerate
+#                  case, every existing install unchanged).
+#   n_ctx          int, the model's usable context in tokens. Absent = no fit
+#                  information (this backend always "fits").
+#   private_ok     bool. Default = (no token_env present) — an uncredentialed
+#                  (local) backend defaults True, a provider-credentialed one
+#                  defaults False. An EXPLICIT value always wins either way.
+#   max_inflight   int, per-backend concurrency ceiling. Absent = unbounded
+#                  (today's behavior).
+#   price_per_mtok_in / price_per_mtok_out — optional operator metadata,
+#                  stored + surfaced on /health for the MONITOR to multiply.
+#                  NEVER used in any routing decision here — the gateway
+#                  stays price-agnostic (M-4 honesty note).
+ROUTING_ROLE_NAMES = frozenset({"extract", "verify", "judge"})
+RESERVED_ROLE_NAMES = frozenset({"summarize"})
+
+
+def _load_llm_backends() -> tuple[
+        list[str], dict[str, float], dict[str, "str | None"], dict[str, "str | None"],
+        dict[str, "dict | None"], dict[str, "frozenset[str] | None"], dict[str, "int | None"],
+        dict[str, bool], dict[str, bool], dict[str, "int | None"],
+        dict[str, "float | None"], dict[str, "float | None"], list[str]]:
+    """Returns (urls, weights, tokens, models, extras, roles, n_ctx, private_ok,
+    private_ok_explicit, max_inflight, price_in, price_out, role_config_errors).
+
+    `role_config_errors` collects a human-readable message per backend whose
+    `roles` list names something outside ROUTING_ROLE_NAMES — collected here
+    (module import time, so every test that imports this module freely still
+    collects cleanly) rather than raised here. The actual SystemExit lives in
+    require_valid_llm_routing_config(), called from main() ONLY — same
+    placement reasoning as require_auth_when_provider_keys_configured()."""
+    role_config_errors: list[str] = []
+
+    def _parse_roles(url: str, raw) -> "frozenset[str] | None":
+        if raw is None:
+            return None
+        if not isinstance(raw, list):
+            role_config_errors.append(
+                f"{url}: roles must be a JSON array, got {type(raw).__name__}")
+            return frozenset()
+        if not raw:
+            # R-3 (decision:1357): an EMPTY roles list makes the backend
+            # eligible for nothing — every request 422s — and it must not
+            # sidestep the M-5 explicit-choice refusal (which tests `is
+            # None`). A backend that serves nothing is a config mistake, not
+            # a scope; refuse loudly at startup.
+            role_config_errors.append(
+                f"{url}: roles is an EMPTY list — this backend would be "
+                f"eligible for NOTHING (every request refused). Either omit "
+                f"`roles` (serves all) or list at least one of "
+                f"{sorted(ROUTING_ROLE_NAMES)}.")
+            return frozenset()
+        names = {str(r).strip().lower() for r in raw}
+        bad = names - ROUTING_ROLE_NAMES
+        if bad:
+            reserved_hit = bad & RESERVED_ROLE_NAMES
+            if reserved_hit:
+                role_config_errors.append(
+                    f"{url}: roles names {sorted(reserved_hit)} — RESERVED, not "
+                    f"accepted (NREM narrative folds are zero-inference; the only "
+                    f"NREM LLM path is judge). Allowed: {sorted(ROUTING_ROLE_NAMES)}")
+            unknown = bad - RESERVED_ROLE_NAMES
+            if unknown:
+                role_config_errors.append(
+                    f"{url}: unknown role name(s) {sorted(unknown)} — allowed: "
+                    f"{sorted(ROUTING_ROLE_NAMES)}")
+        return frozenset(names & ROUTING_ROLE_NAMES)
+
     raw_json = os.environ.get("LLM_BACKENDS_JSON", "").strip()
     if raw_json:
         try:
@@ -175,6 +249,13 @@ def _load_llm_backends() -> tuple[list[str], dict[str, float], dict[str, "str | 
         tokens: dict[str, "str | None"] = {}
         models: dict[str, "str | None"] = {}
         extras: dict[str, "dict | None"] = {}
+        roles: dict[str, "frozenset[str] | None"] = {}
+        n_ctxs: dict[str, "int | None"] = {}
+        private_oks: dict[str, bool] = {}
+        private_ok_explicit: dict[str, bool] = {}
+        max_inflights: dict[str, "int | None"] = {}
+        price_ins: dict[str, "float | None"] = {}
+        price_outs: dict[str, "float | None"] = {}
         for entry in entries:
             url = str(entry.get("url", "")).rstrip("/")
             if not url:
@@ -230,13 +311,55 @@ def _load_llm_backends() -> tuple[list[str], dict[str, float], dict[str, "str | 
                     "(%r) — excluding this backend from the pool.",
                     url, type(extra_body).__name__)
                 continue
+            # R-2 + Optional (decision:1357): both int fields must be a REAL
+            # int >= 1 — bool is an int subclass in Python (True passes a
+            # bare isinstance check), and 0/negative values are traps:
+            # max_inflight=0 makes the backend permanently at-cap (every
+            # request waits the full window then 503s), n_ctx=0 silently
+            # disables the fit check via `if not n_ctx`.
+            n_ctx_raw = entry.get("n_ctx")
+            if n_ctx_raw is not None and (not isinstance(n_ctx_raw, int)
+                                          or isinstance(n_ctx_raw, bool)
+                                          or n_ctx_raw < 1):
+                log.error(
+                    "LLM_BACKENDS_JSON entry for %s has an invalid n_ctx "
+                    "(%r — must be an integer >= 1) — excluding this backend "
+                    "from the pool.", url, n_ctx_raw)
+                continue
+            max_inflight_raw = entry.get("max_inflight")
+            if max_inflight_raw is not None and (not isinstance(max_inflight_raw, int)
+                                                 or isinstance(max_inflight_raw, bool)
+                                                 or max_inflight_raw < 1):
+                log.error(
+                    "LLM_BACKENDS_JSON entry for %s has an invalid max_inflight "
+                    "(%r — must be an integer >= 1) — excluding this backend "
+                    "from the pool.", url, max_inflight_raw)
+                continue
+            private_ok_raw = entry.get("private_ok")
+            if private_ok_raw is not None and not isinstance(private_ok_raw, bool):
+                log.error(
+                    "LLM_BACKENDS_JSON entry for %s has a non-boolean private_ok "
+                    "(%r) — excluding this backend from the pool.",
+                    url, private_ok_raw)
+                continue
             urls.append(url)
             weights[url] = max(float(entry.get("weight", 1.0) or 1.0), 0.1)
             tokens[url] = token
             models[url] = entry.get("model") or None
             extras[url] = extra_body or None
+            roles[url] = _parse_roles(url, entry.get("roles"))
+            n_ctxs[url] = n_ctx_raw
+            max_inflights[url] = max_inflight_raw
+            # Default = (no token_env present): uncredentialed/local backend
+            # defaults True, provider-credentialed defaults False. Explicit
+            # value (private_ok_raw is not None) always wins either way.
+            private_ok_explicit[url] = private_ok_raw is not None
+            private_oks[url] = private_ok_raw if private_ok_raw is not None else (token is None)
+            price_ins[url] = entry.get("price_per_mtok_in")
+            price_outs[url] = entry.get("price_per_mtok_out")
         if urls:
-            return urls, weights, tokens, models, extras
+            return (urls, weights, tokens, models, extras, roles, n_ctxs, private_oks,
+                    private_ok_explicit, max_inflights, price_ins, price_outs, role_config_errors)
         log.error("LLM_BACKENDS_JSON produced no usable backend — falling back to LLM_BACKENDS/LLM_DEFAULT_TARGET")
 
     _raw_backends = [_parse_backend(e) for e in os.environ.get("LLM_BACKENDS", "").split(",") if e.strip()]
@@ -244,18 +367,35 @@ def _load_llm_backends() -> tuple[list[str], dict[str, float], dict[str, "str | 
         _raw_backends = [(DEFAULT_TARGET, 1.0)]
     urls = [u for u, _ in _raw_backends]
     weights = {u: w for u, w in _raw_backends}
-    return urls, weights, {u: None for u in urls}, {u: None for u in urls}, {u: None for u in urls}
+    # Legacy comma form (and the DEFAULT_TARGET fallback) never carries a
+    # credential, so every backend it produces defaults private_ok=True,
+    # roles absent (serves-all) — I-5a: byte-identical to v0.9.12 selection.
+    return (urls, weights, {u: None for u in urls}, {u: None for u in urls}, {u: None for u in urls},
+            {u: None for u in urls}, {u: None for u in urls}, {u: True for u in urls},
+            {u: False for u in urls}, {u: None for u in urls}, {u: None for u in urls},
+            {u: None for u in urls}, [])
 
 
 LLM_BACKENDS: list[str]
 LLM_WEIGHTS: dict[str, float]
 LLM_BACKEND_TOKENS: dict[str, "str | None"]
 LLM_BACKEND_MODELS: dict[str, "str | None"]
-LLM_BACKENDS, LLM_WEIGHTS, LLM_BACKEND_TOKENS, LLM_BACKEND_MODELS, LLM_BACKEND_EXTRAS = _load_llm_backends()
+LLM_BACKEND_ROLES: dict[str, "frozenset[str] | None"]
+LLM_BACKEND_NCTX: dict[str, "int | None"]
+LLM_BACKEND_PRIVATE_OK: dict[str, bool]
+LLM_BACKEND_PRIVATE_OK_EXPLICIT: dict[str, bool]
+LLM_BACKEND_MAX_INFLIGHT: dict[str, "int | None"]
+LLM_BACKEND_PRICE_IN: dict[str, "float | None"]
+LLM_BACKEND_PRICE_OUT: dict[str, "float | None"]
+(LLM_BACKENDS, LLM_WEIGHTS, LLM_BACKEND_TOKENS, LLM_BACKEND_MODELS, LLM_BACKEND_EXTRAS,
+ LLM_BACKEND_ROLES, LLM_BACKEND_NCTX, LLM_BACKEND_PRIVATE_OK, LLM_BACKEND_PRIVATE_OK_EXPLICIT,
+ LLM_BACKEND_MAX_INFLIGHT, LLM_BACKEND_PRICE_IN, LLM_BACKEND_PRICE_OUT,
+ _LLM_BACKEND_ROLE_CONFIG_ERRORS) = _load_llm_backends()
 
 
 def _apply_backend_body_overrides(body: bytes, model: "str | None",
-                                  extra: "dict | None") -> bytes:
+                                  extra: "dict | None",
+                                  _body_obj: "dict | None" = None) -> bytes:
     """The request body as this backend must receive it.
 
     Pure so it can be tested (and mutation-checked) without the proxy plumbing.
@@ -266,16 +406,26 @@ def _apply_backend_body_overrides(body: bytes, model: "str | None",
     long-standing rewrite contract — so an explicit per-backend model always
     beats an extra_body["model"] left there by mistake. Best-effort by design:
     an unparseable or non-object body is forwarded unchanged rather than
-    dropped."""
+    dropped.
+
+    `_body_obj` (A-3, "parse the body once"): handle_proxy already parses the
+    body once for affinity/fit — pass that SAME dict through here to skip a
+    second json.loads of identical bytes. A shallow copy is taken before any
+    mutation so the caller's own parsed struct (read earlier, for affinity/
+    fit) is never touched by this step. None (the default, and every direct
+    unit-test call in this repo) parses `body` itself, unchanged from before."""
     if not model and not extra:
         return body
-    try:
-        payload = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        log.warning("Could not parse request body for backend overrides — forwarding unchanged")
-        return body
-    if not isinstance(payload, dict):
-        return body
+    if _body_obj is not None:
+        payload = dict(_body_obj)
+    else:
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            log.warning("Could not parse request body for backend overrides — forwarding unchanged")
+            return body
+        if not isinstance(payload, dict):
+            return body
     if extra:
         payload.update(extra)
     if model and "model" in payload:
@@ -289,6 +439,64 @@ LLM_FAIL_WINDOW = float(os.environ.get("LLM_FAIL_WINDOW", "60"))
 LLM_COOLDOWN = float(os.environ.get("LLM_COOLDOWN", "300"))
 # Per-request retries across backends on a connect failure (transparent to client).
 LLM_MAX_TRIES = int(os.environ.get("LLM_MAX_TRIES", "2")) + 1
+
+# ── Fit check (A-1/A-2/N-1/N-3, Model_Attributes_Routing_Plan_2026-08-18) ────
+# est_prompt_tokens = body_chars / CHARS_PER_TOKEN_RATIO, computed GATEWAY-side
+# from the already-buffered request body char count (no per-message chat-
+# template simulation — deliberately simple, see N-1). MEASURED (builder,
+# v0.9.13, HANDOFF.md): 20 live /tokenize comparisons against BOTH local
+# backends (localhost:5000, localhost:4000 — same Qwen3-14B model, identical
+# results) across prose/JSON/code/SQL/Greek-text samples gave chars/token
+# ranging 1.205 (Greek, the densest) to 6.905 (English prose, the sparsest).
+# 1.2 is that measured floor, rounded down slightly — the MOST CONSERVATIVE
+# (highest tokens-per-char) observed ratio, per N-3, so est_prompt_tokens
+# never UNDER-counts for any sampled content type. A live chat-completion
+# check (4 real message-array bodies, max_tokens=1) confirmed this floor
+# already overestimates true chat-template prompt_n by 83%-525% in every
+# sample — i.e. RATIO's own conservatism, not FIT_MARGIN, is what protects
+# against under-counting; FIT_MARGIN is the residual buffer below.
+CHARS_PER_TOKEN_RATIO = float(os.environ.get("LLM_CHARS_PER_TOKEN_RATIO", "1.2"))
+# Fraction of n_ctx held back as headroom: eligible iff est_prompt_tokens +
+# effective_max_tokens <= n_ctx * (1 - FIT_MARGIN). MEASURED (builder,
+# v0.9.13): since CHARS_PER_TOKEN_RATIO's own conservatism already
+# overestimates real prompt tokens by 83%-525% against the live samples
+# above, there is no measured within-sample under-count for this margin to
+# cover — its job is the residual, UNMEASURED risk of content denser than
+# anything sampled (heavy CJK/emoji, deeply repeated JSON keys) plus general
+# n_ctx bookkeeping slop (special/BOS-EOS tokens, KV overhead) this estimator
+# does not model. 10% is a modest, deliberately non-zero buffer for that
+# unmeasured residual — flagged, not derived from a further live measurement
+# (see HANDOFF.md; N-3 names per-family ratios as the escalation if this
+# proves insufficient in practice).
+FIT_MARGIN = float(os.environ.get("FIT_MARGIN", "0.10"))
+# Reserved output budget when the caller's body has no max_tokens at all.
+# UNMEASURED (flagged in .env.example per fact:1338) — conservative round
+# number, not derived from a live measurement; the daemons' own task-owned
+# budgets (REM_MAX_TOKENS_*, decision:1330) are the actually-measured ceiling
+# for real dream traffic, this is only the estimator's fallback when a caller
+# sends none at all.
+FIT_DEFAULT_OUTPUT_TOKENS = int(os.environ.get("FIT_DEFAULT_OUTPUT_TOKENS", "2048"))
+# A backend AT its max_inflight cap counts as busy in selection (I-8); when
+# every ELIGIBLE backend is at its cap, the request WAITS on it rather than
+# widening eligibility or picking an over-cap backend (the cap never widens
+# eligibility) — bounded so a permanently-saturated single-backend
+# configuration still fails eventually instead of hanging a request forever.
+LLM_MAX_INFLIGHT_WAIT_S = float(os.environ.get("LLM_MAX_INFLIGHT_WAIT_S", "120"))
+# Floor of 0.05s: a configured 0 would busy-spin the event loop for the whole
+# wait window (Optional finding, decision:1357).
+LLM_MAX_INFLIGHT_POLL_S = max(0.05, float(os.environ.get("LLM_MAX_INFLIGHT_POLL_S", "0.5")))
+# R-4 (decision:1357): how many requests may HOLD a capacity-wait slot at
+# once. Every waiter occupies an admitted request for up to the full wait
+# window (and, with GATEWAY_INFLIGHT_MAX set, counts toward the gateway-wide
+# S-11 shed) — unbounded waiters let one capped backend starve the whole
+# gateway. Beyond this many concurrent waiters a request gets an immediate
+# 503 backend_at_capacity instead of waiting. ⚠ UNMEASURED default
+# (fact:1338 — flagged in .env.example): a small bound chosen for its shape
+# (strictly less than any plausible S-11 admission budget), not derived from
+# a live measurement.
+# Floor of 1 (FR-4, delta re-review): 0/negative would mean nothing ever
+# waits — the same invalid-int class the descriptor fields now reject.
+LLM_MAX_CAPACITY_WAITERS = max(1, int(os.environ.get("LLM_MAX_CAPACITY_WAITERS", "8")))
 
 # The whole pool parallelises. Judge/quality routing (v0.6.1) is GATEWAY-controlled
 # at runtime — NOT a user/env setting. The framework's judge will signal its role
@@ -313,13 +521,34 @@ def _oldest_inflight_age(backend: str, now: float) -> float | None:
     return round(now - min(starts), 1) if starts else None
 
 
+def _v1_models_probe_url(backend_base: str) -> str:
+    """H-3 (Model_Attributes_Routing_Plan_2026-08-18): the /v1/models
+    liveness-probe URL for a backend base, without doubling /v1 when the
+    configured base ALREADY includes it. LLM_BACKENDS_JSON's own documented
+    cloud-base shape is "https://api.deepseek.com/v1" — naively concatenating
+    "/v1/models" onto that probes ".../v1/v1/models", a malformed URL.
+
+    Verified live (builder, v0.9.13): DeepSeek's edge auth governor returns
+    401 uniformly for ANY path under its domain (confirmed against a bogus
+    path too — same 401), so the doubled and correct forms were
+    indistinguishable through DeepSeek specifically; this fix is not
+    validated as observably behavior-changing for that one provider, but the
+    doubled URL is a real construction defect regardless of what any single
+    provider's auth gate happens to do with it — a path-sensitive gate on a
+    different provider would answer these two URLs differently."""
+    base = backend_base.rstrip("/")
+    if base.endswith("/v1"):
+        return f"{base}/models"
+    return f"{base}/v1/models"
+
+
 async def _probe_backend_alive(session, backend: str) -> bool:
     """2s liveness probe of the backend's own health surface. llama.cpp serves
     /health; OpenAI-compatible fallback is /v1/models. True = answered."""
-    for path in ("/health", "/v1/models"):
+    for path in ("/health", None):
         try:
-            async with session.get(f"{backend}{path}",
-                                   timeout=ClientTimeout(total=2.0)) as r:
+            url = f"{backend}{path}" if path else _v1_models_probe_url(backend)
+            async with session.get(url, timeout=ClientTimeout(total=2.0)) as r:
                 if r.status < 500:
                     return True
         except Exception:
@@ -332,6 +561,43 @@ _llm_fail_times: dict[str, list] = {b: [] for b in LLM_BACKENDS}
 # weights (is A770@3 / B580@1 actually happening?) and cooldowns observed.
 _llm_routed: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
 _llm_fail_total: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
+# Routing telemetry (Group 3, fact:1314 shape — flat counters, each paired
+# with its own last-event ts; additive, no existing key changes meaning).
+_llm_routed_by_role: dict[str, int] = {r: 0 for r in ROUTING_ROLE_NAMES}
+_llm_routed_by_role_last_ts: dict[str, "str | None"] = {r: None for r in ROUTING_ROLE_NAMES}
+_routing_no_eligible_backend_count = 0
+_routing_no_eligible_backend_last_ts: "str | None" = None
+_routing_fit_rejected_count = 0
+_routing_fit_rejected_last_ts: "str | None" = None
+# R-1 (decision:1357): the 503 backend_at_capacity refusal gets its OWN
+# counter + last-ts pair — without it a saturated capped backend stalls
+# every record while /health shows zero refusals (the 422 counters never
+# fire on this path).
+_routing_backend_at_capacity_count = 0
+_routing_backend_at_capacity_last_ts: "str | None" = None
+# R-4 (decision:1357): live count of requests currently holding a
+# capacity-wait slot — bounded by LLM_MAX_CAPACITY_WAITERS above.
+_capacity_waiters = 0
+# Optional (decision:1357): unknown X-SM-LLM-Role values seen from
+# steer-permitted callers, warned ONCE per distinct value — a typo'd role
+# silently degrades to role-less eligibility and is otherwise invisible.
+_warned_unknown_role_values: set[str] = set()
+# Per-backend token accounting (post-review addition A). IN-PROCESS only —
+# reset on restart, deliberate, same semantics as every other gateway
+# counter; the paired last-ts is what makes a restart-aware delta
+# computable. Parsed from `usage` on a non-streaming proxied LLM response;
+# a parse failure skips the counter and never breaks the proxy path.
+_llm_tokens_prompt_total: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
+_llm_tokens_completion_total: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
+_llm_tokens_last_ts: dict[str, "str | None"] = {b: None for b in LLM_BACKENDS}
+# Bounds how much response body the usage-parsing peek accumulates for a
+# single LLM call — a streamed multi-megabyte completion must never be held
+# fully in memory just to look for a trailing `usage` object. Capture is
+# abandoned (not attempted) once this is exceeded, and skipped entirely for
+# a compressed response (auto_decompress=False means a compressed body would
+# need full decompression, not just the bounded-prefix helper coordinator.py
+# uses for fault-body peeking — out of scope for this cycle, see HANDOFF.md).
+LLM_USAGE_CAPTURE_CAP_BYTES = int(os.environ.get("LLM_USAGE_CAPTURE_CAP_BYTES", str(2 * 1024 * 1024)))
 # Runtime reservation (gateway-controlled, NEVER env/user). A backend in this set
 # is held OUT of the general parallelise pool so a quality task can use it
 # exclusively, then released — e.g. the periodical golden-set recheck (v0.6.1)
@@ -358,18 +624,205 @@ _llm_affinity_hits = 0
 _llm_affinity_misses = 0
 
 
-def _affinity_key(body: bytes) -> str | None:
+def _parse_json_body(body: bytes) -> "dict | None":
+    """The request body parsed ONCE (Model_Attributes_Routing_Plan_2026-08-18
+    A-3: "affinity, overrides, and fit all read that struct; never a second
+    json.loads of the same body"). Returns a dict, or None for anything that
+    doesn't parse to a JSON object — every caller below treats None exactly
+    like "nothing usable here", never raises."""
+    try:
+        obj = json.loads(body)
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _affinity_key_from_obj(body_obj: "dict | None") -> str | None:
     """sha1 of the leading AFFINITY_PREFIX_CHARS of the concatenated message
     content — identifies requests sharing a large prompt prefix (the KV-cache
-    unit). None if the body is not a parseable chat payload."""
+    unit). None if there is no parsed body or no message content."""
     try:
-        msgs = (json.loads(body) or {}).get("messages") or []
+        msgs = (body_obj or {}).get("messages") or []
         text = "".join(str(m.get("content", "")) for m in msgs)
         if not text:
             return None
         return hashlib.sha1(text[:AFFINITY_PREFIX_CHARS].encode("utf-8", "ignore")).hexdigest()
     except Exception:
         return None
+
+
+def _affinity_key(body: bytes) -> str | None:
+    """Thin bytes-in wrapper over _affinity_key_from_obj, kept for direct
+    unit-testability (tests/test_llm_affinity.py calls this with raw bytes)
+    and any caller that has not already parsed the body itself. handle_proxy
+    calls _affinity_key_from_obj directly against its own single parse."""
+    return _affinity_key_from_obj(_parse_json_body(body))
+
+
+def _extract_effective_max_tokens(body_obj: "dict | None") -> float:
+    """The OUTPUT budget the fit check must reserve headroom for: the
+    caller's own `max_tokens` when present and a positive number, else
+    FIT_DEFAULT_OUTPUT_TOKENS (I-3: this is read-only sizing information for
+    the fit check — it is never written back into the request body)."""
+    if isinstance(body_obj, dict):
+        mt = body_obj.get("max_tokens")
+        if isinstance(mt, (int, float)) and mt > 0:
+            return float(mt)
+    return float(FIT_DEFAULT_OUTPUT_TOKENS)
+
+
+def _serves_all(url: str) -> bool:
+    """True iff `url` is in the "roles absent" serves-all degenerate class —
+    gated by private_ok (the ONLY place private_ok gates a serves-all
+    candidate; an explicit roles list is its own opt-in and is never gated
+    by private_ok, see _role_eligible)."""
+    return LLM_BACKEND_ROLES.get(url) is None and LLM_BACKEND_PRIVATE_OK.get(url, True)
+
+
+def _role_eligible(url: str, role: str) -> bool:
+    """Role+privacy eligibility (P-1/P-3, I-1a) — the HARD PRE-FILTER's role
+    axis, independent of health/cooldown/reserved/cap. Role-carrying traffic:
+    eligible iff (roles absent AND private_ok) OR role in roles — an explicit
+    roles list is itself the per-function privacy opt-in (I-1), so a
+    private_ok=false backend CAN be eligible for a role it explicitly lists.
+    Role-less traffic: eligible on any private_ok backend; the roles list is
+    IGNORED (a local card pinned to "extract" must not refuse an ad-hoc
+    authenticated chat, R-3) — and a private_ok=false backend is NEVER
+    eligible for role-less traffic, regardless of its roles list."""
+    roles = LLM_BACKEND_ROLES.get(url)
+    if not role:
+        return LLM_BACKEND_PRIVATE_OK.get(url, True)
+    if roles is None:
+        return LLM_BACKEND_PRIVATE_OK.get(url, True)
+    return role in roles
+
+
+def _fits(url: str, est_prompt_tokens: float, effective_max_tokens: float) -> bool:
+    """Fit check (A-1): backends without a declared n_ctx always fit
+    (backward compat — no fit information available). May only EXCLUDE a
+    backend (I-3); never modifies the request in any way."""
+    n_ctx = LLM_BACKEND_NCTX.get(url)
+    if not n_ctx:
+        return True
+    return (est_prompt_tokens + effective_max_tokens) <= n_ctx * (1 - FIT_MARGIN)
+
+
+def _eligible_backends(role: str, est_prompt_tokens: float = 0.0,
+                       effective_max_tokens: float = 0.0) -> list[str]:
+    """The HARD PRE-FILTER (P-1 Critical): role+privacy+fit eligibility,
+    computed BEFORE any affinity/health/cooldown/reserved/cap logic runs.
+    Everything else in _select_llm_backend operates strictly inside this
+    set — an empty return here is the 422 no_eligible_backend signal."""
+    role = (role or "").strip().lower()
+    return [b for b in LLM_POOL if _role_eligible(b, role)
+            and _fits(b, est_prompt_tokens, effective_max_tokens)]
+
+
+def _classify_no_eligible_constraint(role: str, est_prompt_tokens: float,
+                                     effective_max_tokens: float) -> str:
+    """Which axis emptied the eligible set, for the 422 body's `constraint`
+    field ("role"|"privacy"|"fit") — computed by re-checking role+privacy
+    ALONE (ignoring fit): if that alone is already empty, the size of the
+    request was never the issue. Within that: "privacy" if a serves-all
+    (roles-absent) candidate EXISTS but is blocked by private_ok=false —
+    the fleet does have a home for this traffic class, if only it were
+    private; "role" if no backend is configured to handle this function at
+    all (privacy is moot — nothing to opt in). Role-less traffic that fails
+    role+privacy is always "privacy" (roles never enter into it)."""
+    role = (role or "").strip().lower()
+    role_privacy_eligible = [b for b in LLM_POOL if _role_eligible(b, role)]
+    if role_privacy_eligible:
+        return "fit"
+    if not role:
+        return "privacy"
+    any_serves_all_candidate = any(LLM_BACKEND_ROLES.get(b) is None for b in LLM_POOL)
+    return "privacy" if any_serves_all_candidate else "role"
+
+
+def _record_role_routed(role: str) -> None:
+    role = (role or "").strip().lower()
+    if role not in _llm_routed_by_role:
+        return
+    _llm_routed_by_role[role] += 1
+    _llm_routed_by_role_last_ts[role] = datetime.now(timezone.utc).isoformat()
+
+
+def _record_no_eligible_backend(constraint: str) -> None:
+    global _routing_no_eligible_backend_count, _routing_no_eligible_backend_last_ts
+    global _routing_fit_rejected_count, _routing_fit_rejected_last_ts
+    now_iso = datetime.now(timezone.utc).isoformat()
+    _routing_no_eligible_backend_count += 1
+    _routing_no_eligible_backend_last_ts = now_iso
+    if constraint == "fit":
+        _routing_fit_rejected_count += 1
+        _routing_fit_rejected_last_ts = now_iso
+
+
+def _record_backend_at_capacity() -> None:
+    """R-1 (decision:1357): count a 503 backend_at_capacity refusal, paired
+    last-ts — same fact:1314 shape as the 422 counters."""
+    global _routing_backend_at_capacity_count, _routing_backend_at_capacity_last_ts
+    _routing_backend_at_capacity_count += 1
+    _routing_backend_at_capacity_last_ts = datetime.now(timezone.utc).isoformat()
+
+
+def _warn_unknown_role_once(role: str) -> None:
+    """Optional (decision:1357): a role value outside ROUTING_ROLE_NAMES from
+    a steer-permitted caller degrades silently to role-less eligibility —
+    warn ONCE per distinct value so a daemon-side typo is visible."""
+    if role in _warned_unknown_role_values:
+        return
+    # FR-1 (delta re-review): bound the dedupe set and truncate the logged
+    # value — distinct garbage values from a steer-permitted (or auth-off)
+    # caller must not grow memory or flood the journal with full-length
+    # strings.
+    if len(_warned_unknown_role_values) >= 64:
+        return
+    _warned_unknown_role_values.add(role)
+    log.warning(
+        "X-SM-LLM-Role %r is not a known routing role %s — treating the "
+        "request as ROLE-LESS (private_ok backends only). If this is a "
+        "daemon-side typo, its traffic is silently degraded until fixed.",
+        role[:80], sorted(ROUTING_ROLE_NAMES))
+
+
+def _counts_free_slot(url: str) -> bool:
+    """C-1 Critical fix (decision:1357, amending the plan's F-3 clause
+    minimally): a backend counts toward /pool/status free_slots iff it can
+    take ANY dream job — either serves-all (roles absent AND private_ok) or
+    an EXPLICIT roles list covering every dream role. Dream traffic always
+    carries a role, so a full explicit list is exactly as capable as
+    serves-all for the daemons' gating purposes; counting only the former
+    (the original F-3 reading) silently zeroed free_slots for a fleet whose
+    every backend declares roles — the very configuration M-5 steers
+    credentialed operators toward — and halted REM/NREM/relation_sweep with
+    no warning anywhere. Partial-role fleets still count 0 (per-role slot
+    accounting stays deferred) — require_valid_llm_routing_config() warns
+    LOUDLY at startup for that case instead of leaving it silent."""
+    roles = LLM_BACKEND_ROLES.get(url)
+    if roles is None:
+        return LLM_BACKEND_PRIVATE_OK.get(url, True)
+    return ROUTING_ROLE_NAMES <= roles
+
+
+def _record_backend_token_usage(backend: str, usage: dict) -> None:
+    """Post-review addition A: per-backend cumulative prompt/completion token
+    counters from a proxied response's `usage` object. Best-effort — never
+    raises, never breaks the proxy path it is called from."""
+    try:
+        p = usage.get("prompt_tokens")
+        c = usage.get("completion_tokens")
+        touched = False
+        if isinstance(p, (int, float)):
+            _llm_tokens_prompt_total[backend] = _llm_tokens_prompt_total.get(backend, 0) + int(p)
+            touched = True
+        if isinstance(c, (int, float)):
+            _llm_tokens_completion_total[backend] = _llm_tokens_completion_total.get(backend, 0) + int(c)
+            touched = True
+        if touched:
+            _llm_tokens_last_ts[backend] = datetime.now(timezone.utc).isoformat()
+    except Exception as exc:
+        log.warning("token usage accounting failed for %s: %s", backend, exc)
 
 
 def _llm_mark_fail(backend: str) -> None:
@@ -389,53 +842,118 @@ def _llm_mark_ok(backend: str) -> None:
     _llm_fail_times[backend] = []
 
 
-def _ordered_llm_backends(role: str = "") -> list[str]:
-    """Backends to try, best-first, by WEIGHTED least-in-flight (inflight/weight).
-    The general pool excludes any backend the gateway has reserved at runtime;
-    healthy (out-of-cooldown) backends come first, cooldown ones last so service
-    never stops. `role` is a gateway-internal signal (e.g. a future quality/judge
-    task addressing its reserved backend) — clients never set or see routing."""
-    now = time.monotonic()
-    pool = [b for b in LLM_POOL if b not in _llm_reserved] or LLM_POOL
-    healthy = [b for b in pool if _llm_unhealthy_until.get(b, 0.0) <= now]
-    cooling = [b for b in pool if b not in healthy]
-    key = lambda b: _llm_inflight.get(b, 0) / LLM_WEIGHTS.get(b, 1.0)
-    return sorted(healthy, key=key) + sorted(cooling, key=key)
+# NOTE: _ordered_llm_backends() was removed (M-3, Model_Attributes_Routing_
+# Plan_2026-08-18 pre-build review) — zero callers anywhere in this repo.
 
+def _select_llm_backend(role: str = "", affinity_key: str | None = None,
+                        est_prompt_tokens: float = 0.0,
+                        effective_max_tokens: float = 0.0) -> "str | None":
+    """Pick a backend, or None. Eligibility (role+privacy+fit) is now a HARD
+    PRE-FILTER (P-1 Critical): every fallback tier below — affinity hit, cold
+    selection, the protected-prefix logic, the cooldown-ignoring last resort
+    — operates STRICTLY inside the eligible set; none of them may widen past
+    it (P-1/P-2). Precedence: eligibility > _llm_reserved > cooldown (P-4).
 
-def _select_llm_backend(role: str = "", affinity_key: str | None = None) -> str:
-    """Pick a backend: cache-affinity first (keep a warm KV prefix on its card),
-    else least-in-flight while PROTECTING cards that hold a frequently-reused
-    prefix from eviction. Allocation-free (no precomputed weights). Clients never
-    choose. Records/refreshes the affinity map as a side effect."""
+    Two None cases, deliberately not distinguished by this function's return
+    value alone (the caller, handle_proxy, tells them apart by calling
+    _eligible_backends() itself FIRST):
+      * the eligible set is empty (role/privacy/fit) — the 422 case.
+      * the eligible set is non-empty but every member is AT its
+        max_inflight cap right now — the WAIT case (I-8: the cap never
+        widens eligibility, so this function will never pick an over-cap
+        backend to avoid returning None).
+
+    Cache-affinity first (keep a warm KV prefix on its card, P-2: an
+    affinity-cached backend outside the eligible set is a MISS), else
+    least-in-flight while PROTECTING cards holding a frequently-reused
+    prefix from eviction. Allocation-free. Clients never choose. Records/
+    refreshes the affinity map as a side effect."""
     global _llm_affinity_hits, _llm_affinity_misses
     now = time.monotonic()
     for k in [k for k, v in _llm_affinity.items() if now - v[1] > AFFINITY_TTL]:
         _llm_affinity.pop(k, None)
 
+    eligible = _eligible_backends(role, est_prompt_tokens, effective_max_tokens)
+    if not eligible:
+        return None
+    eligible_set = set(eligible)
+
+    def _at_cap(b: str) -> bool:
+        cap = LLM_BACKEND_MAX_INFLIGHT.get(b)
+        return cap is not None and _llm_inflight.get(b, 0) >= cap
+
     def _usable(b: str) -> bool:
-        return (b in LLM_POOL and b not in _llm_reserved
+        return (b in eligible_set and b not in _llm_reserved
                 and _llm_unhealthy_until.get(b, 0.0) <= now)
 
-    # 1) affinity hit — same prefix already warm on a usable, non-saturated card
+    # 1) affinity hit — same prefix already warm on an ELIGIBLE, usable,
+    #    non-saturated, non-capped card
     ent = _llm_affinity.get(affinity_key) if affinity_key else None
-    if ent and _usable(ent[0]) and _llm_inflight.get(ent[0], 0) < AFFINITY_MAX_INFLIGHT:
+    if (ent and ent[0] in eligible_set and _usable(ent[0]) and not _at_cap(ent[0])
+            and _llm_inflight.get(ent[0], 0) < AFFINITY_MAX_INFLIGHT):
         ent[1] = now
         ent[2] += 1
         _llm_affinity_hits += 1
         return ent[0]
 
-    # 2) miss — least-in-flight, protecting cards holding a reused (hits>=N) hot prefix
+    # 2) miss — least-in-flight, protecting cards holding a reused (hits>=N)
+    #    hot prefix, with every fallback tier bottoming out at `eligible`
+    #    (P-1/P-2), never the full pool.
     protected = {v[0] for v in _llm_affinity.values()
                  if now - v[1] <= AFFINITY_TTL and v[2] >= AFFINITY_PROTECT_HITS}
-    usable = [b for b in LLM_POOL if _usable(b)]
+    usable = [b for b in eligible if _usable(b)]
     cold = ([b for b in usable if b not in protected] or usable
-            or [b for b in LLM_POOL if b not in _llm_reserved] or list(LLM_POOL))
-    chosen = min(cold, key=lambda b: _llm_inflight.get(b, 0))
+            or [b for b in eligible if b not in _llm_reserved] or eligible)
+    not_capped = [b for b in cold if not _at_cap(b)]
+    if not not_capped:
+        return None   # every eligible candidate is at its concurrency cap
+    chosen = min(not_capped, key=lambda b: _llm_inflight.get(b, 0))
     if affinity_key:
         _llm_affinity[affinity_key] = [chosen, now, (ent[2] + 1 if ent else 1)]
         _llm_affinity_misses += 1
     return chosen
+
+
+async def _select_backend_waiting_on_capacity(
+        role: str, affinity_key: "str | None",
+        est_prompt_tokens: float, effective_max_tokens: float) -> "str | None":
+    """Bounded poll loop around _select_llm_backend for the max_inflight WAIT
+    case (operator ruling 2026-08-18: "daemons already wait synchronously" —
+    this mirrors that, gateway-side, via the existing S-11-style poll shape
+    rather than a new queue). Called ONLY after the caller has already
+    confirmed the eligible set (role+privacy+fit) is non-empty — a None
+    return here means every eligible backend stayed at its cap for the whole
+    wait window, not that nothing was eligible."""
+    deadline = time.monotonic() + LLM_MAX_INFLIGHT_WAIT_S
+    while True:
+        backend = _select_llm_backend(role, affinity_key, est_prompt_tokens, effective_max_tokens)
+        if backend is not None:
+            return backend
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(LLM_MAX_INFLIGHT_POLL_S)
+
+
+async def _wait_for_capacity_slot(role: str, affinity_key: "str | None",
+                                  est_prompt_tokens: float,
+                                  effective_max_tokens: float) -> "str | None":
+    """R-4 (decision:1357): the bounded-WAITER wrapper around the bounded
+    wait. Every waiter holds an admitted request for up to the full wait
+    window (and counts toward any S-11 gateway-wide admission budget), so
+    the number of simultaneous waiters is itself capped — beyond
+    LLM_MAX_CAPACITY_WAITERS the caller gets an immediate None (→ 503)
+    instead of joining the queue. The counter has the same
+    increment-at-entry / release-on-every-exit lifetime discipline as the
+    I-8b inflight score."""
+    global _capacity_waiters
+    if _capacity_waiters >= LLM_MAX_CAPACITY_WAITERS:
+        return None
+    _capacity_waiters += 1
+    try:
+        return await _select_backend_waiting_on_capacity(
+            role, affinity_key, est_prompt_tokens, effective_max_tokens)
+    finally:
+        _capacity_waiters -= 1
 
 # --------------------------------------------------------------------------- #
 # RFC 7230 §6.1 — hop-by-hop headers must never be forwarded by a proxy.
@@ -517,7 +1035,19 @@ def _safe_resolve_identity(request) -> "str | None":
 # below) — are the sole non-admin identities allowed to steer LLM routing.
 _CONSOLIDATION_AGENT_NAME = "consolidation"
 _REM_DAEMON_AGENT_NAME    = "rem_daemon"
-DAEMON_AGENT_NAMES = frozenset({_CONSOLIDATION_AGENT_NAME, _REM_DAEMON_AGENT_NAME})
+# R-6 (decision:1357, closing the plan's R-2 item): standalone framework
+# tools that legitimately steer — relation_sweep sends X-SM-LLM-Role: judge
+# but runs outside the gateway process, so it can never hold a minted daemon
+# token — get in via an OPERATOR-DECLARED name allowlist, unioned here. The
+# operator mints an ordinary agent token under one of these names and points
+# the tool at it. Deliberately a NAME list, never a role-based widening and
+# never admin (auth_middleware confines admin tokens to /admin/*): each
+# entry is one explicit identity the operator chose to trust with steering.
+LLM_STEER_EXTRA_AGENT_NAMES = frozenset(
+    n.strip() for n in os.environ.get("LLM_STEER_EXTRA_AGENT_NAMES", "").split(",")
+    if n.strip())
+DAEMON_AGENT_NAMES = frozenset(
+    {_CONSOLIDATION_AGENT_NAME, _REM_DAEMON_AGENT_NAME}) | LLM_STEER_EXTRA_AGENT_NAMES
 
 
 def _may_steer_llm(request) -> bool:
@@ -651,8 +1181,94 @@ class AsyncHiveMindProxy:
             # then dispatch cache-affinity-first. The key is computed as late as
             # possible, just before selection, so nothing mutates the prompt after.
             llm_body = await request.read() if request.can_read_body else b""
+            # A-3: parse the body ONCE — affinity, fit (est_prompt_tokens is a
+            # pure char count, no parse needed; effective_max_tokens reads the
+            # parsed struct), and the post-selection override rewrite all read
+            # this SAME struct; never a second json.loads of the same body.
+            body_obj = _parse_json_body(llm_body)
             role = steer_headers.get("X-SM-LLM-Role", "").strip().lower()
-            llm_backend = _select_llm_backend(role, _affinity_key(llm_body))
+            affinity_key = _affinity_key_from_obj(body_obj)
+            est_prompt_tokens = (len(llm_body) / CHARS_PER_TOKEN_RATIO
+                                 if CHARS_PER_TOKEN_RATIO > 0 else 0.0)
+            effective_max_tokens = _extract_effective_max_tokens(body_obj)
+
+            # Eligibility is a HARD PRE-FILTER (P-1 Critical): computed BEFORE
+            # any affinity/health/cooldown/reserved/cap logic runs. Empty →
+            # 422, PRE-DISPATCH (I-8b: no inflight accounting has happened
+            # yet, this return is well before the try: block that reserves a
+            # slot) — never silently widens, never falls back to an
+            # ineligible backend, never queues.
+            if role and role not in ROUTING_ROLE_NAMES:
+                _warn_unknown_role_once(role)
+            eligible_pre = _eligible_backends(role, est_prompt_tokens, effective_max_tokens)
+            if not eligible_pre:
+                constraint = _classify_no_eligible_constraint(
+                    role, est_prompt_tokens, effective_max_tokens)
+                _record_no_eligible_backend(constraint)
+                refusal_body = {"error": "no_eligible_backend",
+                                "constraint": constraint, "role": role or None}
+                if constraint == "fit":
+                    # R-5 disposition (decision:1357): retry-without-charge
+                    # STANDS as ruled (F-1: a config gap is not a record
+                    # defect) — observability is the mitigation. The refusal
+                    # names the estimate that failed so an operator can
+                    # retune LLM_CHARS_PER_TOKEN_RATIO / FIT_MARGIN / n_ctx
+                    # against real traffic.
+                    refusal_body["est_prompt_tokens"] = int(est_prompt_tokens)
+                    refusal_body["effective_max_tokens"] = int(effective_max_tokens)
+                    # FR-2 (delta re-review): the daemons' refusal handling
+                    # reads only {error, constraint, role}, so the estimate
+                    # fields alone reach no operator — this journal line is
+                    # where the retune signal actually lands.
+                    log.warning(
+                        "fit-rejected: est_prompt_tokens=%d + max_tokens=%d "
+                        "fits no declared n_ctx (role=%s) — if this request "
+                        "is legitimately sized, retune LLM_CHARS_PER_TOKEN_"
+                        "RATIO / FIT_MARGIN or raise the backend's n_ctx.",
+                        int(est_prompt_tokens), int(effective_max_tokens),
+                        role or "none")
+                return web.json_response(
+                    refusal_body,
+                    status=422, headers={"X-SM-Fault-Origin": "gateway"},
+                )
+
+            # R-4 (decision:1357): a request that can ONLY land on a
+            # credentialed backend but is not on the S-04 allowlist is DOOMED
+            # — deny it here, BEFORE it can hold a capacity-wait slot for the
+            # full window. A mixed eligible set (any uncredentialed member)
+            # falls through: selection may legitimately pick the
+            # uncredentialed one, and the post-selection S-04 check below
+            # still guards the credentialed choice.
+            _route = (request.method, request.path.rstrip("/") or "/")
+            if (_route not in CREDENTIALED_BACKEND_ALLOWED_ROUTES
+                    and all(LLM_BACKEND_TOKENS.get(b) is not None for b in eligible_pre)):
+                record_credentialed_route_denied(
+                    eligible_pre[0], request.method, request.path,
+                    agent_name=_safe_agent_name(request),
+                    request_id=_safe_request_id(request),
+                )
+                return web.json_response(
+                    {"error": "credentialed backends accept only framework endpoints"},
+                    status=403, headers={"X-SM-Fault-Origin": "gateway"},
+                )
+
+            # At least one backend IS eligible — fast path first; only if
+            # every eligible backend is AT its max_inflight cap right now do
+            # we join the (waiter-capped, R-4) bounded wait on it (I-8: the
+            # cap never widens eligibility, so selection never picks an
+            # over-cap backend to avoid waiting) rather than refusing or
+            # overriding the cap. All pre-dispatch: no inflight accounting yet.
+            llm_backend = _select_llm_backend(
+                role, affinity_key, est_prompt_tokens, effective_max_tokens)
+            if llm_backend is None:
+                llm_backend = await _wait_for_capacity_slot(
+                    role, affinity_key, est_prompt_tokens, effective_max_tokens)
+            if llm_backend is None:
+                _record_backend_at_capacity()
+                return web.json_response(
+                    {"error": "backend_at_capacity"}, status=503,
+                    headers={"X-SM-Fault-Origin": "gateway"},
+                )
             target_base = llm_backend
 
             # Per-backend body rewrites (LLM_BACKENDS_JSON "model" +
@@ -662,12 +1278,21 @@ class AsyncHiveMindProxy:
             # caller knows to send. See _apply_backend_body_overrides.
             llm_body = _apply_backend_body_overrides(
                 llm_body, LLM_BACKEND_MODELS.get(llm_backend),
-                LLM_BACKEND_EXTRAS.get(llm_backend))
+                LLM_BACKEND_EXTRAS.get(llm_backend), _body_obj=body_obj)
 
         target_url = f"{target_base}{request.rel_url}"
         log.debug("→ %s %s", request.method, target_url)
 
-        upstream_headers = self._filter_headers(steer_headers)
+        # P-6 (Model_Attributes_Routing_Plan_2026-08-18): X-SM-LLM-* headers
+        # are stripped before the upstream forward for EVERY caller, daemons
+        # and admins included — the role/affinity signal above was already
+        # read off `steer_headers` (whose S-14 gate decides who may SET it
+        # for the gateway's OWN routing decision); the provider itself must
+        # never see routing metadata on the wire, aligning the request
+        # direction with the response direction's existing X-SM- stripping
+        # (_filter_headers' strip_gateway_namespace). Deliberately changes
+        # the pinned expectation in tests/test_llm_steering_headers.py:98.
+        upstream_headers = self._filter_headers(_strip_llm_steering_headers(steer_headers))
         # Authorization was just stripped above (see _filter_headers) — add it
         # back ONLY for a backend that has its own configured credential. Every
         # other backend (local, or one with no token_env) gets none, same as today.
@@ -755,6 +1380,12 @@ class AsyncHiveMindProxy:
                 _llm_inflight[llm_backend] = _llm_inflight.get(llm_backend, 0) + 1
                 _llm_inflight_started.setdefault(llm_backend, []).append(time.monotonic())
                 _llm_routed[llm_backend] = _llm_routed.get(llm_backend, 0) + 1
+                # Optional (decision:1357): the per-role ROUTED counter
+                # increments HERE, at dispatch, beside the inflight/_llm_routed
+                # accounting it mirrors — not back at selection, where a
+                # request could still be refused (S-04) before any dispatch.
+                if role:
+                    _record_role_routed(role)
 
             for attempt in range(max_attempts):
                 try:
@@ -797,10 +1428,37 @@ class AsyncHiveMindProxy:
                         # before parsing. The passthrough chunk itself is untouched.
                         content_encoding = upstream.headers.get("Content-Encoding")
 
+                        # Post-review addition A: accumulate the response body
+                        # for a best-effort `usage` parse AFTER the loop, so a
+                        # per-backend token count can be kept without ever
+                        # delaying or altering the passthrough chunk written
+                        # below. Only attempted for a successful, uncompressed
+                        # LLM response (a compressed body would need full
+                        # decompression, not the bounded-prefix fault-peek
+                        # helper — out of scope this cycle, see HANDOFF.md)
+                        # and bounded by LLM_USAGE_CAPTURE_CAP_BYTES so a large
+                        # streamed completion is never held fully in memory
+                        # just to look for a trailing `usage` object.
+                        # stream:true responses are SSE — the accumulated
+                        # bytes can never parse as a single JSON object, so
+                        # skip capture instead of buffering up to the cap for
+                        # a parse that always fails (Optional, decision:1357).
+                        capture_usage = (llm_backend is not None and upstream.status < 400
+                                        and not content_encoding
+                                        and not (body_obj or {}).get("stream"))
+                        usage_chunks: "list[bytes] | None" = [] if capture_usage else None
+                        usage_bytes = 0
+
                         # write_eof() lives inside the same try as the chunk loop so that
                         # an EOF-time disconnect is handled by the same except clauses.
                         try:
                             async for chunk in upstream.content.iter_any():
+                                if usage_chunks is not None:
+                                    usage_bytes += len(chunk)
+                                    if usage_bytes > LLM_USAGE_CAPTURE_CAP_BYTES:
+                                        usage_chunks = None   # abandon — too big to hold
+                                    else:
+                                        usage_chunks.append(chunk)
                                 if not fault_classified:
                                     fault_classified = True
                                     try:
@@ -858,6 +1516,16 @@ class AsyncHiveMindProxy:
                                 log.warning(
                                     "credential-fault classification failed for %s: %s",
                                     target_url, type(exc).__name__)
+
+                        if usage_chunks:
+                            try:
+                                resp_payload = json.loads(b"".join(usage_chunks))
+                                usage = (resp_payload.get("usage")
+                                        if isinstance(resp_payload, dict) else None)
+                                if isinstance(usage, dict):
+                                    _record_backend_token_usage(llm_backend, usage)
+                            except Exception:
+                                pass   # not a single-object JSON body (e.g. SSE) — skip, never breaks the proxy path
 
                         if llm_backend is not None:
                             _llm_mark_ok(llm_backend)   # connected + served — clear fail streak
@@ -1334,12 +2002,29 @@ async def handle_pool_status(request: web.Request) -> web.Response:
                  and _llm_unhealthy_until.get(b, 0.0) <= now
                  and b not in _llm_reserved)
         age = _oldest_inflight_age(b, now)
+        # F-3 (Model_Attributes_Routing_Plan_2026-08-18): free_slots counts
+        # ONLY serves-all-eligible backends (roles absent AND private_ok) —
+        # dream gating stays conservative rather than assuming a role-scoped
+        # or private_ok=false backend is fair game for whatever the caller
+        # happens to be. Full per-role slot accounting is deferred (F-3,
+        # named follow-up, not built this cycle) — `serves_all` is additive
+        # visibility, not a promise of finer-grained accounting.
+        serves_all = _serves_all(b)
+        # C-1 (decision:1357): the free count uses _counts_free_slot — a
+        # backend with an explicit FULL dream-roles list is as capable as a
+        # serves-all one for the daemons' gating, and counting only
+        # serves-all silently zeroed free_slots (halting every dream daemon)
+        # for all-declared fleets. `counts_free_slot` is surfaced additively
+        # so a monitor can see WHY the count is what it is.
+        counts_free = _counts_free_slot(b)
         entry = {
             "inflight": _llm_inflight.get(b, 0),
             "oldest_inflight_age_s": age,
             "cooldown": round(max(0.0, _llm_unhealthy_until.get(b, 0.0) - now), 1),
             "reserved": b in _llm_reserved,
             "available": avail,
+            "serves_all": serves_all,
+            "counts_free_slot": counts_free,
         }
         # Lazy wedge check (the one exception to "no upstream probes"): only
         # when a request has been in flight suspiciously long — busy-generating
@@ -1347,7 +2032,7 @@ async def handle_pool_status(request: web.Request) -> web.Response:
         if age is not None and age > LLM_WEDGE_SUSPECT_AGE and _session is not None:
             entry["suspect_wedged"] = not await _probe_backend_alive(_session, b)
         backends[b] = entry
-        free += 1 if avail else 0
+        free += 1 if (avail and counts_free) else 0
     return web.json_response({"free_slots": free, "backends": backends})
 
 
@@ -1555,8 +2240,25 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
     backend_status: dict[str, str] = {}
     for b in LLM_BACKENDS:
         try:
-            async with proxy.session.get(f"{b}/v1/models", timeout=ClientTimeout(total=2.0)) as r:
-                backend_status[b] = "ok" if r.status < 400 else f"http_{r.status}"
+            async with proxy.session.get(_v1_models_probe_url(b), timeout=ClientTimeout(total=2.0)) as r:
+                if r.status < 400:
+                    backend_status[b] = "ok"
+                elif LLM_BACKEND_TOKENS.get(b) is not None and r.status in (401, 403):
+                    # H-1/H-2: this is a BARE probe — no Authorization header
+                    # is attached (has_credential is deliberately never used
+                    # to authenticate a liveness poll, see this section's own
+                    # header comment: no per-poll provider-key probing). A
+                    # 401/403 from a CREDENTIALED backend therefore means the
+                    # server ANSWERED — this file's own liveness definition
+                    # ("answered <500 = alive") — its rejection of an
+                    # unauthenticated probe is correct auth behavior, not
+                    # downness. H-1: the unauthenticated probe never carried
+                    # key-validity information anyway; llm_faults.credential
+                    # on a REAL call is that signal. Genuinely down (connect
+                    # error / 5xx) is unaffected by this branch.
+                    backend_status[b] = "ok"
+                else:
+                    backend_status[b] = f"http_{r.status}"
         except asyncio.TimeoutError:
             backend_status[b] = "timeout"
         except Exception:
@@ -1612,6 +2314,38 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
                              if now - v[1] <= AFFINITY_TTL},
         }
 
+    # Routing telemetry (Group 3, fact:1314 shape — flat, additive, each
+    # counter paired with its own last-event ts; no existing key changes
+    # meaning). Surfaced regardless of pool size — meaningful even for a
+    # single role-scoped backend.
+    checks["llm_routing"] = {
+        "routed_role_extract": _llm_routed_by_role.get("extract", 0),
+        "routed_role_extract_last_ts": _llm_routed_by_role_last_ts.get("extract"),
+        "routed_role_verify": _llm_routed_by_role.get("verify", 0),
+        "routed_role_verify_last_ts": _llm_routed_by_role_last_ts.get("verify"),
+        "routed_role_judge": _llm_routed_by_role.get("judge", 0),
+        "routed_role_judge_last_ts": _llm_routed_by_role_last_ts.get("judge"),
+        "routing_no_eligible_backend": _routing_no_eligible_backend_count,
+        "routing_no_eligible_backend_last_ts": _routing_no_eligible_backend_last_ts,
+        "routing_fit_rejected": _routing_fit_rejected_count,
+        "routing_fit_rejected_last_ts": _routing_fit_rejected_last_ts,
+        "routing_backend_at_capacity": _routing_backend_at_capacity_count,
+        "routing_backend_at_capacity_last_ts": _routing_backend_at_capacity_last_ts,
+    }
+    # Post-review addition A: per-backend cumulative token counters, IN-
+    # PROCESS ONLY (reset on restart — deliberate, the ts pairing is what
+    # makes a restart-aware delta computable; see the README proposal's B2
+    # note for the operator-facing framing of this).
+    if LLM_BACKENDS:
+        checks["llm_token_usage"] = {
+            b: {
+                "tokens_prompt_total": _llm_tokens_prompt_total.get(b, 0),
+                "tokens_completion_total": _llm_tokens_completion_total.get(b, 0),
+                "tokens_last_ts": _llm_tokens_last_ts.get(b),
+            }
+            for b in LLM_BACKENDS
+        }
+
     checks["daemon"]     = "running" if _daemon_healthy else "stopped"
     checks["rem_daemon"] = "running" if _rem_healthy    else "stopped"
 
@@ -1641,7 +2375,16 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
         "llm_backends": [
             {"url": b, "weight": LLM_WEIGHTS.get(b, 1.0),
              "has_credential": LLM_BACKEND_TOKENS.get(b) is not None,
-             "model": LLM_BACKEND_MODELS.get(b)}
+             "model": LLM_BACKEND_MODELS.get(b),
+             # Model-attributes routing descriptor fields (additive) — never
+             # used by the monitor for routing math, only display; the
+             # gateway itself stays price-agnostic (M-4).
+             "roles": sorted(LLM_BACKEND_ROLES[b]) if LLM_BACKEND_ROLES.get(b) else None,
+             "n_ctx": LLM_BACKEND_NCTX.get(b),
+             "private_ok": LLM_BACKEND_PRIVATE_OK.get(b, True),
+             "max_inflight": LLM_BACKEND_MAX_INFLIGHT.get(b),
+             "price_per_mtok_in": LLM_BACKEND_PRICE_IN.get(b),
+             "price_per_mtok_out": LLM_BACKEND_PRICE_OUT.get(b)}
             for b in LLM_BACKENDS
         ],
         "llm_pool_tuning": {
@@ -1891,6 +2634,154 @@ def require_auth_when_provider_keys_configured() -> None:
     )
 
 
+def require_valid_llm_routing_config() -> None:
+    """Model-attributes routing startup refusals (Model_Attributes_Routing_
+    Plan_2026-08-18 REVISED DESIGN). Three loud, named refusals, all
+    deferred to main() ONLY — same placement reasoning as require_auth_
+    when_provider_keys_configured() above: every test in this repo imports
+    this module freely with all manner of deliberately-invalid combinations,
+    so an unconditional check at import/parse time would kill test
+    collection itself, not just a genuinely misconfigured gateway.
+
+    1. Unknown `roles` entry — collected by _load_llm_backends() into
+       _LLM_BACKEND_ROLE_CONFIG_ERRORS at parse time; raised here.
+    2. M-5 (Critical): a credentialed (token_env resolved) backend with
+       NEITHER `roles` NOR an EXPLICIT `private_ok` would silently go dark
+       under the plain default — a cloud-only install bricked on upgrade.
+       Demands the operator pick one: private_ok: true (today's
+       serve-everything) or roles: [...] (per-function opt-in).
+    3. P-5: auth OFF (no AGENT_TOKENS configured) + ANY private_ok=false
+       backend configured → refuse (without identities, I-1/I-6 privacy and
+       steering invariants cannot hold — a backend deliberately scoped away
+       from serving arbitrary/private traffic is meaningless if every
+       caller is anonymous and indistinguishable). Governed by the SAME
+       override env S-05 uses (ALLOW_UNAUTHENTICATED_PROVIDER_KEYS=1) —
+       reusing S-05's precedent rather than inventing a second knob for the
+       same "I have decided the risk is acceptable" declaration.
+    """
+    if _LLM_BACKEND_ROLE_CONFIG_ERRORS:
+        raise SystemExit(
+            "FATAL: LLM_BACKENDS_JSON has invalid `roles` entries:\n  "
+            + "\n  ".join(_LLM_BACKEND_ROLE_CONFIG_ERRORS)
+            + f"\nAllowed role names: {sorted(ROUTING_ROLE_NAMES)} "
+              "(\"summarize\" is RESERVED, not accepted)."
+        )
+
+    needs_explicit_choice = sorted(
+        b for b in LLM_BACKENDS
+        if LLM_BACKEND_TOKENS.get(b) is not None
+        and LLM_BACKEND_ROLES.get(b) is None
+        and not LLM_BACKEND_PRIVATE_OK_EXPLICIT.get(b, False)
+    )
+    if needs_explicit_choice:
+        raise SystemExit(
+            "FATAL: credentialed LLM backend(s) configured with neither "
+            f"`roles` nor an explicit `private_ok`: {', '.join(needs_explicit_choice)}. "
+            "Pick one in LLM_BACKENDS_JSON: private_ok: true (keep today's "
+            "serve-everything behavior) or roles: [\"extract\", \"verify\", "
+            "\"judge\"] (per-function opt-in, this backend never receives "
+            "role-less/other-function traffic). See shared-memory/.env.example."
+        )
+
+    if AUTH_CONFIGURED_AT_STARTUP:
+        return
+    private_false = sorted(b for b in LLM_BACKENDS if not LLM_BACKEND_PRIVATE_OK.get(b, True))
+    if not private_false:
+        return
+    if os.environ.get("ALLOW_UNAUTHENTICATED_PROVIDER_KEYS", "").strip().lower() in ("1", "true", "yes", "on"):
+        log.warning(
+            "ALLOW_UNAUTHENTICATED_PROVIDER_KEYS is set — starting UNAUTHENTICATED "
+            "with private_ok=false backend(s) configured: %s. Without agent identities "
+            "the gateway cannot tell one caller from another, so a backend scoped away "
+            "from role-less/private traffic has no enforceable meaning. This is the "
+            "deliberate override documented in shared-memory/.env.example, not a default.",
+            ", ".join(private_false),
+        )
+        return
+    raise SystemExit(
+        "FATAL: AGENT_TOKENS is unset (auth off) but private_ok=false backend(s) "
+        f"are configured ({', '.join(private_false)}) — the privacy/steering "
+        "invariants (I-1/I-6) require a caller identity to enforce, which an "
+        "auth-off install cannot provide. Configure AGENT_TOKENS, or set "
+        "ALLOW_UNAUTHENTICATED_PROVIDER_KEYS=1 to run anyway (see "
+        "shared-memory/.env.example)."
+    )
+
+
+def warn_if_dream_slots_impossible() -> None:
+    """C-1 (decision:1357): if NO backend counts toward /pool/status
+    free_slots, every dream daemon (REM, NREM, relation_sweep) gates itself
+    off a permanent 0 and simply never runs — with no LLM call ever made, no
+    refusal counter ever fires, so without this warning the condition is
+    invisible everywhere. A partial-role fleet (e.g. every backend scoped to
+    a single function) is the remaining way to reach it; per-role slot
+    accounting stays deferred, so the honest answer today is a LOUD startup
+    line naming the fix. A warning, not a refusal — a gateway serving only
+    ad-hoc client traffic is legitimate."""
+    if any(_counts_free_slot(b) for b in LLM_BACKENDS):
+        return
+    log.warning(
+        "NO configured backend counts toward /pool/status free_slots (each "
+        "either declares a partial `roles` list or is private_ok=false with "
+        "no full roles list). The dream daemons (REM/NREM/relation_sweep) "
+        "gate on free_slots and will NEVER run against this fleet. Fix: give "
+        "at least one backend no `roles` field (with private_ok), or an "
+        "explicit roles list covering all of %s.", sorted(ROUTING_ROLE_NAMES))
+
+
+# A2 (post-review addition, operator 2026-08-18): lifecycle token-count sum
+# lines. Read independently here rather than importing coordinator's
+# _audit_writer — this write is DELIBERATELY never routed through
+# AsyncLineWriter (its pre-existing shutdown-only flush-hang, fact:1335 open
+# item, must never risk stalling the gateway's own drain sequence), so there
+# is nothing here to share with that writer beyond the file path.
+GATEWAY_AUDIT_LOG_PATH = os.environ.get("GATEWAY_AUDIT_LOG_PATH", "").strip()
+# UNMEASURED convenience knob (flagged per fact:1338) — 0 disables periodic
+# emission entirely (the shutdown emission still always fires). A deployer
+# who wants bounded loss on a hard kill (no graceful shutdown) sets this.
+TOKEN_LIFECYCLE_SUM_INTERVAL_S = float(os.environ.get("TOKEN_LIFECYCLE_SUM_INTERVAL_S", "0") or "0")
+
+
+def _emit_token_lifecycle_sums(reason: str) -> None:
+    """One structured line per backend with the LIFECYCLE token totals so
+    far, to the journal AND the gateway audit JSONL (A2). DIRECT SYNCHRONOUS
+    write — never AsyncLineWriter, whose shutdown-only flush-hang (fact:1335
+    open item) this call must not risk triggering during the gateway's own
+    drain sequence. Best-effort: a write failure here must never break
+    shutdown or the periodic caller's loop."""
+    ts = datetime.now(timezone.utc).isoformat()
+    for b in LLM_BACKENDS:
+        p = _llm_tokens_prompt_total.get(b, 0)
+        c = _llm_tokens_completion_total.get(b, 0)
+        if p == 0 and c == 0:
+            continue
+        log.info(
+            "llm-token-lifecycle-sum backend=%s reason=%s tokens_prompt_total=%d "
+            "tokens_completion_total=%d", b, reason, p, c)
+        if GATEWAY_AUDIT_LOG_PATH:
+            try:
+                append_secure(GATEWAY_AUDIT_LOG_PATH, json.dumps({
+                    "ts": ts, "kind": "llm_token_lifecycle_sum", "reason": reason,
+                    "backend": b, "tokens_prompt_total": p, "tokens_completion_total": c,
+                }))
+            except Exception as exc:
+                log.warning("token lifecycle sum audit write failed: %s", exc)
+
+
+async def _token_lifecycle_sum_daemon(stop_event: asyncio.Event) -> None:
+    """Periodic A2 emission on TOKEN_LIFECYCLE_SUM_INTERVAL_S (no-op, exits
+    immediately, when unset/0 — the shutdown emission in main()'s drain
+    sequence is unconditional and covers every install either way)."""
+    if TOKEN_LIFECYCLE_SUM_INTERVAL_S <= 0:
+        return
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=TOKEN_LIFECYCLE_SUM_INTERVAL_S)
+            break   # stop_event fired — the drain sequence's own shutdown emission covers this
+        except asyncio.TimeoutError:
+            _emit_token_lifecycle_sums("periodic")
+
+
 def _default_uds_path() -> str:
     """Per-user runtime socket by default (0700 dir → only this user reaches it,
     which is exactly right for a single-user box). For a multi-user gateway set
@@ -1909,6 +2800,11 @@ async def main() -> None:
     # refuses to start — see require_auth_when_provider_keys_configured()'s
     # docstring for why this call lives here too.
     require_auth_when_provider_keys_configured()
+    # Model-attributes routing (M-5/P-5/unknown-role refusals) — see
+    # require_valid_llm_routing_config()'s docstring for why this call
+    # lives here too.
+    require_valid_llm_routing_config()
+    warn_if_dream_slots_impossible()
 
     PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8888
 
@@ -1970,6 +2866,11 @@ async def main() -> None:
     # actually SERVE, not merely whether they answer /health.
     capability_task   = asyncio.create_task(
         _capability_probe_daemon(proxy, stop_event))
+    # A2: periodic lifecycle token-count sum lines (no-op unless
+    # TOKEN_LIFECYCLE_SUM_INTERVAL_S is set) — the unconditional shutdown
+    # emission happens later in the drain sequence below regardless.
+    token_lifecycle_task = asyncio.create_task(
+        _token_lifecycle_sum_daemon(stop_event))
     loop = asyncio.get_running_loop()
 
     def _on_shutdown_signal():
@@ -2017,11 +2918,16 @@ async def main() -> None:
     watchdog_task.cancel()
     rem_watchdog_task.cancel()
     capability_task.cancel()
-    for task in (watchdog_task, rem_watchdog_task, capability_task):
+    token_lifecycle_task.cancel()
+    for task in (watchdog_task, rem_watchdog_task, capability_task, token_lifecycle_task):
         try:
             await task
         except asyncio.CancelledError:
             pass
+    # A2: unconditional lifecycle sum on graceful shutdown — DIRECT
+    # SYNCHRONOUS write (see _emit_token_lifecycle_sums' docstring), so it
+    # runs here rather than through proxy.cleanup()/coordinator.stop().
+    _emit_token_lifecycle_sums("shutdown")
     await coordinator.stop()
     await proxy.cleanup()
     log.info("Clean shutdown complete.")

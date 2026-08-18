@@ -1,7 +1,19 @@
 """S-14 (Credential_Custody_Plan PR A5): X-SM-LLM-* backend-steering headers
 are a daemon/admin capability, not an any-client one. A client-originated
-request gets them stripped before the routing decision is made; a request
-authenticated as one of the two framework daemons keeps them.
+request gets them stripped before the routing decision is EVEN READ — a
+non-steering identity's header never influences routing at all.
+
+⚠ UPDATED (Model_Attributes_Routing_Plan_2026-08-18, P-6): a daemon/admin
+identity's header now behaves differently on the two sides of the gateway —
+it is READ (may SET the header, and it DOES influence which backend gets
+picked) but never FORWARDED upstream: the provider must never see routing
+metadata on the wire, so the header is stripped again right before the
+upstream call, for every caller including daemons. Before this cycle a
+daemon's header survived all the way to the upstream request; that specific
+assertion changed in test_daemon_identity_keeps_steering_header and
+test_rem_daemon_identity_also_keeps_steering_header below. See
+tests/test_model_attributes_routing.py for the routing-still-works half of
+this story.
 
 Uses the request pattern from tests/test_llm_backend_secrets.py — role
 selection surfaces in _select_llm_backend's routing choice, which we observe
@@ -81,12 +93,20 @@ def test_client_steering_header_stripped_before_forwarding(monkeypatch):
 
 
 def test_auth_off_install_keeps_backward_compatible_pass_through(monkeypatch):
-    """An auth-unset install has no identity to gate steering on at all --
-    same backward-compat shape as every other identity-gated check in this
-    file (AUTH_CONFIGURED_AT_STARTUP False means "behave exactly as
-    before"), so the header is NOT stripped here. This is deliberate, not
-    an oversight: S-14 narrows what an AUTHENTICATED non-daemon caller can
-    do, it does not newly restrict an install that never turned auth on."""
+    """An auth-unset install has no identity to gate steering on at all, so
+    S-14's identity gate (_may_steer_llm) is a no-op and the header IS READ
+    for the gateway's own routing decision here -- same backward-compat
+    shape as every other identity-gated check in this file
+    (AUTH_CONFIGURED_AT_STARTUP False means "behave exactly as before") for
+    THAT axis.
+
+    ⚠ DELIBERATELY CHANGED on the FORWARDING axis (Model_Attributes_Routing_
+    Plan_2026-08-18, P-6): the header is now stripped before the upstream
+    call regardless of identity or auth state -- P-6 is upstream-forward
+    hygiene ("the provider must never see routing metadata"), a separate
+    concern from S-14's "who may set this for routing" gate, which this
+    test still exercises via test_p6_role_still_drives_routing_even_though_
+    stripped_on_forward in tests/test_model_attributes_routing.py."""
     monkeypatch.delenv("AGENT_TOKENS", raising=False)
     g = _load_gateway(monkeypatch)
     assert g.AUTH_CONFIGURED_AT_STARTUP is False
@@ -95,13 +115,24 @@ def test_auth_off_install_keeps_backward_compatible_pass_through(monkeypatch):
     proxy.session = session
     req = _req({"X-SM-LLM-Role": "judge"})
     asyncio.run(proxy.handle_proxy(req))
-    assert session.captured_headers.get("X-SM-LLM-Role") == "judge"
+    assert "X-SM-LLM-Role" not in session.captured_headers
 
 
 def test_daemon_identity_keeps_steering_header(monkeypatch):
-    """A request authenticated as one of the two framework daemons keeps
-    X-SM-LLM-Role -- requires AUTH_CONFIGURED_AT_STARTUP True, so a real
-    AGENT_TOKENS entry is configured first."""
+    """A request authenticated as one of the two framework daemons is
+    permitted to SET X-SM-LLM-Role for the gateway's own routing decision --
+    requires AUTH_CONFIGURED_AT_STARTUP True, so a real AGENT_TOKENS entry is
+    configured first.
+
+    DELIBERATELY CHANGED (Model_Attributes_Routing_Plan_2026-08-18, P-6):
+    the header is no longer forwarded upstream even for a daemon identity --
+    "may steer" now means "may set the header for gateway-internal routing",
+    never "may have it reach the provider". See
+    tests/test_model_attributes_routing.py's
+    test_p6_daemon_role_header_still_stripped_before_upstream_forward (the
+    strip, confirmed for THIS SAME daemon identity) and
+    test_p6_role_still_drives_routing_even_though_stripped_on_forward (the
+    role still drives WHICH backend is picked, despite the strip)."""
     monkeypatch.setenv("AGENT_TOKENS", "consolidation:tok_daemon_test")
     g = _load_gateway(monkeypatch)
     assert g.AUTH_CONFIGURED_AT_STARTUP is True
@@ -113,7 +144,7 @@ def test_daemon_identity_keeps_steering_header(monkeypatch):
     req["authenticated_agent"] = "consolidation"
     asyncio.run(proxy.handle_proxy(req))
     assert session.captured_headers is not None
-    assert session.captured_headers.get("X-SM-LLM-Role") == "judge"
+    assert "X-SM-LLM-Role" not in session.captured_headers
 
 
 def test_full_role_client_identity_gets_header_stripped_even_with_auth_on(monkeypatch):
@@ -135,6 +166,10 @@ def test_full_role_client_identity_gets_header_stripped_even_with_auth_on(monkey
 
 
 def test_rem_daemon_identity_also_keeps_steering_header(monkeypatch):
+    """DELIBERATELY CHANGED (P-6, see test_daemon_identity_keeps_steering_
+    header's docstring above): the rem_daemon identity may SET the header
+    for gateway-internal routing, but it is stripped before the upstream
+    forward exactly like every other identity."""
     monkeypatch.setenv("AGENT_TOKENS", "rem_daemon:tok_rem_test")
     g = _load_gateway(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
@@ -143,7 +178,7 @@ def test_rem_daemon_identity_also_keeps_steering_header(monkeypatch):
     req = _req({"X-SM-LLM-Role": "judge"})
     req["authenticated_agent"] = "rem_daemon"
     asyncio.run(proxy.handle_proxy(req))
-    assert session.captured_headers.get("X-SM-LLM-Role") == "judge"
+    assert "X-SM-LLM-Role" not in session.captured_headers
 
 
 def test_admin_role_identity_also_exempt(monkeypatch):

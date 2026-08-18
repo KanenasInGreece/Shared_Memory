@@ -74,9 +74,16 @@ def _req(method: str, path: str):
 
 
 def _load_credentialed_gateway(monkeypatch):
+    # private_ok: true (M-5, Model_Attributes_Routing_Plan_2026-08-18) — this
+    # file is about the S-04 credentialed-route allowlist on role-less
+    # traffic, not the M-5 startup choice (its own coverage lives in
+    # tests/test_model_attributes_routing.py); explicit here so role-less
+    # traffic stays eligible for this backend and reaches the allowlist
+    # check at all.
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-allowlist-test")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "model": "deepseek-chat"},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY",
+         "model": "deepseek-chat", "private_ok": True},
     ]))
     import hive_mind_proxy as g
     importlib.reload(g)
@@ -141,7 +148,7 @@ def test_denied_route_bumps_credential_counter_and_writes_audit_line(monkeypatch
     monkeypatch.setenv("CREDENTIAL_AUDIT_LOG_PATH", str(log_path))
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-allowlist-test")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True},
     ]))
     import coordinator
     importlib.reload(coordinator)

@@ -87,9 +87,10 @@ class FakeDriver:
 
 
 class _FakeResp:
-    def __init__(self, content, headers=None):
+    def __init__(self, content, headers=None, status_code=200):
         self._c = content
         self.headers = headers or {}
+        self.status_code = status_code
 
     def raise_for_status(self):
         pass
@@ -577,6 +578,7 @@ def test_adjudicate_batch_truncated_bounds_tokens_and_drops_final(monkeypatch):
     captured = {}
     class _TruncResp:
         headers = {"X-SM-LLM-Backend": "gemma"}
+        status_code = 200
         def __init__(self, content): self._c = content
         def raise_for_status(self): pass
         def json(self):

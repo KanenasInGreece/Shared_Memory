@@ -183,6 +183,27 @@ def _auth_headers() -> dict:
     return {}
 
 
+def _routing_refusal(resp) -> dict | None:
+    """Recognize a gateway routing refusal — 422 ``no_eligible_backend`` or 503
+    ``backend_at_capacity`` (Model_Attributes_Routing_Plan_2026-08-18 F-1/F-2),
+    both stamped ``X-SM-Fault-Origin: gateway``. Keys on the STRUCTURED BODY +
+    that header, never on status alone — a real provider 422/503 passed
+    through the proxy must never be misread as the gateway declining to place
+    the job. Returns ``{"error", "constraint", "role"}`` or None."""
+    if resp.status_code not in (422, 503):
+        return None
+    if resp.headers.get("X-SM-Fault-Origin") != "gateway":
+        return None
+    try:
+        body = resp.json()
+    except Exception:
+        return None
+    error = body.get("error") if isinstance(body, dict) else None
+    if error not in ("no_eligible_backend", "backend_at_capacity"):
+        return None
+    return {"error": error, "constraint": body.get("constraint"), "role": body.get("role")}
+
+
 def _require_db_credentials() -> None:
     """Wraps secure_env.require_db_credentials() with this daemon's own
     resolved values — called ONLY from the __main__ guard below (review fix
@@ -389,6 +410,10 @@ LLM_FAIL_TRANSPORT = "transport"   # HTTP non-200 / connection / gateway-shape �
 LLM_FAIL_TRUNCATED = "truncated"   # finish_reason=length even after the retry (widened for
                                     # an honest truncation, same-bound for a degenerate one)
 LLM_FAIL_PARSE     = "parse"       # response arrived but its content is unusable
+LLM_FAIL_ROUTING_REFUSED = "routing_refused"   # gateway declined to place the job (422
+                                    # no_eligible_backend / 503 backend_at_capacity,
+                                    # Model_Attributes_Routing_Plan_2026-08-18 F-1/F-2) —
+                                    # a config gap, not a record defect — NOT chargeable
 
 # Failure classes that may count toward a record's dead-letter cap.
 LLM_FAIL_CHARGEABLE = frozenset({LLM_FAIL_TRUNCATED, LLM_FAIL_PARSE})
@@ -1330,6 +1355,13 @@ class REMDaemon:
         # serially within a cycle (same convention as NREM's
         # _last_llm_truncated), so signatures stay stable.
         self._last_llm_failure: str | None = None
+        # Set True by _llm_verify_call when the gateway REFUSED the call
+        # (routing refusal, not a truncation/transport failure) — lets
+        # _verify_novel_edges break the k=3 self-consistency loop after the
+        # FIRST refusal instead of hammering an unchanged fleet two more
+        # times this cycle (I-4's spirit: the gateway already said nothing
+        # eligible exists).
+        self._last_verify_refused: bool = False
         # Link-gate counter: how many proposed names REM declined to link over
         # this daemon's lifetime — absent from the graph, or withheld by the
         # accept set. Process-local by design — the durable record is the
@@ -2348,7 +2380,7 @@ class REMDaemon:
                 async with httpx.AsyncClient(timeout=_ceiling) as client:
                     resp = await client.post(
                         REASONER_URL,
-                        headers=_auth_headers(),
+                        headers={**_auth_headers(), "X-SM-LLM-Role": "extract"},
                         json={
                             "model": LLM_MODEL,
                             "messages": [
@@ -2367,10 +2399,29 @@ class REMDaemon:
                 return None, model, LLM_FAIL_TRANSPORT, False
             _backend = resp.headers.get("X-SM-LLM-Backend")
             model = _backend or "local-model"
+            refusal = _routing_refusal(resp)
+            if refusal:
+                # F-1/F-2: the gateway declined to place this job — a config
+                # gap (no eligible backend / everyone at capacity), never
+                # evidence about THIS record. Log loudly ONCE, skip WITHOUT
+                # charging rem_attempts (LLM_FAIL_ROUTING_REFUSED is not in
+                # LLM_FAIL_CHARGEABLE), no retry within this cycle.
+                logger.warning(
+                    "REM: pg_id=%s solo enrichment call REFUSED by gateway "
+                    "routing (constraint=%s role=%s) — skipping WITHOUT "
+                    "charging rem_attempts; record stays eligible next cycle",
+                    pg_id, refusal["constraint"], refusal["role"],
+                )
+                record_llm_call("REM", None, backend=_backend,
+                                wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
+                                ok=False, note=f"routing_refused_{refusal['error']}",
+                                prompt_chars=len(prompt))
+                return None, model, LLM_FAIL_ROUTING_REFUSED, False
             if resp.status_code != 200:
                 record_llm_call("REM", None, backend=_backend,
                                 wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
-                                ok=False, note=f"http_{resp.status_code}")
+                                ok=False, note=f"http_{resp.status_code}",
+                                prompt_chars=len(prompt))
                 logger.error("LLM returned %d: %s", resp.status_code, resp.text[:200])
                 return None, model, LLM_FAIL_TRANSPORT, False
             try:
@@ -2390,10 +2441,11 @@ class REMDaemon:
                 )
                 record_llm_call("REM", resp_json, backend=_backend,
                                 wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
-                                note=note, specimen=specimen)
+                                note=note, specimen=specimen, prompt_chars=len(prompt))
                 return None, model, LLM_FAIL_TRUNCATED, degenerate
             record_llm_call("REM", resp_json, backend=_backend,
-                            wall_s=time.monotonic() - _start, ceiling_s=_ceiling)
+                            wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
+                            prompt_chars=len(prompt))
             return resp_json, model, None, False
 
         resp_json, model, failure, degenerate = await _attempt(REM_MAX_TOKENS_SOLO)
@@ -2527,7 +2579,7 @@ class REMDaemon:
         try:
             async with httpx.AsyncClient(timeout=_ceiling) as client:
                 resp = await client.post(
-                    REASONER_URL, headers=_auth_headers(),
+                    REASONER_URL, headers={**_auth_headers(), "X-SM-LLM-Role": "extract"},
                     json={"model": LLM_MODEL,
                           "messages": [
                               {"role": "system", "content": "You are a technical knowledge curator. Output only JSONL — one JSON object per line, no prose, no markdown fences, no thinking."},
@@ -2537,10 +2589,29 @@ class REMDaemon:
                 )
                 _backend = resp.headers.get("X-SM-LLM-Backend")
                 model = _backend or "local-model"
+                refusal = _routing_refusal(resp)
+                if refusal:
+                    # F-1/F-2: skip WITHOUT charging — a config gap says
+                    # nothing about any of the batched records; they all
+                    # retry, still batched, next cycle (same non-attributable
+                    # shape as any other whole-call failure, F1).
+                    logger.warning(
+                        "REM batch: call (%d facts) REFUSED by gateway "
+                        "routing (constraint=%s role=%s) — skipping WITHOUT "
+                        "charging any attempt; all %d fact(s) retry next cycle",
+                        len(items), refusal["constraint"], refusal["role"], len(items),
+                    )
+                    record_llm_call("REM", None, backend=_backend,
+                                    wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
+                                    ok=False, note=f"batch_routing_refused_{refusal['error']}",
+                                    prompt_chars=len(prompt))
+                    self._last_llm_failure = LLM_FAIL_ROUTING_REFUSED
+                    return None, None, model
                 if resp.status_code != 200:
                     record_llm_call("REM", None, backend=_backend,
                                     wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
-                                    ok=False, note=f"batch_http_{resp.status_code}")
+                                    ok=False, note=f"batch_http_{resp.status_code}",
+                                    prompt_chars=len(prompt))
                     logger.error("REM batch LLM returned %d: %s", resp.status_code, resp.text[:200])
                     self._last_llm_failure = LLM_FAIL_TRANSPORT
                     return None, None, model
@@ -2570,11 +2641,11 @@ class REMDaemon:
                     )
                     record_llm_call("REM", resp_json, backend=_backend,
                                     wall_s=_wall_s, ceiling_s=_ceiling,
-                                    note=_note, specimen=specimen)
+                                    note=_note, specimen=specimen, prompt_chars=len(prompt))
                 else:
                     record_llm_call("REM", resp_json, backend=_backend,
                                     wall_s=_wall_s, ceiling_s=_ceiling,
-                                    note=f"batch={len(items)}")
+                                    note=f"batch={len(items)}", prompt_chars=len(prompt))
         except Exception as exc:
             logger.error("REM batch LLM error: %s: %s", type(exc).__name__, exc)
             self._last_llm_failure = LLM_FAIL_TRANSPORT
@@ -2702,10 +2773,11 @@ class REMDaemon:
         _max_tokens = max(REM_VERIFY_MAX_TOKENS_FLOOR,
                           REM_MAX_TOKENS_PER_VERIFY_EDGE * max(n_edges, 1))
         _start = time.monotonic()
+        self._last_verify_refused = False
         try:
             async with httpx.AsyncClient(timeout=_ceiling) as client:
                 resp = await client.post(
-                    REASONER_URL, headers=_auth_headers(),
+                    REASONER_URL, headers={**_auth_headers(), "X-SM-LLM-Role": "verify"},
                     json={"model": LLM_MODEL,
                           "messages": [
                               {"role": "system", "content": "You verify proposed knowledge-graph edges. Output only JSONL confirm lines — no prose, no markdown fences, no thinking."},
@@ -2714,15 +2786,34 @@ class REMDaemon:
                           "max_tokens": _max_tokens},
                 )
                 _backend = resp.headers.get("X-SM-LLM-Backend")
+                refusal = _routing_refusal(resp)
+                if refusal:
+                    # F-1/F-2: skip WITHOUT charging — verification has no
+                    # rem_attempts of its own; a refused call simply fails to
+                    # vote (degrades k, same as any other failed verify call)
+                    # and _verify_novel_edges stops asking again this cycle.
+                    logger.warning(
+                        "REM: pg_id=%d verification call REFUSED by gateway "
+                        "routing (constraint=%s role=%s) — vote skipped, no "
+                        "further verify calls this cycle",
+                        pg_id, refusal["constraint"], refusal["role"],
+                    )
+                    record_llm_call("REM", None, backend=_backend,
+                                    wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
+                                    ok=False, note=f"verify_routing_refused_{refusal['error']}",
+                                    prompt_chars=len(prompt))
+                    self._last_verify_refused = True
+                    return None
                 if resp.status_code != 200:
                     record_llm_call("REM", None, backend=_backend,
                                     wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
-                                    ok=False, note=f"verify_http_{resp.status_code}")
+                                    ok=False, note=f"verify_http_{resp.status_code}",
+                                    prompt_chars=len(prompt))
                     return None
                 resp_json = resp.json()
                 record_llm_call("REM", resp_json, backend=_backend,
                                 wall_s=time.monotonic() - _start, ceiling_s=_ceiling,
-                                note="verify")
+                                note="verify", prompt_chars=len(prompt))
                 if _truncated(resp_json):
                     # A truncated verification is a FAILED call (degrades k) —
                     # a partial confirm list would silently deny the tail edges.
@@ -2773,6 +2864,15 @@ class REMDaemon:
             confirms = await self._llm_verify_call(prompt, pg_id,
                                                    n_edges=len(proposed))
             if confirms is None:
+                if getattr(self, "_last_verify_refused", False):
+                    # I-4's spirit: the gateway already said nothing eligible
+                    # exists for this cycle — asking again VERIFY_CALLS-1
+                    # more times changes nothing, only hammers it.
+                    logger.info(
+                        "REM: pg_id=%d verification stopped after a gateway "
+                        "routing refusal — no further self-consistency calls "
+                        "this cycle", pg_id)
+                    break
                 continue
             k += 1
             for i in range(len(proposed)):
@@ -2817,7 +2917,7 @@ class REMDaemon:
             logger.warning(
                 "REM: pg_id=%d LLM failed (%s) — skipping%s",
                 pg_id, failure,
-                "" if chargeable else " (transport failure — attempt NOT charged)",
+                "" if chargeable else f" ({failure} — attempt NOT charged)",
             )
             if chargeable:
                 await self._bump_rem_attempts([pg_id])

@@ -56,8 +56,13 @@ def test_client_authorization_never_forwarded_to_llm_backend(monkeypatch):
 
 def test_backend_token_env_injected_as_authorization(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-123")
+    # private_ok: true (M-5, Model_Attributes_Routing_Plan_2026-08-18) — this
+    # test is about token_env→Authorization injection, not the M-5 startup
+    # choice (that has its own coverage in test_model_attributes_routing.py);
+    # explicit here so role-less traffic stays eligible for this backend.
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "model": "deepseek-chat"},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY",
+         "model": "deepseek-chat", "private_ok": True},
     ]))
     import hive_mind_proxy as g
     importlib.reload(g)
@@ -268,8 +273,12 @@ class _FailSession:
 
 def test_token_never_leaks_into_client_visible_error_response(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-must-never-appear-to-any-client")
+    # private_ok: true (M-5) — see test_backend_token_env_injected_as_
+    # authorization's comment above; this test needs role-less traffic to
+    # actually reach dispatch (and then fail) to exercise the leak check.
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "model": "deepseek-chat"},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY",
+         "model": "deepseek-chat", "private_ok": True},
     ]))
     import hive_mind_proxy as g
     importlib.reload(g)

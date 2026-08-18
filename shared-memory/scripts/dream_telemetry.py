@@ -291,6 +291,7 @@ def record_llm_call(
     ok: bool = True,
     note: str | None = None,
     specimen: str | None = None,
+    prompt_chars: int | None = None,
 ) -> dict:
     """Record one dream-cycle LLM call. Never raises (telemetry must not break a
     daemon cycle). Returns the record dict for callers that want to inspect it.
@@ -301,7 +302,16 @@ def record_llm_call(
     row when present and omitted (None) otherwise; this function does not
     bound or validate it. `note`/`ok` keep their existing meanings — a
     truncation classification (L0-b) is carried in `note`, it never flips `ok`
-    (N4: additive keys only, no existing key changes meaning)."""
+    (N4: additive keys only, no existing key changes meaning).
+
+    `prompt_chars` (N-4, Model_Attributes_Routing_Plan_2026-08-18): the
+    caller's own char-count of the prompt it built, additive and optional.
+    N-1 found the originally-planned chars/token ratio measurement from
+    dream-metrics history uncomputable because `prompt_n` (from llama.cpp's
+    `timings`) and a char count never co-occurred in the same row — this
+    field is what lets that pairing accumulate going forward, alongside the
+    existing `prompt_n`, for a future from-history re-measurement of the
+    gateway's own CHARS_PER_TOKEN_RATIO."""
     t = (resp_json or {}).get("timings") or {}
     usage = (resp_json or {}).get("usage") or {}
     tok_s = t.get("predicted_per_second")
@@ -323,6 +333,7 @@ def record_llm_call(
         "ok": ok,
         "note": note,
         "specimen": specimen,
+        "prompt_chars": prompt_chars,
     }
     try:
         logger.info(
