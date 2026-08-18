@@ -344,7 +344,7 @@ REM_TRUNCATION_RETRY_FACTOR = float(os.environ.get("REM_TRUNCATION_RETRY_FACTOR"
 # WARN/ERROR line and the dream-metrics JSONL row, never the persisted record
 # (a truncated body is never parsed or saved; see truncation_is_degenerate and
 # N3 below). Same disclosure class as the raw[:300]/resp.text[:200] excerpts
-# already logged elsewhere in this file (fact:1338 F-8).
+# already logged elsewhere in this file (fact:1346 F-8).
 REM_TRUNCATION_SPECIMEN_CHARS = int(os.environ.get("REM_TRUNCATION_SPECIMEN_CHARS", "500"))
 
 # Poison-record escape hatch: a record whose enrichment failed this many times
@@ -425,9 +425,13 @@ def _completion_text(resp_json) -> str:
     on anything it can't read, which is exactly what truncation_is_degenerate
     fails open on."""
     try:
-        return (resp_json.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        content = (resp_json.get("choices") or [{}])[0].get("message", {}).get("content")
     except (AttributeError, IndexError, TypeError):
         return ""
+    # A non-string content (list/dict envelope variants) must not escape: the
+    # solo call site classifies OUTSIDE any try, so a passed-through non-str
+    # would abort the whole REM cycle (fact:1347 S-2, executed).
+    return content if isinstance(content, str) else ""
 
 
 # Parse-free flat-object extractor: matches the innermost `{...}` spans (no
@@ -483,9 +487,20 @@ def _truncation_specimen(body: str) -> str:
     """Bounded, single-line tail of a truncated completion body for the
     journal WARN and the dream-metrics `specimen` key — never the full body.
     Last REM_TRUNCATION_SPECIMEN_CHARS characters (the array elements a max-
-    tokens cut lands on), newlines collapsed so it stays one log line."""
-    tail = (body or "")[-REM_TRUNCATION_SPECIMEN_CHARS:]
-    return " ".join(tail.split())
+    tokens cut lands on), newlines collapsed so it stays one log line.
+
+    Zero or negative means DISABLED and must yield the empty string — slicing
+    with `[-0:]` is `[0:]`, so without this guard the value an operator picks
+    to turn specimens OFF would log the ENTIRE body (security review
+    fact:1347 S-1, executed: a 44,000-char body logged whole at CHARS=0).
+    Non-printables beyond whitespace (ESC/CSI, NUL, BS) are replaced so
+    crafted model output cannot smuggle terminal control sequences into
+    journalctl (S-4); the JSONL sink is safe either way (json.dumps)."""
+    n = REM_TRUNCATION_SPECIMEN_CHARS
+    if n <= 0:
+        return ""
+    tail = " ".join((body or "")[-n:].split())
+    return "".join(ch if ch.isprintable() else " " for ch in tail)
 
 
 def _drop_final_nonempty_line(raw: str) -> str:
@@ -2413,9 +2428,11 @@ class REMDaemon:
                     logger.error(
                         "REM: pg_id=%s solo enrichment TRUNCATED again "
                         "(degenerate) at max_tokens=%d — failing the unit; "
-                        "no parse, no repair. This is a repetition loop, not "
-                        "a size problem — raising REM_MAX_TOKENS_SOLO will "
-                        "not fix it (fact:1329/1330).",
+                        "no parse, no repair. Raising REM_MAX_TOKENS_SOLO "
+                        "does not fix a repetition loop (fact:1329/1330); if "
+                        "this record dead-letters with DIFFERING specimens "
+                        "each attempt, suspect a classifier false positive "
+                        "instead.",
                         pg_id, retry_bound,
                     )
                 else:

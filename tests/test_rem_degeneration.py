@@ -204,13 +204,47 @@ async def test_second_truncation_of_either_class_fails_the_unit(monkeypatch):
 
 def test_truncation_specimen_is_the_bounded_tail():
     """Pure specimen extraction: last REM_TRUNCATION_SPECIMEN_CHARS chars,
-    single line (newlines collapsed)."""
+    single line (newlines collapsed). The length is pinned against a literal
+    500 on one side, not only against the module constant — an equality
+    between two expressions is half a guard (fact:1309): both sides moving
+    with the same knob could drift together to a wrong value."""
     body = "a" * 1000 + "\nTAIL\nEND" + "b" * 10
     specimen = _truncation_specimen(body)
-    assert len(specimen) <= REM_TRUNCATION_SPECIMEN_CHARS
+    assert REM_TRUNCATION_SPECIMEN_CHARS == 500   # the shipped default, literally
+    assert len(specimen) <= 500
     assert "\n" not in specimen
     assert specimen.endswith("b" * 10)          # it IS the tail, not the head
     assert "a" * 1000 not in specimen            # never the full body
+
+
+def test_specimen_zero_or_negative_chars_means_disabled_not_full_body(monkeypatch):
+    """S-1 (fact:1347, Required): `body[-0:]` is the WHOLE body, so the value
+    an operator picks to disable specimens must yield the EMPTY string — the
+    exact inversion the security review executed (44,000-char body logged
+    whole at CHARS=0)."""
+    body = "x" * 44_000
+    for n in (0, -1):
+        monkeypatch.setattr(rem_mod, "REM_TRUNCATION_SPECIMEN_CHARS", n)
+        assert rem_mod._truncation_specimen(body) == ""
+
+
+def test_specimen_strips_terminal_control_characters(monkeypatch):
+    """S-4 (fact:1347): ESC/CSI, NUL and BS must not reach journalctl —
+    crafted model output cannot smuggle terminal control sequences."""
+    monkeypatch.setattr(rem_mod, "REM_TRUNCATION_SPECIMEN_CHARS", 500)
+    specimen = rem_mod._truncation_specimen('{"a": "b"}\x1b[31mFAKE\x00\x08')
+    assert "\x1b" not in specimen and "\x00" not in specimen and "\x08" not in specimen
+    assert "FAKE" in specimen                    # content survives, controls do not
+
+
+def test_non_string_completion_content_classifies_as_empty():
+    """S-2 (fact:1347): a non-string `content` in the envelope must coerce to
+    "" (fail-open honest) rather than escape into the un-try'd solo path and
+    abort the REM cycle."""
+    for content in ({"t": 1}, 7, ["a"], None):
+        resp = {"choices": [{"message": {"content": content},
+                             "finish_reason": "length"}]}
+        assert rem_mod._completion_text(resp) == ""
 
 
 @pytest.mark.asyncio
