@@ -188,12 +188,25 @@ def test_unknown_role_refuses_startup(monkeypatch):
 def test_m5_credentialed_backend_with_no_choice_refuses_startup(monkeypatch):
     """MUTATION TARGET (M-5 Critical): a credentialed backend with neither
     roles nor an explicit private_ok would silently go dark under the plain
-    default — must refuse rather than brick a cloud-only install on upgrade."""
+    default — must refuse rather than brick a cloud-only install on upgrade.
+
+    Auth is configured ON here so P-5 cannot ALSO independently refuse this
+    exact scenario (private_ok defaults False for a credentialed backend,
+    which P-5 would catch on an auth-off install regardless of M-5) —
+    isolating M-5 as the SOLE possible cause of the refusal is what makes
+    this test actually prove M-5 works, not just "some refusal happened"."""
+    monkeypatch.setenv("AGENT_TOKENS", "claude:tok_m5_isolated_test")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
     ]))
-    g = _fresh(monkeypatch)
+    import secure_env
+    secure_env._secrets.pop("AGENT_TOKENS", None)
+    import coordinator
+    importlib.reload(coordinator)
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    assert g.AUTH_CONFIGURED_AT_STARTUP is True
     try:
         g.require_valid_llm_routing_config()
         assert False, "expected SystemExit"
