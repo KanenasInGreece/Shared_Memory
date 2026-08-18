@@ -172,8 +172,8 @@ CREATE TABLE IF NOT EXISTS entity_vocab_aliases (
     normalized_alias TEXT NOT NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     created_by       TEXT NOT NULL DEFAULT 'system'::text,
-    CONSTRAINT entity_vocab_aliases_not_blank CHECK ((btrim(alias) <> ''::text)),
-    CONSTRAINT entity_vocab_aliases_normalized_alias_not_empty CHECK ((normalized_alias <> ''::text))
+    CONSTRAINT entity_vocab_aliases_normalized_alias_not_empty CHECK ((normalized_alias <> ''::text)),
+    CONSTRAINT entity_vocab_aliases_not_blank CHECK ((btrim(alias) <> ''::text))
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS entity_vocab_aliases_alias_unique ON public.entity_vocab_aliases USING btree (alias);
@@ -187,12 +187,12 @@ CREATE TABLE IF NOT EXISTS entity_vocabulary (
     normalized_key   TEXT NOT NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     registered_by    TEXT NOT NULL DEFAULT 'system'::text,
-    CONSTRAINT entity_vocabulary_not_blank CHECK ((btrim(name) <> ''::text)),
-    CONSTRAINT entity_vocabulary_normalized_key_not_empty CHECK ((normalized_key <> ''::text))
+    CONSTRAINT entity_vocabulary_normalized_key_not_empty CHECK ((normalized_key <> ''::text)),
+    CONSTRAINT entity_vocabulary_not_blank CHECK ((btrim(name) <> ''::text))
 );
 
-CREATE INDEX IF NOT EXISTS idx_entity_vocabulary_created_at ON public.entity_vocabulary USING btree (created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS entity_vocabulary_normalized_key_unique ON public.entity_vocabulary USING btree (normalized_key);
+CREATE INDEX IF NOT EXISTS idx_entity_vocabulary_created_at ON public.entity_vocabulary USING btree (created_at);
 
 -- ─── neo4j_outbox ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS neo4j_outbox (
@@ -514,6 +514,8 @@ BEGIN
             'entity_vocabulary row', NEW.entity_id;
     END IF;
 
+    -- Refused if this normalized value is already a DIFFERENT canonical's
+    -- identity. Equal to its OWN parent's key is fine — the ordinary case.
     IF EXISTS (
         SELECT 1 FROM entity_vocabulary v
          WHERE v.normalized_key = NEW.normalized_alias
