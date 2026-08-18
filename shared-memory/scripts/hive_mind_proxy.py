@@ -53,6 +53,8 @@ from coordinator import (
     record_llm_upstream_fault,
     _parse_upstream_error_type,
     _decompress_prefix_for_parse,
+    _decompress_full_for_usage,
+    SUPPORTED_CONTENT_ENCODINGS,
     _short,
 )
 
@@ -590,13 +592,30 @@ _warned_unknown_role_values: set[str] = set()
 _llm_tokens_prompt_total: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
 _llm_tokens_completion_total: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
 _llm_tokens_last_ts: dict[str, "str | None"] = {b: None for b in LLM_BACKENDS}
+# Per-backend LLM request latency (new instrument, single-cloud-fleet
+# debugging cycle): nothing recorded per-request latency, so a local-vs-
+# online backend comparison had no data. Measured with time.monotonic()
+# around the FULL proxied upstream exchange — request sent through response
+# body fully drained (write_eof or the terminal disconnect/cancellation
+# branch) — for pool-routed LLM requests only (llm_backend is not None;
+# embeddings/reranking never touch these dicts). Recorded for success AND
+# failure, with failures (status >= 400 or an exception) counted separately
+# so the average isn't diluted by them. IN-PROCESS only — reset on restart,
+# same lifecycle as the token counters above; the paired last-ts is what
+# makes a restart-aware delta computable.
+_llm_requests_total: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
+_llm_requests_failed_total: dict[str, int] = {b: 0 for b in LLM_BACKENDS}
+_llm_latency_sum_s: dict[str, float] = {b: 0.0 for b in LLM_BACKENDS}
+_llm_latency_max_s: dict[str, float] = {b: 0.0 for b in LLM_BACKENDS}
+_llm_latency_last_ts: dict[str, "str | None"] = {b: None for b in LLM_BACKENDS}
 # Bounds how much response body the usage-parsing peek accumulates for a
 # single LLM call — a streamed multi-megabyte completion must never be held
 # fully in memory just to look for a trailing `usage` object. Capture is
-# abandoned (not attempted) once this is exceeded, and skipped entirely for
-# a compressed response (auto_decompress=False means a compressed body would
-# need full decompression, not just the bounded-prefix helper coordinator.py
-# uses for fault-body peeking — out of scope for this cycle, see HANDOFF.md).
+# abandoned (not attempted) once this is exceeded. Applies to the COMPRESSED
+# bytes accumulated for a gzip/deflate/br response too (see
+# _decompress_full_for_usage in coordinator.py) — the memory bound is the
+# point, and decompression happens once, after the loop, on the
+# already-cap-bounded accumulated body.
 LLM_USAGE_CAPTURE_CAP_BYTES = int(os.environ.get("LLM_USAGE_CAPTURE_CAP_BYTES", str(2 * 1024 * 1024)))
 # Runtime reservation (gateway-controlled, NEVER env/user). A backend in this set
 # is held OUT of the general parallelise pool so a quality task can use it
@@ -823,6 +842,22 @@ def _record_backend_token_usage(backend: str, usage: dict) -> None:
             _llm_tokens_last_ts[backend] = datetime.now(timezone.utc).isoformat()
     except Exception as exc:
         log.warning("token usage accounting failed for %s: %s", backend, exc)
+
+
+def _record_llm_latency(backend: str, elapsed_s: float, failed: bool) -> None:
+    """New instrument: per-backend LLM request latency. Called exactly once
+    per pool-routed request from handle_proxy's finally block (O-2 precedent
+    at the credential-fault recorder above) — wrapped so an exception here
+    can never break the proxy path it is called from."""
+    try:
+        _llm_requests_total[backend] = _llm_requests_total.get(backend, 0) + 1
+        if failed:
+            _llm_requests_failed_total[backend] = _llm_requests_failed_total.get(backend, 0) + 1
+        _llm_latency_sum_s[backend] = _llm_latency_sum_s.get(backend, 0.0) + elapsed_s
+        _llm_latency_max_s[backend] = max(_llm_latency_max_s.get(backend, 0.0), elapsed_s)
+        _llm_latency_last_ts[backend] = datetime.now(timezone.utc).isoformat()
+    except Exception as exc:
+        log.warning("latency accounting failed for %s: %s", backend, exc)
 
 
 def _llm_mark_fail(backend: str) -> None:
@@ -1387,6 +1422,17 @@ class AsyncHiveMindProxy:
                 if role:
                     _record_role_routed(role)
 
+            # New instrument: latency timer starts here (request dispatch),
+            # spans every retry attempt below as ONE logical request (same
+            # framing as the inflight/_llm_routed accounting just above —
+            # a retry is the same call, not a second one), and is read back
+            # in the finally at the bottom of this method regardless of how
+            # the method exits. _llm_req_failed defaults to True (covers
+            # every exception/error-status exit path below) and is flipped
+            # to False only at the single success return.
+            _llm_req_start_mono = time.monotonic() if llm_backend is not None else None
+            _llm_req_failed = True
+
             for attempt in range(max_attempts):
                 try:
                     async with self.session.request(
@@ -1432,19 +1478,34 @@ class AsyncHiveMindProxy:
                         # for a best-effort `usage` parse AFTER the loop, so a
                         # per-backend token count can be kept without ever
                         # delaying or altering the passthrough chunk written
-                        # below. Only attempted for a successful, uncompressed
-                        # LLM response (a compressed body would need full
-                        # decompression, not the bounded-prefix fault-peek
-                        # helper — out of scope this cycle, see HANDOFF.md)
-                        # and bounded by LLM_USAGE_CAPTURE_CAP_BYTES so a large
-                        # streamed completion is never held fully in memory
-                        # just to look for a trailing `usage` object.
+                        # below. Attempted for a successful LLM response that
+                        # is either uncompressed OR compressed with a
+                        # SUPPORTED_CONTENT_ENCODINGS value (gzip/deflate/br —
+                        # see _decompress_full_for_usage). Live debugging on a
+                        # cloud backend (api.deepseek.com) showed the original
+                        # `not content_encoding` gate reading 0 tokens on
+                        # every gzipped response while the billable call
+                        # succeeded — the cost meter was blind exactly where
+                        # cost matters. The accumulation itself is bounded by
+                        # LLM_USAGE_CAPTURE_CAP_BYTES on the COMPRESSED bytes
+                        # (the memory bound is the point — decompression
+                        # happens once, after the loop, on the accumulated
+                        # cap-bounded body) so a large streamed completion is
+                        # never held fully in memory just to look for a
+                        # trailing `usage` object. An unsupported/unknown
+                        # encoding (e.g. a future provider using `zstd`)
+                        # leaves capture_usage False, same as the original
+                        # gate for any compression it didn't understand.
                         # stream:true responses are SSE — the accumulated
                         # bytes can never parse as a single JSON object, so
                         # skip capture instead of buffering up to the cap for
                         # a parse that always fails (Optional, decision:1357).
+                        _capture_encoding_ok = (
+                            not content_encoding
+                            or content_encoding.strip().lower() in SUPPORTED_CONTENT_ENCODINGS
+                        )
                         capture_usage = (llm_backend is not None and upstream.status < 400
-                                        and not content_encoding
+                                        and _capture_encoding_ok
                                         and not (body_obj or {}).get("stream"))
                         usage_chunks: "list[bytes] | None" = [] if capture_usage else None
                         usage_bytes = 0
@@ -1519,7 +1580,21 @@ class AsyncHiveMindProxy:
 
                         if usage_chunks:
                             try:
-                                resp_payload = json.loads(b"".join(usage_chunks))
+                                usage_body = b"".join(usage_chunks)
+                                if content_encoding:
+                                    # Whole-body decompress — mirrors
+                                    # _decompress_prefix_for_parse's encoding
+                                    # support exactly (gzip/deflate/br) but
+                                    # without its bounded-prefix truncation,
+                                    # since the `usage` object trails the
+                                    # response and a prefix would miss it.
+                                    # Raises on failure (unlike the prefix
+                                    # helper), caught by this same except —
+                                    # a decompression failure abandons
+                                    # capture silently, exactly like today's
+                                    # parse failure.
+                                    usage_body = _decompress_full_for_usage(usage_body, content_encoding)
+                                resp_payload = json.loads(usage_body)
                                 usage = (resp_payload.get("usage")
                                         if isinstance(resp_payload, dict) else None)
                                 if isinstance(usage, dict):
@@ -1529,6 +1604,15 @@ class AsyncHiveMindProxy:
 
                         if llm_backend is not None:
                             _llm_mark_ok(llm_backend)   # connected + served — clear fail streak
+                        # The exchange completed and the body was fully
+                        # written above (write_eof / the disconnect branches
+                        # both fall through to here) — but a fault STATUS
+                        # from upstream (>= 400) still reaches this same
+                        # return (the body passes through verbatim either
+                        # way, per the X-SM-Fault-Origin comment above), so
+                        # the latency instrument's failed flag reads the
+                        # status here rather than assuming success.
+                        _llm_req_failed = upstream.status >= 400
                         return proxy_resp
 
                 except (ClientConnectionResetError, ServerDisconnectedError) as e:
@@ -1637,6 +1721,17 @@ class AsyncHiveMindProxy:
                 starts = _llm_inflight_started.get(llm_backend)
                 if starts:
                     starts.remove(min(starts))
+                # New instrument: record latency for every exit path from
+                # this method (success, upstream fault status, gateway
+                # error, timeout, cancellation) — _llm_req_start_mono is set
+                # iff llm_backend is not None, i.e. exactly the pool-routed
+                # requests this instrument covers; embeddings/reranking
+                # never reach here with a backend set. _llm_req_failed
+                # defaults True and is flipped only at the single success
+                # return above, reading the upstream status there.
+                if _llm_req_start_mono is not None:
+                    _record_llm_latency(
+                        llm_backend, time.monotonic() - _llm_req_start_mono, _llm_req_failed)
 
 
 # --------------------------------------------------------------------------- #
@@ -2281,7 +2376,15 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
                         _wedged.append(b)
             if _wedged:
                 checks["llm_suspect_wedged"] = _wedged
-    if len(LLM_BACKENDS) > 1:
+    # Gate on ANY configured backend, not "more than one" — the original
+    # `> 1` read single-backend as "legacy default, nothing interesting to
+    # show", but that meaning inverted: a cloud-only fleet (the
+    # VRAM-constrained configuration our own docs recommend) IS a
+    # single-backend fleet, and the old gate made it vanish from the
+    # monitor entirely. This is a PRESENCE change only — additive, no
+    # existing key's meaning changes; sections below now also appear for a
+    # one-backend fleet.
+    if LLM_BACKENDS:
         checks["llm_backends"] = backend_status
         if _llm_reserved:
             checks["llm_reserved"] = sorted(_llm_reserved)
@@ -2342,6 +2445,25 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
                 "tokens_prompt_total": _llm_tokens_prompt_total.get(b, 0),
                 "tokens_completion_total": _llm_tokens_completion_total.get(b, 0),
                 "tokens_last_ts": _llm_tokens_last_ts.get(b),
+            }
+            for b in LLM_BACKENDS
+        }
+    # New instrument: per-backend LLM request latency (local-vs-online
+    # comparison). Same lifecycle as llm_token_usage above — IN-PROCESS
+    # ONLY, reset on restart, the ts pairing is what makes a restart-aware
+    # delta computable. latency_sum_s + requests_total makes the average
+    # derivable on the read side without the gateway ever caring what
+    # "average" means; requests_failed_total is counted separately so a
+    # string of failures (fast, low-latency) doesn't dilute the success
+    # average.
+    if LLM_BACKENDS:
+        checks["llm_latency"] = {
+            b: {
+                "requests_total": _llm_requests_total.get(b, 0),
+                "requests_failed_total": _llm_requests_failed_total.get(b, 0),
+                "latency_sum_s": round(_llm_latency_sum_s.get(b, 0.0), 6),
+                "latency_max_s": round(_llm_latency_max_s.get(b, 0.0), 6),
+                "latency_last_ts": _llm_latency_last_ts.get(b),
             }
             for b in LLM_BACKENDS
         }

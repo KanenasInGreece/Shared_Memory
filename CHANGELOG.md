@@ -5,6 +5,43 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.14] — 2026-08-19
+
+### Fixed — the cost meter works where cost actually matters
+
+- **Token accounting no longer skips compressed upstream responses.** The usage-capture
+  gate required an uncompressed body, but cloud providers routinely answer with
+  `Content-Encoding: gzip` — so the per-backend token counters read 0 while billable
+  calls succeeded, exactly on the backends where the meter is the point. Capture now
+  accepts the same encodings the fault-body parser already understands
+  (`gzip`/`deflate`/`br`, via a shared `SUPPORTED_CONTENT_ENCODINGS` constant) and
+  decompresses the accumulated body once, after the stream loop. Capture stays
+  best-effort — an unsupported encoding or a failed decompression abandons the count,
+  never the request.
+- **Both sides of that decompression are bounded** (security review, Required):
+  `LLM_USAGE_CAPTURE_CAP_BYTES` caps the compressed bytes accumulated (as before), and
+  a new `LLM_USAGE_DECOMPRESS_CAP_BYTES` (default 64 MiB) caps what they may inflate
+  to — real LLM-shaped JSON gzips at ~3:1, while a hostile body measures 1028:1, and
+  the bound cuts that worst case to 32:1 without ever touching a legitimate response.
+- **A single-backend fleet is visible on `/health` again.** The backend roster sections
+  (`llm_backends`, `llm_pool`, `llm_affinity`, …) were gated behind "more than one
+  backend" — a reading that inverted once a single backend stopped meaning "legacy
+  default" and started meaning "cloud-only fleet", the very configuration the docs
+  recommend to VRAM-constrained operators. The gate is now "any backend configured".
+  Presence change only; no existing key's meaning moves.
+
+### Added — per-backend request latency
+
+- **New `/health` section `llm_latency`**: `requests_total`, `requests_failed_total`,
+  `latency_sum_s`, `latency_max_s`, `latency_last_ts` per configured backend, timed
+  across the full proxied exchange (dispatch through body fully drained, retries
+  counted as one logical request). Failures are counted separately so they never
+  dilute the success average, and the sum/count split leaves "average" to the reader.
+  Same in-process, reset-on-restart lifecycle as the token counters; served behind
+  the same authenticated-`/health` surface.
+
+---
+
 ## [0.9.13] — 2026-08-18
 
 ### Added — requirement-declaration LLM routing: the gateway decides, per model
