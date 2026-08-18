@@ -494,7 +494,9 @@ LLM_MAX_INFLIGHT_POLL_S = max(0.05, float(os.environ.get("LLM_MAX_INFLIGHT_POLL_
 # (fact:1338 — flagged in .env.example): a small bound chosen for its shape
 # (strictly less than any plausible S-11 admission budget), not derived from
 # a live measurement.
-LLM_MAX_CAPACITY_WAITERS = int(os.environ.get("LLM_MAX_CAPACITY_WAITERS", "8"))
+# Floor of 1 (FR-4, delta re-review): 0/negative would mean nothing ever
+# waits — the same invalid-int class the descriptor fields now reject.
+LLM_MAX_CAPACITY_WAITERS = max(1, int(os.environ.get("LLM_MAX_CAPACITY_WAITERS", "8")))
 
 # The whole pool parallelises. Judge/quality routing (v0.6.1) is GATEWAY-controlled
 # at runtime — NOT a user/env setting. The framework's judge will signal its role
@@ -770,12 +772,18 @@ def _warn_unknown_role_once(role: str) -> None:
     warn ONCE per distinct value so a daemon-side typo is visible."""
     if role in _warned_unknown_role_values:
         return
+    # FR-1 (delta re-review): bound the dedupe set and truncate the logged
+    # value — distinct garbage values from a steer-permitted (or auth-off)
+    # caller must not grow memory or flood the journal with full-length
+    # strings.
+    if len(_warned_unknown_role_values) >= 64:
+        return
     _warned_unknown_role_values.add(role)
     log.warning(
         "X-SM-LLM-Role %r is not a known routing role %s — treating the "
         "request as ROLE-LESS (private_ok backends only). If this is a "
         "daemon-side typo, its traffic is silently degraded until fixed.",
-        role, sorted(ROUTING_ROLE_NAMES))
+        role[:80], sorted(ROUTING_ROLE_NAMES))
 
 
 def _counts_free_slot(url: str) -> bool:
@@ -1208,6 +1216,17 @@ class AsyncHiveMindProxy:
                     # against real traffic.
                     refusal_body["est_prompt_tokens"] = int(est_prompt_tokens)
                     refusal_body["effective_max_tokens"] = int(effective_max_tokens)
+                    # FR-2 (delta re-review): the daemons' refusal handling
+                    # reads only {error, constraint, role}, so the estimate
+                    # fields alone reach no operator — this journal line is
+                    # where the retune signal actually lands.
+                    log.warning(
+                        "fit-rejected: est_prompt_tokens=%d + max_tokens=%d "
+                        "fits no declared n_ctx (role=%s) — if this request "
+                        "is legitimately sized, retune LLM_CHARS_PER_TOKEN_"
+                        "RATIO / FIT_MARGIN or raise the backend's n_ctx.",
+                        int(est_prompt_tokens), int(effective_max_tokens),
+                        role or "none")
                 return web.json_response(
                     refusal_body,
                     status=422, headers={"X-SM-Fault-Origin": "gateway"},
