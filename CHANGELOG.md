@@ -5,6 +5,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.17] — 2026-08-19
+
+### Added — postflight: the install's working order is now a defined contract, not an assumption
+
+- **`shared-memory/Documentation/postflight.md`** — the seven-assertion post-install
+  verification contract: A1 liveness & payload shape (doubles as an S-10 regression check) ·
+  A2 version/api_version contract (a stale gateway is named "restart owed", not "mismatch") ·
+  A3 schema truth (incorporates the two shipped verifiers) · A4 write path end to end (canary
+  save → embedding dimension **equals 1024** → outbox `applied` → `:Fact` node in the graph) ·
+  A5 read path honestly graded (a real reranker score or an explicitly declared degraded mode
+  both pass, and the report says which) · A6 baseline emission (timings + `backend_capability`
+  + hardware fingerprint → JSON under `~/.shared-memory/postflight/`, measurement never a
+  gate) · A7 conduct constraints (gateway-only traffic; every deviation an incorporated tool
+  makes is stated rather than papered over).
+- **`shared-memory/scripts/postflight.sh`** — the implementation, in `preflight.sh`'s style:
+  every assertion runs, failures are summarized, exit 0 iff A1–A5 pass. Canaries land under
+  the reserved project `install-verification` and stay — the install's birth certificate.
+  Measurement honesty is engineered, not hoped for: the `uv` environment is warmed untimed,
+  each timing window holds exactly one save, and a timeout records `null`, never the ceiling.
+- **AGENTS.md Phase 9** — run postflight after first install and after every upgrade (one line
+  added to the Upgrade runbook).
+- Reviewed via the builder/reviewer/merger split; the review's findings (a conduct-claim
+  contradiction, two diagnosis-attribution errors, baseline pollution, a dead retry branch)
+  were fixed before merge.
+
+---
+
 ## [0.9.16] — 2026-08-19
 
 ### Added — minimal-install hardening (findings from a below-floor install test)
