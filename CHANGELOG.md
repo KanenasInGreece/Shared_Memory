@@ -5,6 +5,43 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.16] — 2026-08-19
+
+### Added — minimal-install hardening (findings from a below-floor install test)
+
+- **Neo4j memory is now env-overridable**: `NEO4J_HEAP_INITIAL` / `NEO4J_HEAP_MAX` /
+  `NEO4J_PAGECACHE` in `shared-memory/.env`, defaults unchanged (1G/2G/2G). Neo4j refuses to
+  start when heap max + pagecache exceed physical RAM, and the values were literals in a
+  tracked file — a small host had no knob to turn. `.env.example` documents a measured
+  small-host preset (256M/512M/256M).
+- **`preflight.sh` grew four checks** that convert the first fresh-install failures into
+  pre-`up` messages: Fedora/RHEL docker guidance (the distro ships podman; names the packages
+  that provide `docker compose` v2) · a tiered RAM check that knows the ~8 GB no-override
+  floor and detects the small-host override · encoder GGUF existence under `LLM_MODELS_DIR` ·
+  Neo4j dir writability for the container user (uid 7474 — the image chowns `data/`+`logs/`
+  but never `import/`+`plugins/`; user-owned 0755 dirs crash-loop the container).
+- **`install_framework.sh`** now refuses a Neo4j password containing `/` (it breaks
+  `NEO4J_AUTH=neo4j/<password>` parsing — the container restart-loops on "… is invalid") and
+  chowns the Neo4j `import/`/`plugins/` dirs to the container user after creating them.
+- **README**: the ~8 GB hard floor stated under §3 with a new ④ "almost no machine at all"
+  account of the below-floor install; §14 Fedora runtime + dir-ownership prerequisites;
+  §15 points at the GGUF download commands (now in `.env.example`); three new
+  troubleshooting rows (the two Neo4j crash-loop signatures and the memory refusal).
+- **AGENTS.md**: GGUF download commands in Phase 0 · hex-only password rule (base64's `/`
+  breaks `NEO4J_AUTH`) · `LLAMA_CPU_THREADS` derivation and small-host preset in Phase 1 ·
+  session-sudo pattern for agent-driven installs in Phase 3 · the token `--reveal` is
+  explicitly the human's command, never the agent's (transcripts are durable) · the Phase 8
+  smoke-test save carries `new_project: true` (a fresh corpus has no registered projects — the
+  documented example could never succeed) · Status runbook documents two staleness traps:
+  `backend_capability` does not re-probe on an encoder swap, and outbox rows exhaust their
+  retries into a terminal `failed` status during a long Neo4j outage — with the one-statement
+  requeue.
+- `.env.example` also documents the mixed encoder pair (GPU embedder + CPU reranker via
+  `--scale`) — the measured best arrangement for an iGPU host, where "GPU memory" is pinned
+  system RAM.
+
+---
+
 ## [0.9.15] — 2026-08-19
 
 ### Added — reproducible installs: pinned dependency locks

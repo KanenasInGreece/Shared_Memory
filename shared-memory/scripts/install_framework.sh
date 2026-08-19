@@ -32,7 +32,19 @@ ask_secret() {  # prompt → echoes answer (input hidden)
 NEO4J_HOST_DIR="$(ask 'Neo4j host data dir'        "$HOME/databases/neo4j")"
 PG_DATA_DIR="$(ask 'Postgres data dir'             "$HOME/databases/postgres")"
 LLM_MODELS_DIR="$(ask 'GGUF models dir (blank if using LM Studio)' '')"
-NEO4J_PASSWORD="$(ask_secret 'Neo4j password')"
+# The compose file passes the Neo4j password as NEO4J_AUTH=neo4j/<password>,
+# a '/'-delimited string — a password containing '/' silently breaks parsing
+# and the container restart-loops on "… is invalid" (measured on a fresh
+# install; base64 output is the classic source). Refuse it here, where it is
+# one keystroke to fix, instead of there. Hex never has this problem:
+#   openssl rand -hex 20
+while :; do
+  NEO4J_PASSWORD="$(ask_secret 'Neo4j password (no "/" — hex is safest, e.g. openssl rand -hex 20)')"
+  case "$NEO4J_PASSWORD" in
+    */*) echo "  ✗ contains '/' — breaks the container's NEO4J_AUTH parsing; pick another" >&2 ;;
+    *)   break ;;
+  esac
+done
 PG_PASSWORD="$(ask_secret 'Postgres password')"
 # CPU thread budget for the two encoder containers, DERIVED from this host
 # rather than assumed: about half its threads plus one, so reranking cannot
@@ -86,6 +98,26 @@ export NEO4J_HOST_DIR PG_DATA_DIR LLM_MODELS_DIR LLAMA_CPU_THREADS
 chmod 600 "$ENV_FILE"
 
 mkdir -p "$NEO4J_HOST_DIR"/{data,logs,import,plugins} "$PG_DATA_DIR"
+
+# The neo4j container drops to uid 7474 and demands WRITE access to its
+# mounted dirs. Its entrypoint chowns /data and /logs itself, but NOT /import
+# and /plugins — freshly mkdir'ed user-owned 0755 dirs crash-loop the
+# container on "/import is not accessible" (measured on a fresh Fedora
+# install). Chown them now; plain chown needs root, so fall back to a docker
+# one-liner (root inside the container), and to printing the command when
+# neither is possible. preflight.sh verifies this either way.
+if ! chown -R 7474:7474 "$NEO4J_HOST_DIR"/{import,plugins} 2>/dev/null; then
+  if docker info >/dev/null 2>&1 && \
+     docker run --rm -v "$NEO4J_HOST_DIR":/t:z alpine chown -R 7474:7474 /t/import /t/plugins 2>/dev/null; then
+    echo "  ✓ Neo4j import/plugins dirs chowned to the container user (via docker)"
+  else
+    echo "  ⚠ Could not chown Neo4j dirs to the container user. Run:"
+    echo "      sudo chown -R 7474:7474 \"$NEO4J_HOST_DIR\"/{import,plugins}"
+    echo "    (preflight.sh will re-check this)"
+  fi
+else
+  echo "  ✓ Neo4j import/plugins dirs chowned to the container user"
+fi
 
 echo
 echo "✓ Wrote $ENV_FILE (chmod 600) and created data dirs."

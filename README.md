@@ -176,6 +176,40 @@ machine unless a backend you marked `private_ok` exists to receive it. More RAM 
 comfort for a box that also runs your agents and a desktop — not a deployment requirement.
 *Example minimum: 8+ threads · 16 GB RAM · 8–12 GB VRAM · 40 GB disk.*
 
+**The hard floor under all three: ~8 GB RAM.** Neo4j checks its configured memory against
+physical RAM at startup and the shipped settings (2 GB heap + 2 GB pagecache) refuse to boot
+on less than ~4 GB — and the full CPU stack's measured working set lands near 6 GB — so 8 GB
+is the least that runs the defaults untouched. (Projected from component measurements; the
+example configurations above are the measured ones.) Below it you are in ④ territory.
+
+**④ Almost no machine at all.** To find out where the floor really is, we installed the
+framework on a 2018 budget laptop: two AMD cores, 3.2 GB of usable RAM, integrated graphics
+from the era when that phrase was an apology — deliberately far below every number in this
+chapter. It is not a supported configuration; it is a measured account of what breaks, in what
+order, and what the framework does about it.
+
+The stack would not start as shipped — Neo4j checks its configured memory against physical RAM
+and refuses — and that refusal is the honest boundary of the defaults above. With the
+small-host values in `.env.example` (a quarter-gigabyte heap and pagecache), Neo4j runs in
+about 800 MB with both plugins loaded, Postgres asks for barely a hundred, and the whole
+storage layer fits. The CPU encoders were the real wall: on two slow cores a realistic
+three-kilobyte record blew past the save timeout — the gateway's own health endpoint diagnosed
+it, projecting the embedder at a fortieth of the assumed throughput. The surprise was the
+integrated GPU. The same Vulkan encoder image that serves discrete cards loaded BGE-M3 on a
+2015 Radeon iGPU and turned that failing save into an eleven-second success — the ~6× of
+configuration ② reproduced on the weakest plausible hardware. One caveat matters: an iGPU's
+memory *is* system RAM, pinned and unswappable, so the viable arrangement pairs the GPU
+embedder with the CPU reranker and lets searches degrade to vector order when the reranker
+falls behind — which the gateway does on its own, scores marked null rather than invented.
+
+What this buys you is not a production host. It is the knowledge that the floor is soft: every
+refusal on the way down was explicit, every degradation visible in telemetry, and a machine
+this small still saved, embedded at 1024 dimensions, synced both stores, and answered
+searches. If your hardware sits anywhere above the floor of configuration ①, nothing here is
+your problem — but if you ever wonder whether the old laptop in the drawer can host a memory,
+the answer is: with the knobs, barely, and it will tell you exactly which compromise it is
+making.
+
 **Disk, itemised (measured):** container images 1.8–3 GB (pgvector 0.6 + Neo4j 1.0 + llama.cpp
 0.2 CPU or 1.2 Vulkan) · encoder models 1.2 GB · database stores 0.8 GB at 1,300 records,
 growing with the corpus · your reasoning model if local (8.4 GB for the 14B example) · the OS
@@ -259,7 +293,7 @@ idempotent and safe to re-run.
 > or the shipped `systemd --user` timer. Rebuilding a host? Bring the databases up empty, then
 > `ops/restore.sh`. Full detail: [§22](#22-backups-and-restore).
 
-### Troubleshooting — the first four you'll hit
+### Troubleshooting — the first failures you'll hit
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
@@ -267,6 +301,9 @@ idempotent and safe to re-run.
 | **503 on save/search** | Embedder/reranker down or `unhealthy` | `docker compose ps` first — an `unhealthy` service (usually a wrong model path, §15) is the cause. Then `curl :8888/health`. |
 | **Search returns HTTP 500** | Migrations not applied | Run `apply.py` (§16). Idempotent. |
 | **Silent DB failures (Fedora)** | inotify limits, or a mount missing `:z` | §14, §15. |
+| **Neo4j crash-loops: "/import is not accessible"** | mounted dirs not writable by the container user (uid 7474) | `sudo chown -R 7474:7474 $NEO4J_HOST_DIR/{data,logs,import,plugins}` (§14). Preflight checks this. |
+| **Neo4j crash-loops: "neo4j/… is invalid"** | password contains `/` — breaks `NEO4J_AUTH` parsing | Regenerate as hex (`openssl rand -hex 20`), update `.env`, recreate the container. |
+| **Neo4j: "Invalid memory configuration — exceeds physical memory"** | host RAM below the shipped heap+pagecache | Set the small-host preset in `.env` (§3 floor note, values in `.env.example`). |
 | *Bonus:* **agent "doesn't know" earlier facts** | the skill was never invoked | Activate it and ask the agent to search shared memory first. |
 
 > **Maintainers:** this chapter is the single source of setup truth. Any change that affects
@@ -547,6 +584,18 @@ sudo sysctl -p /etc/sysctl.d/90-inotify.conf
 
 Keep the `:z` suffixes on the compose volume mounts — SELinux needs them.
 
+Fedora ships **podman**, not docker, and the helper scripts call the docker CLI — Fedora's own
+repos carry what's needed (`sudo dnf install moby-engine docker-compose` provides the
+`docker compose` v2 subcommand; enable with `sudo systemctl enable --now docker` and add your
+user to the `docker` group). The `podman-docker` shim is the untested alternative.
+
+One ownership step the tooling can't skip: the Neo4j container runs as uid 7474 and needs
+**write** access to its mounted dirs. Its entrypoint fixes `data/` and `logs/` itself but not
+`import/` and `plugins/` — freshly created user-owned dirs crash-loop the container on
+"/import is not accessible". `install_framework.sh` chowns them for you; `preflight.sh`
+verifies it; by hand it is
+`sudo chown -R 7474:7474 $NEO4J_HOST_DIR/{data,logs,import,plugins}`.
+
 ## 15. The stack: Docker Compose
 
 `shared-memory/ops/postgres_neo4j_limits.yaml` defines four services: **postgres** (pgvector), **neo4j**
@@ -561,7 +610,10 @@ docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared
 docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env ps   # all four healthy
 ```
 
-Place your GGUF files where the compose mounts expect them (or edit the mount and `-m` paths).
+Place your GGUF files where the compose mounts expect them (or edit the mount and `-m` paths) —
+both models are on Hugging Face, and the download commands (with the exact layout the compose
+defaults name) are in `shared-memory/.env.example` next to `LLM_MODELS_DIR`. `preflight.sh`
+checks both files exist before you ever reach a container healthcheck.
 The inference services carry healthchecks: an `unhealthy` embedder or reranker — almost always a
 wrong model path — is why saves and searches return 503. Check `ps` before debugging anything
 else.

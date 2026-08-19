@@ -14,7 +14,7 @@ Everything here runs on the **gateway host** — the one machine that owns the d
 
 ## Ground rules for the operating agent
 
-1. **Secrets never enter the conversation or git.** Generate passwords yourself (`openssl rand -base64 24` or Python `secrets`) instead of asking the user to type them into chat. Write them only to the gitignored `shared-memory/.env` (`chmod 600`). Confirm with `git check-ignore shared-memory/.env` before moving on. Never commit `.env`, tokens, or anything under a user's home config.
+1. **Secrets never enter the conversation or git.** Generate passwords yourself — **hex only** (`openssl rand -hex 20` or Python `secrets.token_hex(20)`), never base64: base64 output contains `/`, which the compose file's `NEO4J_AUTH=neo4j/<password>` cannot carry — the container restart-loops on "… is invalid" (measured on a fresh install). Generate rather than asking the user to type them into chat. Write them only to the gitignored `shared-memory/.env` (`chmod 600`). Confirm with `git check-ignore shared-memory/.env` before moving on. Never commit `.env`, tokens, or anything under a user's home config.
    **This is stricter still for a reasoning-LLM backend's own API credential** (`LLM_BACKENDS_JSON`'s `token_env`, Q3/Phase 1 below) — that value is never written to *any* file at all, gitignored or not, including `shared-memory/.env` itself. Ask the user only for the **name** of an env var they'll export from their own encrypted secret store (`pass`, GPG-backed, or equivalent); never ask them to paste the literal key into chat or a file. If a `.env`/`LLM_BACKENDS_JSON` you're editing ever contains something that looks like a real key in a `token`/`api_key`/`secret` field rather than a `token_env` name, stop and fix it — the gateway itself refuses to load that backend (`hive_mind_proxy.py`, `_load_llm_backends`) and logs exactly why, but don't rely on that as the first line of defense.
 2. **Ask before destructive actions.** Token rotation (`bootstrap_tokens.sh --force`) invalidates every existing agent token; `ops/restore.sh` overwrites both databases; removing data dirs loses memory permanently. Get explicit confirmation each time.
 3. **Verify each phase before the next.** Every phase ends with a check command. Do not continue past a failing check — the Quick Start troubleshooting table (README) maps the first failures you'll hit.
@@ -59,7 +59,18 @@ $LLM_MODELS_DIR/gpustack/bge-m3-GGUF/bge-m3-Q8_0.gguf
 $LLM_MODELS_DIR/gpustack/bge-reranker-v2-m3-GGUF/bge-reranker-v2-m3-Q8_0.gguf
 ```
 
-Verify both files exist before Phase 4. If the user substitutes a different embedding model, the vector dimension must match the schema — see the embedding-consistency note in README Quick Start step 4.
+If the user does not have the files yet, download them (~600 MB each, from the
+`gpustack` GGUF repackagings on Hugging Face — the same paths the compose defaults name):
+
+```bash
+mkdir -p "$LLM_MODELS_DIR"/gpustack/{bge-m3-GGUF,bge-reranker-v2-m3-GGUF}
+curl -L -o "$LLM_MODELS_DIR/gpustack/bge-m3-GGUF/bge-m3-Q8_0.gguf" \
+  https://huggingface.co/gpustack/bge-m3-GGUF/resolve/main/bge-m3-Q8_0.gguf
+curl -L -o "$LLM_MODELS_DIR/gpustack/bge-reranker-v2-m3-GGUF/bge-reranker-v2-m3-Q8_0.gguf" \
+  https://huggingface.co/gpustack/bge-reranker-v2-m3-GGUF/resolve/main/bge-reranker-v2-m3-Q8_0.gguf
+```
+
+Verify both files exist before Phase 4 (preflight checks this too). If the user substitutes a different embedding model, the vector dimension must match the schema — see the embedding-consistency note in README Quick Start step 4.
 
 ### Phase 1 — Write the framework `.env`
 
@@ -73,6 +84,8 @@ chmod 600 shared-memory/.env          # belt-and-suspenders — umask above alre
 git check-ignore shared-memory/.env          # MUST print the path
 mkdir -p "$NEO4J_HOST_DIR"/{data,logs,import,plugins} "$PG_DATA_DIR"
 ```
+
+Also set `LLAMA_CPU_THREADS` the way the script derives it — host threads / 2 + 1 (`$(( $(nproc) / 2 + 1 ))`) — the compose fallback is 4, which oversubscribes a small CPU and starves the databases. On a host under ~8 GB RAM, set the small-host Neo4j memory preset too (`NEO4J_HEAP_INITIAL`/`NEO4J_HEAP_MAX`/`NEO4J_PAGECACHE` — values and the why in `.env.example`): the shipped defaults refuse to start when heap max + pagecache exceed physical RAM.
 
 Uncomment/set `DREAM_TEMPERATURE` (Q4) and, for multiple LLM backends, `LLM_BACKENDS` (Q3). If the user's reasoning server **validates model names** (a named-model server, a routing proxy, a hosted OpenAI-compatible endpoint, or a desktop app with several models loaded), also set `LLM_MODEL` to the real id — the shipped default only suits servers that ignore the field. A single backend on a non-default port is `LLM_DEFAULT_TARGET`. All framework and helper tooling reads `shared-memory/.env` first, with a repo-root `.env` honoured as a pre-0.6 fallback.
 
@@ -89,6 +102,14 @@ Verifies Docker + compose v2, `uv`, and a populated `.env`; warns on low RAM/dis
 ### Phase 3 — OS limits (Linux)
 
 Raise inotify limits per README §4 (needs sudo — give the user the commands to run if you cannot). On Fedora/RHEL with SELinux, keep the `:z` suffixes on the compose volume mounts.
+
+**Sudo for an agent-driven install:** several steps here need root (package install, inotify, dir ownership). Either hand the user each command to run in their own terminal, or ask them to grant the session temporary passwordless sudo — from a real terminal (an agent session has no TTY for the password prompt):
+
+```bash
+ssh -t <host> "echo '<user> ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/99-<user>-temp"
+```
+
+and **delete `/etc/sudoers.d/99-<user>-temp` at the end of the session** — offer that cleanup unprompted. On Fedora/RHEL, docker itself is the first thing needing it: the distro ships podman, and the helper scripts call the docker CLI (`sudo dnf install moby-engine docker-compose` provides `docker compose` v2; the `podman-docker` shim is the untested alternative).
 
 ### Phase 4 — Databases + inference containers
 
@@ -131,7 +152,7 @@ uv run --with neo4j python shared-memory/migrations/verify_neo4j_init.py
 bash shared-memory/scripts/bootstrap_tokens.sh
 ```
 
-Appends `AGENT_TOKENS` (digest form) and a read-only `AGENT_ROLES` line for `monitor` to the framework `.env`. generate_tokens.py's write-through mint flow (PR A2) writes each LOCAL agent's token straight into that agent's own skill `.env` (mode 600) — nothing is printed here to save. A REMOTE agent's token needs `--reveal <name>` passed to `bootstrap_tokens.sh` itself on this SAME invocation (a later, separate reveal mints a fresh token for every agent — a full rotation, not a free peek). One distinct token per agent, never shared. The script refuses to overwrite an existing registry; `--force` rotates **all** tokens (destructive — rule 2).
+Appends `AGENT_TOKENS` (digest form) and a read-only `AGENT_ROLES` line for `monitor` to the framework `.env`. generate_tokens.py's write-through mint flow (PR A2) writes each LOCAL agent's token straight into that agent's own skill `.env` (mode 600) — nothing is printed here to save. A REMOTE agent's token needs `--reveal <name>` passed to `bootstrap_tokens.sh` itself on this SAME invocation (a later, separate reveal mints a fresh token for every agent — a full rotation, not a free peek). ⚠ **The reveal invocation is the one command the HUMAN runs in their own terminal, never you** — the script prints the raw token, and an agent transcript turns "shown once" into "stored forever" (the script's own warning; verified the hard way — a token revealed through an agent session had to be rotated). Hand the user the exact command line and step back. One distinct token per agent, never shared. The script refuses to overwrite an existing registry; `--force` rotates **all** tokens (destructive — rule 2).
 
 ### Phase 7 — Start the gateway and verify
 
@@ -181,9 +202,14 @@ Final end-to-end check, as an agent (uses the skill path, exercises auth + embed
 
 ```bash
 uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py doctor
-uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py save "install smoke test" '{"source":"<agent>","entities":["SetupTest"]}'
+uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py save "install smoke test" '{"source":"<agent>","entities":["SetupTest"],"new_project":true}'
 uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py search "install smoke test" 3
 ```
+
+`new_project: true` is needed exactly once: a fresh corpus has no registered projects, so the
+very first save is always refused with `project_unknown` until one is registered — the gateway
+derives the project name from where the save runs and asks rather than guessing. Every later
+save into a registered project omits the flag.
 
 **Hand each installed agent its expectations** (tell the user to relay this, or write it where that
 agent will read it — Phase 8b): the memory is built around **facts** (durable results of work, with
@@ -296,6 +322,19 @@ On **`GET /memory/telemetry`** → `consolidation.<cycle_type>` (e.g. `consolida
 - `last_deferred_reason` says *why* it yielded; `folds_attempted_24h` / `folds_succeeded_24h` separate "tried and failed" from "never tried".
 
 So the triage order is: `/health` → `stalled_types` → then switch to `status` / `/memory/telemetry` for that type's `eligible_clusters` → its `last_deferred_reason` → only then the reasoning LLM.
+
+**Two staleness traps in the same payload.** `backend_capability` (the embedder/reranker speed
+projection) re-probes on its own schedule, not on backend changes — after swapping encoders
+(CPU pair ↔ GPU pair) it can keep reporting the OLD backend's numbers for a while; check
+`probed_at` before acting on it. And a **Neo4j outage longer than the outbox retry window**
+(5 attempts with backoff) leaves `neo4j_outbox` rows in a terminal `failed` status that nothing
+retries — Tier 1 keeps the record, but it stays absent from the graph. `/health` surfaces it as
+a non-null `failed_age`; recovery is one statement, then the worker drains it within seconds:
+
+```bash
+docker exec postgres-vector psql -U postgres -d agent_data \
+  -c "UPDATE neo4j_outbox SET status='pending', retries=0, next_attempt_at=now() WHERE status='failed';"
+```
 
 ### Upgrade (gateway host)
 

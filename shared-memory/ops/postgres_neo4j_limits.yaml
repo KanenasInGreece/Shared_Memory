@@ -36,9 +36,13 @@ services:
       # (ops/backup.sh → apoc.export.cypher.all). Online, no container stop.
       - NEO4J_apoc_export_file_enabled=true
       # Corrected Neo4j 5 Memory Mapping (Note the double underscores __)
-      - NEO4J_server_memory_heap_initial__size=1G
-      - NEO4J_server_memory_heap_max__size=2G
-      - NEO4J_server_memory_pagecache_size=2G
+      # Defaults suit the 16 GB reference configuration (README §3). Neo4j
+      # refuses to start when heap max + pagecache exceed physical RAM, so a
+      # small host must lower these — via shared-memory/.env, never by editing
+      # this tracked file (the small-host preset is in .env.example).
+      - NEO4J_server_memory_heap_initial__size=${NEO4J_HEAP_INITIAL:-1G}
+      - NEO4J_server_memory_heap_max__size=${NEO4J_HEAP_MAX:-2G}
+      - NEO4J_server_memory_pagecache_size=${NEO4J_PAGECACHE:-2G}
     deploy:
       resources:
         limits:
