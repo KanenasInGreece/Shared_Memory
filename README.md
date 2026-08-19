@@ -546,8 +546,13 @@ names are configurable in `shared-memory/ontology.yaml`; the machinery does not 
 
 Two small encoders serve the write and search paths — BGE-M3 embeds, BGE-Reranker-v2-m3 ranks —
 and they came up with the compose stack. As packaged they run on CPU, which works everywhere and
-costs time; `shared-memory/ops/compose.gpu-encoders.yaml` is a worked Vulkan overlay that puts both on one GPU
-(one image covers Intel, AMD and NVIDIA). On CPU, `RERANK_MAX_DOC_CHARS` bounds what the
+costs time; the same compose file also carries a Vulkan GPU pair for them (one image covers
+Intel, AMD and NVIDIA), off by default — the choice is two `.env` lines, `GPU_ENCODER_REPLICAS=1`
+and `CPU_ENCODER_REPLICAS=0`, and what you run never diverges from what ships. If you have one
+GPU to allocate, the compromise is plain: a card with enough VRAM for your reasoning model is
+usually better spent on the model backend, while a small card — 4 GB, say — is best spent on
+the encoders, which fit in about 2 GB and repay it in search latency. Your call, always.
+On CPU, `RERANK_MAX_DOC_CHARS` bounds what the
 reranker scores — a concession, not a free win: capping at 2,000 chars kept about half of
 reranking's improvement in our measurements. Run the encoders however you please — Docker, bare
 `llama-server`, another machine; `EMBEDDER_URL` and `RERANKER_URL` say where the gateway looks,
