@@ -245,6 +245,20 @@ marker-delimited block with the new one (show what changed and why) — never ov
 If the agent's constitution file has no marker-delimited block at all, treat it as never having
 been offered and fall back to Phase 8b.
 
+### Phase 9 — Verify the install (postflight)
+
+Prove the installed stack works end to end — liveness and payload shape, version contract, schema
+truth, the full write path (canary save → 1024-dim vector → outbox applied → `:Fact` node), and an
+honestly-graded read path — and emit a performance baseline for this hardware. The contract is
+`shared-memory/Documentation/postflight.md`; the script implements it and exits 0 iff assertions
+A1–A5 pass. The canary lands under the reserved project `install-verification` and stays in the
+corpus — the install's birth certificate.
+
+```bash
+export AGENT_TOKEN=...   # auth-on installs: any minted agent token, from that agent's skill .env
+bash shared-memory/scripts/postflight.sh
+```
+
 ## Runbooks
 
 ### Add an agent later (no token rotation)
@@ -351,6 +365,7 @@ uv run --with psycopg2-binary python \
 uv run --with psycopg2-binary python \
     shared-memory/scripts/backfill_domain_of.py --apply                  # then APPLY — dry-run alone enqueues nothing
 bash shared-memory/scripts/sync_skills.sh                                # refresh installed skills
+bash shared-memory/scripts/postflight.sh                                 # verify end to end (Phase 9)
 ```
 
 ⚠ **`backfill_domain_of.py` runs AFTER the restart, and that ordering is a guard rather than a
