@@ -1,6 +1,7 @@
 # Shared Memory Framework — runtime dependencies
 # Tested on Python 3.12+ with the versions shown below.
 # Install into a clean venv: pip install -r requirements.txt
+# Reproducible install (exact tested versions): uv venv && uv pip sync requirements.lock
 
 aiohttp>=3.13.5        # Hive-Mind Gateway (hive_mind_proxy.py)
 asyncpg>=0.31.0        # Async Postgres pool — coordinator.py
@@ -10,3 +11,5 @@ neo4j>=6.2.0           # Neo4j driver — coordinator.py, consolidation_loop.py
 fastmcp>=3.3.1         # MCP server — vector-skill.py (LM Studio only)
 python-dotenv>=1.2.2   # Load .env at startup — vector-skill.py (MCP host may not inherit shell env)
 starlette>=1.0.1       # Transitive via fastmcp; floor enforces BadHost fix (CVE-2026-48710)
+json-repair>=0.63.2    # Salvage LLM JSON slips — rem_loop.py, relation_sweep.py
+numpy>=2.5.2           # Vector math — relation_sweep.py

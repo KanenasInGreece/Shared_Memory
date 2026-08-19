@@ -84,7 +84,7 @@ Uncomment/set `DREAM_TEMPERATURE` (Q4) and, for multiple LLM backends, `LLM_BACK
 bash shared-memory/scripts/preflight.sh
 ```
 
-Verifies Docker + compose v2, `uv`, and a populated `.env`; warns on low RAM/disk (lean minimum: 16 GB RAM, ~8 GB VRAM, ~30 GB disk). Resolve every ✗ before continuing.
+Verifies Docker + compose v2, `uv`, and a populated `.env`; warns on low RAM/disk (16 GB RAM and ~30 GB disk are the common floor; a GPU is optional — the three measured example configurations are README §3). Resolve every ✗ before continuing.
 
 ### Phase 3 — OS limits (Linux)
 
