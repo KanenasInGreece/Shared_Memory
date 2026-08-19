@@ -140,10 +140,16 @@ Smoke-test in the foreground first:
 ```bash
 uv run --with aiohttp --with asyncpg --with neo4j --with httpx --with json-repair \
   python shared-memory/scripts/hive_mind_proxy.py 8888
-curl -s http://localhost:8888/health
+curl -s http://localhost:8888/health                       # anonymous: liveness only
+curl -s -H "Authorization: Bearer <a-phase-6-token>" http://localhost:8888/health   # full payload
 ```
 
-Expect `"status":"ok"`, `"auth_required":true`, `"embedder":"ok"`, `"daemon":"running"`, `"rem_daemon":"running"`. (`"llm":"down"` only blocks dreaming, not saves/search — check the reasoning LLM from Q3.)
+**`/health` has two shapes once Phase 6 minted tokens (S-10):** an anonymous caller gets exactly
+`{"status","version","api_version"}` — enough for liveness, nothing more — and every richer field
+needs a bearer token. So: from the bare curl expect just `"status":"ok"`; from the authenticated
+one expect `"auth_required":true`, `"embedder":"ok"`, `"daemon":"running"`, `"rem_daemon":"running"`.
+(`"llm":"down"` only blocks dreaming, not saves/search — check the reasoning LLM from Q3.) An
+install that skipped tokens (auth off) serves the full payload to everyone, unchanged.
 
 Then make it survive logout/reboot with the shipped `systemd --user` unit — a terminal-launched gateway dies with its session:
 
@@ -251,14 +257,21 @@ Stopping only the inference containers (`docker stop llama-retriever llama-reran
 ### Status / health
 
 ```bash
-curl -s http://localhost:8888/health          # gateway, daemons, backends, consolidation liveness
+curl -s -H "Authorization: Bearer $AGENT_TOKEN" http://localhost:8888/health \
+                                              # gateway, daemons, backends, consolidation liveness
 docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env ps
 systemctl --user status hive-mind-gateway.service
 journalctl --user -u hive-mind-gateway.service -n 50   # daemon logs
 uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py status   # telemetry
 ```
 
-`status: degraded` on `/health` names the down backend.
+⚠ **Every `/health` read below this point means the AUTHENTICATED payload** (any minted agent
+token; S-10 slims the anonymous shape to `status`/`version`/`api_version`). A triage that reads
+`consolidation`, `stalled_types`, backend names, `project_identity` or `domain_identity` from a
+bare curl on an auth-configured install sees none of them — that is the missing token, not a
+broken gateway. `memory_bridge.py status` sends its own token and is unaffected.
+
+`status: degraded` shows anonymously; *which* backend is down is in the authenticated payload.
 
 **Reading `consolidation` — the two halves live on DIFFERENT endpoints.** There is more than one consolidation cycle type, with very different costs and cadences, so the per-type block is what you act on. But `/health` carries only the summary; the per-type census is on `/memory/telemetry`, which is what `memory_bridge.py status` reads. Asking `/health` for a per-type field returns nothing and is the easiest way to get stuck mid-triage.
 
@@ -310,10 +323,10 @@ and cannot reach Neo4j, so this stamps the nodes. It is idempotent and read-only
 it on every upgrade, exactly like the Neo4j constraint check, and for the same reason. **Skipping it
 does not break writes**: records still save, still search, still enrich. What stops is *cross-project
 synthesis* — the gate fails closed on a node with no identity — which presents as a system with nothing
-to fold rather than as an error. `GET /health` → `project_identity` is where that state is visible
-(`complete: false` with an `unidentified` count).
+to fold rather than as an error. Authenticated `GET /health` → `project_identity` is where that
+state is visible (`complete: false` with an `unidentified` count).
 
-⚠ **The domain axis has the same shape and one extra number.** `GET /health` → `domain_identity`
+⚠ **The domain axis has the same shape and one extra number.** Authenticated `GET /health` → `domain_identity`
 reports `unregistered` / `mismatched` between the registry and the graph, plus **`unattached`** — a
 `:Domain` node with no `PROJECT_OF` edge, i.e. a section belonging to no project. That last one is
 reported for a walk that does not exist yet: cross-project and cross-domain synthesis will traverse
