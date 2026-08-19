@@ -95,9 +95,18 @@ Raise inotify limits per README §4 (needs sudo — give the user the commands t
 ```bash
 docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d
 docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env ps   # all four healthy
-# (two, not four, when CPU_ENCODER_REPLICAS=0 in .env — the encoders are hosted
-#  outside the stack on that install; EMBEDDER_URL/RERANKER_URL say where.)
 ```
+
+The one yaml carries **both** encoder pairs — CPU (`llama-retriever`/`llama-reranker`, the
+default) and Vulkan GPU (`llama-retriever-gpu`/`llama-reranker-gpu`, off by default). The
+choice is two lines in `shared-memory/.env`: `GPU_ENCODER_REPLICAS=1` + `CPU_ENCODER_REPLICAS=0`
+(exactly one pair nonzero — they share ports). **Put the choice to the operator, with the
+compromise stated plainly:** a GPU with enough VRAM for their reasoning model is usually better
+spent on the model backend; a small card (~4 GB) is best spent on the encoders (~2 GB for the
+pair, repaid in search latency — measured numbers in README §17). Always the operator's call —
+never pick silently. `ps` accordingly shows four healthy containers (which four depends on the
+pair), or two when **both** pairs are 0 because the encoders are hosted outside the stack
+entirely — then `EMBEDDER_URL`/`RERANKER_URL` must say where, or saves are refused.
 
 Postgres (`:5432`), Neo4j (`:7474/:7687`), embedder (`:8070`), reranker (`:8071`). An `unhealthy` inference container is almost always a wrong model path (Phase 0 Q2).
 
