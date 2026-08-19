@@ -561,11 +561,105 @@ llama-server -m bge-reranker-v2-m3-Q8_0.gguf --port 8071 --rerank -c 8192 -b 819
 Keep them as separate processes: the embedder is on the critical write path (a save is refused
 rather than stored without a vector); the reranker degrades gracefully to vector order.
 
+### What a small GPU buys the encoders — measured
+
+The encoders are where a cheap GPU pays for itself, and we measured it rather than assumed it.
+Both models are 0.6 GiB Q8_0 files; with full offload and the 8K context above, the pair ran
+side by side on one mid-range card using roughly a gigabyte each including buffers — **any 4 GB
+card should hold both** (that last step is an estimate from the measured footprint, not yet run
+on such a card). Against the CPU containers on a 12-core desktop, end-to-end search fell from
+28–33 seconds to a **4.7-second mean over an 11-hour soak** — 102 searches, every 20 minutes,
+zero failures, zero drift — with the embedder at roughly 5× throughput and the reranker, which
+on a loaded CPU can time out outright, answering in under a second. Same vectors, too: CPU and
+GPU embeddings of the same text agree to cosine 0.9996, so the swap changes nothing about the
+stored space.
+
+One honest wrinkle from sharing a card: called solo, each service is a metronome (the reranker's
+latency varied by ~1 ms). Called concurrently, means rise modestly — reranker ×1.2, embedder
+×1.8 — but latency stops being deterministic: the reranker's p95 roughly doubles. Nothing
+fails; everything stays far below the CPU baseline; but if you need flat tails under sustained
+parallel load, that is the argument for giving each encoder its own small card rather than for
+more VRAM on one.
+
 The **reasoning LLM** on `:5000` is yours to run — LM Studio or any OpenAI-compatible server —
 and it can be a pool: `LLM_BACKENDS="url@weight,…"` load-balances the dreaming across several
 backends (one per GPU, or remote; a pool member may even be a cloud API via
 `LLM_BACKENDS_JSON`, with credentials resolved from the environment and never written to disk).
 Clients never know the difference; the gateway owns the routing.
+
+### Mixing models — and who decides what runs where
+
+A pool stops being simple the moment its members stop being identical. A second GPU with a
+smaller card, a big-context model on another machine, a paid cloud API kept for the jobs the
+local cards can't hold — each is useful, and each breaks the assumption that any backend can
+take any job. The `.env` lets you say so per backend, in `LLM_BACKENDS_JSON`:
+
+- **`roles`** — which dreaming functions this backend may serve (`extract`, `verify`,
+  `judge`). Leave it out and the backend serves everything, which is exactly what a
+  uniform local pool wants.
+- **`n_ctx`** — the model's usable context. Declared, it lets the gateway keep a job that
+  cannot fit away from a backend that would truncate it.
+- **`private_ok`** — may record content land here as ordinary, unrestricted traffic? A
+  local backend defaults to yes; a credentialed provider defaults to no, and asks you to
+  choose out loud.
+- **`max_inflight`** — how many simultaneous requests this backend may hold, for the
+  metered or fragile ones.
+
+The dilemma these knobs settle is real and worth stating plainly: an external LLM trades
+**privacy** — record content leaves the machine — for **lower VRAM demands and a bigger
+context** than the cards in the box. There is no universally right answer; there is only
+your answer, per function, per install. Naming a provider's entry `roles: ["judge"]` says
+insight folds may go out but raw record enrichment never does; `private_ok: true` says the
+provider is trusted like a local card; leaving both unsaid is refused at startup rather
+than guessed at.
+
+Three properties hold however you configure it:
+
+- **One decision-maker.** The gateway alone decides which model serves which job. Daemons
+  only declare what *kind* of work they carry; nothing a client sends can steer work onto
+  a paid or external model.
+- **The gateway keeps score.** Every request routed to a model counts against it exactly
+  as long as it runs and is released the moment it finishes or fails — so "how busy is
+  each model" is always a true number, and a capped external model can never be flooded by
+  several daemons arriving at once.
+- **Loud refusals, never silent fallbacks.** If no model is allowed to take a job —
+  privacy, function, or size — the framework says so in a structured error rather than
+  quietly sending the work somewhere you did not permit. The affected record simply waits;
+  a configuration gap is never treated as a defect in your data.
+
+One consequence deserves its own sentence: a fleet whose *only* members are external
+providers with a full `roles` list is a fleet where the dreaming runs — and bills —
+externally. That is not a trap; it is exactly what listing all three roles asks for.
+The knobs state your policy; they do not second-guess it.
+
+The authenticated `/health` payload counts tokens and request latency per backend (with a
+last-event timestamp each), and can carry your own price-per-million metadata for a
+dashboard to multiply — the gateway itself never reads prices. **These counters reset on
+every gateway restart** — they are per-lifecycle by design, so compute dashboard deltas
+restart-aware (the paired timestamps are what make that possible), and never read a
+post-restart drop as negative usage. The gateway also writes one summable token line per
+backend to its log on shutdown, so lifetime accounting survives restarts in the journal
+even though the live counters do not.
+
+### No local LLM at all — tested, not asserted
+
+The VRAM-constrained configuration this section keeps gesturing at has now been run for
+real: both local models stopped, one metered provider as the entire pool, overnight. The
+dreaming ran — enrichment routed to the provider and succeeded, folds formed — and the
+whole night, probes and debugging included, cost **eighteen thousand tokens: under a
+cent**. Enrichment of a typical record lands near one token per character of content, a
+few seconds of latency per call — numbers that do not matter to a background daemon and
+barely matter to a wallet. The security posture holds while it happens: the provider key
+lives in a mode-600 file outside the repo and is referenced by path (`*_API_KEY_FILE`),
+the gateway's own token wall stands between the network and that key — an unauthenticated
+request gets 401, and the anonymous `/health` shape stays three harmless keys — and the
+telemetry reports `has_credential` as a boolean, never the material.
+
+And with no LLM anywhere? The system does not die. Saves, semantic search, the graph,
+facts, decisions and retrospectives all keep working on the encoders alone. What waits is
+the dreaming: records queue durably in the outbox ledger, and thematic summaries and
+insights are simply not formed until a backend appears — then it catches up. A missing
+model is a pause, never a loss.
 
 > **Never call `:8070`/`:8071` directly** — the gateway on `:8888` is what enforces one shared
 > embedding space. And never point `EMBEDDER_URL` at the reranker: asked to embed, it answers
