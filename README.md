@@ -129,9 +129,59 @@ it; on skew it names which side to upgrade.
 
 ### Resources & prerequisites
 
-**Hardware — lean minimum:** **16 GB RAM · ~8 GB VRAM · ~30 GB free disk.** Postgres + Neo4j
-take ~6 GB RAM between them; BGE-M3 and the reranker are small; your **reasoning LLM dominates
-VRAM**. This is the backend requirement, not the client side.
+**Hardware — three example configurations, not an exhaustive list.** Mixes are just as
+legitimate: one GPU for the encoders and another for a local LLM with an online provider
+beside them, or two online providers and no card at all — the `.env` states whatever you
+choose, and an agent following [AGENTS.md](AGENTS.md) can configure any shape here without
+improvising. The numbers are **minimums for the deployment alone** — databases, gateway,
+daemons, encoders, with headroom. The agents that will *use* the memory, and your desktop if
+this box has one, are not in them; budget those separately. Measurements come from a live
+install with a 1,300-record corpus on Fedora; macOS (where unified memory redraws the
+RAM/VRAM split entirely), Ubuntu or Windows/WSL shift the shares somewhat — which is exactly
+why these are example minimums, not prescriptions.
+
+**① No GPU at all.** The framework itself is a CPU/RAM affair: Postgres and Neo4j used
+~2.5 GB working memory here (the compose file caps them at 4 + 8 GB), the gateway and daemons
+~half a gigabyte, the two CPU encoders 0.6 GB each — though under sustained heavy search the
+reranker's cache can grow toward its 8 GB default cap, so give it room. The reasoning LLM is
+an **online provider**: one `LLM_BACKENDS_JSON` entry, and the dreaming runs — and bills —
+externally; an overnight of dreaming measured ~18,000 tokens, under a cent. The privacy
+trade-off that entry represents, and the knobs that state your answer, live in
+[§17](#17-inference-the-encoders-and-the-reasoning-llm); the custody measures around the
+provider key — where it lives, what stands between the network and it — are in §17's
+tested-configuration passage, [§19](#19-tokens-and-agents) and [SECURITY.md](SECURITY.md).
+With no LLM configured nothing dies: saves, search and the graph keep working; summaries and
+insights queue durably until a backend appears. Searches on CPU encoders took ~30 seconds here.
+*Example minimum: 4–8 threads · 16 GB RAM · no GPU · 30 GB disk.*
+
+**② A small GPU (~4 GB).** Everything in ①, plus two `.env` lines (`GPU_ENCODER_REPLICAS=1`,
+`CPU_ENCODER_REPLICAS=0`) move the encoders onto the card: the pair fits in ~2 GB measured,
+search fell from ~30 to under 5 seconds (~6×), and the reranker — which on a loaded CPU can
+time out — answers in under a second. GPU support is whatever your encoder server supports:
+the shipped GPU pair is llama.cpp's Vulkan image — one image for Intel, AMD and NVIDIA, swap
+the tag for CUDA — and hosting the encoders outside the stack with vLLM, LM Studio or bare
+`llama-server` is equally legitimate; the gateway only needs endpoints that answer. The LLM
+stays online; ①'s caveat pointers apply unchanged.
+*Example minimum: 4–8 threads · 16 GB RAM · 4 GB VRAM · 30 GB disk.*
+
+**③ Everything local.** A local reasoning LLM, the cloud an option rather than a necessity —
+and it takes less than you might fear: **16 GB RAM and one 12 GB card run the whole thing.**
+With the model fully offloaded its host-side footprint measured a fifth of a gigabyte — VRAM
+is where it lives, and VRAM is dominated by model and context: our 14B at Q4 with a generous
+64K context measured 11.2 GB by itself, so on a single 12 GB card pair it with the encoders by
+trimming context, or run a 7–8B and fit everything with room to spare. With two cards the
+compromise states itself: the model takes the big one, the encoders the small one
+([§17](#17-inference-the-encoders-and-the-reasoning-llm)). Local content never leaves the
+machine unless a backend you marked `private_ok` exists to receive it. More RAM (32 GB) is
+comfort for a box that also runs your agents and a desktop — not a deployment requirement.
+*Example minimum: 8+ threads · 16 GB RAM · 8–12 GB VRAM · 40 GB disk.*
+
+**Disk, itemised (measured):** container images 1.8–3 GB (pgvector 0.6 + Neo4j 1.0 + llama.cpp
+0.2 CPU or 1.2 Vulkan) · encoder models 1.2 GB · database stores 0.8 GB at 1,300 records,
+growing with the corpus · your reasoning model if local (8.4 GB for the 14B example) · the OS
+itself (a headless Linux server installs in ~3 GB and idles under half a gigabyte of RAM; a
+desktop OS beside the deployment costs gigabytes of both — budget it as the separate thing it
+is).
 
 **Software:** Docker + Docker Compose · [`uv`](https://docs.astral.sh/uv/) (recommended — every
 command here uses it; or Python 3.11+ with `pip`) · a server for your reasoning LLM on `:5000`
