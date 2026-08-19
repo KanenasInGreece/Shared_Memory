@@ -48,10 +48,10 @@ import pytest
 SCRIPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts")
 sys.path.insert(0, SCRIPTS_DIR)
 
-# Modules the shipped gateway service does NOT carry (see
-# shared-memory/ops/hive-mind-gateway.service's --with list). Any module a
-# gateway-process code path imports at call time must survive all of these
-# being unimportable.
+# Modules the shipped gateway service does NOT carry (its environment is
+# pinned by requirements-gateway.lock — the restricted set declared in
+# requirements-gateway.txt). Any module a gateway-process code path imports
+# at call time must survive all of these being unimportable.
 _GATEWAY_MISSING_MODULES = ("psycopg2",)
 
 
@@ -160,7 +160,8 @@ def test_nrem_gate_source_imports_no_db_or_network_driver():
     module docstring, which legitimately discusses psycopg2 in prose while
     explaining the defect this module exists to remove) for any DB or
     network driver the gateway service does NOT carry — see
-    shared-memory/ops/hive-mind-gateway.service's --with list."""
+    requirements-gateway.txt (pinned as requirements-gateway.lock, which the
+    shipped shared-memory/ops/hive-mind-gateway.service unit runs from)."""
     import re
 
     nrem_gate_path = os.path.join(SCRIPTS_DIR, "nrem_gate.py")
@@ -172,3 +173,28 @@ def test_nrem_gate_source_imports_no_db_or_network_driver():
     )
     hits = forbidden_pattern.findall(source)
     assert not hits, f"nrem_gate.py must not import a DB/network driver, found: {hits}"
+
+
+# ── Guard 3 — the gateway lock itself never gains a blocked module ────────────
+
+def test_gateway_lock_carries_no_blocked_module():
+    """The premise of every test above is that the gateway's shipped
+    environment genuinely lacks _GATEWAY_MISSING_MODULES. Since the unit now
+    installs exactly requirements-gateway.lock, that premise is checkable:
+    if psycopg2 (as psycopg2 or psycopg2-binary) ever lands in the gateway
+    lock, Guard 1's block stops modelling production and this file's
+    guarantees silently expire. Proven against the known-broken artefact:
+    pointed at requirements.lock (the FULL tree, which does carry
+    psycopg2-binary), this test fails."""
+    lock_path = os.path.join(SCRIPTS_DIR, "..", "..", "requirements-gateway.lock")
+    with open(lock_path, encoding="utf-8") as f:
+        pinned = [
+            line.split("==")[0].strip()
+            for line in f
+            if "==" in line and not line.lstrip().startswith(("#", "--"))
+        ]
+    for blocked in _GATEWAY_MISSING_MODULES:
+        offenders = [p for p in pinned if p == blocked or p == f"{blocked}-binary"]
+        assert not offenders, (
+            f"requirements-gateway.lock must not carry {blocked}: {offenders}"
+        )

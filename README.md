@@ -866,6 +866,12 @@ uv run --with pytest --with pytest-asyncio --with fastmcp \
        pytest tests/ -v
 ```
 
+Every `uv run --with` in this README resolves dependencies fresh, which is fine for trying
+things out. To reproduce the exact dependency versions this framework is developed and tested
+against, `requirements.lock` pins the full runtime tree (hashes included, audited for known
+CVEs at generation time): `uv venv && uv pip sync requirements.lock`. The floors live in
+`requirements.txt`; dev extras in `requirements-dev.txt`.
+
 ---
 
 # Part III — Under the hood

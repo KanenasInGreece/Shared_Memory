@@ -1,0 +1,14 @@
+# Gateway-process dependencies — the RESTRICTED set the shipped systemd unit runs with.
+# Deliberately narrower than requirements.txt: the gateway process must NOT carry
+# psycopg2 — its code paths are required to survive that module being absent
+# (tests/test_nrem_gate_import_purity.py guards this; consolidation_loop runs as a
+# separate process with its own imports). Add a package here only if the gateway
+# process itself imports it.
+# Regenerate the pinned lock after editing:
+#   uv pip compile requirements-gateway.txt -o requirements-gateway.lock --generate-hashes
+
+aiohttp
+asyncpg
+neo4j
+httpx
+json-repair

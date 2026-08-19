@@ -76,7 +76,7 @@ mem_gb=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null 
 if [[ "$mem_gb" -ge 16 ]]; then
     ok "RAM ${mem_gb} GB (>= 16 GB)"
 elif [[ "$mem_gb" -gt 0 ]]; then
-    warn "RAM ${mem_gb} GB — 16 GB recommended (Postgres + Neo4j ~6 GB; your LLM dominates VRAM)"
+    warn "RAM ${mem_gb} GB — 16 GB recommended (measured example configurations: README §3)"
 fi
 
 disk_gb=$(df -BG --output=avail "$REPO_ROOT" 2>/dev/null | tail -1 | tr -dc '0-9' || echo 0)
@@ -93,7 +93,7 @@ command -v nvtop >/dev/null 2>&1 \
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo
 if [[ "$fail" -eq 0 ]]; then
-    grn "Preflight passed. Next: docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml up -d"
+    grn "Preflight passed. Next: docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d"
 else
     red "Preflight failed — resolve the ✗ items above, then re-run."
 fi
