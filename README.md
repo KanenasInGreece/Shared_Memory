@@ -97,8 +97,8 @@ turns saved facts into shared knowledge.
 > Antigravity CLI, Grok, …) at the repo root and say: *"Read `AGENTS.md` and set up the
 > framework."* Part 1 of [`AGENTS.md`](AGENTS.md) interviews you for the required choices — data
 > folders, model files, your reasoning-LLM address and port, which agents get tokens — then
-> drives the same steps 1–9 below for you: writing `.env` from the template, minting tokens,
-> verifying health. The same file carries the day-2 runbooks, so "stop the framework" or
+> drives the same steps 1–10 below for you: writing `.env` from the template, minting tokens,
+> running the postflight verification. The same file carries the day-2 runbooks, so "stop the framework" or
 > "upgrade the framework" work as agent requests too.
 
 **The manual path — the numbered steps below.** They're what the agent runs on your behalf:
@@ -121,7 +121,8 @@ common setup mistake.
 daemons never run from a skill directory. Daemon and **schema** changes reach a hive through
 `git` on the gateway host — never through a skill download. The operations runbook lives in
 [`shared-memory/Documentation/server-setup.md`](shared-memory/Documentation/server-setup.md).
-Steps 1–7 below are operations (gateway host); steps 8–9 are usage (any agent).
+Steps 1–7 below are operations (gateway host); steps 8 and 10 are usage (any agent); step 9 —
+the postflight verification — runs on the gateway host again, with any minted token.
 
 **Version contract:** client and gateway are decoupled and may drift, so compatibility is
 enforced by an `api_version` exchanged on `GET /health`. Run `memory_bridge.py doctor` to check
@@ -284,10 +285,18 @@ idempotent and safe to re-run.
    ([§19](#19-tokens-and-agents); remote clients → [§20](#20-remote-clients)). Shortcut: tell
    your agent — *"clone this repo and install the shared-memory skill per README §19."*
 
-9. **Use it.** Activate the skill — `/shared-memory` (Claude Code, Grok), `$shared-memory`
-   (Codex), `/activate shared-memory` (Antigravity) — and tell the agent to **recall context
-   before a task and store decisions after**. Smoke test:
-   `memory_bridge.py search "test" 3`.
+9. **Verify the install.** Back on the gateway host:
+   `export AGENT_TOKEN=...` (any token from step 5), then
+   `bash shared-memory/scripts/postflight.sh` — seven assertions that prove the stack end to
+   end, from health payload shapes to a canary save traced into both stores, and a baseline
+   JSON of this hardware's save/search timings for later comparison. The contract it checks
+   is [`shared-memory/Documentation/postflight.md`](shared-memory/Documentation/postflight.md);
+   re-run it after every upgrade.
+
+10. **Use it.** Activate the skill — `/shared-memory` (Claude Code, Grok), `$shared-memory`
+    (Codex), `/activate shared-memory` (Antigravity) — and tell the agent to **recall context
+    before a task and store decisions after**. Smoke test:
+    `memory_bridge.py search "test" 3`.
 
 > **Day-2 — back it up.** Schedule `ops/backup.sh` (quiesced, captures **both** stores) via cron
 > or the shipped `systemd --user` timer. Rebuilding a host? Bring the databases up empty, then
