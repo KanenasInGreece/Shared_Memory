@@ -138,11 +138,20 @@ Appends `AGENT_TOKENS` (digest form) and a read-only `AGENT_ROLES` line for `mon
 Smoke-test in the foreground first:
 
 ```bash
-uv run --with aiohttp --with asyncpg --with neo4j --with httpx --with json-repair \
+uv run --no-project --with-requirements requirements-gateway.lock \
   python shared-memory/scripts/hive_mind_proxy.py 8888
 curl -s http://localhost:8888/health                       # anonymous: liveness only
 curl -s -H "Authorization: Bearer <a-phase-6-token>" http://localhost:8888/health   # full payload
 ```
+
+**Dependency pinning is the default — say so when you start the gateway.** The lock pins the
+gateway's dependencies to the exact tested versions (the shipped systemd unit below runs from the
+same lock, and `git pull` advances it with the code). Tell the user that is what you did; if they
+prefer latest-at-invocation resolution instead, the equivalent unpinned form is
+`uv run --with aiohttp --with asyncpg --with neo4j --with httpx --with json-repair python …` —
+their call, not yours. `requirements-gateway.lock` is deliberately narrower than
+`requirements.txt` (the gateway process must not carry `psycopg2`) — never substitute the full
+`requirements.lock` here.
 
 **`/health` has two shapes once Phase 6 minted tokens (S-10):** an anonymous caller gets exactly
 `{"status","version","api_version"}` — enough for liveness, nothing more — and every richer field
