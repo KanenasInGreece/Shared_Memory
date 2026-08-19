@@ -99,6 +99,12 @@ services:
   retriever-api:
     image: ghcr.io/ggml-org/llama.cpp:server
     container_name: llama-retriever
+    # Set CPU_ENCODER_REPLICAS=0 (ops/.env or shell) when the encoders are
+    # hosted OUTSIDE this stack (e.g. bare llama-server on a GPU) — otherwise
+    # `up` would race the external processes for :8070/:8071. Default 1: a
+    # fresh install always gets working encoders.
+    deploy:
+      replicas: ${CPU_ENCODER_REPLICAS:-1}
     ports: ["${INFERENCE_BIND:-127.0.0.1}:8070:8070"]
     volumes:
       - ${LLM_MODELS_DIR:-./models}:/models:ro,z
@@ -118,6 +124,9 @@ services:
   reranker-api:
     image: ghcr.io/ggml-org/llama.cpp:server
     container_name: llama-reranker
+    # Same knob as retriever-api above — the pair moves together.
+    deploy:
+      replicas: ${CPU_ENCODER_REPLICAS:-1}
     ports: ["${INFERENCE_BIND:-127.0.0.1}:8071:8071"]
     volumes:
       - ${LLM_MODELS_DIR:-./models}:/models:ro,z

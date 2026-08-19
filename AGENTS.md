@@ -95,6 +95,8 @@ Raise inotify limits per README §4 (needs sudo — give the user the commands t
 ```bash
 docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d
 docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env ps   # all four healthy
+# (two, not four, when CPU_ENCODER_REPLICAS=0 in .env — the encoders are hosted
+#  outside the stack on that install; EMBEDDER_URL/RERANKER_URL say where.)
 ```
 
 Postgres (`:5432`), Neo4j (`:7474/:7687`), embedder (`:8070`), reranker (`:8071`). An `unhealthy` inference container is almost always a wrong model path (Phase 0 Q2).
