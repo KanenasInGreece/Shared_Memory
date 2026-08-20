@@ -103,7 +103,14 @@ def _coordinator_with_mocks():
     # but scoped to this one method so a generic AsyncMock return value never
     # masquerades as a canonical name (a Mock object landing in `entities`/
     # `entities_provenance` broke the exact-value assertions below).
-    c._entity_vocab_resolve = AsyncMock(side_effect=lambda name: name)
+    #
+    # FIX ROUND (S-5, security review fact:1412): the gate now batches
+    # resolution through `_entity_vocab_resolve_many` (one round trip,
+    # `conn.fetch`) instead of one `_entity_vocab_resolve` call per name —
+    # stub the batched method with the same identity-resolves-trivially
+    # convention.
+    c._entity_vocab_resolve_many = AsyncMock(
+        side_effect=lambda names: {n: n for n in names})
 
     return c, mock_conn, mock_session
 
