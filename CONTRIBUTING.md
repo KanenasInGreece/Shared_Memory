@@ -33,7 +33,7 @@ These constraints are architectural. A PR that violates them will not be merged 
 - **All embedding and reranking calls must route through the Hive-Mind Gateway on port 8888.** Never call port 8070 (BGE-M3) or 8071 (BGE-Reranker-v2-m3) directly. The 1024-dim consistency guarantee depends on this.
 - **Saves must abort if the gateway is unreachable.** An artifact stored without a vector is permanently invisible to semantic search. This failure must surface, never be swallowed.
 - **`pg_notify` must fire inside the same transaction as the INSERT**, before `conn.commit()`. If the notification is decoupled from the commit, it can be permanently lost.
-- **Facts saved without `"entities"` in metadata are never eligible for Tier 3 consolidation.** This is intentional — do not add a workaround that bypasses the entity requirement.
+- **Entities are optional and never gate Tier 3 consolidation** — consolidation folds on `(project, domain)`. Entities remain the only way a new concept enters the graph and are operator-explicit: do not add code that invents or auto-fills them.
 - **SHA-256 idempotency** — `ON CONFLICT (content_hash) DO UPDATE` must remain. Re-saving identical content must be safe.
 
 ## No Hardcoded Credentials
@@ -50,12 +50,22 @@ All tests are fully mocked — no live database or gateway is required.
 # Full suite
 uv run --with pytest --with pytest-asyncio --with fastmcp \
        --with psycopg2-binary --with httpx --with neo4j \
+       --with asyncpg --with aiohttp --with json-repair --with numpy \
        pytest tests/ -v
 
 # Skip LLM calls in consolidation tests
 MOCK_LLM=1 uv run --with pytest --with pytest-asyncio --with fastmcp \
            --with psycopg2-binary --with httpx --with neo4j \
+           --with asyncpg --with aiohttp --with json-repair --with numpy \
            pytest tests/test_consolidation_e2e.py
+```
+
+Prefer a persistent, reproducible environment instead? `requirements.lock` pins the exact
+tested versions of every runtime dependency (audited for known CVEs at generation time):
+
+```bash
+uv venv && uv pip sync requirements.lock          # runtime deps, exact versions
+uv pip install -r requirements-dev.txt            # adds pytest + pytest-asyncio
 ```
 
 Run the full suite before opening a PR. A PR that breaks existing tests will not be reviewed until the tests pass.

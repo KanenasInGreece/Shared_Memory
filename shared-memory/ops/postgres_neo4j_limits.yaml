@@ -36,9 +36,13 @@ services:
       # (ops/backup.sh → apoc.export.cypher.all). Online, no container stop.
       - NEO4J_apoc_export_file_enabled=true
       # Corrected Neo4j 5 Memory Mapping (Note the double underscores __)
-      - NEO4J_server_memory_heap_initial__size=1G
-      - NEO4J_server_memory_heap_max__size=2G
-      - NEO4J_server_memory_pagecache_size=2G
+      # Defaults suit the 16 GB reference configuration (README §3). Neo4j
+      # refuses to start when heap max + pagecache exceed physical RAM, so a
+      # small host must lower these — via shared-memory/.env, never by editing
+      # this tracked file (the small-host preset is in .env.example).
+      - NEO4J_server_memory_heap_initial__size=${NEO4J_HEAP_INITIAL:-1G}
+      - NEO4J_server_memory_heap_max__size=${NEO4J_HEAP_MAX:-2G}
+      - NEO4J_server_memory_pagecache_size=${NEO4J_PAGECACHE:-2G}
     deploy:
       resources:
         limits:
@@ -96,9 +100,24 @@ services:
   # move it; thread count is not.
   #
   # Retriever: BGE-M3
+  # ── THE ENCODER CHOICE: CPU pair (default) or GPU pair, one yaml ───────────
+  # Exactly ONE of the two pairs below should have replicas 1 — they bind the
+  # same ports, so 1/1 fails loudly on the second bind rather than silently.
+  # CPU_ENCODER_REPLICAS defaults to 1: a fresh install always gets working
+  # encoders with no special hardware. GPU_ENCODER_REPLICAS=1 (+ CPU=0) moves
+  # both onto a Vulkan-capable card — see the measured numbers in README §17.
+  # The one-GPU compromise, plainly: a card with enough VRAM for your reasoning
+  # model is usually better spent on the MODEL backend; a small card (~4 GB)
+  # is best spent on the encoders, which fit in ~2 GB and repay it in search
+  # latency. Always the operator's call — these knobs state it, in .env.
+  # Setting BOTH pairs to 0 means the encoders are hosted outside the stack
+  # entirely (bare llama-server, another machine): then EMBEDDER_URL /
+  # RERANKER_URL must point at whatever serves them, or saves are refused.
   retriever-api:
     image: ghcr.io/ggml-org/llama.cpp:server
     container_name: llama-retriever
+    deploy:
+      replicas: ${CPU_ENCODER_REPLICAS:-1}
     ports: ["${INFERENCE_BIND:-127.0.0.1}:8070:8070"]
     volumes:
       - ${LLM_MODELS_DIR:-./models}:/models:ro,z
@@ -118,6 +137,9 @@ services:
   reranker-api:
     image: ghcr.io/ggml-org/llama.cpp:server
     container_name: llama-reranker
+    # Same knob as retriever-api above — the pair moves together.
+    deploy:
+      replicas: ${CPU_ENCODER_REPLICAS:-1}
     ports: ["${INFERENCE_BIND:-127.0.0.1}:8071:8071"]
     volumes:
       - ${LLM_MODELS_DIR:-./models}:/models:ro,z
@@ -125,6 +147,71 @@ services:
       -m /models/${RERANK_MODEL_SUBPATH:-gpustack/bge-reranker-v2-m3-GGUF/bge-reranker-v2-m3-Q8_0.gguf}
       --rerank --host 0.0.0.0 --port 8071
       --threads ${LLAMA_CPU_THREADS:-4}  -c 8192 -b 8192 -ub 8192
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8071/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: always
+
+  # ── GPU encoder pair — same models, same ports, Vulkan image ───────────────
+  # Off by default (replicas 0). Enable with GPU_ENCODER_REPLICAS=1 and
+  # CPU_ENCODER_REPLICAS=0 in shared-memory/.env. Vulkan is deliberate: one
+  # image covers Intel, AMD and NVIDIA (swap the tag for a CUDA build if you
+  # prefer CUDA — nothing else changes). ENCODER_GPU_INDEX pins WHICH card:
+  # llama.cpp enumerates Vulkan devices in driver order, not PCI order — read
+  # the startup log before trusting an index. Both encoders share one card on
+  # purpose. Once on a GPU, raise RERANK_MAX_DOC_CHARS to match EMBED_MAX_CHARS:
+  # the CPU-latency reason for narrowing the reranker's view is gone.
+  # Two containers, not one, is NOT an accident: the embedder is on the critical
+  # write path (a save is refused rather than stored without a vector), the
+  # reranker degrades to vector order — one shared lifecycle would let a
+  # reranker crash restart the embedder and stop all writes.
+  retriever-api-gpu:
+    image: ghcr.io/ggml-org/llama.cpp:server-vulkan
+    container_name: llama-retriever-gpu
+    deploy:
+      replicas: ${GPU_ENCODER_REPLICAS:-0}
+    ports: ["${INFERENCE_BIND:-127.0.0.1}:8070:8070"]
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - ${GPU_RENDER_GID:-video}
+    environment:
+      GGML_VK_VISIBLE_DEVICES: ${ENCODER_GPU_INDEX:-0}
+    volumes:
+      - ${LLM_MODELS_DIR:-./models}:/models:ro,z
+    command: >
+      -m /models/${EMBED_MODEL_SUBPATH:-gpustack/bge-m3-GGUF/bge-m3-Q8_0.gguf}
+      --embedding --host 0.0.0.0 --port 8070
+      -ngl 99 -c 8192 -b 8192 -ub 8192
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8070/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: always
+
+  reranker-api-gpu:
+    image: ghcr.io/ggml-org/llama.cpp:server-vulkan
+    container_name: llama-reranker-gpu
+    deploy:
+      replicas: ${GPU_ENCODER_REPLICAS:-0}
+    ports: ["${INFERENCE_BIND:-127.0.0.1}:8071:8071"]
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - ${GPU_RENDER_GID:-video}
+    environment:
+      GGML_VK_VISIBLE_DEVICES: ${ENCODER_GPU_INDEX:-0}
+    volumes:
+      - ${LLM_MODELS_DIR:-./models}:/models:ro,z
+    command: >
+      -m /models/${RERANK_MODEL_SUBPATH:-gpustack/bge-reranker-v2-m3-GGUF/bge-reranker-v2-m3-Q8_0.gguf}
+      --rerank --host 0.0.0.0 --port 8071
+      -ngl 99 -c 8192 -b 8192 -ub 8192
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8071/health"]
       interval: 30s

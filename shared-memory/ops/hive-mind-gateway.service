@@ -9,7 +9,10 @@ Wants=network-online.target
 Type=simple
 # Repo root — the .env beside it is loaded automatically by hive_mind_proxy.py.
 WorkingDirectory=/path/to/your/shared-memory-GitHub
-ExecStart=/usr/bin/uv run --with aiohttp --with asyncpg --with neo4j --with httpx --with json-repair python shared-memory/scripts/hive_mind_proxy.py 8888
+# Dependencies are pinned to the tested versions (requirements-gateway.lock, the
+# gateway process's RESTRICTED set — deliberately narrower than requirements.txt;
+# see requirements-gateway.txt). Resolves relative to WorkingDirectory above.
+ExecStart=/usr/bin/uv run --no-project --with-requirements requirements-gateway.lock python shared-memory/scripts/hive_mind_proxy.py 8888
 # The proxy traps SIGTERM and drains the daemons cleanly — let it.
 KillSignal=SIGTERM
 TimeoutStopSec=30

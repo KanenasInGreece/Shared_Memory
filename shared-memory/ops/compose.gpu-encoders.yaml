@@ -1,5 +1,11 @@
 # GPU overlay for the two encoder services (embedder + reranker).
 #
+# ⚠ LEGACY PATH — still works, no longer the recommended one. The base file
+# `postgres_neo4j_limits.yaml` now ships BOTH encoder pairs itself; the choice
+# is two lines in shared-memory/.env (GPU_ENCODER_REPLICAS=1 +
+# CPU_ENCODER_REPLICAS=0) with no second -f file. This overlay is kept so
+# existing installs' documented invocation keeps working unchanged.
+#
 # A WORKING SAMPLE, TESTED — not a prescription. The framework requires only an
 # embedding endpoint and a reranking endpoint it can reach (EMBEDDER_URL /
 # RERANKER_URL, defaulting to :8070 and :8071). Docker, bare llama-server, a GPU,

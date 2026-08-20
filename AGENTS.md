@@ -2,7 +2,7 @@
 
 **The canonical agent file for this repository.** Codex CLI reads it automatically before each session; Claude Code, Grok, Antigravity CLI and others are pointed here by `AGENT.md`.
 
-It has **one mission: operate the framework** — get this repo *installed, configured, started, stopped, upgraded, or backed up* on the user's machine. You will interview the user, write their `.env`, bring up the stack, mint tokens, and verify health. Quick start, maintenance, and updates: nothing else.
+It has **one mission: operate the framework** — get this repo *installed, configured, started, stopped, upgraded, or backed up* on the user's machine. You will interview the user, write their `.env`, bring up the stack, mint tokens, and prove the result with the postflight verification (Phase 9) — an install is not finished until postflight passes. Quick start, maintenance, and updates: nothing else.
 
 `README.md` is the authoritative deep reference for everything else — architecture, internals, and working on the framework's own code; every step below links the section with the full detail. Setup-affecting changes must keep README Quick Start, this file, and `CHANGELOG.md` in sync.
 
@@ -14,7 +14,7 @@ Everything here runs on the **gateway host** — the one machine that owns the d
 
 ## Ground rules for the operating agent
 
-1. **Secrets never enter the conversation or git.** Generate passwords yourself (`openssl rand -base64 24` or Python `secrets`) instead of asking the user to type them into chat. Write them only to the gitignored `shared-memory/.env` (`chmod 600`). Confirm with `git check-ignore shared-memory/.env` before moving on. Never commit `.env`, tokens, or anything under a user's home config.
+1. **Secrets never enter the conversation or git.** Generate passwords yourself — **hex only** (`openssl rand -hex 20` or Python `secrets.token_hex(20)`), never base64: base64 output contains `/`, which the compose file's `NEO4J_AUTH=neo4j/<password>` cannot carry — the container restart-loops on "… is invalid" (measured on a fresh install). Generate rather than asking the user to type them into chat. Write them only to the gitignored `shared-memory/.env` (`chmod 600`). Confirm with `git check-ignore shared-memory/.env` before moving on. Never commit `.env`, tokens, or anything under a user's home config.
    **This is stricter still for a reasoning-LLM backend's own API credential** (`LLM_BACKENDS_JSON`'s `token_env`, Q3/Phase 1 below) — that value is never written to *any* file at all, gitignored or not, including `shared-memory/.env` itself. Ask the user only for the **name** of an env var they'll export from their own encrypted secret store (`pass`, GPG-backed, or equivalent); never ask them to paste the literal key into chat or a file. If a `.env`/`LLM_BACKENDS_JSON` you're editing ever contains something that looks like a real key in a `token`/`api_key`/`secret` field rather than a `token_env` name, stop and fix it — the gateway itself refuses to load that backend (`hive_mind_proxy.py`, `_load_llm_backends`) and logs exactly why, but don't rely on that as the first line of defense.
 2. **Ask before destructive actions.** Token rotation (`bootstrap_tokens.sh --force`) invalidates every existing agent token; `ops/restore.sh` overwrites both databases; removing data dirs loses memory permanently. Get explicit confirmation each time.
 3. **Verify each phase before the next.** Every phase ends with a check command. Do not continue past a failing check — the Quick Start troubleshooting table (README) maps the first failures you'll hit.
@@ -59,7 +59,18 @@ $LLM_MODELS_DIR/gpustack/bge-m3-GGUF/bge-m3-Q8_0.gguf
 $LLM_MODELS_DIR/gpustack/bge-reranker-v2-m3-GGUF/bge-reranker-v2-m3-Q8_0.gguf
 ```
 
-Verify both files exist before Phase 4. If the user substitutes a different embedding model, the vector dimension must match the schema — see the embedding-consistency note in README Quick Start step 4.
+If the user does not have the files yet, download them (~600 MB each, from the
+`gpustack` GGUF repackagings on Hugging Face — the same paths the compose defaults name):
+
+```bash
+mkdir -p "$LLM_MODELS_DIR"/gpustack/{bge-m3-GGUF,bge-reranker-v2-m3-GGUF}
+curl -L -o "$LLM_MODELS_DIR/gpustack/bge-m3-GGUF/bge-m3-Q8_0.gguf" \
+  https://huggingface.co/gpustack/bge-m3-GGUF/resolve/main/bge-m3-Q8_0.gguf
+curl -L -o "$LLM_MODELS_DIR/gpustack/bge-reranker-v2-m3-GGUF/bge-reranker-v2-m3-Q8_0.gguf" \
+  https://huggingface.co/gpustack/bge-reranker-v2-m3-GGUF/resolve/main/bge-reranker-v2-m3-Q8_0.gguf
+```
+
+Verify both files exist before Phase 4 (preflight checks this too). If the user substitutes a different embedding model, the vector dimension must match the schema — see the embedding-consistency note in README Quick Start step 4.
 
 ### Phase 1 — Write the framework `.env`
 
@@ -74,6 +85,8 @@ git check-ignore shared-memory/.env          # MUST print the path
 mkdir -p "$NEO4J_HOST_DIR"/{data,logs,import,plugins} "$PG_DATA_DIR"
 ```
 
+Also set `LLAMA_CPU_THREADS` the way the script derives it — host threads / 2 + 1 (`$(( $(nproc) / 2 + 1 ))`) — the compose fallback is 4, which oversubscribes a small CPU and starves the databases. On a host under ~8 GB RAM, set the small-host Neo4j memory preset too (`NEO4J_HEAP_INITIAL`/`NEO4J_HEAP_MAX`/`NEO4J_PAGECACHE` — values and the why in `.env.example`): the shipped defaults refuse to start when heap max + pagecache exceed physical RAM.
+
 Uncomment/set `DREAM_TEMPERATURE` (Q4) and, for multiple LLM backends, `LLM_BACKENDS` (Q3). If the user's reasoning server **validates model names** (a named-model server, a routing proxy, a hosted OpenAI-compatible endpoint, or a desktop app with several models loaded), also set `LLM_MODEL` to the real id — the shipped default only suits servers that ignore the field. A single backend on a non-default port is `LLM_DEFAULT_TARGET`. All framework and helper tooling reads `shared-memory/.env` first, with a repo-root `.env` honoured as a pre-0.6 fallback.
 
 **If Q3 turned up a backend needing a credential, use `LLM_BACKENDS_JSON` instead of `LLM_BACKENDS`.** The complete numbered walkthrough (encrypted store → `LoadCredential=` or a `<VAR_NAME>_FILE` runtime pointer → JSON entry with `token_env` plus the mandatory `private_ok`/`roles` choice → restart → verify on `/health`) and the full per-entry parameter table both live in `shared-memory/ops/README.md`, "Reasoning-LLM backends" — **follow them verbatim rather than improvising**; `.env.example` carries the short form beside `LLM_BACKENDS_JSON`. Three rules they encode: the literal key never goes in any file this framework writes — only the env-var **name**; the key at rest belongs in an encrypted store (`pass`/GPG/`systemd-creds`), with **`LoadCredential=` or a runtime `<VAR_NAME>_FILE`** (SEC-06, PR A4) preferred over `systemctl --user import-environment`, which is deprecated (readable by any same-uid process via `show-environment`, and inherited by every user unit); and a credentialed entry with neither `roles` nor an explicit `private_ok` refuses gateway startup by design — ask the operator which they want; never pick for them.
@@ -84,11 +97,19 @@ Uncomment/set `DREAM_TEMPERATURE` (Q4) and, for multiple LLM backends, `LLM_BACK
 bash shared-memory/scripts/preflight.sh
 ```
 
-Verifies Docker + compose v2, `uv`, and a populated `.env`; warns on low RAM/disk (lean minimum: 16 GB RAM, ~8 GB VRAM, ~30 GB disk). Resolve every ✗ before continuing.
+Verifies Docker + compose v2, `uv`, and a populated `.env`; warns on low RAM/disk (16 GB RAM and ~30 GB disk are the common floor; a GPU is optional — the three measured example configurations are README §3). Resolve every ✗ before continuing.
 
 ### Phase 3 — OS limits (Linux)
 
 Raise inotify limits per README §4 (needs sudo — give the user the commands to run if you cannot). On Fedora/RHEL with SELinux, keep the `:z` suffixes on the compose volume mounts.
+
+**Sudo for an agent-driven install:** several steps here need root (package install, inotify, dir ownership). Either hand the user each command to run in their own terminal, or ask them to grant the session temporary passwordless sudo — from a real terminal (an agent session has no TTY for the password prompt):
+
+```bash
+ssh -t <host> "echo '<user> ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/99-<user>-temp"
+```
+
+and **delete `/etc/sudoers.d/99-<user>-temp` at the end of the session** — offer that cleanup unprompted. On Fedora/RHEL, docker itself is the first thing needing it: the distro ships podman, and the helper scripts call the docker CLI (`sudo dnf install moby-engine docker-compose` provides `docker compose` v2; the `podman-docker` shim is the untested alternative).
 
 ### Phase 4 — Databases + inference containers
 
@@ -96,6 +117,17 @@ Raise inotify limits per README §4 (needs sudo — give the user the commands t
 docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d
 docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env ps   # all four healthy
 ```
+
+The one yaml carries **both** encoder pairs — CPU (`llama-retriever`/`llama-reranker`, the
+default) and Vulkan GPU (`llama-retriever-gpu`/`llama-reranker-gpu`, off by default). The
+choice is two lines in `shared-memory/.env`: `GPU_ENCODER_REPLICAS=1` + `CPU_ENCODER_REPLICAS=0`
+(exactly one pair nonzero — they share ports). **Put the choice to the operator, with the
+compromise stated plainly:** a GPU with enough VRAM for their reasoning model is usually better
+spent on the model backend; a small card (~4 GB) is best spent on the encoders (~2 GB for the
+pair, repaid in search latency — measured numbers in README §17). Always the operator's call —
+never pick silently. `ps` accordingly shows four healthy containers (which four depends on the
+pair), or two when **both** pairs are 0 because the encoders are hosted outside the stack
+entirely — then `EMBEDDER_URL`/`RERANKER_URL` must say where, or saves are refused.
 
 Postgres (`:5432`), Neo4j (`:7474/:7687`), embedder (`:8070`), reranker (`:8071`). An `unhealthy` inference container is almost always a wrong model path (Phase 0 Q2).
 
@@ -120,19 +152,34 @@ uv run --with neo4j python shared-memory/migrations/verify_neo4j_init.py
 bash shared-memory/scripts/bootstrap_tokens.sh
 ```
 
-Appends `AGENT_TOKENS` (digest form) and a read-only `AGENT_ROLES` line for `monitor` to the framework `.env`. generate_tokens.py's write-through mint flow (PR A2) writes each LOCAL agent's token straight into that agent's own skill `.env` (mode 600) — nothing is printed here to save. A REMOTE agent's token needs `--reveal <name>` passed to `bootstrap_tokens.sh` itself on this SAME invocation (a later, separate reveal mints a fresh token for every agent — a full rotation, not a free peek). One distinct token per agent, never shared. The script refuses to overwrite an existing registry; `--force` rotates **all** tokens (destructive — rule 2).
+Appends `AGENT_TOKENS` (digest form) and a read-only `AGENT_ROLES` line for `monitor` to the framework `.env`. generate_tokens.py's write-through mint flow (PR A2) writes each LOCAL agent's token straight into that agent's own skill `.env` (mode 600) — nothing is printed here to save. A REMOTE agent's token needs `--reveal <name>` passed to `bootstrap_tokens.sh` itself on this SAME invocation (a later, separate reveal mints a fresh token for every agent — a full rotation, not a free peek). ⚠ **The reveal invocation is the one command the HUMAN runs in their own terminal, never you** — the script prints the raw token, and an agent transcript turns "shown once" into "stored forever" (the script's own warning; verified the hard way — a token revealed through an agent session had to be rotated). Hand the user the exact command line and step back. One distinct token per agent, never shared. The script refuses to overwrite an existing registry; `--force` rotates **all** tokens (destructive — rule 2).
 
 ### Phase 7 — Start the gateway and verify
 
 Smoke-test in the foreground first:
 
 ```bash
-uv run --with aiohttp --with asyncpg --with neo4j --with httpx --with json-repair \
+uv run --no-project --with-requirements requirements-gateway.lock \
   python shared-memory/scripts/hive_mind_proxy.py 8888
-curl -s http://localhost:8888/health
+curl -s http://localhost:8888/health                       # anonymous: liveness only
+curl -s -H "Authorization: Bearer <a-phase-6-token>" http://localhost:8888/health   # full payload
 ```
 
-Expect `"status":"ok"`, `"auth_required":true`, `"embedder":"ok"`, `"daemon":"running"`, `"rem_daemon":"running"`. (`"llm":"down"` only blocks dreaming, not saves/search — check the reasoning LLM from Q3.)
+**Dependency pinning is the default — say so when you start the gateway.** The lock pins the
+gateway's dependencies to the exact tested versions (the shipped systemd unit below runs from the
+same lock, and `git pull` advances it with the code). Tell the user that is what you did; if they
+prefer latest-at-invocation resolution instead, the equivalent unpinned form is
+`uv run --with aiohttp --with asyncpg --with neo4j --with httpx --with json-repair python …` —
+their call, not yours. `requirements-gateway.lock` is deliberately narrower than
+`requirements.txt` (the gateway process must not carry `psycopg2`) — never substitute the full
+`requirements.lock` here.
+
+**`/health` has two shapes once Phase 6 minted tokens (S-10):** an anonymous caller gets exactly
+`{"status","version","api_version"}` — enough for liveness, nothing more — and every richer field
+needs a bearer token. So: from the bare curl expect just `"status":"ok"`; from the authenticated
+one expect `"auth_required":true`, `"embedder":"ok"`, `"daemon":"running"`, `"rem_daemon":"running"`.
+(`"llm":"down"` only blocks dreaming, not saves/search — check the reasoning LLM from Q3.) An
+install that skipped tokens (auth off) serves the full payload to everyone, unchanged.
 
 Then make it survive logout/reboot with the shipped `systemd --user` unit — a terminal-launched gateway dies with its session:
 
@@ -155,9 +202,14 @@ Final end-to-end check, as an agent (uses the skill path, exercises auth + embed
 
 ```bash
 uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py doctor
-uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py save "install smoke test" '{"source":"<agent>","entities":["SetupTest"]}'
+uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py save "install smoke test" '{"source":"<agent>","entities":["SetupTest"],"new_project":true}'
 uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py search "install smoke test" 3
 ```
+
+`new_project: true` is needed exactly once: a fresh corpus has no registered projects, so the
+very first save is always refused with `project_unknown` until one is registered — the gateway
+derives the project name from where the save runs and asks rather than guessing. Every later
+save into a registered project omits the flag.
 
 **Hand each installed agent its expectations** (tell the user to relay this, or write it where that
 agent will read it — Phase 8b): the memory is built around **facts** (durable results of work, with
@@ -192,6 +244,20 @@ freshly-updated `CONSTITUTION_SNIPPET.md`. If they differ, **propose** replacing
 marker-delimited block with the new one (show what changed and why) — never overwrite it silently.
 If the agent's constitution file has no marker-delimited block at all, treat it as never having
 been offered and fall back to Phase 8b.
+
+### Phase 9 — Verify the install (postflight)
+
+Prove the installed stack works end to end — liveness and payload shape, version contract, schema
+truth, the full write path (canary save → 1024-dim vector → outbox applied → `:Fact` node), and an
+honestly-graded read path — and emit a performance baseline for this hardware. The contract is
+`shared-memory/Documentation/postflight.md`; the script implements it and exits 0 iff assertions
+A1–A5 pass. The canary lands under the reserved project `install-verification` and stays in the
+corpus — the install's birth certificate.
+
+```bash
+export AGENT_TOKEN=...   # auth-on installs: any minted agent token, from that agent's skill .env
+bash shared-memory/scripts/postflight.sh
+```
 
 ## Runbooks
 
@@ -240,14 +306,21 @@ Stopping only the inference containers (`docker stop llama-retriever llama-reran
 ### Status / health
 
 ```bash
-curl -s http://localhost:8888/health          # gateway, daemons, backends, consolidation liveness
+curl -s -H "Authorization: Bearer $AGENT_TOKEN" http://localhost:8888/health \
+                                              # gateway, daemons, backends, consolidation liveness
 docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env ps
 systemctl --user status hive-mind-gateway.service
 journalctl --user -u hive-mind-gateway.service -n 50   # daemon logs
 uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py status   # telemetry
 ```
 
-`status: degraded` on `/health` names the down backend.
+⚠ **Every `/health` read below this point means the AUTHENTICATED payload** (any minted agent
+token; S-10 slims the anonymous shape to `status`/`version`/`api_version`). A triage that reads
+`consolidation`, `stalled_types`, backend names, `project_identity` or `domain_identity` from a
+bare curl on an auth-configured install sees none of them — that is the missing token, not a
+broken gateway. `memory_bridge.py status` sends its own token and is unaffected.
+
+`status: degraded` shows anonymously; *which* backend is down is in the authenticated payload.
 
 **Reading `consolidation` — the two halves live on DIFFERENT endpoints.** There is more than one consolidation cycle type, with very different costs and cadences, so the per-type block is what you act on. But `/health` carries only the summary; the per-type census is on `/memory/telemetry`, which is what `memory_bridge.py status` reads. Asking `/health` for a per-type field returns nothing and is the easiest way to get stuck mid-triage.
 
@@ -264,6 +337,19 @@ On **`GET /memory/telemetry`** → `consolidation.<cycle_type>` (e.g. `consolida
 
 So the triage order is: `/health` → `stalled_types` → then switch to `status` / `/memory/telemetry` for that type's `eligible_clusters` → its `last_deferred_reason` → only then the reasoning LLM.
 
+**Two staleness traps in the same payload.** `backend_capability` (the embedder/reranker speed
+projection) re-probes on its own schedule, not on backend changes — after swapping encoders
+(CPU pair ↔ GPU pair) it can keep reporting the OLD backend's numbers for a while; check
+`probed_at` before acting on it. And a **Neo4j outage longer than the outbox retry window**
+(5 attempts with backoff) leaves `neo4j_outbox` rows in a terminal `failed` status that nothing
+retries — Tier 1 keeps the record, but it stays absent from the graph. `/health` surfaces it as
+a non-null `failed_age`; recovery is one statement, then the worker drains it within seconds:
+
+```bash
+docker exec postgres-vector psql -U postgres -d agent_data \
+  -c "UPDATE neo4j_outbox SET status='pending', retries=0, next_attempt_at=now() WHERE status='failed';"
+```
+
 ### Upgrade (gateway host)
 
 ```bash
@@ -279,6 +365,7 @@ uv run --with psycopg2-binary python \
 uv run --with psycopg2-binary python \
     shared-memory/scripts/backfill_domain_of.py --apply                  # then APPLY — dry-run alone enqueues nothing
 bash shared-memory/scripts/sync_skills.sh                                # refresh installed skills
+bash shared-memory/scripts/postflight.sh                                 # verify end to end (Phase 9)
 ```
 
 ⚠ **`backfill_domain_of.py` runs AFTER the restart, and that ordering is a guard rather than a
@@ -299,10 +386,10 @@ and cannot reach Neo4j, so this stamps the nodes. It is idempotent and read-only
 it on every upgrade, exactly like the Neo4j constraint check, and for the same reason. **Skipping it
 does not break writes**: records still save, still search, still enrich. What stops is *cross-project
 synthesis* — the gate fails closed on a node with no identity — which presents as a system with nothing
-to fold rather than as an error. `GET /health` → `project_identity` is where that state is visible
-(`complete: false` with an `unidentified` count).
+to fold rather than as an error. Authenticated `GET /health` → `project_identity` is where that
+state is visible (`complete: false` with an `unidentified` count).
 
-⚠ **The domain axis has the same shape and one extra number.** `GET /health` → `domain_identity`
+⚠ **The domain axis has the same shape and one extra number.** Authenticated `GET /health` → `domain_identity`
 reports `unregistered` / `mismatched` between the registry and the graph, plus **`unattached`** — a
 `:Domain` node with no `PROJECT_OF` edge, i.e. a section belonging to no project. That last one is
 reported for a walk that does not exist yet: cross-project and cross-domain synthesis will traverse

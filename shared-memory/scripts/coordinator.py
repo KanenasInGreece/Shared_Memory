@@ -142,7 +142,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.13"
+FRAMEWORK_VERSION = "0.9.17"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -997,6 +997,12 @@ def _parse_upstream_error_type(body: bytes) -> str | None:
 
 _DECOMPRESS_PREFIX_CAP = 8192  # bytes of DECOMPRESSED output — bounds a hostile expansion ratio too
 
+# Single source of truth for which Content-Encoding values either decompression
+# helper below understands. Referenced by hive_mind_proxy.py's usage-capture
+# gate too, so the two paths (fault-body peek, usage-body decompress) can never
+# drift apart on what "supported" means.
+SUPPORTED_CONTENT_ENCODINGS = {"gzip", "deflate", "br"}
+
 
 def _decompress_prefix_for_parse(body: bytes, content_encoding: str | None) -> bytes:
     """Security review R-3: `auto_decompress=False` on the shared proxy
@@ -1032,6 +1038,61 @@ def _decompress_prefix_for_parse(body: bytes, content_encoding: str | None) -> b
     except Exception:
         pass
     return body
+
+
+# Ceiling on the DECOMPRESSED output of `_decompress_full_for_usage` below —
+# the R-3 rationale on `_DECOMPRESS_PREFIX_CAP` above ("bounds a hostile
+# expansion ratio too") applies to this path's peer identically. Default is
+# 32× the compressed-side cap (2 MiB × 32 = 64 MiB): measured on real
+# LLM-shaped JSON, gzip compresses ~2.9:1, so a max-cap body decompresses to
+# ~6 MiB — this leaves >10× headroom over that while cutting the worst-case
+# amplification from the measured 1028:1 down to 32:1.
+LLM_USAGE_DECOMPRESS_CAP_BYTES = int(os.environ.get(
+    "LLM_USAGE_DECOMPRESS_CAP_BYTES", str(64 * 1024 * 1024)))
+
+
+def _decompress_full_for_usage(body: bytes, content_encoding: str) -> bytes:
+    """Whole-body decompression for hive_mind_proxy.py's usage-capture path,
+    which needs the COMPLETE trailing `usage` object rather than the bounded
+    fault-body prefix `_decompress_prefix_for_parse` above peeks at. Supports
+    exactly the same encodings as that function (see
+    SUPPORTED_CONTENT_ENCODINGS — gzip/deflate/br, no new encodings added).
+    LLM_USAGE_CAPTURE_CAP_BYTES bounds the COMPRESSED bytes the caller
+    accumulates; LLM_USAGE_DECOMPRESS_CAP_BYTES bounds what this function
+    will inflate them to (gzip/deflate never allocate past it; br is checked
+    after the fact, matching the prefix helper's own unbounded br call).
+
+    Unlike `_decompress_prefix_for_parse`, this RAISES on any failure
+    (unsupported encoding, corrupt/truncated body, over-cap decompressed
+    output, `brotli` not installed) instead of returning the input
+    unchanged — the caller's usage capture is best-effort and abandons on
+    any exception, so a silent pass-through here would hand compressed
+    bytes to `json.loads` instead of just failing cleanly at the point the
+    trouble actually occurred.
+    """
+    enc = content_encoding.strip().lower()
+    cap = LLM_USAGE_DECOMPRESS_CAP_BYTES
+    if enc == "gzip":
+        import io
+        import zlib
+        # wbits=16+MAX_WBITS reads the gzip framing; decompressobj honours
+        # max_length so an over-cap body never allocates past cap+1.
+        out = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(body, cap + 1)
+    elif enc == "deflate":
+        import zlib
+        try:
+            out = zlib.decompressobj(-zlib.MAX_WBITS).decompress(body, cap + 1)
+        except zlib.error:
+            out = zlib.decompressobj().decompress(body, cap + 1)
+    elif enc == "br":
+        import brotli  # optional dependency — not declared elsewhere in this repo
+        out = brotli.Decompressor().decompress(body)
+    else:
+        raise ValueError(f"unsupported content-encoding for usage capture: {content_encoding!r}")
+    if len(out) > cap:
+        raise ValueError(
+            f"decompressed usage body exceeds LLM_USAGE_DECOMPRESS_CAP_BYTES ({cap})")
+    return out
 
 
 CREDENTIAL_AUDIT_LOG_PATH = os.environ.get(

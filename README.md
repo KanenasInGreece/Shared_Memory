@@ -97,8 +97,8 @@ turns saved facts into shared knowledge.
 > Antigravity CLI, Grok, …) at the repo root and say: *"Read `AGENTS.md` and set up the
 > framework."* Part 1 of [`AGENTS.md`](AGENTS.md) interviews you for the required choices — data
 > folders, model files, your reasoning-LLM address and port, which agents get tokens — then
-> drives the same steps 1–9 below for you: writing `.env` from the template, minting tokens,
-> verifying health. The same file carries the day-2 runbooks, so "stop the framework" or
+> drives the same steps 1–10 below for you: writing `.env` from the template, minting tokens,
+> running the postflight verification. The same file carries the day-2 runbooks, so "stop the framework" or
 > "upgrade the framework" work as agent requests too.
 
 **The manual path — the numbered steps below.** They're what the agent runs on your behalf:
@@ -121,7 +121,8 @@ common setup mistake.
 daemons never run from a skill directory. Daemon and **schema** changes reach a hive through
 `git` on the gateway host — never through a skill download. The operations runbook lives in
 [`shared-memory/Documentation/server-setup.md`](shared-memory/Documentation/server-setup.md).
-Steps 1–7 below are operations (gateway host); steps 8–9 are usage (any agent).
+Steps 1–7 below are operations (gateway host); steps 8 and 10 are usage (any agent); step 9 —
+the postflight verification — runs on the gateway host again, with any minted token.
 
 **Version contract:** client and gateway are decoupled and may drift, so compatibility is
 enforced by an `api_version` exchanged on `GET /health`. Run `memory_bridge.py doctor` to check
@@ -129,9 +130,93 @@ it; on skew it names which side to upgrade.
 
 ### Resources & prerequisites
 
-**Hardware — lean minimum:** **16 GB RAM · ~8 GB VRAM · ~30 GB free disk.** Postgres + Neo4j
-take ~6 GB RAM between them; BGE-M3 and the reranker are small; your **reasoning LLM dominates
-VRAM**. This is the backend requirement, not the client side.
+**Hardware — three example configurations, not an exhaustive list.** Mixes are just as
+legitimate: one GPU for the encoders and another for a local LLM with an online provider
+beside them, or two online providers and no card at all — the `.env` states whatever you
+choose, and an agent following [AGENTS.md](AGENTS.md) can configure any shape here without
+improvising. The numbers are **minimums for the deployment alone** — databases, gateway,
+daemons, encoders, with headroom. The agents that will *use* the memory, and your desktop if
+this box has one, are not in them; budget those separately. Measurements come from a live
+install with a 1,300-record corpus on Fedora; macOS (where unified memory redraws the
+RAM/VRAM split entirely), Ubuntu or Windows/WSL shift the shares somewhat — which is exactly
+why these are example minimums, not prescriptions.
+
+**① No GPU at all.** The framework itself is a CPU/RAM affair: Postgres and Neo4j used
+~2.5 GB working memory here (the compose file caps them at 4 + 8 GB), the gateway and daemons
+~half a gigabyte, the two CPU encoders 0.6 GB each — though under sustained heavy search the
+reranker's cache can grow toward its 8 GB default cap, so give it room. The reasoning LLM is
+an **online provider**: one `LLM_BACKENDS_JSON` entry, and the dreaming runs — and bills —
+externally; an overnight of dreaming measured ~18,000 tokens, under a cent. The privacy
+trade-off that entry represents, and the knobs that state your answer, live in
+[§17](#17-inference-the-encoders-and-the-reasoning-llm); the custody measures around the
+provider key — where it lives, what stands between the network and it — are in §17's
+tested-configuration passage, [§19](#19-tokens-and-agents) and [SECURITY.md](SECURITY.md).
+With no LLM configured nothing dies: saves, search and the graph keep working; summaries and
+insights queue durably until a backend appears. Searches on CPU encoders took ~30 seconds here.
+*Example minimum: 4–8 threads · 16 GB RAM · no GPU · 30 GB disk.*
+
+**② A small GPU (~4 GB).** Everything in ①, plus two `.env` lines (`GPU_ENCODER_REPLICAS=1`,
+`CPU_ENCODER_REPLICAS=0`) move the encoders onto the card: the pair fits in ~2 GB measured,
+search fell from ~30 to under 5 seconds (~6×), and the reranker — which on a loaded CPU can
+time out — answers in under a second. GPU support is whatever your encoder server supports:
+the shipped GPU pair is llama.cpp's Vulkan image — one image for Intel, AMD and NVIDIA, swap
+the tag for CUDA — and hosting the encoders outside the stack with vLLM, LM Studio or bare
+`llama-server` is equally legitimate; the gateway only needs endpoints that answer. The LLM
+stays online; ①'s caveat pointers apply unchanged.
+*Example minimum: 4–8 threads · 16 GB RAM · 4 GB VRAM · 30 GB disk.*
+
+**③ Everything local.** A local reasoning LLM, the cloud an option rather than a necessity —
+and it takes less than you might fear: **16 GB RAM and one 12 GB card run the whole thing.**
+With the model fully offloaded its host-side footprint measured a fifth of a gigabyte — VRAM
+is where it lives, and VRAM is dominated by model and context: our 14B at Q4 with a generous
+64K context measured 11.2 GB by itself, so on a single 12 GB card pair it with the encoders by
+trimming context, or run a 7–8B and fit everything with room to spare. With two cards the
+compromise states itself: the model takes the big one, the encoders the small one
+([§17](#17-inference-the-encoders-and-the-reasoning-llm)). Local content never leaves the
+machine unless a backend you marked `private_ok` exists to receive it. More RAM (32 GB) is
+comfort for a box that also runs your agents and a desktop — not a deployment requirement.
+*Example minimum: 8+ threads · 16 GB RAM · 8–12 GB VRAM · 40 GB disk.*
+
+**The hard floor under all three: ~8 GB RAM.** Neo4j checks its configured memory against
+physical RAM at startup and the shipped settings (2 GB heap + 2 GB pagecache) refuse to boot
+on less than ~4 GB — and the full CPU stack's measured working set lands near 6 GB — so 8 GB
+is the least that runs the defaults untouched. (Projected from component measurements; the
+example configurations above are the measured ones.) Below it you are in ④ territory.
+
+**④ Almost no machine at all.** To find out where the floor really is, we installed the
+framework on a 2018 budget laptop: two AMD cores, 3.2 GB of usable RAM, integrated graphics
+from the era when that phrase was an apology — deliberately far below every number in this
+chapter. It is not a supported configuration; it is a measured account of what breaks, in what
+order, and what the framework does about it.
+
+The stack would not start as shipped — Neo4j checks its configured memory against physical RAM
+and refuses — and that refusal is the honest boundary of the defaults above. With the
+small-host values in `.env.example` (a quarter-gigabyte heap and pagecache), Neo4j runs in
+about 800 MB with both plugins loaded, Postgres asks for barely a hundred, and the whole
+storage layer fits. The CPU encoders were the real wall: on two slow cores a realistic
+three-kilobyte record blew past the save timeout — the gateway's own health endpoint diagnosed
+it, projecting the embedder at a fortieth of the assumed throughput. The surprise was the
+integrated GPU. The same Vulkan encoder image that serves discrete cards loaded BGE-M3 on a
+2015 Radeon iGPU and turned that failing save into an eleven-second success — the ~6× of
+configuration ② reproduced on the weakest plausible hardware. One caveat matters: an iGPU's
+memory *is* system RAM, pinned and unswappable, so the viable arrangement pairs the GPU
+embedder with the CPU reranker and lets searches degrade to vector order when the reranker
+falls behind — which the gateway does on its own, scores marked null rather than invented.
+
+What this buys you is not a production host. It is the knowledge that the floor is soft: every
+refusal on the way down was explicit, every degradation visible in telemetry, and a machine
+this small still saved, embedded at 1024 dimensions, synced both stores, and answered
+searches. If your hardware sits anywhere above the floor of configuration ①, nothing here is
+your problem — but if you ever wonder whether the old laptop in the drawer can host a memory,
+the answer is: with the knobs, barely, and it will tell you exactly which compromise it is
+making.
+
+**Disk, itemised (measured):** container images 1.8–3 GB (pgvector 0.6 + Neo4j 1.0 + llama.cpp
+0.2 CPU or 1.2 Vulkan) · encoder models 1.2 GB · database stores 0.8 GB at 1,300 records,
+growing with the corpus · your reasoning model if local (8.4 GB for the 14B example) · the OS
+itself (a headless Linux server installs in ~3 GB and idles under half a gigabyte of RAM; a
+desktop OS beside the deployment costs gigabytes of both — budget it as the separate thing it
+is).
 
 **Software:** Docker + Docker Compose · [`uv`](https://docs.astral.sh/uv/) (recommended — every
 command here uses it; or Python 3.11+ with `pip`) · a server for your reasoning LLM on `:5000`
@@ -200,16 +285,24 @@ idempotent and safe to re-run.
    ([§19](#19-tokens-and-agents); remote clients → [§20](#20-remote-clients)). Shortcut: tell
    your agent — *"clone this repo and install the shared-memory skill per README §19."*
 
-9. **Use it.** Activate the skill — `/shared-memory` (Claude Code, Grok), `$shared-memory`
-   (Codex), `/activate shared-memory` (Antigravity) — and tell the agent to **recall context
-   before a task and store decisions after**. Smoke test:
-   `memory_bridge.py search "test" 3`.
+9. **Verify the install.** Back on the gateway host:
+   `export AGENT_TOKEN=...` (any token from step 5), then
+   `bash shared-memory/scripts/postflight.sh` — seven assertions that prove the stack end to
+   end, from health payload shapes to a canary save traced into both stores, and a baseline
+   JSON of this hardware's save/search timings for later comparison. The contract it checks
+   is [`shared-memory/Documentation/postflight.md`](shared-memory/Documentation/postflight.md);
+   re-run it after every upgrade.
+
+10. **Use it.** Activate the skill — `/shared-memory` (Claude Code, Grok), `$shared-memory`
+    (Codex), `/activate shared-memory` (Antigravity) — and tell the agent to **recall context
+    before a task and store decisions after**. Smoke test:
+    `memory_bridge.py search "test" 3`.
 
 > **Day-2 — back it up.** Schedule `ops/backup.sh` (quiesced, captures **both** stores) via cron
 > or the shipped `systemd --user` timer. Rebuilding a host? Bring the databases up empty, then
 > `ops/restore.sh`. Full detail: [§22](#22-backups-and-restore).
 
-### Troubleshooting — the first four you'll hit
+### Troubleshooting — the first failures you'll hit
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
@@ -217,6 +310,9 @@ idempotent and safe to re-run.
 | **503 on save/search** | Embedder/reranker down or `unhealthy` | `docker compose ps` first — an `unhealthy` service (usually a wrong model path, §15) is the cause. Then `curl :8888/health`. |
 | **Search returns HTTP 500** | Migrations not applied | Run `apply.py` (§16). Idempotent. |
 | **Silent DB failures (Fedora)** | inotify limits, or a mount missing `:z` | §14, §15. |
+| **Neo4j crash-loops: "/import is not accessible"** | mounted dirs not writable by the container user (uid 7474) | `sudo chown -R 7474:7474 $NEO4J_HOST_DIR/{data,logs,import,plugins}` (§14). Preflight checks this. |
+| **Neo4j crash-loops: "neo4j/… is invalid"** | password contains `/` — breaks `NEO4J_AUTH` parsing | Regenerate as hex (`openssl rand -hex 20`), update `.env`, recreate the container. |
+| **Neo4j: "Invalid memory configuration — exceeds physical memory"** | host RAM below the shipped heap+pagecache | Set the small-host preset in `.env` (§3 floor note, values in `.env.example`). |
 | *Bonus:* **agent "doesn't know" earlier facts** | the skill was never invoked | Activate it and ask the agent to search shared memory first. |
 
 > **Maintainers:** this chapter is the single source of setup truth. Any change that affects
@@ -497,6 +593,18 @@ sudo sysctl -p /etc/sysctl.d/90-inotify.conf
 
 Keep the `:z` suffixes on the compose volume mounts — SELinux needs them.
 
+Fedora ships **podman**, not docker, and the helper scripts call the docker CLI — Fedora's own
+repos carry what's needed (`sudo dnf install moby-engine docker-compose` provides the
+`docker compose` v2 subcommand; enable with `sudo systemctl enable --now docker` and add your
+user to the `docker` group). The `podman-docker` shim is the untested alternative.
+
+One ownership step the tooling can't skip: the Neo4j container runs as uid 7474 and needs
+**write** access to its mounted dirs. Its entrypoint fixes `data/` and `logs/` itself but not
+`import/` and `plugins/` — freshly created user-owned dirs crash-loop the container on
+"/import is not accessible". `install_framework.sh` chowns them for you; `preflight.sh`
+verifies it; by hand it is
+`sudo chown -R 7474:7474 $NEO4J_HOST_DIR/{data,logs,import,plugins}`.
+
 ## 15. The stack: Docker Compose
 
 `shared-memory/ops/postgres_neo4j_limits.yaml` defines four services: **postgres** (pgvector), **neo4j**
@@ -511,7 +619,10 @@ docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared
 docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env ps   # all four healthy
 ```
 
-Place your GGUF files where the compose mounts expect them (or edit the mount and `-m` paths).
+Place your GGUF files where the compose mounts expect them (or edit the mount and `-m` paths) —
+both models are on Hugging Face, and the download commands (with the exact layout the compose
+defaults name) are in `shared-memory/.env.example` next to `LLM_MODELS_DIR`. `preflight.sh`
+checks both files exist before you ever reach a container healthcheck.
 The inference services carry healthchecks: an `unhealthy` embedder or reranker — almost always a
 wrong model path — is why saves and searches return 503. Check `ps` before debugging anything
 else.
@@ -546,8 +657,13 @@ names are configurable in `shared-memory/ontology.yaml`; the machinery does not 
 
 Two small encoders serve the write and search paths — BGE-M3 embeds, BGE-Reranker-v2-m3 ranks —
 and they came up with the compose stack. As packaged they run on CPU, which works everywhere and
-costs time; `shared-memory/ops/compose.gpu-encoders.yaml` is a worked Vulkan overlay that puts both on one GPU
-(one image covers Intel, AMD and NVIDIA). On CPU, `RERANK_MAX_DOC_CHARS` bounds what the
+costs time; the same compose file also carries a Vulkan GPU pair for them (one image covers
+Intel, AMD and NVIDIA), off by default — the choice is two `.env` lines, `GPU_ENCODER_REPLICAS=1`
+and `CPU_ENCODER_REPLICAS=0`, and what you run never diverges from what ships. If you have one
+GPU to allocate, the compromise is plain: a card with enough VRAM for your reasoning model is
+usually better spent on the model backend, while a small card — 4 GB, say — is best spent on
+the encoders, which fit in about 2 GB and repay it in search latency. Your call, always.
+On CPU, `RERANK_MAX_DOC_CHARS` bounds what the
 reranker scores — a concession, not a free win: capping at 2,000 chars kept about half of
 reranking's improvement in our measurements. Run the encoders however you please — Docker, bare
 `llama-server`, another machine; `EMBEDDER_URL` and `RERANKER_URL` say where the gateway looks,
@@ -561,11 +677,105 @@ llama-server -m bge-reranker-v2-m3-Q8_0.gguf --port 8071 --rerank -c 8192 -b 819
 Keep them as separate processes: the embedder is on the critical write path (a save is refused
 rather than stored without a vector); the reranker degrades gracefully to vector order.
 
+### What a small GPU buys the encoders — measured
+
+The encoders are where a cheap GPU pays for itself, and we measured it rather than assumed it.
+Both models are 0.6 GiB Q8_0 files; with full offload and the 8K context above, the pair ran
+side by side on one mid-range card using roughly a gigabyte each including buffers — **any 4 GB
+card should hold both** (that last step is an estimate from the measured footprint, not yet run
+on such a card). Against the CPU containers on a 12-core desktop, end-to-end search fell from
+28–33 seconds to a **4.7-second mean over an 11-hour soak** — 102 searches, every 20 minutes,
+zero failures, zero drift — with the embedder at roughly 5× throughput and the reranker, which
+on a loaded CPU can time out outright, answering in under a second. Same vectors, too: CPU and
+GPU embeddings of the same text agree to cosine 0.9996, so the swap changes nothing about the
+stored space.
+
+One honest wrinkle from sharing a card: called solo, each service is a metronome (the reranker's
+latency varied by ~1 ms). Called concurrently, means rise modestly — reranker ×1.2, embedder
+×1.8 — but latency stops being deterministic: the reranker's p95 roughly doubles. Nothing
+fails; everything stays far below the CPU baseline; but if you need flat tails under sustained
+parallel load, that is the argument for giving each encoder its own small card rather than for
+more VRAM on one.
+
 The **reasoning LLM** on `:5000` is yours to run — LM Studio or any OpenAI-compatible server —
 and it can be a pool: `LLM_BACKENDS="url@weight,…"` load-balances the dreaming across several
 backends (one per GPU, or remote; a pool member may even be a cloud API via
 `LLM_BACKENDS_JSON`, with credentials resolved from the environment and never written to disk).
 Clients never know the difference; the gateway owns the routing.
+
+### Mixing models — and who decides what runs where
+
+A pool stops being simple the moment its members stop being identical. A second GPU with a
+smaller card, a big-context model on another machine, a paid cloud API kept for the jobs the
+local cards can't hold — each is useful, and each breaks the assumption that any backend can
+take any job. The `.env` lets you say so per backend, in `LLM_BACKENDS_JSON`:
+
+- **`roles`** — which dreaming functions this backend may serve (`extract`, `verify`,
+  `judge`). Leave it out and the backend serves everything, which is exactly what a
+  uniform local pool wants.
+- **`n_ctx`** — the model's usable context. Declared, it lets the gateway keep a job that
+  cannot fit away from a backend that would truncate it.
+- **`private_ok`** — may record content land here as ordinary, unrestricted traffic? A
+  local backend defaults to yes; a credentialed provider defaults to no, and asks you to
+  choose out loud.
+- **`max_inflight`** — how many simultaneous requests this backend may hold, for the
+  metered or fragile ones.
+
+The dilemma these knobs settle is real and worth stating plainly: an external LLM trades
+**privacy** — record content leaves the machine — for **lower VRAM demands and a bigger
+context** than the cards in the box. There is no universally right answer; there is only
+your answer, per function, per install. Naming a provider's entry `roles: ["judge"]` says
+insight folds may go out but raw record enrichment never does; `private_ok: true` says the
+provider is trusted like a local card; leaving both unsaid is refused at startup rather
+than guessed at.
+
+Three properties hold however you configure it:
+
+- **One decision-maker.** The gateway alone decides which model serves which job. Daemons
+  only declare what *kind* of work they carry; nothing a client sends can steer work onto
+  a paid or external model.
+- **The gateway keeps score.** Every request routed to a model counts against it exactly
+  as long as it runs and is released the moment it finishes or fails — so "how busy is
+  each model" is always a true number, and a capped external model can never be flooded by
+  several daemons arriving at once.
+- **Loud refusals, never silent fallbacks.** If no model is allowed to take a job —
+  privacy, function, or size — the framework says so in a structured error rather than
+  quietly sending the work somewhere you did not permit. The affected record simply waits;
+  a configuration gap is never treated as a defect in your data.
+
+One consequence deserves its own sentence: a fleet whose *only* members are external
+providers with a full `roles` list is a fleet where the dreaming runs — and bills —
+externally. That is not a trap; it is exactly what listing all three roles asks for.
+The knobs state your policy; they do not second-guess it.
+
+The authenticated `/health` payload counts tokens and request latency per backend (with a
+last-event timestamp each), and can carry your own price-per-million metadata for a
+dashboard to multiply — the gateway itself never reads prices. **These counters reset on
+every gateway restart** — they are per-lifecycle by design, so compute dashboard deltas
+restart-aware (the paired timestamps are what make that possible), and never read a
+post-restart drop as negative usage. The gateway also writes one summable token line per
+backend to its log on shutdown, so lifetime accounting survives restarts in the journal
+even though the live counters do not.
+
+### No local LLM at all — tested, not asserted
+
+The VRAM-constrained configuration this section keeps gesturing at has now been run for
+real: both local models stopped, one metered provider as the entire pool, overnight. The
+dreaming ran — enrichment routed to the provider and succeeded, folds formed — and the
+whole night, probes and debugging included, cost **eighteen thousand tokens: under a
+cent**. Enrichment of a typical record lands near one token per character of content, a
+few seconds of latency per call — numbers that do not matter to a background daemon and
+barely matter to a wallet. The security posture holds while it happens: the provider key
+lives in a mode-600 file outside the repo and is referenced by path (`*_API_KEY_FILE`),
+the gateway's own token wall stands between the network and that key — an unauthenticated
+request gets 401, and the anonymous `/health` shape stays three harmless keys — and the
+telemetry reports `has_credential` as a boolean, never the material.
+
+And with no LLM anywhere? The system does not die. Saves, semantic search, the graph,
+facts, decisions and retrospectives all keep working on the encoders alone. What waits is
+the dreaming: records queue durably in the outbox ledger, and thematic summaries and
+insights are simply not formed until a backend appears — then it catches up. A missing
+model is a pause, never a loss.
 
 > **Never call `:8070`/`:8071` directly** — the gateway on `:8888` is what enforces one shared
 > embedding space. And never point `EMBEDDER_URL` at the reranker: asked to embed, it answers
@@ -716,6 +926,12 @@ uv run --with pytest --with pytest-asyncio --with fastmcp \
        --with asyncpg --with aiohttp --with json-repair --with numpy \
        pytest tests/ -v
 ```
+
+Every `uv run --with` in this README resolves dependencies fresh, which is fine for trying
+things out. To reproduce the exact dependency versions this framework is developed and tested
+against, `requirements.lock` pins the full runtime tree (hashes included, audited for known
+CVEs at generation time): `uv venv && uv pip sync requirements.lock`. The floors live in
+`requirements.txt`; dev extras in `requirements-dev.txt`.
 
 ---
 
