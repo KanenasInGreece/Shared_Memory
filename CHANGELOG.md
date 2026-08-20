@@ -5,6 +5,59 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.18] — 2026-08-20
+
+### Added — entities become the third operator-governed axis: a vocabulary, and a gate that consults it
+
+- **Migrations 033 + 034** — `entity_vocabulary` (canonical spellings) and
+  `entity_vocab_aliases` (operator-curated equivalent spellings), matched through one shared
+  `entity_normalize()` SQL function: case- and punctuation-insensitive, so casing variants of
+  one concept resolve to one canonical. Aliases are semantic — any spelling an operator ruled
+  equivalent, not merely a normalization twin. Seeded from the install's existing
+  `entity_registry`; write-time triggers refuse rows that would normalize to nothing or
+  collide. 034 aligns three legacy VARCHAR columns with the TEXT a fresh install already gets.
+- **The save-time entity ingress gate** (coordinator, all three record types): entity names
+  resolve against the vocabulary in one batched query; known names — aliases and case variants
+  included — are rewritten to their canonical spelling before anything is stored, and the save
+  response carries `entities_rewritten` whenever that happened, so a substitution is never
+  silent. An unknown name refuses the save with a structured `entity_unknown` answer stating
+  exactly how to proceed: re-send with `metadata.new_entities` naming the genuinely new
+  concepts (each must also appear in `entities` — enforced), or save under the registered
+  spelling. Minting is the only write path into the vocabulary, records who minted, and
+  survives concurrent races through the unique index alone. Entities remain optional
+  throughout: an entity-less save is untouched, and consolidation eligibility never depends on
+  entities. Noise the graph gate would drop anyway (bare numbers, leaked ids) is deliberately
+  exempt — not a concept, so neither refused nor canonicalized.
+- **Request bounds** — `ENTITY_LIST_MAX_LEN` (default 50) and `ENTITY_NAME_MAX_LEN` (default
+  200), env-overridable; defaults sit roughly an order of magnitude above live-corpus maxima
+  measured before choosing them. Oversized input refuses cleanly and is never echoed back.
+- **`verify_schema_init.py` column-type check** — proven against a known-broken artifact
+  first; on its first real run it caught three pre-existing fresh-vs-live type divergences
+  (the generator's historical varchar-length collapse), closing the fifth
+  silently-dropped-DDL class.
+
+### Fixed
+
+- A name that normalizes to the empty string (pure punctuation/emoji) used to escape the mint
+  path as an unhandled 500 whose non-JSON body clients reported as "coordinator is down"; it
+  is now a structured 400 `new_entities_invalid`. The catch is specific — real connection
+  failures still surface as errors.
+- Whitespace variants of a registered entity name (trailing space, doubled internal space)
+  used to pass the gate uncanonicalized; canonicalization now survives the sanitize transform
+  in both `entities` and `entities_provenance`.
+- A save refused for an unrelated validation error can no longer mint vocabulary rows on its
+  way out: the gate runs last among refusals on both write endpoints. (A mint surviving a
+  post-gate infrastructure abort is accepted and documented: a minted-but-unsaved canonical is
+  operator-declared vocabulary, visible in the registry log.)
+
+### Review
+
+- Built and hardened under the builder/reviewer/merger split: QA + security reviews, a
+  seven-item ruled fix round, and a security delta re-review that re-probed every fix against
+  the migration's real triggers — verdict CLEAR TO MERGE. 2000 tests green; new invariants
+  mutation-checked. Client-side elicitation of `new_entities` is the next leg; until it
+  ships, the refusal message itself carries the recovery instructions.
+
 ## [0.9.17] — 2026-08-19
 
 ### Added — postflight: the install's working order is now a defined contract, not an assumption
