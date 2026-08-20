@@ -4713,6 +4713,37 @@ class MemoryCoordinator:
         # below) so it is seen at capture time rather than only on inspection.
         entities_provenance_missing = bool(entities) and entities_provenance is None
 
+        # Entity vocabulary ingress gate (fact:1375, migration 033) — additive
+        # AFTER sanitize_entity_name (rule 7), lookup-never-create (rule 2),
+        # refuses an unknown name unless metadata.new_entities explicitly
+        # mints it (rules 4/5). Rewrites `metadata['entities']` to the
+        # CANONICAL spelling in place before anything downstream — locks, PG
+        # metadata, the outbox row, entity_registry, the graph — sees this
+        # list, so `entities` is re-read below.
+        #
+        # ⛔ S-4 (security review fact:1412, ruled decision:1413): called LAST
+        # among the 400-capable metadata checks — AFTER entities_provenance
+        # above, not before it as originally built. A mint is a real write
+        # (to entity_vocabulary, no shared transaction with the record
+        # insert), so anything that can still 400 the save must run BEFORE
+        # this call, or a mint survives the very refusal that requested it.
+        # Only the hard-mandate embedding 503 (unavoidably later — it needs
+        # the final content) can still race a mint; that residual is
+        # accepted by ruling, not fixed here — see the method's own
+        # docstring.
+        entities_before = list(entities)
+        entity_error = await self._entity_ingress_error(metadata, agent_id)
+        if entity_error is not None:
+            return web.json_response(entity_error, status=400)
+        entities = metadata.get("entities", [])
+        # S-6 (security review fact:1412): a caller must be able to see what
+        # was actually stored when the gate changed anything — an alias/
+        # case-variant rewrite, or a mint substituting a race's winning
+        # spelling (S-6/S-12) — never silently. `None` when nothing moved,
+        # so the ordinary case (no entities, or every name already
+        # canonical) adds no noise to the response.
+        entities_rewritten = entities if entities != entities_before else None
+
         content_hash = hashlib.sha256(content.encode()).hexdigest()
 
         # Embedding — hard mandate; no save without a vector
@@ -4920,6 +4951,12 @@ class MemoryCoordinator:
             "superseded": superseded_pg_id,
             "message": f"Artifact stored with ID {pg_id}.{sup_msg}{warn}",
             "entities_provenance_note": entities_provenance_note,
+            # S-6 (security review fact:1412): non-null only when the entity
+            # vocabulary gate changed something the caller sent — an alias/
+            # case-variant rewritten to its canonical, or a name substituted
+            # by a mint race's winner (S-6/S-12) — so a caller can always see
+            # what was actually stored, never infer it.
+            "entities_rewritten": entities_rewritten,
         })
 
     # ── POST /memory/supersede ────────────────────────────────────────────────
@@ -5177,14 +5214,6 @@ class MemoryCoordinator:
         new_entities_body = body.get("new_entities")
         if new_entities_body is not None:
             metadata["new_entities"] = new_entities_body
-        # Entity vocabulary ingress gate (fact:1375) — the second of the two
-        # writers `_entity_ingress_error` covers; see its docstring. Runs
-        # before the embedding call so a refusal fails fast, and rewrites
-        # `metadata['entities']` to the canonical spelling in place before the
-        # locks loop below reads it.
-        entity_error = await self._entity_ingress_error(metadata, agent_id)
-        if entity_error is not None:
-            return web.json_response(entity_error, status=400)
         if source_ref:
             metadata["source_ref"] = source_ref
         if body.get("elicited"):
@@ -5229,6 +5258,26 @@ class MemoryCoordinator:
                 {"status": "error", "message": f"No record found with pg_id={pg_id}"},
                 status=404,
             )
+
+        # Entity vocabulary ingress gate (fact:1375) — the second of the two
+        # writers `_entity_ingress_error` covers; see its docstring.
+        #
+        # ⛔ S-4 (security review fact:1412, ruled decision:1413): called LAST
+        # among this endpoint's 400/404-capable checks — AFTER grounded_in and
+        # the pg_id existence pre-check above, not right after `metadata` was
+        # built as originally placed. A mint is a real write with no shared
+        # transaction; anything that can still refuse the save must run
+        # before this call. Only the hard-mandate embedding 503 just below is
+        # unavoidably later — that residual is accepted by ruling, see the
+        # method's own docstring. Rewrites `metadata['entities']` to the
+        # canonical spelling in place before the locks loop below reads it.
+        entities_before = list(metadata["entities"])
+        entity_error = await self._entity_ingress_error(metadata, agent_id)
+        if entity_error is not None:
+            return web.json_response(entity_error, status=400)
+        entities_rewritten = (
+            metadata["entities"] if metadata["entities"] != entities_before else None
+        )
 
         # Embedding — hard mandate, same as every record; no save without a vector.
         # Identity: a retrospective is (target decision, notes) — the target is part
@@ -5378,6 +5427,8 @@ class MemoryCoordinator:
             "target_pg_id": pg_id,
             "message": f"Retrospective stored with ID {retro_pg_id} "
                        f"(rating={rating}, target decision {pg_id}).",
+            # S-6 (security review fact:1412) — see handle_save's identical field.
+            "entities_rewritten": entities_rewritten,
         })
 
     # ── POST /memory/relations/review + /memory/relations/label ──────────────
