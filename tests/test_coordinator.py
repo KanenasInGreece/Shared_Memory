@@ -76,6 +76,18 @@ def _coordinator_with_mocks():
     mock_conn.fetch      = AsyncMock(return_value=[])
     mock_conn.transaction = MagicMock(return_value=_async_ctx(None))
 
+    # Entity vocabulary ingress gate (fact:1375, FIX ROUND S-5): resolution
+    # batches through `_entity_vocab_resolve_many` (one round trip via
+    # `conn.fetch`), which this fixture explicitly stubs to `[]` above for
+    # OTHER callers of `conn.fetch` — meaning every entity would otherwise
+    # resolve to "unknown" and every save naming one would be wrongly
+    # refused. Stub the gate's own method directly so a name resolves to
+    # ITSELF, unless a test overrides it — the same "passes trivially"
+    # convention `mock_conn.fetchrow`'s fixed `{"id": 99}` return gives every
+    # other unconfigured lookup here.
+    c._entity_vocab_resolve_many = AsyncMock(
+        side_effect=lambda names: {n: n for n in names})
+
     # asyncpg pool mock — acquire() must return an async ctx manager
     mock_pool = MagicMock()
     mock_pool.acquire = MagicMock(return_value=_async_ctx(mock_conn))

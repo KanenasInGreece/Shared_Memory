@@ -181,6 +181,8 @@ Commit findings, decisions, and technical facts to long-term shared memory.
 
 **Capture discipline (ruled, fact 1215): entities the operator did not name are NEVER added by the agent.** When none are given, ask once and accept none as the answer — do not keep asking, and do not infer one from the content to fill the field. One is enough when one is given. Name each as a **concept, not a sentence** (`OutboxPattern`, not `must be performed on the VM`) — and never as the project or section it belongs to: that is asking *where the record belongs*, and an entity answers *what the record is about* (the subject-vs-axis test). Stamp each entity's origin in `entities_provenance`, e.g. `'{"entities":["OutboxPattern"],"entities_provenance":{"OutboxPattern":"operator"}}'` in the metadata JSON — a value of `"operator"` or `"agent"` per named entity. Omitting it still saves; the response's `entities_provenance_note` names the gap so it is seen at capture time, not just on inspection. A mapping naming an entity outside the save's `entities` list, or a value that is not `operator`/`agent`, is refused (400 `entities_provenance_invalid`) — fix the mapping and re-send.
 
+**Every named entity is checked against a controlled vocabulary at save time (fact 1375) — an unregistered name is refused (400 `entity_unknown`), never silently dropped or auto-registered.** A registered alias or case/punctuation variant is rewritten to its canonical spelling before storage; noise `sanitize_entity_name` already rejects (a leaked pg_id, a bare number, ...) never reaches this check at all. On refusal, ASK THE OPERATOR whether each name is genuinely new or a spelling of something already registered; if genuinely new, re-send with `"new_entities": ["<name>", ...]` naming exactly the unknown entities to mint as canonicals — each must also appear in `entities` (a name in `new_entities` that does not is refused 400 `new_entities_invalid`, not silently ignored), and minting creates the canonical only, never an alias (alias curation stays a separate, deliberate operator act). A `new_entities` that is not a list of strings is refused 400 `new_entities_invalid`. Both `entities` and `new_entities` are capped at `ENTITY_LIST_MAX_LEN` items (default 50, env-overridable) — refused 400 `entities_list_too_long` — and every individual name at `ENTITY_NAME_MAX_LEN` characters (default 200, env-overridable) — refused 400 `entity_name_too_long`. When the gate rewrites anything, the save response's `entities_rewritten` field carries the final canonical list — `null` when nothing changed.
+
 The enrichment pass links only to concepts a fact's `entities` list already named — never inventing one, and never reaching a name it introduced itself — and decisions and retrospectives no longer name their own, inheriting from the facts they rest on. A phrase you type here becomes a node for good — the one way back is to **supersede the fact**, which retires the concepts only that fact named from the enrichment pass's reach (nothing is deleted; existing links stay). Spelling binds the node you create, but not the links that follow: the enrichment pass groups known spellings of one concept and attaches to the form already most used.
 
 **`project` is REQUIRED on a fact AND on a decision, and checked against a registry — a save with none is REJECTED (400).** (A retrospective supplies none: it inherits the project of the decision it judges.) NREM keys community summaries on **(entity, project)**; facts sharing an entity but carrying different projects are never fused into one summary, and a fact whose project does not resolve is not folded at all — it is skipped, never pooled with other untagged facts, because an absence is not a subject. **Omit `project` and the client derives it from the project folder name** (walking up to the nearest `.git`/`CLAUDE.md`/`AGENTS.md`; `SHARED_MEMORY_PROJECT` overrides; failing that, from an **absolute** `source_ref`'s directory). An explicit value always wins, so **do not hand-type a project that differs from the folder** — state the derived tag when saving work belonging to a *different* project than the current directory.
@@ -583,7 +585,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness (anonymous — status/version/api_version only, v0.9.9 S-10):
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":4,"version":"0.9.17"}
+# → {"status":"ok","api_version":4,"version":"0.9.18"}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -654,7 +656,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.17", "api_version": 4, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.18", "api_version": 4, "tool": "shared-memory-framework"}`
 
 ### Updating This Skill
 
