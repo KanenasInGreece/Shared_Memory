@@ -5,6 +5,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.19] — 2026-08-21
+
+### Fixed — clean-install portability, found by a fresh-VM install test (Ubuntu Server 26.04, CPU-only + online LLM)
+
+- **`install_service.sh` now resolves the host's actual `uv`** and substitutes it into the
+  unit's `ExecStart` *and* into an `Environment=PATH=` line the unit template now carries. The
+  shipped template hardcoded `/usr/bin/uv`, but the documented uv installer lands in
+  `~/.local/bin` — a fresh install's gateway crash-looped with 203/EXEC, and even with
+  ExecStart corrected the daemon spawns (`shutil.which("uv")` under the unit's default PATH)
+  came up empty, leaving consolidation/REM silently stopped behind a healthy-looking gateway.
+- **Gateway daemon spawns fall back to `~/.local/bin/uv` / `~/.cargo/bin/uv`** when PATH
+  resolution fails, and say where they looked when they cannot start a daemon.
+- **`postflight.sh` timings no longer trust `date +%s%3N`** — uutils coreutils (default on
+  Ubuntu ≥25.10) ignores the `%3N` width and returns nanoseconds, inflating every reported
+  timing and the baseline JSON ×10⁶. Timing now uses bash's own `$EPOCHREALTIME`.
+- **AGENTS.md Phase 8 smoke test matches the gateway it talks to**: run from a project
+  directory (the client derives the project from the cwd; elsewhere the save is refused with
+  `project_required`), and the example save now mints its entity via `new_entities` — the
+  entity vocabulary gate (0.9.18) refuses the previous example on any fresh corpus.
+- **AGENTS.md**: interview Q4 covers online DeepSeek backends (temperature is honored only
+  with thinking disabled); agent-driven installs over ssh are told to use a login shell
+  (`bash -lc`) so user-level tools resolve; compose `ps` wording no longer promises "four
+  healthy" — the stores ship without healthchecks and read `Up` (README aligned too).
+- **`.env.example` ships `TAVILY_API_KEY` commented out** — skipping the optional web-search
+  interview question no longer leaves a live placeholder value in the written `.env`.
+
+### Added
+
+- README §3 configuration ① records the verified minimal install: 6 vCPUs of a 2013 Xeon
+  E3-1230 v3, 12 GB RAM, 30 GB disk — postflight pass, 5.5 s realistic save / 1.5 s search on
+  CPU encoders, ~5 GB steady-state.
+
+---
+
 ## [0.9.18] — 2026-08-20
 
 ### Added — entities become the third operator-governed axis: a vocabulary, and a gate that consults it

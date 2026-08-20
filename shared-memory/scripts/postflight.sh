@@ -75,7 +75,11 @@ json_keys() {  # sorted comma-joined top-level keys of the JSON on stdin
 }
 
 # GNU date assumed (%3N) — like the rest of the stack (Linux/docker hosts).
-now_ms() { date +%s%3N; }
+# Bash builtin, never `date`: uutils coreutils (default on Ubuntu ≥25.10)
+# ignores the %3N width in `date +%s%3N` and returns nanoseconds — every timing
+# silently inflated ×10⁶ (measured on a clean Ubuntu 26.04 install).
+# $EPOCHREALTIME is "<seconds>.<microseconds>" from bash itself, everywhere.
+now_ms() { local t=$EPOCHREALTIME; echo $(( ${t%.*} * 1000 + 10#${t#*.} / 1000 )); }
 
 # Canary save through the gateway (A4/A6). new_project is idempotent-safe BY
 # CONSTRUCTION: a registered project short-circuits ingress before the flag is

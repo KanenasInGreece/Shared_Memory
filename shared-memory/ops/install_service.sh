@@ -47,8 +47,26 @@ _raw_remote="$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null || true)"
 REPO_URL="$(printf '%s' "$_raw_remote" | sed -E 's#^git@github\.com:#https://github.com/#; s#\.git$##')"
 [[ "$REPO_URL" == https://* ]] || REPO_URL="https://github.com/YOUR_GITHUB_USER/shared-memory"
 
+# Resolve the uv this host actually has. The unit template's /usr/bin/uv is a
+# placeholder: the documented uv install (https://astral.sh/uv) lands in
+# ~/.local/bin, which is neither the template path nor on a systemd unit's
+# default PATH — an unsubstituted unit crash-loops with 203/EXEC, and even with
+# ExecStart fixed the gateway's daemon spawns (shutil.which("uv")) come up
+# empty, leaving consolidation/REM silently stopped. Substitute both.
+UV_BIN="$(command -v uv || true)"
+[[ -x "$UV_BIN" ]] || UV_BIN="$HOME/.local/bin/uv"
+[[ -x "$UV_BIN" ]] || UV_BIN="$HOME/.cargo/bin/uv"
+[[ -x "$UV_BIN" ]] || {
+    red "ERROR: uv not found (PATH, ~/.local/bin, ~/.cargo/bin)."
+    echo "  Install it first: https://docs.astral.sh/uv/ — then re-run this script."
+    exit 1
+}
+UV_DIR="$(dirname "$UV_BIN")"
+
 sed -e "s#/path/to/your/shared-memory-GitHub#$REPO_DIR#" \
     -e "s#https://github.com/YOUR_GITHUB_USER/shared-memory#$REPO_URL#" \
+    -e "s#^ExecStart=/usr/bin/uv #ExecStart=$UV_BIN #" \
+    -e "s#^Environment=PATH=#Environment=PATH=$UV_DIR:#" \
     "$UNIT_SRC" > "$UNIT_DST"
 
 systemctl --user daemon-reload
