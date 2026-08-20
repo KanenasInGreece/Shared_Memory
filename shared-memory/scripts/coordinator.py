@@ -709,6 +709,46 @@ def _supersession_target_error(pg_id: int, record_type: object) -> str | None:
 ENTITIES_PROVENANCE_VALUES = ("operator", "agent")
 
 
+# ── Entity vocabulary ingress (fact:1375, migration 033) ──────────────────────
+#
+# The two SQL primitives the save-time entity gate needs (Coordinator methods
+# `_entity_vocab_resolve`/`_entity_vocab_mint`, near `_project_ingress_error`).
+# Both call the migration's own `entity_normalize()` rather than reimplementing
+# it in Python — the ONE normalization definition every reader/writer of this
+# vocabulary must share (033's own comment on the function).
+#
+# Resolve: canonical match first, alias match second, COALESCEd into one
+# column — NULL when neither table knows the name. LIMIT 1 caps the (harmless,
+# same-canonical) duplicate rows Option B's alias table can produce when one
+# entity has two verbatim aliases that happen to normalize to the same key.
+ENTITY_VOCAB_RESOLVE_SQL = """
+    SELECT COALESCE(canon.name, alias_canon.name) AS canonical_name
+      FROM (SELECT entity_normalize($1::text) AS norm) n
+      LEFT JOIN entity_vocabulary canon
+        ON canon.normalized_key = n.norm
+      LEFT JOIN entity_vocab_aliases a
+        ON a.normalized_alias = n.norm
+      LEFT JOIN entity_vocabulary alias_canon
+        ON alias_canon.id = a.entity_id
+     LIMIT 1
+"""
+
+# Mint: the ONLY INSERT this gate ever issues, and only into entity_vocabulary
+# — never entity_vocab_aliases (rule 5; alias curation stays a manual,
+# operator-only act, decision:1380). ON CONFLICT (normalized_key) DO NOTHING
+# lets Postgres's own unique index arbitrate a same-table race between two
+# concurrent mints (exactly what the migration's seed relies on for its own
+# idempotency — "ON CONFLICT arbitrates"); RETURNING comes back empty exactly
+# when that happened, which is the caller's signal to re-resolve rather than
+# assume its own mint won.
+ENTITY_VOCAB_MINT_SQL = """
+    INSERT INTO entity_vocabulary (name, registered_by)
+    VALUES ($1, $2)
+    ON CONFLICT (normalized_key) DO NOTHING
+    RETURNING id, name
+"""
+
+
 def save_response_warning(record_type: object, entities, grounded_in) -> str:
     """The save response's advisory suffix — WHICH omission leaves this record
     unreachable by synthesis, stated per record type.
@@ -3890,6 +3930,186 @@ class MemoryCoordinator:
             body["proposals"] = proposals
         return body
 
+    # ── Entity vocabulary ingress (fact:1375, migration 033) ──────────────────
+    #
+    # The whole gate lives in `_entity_ingress_error`, called from both writers
+    # of caller-supplied entity names — handle_save (facts and decisions share
+    # this generic path) and handle_retrospective (its own endpoint, its own
+    # `entities` field). See that method's docstring for the full rule; the
+    # two methods below are its DB-facing primitives, kept separate so a test
+    # can stub either one without reimplementing the gate's control flow.
+
+    async def _entity_vocab_resolve(self, name: str) -> str | None:
+        """The canonical spelling `name` resolves to via `entity_vocabulary` +
+        `entity_vocab_aliases` (migration 033's `entity_normalize` match), or
+        None if unregistered. Deliberately UNCACHED, one lookup per name — the
+        same choice `_project_identity`/`_domain_identity` make, for the same
+        reason: this sits on a path already writing to two stores, and no
+        measurement justifies a cache here (fact:1338 — an unmeasured cache
+        size/TTL is a measurement claim in disguise).
+        """
+        async with self._acquire() as conn:
+            return await conn.fetchval(ENTITY_VOCAB_RESOLVE_SQL, name)
+
+    async def _entity_vocab_mint(self, name: str, agent_id: str) -> str:
+        """Mint NAME as a new canonical — the ONLY path that ever inserts into
+        `entity_vocabulary` (rule 2, lookup-never-create everywhere else).
+        Creates the canonical alone, no alias (rule 5 — alias curation stays a
+        manual, operator-only act, decision:1380). Attribution is the save's
+        own agent identity, in `registered_by` — the same column the 033 seed
+        carried over from `entity_registry.registered_by`.
+
+        Returns the canonical NAME actually on record: `name` itself on a
+        clean mint, or whatever canonical already claims this normalized key
+        if two mints race — `ON CONFLICT (normalized_key) DO NOTHING` lets
+        Postgres's own unique index arbitrate that, same-table, exactly as the
+        migration's seed relies on for its own idempotency. No
+        application-level lock is added here: this path NEVER inserts into
+        `entity_vocab_aliases`, so it cannot produce the CROSS-table race the
+        migration's trigger comment warns about — that race needs a
+        concurrent alias insert, which stays a separate, manual, operator-only
+        act per decision:1380 and is not something this gate (or any current
+        writer) performs. See the handoff's N-3/trigger-race disposition.
+        """
+        async with self._acquire() as conn:
+            row = await conn.fetchrow(ENTITY_VOCAB_MINT_SQL, name, agent_id or "unknown")
+        if row is not None:
+            return row["name"]
+        resolved = await self._entity_vocab_resolve(name)
+        return resolved if resolved is not None else name
+
+    @staticmethod
+    def _entity_unknown_rejection(unknown: list[str]) -> dict:
+        """The 400 body for one or more entity names the vocabulary does not
+        know. A refusal is a QUESTION for the operator, never a silent drop or
+        auto-registration (rule 4) — the message says exactly how to answer
+        it, mirroring the project/domain rejections' "ASK THE OPERATOR" shape.
+        """
+        plural = len(unknown) != 1
+        return {
+            "status": "error",
+            "error": "entity_unknown",
+            "message": (
+                f"entit{'ies' if plural else 'y'} "
+                f"{', '.join(_short(n) for n in unknown)} "
+                f"{'are' if plural else 'is'} not in the entity vocabulary. "
+                "ASK THE OPERATOR whether each is a genuinely new concept or a "
+                "spelling of an existing one. If it is new, re-send with "
+                "metadata.new_entities listing exactly these names (each must "
+                "also appear in metadata.entities) to mint it as a canonical "
+                "spelling; if it is a spelling of something that already "
+                "exists, save under the registered canonical name instead."
+            ),
+            "unknown_entities": unknown,
+        }
+
+    @staticmethod
+    def _rewrite_entities(metadata: dict, resolved: dict[str, str]) -> None:
+        """Replace every entity name the gate canonicalized, IN PLACE,
+        everywhere it is carried: `entities` itself and, if present, the KEYS
+        of `entities_provenance` — which must keep naming exactly the values
+        in `entities`, or its own "not in this save's entities list" check
+        would spuriously fire on a name this gate just rewrote. A name
+        mapping to itself (already canonical) is a harmless no-op replace.
+
+        Names `sanitize_entity_name` rejected never entered `resolved` (the
+        gate only resolves its `candidates` — sanitize's survivors — see
+        `_entity_ingress_error`) and so are left untouched here: verbatim,
+        exactly as Tier 1 has always stored them (`sanitize_entity_name`'s own
+        contract — "governs what reaches the GRAPH, never what is stored").
+        """
+        if not resolved:
+            return
+        entities = metadata.get("entities")
+        if isinstance(entities, list):
+            metadata["entities"] = [
+                resolved.get(e, e) if isinstance(e, str) else e for e in entities
+            ]
+        provenance = metadata.get("entities_provenance")
+        if isinstance(provenance, dict):
+            metadata["entities_provenance"] = {
+                resolved.get(k, k): v for k, v in provenance.items()
+            }
+
+    async def _entity_ingress_error(self, metadata: dict, agent_id: str) -> dict | None:
+        """The whole save-time entity ingress gate (fact:1375). Returns the
+        400 body, or None when the save may proceed — having already
+        rewritten `metadata['entities']` (+ `entities_provenance` keys) to the
+        CANONICAL spelling in place, the same "resolve once at ingress, store
+        the canonical" choice `_project_ingress_error`/`_domain_value_error`
+        make for their own axes (rule 3).
+
+        Runs on BOTH writers of caller-supplied entity names: handle_save
+        (facts and decisions share this generic path — a decision's `entities`
+        stays Tier-1-only and is never minted into the graph, but it DOES
+        reach Postgres metadata, so it is in scope for canonicalization) and
+        handle_retrospective (its own endpoint, its own `entities` field).
+        Retrospectives also never mint into the graph (`_inherit_domains`/the
+        v2 outbox row writes no MENTIONS edge for them either), but the same
+        Tier-1-reaches-metadata reasoning applies.
+
+        ⛔ ENTITIES STAY OPTIONAL (fact:1215) — an empty/absent list returns
+        None immediately, before any lookup or `new_entities` validation. The
+        gate must never affect consolidation eligibility, which keys on
+        project+domain, never on entities.
+
+        Scope is deliberately narrower than "every string in entities": only
+        names `sanitize_entity_name` (ontology.py) would treat as a genuine
+        entity candidate are checked against the vocabulary — rule 7's
+        "additive AFTER it, not a replacement" taken literally. A name
+        sanitize would reject as noise (a leaked pg_id, a bare number, an
+        axis declaration, ...) is not a candidate for canonicalization
+        either: it is left exactly where it already lived, verbatim, in
+        Postgres metadata, and the outbox→graph gate (`_gate_graph_entities`)
+        still filters it out before the graph, unchanged. Asking "is `12345`
+        a registered entity" makes no sense, and refusing an entire save over
+        it would be a regression from today's silent-drop behaviour, which
+        this gate must not cause. A side effect of this scoping: every name
+        this gate ever mints has ALREADY passed `sanitize_entity_name` (mint
+        only sees `candidates`, sanitize's survivors), so a canonical can
+        never enter the vocabulary in a shape the graph gate would later
+        reject — see EG_LEG1_HANDOFF.md's invariant list.
+        """
+        raw_entities = metadata.get("entities") or []
+        candidates = sanitize_entity_names(raw_entities)
+        if not candidates:
+            return None
+
+        new_entities_raw = metadata.get("new_entities")
+        if new_entities_raw is not None:
+            if not isinstance(new_entities_raw, list) or not all(
+                isinstance(n, str) for n in new_entities_raw
+            ):
+                return {
+                    "status": "error",
+                    "error": "new_entities_invalid",
+                    "message": "metadata.new_entities must be a list of strings.",
+                }
+        mint_requested = set(new_entities_raw or [])
+
+        resolved: dict[str, str] = {}
+        unknown: list[str] = []
+        for name in candidates:
+            canonical = await self._entity_vocab_resolve(name)
+            if canonical is not None:
+                resolved[name] = canonical
+            else:
+                unknown.append(name)
+
+        if unknown:
+            to_mint = [n for n in unknown if n in mint_requested]
+            still_unknown = [n for n in unknown if n not in mint_requested]
+            if still_unknown:
+                return self._entity_unknown_rejection(still_unknown)
+            for name in to_mint:
+                canonical = await self._entity_vocab_mint(name, agent_id)
+                resolved[name] = canonical
+                log.info("entity vocabulary: %r minted as canonical %r by %s "
+                         "(new_entities)", name, canonical, agent_id)
+
+        self._rewrite_entities(metadata, resolved)
+        return None
+
     async def _project_registered(self, name: str) -> bool:
         """Is this an established project? (P4, migration 022's registry.)"""
         async with self._acquire() as conn:
@@ -4218,6 +4438,18 @@ class MemoryCoordinator:
                 {"status": "error", "message": "metadata.entities must be a list"},
                 status=400,
             )
+
+        # Entity vocabulary ingress gate (fact:1375, migration 033) — additive
+        # AFTER sanitize_entity_name (rule 7), lookup-never-create (rule 2),
+        # refuses an unknown name unless metadata.new_entities explicitly
+        # mints it (rules 4/5). Rewrites `metadata['entities']` to the
+        # CANONICAL spelling in place before anything downstream — locks, PG
+        # metadata, the outbox row, entity_registry, the graph — sees this
+        # list, so `entities` is re-read below.
+        entity_error = await self._entity_ingress_error(metadata, agent_id)
+        if entity_error is not None:
+            return web.json_response(entity_error, status=400)
+        entities = metadata.get("entities", [])
 
         # Per-entity provenance stamping (fact:1215) — additive, no api_version
         # bump. `entities_provenance` is an optional {name: "operator"|"agent"}
@@ -4733,6 +4965,17 @@ class MemoryCoordinator:
             "entities": [e for e in (raw_entities or [])
                          if isinstance(e, str) and e.strip()],
         }
+        new_entities_body = body.get("new_entities")
+        if new_entities_body is not None:
+            metadata["new_entities"] = new_entities_body
+        # Entity vocabulary ingress gate (fact:1375) — the second of the two
+        # writers `_entity_ingress_error` covers; see its docstring. Runs
+        # before the embedding call so a refusal fails fast, and rewrites
+        # `metadata['entities']` to the canonical spelling in place before the
+        # locks loop below reads it.
+        entity_error = await self._entity_ingress_error(metadata, agent_id)
+        if entity_error is not None:
+            return web.json_response(entity_error, status=400)
         if source_ref:
             metadata["source_ref"] = source_ref
         if body.get("elicited"):

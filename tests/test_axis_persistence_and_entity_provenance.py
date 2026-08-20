@@ -97,6 +97,14 @@ def _coordinator_with_mocks():
     mock_neo4j.session = MagicMock(return_value=_async_ctx(mock_session))
     c._neo4j = mock_neo4j
 
+    # Entity vocabulary ingress gate (fact:1375): unless a test overrides it,
+    # every name resolves to ITSELF — the same "passes trivially" convention
+    # the unconfigured `fetchval` above gives every other axis lookup here,
+    # but scoped to this one method so a generic AsyncMock return value never
+    # masquerades as a canonical name (a Mock object landing in `entities`/
+    # `entities_provenance` broke the exact-value assertions below).
+    c._entity_vocab_resolve = AsyncMock(side_effect=lambda name: name)
+
     return c, mock_conn, mock_session
 
 
