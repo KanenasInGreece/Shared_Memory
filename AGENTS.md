@@ -47,7 +47,7 @@ Collect these answers before touching anything. Defaults in brackets are safe to
 | 1 | Where should database data live on disk? [`~/databases/neo4j`, `~/databases/postgres`] | `NEO4J_HOST_DIR`, `PG_DATA_DIR` |
 | 2 | Use the **bundled embedder + reranker containers** (recommended; CPU-only, started by compose), or an existing endpoint? If bundled: which folder holds your GGUF model files? | `LLM_MODELS_DIR` |
 | 3 | Where is your **reasoning LLM** served? Any OpenAI-compatible endpoint works (LM Studio, llama.cpp server, etc.) [`http://localhost:5000`]. More than one backend, local or remote? List them all. **Does any of them need an API credential** (a paid cloud endpoint, e.g. DeepSeek/xAI/OpenRouter)? If so, ask only for the **name** of the env var they'll export it under — never the key itself. | default `:5000` route, `LLM_BACKENDS`, or `LLM_BACKENDS_JSON` |
-| 4 | Which model family is it? Gemma → `DREAM_TEMPERATURE=0.6`; Mistral-3 Instruct / Qwen → `0.1`; Mistral-3 Reasoning → `1.0` | `DREAM_TEMPERATURE` |
+| 4 | Which model family is it? Gemma → `DREAM_TEMPERATURE=0.6`; Mistral-3 Instruct / Qwen → `0.1`; Mistral-3 Reasoning → `1.0`; DeepSeek (online) → `0.6`, **with thinking disabled** via the backend entry's `extra_body` — in thinking mode DeepSeek silently ignores temperature | `DREAM_TEMPERATURE` |
 | 5 | Which **agents** will use the memory? (Claude Code / Codex CLI / Grok / Antigravity CLI / LM Studio / a read-only monitor) | token minting + Phase 8 targets |
 | 6 | DB passwords: shall I generate strong random ones? (recommended) | `NEO4J_PASSWORD`, `PG_PASSWORD` |
 | 7 | *(optional)* Tavily API key for LM Studio web search? Backups from day one? | `TAVILY_API_KEY`, §Backup runbook |
@@ -111,6 +111,11 @@ ssh -t <host> "echo '<user> ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/9
 
 and **delete `/etc/sudoers.d/99-<user>-temp` at the end of the session** — offer that cleanup unprompted. On Fedora/RHEL, docker itself is the first thing needing it: the distro ships podman, and the helper scripts call the docker CLI (`sudo dnf install moby-engine docker-compose` provides `docker compose` v2; the `podman-docker` shim is the untested alternative).
 
+**Driving the install over ssh: run every phase through a login shell** (`bash -lc "…"`). A bare
+ssh command runs a non-interactive shell whose PATH omits user-level installs — uv's documented
+installer lands in `~/.local/bin`, so preflight reports "uv not found" on a machine where uv is
+correctly installed (measured on a clean Ubuntu Server install).
+
 ### Phase 4 — Databases + inference containers
 
 ```bash
@@ -125,9 +130,11 @@ choice is two lines in `shared-memory/.env`: `GPU_ENCODER_REPLICAS=1` + `CPU_ENC
 compromise stated plainly:** a GPU with enough VRAM for their reasoning model is usually better
 spent on the model backend; a small card (~4 GB) is best spent on the encoders (~2 GB for the
 pair, repaid in search latency — measured numbers in README §17). Always the operator's call —
-never pick silently. `ps` accordingly shows four healthy containers (which four depends on the
-pair), or two when **both** pairs are 0 because the encoders are hosted outside the stack
-entirely — then `EMBEDDER_URL`/`RERANKER_URL` must say where, or saves are refused.
+never pick silently. `ps` accordingly shows four containers — the inference pair `healthy`
+(they carry healthchecks; which pair depends on the choice) and the two stores `Up` (they
+carry none; Phase 5's init is what proves them) — or two when **both** pairs are 0 because the
+encoders are hosted outside the stack entirely — then `EMBEDDER_URL`/`RERANKER_URL` must say
+where, or saves are refused.
 
 Postgres (`:5432`), Neo4j (`:7474/:7687`), embedder (`:8070`), reranker (`:8071`). An `unhealthy` inference container is almost always a wrong model path (Phase 0 Q2).
 
@@ -198,18 +205,24 @@ For every agent from Q5, follow README §10 (§10a for remote/laptop clients): c
 
 ⛔ **COPY EVERY FILE — NEVER SYMLINK ONE INTO A SOURCE CHECKOUT.** A link is auto-current, and that convenience is not worth what it costs: it binds every agent on the machine to one checkout's path, so moving, renaming or archiving that directory breaks all of them at once, silently, and the first symptom is an agent failing mid-task. Staleness is the lesser risk precisely because it is **detectable** — every file is content-compared on each sync and `doctor` reports version skew. `sync_skills.sh` and `update_skill.sh` both **replace** any symlink they find with a real copy, and `sync_skills.sh` refuses outright to write into an install directory that is itself a link, because that would make the source its own destination.
 
-Final end-to-end check, as an agent (uses the skill path, exercises auth + embedding + storage):
+Final end-to-end check, as an agent (uses the skill path, exercises auth + embedding + storage).
+**Run it from inside a project directory** — the repo checkout itself is fine — because the
+client derives the record's project from the working directory; issued from elsewhere (the
+skill dir, `$HOME`) the save is refused with `project_required`:
 
 ```bash
+cd <repo-or-any-project-root>
 uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py doctor
-uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py save "install smoke test" '{"source":"<agent>","entities":["SetupTest"],"new_project":true}'
+uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py save "install smoke test" '{"source":"<agent>","entities":["SetupTest"],"new_entities":["SetupTest"],"new_project":true}'
 uv run --with httpx --with python-dotenv python <skill-dir>/scripts/memory_bridge.py search "install smoke test" 3
 ```
 
-`new_project: true` is needed exactly once: a fresh corpus has no registered projects, so the
-very first save is always refused with `project_unknown` until one is registered — the gateway
-derives the project name from where the save runs and asks rather than guessing. Every later
-save into a registered project omits the flag.
+Two flags are needed exactly once, for the same reason: a fresh corpus has no registered
+projects and an empty entity vocabulary, so the very first save is refused (`project_unknown`
+/ `entity_unknown`) until `new_project: true` registers the project and `new_entities` mints
+the entity's canonical spelling — the gateway asks rather than guessing. Every later save into
+a registered project with known entities omits both. (Each refusal's message carries its own
+recovery instructions; follow them rather than overriding.)
 
 **Hand each installed agent its expectations** (tell the user to relay this, or write it where that
 agent will read it — Phase 8b): the memory is built around **facts** (durable results of work, with

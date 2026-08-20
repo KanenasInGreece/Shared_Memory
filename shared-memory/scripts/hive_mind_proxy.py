@@ -1852,14 +1852,33 @@ def _daemon_env_and_token_fd(agent_name: str) -> "tuple[dict, int | None]":
 # --------------------------------------------------------------------------- #
 # Consolidation daemon lifecycle
 # --------------------------------------------------------------------------- #
+def _find_uv() -> "str | None":
+    """Resolve the uv binary for daemon spawns.
+
+    PATH first; then the documented user-level install locations, because a
+    systemd unit's default PATH omits ~/.local/bin — without the fallback the
+    gateway serves normally while both daemons silently stay stopped.
+    """
+    uv = shutil.which("uv")
+    if uv:
+        return uv
+    for candidate in (
+        Path.home() / ".local" / "bin" / "uv",
+        Path.home() / ".cargo" / "bin" / "uv",
+    ):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
 async def _start_daemon() -> "asyncio.subprocess.Process | None":
     daemon_path = Path(__file__).parent / "consolidation_loop.py"
     if not daemon_path.exists():
         log.warning("Daemon script not found at %s — consolidation will not run", daemon_path)
         return None
-    uv = shutil.which("uv")
+    uv = _find_uv()
     if not uv:
-        log.warning("uv not in PATH — cannot start consolidation daemon")
+        log.warning("uv not found (PATH, ~/.local/bin, ~/.cargo/bin) — cannot start consolidation daemon")
         return None
     env, read_fd = _daemon_env_and_token_fd(_CONSOLIDATION_AGENT_NAME)
     try:
@@ -1892,9 +1911,9 @@ async def _start_rem_daemon() -> "asyncio.subprocess.Process | None":
     if not rem_path.exists():
         log.warning("REM script not found at %s — REM enrichment will not run", rem_path)
         return None
-    uv = shutil.which("uv")
+    uv = _find_uv()
     if not uv:
-        log.warning("uv not in PATH — cannot start REM daemon")
+        log.warning("uv not found (PATH, ~/.local/bin, ~/.cargo/bin) — cannot start REM daemon")
         return None
     env, read_fd = _daemon_env_and_token_fd(_REM_DAEMON_AGENT_NAME)
     try:

@@ -12,7 +12,14 @@ WorkingDirectory=/path/to/your/shared-memory-GitHub
 # Dependencies are pinned to the tested versions (requirements-gateway.lock, the
 # gateway process's RESTRICTED set — deliberately narrower than requirements.txt;
 # see requirements-gateway.txt). Resolves relative to WorkingDirectory above.
+# The uv path below is a PLACEHOLDER — install_service.sh substitutes the uv it
+# resolves on this host (the documented installer puts uv in ~/.local/bin, which
+# a systemd unit's default PATH does not include; measured: 203/EXEC crash-loop).
 ExecStart=/usr/bin/uv run --no-project --with-requirements requirements-gateway.lock python shared-memory/scripts/hive_mind_proxy.py 8888
+# The gateway spawns the consolidation/REM daemons through `uv` resolved from
+# PATH — install_service.sh prepends the resolved uv's directory here, or the
+# daemons silently stay stopped while the gateway itself looks healthy.
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # The proxy traps SIGTERM and drains the daemons cleanly — let it.
 KillSignal=SIGTERM
 TimeoutStopSec=30

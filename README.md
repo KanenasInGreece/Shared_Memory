@@ -153,6 +153,10 @@ provider key — where it lives, what stands between the network and it — are 
 tested-configuration passage, [§19](#19-tokens-and-agents) and [SECURITY.md](SECURITY.md).
 With no LLM configured nothing dies: saves, search and the graph keep working; summaries and
 insights queue durably until a backend appears. Searches on CPU encoders took ~30 seconds here.
+This configuration has also been verified end to end on a deliberately modest VM — 6 vCPUs of
+a 2013 Xeon E3-1230 v3, 12 GB RAM, 30 GB disk, Ubuntu Server 26.04 with Docker — where the full
+install passed postflight with a 5.5 s realistic save and 1.5 s search on the CPU encoders,
+using ~5 GB steady-state with the whole stack up.
 *Example minimum: 4–8 threads · 16 GB RAM · no GPU · 30 GB disk.*
 
 **② A small GPU (~4 GB).** Everything in ①, plus two `.env` lines (`GPU_ENCODER_REPLICAS=1`,
@@ -251,7 +255,8 @@ idempotent and safe to re-run.
    folder the compose mounts ([§15](#15-the-stack-docker-compose)), then
    `docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d` brings up
    Postgres, Neo4j, the embedder (`:8070`) and the reranker (`:8071`);
-   `docker compose … ps` should show all four `healthy`.
+   `docker compose … ps` should show the two inference services `healthy` and both
+   stores `Up` (the stores carry no healthcheck — step 4's init is what proves them).
 
 4. **Initialise both databases — one command.** `bash shared-memory/scripts/init_db.sh` applies
    the Postgres schema and the Neo4j constraints, running the clients inside the containers.
@@ -615,7 +620,7 @@ hand).
 
 ```bash
 docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d
-docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env ps   # all four healthy
+docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env ps   # inference healthy, stores Up
 ```
 
 Place your GGUF files where the compose mounts expect them (or edit the mount and `-m` paths) —
