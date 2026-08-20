@@ -184,8 +184,11 @@ comfort for a box that also runs your agents and a desktop — not a deployment 
 **The hard floor under all three: ~8 GB RAM.** Neo4j checks its configured memory against
 physical RAM at startup and the shipped settings (2 GB heap + 2 GB pagecache) refuse to boot
 on less than ~4 GB — and the full CPU stack's measured working set lands near 6 GB — so 8 GB
-is the least that runs the defaults untouched. (Projected from component measurements; the
-example configurations above are the measured ones.) Below it you are in ④ territory.
+is the least that runs the defaults untouched. (Measured, no longer projected: the same VM
+that verified ① was rebooted at 8 GB and passed the full install verification with the
+defaults untouched — 5.0 GB peak during the save burst, search stretching from ~7 to ~12
+seconds under the tighter caches, which is the graceful kind of degradation.) Below it you
+are in ④ territory.
 
 **④ Almost no machine at all.** To find out where the floor really is, we installed the
 framework on a 2018 budget laptop: two AMD cores, 3.2 GB of usable RAM, integrated graphics
