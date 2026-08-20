@@ -443,15 +443,14 @@ they name, proposing relationships, writing the compact summaries later passes b
 
 **NREM, the consolidation pass,** builds two syntheses:
 
-**Thematic summaries — the Zettelkasten.** For each project section, the facts fold into one
+**Thematic summaries — the index** For each project domain, the facts fold into one
 index card: each fact compressed to its tightest form, keyed by its identity, in one block. The
 card is borrowed deliberately from the Zettelkasten tradition, where the card *is the index into
-the whole system of knowledge* — compression plus a way in. And the compression is a token
-economy: an agent that hits the card spends a few hundred tokens to learn the shape of what a
-whole section knows, instead of thousands to read every fact — then follows the keys down to the
-two facts worth full price. The card is assembled deterministically from the records themselves;
-nothing is invented on the way, and it is rebuilt in place as the section grows or its facts
-retire.
+the whole system of knowledge* — offering compression, token economy, plus a way in. An agent 
+that hits the card spends a few hundred tokens to learn the shape of what a whole section knows, 
+instead of thousands to read every fact — then follows the keys down to the two facts worth full price. 
+The card is assembled deterministically from the records themselves; nothing is invented on the way, 
+and it is rebuilt in place as the section grows or its facts retire.
 
 **Insight summaries — the causal chain.** Where decisions and their retrospectives cluster, the
 framework distils the chain: each decision's title verbatim with a line of its rationale, each
