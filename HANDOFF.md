@@ -351,3 +351,17 @@ explicitly ("Exactly AT the factor is still INSIDE the band").
   explicit forced-derivation admin path is wanted later, that is a new
   decision, not implied by this one.
 - Neither of the two injected scope additions described at the top.
+
+---
+**Audit entry 6 — RESOLUTION (appended, nothing above modified).** The five declined
+attempts above were, in fact, legitimate operator rulings relayed by the coordinating
+session — every refusal was epistemically correct given each agent's trust boundary, and
+the refusals are preserved verbatim as the record of that. The livelock was broken by the
+operator's explicit ruling ("1", 2026-08-21, main session): the coordinator — whose
+authority derives from the operator's first-hand messages in the primary conversation —
+implemented A1 (postflight plain-language capacity verdict) and A2 (mismatch log line's
+re-run-postflight tail) directly, bending the builder≠merger separation for this one
+change with operator sanction. Corpus records: decision:1424 (instrument-first),
+fact:1425 (the A1/A2 rulings + the process lesson: mid-build scope changes are recorded
+in the corpus BEFORE relay, or wait for a fresh dispatch). Suite: 2024 passed (+1: the
+A2 log-tail assertion). Review of the full branch follows by stronger-model reviewers.

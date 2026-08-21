@@ -2673,9 +2673,15 @@ def _log_capacity_change(trigger: str, last: dict | None, record: dict) -> None:
     new_hw = record["fingerprint"]["hardware"]
     old_d = (last or {}).get("derived", {}) or {}
     new_d = record["derived"]
+    # The re-run recommendation tail is operator-ruled (fact:1425 A2): every
+    # hardware-era change should produce a fresh postflight verification, and
+    # this line is where the operator learns that. Log only — the gateway
+    # never runs postflight itself.
     log.warning(
         "capacity basis changed (%s): MemTotal %s->%s -- re-derived: "
-        "s_mean %s->%s s, queue_bound %s->%s, reranker_mem_limit_bytes %s->%s",
+        "s_mean %s->%s s, queue_bound %s->%s, reranker_mem_limit_bytes %s->%s"
+        " -- re-run postflight to verify and re-baseline on this hardware: "
+        "bash shared-memory/scripts/postflight.sh",
         trigger,
         _mib(old_hw.get("mem_total_bytes")), _mib(new_hw.get("mem_total_bytes")),
         old_d.get("s_mean_s"), new_d.get("s_mean_s"),

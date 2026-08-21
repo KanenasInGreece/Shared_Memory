@@ -152,6 +152,23 @@ def test_first_probe_with_no_prior_record_fires_fingerprint_mismatch(monkeypatch
     assert records[0]["derived"]["s_mean_s"] == 10.0
 
 
+def test_mismatch_log_line_ends_with_postflight_recommendation(monkeypatch, tmp_path, caplog):
+    # fact:1425 A2: the basis-changed warning must tell the operator to re-run
+    # postflight, so every hardware-era change produces a fresh verification.
+    g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(g._maybe_derive_capacity(_capability()))
+
+    basis_lines = [r.getMessage() for r in caplog.records
+                   if "capacity basis changed" in r.getMessage()]
+    assert len(basis_lines) == 1
+    assert basis_lines[0].endswith(
+        "re-run postflight to verify and re-baseline on this hardware: "
+        "bash shared-memory/scripts/postflight.sh"
+    )
+
+
 def test_identical_fingerprint_on_second_cycle_does_not_fire(monkeypatch, tmp_path):
     g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
     cap = _capability()

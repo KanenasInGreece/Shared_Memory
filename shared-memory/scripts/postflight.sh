@@ -460,6 +460,26 @@ print(path)
     else
         warn "A6 baseline JSON could not be written (measurement lost, never a gate)"
     fi
+
+    # Plain-language capacity verdict (fact:1425 A1 / decision:1424) — rendered
+    # strictly from the record the gateway already published on /health; no
+    # measurement or derivation happens here. Informational only: nothing in
+    # this section may affect the exit code.
+    cap_fields="$(printf '%s' "${health_full:-}" | python3 -c '
+import json, sys
+try:
+    d = ((json.load(sys.stdin) or {}).get("capacity") or {}).get("derived") or {}
+except Exception:
+    d = {}
+s, n = d.get("s_mean_s"), d.get("queue_bound")
+print("UNDERIVABLE" if s is None or n is None else f"{s}|{n}")
+' 2>/dev/null)"
+    if [[ -z "$cap_fields" || "$cap_fields" == "UNDERIVABLE" ]]; then
+        warn "Capacity verdict not derivable — the gateway has not published a capacity record yet (fresh install, first probe still in flight, or anonymous-only health); informational, never a gate"
+    else
+        ok "Capacity on this hardware: a fully-ranked search is projected at ~${cap_fields%%|*}s (unranked: measured in the baseline above); sustainable queue depth at that speed: ${cap_fields##*|}"
+        echo "     Interactive-grade ranked search on this box needs GPU encoders or a payload cap — README §17 states the trade."
+    fi
 fi
 
 # ── A7 — conduct constraints (by construction) ────────────────────────────────
