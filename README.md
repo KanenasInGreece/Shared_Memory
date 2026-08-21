@@ -187,8 +187,14 @@ on less than ~4 GB — and the full CPU stack's measured working set lands near 
 is the least that runs the defaults untouched. (Measured, no longer projected: the same VM
 that verified ① was rebooted at 8 GB and passed the full install verification with the
 defaults untouched — 5.0 GB peak during the save burst, search stretching from ~7 to ~12
-seconds under the tighter caches, which is the graceful kind of degradation.) Below it you
-are in ④ territory.
+seconds under the tighter caches.) Know what 8 GB does and does not buy: an overnight
+stress run on that VM — bulk ingest, the full dreaming cycle through to an insight, then a
+query barrage — showed capture and dreaming entirely comfortable, while *sustained search*
+eventually grew the reranker's cache past what the box could give; the kernel killed it,
+Docker restarted it, and every search kept answering correctly from vector order — but
+unranked, and with the Tier-3 summaries dropping out of the results, which is the real
+price of degraded mode. For search-heavy use, give it the 16 GB of the example minimum, a
+GPU for the encoders, or a cap on the reranker's cache. Below 8 GB you are in ④ territory.
 
 **④ Almost no machine at all.** To find out where the floor really is, we installed the
 framework on a 2018 budget laptop: two AMD cores, 3.2 GB of usable RAM, integrated graphics
