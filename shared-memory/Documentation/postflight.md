@@ -101,7 +101,12 @@ live instance — duplicates can appear silently under a race (`--apply` is its 
 
 **In RE-BASELINE MODE, A4 saves nothing.** It prints one explicit informational line stating that
 write-path proof stays anchored to the install canary (the accepted trade above), and **it cannot
-fail in this mode** — there is nothing left for it to assert.
+fail in this mode — including indirectly.** No code path may set A4's exit-code contribution in
+re-baseline mode, under any earlier assertion's outcome (e.g. a missing `AGENT_TOKEN` diagnosed at
+A1, which in canary mode pre-marks A4 as failed since A4 cannot run without a token — in
+re-baseline mode A4 needs no token at all, so that pre-mark must not fire, and A1's own message
+must not name A4 among what a missing token skips in this mode). **Spec wins**: where the script
+and this rule disagree, the script is the defect (fix-round ruling `decision:1435`, R1).
 
 **In CANARY MODE (below), behavior is unchanged.**
 
@@ -158,26 +163,46 @@ a named mode, because failure ≠ idle and degraded ≠ broken.
   and take the first up-to-8 whitespace-separated tokens. Falls back to the raw content when every
   line is prefix-only. Same content always yields the same phrase; survives unicode (splits on
   Unicode whitespace) and short content (returns however many words exist, down to one).
-- **Search and grade.** Search the phrase through the bridge (no project filter — summaries are
-  not scoped to `install-verification`) and time it (feeds the `search` field of A6's baseline,
-  same as canary mode).
-  - **Ranked results** (`ranked: true`): pass requires the selected summary's qualified ref to
-    appear among the returned rows. Absent: a genuine A5 failure — the read path is broken even
-    though reranking is live.
-  - **Degraded mode** (`ranked: false`): the summary-presence assertion is **waived**, with an
-    explicit printed line stating Tier-3 narratives are omitted in degraded mode by design
-    (measured in the 2026-08-21 stress test; v0.8.54 ruling "ranked, not guaranteed"). Pass
-    requires results to be returned at all — an empty result set still fails, exactly as in canary
-    mode. Never a silent pass.
+- **Search and grade.** Search the phrase through the bridge, **limit 20** (no project filter —
+  summaries are not scoped to `install-verification`), and time it. **This timing is NOT the
+  `search` field of A6's baseline** — it lands under its own key, `search_rebaseline` (see A6;
+  fix-round ruling `decision:1435`, R2). Three result shapes, distinguished by the **presence**,
+  not merely the value, of the `ranked` key on a returned row (fix-round ruling `decision:1435`,
+  C1/C2):
+  - **`ranked` key present and `true`** — reranking is live. Pass requires the selected summary's
+    qualified ref to appear **anywhere among the (up to 20) returned rows — never a rank or
+    top-*N* position**. Measured basis (reviewer probe, reference install, 8 most-recently-updated
+    live summaries): 2/8 false-fail at a top-5 assertion (worst observed rank 16 of 20), 8/8
+    present within 20. A rank assertion re-asserts exactly the guarantee the v0.8.54 ruling
+    removed ("ranked, not guaranteed") — Tier-3 rows compete against Tier-1 facts for rank and are
+    not owed a position, only retrievability. Absent from all 20 rows: a genuine A5 failure — the
+    failure message states plainly that the summary was **absent from a 20-row result set**, never
+    that "the read path is broken" (that framing implied a rank guarantee this check does not
+    make).
+  - **`ranked` key present and `false`** (honest degraded mode) — the summary-presence assertion
+    is **waived**, with an explicit printed line stating Tier-3 narratives are omitted in degraded
+    mode by design (measured in the 2026-08-21 stress test; v0.8.54 ruling "ranked, not
+    guaranteed"). Pass requires results to be returned at all — an empty result set still fails,
+    exactly as in canary mode. Never a silent pass.
+  - **`ranked` key ABSENT entirely** — the coordinator's keyword-fallback shape, served when the
+    embedder is unreachable (rows carry no `ranked`, no `ref`, no `pg_id`; semantic search has
+    been replaced by substring matching). This is indistinguishable from honest degraded mode by
+    *value* but not by *key presence*, and it is a **genuine A5 failure**, never the DEGRADED
+    waiver: "semantic search is not serving — keyword fallback shape detected." Conflating the two
+    would let a dead embedder exit the whole run green, since re-baseline A4 performs no save and
+    so never independently trips the embedding mandate.
 
-**Pass criterion (re-baseline mode).** Ranked mode: the selected summary's ref is in the results.
-Degraded mode: at least one result is returned (the summary-presence check is waived, not
-skipped).
+**Pass criterion (re-baseline mode).** `ranked: true`: the selected summary's ref is present
+anywhere in the (up to 20) results. `ranked: false` (key present): at least one result is
+returned (the summary-presence check is waived, not skipped). `ranked` key absent (keyword
+fallback): always fails.
 
 **Failure meaning (re-baseline mode).** No live summary readable when the mode-selection count
-said one should exist: the count and this read disagree — check the store directly. Ranked but
-the summary is missing from results: the read path is broken for real content, not just canaries.
-Zero results even in degraded mode: retrieval is broken end to end.
+said one should exist: the count and this read disagree — check the store directly. Present
+`ranked: true` but the summary absent from all 20 rows: the summary was not retrieved at all —
+this is a presence failure, not a rank complaint. Zero results even in degraded mode: retrieval is
+broken end to end. `ranked` key missing: semantic search itself is down (keyword fallback is
+serving), which A4's zero-save contract would otherwise leave undetected in this mode.
 
 ## A6 — Baseline emission (measurement, never a gate)
 
@@ -197,11 +222,16 @@ never the timeout ceiling; and the JSON carries a note stating all three rules.
 
 **In RE-BASELINE MODE**, A6 performs **no saves of any kind** (mirroring A4's zero-saves
 contract). `save_short` and `save_realistic` are both `null`, with a note naming the accepted
-trade — write-path timing stays anchored to the original install canary. `search` carries A5's
-summary-search timing instead of a canary search timing. Everything else — `backend_capability`,
-`capacity`, `hardware`, `framework_version`, `date` — is unchanged, read-only, and rendered
-identically to canary mode; **the capacity verdict section (below the JSON write) is untouched by
-mode.**
+trade — write-path timing stays anchored to the original install canary. **`search` stays
+canary-search-only and is `null` in this mode**, with a note explaining why (fix-round ruling
+`decision:1435`, R2: a metric whose meaning silently changes between modes while its name stays
+constant is the framework's known monitor-class defect — canary-mode `search` times a
+project-filtered search for a unique marker; re-baseline's phrase search is unfiltered and
+whole-corpus, a different workload). A5's summary-search timing instead lands under its **own**
+key, `search_rebaseline` — `null` in canary mode, populated in re-baseline mode. Everything else —
+`backend_capability`, `capacity`, `hardware`, `framework_version`, `date` — is unchanged,
+read-only, and rendered identically to canary mode; **the capacity verdict section (below the JSON
+write) is untouched by mode.**
 
 **Pass criterion.** None — A6 is a measurement. A written baseline is the deliverable; a slow
 number is information, not a failure. It gives a later "the system feels slow" session a
