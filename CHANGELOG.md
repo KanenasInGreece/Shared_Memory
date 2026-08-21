@@ -5,6 +5,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.21] — 2026-08-21
+
+### Added — OOM faults are legible from any distance
+
+- **Rerank fallback counters surfaced**: `GET /memory/telemetry` gains `rerank_successes_total`,
+  `rerank_fallbacks_total` and `rerank_fallbacks_last_ts` (flat additive keys) — the counters
+  existed since the fallback shipped but were never readable; a fallback burst on a small host
+  now reads as degradation, not quiet.
+- **Probable-cause log tail**: when a rerank fails with a dropped-connection shape
+  (`RemoteProtocolError`/`ConnectError`/`ReadError` — verified disjoint from the timeout family
+  in the pinned httpx), the fallback warning names the likely cause on memory-constrained
+  hosts (kernel OOM kill of the reranker) and the exact triage commands (`docker inspect`
+  on your reranker container, `dmesg`, the capacity record on authenticated `/health`).
+  Timeout-shaped failures keep the plain message — a timeout is not an OOM signature.
+- AGENTS.md status runbook carries the matching triage bullet.
+- Housekeeping: `HANDOFF.md` (a build-process audit file that reached `main` with v0.9.20's
+  merge) is removed from the repository.
+
+---
+
 ## [0.9.20] — 2026-08-21
 
 ### Added — the capacity instrument: every install knows its own numbers (decision:1424, instrument-first)

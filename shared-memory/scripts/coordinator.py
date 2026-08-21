@@ -142,7 +142,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.20"
+FRAMEWORK_VERSION = "0.9.21"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -6344,9 +6344,10 @@ class MemoryCoordinator:
                     msg += (
                         " — a dropped connection mid-rerank on a "
                         "memory-constrained host is most often the kernel "
-                        "OOM-killing the reranker: check `docker inspect "
-                        "llama-reranker --format '{{.State.OOMKilled}} "
-                        "{{.RestartCount}}'` and the kernel log (dmesg), and "
+                        "OOM-killing the reranker: check your reranker "
+                        "container (llama-reranker or llama-reranker-gpu) — "
+                        "`docker inspect <name> --format '{{.State.OOMKilled}} "
+                        "{{.RestartCount}}'` — and the kernel log (dmesg), and "
                         "see the capacity record on authenticated /health "
                         "for this host's derived limits"
                     )
@@ -7081,7 +7082,8 @@ class MemoryCoordinator:
         # a memory-constrained host) and still answers 200 — so without this
         # the whole class of failure is invisible from outside the log.
         # Flat additive keys + a paired last-event timestamp, never a nested
-        # restructure (see _credentials_snapshot).
+        # restructure (see inference_busy — the existing flat top-level
+        # exemplar; ruled flat at W2' merge, fact:1314 shape).
         snap["rerank_successes_total"] = self._rerank_successes
         snap["rerank_fallbacks_total"] = self._rerank_failures
         snap["rerank_fallbacks_last_ts"] = self._rerank_fallback_last_ts

@@ -370,7 +370,7 @@ previously invisible from outside the log). A rising `rerank_fallbacks_total` ag
 `rerank_successes_total` on a memory-constrained install is most often the kernel OOM-killing the
 reranker container — the fallback's WARNING log line names this explicitly when the failure is a
 dropped/reset connection (not a timeout): check
-`docker inspect llama-reranker --format '{{.State.OOMKilled}} {{.RestartCount}}'`, `dmesg`, and the
+`docker inspect <your reranker container: llama-reranker or llama-reranker-gpu> --format '{{.State.OOMKilled}} {{.RestartCount}}'` (a bare `llama-server` reranker has no container — go straight to `dmesg`), `dmesg`, and the
 `capacity` record on authenticated `/health` for this host's derived limits. The mem_limit itself
 is reported-only (decision:1424) — nothing here caps or restarts the container.
 
