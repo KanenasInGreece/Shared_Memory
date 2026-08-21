@@ -174,6 +174,66 @@ def test_unicode_content_is_preserved_and_split_on_unicode_whitespace():
     assert "Θεσσαλονίκη" in phrase
 
 
+# ── Control characters (SEC-01, decision:1439 -- correcting fact:1437's
+# CRITICAL "terminal escape sequence injection" claim to REQUIRED: the real
+# impact is operator-visible output spoofing / log poisoning via whatever
+# terminal renders postflight's output, not code execution -- printf '%s'
+# never interprets escapes in its argument). C0 (0x00-0x1F, ESC 0x1B
+# included) and C1 (0x80-0x9F) control characters must be stripped from the
+# FINAL phrase, whether they arrive embedded in a plain word or inside a
+# fabricated ANSI-looking escape sequence. ─────────────────────────────────
+
+def test_strips_esc_and_other_c0_control_characters_embedded_in_words():
+    content = "[FACT] hello\x1bworld control\x07char test here now"
+    result = run_select_phrase(content)
+    assert result.returncode == 0
+    phrase = result.stdout.strip()
+    assert "\x1b" not in phrase
+    assert "\x07" not in phrase
+    assert phrase == "helloworld controlchar test here now"
+
+
+def test_strips_esc_from_a_fabricated_ansi_escape_sequence_but_keeps_printable_bytes():
+    # A realistic attack shape: ESC [ 31 m ... ESC [ 0 m (an ANSI color
+    # sequence) around fake alert text. SEC-01 strips only the control
+    # BYTES (the two ESC characters) -- the surrounding printable digits
+    # and brackets are ordinary content, not control characters, and are
+    # left alone. This is the literal ruling's scope, not a full ANSI
+    # sequence stripper.
+    content = "\x1b[31mALERT\x1b[0m fake error message here for testing"
+    result = run_select_phrase(content)
+    assert result.returncode == 0
+    phrase = result.stdout.strip()
+    assert "\x1b" not in phrase
+    assert phrase == "[31mALERT[0m fake error message here for testing"
+
+
+def test_strips_c1_control_characters():
+    # \x9c (STRING TERMINATOR) / \x9d (OPERATING SYSTEM COMMAND) -- real C1
+    # control codes used in 8-bit terminal escape tricks. Written as
+    # explicit \x escapes, not literal bytes, so the source stays readable
+    # -- the two literal ones a prior draft of this test embedded directly
+    # were invisible on screen, which is itself the class SEC-01 exists
+    # to catch.
+    content = "[FACT] test \x9cinjected\x9d more words here indeed"
+    result = run_select_phrase(content)
+    assert result.returncode == 0
+    phrase = result.stdout.strip()
+    assert "\x9c" not in phrase
+    assert "\x9d" not in phrase
+    assert phrase == "test injected more words here indeed"
+
+
+def test_content_of_only_control_characters_exits_nonzero_with_no_stdout():
+    # Every "word" is entirely control bytes -- after stripping, the phrase
+    # is empty, which must be treated exactly like no-words-at-all (exit 1,
+    # no stdout), never an empty string printed as if it were a phrase.
+    content = "\x01\x02\x03\x04\x05"
+    result = run_select_phrase(content)
+    assert result.returncode == 1
+    assert result.stdout.strip() == ""
+
+
 # ── Short content ───────────────────────────────────────────────────────
 
 def test_single_word_content_returns_that_word():
