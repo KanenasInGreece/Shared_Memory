@@ -142,9 +142,10 @@ def test_strips_bare_fact_prefix_line():
 
 def test_strips_decorated_fact_and_decision_prefix_lines_multiline():
     content = (
-        '[FACT kind=observation from="glxvm" recorded=2026-08-21 pg_id=1402] '
+        '[FACT kind=measured from="shared-memory/scripts/coordinator.py" '
+        "recorded=2026-01-01 pg_id=123] "
         "first line of real content here indeed\n"
-        "[DECISION kind=architecture pg_id=1403] second line follows after that"
+        "[DECISION kind=architecture pg_id=124] second line follows after that"
     )
     result = run_select_phrase(content)
     assert result.returncode == 0
