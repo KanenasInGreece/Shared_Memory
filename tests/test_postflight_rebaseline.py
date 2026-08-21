@@ -59,6 +59,58 @@ def test_extracted_block_defines_the_function():
     assert "select_summary_phrase()" in source
 
 
+# ── Fix-round probe-6 (decision:1435, grounded in fact:1434): the twelve
+# tests above only prove select_summary_phrase computes correctly in
+# isolation -- none of them pin that A5 actually CALLS it. Without this
+# guard, deleting the call site from A5 (e.g. hardcoding a phrase, or
+# silently regressing to something else) would leave every other test in
+# this file green. This test greps postflight.sh's own A5 SECTION for a
+# real invocation -- piped into the function, not merely the string
+# "select_summary_phrase" appearing anywhere (which the function's own
+# definition and its doc comments already satisfy trivially) --
+# capture-surface-test style (grep-style assertion against the shipped
+# source, per tests/test_capture_surface_documented.py's pattern).
+
+A5_SECTION_START = "# ── A5 — read path, honestly graded"
+A5_SECTION_END = "# ── A6 — baseline emission"
+
+
+def _extract_a5_section() -> str:
+    text = POSTFLIGHT.read_text()
+    start = text.find(A5_SECTION_START)
+    end = text.find(A5_SECTION_END)
+    assert start != -1, (
+        f"could not find the A5 section header {A5_SECTION_START!r} in "
+        f"{POSTFLIGHT} -- section markers moved or were renamed"
+    )
+    assert end != -1 and end > start, (
+        f"could not find the A6 section header {A5_SECTION_END!r} after "
+        f"the A5 header in {POSTFLIGHT} -- section markers moved or were "
+        f"renamed"
+    )
+    return text[start:end]
+
+
+def test_a5_section_actually_invokes_the_phrase_selector():
+    a5 = _extract_a5_section()
+    # A genuine call site: piped INTO the function, inside a command
+    # substitution, assigned to `phrase`. Not merely a substring match --
+    # that would also match a comment or the function's own name in prose.
+    assert '| select_summary_phrase)"' in a5, (
+        "A5's re-baseline branch no longer pipes content into "
+        "select_summary_phrase() -- the phrase-selection call site was "
+        "deleted, renamed, or replaced with something else. This is "
+        "exactly the gap the fix-round review (fact:1434, probe 6) named: "
+        "no other test in this file would catch that."
+    )
+    assert 'phrase="$(printf' in a5, (
+        "expected the call site to assign the selector's output to "
+        "`phrase` via a printf | select_summary_phrase command "
+        "substitution, matching every other content-reading call in this "
+        "script (json_get/json_keys use the same idiom)"
+    )
+
+
 # ── Determinism ──────────────────────────────────────────────────────────
 
 def test_same_content_yields_the_same_phrase_every_run():
