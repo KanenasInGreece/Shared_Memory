@@ -5,6 +5,38 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.20] — 2026-08-21
+
+### Added — the capacity instrument: every install knows its own numbers (decision:1424, instrument-first)
+
+- **Capacity derivation in the gateway.** On qualifying events the gateway derives and stores a
+  provenanced capacity record: projected rerank-stage service time (worst-case payload ÷
+  probe-measured throughput), sustainable queue depth against an operator tolerance
+  (`CAPACITY_TOLERABLE_WAIT_S`, default 30 s — measured and human-validated on the developer
+  reference machine, not a guess), the client-ceiling mirror, and a **reported-only**
+  recommended reranker memory limit derived per host by subtraction (databases and embedder
+  protected by arithmetic, never flags). The instrument is read-and-report: it never limits,
+  queues, rejects or resizes a request.
+- **Triggers with provenance**: `first_derivation` (INFO; defers until the first healthy
+  reranker probe rather than freezing a bad baseline), `gateway_start_fingerprint_mismatch`
+  (loud old→new basis log ending with a re-run-postflight recommendation — every hardware
+  change gets a fresh verification era), `probe_drift` (×2 band, guarded on healthy probe
+  status both sides), `config_change`, and `basis_recovery` (a stored unhealthy baseline
+  recovers on the next healthy probe). Records are JSONL with hardware+config fingerprint,
+  probe readings, outputs, timestamp and trigger; pruned; 0600/0700.
+- **Surfacing**: latest record on authenticated `/health` as an additive `capacity` key
+  (anonymous payload unchanged); postflight's baseline now embeds the record and prints a
+  plain-language verdict — including the honest slow-box form: "a single rerank-stage
+  projection already exceeds the tolerable wait — queue depth 0 means exactly that."
+- All numeric `CAPACITY_*` env parsing fails open with a named warning (a typo can no longer
+  stop the gateway); unparsable memory allowances null the recommendation rather than
+  inflating it; k8s `Gi`/`Mi`/`Ki` notation accepted; encoder URLs are credential-scrubbed
+  before persisting.
+- Review chain: built by Sonnet builders, reviewed across three rounds by Opus with per-trigger
+  probe evidence; 2,043 tests (+19 over 0.9.19).
+
+---
+
 ## [0.9.19] — 2026-08-21
 
 ### Fixed — clean-install portability, found by a fresh-VM install test (Ubuntu Server 26.04, CPU-only + online LLM)
