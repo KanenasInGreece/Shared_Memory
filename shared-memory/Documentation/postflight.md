@@ -151,58 +151,92 @@ vector search, or the gateway search path). A fabricated uniform score would be 
 reranker must be distinguishable from a confident one; the honest degraded verdict is a pass with
 a named mode, because failure ≠ idle and degraded ≠ broken.
 
-**In RE-BASELINE MODE**, A5 proves the read path against real Tier-3 content instead of a canary:
+**In RE-BASELINE MODE**, A5 proves the read path against real Tier-3 content instead of a canary,
+via a **bounded multi-candidate probe** (fix-round-2 ruling `decision:1439`, QA-01 — replacing the
+single-summary gate `decision:1435`'s C1 shipped, which fix round 2 found still false-fails on a
+healthy install):
 
-- **Select.** At run time, read the single most-recently-updated live (non-superseded)
-  `community_summaries` row (either kind) — never a pinned id, since supersession would orphan a
-  pinned check. Its qualified reference is `summary:<id>` (thematic) or `insight:<id>` (insight
-  kind), matching `record_ref.py`'s `summary_record_type`.
-- **Extract a distinctive phrase, deterministically.** A pure function of the row's `content`:
-  strip any leading `[TAG ...]` bracket prefix from each line (the zero-inference thematic fold's
-  `fold_record_line` format, e.g. `[FACT]` or `[DECISION kind=... pg_id=123]`), join what remains,
-  and take the first up-to-8 whitespace-separated tokens. Falls back to the raw content when every
-  line is prefix-only. Same content always yields the same phrase; survives unicode (splits on
-  Unicode whitespace) and short content (returns however many words exist, down to one).
-- **Search and grade.** Search the phrase through the bridge, **limit 20** (no project filter —
-  summaries are not scoped to `install-verification`), and time it. **This timing is NOT the
-  `search` field of A6's baseline** — it lands under its own key, `search_rebaseline` (see A6;
-  fix-round ruling `decision:1435`, R2). Three result shapes, distinguished by the **presence**,
-  not merely the value, of the `ranked` key on a returned row (fix-round ruling `decision:1435`,
-  C1/C2):
-  - **`ranked` key present and `true`** — reranking is live. Pass requires the selected summary's
-    qualified ref to appear **anywhere among the (up to 20) returned rows — never a rank or
-    top-*N* position**. Measured basis (reviewer probe, reference install, 8 most-recently-updated
-    live summaries): 2/8 false-fail at a top-5 assertion (worst observed rank 16 of 20), 8/8
-    present within 20. A rank assertion re-asserts exactly the guarantee the v0.8.54 ruling
-    removed ("ranked, not guaranteed") — Tier-3 rows compete against Tier-1 facts for rank and are
-    not owed a position, only retrievability. Absent from all 20 rows: a genuine A5 failure — the
-    failure message states plainly that the summary was **absent from a 20-row result set**, never
-    that "the read path is broken" (that framing implied a rank guarantee this check does not
-    make).
-  - **`ranked` key present and `false`** (honest degraded mode) — the summary-presence assertion
-    is **waived**, with an explicit printed line stating Tier-3 narratives are omitted in degraded
-    mode by design (measured in the 2026-08-21 stress test; v0.8.54 ruling "ranked, not
-    guaranteed"). Pass requires results to be returned at all — an empty result set still fails,
-    exactly as in canary mode. Never a silent pass.
-  - **`ranked` key ABSENT entirely** — the coordinator's keyword-fallback shape, served when the
-    embedder is unreachable (rows carry no `ranked`, no `ref`, no `pg_id`; semantic search has
-    been replaced by substring matching). This is indistinguishable from honest degraded mode by
-    *value* but not by *key presence*, and it is a **genuine A5 failure**, never the DEGRADED
-    waiver: "semantic search is not serving — keyword fallback shape detected." Conflating the two
-    would let a dead embedder exit the whole run green, since re-baseline A4 performs no save and
-    so never independently trips the embedding mandate.
+- **Select up to 3 candidates.** At run time, read the **3** most-recently-updated live
+  (non-superseded) `community_summaries` rows (either kind, in order — never pinned ids, since
+  supersession would orphan a pinned check); fewer than 3 live rows exist, use what exists. Each
+  candidate's qualified reference is `summary:<id>` (thematic) or `insight:<id>` (insight kind),
+  matching `record_ref.py`'s `summary_record_type`.
+  **Why 3, measured, not chosen** (fact:1438 sweep, all 21 live rows on the reference install
+  probed with the shipped selector at limit 20): exactly **1 of 21** rows false-fails
+  individually — both its Tier-3 candidate slots lost the rerank cut against 20 verbatim Tier-1
+  facts (see the two-preconditions note below). At that measured rate, no set of 3 *distinct* rows
+  drawn from this corpus can consist entirely of failures, while a genuine, wholesale Tier-3
+  retrieval break still fails all 3 candidates loudly. This is a property of *this corpus at this
+  moment*, not a constant — the fresh-install VM test is where the rate gets re-measured on a
+  young corpus, and a materially different rate reopens the choice of 3.
+- **Extract a distinctive phrase, deterministically, per candidate.** A pure function of each
+  row's `content`: strip any leading `[TAG ...]` bracket prefix from each line (the zero-inference
+  thematic fold's `fold_record_line` format, e.g. `[FACT]` or `[DECISION kind=... pg_id=123]`),
+  join what remains, and take the first up-to-8 whitespace-separated tokens. Falls back to the raw
+  content when every line is prefix-only. Same content always yields the same phrase; survives
+  unicode (splits on Unicode whitespace) and short content (returns however many words exist, down
+  to one). **Control characters are stripped from the final phrase** (fix-round-2 ruling
+  `decision:1439`, SEC-01 — see the dedicated note below) before it is ever printed or searched.
+- **Try candidates in order; search and grade each.** Search a candidate's phrase through the
+  bridge, **limit 20** (no project filter — summaries are not scoped to `install-verification`).
+  The **whole probe is timed as one measurement** — it lands under `search_rebaseline` (see A6;
+  `decision:1435` R2), covering however many of the (up to 3) searches were actually attempted;
+  postflight does **not** mint a second timing key per candidate. Each candidate's result is one
+  of five shapes, distinguished by the **presence**, not merely the value, of the `ranked` key on
+  a returned row (`decision:1435` C1/C2):
+  - **Present** (`ranked` key `true`, the candidate's ref among the — **up to 20**, never an
+    absolute count — returned rows): **the probe passes immediately** on this candidate. The
+    output names which candidate succeeded and at what rank (e.g. "candidate 2 of 3, insight:451
+    at rank 17 of 20"), so the operator sees the margin, not just a bare pass.
+  - **Degraded** (`ranked` key present and `false`, the honest waiver) — **the probe passes
+    immediately**, short-circuiting exactly like Present: results were returned, and the
+    summary-presence assertion is waived with an explicit printed line stating Tier-3 narratives
+    are omitted in degraded mode by design (measured in the 2026-08-21 stress test; v0.8.54 ruling
+    "ranked, not guaranteed").
+  - **Keyword fallback** (`ranked` key ABSENT entirely — the coordinator's keyword-fallback shape,
+    served when the embedder is unreachable; rows carry no `ranked`, no `ref`, no `pg_id`) — an
+    **immediate hard failure that stops the probe** without trying further candidates. The
+    embedder being gone is not a per-row problem that a different candidate could route around;
+    trying more candidates against a dead embedder would only waste the client timeout budget
+    three times over for no better answer. Conflating this with honest degraded mode would let a
+    dead embedder exit the whole run green, since re-baseline A4 performs no save and so never
+    independently trips the embedding mandate.
+  - **Absent** (`ranked: true`, the candidate's ref not among the — up to 20 — returned rows) or
+    **Empty** (zero results for that candidate's phrase) — **try the next candidate.** Neither is
+    a probe failure on its own; the probe fails only if every attempted candidate ends this way (or
+    the keyword-fallback case fires).
+  - **Error / unparseable** (a transport error, or no parseable JSON — a timeout by another name) —
+    **try the next candidate**, same as Absent/Empty. If the probe's **final** outcome is decided
+    by this shape (every candidate ended here, or the last one attempted did, with no earlier
+    Present/Degraded/Keyword-fallback), the probe's timing is recorded as `null` in
+    `search_rebaseline` rather than the timeout ceiling — invariant 6 applied to the whole probe's
+    decisive attempt, not to an individual search that a later candidate's real result superseded.
 
-**Pass criterion (re-baseline mode).** `ranked: true`: the selected summary's ref is present
-anywhere in the (up to 20) results. `ranked: false` (key present): at least one result is
-returned (the summary-presence check is waived, not skipped). `ranked` key absent (keyword
-fallback): always fails.
+**Pass criterion (re-baseline mode).** The FIRST candidate (of up to 3, tried in order) that comes
+back Present or Degraded passes the whole probe. Fail only if the keyword-fallback shape is
+detected (immediate) or if none of the attempted candidates comes back at all.
 
 **Failure meaning (re-baseline mode).** No live summary readable when the mode-selection count
-said one should exist: the count and this read disagree — check the store directly. Present
-`ranked: true` but the summary absent from all 20 rows: the summary was not retrieved at all —
-this is a presence failure, not a rank complaint. Zero results even in degraded mode: retrieval is
-broken end to end. `ranked` key missing: semantic search itself is down (keyword fallback is
-serving), which A4's zero-save contract would otherwise leave undetected in this mode.
+said at least one should exist: the count and this read disagree — check the store directly. All
+attempted candidates Absent/Empty/unparseable: the failure message names the **two preconditions**
+a candidate must clear, so a reader can tell a rerank cut from a broken read path — **(a)** the
+summary must first win its kind's single Tier-3 candidate slot, chosen by vector nearest-neighbour
+(`coordinator.py:6164-6205` — the caller's search `limit` does not widen this slot count), and
+**(b)** it must then survive the rerank cut against the Tier-1 candidates in the pool. A failure at
+this point, with 3 independent candidates all clearing neither, is a genuine read-path break, not
+a rank complaint on any single row. `ranked` key missing: semantic search itself is down (keyword
+fallback is serving), which A4's zero-save contract would otherwise leave undetected in this mode.
+
+**SEC-01 — control-character stripping** (`decision:1439`, correcting `fact:1437`'s CRITICAL
+"terminal escape sequence injection" finding to REQUIRED). `select_summary_phrase` strips C0
+(`0x00`–`0x1F`, ESC `0x1B` included) and C1 (`0x80`–`0x9F`) control characters from the phrase
+before it is ever printed or searched. **The mechanism, stated correctly**: `postflight.sh`'s
+`printf '%s'` idiom does not interpret escapes in its argument, so no code executes — the real
+impact is that raw ESC/control bytes, if left in a phrase extracted from corpus content, pass
+through verbatim to whatever terminal or log viewer renders postflight's output. That is
+operator-visible **output spoofing and log poisoning** on a diagnostic tool (by an actor who can
+already write corpus content — not privilege escalation), which is a real, cheaply-fixed class
+even though it is not code execution.
 
 ## A6 — Baseline emission (measurement, never a gate)
 
