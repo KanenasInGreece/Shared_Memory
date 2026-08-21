@@ -477,8 +477,15 @@ print("UNDERIVABLE" if s is None or n is None else f"{s}|{n}")
     if [[ -z "$cap_fields" || "$cap_fields" == "UNDERIVABLE" ]]; then
         warn "Capacity verdict not derivable — the gateway has not published a capacity record yet (fresh install, first probe still in flight, or anonymous-only health); informational, never a gate"
     else
-        ok "Capacity on this hardware: a fully-ranked search is projected at ~${cap_fields%%|*}s (unranked: measured in the baseline above); sustainable queue depth at that speed: ${cap_fields##*|}"
-        echo "     Interactive-grade ranked search on this box needs GPU encoders or a payload cap — README §17 states the trade."
+        # M6 (fix round): this is the RERANK-STAGE worst-case projection
+        # (the probe's fixed 20-doc model, see hive_mind_proxy.py's own
+        # docstring on _build_capacity_record) -- not a claim about "a
+        # fully-ranked search" in general, and the baseline above is not
+        # necessarily ranked on every install, so the old "(unranked:
+        # measured in the baseline above)" parenthetical was false on a
+        # healthy install where the baseline search WAS ranked.
+        ok "Capacity on this hardware: the rerank-stage worst-case projection is ~${cap_fields%%|*}s; sustainable queue depth at that speed: ${cap_fields##*|}"
+        echo "     If that projection is too slow for your use, README §17's payload cap and GPU-encoder options are the dials."
     fi
 fi
 

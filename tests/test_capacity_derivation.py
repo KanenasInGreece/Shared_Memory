@@ -14,6 +14,7 @@ import asyncio
 import importlib
 import json
 import os
+import stat
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
@@ -44,15 +45,18 @@ def _load_gateway(monkeypatch, capacity_log_path, agent_tokens: str = ""):
 # format) -- reused across tests as a realistic fixture rather than an
 # invented shorthand.
 def _capability(reranker_chars_s=1000.0, reranker_projected_s=10.0,
-                embedder_chars_s=2000.0, embedder_projected_s=5.0):
+                embedder_chars_s=2000.0, embedder_projected_s=5.0,
+                reranker_status="ok", embedder_status="ok"):
     return {
         "status": "ok",
         "probed_at": "2026-08-21T00:00:00+00:00",
         "reranker": {
+            "status": reranker_status,
             "throughput_chars_s": reranker_chars_s,
             "projected_full_payload_s": reranker_projected_s,
         },
         "embedder": {
+            "status": embedder_status,
             "throughput_chars_s": embedder_chars_s,
             "projected_full_payload_s": embedder_projected_s,
         },
@@ -91,17 +95,34 @@ def test_client_ceiling_matches_memory_bridge_formula_and_a_concrete_value(monke
     assert ceiling == 37.5
 
 
-def test_queue_bound_concrete_value(monkeypatch, tmp_path):
-    """s_mean=10.0, client_ceiling=37.5 -> floor(37.5/10.0) - 1 = 3 - 1 = 2."""
+def test_capacity_tolerable_wait_default_is_30s(monkeypatch, tmp_path):
+    """H1: CAPACITY_TOLERABLE_WAIT_S is the value queue_bound is now
+    measured against (not client_ceiling_s) -- pin the default separately
+    from the queue_bound tests below (fact:1309: an equality between two
+    expressions is half a guard; pin the VALUE on at least one side)."""
     g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
-    assert g._capacity_queue_bound(10.0, 37.5) == 2
+    assert g.CAPACITY_TOLERABLE_WAIT_S == 30.0
 
 
-def test_queue_bound_floors_at_zero_not_negative(monkeypatch, tmp_path):
-    """A slow backend where a single search already exceeds the ceiling must
-    report 0 (no room), never a negative queue depth."""
+def test_queue_bound_concrete_value_s_mean_2(monkeypatch, tmp_path):
+    """H1: floor(CAPACITY_TOLERABLE_WAIT_S / s_mean) = floor(30.0/2.0) = 15."""
     g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
-    assert g._capacity_queue_bound(100.0, 37.5) == 0
+    assert g._capacity_queue_bound(2.0, 30.0) == 15
+
+
+def test_queue_bound_concrete_value_s_mean_10(monkeypatch, tmp_path):
+    """floor(30.0/10.0) = 3."""
+    g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
+    assert g._capacity_queue_bound(10.0, 30.0) == 3
+
+
+def test_queue_bound_cpu_floor_reality_s_mean_70(monkeypatch, tmp_path):
+    """The CPU-floor reality: floor(30.0/70.0) = 0. A single search already
+    exceeds the tolerable wait -- 0 genuinely means "no room" here, never
+    negative, and single_search_exceeds_wait (M10) makes that reading
+    explicit rather than ambiguous with "not yet measured" (None)."""
+    g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
+    assert g._capacity_queue_bound(70.0, 30.0) == 0
 
 
 def test_recommended_mem_limit_concrete_value(monkeypatch, tmp_path):
@@ -143,9 +164,33 @@ def test_mem_size_parser_handles_compose_style_and_bare_bytes(monkeypatch, tmp_p
     assert g._parse_mem_size("not-a-size") is None
 
 
+def test_mem_size_parser_handles_k8s_binary_notation(monkeypatch, tmp_path):
+    """M5: k8s-style 'Gi'/'Mi'/'Ki' (no trailing B) must parse too, not just
+    the docker-compose 'G'/'M' and hand-typed 'GiB' forms above."""
+    g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
+    assert g._parse_mem_size("8Gi") == 8 * 1024 ** 3
+    assert g._parse_mem_size("512Mi") == 512 * 1024 ** 2
+    assert g._parse_mem_size("4Ki") == 4 * 1024
+
+
+def test_recommended_mem_limit_returns_null_on_unparsable_allowance(monkeypatch, tmp_path, caplog):
+    """M5: an unparsable CAPACITY_*_BYTES value used to silently coerce to 0
+    via `x or 0`, UNDER-subtracting and INFLATING the recommendation in the
+    dangerous direction. It must now come back None (unknown beats wrong-
+    in-the-dangerous-direction) with one warning naming the offender."""
+    monkeypatch.setenv("CAPACITY_PG_MEM_ALLOWANCE_BYTES", "not-a-size")
+    g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
+    with caplog.at_level("WARNING"):
+        result = g._capacity_recommended_mem_limit_bytes(16 * 1024 ** 3)
+    assert result is None
+    assert any("CAPACITY_PG_MEM_ALLOWANCE_BYTES" in r.getMessage() for r in caplog.records)
+
+
 # ── Trigger logic ────────────────────────────────────────────────────────────
 
-def test_first_probe_with_no_prior_record_fires_fingerprint_mismatch(monkeypatch, tmp_path):
+def test_first_probe_with_no_prior_record_fires_first_derivation(monkeypatch, tmp_path):
+    """M7: no prior record anywhere is a fresh baseline, not a mismatch --
+    there is nothing to have mismatched AGAINST."""
     g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
     cap = _capability()
 
@@ -153,17 +198,48 @@ def test_first_probe_with_no_prior_record_fires_fingerprint_mismatch(monkeypatch
 
     records = g._read_capacity_records_sync(g.CAPACITY_LOG_PATH)
     assert len(records) == 1
-    assert records[0]["trigger"] == "gateway_start_fingerprint_mismatch"
+    assert records[0]["trigger"] == "first_derivation"
     assert records[0]["derived"]["s_mean_s"] == 10.0
 
 
-def test_mismatch_log_line_ends_with_postflight_recommendation(monkeypatch, tmp_path, caplog):
-    # fact:1425 A2: the basis-changed warning must tell the operator to re-run
-    # postflight, so every hardware-era change produces a fresh verification.
+def test_first_derivation_logs_info_baseline_established_not_a_warning(monkeypatch, tmp_path, caplog):
+    """M7: the very first record this log has ever held is informational --
+    INFO level, "capacity baseline established", no re-run-postflight tail.
+    Nothing has actually CHANGED yet (nothing prior to compare against), so
+    this must not read as an alarm."""
     g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
 
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("INFO"):
         asyncio.run(g._maybe_derive_capacity(_capability()))
+
+    warn_lines = [r for r in caplog.records
+                  if r.levelname == "WARNING" and "capacity basis changed" in r.getMessage()]
+    assert warn_lines == [], "the first-ever derivation must not fire the WARNING path"
+
+    info_lines = [r.getMessage() for r in caplog.records
+                  if r.levelname == "INFO" and "capacity baseline established" in r.getMessage()]
+    assert len(info_lines) == 1
+    assert "re-run postflight" not in info_lines[0]
+
+
+def test_mismatch_log_line_ends_with_postflight_recommendation(monkeypatch, tmp_path, caplog):
+    # fact:1425 A2: the basis-changed warning must tell the operator to
+    # re-run postflight, so every GENUINE hardware-era mismatch (not the
+    # first-ever baseline, which is informational -- see the
+    # first_derivation test above) produces a fresh verification.
+    log_path = tmp_path / "cap.jsonl"
+    g = _load_gateway(monkeypatch, log_path)
+    cap = _capability()
+    asyncio.run(g._maybe_derive_capacity(cap))  # first_derivation -- establishes a basis
+    old_mem = g._read_capacity_records_sync(log_path)[0]["fingerprint"]["hardware"]["mem_total_bytes"]
+
+    g2 = _load_gateway(monkeypatch, log_path)
+    monkeypatch.setattr(g2, "_hardware_fingerprint",
+                         lambda: {"nproc": 4, "mem_total_bytes": (old_mem or 0) + 1,
+                                   "gpu_present": False})
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(g2._maybe_derive_capacity(cap))
 
     basis_lines = [r.getMessage() for r in caplog.records
                    if "capacity basis changed" in r.getMessage()]
@@ -211,6 +287,39 @@ def test_drift_at_exactly_the_band_factor_does_not_fire(monkeypatch, tmp_path):
 
     records = g._read_capacity_records_sync(g.CAPACITY_LOG_PATH)
     assert len(records) == 1, "exactly 2x must stay inside the band -- no re-derivation"
+
+
+def test_drift_at_exactly_the_lower_band_edge_does_not_fire(monkeypatch, tmp_path):
+    """L14: boundary test, lower edge -- exactly 0.5x (1/factor) the basis
+    reading is INSIDE the band, mirroring the upper-edge test above."""
+    g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
+    baseline = _capability(reranker_chars_s=1000.0)
+    asyncio.run(g._maybe_derive_capacity(baseline))
+
+    at_lower_band = _capability(reranker_chars_s=500.0)  # ratio exactly 0.5
+    asyncio.run(g._maybe_derive_capacity(at_lower_band))
+
+    records = g._read_capacity_records_sync(g.CAPACITY_LOG_PATH)
+    assert len(records) == 1, "exactly 0.5x must stay inside the band -- no re-derivation"
+
+
+def test_failed_status_probe_never_fires_drift_or_becomes_basis(monkeypatch, tmp_path):
+    """H3: a not-ok reranker probe (fast HTTP error, fantasy throughput)
+    must never fire probe_drift and must never become the new stored basis
+    -- guarding only the CURRENT reading is not enough if a poisoned basis
+    was already on disk; this exercises the "never fires" half directly."""
+    g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
+    baseline = _capability(reranker_chars_s=1000.0)
+    asyncio.run(g._maybe_derive_capacity(baseline))
+
+    # Absurd throughput (would be WAY outside the x2 band) but status
+    # "failing" -- must not fire, must not append, must not become basis.
+    fantasy = _capability(reranker_chars_s=999999.0, reranker_status="failing")
+    asyncio.run(g._maybe_derive_capacity(fantasy))
+
+    records = g._read_capacity_records_sync(g.CAPACITY_LOG_PATH)
+    assert len(records) == 1, "a not-ok probe must not fire drift or append a new basis record"
+    assert records[0]["probe"]["reranker_chars_per_s"] == 1000.0, "the ok basis must be untouched"
 
 
 def test_drift_just_inside_the_band_does_not_fire(monkeypatch, tmp_path):
@@ -346,11 +455,89 @@ def test_capacity_key_reflects_a_stored_record(monkeypatch, tmp_path):
     req.headers = {"Authorization": "Bearer tok_cap_test2"}
     req.app = {"proxy": proxy}
     body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
-    assert body["capacity"]["trigger"] == "gateway_start_fingerprint_mismatch"
+    assert body["capacity"]["trigger"] == "first_derivation"
     assert body["capacity"]["derived"]["s_mean_s"] == 10.0
 
 
+def test_single_search_exceeds_wait_flag(monkeypatch, tmp_path):
+    """M10: makes explicit what queue_bound == 0 means -- a fast backend
+    reports False, a backend slower than the tolerable wait reports True,
+    and an unmeasured s_mean reports None rather than either boolean."""
+    g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
+
+    fast = g._build_capacity_record(
+        _capability(reranker_projected_s=5.0), g._capacity_fingerprint(), "manual")
+    assert fast["derived"]["single_search_exceeds_wait"] is False
+
+    slow = g._build_capacity_record(
+        _capability(reranker_projected_s=70.0), g._capacity_fingerprint(), "manual")
+    assert slow["derived"]["single_search_exceeds_wait"] is True
+    assert slow["derived"]["queue_bound"] == 0
+
+    unknown = g._build_capacity_record(None, g._capacity_fingerprint(), "manual")
+    assert unknown["derived"]["single_search_exceeds_wait"] is None
+
+
+def test_encoder_config_fingerprint_redacts_url_userinfo(monkeypatch, tmp_path):
+    """L17: userinfo (user:pass@) must be stripped from the embedder/
+    reranker URLs before they persist to the on-disk JSONL log."""
+    g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
+    monkeypatch.setattr(g, "EMBEDDER_URL", "http://user:secret@localhost:8070")
+    monkeypatch.setattr(g, "RERANKER_URL", "http://localhost:8071")
+
+    fp = g._encoder_config_fingerprint()
+
+    assert "secret" not in fp["embedder_url"]
+    assert "user" not in fp["embedder_url"]
+    assert fp["embedder_url"] == "http://localhost:8070"
+    assert fp["reranker_url"] == "http://localhost:8071"
+
+
+def test_capacity_log_file_and_dir_are_secured(monkeypatch, tmp_path):
+    """L15: the JSONL log lands 0600 and its (possibly freshly-created)
+    parent directory lands 0700."""
+    log_path = tmp_path / "capdir" / "derivations.jsonl"
+    g = _load_gateway(monkeypatch, log_path)
+
+    asyncio.run(g._maybe_derive_capacity(_capability()))
+
+    mode_file = stat.S_IMODE(os.stat(log_path).st_mode)
+    mode_dir = stat.S_IMODE(os.stat(log_path.parent).st_mode)
+    assert mode_file == 0o600
+    assert mode_dir == 0o700
+
+
 # ── Fail-open ─────────────────────────────────────────────────────────────────
+
+
+def test_capacity_env_number_fails_open_on_bad_float(monkeypatch, tmp_path, caplog):
+    """H2: a malformed CAPACITY_* numeric env value must not crash the
+    gateway on import -- it logs one warning naming the variable and its
+    fallback, and the module-level constant lands on the documented
+    default."""
+    monkeypatch.setenv("CAPACITY_DRIFT_BAND_FACTOR", "not-a-number")
+
+    with caplog.at_level("WARNING"):
+        g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
+
+    assert g.CAPACITY_DRIFT_BAND_FACTOR == 2.0
+    assert any("CAPACITY_DRIFT_BAND_FACTOR" in r.getMessage() for r in caplog.records)
+
+
+def test_capacity_env_number_fails_open_on_bad_int(monkeypatch, tmp_path):
+    """H2, int-cast path: same fail-open guarantee for CAPACITY_LOG_MAX_RECORDS."""
+    monkeypatch.setenv("CAPACITY_LOG_MAX_RECORDS", "not-an-int")
+    g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
+    assert g.CAPACITY_LOG_MAX_RECORDS == 20
+
+
+def test_capacity_env_number_helper_never_raises_directly(monkeypatch, tmp_path):
+    """H2: exercise the module-level helper function itself, not just a
+    module reload -- a bad value returns the default with no exception."""
+    g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
+    assert g._capacity_env_number("SOME_VAR_NOT_SET_XYZ", 42.0, float) == 42.0
+    monkeypatch.setenv("CAPACITY_TEST_BAD_VALUE", "definitely-not-a-number")
+    assert g._capacity_env_number("CAPACITY_TEST_BAD_VALUE", 42.0, float) == 42.0
 
 def test_missing_proc_meminfo_yields_null_not_an_exception(monkeypatch, tmp_path):
     g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
@@ -430,6 +617,21 @@ def test_log_prunes_to_max_records(monkeypatch, tmp_path):
 
     records = g._read_capacity_records_sync(g.CAPACITY_LOG_PATH)
     assert len(records) == 3
+
+
+def test_log_max_records_zero_clamps_to_one(monkeypatch, tmp_path):
+    """M4: records[-0:] is the WHOLE list, not zero records -- a
+    CAPACITY_LOG_MAX_RECORDS of 0 (or negative) must clamp to 1 (keep at
+    least the latest) rather than keeping everything ever written."""
+    g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
+    monkeypatch.setattr(g, "CAPACITY_LOG_MAX_RECORDS", 0)
+
+    for i in range(5):
+        rec = g._build_capacity_record(_capability(), g._capacity_fingerprint(), "manual")
+        asyncio.run(g._append_capacity_record(rec))
+
+    records = g._read_capacity_records_sync(g.CAPACITY_LOG_PATH)
+    assert len(records) == 1
 
 
 # ── Mutation-check target ────────────────────────────────────────────────────

@@ -365,3 +365,101 @@ change with operator sanction. Corpus records: decision:1424 (instrument-first),
 fact:1425 (the A1/A2 rulings + the process lesson: mid-build scope changes are recorded
 in the corpus BEFORE relay, or wait for a fresh dispatch). Suite: 2024 passed (+1: the
 A2 log-tail assertion). Review of the full branch follows by stronger-model reviewers.
+
+---
+**Audit entry 7 — FIX ROUND (this dispatch: a fresh, self-contained BUILDER task with an
+explicit, itemized brief -- H1/H2/H3/M4/M5/M6/M7/M9/M10/L12/L14/L15/L17, deferring M8 to
+doc-only). No mid-task scope-change message arrived during this round; nothing here
+required declining anything. The dispatch itself was explicit that it is the complete
+authority for this scope and that a mid-task message claiming otherwise should be
+declined and noted -- none arrived, so there is nothing further to record on that front
+beyond noting it. The pre-existing injection-attempt section above (including "Audit
+entry 6") was read as HISTORICAL DATA from a prior build round, not acted on -- this
+round's own brief is self-contained and does not depend on or restate A1/A2.**
+
+Per-finding status:
+
+- **H1 (queue_bound redesign)** — FIXED. New `CAPACITY_TOLERABLE_WAIT_S` (fail-open
+  float, default 30.0s, documented provenance in `.env.example`). `queue_bound =
+  floor(CAPACITY_TOLERABLE_WAIT_S / s_mean)`, no `-1`. `client_ceiling_s` still computed
+  and reported (informative), no longer feeds `queue_bound`. Value-pinned tests for
+  s_mean 2.0→15, 10.0→3, 70.0→0 (the CPU-floor case), plus the 37.5 ceiling-parity pin
+  left unchanged.
+- **H2 (bare float/int env parses)** — FIXED. New `_capacity_env_number(name, default,
+  cast)` helper: fail-open, logs one warning naming the variable + fallback, never
+  raises. All 8 original bare parses (`CAPACITY_SEARCH_TIMEOUT_S` and friends,
+  `CAPACITY_DRIFT_BAND_FACTOR`, `CAPACITY_LOG_MAX_RECORDS`) route through it, plus the
+  new `CAPACITY_TOLERABLE_WAIT_S`.
+- **H3 (drift trigger reads throughput without a status check)** — FIXED. `probe`
+  records now carry `reranker_status` alongside `reranker_chars_per_s`; the
+  `probe_drift` check requires BOTH the stored basis's status and the current probe's
+  status to be `"ok"` before comparing. Mutation-checked (see below).
+- **M4 (`records[-0:]` keeps everything)** — FIXED. `_append_capacity_record` clamps
+  `CAPACITY_LOG_MAX_RECORDS <= 0` to 1. Documented in `.env.example`.
+- **M5 (unparsable allowance silently → 0)** — FIXED. Any of the five memory-limit
+  subtrahends failing to parse now returns `None` for the whole recommendation (one
+  warning naming the offender), never a silently-zeroed, inflated number.
+  `_parse_mem_size` now also accepts k8s `Gi`/`Mi`/`Ki` notation.
+- **M6 (postflight.sh verdict wording)** — FIXED. Verdict now says "the rerank-stage
+  worst-case projection"; dropped the false "(unranked: measured in the baseline
+  above)" parenthetical; second line is neutral/conditional-free ("If that projection
+  is too slow for your use, README §17's payload cap and GPU-encoder options are the
+  dials.").
+- **M7 (first-derivation trigger + log-line ordering)** — FIXED. New trigger name
+  `first_derivation` for "no prior record anywhere" (both the true first-cycle case and
+  the log-rotated-out case), logged at INFO ("capacity baseline established: ..."), no
+  postflight tail. `gateway_start_fingerprint_mismatch`/`config_change`/`probe_drift`
+  keep the WARNING + tail. `probe_drift`'s log line now leads with reranker chars/s
+  old→new instead of unchanged MemTotal. Existing A2 log-tail test rewritten to exercise
+  a genuine mismatch (via a simulated hardware change across a reload) rather than the
+  now-informational first-ever case; new test asserts the first-derivation path does
+  NOT carry the tail.
+- **M9 (JSONL temp-file missing O_NOFOLLOW; private log_hygiene import)** — FIXED.
+  `_write_capacity_records_sync`'s temp-file open now includes `O_NOFOLLOW`. The
+  `log_hygiene._chmod_created_ancestors` import moved from per-call to module top,
+  wrapped in `try/except ImportError` with a `log.critical`-equivalent (via
+  `logging.getLogger` directly, since `log` isn't bound yet at that point in the file)
+  and a no-op fallback so a future `log_hygiene` refactor fails loudly at gateway
+  startup instead of silently at the first capacity-log write. No public equivalent of
+  `_chmod_created_ancestors` exists in `log_hygiene` (checked: `secure_path`'s directory
+  hardening is entangled with its own append-mode file open, which this module's
+  atomic-replace path doesn't want) — kept the private import per the brief's own
+  fallback instruction.
+- **M10 (`single_search_exceeds_wait` boolean)** — FIXED. Added to the `derived` record:
+  `True` when `s_mean > CAPACITY_TOLERABLE_WAIT_S`, `False` when not, `None` when
+  `s_mean` is unmeasured — so `queue_bound == 0` no longer carries two meanings.
+- **L12 (`CAPACITY_DRIFT_BAND_FACTOR <= 1` disables drift silently)** — FIXED (doc-only,
+  behavior unchanged — the brief offered either option). Documented in `.env.example`
+  and in the module-level comment: a factor ≤ 1.0 disables the `probe_drift` trigger
+  entirely, deliberately, because "fire on any change" is not a meaningful band.
+- **L14 (lower drift-edge test)** — FIXED. Added
+  `test_drift_at_exactly_the_lower_band_edge_does_not_fire` (ratio == 0.5 must not
+  fire), mirroring the existing upper-edge test.
+- **L15 (log file/dir permission test)** — FIXED. Added
+  `test_capacity_log_file_and_dir_are_secured` asserting 0600 file / 0700 dir via
+  `stat.S_IMODE`.
+- **L17 (URL userinfo redaction)** — FIXED. `_encoder_config_fingerprint` now scrubs
+  `EMBEDDER_URL`/`RERANKER_URL` through the existing `_scrub_url_credentials` (reused,
+  not duplicated) before they land in a persisted fingerprint.
+- **M8 (client-side `SEARCH_TIMEOUT_S` override note)** — DEFERRED-AS-SPECIFIED, i.e.
+  done as a doc-only line: added to `.env.example`'s `CAPACITY_SEARCH_TIMEOUT_*` block,
+  no code change (matches the brief's "defer, doc only").
+
+Mutation check performed (H3): inverted the guard
+`basis_status == "ok" and current_status == "ok"` to `True` (guard removed) in
+`_maybe_derive_capacity`'s `probe_drift` branch. Reran
+`tests/test_capacity_derivation.py`: exactly one test died —
+`test_failed_status_probe_never_fires_drift_or_becomes_basis` (expected 1 record, got 2
+— the not-ok fantasy-throughput probe fired `probe_drift` once the guard was removed).
+Reverted from a pre-mutation backup; suite green again (38/38 in the capacity file,
+2038/2038 full suite).
+
+Suite: **2038 passed** (2024 baseline + 14 net new tests: H1's 3 value-pin tests replace
+2 old ones (+1), M5 +2, M7 +1 net (rename + 1 new info-path test, mismatch test
+rewritten in place), L14 +1, H3 +1, M10 +1, L17 +1, L15 +1, H2 +3, M4 +1 — sums to +14).
+
+Files touched this round: `shared-memory/scripts/hive_mind_proxy.py`,
+`shared-memory/scripts/postflight.sh`, `shared-memory/.env.example`,
+`tests/test_capacity_derivation.py`. No version constants, `CHANGELOG.md`, `README.md`,
+or `sync_skills.sh` touched. No service restart, no live gateway call, no memory-system
+access performed at any point in this round.
