@@ -142,7 +142,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.20"
+FRAMEWORK_VERSION = "0.9.21"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -2210,6 +2210,11 @@ class MemoryCoordinator:
         # is a reranker that is up (it answers /health) but cannot serve.
         self._rerank_successes = 0
         self._rerank_failures = 0
+        # When the fallback last fired. Stamped beside _rerank_failures at the
+        # same increment (never derived from the log) so the pair can never
+        # disagree — same contract as _credential_last_ts. ISO-8601 UTC, None
+        # until the first fallback in this process.
+        self._rerank_fallback_last_ts: str | None = None
         # Backup quiesce: dedicated connection holding the EXCLUSIVE advisory lock
         # (None = not held), plus the TTL auto-resume task.
         self._quiesce_conn: Any = None
@@ -6322,10 +6327,33 @@ class MemoryCoordinator:
                 # different answer from a ranked one — so it is logged, counted
                 # and declared in the response rather than dressed up as a
                 # confident uniform score.
-                log.warning("rerank failed (%s: %s) — serving vector order "
-                            "for %d candidates", type(exc).__name__, exc,
-                            len(rerank_docs))
+                #
+                # Probable-cause extension (operator ruling, W2′): a dropped or
+                # reset connection mid-request is the httpx shape a reranker
+                # container makes when the kernel OOM-kills it — a timeout is
+                # not that shape (the process is merely slow/busy, not gone),
+                # so only the transport-drop family gets the extra sentence.
+                # Matched by TYPE, never a blanket except-Exception guess.
+                is_dropped_connection = isinstance(
+                    exc,
+                    (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError),
+                )
+                msg = ("rerank failed (%s: %s) — serving vector order "
+                       "for %d candidates")
+                if is_dropped_connection:
+                    msg += (
+                        " — a dropped connection mid-rerank on a "
+                        "memory-constrained host is most often the kernel "
+                        "OOM-killing the reranker: check your reranker "
+                        "container (llama-reranker or llama-reranker-gpu) — "
+                        "`docker inspect <name> --format '{{.State.OOMKilled}} "
+                        "{{.RestartCount}}'` — and the kernel log (dmesg), and "
+                        "see the capacity record on authenticated /health "
+                        "for this host's derived limits"
+                    )
+                log.warning(msg, type(exc).__name__, exc, len(rerank_docs))
                 self._rerank_failures += 1
+                self._rerank_fallback_last_ts = datetime.now(timezone.utc).isoformat()
                 # ⛔ THE FALLBACK DROPS TIER-3 ENTIRELY, and that is deliberate.
                 # Vector order is meaningful only WITHIN one table: the fact
                 # distances and the summary distances come from separate queries
@@ -7046,6 +7074,19 @@ class MemoryCoordinator:
         # shells out to nvtop itself. "unknown" (nvtop absent) is surfaced verbatim
         # so the monitor never shows a false "idle".
         snap["inference_busy"] = self._consolidation_health.get("inference_busy", "unknown")
+
+        # Rerank outcome counters (operator ruling, W2′) — in-process, no I/O,
+        # same reset-on-restart contract as the LLM-fault/credential counters
+        # this pairing mirrors. The reranker degrades to vector order on ANY
+        # failure (a dead process, a timeout, or the kernel OOM-killing it on
+        # a memory-constrained host) and still answers 200 — so without this
+        # the whole class of failure is invisible from outside the log.
+        # Flat additive keys + a paired last-event timestamp, never a nested
+        # restructure (see inference_busy — the existing flat top-level
+        # exemplar; ruled flat at W2' merge, fact:1314 shape).
+        snap["rerank_successes_total"] = self._rerank_successes
+        snap["rerank_fallbacks_total"] = self._rerank_failures
+        snap["rerank_fallbacks_last_ts"] = self._rerank_fallback_last_ts
 
         # Credential-use audit trail signal (PR A3) — in-process counters, no
         # I/O, so no try/except: same reset-on-restart contract as the
