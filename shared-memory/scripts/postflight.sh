@@ -106,7 +106,19 @@ def select_phrase(content):
     words = text.split()
     if not words:
         return None
-    return " ".join(words[:8])
+    phrase = " ".join(words[:8])
+    # SEC-01 (decision:1439, correcting fact:1437 CRITICAL to REQUIRED): strip
+    # C0 (0x00-0x1F, ESC 0x1B included) and C1 (0x80-0x9F) control characters
+    # from the FINAL phrase before it is ever printed or searched. The real
+    # mechanism, stated correctly: postflight.sh printf %s does not interpret
+    # escapes in its argument -- nothing here executes -- but raw ESC/control
+    # bytes left in a phrase pulled from corpus content pass through verbatim
+    # to whatever terminal or log viewer renders postflight output. That is
+    # operator-visible output spoofing and log poisoning on a diagnostic
+    # tool, by an actor who can already write corpus content -- not code
+    # execution, but a real class, and one regex closes it.
+    phrase = re.sub(r"[\x00-\x1f\x80-\x9f]", "", phrase)
+    return phrase if phrase else None
 
 phrase = select_phrase(sys.stdin.read())
 if phrase:
@@ -413,34 +425,69 @@ if [[ "$POSTFLIGHT_MODE" == "re-baseline" ]]; then
     elif ! command -v docker >/dev/null 2>&1; then
         bad A5 "docker not found on PATH — cannot select a live Tier-3 summary for re-baseline verification"
     else
-        # Most-recently-updated live row, either kind — one query, one row;
-        # json_build_object keeps embedded newlines/unicode JSON-escaped so
-        # this stays a single -tAc line (same reasoning as A4's psql calls).
-        summary_row="$(docker exec "$PG_CONTAINER" psql -U postgres -d "$PG_DB" -tAc \
-                "SELECT json_build_object('id', id, 'content', content, 'kind', COALESCE(metadata->>'kind','thematic')) FROM community_summaries WHERE NOT superseded ORDER BY updated_at DESC LIMIT 1" 2>/dev/null)"
-        summary_id="$(printf '%s' "$summary_row" | json_get id)"
-        summary_kind="$(printf '%s' "$summary_row" | json_get kind)"
-        summary_content="$(printf '%s' "$summary_row" | json_get content)"
-        if [[ ! "$summary_id" =~ ^[0-9]+$ ]]; then
-            bad A5 "re-baseline mode selected on a nonzero live-summary count, but no live non-superseded community_summaries row could be read just now — the count and this read disagree; the corpus may have changed between the two, or the store is unreachable"
+        # QA-01 (decision:1439): BOUNDED MULTI-CANDIDATE PROBE, not a
+        # single-summary gate. The 3 most-recently-updated live rows
+        # (either kind, in order); fewer than 3 live rows: use what
+        # exists. json_agg(... ORDER BY updated_at DESC) keeps embedded
+        # newlines/unicode JSON-escaped and the ordering explicit; COALESCE
+        # covers the zero-row case (json_agg returns NULL, not '[]', on an
+        # empty input set).
+        #
+        # Why 3, measured not chosen (fact:1438 sweep, all 21 live rows on
+        # the reference install, same selector/limit-20 search this script
+        # runs): exactly 1/21 rows fails individually -- both its Tier-3
+        # candidate slots lost the rerank cut against 20 Tier-1 facts. At
+        # that rate no set of 3 DISTINCT rows on this corpus can consist
+        # entirely of failures, while a wholesale Tier-3 retrieval break
+        # still fails all 3 loudly. This is a property of this corpus at
+        # this moment, not a constant -- the fresh-install VM test
+        # re-measures it on a young corpus.
+        candidates_json="$(docker exec "$PG_CONTAINER" psql -U postgres -d "$PG_DB" -tAc \
+                "SELECT COALESCE(json_agg(row_json ORDER BY updated_at DESC), '[]') FROM (SELECT json_build_object('id', id, 'content', content, 'kind', COALESCE(metadata->>'kind','thematic')) AS row_json, updated_at FROM community_summaries WHERE NOT superseded ORDER BY updated_at DESC LIMIT 3) sub" 2>/dev/null)"
+        candidate_count="$(printf '%s' "$candidates_json" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = None
+print(len(d) if isinstance(d, list) else 0)
+' 2>/dev/null)"
+        if [[ ! "$candidate_count" =~ ^[0-9]+$ || "$candidate_count" -lt 1 ]]; then
+            bad A5 "re-baseline mode selected on a nonzero live-summary count, but no live non-superseded community_summaries rows could be read just now for the multi-candidate probe — the count and this read disagree; the corpus may have changed between the two, or the store is unreachable"
         else
-            summary_ref_type="summary"
-            [[ "$summary_kind" == "insight" ]] && summary_ref_type="insight"
-            summary_ref="${summary_ref_type}:${summary_id}"
-            phrase="$(printf '%s' "$summary_content" | select_summary_phrase)"
-            if [[ -z "$phrase" ]]; then
-                bad A5 "selected $summary_ref has no extractable phrase (content yields no words after cleaning) — cannot search for it"
-            else
-                # C1 (decision:1435): limit 20, not 5 -- measured 2/8
-                # false-fail at top-5 (worst rank 16 of 20), 8/8 present at
-                # 20, on the reference install's 8 most-recently-updated
-                # live summaries.
-                t0="$(now_ms)"
-                search_out="$(timeout "$CLIENT_TIMEOUT" uv run --with httpx --with python-dotenv \
-                        python "$BRIDGE" search "$phrase" 20 2>/dev/null)"
-                t1="$(now_ms)"
-                search_rebaseline_ms=$((t1 - t0))
-                verdict="$(printf '%s' "$search_out" | python3 -c '
+            probe_pass_message=""
+            probe_hardfail_message=""
+            probe_last_message=""
+            probe_last_was_catchall=0
+            t0="$(now_ms)"
+            for cand_idx in $(seq 1 "$candidate_count"); do
+                cand_row="$(printf '%s' "$candidates_json" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(json.dumps(d[$cand_idx - 1]))
+")"
+                cand_id="$(printf '%s' "$cand_row" | json_get id)"
+                cand_kind="$(printf '%s' "$cand_row" | json_get kind)"
+                cand_content="$(printf '%s' "$cand_row" | json_get content)"
+                cand_ref_type="summary"
+                [[ "$cand_kind" == "insight" ]] && cand_ref_type="insight"
+                cand_ref="${cand_ref_type}:${cand_id}"
+                cand_phrase="$(printf '%s' "$cand_content" | select_summary_phrase)"
+                if [[ -z "$cand_phrase" ]]; then
+                    probe_last_message="candidate $cand_idx of $candidate_count, $cand_ref has no extractable phrase (content yields no words after cleaning)"
+                    probe_last_was_catchall=0
+                    continue
+                fi
+                cand_search_out="$(timeout "$CLIENT_TIMEOUT" uv run --with httpx --with python-dotenv \
+                        python "$BRIDGE" search "$cand_phrase" 20 2>/dev/null)"
+                # C2 (decision:1435): the coordinator keyword-fallback shape
+                # (served when the embedder is unreachable) omits the
+                # "ranked" key entirely -- a DIFFERENT signal from an honest
+                # ranked:false degraded result, never graded as one.
+                # QA-02 (decision:1439): report the ACTUAL returned count
+                # (n), never a hardcoded 20 -- the set is at MOST 20 and
+                # smaller on a young or filtered corpus.
+                cand_verdict="$(printf '%s' "$cand_search_out" | python3 -c '
 import json, sys
 ref = sys.argv[1]
 try:
@@ -451,37 +498,69 @@ if isinstance(d, dict):
     print("ERROR:" + str(d.get("message") or d.get("error") or "unexpected reply")[:200]); sys.exit(0)
 if not d:
     print("EMPTY"); sys.exit(0)
-# C2 (decision:1435): the coordinator keyword-fallback shape (served when
-# the embedder is unreachable) omits the "ranked" key entirely -- that is
-# a DIFFERENT signal from an honest ranked:false degraded result, and must
-# not be graded as one. Presence of the key, not its value, is the branch.
 if "ranked" not in d[0]:
     print("KEYWORD_FALLBACK"); sys.exit(0)
 ranked = bool(d[0].get("ranked"))
-hit = next((r for r in d if r.get("ref") == ref), None)
+n = len(d)
 if ranked:
-    print("PRESENT" if hit is not None else "ABSENT")
+    idx = next((i for i, r in enumerate(d) if r.get("ref") == ref), None)
+    print(("PRESENT:%d:%d" % (idx + 1, n)) if idx is not None else ("ABSENT:%d" % n))
 else:
     print("DEGRADED")
-' "$summary_ref")"
-                case "$verdict" in
-                    PRESENT)
-                        ok "A5 re-baseline: $summary_ref present among the 20 ranked results for phrase \"$phrase\" (presence, not rank, asserted — v0.8.54 gives no rank guarantee)" ;;
-                    ABSENT)
-                        bad A5 "re-baseline: $summary_ref absent from all 20 returned rows for phrase \"$phrase\" — the summary was not retrieved at all (this is presence, not rank: a lower-ranked hit would still pass)" ;;
+' "$cand_ref")"
+                case "$cand_verdict" in
+                    PRESENT:*)
+                        rest="${cand_verdict#PRESENT:}"
+                        cand_rank="${rest%%:*}"
+                        cand_total="${rest#*:}"
+                        probe_pass_message="A5 re-baseline: candidate $cand_idx of $candidate_count, $cand_ref present at rank $cand_rank of $cand_total for phrase \"$cand_phrase\" (presence, not rank, asserted — v0.8.54 gives no rank guarantee)"
+                        break
+                        ;;
                     DEGRADED)
-                        ok "A5 re-baseline: results returned, DEGRADED mode declared honestly — Tier-3 narratives are omitted in degraded mode by design (measured in the 2026-08-21 stress test; v0.8.54 ruling \"ranked, not guaranteed\"); the $summary_ref presence assertion is WAIVED, not silently passed" ;;
+                        probe_pass_message="A5 re-baseline: candidate $cand_idx of $candidate_count, $cand_ref — results returned, DEGRADED mode declared honestly — Tier-3 narratives are omitted in degraded mode by design (measured in the 2026-08-21 stress test; v0.8.54 ruling \"ranked, not guaranteed\"); the presence assertion is WAIVED for this candidate, not silently passed"
+                        break
+                        ;;
                     KEYWORD_FALLBACK)
-                        bad A5 "re-baseline: results carry no \"ranked\" key at all — semantic search is not serving, keyword-fallback shape detected (the embedder is unreachable); this is a real failure, never the honest-degraded waiver, since re-baseline A4 performs no save and so never independently trips the embedding mandate" ;;
+                        # Immediate hard failure -- do NOT keep trying
+                        # candidates. The embedder being gone is not a
+                        # per-row problem a different candidate could route
+                        # around; re-baseline A4 performs no save, so this
+                        # would otherwise pass undetected.
+                        probe_hardfail_message="re-baseline: candidate $cand_idx of $candidate_count, $cand_ref — results carry no \"ranked\" key at all, semantic search is not serving, keyword-fallback shape detected (the embedder is unreachable); the probe stops here rather than trying more candidates"
+                        break
+                        ;;
+                    ABSENT:*)
+                        cand_total="${cand_verdict#ABSENT:}"
+                        probe_last_message="candidate $cand_idx of $candidate_count, $cand_ref absent from the $cand_total returned rows"
+                        probe_last_was_catchall=0
+                        ;;
                     EMPTY)
-                        bad A5 "re-baseline: search for phrase \"$phrase\" returned zero results — even degraded mode requires results returned" ;;
+                        probe_last_message="candidate $cand_idx of $candidate_count, $cand_ref — search returned zero results"
+                        probe_last_was_catchall=0
+                        ;;
                     ERROR:*)
-                        bad A5 "re-baseline search failed: ${verdict#ERROR:}" ;;
+                        probe_last_message="candidate $cand_idx of $candidate_count, $cand_ref — search failed: ${cand_verdict#ERROR:}"
+                        probe_last_was_catchall=0
+                        ;;
                     *)
-                        bad A5 "re-baseline search returned no parseable JSON (timeout after ${CLIENT_TIMEOUT}s?)"
-                        search_rebaseline_ms=""   # a timeout is not a measurement — record null, not the ceiling
+                        probe_last_message="candidate $cand_idx of $candidate_count, $cand_ref — no parseable JSON (timeout after ${CLIENT_TIMEOUT}s?)"
+                        probe_last_was_catchall=1
                         ;;
                 esac
+            done
+            t1="$(now_ms)"
+            search_rebaseline_ms=$((t1 - t0))
+            if [[ -n "$probe_pass_message" ]]; then
+                ok "$probe_pass_message"
+            elif [[ -n "$probe_hardfail_message" ]]; then
+                bad A5 "$probe_hardfail_message"
+            else
+                # QA-03 (decision:1439): name the two preconditions so a
+                # reader can tell a rerank cut from a broken read path.
+                bad A5 "none of the $candidate_count attempted candidate(s) came back — last: ${probe_last_message:-no candidate could be evaluated}. A candidate must (a) win its kind's single Tier-3 slot by vector nearest-neighbour, then (b) survive the rerank cut against the Tier-1 candidates in the pool — a genuine break here, across $candidate_count independent candidates, is a real read-path failure, not a rank complaint on any single row"
+                if [[ "$probe_last_was_catchall" == "1" ]]; then
+                    search_rebaseline_ms=""   # the decisive attempt was unparseable/timed out — not a measurement
+                fi
             fi
         fi
     fi
