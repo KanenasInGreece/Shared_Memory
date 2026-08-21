@@ -30,7 +30,25 @@ from multidict import CIMultiDict
 # every secret it held. It is now the shared split loader also used by
 # rem_loop.py and consolidation_loop.py — see secure_env.py.
 from secure_env import load_split_env, get_secret, is_secret_key  # noqa: E402
-from log_hygiene import append_secure  # noqa: E402
+from log_hygiene import append_secure, secure_path, FILE_MODE  # noqa: E402
+# M9 (fix round): _chmod_created_ancestors is a private log_hygiene member --
+# the only thing this module needs from it that has no public equivalent
+# (secure_path's own dir-hardening is entangled with its append-mode open,
+# which _write_capacity_records_sync's atomic-replace path doesn't want).
+# Imported here (module top, not per-call as it was) so a future log_hygiene
+# refactor that drops or renames it fails LOUDLY at gateway startup instead
+# of silently at the first capacity-log write.
+try:
+    from log_hygiene import _chmod_created_ancestors  # noqa: E402
+except ImportError:  # pragma: no cover -- defensive against a log_hygiene refactor
+    logging.getLogger("hive-proxy").critical(
+        "log_hygiene._chmod_created_ancestors is no longer importable -- "
+        "capacity-log parent directories will NOT be hardened to 0700 on "
+        "first creation; update hive_mind_proxy.py's import to match "
+        "log_hygiene's current internals")
+
+    def _chmod_created_ancestors(dir_path):  # type: ignore[no-redef]
+        pass
 
 load_split_env()
 
@@ -2270,6 +2288,7 @@ async def _capability_probe_daemon(proxy, stop_event) -> None:
     while not stop_event.is_set():
         try:
             _capability = await _probe_capability(proxy.session)
+            await _maybe_derive_capacity(_capability)
         except Exception as exc:
             log.warning("capability probe failed: %s", exc)
         try:
@@ -2277,6 +2296,702 @@ async def _capability_probe_daemon(proxy, stop_event) -> None:
                                    timeout=CAPABILITY_PROBE_INTERVAL_S)
         except asyncio.TimeoutError:
             pass
+
+
+# --------------------------------------------------------------------------- #
+# Capacity derivation — R0-I (decision:1424). REPORT ONLY: this section never
+# limits, queues, rejects or resizes a single request. It reads the capability
+# probe's own numbers (never a second measurement) and derives what an
+# operator or a future wall would need — a projected mean rerank service
+# time, a sustainable queue depth against the CLIENT's own timeout ceiling,
+# and a memory allowance the reranker container could be given without
+# starving Neo4j/Postgres/the embedder/the gateway/the OS. Nothing here
+# writes a compose file or applies a limit.
+# --------------------------------------------------------------------------- #
+_MEM_SIZE_RE = re.compile(r"^([0-9]*\.?[0-9]+)\s*([KMGT]?I?B?)$", re.IGNORECASE)
+# M5 (fix round): KI/MI/GI/TI added alongside the existing KIB/MIB/GIB/TIB
+# so k8s-style binary notation ("8Gi", "512Mi", "4Ki" -- no trailing "B")
+# parses too, not just the docker-compose "8G"/"512M" and hand-typed
+# "2GiB" forms already handled.
+_MEM_SIZE_MULTIPLIERS = {
+    "": 1, "B": 1,
+    "K": 1024, "KB": 1024, "KI": 1024, "KIB": 1024,
+    "M": 1024**2, "MB": 1024**2, "MI": 1024**2, "MIB": 1024**2,
+    "G": 1024**3, "GB": 1024**3, "GI": 1024**3, "GIB": 1024**3,
+    "T": 1024**4, "TB": 1024**4, "TI": 1024**4, "TIB": 1024**4,
+}
+
+
+def _parse_mem_size(raw: str | None) -> int | None:
+    """Parse a docker-compose-style memory size ('8G', '512M', a bare byte
+    count, or an operator's hand-edited 'GiB'/'MiB'/'KiB' notation) into
+    bytes. None on anything unparsable — fail-open, never raises, so a
+    malformed env value degrades the derivation rather than the gateway."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    m = _MEM_SIZE_RE.match(s)
+    if not m:
+        return None
+    mult = _MEM_SIZE_MULTIPLIERS.get(m.group(2).upper())
+    if mult is None:
+        return None
+    try:
+        return int(float(m.group(1)) * mult)
+    except ValueError:
+        return None
+
+
+# Each subtrahend below is a DECLARED ALLOWANCE, not a measurement — the
+# comment on each says what it stands in for. Every one is env-overridable so
+# a deployment whose compose limits or steady-state usage differ can correct
+# the recommendation without a code change.
+#
+# Neo4j: prefer the OPERATOR'S OWN configured heap+pagecache (the same
+# NEO4J_HEAP_MAX / NEO4J_PAGECACHE env vars ops/postgres_neo4j_limits.yaml
+# already reads) over the compose `deploy.resources.limits.memory: 8G` cap —
+# the configured heap+pagecache is what Neo4j will actually try to hold;
+# the 8G cap is only what docker permits it, and is usually never reached.
+CAPACITY_NEO4J_FALLBACK_BYTES = _parse_mem_size(
+    os.environ.get("CAPACITY_NEO4J_FALLBACK_BYTES", "8G"))
+# Postgres: the compose `deploy.resources.limits.memory: 4G` cap — Postgres
+# has no single configured-heap equivalent to read (shared_buffers=1GB in the
+# compose command is a floor, not what the backend processes actually use
+# under load), so the allowance is the container's own docker ceiling.
+CAPACITY_PG_MEM_ALLOWANCE_BYTES = _parse_mem_size(
+    os.environ.get("CAPACITY_PG_MEM_ALLOWANCE_BYTES", "4G"))
+# Embedder: NOT measured here — a steady-state allowance for the llama.cpp
+# embedding container (fits in ~2 GB per ops/postgres_neo4j_limits.yaml's own
+# comment on the encoder pair). Only relevant when the embedder runs on THIS
+# host (CPU_ENCODER_REPLICAS=1); an operator running it elsewhere can zero
+# this.
+CAPACITY_EMBEDDER_MEM_ALLOWANCE_BYTES = _parse_mem_size(
+    os.environ.get("CAPACITY_EMBEDDER_MEM_ALLOWANCE_BYTES", "2G"))
+# Gateway: NOT measured — this process's own steady-state footprint
+# (aiohttp + asyncpg pool + in-process telemetry dicts).
+CAPACITY_GATEWAY_MEM_ALLOWANCE_BYTES = _parse_mem_size(
+    os.environ.get("CAPACITY_GATEWAY_MEM_ALLOWANCE_BYTES", "512M"))
+# OS margin: NOT measured — kernel, page cache pressure, the operator's own
+# desktop session on a shared box.
+CAPACITY_OS_MEM_MARGIN_BYTES = _parse_mem_size(
+    os.environ.get("CAPACITY_OS_MEM_MARGIN_BYTES", "1G"))
+
+# Fail-open parse for a CAPACITY_* numeric env setting (H2, fix round): a
+# malformed value used to crash the gateway on import via a bare float()/
+# int() call -- these are observability/tuning knobs, not something a typo
+# in .env should be able to take the whole process down over. Logs ONE
+# warning naming the variable and the fallback it's using instead, then
+# returns the default -- never raises.
+def _capacity_env_number(name: str, default, cast):
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return cast(raw)
+    except (TypeError, ValueError):
+        log.warning(
+            "capacity: %s=%r is not a valid number -- using default %r",
+            name, raw, default)
+        return default
+
+
+# Mirrors memory_bridge.py's search_ceiling() — same FORMULA, same shipped
+# DEFAULTS — so client_ceiling_s (reported alongside, but see
+# CAPACITY_TOLERABLE_WAIT_S below for what queue_bound is actually measured
+# against) reflects the same timeout the client will actually apply by
+# default. Duplicated rather than imported: hive_mind_proxy is the server
+# (ADR-014); importing the thin client back into the server would invert
+# that split. A parity unit test (given the same capability input, both
+# functions must agree) is the guard against the two copies drifting apart.
+#
+# Deliberately CAPACITY_-prefixed, NOT the client's own SEARCH_TIMEOUT_* names
+# — this repo's own .env.example already documents that those names, set in
+# the GATEWAY's env, "have no effect unless a client happens to run with this
+# file loaded" (the client reads them from its own, separate .env). Reusing
+# the identical names here would make that documented boundary quietly false
+# for this one purpose while looking unchanged everywhere else — exactly the
+# kind of stale-comment defect CLAUDE.md calls out. An operator who wants
+# this derivation's ceiling to track a non-default client ceiling sets the
+# CAPACITY_ variant explicitly; the defaults agree today by construction
+# (the parity test pins the numbers, not just the env var names).
+CAPACITY_SEARCH_TIMEOUT_S          = _capacity_env_number("CAPACITY_SEARCH_TIMEOUT_S", 0.0, float)
+CAPACITY_SEARCH_TIMEOUT_FLOOR_S    = _capacity_env_number("CAPACITY_SEARCH_TIMEOUT_FLOOR_S", 30.0, float)
+CAPACITY_SEARCH_TIMEOUT_MAX_S      = _capacity_env_number("CAPACITY_SEARCH_TIMEOUT_MAX_S", 300.0, float)
+CAPACITY_SEARCH_TIMEOUT_FALLBACK_S = _capacity_env_number("CAPACITY_SEARCH_TIMEOUT_FALLBACK_S", 120.0, float)
+CAPACITY_SEARCH_SAFETY_FACTOR      = _capacity_env_number("CAPACITY_SEARCH_SAFETY_FACTOR", 1.5, float)
+CAPACITY_SEARCH_OVERHEAD_S         = _capacity_env_number("CAPACITY_SEARCH_OVERHEAD_S", 15.0, float)
+
+# H1 (fix round): what queue_bound is actually measured against -- an
+# operator's own stated tolerance for how long a search may sit in queue.
+# Deliberately NOT client_ceiling_s: client_ceiling_s is itself partly
+# DERIVED from s_mean (see _capacity_client_ceiling_s), so the original
+# queue_bound = floor(client_ceiling / s_mean) - 1 folded the same
+# measurement into itself -- circular, and degenerate (pinned to 0 or 1)
+# outside a narrow clamp region. client_ceiling_s is still computed and
+# reported as its own field (informative: what the client will itself time
+# out at) but no longer feeds this calculation.
+#
+# Default 30.0s is MEASURED, not a guess: it is the developer reference
+# machine's own validated tolerance -- see .env.example's
+# CAPACITY_TOLERABLE_WAIT_S comment for the full provenance. Change it to
+# your own validated tolerance.
+CAPACITY_TOLERABLE_WAIT_S = _capacity_env_number("CAPACITY_TOLERABLE_WAIT_S", 30.0, float)
+
+# "Outside a x2 band" for the probe_drift trigger: fires when the current
+# reranker chars/s is more than this factor above OR below the basis
+# reading stored in the last derivation record. Exactly at the factor is
+# still INSIDE the band (see _capacity_drift_outside_band's docstring).
+# A factor <= 1.0 DISABLES this trigger entirely (see
+# _capacity_drift_outside_band's own guard) -- documented in .env.example
+# (L12, fix round): "fire on any change" is not a meaningful band, so a
+# non-positive-band value is treated as "do not use this trigger" rather
+# than as "fire on the smallest possible difference".
+CAPACITY_DRIFT_BAND_FACTOR = _capacity_env_number("CAPACITY_DRIFT_BAND_FACTOR", 2.0, float)
+
+# Where derivation records persist (MEMORY_LOG_PATH's convention: env-
+# overridable, ~/.shared-memory/... default, secured 0600/0700 via
+# log_hygiene). JSON-lines, oldest-first; capped at the last N (values <= 0
+# behave as 1 -- see _append_capacity_record's M4 clamp).
+CAPACITY_LOG_PATH = os.environ.get(
+    "CAPACITY_LOG_PATH", "~/.shared-memory/capacity/derivations.jsonl")
+CAPACITY_LOG_MAX_RECORDS = _capacity_env_number("CAPACITY_LOG_MAX_RECORDS", 20, int)
+
+# In-memory mirror of the latest record, surfaced on /health without a disk
+# read on every hit. None until the first derivation of this process's
+# lifetime lands OR a prior record is lazily loaded from disk (see
+# _capacity_latest_snapshot). Never asserted as present on no data — the same
+# discipline decision 928 established for _capability.
+_capacity_latest: dict | None = None
+_capacity_latest_loaded_from_disk = False   # memoizes the one lazy disk read
+# True once this PROCESS has run its first capability probe — distinguishes
+# the startup check (trigger gateway_start_fingerprint_mismatch, which
+# compares against whatever the LOG says, not against this process's own
+# prior state) from every later cycle (trigger config_change / probe_drift).
+_capacity_first_probe_done = False
+
+
+def _capacity_neo4j_allowance_bytes() -> int | None:
+    """Operator-configured heap+pagecache when BOTH parse; otherwise the
+    compose cap default. Partial config (one of the two set) still falls
+    back to the default rather than guessing the missing half. None
+    (never silently 0) when the fallback itself fails to parse -- M5, fix
+    round: the caller decides what an unparsable allowance means for the
+    overall recommendation.
+
+    N3 (fix round 2): a variable that was left UNSET falls back silently --
+    that is the normal, expected "not configured" case, nothing failed.
+    A variable that WAS set but rejected by _parse_mem_size is different:
+    the operator tried to configure this and got silently overridden by the
+    default, which used to leave no trace anywhere. One warning names the
+    rejected variable (never its value -- these are memory sizes, not
+    secrets, but there is no reason to echo a malformed operator string back
+    into the log either); the fallback behavior itself is unchanged."""
+    heap_raw = os.environ.get("NEO4J_HEAP_MAX")
+    pagecache_raw = os.environ.get("NEO4J_PAGECACHE")
+    heap = _parse_mem_size(heap_raw)
+    pagecache = _parse_mem_size(pagecache_raw)
+    if heap_raw is not None and heap is None:
+        log.warning(
+            "capacity: NEO4J_HEAP_MAX is set but did not parse as a memory "
+            "size -- using the CAPACITY_NEO4J_FALLBACK_BYTES default for "
+            "the neo4j allowance")
+    if pagecache_raw is not None and pagecache is None:
+        log.warning(
+            "capacity: NEO4J_PAGECACHE is set but did not parse as a "
+            "memory size -- using the CAPACITY_NEO4J_FALLBACK_BYTES "
+            "default for the neo4j allowance")
+    if heap is not None and pagecache is not None:
+        return heap + pagecache
+    return CAPACITY_NEO4J_FALLBACK_BYTES
+
+
+def _hardware_fingerprint() -> dict:
+    """nproc + MemTotal + GPU presence. Every field fails open to None/False
+    on a platform that cannot answer — this must never raise, called from a
+    background daemon loop with no request to fail."""
+    out: dict = {"nproc": None, "mem_total_bytes": None, "gpu_present": False}
+    try:
+        out["nproc"] = os.cpu_count()
+    except Exception:
+        pass
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemTotal"):
+                    out["mem_total_bytes"] = int(line.split()[1]) * 1024
+                    break
+    except (OSError, ValueError, IndexError):
+        pass   # non-Linux, unreadable, or unexpected format — stays None
+    try:
+        from gpu_load import gpu_probe_available
+        out["gpu_present"] = bool(gpu_probe_available())
+    except Exception:
+        pass   # never let GPU detection block a fingerprint
+    return out
+
+
+def _encoder_config_fingerprint() -> dict:
+    """The config subset that changes what the probe measures or what the
+    derivation assumes. RERANK_MAX_DOC_CHARS/SEARCH_CANDIDATE_FLOOR come
+    from the encoder-sizing modules (imported lazily, matching
+    _probe_capability's own pattern, to avoid a load-order dependency).
+    Replica counts are the compose knobs that move the encoders onto a GPU
+    (ops/postgres_neo4j_limits.yaml CPU_ENCODER_REPLICAS / GPU_ENCODER_
+    REPLICAS) — not read anywhere else in this module, so read directly."""
+    from dream_telemetry import RERANK_MAX_DOC_CHARS
+    from coordinator import SEARCH_CANDIDATE_FLOOR
+    return {
+        "rerank_max_doc_chars": RERANK_MAX_DOC_CHARS,
+        "search_candidate_floor": SEARCH_CANDIDATE_FLOOR,
+        # L17 (fix round): strip userinfo (user:pass@) before this persists
+        # to the on-disk JSONL log -- same scrub already applied to
+        # client-visible error text elsewhere in this module.
+        "embedder_url": _scrub_url_credentials(EMBEDDER_URL or ""),
+        "reranker_url": _scrub_url_credentials(RERANKER_URL or ""),
+        "cpu_encoder_replicas": os.environ.get("CPU_ENCODER_REPLICAS", "1"),
+        "gpu_encoder_replicas": os.environ.get("GPU_ENCODER_REPLICAS", "0"),
+    }
+
+
+def _capacity_fingerprint() -> dict:
+    return {"hardware": _hardware_fingerprint(),
+            "encoder_config": _encoder_config_fingerprint()}
+
+
+def _capacity_client_ceiling_s(capability: dict | None) -> float:
+    """Server-side mirror of memory_bridge.search_ceiling() — see that
+    function's docstring for the reasoning; this must stay semantically
+    identical (a parity test asserts it) so queue_bound is computed against
+    the timeout the client will genuinely apply, not a server guess."""
+    if CAPACITY_SEARCH_TIMEOUT_S > 0:
+        return CAPACITY_SEARCH_TIMEOUT_S
+
+    projected, probed = 0.0, False
+    for backend in ("reranker", "embedder"):
+        block = (capability or {}).get(backend)
+        if not isinstance(block, dict):
+            continue
+        try:
+            value = float(block.get("projected_full_payload_s") or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            projected += value
+            probed = True
+    if not probed:
+        return CAPACITY_SEARCH_TIMEOUT_FALLBACK_S
+
+    derived = projected * CAPACITY_SEARCH_SAFETY_FACTOR + CAPACITY_SEARCH_OVERHEAD_S
+    return max(CAPACITY_SEARCH_TIMEOUT_FLOOR_S,
+               min(derived, CAPACITY_SEARCH_TIMEOUT_MAX_S))
+
+
+def _capacity_queue_bound(s_mean: float | None, tolerable_wait_s: float) -> int | None:
+    """floor(tolerable_wait_s / s_mean), floored at 0 (division of two
+    positives already never goes negative; the floor is defensive
+    documentation, not a correction). None when s_mean is unknown/non-
+    positive (no probe reading yet) — a queue bound of 0 would otherwise
+    read as "no room", which is a different claim from "not yet measured".
+
+    H1 (fix round): measured against CAPACITY_TOLERABLE_WAIT_S, an
+    operator-stated tolerance, NOT client_ceiling_s — see that constant's
+    module-level comment for why the old client_ceiling-based formula was
+    circular. 0 here genuinely means "a single search already exceeds the
+    tolerable wait" (see single_search_exceeds_wait in the derived record,
+    M10) rather than a second, ambiguous meaning of "no room"."""
+    if not s_mean or s_mean <= 0:
+        return None
+    return max(0, int(tolerable_wait_s // s_mean))
+
+
+def _capacity_recommended_mem_limit_bytes(mem_total_bytes: int | None) -> int | None:
+    """MemTotal minus every declared allowance above. None when MemTotal
+    itself is unknown, OR (M5, fix round) when ANY declared allowance failed
+    to parse -- an operator-set CAPACITY_*_BYTES value _parse_mem_size
+    rejected used to silently coerce to 0 via `x or 0`, which SUBTRACTS
+    LESS than intended and so INFLATES the recommendation in the dangerous
+    direction (recommending more memory for the reranker than the host
+    actually has spare). Unknown beats wrong-in-the-dangerous-direction: one
+    warning names the offending variable and the whole recommendation comes
+    back None rather than a falsely generous number. Floored at 0 rather
+    than negative when every value DOES parse — a negative number is not a
+    smaller recommendation, it is "no room", which 0 says plainly."""
+    if mem_total_bytes is None:
+        return None
+    named = [
+        ("neo4j allowance (NEO4J_HEAP_MAX/NEO4J_PAGECACHE or "
+         "CAPACITY_NEO4J_FALLBACK_BYTES)", _capacity_neo4j_allowance_bytes()),
+        ("CAPACITY_PG_MEM_ALLOWANCE_BYTES", CAPACITY_PG_MEM_ALLOWANCE_BYTES),
+        ("CAPACITY_EMBEDDER_MEM_ALLOWANCE_BYTES", CAPACITY_EMBEDDER_MEM_ALLOWANCE_BYTES),
+        ("CAPACITY_GATEWAY_MEM_ALLOWANCE_BYTES", CAPACITY_GATEWAY_MEM_ALLOWANCE_BYTES),
+        ("CAPACITY_OS_MEM_MARGIN_BYTES", CAPACITY_OS_MEM_MARGIN_BYTES),
+    ]
+    subtrahends = []
+    for label, value in named:
+        if value is None:
+            log.warning(
+                "capacity: %s did not parse -- memory-limit recommendation "
+                "withheld (unknown beats a silently-zeroed, inflated "
+                "recommendation)", label)
+            return None
+        subtrahends.append(value)
+    return max(0, mem_total_bytes - sum(subtrahends))
+
+
+def _capacity_drift_outside_band(current: float | None, basis: float | None,
+                                  band_factor: float | None = None) -> bool:
+    """True iff `current` sits outside a [1/band, band] ratio of `basis`.
+    Exactly AT the factor (ratio == band or == 1/band) is still INSIDE the
+    band — "outside a x2 band" means strictly outside, not at-or-beyond, so
+    a probe that happens to land on exactly double doesn't flap the trigger
+    on rounding. None/non-positive inputs never fire (nothing to compare)."""
+    if band_factor is None:
+        band_factor = CAPACITY_DRIFT_BAND_FACTOR
+    if not current or not basis or current <= 0 or basis <= 0 or band_factor <= 1:
+        return False
+    ratio = current / basis
+    return ratio > band_factor or ratio < (1.0 / band_factor)
+
+
+def _build_capacity_record(capability: dict | None, fingerprint: dict,
+                            trigger: str) -> dict:
+    """Assemble one capacity derivation record. `capability` is the SAME
+    dict _probe_capability() produced this cycle (capability_snapshot()'s
+    shape) — s_mean reuses its reranker.projected_full_payload_s verbatim
+    rather than recomputing a second model.
+
+    NOTE on the probe's own model vs the real candidate pool: the probe
+    projects onto 20 x RERANK_MAX_DOC_CHARS (see _probe_capability), a fixed
+    worst-case count. The REAL per-search candidate pool is
+    max(SEARCH_CANDIDATE_FLOOR, limit) + 2 (coordinator.py's Tier-1 fetch:
+    the vector-search LIMIT plus the Tier-3 summary and the deep-dive
+    lookup that ride along). s_mean here is the probe's own number,
+    unmodified — encoder_config.search_candidate_floor is recorded
+    alongside it so a reader can see how far the fixed model sits from a
+    caller who requests more than the floor."""
+    reranker = (capability or {}).get("reranker") or {}
+    embedder = (capability or {}).get("embedder") or {}
+    s_mean = reranker.get("projected_full_payload_s")
+    # H1: queue_bound is measured against the operator's own tolerable-wait
+    # setting, NOT client_ceiling_s -- client_ceiling_s is still computed
+    # and reported below (informative: what the client will itself time out
+    # at) but no longer feeds this calculation. See CAPACITY_TOLERABLE_WAIT_S's
+    # module-level comment for why the old formula was circular.
+    client_ceiling = _capacity_client_ceiling_s(capability)
+    queue_bound = _capacity_queue_bound(s_mean, CAPACITY_TOLERABLE_WAIT_S)
+    # M10: makes explicit what queue_bound == 0 means, since "not yet
+    # measured" (None) and "one search already exceeds the tolerable wait"
+    # (0) would otherwise both read as "no usable number".
+    single_search_exceeds_wait = (
+        None if not s_mean or s_mean <= 0
+        else s_mean > CAPACITY_TOLERABLE_WAIT_S
+    )
+    mem_total = fingerprint.get("hardware", {}).get("mem_total_bytes")
+    recommended_mem_limit = _capacity_recommended_mem_limit_bytes(mem_total)
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "trigger": trigger,
+        "fingerprint": fingerprint,
+        "probe": {
+            "reranker_chars_per_s": reranker.get("throughput_chars_s"),
+            # H3: the probe's own status rides along with the reading it
+            # describes, so a future comparison can refuse to trust a
+            # reading that was never actually "ok" (see _maybe_derive_
+            # capacity's probe_drift guard).
+            "reranker_status": reranker.get("status"),
+            "embedder_chars_per_s": embedder.get("throughput_chars_s"),
+            "probed_at": (capability or {}).get("probed_at"),
+        },
+        "derived": {
+            "s_mean_s": s_mean,
+            "client_ceiling_s": client_ceiling,
+            "queue_bound": queue_bound,
+            # N2 (fix round 2): the tolerance queue_bound was actually
+            # measured against travels WITH the record it produced -- a
+            # reader (postflight, /health, a future dashboard) must not have
+            # to know today's CAPACITY_TOLERABLE_WAIT_S default separately
+            # to make sense of a stored queue_bound; the record is
+            # self-describing even if the operator's setting changes later.
+            "tolerable_wait_s": CAPACITY_TOLERABLE_WAIT_S,
+            "single_search_exceeds_wait": single_search_exceeds_wait,
+            "recommended_reranker_mem_limit_bytes": recommended_mem_limit,
+        },
+    }
+
+
+def _read_capacity_records_sync(path: str) -> list[dict]:
+    """Tolerant JSON-lines reader: a malformed line is skipped, never fatal
+    — the log is an observability trail, not a transaction log. Missing
+    file returns []."""
+    expanded = os.path.expanduser(path)
+    if not os.path.exists(expanded):
+        return []
+    out: list[dict] = []
+    try:
+        with open(expanded, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return []
+    return out
+
+
+def _write_capacity_records_sync(path: str, records: list[dict]) -> None:
+    """Atomic replace via a same-directory temp file opened 0600 directly
+    (log_hygiene's FILE_MODE) — os.replace preserves the source inode's
+    permission bits, so the final file is never briefly world-readable
+    under the process umask the way `open(tmp, 'w')` then chmod would be.
+
+    M9 (fix round): the temp-file open now carries O_NOFOLLOW too, mirroring
+    log_hygiene.secure_path's own reasoning -- a symlink pre-planted at the
+    `.tmp` path by a different-uid actor in a relocated (CAPACITY_LOG_PATH
+    under /tmp or another shared dir) log directory must not get this
+    process to write through it."""
+    expanded = os.path.expanduser(path)
+    _chmod_created_ancestors(Path(expanded).parent)
+    tmp = f"{expanded}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, FILE_MODE)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            for r in records:
+                fh.write(json.dumps(r) + "\n")
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    os.replace(tmp, expanded)
+    secure_path(expanded)   # tightens perms if the target pre-existed at 0644
+
+
+async def _append_capacity_record(record: dict) -> None:
+    """Append + prune to the last CAPACITY_LOG_MAX_RECORDS, off the event
+    loop (log_hygiene.AsyncLineWriter's reasoning — disk I/O never runs
+    inline — but this needs read-modify-write for pruning, which
+    AsyncLineWriter's append-only writer does not do)."""
+    def _do() -> None:
+        records = _read_capacity_records_sync(CAPACITY_LOG_PATH)
+        records.append(record)
+        # M4 (fix round): records[-0:] is the WHOLE list, not zero records --
+        # a CAPACITY_LOG_MAX_RECORDS of 0 (or a negative value) used to keep
+        # every record ever written instead of pruning. Clamp to 1: always
+        # keep at least the latest.
+        max_records = CAPACITY_LOG_MAX_RECORDS if CAPACITY_LOG_MAX_RECORDS > 0 else 1
+        records = records[-max_records:]
+        _write_capacity_records_sync(CAPACITY_LOG_PATH, records)
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _do)
+    except RuntimeError:
+        _do()   # no running loop (sync caller/test) — inline, matches
+                # AsyncLineWriter.write's own fallback
+
+
+def _last_capacity_record() -> dict | None:
+    records = _read_capacity_records_sync(CAPACITY_LOG_PATH)
+    return records[-1] if records else None
+
+
+def capacity_snapshot() -> dict | None:
+    """The latest derivation record, or None before any exists (this
+    process's own derivation OR a prior process's, lazily loaded from disk
+    once). Read by /health — never asserted as present on no data."""
+    global _capacity_latest, _capacity_latest_loaded_from_disk
+    if _capacity_latest is None and not _capacity_latest_loaded_from_disk:
+        _capacity_latest_loaded_from_disk = True
+        try:
+            _capacity_latest = _last_capacity_record()
+        except Exception:
+            pass   # fail-open — a corrupt/unreadable log must not break /health
+    return dict(_capacity_latest) if _capacity_latest is not None else None
+
+
+def _log_capacity_change(trigger: str, last: dict | None, record: dict) -> None:
+    """One line per re-derivation.
+
+    M7 (fix round): the very first record this log has EVER held is not an
+    alarm -- there is nothing prior to compare against, so it logs at INFO
+    as "capacity baseline established" and carries no re-run-postflight
+    tail. Every other trigger means something ACTUALLY changed (a hardware/
+    config mismatch, or measured drift) and keeps the louder WARNING path
+    with that tail (fact:1425 A2: every hardware-era change should produce
+    a fresh postflight verification, and this line is where the operator
+    learns that -- log only, the gateway never runs postflight itself).
+
+    N1(b) (fix round 2): basis_recovery is likewise informational, not an
+    alarm -- it means the instrument just HEALED itself from an unusable
+    basis, which is good news the operator did nothing to cause and need do
+    nothing about. No re-run-postflight tail either."""
+    def _mib(b):
+        return f"{b / (1024 ** 2):.0f}MiB" if isinstance(b, (int, float)) else "?"
+
+    new_d = record["derived"]
+
+    if trigger == "first_derivation":
+        log.info(
+            "capacity baseline established: s_mean %s s, queue_bound %s, "
+            "reranker_mem_limit_bytes %s",
+            new_d.get("s_mean_s"), new_d.get("queue_bound"),
+            new_d.get("recommended_reranker_mem_limit_bytes"),
+        )
+        return
+
+    if trigger == "basis_recovery":
+        log.info(
+            "capacity basis recovered: deriving from the first healthy "
+            "probe (s_mean %s s, queue_bound %s, reranker_mem_limit_bytes "
+            "%s)",
+            new_d.get("s_mean_s"), new_d.get("queue_bound"),
+            new_d.get("recommended_reranker_mem_limit_bytes"),
+        )
+        return
+
+    old_hw = (last or {}).get("fingerprint", {}).get("hardware", {}) or {}
+    new_hw = record["fingerprint"]["hardware"]
+    old_d = (last or {}).get("derived", {}) or {}
+    old_probe = (last or {}).get("probe", {}) or {}
+    new_probe = record["probe"]
+
+    if trigger == "probe_drift":
+        # M7: the number that actually MOVED for this trigger is reranker
+        # chars/s -- MemTotal is unchanged in a drift event, so leading with
+        # it read as "nothing happened" to an operator scanning the log.
+        headline = (f"capacity basis changed ({trigger}): reranker "
+                    f"{old_probe.get('reranker_chars_per_s')}->"
+                    f"{new_probe.get('reranker_chars_per_s')} chars/s")
+    else:
+        headline = (f"capacity basis changed ({trigger}): MemTotal "
+                    f"{_mib(old_hw.get('mem_total_bytes'))}->"
+                    f"{_mib(new_hw.get('mem_total_bytes'))}")
+
+    log.warning(
+        "%s -- re-derived: s_mean %s->%s s, queue_bound %s->%s, "
+        "reranker_mem_limit_bytes %s->%s -- re-run postflight to verify and "
+        "re-baseline on this hardware: bash shared-memory/scripts/postflight.sh",
+        headline,
+        old_d.get("s_mean_s"), new_d.get("s_mean_s"),
+        old_d.get("queue_bound"), new_d.get("queue_bound"),
+        old_d.get("recommended_reranker_mem_limit_bytes"),
+        new_d.get("recommended_reranker_mem_limit_bytes"),
+    )
+
+
+async def _maybe_derive_capacity(capability: dict) -> None:
+    """Called every capability-probe cycle. Decides which of the passive
+    triggers (if any) fires, derives + stores + logs on a hit, and NEVER
+    raises — this rides the same observability path _probe_capability does,
+    so a bug here must not take down the probe daemon (Group 3)."""
+    global _capacity_first_probe_done
+    try:
+        fingerprint = _capacity_fingerprint()
+        last = _last_capacity_record()
+        is_first = not _capacity_first_probe_done
+        _capacity_first_probe_done = True
+
+        current_reranker = (capability or {}).get("reranker") or {}
+        current_status = current_reranker.get("status")
+
+        trigger = None
+        if is_first:
+            if last is None:
+                # N1(a) (fix round 2): no prior record ANYWHERE -- this is a
+                # first-ever baseline, not a mismatch (there is nothing to
+                # have mismatched against). But a not-ok probe (warming
+                # compose stack, connection refused, fast HTTP error) must
+                # NOT be allowed to establish that baseline: a not-ok basis
+                # blocks every later trigger from ever firing again --
+                # probe_drift requires an "ok" stored basis, config_change
+                # has nothing changed to compare, and a later restart's
+                # fingerprint still matches -- so a single bad first probe
+                # used to freeze the instrument permanently with no operator
+                # remedy. Defer silently (one INFO log) instead; the next
+                # healthy probe cycle derives the baseline normally.
+                if current_status != "ok":
+                    log.info(
+                        "capacity baseline deferred -- reranker probe not "
+                        "ok yet; will derive on the first healthy probe")
+                    return
+                trigger = "first_derivation"
+            elif last.get("fingerprint") != fingerprint:
+                trigger = "gateway_start_fingerprint_mismatch"
+        else:
+            # config_change: encoder_config is module-level state fixed for
+            # this process's whole lifetime (RERANK_MAX_DOC_CHARS et al. are
+            # read once at import), so within ONE process this can only ever
+            # equal what trigger 1 already checked. It still earns its own
+            # cheap check on every cycle because the LOG is shared state: a
+            # differently-configured process (a rolling restart mid-flight,
+            # or CAPACITY_LOG_PATH pointed at a shared location) can have
+            # written the last record, and that mismatch should surface on
+            # the very next cycle rather than wait for this process's own
+            # next restart.
+            if last is None:
+                # Log file cleared/rotated out from under a running process,
+                # OR this process's own first cycle never found one either.
+                # M7: nothing prior exists to have mismatched against, so
+                # this is a fresh baseline too, not an alarm. N1(a): the
+                # same not-ok guard as the is_first branch above applies
+                # here too -- a not-ok probe must not become the first
+                # stored basis via this path either.
+                if current_status != "ok":
+                    log.info(
+                        "capacity baseline deferred -- reranker probe not "
+                        "ok yet; will derive on the first healthy probe")
+                    return
+                trigger = "first_derivation"
+            elif last.get("fingerprint", {}).get(
+                    "encoder_config") != fingerprint.get("encoder_config"):
+                trigger = "config_change"
+            else:
+                probe_block = (last.get("probe") or {})
+                basis = probe_block.get("reranker_chars_per_s")
+                basis_status = probe_block.get("reranker_status")
+                current = current_reranker.get("throughput_chars_s")
+                # H3: a probe that did not answer "ok" produces fantasy
+                # throughput (a fast HTTP error can read as near-zero
+                # latency), so it must never fire drift and must never
+                # become the new basis. Both sides are guarded: the stored
+                # basis must have been recorded under an "ok" reading too,
+                # or a genuinely-recovered probe would compare against a
+                # poisoned number forever.
+                if (basis_status == "ok" and current_status == "ok"
+                        and _capacity_drift_outside_band(current, basis)):
+                    trigger = "probe_drift"
+
+        if trigger is None and last is not None:
+            # N1(b) (fix round 2): recovers an already-stored not-ok basis
+            # (or a status-less legacy record predating this field -- absent
+            # reads the same as not-ok here) the moment a healthy probe shows
+            # up. Mirror image of (a): the only remedy for a basis that was
+            # ALREADY poisoned before this fix landed, since (a) alone only
+            # stops NEW poisoning. No operator action needed -- the next
+            # healthy probe cycle heals it on its own. Only reached once
+            # every trigger above has had its say: a fingerprint/config
+            # change already produces a fresh (healthy) record on its own,
+            # so this exists specifically for the "nothing else moved" case
+            # that used to go permanently, silently stuck.
+            basis_status = (last.get("probe") or {}).get("reranker_status")
+            if basis_status != "ok" and current_status == "ok":
+                trigger = "basis_recovery"
+
+        if trigger is None:
+            return
+        record = _build_capacity_record(capability, fingerprint, trigger)
+        await _append_capacity_record(record)
+        global _capacity_latest
+        _capacity_latest = record
+        _log_capacity_change(trigger, last, record)
+    except Exception as exc:
+        log.warning("capacity derivation failed: %s", exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -2347,6 +3062,13 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
     # the probe costs real seconds, and /health is polled by the monitor, so it
     # must never run inline. Same pattern as the consolidation snapshot below.
     checks["backend_capability"] = capability_snapshot()
+    # R0-I (decision:1424): the latest CAPACITY derivation record, if any —
+    # a top-level ADDITIVE key, never nested under backend_capability (that
+    # dict is the raw probe reading; this is what was DERIVED from it plus
+    # the hardware/config fingerprint). None until the first derivation of
+    # this deployment's lifetime lands. REPORT ONLY — see the section this
+    # snapshot function lives in for the "never limits a request" invariant.
+    checks["capacity"] = capacity_snapshot()
 
     # Reasoning-LLM backend pool — probe each; "llm" is ok if ANY is up (the pool
     # tolerates a down backend). Per-backend statuses are reported for observability;

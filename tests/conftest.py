@@ -36,3 +36,14 @@ os.environ["SECURE_ENV_FILE"] = ""
 def _credential_audit_log_path_never_touches_real_home(tmp_path, monkeypatch):
     monkeypatch.setenv("CREDENTIAL_AUDIT_LOG_PATH", str(tmp_path / "credential-audit.jsonl"))
     yield
+
+
+@pytest.fixture(autouse=True)
+def _capacity_log_path_never_touches_real_home(tmp_path, monkeypatch):
+    """Same backstop as the credential-audit fixture above, for R0-I's
+    capacity-derivation log (default ~/.shared-memory/capacity/
+    derivations.jsonl): any test that reloads hive_mind_proxy without
+    explicitly setting CAPACITY_LOG_PATH still lands in a disposable
+    tmp_path rather than reading/writing the operator's real log."""
+    monkeypatch.setenv("CAPACITY_LOG_PATH", str(tmp_path / "capacity-derivations.jsonl"))
+    yield

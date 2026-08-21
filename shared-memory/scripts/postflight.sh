@@ -11,7 +11,7 @@
 #   A3  schema truth            delegates to the two shipped verifiers
 #   A4  write path end to end   canary save → 1024-dim vector → outbox applied → :Fact
 #   A5  read path, graded       search finds the canary; reranked OR declared degraded
-#   A6  baseline emission       timings + backend_capability + hardware → JSON (never a gate)
+#   A6  baseline emission       timings + backend_capability + capacity + hardware → JSON (never a gate)
 #   A7  conduct constraints     by construction — see the spec; stated, not tested
 #
 # Exit 0 iff A1–A5 all pass. Run after first install (AGENTS.md Phase 9) and
@@ -442,6 +442,12 @@ doc = {
                  "operation records null, never the timeout ceiling"),
     },
     "backend_capability": h.get("backend_capability"),
+    # R0-I (decision:1424), trigger "manual": the current CAPACITY record the
+    # gateway already derived and stored, fetched verbatim off the
+    # authenticated /health payload -- no re-derivation happens in bash. None
+    # when the gateway has not derived one yet (fresh install, first probe
+    # still in flight) or when only the anonymous payload was available.
+    "capacity": h.get("capacity"),
     "hardware": hw,
 }
 os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -453,6 +459,46 @@ print(path)
         ok "A6 baseline written: $written"
     else
         warn "A6 baseline JSON could not be written (measurement lost, never a gate)"
+    fi
+
+    # Plain-language capacity verdict (fact:1425 A1 / decision:1424) — rendered
+    # strictly from the record the gateway already published on /health; no
+    # measurement or derivation happens here. Informational only: nothing in
+    # this section may affect the exit code.
+    cap_fields="$(printf '%s' "${health_full:-}" | python3 -c '
+import json, sys
+try:
+    d = ((json.load(sys.stdin) or {}).get("capacity") or {}).get("derived") or {}
+except Exception:
+    d = {}
+s, n = d.get("s_mean_s"), d.get("queue_bound")
+exceeds, tolerable = d.get("single_search_exceeds_wait"), d.get("tolerable_wait_s")
+print("UNDERIVABLE" if s is None or n is None else f"{s}|{n}|{exceeds}|{tolerable}")
+' 2>/dev/null)"
+    if [[ -z "$cap_fields" || "$cap_fields" == "UNDERIVABLE" ]]; then
+        warn "Capacity verdict not derivable — the gateway has not published a capacity record yet (fresh install, first probe still in flight, or anonymous-only health); informational, never a gate"
+    else
+        # M6 (fix round): this is the RERANK-STAGE worst-case projection
+        # (the probe's fixed 20-doc model, see hive_mind_proxy.py's own
+        # docstring on _build_capacity_record) -- not a claim about "a
+        # fully-ranked search" in general, and the baseline above is not
+        # necessarily ranked on every install, so the old "(unranked:
+        # measured in the baseline above)" parenthetical was false on a
+        # healthy install where the baseline search WAS ranked.
+        #
+        # N2 (fix round 2): a bare "queue depth 0" is ambiguous -- it can
+        # mean "a single search already exceeds the tolerable wait" or read
+        # as "no data". single_search_exceeds_wait disambiguates which one
+        # this is, and tolerable_wait_s names what the depth was actually
+        # measured against (CAPACITY_TOLERABLE_WAIT_S) rather than leaving
+        # the reader to guess or assume the shipped default.
+        IFS='|' read -r cap_s cap_n cap_exceeds cap_tolerable <<< "$cap_fields"
+        if [[ "$cap_exceeds" == "True" ]]; then
+            ok "Capacity on this hardware: a single rerank-stage projection (~${cap_s}s) already exceeds the tolerable wait (${cap_tolerable}s) — queue depth 0 means exactly that"
+        else
+            ok "Capacity on this hardware: the rerank-stage worst-case projection is ~${cap_s}s; sustainable queue depth within the ${cap_tolerable}s tolerable wait: ${cap_n}"
+        fi
+        echo "     If that projection is too slow for your use, README §17's payload cap and GPU-encoder options are the dials."
     fi
 fi
 
