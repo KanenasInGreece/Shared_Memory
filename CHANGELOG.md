@@ -5,6 +5,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.22] — 2026-08-21
+
+### Changed — verification stops re-minting canaries once your corpus has grown up
+
+- **Postflight gains a re-baseline mode.** Until your corpus holds a live community summary,
+  postflight behaves exactly as before: it saves two canaries and verifies the write path with
+  them. Once at least one live summary exists, a re-run switches to **re-baseline mode** — it
+  saves nothing at all and proves the read path against real Tier-3 content instead, selecting a
+  live summary at run time (never a pinned id, which supersession would orphan), searching a
+  distinctive phrase from it, and asserting that the summary comes back. The mode chosen, and
+  the count that decided it, are printed at the top of every run.
+- **The trade is stated rather than hidden**: a re-run no longer re-proves the write path — that
+  proof stays anchored to the install canary — and A4 says so in its own output line.
+- **Presence, never rank.** The check asserts that the summary is among the returned results, not
+  that it ranks highly: Tier-3 narratives are ranked, not guaranteed (the v0.8.54 ruling), and a
+  verification tool must not re-assert a guarantee the framework deliberately withdrew.
+- **A single row is not the gate.** The probe tries up to three of the most recently updated live
+  summaries and passes on the first one retrieved, because a healthy install can legitimately fail
+  to surface any one particular summary — measured, on a live corpus, at roughly one row in
+  twenty. It fails only when none of the candidates comes back.
+- **Honest degradation is distinguished from a dead embedder.** A `ranked: false` result is the
+  reranker degrading honestly and waives the presence assertion with a printed line; results that
+  carry no ranking field at all are the keyword-fallback shape served when the embedder is
+  unreachable, and that is a hard failure — in re-baseline mode nothing else would catch it.
+- **Baseline JSON** gains `mode`, and the re-baseline search gets its own `search_rebaseline`
+  timing key rather than overloading `search`, whose meaning would otherwise change silently
+  between modes while its name stayed the same.
+- Control characters are stripped from the extracted phrase before it is printed, so corpus
+  content cannot spoof a verification tool's terminal output.
+- Spec (`shared-memory/Documentation/postflight.md`) documents all of the above; it remains the
+  contract, and the script is the defect where they disagree.
+
+---
+
 ## [0.9.21] — 2026-08-21
 
 ### Added — OOM faults are legible from any distance
