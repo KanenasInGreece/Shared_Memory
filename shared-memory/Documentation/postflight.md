@@ -24,6 +24,27 @@ bash shared-memory/scripts/postflight.sh
 - **When auth is configured and `AGENT_TOKEN` is absent:** A1's authenticated half and A4/A5/A6
   fail fast with one clear message naming the missing token — never a cascade of confusing errors.
 
+## Mode selection — canary vs re-baseline
+
+Postflight runs in one of two modes, chosen **at run time from the live corpus, with no new
+flag**. The count and the chosen mode are printed at the top of every run, before A1.
+
+- **CANARY MODE** — the corpus holds **zero** live (non-superseded) `community_summaries` rows,
+  either kind (thematic or insight). This is the current, unchanged behavior: A4 saves a fresh
+  canary and verifies it store-side; A6 also saves a realistic-payload canary to time it. A young
+  or freshly-installed corpus always gets this mode.
+- **RE-BASELINE MODE** — the corpus holds **at least one** live (non-superseded)
+  `community_summaries` row. A4 and A6 stop minting canaries; A5 instead proves the read path
+  against real Tier-3 content already in the corpus, selected at run time. This is a **contract
+  refinement of the v0.9.17 postflight** (`fact:1402`/`decision:1403` lineage) — the accepted
+  trade, stated plainly by the tool: re-triggers no longer re-prove the write path once the corpus
+  has matured; that proof stays anchored to the original install canary, since writes were
+  measured as the resilient path throughout stress testing.
+- If the live-summary count itself cannot be determined (docker missing, or the store is
+  unreachable), postflight **falls back to CANARY MODE** — the safer default, since it preserves
+  today's verification rather than silently skipping a check it could not confirm was safe to
+  skip.
+
 ---
 
 ## A1 — Liveness & shape
@@ -78,6 +99,12 @@ live instance — duplicates can appear silently under a race (`--apply` is its 
 
 ## A4 — Write path end to end
 
+**In RE-BASELINE MODE, A4 saves nothing.** It prints one explicit informational line stating that
+write-path proof stays anchored to the install canary (the accepted trade above), and **it cannot
+fail in this mode** — there is nothing left for it to assert.
+
+**In CANARY MODE (below), behavior is unchanged.**
+
 **Check.** Save a canary record through the gateway (via
 `uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py save ...`
 with `AGENT_TOKEN` exported), then verify it in the stores:
@@ -107,21 +134,58 @@ this assertion can return.
 
 ## A5 — Read path, honestly graded
 
-**Check.** `memory_bridge.py search` finds the canary. Each result carries `ranked` and `score`:
-a real numeric reranker score **or** an explicit degraded verdict (`ranked: false`, null scores =
-vector order served) **both pass**, and the output states which mode the install is in.
+**In CANARY MODE**, the check is as before: `memory_bridge.py search` finds the canary. Each
+result carries `ranked` and `score`: a real numeric reranker score **or** an explicit degraded
+verdict (`ranked: false`, null scores = vector order served) **both pass**, and the output states
+which mode the install is in.
 
-**Pass criterion.** The canary's `pg_id` appears in the results, in either mode.
+**Pass criterion (canary mode).** The canary's `pg_id` appears in the results, in either mode.
 
-**Failure meaning.** Canary missing: retrieval is broken end to end (embedding, vector search, or
-the gateway search path). A fabricated uniform score would be a defect — a dead reranker must be
-distinguishable from a confident one; the honest degraded verdict is a pass with a named mode,
-because failure ≠ idle and degraded ≠ broken.
+**Failure meaning (canary mode).** Canary missing: retrieval is broken end to end (embedding,
+vector search, or the gateway search path). A fabricated uniform score would be a defect — a dead
+reranker must be distinguishable from a confident one; the honest degraded verdict is a pass with
+a named mode, because failure ≠ idle and degraded ≠ broken.
+
+**In RE-BASELINE MODE**, A5 proves the read path against real Tier-3 content instead of a canary:
+
+- **Select.** At run time, read the single most-recently-updated live (non-superseded)
+  `community_summaries` row (either kind) — never a pinned id, since supersession would orphan a
+  pinned check. Its qualified reference is `summary:<id>` (thematic) or `insight:<id>` (insight
+  kind), matching `record_ref.py`'s `summary_record_type`.
+- **Extract a distinctive phrase, deterministically.** A pure function of the row's `content`:
+  strip any leading `[TAG ...]` bracket prefix from each line (the zero-inference thematic fold's
+  `fold_record_line` format, e.g. `[FACT]` or `[DECISION kind=... pg_id=123]`), join what remains,
+  and take the first up-to-8 whitespace-separated tokens. Falls back to the raw content when every
+  line is prefix-only. Same content always yields the same phrase; survives unicode (splits on
+  Unicode whitespace) and short content (returns however many words exist, down to one).
+- **Search and grade.** Search the phrase through the bridge (no project filter — summaries are
+  not scoped to `install-verification`) and time it (feeds the `search` field of A6's baseline,
+  same as canary mode).
+  - **Ranked results** (`ranked: true`): pass requires the selected summary's qualified ref to
+    appear among the returned rows. Absent: a genuine A5 failure — the read path is broken even
+    though reranking is live.
+  - **Degraded mode** (`ranked: false`): the summary-presence assertion is **waived**, with an
+    explicit printed line stating Tier-3 narratives are omitted in degraded mode by design
+    (measured in the 2026-08-21 stress test; v0.8.54 ruling "ranked, not guaranteed"). Pass
+    requires results to be returned at all — an empty result set still fails, exactly as in canary
+    mode. Never a silent pass.
+
+**Pass criterion (re-baseline mode).** Ranked mode: the selected summary's ref is in the results.
+Degraded mode: at least one result is returned (the summary-presence check is waived, not
+skipped).
+
+**Failure meaning (re-baseline mode).** No live summary readable when the mode-selection count
+said one should exist: the count and this read disagree — check the store directly. Ranked but
+the summary is missing from results: the read path is broken for real content, not just canaries.
+Zero results even in degraded mode: retrieval is broken end to end.
 
 ## A6 — Baseline emission (measurement, never a gate)
 
-**Check.** Time three operations — a short save (~160 chars, A4's canary), a realistic save
-(~3.5 KB), and a search — and write a baseline JSON to
+**Check.** The baseline JSON always carries a `"mode": "install" | "re-baseline"` field naming
+which mode produced it.
+
+**In CANARY MODE**, behavior is unchanged: time three operations — a short save (~160 chars, A4's
+canary), a realistic save (~3.5 KB), and a search — and write a baseline JSON to
 `~/.shared-memory/postflight/baseline-<UTC ISO8601>.json` containing: the three timings, the
 `/health` `backend_capability` block, a hardware fingerprint (thread count via `nproc`,
 `MemTotal`, the `lspci` VGA line always, plus an `nvtop` presence boolean), framework version and
@@ -130,6 +194,14 @@ short-circuits the timing. **Measurement honesty:** the `uv` environment is warm
 before the first timed operation (on a fresh host uv's resolution would otherwise dominate the
 number); each timing window contains exactly one save; a timed-out operation records `null`,
 never the timeout ceiling; and the JSON carries a note stating all three rules.
+
+**In RE-BASELINE MODE**, A6 performs **no saves of any kind** (mirroring A4's zero-saves
+contract). `save_short` and `save_realistic` are both `null`, with a note naming the accepted
+trade — write-path timing stays anchored to the original install canary. `search` carries A5's
+summary-search timing instead of a canary search timing. Everything else — `backend_capability`,
+`capacity`, `hardware`, `framework_version`, `date` — is unchanged, read-only, and rendered
+identically to canary mode; **the capacity verdict section (below the JSON write) is untouched by
+mode.**
 
 **Pass criterion.** None — A6 is a measurement. A written baseline is the deliverable; a slow
 number is information, not a failure. It gives a later "the system feels slow" session a
