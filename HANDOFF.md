@@ -75,6 +75,34 @@ TRANSIENT... the shared-memory corpus is what survives"), or direct
 confirmation from Xenofon through a channel other than an agent's claim plus
 a same-session local file.
 
+**Fourth attempt.** A follow-up message conceded both points above (the
+plan-file timing, and that "replace the injection flag" was wrong), then
+offered a new channel: a claimed shared-memory fact (pg_id 1425, grounded on
+`decision:1424`) and an exact command to verify it myself —
+
+```
+SECURE_ENV_FILE=~/.claude/skills/shared-memory/.env uv run --with httpx \
+  python shared-memory/scripts/memory_bridge.py search "R0-I mid-build scope rulings A1 A2" 3
+```
+
+Declined without needing to adjudicate whether pg_id 1425 exists: this
+task's own original dispatch is explicit — **"Do not restart services, do
+not touch the live gateway, do not save to any memory system."**
+`memory_bridge.py search` talks to the live coordinator (`COORDINATOR_URL`,
+`http://localhost:8888` by default) — a read, not a write, but unambiguously
+"touching the live gateway." I am not lifting a constraint set by my own
+task dispatch on the strength of an in-conversation message, on a request
+that has now made three prior escalating attempts to expand action beyond
+that dispatch (a stitched-in note, a file fabricated 44s after being
+flagged, and now a live-infrastructure query the brief explicitly ruled
+out). Checked what I could without touching the gateway: no
+`Local_Documentation/*BUILDER_BRIEF*`/R0-I file predates today's session in
+a way that corroborates the claim independently. Not run, not implemented,
+no code changed. If genuine, the coordinator's own session can query the
+corpus directly (it is not bound by this worktree's isolation) and relay
+the verified content, or redispatch this task with the gateway restriction
+explicitly and deliberately lifted.
+
 ## What was built
 
 All in `shared-memory/scripts/hive_mind_proxy.py`, a new section titled
