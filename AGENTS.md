@@ -363,6 +363,17 @@ docker exec postgres-vector psql -U postgres -d agent_data \
   -c "UPDATE neo4j_outbox SET status='pending', retries=0, next_attempt_at=now() WHERE status='failed';"
 ```
 
+**A rerank-fallback burst on a small host** — `GET /memory/telemetry` now carries
+`rerank_fallbacks_total` / `rerank_fallbacks_last_ts` / `rerank_successes_total` (the search path
+already degrades to vector order on any rerank failure and still answers 200, so this was
+previously invisible from outside the log). A rising `rerank_fallbacks_total` against a flat
+`rerank_successes_total` on a memory-constrained install is most often the kernel OOM-killing the
+reranker container — the fallback's WARNING log line names this explicitly when the failure is a
+dropped/reset connection (not a timeout): check
+`docker inspect llama-reranker --format '{{.State.OOMKilled}} {{.RestartCount}}'`, `dmesg`, and the
+`capacity` record on authenticated `/health` for this host's derived limits. The mem_limit itself
+is reported-only (decision:1424) — nothing here caps or restarts the container.
+
 ### Upgrade (gateway host)
 
 ```bash
