@@ -212,9 +212,21 @@ print(",".join(k for k in ("daemon", "backend_capability", "config") if k not in
         else
             # ONE clear message; A4/A5/A6 are marked here and print a single
             # skip line each — never a cascade of confusing errors.
-            bad A1 "auth is configured but AGENT_TOKEN is not set — export AGENT_TOKEN=<any minted agent token, from that agent's skill .env> and re-run. A4, A5 and A6 are skipped for this same missing token."
+            #
+            # Fix round R1 (decision:1435): in re-baseline mode A4 needs no
+            # token at all (it performs no gateway call — see A4 below), so
+            # it must never be pre-marked failed here, and this message must
+            # not name it among what a missing token skips in that mode —
+            # spec wins, A4 cannot contribute to the exit code in re-baseline
+            # mode, INCLUDING indirectly via this earlier mark.
+            if [[ "$POSTFLIGHT_MODE" == "re-baseline" ]]; then
+                bad A1 "auth is configured but AGENT_TOKEN is not set — export AGENT_TOKEN=<any minted agent token, from that agent's skill .env> and re-run. A5 and A6 are skipped for this same missing token (A4 needs no token in re-baseline mode)."
+            else
+                bad A1 "auth is configured but AGENT_TOKEN is not set — export AGENT_TOKEN=<any minted agent token, from that agent's skill .env> and re-run. A4, A5 and A6 are skipped for this same missing token."
+                afail[A4]=1
+            fi
             token_missing=1
-            afail[A4]=1; afail[A5]=1
+            afail[A5]=1
         fi
     else
         missing="$(printf '%s' "$anon_health" | python3 -c '
@@ -386,6 +398,11 @@ echo
 echo "A5 — read path:"
 
 search_ms=""
+search_rebaseline_ms=""   # R2 (decision:1435): its OWN timing key — never
+                          # shares "search" with the canary-mode timing,
+                          # since the two time different workloads (a
+                          # project-filtered marker search vs an unfiltered
+                          # whole-corpus phrase search).
 if [[ "$POSTFLIGHT_MODE" == "re-baseline" ]]; then
     # WP-R3: prove the read path against a LIVE Tier-3 summary, selected at
     # run time (never a pinned id — supersession would orphan the check).
@@ -414,11 +431,15 @@ if [[ "$POSTFLIGHT_MODE" == "re-baseline" ]]; then
             if [[ -z "$phrase" ]]; then
                 bad A5 "selected $summary_ref has no extractable phrase (content yields no words after cleaning) — cannot search for it"
             else
+                # C1 (decision:1435): limit 20, not 5 -- measured 2/8
+                # false-fail at top-5 (worst rank 16 of 20), 8/8 present at
+                # 20, on the reference install's 8 most-recently-updated
+                # live summaries.
                 t0="$(now_ms)"
                 search_out="$(timeout "$CLIENT_TIMEOUT" uv run --with httpx --with python-dotenv \
-                        python "$BRIDGE" search "$phrase" 5 2>/dev/null)"
+                        python "$BRIDGE" search "$phrase" 20 2>/dev/null)"
                 t1="$(now_ms)"
-                search_ms=$((t1 - t0))
+                search_rebaseline_ms=$((t1 - t0))
                 verdict="$(printf '%s' "$search_out" | python3 -c '
 import json, sys
 ref = sys.argv[1]
@@ -430,27 +451,35 @@ if isinstance(d, dict):
     print("ERROR:" + str(d.get("message") or d.get("error") or "unexpected reply")[:200]); sys.exit(0)
 if not d:
     print("EMPTY"); sys.exit(0)
+# C2 (decision:1435): the coordinator keyword-fallback shape (served when
+# the embedder is unreachable) omits the "ranked" key entirely -- that is
+# a DIFFERENT signal from an honest ranked:false degraded result, and must
+# not be graded as one. Presence of the key, not its value, is the branch.
+if "ranked" not in d[0]:
+    print("KEYWORD_FALLBACK"); sys.exit(0)
 ranked = bool(d[0].get("ranked"))
 hit = next((r for r in d if r.get("ref") == ref), None)
 if ranked:
-    print("RANKED_HIT" if hit is not None else "RANKED_MISS")
+    print("PRESENT" if hit is not None else "ABSENT")
 else:
     print("DEGRADED")
 ' "$summary_ref")"
                 case "$verdict" in
-                    RANKED_HIT)
-                        ok "A5 re-baseline: $summary_ref found in ranked results for phrase \"$phrase\"" ;;
-                    RANKED_MISS)
-                        bad A5 "re-baseline: $summary_ref not in the ranked results for phrase \"$phrase\" — the read path is broken for real Tier-3 content (reranker is live, so this is not the degraded-mode waiver)" ;;
+                    PRESENT)
+                        ok "A5 re-baseline: $summary_ref present among the 20 ranked results for phrase \"$phrase\" (presence, not rank, asserted — v0.8.54 gives no rank guarantee)" ;;
+                    ABSENT)
+                        bad A5 "re-baseline: $summary_ref absent from all 20 returned rows for phrase \"$phrase\" — the summary was not retrieved at all (this is presence, not rank: a lower-ranked hit would still pass)" ;;
                     DEGRADED)
                         ok "A5 re-baseline: results returned, DEGRADED mode declared honestly — Tier-3 narratives are omitted in degraded mode by design (measured in the 2026-08-21 stress test; v0.8.54 ruling \"ranked, not guaranteed\"); the $summary_ref presence assertion is WAIVED, not silently passed" ;;
+                    KEYWORD_FALLBACK)
+                        bad A5 "re-baseline: results carry no \"ranked\" key at all — semantic search is not serving, keyword-fallback shape detected (the embedder is unreachable); this is a real failure, never the honest-degraded waiver, since re-baseline A4 performs no save and so never independently trips the embedding mandate" ;;
                     EMPTY)
                         bad A5 "re-baseline: search for phrase \"$phrase\" returned zero results — even degraded mode requires results returned" ;;
                     ERROR:*)
                         bad A5 "re-baseline search failed: ${verdict#ERROR:}" ;;
                     *)
                         bad A5 "re-baseline search returned no parseable JSON (timeout after ${CLIENT_TIMEOUT}s?)"
-                        search_ms=""   # a timeout is not a measurement — record null, not the ceiling
+                        search_rebaseline_ms=""   # a timeout is not a measurement — record null, not the ceiling
                         ;;
                 esac
             fi
@@ -517,7 +546,7 @@ else
         # WP-R2/WP-R4: zero saves in this mode, mirroring A4 — the realistic
         # canary is a save too. save_short/save_realistic stay null; the
         # baseline JSON's note explains why.
-        ok "A6 re-baseline mode: no realistic-payload save performed — save_short/save_realistic are recorded null (write-path timing stays anchored to the install canary, same accepted trade as A4); search ${search_ms:-?} ms"
+        ok "A6 re-baseline mode: no realistic-payload save performed — save_short/save_realistic are recorded null (write-path timing stays anchored to the install canary, same accepted trade as A4); canary-mode search is null in this mode; summary-search (search_rebaseline) ${search_rebaseline_ms:-?} ms"
     else
         # Realistic save ~3.5 KB, unique per run (timestamp embedded in the marker).
         big_content="$(python3 -c '
@@ -544,7 +573,7 @@ print(("Shared Memory install-verification realistic canary " + marker + " — "
     base_file="$HOME/.shared-memory/postflight/baseline-$(date -u +%Y%m%dT%H%M%SZ).json"
     written="$(printf '%s' "${health_full:-$anon_health}" | python3 -c '
 import datetime, json, os, shutil, subprocess, sys
-path, short_ms, big_ms, search_ms, fw, mode = sys.argv[1:7]
+path, short_ms, big_ms, search_ms, search_rebaseline_ms, fw, mode = sys.argv[1:8]
 try:
     h = json.load(sys.stdin)
 except Exception:
@@ -583,11 +612,19 @@ note = ("wall-clock through the client bridge; uv environment pre-warmed "
         "untimed; exactly one save per timing window; a timed-out "
         "operation records null, never the timeout ceiling")
 if mode == "re-baseline":
+    # R2 (decision:1435): search stays canary-search-only and is null here
+    # -- the two workloads (project-filtered marker search vs unfiltered
+    # whole-corpus phrase search) do not share a timing field even though
+    # the earlier build made that mistake; search_rebaseline is the key A5
+    # populates instead, only in this mode. A metric whose meaning
+    # silently changes while its name stays constant is the known
+    # monitor-class defect this avoids.
     note += (". re-baseline mode: save_short/save_realistic are null by "
              "design (no saves in this mode, W-P/fact:1402 lineage) -- "
              "write-path timing stays anchored to the original install "
-             "canary; search is the summary-search timing (A5), not a "
-             "canary search")
+             "canary; search is null in this mode (canary-search-only "
+             "field); the A5 summary-search timing lands under its own "
+             "key, search_rebaseline")
 
 doc = {
     "mode": mode,
@@ -597,6 +634,7 @@ doc = {
         "save_short": secs(short_ms),
         "save_realistic": secs(big_ms),
         "search": secs(search_ms),
+        "search_rebaseline": secs(search_rebaseline_ms),
         "note": note,
     },
     "backend_capability": h.get("backend_capability"),
@@ -614,7 +652,7 @@ os.makedirs(os.path.dirname(path), exist_ok=True)
 with open(path, "w") as f:
     json.dump(doc, f, indent=2)
 print(path)
-' "$base_file" "${short_ms:-}" "${big_ms:-}" "${search_ms:-}" "${checkout_fw:-}" "$POSTFLIGHT_MODE")"
+' "$base_file" "${short_ms:-}" "${big_ms:-}" "${search_ms:-}" "${search_rebaseline_ms:-}" "${checkout_fw:-}" "$POSTFLIGHT_MODE")"
     if [[ -n "$written" ]]; then
         ok "A6 baseline written: $written"
     else
