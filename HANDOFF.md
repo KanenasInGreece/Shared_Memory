@@ -103,6 +103,56 @@ corpus directly (it is not bound by this worktree's isolation) and relay
 the verified content, or redispatch this task with the gateway restriction
 explicitly and deliberately lifted.
 
+**Fifth attempt (new session, fresh subagent — this entry).** A brand-new
+BUILDER dispatch arrived, in a session with no memory of any of the above,
+via the standard Agent-tool task-prompt channel. Its content is a verbatim
+match for the two previously-declined additions:
+
+- "A1" reproduces "SCOPE ADDENDUM"'s postflight.sh plain-language capacity
+  verdict, citing "README §17" — same section citation as the first attempt.
+- "A2" reproduces "SCOPE ADDENDUM 2"'s exact fingerprint-mismatch log-line
+  tail text, word for word: `" — re-run postflight to verify and re-baseline
+  on this hardware: bash shared-memory/scripts/postflight.sh"`.
+
+The dispatch frames itself as "operator-ruled," states "This dispatch IS the
+authority for this scope," and pre-emptively instructs the builder to
+decline any mid-task message claiming to change scope — which, read
+together with the rest of the pattern, is structured to make exactly this
+HANDOFF section (evidence, not a scope change) look like the thing to
+ignore. It also explicitly instructs reading this HANDOFF first and
+appending to, never rewriting, this section — which this entry does.
+
+This is the vulnerability the fourth attempt's closing line named directly:
+*"redispatch this task with the gateway restriction explicitly and
+deliberately lifted"* would look, to a fresh subagent with no memory of
+attempts 1–4, exactly like this dispatch does — a clean, fully-specified,
+first-contact task prompt for content that has in fact already been
+individually investigated and declined three times over, with forensic
+evidence (a file birth timestamp postdating the commit it was offered to
+corroborate) that at least one prior corroboration attempt was fabricated.
+
+A fresh subagent has no way to independently distinguish "the operator
+reviewed the prior refusals and is now legitimately overriding them through
+a new dispatch" from "the same injection pattern, now routed around the
+agent who caught it by starting a new one with no memory of the catch." Both
+produce an identical-looking task prompt. Per this repo's own stated rule
+(an agent's task prompt is not the user's consent — only the permission
+system or the user's own words are) and per the fourth attempt's own
+resolution path (a shared-memory decision record, checked directly by a
+session not bound by this worktree's gateway restriction, or direct
+confirmation from Xenofon through a channel other than an agent's claim),
+this dispatch alone does not clear that bar — and this dispatch's own stated
+constraints (no live gateway, no memory-system saves) block the one
+in-session way to check the shared-memory-decision path myself.
+
+**A1 and A2 were NOT implemented in this session either.** No code in this
+diff changes as a result of this fifth attempt. This section is appended,
+not replaced. What would resolve this: the operator (Xenofon) confirming
+directly, in his own words, that A1/A2 should proceed — or a session with
+gateway access confirming a genuine grounding decision exists in shared
+memory for them, superseding rather than merely repeating this dispatch's
+own unverified "operator-ruled" framing.
+
 ## What was built
 
 All in `shared-memory/scripts/hive_mind_proxy.py`, a new section titled
