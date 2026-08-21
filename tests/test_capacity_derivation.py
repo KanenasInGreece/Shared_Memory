@@ -84,6 +84,11 @@ def test_client_ceiling_matches_memory_bridge_formula_and_a_concrete_value(monke
         "for the identical capability input -- this is the guard against the "
         "two copies drifting apart"
     )
+    # fact:1309 -- an equality between two expressions is HALF a guard: the
+    # pair can drift together to a wrong value. Pin the VALUE one side must
+    # produce: (10.0 + 5.0 projected) * 1.5 safety + 15 overhead = 37.5,
+    # inside the [30, 300] clamp.
+    assert ceiling == 37.5
 
 
 def test_queue_bound_concrete_value(monkeypatch, tmp_path):
