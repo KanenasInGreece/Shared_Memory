@@ -85,10 +85,11 @@ import re, sys
 
 def select_phrase(content):
     """Pure function of content -> a short phrase for A5 re-baseline mode to
-    search for. Same content always yields the same phrase (determinism).
-    Strips a leading bracket-tag prefix from each line -- a zero-inference
-    thematic summary's content is literally consolidation_loop.py's
-    fold_record_line() output, joined line by line, e.g. "[FACT]" or
+    search for. The same content always yields the same phrase (determinism).
+    Strips a leading bracket-tag prefix from each line -- for a zero-
+    inference thematic summary, content is literally the output of
+    consolidation_loop.py fold_record_line(), joined line by line, e.g.
+    "[FACT]" or
     "[DECISION kind=observation from=\"x\" recorded=... pg_id=123]" -- so a
     naive first-N-words grab would surface the machine tag, not the summary
     prose. Falls back to the raw content when every line is prefix-only (still
