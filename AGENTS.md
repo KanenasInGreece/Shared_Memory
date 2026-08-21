@@ -265,7 +265,10 @@ truth, the full write path (canary save → 1024-dim vector → outbox applied �
 honestly-graded read path — and emit a performance baseline for this hardware. The contract is
 `shared-memory/Documentation/postflight.md`; the script implements it and exits 0 iff assertions
 A1–A5 pass. The canary lands under the reserved project `install-verification` and stays in the
-corpus — the install's birth certificate.
+corpus — the install's birth certificate. **This first run always mints it** (the corpus has no
+live Tier-3 summaries yet); a **later re-run** (e.g. after a hardware change) switches
+automatically to re-baseline mode once the corpus holds real summaries — no new canary, the read
+path is proven against that real content instead (see `postflight.md`).
 
 ```bash
 export AGENT_TOKEN=...   # auth-on installs: any minted agent token, from that agent's skill .env

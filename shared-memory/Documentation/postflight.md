@@ -24,6 +24,27 @@ bash shared-memory/scripts/postflight.sh
 - **When auth is configured and `AGENT_TOKEN` is absent:** A1's authenticated half and A4/A5/A6
   fail fast with one clear message naming the missing token — never a cascade of confusing errors.
 
+## Mode selection — canary vs re-baseline
+
+Postflight runs in one of two modes, chosen **at run time from the live corpus, with no new
+flag**. The count and the chosen mode are printed at the top of every run, before A1.
+
+- **CANARY MODE** — the corpus holds **zero** live (non-superseded) `community_summaries` rows,
+  either kind (thematic or insight). This is the current, unchanged behavior: A4 saves a fresh
+  canary and verifies it store-side; A6 also saves a realistic-payload canary to time it. A young
+  or freshly-installed corpus always gets this mode.
+- **RE-BASELINE MODE** — the corpus holds **at least one** live (non-superseded)
+  `community_summaries` row. A4 and A6 stop minting canaries; A5 instead proves the read path
+  against real Tier-3 content already in the corpus, selected at run time. This is a **contract
+  refinement of the v0.9.17 postflight** (`fact:1402`/`decision:1403` lineage) — the accepted
+  trade, stated plainly by the tool: re-triggers no longer re-prove the write path once the corpus
+  has matured; that proof stays anchored to the original install canary, since writes were
+  measured as the resilient path throughout stress testing.
+- If the live-summary count itself cannot be determined (docker missing, or the store is
+  unreachable), postflight **falls back to CANARY MODE** — the safer default, since it preserves
+  today's verification rather than silently skipping a check it could not confirm was safe to
+  skip.
+
 ---
 
 ## A1 — Liveness & shape
@@ -78,6 +99,17 @@ live instance — duplicates can appear silently under a race (`--apply` is its 
 
 ## A4 — Write path end to end
 
+**In RE-BASELINE MODE, A4 saves nothing.** It prints one explicit informational line stating that
+write-path proof stays anchored to the install canary (the accepted trade above), and **it cannot
+fail in this mode — including indirectly.** No code path may set A4's exit-code contribution in
+re-baseline mode, under any earlier assertion's outcome (e.g. a missing `AGENT_TOKEN` diagnosed at
+A1, which in canary mode pre-marks A4 as failed since A4 cannot run without a token — in
+re-baseline mode A4 needs no token at all, so that pre-mark must not fire, and A1's own message
+must not name A4 among what a missing token skips in this mode). **Spec wins**: where the script
+and this rule disagree, the script is the defect (fix-round ruling `decision:1435`, R1).
+
+**In CANARY MODE (below), behavior is unchanged.**
+
 **Check.** Save a canary record through the gateway (via
 `uv run --with httpx --with python-dotenv python shared-memory/scripts/memory_bridge.py save ...`
 with `AGENT_TOKEN` exported), then verify it in the stores:
@@ -107,21 +139,112 @@ this assertion can return.
 
 ## A5 — Read path, honestly graded
 
-**Check.** `memory_bridge.py search` finds the canary. Each result carries `ranked` and `score`:
-a real numeric reranker score **or** an explicit degraded verdict (`ranked: false`, null scores =
-vector order served) **both pass**, and the output states which mode the install is in.
+**In CANARY MODE**, the check is as before: `memory_bridge.py search` finds the canary. Each
+result carries `ranked` and `score`: a real numeric reranker score **or** an explicit degraded
+verdict (`ranked: false`, null scores = vector order served) **both pass**, and the output states
+which mode the install is in.
 
-**Pass criterion.** The canary's `pg_id` appears in the results, in either mode.
+**Pass criterion (canary mode).** The canary's `pg_id` appears in the results, in either mode.
 
-**Failure meaning.** Canary missing: retrieval is broken end to end (embedding, vector search, or
-the gateway search path). A fabricated uniform score would be a defect — a dead reranker must be
-distinguishable from a confident one; the honest degraded verdict is a pass with a named mode,
-because failure ≠ idle and degraded ≠ broken.
+**Failure meaning (canary mode).** Canary missing: retrieval is broken end to end (embedding,
+vector search, or the gateway search path). A fabricated uniform score would be a defect — a dead
+reranker must be distinguishable from a confident one; the honest degraded verdict is a pass with
+a named mode, because failure ≠ idle and degraded ≠ broken.
+
+**In RE-BASELINE MODE**, A5 proves the read path against real Tier-3 content instead of a canary,
+via a **bounded multi-candidate probe** (fix-round-2 ruling `decision:1439`, QA-01 — replacing the
+single-summary gate `decision:1435`'s C1 shipped, which fix round 2 found still false-fails on a
+healthy install):
+
+- **Select up to 3 candidates.** At run time, read the **3** most-recently-updated live
+  (non-superseded) `community_summaries` rows (either kind, in order — never pinned ids, since
+  supersession would orphan a pinned check); fewer than 3 live rows exist, use what exists. Each
+  candidate's qualified reference is `summary:<id>` (thematic) or `insight:<id>` (insight kind),
+  matching `record_ref.py`'s `summary_record_type`.
+  **Why 3, measured, not chosen** (fact:1438 sweep, all 21 live rows on the reference install
+  probed with the shipped selector at limit 20): exactly **1 of 21** rows false-fails
+  individually — both its Tier-3 candidate slots lost the rerank cut against 20 verbatim Tier-1
+  facts (see the two-preconditions note below). At that measured rate, no set of 3 *distinct* rows
+  drawn from this corpus can consist entirely of failures, while a genuine, wholesale Tier-3
+  retrieval break still fails all 3 candidates loudly. This is a property of *this corpus at this
+  moment*, not a constant — the fresh-install VM test is where the rate gets re-measured on a
+  young corpus, and a materially different rate reopens the choice of 3.
+- **Extract a distinctive phrase, deterministically, per candidate.** A pure function of each
+  row's `content`: strip any leading `[TAG ...]` bracket prefix from each line (the zero-inference
+  thematic fold's `fold_record_line` format, e.g. `[FACT]` or `[DECISION kind=... pg_id=123]`),
+  join what remains, and take the first up-to-8 whitespace-separated tokens. Falls back to the raw
+  content when every line is prefix-only. Same content always yields the same phrase; survives
+  unicode (splits on Unicode whitespace) and short content (returns however many words exist, down
+  to one). **Control characters are stripped from the final phrase** (fix-round-2 ruling
+  `decision:1439`, SEC-01 — see the dedicated note below) before it is ever printed or searched.
+- **Try candidates in order; search and grade each.** Search a candidate's phrase through the
+  bridge, **limit 20** (no project filter — summaries are not scoped to `install-verification`).
+  The **whole probe is timed as one measurement** — it lands under `search_rebaseline` (see A6;
+  `decision:1435` R2), covering however many of the (up to 3) searches were actually attempted;
+  postflight does **not** mint a second timing key per candidate. Each candidate's result is one
+  of five shapes, distinguished by the **presence**, not merely the value, of the `ranked` key on
+  a returned row (`decision:1435` C1/C2):
+  - **Present** (`ranked` key `true`, the candidate's ref among the — **up to 20**, never an
+    absolute count — returned rows): **the probe passes immediately** on this candidate. The
+    output names which candidate succeeded and at what rank (e.g. "candidate 2 of 3, insight:451
+    at rank 17 of 20"), so the operator sees the margin, not just a bare pass.
+  - **Degraded** (`ranked` key present and `false`, the honest waiver) — **the probe passes
+    immediately**, short-circuiting exactly like Present: results were returned, and the
+    summary-presence assertion is waived with an explicit printed line stating Tier-3 narratives
+    are omitted in degraded mode by design (measured in the 2026-08-21 stress test; v0.8.54 ruling
+    "ranked, not guaranteed").
+  - **Keyword fallback** (`ranked` key ABSENT entirely — the coordinator's keyword-fallback shape,
+    served when the embedder is unreachable; rows carry no `ranked`, no `ref`, no `pg_id`) — an
+    **immediate hard failure that stops the probe** without trying further candidates. The
+    embedder being gone is not a per-row problem that a different candidate could route around;
+    trying more candidates against a dead embedder would only waste the client timeout budget
+    three times over for no better answer. Conflating this with honest degraded mode would let a
+    dead embedder exit the whole run green, since re-baseline A4 performs no save and so never
+    independently trips the embedding mandate.
+  - **Absent** (`ranked: true`, the candidate's ref not among the — up to 20 — returned rows) or
+    **Empty** (zero results for that candidate's phrase) — **try the next candidate.** Neither is
+    a probe failure on its own; the probe fails only if every attempted candidate ends this way (or
+    the keyword-fallback case fires).
+  - **Error / unparseable** (a transport error, or no parseable JSON — a timeout by another name) —
+    **try the next candidate**, same as Absent/Empty. If the probe's **final** outcome is decided
+    by this shape (every candidate ended here, or the last one attempted did, with no earlier
+    Present/Degraded/Keyword-fallback), the probe's timing is recorded as `null` in
+    `search_rebaseline` rather than the timeout ceiling — invariant 6 applied to the whole probe's
+    decisive attempt, not to an individual search that a later candidate's real result superseded.
+
+**Pass criterion (re-baseline mode).** The FIRST candidate (of up to 3, tried in order) that comes
+back Present or Degraded passes the whole probe. Fail only if the keyword-fallback shape is
+detected (immediate) or if none of the attempted candidates comes back at all.
+
+**Failure meaning (re-baseline mode).** No live summary readable when the mode-selection count
+said at least one should exist: the count and this read disagree — check the store directly. All
+attempted candidates Absent/Empty/unparseable: the failure message names the **two preconditions**
+a candidate must clear, so a reader can tell a rerank cut from a broken read path — **(a)** the
+summary must first win its kind's single Tier-3 candidate slot, chosen by vector nearest-neighbour
+(`coordinator.py:6164-6205` — the caller's search `limit` does not widen this slot count), and
+**(b)** it must then survive the rerank cut against the Tier-1 candidates in the pool. A failure at
+this point, with 3 independent candidates all clearing neither, is a genuine read-path break, not
+a rank complaint on any single row. `ranked` key missing: semantic search itself is down (keyword
+fallback is serving), which A4's zero-save contract would otherwise leave undetected in this mode.
+
+**SEC-01 — control-character stripping** (`decision:1439`, correcting `fact:1437`'s CRITICAL
+"terminal escape sequence injection" finding to REQUIRED). `select_summary_phrase` strips C0
+(`0x00`–`0x1F`, ESC `0x1B` included) and C1 (`0x80`–`0x9F`) control characters from the phrase
+before it is ever printed or searched. **The mechanism, stated correctly**: `postflight.sh`'s
+`printf '%s'` idiom does not interpret escapes in its argument, so no code executes — the real
+impact is that raw ESC/control bytes, if left in a phrase extracted from corpus content, pass
+through verbatim to whatever terminal or log viewer renders postflight's output. That is
+operator-visible **output spoofing and log poisoning** on a diagnostic tool (by an actor who can
+already write corpus content — not privilege escalation), which is a real, cheaply-fixed class
+even though it is not code execution.
 
 ## A6 — Baseline emission (measurement, never a gate)
 
-**Check.** Time three operations — a short save (~160 chars, A4's canary), a realistic save
-(~3.5 KB), and a search — and write a baseline JSON to
+**Check.** The baseline JSON always carries a `"mode": "install" | "re-baseline"` field naming
+which mode produced it.
+
+**In CANARY MODE**, behavior is unchanged: time three operations — a short save (~160 chars, A4's
+canary), a realistic save (~3.5 KB), and a search — and write a baseline JSON to
 `~/.shared-memory/postflight/baseline-<UTC ISO8601>.json` containing: the three timings, the
 `/health` `backend_capability` block, a hardware fingerprint (thread count via `nproc`,
 `MemTotal`, the `lspci` VGA line always, plus an `nvtop` presence boolean), framework version and
@@ -130,6 +253,19 @@ short-circuits the timing. **Measurement honesty:** the `uv` environment is warm
 before the first timed operation (on a fresh host uv's resolution would otherwise dominate the
 number); each timing window contains exactly one save; a timed-out operation records `null`,
 never the timeout ceiling; and the JSON carries a note stating all three rules.
+
+**In RE-BASELINE MODE**, A6 performs **no saves of any kind** (mirroring A4's zero-saves
+contract). `save_short` and `save_realistic` are both `null`, with a note naming the accepted
+trade — write-path timing stays anchored to the original install canary. **`search` stays
+canary-search-only and is `null` in this mode**, with a note explaining why (fix-round ruling
+`decision:1435`, R2: a metric whose meaning silently changes between modes while its name stays
+constant is the framework's known monitor-class defect — canary-mode `search` times a
+project-filtered search for a unique marker; re-baseline's phrase search is unfiltered and
+whole-corpus, a different workload). A5's summary-search timing instead lands under its **own**
+key, `search_rebaseline` — `null` in canary mode, populated in re-baseline mode. Everything else —
+`backend_capability`, `capacity`, `hardware`, `framework_version`, `date` — is unchanged,
+read-only, and rendered identically to canary mode; **the capacity verdict section (below the JSON
+write) is untouched by mode.**
 
 **Pass criterion.** None — A6 is a measurement. A written baseline is the deliverable; a slow
 number is information, not a failure. It gives a later "the system feels slow" session a

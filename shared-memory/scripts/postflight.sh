@@ -74,6 +74,61 @@ json_keys() {  # sorted comma-joined top-level keys of the JSON on stdin
     python3 -c 'import json,sys; print(",".join(sorted(json.load(sys.stdin).keys())))' 2>/dev/null
 }
 
+# >>> SELECT_SUMMARY_PHRASE (tests/test_postflight_rebaseline.py extracts this
+# block VERBATIM by its markers and runs it standalone via subprocess with
+# fixture stdin — python3 stdlib only, keep it self-contained. WP-R3.)
+select_summary_phrase() {  # reads one community_summaries row's content on
+    # stdin, prints a deterministic distinctive phrase, or nothing + exit 1
+    # when the content yields no words at all.
+    python3 -c '
+import re, sys
+
+def select_phrase(content):
+    """Pure function of content -> a short phrase for A5 re-baseline mode to
+    search for. The same content always yields the same phrase (determinism).
+    Strips a leading bracket-tag prefix from each line -- for a zero-
+    inference thematic summary, content is literally the output of
+    consolidation_loop.py fold_record_line(), joined line by line, e.g.
+    "[FACT]" or
+    "[DECISION kind=observation from=\"x\" recorded=... pg_id=123]" -- so a
+    naive first-N-words grab would surface the machine tag, not the summary
+    prose. Falls back to the raw content when every line is prefix-only (still
+    returns something rather than nothing). str.split() splits on any Unicode
+    whitespace, so this is unicode-safe; a short summary just yields fewer
+    words, never a crash or an empty result unless the content truly has none."""
+    lines = content.splitlines()
+    cleaned = []
+    for line in lines:
+        line = re.sub(r"^\[[^\]]*\]\s*", "", line).strip()
+        if line:
+            cleaned.append(line)
+    text = " ".join(cleaned) if cleaned else content.strip()
+    words = text.split()
+    if not words:
+        return None
+    phrase = " ".join(words[:8])
+    # SEC-01 (decision:1439, correcting fact:1437 CRITICAL to REQUIRED): strip
+    # C0 (0x00-0x1F, ESC 0x1B included) and C1 (0x80-0x9F) control characters
+    # from the FINAL phrase before it is ever printed or searched. The real
+    # mechanism, stated correctly: postflight.sh printf %s does not interpret
+    # escapes in its argument -- nothing here executes -- but raw ESC/control
+    # bytes left in a phrase pulled from corpus content pass through verbatim
+    # to whatever terminal or log viewer renders postflight output. That is
+    # operator-visible output spoofing and log poisoning on a diagnostic
+    # tool, by an actor who can already write corpus content -- not code
+    # execution, but a real class, and one regex closes it.
+    phrase = re.sub(r"[\x00-\x1f\x80-\x9f]", "", phrase)
+    return phrase if phrase else None
+
+phrase = select_phrase(sys.stdin.read())
+if phrase:
+    print(phrase)
+else:
+    sys.exit(1)
+'
+}
+# <<< SELECT_SUMMARY_PHRASE
+
 # GNU date assumed (%3N) — like the rest of the stack (Linux/docker hosts).
 # Bash builtin, never `date`: uutils coreutils (default on Ubuntu ≥25.10)
 # ignores the %3N width in `date +%s%3N` and returns nanoseconds — every timing
@@ -94,6 +149,30 @@ do_save() {  # do_save <content>  — prints the bridge's JSON reply
 }
 
 echo "Shared Memory — postflight verification (spec: shared-memory/Documentation/postflight.md)"
+echo
+
+# ── Mode selection (W-P, WP-R1) ────────────────────────────────────────────────
+# Runtime-detected, no new flag: CANARY MODE (current behavior, unchanged) while
+# the corpus holds ZERO live non-superseded community_summaries rows (either
+# kind); RE-BASELINE MODE once at least one exists. Contract refinement of the
+# v0.9.17 postflight (fact:1402/decision:1403 lineage). When the count itself is
+# undeterminable (docker missing, or the store unreachable) this FALLS BACK to
+# CANARY MODE — the safer default, since it preserves today's verification
+# rather than silently skipping a check it could not confirm was safe to skip.
+POSTFLIGHT_MODE="install"
+live_summary_count=""
+if command -v docker >/dev/null 2>&1; then
+    live_summary_count="$(docker exec "$PG_CONTAINER" psql -U postgres -d "$PG_DB" -tAc \
+            "SELECT count(*) FROM community_summaries WHERE NOT superseded" 2>/dev/null | tr -d '[:space:]')"
+fi
+if [[ "$live_summary_count" =~ ^[0-9]+$ && "$live_summary_count" -ge 1 ]]; then
+    POSTFLIGHT_MODE="re-baseline"
+    echo "Mode: RE-BASELINE ($live_summary_count live non-superseded community summaries found) — A4 saves nothing (write-path proof stays anchored to the install canary); A5 proves the read path against a live Tier-3 summary; A6's save timings are null."
+elif [[ "$live_summary_count" =~ ^[0-9]+$ ]]; then
+    echo "Mode: CANARY (0 live non-superseded community summaries) — install-mode behavior, unchanged: A4/A6 save fresh canaries."
+else
+    echo "Mode: CANARY (community_summaries count undeterminable — docker missing or the store unreachable; defaulting to canary mode)."
+fi
 echo
 
 # ── A1 — liveness & shape ─────────────────────────────────────────────────────
@@ -145,9 +224,21 @@ print(",".join(k for k in ("daemon", "backend_capability", "config") if k not in
         else
             # ONE clear message; A4/A5/A6 are marked here and print a single
             # skip line each — never a cascade of confusing errors.
-            bad A1 "auth is configured but AGENT_TOKEN is not set — export AGENT_TOKEN=<any minted agent token, from that agent's skill .env> and re-run. A4, A5 and A6 are skipped for this same missing token."
+            #
+            # Fix round R1 (decision:1435): in re-baseline mode A4 needs no
+            # token at all (it performs no gateway call — see A4 below), so
+            # it must never be pre-marked failed here, and this message must
+            # not name it among what a missing token skips in that mode —
+            # spec wins, A4 cannot contribute to the exit code in re-baseline
+            # mode, INCLUDING indirectly via this earlier mark.
+            if [[ "$POSTFLIGHT_MODE" == "re-baseline" ]]; then
+                bad A1 "auth is configured but AGENT_TOKEN is not set — export AGENT_TOKEN=<any minted agent token, from that agent's skill .env> and re-run. A5 and A6 are skipped for this same missing token (A4 needs no token in re-baseline mode)."
+            else
+                bad A1 "auth is configured but AGENT_TOKEN is not set — export AGENT_TOKEN=<any minted agent token, from that agent's skill .env> and re-run. A4, A5 and A6 are skipped for this same missing token."
+                afail[A4]=1
+            fi
             token_missing=1
-            afail[A4]=1; afail[A5]=1
+            afail[A5]=1
         fi
     else
         missing="$(printf '%s' "$anon_health" | python3 -c '
@@ -224,7 +315,12 @@ pg_id=""
 short_ms=""
 marker="$(date -u +%Y-%m-%dT%H:%M:%SZ) run-$$-$RANDOM"
 
-if [[ "$token_missing" == "1" ]]; then
+if [[ "$POSTFLIGHT_MODE" == "re-baseline" ]]; then
+    # WP-R2: no saves of any kind; cannot fail in this mode — there is
+    # nothing left here for A4 to assert. Unconditional: does not depend on
+    # gateway/token state, since it performs no gateway call at all.
+    ok "A4 re-baseline mode: no canary save performed — write-path proof stays anchored to the install canary (accepted trade: re-triggers no longer re-prove the write path once the corpus has matured; writes were measured as the resilient path throughout stress testing — fact:1402/decision:1403 lineage)"
+elif [[ "$token_missing" == "1" ]]; then
     warn "A4 skipped — AGENT_TOKEN missing (see A1)"
 elif [[ "$gateway_down" == "1" ]]; then
     bad A4 "skipped — gateway unreachable (see A1)"
@@ -314,7 +410,161 @@ echo
 echo "A5 — read path:"
 
 search_ms=""
-if [[ "$token_missing" == "1" ]]; then
+search_rebaseline_ms=""   # R2 (decision:1435): its OWN timing key — never
+                          # shares "search" with the canary-mode timing,
+                          # since the two time different workloads (a
+                          # project-filtered marker search vs an unfiltered
+                          # whole-corpus phrase search).
+if [[ "$POSTFLIGHT_MODE" == "re-baseline" ]]; then
+    # WP-R3: prove the read path against a LIVE Tier-3 summary, selected at
+    # run time (never a pinned id — supersession would orphan the check).
+    if [[ "$token_missing" == "1" ]]; then
+        warn "A5 skipped — AGENT_TOKEN missing (see A1)"
+    elif [[ "$gateway_down" == "1" ]]; then
+        bad A5 "skipped — gateway unreachable (see A1)"
+    elif ! command -v docker >/dev/null 2>&1; then
+        bad A5 "docker not found on PATH — cannot select a live Tier-3 summary for re-baseline verification"
+    else
+        # QA-01 (decision:1439): BOUNDED MULTI-CANDIDATE PROBE, not a
+        # single-summary gate. The 3 most-recently-updated live rows
+        # (either kind, in order); fewer than 3 live rows: use what
+        # exists. json_agg(... ORDER BY updated_at DESC) keeps embedded
+        # newlines/unicode JSON-escaped and the ordering explicit; COALESCE
+        # covers the zero-row case (json_agg returns NULL, not '[]', on an
+        # empty input set).
+        #
+        # Why 3, measured not chosen (fact:1438 sweep, all 21 live rows on
+        # the reference install, same selector/limit-20 search this script
+        # runs): exactly 1/21 rows fails individually -- both its Tier-3
+        # candidate slots lost the rerank cut against 20 Tier-1 facts. At
+        # that rate no set of 3 DISTINCT rows on this corpus can consist
+        # entirely of failures, while a wholesale Tier-3 retrieval break
+        # still fails all 3 loudly. This is a property of this corpus at
+        # this moment, not a constant -- the fresh-install VM test
+        # re-measures it on a young corpus.
+        candidates_json="$(docker exec "$PG_CONTAINER" psql -U postgres -d "$PG_DB" -tAc \
+                "SELECT COALESCE(json_agg(row_json ORDER BY updated_at DESC), '[]') FROM (SELECT json_build_object('id', id, 'content', content, 'kind', COALESCE(metadata->>'kind','thematic')) AS row_json, updated_at FROM community_summaries WHERE NOT superseded ORDER BY updated_at DESC LIMIT 3) sub" 2>/dev/null)"
+        candidate_count="$(printf '%s' "$candidates_json" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = None
+print(len(d) if isinstance(d, list) else 0)
+' 2>/dev/null)"
+        if [[ ! "$candidate_count" =~ ^[0-9]+$ || "$candidate_count" -lt 1 ]]; then
+            bad A5 "re-baseline mode selected on a nonzero live-summary count, but no live non-superseded community_summaries rows could be read just now for the multi-candidate probe — the count and this read disagree; the corpus may have changed between the two, or the store is unreachable"
+        else
+            probe_pass_message=""
+            probe_hardfail_message=""
+            probe_last_message=""
+            probe_last_was_catchall=0
+            t0="$(now_ms)"
+            for cand_idx in $(seq 1 "$candidate_count"); do
+                cand_row="$(printf '%s' "$candidates_json" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(json.dumps(d[$cand_idx - 1]))
+")"
+                cand_id="$(printf '%s' "$cand_row" | json_get id)"
+                cand_kind="$(printf '%s' "$cand_row" | json_get kind)"
+                cand_content="$(printf '%s' "$cand_row" | json_get content)"
+                cand_ref_type="summary"
+                [[ "$cand_kind" == "insight" ]] && cand_ref_type="insight"
+                cand_ref="${cand_ref_type}:${cand_id}"
+                cand_phrase="$(printf '%s' "$cand_content" | select_summary_phrase)"
+                if [[ -z "$cand_phrase" ]]; then
+                    probe_last_message="candidate $cand_idx of $candidate_count, $cand_ref has no extractable phrase (content yields no words after cleaning)"
+                    probe_last_was_catchall=0
+                    continue
+                fi
+                cand_search_out="$(timeout "$CLIENT_TIMEOUT" uv run --with httpx --with python-dotenv \
+                        python "$BRIDGE" search "$cand_phrase" 20 2>/dev/null)"
+                # C2 (decision:1435): the coordinator keyword-fallback shape
+                # (served when the embedder is unreachable) omits the
+                # "ranked" key entirely -- a DIFFERENT signal from an honest
+                # ranked:false degraded result, never graded as one.
+                # QA-02 (decision:1439): report the ACTUAL returned count
+                # (n), never a hardcoded 20 -- the set is at MOST 20 and
+                # smaller on a young or filtered corpus.
+                cand_verdict="$(printf '%s' "$cand_search_out" | python3 -c '
+import json, sys
+ref = sys.argv[1]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("BADJSON"); sys.exit(0)
+if isinstance(d, dict):
+    print("ERROR:" + str(d.get("message") or d.get("error") or "unexpected reply")[:200]); sys.exit(0)
+if not d:
+    print("EMPTY"); sys.exit(0)
+if "ranked" not in d[0]:
+    print("KEYWORD_FALLBACK"); sys.exit(0)
+ranked = bool(d[0].get("ranked"))
+n = len(d)
+if ranked:
+    idx = next((i for i, r in enumerate(d) if r.get("ref") == ref), None)
+    print(("PRESENT:%d:%d" % (idx + 1, n)) if idx is not None else ("ABSENT:%d" % n))
+else:
+    print("DEGRADED")
+' "$cand_ref")"
+                case "$cand_verdict" in
+                    PRESENT:*)
+                        rest="${cand_verdict#PRESENT:}"
+                        cand_rank="${rest%%:*}"
+                        cand_total="${rest#*:}"
+                        probe_pass_message="A5 re-baseline: candidate $cand_idx of $candidate_count, $cand_ref present at rank $cand_rank of $cand_total for phrase \"$cand_phrase\" (presence, not rank, asserted — v0.8.54 gives no rank guarantee)"
+                        break
+                        ;;
+                    DEGRADED)
+                        probe_pass_message="A5 re-baseline: candidate $cand_idx of $candidate_count, $cand_ref — results returned, DEGRADED mode declared honestly — Tier-3 narratives are omitted in degraded mode by design (measured in the 2026-08-21 stress test; v0.8.54 ruling \"ranked, not guaranteed\"); the presence assertion is WAIVED for this candidate, not silently passed"
+                        break
+                        ;;
+                    KEYWORD_FALLBACK)
+                        # Immediate hard failure -- do NOT keep trying
+                        # candidates. The embedder being gone is not a
+                        # per-row problem a different candidate could route
+                        # around; re-baseline A4 performs no save, so this
+                        # would otherwise pass undetected.
+                        probe_hardfail_message="re-baseline: candidate $cand_idx of $candidate_count, $cand_ref — results carry no \"ranked\" key at all, semantic search is not serving, keyword-fallback shape detected (the embedder is unreachable); the probe stops here rather than trying more candidates"
+                        break
+                        ;;
+                    ABSENT:*)
+                        cand_total="${cand_verdict#ABSENT:}"
+                        probe_last_message="candidate $cand_idx of $candidate_count, $cand_ref absent from the $cand_total returned rows"
+                        probe_last_was_catchall=0
+                        ;;
+                    EMPTY)
+                        probe_last_message="candidate $cand_idx of $candidate_count, $cand_ref — search returned zero results"
+                        probe_last_was_catchall=0
+                        ;;
+                    ERROR:*)
+                        probe_last_message="candidate $cand_idx of $candidate_count, $cand_ref — search failed: ${cand_verdict#ERROR:}"
+                        probe_last_was_catchall=0
+                        ;;
+                    *)
+                        probe_last_message="candidate $cand_idx of $candidate_count, $cand_ref — no parseable JSON (timeout after ${CLIENT_TIMEOUT}s?)"
+                        probe_last_was_catchall=1
+                        ;;
+                esac
+            done
+            t1="$(now_ms)"
+            search_rebaseline_ms=$((t1 - t0))
+            if [[ -n "$probe_pass_message" ]]; then
+                ok "$probe_pass_message"
+            elif [[ -n "$probe_hardfail_message" ]]; then
+                bad A5 "$probe_hardfail_message"
+            else
+                # QA-03 (decision:1439): name the two preconditions so a
+                # reader can tell a rerank cut from a broken read path.
+                bad A5 "none of the $candidate_count attempted candidate(s) came back — last: ${probe_last_message:-no candidate could be evaluated}. A candidate must (a) win its kind's single Tier-3 slot by vector nearest-neighbour, then (b) survive the rerank cut against the Tier-1 candidates in the pool — a genuine break here, across $candidate_count independent candidates, is a real read-path failure, not a rank complaint on any single row"
+                if [[ "$probe_last_was_catchall" == "1" ]]; then
+                    search_rebaseline_ms=""   # the decisive attempt was unparseable/timed out — not a measurement
+                fi
+            fi
+        fi
+    fi
+elif [[ "$token_missing" == "1" ]]; then
     warn "A5 skipped — AGENT_TOKEN missing (see A1)"
 elif [[ "$gateway_down" == "1" ]]; then
     bad A5 "skipped — gateway unreachable (see A1)"
@@ -370,8 +620,15 @@ if [[ "$token_missing" == "1" ]]; then
 elif [[ "$gateway_down" == "1" ]]; then
     warn "A6 skipped — gateway unreachable (see A1)"
 else
-    # Realistic save ~3.5 KB, unique per run (timestamp embedded in the marker).
-    big_content="$(python3 -c '
+    big_ms=""
+    if [[ "$POSTFLIGHT_MODE" == "re-baseline" ]]; then
+        # WP-R2/WP-R4: zero saves in this mode, mirroring A4 — the realistic
+        # canary is a save too. save_short/save_realistic stay null; the
+        # baseline JSON's note explains why.
+        ok "A6 re-baseline mode: no realistic-payload save performed — save_short/save_realistic are recorded null (write-path timing stays anchored to the install canary, same accepted trade as A4); canary-mode search is null in this mode; summary-search (search_rebaseline) ${search_rebaseline_ms:-?} ms"
+    else
+        # Realistic save ~3.5 KB, unique per run (timestamp embedded in the marker).
+        big_content="$(python3 -c '
 import sys
 marker = sys.argv[1]
 para = ("This is the postflight realistic-payload canary for the Shared Memory "
@@ -381,21 +638,21 @@ para = ("This is the postflight realistic-payload canary for the Shared Memory "
         "design and unique per run, so idempotency never short-circuits the timing. ")
 print(("Shared Memory install-verification realistic canary " + marker + " — " + para * 12)[:3500])
 ' "$marker")"
-    t0="$(now_ms)"
-    big_out="$(do_save "$big_content")"
-    t1="$(now_ms)"
-    big_ms=""
-    if [[ "$(printf '%s' "$big_out" | json_get status)" == "success" ]]; then
-        big_ms=$((t1 - t0))
-        ok "A6 realistic save timed (${big_ms} ms; short save ${short_ms:-?} ms; search ${search_ms:-?} ms)"
-    else
-        warn "A6 realistic save did not succeed — its timing is recorded as null"
+        t0="$(now_ms)"
+        big_out="$(do_save "$big_content")"
+        t1="$(now_ms)"
+        if [[ "$(printf '%s' "$big_out" | json_get status)" == "success" ]]; then
+            big_ms=$((t1 - t0))
+            ok "A6 realistic save timed (${big_ms} ms; short save ${short_ms:-?} ms; search ${search_ms:-?} ms)"
+        else
+            warn "A6 realistic save did not succeed — its timing is recorded as null"
+        fi
     fi
 
     base_file="$HOME/.shared-memory/postflight/baseline-$(date -u +%Y%m%dT%H%M%SZ).json"
     written="$(printf '%s' "${health_full:-$anon_health}" | python3 -c '
 import datetime, json, os, shutil, subprocess, sys
-path, short_ms, big_ms, search_ms, fw = sys.argv[1:6]
+path, short_ms, big_ms, search_ms, search_rebaseline_ms, fw, mode = sys.argv[1:8]
 try:
     h = json.load(sys.stdin)
 except Exception:
@@ -430,16 +687,34 @@ try:
 except Exception:
     pass
 
+note = ("wall-clock through the client bridge; uv environment pre-warmed "
+        "untimed; exactly one save per timing window; a timed-out "
+        "operation records null, never the timeout ceiling")
+if mode == "re-baseline":
+    # R2 (decision:1435): search stays canary-search-only and is null here
+    # -- the two workloads (project-filtered marker search vs unfiltered
+    # whole-corpus phrase search) do not share a timing field even though
+    # the earlier build made that mistake; search_rebaseline is the key A5
+    # populates instead, only in this mode. A metric whose meaning
+    # silently changes while its name stays constant is the known
+    # monitor-class defect this avoids.
+    note += (". re-baseline mode: save_short/save_realistic are null by "
+             "design (no saves in this mode, W-P/fact:1402 lineage) -- "
+             "write-path timing stays anchored to the original install "
+             "canary; search is null in this mode (canary-search-only "
+             "field); the A5 summary-search timing lands under its own "
+             "key, search_rebaseline")
+
 doc = {
+    "mode": mode,
     "framework_version": fw or h.get("version"),
     "date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "timings_s": {
         "save_short": secs(short_ms),
         "save_realistic": secs(big_ms),
         "search": secs(search_ms),
-        "note": ("wall-clock through the client bridge; uv environment pre-warmed "
-                 "untimed; exactly one save per timing window; a timed-out "
-                 "operation records null, never the timeout ceiling"),
+        "search_rebaseline": secs(search_rebaseline_ms),
+        "note": note,
     },
     "backend_capability": h.get("backend_capability"),
     # R0-I (decision:1424), trigger "manual": the current CAPACITY record the
@@ -447,6 +722,8 @@ doc = {
     # authenticated /health payload -- no re-derivation happens in bash. None
     # when the gateway has not derived one yet (fresh install, first probe
     # still in flight) or when only the anonymous payload was available.
+    # Rendered identically in both modes -- the capacity verdict section
+    # below is untouched by mode (WP-R4).
     "capacity": h.get("capacity"),
     "hardware": hw,
 }
@@ -454,7 +731,7 @@ os.makedirs(os.path.dirname(path), exist_ok=True)
 with open(path, "w") as f:
     json.dump(doc, f, indent=2)
 print(path)
-' "$base_file" "${short_ms:-}" "${big_ms:-}" "${search_ms:-}" "${checkout_fw:-}")"
+' "$base_file" "${short_ms:-}" "${big_ms:-}" "${search_ms:-}" "${search_rebaseline_ms:-}" "${checkout_fw:-}" "$POSTFLIGHT_MODE")"
     if [[ -n "$written" ]]; then
         ok "A6 baseline written: $written"
     else
