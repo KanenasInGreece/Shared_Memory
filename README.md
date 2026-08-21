@@ -693,6 +693,27 @@ llama-server -m bge-reranker-v2-m3-Q8_0.gguf --port 8071 --rerank -c 8192 -b 819
 Keep them as separate processes: the embedder is on the critical write path (a save is refused
 rather than stored without a vector); the reranker degrades gracefully to vector order.
 
+### The capacity instrument — what the gateway knows about your hardware
+
+The gateway derives a capacity record for the host it runs on — at first healthy start, on
+every restart where the hardware or encoder configuration changed, and when measured encoder
+throughput drifts. Each record carries its full provenance (hardware fingerprint, encoder
+configuration, the probe readings it was derived from, and which event triggered it), lives
+in a small local log, and is served on authenticated `/health`; postflight renders it as a
+plain-language verdict. From it come three numbers: the projected worst-case rerank-stage
+service time, the sustainable queue depth against a tolerable wait
+(`CAPACITY_TOLERABLE_WAIT_S`, default 30 s — a measured, human-validated default, not a
+guess), and a proposed reranker memory limit, derived per host and never applied for you.
+
+The division of labor is deliberate. **The probe measures what the machine can do. The
+policy defines how much latency you are willing to tolerate. The queue bound keeps operation
+inside that region. The memory limit prevents the model from being violated when reality
+differs from the derivation.** The first is measurement, the second is your call, the third
+is arithmetic (Little's law: no more than *tolerable wait ÷ service time* requests may be in
+the system if every one is to leave in time), and the fourth is the safeguard you choose to
+apply — the reranker is the one component it may sacrifice, because it is the one with a
+graceful fallback.
+
 ### What a small GPU buys the encoders — measured
 
 The encoders are where a cheap GPU pays for itself, and we measured it rather than assumed it.
