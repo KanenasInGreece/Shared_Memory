@@ -11,7 +11,7 @@
 #   A3  schema truth            delegates to the two shipped verifiers
 #   A4  write path end to end   canary save → 1024-dim vector → outbox applied → :Fact
 #   A5  read path, graded       search finds the canary; reranked OR declared degraded
-#   A6  baseline emission       timings + backend_capability + hardware → JSON (never a gate)
+#   A6  baseline emission       timings + backend_capability + capacity + hardware → JSON (never a gate)
 #   A7  conduct constraints     by construction — see the spec; stated, not tested
 #
 # Exit 0 iff A1–A5 all pass. Run after first install (AGENTS.md Phase 9) and
@@ -442,6 +442,12 @@ doc = {
                  "operation records null, never the timeout ceiling"),
     },
     "backend_capability": h.get("backend_capability"),
+    # R0-I (decision:1424), trigger "manual": the current CAPACITY record the
+    # gateway already derived and stored, fetched verbatim off the
+    # authenticated /health payload -- no re-derivation happens in bash. None
+    # when the gateway has not derived one yet (fresh install, first probe
+    # still in flight) or when only the anonymous payload was available.
+    "capacity": h.get("capacity"),
     "hardware": hw,
 }
 os.makedirs(os.path.dirname(path), exist_ok=True)
