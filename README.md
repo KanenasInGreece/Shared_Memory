@@ -155,8 +155,11 @@ With no LLM configured nothing dies: saves, search and the graph keep working; s
 insights queue durably until a backend appears. Searches on CPU encoders took ~30 seconds here.
 This configuration has also been verified end to end on a deliberately modest VM — 6 vCPUs of
 a 2013 Xeon E3-1230 v3, 12 GB RAM, 30 GB disk, Ubuntu Server 26.04 with Docker — where the full
-install passed postflight with a 5.5 s realistic save and 1.5 s search on the CPU encoders,
-using ~5 GB steady-state with the whole stack up.
+install passed postflight with a 5.5 s realistic save, ~5 GB steady-state with the whole stack
+up, and searches measured at both ends of the reranking trade: ~1.3 s unranked vector order,
+~70 s with the reranker scoring the full default payload (22 candidates, uncapped documents) on
+that CPU — real distinct scores, zero crashes at 12 GB. `RERANK_MAX_DOC_CHARS`
+([§17](#17-inference-the-encoders-and-the-reasoning-llm)) is the dial between those two points.
 *Example minimum: 4–8 threads · 16 GB RAM · no GPU · 30 GB disk.*
 
 **② A small GPU (~4 GB).** Everything in ①, plus two `.env` lines (`GPU_ENCODER_REPLICAS=1`,
