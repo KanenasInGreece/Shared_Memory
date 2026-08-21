@@ -2478,9 +2478,30 @@ def _capacity_neo4j_allowance_bytes() -> int | None:
     back to the default rather than guessing the missing half. None
     (never silently 0) when the fallback itself fails to parse -- M5, fix
     round: the caller decides what an unparsable allowance means for the
-    overall recommendation."""
-    heap = _parse_mem_size(os.environ.get("NEO4J_HEAP_MAX"))
-    pagecache = _parse_mem_size(os.environ.get("NEO4J_PAGECACHE"))
+    overall recommendation.
+
+    N3 (fix round 2): a variable that was left UNSET falls back silently --
+    that is the normal, expected "not configured" case, nothing failed.
+    A variable that WAS set but rejected by _parse_mem_size is different:
+    the operator tried to configure this and got silently overridden by the
+    default, which used to leave no trace anywhere. One warning names the
+    rejected variable (never its value -- these are memory sizes, not
+    secrets, but there is no reason to echo a malformed operator string back
+    into the log either); the fallback behavior itself is unchanged."""
+    heap_raw = os.environ.get("NEO4J_HEAP_MAX")
+    pagecache_raw = os.environ.get("NEO4J_PAGECACHE")
+    heap = _parse_mem_size(heap_raw)
+    pagecache = _parse_mem_size(pagecache_raw)
+    if heap_raw is not None and heap is None:
+        log.warning(
+            "capacity: NEO4J_HEAP_MAX is set but did not parse as a memory "
+            "size -- using the CAPACITY_NEO4J_FALLBACK_BYTES default for "
+            "the neo4j allowance")
+    if pagecache_raw is not None and pagecache is None:
+        log.warning(
+            "capacity: NEO4J_PAGECACHE is set but did not parse as a "
+            "memory size -- using the CAPACITY_NEO4J_FALLBACK_BYTES "
+            "default for the neo4j allowance")
     if heap is not None and pagecache is not None:
         return heap + pagecache
     return CAPACITY_NEO4J_FALLBACK_BYTES
@@ -2687,6 +2708,13 @@ def _build_capacity_record(capability: dict | None, fingerprint: dict,
             "s_mean_s": s_mean,
             "client_ceiling_s": client_ceiling,
             "queue_bound": queue_bound,
+            # N2 (fix round 2): the tolerance queue_bound was actually
+            # measured against travels WITH the record it produced -- a
+            # reader (postflight, /health, a future dashboard) must not have
+            # to know today's CAPACITY_TOLERABLE_WAIT_S default separately
+            # to make sense of a stored queue_bound; the record is
+            # self-describing even if the operator's setting changes later.
+            "tolerable_wait_s": CAPACITY_TOLERABLE_WAIT_S,
             "single_search_exceeds_wait": single_search_exceeds_wait,
             "recommended_reranker_mem_limit_bytes": recommended_mem_limit,
         },
@@ -2797,7 +2825,12 @@ def _log_capacity_change(trigger: str, last: dict | None, record: dict) -> None:
     config mismatch, or measured drift) and keeps the louder WARNING path
     with that tail (fact:1425 A2: every hardware-era change should produce
     a fresh postflight verification, and this line is where the operator
-    learns that -- log only, the gateway never runs postflight itself)."""
+    learns that -- log only, the gateway never runs postflight itself).
+
+    N1(b) (fix round 2): basis_recovery is likewise informational, not an
+    alarm -- it means the instrument just HEALED itself from an unusable
+    basis, which is good news the operator did nothing to cause and need do
+    nothing about. No re-run-postflight tail either."""
     def _mib(b):
         return f"{b / (1024 ** 2):.0f}MiB" if isinstance(b, (int, float)) else "?"
 
@@ -2807,6 +2840,16 @@ def _log_capacity_change(trigger: str, last: dict | None, record: dict) -> None:
         log.info(
             "capacity baseline established: s_mean %s s, queue_bound %s, "
             "reranker_mem_limit_bytes %s",
+            new_d.get("s_mean_s"), new_d.get("queue_bound"),
+            new_d.get("recommended_reranker_mem_limit_bytes"),
+        )
+        return
+
+    if trigger == "basis_recovery":
+        log.info(
+            "capacity basis recovered: deriving from the first healthy "
+            "probe (s_mean %s s, queue_bound %s, reranker_mem_limit_bytes "
+            "%s)",
             new_d.get("s_mean_s"), new_d.get("queue_bound"),
             new_d.get("recommended_reranker_mem_limit_bytes"),
         )
@@ -2843,10 +2886,10 @@ def _log_capacity_change(trigger: str, last: dict | None, record: dict) -> None:
 
 
 async def _maybe_derive_capacity(capability: dict) -> None:
-    """Called every capability-probe cycle. Decides which of the three
-    passive triggers (if any) fires, derives + stores + logs on a hit, and
-    NEVER raises — this rides the same observability path _probe_capability
-    does, so a bug here must not take down the probe daemon (Group 3)."""
+    """Called every capability-probe cycle. Decides which of the passive
+    triggers (if any) fires, derives + stores + logs on a hit, and NEVER
+    raises — this rides the same observability path _probe_capability does,
+    so a bug here must not take down the probe daemon (Group 3)."""
     global _capacity_first_probe_done
     try:
         fingerprint = _capacity_fingerprint()
@@ -2854,12 +2897,29 @@ async def _maybe_derive_capacity(capability: dict) -> None:
         is_first = not _capacity_first_probe_done
         _capacity_first_probe_done = True
 
+        current_reranker = (capability or {}).get("reranker") or {}
+        current_status = current_reranker.get("status")
+
         trigger = None
         if is_first:
             if last is None:
-                # M7: no prior record ANYWHERE -- this is a first-ever
-                # baseline, not a mismatch (there is nothing to have
-                # mismatched against).
+                # N1(a) (fix round 2): no prior record ANYWHERE -- this is a
+                # first-ever baseline, not a mismatch (there is nothing to
+                # have mismatched against). But a not-ok probe (warming
+                # compose stack, connection refused, fast HTTP error) must
+                # NOT be allowed to establish that baseline: a not-ok basis
+                # blocks every later trigger from ever firing again --
+                # probe_drift requires an "ok" stored basis, config_change
+                # has nothing changed to compare, and a later restart's
+                # fingerprint still matches -- so a single bad first probe
+                # used to freeze the instrument permanently with no operator
+                # remedy. Defer silently (one INFO log) instead; the next
+                # healthy probe cycle derives the baseline normally.
+                if current_status != "ok":
+                    log.info(
+                        "capacity baseline deferred -- reranker probe not "
+                        "ok yet; will derive on the first healthy probe")
+                    return
                 trigger = "first_derivation"
             elif last.get("fingerprint") != fingerprint:
                 trigger = "gateway_start_fingerprint_mismatch"
@@ -2878,7 +2938,15 @@ async def _maybe_derive_capacity(capability: dict) -> None:
                 # Log file cleared/rotated out from under a running process,
                 # OR this process's own first cycle never found one either.
                 # M7: nothing prior exists to have mismatched against, so
-                # this is a fresh baseline too, not an alarm.
+                # this is a fresh baseline too, not an alarm. N1(a): the
+                # same not-ok guard as the is_first branch above applies
+                # here too -- a not-ok probe must not become the first
+                # stored basis via this path either.
+                if current_status != "ok":
+                    log.info(
+                        "capacity baseline deferred -- reranker probe not "
+                        "ok yet; will derive on the first healthy probe")
+                    return
                 trigger = "first_derivation"
             elif last.get("fingerprint", {}).get(
                     "encoder_config") != fingerprint.get("encoder_config"):
@@ -2887,9 +2955,7 @@ async def _maybe_derive_capacity(capability: dict) -> None:
                 probe_block = (last.get("probe") or {})
                 basis = probe_block.get("reranker_chars_per_s")
                 basis_status = probe_block.get("reranker_status")
-                current_block = (capability or {}).get("reranker") or {}
-                current = current_block.get("throughput_chars_s")
-                current_status = current_block.get("status")
+                current = current_reranker.get("throughput_chars_s")
                 # H3: a probe that did not answer "ok" produces fantasy
                 # throughput (a fast HTTP error can read as near-zero
                 # latency), so it must never fire drift and must never
@@ -2900,6 +2966,22 @@ async def _maybe_derive_capacity(capability: dict) -> None:
                 if (basis_status == "ok" and current_status == "ok"
                         and _capacity_drift_outside_band(current, basis)):
                     trigger = "probe_drift"
+
+        if trigger is None and last is not None:
+            # N1(b) (fix round 2): recovers an already-stored not-ok basis
+            # (or a status-less legacy record predating this field -- absent
+            # reads the same as not-ok here) the moment a healthy probe shows
+            # up. Mirror image of (a): the only remedy for a basis that was
+            # ALREADY poisoned before this fix landed, since (a) alone only
+            # stops NEW poisoning. No operator action needed -- the next
+            # healthy probe cycle heals it on its own. Only reached once
+            # every trigger above has had its say: a fingerprint/config
+            # change already produces a fresh (healthy) record on its own,
+            # so this exists specifically for the "nothing else moved" case
+            # that used to go permanently, silently stuck.
+            basis_status = (last.get("probe") or {}).get("reranker_status")
+            if basis_status != "ok" and current_status == "ok":
+                trigger = "basis_recovery"
 
         if trigger is None:
             return

@@ -173,6 +173,24 @@ def test_mem_size_parser_handles_k8s_binary_notation(monkeypatch, tmp_path):
     assert g._parse_mem_size("4Ki") == 4 * 1024
 
 
+def test_neo4j_allowance_warns_when_exactly_one_var_fails_to_parse(monkeypatch, tmp_path, caplog):
+    """N3 (fix round 2): NEO4J_HEAP_MAX set-but-unparsable + NEO4J_PAGECACHE
+    set-and-valid must still fall back to CAPACITY_NEO4J_FALLBACK_BYTES
+    (behavior unchanged -- partial config can't be combined), but now names
+    the rejected variable in a warning instead of failing silently. The
+    valid sibling variable must NOT be named -- only the one that actually
+    failed to parse."""
+    monkeypatch.setenv("NEO4J_HEAP_MAX", "not-a-size")
+    monkeypatch.setenv("NEO4J_PAGECACHE", "1G")
+    g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
+    with caplog.at_level("WARNING"):
+        result = g._capacity_neo4j_allowance_bytes()
+    assert result == g.CAPACITY_NEO4J_FALLBACK_BYTES
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("NEO4J_HEAP_MAX" in m for m in messages)
+    assert not any("NEO4J_PAGECACHE" in m for m in messages)
+
+
 def test_recommended_mem_limit_returns_null_on_unparsable_allowance(monkeypatch, tmp_path, caplog):
     """M5: an unparsable CAPACITY_*_BYTES value used to silently coerce to 0
     via `x or 0`, UNDER-subtracting and INFLATING the recommendation in the
@@ -393,6 +411,88 @@ def test_hardware_change_across_a_restart_fires_on_first_probe(monkeypatch, tmp_
     assert records[-1]["trigger"] == "gateway_start_fingerprint_mismatch"
 
 
+# ── N1 (fix round 2): a bad first probe must not freeze the instrument ──────
+
+def _write_raw_capacity_record(g, log_path, record: dict) -> None:
+    """Write a hand-built record directly to the log, bypassing
+    _maybe_derive_capacity/_build_capacity_record's own trigger decisions --
+    simulates a basis that is already stored on disk (e.g. one written
+    before this fix landed, or one N1(a) alone cannot retroactively repair)."""
+    g._write_capacity_records_sync(str(log_path), [record])
+
+
+def test_first_probe_not_ok_defers_then_second_healthy_cycle_derives(monkeypatch, tmp_path):
+    """N1(a), test (i): a not-ok first-ever probe must write NOTHING --
+    deferring the baseline rather than establishing an unusable one. Once a
+    healthy probe lands on the very next cycle, exactly one record is
+    written, trigger first_derivation -- the deferred cycle leaves nothing
+    behind to distinguish it from a genuinely first cycle."""
+    g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
+
+    asyncio.run(g._maybe_derive_capacity(_capability(reranker_status="failing")))
+    assert g._read_capacity_records_sync(g.CAPACITY_LOG_PATH) == [], (
+        "a not-ok first probe must not establish a not-ok baseline")
+
+    asyncio.run(g._maybe_derive_capacity(_capability(reranker_status="ok")))
+    records = g._read_capacity_records_sync(g.CAPACITY_LOG_PATH)
+    assert len(records) == 1
+    assert records[0]["trigger"] == "first_derivation"
+
+
+def test_stored_not_ok_basis_recovers_on_next_healthy_probe(monkeypatch, tmp_path):
+    """N1(b), test (ii): a stored basis with reranker_status != "ok" plus a
+    now-healthy current probe must derive a NEW record via basis_recovery --
+    the remedy for a basis that was already poisoned before this fix landed
+    (N1(a) alone only stops NEW poisoning, it cannot repair old data)."""
+    log_path = tmp_path / "cap.jsonl"
+    g = _load_gateway(monkeypatch, log_path)
+    stale = g._build_capacity_record(
+        _capability(reranker_status="failing"), g._capacity_fingerprint(), "manual")
+    _write_raw_capacity_record(g, log_path, stale)
+
+    asyncio.run(g._maybe_derive_capacity(_capability(reranker_status="ok")))
+
+    records = g._read_capacity_records_sync(log_path)
+    assert len(records) == 2
+    assert records[-1]["trigger"] == "basis_recovery"
+
+
+def test_stored_basis_lacking_status_field_recovers_too(monkeypatch, tmp_path):
+    """N1(b), test (iii): a legacy record predating the reranker_status
+    field entirely (absent, not merely not "ok") must recover exactly the
+    same way -- "not ok" and "unknown" are the same problem here: neither
+    can be trusted as a drift-comparison basis."""
+    log_path = tmp_path / "cap.jsonl"
+    g = _load_gateway(monkeypatch, log_path)
+    legacy = g._build_capacity_record(
+        _capability(reranker_status="ok"), g._capacity_fingerprint(), "manual")
+    del legacy["probe"]["reranker_status"]  # hand-build the pre-fix shape
+    _write_raw_capacity_record(g, log_path, legacy)
+
+    asyncio.run(g._maybe_derive_capacity(_capability(reranker_status="ok")))
+
+    records = g._read_capacity_records_sync(log_path)
+    assert len(records) == 2
+    assert records[-1]["trigger"] == "basis_recovery"
+
+
+def test_stored_not_ok_basis_stays_stuck_while_current_probe_also_not_ok(monkeypatch, tmp_path):
+    """N1, test (iv): a stored not-ok basis and a STILL not-ok current probe
+    fires nothing and writes nothing -- there is genuinely no healthy
+    reading yet to recover from, so the instrument correctly stays quiet
+    rather than writing another unusable record."""
+    log_path = tmp_path / "cap.jsonl"
+    g = _load_gateway(monkeypatch, log_path)
+    stale = g._build_capacity_record(
+        _capability(reranker_status="failing"), g._capacity_fingerprint(), "manual")
+    _write_raw_capacity_record(g, log_path, stale)
+
+    asyncio.run(g._maybe_derive_capacity(_capability(reranker_status="failing")))
+
+    records = g._read_capacity_records_sync(log_path)
+    assert len(records) == 1, "no healthy probe yet -- must not fire or write"
+
+
 # ── /health surfacing ────────────────────────────────────────────────────────
 
 class _HealthProbeResp:
@@ -462,20 +562,29 @@ def test_capacity_key_reflects_a_stored_record(monkeypatch, tmp_path):
 def test_single_search_exceeds_wait_flag(monkeypatch, tmp_path):
     """M10: makes explicit what queue_bound == 0 means -- a fast backend
     reports False, a backend slower than the tolerable wait reports True,
-    and an unmeasured s_mean reports None rather than either boolean."""
+    and an unmeasured s_mean reports None rather than either boolean.
+
+    N2 (fix round 2, record-shape extension): every derived record also
+    carries the tolerance it was computed against -- pinned here at the
+    30.0s default (fact:1309: pin the VALUE, not just an equality) -- so a
+    reader (postflight, /health) never has to know CAPACITY_TOLERABLE_WAIT_S
+    separately to make sense of a stored queue_bound or exceeds-flag."""
     g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
 
     fast = g._build_capacity_record(
         _capability(reranker_projected_s=5.0), g._capacity_fingerprint(), "manual")
     assert fast["derived"]["single_search_exceeds_wait"] is False
+    assert fast["derived"]["tolerable_wait_s"] == 30.0
 
     slow = g._build_capacity_record(
         _capability(reranker_projected_s=70.0), g._capacity_fingerprint(), "manual")
     assert slow["derived"]["single_search_exceeds_wait"] is True
     assert slow["derived"]["queue_bound"] == 0
+    assert slow["derived"]["tolerable_wait_s"] == 30.0
 
     unknown = g._build_capacity_record(None, g._capacity_fingerprint(), "manual")
     assert unknown["derived"]["single_search_exceeds_wait"] is None
+    assert unknown["derived"]["tolerable_wait_s"] == 30.0
 
 
 def test_encoder_config_fingerprint_redacts_url_userinfo(monkeypatch, tmp_path):
@@ -555,19 +664,26 @@ def test_missing_proc_meminfo_yields_null_not_an_exception(monkeypatch, tmp_path
     assert hw["nproc"] is not None  # unaffected by the meminfo failure
 
 
-def test_probe_none_still_derives_a_record_with_nulls(monkeypatch, tmp_path):
-    """capability=None (a probe that never landed, or failed entirely) must
-    still produce a storable record -- s_mean/queue_bound/ceiling degrade to
-    None/fallback rather than raising."""
+def test_probe_none_defers_first_baseline_but_null_degrade_math_is_unaffected(monkeypatch, tmp_path):
+    """N1(a) (fix round 2): capability=None (a probe that never landed) has
+    no "ok" status either, so it must NOT establish the first-ever baseline
+    -- same freeze risk as any other not-ok first probe (see the
+    first_derivation-defers tests below). This supersedes this test's own
+    prior behavior (pre-N1, capability=None used to write a null-degraded
+    record on the very first cycle); _build_capacity_record's own
+    null-degrade math (s_mean/queue_bound -> None, client_ceiling_s ->
+    fallback) is unchanged and still exercised directly here so that
+    regression coverage is not lost."""
     g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
 
     asyncio.run(g._maybe_derive_capacity(None))
+    assert g._read_capacity_records_sync(g.CAPACITY_LOG_PATH) == [], (
+        "a capability=None first probe must defer, not establish a null basis")
 
-    records = g._read_capacity_records_sync(g.CAPACITY_LOG_PATH)
-    assert len(records) == 1
-    assert records[0]["derived"]["s_mean_s"] is None
-    assert records[0]["derived"]["queue_bound"] is None
-    assert records[0]["derived"]["client_ceiling_s"] == g.CAPACITY_SEARCH_TIMEOUT_FALLBACK_S
+    record = g._build_capacity_record(None, g._capacity_fingerprint(), "manual")
+    assert record["derived"]["s_mean_s"] is None
+    assert record["derived"]["queue_bound"] is None
+    assert record["derived"]["client_ceiling_s"] == g.CAPACITY_SEARCH_TIMEOUT_FALLBACK_S
 
 
 def test_gpu_probe_exception_never_propagates(monkeypatch, tmp_path):

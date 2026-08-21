@@ -472,7 +472,8 @@ try:
 except Exception:
     d = {}
 s, n = d.get("s_mean_s"), d.get("queue_bound")
-print("UNDERIVABLE" if s is None or n is None else f"{s}|{n}")
+exceeds, tolerable = d.get("single_search_exceeds_wait"), d.get("tolerable_wait_s")
+print("UNDERIVABLE" if s is None or n is None else f"{s}|{n}|{exceeds}|{tolerable}")
 ' 2>/dev/null)"
     if [[ -z "$cap_fields" || "$cap_fields" == "UNDERIVABLE" ]]; then
         warn "Capacity verdict not derivable — the gateway has not published a capacity record yet (fresh install, first probe still in flight, or anonymous-only health); informational, never a gate"
@@ -484,7 +485,19 @@ print("UNDERIVABLE" if s is None or n is None else f"{s}|{n}")
         # necessarily ranked on every install, so the old "(unranked:
         # measured in the baseline above)" parenthetical was false on a
         # healthy install where the baseline search WAS ranked.
-        ok "Capacity on this hardware: the rerank-stage worst-case projection is ~${cap_fields%%|*}s; sustainable queue depth at that speed: ${cap_fields##*|}"
+        #
+        # N2 (fix round 2): a bare "queue depth 0" is ambiguous -- it can
+        # mean "a single search already exceeds the tolerable wait" or read
+        # as "no data". single_search_exceeds_wait disambiguates which one
+        # this is, and tolerable_wait_s names what the depth was actually
+        # measured against (CAPACITY_TOLERABLE_WAIT_S) rather than leaving
+        # the reader to guess or assume the shipped default.
+        IFS='|' read -r cap_s cap_n cap_exceeds cap_tolerable <<< "$cap_fields"
+        if [[ "$cap_exceeds" == "True" ]]; then
+            ok "Capacity on this hardware: a single rerank-stage projection (~${cap_s}s) already exceeds the tolerable wait (${cap_tolerable}s) — queue depth 0 means exactly that"
+        else
+            ok "Capacity on this hardware: the rerank-stage worst-case projection is ~${cap_s}s; sustainable queue depth within the ${cap_tolerable}s tolerable wait: ${cap_n}"
+        fi
         echo "     If that projection is too slow for your use, README §17's payload cap and GPU-encoder options are the dials."
     fi
 fi

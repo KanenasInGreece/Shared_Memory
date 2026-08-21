@@ -463,3 +463,93 @@ Files touched this round: `shared-memory/scripts/hive_mind_proxy.py`,
 `tests/test_capacity_derivation.py`. No version constants, `CHANGELOG.md`, `README.md`,
 or `sync_skills.sh` touched. No service restart, no live gateway call, no memory-system
 access performed at any point in this round.
+
+---
+**Audit entry 8 — FIX ROUND 2 (this dispatch: a fresh, self-contained BUILDER task,
+three findings from an Opus delta review -- N1/N2/N3, re-verified against this branch's
+own HEAD before implementing). No mid-task scope-change message arrived; nothing here
+required declining anything.**
+
+Per-finding status:
+
+- **N1 (HIGH -- a bad first probe freezes the instrument permanently)** — FIXED, both
+  halves. (a) `_maybe_derive_capacity`'s two `first_derivation` sites (the true first-ever
+  case and the log-rotated-out case) now check the CURRENT probe's `reranker.status`
+  before writing: not `"ok"` → the write is skipped entirely (one INFO log, "capacity
+  baseline deferred -- reranker probe not ok yet; will derive on the first healthy
+  probe"), no record, no basis established. (b) New trigger `basis_recovery`: once every
+  other trigger check has had its say and none fired, if the STORED latest record's
+  `probe.reranker_status` is not `"ok"` (including absent/None -- covers pre-fix legacy
+  records too) and the CURRENT probe status IS `"ok"`, a new record is derived and stored
+  with trigger `basis_recovery`, logged at INFO (mirrors `first_derivation`'s tone --
+  this is good news, not an alarm, no re-run-postflight tail). Together, (a) stops new
+  poisoning and (b) repairs any basis already poisoned (by a pre-fix gateway, or in the
+  brief moment between (a) shipping and the first healthy probe after it).
+  Tests added: `test_first_probe_not_ok_defers_then_second_healthy_cycle_derives` (i),
+  `test_stored_not_ok_basis_recovers_on_next_healthy_probe` (ii),
+  `test_stored_basis_lacking_status_field_recovers_too` (iii),
+  `test_stored_not_ok_basis_stays_stuck_while_current_probe_also_not_ok` (iv).
+  ⚠ **Pre-existing test conflict, resolved by design, not by instruction:**
+  `test_probe_none_still_derives_a_record_with_nulls` asserted that
+  `_maybe_derive_capacity(None)` (a probe that never landed at all -- synthetic; the real
+  `_capability_probe_daemon` call site always passes a dict with a status field, never
+  `None` itself) wrote a null-degraded record on the very first cycle. Under N1(a) this
+  is now also "not ok" (status reads as `None`, `!= "ok"`) and must defer for the exact
+  same freeze reason the finding describes -- a null-degraded FIRST record is just as
+  unusable a basis as a `"failing"`-status one. Renamed to
+  `test_probe_none_defers_first_baseline_but_null_degrade_math_is_unaffected`: asserts
+  the defer (zero records), then re-exercises `_build_capacity_record(None, ...)`
+  directly (trigger `"manual"`) to keep the pre-existing null-degrade-math regression
+  coverage (`s_mean_s`/`queue_bound` → `None`, `client_ceiling_s` → the fallback
+  constant) without contradicting the new, intentional trigger-level behavior.
+- **N2 (MEDIUM -- postflight verdict ignores the disambiguating field, doesn't name the
+  tolerance)** — FIXED. `tolerable_wait_s` (the `CAPACITY_TOLERABLE_WAIT_S` value the
+  record was actually derived against) added to `_build_capacity_record`'s `derived`
+  dict, alongside the pre-existing `single_search_exceeds_wait`. `postflight.sh`'s
+  capacity block now parses both fields off `/health`'s `capacity.derived` (pipe-joined
+  4-field python emission, `IFS='|' read -r`) and branches: `single_search_exceeds_wait
+  == True` → "a single rerank-stage projection (~Xs) already exceeds the tolerable wait
+  (Ys) — queue depth 0 means exactly that"; otherwise → "the rerank-stage worst-case
+  projection is ~Xs; sustainable queue depth within the Ys tolerable wait: N". Exit-code
+  neutrality unchanged (still `ok`/`warn`, never touches `$fail`). Extended
+  `test_single_search_exceeds_wait_flag` to pin `tolerable_wait_s == 30.0` on all three
+  of its existing fast/slow/unknown records (fact:1309: pin the value, not just an
+  equality).
+- **N3 (LOW -- `_capacity_neo4j_allowance_bytes` silent fallback on a set-but-unparsable
+  var)** — FIXED. The function now reads the raw env strings once each; when a variable
+  IS set (`raw is not None`) but `_parse_mem_size` rejects it, one warning names that
+  variable specifically ("NEO4J_HEAP_MAX is set but did not parse as a memory size --
+  using the CAPACITY_NEO4J_FALLBACK_BYTES default for the neo4j allowance") -- never the
+  rejected value itself. A variable left simply UNSET (the normal partial/no-config case,
+  already documented as falling back silently) still produces no warning. Fallback
+  behavior itself is unchanged. Test:
+  `test_neo4j_allowance_warns_when_exactly_one_var_fails_to_parse` (HEAP_MAX bad,
+  PAGECACHE good and valid → fallback used, warning names HEAP_MAX only, PAGECACHE never
+  named).
+
+Mutation check performed (N1(b)): scratchpad-copy method (fact:1244 -- never `git
+checkout`). Backed up `hive_mind_proxy.py` to the session scratchpad, replaced the
+`basis_recovery` guard `if basis_status != "ok" and current_status == "ok":` with `if
+True:` (guard removed) in place. Reran `tests/test_capacity_derivation.py`: **six** tests
+died (not just one) -- `test_identical_fingerprint_on_second_cycle_does_not_fire`,
+`test_drift_at_exactly_the_band_factor_does_not_fire`,
+`test_drift_at_exactly_the_lower_band_edge_does_not_fire`,
+`test_failed_status_probe_never_fires_drift_or_becomes_basis`,
+`test_drift_just_inside_the_band_does_not_fire`, and -- notably -- this round's own
+`test_stored_not_ok_basis_stays_stuck_while_current_probe_also_not_ok` (test (iv) from
+the brief), confirming the guard is load-bearing and that (iv) specifically catches its
+removal. Restored `hive_mind_proxy.py` from the scratchpad backup (diff confirmed
+byte-identical to the backup); reran the full suite to confirm the tree is clean and
+green again.
+
+Suite: **2043 passed** (2038 baseline + 5 net new: N1's 4 tests (i-iv) + N3's 1 test; N2
+extended an existing test in place, no count change; the N1(a) test rename is a rename,
+not an addition).
+
+Files touched this round: `shared-memory/scripts/hive_mind_proxy.py`,
+`shared-memory/scripts/postflight.sh`, `tests/test_capacity_derivation.py`. No version
+constants, `CHANGELOG.md`, `README.md`, `sync_skills.sh`, or `.env.example` touched (N2/N3
+needed no new env var or documentation change; `tolerable_wait_s` reuses the existing
+`CAPACITY_TOLERABLE_WAIT_S` constant already documented in `.env.example`). No service
+restart, no live gateway call, no memory-system access performed at any point in this
+round.
