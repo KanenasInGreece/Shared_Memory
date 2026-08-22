@@ -53,7 +53,7 @@ def test_mint_writes_local_agent_token_file_mode_600(tmp_path):
     claude_dir.mkdir()
     gt.LOCAL_SKILL_ENV_PATHS = {"claude": str(claude_dir / ".env")}
 
-    (tokens, digests), _out = _capture(gt.mint)
+    (tokens, digests, _failures), _out = _capture(gt.mint)
 
     env_file = claude_dir / ".env"
     assert env_file.exists()
@@ -68,7 +68,7 @@ def test_mint_never_prints_any_minted_token_value(tmp_path):
     claude_dir.mkdir()
     gt.LOCAL_SKILL_ENV_PATHS = {"claude": str(claude_dir / ".env")}
 
-    (tokens, digests), out = _capture(gt.mint)
+    (tokens, digests, _failures), out = _capture(gt.mint)
 
     for name, token in tokens.items():
         assert token not in out, f"{name}'s raw token leaked into stdout"
@@ -80,7 +80,7 @@ def test_mint_never_prints_any_minted_token_value(tmp_path):
 def test_mint_prints_digest_form_agent_tokens_line(tmp_path):
     gt = load_generate_tokens()
     gt.LOCAL_SKILL_ENV_PATHS = {}
-    (tokens, digests), out = _capture(gt.mint)
+    (tokens, digests, _failures), out = _capture(gt.mint)
     line = next(l for l in out.splitlines() if l.startswith("AGENT_TOKENS="))
     for name in gt.AGENTS:
         assert f"{name}:sha256:{digests[name]}" in line
@@ -102,7 +102,7 @@ def test_mint_preserves_other_keys_in_existing_env_file(tmp_path):
     env_path.write_text("COORDINATOR_URL=http://localhost:8888\nAGENT_TOKEN=tok_stale\n")
     gt.LOCAL_SKILL_ENV_PATHS = {"claude": str(env_path)}
 
-    (tokens, _digests), _out = _capture(gt.mint)
+    (tokens, _digests, _failures), _out = _capture(gt.mint)
 
     content = env_path.read_text()
     assert "COORDINATOR_URL=http://localhost:8888" in content
@@ -192,7 +192,7 @@ def test_mint_refuses_symlinked_local_env_and_continues_other_agents(tmp_path):
         "codex": str(codex_dir / ".env"),
     }
 
-    (tokens, _digests), out = _capture(gt.mint)
+    (tokens, _digests, _failures), out = _capture(gt.mint)
 
     refused_lines = [l for l in out.splitlines() if "REFUSED" in l]
     assert len(refused_lines) == 1
@@ -434,7 +434,7 @@ def test_mint_refuses_registered_path_with_missing_directory(tmp_path):
     missing_dir_path = str(tmp_path / "claude_skill" / ".env")  # never mkdir'd
     gt.LOCAL_SKILL_ENV_PATHS = {"claude": missing_dir_path}
 
-    (tokens, digests), out = _capture(gt.mint, env_path=str(env_path))
+    (tokens, digests, _failures), out = _capture(gt.mint, env_path=str(env_path))
 
     assert "claude" not in tokens
     assert "claude" not in digests
@@ -471,7 +471,7 @@ def test_mint_infers_nothing_once_a_registry_is_present(tmp_path):
     # for claude -- if mint() were still guessing from it, this would write.
     gt.LOCAL_SKILL_ENV_PATHS = {"claude": str(claude_dir / ".env")}
 
-    (_tokens, _digests), out = _capture(gt.mint, env_path=str(env_path))
+    (_tokens, _digests, _failures), out = _capture(gt.mint, env_path=str(env_path))
 
     assert not (claude_dir / ".env").exists(), "a present registry must never fall back to guessing"
     claude_report_line = next(l for l in out.splitlines() if l.strip().startswith("claude"))
@@ -668,3 +668,307 @@ def test_add_flag_refuses_reveal_for_a_different_name(tmp_path, monkeypatch):
     rc = gt.main(["--add", "codex", "--reveal", "someone_else"])
 
     assert rc == 1
+
+
+# ── I-A7: a symlink at ANY component of the registered path is refused ──────
+#
+# CRITICAL fix (security review, execution-reproduced fix round 2): the
+# FIRST cut of the symlink guard applied O_NOFOLLOW to the leaf only.
+# os.path.isdir(skill_dir) happily followed a symlinked PARENT directory,
+# so a same-uid process that replaced the parent with a symlink defeated
+# the guard completely -- the write reported SUCCESS and the live bearer
+# token landed in an attacker-controlled directory. These tests reproduce
+# that exact scenario (parent symlink) plus a grandparent-level variant,
+# against the actual _write_agent_token_file() -- not a reimplementation.
+
+def test_write_agent_token_file_refuses_symlinked_parent_directory(tmp_path):
+    """The exact CRITICAL finding: registry path <legit>/shared-memory/.env
+    where shared-memory itself is a symlink to an attacker-controlled
+    directory. Must refuse -- no exception swallowed into a plain False,
+    no write anywhere."""
+    gt = load_generate_tokens()
+    attacker_dir = tmp_path / "attacker_controlled"
+    attacker_dir.mkdir()
+    legit_base = tmp_path / "legit"
+    legit_base.mkdir()
+    symlinked_skill_dir = legit_base / "shared-memory"
+    os.symlink(attacker_dir, symlinked_skill_dir)
+    attack_path = symlinked_skill_dir / ".env"
+
+    with pytest.raises(gt.AgentEnvIsSymlink):
+        gt._write_agent_token_file(str(attack_path), "tok_attack")
+
+    assert list(attacker_dir.iterdir()) == [], "nothing may land in the attacker-controlled directory"
+
+
+def test_write_agent_token_file_refuses_symlinked_grandparent_directory(tmp_path):
+    """A symlink further up the chain than the immediate parent must ALSO
+    be refused -- I-A7 says ANY component, not just the leaf's parent."""
+    gt = load_generate_tokens()
+    attacker_dir = tmp_path / "gp_attacker"
+    (attacker_dir / "skills" / "shared-memory").mkdir(parents=True)
+    real_base = tmp_path / "gp_real_base"
+    real_base.mkdir()
+    symlinked_ancestor = real_base / "claude_link"
+    os.symlink(attacker_dir, symlinked_ancestor)
+    attack_path = symlinked_ancestor / "skills" / "shared-memory" / ".env"
+
+    with pytest.raises(gt.AgentEnvIsSymlink):
+        gt._write_agent_token_file(str(attack_path), "tok_attack")
+
+    assert not (attacker_dir / "skills" / "shared-memory" / ".env").exists()
+
+
+def test_resolve_symlink_free_dir_fd_names_the_offending_component(tmp_path):
+    gt = load_generate_tokens()
+    attacker_dir = tmp_path / "attacker"
+    attacker_dir.mkdir()
+    legit_base = tmp_path / "legit"
+    legit_base.mkdir()
+    link = legit_base / "sm"
+    os.symlink(attacker_dir, link)
+
+    with pytest.raises(gt.AgentEnvIsSymlink) as exc_info:
+        gt._resolve_symlink_free_dir_fd(str(link))
+    assert str(link) in str(exc_info.value)
+
+
+def test_resolve_symlink_free_dir_fd_missing_directory_raises_file_not_found(tmp_path):
+    """A genuinely missing directory must still raise FileNotFoundError
+    (D19's "not installed locally" signal), never AgentEnvIsSymlink."""
+    gt = load_generate_tokens()
+    with pytest.raises(FileNotFoundError):
+        gt._resolve_symlink_free_dir_fd(str(tmp_path / "does_not_exist" / "skill"))
+
+
+# ── F4 atomicity: a mid-write failure leaves the ORIGINAL file untouched ────
+
+def test_write_agent_token_file_atomic_write_leaves_original_untouched_on_failure(
+    tmp_path, monkeypatch,
+):
+    gt = load_generate_tokens()
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    env_path = skill_dir / ".env"
+    env_path.write_text("AGENT_TOKEN=tok_original\n")
+
+    def _failing_fsync(fd):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(gt.os, "fsync", _failing_fsync)
+
+    with pytest.raises(OSError):
+        gt._write_agent_token_file(str(env_path), "tok_should_not_land")
+
+    assert env_path.read_text() == "AGENT_TOKEN=tok_original\n"
+    leftovers = [p for p in skill_dir.iterdir() if p.name != ".env"]
+    assert leftovers == [], f"no temp file should be left behind: {leftovers}"
+
+
+# ── I-A8: a delimiter/newline/NUL/whitespace-padded name or path is refused
+#    at INPUT, before anything is minted, written, or registered ───────────
+
+def test_validate_registry_field_refuses_comma():
+    gt = load_generate_tokens()
+    with pytest.raises(ValueError):
+        gt._validate_registry_field("a,b", "agent name")
+
+
+def test_validate_registry_field_refuses_colon():
+    gt = load_generate_tokens()
+    with pytest.raises(ValueError):
+        gt._validate_registry_field("a:b", "agent name")
+
+
+def test_validate_registry_field_refuses_newline():
+    gt = load_generate_tokens()
+    with pytest.raises(ValueError):
+        gt._validate_registry_field("a\nb", "install path")
+
+
+def test_validate_registry_field_refuses_nul():
+    gt = load_generate_tokens()
+    with pytest.raises(ValueError):
+        gt._validate_registry_field("a\x00b", "install path")
+
+
+def test_validate_registry_field_refuses_leading_trailing_whitespace():
+    gt = load_generate_tokens()
+    with pytest.raises(ValueError):
+        gt._validate_registry_field(" codex", "agent name")
+    with pytest.raises(ValueError):
+        gt._validate_registry_field("codex ", "agent name")
+
+
+def test_validate_registry_field_accepts_a_clean_name():
+    gt = load_generate_tokens()
+    gt._validate_registry_field("codex", "agent name")  # must not raise
+
+
+def test_add_refuses_name_containing_comma_mints_nothing(tmp_path, capsys):
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+
+    rc, token = gt.add_agent("codex,evil", install_path=None, env_path=str(env_path))
+
+    assert rc == 1
+    assert token is None
+    assert not env_path.exists()
+
+
+def test_add_refuses_install_path_containing_comma_reproduces_f2(tmp_path):
+    """F2, reproduced verbatim: an install path smuggling a second
+    name:path pair via a comma must never reach the printed AGENT_INSTALLS
+    line -- add_agent() must refuse before minting or printing anything.
+
+    Asserts on the VALIDATION error message specifically (naming the
+    comma), not merely rc == 1 -- any payload containing a comma followed
+    by a second "/" also makes os.path.dirname() resolve to a NONEXISTENT
+    directory, which the D19 check refuses independently. An earlier draft
+    of this test used exactly such a payload and kept passing after a
+    mutation that disabled validation entirely -- masked by that other,
+    unrelated refusal path. Asserting the message text is what actually
+    isolates this guard."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    real_dir = tmp_path / "opencode_skill"
+    real_dir.mkdir()
+    malicious_path = f"{real_dir}/.env,victim:/attacker/victim.env"
+
+    with contextlib.redirect_stderr(io.StringIO()) as err:
+        rc, token = gt.add_agent("opencode", install_path=malicious_path, env_path=str(env_path))
+
+    assert rc == 1
+    assert token is None
+    assert "delimiter" in err.getvalue()
+    assert not env_path.exists()
+    assert list(real_dir.iterdir()) == [], "nothing may be written through a malicious path"
+
+
+def test_add_refuses_install_path_containing_newline_reproduces_f2b(tmp_path):
+    """F2b, reproduced verbatim: a newline in an install path must never
+    reach the printed AGENT_INSTALLS line, where it would forge a second
+    .env assignment (this same file is passed to
+    `docker compose --env-file`).
+
+    Uses a REAL, existing directory prefix so this test isolates the
+    VALIDATION refusal specifically -- a nonexistent-directory path would
+    also be refused by the D19 check, which would let this test pass
+    "for the wrong reason" even if validation itself were broken (a
+    mutation-check found exactly this gap in an earlier draft: the D19
+    path masked the missing validation)."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    real_dir = tmp_path / "opencode_skill"
+    real_dir.mkdir()
+    malicious_path = f"{real_dir}/.env\nAGENT_TOKENS=attacker:sha256:deadbeef"
+
+    with contextlib.redirect_stderr(io.StringIO()) as err:
+        rc, token = gt.add_agent("opencode", install_path=malicious_path, env_path=str(env_path))
+
+    assert rc == 1
+    assert token is None
+    assert "delimiter" in err.getvalue()
+    assert not env_path.exists()
+    assert list(real_dir.iterdir()) == [], "nothing may be written through a malicious path"
+
+
+# ── I-A9: registry paths compared by NORMALIZED identity ────────────────────
+
+def test_same_registered_file_detects_dotdot_aliasing():
+    gt = load_generate_tokens()
+    a = "/tmp/s/claude/skills/shared-memory/.env"
+    b = "/tmp/s/claude/skills/other/../shared-memory/.env"
+    assert a != b  # the old literal-equality check would miss this
+    assert gt._same_registered_file(a, b) is True
+
+
+def test_same_registered_file_rejects_genuinely_different_paths():
+    gt = load_generate_tokens()
+    assert gt._same_registered_file("/tmp/a/.env", "/tmp/b/.env") is False
+
+
+def test_add_refuses_dotdot_aliased_clobber_reproduces_f3(tmp_path):
+    """F3, reproduced verbatim: two spellings of the SAME file must both be
+    caught by the clobber check, not just a literal string match."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    shared_dir = tmp_path / "claude" / "skills" / "shared-memory"
+    shared_dir.mkdir(parents=True)
+    real_path = str(shared_dir / ".env")
+    aliased_path = str(tmp_path / "claude" / "skills" / "other" / ".." / "shared-memory" / ".env")
+    assert real_path != aliased_path
+
+    env_path.write_text(
+        f"AGENT_TOKENS=claude:sha256:{_digest('tok_claude')}\n"
+        f"AGENT_INSTALLS=claude:{real_path}\n",
+    )
+
+    rc, token = gt.add_agent("grok", install_path=aliased_path, env_path=str(env_path))
+
+    assert rc == 1
+    assert token is None
+    assert not (shared_dir / ".env").exists()
+
+
+# ── I-A10: a partial bulk-mint failure never revokes a working credential ──
+
+def test_mint_carries_forward_existing_digest_when_write_fails(tmp_path):
+    """F4: a ROTATION of an already-registered agent whose write fails this
+    round must NOT drop that agent's entry from the printed AGENT_TOKENS
+    line -- the OLD digest (still valid against the untouched file) is
+    carried forward verbatim, so nothing is revoked."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    existing_digest = _digest("tok_existing_claude")
+    env_path.write_text(
+        f"AGENT_TOKENS=claude:sha256:{existing_digest}\n"
+        f"AGENT_INSTALLS=claude:{tmp_path / 'gone' / '.env'}\n",  # directory never created
+    )
+
+    (tokens, digests, failures), out = _capture(gt.mint, env_path=str(env_path))
+
+    assert "claude" not in tokens  # nothing NEW was minted for it
+    line = next(l for l in out.splitlines() if l.startswith("AGENT_TOKENS="))
+    assert f"claude:sha256:{existing_digest}" in line, "the OLD, still-valid entry must survive"
+    assert any(name == "claude" for name, _reason in failures)
+
+
+def test_mint_omits_first_time_agent_entirely_on_write_failure(tmp_path):
+    """The carry-forward only applies to a ROTATION -- an agent with NO
+    prior entry that fails on its first mint is correctly omitted (D19's
+    original intent: never register a digest nobody holds the plaintext
+    for)."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    env_path.write_text(f"AGENT_INSTALLS=claude:{tmp_path / 'gone' / '.env'}\n")
+
+    (tokens, digests, failures), out = _capture(gt.mint, env_path=str(env_path))
+
+    assert "claude" not in tokens
+    line = next(l for l in out.splitlines() if l.startswith("AGENT_TOKENS="))
+    assert "claude" not in line
+    assert any(name == "claude" for name, _reason in failures)
+
+
+def test_mint_prints_partial_failure_block_when_any_agent_fails(tmp_path):
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    env_path.write_text(f"AGENT_INSTALLS=claude:{tmp_path / 'gone' / '.env'}\n")
+
+    _result, out = _capture(gt.mint, env_path=str(env_path))
+
+    assert "PARTIAL FAILURE" in out
+    assert "claude" in out
+
+
+def test_mint_no_partial_failure_block_when_everything_succeeds(tmp_path):
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    claude_dir = tmp_path / "claude_skill"
+    claude_dir.mkdir()
+    gt.LOCAL_SKILL_ENV_PATHS = {"claude": str(claude_dir / ".env")}
+
+    _result, out = _capture(gt.mint, env_path=str(env_path))
+
+    assert "PARTIAL FAILURE" not in out

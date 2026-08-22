@@ -90,6 +90,7 @@ import errno
 import hashlib
 import os
 import secrets
+import stat
 import sys
 import tempfile
 
@@ -175,6 +176,83 @@ def _read_env_raw_value(env_path: str, key: str) -> "str | None":
     return None
 
 
+# Characters that can never appear in a registered agent NAME or install
+# PATH (security-review findings F2/F2b, ruled I-A8): AGENT_TOKENS and
+# AGENT_INSTALLS are comma-separated name:value pairs, so a `,` forges a
+# second entry and a `:` (beyond the one splitting name from value) forges
+# a bogus value -- reproduced: --install-path
+# "/legit/.env,victim:/attacker/victim.env" made a SECOND registry entry,
+# "victim", pointing at an attacker-controlled path, which the next bulk
+# rotation would write a real agent's fresh token straight into (token
+# theft). A newline forges a WHOLE SECOND .env assignment line -- this same
+# file is passed to `docker compose --env-file`. A NUL byte terminates a C
+# string early in anything that eventually shells out to it.
+#
+# Validated at INPUT, before anything is minted, written, or registered --
+# CLAUDE.md's own rule applies here verbatim ("a separator that can occur
+# in the data is not a delimiter, on either side"): an ESCAPE scheme would
+# need a matching UNESCAPE in _parse_agent_installs, in bootstrap_tokens.sh's
+# own grep/cut handling of these lines, and in any future reader -- one of
+# those would eventually be missed. Refusing the character outright has no
+# distributed contract to keep in sync.
+_FORBIDDEN_REGISTRY_CHARS = (",", ":", "\n", "\r", "\x00")
+
+
+def _validate_registry_field(value: str, what: str) -> None:
+    """Refuse `value` (an agent NAME or an install PATH about to be written
+    into AGENT_TOKENS/AGENT_INSTALLS) if it could inject a second registry
+    entry or a second .env assignment line. Raises ValueError naming
+    `what`, the value, and the offending character -- callers turn this
+    into a loud, non-crashing refusal (see add_agent())."""
+    if not value:
+        raise ValueError(f"{what} is empty — refused")
+    if value != value.strip():
+        raise ValueError(
+            f"{what} {value!r} has leading/trailing whitespace — refused "
+            "(a registry entry is parsed by splitting on ',' after a bare "
+            ".strip(), so padding here could silently merge with a "
+            "neighbouring entry)"
+        )
+    for ch in _FORBIDDEN_REGISTRY_CHARS:
+        if ch in value:
+            raise ValueError(
+                f"{what} {value!r} contains {ch!r}, which is a registry "
+                "delimiter or line-injection character (',' and ':' "
+                "separate AGENT_TOKENS/AGENT_INSTALLS entries; a newline "
+                "would forge a second .env assignment; a NUL terminates a "
+                "C string early) — refused"
+            )
+
+
+def _same_registered_file(path_a: str, path_b: str) -> bool:
+    """Whether two install-path STRINGS name the same file on disk
+    (security-review finding F3, ruled I-A9): the clobber check in
+    add_agent() used to compare with literal string equality, which a
+    `..`-aliased or symlink-aliased spelling of the identical path defeats
+    trivially — two agents register "different" paths that are actually
+    one file, a write-through mint silently overwrites the first agent's
+    live token, and that agent starts authenticating AS the second (the
+    gateway stamps `source` from the presented token's identity, so this
+    is silent provenance corruption of every record that agent's identity
+    ever touches afterward).
+
+    os.path.realpath() resolves BOTH '..'/'.' components and any symlink
+    in the chain to the SAME canonical form for two different spellings of
+    one target. Safe to call on a path that doesn't exist yet (or no
+    longer exists) — realpath degrades to abspath-style lexical resolution
+    for a missing component rather than raising, so this never throws.
+
+    Deliberately NOT the mechanism _write_agent_token_file() uses to REFUSE
+    a symlink at write time (that check exists precisely to catch and
+    refuse aliasing, not resolve through it) — this function answers a
+    different, narrower question asked BEFORE any write is attempted:
+    "would writing to path_b land on the exact same file path_a already
+    points at". The write-time refusal still fires independently if a
+    symlink is genuinely involved in resolving either path.
+    """
+    return os.path.realpath(path_a) == os.path.realpath(path_b)
+
+
 def _parse_agent_installs(raw: str) -> "dict[str, str]":
     """Parse an AGENT_INSTALLS= value: comma-separated name:path entries.
     Split on the FIRST colon only (str.partition), so a path containing a
@@ -252,72 +330,225 @@ def _resolve_roster(env_path: str) -> "list[str]":
 
 
 class AgentEnvIsSymlink(Exception):
-    """Raised by _write_agent_token_file when `path` is a symlink. This
-    framework's threat model treats other same-uid agent processes as
-    adversarial (S-01/S-10's whole premise), so writing a live bearer token
-    through a symlink -- which could point anywhere another process placed
-    it -- is refused outright rather than followed."""
+    """Raised by _write_agent_token_file when ANY component of the
+    registered path is a symlink — not only the leaf `.env` file itself.
+
+    CRITICAL fix (security review, execution-reproduced): the ORIGINAL
+    version of this guard applied `os.O_NOFOLLOW` to the final path
+    component only. `os.path.isdir(skill_dir)` happily followed a symlink
+    at the PARENT directory, so a same-uid process that replaced the
+    parent with a symlink (e.g. `<skill>/` -> `/tmp/attacker/`) defeated
+    the guard completely: the write reported SUCCESS and the live bearer
+    token landed in the attacker-controlled directory, mode 600, readable
+    only by the same uid that put it there — which is exactly the
+    adversary this framework's threat model (S-01/S-10) says to assume.
+    The docstring claimed "refused outright"; the code did not do that,
+    which is worse than no guard, because the next reader trusts the claim
+    and stops checking.
+
+    Fixed by resolving the parent directory ONE path component at a time
+    via `openat(..., O_NOFOLLOW)` (see _resolve_symlink_free_dir_fd()) —
+    every hop is refused atomically if it is itself a symlink, with no
+    separate check-then-open window for another same-uid process to win by
+    swapping a component in between (this is why a `realpath()` COMPARISON
+    was rejected as the fix: comparing before opening is still a
+    check-then-use race under this framework's own threat model, which
+    treats a racing same-uid process as an active adversary, not a
+    theoretical one)."""
+
+
+def _resolve_symlink_free_dir_fd(dir_path: str) -> int:
+    """Open `dir_path` as a directory file descriptor, walking it ONE path
+    component at a time via `openat(..., O_NOFOLLOW)` from the filesystem
+    root — so EVERY component (not just the leaf, not just the immediate
+    parent) is refused, atomically, if it is a symlink. Each hop's
+    O_NOFOLLOW is enforced by the kernel on that single openat() call, so
+    there is no separate stat-then-open step for a same-uid adversarial
+    process to win a race on by swapping a component after it was checked
+    but before it was used — see AgentEnvIsSymlink's docstring for why a
+    realpath() comparison does not give this guarantee.
+
+    Returns an open fd to the fully-resolved, symlink-free directory;
+    caller is responsible for os.close()ing it once done (typically after
+    also opening/writing the leaf file relative to this SAME fd via
+    `dir_fd=`, so the leaf write inherits the identical guarantee instead
+    of re-resolving the path — and re-resolving would itself reopen a
+    check-then-use window).
+
+    Raises AgentEnvIsSymlink naming the exact offending path prefix when
+    any component is a symlink. Raises FileNotFoundError /
+    NotADirectoryError (standard os.open semantics, unchanged) when a
+    component doesn't exist, or genuinely isn't a directory (a plain file
+    sitting where one was expected), — callers translate FileNotFoundError
+    into "not installed locally" (D19), matching what the old
+    `os.path.isdir()` pre-check used to signal, but now as part of the
+    SAME atomic resolution instead of a separate non-atomic check.
+
+    Linux quirk, probe-confirmed: `O_NOFOLLOW | O_DIRECTORY` on a symlink
+    raises **ENOTDIR**, not ELOOP — a symlink node is never itself a
+    directory, and O_NOFOLLOW blocks resolving it to find out what it
+    points to, so the kernel reports "not a directory" rather than "too
+    many levels of symbolic links". Reproduced: a symlinked skill directory
+    (the exact attack this function exists to close) raised NotADirectoryError,
+    which the FIRST version of this function let fall through to the
+    generic `raise`, silently reported as "not installed locally" (D19)
+    instead of the CRITICAL symlink refusal it actually is. ENOTDIR/ELOOP
+    are therefore both treated as "possibly a symlink" and disambiguated by
+    an `lstat()` of the SAME component, relative to the SAME still-open
+    `fd` — this lstat is purely diagnostic (it only decides which
+    EXCEPTION to raise for an attempt the kernel has already refused
+    atomically), so it introduces no new race: nothing is written, and no
+    security decision depends on what the lstat observes.
+    """
+    abs_path = os.path.abspath(dir_path)
+    parts = [p for p in abs_path.split(os.sep) if p]
+    fd = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY)
+    walked = ""
+    try:
+        for part in parts:
+            walked += os.sep + part
+            try:
+                next_fd = os.open(
+                    part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd,
+                )
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    try:
+                        component_stat = os.lstat(part, dir_fd=fd)
+                    except OSError:
+                        raise exc from None
+                    if stat.S_ISLNK(component_stat.st_mode):
+                        raise AgentEnvIsSymlink(walked) from exc
+                raise
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def _write_agent_token_file(path: str, token: str) -> bool:
-    """Write-through: set AGENT_TOKEN=<token> in the skill .env at `path`,
-    mode 600 BEFORE any content is written (S-01, tightened per finding 4
-    of the A2 security review) — no create-then-chmod window and no
-    write-then-chmod window either. Preserves every other line already in
-    the file; replaces only an existing AGENT_TOKEN= line (or appends one).
+    """Write-through: set AGENT_TOKEN=<token> in the skill .env at `path`.
 
-    `os.open()`'s mode argument only takes effect when the file is CREATED
-    — for a PRE-EXISTING file (the entire measured population at review
-    time: every installed skill .env was already 0644) the old mode governs
-    until something changes it. Writing the token first and `chmod`ing
-    after therefore left it world-readable for the whole write; this now
-    calls `os.fchmod()` on the open fd immediately, before the first byte
-    of content, closing that window.
+    Symlink safety (see AgentEnvIsSymlink / _resolve_symlink_free_dir_fd
+    docstrings for the CRITICAL finding this fixes): resolves the PARENT
+    directory component-by-component with O_NOFOLLOW at every hop, then
+    opens/writes the leaf ONLY relative to that already-verified,
+    already-open directory fd (`dir_fd=`) — never by re-resolving the full
+    path string a second time, which would reopen the exact check-then-use
+    race this function exists to close. The leaf itself is separately
+    lstat'd (also relative to the verified dir_fd, also O_NOFOLLOW-safe)
+    and refused if it is a symlink, preserving the original intent: a
+    symlink where a live bearer token belongs is treated as tampering
+    evidence to surface, not a target to write through OR to silently
+    clobber.
 
-    Refuses (raises AgentEnvIsSymlink) rather than following a symlink at
-    `path` — `os.O_NOFOLLOW` makes the kernel enforce this atomically, with
-    no check-then-open race for another same-uid process to win.
+    Atomicity (security-review finding F4 — a partial bulk-mint failure
+    must never leave a HALF-written skill .env, which is a worse state
+    than the file it replaced): writes to a fresh temp name in the SAME
+    verified directory, fsyncs, then atomically renames it over the leaf
+    (`os.rename(..., src_dir_fd=..., dst_dir_fd=...)`, both relative to the
+    SAME fd) — a mid-write failure (ENOSPC, EPERM) leaves the ORIGINAL file
+    completely untouched; the caller's failure handling (mint() / add_agent())
+    can therefore trust that a raised exception here means NOTHING changed
+    on disk for this agent, not "changed to something unknown".
+
+    Mode 600 from the first byte (S-01, tightened per finding 4 of the A2
+    security review): the temp file is created with mode 600 directly, and
+    `os.fchmod()`'d again immediately after creation before any content is
+    written — belt and braces against a hostile umask, no create-then-chmod
+    window and no write-then-chmod window.
+
+    Preserves every other line already in the file; replaces only an
+    existing AGENT_TOKEN= line (or appends one).
 
     Returns False without writing anything when the skill directory itself
-    doesn't exist — nothing to write through to; this agent is treated as
-    not-installed-locally, same as a genuinely remote one.
+    (or any ancestor) doesn't exist yet — nothing to write through to; this
+    agent is treated as not-installed-locally (D19), same as a genuinely
+    remote one. Raises AgentEnvIsSymlink when any component of the parent
+    directory, OR the leaf itself, is a symlink. Any OTHER OSError (EPERM,
+    ENOSPC, EROFS, ...) propagates to the caller UNCAUGHT — this function
+    does not decide how a genuine write failure should be reported; see
+    mint()'s and add_agent()'s own handling (security-review finding F4).
     """
     skill_dir = os.path.dirname(path)
-    if not os.path.isdir(skill_dir):
-        return False
-    if os.path.islink(path):
-        raise AgentEnvIsSymlink(path)
-    lines: list[str] = []
-    if os.path.exists(path):
-        with open(path) as f:
-            for line in f:
-                if line.startswith("AGENT_TOKEN="):
-                    continue
-                lines.append(line.rstrip("\n"))
-    lines.append(f"AGENT_TOKEN={token}")
+    leaf = os.path.basename(path)
+
     try:
-        fd = os.open(
-            path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600,
+        dir_fd = _resolve_symlink_free_dir_fd(skill_dir)
+    except FileNotFoundError:
+        return False
+    except NotADirectoryError:
+        return False
+
+    try:
+        # Refuse a symlinked LEAF explicitly (rather than letting the
+        # rename below silently clobber it) — lstat here is relative to
+        # the already-verified, already-open dir_fd, so this is not a
+        # fresh check-then-use window: dir_fd cannot itself be swapped for
+        # something else by another process (a process can only replace a
+        # directory ENTRY, not the inode an already-open fd refers to).
+        try:
+            leaf_stat = os.stat(leaf, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            leaf_stat = None
+        if leaf_stat is not None and stat.S_ISLNK(leaf_stat.st_mode):
+            raise AgentEnvIsSymlink(path)
+
+        lines: list[str] = []
+        if leaf_stat is not None:
+            try:
+                read_fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise AgentEnvIsSymlink(path) from exc
+                raise
+            with os.fdopen(read_fd) as f:
+                for line in f:
+                    if line.startswith("AGENT_TOKEN="):
+                        continue
+                    lines.append(line.rstrip("\n"))
+        lines.append(f"AGENT_TOKEN={token}")
+        content = "\n".join(lines) + "\n"
+
+        tmp_name = f".{leaf}.mint_tmp_{secrets.token_hex(8)}"
+        tmp_fd = os.open(
+            tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600, dir_fd=dir_fd,
         )
-    except OSError as exc:
-        if exc.errno == errno.ELOOP:
-            raise AgentEnvIsSymlink(path) from exc
-        raise
-    os.fchmod(fd, 0o600)  # BEFORE any write — closes the world-readable window
-    with os.fdopen(fd, "w") as f:
-        f.write("\n".join(lines) + "\n")
-    return True
+        try:
+            os.fchmod(tmp_fd, 0o600)  # belt and braces against a hostile umask
+            with os.fdopen(tmp_fd, "w") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            # Atomic replace, relative to the SAME verified dir_fd on both
+            # sides — never re-resolves the leaf's path string.
+            os.rename(tmp_name, leaf, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except BaseException:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            except FileNotFoundError:
+                pass
+            raise
+        return True
+    finally:
+        os.close(dir_fd)
 
 
 def mint(
     env_path: str = _DEFAULT_GATEWAY_ENV, roster: "list[str] | None" = None,
-) -> "tuple[dict, dict]":
+) -> "tuple[dict, dict, list]":
     """Mint a fresh token for every agent in `roster` (default: resolved by
     _resolve_roster() -- AGENTS union whatever's already registered),
     write-through every agent with a REGISTERED install path whose skill
     directory exists, and print only names/digests/destination paths.
-    Returns (tokens, digests) so main() can serve --reveal from the SAME
-    minted set without re-parsing anything.
+    Returns (tokens, digests, failures) so main() can serve --reveal from
+    the SAME minted set without re-parsing anything, and report a partial
+    failure without a stack trace (security-review finding F4 / I-A10 --
+    see the per-agent failure handling below). `failures` is a list of
+    (name, reason) pairs, empty when nothing went wrong.
 
     Install-path resolution (D19/roster fix, ruled -- see the
     LOCAL_SKILL_ENV_PATHS and AGENTS docstrings): reads the AGENT_INSTALLS
@@ -329,31 +560,52 @@ def mint(
     missing from it is REMOTE, full stop, never re-guessed from its name.
 
     Per agent, in `roster` order:
-      - no registered path            -> REMOTE: token minted, digest
+      - no registered path              -> REMOTE: token minted, digest
         registered, nothing written; --reveal is the only delivery path.
-      - registered path, dir missing  -> REFUSED (D19): nothing minted for
-        this agent at all -- no token, no digest, no AGENT_INSTALLS entry.
-        The old behaviour minted anyway and silently discarded the
-        plaintext, leaving an AGENT_TOKENS entry nobody could ever satisfy;
-        the only recovery was rotating everyone. Now the operator gets the
-        exact expected directory and a re-run command, and the recovery is
-        cheap: install the skill package, then re-run (bulk, or --add).
-      - registered path, dir exists   -> written through (mode 600),
-        digest registered, AGENT_INSTALLS entry carried forward.
-      - registered path is a symlink  -> REFUSED (pre-existing S-01/S-10
-        threat model, unchanged): digest still registered (so --reveal can
-        recover it), but nothing written and the AGENT_INSTALLS entry is
-        dropped -- there is nowhere trustworthy that path could mean.
+      - registered path, write succeeds -> written through (mode 600,
+        atomically -- see _write_agent_token_file), digest registered,
+        AGENT_INSTALLS entry carried forward.
+      - registered path, write FAILS (directory missing -- D19; any
+        component is a symlink -- the CRITICAL fix; or a genuine OSError,
+        e.g. EPERM/ENOSPC) -> REFUSED, loudly, naming the reason. Nothing
+        is written for this agent (_write_agent_token_file's atomicity
+        guarantees that on ANY failure the existing file, if any, is
+        untouched). The printed AGENT_TOKENS entry for this agent is then:
+          * the agent's EXISTING registered digest, UNCHANGED, if this is a
+            rotation of an already-registered agent -- security-review
+            finding F4: the old behaviour either dropped the entry
+            (revoking a still-working credential the agent's own file
+            never lost) or, worse, registered a digest for a plaintext
+            that was silently discarded (D19's original defect). Carrying
+            the OLD entry forward means a partial failure never revokes a
+            credential that still authenticates against the file it
+            actually lives in.
+          * OMITTED entirely if this is the agent's FIRST-EVER mint --
+            nothing to carry forward, matches D19's original intent (never
+            register a digest nobody holds the matching plaintext for).
     """
     roster = _resolve_roster(env_path) if roster is None else roster
     installs, registry_present = _load_agent_installs_registry(env_path)
     if not registry_present:
         installs = dict(LOCAL_SKILL_ENV_PATHS)  # first-bootstrap seed, once
+    existing_entries = _parse_agent_tokens_line(_read_env_raw_value(env_path, "AGENT_TOKENS") or "")
 
     tokens: dict[str, str] = {}
     digests: dict[str, str] = {}
     persisted_installs: dict[str, str] = {}
+    failures: list[tuple[str, str]] = []
     lines: list[str] = []  # per-agent report lines, printed after the header blocks
+
+    def _fail(name: str, reason: str) -> None:
+        failures.append((name, reason))
+        if name in existing_entries:
+            lines.append(f"  {name:15}  REFUSED — {reason}")
+            lines.append("                   existing registered token for this agent is UNCHANGED "
+                          "(nothing was revoked)")
+        else:
+            lines.append(f"  {name:15}  REFUSED — {reason}")
+            lines.append(f"                   install the {name} skill package first, then re-run:")
+            lines.append(f"                   generate_tokens.py --add {name} --install-path {installs.get(name, '<path>')}")
 
     for a in roster:
         path = installs.get(a)
@@ -366,27 +618,29 @@ def mint(
             lines.append(f"                   generate_tokens.py --reveal {a}")
             continue
 
-        skill_dir = os.path.dirname(path)
-        if not os.path.isdir(skill_dir):
-            # D19: a REGISTERED path whose directory doesn't exist yet must
-            # refuse outright -- minting a token nobody can receive, then
-            # registering its digest anyway, is exactly the fresh-host
-            # defect this fix exists for.
-            lines.append(f"  {a:15}  REFUSED — expected directory {skill_dir} does not exist")
-            lines.append(f"                   install the {a} skill package first, then re-run:")
-            lines.append(f"                   generate_tokens.py --add {a} --install-path {path}")
-            continue
-
         token = _mint_one()
         try:
-            _write_agent_token_file(path, token)
-        except AgentEnvIsSymlink:
-            tokens[a] = token
-            digests[a] = _digest(token)
-            lines.append(f"  {a:15}  REFUSED — {path} is a symlink; not following it")
-            lines.append("                   (same-uid agents are treated as adversarial —")
-            lines.append("                   replace it with a real file and re-run, or reveal:")
-            lines.append(f"                   generate_tokens.py --reveal {a}")
+            written = _write_agent_token_file(path, token)
+        except AgentEnvIsSymlink as exc:
+            _fail(a, f"{exc} is a symlink; not following it (same-uid agents are "
+                     "treated as adversarial)")
+            continue
+        except OSError as exc:
+            # A genuine write failure (EPERM, ENOSPC, EROFS, ...) --
+            # security-review finding F4: this must NOT crash the whole
+            # mint with a stack trace and leave every OTHER agent
+            # unprocessed. _write_agent_token_file's atomicity means the
+            # agent's existing file (if any) is untouched by this failure.
+            _fail(a, f"write failed ({exc.__class__.__name__}: {exc})")
+            continue
+
+        if not written:
+            # D19: a REGISTERED path whose directory (or an ancestor)
+            # doesn't exist yet -- minting a token nobody can receive, then
+            # registering its digest anyway, is exactly the fresh-host
+            # defect this fix exists for.
+            skill_dir = os.path.dirname(path)
+            _fail(a, f"expected directory {skill_dir} does not exist")
             continue
 
         tokens[a] = token
@@ -394,8 +648,19 @@ def mint(
         persisted_installs[a] = path
         lines.append(f"  {a:15}  written → {path}  (mode 600)")
 
+    # Final AGENT_TOKENS entries: every successful mint's fresh digest, plus
+    # -- for a FAILED agent that was already registered -- its existing
+    # entry carried forward VERBATIM (never recomputed; I-A1's byte-identical
+    # guarantee extends to this carry-forward path too).
+    final_entries: dict[str, str] = {}
+    for a in roster:
+        if a in digests:
+            final_entries[a] = f"{a}:sha256:{digests[a]}"
+        elif a in existing_entries:
+            final_entries[a] = existing_entries[a]
+
     print("=== Gateway .env — add this line (digest form; safe to print/paste) ===")
-    print("AGENT_TOKENS=" + ",".join(f"{a}:sha256:{digests[a]}" for a in tokens))
+    print("AGENT_TOKENS=" + ",".join(final_entries.values()))
     print()
     print("=== Gateway .env — optional read-only roles ===")
     print("AGENT_ROLES=" + ",".join(f"{a}:read" for a in READ_ONLY_AGENTS))
@@ -412,7 +677,18 @@ def mint(
     print()
     print("Each agent must use its own distinct token — never share tokens across agents.")
 
-    return tokens, digests
+    if failures:
+        print()
+        print("⚠ PARTIAL FAILURE — the following agent(s) were NOT updated this mint:")
+        for name, reason in failures:
+            carried = " (existing token preserved, nothing revoked)" if name in existing_entries else " (never registered -- nothing to carry forward)"
+            print(f"  {name:15}  {reason}{carried}")
+        print("  The AGENT_TOKENS line above is still SAFE to apply as printed -- it")
+        print("  never drops a working credential, it only omits one that was never")
+        print("  delivered. Fix the underlying issue for the affected agent(s) and")
+        print("  re-run (bulk, or --add for just that one).")
+
+    return tokens, digests, failures
 
 
 def add_agent(
@@ -432,7 +708,21 @@ def add_agent(
     when nothing was minted. rc is 0 on success, 1 on refusal -- every
     refusal path below returns BEFORE anything is minted, written, or
     registered, so a refused --add leaves no trace at all.
+
+    Input validation (security-review findings F2/F2b, ruled I-A8) runs
+    FIRST, before any registry is even read: a name or path containing a
+    registry delimiter or line-injection character is refused outright --
+    see _validate_registry_field()'s docstring for why this is validated
+    at input rather than escaped on output.
     """
+    try:
+        _validate_registry_field(name, "agent name")
+        if install_path is not None:
+            _validate_registry_field(install_path, "install path")
+    except ValueError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 1, None
+
     existing_raw = _read_env_raw_value(env_path, "AGENT_TOKENS") or ""
     existing_entries = _parse_agent_tokens_line(existing_raw)
     if name in existing_entries:
@@ -448,13 +738,23 @@ def add_agent(
     installs, _present = _load_agent_installs_registry(env_path)
 
     if install_path is not None:
-        # I-A2: two agents MAY legitimately share one install path (one tool
-        # reading another's skill directory) -- but _write_agent_token_file()
-        # REPLACES any existing AGENT_TOKEN= line at that path wholesale, so
-        # writing THIS agent's token there would clobber whichever registered
-        # agent already has a live token at the same path. Refuse, naming
-        # both, rather than silently overwriting a working credential.
-        clobbered = [n for n, p in installs.items() if p == install_path and n in existing_entries]
+        # I-A2/I-A9: two agents MAY legitimately share one install path (one
+        # tool reading another's skill directory) -- but
+        # _write_agent_token_file() REPLACES any existing AGENT_TOKEN= line
+        # at that path wholesale, so writing THIS agent's token there would
+        # clobber whichever registered agent already has a live token at
+        # the SAME file. Compared by NORMALIZED identity (_same_registered_
+        # file, resolving '..' and any symlink), not literal string
+        # equality -- security-review finding F3: two spellings of the
+        # identical file (".../shared-memory/.env" vs
+        # ".../other/../shared-memory/.env") defeated a `==` comparison,
+        # letting a second mint silently overwrite the first agent's token
+        # and start authenticating AS the second agent (the gateway stamps
+        # `source` from token identity -- silent provenance corruption).
+        clobbered = [
+            n for n, p in installs.items()
+            if n in existing_entries and _same_registered_file(p, install_path)
+        ]
         if clobbered:
             print(
                 f"✗ install path {install_path} is already registered to "
@@ -465,25 +765,36 @@ def add_agent(
             )
             return 1, None
 
-        skill_dir = os.path.dirname(install_path)
-        if not os.path.isdir(skill_dir):
+    token = _mint_one()
+    if install_path is not None:
+        try:
+            written = _write_agent_token_file(install_path, token)
+        except AgentEnvIsSymlink as exc:
+            print(
+                f"✗ REFUSED — {exc} is a symlink; not following it "
+                "(same-uid agents are treated as adversarial). Replace it "
+                "with a real file and re-run.",
+                file=sys.stderr,
+            )
+            return 1, None
+        except OSError as exc:
+            # Security-review finding F4: a genuine write failure (EPERM,
+            # ENOSPC, ...) must report cleanly, not crash with a stack
+            # trace -- _write_agent_token_file's atomicity means nothing on
+            # disk changed, so this is a clean refusal, not a
+            # partially-applied one.
+            print(
+                f"✗ REFUSED — write failed ({exc.__class__.__name__}: {exc}). "
+                "Nothing was written or registered.",
+                file=sys.stderr,
+            )
+            return 1, None
+        if not written:
+            skill_dir = os.path.dirname(install_path)
             print(
                 f"✗ REFUSED — expected directory {skill_dir} does not exist. "
                 f"Install the {name} skill package first, then re-run:\n"
                 f"  generate_tokens.py --add {name} --install-path {install_path}",
-                file=sys.stderr,
-            )
-            return 1, None
-
-    token = _mint_one()
-    if install_path is not None:
-        try:
-            _write_agent_token_file(install_path, token)
-        except AgentEnvIsSymlink:
-            print(
-                f"✗ REFUSED — {install_path} is a symlink; not following it "
-                "(same-uid agents are treated as adversarial). Replace it "
-                "with a real file and re-run.",
                 file=sys.stderr,
             )
             return 1, None
@@ -689,7 +1000,7 @@ def main(argv=None) -> int:
               f"(known: {', '.join(roster)})", file=sys.stderr)
         return 1
 
-    tokens, _digests = mint(env_path=_DEFAULT_GATEWAY_ENV, roster=roster)
+    tokens, _digests, failures = mint(env_path=_DEFAULT_GATEWAY_ENV, roster=roster)
 
     if args.reveal:
         print()
@@ -702,6 +1013,18 @@ def main(argv=None) -> int:
                 continue
             print(f"  {name}: AGENT_TOKEN={tokens[name]}")
 
+    # Security-review finding F4 / I-A10: a partial per-agent failure does
+    # NOT abort this exit code as 0 -- the printed AGENT_TOKENS line is
+    # still SAFE to write into the gateway .env as-is (a failed agent's
+    # existing entry is carried forward unchanged, never dropped; see
+    # mint()'s docstring). Returning nonzero here would make bootstrap_
+    # tokens.sh's `out="$(... )"` capture (running under `set -e`) abort
+    # BEFORE it ever echoes this output or applies the safe merged line --
+    # exactly backwards from what an operator needs to see. Instead,
+    # bootstrap_tokens.sh itself greps this stdout for the "PARTIAL
+    # FAILURE" marker AFTER applying the (safe) merged registry, and exits
+    # nonzero itself at that point -- so automation still gets a
+    # distinguishable exit code, without suppressing the report.
     return 0
 
 

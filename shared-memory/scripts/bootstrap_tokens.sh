@@ -209,3 +209,24 @@ fi
 
 echo
 ylw "Restart the gateway to load the new AGENT_TOKENS."
+
+# Security-review finding F4 / I-A10: generate_tokens.py's bulk mint()
+# returns exit 0 even when one or more agents FAILED this round (a genuine
+# write error, a missing directory, or a symlink refusal) -- deliberately,
+# because the AGENT_TOKENS line already applied above is SAFE regardless
+# (a failed agent's existing entry is carried forward unchanged, never
+# dropped; see mint()'s own docstring). Returning nonzero from THAT script
+# would have made the `out="$(...)"` capture above abort under `set -e`
+# BEFORE this script ever echoed the report or applied the safe merge --
+# exactly backwards. Instead, check for the marker HERE, after the safe
+# write already happened, so automation still gets a distinguishable exit
+# code without the report ever being suppressed.
+if grep -q "PARTIAL FAILURE" <<<"$out"; then
+    echo
+    red "⚠ PARTIAL FAILURE during this mint — see the report above for which"
+    red "  agent(s) are affected and how to recover. The registry written above"
+    red "  IS safe as applied (no working credential was revoked) — but go fix"
+    red "  the underlying issue for the affected agent(s) and re-run (bulk, or"
+    red "  --add for just that one) once ready."
+    exit 2
+fi

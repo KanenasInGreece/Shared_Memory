@@ -125,9 +125,17 @@ def test_bulk_mint_surfaces_the_refusal_for_a_missing_directory(tmp_path):
 
     proc = _run(fake_root, [])
 
-    assert proc.returncode == 0  # a per-agent refusal does not fail the whole bulk mint
+    # F4/I-A10 (fix round 2): the safe merged registry IS still written (a
+    # per-agent refusal never blocks the agents that succeeded), but the
+    # script now exits 2 -- a distinguishable "partial failure, needs
+    # attention" signal for automation -- rather than a bare 0. This is a
+    # deliberate behaviour change from the first cut of D19: the refusal
+    # itself was always non-fatal to the OTHER agents, but this run's exit
+    # code used to say nothing was wrong at all.
+    assert proc.returncode == 2
     assert "REFUSED" in proc.stdout
     assert "claude" in proc.stdout
+    assert "PARTIAL FAILURE" in proc.stdout
     content = _env_path(fake_root).read_text()
     assert "claude:sha256:" not in content, "a refused agent's digest must not land in AGENT_TOKENS"
 
