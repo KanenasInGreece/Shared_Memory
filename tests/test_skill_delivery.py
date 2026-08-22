@@ -320,3 +320,40 @@ def test_install_refuses_a_target_the_registry_does_not_name(tmp_path):
     assert not unregistered.exists(), (
         "--install created a directory the registry never named"
     )
+
+
+def test_registry_does_not_orphan_installs_that_predate_it(tmp_path, monkeypatch):
+    """⛔ THE REGISTRY IS A UNION WITH WHAT IS INSTALLED, NEVER A REPLACEMENT.
+
+    Measured regression, caught on a live host: the registry only starts existing
+    when someone adds an agent, and it then names ONLY that agent. Treating it as
+    the whole target list dropped every install that predates it — silently, with
+    no SKIP line — leaving those agents pinned to whatever version they last
+    received. Stale copies fail silently, which is the whole reason this project
+    ships copies and reports every refresh.
+    """
+    home = tmp_path / "home"
+    existing = home / ".claude" / "skills" / "shared-memory"
+    existing.mkdir(parents=True)
+    registered = tmp_path / "newagent" / "shared-memory"
+    registered.mkdir(parents=True)
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"AGENT_INSTALLS=newagent:{registered}/.env\n")
+
+    env = dict(os.environ)
+    env.pop("SHARED_MEMORY_SYNC_AGENTS", None)
+    env["SHARED_MEMORY_ENV_FILE"] = str(env_file)
+    env["SHARED_MEMORY_SYNC_SKIP_TRACKED"] = "1"
+    env["HOME"] = str(home)
+    result = subprocess.run(["bash", _SYNC], capture_output=True, text=True,
+                            env=env, cwd=_REPO, timeout=180)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    assert (registered / "SKILL.md").is_file(), "registered target was not synced"
+    assert (existing / "SKILL.md").is_file(), (
+        "an install that predates the registry was ORPHANED — adding one agent "
+        "silently stopped every existing agent from being updated"
+    )
+    assert not (home / ".codex").exists(), (
+        "a default path that is not installed must still never be created"
+    )
