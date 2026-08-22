@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.29] — 2026-08-22
+
+### Fixed — adding one agent silently stopped every existing agent from being updated
+
+- **The install-path registry is a union with what is already installed, never a replacement for it.**
+  The registry only starts existing when someone adds an agent, and it then names only that agent —
+  every install predating it is registered nowhere. 0.9.28 treated it as the whole target list, so
+  the first `--add` on a machine with existing installs dropped them from delivery, with no SKIP line
+  and no other symptom, leaving those agents pinned to whatever version they last received. Sync now
+  targets everything registered plus any historical default that actually exists on disk, and prints
+  where each target came from. A default path that is *not* installed is still never created.
+
+Caught on a live host immediately after the first real additive mint: the sync reported one target
+where the machine had more.
+
 ## [0.9.28] — 2026-08-22
 
 ### Fixed — three tests asserted an isolation they did not have

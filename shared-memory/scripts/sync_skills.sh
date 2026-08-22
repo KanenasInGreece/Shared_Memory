@@ -154,19 +154,38 @@ echo ""
 # host, not something a naming convention can be trusted to reproduce. The
 # hardcoded four remain as the pre-registry fallback so an install that has not
 # minted since the upgrade keeps working unchanged.
+_default_dirs=(
+  "$HOME/.claude/skills/shared-memory"
+  "$HOME/.codex/skills/shared-memory"
+  "$HOME/.gemini/skills/shared-memory"
+  "$HOME/.grok/skills/shared-memory"
+)
+
 if [ -n "${SHARED_MEMORY_SYNC_AGENTS:-}" ]; then
   IFS=':' read -r -a AGENTS <<< "$SHARED_MEMORY_SYNC_AGENTS"
 elif [ "${#registry_dirs[@]}" -gt 0 ]; then
+  # ⛔ THE REGISTRY IS A UNION WITH WHAT IS ALREADY INSTALLED, NEVER A REPLACEMENT
+  # FOR IT. The registry only starts existing when someone adds an agent, and it
+  # then names ONLY that agent — every install that predates it is registered
+  # nowhere. Treating it as the whole target list therefore drops the existing
+  # installs the moment a new agent is added, silently and with no SKIP line,
+  # leaving four agents pinned to whatever version they last received. Stale
+  # copies fail silently, which is exactly why this project ships copies and
+  # reports every refresh. So: everything registered, PLUS any historical
+  # default that actually exists on disk. An unregistered path that is NOT
+  # installed is still not conjured into existence.
   AGENTS=("${registry_dirs[@]}")
-  echo "Targets from AGENT_INSTALLS registry (${#AGENTS[@]}): $(printf '%s ' "${AGENTS[@]}")"
+  for _d in "${_default_dirs[@]}"; do
+    [ -d "$_d" ] || continue
+    _dup=0
+    for _a in "${AGENTS[@]}"; do [ "$_a" = "$_d" ] && _dup=1; done
+    [ "$_dup" = "0" ] && AGENTS+=("$_d") && _carried=$((${_carried:-0} + 1))
+  done
+  echo "Targets: ${#registry_dirs[@]} from the AGENT_INSTALLS registry + ${_carried:-0} unregistered install(s) already on disk"
+  printf '  %s\n' "${AGENTS[@]}"
   echo ""
 else
-  AGENTS=(
-    "$HOME/.claude/skills/shared-memory"
-    "$HOME/.codex/skills/shared-memory"
-    "$HOME/.gemini/skills/shared-memory"
-    "$HOME/.grok/skills/shared-memory"
-  )
+  AGENTS=("${_default_dirs[@]}")
 fi
 
 for dir in "${AGENTS[@]}"; do
