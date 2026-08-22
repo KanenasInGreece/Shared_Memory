@@ -109,7 +109,11 @@ Raise inotify limits per README §4 (needs sudo — give the user the commands t
 ssh -t <host> "echo '<user> ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/99-<user>-temp"
 ```
 
-and **delete `/etc/sudoers.d/99-<user>-temp` at the end of the session** — offer that cleanup unprompted. On Fedora/RHEL, docker itself is the first thing needing it: the distro ships podman, and the helper scripts call the docker CLI (`sudo dnf install moby-engine docker-compose` provides `docker compose` v2; the `podman-docker` shim is the untested alternative).
+and **delete `/etc/sudoers.d/99-<user>-temp` at the end of the session** — offer that cleanup unprompted. On Fedora/RHEL, docker itself is the first thing needing it: the distro ships podman, and the helper scripts call the docker CLI.
+
+⛔ **Install Docker Engine + Compose v2 from Docker's own repository — <https://docs.docker.com/engine/install/> — on every distro.** That is the packaging our installs run and the only one this project tests against; a distro's own docker packages may work but are not the tested path. (Recorded fallbacks, with provenance: Fedora's repos carry `moby-engine` + `docker-compose`, measured on Fedora 43; Debian 13 ships compose v2 under the legacy package name `docker-compose`, measured on Debian 13. The `podman-docker` shim remains untested.)
+
+⚠ **Switching to Docker's repo on a host where `docker.io` was ever installed:** purging `docker.io`, `docker-compose`, `containerd` and `runc` is **not enough**. Debian's `docker-buildx` arrives as a dependency of `docker.io`, survives that purge, and owns `/usr/libexec/docker/cli-plugins/docker-buildx` — so Docker's `docker-buildx-plugin` fails to unpack on a file-overwrite conflict and the install half-lands: binaries answer `--version`, several packages sit unpacked-but-unconfigured, and `docker.service` is left **disabled and dead** while nothing obviously looks wrong. Recovery: `sudo apt purge docker-buildx` → `sudo dpkg --configure -a` → reinstall the five Docker packages → `sudo systemctl enable --now docker`.
 
 **Driving the install over ssh: run every phase through a login shell** (`bash -lc "…"`). A bare
 ssh command runs a non-interactive shell whose PATH omits user-level installs — uv's documented

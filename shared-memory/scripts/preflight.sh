@@ -41,14 +41,19 @@ if command -v docker >/dev/null 2>&1; then
         bad "docker is installed but the daemon is not reachable (start Docker / check permissions)"
     fi
 else
-    # Fedora/RHEL ship podman, not docker — and the helper scripts
-    # (init_db.sh, ops/backup.sh) call the docker CLI, so name the packages
-    # that actually provide it there (verified: Fedora's own repos carry
-    # moby-engine + docker-compose, and the latter provides `docker compose` v2).
+    # THE TESTED PATH IS DOCKER'S OWN REPOSITORY, for every distro — that is
+    # what our installs run and therefore the only packaging this project can
+    # speak for. Distro packages are named only as a fallback FACT, with their
+    # provenance, never as the recommendation: Fedora's own repos carry
+    # moby-engine + docker-compose (measured on a Fedora 43 install, fact:1399)
+    # and Debian ships compose v2 under the legacy name `docker-compose`
+    # (measured on Debian 13). Neither is what we test against.
     if command -v dnf >/dev/null 2>&1; then
-        bad "docker not found — this distro ships podman; install real docker: sudo dnf install moby-engine docker-compose && sudo systemctl enable --now docker (then add your user to the docker group)"
+        bad "docker not found — install Docker Engine + Compose v2 from Docker's own repository (the tested path): https://docs.docker.com/engine/install/fedora/ — then sudo systemctl enable --now docker and add your user to the docker group. Fedora's own moby-engine + docker-compose also provide 'docker compose' v2, but that is not the packaging we test."
+    elif command -v apt-get >/dev/null 2>&1; then
+        bad "docker not found — install Docker Engine + Compose v2 from Docker's own repository (the tested path): https://docs.docker.com/engine/install/debian/ (or .../ubuntu/) — then sudo systemctl enable --now docker and add your user to the docker group. If docker.io was EVER installed here, purge docker-buildx too: it owns /usr/libexec/docker/cli-plugins/docker-buildx and blocks Docker's docker-buildx-plugin with a dpkg overwrite conflict that leaves the daemon disabled while docker --version still answers."
     else
-        bad "docker not found — install Docker Engine + Compose"
+        bad "docker not found — install Docker Engine + Compose v2 from Docker's own repository (the tested path): https://docs.docker.com/engine/install/"
     fi
 fi
 
