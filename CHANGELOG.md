@@ -5,6 +5,49 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.23] — 2026-08-22
+
+### Fixed — the install path, measured on a bare Debian 13 box with a discrete GPU
+
+A fresh bare-metal install (Debian 13, terminal-only, AMD RX 580) walked the documented path end
+to end and found six defects in it. Every one was invisible on a host that already worked.
+
+- **Preflight measured the wrong filesystem for disk space.** It checked the filesystem holding
+  the checkout, while images, volumes and both databases land under docker's data-root — often a
+  different mount entirely. On Debian's default LVM layout that meant reporting hundreds of free
+  gigabytes while the filesystem about to fill had eleven. It now measures docker's data-root, and
+  reports the checkout's filesystem separately when the two differ.
+- **Preflight asserted a GPU capability it never probed.** `nvtop present` was taken to mean
+  GPU-aware dreaming was enabled; on Debian 13 the packaged nvtop links no libdrm backends and
+  dlopens them at runtime, so without `libdrm-amdgpu1` it reports no GPU at all — as root too, so
+  it does not even read as a permission problem. Preflight now runs the probe, distinguishes
+  "sees no GPU" from "sees a GPU but reports no memory" (an older build), and names the library.
+- **The RAM check could never pass on the hardware it recommends.** MemTotal is what the kernel
+  was left, not what is fitted, so a 16 GB host reports 15 and warned forever.
+- **Postgres and Neo4j were published on every interface** while the encoders, which have no
+  authentication at all, were correctly confined to loopback — the exposure was inverted relative
+  to the risk. Both now default to loopback through `DB_BIND`, the same env-overridable shape the
+  inference ports already used, so a gateway on another host stays supported and becomes deliberate.
+- **`LLAMA_CPU_THREADS` was silently inert on GPU installs.** The CPU encoder services honoured it;
+  the GPU ones passed no thread flag, so llama.cpp claimed every core. Both now honour the budget.
+- **Preflight named the gap but not the fix.** The agent running it usually cannot install anything
+  — prerequisites belong to whoever administers the host — so every hard failure now records the
+  exact command or source, reprinted as one block that can be handed over as-is. Adds a `git`
+  check, which never existed.
+
+### Changed — documentation that disagreed with practice
+
+- **Docker installs from Docker's own repository, on every distro.** That is the packaging these
+  instructions are tested against; distro packages are still named, with their provenance, as
+  fallbacks rather than recommendations. Includes a measured switching trap: purging `docker.io`
+  leaves Debian's `docker-buildx` behind, which blocks Docker's plugin and leaves the install
+  half-landed — binaries answering `--version` while the daemon is disabled and dead.
+- **The credential keyfile example pointed somewhere no install uses**, and hid a reboot trap: a
+  runtime/tmpfs path is erased on reboot, so the gateway restarts with that backend excluded, and
+  where it is the only backend the dreaming passes stop with no error anywhere. Also marks that a
+  `<KEY>_FILE` pointer is used verbatim — `~` is not expanded for it, unlike other path settings
+  in the same file.
+
 ## [0.9.22] — 2026-08-21
 
 ### Changed — verification stops re-minting canaries once your corpus has grown up

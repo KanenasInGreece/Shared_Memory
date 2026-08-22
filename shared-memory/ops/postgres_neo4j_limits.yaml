@@ -11,9 +11,16 @@ services:
   neo4j:
     image: neo4j:5-community
     container_name: neo4j-memory
+    # Loopback by default, same rule and same shape as INFERENCE_BIND below:
+    # a bare "7474:7474" publishes on ALL interfaces, putting the store that
+    # holds the entire corpus on the network behind nothing but its password.
+    # The gateway is a host process and reaches these over localhost; container
+    # peers use the compose network by service name, not a published port —
+    # so loopback costs neither. Widen only for a gateway on another host, and
+    # only over a network you trust.
     ports:
-      - "7474:7474"
-      - "7687:7687"
+      - "${DB_BIND:-127.0.0.1}:7474:7474"
+      - "${DB_BIND:-127.0.0.1}:7687:7687"
     volumes:
       # Host data dirs come from the framework env (shared-memory/.env); the
       # first-install script (scripts/install_framework.sh) sets NEO4J_HOST_DIR.
@@ -55,7 +62,7 @@ services:
     image: pgvector/pgvector:pg17
     container_name: postgres-vector
     ports:
-      - "5432:5432"
+      - "${DB_BIND:-127.0.0.1}:5432:5432"
     volumes:
       - ${PG_DATA_DIR:?set PG_DATA_DIR in shared-memory/.env}:/var/lib/postgresql/data:z
     command: >
@@ -185,7 +192,7 @@ services:
     command: >
       -m /models/${EMBED_MODEL_SUBPATH:-gpustack/bge-m3-GGUF/bge-m3-Q8_0.gguf}
       --embedding --host 0.0.0.0 --port 8070
-      -ngl 99 -c 8192 -b 8192 -ub 8192
+      -ngl 99 --threads ${LLAMA_CPU_THREADS:-4} -c 8192 -b 8192 -ub 8192
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8070/health"]
       interval: 30s
@@ -211,7 +218,7 @@ services:
     command: >
       -m /models/${RERANK_MODEL_SUBPATH:-gpustack/bge-reranker-v2-m3-GGUF/bge-reranker-v2-m3-Q8_0.gguf}
       --rerank --host 0.0.0.0 --port 8071
-      -ngl 99 -c 8192 -b 8192 -ub 8192
+      -ngl 99 --threads ${LLAMA_CPU_THREADS:-4} -c 8192 -b 8192 -ub 8192
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8071/health"]
       interval: 30s
