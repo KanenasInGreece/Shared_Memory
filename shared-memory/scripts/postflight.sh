@@ -14,11 +14,12 @@
 #   A6  baseline emission       timings + backend_capability + capacity + hardware → JSON (never a gate)
 #   A7  conduct constraints     by construction — see the spec; stated, not tested
 #   A8  reasoning-backend       a REAL completion through the gateway proxy path; SKIPs
-#       liveness, end to end    when no backend is configured, never on a missing LLM
+#       liveness, end to end    when no backend is reported HEALTHY (/health's
+#                                llm_backends status map), never on a missing LLM
 #
 # Exit 0 iff A1–A5 and A8 all pass (A8 SKIPs, never gates, when no reasoning
-# backend is configured). Run after first install (AGENTS.md Phase 9) and
-# after every upgrade:
+# backend is reported healthy right now). Run after first install (AGENTS.md
+# Phase 9) and after every upgrade:
 #
 #   export AGENT_TOKEN=...   # auth-on installs: any minted agent token,
 #                            # from that agent's skill .env
@@ -135,22 +136,42 @@ else:
 # >>> A8_BACKEND_INFO (tests/test_postflight_a8.py extracts this block
 # VERBATIM and runs it standalone via subprocess with fixture stdin — same
 # technique as SELECT_SUMMARY_PHRASE above. Pure function: given the
-# /health payload (health_full) on stdin, prints "<count>|<comma-joined
-# urls, no credentials>" — the GATEWAY'S OWN resolved backend list
-# (config.llm_backends off /health), never a bash re-parse of LLM_BACKENDS /
-# LLM_BACKENDS_JSON / LLM_DEFAULT_TARGET. A3's own philosophy applies here
-# too: postflight never duplicates the gateway's logic (_load_llm_backends()
-# in hive_mind_proxy.py has its own priority order, weight parsing and
-# credential resolution — re-deriving even a summary of that in bash would
-# drift from it the first time that function changes); it asks the gateway
-# what it already decided and trusts the answer. count==0 is A8's SKIP
-# signal — "no reasoning backend configured" — which can only arise if
-# LLM_DEFAULT_TARGET was explicitly blanked with LLM_BACKENDS/
-# LLM_BACKENDS_JSON unset (the code fallback otherwise always yields at
-# least one backend, so this is a real but deliberately-inert install, never
-# the common case). Only "url" is ever read — has_credential is a bool the
-# gateway itself never echoes the credential for, and this function does not
-# even look at it, so nothing here can leak a key.
+# /health payload (health_full) on stdin, prints
+# "<healthy_count>|<comma-joined healthy urls, no credentials>|<comma-
+# joined url=status for EVERY reported backend>".
+#
+# Fix round (operator ruling, post-build review): the first cut of this
+# function keyed on `config.llm_backends` — the CONFIGURED list — which
+# hive_mind_proxy.py's own _load_llm_backends() NEVER returns empty (unset
+# LLM_BACKENDS/LLM_BACKENDS_JSON falls back to a single-entry list built
+# from LLM_DEFAULT_TARGET, itself defaulting to "http://localhost:5000").
+# That made the "no backend configured" SKIP branch effectively
+# unreachable on any ordinary install, so a perfectly healthy LLM-less
+# deployment (AGENTS.md Phase 7: "llm":"down" blocks dreaming only, never
+# saves/search) would fire a doomed completion at the unconfigured
+# default and FAIL postflight for having no LLM at all — exactly the
+# outcome A8 exists to never cause.
+#
+# The correct signal lives in a DIFFERENT top-level /health key —
+# `llm_backends` (not `config.llm_backends`) — the per-backend STATUS MAP
+# the gateway's own liveness probe already populates every request cycle,
+# e.g. {"http://localhost:5000": "ok", "https://api.deepseek.com":
+# "timeout"}. Confirmed values (hive_mind_proxy.py, the loop that builds
+# `backend_status` just above `checks["llm"] = ...`): "ok" (probe answered
+# <400, or a credentialed backend's unauthenticated-probe 401/403 — see
+# that code's own H-1/H-2 comment), "http_<code>" (any other status),
+# "timeout", or "down" (connect/other exception) — "ok" is the ONLY
+# healthy value; every OTHER value in the vocabulary, and no backend
+# entry at all, means "not currently healthy". A3's own philosophy still
+# applies: postflight never re-derives what the gateway already decided,
+# it reads the gateway's verdict and trusts it — the fix is which VERDICT
+# to read, not a return to re-parsing LLM_BACKENDS/LLM_BACKENDS_JSON/
+# LLM_DEFAULT_TARGET in bash. healthy_count==0 is now A8's real,
+# REACHABLE SKIP signal — genuinely no backend is answering right now,
+# the documented non-fatal state, already surfaced by A1's own "llm"
+# field. Only "url" (the map's key) is ever read for the healthy-urls
+# list — has_credential/token_env never appear in this map at all, so
+# nothing here can leak a key.
 a8_backend_info() {  # reads /health JSON on stdin
     python3 -c '
 import json, sys
@@ -158,9 +179,12 @@ try:
     d = json.load(sys.stdin)
 except Exception:
     d = {}
-backends = ((d.get("config") or {}).get("llm_backends")) or []
-urls = [b.get("url") for b in backends if isinstance(b, dict) and b.get("url")]
-print(str(len(backends)) + "|" + ",".join(urls))
+statuses = d.get("llm_backends")
+if not isinstance(statuses, dict):
+    statuses = {}
+healthy = [url for url, status in statuses.items() if status == "ok"]
+summary = ",".join(f"{url}={status}" for url, status in statuses.items())
+print(str(len(healthy)) + "|" + ",".join(healthy) + "|" + summary)
 '
 }
 # <<< A8_BACKEND_INFO
@@ -945,16 +969,21 @@ if [[ "$token_missing" == "1" ]]; then
 elif [[ "$gateway_down" == "1" ]]; then
     bad A8 "skipped — gateway unreachable (see A1)"
 else
+    # IFS='|' read, matching the idiom already used for cap_fields below —
+    # a8_backend_info's third field (the full status summary) can be empty
+    # (no backends reported at all), which a bash `#*|`/`%%|*` split alone
+    # handles awkwardly once there are two delimiters.
     backend_info="$(printf '%s' "${health_full:-}" | a8_backend_info)"
-    backend_count="${backend_info%%|*}"
-    backend_urls="${backend_info#*|}"
+    IFS='|' read -r backend_count backend_urls backend_status_summary <<< "$backend_info"
     if [[ ! "$backend_count" =~ ^[0-9]+$ || "$backend_count" -lt 1 ]]; then
-        # NEVER a gate: an install can legitimately have no reasoning
-        # backend configured (LLM_DEFAULT_TARGET blanked, LLM_BACKENDS/
-        # LLM_BACKENDS_JSON unset — see a8_backend_info's own comment for
-        # exactly how that arises in _load_llm_backends()); this branch must
-        # never call bad(), only warn().
-        warn "A8 skipped — no reasoning backend configured on this gateway (LLM_BACKENDS / LLM_BACKENDS_JSON / LLM_DEFAULT_TARGET all resolve to nothing) — this install legitimately has no LLM; A8 can never fail an install for lacking one"
+        # NEVER a gate: no backend is reported HEALTHY right now (per
+        # /health's own llm_backends status map — see a8_backend_info's own
+        # comment for the full fix-round reasoning and status vocabulary).
+        # This is the documented non-fatal state (AGENTS.md Phase 7:
+        # "llm":"down" blocks dreaming only, never saves/search), already
+        # surfaced by A1's own "llm" field — this branch must never call
+        # bad(), only warn().
+        warn "A8 skipped — no reasoning backend reported healthy on this gateway right now (per /health's llm_backends status map${backend_status_summary:+: $backend_status_summary}) — this is the documented non-fatal no-working-LLM state; A8 can never fail an install for it"
     else
         # A minimal REAL completion, not a probe: small deterministic
         # prompt, small max_tokens, same route (POST $GATEWAY_URL/v1/chat/
@@ -1007,16 +1036,16 @@ print(json.dumps({
                 ok "A8 real completion returned through the gateway proxy path (model $a8_model, ${reasoning_ms} ms)"
                 ;;
             EMPTY)
-                bad A8 "gateway returned HTTP 200 but no usable completion content — a 200 with empty content is a failure, not a pass. Configured backend(s): ${backend_urls:-<none>}"
+                bad A8 "gateway returned HTTP 200 but no usable completion content — a 200 with empty content is a failure, not a pass. Healthy backend(s) at request time: ${backend_urls:-<none>}"
                 ;;
             HTTP_404)
-                bad A8 "gateway returned 404 from the reasoning-backend proxy path — the known cause (D23) is a doubled /v1 path segment when a configured base already ends in /v1. Configured backend(s): ${backend_urls:-<none>}"
+                bad A8 "gateway returned 404 from the reasoning-backend proxy path — the known cause (D23) is a doubled /v1 path segment when a configured base already ends in /v1. Healthy backend(s) at request time: ${backend_urls:-<none>}"
                 ;;
             HTTP_*)
-                bad A8 "gateway returned HTTP ${a8_verdict#HTTP_} from the reasoning-backend proxy path. Configured backend(s): ${backend_urls:-<none>}"
+                bad A8 "gateway returned HTTP ${a8_verdict#HTTP_} from the reasoning-backend proxy path. Healthy backend(s) at request time: ${backend_urls:-<none>}"
                 ;;
             *)
-                bad A8 "no response from $GATEWAY_URL/v1/chat/completions (timeout after ${CLIENT_TIMEOUT}s, or connection failed). Configured backend(s): ${backend_urls:-<none>}"
+                bad A8 "no response from $GATEWAY_URL/v1/chat/completions (timeout after ${CLIENT_TIMEOUT}s, or connection failed). Healthy backend(s) at request time: ${backend_urls:-<none>}"
                 ;;
         esac
     fi

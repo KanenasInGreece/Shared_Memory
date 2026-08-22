@@ -30,6 +30,29 @@ extracted section against a local stub HTTP server standing in for the
 gateway -- no docker, no live gateway, no Postgres/Neo4j, unlike A1-A7's own
 end-to-end verification against a reference install (see
 test_postflight_rebaseline.py's docstring for that same split).
+
+Fix round (operator ruling, post-build review): the first cut of
+a8_backend_info() keyed "is a reasoning backend configured?" on /health's
+`config.llm_backends` -- the CONFIGURED list, which hive_mind_proxy.py's
+own _load_llm_backends() NEVER returns empty (an unset LLM_BACKENDS/
+LLM_BACKENDS_JSON falls back to a single-entry list built from
+LLM_DEFAULT_TARGET, itself defaulting to "http://localhost:5000"). That made
+A8's SKIP branch effectively unreachable on any ordinary install: a
+perfectly healthy LLM-less deployment (AGENTS.md Phase 7: "llm":"down"
+blocks dreaming only, never saves/search) would fire a doomed completion at
+the unconfigured default and FAIL postflight for lacking an LLM -- exactly
+the outcome A8 exists to never cause. The fix re-keys on a DIFFERENT
+top-level /health field, `llm_backends` (no `config.` prefix) -- the
+per-backend STATUS MAP the gateway's own liveness probe already populates.
+Confirmed vocabulary (hive_mind_proxy.py, the loop building `backend_status`
+just above `checks["llm"] = ...`): "ok" (probe answered <400, or a
+credentialed backend's unauthenticated 401/403 -- see that code's own
+H-1/H-2 comment), "http_<code>" (any other status), "timeout", or "down"
+(connect/other exception). "ok" is the ONLY healthy value. This file's tests
+below cover BOTH reachable SKIP shapes: no backend reported at all, and
+backends present but every one unhealthy (the realistic shape, since
+config-resolved backends always exist by construction) -- the latter is the
+case the fix round specifically required be testable.
 """
 import contextlib
 import http.server
@@ -111,54 +134,88 @@ def test_a8_backend_info_markers_present_exactly_once():
     assert text.count("# <<< A8_BACKEND_INFO") == 1
 
 
-def test_backend_info_empty_health_yields_zero_and_no_urls():
+def test_backend_info_empty_health_yields_zero_healthy():
     result = run_a8_backend_info("")
     assert result.returncode == 0
-    assert result.stdout.strip() == "0|"
+    assert result.stdout.strip() == "0||"
 
 
-def test_backend_info_missing_config_key_yields_zero():
+def test_backend_info_missing_llm_backends_key_yields_zero_healthy():
     result = run_a8_backend_info(json.dumps({"status": "ok"}))
     assert result.returncode == 0
-    assert result.stdout.strip() == "0|"
+    assert result.stdout.strip() == "0||"
 
 
-def test_backend_info_empty_llm_backends_list_yields_zero():
-    health = {"config": {"llm_backends": []}}
+def test_backend_info_empty_llm_backends_map_yields_zero_healthy():
+    health = {"llm_backends": {}}
     result = run_a8_backend_info(json.dumps(health))
     assert result.returncode == 0
-    assert result.stdout.strip() == "0|"
+    assert result.stdout.strip() == "0||"
 
 
-def test_backend_info_one_backend_reports_count_and_url():
-    health = {"config": {"llm_backends": [{"url": "http://example-backend:5000"}]}}
+def test_backend_info_one_healthy_backend_reports_count_url_and_summary():
+    health = {"llm_backends": {"http://example-backend:5000": "ok"}}
     result = run_a8_backend_info(json.dumps(health))
     assert result.returncode == 0
-    assert result.stdout.strip() == "1|http://example-backend:5000"
+    assert result.stdout.strip() == "1|http://example-backend:5000|http://example-backend:5000=ok"
 
 
-def test_backend_info_multiple_backends_preserve_order():
-    health = {"config": {"llm_backends": [
-        {"url": "http://backend-a:5000"},
-        {"url": "http://backend-b:4000"},
-    ]}}
+def test_backend_info_only_ok_status_counts_as_healthy():
+    # Confirmed vocabulary (hive_mind_proxy.py's backend_status loop): "ok",
+    # "http_<code>", "timeout", "down" -- "ok" is the ONLY healthy value.
+    # Every other value must be excluded from the healthy list/count, but
+    # still show up in the full status summary (so a SKIP message can name
+    # WHY, not just THAT).
+    health = {"llm_backends": {
+        "http://backend-a:5000": "ok",
+        "http://backend-b:4000": "down",
+        "http://backend-c:4001": "timeout",
+        "http://backend-d:4002": "http_500",
+    }}
     result = run_a8_backend_info(json.dumps(health))
     assert result.returncode == 0
-    assert result.stdout.strip() == "2|http://backend-a:5000,http://backend-b:4000"
+    count, urls, summary = result.stdout.strip().split("|")
+    assert count == "1"
+    assert urls == "http://backend-a:5000"
+    assert "http://backend-b:4000=down" in summary
+    assert "http://backend-c:4001=timeout" in summary
+    assert "http://backend-d:4002=http_500" in summary
 
 
-def test_backend_info_never_echoes_a_credential():
-    # A backend descriptor legitimately carries has_credential (bool) --
-    # never a token, never a token_env value. Feed a fixture with a
-    # plausible-looking secret-shaped field and confirm it never reaches the
-    # printed line, even by accident.
-    health = {"config": {"llm_backends": [
-        {"url": "http://example.com", "has_credential": True,
-         "token": "sk-should-never-appear-anywhere"},
-    ]}}
+def test_backend_info_multiple_healthy_backends_preserve_order():
+    health = {"llm_backends": {
+        "http://backend-a:5000": "ok",
+        "http://backend-b:4000": "ok",
+    }}
     result = run_a8_backend_info(json.dumps(health))
     assert result.returncode == 0
+    assert result.stdout.strip() == (
+        "2|http://backend-a:5000,http://backend-b:4000|"
+        "http://backend-a:5000=ok,http://backend-b:4000=ok"
+    )
+
+
+def test_backend_info_reads_the_status_map_never_the_configured_list():
+    # The fix-round bug: an earlier cut of this function read `config.
+    # llm_backends` (the CONFIGURED list, never empty by construction) --
+    # confirm the current version reads the top-level `llm_backends` STATUS
+    # map instead, and never falls back to `config` even when both keys are
+    # present with different, conflicting content. Also doubles as the
+    # credential-safety check: a backend descriptor under `config` can
+    # legitimately carry has_credential/token_env-shaped fields, and none of
+    # that must ever reach this function's output.
+    health = {
+        "config": {"llm_backends": [
+            {"url": "http://not-the-answer:9999", "has_credential": True,
+             "token": "sk-should-never-appear-anywhere"},
+        ]},
+        "llm_backends": {"http://real-backend:5000": "ok"},
+    }
+    result = run_a8_backend_info(json.dumps(health))
+    assert result.returncode == 0
+    assert result.stdout.strip() == "1|http://real-backend:5000|http://real-backend:5000=ok"
     assert "sk-should-never-appear-anywhere" not in result.stdout
+    assert "not-the-answer" not in result.stdout
 
 
 # ── a8_grade_completion (pure) ─────────────────────────────────────────────
@@ -342,18 +399,40 @@ def test_a8_token_missing_skips_without_gating_its_own_section():
     assert _afail(result) == "0"
 
 
-def test_a8_no_backend_configured_skips_and_never_gates():
-    health = json.dumps({"config": {"llm_backends": []}})
+def test_a8_no_backend_at_all_skips_and_never_gates():
+    health = json.dumps({"llm_backends": {}})
     result = run_a8_live(gateway_url="http://127.0.0.1:1", health_full=health)
     assert "A8 skipped" in result.stdout
-    assert "no reasoning backend configured" in result.stdout
+    assert "no reasoning backend reported healthy" in result.stdout
+    assert "✗ A8" not in result.stdout
+    assert _afail(result) == "0"
+
+
+def test_a8_backends_present_but_none_healthy_skips_and_never_gates():
+    # I-D2, the case the fix round exists for: this is the REALISTIC shape
+    # (config always resolves to at least one backend by construction, per
+    # a8_backend_info's own fix-round comment) -- backends ARE present, none
+    # currently answer "ok". This must SKIP exactly like the empty-map case
+    # above, never fail, and the message should show WHY (the actual
+    # statuses), matching AGENTS.md Phase 7: "llm":"down" blocks dreaming
+    # only, never saves/search -- a healthy LLM-less-right-now install must
+    # not fail postflight for it.
+    health = json.dumps({"llm_backends": {
+        "http://localhost:5000": "down",
+        "https://api.deepseek.com": "timeout",
+    }})
+    result = run_a8_live(gateway_url="http://127.0.0.1:1", health_full=health)
+    assert "A8 skipped" in result.stdout
+    assert "no reasoning backend reported healthy" in result.stdout
+    assert "http://localhost:5000=down" in result.stdout
+    assert "https://api.deepseek.com=timeout" in result.stdout
     assert "✗ A8" not in result.stdout
     assert _afail(result) == "0"
 
 
 def test_a8_real_completion_passes_and_never_gates():
     with _stub_server(200, b'{"choices":[{"message":{"content":"ok"}}]}') as (url, handler):
-        health = json.dumps({"config": {"llm_backends": [{"url": "http://example:5000"}]}})
+        health = json.dumps({"llm_backends": {"http://example:5000": "ok"}})
         result = run_a8_live(gateway_url=url, health_full=health)
     assert "✓" in result.stdout and "A8 real completion returned" in result.stdout
     assert _afail(result) == "0"
@@ -361,9 +440,11 @@ def test_a8_real_completion_passes_and_never_gates():
 
 
 def test_a8_200_with_empty_content_fails_and_gates():
-    # I-D1: a 200 with empty content is a failure, not a pass.
+    # I-D1: a 200 with empty content is a failure, not a pass. This is
+    # exactly the D23 signature the fix round called out: the gateway's own
+    # liveness probe says "ok", but the real work path does not work.
     with _stub_server(200, b'{"choices":[{"message":{"content":""}}]}') as (url, _):
-        health = json.dumps({"config": {"llm_backends": [{"url": "http://example:5000"}]}})
+        health = json.dumps({"llm_backends": {"http://example:5000": "ok"}})
         result = run_a8_live(gateway_url=url, health_full=health)
     assert "✗ A8" in result.stdout
     assert "empty" in result.stdout.lower()
@@ -371,19 +452,22 @@ def test_a8_200_with_empty_content_fails_and_gates():
 
 
 def test_a8_404_fails_and_names_the_D23_known_cause():
+    # The backend reports "ok" on /health's liveness probe (that's what
+    # makes it eligible for A8's real completion at all) while the real
+    # proxy path 404s -- exactly the D23 shape.
     with _stub_server(404, b'{"error":"not found"}') as (url, _):
-        health = json.dumps({"config": {"llm_backends": [{"url": "https://provider.example/v1"}]}})
+        health = json.dumps({"llm_backends": {"https://provider.example/v1": "ok"}})
         result = run_a8_live(gateway_url=url, health_full=health)
     assert "✗ A8" in result.stdout
     assert "404" in result.stdout
     assert "doubled" in result.stdout
-    assert "https://provider.example/v1" in result.stdout  # names the configured base
+    assert "https://provider.example/v1" in result.stdout  # names the healthy backend
     assert _afail(result) == "1"
 
 
 def test_a8_500_fails_with_status_named():
     with _stub_server(500, b"internal error") as (url, _):
-        health = json.dumps({"config": {"llm_backends": [{"url": "http://example:5000"}]}})
+        health = json.dumps({"llm_backends": {"http://example:5000": "ok"}})
         result = run_a8_live(gateway_url=url, health_full=health)
     assert "✗ A8" in result.stdout
     assert "500" in result.stdout
@@ -392,7 +476,7 @@ def test_a8_500_fails_with_status_named():
 
 def test_a8_connection_refused_fails_as_no_response():
     dead_port = _free_closed_port()
-    health = json.dumps({"config": {"llm_backends": [{"url": "http://example:5000"}]}})
+    health = json.dumps({"llm_backends": {"http://example:5000": "ok"}})
     result = run_a8_live(gateway_url=f"http://127.0.0.1:{dead_port}", health_full=health,
                           client_timeout="3")
     assert "✗ A8" in result.stdout
@@ -402,7 +486,7 @@ def test_a8_connection_refused_fails_as_no_response():
 
 def test_a8_sends_bearer_token_when_auth_on():
     with _stub_server(200, b'{"choices":[{"message":{"content":"ok"}}]}') as (url, handler):
-        health = json.dumps({"config": {"llm_backends": [{"url": "http://example:5000"}]}})
+        health = json.dumps({"llm_backends": {"http://example:5000": "ok"}})
         result = run_a8_live(gateway_url=url, health_full=health, auth_on="1",
                               agent_token="test-token-fixture-value")
     assert _afail(result) == "0"
@@ -411,7 +495,7 @@ def test_a8_sends_bearer_token_when_auth_on():
 
 def test_a8_never_sends_a_bearer_header_when_auth_off():
     with _stub_server(200, b'{"choices":[{"message":{"content":"ok"}}]}') as (url, handler):
-        health = json.dumps({"config": {"llm_backends": [{"url": "http://example:5000"}]}})
+        health = json.dumps({"llm_backends": {"http://example:5000": "ok"}})
         result = run_a8_live(gateway_url=url, health_full=health, auth_on="0")
     assert _afail(result) == "0"
     assert handler.seen_auth_header is None
@@ -446,10 +530,11 @@ def test_a1_marks_afail_a8_on_missing_token_both_modes():
 def test_a8_no_backend_branch_uses_warn_never_bad():
     a8 = _extract_a8_section()
     # Structural guarantee behind I-D2: the specific line that fires when no
-    # backend is configured must call warn(), never bad() -- a mutation here
-    # would silently turn a legitimate no-LLM install into a failing one.
-    m = re.search(r'no reasoning backend configured[^\n]*', a8)
-    assert m, "could not find the no-backend-configured message in the A8 section"
+    # backend is reported healthy must call warn(), never bad() -- a
+    # mutation here would silently turn a legitimate no-working-LLM install
+    # into a failing one.
+    m = re.search(r'no reasoning backend reported healthy[^\n]*', a8)
+    assert m, "could not find the no-backend-healthy message in the A8 section"
     line_start = a8.rfind("\n", 0, m.start()) + 1
     line = a8[line_start:m.end()]
     assert line.strip().startswith("warn "), (
