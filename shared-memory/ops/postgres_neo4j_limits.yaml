@@ -11,9 +11,16 @@ services:
   neo4j:
     image: neo4j:5-community
     container_name: neo4j-memory
+    # Loopback by default, same rule and same shape as INFERENCE_BIND below:
+    # a bare "7474:7474" publishes on ALL interfaces, putting the store that
+    # holds the entire corpus on the network behind nothing but its password.
+    # The gateway is a host process and reaches these over localhost; container
+    # peers use the compose network by service name, not a published port —
+    # so loopback costs neither. Widen only for a gateway on another host, and
+    # only over a network you trust.
     ports:
-      - "7474:7474"
-      - "7687:7687"
+      - "${DB_BIND:-127.0.0.1}:7474:7474"
+      - "${DB_BIND:-127.0.0.1}:7687:7687"
     volumes:
       # Host data dirs come from the framework env (shared-memory/.env); the
       # first-install script (scripts/install_framework.sh) sets NEO4J_HOST_DIR.
@@ -55,7 +62,7 @@ services:
     image: pgvector/pgvector:pg17
     container_name: postgres-vector
     ports:
-      - "5432:5432"
+      - "${DB_BIND:-127.0.0.1}:5432:5432"
     volumes:
       - ${PG_DATA_DIR:?set PG_DATA_DIR in shared-memory/.env}:/var/lib/postgresql/data:z
     command: >
