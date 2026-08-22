@@ -5,6 +5,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.28] — 2026-08-22
+
+### Fixed — three tests asserted an isolation they did not have
+
+- **`mint()` and `add_agent()` bound the gateway `.env` path as a default argument**, which Python
+  evaluates once at import. Three tests rebound that module constant expecting to be redirected at a
+  temporary file and were silently ignored — they passed only because the tree they ran in happened
+  to have no gateway `.env` at all, and one of them failed the moment the suite was run on a machine
+  that had one. The path is now resolved at call time. Runtime behaviour is unchanged: a real
+  invocation still reads the real `.env`, which is the point.
+
+### Changed — skill delivery follows the registry instead of a hardcoded list
+
+- **`sync_skills.sh` takes its targets from `AGENT_INSTALLS`** when the registry exists, falling back
+  to the historical four paths when it does not, and still yielding to
+  `SHARED_MEMORY_SYNC_AGENTS` when that is set. Without this the two halves of the roster disagreed
+  about where an agent lives: 0.9.27 made the mint follow the registry while delivery still walked a
+  list of guesses.
+- **`--install` creates a target directory the registry names, and only one it names.** The default
+  stays update-only — an install that is absent is reported and skipped, never conjured — but on a
+  genuinely fresh host that meant neither the mint nor the sync would create the directory the other
+  one needed, and the operator was left to discover the gap. A registered path is an explicit
+  statement of where an agent lives, so creating it honours the registry rather than guessing.
+- **`SHARED_MEMORY_ENV_FILE` overrides which `.env` the registry is read from**, for the same reason
+  the agent list has had an override: otherwise the registry branch could only ever be exercised
+  against the machine's real `.env`, and its tests would have to read this script's source and
+  believe it rather than run it.
+
 ## [0.9.27] — 2026-08-22
 
 ### Added — agents are registered, not hardcoded, and adding one no longer rotates everyone's token

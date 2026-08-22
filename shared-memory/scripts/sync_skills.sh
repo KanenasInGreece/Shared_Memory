@@ -45,7 +45,50 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 SRC="$REPO/shared-memory"
 SKILL_COPY="$REPO/shared-memory-skill/shared-memory"
 PRUNE=0
-[ "${1:-}" = "--prune" ] && PRUNE=1
+INSTALL_MISSING=0
+for _arg in "$@"; do
+  case "$_arg" in
+    --prune)   PRUNE=1 ;;
+    --install) INSTALL_MISSING=1 ;;
+  esac
+done
+
+# ── The install-path REGISTRY (AGENT_INSTALLS), read from the gateway .env ────
+#
+# Standing candidate order for every loader in this family (apply.py,
+# secure_env.py, bootstrap_tokens.sh): shared-memory/.env first, the repo-root
+# .env as the pre-0.6 fallback. Parsed here rather than sourced — this file
+# holds every credential the install has, and `source`ing it would execute
+# whatever a malformed line happens to look like.
+# SHARED_MEMORY_ENV_FILE overrides the candidate search — same reason
+# SHARED_MEMORY_SYNC_AGENTS exists: without it the registry branch could only
+# ever be exercised against this machine's real .env, so a test would have to
+# read this script's source and believe it rather than run it.
+_registry_env=""
+for _cand in "${SHARED_MEMORY_ENV_FILE:-}" "$SRC/.env" "$REPO/.env"; do
+  [ -n "$_cand" ] && [ -f "$_cand" ] && { _registry_env="$_cand"; break; }
+done
+
+# AGENT_INSTALLS is name:path, comma-separated, split on the FIRST colon only
+# (a path may legitimately contain one). The registry records each agent's
+# skill .env; the directory this script syncs is that file's parent.
+registry_dirs=()
+if [ -n "$_registry_env" ]; then
+  _raw="$(sed -n 's/^[[:space:]]*AGENT_INSTALLS=//p' "$_registry_env" | tail -n1)"
+  _raw="${_raw%\"}"; _raw="${_raw#\"}"
+  if [ -n "$_raw" ]; then
+    _old_ifs="$IFS"; IFS=','
+    for _pair in $_raw; do
+      _pair="$(printf '%s' "$_pair" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+      [ -z "$_pair" ] && continue
+      case "$_pair" in *:*) ;; *) continue ;; esac
+      _envpath="${_pair#*:}"
+      [ -z "$_envpath" ] && continue
+      registry_dirs+=("$(dirname "$_envpath")")
+    done
+    IFS="$_old_ifs"
+  fi
+fi
 
 # ── Phase 1: framework source → tracked skill copy (the distribution source) ─
 #
@@ -104,8 +147,19 @@ echo ""
 # delivery testable at all — a test points it at a temporary tree and asserts
 # what actually lands there, rather than reading this script's source and
 # believing it.
+# Target selection, most specific first. The REGISTRY is preferred over the
+# built-in list because it is the only source that knows where agents on THIS
+# machine actually live: v0.9.27 replaced the guessed-from-name layout with
+# AGENT_INSTALLS precisely because an install path is owned information about a
+# host, not something a naming convention can be trusted to reproduce. The
+# hardcoded four remain as the pre-registry fallback so an install that has not
+# minted since the upgrade keeps working unchanged.
 if [ -n "${SHARED_MEMORY_SYNC_AGENTS:-}" ]; then
   IFS=':' read -r -a AGENTS <<< "$SHARED_MEMORY_SYNC_AGENTS"
+elif [ "${#registry_dirs[@]}" -gt 0 ]; then
+  AGENTS=("${registry_dirs[@]}")
+  echo "Targets from AGENT_INSTALLS registry (${#AGENTS[@]}): $(printf '%s ' "${AGENTS[@]}")"
+  echo ""
 else
   AGENTS=(
     "$HOME/.claude/skills/shared-memory"
@@ -117,8 +171,27 @@ fi
 
 for dir in "${AGENTS[@]}"; do
   if [ ! -d "$dir" ]; then
-    echo "SKIP (not installed): $dir"
-    continue
+    # ⛔ --install CREATES A DIRECTORY ONLY FOR AN AGENT THE REGISTRY NAMES.
+    # Without it this script only ever UPDATES an existing install, which is
+    # correct by default — but on a genuinely fresh host it meant neither the
+    # mint nor the sync would create the directory the other one needed, and
+    # the operator was left to do it by hand or discover the gap the hard way.
+    # A registered path is an explicit operator statement of where an agent
+    # lives, so creating it is honouring the registry rather than guessing.
+    if [ "$INSTALL_MISSING" = "1" ] && [ "${#registry_dirs[@]}" -gt 0 ]; then
+      _registered=0
+      for _rd in "${registry_dirs[@]}"; do [ "$_rd" = "$dir" ] && _registered=1; done
+      if [ "$_registered" = "1" ]; then
+        mkdir -p "$dir"
+        echo "CREATED (registered, --install): $dir"
+      else
+        echo "SKIP (not installed, not in registry): $dir"
+        continue
+      fi
+    else
+      echo "SKIP (not installed): $dir"
+      continue
+    fi
   fi
   # ⛔ AN INSTALL DIRECTORY THAT IS ITSELF A SYMLINK IS REFUSED. Copying into it
   # would write THROUGH the link into the repo's own tracked copy — the source
@@ -264,6 +337,6 @@ echo ""
 if [ "$PRUNE" -eq 1 ]; then
   echo "Sync + prune complete. Skill dirs now carry the thin client only."
 else
-  echo "Sync complete. Run with --prune to remove daemon scripts left by older installs."
+  echo "Sync complete. --prune removes daemon scripts left by older installs; --install creates a registered target directory that does not exist yet."
 fi
 echo "Daemon/schema changes deploy on the GATEWAY host: git pull + migrations/apply.py + restart."

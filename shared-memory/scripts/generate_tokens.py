@@ -538,7 +538,7 @@ def _write_agent_token_file(path: str, token: str) -> bool:
 
 
 def mint(
-    env_path: str = _DEFAULT_GATEWAY_ENV, roster: "list[str] | None" = None,
+    env_path: "str | None" = None, roster: "list[str] | None" = None,
 ) -> "tuple[dict, dict, list]":
     """Mint a fresh token for every agent in `roster` (default: resolved by
     _resolve_roster() -- AGENTS union whatever's already registered),
@@ -584,6 +584,8 @@ def mint(
             nothing to carry forward, matches D19's original intent (never
             register a digest nobody holds the matching plaintext for).
     """
+    if env_path is None:
+        env_path = _DEFAULT_GATEWAY_ENV
     roster = _resolve_roster(env_path) if roster is None else roster
     installs, registry_present = _load_agent_installs_registry(env_path)
     if not registry_present:
@@ -692,7 +694,7 @@ def mint(
 
 
 def add_agent(
-    name: str, install_path: "str | None" = None, env_path: str = _DEFAULT_GATEWAY_ENV,
+    name: str, install_path: "str | None" = None, env_path: "str | None" = None,
 ) -> "tuple[int, str | None]":
     """Additive mint (roster growth without rotation, item 2): mint exactly
     ONE new token for `name`, leaving every OTHER agent's digest in
@@ -702,6 +704,13 @@ def add_agent(
     for bootstrap_tokens.sh to write into the gateway .env in place; this
     function itself never touches the gateway .env, exactly like mint() --
     the per-agent skill .env is the only file written directly.
+
+    env_path defaults to _DEFAULT_GATEWAY_ENV resolved AT CALL TIME, never as
+    a default argument value. A module constant bound into a signature is read
+    once at import, so a caller (or a test) that rebinds the constant afterwards
+    is silently ignored -- which is exactly how three tests came to assert an
+    isolation they did not have, passing only because the tree they ran in
+    happened to have no gateway .env at all.
 
     Returns (rc, token): token is the raw minted value (needed so main() can
     serve --reveal for the SAME invocation, same contract as mint()) or None
@@ -715,6 +724,8 @@ def add_agent(
     see _validate_registry_field()'s docstring for why this is validated
     at input rather than escaped on output.
     """
+    if env_path is None:
+        env_path = _DEFAULT_GATEWAY_ENV
     try:
         _validate_registry_field(name, "agent name")
         if install_path is not None:
