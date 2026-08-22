@@ -411,3 +411,260 @@ def test_digest_flag_empty_stdin_errors_without_printing_a_digest(monkeypatch):
 
     assert rc == 1
     assert "sha256" not in out
+
+
+# ── Install-path registry + additive mint (fresh-host findings D19-D21) ─────
+#
+# Every fixture here uses a tmp_path "gateway .env" -- never the real
+# shared-memory/.env -- so these tests never depend on, or race, anything
+# under an actual install (CLAUDE.md Group 4's "run against the live DB"
+# obligation is about SQL; this registry lives entirely in a plaintext file
+# this script owns the parsing of end to end).
+
+
+def test_mint_refuses_registered_path_with_missing_directory(tmp_path):
+    """D19: a REGISTERED install path whose directory does not exist yet
+    (a fresh host, before the skill package is installed) must REFUSE
+    outright -- no token minted, no digest registered, nothing written --
+    rather than the old behaviour (silently discard the plaintext while the
+    digest still lands in AGENT_TOKENS, leaving an entry nobody can ever
+    satisfy short of rotating every agent)."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"  # no gateway .env at all -- first bootstrap
+    missing_dir_path = str(tmp_path / "claude_skill" / ".env")  # never mkdir'd
+    gt.LOCAL_SKILL_ENV_PATHS = {"claude": missing_dir_path}
+
+    (tokens, digests), out = _capture(gt.mint, env_path=str(env_path))
+
+    assert "claude" not in tokens
+    assert "claude" not in digests
+    refused = [l for l in out.splitlines() if "REFUSED" in l and "claude" in l]
+    assert len(refused) == 1
+    assert str(tmp_path / "claude_skill") in refused[0]
+    assert not os.path.exists(missing_dir_path)
+
+
+def test_mint_installs_line_excludes_a_refused_agent(tmp_path):
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    missing_dir_path = str(tmp_path / "claude_skill" / ".env")
+    gt.LOCAL_SKILL_ENV_PATHS = {"claude": missing_dir_path}
+
+    _tokens, out = _capture(gt.mint, env_path=str(env_path))
+
+    installs_line = next(l for l in out.splitlines() if l.startswith("AGENT_INSTALLS="))
+    assert "claude" not in installs_line
+
+
+def test_mint_infers_nothing_once_a_registry_is_present(tmp_path):
+    """I-A3: once an AGENT_INSTALLS registry line exists (even with zero
+    entries), LOCAL_SKILL_ENV_PATHS's guessed defaults must never be
+    consulted again -- an agent absent from the registry is REMOTE, full
+    stop, even when its name is one this script could easily have guessed a
+    path for."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    env_path.write_text("AGENT_INSTALLS=\n")  # registry present, but empty
+    claude_dir = tmp_path / "claude_skill"
+    claude_dir.mkdir()
+    # LOCAL_SKILL_ENV_PATHS still names a perfectly good, EXISTING directory
+    # for claude -- if mint() were still guessing from it, this would write.
+    gt.LOCAL_SKILL_ENV_PATHS = {"claude": str(claude_dir / ".env")}
+
+    (_tokens, _digests), out = _capture(gt.mint, env_path=str(env_path))
+
+    assert not (claude_dir / ".env").exists(), "a present registry must never fall back to guessing"
+    claude_report_line = next(l for l in out.splitlines() if l.strip().startswith("claude"))
+    assert "REMOTE" in claude_report_line
+
+
+def _capture_err(fn, *a, **kw):
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        result = fn(*a, **kw)
+    return result, buf.getvalue()
+
+
+def test_add_mints_one_agent_and_leaves_others_byte_identical(tmp_path):
+    """I-A1: an additive mint leaves every OTHER agent's digest in
+    AGENT_TOKENS byte-identical -- copied verbatim off disk, never
+    recomputed."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    existing_digest = _digest("tok_existing_claude")
+    env_path.write_text(f"AGENT_TOKENS=claude:sha256:{existing_digest}\n")
+
+    codex_dir = tmp_path / "codex_skill"
+    codex_dir.mkdir()
+    codex_env = str(codex_dir / ".env")
+
+    (rc, token), out = _capture(
+        gt.add_agent, "codex", install_path=codex_env, env_path=str(env_path),
+    )
+
+    assert rc == 0
+    assert token is not None
+    merged_line = next(l for l in out.splitlines() if l.startswith("AGENT_TOKENS="))
+    assert f"claude:sha256:{existing_digest}" in merged_line, "claude's entry must be byte-identical"
+    assert f"codex:sha256:{_digest(token)}" in merged_line
+    assert f"AGENT_TOKEN={token}" in (codex_dir / ".env").read_text()
+    # add_agent must not have MODIFIED the gateway .env itself -- bash does
+    # that write, based on the merged line this function prints to stdout.
+    assert env_path.read_text() == f"AGENT_TOKENS=claude:sha256:{existing_digest}\n"
+
+
+def test_add_refuses_when_name_already_registered(tmp_path):
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    env_path.write_text(f"AGENT_TOKENS=codex:sha256:{_digest('tok_codex')}\n")
+
+    (rc, token), err = _capture_err(
+        gt.add_agent, "codex", install_path=None, env_path=str(env_path),
+    )
+
+    assert rc == 1
+    assert token is None
+    assert "already registered" in err
+
+
+def test_add_refuses_missing_directory_and_mints_nothing(tmp_path):
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    missing_path = str(tmp_path / "nope_skill" / ".env")
+
+    (rc, token), err = _capture_err(
+        gt.add_agent, "codex", install_path=missing_path, env_path=str(env_path),
+    )
+
+    assert rc == 1
+    assert token is None
+    assert "does not exist" in err
+    assert not os.path.exists(missing_path)
+
+
+def test_add_refuses_shared_path_that_would_clobber_a_live_token(tmp_path):
+    """I-A2 (second clause): two agents MAY legitimately share an install
+    path (one tool reading another's skill directory), but a write-through
+    mint into a path another REGISTERED agent already holds a LIVE token at
+    would clobber it (_write_agent_token_file replaces any existing
+    AGENT_TOKEN= line wholesale) -- refuse, naming both agents, rather than
+    silently overwriting a working credential."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    shared_dir = tmp_path / "shared_skill"
+    shared_dir.mkdir()
+    shared_env = str(shared_dir / ".env")
+    env_path.write_text(
+        f"AGENT_TOKENS=codex:sha256:{_digest('tok_codex')}\n"
+        f"AGENT_INSTALLS=codex:{shared_env}\n",
+    )
+
+    (rc, token), err = _capture_err(
+        gt.add_agent, "grok", install_path=shared_env, env_path=str(env_path),
+    )
+
+    assert rc == 1
+    assert token is None
+    assert "codex" in err and "grok" in err
+    assert not os.path.exists(shared_env), "refused before writing anything"
+
+
+def test_add_allows_a_shared_path_when_the_other_agent_has_no_live_token_there(tmp_path):
+    """A shared path is refused only when the OTHER agent registered there
+    actually holds a LIVE AGENT_TOKENS entry -- an AGENT_INSTALLS entry with
+    no matching token (e.g. left over from a D19 refusal, which never
+    registers one) is not "live" and must not block a legitimate
+    registration."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    shared_dir = tmp_path / "shared_skill"
+    shared_dir.mkdir()
+    shared_env = str(shared_dir / ".env")
+    # AGENT_INSTALLS names "codex" at this path, but AGENT_TOKENS does NOT --
+    # codex was never actually minted/registered here (e.g. a stale entry).
+    env_path.write_text(f"AGENT_INSTALLS=codex:{shared_env}\n")
+
+    (rc, token), _out = _capture(
+        gt.add_agent, "grok", install_path=shared_env, env_path=str(env_path),
+    )
+
+    assert rc == 0
+    assert token is not None
+
+
+def test_add_never_prints_the_minted_token_value(tmp_path):
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    codex_dir = tmp_path / "codex_skill"
+    codex_dir.mkdir()
+
+    (rc, token), out = _capture(
+        gt.add_agent, "codex", install_path=str(codex_dir / ".env"), env_path=str(env_path),
+    )
+
+    assert rc == 0
+    assert token not in out
+
+
+def test_resolve_roster_includes_a_previously_added_agent(tmp_path):
+    """A bulk mint (bootstrap_tokens.sh --force, a full rotation) must roll
+    in every name already registered, not just the fixed default AGENTS
+    list -- otherwise an agent added later via --add is silently dropped
+    from the next rotation and quietly stops being trusted."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        f"AGENT_TOKENS=claude:sha256:{_digest('t1')},cursor:sha256:{_digest('t2')}\n",
+    )
+
+    roster = gt._resolve_roster(str(env_path))
+
+    assert "cursor" in roster
+    for name in gt.AGENTS:
+        assert name in roster
+
+
+def test_reveal_accepts_a_previously_added_agent_outside_the_default_roster(tmp_path, monkeypatch):
+    """--reveal must stop refusing names outside the OLD hardcoded AGENTS
+    list -- it now accepts any REGISTERED name, resolved from the roster
+    (AGENTS union the on-disk registry), not the fixed AGENTS constant."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    env_path.write_text(f"AGENT_TOKENS=cursor:sha256:{_digest('t1')}\n")
+    monkeypatch.setattr(gt, "_DEFAULT_GATEWAY_ENV", str(env_path))
+    gt.LOCAL_SKILL_ENV_PATHS = {}
+
+    rc, out = _capture(gt.main, ["--reveal", "cursor"])
+
+    assert rc == 0
+    assert "REVEALING" in out
+    reveal_lines = [l for l in out.splitlines() if l.strip().startswith("cursor: AGENT_TOKEN=")]
+    assert len(reveal_lines) == 1
+
+
+def test_add_flag_via_main_prints_no_token_and_writes_through(tmp_path, monkeypatch):
+    """End-to-end through main(), the CLI surface bootstrap_tokens.sh --add
+    actually invokes."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    monkeypatch.setattr(gt, "_DEFAULT_GATEWAY_ENV", str(env_path))
+    codex_dir = tmp_path / "codex_skill"
+    codex_dir.mkdir()
+    codex_env = str(codex_dir / ".env")
+
+    rc, out = _capture(gt.main, ["--add", "codex", "--install-path", codex_env])
+
+    assert rc == 0
+    assert "AGENT_TOKEN=" not in out  # no plaintext without --reveal
+    content = (codex_dir / ".env").read_text()
+    assert content.startswith("AGENT_TOKEN=tok_")
+
+
+def test_add_flag_refuses_reveal_for_a_different_name(tmp_path, monkeypatch):
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    monkeypatch.setattr(gt, "_DEFAULT_GATEWAY_ENV", str(env_path))
+
+    rc = gt.main(["--add", "codex", "--reveal", "someone_else"])
+
+    assert rc == 1
