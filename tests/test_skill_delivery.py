@@ -230,3 +230,93 @@ def test_a_missing_install_directory_is_skipped_not_created(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert not absent.exists()
     assert "SKIP" in result.stdout
+
+
+# ── The install-path registry drives sync's targets (v0.9.27) ────────────────
+#
+# EXECUTABLE, not source-reading: these run the real script against a temporary
+# tree. v0.9.27 replaced a roster guessed from agent names with AGENT_INSTALLS,
+# and sync has to follow the registry or the two halves disagree about where an
+# agent lives — which is exactly the fresh-install trap (a mint with nowhere to
+# write, and a sync that would never create the target) this closes.
+
+def _run_sync_with_registry(env_file, extra_args=()):
+    env = dict(os.environ)
+    env.pop("SHARED_MEMORY_SYNC_AGENTS", None)   # registry must be what decides
+    env["SHARED_MEMORY_ENV_FILE"] = str(env_file)
+    env["SHARED_MEMORY_SYNC_SKIP_TRACKED"] = "1"
+    return subprocess.run(["bash", _SYNC, *extra_args], capture_output=True,
+                          text=True, env=env, cwd=_REPO, timeout=180)
+
+
+def test_sync_targets_come_from_the_agent_installs_registry(tmp_path):
+    """The registry records each agent's skill .env; the directory synced is that
+    file's parent. An install listed in the registry is updated even though it is
+    not one of the four historical hardcoded paths."""
+    install = tmp_path / "somewhere" / "custom-agent" / "shared-memory"
+    install.mkdir(parents=True)
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"AGENT_INSTALLS=custom:{install}/.env\n")
+
+    result = _run_sync_with_registry(env_file)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "AGENT_INSTALLS registry" in result.stdout
+    assert (install / "SKILL.md").is_file(), (
+        "a registered install was not synced — sync is still using the old "
+        "hardcoded roster instead of the registry"
+    )
+
+
+def test_a_path_containing_a_colon_still_parses_whole(tmp_path):
+    """AGENT_INSTALLS splits name:path on the FIRST colon only. A path carrying a
+    colon of its own must survive intact, or the directory silently becomes a
+    truncated prefix and the sync writes to the wrong place."""
+    install = tmp_path / "od:d" / "shared-memory"
+    install.mkdir(parents=True)
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"AGENT_INSTALLS=weird:{install}/.env\n")
+
+    result = _run_sync_with_registry(env_file)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (install / "SKILL.md").is_file(), (
+        "a path containing a colon was truncated by the registry parser"
+    )
+
+
+def test_a_registered_directory_is_created_only_with_install(tmp_path):
+    """Default stays UPDATE-ONLY — the standing rule that an absent install is
+    never conjured into existence. --install is the explicit opt-in, and it acts
+    only on a path the REGISTRY names, never on a guess."""
+    absent = tmp_path / "fresh" / "shared-memory"
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"AGENT_INSTALLS=fresh:{absent}/.env\n")
+
+    without = _run_sync_with_registry(env_file)
+    assert without.returncode == 0, without.stdout + without.stderr
+    assert not absent.exists(), "sync created a directory without --install"
+
+    with_flag = _run_sync_with_registry(env_file, extra_args=("--install",))
+    assert with_flag.returncode == 0, with_flag.stdout + with_flag.stderr
+    assert (absent / "SKILL.md").is_file(), (
+        "--install did not create and populate a REGISTERED target"
+    )
+
+
+def test_install_refuses_a_target_the_registry_does_not_name(tmp_path):
+    """--install honours the registry; it does not license creating anything the
+    operator never registered."""
+    registered = tmp_path / "known" / "shared-memory"
+    unregistered = tmp_path / "unknown" / "shared-memory"
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"AGENT_INSTALLS=known:{registered}/.env\n")
+
+    env = dict(os.environ)
+    env["SHARED_MEMORY_SYNC_AGENTS"] = str(unregistered)
+    env["SHARED_MEMORY_ENV_FILE"] = str(env_file)
+    env["SHARED_MEMORY_SYNC_SKIP_TRACKED"] = "1"
+    result = subprocess.run(["bash", _SYNC, "--install"], capture_output=True,
+                            text=True, env=env, cwd=_REPO, timeout=180)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not unregistered.exists(), (
+        "--install created a directory the registry never named"
+    )
