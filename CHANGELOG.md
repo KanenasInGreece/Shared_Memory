@@ -5,6 +5,57 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.27] — 2026-08-22
+
+### Added — agents are registered, not hardcoded, and adding one no longer rotates everyone's token
+
+- **`AGENT_INSTALLS`, an install-path registry in the gateway `.env`.** The roster used to be a fixed
+  list in two places, so adding any agent required a framework release, and each agent's install path
+  was *guessed* from its name. The registry records where an agent actually lives, at mint time, and
+  the tooling syncs exactly what is registered — inferring nothing and prescribing no layout.
+- **Additive mint: `--add <name> [--install-path <path>]`.** Registers one agent and leaves every
+  other agent's digest byte-identical, copied verbatim rather than recomputed. Previously the only
+  way to add an agent was a full rotation of every token on the machine.
+
+### Fixed — a fresh install could mint tokens that nobody could ever use
+
+- **Tokens are no longer discarded in silence.** The mint writes each agent's token straight into its
+  skill `.env` and prints nothing, which is the correct custody design — but on a machine with no
+  agent directory yet, there was nowhere to write, so the plaintext was dropped while the digest was
+  still registered. The operator was then told to install a token that no longer existed, and the
+  only recovery was rotating everything. A missing target directory is now refused, loudly, and
+  nothing is minted or registered for that agent.
+- **The service installer no longer reports linger it did not enable.** It tried unprivileged, failed
+  silently on a non-interactive session, printed success anyway, and left a gateway that dies at
+  logout — the one outcome the script exists to prevent. It now retries under `sudo -n`, verifies the
+  real end state, and on failure prints the exact command and what its absence costs.
+- **One live `AGENT_TOKENS` assignment instead of two.** The shipped example carried an empty
+  assignment and the bootstrap appended a real one, leaving a file that worked only because the
+  parser takes the last — while the same file is also passed to `docker compose --env-file`.
+
+### Security — hardening the paths the registry turned into data
+
+Making install paths operator-supplied is what turned four latent assumptions into real exposures.
+All four were reproduced by execution before being fixed, and again afterwards.
+
+- **A symlinked parent directory defeated the symlink guard.** `O_NOFOLLOW` protected only the final
+  component, so a token could be written outside the registered tree while the mint reported success.
+  The parent is now walked one component at a time with `openat(O_NOFOLLOW)`, refusing at whichever
+  hop is a link — chosen over comparing a resolved path, which leaves a check-then-use window a
+  same-uid process can win.
+- **A comma or newline in an install path injected registry entries.** A crafted path parsed back as
+  two registrations, so the next rotation would write one agent's fresh token into a directory chosen
+  by whoever supplied the value; a newline injected an entire assignment into the `.env`. Registry
+  fields now refuse separators, newlines, NULs and padding at input — a separator that can occur in
+  the data is not a delimiter.
+- **Two spellings of one path bypassed the collision check.** It compared strings, so an alias
+  slipped past and one agent's token overwrote another's — after which that agent authenticated as
+  the other, and records were attributed to the wrong source. Paths are now compared by resolved
+  identity.
+- **A partial failure no longer revokes a working credential.** Per-agent writes are atomic, a
+  failure carries the existing digest forward untouched, and the run reports which agents were
+  affected instead of ending in a stack trace.
+
 ## [0.9.26] — 2026-08-22
 
 ### Added — searches now record how much text the reranker was actually given

@@ -1,0 +1,209 @@
+"""bootstrap_tokens.sh — the install-path registry + additive mint wiring
+(fresh-host findings D19/D20, roster-registry-mint build).
+
+bootstrap_tokens.sh resolves its own gateway .env from its OWN script
+location (REPO_ROOT = two directories up from the script), so it cannot be
+pointed at a fixture .env via an argument or env var -- exercising the
+REAL, SHIPPED script (never a hand-rolled reimplementation of its bash
+logic) means running it from a COPY of the repo's relevant scripts under an
+isolated fake root, with generate_tokens.py's LOCAL_SKILL_ENV_PATHS patched
+to point at fixture directories under that SAME root. This is the only way
+to prove the actual shipped bash -- replace_registry_line(), the --add
+branch, the bulk-mint guard -- without ever touching a real skill .env on
+the machine running these tests (several of which hold this machine's own
+live production tokens).
+
+Every subprocess call uses a 30s timeout: a hang here would otherwise stall
+the whole suite silently.
+"""
+import hashlib
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).parent.parent
+BOOTSTRAP_SRC = REPO_ROOT / "shared-memory" / "scripts" / "bootstrap_tokens.sh"
+GENERATE_SRC = REPO_ROOT / "shared-memory" / "scripts" / "generate_tokens.py"
+
+
+def _digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _make_fake_root(tmp_path, local_paths: dict) -> Path:
+    """Copies the ACTUAL shipped bootstrap_tokens.sh and generate_tokens.py
+    into tmp_path/shared-memory/scripts, patching only the COPY of
+    generate_tokens.py's LOCAL_SKILL_ENV_PATHS to point at fixture
+    directories under tmp_path -- never the real ~/.claude, ~/.codex, etc.
+    Returns the fake repo root; the caller creates shared-memory/.env there.
+    """
+    scripts_dir = tmp_path / "shared-memory" / "scripts"
+    scripts_dir.mkdir(parents=True)
+    shutil.copy(BOOTSTRAP_SRC, scripts_dir / "bootstrap_tokens.sh")
+    os.chmod(scripts_dir / "bootstrap_tokens.sh", 0o755)
+
+    src = GENERATE_SRC.read_text()
+    marker = "LOCAL_SKILL_ENV_PATHS = {"
+    start = src.index(marker)
+    end = src.index("\n}\n", start) + len("\n}\n")
+    entries = "\n".join(f'    "{name}": {path!r},' for name, path in local_paths.items())
+    patched = src[:start] + "LOCAL_SKILL_ENV_PATHS = {\n" + entries + "\n}\n" + src[end:]
+    assert patched != src, "LOCAL_SKILL_ENV_PATHS block not found/replaced -- fixture is stale"
+    (scripts_dir / "generate_tokens.py").write_text(patched)
+
+    return tmp_path
+
+
+def _run(fake_root: Path, args: "list[str]") -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", str(fake_root / "shared-memory" / "scripts" / "bootstrap_tokens.sh"), *args],
+        cwd=fake_root, capture_output=True, text=True, timeout=30,
+    )
+
+
+def _env_path(fake_root: Path) -> Path:
+    return fake_root / "shared-memory" / ".env"
+
+
+# ── D20: exactly one live AGENT_TOKENS=/AGENT_ROLES= after a run against an
+#    .env.example-shaped starting file ─────────────────────────────────────
+
+def test_bulk_mint_against_env_example_shape_leaves_one_live_line_each(tmp_path):
+    """I-A4/I-A5: starting from a .env carrying the SAME commented
+    placeholders .env.example now ships (never a live assignment), a bulk
+    mint must leave exactly one live AGENT_TOKENS= and one live
+    AGENT_ROLES=."""
+    claude_dir = tmp_path / "claude_skill"
+    claude_dir.mkdir()
+    fake_root = _make_fake_root(tmp_path, {"claude": str(claude_dir / ".env")})
+    _env_path(fake_root).parent.mkdir(parents=True, exist_ok=True)
+    _env_path(fake_root).write_text(
+        "PG_PASSWORD=fake\n"
+        "# GATEWAY .env: the agent token registry. Empty = auth DISABLED.\n"
+        "# AGENT_TOKENS=\n"
+        "# GATEWAY .env: optional read-only roles.\n"
+        "# AGENT_ROLES=monitor:read\n"
+    )
+
+    proc = _run(fake_root, [])
+
+    assert proc.returncode == 0, proc.stderr
+    content = _env_path(fake_root).read_text()
+    assert len([l for l in content.splitlines() if l.startswith("AGENT_TOKENS=")]) == 1
+    assert len([l for l in content.splitlines() if l.startswith("AGENT_ROLES=")]) == 1
+    assert "AGENT_TOKEN=" in (claude_dir / ".env").read_text()
+
+
+def test_rerun_against_a_stale_pre_fix_env_still_converges_to_one_live_line(tmp_path):
+    """D20's other half: an OLDER .env that still carries a LIVE, empty
+    AGENT_TOKENS= placeholder (what .env.example shipped before this fix)
+    must also converge to exactly one live line, not two, when
+    bootstrap_tokens.sh --force runs against it."""
+    fake_root = _make_fake_root(tmp_path, {})
+    _env_path(fake_root).parent.mkdir(parents=True, exist_ok=True)
+    _env_path(fake_root).write_text(
+        f"AGENT_TOKENS=claude:sha256:{_digest('tok_old')}\nAGENT_ROLES=\n",
+    )
+
+    proc = _run(fake_root, ["--force"])
+
+    assert proc.returncode == 0, proc.stderr
+    content = _env_path(fake_root).read_text()
+    assert len([l for l in content.splitlines() if l.startswith("AGENT_TOKENS=")]) == 1
+
+
+# ── D19: a registered-but-missing directory refuses, loudly, through to the
+#    operator running THIS script (not just generate_tokens.py in isolation)
+
+def test_bulk_mint_surfaces_the_refusal_for_a_missing_directory(tmp_path):
+    fake_root = _make_fake_root(
+        tmp_path, {"claude": str(tmp_path / "claude_skill" / ".env")},  # never mkdir'd
+    )
+    _env_path(fake_root).parent.mkdir(parents=True, exist_ok=True)
+    _env_path(fake_root).write_text("PG_PASSWORD=fake\n")
+
+    proc = _run(fake_root, [])
+
+    # F4/I-A10 (fix round 2): the safe merged registry IS still written (a
+    # per-agent refusal never blocks the agents that succeeded), but the
+    # script now exits 2 -- a distinguishable "partial failure, needs
+    # attention" signal for automation -- rather than a bare 0. This is a
+    # deliberate behaviour change from the first cut of D19: the refusal
+    # itself was always non-fatal to the OTHER agents, but this run's exit
+    # code used to say nothing was wrong at all.
+    assert proc.returncode == 2
+    assert "REFUSED" in proc.stdout
+    assert "claude" in proc.stdout
+    assert "PARTIAL FAILURE" in proc.stdout
+    content = _env_path(fake_root).read_text()
+    assert "claude:sha256:" not in content, "a refused agent's digest must not land in AGENT_TOKENS"
+
+
+# ── --add: roster growth without rotation, and its refusal paths ───────────
+
+def test_add_grows_the_roster_without_touching_the_first_agents_digest(tmp_path):
+    claude_dir = tmp_path / "claude_skill"
+    claude_dir.mkdir()
+    fake_root = _make_fake_root(tmp_path, {"claude": str(claude_dir / ".env")})
+    _env_path(fake_root).parent.mkdir(parents=True, exist_ok=True)
+    _env_path(fake_root).write_text("PG_PASSWORD=fake\n")
+
+    first = _run(fake_root, [])
+    assert first.returncode == 0, first.stderr
+    before = _env_path(fake_root).read_text()
+    claude_line = next(l for l in before.splitlines() if l.startswith("AGENT_TOKENS="))
+    claude_entries = claude_line[len("AGENT_TOKENS="):].split(",")
+    claude_digest = next(p for p in claude_entries if p.startswith("claude:"))
+
+    cursor_dir = tmp_path / "cursor_skill"
+    cursor_dir.mkdir()
+    second = _run(fake_root, ["--add", "cursor", "--install-path", str(cursor_dir / ".env")])
+
+    assert second.returncode == 0, second.stderr
+    after = _env_path(fake_root).read_text()
+    assert len([l for l in after.splitlines() if l.startswith("AGENT_TOKENS=")]) == 1
+    after_line = next(l for l in after.splitlines() if l.startswith("AGENT_TOKENS="))
+    assert claude_digest in after_line, "I-A1: claude's digest must survive --add byte-identical"
+    assert "cursor:sha256:" in after_line
+    assert "AGENT_TOKEN=" in (cursor_dir / ".env").read_text()
+
+
+def test_add_refuses_an_already_registered_name_and_touches_nothing(tmp_path):
+    fake_root = _make_fake_root(tmp_path, {})
+    _env_path(fake_root).parent.mkdir(parents=True, exist_ok=True)
+    _env_path(fake_root).write_text(f"AGENT_TOKENS=codex:sha256:{_digest('tok_codex')}\n")
+    before = _env_path(fake_root).read_text()
+
+    proc = _run(fake_root, ["--add", "codex"])
+
+    assert proc.returncode != 0
+    assert "already registered" in proc.stdout
+    assert _env_path(fake_root).read_text() == before, "a refused --add must not modify the .env"
+
+
+def test_add_and_force_together_are_rejected_before_any_minting(tmp_path):
+    fake_root = _make_fake_root(tmp_path, {})
+    _env_path(fake_root).parent.mkdir(parents=True, exist_ok=True)
+    _env_path(fake_root).write_text(f"AGENT_TOKENS=codex:sha256:{_digest('tok_codex')}\n")
+
+    proc = _run(fake_root, ["--add", "grok", "--force"])
+
+    assert proc.returncode != 0
+    assert "mutually exclusive" in proc.stdout + proc.stderr
+
+
+def test_bulk_mint_refuses_without_force_when_already_registered(tmp_path):
+    """Pre-existing safety guard (unchanged by this build) -- a bulk mint
+    must still refuse outright when AGENT_TOKENS is already live, pointing
+    at --add for the additive case."""
+    fake_root = _make_fake_root(tmp_path, {})
+    _env_path(fake_root).parent.mkdir(parents=True, exist_ok=True)
+    _env_path(fake_root).write_text(f"AGENT_TOKENS=codex:sha256:{_digest('tok_codex')}\n")
+    before = _env_path(fake_root).read_text()
+
+    proc = _run(fake_root, [])
+
+    assert proc.returncode == 0  # refuses quietly (exit 0), same as before this build
+    assert "refusing to regenerate" in proc.stdout
+    assert _env_path(fake_root).read_text() == before
