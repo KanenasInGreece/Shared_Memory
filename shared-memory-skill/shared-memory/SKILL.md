@@ -39,6 +39,14 @@ This skill bridges the Shared Memory Framework — a three-tier semantic and rel
 
 ---
 
+> **Troubleshooting — `uv: command not found` (or the skill silently doing something else).** Every command in this document runs `memory_bridge.py` **through `uv run`**. If the shell this agent spawned to run that command cannot find `uv`, the command fails immediately — and because that shell is typically **non-interactive and non-login** (a CLI harness execs a command, it does not open a terminal), it never reads `~/.bashrc` / `~/.profile`, which is exactly where the standard `uv` installer (`curl -LsSf https://astral.sh/uv/install.sh | sh`) adds `$HOME/.local/bin` to `PATH`. `uv` can therefore be genuinely installed and working for the *operator's own* interactive shell — `which uv` there says yes — while every agent invocation still fails, because that agent's shell never inherits the profile edit. This is the **expected result of the documented install**, not a sign anything is broken.
+>
+> **What this looks like from the outside, and why it is dangerous:** the agent does not report a broken memory system. It falls back to some other way of answering (a raw `curl`, a web search, its own recollection) or simply saves nothing — either way, silently, with no error surfaced to the operator. If an agent's answer to a memory question seems to have skipped this skill entirely, suspect this before anything else.
+>
+> **Fix (either works, and both keep the recommended `uv` install as-is):** put `uv` somewhere already on the **system default PATH** (e.g. `sudo ln -s "$(command -v uv)" /usr/local/bin/uv`, run once as the operator), or add `uv`'s directory to `PATH` inside this specific agent's own configuration. `shared-memory/scripts/preflight.sh` checks for exactly this (a warning distinct from its "is uv installed at all" check) — **re-run it after installing an agent, not only before**, since this is a per-agent-shell condition, not a one-time per-host one.
+
+---
+
 ## The record model — what each field captures, and why it is asked for
 
 **Read this before eliciting anything.** Every field below exists because something downstream
@@ -585,7 +593,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness (anonymous — status/version/api_version only, v0.9.9 S-10):
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":4,"version":"0.9.29"}
+# → {"status":"ok","api_version":4,"version":"0.9.30"}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -656,7 +664,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.29", "api_version": 4, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.30", "api_version": 4, "tool": "shared-memory-framework"}`
 
 ### Updating This Skill
 

@@ -188,6 +188,57 @@ else
   AGENTS=("${_default_dirs[@]}")
 fi
 
+# ── uv PATH reachability — the same silent failure preflight.sh now checks,
+# printed from HERE instead where it actually matters for delivery. ─────────
+#
+# preflight.sh can only ask "is uv installed somewhere on this host" — it has
+# no idea whether an agent skill is actually deployed. This script is the one
+# place that DOES know: it is about to write (or has already written) real
+# skill installs into real directories. So this is where the warning belongs
+# for an operator who never ran (or re-ran) preflight after installing an
+# agent — sync runs on every release, preflight does not.
+#
+# Mirrors preflight.sh's check exactly (see the long comment there for the
+# full rationale): env -i clears the whole environment so no inherited PATH
+# edit survives, and getconf PATH is the platform's own compiled-in default —
+# the closest thing to "what a profile-free shell starts with" any POSIX host
+# can answer, and it depends on neither uv nor python (this project's OWN
+# instrument obligation, fact:1338/1321 — the check must not depend on the
+# thing it is checking for).
+#
+# ONE warning for the whole run, not one per directory: the cause is a
+# property of THIS HOST's PATH, not of any individual agent's install, and a
+# warning repeated once per target would just restate the same fact four
+# times. Gated on at least one install actually existing on disk — an
+# operator syncing to nothing but --install targets that do not exist yet has
+# nothing here to warn about (yet).
+#
+# Non-fatal by design: sync's job is delivery, and a host without any CLI
+# agent depending on the skill (e.g. LM Studio / MCP only) is not broken by
+# this at all.
+_any_install_exists=0
+for _d in "${AGENTS[@]}"; do
+  [ -d "$_d" ] && _any_install_exists=1 && break
+done
+if [ "$_any_install_exists" = "1" ] && command -v uv >/dev/null 2>&1; then
+  _sys_path="$(getconf PATH 2>/dev/null)"
+  if [ -n "$_sys_path" ] && ! env -i PATH="$_sys_path" sh -c 'command -v uv' >/dev/null 2>&1; then
+    echo "⚠ uv resolves ONLY when your shell profile is loaded — it is NOT on the"
+    echo "  system default PATH ($_sys_path). This is the normal outcome of the"
+    echo "  install this project recommends (curl -LsSf"
+    echo "  https://astral.sh/uv/install.sh | sh puts uv under \$HOME/.local/bin and"
+    echo "  counts on your profile to expose it), not a misconfiguration. Any AGENT"
+    echo "  installed below that spawns a non-interactive, non-login shell to run"
+    echo "  this skill will be UNABLE to find uv — and the failure is SILENT: the"
+    echo "  agent answers some other way (or saves nothing) instead of reporting a"
+    echo "  broken memory system. Fix EITHER (keeps the upstream installer either"
+    echo "  way): symlink uv onto a directory already on the system default PATH,"
+    echo "  e.g. sudo ln -s \"\$(command -v uv)\" /usr/local/bin/uv — or set PATH"
+    echo "  inside the affected agent's own configuration."
+    echo ""
+  fi
+fi
+
 for dir in "${AGENTS[@]}"; do
   if [ ! -d "$dir" ]; then
     # ⛔ --install CREATES A DIRECTORY ONLY FOR AN AGENT THE REGISTRY NAMES.
