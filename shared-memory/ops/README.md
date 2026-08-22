@@ -111,9 +111,18 @@ the framework's own files never hold the key either way.
    plaintext. Without systemd credentials: keep it in `pass`/GPG and emit it
    at boot to a **runtime** file (e.g. under `/run/user/<uid>/`, tmpfs), or —
    the floor — `install -m 600 /dev/null <keyfile>` and paste the key in
-   with an editor (never `echo`; shell history keeps it).
+   with an editor (never `echo`; shell history keeps it). The conventional
+   location for that file is **`~/.shared-memory/creds/<name>`** (mode 600,
+   in a 0700 directory), beside the framework's other per-host state.
+   ⚠ **A runtime/tmpfs path is erased on reboot.** Unless something re-emits
+   it at every boot, the gateway restarts with that backend excluded — and if
+   it is the only backend, the dreaming passes stop with no error anywhere.
+   Choose the persistent path or automate the re-emit; do not leave it to
+   memory.
 2. **Point the gateway at it** — one line in `shared-memory/.env`:
-   `DEEPSEEK_API_KEY_FILE=/path/to/keyfile` (skip this line entirely when
+   `DEEPSEEK_API_KEY_FILE=/absolute/path/to/keyfile` — the pointer is used
+   verbatim, so `~` is **not** expanded here even though other path settings
+   in `.env` do expand it (skip this line entirely when
    using `LoadCredential=` — the credentials directory is checked first;
    resolution order is `$CREDENTIALS_DIRECTORY` > `<NAME>_FILE` > a plain
    env var, which is advisory-warned).
