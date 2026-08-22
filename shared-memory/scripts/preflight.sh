@@ -158,11 +158,16 @@ echo "Recommended:"
 # so a very small host is a HARD failure unless the .env overrides are set,
 # not a soft "you may be slow" warning. Measured on a 3.2 GB host: shipped
 # defaults refuse; the .env.example small-host preset runs.
+# MemTotal is what the kernel was LEFT, not what is fitted: firmware and
+# integrated graphics reserve some first, so a nominally-16 GB host reports 15.
+# Thresholds below are therefore set one GB under each nominal figure — a
+# machine that meets the recommendation must be able to PASS the check for it
+# (measured: 16 GB host, MemTotal 15 GB, previously warned forever).
 mem_gb=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 0)
 neo4j_heap_override="$(read_env NEO4J_HEAP_MAX)"
-if [[ "$mem_gb" -ge 16 ]]; then
-    ok "RAM ${mem_gb} GB (>= 16 GB)"
-elif [[ "$mem_gb" -ge 8 ]]; then
+if [[ "$mem_gb" -ge 15 ]]; then
+    ok "RAM ${mem_gb} GB (meets the 16 GB recommendation)"
+elif [[ "$mem_gb" -ge 7 ]]; then
     warn "RAM ${mem_gb} GB — 16 GB recommended (measured example configurations: README §3)"
 elif [[ "$mem_gb" -gt 0 && -n "$neo4j_heap_override" ]]; then
     warn "RAM ${mem_gb} GB with small-host Neo4j override (NEO4J_HEAP_MAX=$neo4j_heap_override) — expect reduced capacity; 8 GB is the no-override floor, 16 GB recommended"
@@ -172,16 +177,53 @@ elif [[ "$mem_gb" -gt 0 ]]; then
     bad "RAM ${mem_gb} GB — the shipped Neo4j memory defaults (heap 2G + pagecache 2G) exceed physical RAM and Neo4j will refuse to start. Set the small-host preset in shared-memory/.env (see .env.example) and re-run"
 fi
 
-disk_gb=$(df -BG --output=avail "$REPO_ROOT" 2>/dev/null | tail -1 | tr -dc '0-9' || echo 0)
+# THE FILESYSTEM THAT FILLS IS DOCKER'S, NOT THE REPO'S. Images, volumes and
+# both databases live under the docker data-root; the checkout holds source.
+# They are frequently different mounts — Debian's default LVM layout gives /var
+# ~11 GB while /home gets the rest, so measuring the repo reported hundreds of
+# free GB while the filesystem about to fill had eleven (measured, Debian 13).
+avail_gb() { df -BG --output=avail "$1" 2>/dev/null | tail -1 | tr -dc '0-9' || echo 0; }
+docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+[[ -d "$docker_root" ]] || docker_root=/var/lib/docker
+[[ -d "$docker_root" ]] || docker_root="$REPO_ROOT"
+
+disk_gb=$(avail_gb "$docker_root")
+[[ -n "$disk_gb" ]] || disk_gb=0
 if [[ "$disk_gb" -ge 30 ]]; then
-    ok "Disk ${disk_gb} GB free (>= 30 GB)"
+    ok "Disk ${disk_gb} GB free on $docker_root (>= 30 GB)"
 elif [[ "$disk_gb" -gt 0 ]]; then
-    warn "Disk ${disk_gb} GB free — ~30 GB recommended (images + model GGUFs + data)"
+    warn "Disk ${disk_gb} GB free on $docker_root — ~30 GB recommended there (images + volumes + both databases land on THIS filesystem, not the checkout's). Move docker's data-root to a larger filesystem, or grow this one."
 fi
 
-command -v nvtop >/dev/null 2>&1 \
-    && ok "nvtop present (GPU-aware dreaming enabled)" \
-    || warn "nvtop not found — REM/NREM fall back to the time-based quiesce guard (optional)"
+# The checkout's own filesystem matters too (GGUFs commonly sit near it), but
+# only report it when it is a DIFFERENT mount — otherwise it is the same number.
+repo_fs=$(df --output=target "$REPO_ROOT" 2>/dev/null | tail -1)
+docker_fs=$(df --output=target "$docker_root" 2>/dev/null | tail -1)
+if [[ -n "$repo_fs" && "$repo_fs" != "$docker_fs" ]]; then
+    repo_gb=$(avail_gb "$REPO_ROOT")
+    [[ "$repo_gb" -ge 10 ]] \
+        && ok "Disk ${repo_gb} GB free on $repo_fs (checkout + GGUFs)" \
+        || warn "Disk ${repo_gb} GB free on $repo_fs — the checkout and model GGUFs live here"
+fi
+
+# PROBE IT, DO NOT ASSERT IT. `command -v nvtop` says a binary exists; it says
+# nothing about whether that binary can see a GPU. Measured on Debian 13: the
+# packaged nvtop links no libdrm backends and dlopens them at runtime, so
+# without libdrm-amdgpu1 it answers "No GPU to monitor" — as root too, so it
+# does not even look like a permission problem — while preflight cheerfully
+# reported GPU-aware dreaming as enabled.
+if ! command -v "${NVTOP_BIN:-nvtop}" >/dev/null 2>&1; then
+    warn "nvtop not found — REM/NREM fall back to the time-based quiesce guard (optional)"
+elif nvtop_out=$("${NVTOP_BIN:-nvtop}" -s 2>/dev/null) && [[ "$nvtop_out" == *device_name* ]]; then
+    if [[ "$nvtop_out" == *mem_total* ]]; then
+        ok "nvtop sees a GPU and reports memory (GPU-aware dreaming enabled)"
+    else
+        warn "nvtop sees a GPU but reports NO memory fields — this build is too old for VRAM-aware checks (measured: 3.2.0 has no mem_total, 3.3.2 does). GPU-aware dreaming still works."
+    fi
+else
+    warn "nvtop is installed but sees NO GPU — GPU-aware dreaming is inert. On AMD this is usually a missing libdrm-amdgpu1 (nvtop dlopens it); it normally arrives with Mesa, which a container-encoder host does not otherwise need. Verify with: ${NVTOP_BIN:-nvtop} -s"
+    need "libdrm for your GPU vendor, so nvtop can see it (AMD: libdrm-amdgpu1) — then confirm '${NVTOP_BIN:-nvtop} -s' lists a device"
+fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo

@@ -192,7 +192,7 @@ services:
     command: >
       -m /models/${EMBED_MODEL_SUBPATH:-gpustack/bge-m3-GGUF/bge-m3-Q8_0.gguf}
       --embedding --host 0.0.0.0 --port 8070
-      -ngl 99 -c 8192 -b 8192 -ub 8192
+      -ngl 99 --threads ${LLAMA_CPU_THREADS:-4} -c 8192 -b 8192 -ub 8192
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8070/health"]
       interval: 30s
@@ -218,7 +218,7 @@ services:
     command: >
       -m /models/${RERANK_MODEL_SUBPATH:-gpustack/bge-reranker-v2-m3-GGUF/bge-reranker-v2-m3-Q8_0.gguf}
       --rerank --host 0.0.0.0 --port 8071
-      -ngl 99 -c 8192 -b 8192 -ub 8192
+      -ngl 99 --threads ${LLAMA_CPU_THREADS:-4} -c 8192 -b 8192 -ub 8192
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8071/health"]
       interval: 30s
