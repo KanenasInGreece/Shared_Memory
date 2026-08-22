@@ -234,11 +234,24 @@ itself (a headless Linux server installs in ~3 GB and idles under half a gigabyt
 desktop OS beside the deployment costs gigabytes of both — budget it as the separate thing it
 is).
 
-**Software:** Docker + Docker Compose · [`uv`](https://docs.astral.sh/uv/) (recommended — every
-command here uses it; or Python 3.11+ with `pip`) · a server for your reasoning LLM on `:5000`
+**Software:** Docker + Docker Compose v2, installed from
+[Docker's own instructions](https://docs.docker.com/engine/install/) ·
+[`uv`](https://docs.astral.sh/uv/), installed from
+[Astral's own instructions](https://docs.astral.sh/uv/getting-started/installation/)
+(recommended — every command here uses it; or Python 3.11+ with `pip`) · a server for your
+reasoning LLM on `:5000`
 (LM Studio, or any OpenAI-compatible endpoint) — the embedder and reranker run as Docker
 containers from the compose file · at least one consumer: a CLI agent (Claude Code, Antigravity
 CLI, Grok, Codex CLI) and/or LM Studio via MCP.
+
+Both come from the vendors' own instructions rather than your distribution's packages — one baseline
+that behaves the same across Debian, Ubuntu and Fedora, and the default these steps assume. A distro
+package may work (Fedora's `moby-engine` is what this project's own reference workstation runs), but
+it is a different version and layout. Switching an existing machine from a distro package to the
+vendor's repository is its own exercise — do it before installing the framework, not after.
+⚠ uv's installer puts it in `$HOME/.local/bin`. That is on *your* PATH, but not necessarily on the
+PATH of a service or an agent process — which is why an agent can fail to run the skill on a machine
+where you run it fine.
 
 **Reasoning LLM (your choice, on `:5000`):** any OpenAI-compatible local endpoint works. We run
 **google/gemma-4-12b** — tested for REM enrichment and NREM consolidation. Load it text-only;
@@ -609,10 +622,17 @@ sudo sysctl -p /etc/sysctl.d/90-inotify.conf
 
 Keep the `:z` suffixes on the compose volume mounts — SELinux needs them.
 
-Fedora ships **podman**, not docker, and the helper scripts call the docker CLI — Fedora's own
-repos carry what's needed (`sudo dnf install moby-engine docker-compose` provides the
-`docker compose` v2 subcommand; enable with `sudo systemctl enable --now docker` and add your
-user to the `docker` group). The `podman-docker` shim is the untested alternative.
+Fedora ships **podman**, not docker, and the helper scripts call the docker CLI. Install Docker
+Engine + Compose v2 from [Docker's own instructions](https://docs.docker.com/engine/install/) —
+that is the default this project recommends. Fedora's own repos are also a working route, and are
+in fact what this project's reference workstation runs (`sudo dnf install moby-engine
+docker-compose` provides the `docker compose` v2 subcommand; enable with
+`sudo systemctl enable --now docker` and add your user to the `docker` group).
+
+**podman is supported on principle and requires further testing.** The `podman-docker` shim makes
+the `docker` CLI resolve to podman, and the helper scripts should work through it — the design has
+no dependency on the daemon itself. But no end-to-end install has been run on podman, so treat it
+as a path we expect to work rather than one we have proven.
 
 One ownership step the tooling can't skip: the Neo4j container runs as uid 7474 and needs
 **write** access to its mounted dirs. Its entrypoint fixes `data/` and `logs/` itself but not

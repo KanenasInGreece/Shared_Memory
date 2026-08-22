@@ -5,6 +5,43 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.30] — 2026-08-22
+
+### Fixed — an agent could not run the skill on a machine where you can run it yourself
+
+- **Preflight now checks whether `uv` is reachable without your shell profile.** It already checked
+  that `uv` was on *your* PATH, which is a different question: the upstream installer puts `uv` under
+  `$HOME/.local/bin` and relies on your profile to expose it, so an agent that spawns a
+  non-interactive, non-login shell cannot find it — while preflight passes on that same machine. The
+  new check resolves `uv` in a cleared environment against the system default PATH, and when it is
+  reachable only via your profile it says so, names the consequence, and gives two remedies that keep
+  the upstream installer: symlink `uv` onto the system default PATH, or set PATH in that agent's own
+  configuration. It is a warning, not a hard failure — a host running only an MCP client is not
+  broken by this.
+- **The failure it catches is silent, which is why it needed a check at all.** An agent that cannot
+  reach the skill does not report a broken memory system. It answers some other way, or saves nothing.
+- `sync_skills.sh` prints the same warning once per run when it sees at least one installed agent
+  directory, since that is the moment an agent install is known to exist. Neither check runs under
+  `uv` or Python — they cannot, since those are what may be missing.
+
+### Changed — the install documentation says where Docker and uv come from
+
+- **Quick Start now names the sources** — [Docker's own instructions](https://docs.docker.com/engine/install/)
+  and [Astral's own instructions](https://docs.astral.sh/uv/getting-started/installation/) — rather
+  than leaving an operator preparing a machine by hand to infer it, and states why: one baseline that
+  behaves the same across distributions.
+- **§14 no longer offers the distribution package as the primary route for Fedora**, and now says
+  plainly that **podman is supported on principle and requires further testing** — the `podman-docker`
+  shim should make the helper scripts work, but no end-to-end install has been run on it.
+
+### Removed
+
+- **`compose.gpu-encoders.yaml`.** The GPU encoders it provided are services in the main compose file,
+  selected by `.env` knobs, so the older two-file overlay was superseded and referenced by no install
+  surface at all. **If you still run the two-file form** — `docker compose -f postgres_neo4j_limits.yaml
+  -f compose.gpu-encoders.yaml …` published in 0.8.52 — drop the second `-f` and select the GPU
+  encoders through the `.env` knobs documented in `.env.example` instead.
+
 ## [0.9.29] — 2026-08-22
 
 ### Fixed — adding one agent silently stopped every existing agent from being updated
