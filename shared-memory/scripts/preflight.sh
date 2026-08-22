@@ -77,6 +77,49 @@ fi
 
 if command -v uv >/dev/null 2>&1; then
     ok "uv ($(uv --version | awk '{print $2}'))"
+
+    # ── Is uv reachable WITHOUT the operator's shell profile? ─────────────────
+    #
+    # The check just above answers "can the OPERATOR run uv" — it runs in
+    # whatever shell invoked preflight.sh, almost always an interactive login
+    # shell that has already sourced ~/.bashrc / ~/.profile. Every agent that
+    # spawns uv instead runs it through a NON-interactive, NON-login shell (a
+    # CLI harness execs a command; it does not open a terminal), and that kind
+    # of shell reads none of those files — it starts with whatever PATH its own
+    # parent process handed it, nothing more.
+    #
+    # The recommended install two lines above — curl -LsSf
+    # https://astral.sh/uv/install.sh | sh, the upstream installer and the ONLY
+    # path this project tests against; a distro package is not something this
+    # project can speak for — places uv under $HOME/.local/bin and relies on
+    # the shell profile to put that directory on PATH. So on a fresh host that
+    # followed this exact recommendation correctly, uv ends up on the
+    # operator's PATH and invisible to everything else. That is the EXPECTED
+    # RESULT of the documented install, not a misconfiguration — and it fails
+    # completely silently: an agent that cannot run uv does not report a
+    # broken memory system, it answers some other way (or saves nothing) and
+    # nobody sees why.
+    #
+    # What is actually knowable here, and no more: whether uv resolves with NO
+    # profile in effect at all. `env -i` clears the entire environment (not
+    # just PATH) so no inherited variable can smuggle a profile's PATH edit
+    # back in; the reference path is `getconf PATH`, the platform's own
+    # compiled-in default search path — the closest thing to "what a shell has
+    # before anything user-specific runs" that any POSIX host can answer, and
+    # asking it costs nothing (getconf ships with the C library; it is never
+    # uv or python — see the note above `need()` for why that matters here).
+    # This cannot know any particular AGENT's own PATH — a framework may set
+    # one of its own — so it is worded as what was actually measured, never as
+    # a verdict on a specific agent.
+    sys_path="$(getconf PATH 2>/dev/null)"
+    if [[ -z "$sys_path" ]]; then
+        : # getconf unavailable — nothing measured, so nothing claimed either way
+    elif env -i PATH="$sys_path" sh -c 'command -v uv' >/dev/null 2>&1; then
+        ok "uv also resolves on the system default PATH ($sys_path) — reachable from a profile-free shell"
+    else
+        warn "uv resolves ONLY when your shell profile is loaded — it is NOT on the system default PATH ($sys_path). This is the normal outcome of the install recommended above, not a misconfiguration: the upstream installer puts uv under \$HOME/.local/bin and counts on your profile to expose it. Any AGENT that spawns a non-interactive, non-login shell to run this skill will be UNABLE to find uv — and the failure is SILENT, the agent answers some other way (or saves nothing) instead of reporting a broken memory system. Fix EITHER (keeps the upstream installer either way): symlink uv onto a directory already on the system default PATH, e.g. sudo ln -s \"\$(command -v uv)\" /usr/local/bin/uv — or set PATH inside that agent's OWN configuration to include uv's directory."
+        need "uv is reachable only via your shell profile, not the system default PATH — a non-login agent shell cannot find it. Either: sudo ln -s \"\$(command -v uv)\" /usr/local/bin/uv   (exposes the existing upstream install system-wide, no reinstall)   or add uv's directory to PATH in the affected agent's own configuration."
+    fi
 else
     bad "uv not found — install from https://docs.astral.sh/uv/ (user-local, no root needed)"
     need "uv (user-local, no root): curl -LsSf https://astral.sh/uv/install.sh | sh — then ensure \$HOME/.local/bin is on PATH, including for systemd units"
