@@ -142,7 +142,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.25"
+FRAMEWORK_VERSION = "0.9.26"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -2215,6 +2215,14 @@ class MemoryCoordinator:
         # disagree — same contract as _credential_last_ts. ISO-8601 UTC, None
         # until the first fallback in this process.
         self._rerank_fallback_last_ts: str | None = None
+        # Payload-size instrument (fact:1441) — cumulative chars/docs actually
+        # handed to the reranker across every search this process has served,
+        # regardless of outcome (a fallback still counts what it WOULD have
+        # sent). No paired "measured" counter: that count is already
+        # _rerank_successes + _rerank_failures (see handle_search), and
+        # writing it twice would duplicate a derivable value.
+        self._rerank_payload_chars_total = 0
+        self._rerank_payload_docs_total = 0
         # Backup quiesce: dedicated connection holding the EXCLUSIVE advisory lock
         # (None = not held), plus the TTL auto-resume task.
         self._quiesce_conn: Any = None
@@ -6303,6 +6311,48 @@ class MemoryCoordinator:
                 clamp_rerank_doc(_rerank_doc_text(c, m, t))
                 for c, m, t in zip(contents, metas, createds)
             ]
+            # Payload-size instrument (fact:1441). fact:1441's cross-host
+            # capacity sweep on a CPU-only test host produced an
+            # UNDER-DETERMINED finding: the harness never recorded how many
+            # characters were actually sent to the reranker per search, so
+            # per-request FIXED OVERHEAD (embedding, two DB round trips,
+            # candidate batching, HTTP) could not be separated from
+            # DOCUMENT-LENGTH cost — and the capacity model's `chars / mu`
+            # term, with no fixed-overhead component, turns from conservative
+            # to OPTIMISTIC below roughly 2000 chars. This closes exactly that
+            # gap: total chars and document count, so a mean chars/doc can be
+            # derived per search.
+            #
+            # Measured HERE, after `rerank_docs` is fully built — every entry
+            # has already been through `clamp_rerank_doc` above — because a
+            # PRE-clamp count would reintroduce the very ambiguity this exists
+            # to remove (a document longer than RERANK_MAX_DOC_CHARS is
+            # truncated before the reranker ever sees the rest of it, so only
+            # the truncated length was actually "sent"). Pure arithmetic over
+            # a list already in hand: no extra query, no extra I/O, and
+            # nothing here can raise — adding a metric must not add a new
+            # failure mode to the search path.
+            #
+            # Computed BEFORE the try/except below so BOTH outcomes carry the
+            # measurement: a reranked search records what it sent, and a
+            # fallback records what it WOULD have sent — the two are
+            # distinguished by `ranked`, never by one of them going missing.
+            rerank_payload_chars = sum(len(d) for d in rerank_docs)
+            rerank_payload_docs = len(rerank_docs)
+            # Cumulative, same reset-on-restart contract as
+            # _rerank_successes/_rerank_failures below. Deliberately NOT
+            # paired with a third "searches measured" counter: that count
+            # already exists as _rerank_successes + _rerank_failures (every
+            # search that reaches this point ends up in exactly one of those
+            # two buckets), and writing it again would be exactly the
+            # derived-value duplication this repo's storage rule forbids.
+            # Read it off the pair instead: successes+failures == 0 means
+            # "not measured yet" (the payload totals below are vacuous, not a
+            # real zero); once it's > 0 the totals are real measurements, and
+            # a zero among them is a genuine all-empty-content search, not an
+            # absence.
+            self._rerank_payload_chars_total += rerank_payload_chars
+            self._rerank_payload_docs_total += rerank_payload_docs
             reranked = False
             try:
                 rr = await client.post(
@@ -6536,6 +6586,11 @@ class MemoryCoordinator:
                         "pg_id": row.get("id"),
                         "content": row["content"],
                         "ranked": reranked,
+                        # Per-search payload instrument (fact:1441), repeated
+                        # on every row exactly the way `ranked` is — see the
+                        # fact-tier branch below for the full rationale.
+                        "rerank_payload_chars": rerank_payload_chars,
+                        "rerank_payload_docs": rerank_payload_docs,
                         "score": raw_score,
                         "score_normalized": (_sigmoid(raw_score)
                                              if raw_score is not None else None),
@@ -6578,6 +6633,20 @@ class MemoryCoordinator:
                     # and carry NO score — a fabricated 1.0 made a dead reranker
                     # indistinguishable from a confident one.
                     "ranked": reranked,
+                    # Chars/docs actually sent to the reranker for THIS
+                    # search — same value on every row of the response, one
+                    # search-level measurement, not a per-row one (fact:1441).
+                    # Computed once, before the rerank try/except, so a
+                    # fallback row carries the payload it WOULD have sent
+                    # rather than a null: `ranked` is what tells the reader
+                    # whether it was scored, this is what tells them what was
+                    # measured — the two are never conflated, and a zero here
+                    # is always a real (if degenerate) all-empty-content
+                    # search, never "not measured" (see the counters near
+                    # __init__ for how absence is told apart from zero at the
+                    # cumulative-telemetry level).
+                    "rerank_payload_chars": rerank_payload_chars,
+                    "rerank_payload_docs": rerank_payload_docs,
                     "score": raw_score,
                     "score_normalized": (_sigmoid(raw_score)
                                          if raw_score is not None else None),
@@ -7087,6 +7156,20 @@ class MemoryCoordinator:
         snap["rerank_successes_total"] = self._rerank_successes
         snap["rerank_fallbacks_total"] = self._rerank_failures
         snap["rerank_fallbacks_last_ts"] = self._rerank_fallback_last_ts
+
+        # Payload-size instrument (fact:1441) — same flat-additive style,
+        # ADDED alongside the pair above rather than restructuring them.
+        # Cumulative chars/docs actually handed to the reranker across every
+        # search this process has served (both outcomes count — see
+        # handle_search). Deliberately no third "searches measured" counter:
+        # rerank_successes_total + rerank_fallbacks_total already IS that
+        # count, and a reader who wants to know whether the totals below are
+        # a real zero or simply "no searches yet" reads it off that existing
+        # pair rather than a duplicate written here. Divide chars_total by
+        # docs_total for the mean-chars-per-doc that separates document-length
+        # cost from the fixed per-request overhead fact:1441 could not.
+        snap["rerank_payload_chars_total"] = self._rerank_payload_chars_total
+        snap["rerank_payload_docs_total"] = self._rerank_payload_docs_total
 
         # Credential-use audit trail signal (PR A3) — in-process counters, no
         # I/O, so no try/except: same reset-on-restart contract as the
