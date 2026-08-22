@@ -12,8 +12,9 @@ export AGENT_TOKEN=...
 bash shared-memory/scripts/postflight.sh
 ```
 
-- **Exit code:** `0` iff assertions **A1–A5** all pass. A6 is a measurement, never a gate; A7 holds
-  by construction and is documented below.
+- **Exit code:** `0` iff assertions **A1–A5 and A8** all pass. A6 is a measurement, never a gate;
+  A7 holds by construction and is documented below. A8 **SKIPs** (never gates) when no reasoning
+  backend is configured on the gateway — see A8 below for exactly when that applies.
 - **Configuration:** `GATEWAY_URL` (default `http://localhost:8888`), `AGENT_TOKEN` (environment
   only), `PG_CONTAINER`/`NEO4J_CONTAINER`/`PG_DB` (defaults `postgres-vector`/`neo4j-memory`/
   `agent_data`, as in `init_db.sh`). `shared-memory/.env` is read key-by-key (grep/cut), never
@@ -254,6 +255,26 @@ before the first timed operation (on a fresh host uv's resolution would otherwis
 number); each timing window contains exactly one save; a timed-out operation records `null`,
 never the timeout ceiling; and the JSON carries a note stating all three rules.
 
+**D22 — the baseline states the corpus it was measured against.** The JSON carries a
+`corpus_size` object: `scope` (the same scope A5's search actually ran against — `project:
+install-verification` in canary mode, `global` in re-baseline mode), `technical_docs` (the row
+count in that scope at write time, or `null` when it could not be measured — docker missing or
+unreachable, never a false zero), and `community_summaries_live` (populated only in re-baseline
+mode, mirroring the mode-selection count printed at the top of the run). The reasoning this
+exists to prevent: on a fresh install the reranker scores whatever tiny candidate pool actually
+exists — frequently the single canary A4 just saved — which is a **floor** on search latency (how
+fast a search can possibly be), never a steady-state reference for a mature corpus. A baseline
+JSON that omits its own corpus size lets a later reader compare two numbers measured against
+wildly different pool sizes as if they were the same measurement. `corpus_size` is emitted in
+both postflight modes and, like every other A6 field, never affects the exit code. A printed
+summary line states the same scope and count alongside "A6 baseline written: …".
+
+⚠ **Related trap, deliberately not reproduced here:** the capacity verdict section below prints a
+worst-case rerank-stage projection (typically tens of seconds) beside the search timing measured
+above (typically ~1 s). Those are two different quantities — a fixed 20-document worst-case model
+versus an actually-measured search — and their ratio is not a conservatism figure. Postflight does
+not compute or print one.
+
 **In RE-BASELINE MODE**, A6 performs **no saves of any kind** (mirroring A4's zero-saves
 contract). `save_short` and `save_realistic` are both `null`, with a note naming the accepted
 trade — write-path timing stays anchored to the original install canary. **`search` stays
@@ -301,3 +322,50 @@ its output rather than testing them.
 
 **Failure meaning.** A change to the script that violates one of these is a defect against this
 contract, whatever its tests say.
+
+## A8 — Reasoning-backend liveness, end to end
+
+**Why this assertion exists.** In v0.9.24, `hive_mind_proxy.py` joined a configured backend base
+and the incoming request path with a naive concatenation, so a base ending in `/v1` — every cloud
+provider's documented shape, and this framework's own shipped `.env.example` before the fix —
+doubled into `/v1/v1/chat/completions`, which providers answer with `404`. It failed **completely
+silently**: a `404` is never billed (no token-counter or provider-dashboard signal), `/health`
+reported the backend `"ok"` (that check is a bare `/v1/models` liveness probe — a different code
+path that happened not to share the bug), both daemons said `"running"`, and A1–A7 (there was no
+A8 yet) passed green while REM retried the same dead completion every 30 s for 45 minutes,
+achieving nothing. A8 exists specifically to close that hole.
+
+**Check.** Determine whether a reasoning backend is configured by reading the **gateway's own**
+resolved backend list — `config.llm_backends` off the authenticated (or, on an auth-off install,
+anonymous) `/health` payload — never by re-parsing `LLM_BACKENDS` / `LLM_BACKENDS_JSON` /
+`LLM_DEFAULT_TARGET` in bash (same reasoning as A3: postflight never duplicates the gateway's own
+resolution logic, it asks and trusts the answer). If that list is empty, A8 **SKIPs**. Otherwise,
+issue one minimal **real completion** — `POST $GATEWAY_URL/v1/chat/completions`, the exact proxy
+route and body shape the daemons themselves use (`model` from `LLM_MODEL`, defaulting to
+`"local-model"` exactly like `rem_loop.py`/`consolidation_loop.py`; a small deterministic prompt;
+`max_tokens: 16`) — with a Bearer `AGENT_TOKEN` when auth is configured, via curl's `-K` stdin
+config idiom so the token never appears in argv. This is **never** a `/health` field read, a
+`/v1/models` probe, or a bare TCP connect — none of those observed the D23 incident; only a real
+completion through the real join does.
+
+**Pass criterion.** HTTP `200` **and** a non-empty `choices[0].message.content` string. A `200`
+with empty content is graded a failure, not a pass — liveness is not capability, and a shape check
+is not a content check.
+
+**Failure meaning.** `404`: the message names the known cause (a doubled `/v1` path segment when
+the configured base already ends in `/v1`) and lists the configured backend base(s), read off
+`config.llm_backends[].url` — never a credential, never `has_credential`, never a `token_env`
+name. Any other non-`200`, or `200` with no usable content: the status/shape is stated plainly
+alongside the same configured-backend list. No response within `CLIENT_TIMEOUT`: reported as a
+timeout-or-connection-failure.
+
+**When A8 SKIPs — and never gates.** Three cases, none of which may ever call the failure path:
+**(1)** `AGENT_TOKEN` missing while auth is configured — same precondition as A4/A5/A6, and marked
+at A1 the same way A5 already is (needed in **every** postflight mode, unlike A4 which re-baseline
+mode exempts). **(2)** The gateway is unreachable — this is a real problem A1 already reports; A8
+marks itself failed here too (matching A2/A4/A5's own cascading-failure convention) rather than
+SKIP, since "unreachable" is not "no backend configured". **(3)** The gateway's own resolved
+backend list is genuinely empty — the honest "no reasoning backend configured" case, which can
+only arise if `LLM_DEFAULT_TARGET` was explicitly blanked with `LLM_BACKENDS`/`LLM_BACKENDS_JSON`
+unset (the code fallback otherwise always yields at least one backend). **Only case (3) prints as
+a SKIP** (never `bad()`); it exists so A8 can never fail an install that legitimately has no LLM.
