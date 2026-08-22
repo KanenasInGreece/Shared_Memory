@@ -21,6 +21,45 @@ UNIT_DST="$UNIT_DST_DIR/hive-mind-gateway.service"
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 grn() { printf '\033[32m%s\033[0m\n' "$*"; }
+ylw() { printf '\033[33m%s\033[0m\n' "$*"; }
+
+# ── Linger: keeps user services running with no active login session ───────
+# (survives logout/reboot) -- see D18 below.
+#
+# `loginctl show-user "$USER" --property=Linger` reads systemd-logind's OWN
+# record of the flag -- the only source of truth this function trusts. It
+# is consulted at the END, never inferred from either enable-linger
+# invocation's exit status: a fresh-host finding (D18) was that unprivileged
+# `loginctl enable-linger` fails with "Could not enable linger: Access
+# denied" on a NON-INTERACTIVE session (no polkit agent — e.g. a script run
+# over a plain SSH session with no active seat), the OLD code ran it,
+# ignored the failure entirely, and then unconditionally printed
+# "✓ Linger enabled for $USER" — a lie. Without linger, `systemd --user` is
+# torn down the moment the install session ends and the gateway dies on
+# logout, which is the ONE failure mode this whole script exists to
+# prevent, so a script that reports success without checking is worse than
+# one that says nothing.
+# >>> ENABLE_LINGER
+enable_linger() {
+    # 1. Unprivileged attempt — works whenever polkit grants it directly
+    #    (the common case: an interactive desktop or SSH login).
+    loginctl enable-linger "$USER" >/dev/null 2>&1 || true
+
+    # 2. Non-interactive sudo retry (-n: fail immediately, never prompt for
+    #    a password — a script blocking on a hidden prompt is worse than
+    #    failing loudly). Covers a host where the operator has passwordless
+    #    sudo but no polkit agent (a bare-metal/CI install, the case D18
+    #    was actually measured on).
+    if ! loginctl show-user "$USER" --property=Linger 2>/dev/null | grep -qx "Linger=yes"; then
+        sudo -n loginctl enable-linger "$USER" >/dev/null 2>&1 || true
+    fi
+
+    # 3. VERIFY the real end state, never trust either exit status — immune
+    #    both to the silent no-op above and to a loginctl/sudo combination
+    #    that exits 0 without actually flipping the flag.
+    loginctl show-user "$USER" --property=Linger 2>/dev/null | grep -qx "Linger=yes"
+}
+# <<< ENABLE_LINGER
 
 [[ -f "$UNIT_SRC" ]] || { red "ERROR: missing $UNIT_SRC"; exit 1; }
 
@@ -71,14 +110,32 @@ sed -e "s#/path/to/your/shared-memory-GitHub#$REPO_DIR#" \
 
 systemctl --user daemon-reload
 systemctl --user enable --now hive-mind-gateway.service
-# Makes user services keep running with no active login session (survives logout/reboot).
-loginctl enable-linger "$USER"
+
+if enable_linger; then
+    LINGER_OK=1
+else
+    LINGER_OK=0
+fi
 
 echo
 grn "✓ Installed $UNIT_DST"
 grn "✓ Enabled + started hive-mind-gateway.service"
-grn "✓ Linger enabled for $USER — the gateway now starts at boot and stops cleanly"
-echo "  at shutdown, no login session required, no manual restart step."
+if [[ "$LINGER_OK" -eq 1 ]]; then
+    grn "✓ Linger enabled for $USER — the gateway now starts at boot and stops cleanly"
+    echo "  at shutdown, no login session required, no manual restart step."
+else
+    red "✗ Linger could NOT be enabled for $USER (D18: no polkit agent on this"
+    red "  session, and passwordless sudo isn't available either)."
+    echo "  Without it, systemd --user is torn down the moment THIS session ends —"
+    echo "  the gateway will be KILLED when your last session ends, exactly the"
+    echo "  failure this service exists to prevent. Run this yourself, in a session"
+    echo "  with a real terminal (it will prompt for your password):"
+    echo
+    echo "    sudo loginctl enable-linger $USER"
+    echo
+    echo "  Then verify:  loginctl show-user $USER --property=Linger"
+    echo "  (expect Linger=yes)"
+fi
 echo
 echo "  Verify:  systemctl --user status hive-mind-gateway.service"
 echo "           curl -s localhost:8888/health"
@@ -90,3 +147,5 @@ echo "  until those are in place — nothing more to do once those steps are don
 echo
 echo "  Want a reasoning-LLM backend (local-supervised, remote, or a paid cloud"
 echo "  API) configured too? bash shared-memory/ops/install_llm_backends.sh"
+
+[[ "$LINGER_OK" -eq 1 ]] || exit 1
