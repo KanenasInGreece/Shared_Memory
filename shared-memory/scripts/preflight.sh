@@ -27,6 +27,14 @@ fail=0
 ok()   { grn "  ✓ $*"; }
 warn() { ylw "  ! $*"; }
 bad()  { red "  ✗ $*"; fail=1; }
+# OPERATOR-ACTIONABLE REMEDIATION. The agent running preflight is often not
+# permitted to install anything on the host — prerequisites are the operator's
+# to place. So every hard failure that a human must fix by installing something
+# also records the exact command or source here, reprinted as ONE block at the
+# end. A ✗ that only says what is missing leaves the operator to go and find
+# out how; this hands it to them.
+REMEDIES=()
+need() { REMEDIES+=("$*"); }
 
 echo "Shared Memory — preflight checks"
 echo
@@ -50,23 +58,35 @@ else
     # (measured on Debian 13). Neither is what we test against.
     if command -v dnf >/dev/null 2>&1; then
         bad "docker not found — install Docker Engine + Compose v2 from Docker's own repository (the tested path): https://docs.docker.com/engine/install/fedora/ — then sudo systemctl enable --now docker and add your user to the docker group. Fedora's own moby-engine + docker-compose also provide 'docker compose' v2, but that is not the packaging we test."
+        need "Docker Engine + Compose v2, from Docker's repo: https://docs.docker.com/engine/install/fedora/ then: sudo systemctl enable --now docker && sudo usermod -aG docker \$USER"
     elif command -v apt-get >/dev/null 2>&1; then
         bad "docker not found — install Docker Engine + Compose v2 from Docker's own repository (the tested path): https://docs.docker.com/engine/install/debian/ (or .../ubuntu/) — then sudo systemctl enable --now docker and add your user to the docker group. If docker.io was EVER installed here, purge docker-buildx too: it owns /usr/libexec/docker/cli-plugins/docker-buildx and blocks Docker's docker-buildx-plugin with a dpkg overwrite conflict that leaves the daemon disabled while docker --version still answers."
+        need "Docker Engine + Compose v2, from Docker's repo: https://docs.docker.com/engine/install/debian/ then: sudo systemctl enable --now docker && sudo usermod -aG docker \$USER  (if docker.io was ever installed: sudo apt purge docker-buildx first)"
     else
         bad "docker not found — install Docker Engine + Compose v2 from Docker's own repository (the tested path): https://docs.docker.com/engine/install/"
+        need "Docker Engine + Compose v2, from Docker's repo: https://docs.docker.com/engine/install/"
     fi
 fi
 
 if docker compose version >/dev/null 2>&1; then
     ok "docker compose ($(docker compose version --short 2>/dev/null))"
 else
-    bad "docker compose v2 not found (the 'docker compose' subcommand)"
+    bad "docker compose v2 not found (the 'docker compose' subcommand) — the standalone docker-compose binary is NOT a substitute; the scripts call the subcommand"
+    need "Compose v2 plugin: install docker-compose-plugin from Docker's repo (https://docs.docker.com/engine/install/) — verify with: docker compose version"
 fi
 
 if command -v uv >/dev/null 2>&1; then
     ok "uv ($(uv --version | awk '{print $2}'))"
 else
-    bad "uv not found — install from https://docs.astral.sh/uv/"
+    bad "uv not found — install from https://docs.astral.sh/uv/ (user-local, no root needed)"
+    need "uv (user-local, no root): curl -LsSf https://astral.sh/uv/install.sh | sh — then ensure \$HOME/.local/bin is on PATH, including for systemd units"
+fi
+
+if command -v git >/dev/null 2>&1; then
+    ok "git ($(git --version | awk '{print $3}'))"
+else
+    bad "git not found — needed to obtain and update this checkout"
+    need "git: your distro's package is fine (apt install git / dnf install git)"
 fi
 
 # Read one key from .env without sourcing it — values may contain spaces or
@@ -169,5 +189,10 @@ if [[ "$fail" -eq 0 ]]; then
     grn "Preflight passed. Next: docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d"
 else
     red "Preflight failed — resolve the ✗ items above, then re-run."
+    if [[ ${#REMEDIES[@]} -gt 0 ]]; then
+        echo
+        ylw "Hand this to whoever administers the host — preflight never installs anything:"
+        for r in "${REMEDIES[@]}"; do printf '  • %s\n' "$r"; done
+    fi
 fi
 exit "$fail"
