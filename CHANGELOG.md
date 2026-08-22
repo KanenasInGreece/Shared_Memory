@@ -5,6 +5,36 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.25] — 2026-08-22
+
+### Added — install verification now exercises the reasoning backend, not just its liveness probe
+
+- **A new assertion, A8, drives a real completion through the gateway.** Until now an install could
+  pass full verification with a dreaming path that had never once succeeded. That is not
+  hypothetical: it is exactly what happened in 0.9.24, where a doubled `/v1` made every reasoning
+  call 404 while the liveness probe, both daemons and all seven assertions stayed green. A8 posts an
+  actual chat completion through the same proxy join that broke, and requires HTTP 200 **with
+  non-empty content** — a 200 carrying nothing is a failure, not a pass.
+- **It keys on the backend's reported health, not on what is configured.** The configured backend
+  list is never empty — an install that sets nothing still resolves to a local default — so
+  "is a backend configured?" is not a question with a useful answer. A8 instead runs when the
+  gateway reports at least one backend `ok`, and **skips, loudly, when none is healthy**. An install
+  that deliberately runs without an LLM therefore cannot be failed by this check, while an install
+  whose gateway believes its backend is fine gets that belief tested.
+- **The failure message names the known cause.** A 404 from this path says so, and names the base URL
+  it used, because that is the shape a doubled path segment takes.
+
+### Fixed — the install baseline no longer reads as a steady-state measurement
+
+- **A6's timings now state the corpus size they were measured against.** On a fresh install the
+  baseline is taken against a one-record corpus, so the reranker scores a single document rather than
+  a real candidate pool. Those numbers are a floor, not a search time, and they are not comparable
+  to a later re-baseline taken on a mature corpus. The emitted JSON and the printed summary now carry
+  the corpus size, so the difference is visible rather than inferred.
+
+The verification contract is now eight assertions rather than seven; `Documentation/postflight.md`
+is the specification and has been updated alongside the script.
+
 ## [0.9.24] — 2026-08-22
 
 ### Fixed — the documented cloud-backend configuration could never work, and failed silently
