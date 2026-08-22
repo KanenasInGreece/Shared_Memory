@@ -144,3 +144,32 @@ def test_every_script_the_upgrade_path_names_actually_exists():
                      if not os.path.exists(os.path.join(_ROOT, p)))
     assert not missing, (
         f"AGENTS.md names these scripts and they do not exist: {missing}")
+
+
+def test_agents_md_states_postflights_actual_exit_condition():
+    """GROUP 5. AGENTS.md line ~272 said postflight "exits 0 iff assertions
+    A1-A5 pass" through v0.9.24, when A8 shipped (a REAL reasoning-backend
+    completion through the gateway proxy path) and postflight.md's own spec
+    (the authoritative contract -- postflight.sh's header says so explicitly:
+    "THE SPEC IS THE CONTRACT... where this script and that document
+    disagree, the document wins") moved the exit condition to A1-A5 AND A8.
+    AGENTS.md was never updated, so an operating agent reading it would
+    believe an A8 failure (or a missing SKIP) does not affect the exit code.
+
+    This pins AGENTS.md's claim against postflight.md's own "Exit code:"
+    line rather than a hardcoded string, so the NEXT assertion added to the
+    contract (A9, say) fails this test the same way A8 did, instead of
+    leaving AGENTS.md to drift silently again.
+    """
+    spec = _read("shared-memory", "Documentation", "postflight.md")
+    m = re.search(r"\*\*Exit code:\*\*\s*`0`\s*iff assertions\s*\*\*([^*]+?)\*\*\s*all pass",
+                   spec)
+    assert m, "postflight.md's own Exit code line has changed shape — update the regex"
+    exit_condition = m.group(1).strip()  # e.g. "A1–A5 and A8"
+
+    agents = _read("AGENTS.md")
+    assert exit_condition in agents, (
+        f"postflight.md's spec now says the exit condition is {exit_condition!r}, "
+        "but AGENTS.md's Phase 9 section does not say the same thing -- "
+        "it is quoting a stale assertion range again."
+    )

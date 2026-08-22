@@ -45,7 +45,7 @@ Collect these answers before touching anything. Defaults in brackets are safe to
 | # | Ask the user | Fills |
 |---|---|---|
 | 1 | Where should database data live on disk? [`~/databases/neo4j`, `~/databases/postgres`] | `NEO4J_HOST_DIR`, `PG_DATA_DIR` |
-| 2 | Use the **bundled embedder + reranker containers** (recommended; CPU-only, started by compose), or an existing endpoint? If bundled: which folder holds your GGUF model files? | `LLM_MODELS_DIR` |
+| 2 | Use the **bundled embedder + reranker containers** (recommended; started by compose, CPU-only by default), or an existing endpoint? If bundled: which folder holds your GGUF model files? **Does this host have a spare GPU you want the encoder pair to use instead?** (Phase 4 has the trade-off — a GPU is otherwise easy to leave silently unused, or double-booked with the reasoning LLM.) | `LLM_MODELS_DIR`; if GPU: `GPU_ENCODER_REPLICAS`/`CPU_ENCODER_REPLICAS`, `GPU_RENDER_GID` |
 | 3 | Where is your **reasoning LLM** served? Any OpenAI-compatible endpoint works (LM Studio, llama.cpp server, etc.) [`http://localhost:5000`]. More than one backend, local or remote? List them all. **Does any of them need an API credential** (a paid cloud endpoint, e.g. DeepSeek/xAI/OpenRouter)? If so, ask only for the **name** of the env var they'll export it under — never the key itself. | default `:5000` route, `LLM_BACKENDS`, or `LLM_BACKENDS_JSON` |
 | 4 | Which model family is it? Gemma → `DREAM_TEMPERATURE=0.6`; Mistral-3 Instruct / Qwen → `0.1`; Mistral-3 Reasoning → `1.0`; DeepSeek (online) → `0.6`, **with thinking disabled** via the backend entry's `extra_body` — in thinking mode DeepSeek silently ignores temperature | `DREAM_TEMPERATURE` |
 | 5 | Which **agents** will use the memory? (Claude Code / Codex CLI / Grok / Antigravity CLI / LM Studio / a read-only monitor) | token minting + Phase 8 targets |
@@ -74,20 +74,64 @@ Verify both files exist before Phase 4 (preflight checks this too). If the user 
 
 ### Phase 1 — Write the framework `.env`
 
-`bash shared-memory/scripts/install_framework.sh` does this interactively for a human. As an agent, write the file directly instead — **under `umask 077` before the copy**, the same fix item 3/S-07 applied to the script itself, so the file holding two DB passwords is never even briefly world/group-readable (create-then-chmod leaves exactly that window): copy `shared-memory/.env.example` → `shared-memory/.env`, replace the values for `NEO4J_HOST_DIR`, `PG_DATA_DIR`, `LLM_MODELS_DIR`, `NEO4J_PASSWORD`, `PG_PASSWORD` (leave every other line as shipped — the commented defaults are correct), then:
+`bash shared-memory/scripts/install_framework.sh` does this interactively for a human — and it does
+more than write a file: it also derives `LLAMA_CPU_THREADS` from this host's core count and chowns
+Neo4j's `import`/`plugins` dirs to the container's uid (7474), which a freshly `mkdir -p`'d,
+user-owned dir is NOT (the container crash-loops on "/import is not accessible" without it —
+measured on a fresh install). An earlier version of this phase hand-reimplemented the file write and
+`mkdir` for agent use and never picked up the chown step at all, so every agent-driven install
+silently skipped it — a **second instance of the same class**: an agent path that hand-mirrors a
+helper script's side effects only stays correct until the script grows a new one. **The fix is to
+stop mirroring and DRIVE THE SCRIPT ITSELF**, so this phase cannot drift from what
+`install_framework.sh` actually does again — when the script changes, this phase's behavior changes
+with it, automatically. Any other phase that reimplements a helper script's logic by hand rather
+than invoking it carries the identical risk and deserves the same treatment.
+
+`install_framework.sh` is interactive (`read -r -p` prompts), but that does not require a live
+terminal — feeding its answers as newline-delimited **stdin**, in the order it asks them, drives it
+exactly as a human would (`read`/`read -s` consume the next line from a pipe the same as from a tty;
+`-s` just can't visually hide it, which does not matter here since nothing sensitive is echoed back).
+Generate the two passwords yourself first (ground rule 1 — hex only, never base64: a `/` breaks the
+compose file's `NEO4J_AUTH=neo4j/<password>` parsing and the container restart-loops on "… is
+invalid", though the script itself also rejects one and re-prompts, so this is belt-and-suspenders).
+**Skip this phase entirely if `shared-memory/.env` already exists** (resuming a stopped setup) —
+re-running the script would hit its own overwrite prompt instead of the directory prompts, which is
+not what a resume wants.
 
 ```bash
-umask 077
-cp shared-memory/.env.example shared-memory/.env
-# … edit shared-memory/.env in place: NEO4J_HOST_DIR, PG_DATA_DIR, LLM_MODELS_DIR, NEO4J_PASSWORD, PG_PASSWORD …
-chmod 600 shared-memory/.env          # belt-and-suspenders — umask above already made it 600
+NEO4J_DIR=<from Q1>                      # e.g. $HOME/databases/neo4j
+PG_DIR=<from Q1>                         # e.g. $HOME/databases/postgres
+MODELS_DIR=<from Q2, blank if using LM Studio>
+NEO4J_PW="$(openssl rand -hex 20)"
+PG_PW="$(openssl rand -hex 20)"
+# 5 answers for the dirs/passwords, then "n" to each of the two TRAILING prompts
+# (systemd service install, LLM-backend helper) — Phase 7 and the LLM_BACKENDS /
+# LLM_BACKENDS_JSON edit below handle those explicitly, with more context than
+# the script's own generic prompt gives. printf is a shell builtin, so none of
+# this — including the passwords — ever appears on a process's own argv.
+printf '%s\n%s\n%s\n%s\n%s\nn\nn\n' "$NEO4J_DIR" "$PG_DIR" "$MODELS_DIR" "$NEO4J_PW" "$PG_PW" \
+  | bash shared-memory/scripts/install_framework.sh
 git check-ignore shared-memory/.env          # MUST print the path
-mkdir -p "$NEO4J_HOST_DIR"/{data,logs,import,plugins} "$PG_DATA_DIR"
 ```
 
-Also set `LLAMA_CPU_THREADS` the way the script derives it — host threads / 2 + 1 (`$(( $(nproc) / 2 + 1 ))`) — the compose fallback is 4, which oversubscribes a small CPU and starves the databases. On a host under ~8 GB RAM, set the small-host Neo4j memory preset too (`NEO4J_HEAP_INITIAL`/`NEO4J_HEAP_MAX`/`NEO4J_PAGECACHE` — values and the why in `.env.example`): the shipped defaults refuse to start when heap max + pagecache exceed physical RAM.
+The script already writes the file `umask 077` (S-07 — never briefly world/group-readable), derives
+`LLAMA_CPU_THREADS` from this host rather than the compose fallback of 4 (which oversubscribes a
+small CPU and starves the databases), creates every data dir, and chowns Neo4j's `import`/`plugins`
+for you. On a host under ~8 GB RAM, still set the small-host Neo4j memory preset by hand afterward
+(`NEO4J_HEAP_INITIAL`/`NEO4J_HEAP_MAX`/`NEO4J_PAGECACHE` — values and the why in `.env.example`): the
+script does not ask about RAM, and the shipped defaults refuse to start when heap max + pagecache
+exceed physical RAM.
 
-Uncomment/set `DREAM_TEMPERATURE` (Q4) and, for multiple LLM backends, `LLM_BACKENDS` (Q3). If the user's reasoning server **validates model names** (a named-model server, a routing proxy, a hosted OpenAI-compatible endpoint, or a desktop app with several models loaded), also set `LLM_MODEL` to the real id — the shipped default only suits servers that ignore the field. A single backend on a non-default port is `LLM_DEFAULT_TARGET`. All framework and helper tooling reads `shared-memory/.env` first, with a repo-root `.env` honoured as a pre-0.6 fallback.
+Uncomment/set `DREAM_TEMPERATURE` (Q4) and, for multiple LLM backends, `LLM_BACKENDS` (Q3). **If Q2
+turned up a GPU for the encoders**, uncomment/set `GPU_ENCODER_REPLICAS=1` + `CPU_ENCODER_REPLICAS=0`
+(Phase 4 has the trade-off) and `GPU_RENDER_GID` — read the actual value with
+`stat -c '%g' /dev/dri/renderD128` rather than trusting the packaged default: on Debian the render
+node's group is `render` (gid 992 there, measured on a fresh Debian 13 install), not `video`. If the
+user's reasoning server **validates model names** (a named-model server, a routing proxy, a hosted
+OpenAI-compatible endpoint, or a desktop app with several models loaded), also set `LLM_MODEL` to the
+real id — the shipped default only suits servers that ignore the field. A single backend on a
+non-default port is `LLM_DEFAULT_TARGET`. All framework and helper tooling reads `shared-memory/.env`
+first, with a repo-root `.env` honoured as a pre-0.6 fallback.
 
 **If Q3 turned up a backend needing a credential, use `LLM_BACKENDS_JSON` instead of `LLM_BACKENDS`.** The complete numbered walkthrough (encrypted store → `LoadCredential=` or a `<VAR_NAME>_FILE` runtime pointer → JSON entry with `token_env` plus the mandatory `private_ok`/`roles` choice → restart → verify on `/health`) and the full per-entry parameter table both live in `shared-memory/ops/README.md`, "Reasoning-LLM backends" — **follow them verbatim rather than improvising**; `.env.example` carries the short form beside `LLM_BACKENDS_JSON`. Three rules they encode: the literal key never goes in any file this framework writes — only the env-var **name**; the key at rest belongs in an encrypted store (`pass`/GPG/`systemd-creds`), with **`LoadCredential=` or a runtime `<VAR_NAME>_FILE`** (SEC-06, PR A4) preferred over `systemctl --user import-environment`, which is deprecated (readable by any same-uid process via `show-environment`, and inherited by every user unit); and a credentialed entry with neither `roles` nor an explicit `private_ok` refuses gateway startup by design — ask the operator which they want; never pick for them.
 
@@ -98,6 +142,17 @@ bash shared-memory/scripts/preflight.sh
 ```
 
 Verifies Docker + compose v2, `uv`, and a populated `.env`; warns on low RAM/disk (16 GB RAM and ~30 GB disk are the common floor; a GPU is optional — the three measured example configurations are README §3). Resolve every ✗ before continuing.
+
+**The disk warning is about docker's data-root, not the checkout — a different concern from Q1's
+`NEO4J_HOST_DIR`/`PG_DATA_DIR`.** `preflight.sh` measures free space on
+`docker info --format '{{.DockerRootDir}}'` (falling back to `/var/lib/docker`): images and container
+layers land there, NOT the databases (those follow wherever Q1 pointed them — a separate, already-made
+decision). On many distros' default partitioning this is a smaller, DIFFERENT filesystem than the
+checkout (Debian's default LVM layout commonly gives `/var` a thin slice and `/home` the rest —
+measured on a fresh Debian 13 install). Resolve a low-disk warning here, **before Phase 4 pulls any
+images** — moving docker's data-root after several GB have already landed there just repeats the
+copy. To move it: stop docker, set `"data-root": "/new/path"` in `/etc/docker/daemon.json`,
+`rsync -a` the old tree across, restart docker, and confirm with the same `docker info` command.
 
 ### Phase 3 — OS limits (Linux)
 
@@ -110,6 +165,21 @@ ssh -t <host> "echo '<user> ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/9
 ```
 
 and **delete `/etc/sudoers.d/99-<user>-temp` at the end of the session** — offer that cleanup unprompted. On Fedora/RHEL, docker itself is the first thing needing it: the distro ships podman, and the helper scripts call the docker CLI.
+
+**Which steps actually need root**, enumerated so a temporary-sudo grant can cover all of them in
+one window instead of being discovered piecemeal mid-install:
+- Phase 3 — installing the Docker Engine + Compose v2 packages themselves (`apt`/`dnf install …`).
+- Phase 3 — `systemctl enable --now docker`, `usermod -aG docker $USER` (group membership needs a
+  fresh login/shell to take effect — do not expect it to apply to the CURRENT shell).
+- Phase 3 — raising inotify limits (`sysctl`, per README §4).
+- Phase 3, only if `docker.io` was ever installed on this host — `apt purge docker-buildx`,
+  `dpkg --configure -a` (the recovery two paragraphs up).
+- Phase 7, only as a fallback — `install_service.sh` tries `loginctl enable-linger` for the current
+  user first, which works without root on most systemd-logind setups, and reaches for `sudo` only if
+  that is refused.
+
+Everything else in this file — `docker compose`, `docker exec`, the Python/bash helper scripts, the
+skill itself — runs as the ordinary user; do not `sudo` anything not on this list.
 
 ⛔ **Install Docker Engine + Compose v2 from Docker's own repository — <https://docs.docker.com/engine/install/> — on every distro.** That is the packaging our installs run and the only one this project tests against; a distro's own docker packages may work but are not the tested path. (Recorded fallbacks, with provenance: Fedora's repos carry `moby-engine` + `docker-compose`, measured on Fedora 43; Debian 13 ships compose v2 under the legacy package name `docker-compose`, measured on Debian 13. The `podman-docker` shim remains untested.)
 
@@ -241,14 +311,38 @@ should ask its user rather than invent. The full field schemas and CLI wording l
 ### Phase 8b — Offer a constitution line (per agent, optional)
 
 A skill tells an agent *how* to call the memory; it cannot make the agent *reach for it*. That
-standing behavior lives in each agent's own constitution file (`~/.claude/CLAUDE.md`,
-`~/.grok/AGENTS.md`, `~/.codex/AGENTS.md`, Antigravity's `~/.gemini/` equivalent, …). For every
-agent installed in Phase 8, **ask the user**: *"Would you like a short section in this agent's
-constitution describing the shared memory as its preferred depository of knowledge?"* If yes,
-copy the block verbatim from **`CONSTITUTION_SNIPPET.md`** (shipped alongside `SKILL.md` in this
-same skill directory — the file, not this paragraph, is the canonical source of truth) into the
-constitution file, adapting only the surrounding tone if needed and never overwriting existing
-content. Do not regenerate or paraphrase the block — copying it verbatim keeps it marker-delimited
+standing behavior lives in each agent's own constitution file. **The `AGENT_INSTALLS` registry
+(Phase 6, `generate_tokens.py`) is the actual roster of installed agents as of v0.9.27 — an agent
+added later via `--add` needs no framework release to be supported by THAT mechanism.** This
+section stays prose rather than deriving its list from the registry (a documentation phase has no
+programmatic view of it), so treat the paths below as illustrative of the ones this framework
+ships a thin-client skill to, not exhaustive — nothing in this repo tracks a constitution-file path
+per agent centrally, only the skill-install path. Known constitution files: `~/.claude/CLAUDE.md`
+(Claude Code), `~/.grok/AGENTS.md` (Grok), `~/.codex/AGENTS.md` (Codex CLI), Antigravity's
+`~/.gemini/` equivalent, `~/.config/opencode/AGENTS.md` (opencode's own native global instruction
+file). *(This list drifted before: opencode was the first agent ever registered through the new
+`AGENT_INSTALLS` mechanism and was never added here — the roster mechanism stopped needing a
+release, the prose enumerating it did not follow.)* For an agent not listed here, ask the operator
+where that agent's own constitution/instructions file lives rather than guessing a path.
+
+For every agent installed in Phase 8, **ask the user**: *"Would you like a short section in this
+agent's constitution describing the shared memory as its preferred depository of knowledge?"* If
+yes, copy the block verbatim from **`CONSTITUTION_SNIPPET.md` AT THAT AGENT'S OWN INSTALLED SKILL
+DIRECTORY** — the exact file Phase 8 just placed there, e.g.
+`~/.claude/skills/shared-memory/CONSTITUTION_SNIPPET.md` — into the constitution file, adapting
+only the surrounding tone if needed and never overwriting existing content.
+
+⚠ **Read the INSTALLED skill's copy, never a repository clone that happens to sit on the same
+machine.** A host that also has this repo checked out carries a SECOND `CONSTITUTION_SNIPPET.md`
+under the checkout's own `shared-memory-skill/shared-memory/` tree, and the two can diverge — the
+checkout may sit on a different tag than the last `sync_skills.sh` run, or be mid-edit on a branch.
+Copying from the checkout risks installing a snippet version the installed skill does not actually
+ship, while Phase 8c's drift check compares the constitution file against the *installed skill's*
+copy and would report it current regardless — a wrong install that silently reads as verified. The
+installed skill directory is the only source of truth for this step; a repository checkout is a
+development tree, never an install.
+
+Do not regenerate or paraphrase the block — copying it verbatim keeps it marker-delimited
 and versioned (`<!-- shared-memory:constitution-snippet vN -->`), which is what lets a later
 update (Phase 8c below) detect drift and re-propose instead of duplicating it.
 
@@ -270,7 +364,8 @@ Prove the installed stack works end to end — liveness and payload shape, versi
 truth, the full write path (canary save → 1024-dim vector → outbox applied → `:Fact` node), and an
 honestly-graded read path — and emit a performance baseline for this hardware. The contract is
 `shared-memory/Documentation/postflight.md`; the script implements it and exits 0 iff assertions
-A1–A5 pass. The canary lands under the reserved project `install-verification` and stays in the
+**A1–A5 and A8** pass (A8 SKIPs rather than gates when no reasoning backend is currently reported
+healthy — a SKIP there is not a failure). The canary lands under the reserved project `install-verification` and stays in the
 corpus — the install's birth certificate. **This first run always mints it** (the corpus has no
 live Tier-3 summaries yet); a **later re-run** (e.g. after a hardware change) switches
 automatically to re-baseline mode once the corpus holds real summaries — no new canary, the read
@@ -285,23 +380,37 @@ bash shared-memory/scripts/postflight.sh
 
 ### Add an agent later (no token rotation)
 
-`bootstrap_tokens.sh` refuses to touch an existing registry and `--force` rotates **everyone** —
-neither is what you want for one new agent. Instead: choose one token yourself
-(`openssl rand -hex 32`), get its **digest** entry with `generate_tokens.py --digest` (reads the
-raw token from STDIN, never argv — argv is visible via `ps` and shell history), append the printed
-`<agent>:sha256:<hex>` to the existing `AGENT_TOKENS=` line in `shared-memory/.env` (and to
-`AGENT_ROLES=` only if it needs a restricted role), write the SAME raw token into that agent's own
-skill `.env` yourself (mode 600 — `chmod 600` it), restart the gateway
-(`systemctl --user restart hive-mind-gateway.service`), then run Phase 8 (+ 8b) for that agent
-alone. Verify with the agent's own `doctor`. **A plaintext `<agent>:<token>` entry is refused
-outright as of v0.9.3** — the gateway will not start with one, so the digest step above is not
-optional.
+`bootstrap_tokens.sh` (bare) refuses to touch an existing registry and `--force` rotates
+**everyone** — neither is what you want for one new agent. `--add` (v0.9.27) is the purpose-built
+additive mint: it registers exactly one new agent's `AGENT_INSTALLS` entry, mints its token,
+write-throughs it into that agent's skill `.env` (mode 600), and updates `AGENT_TOKENS` +
+`AGENT_INSTALLS` in `shared-memory/.env` **in place** — every other agent's digest byte-identical,
+untouched.
+
+⚠ **The required order — two individually-correct guards are jointly circular otherwise:**
+`--add` REFUSES a target directory that does not exist yet (deliberate — D19: never mint a token
+into a digest registry that nobody actually received, which is worse than not minting at all), while
+`sync_skills.sh` only creates a directory for an agent the registry **already** names. Neither script
+can bootstrap the other, so the directory has to come from somewhere outside both:
+
+1. **`mkdir -p <skill-dir>`** — the ONE manual step, e.g. `mkdir -p ~/.codex/skills/shared-memory`.
+2. **`bootstrap_tokens.sh --add <agent> --install-path <skill-dir>/.env`** — mints, writes the token
+   through, and updates the gateway `.env` registry.
+3. **`sync_skills.sh`** — the directory and the registry entry both exist now, so this populates the
+   rest of the skill package (`SKILL.md`, `memory_bridge.py`, …) into it — no `--install` flag
+   needed (that flag is for the *other* edge case: a registered agent whose directory does not exist
+   yet, not this one).
+
+Then restart the gateway (`systemctl --user restart hive-mind-gateway.service`) so it loads the
+updated `AGENT_TOKENS`, add the agent to `AGENT_ROLES=` by hand only if it needs a restricted role
+(`--add` does not touch `AGENT_ROLES`), and run Phase 8b for that agent alone (the constitution
+offer — the skill itself is already installed by step 3). Verify with the agent's own `doctor`.
 
 ```bash
-tok=$(openssl rand -hex 32)
-printf '%s' "$tok" | uv run python shared-memory/scripts/generate_tokens.py --digest <agent>
-# → prints <agent>:sha256:<hex> — append that to AGENT_TOKENS= in shared-memory/.env
-echo "AGENT_TOKEN=$tok" >> <skill-dir>/.env && chmod 600 <skill-dir>/.env
+mkdir -p <skill-dir>
+bash shared-memory/scripts/bootstrap_tokens.sh --add <agent> --install-path <skill-dir>/.env
+bash shared-memory/scripts/sync_skills.sh
+systemctl --user restart hive-mind-gateway.service
 ```
 
 ### Start (e.g. after reboot)

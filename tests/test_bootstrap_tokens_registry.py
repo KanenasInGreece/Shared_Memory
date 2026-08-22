@@ -182,6 +182,30 @@ def test_add_refuses_an_already_registered_name_and_touches_nothing(tmp_path):
     assert _env_path(fake_root).read_text() == before, "a refused --add must not modify the .env"
 
 
+def test_add_refuses_when_the_skill_directory_does_not_exist_yet(tmp_path):
+    """AGENTS.md's 'Add an agent later' runbook documents a required order
+    (mkdir the skill dir, THEN --add, THEN sync_skills.sh) precisely because
+    --add refuses a target whose directory is not there yet -- D19: minting a
+    token into the registry that nobody actually received is worse than not
+    minting at all. This pins that refusal so the documented order stays
+    load-bearing rather than aspirational; if --add ever started silently
+    creating the directory itself, the runbook's warning would go stale the
+    same way the chown step did (D11)."""
+    fake_root = _make_fake_root(tmp_path, {})
+    _env_path(fake_root).parent.mkdir(parents=True, exist_ok=True)
+    _env_path(fake_root).write_text("PG_PASSWORD=fake\n")
+
+    never_created = tmp_path / "newagent_skill"  # deliberately never mkdir'd
+    proc = _run(fake_root, ["--add", "newagent", "--install-path", str(never_created / ".env")])
+
+    assert proc.returncode != 0
+    assert "REFUSED" in proc.stdout
+    assert "does not exist" in proc.stdout
+    after = _env_path(fake_root).read_text()
+    assert "newagent" not in after, "a refused --add must not register the agent either"
+    assert not never_created.exists(), "--add must not create the directory itself"
+
+
 def test_add_and_force_together_are_rejected_before_any_minting(tmp_path):
     fake_root = _make_fake_root(tmp_path, {})
     _env_path(fake_root).parent.mkdir(parents=True, exist_ok=True)
