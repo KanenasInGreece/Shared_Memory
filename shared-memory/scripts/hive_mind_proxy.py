@@ -562,6 +562,32 @@ def _v1_models_probe_url(backend_base: str) -> str:
     return f"{base}/v1/models"
 
 
+def _upstream_url(target_base: str, rel_url) -> str:
+    """Join a backend base to the incoming request path WITHOUT doubling /v1.
+
+    Every OpenAI-compatible cloud provider publishes a base that already ends
+    in /v1 (our own .env.example ships exactly that for DeepSeek), while the
+    daemons address this gateway at /v1/chat/completions. A naive concat
+    therefore produced /v1/v1/chat/completions, which providers answer with
+    404 -- measured live: 404 on the doubled path, 200 on the correct one with
+    the same key. It failed SILENTLY: a 404 is never billed, so neither the
+    token counters nor the provider dashboard showed anything, while /health
+    reported the backend ok and REM retried every 30 s forever.
+
+    _v1_models_probe_url already de-duplicated this for the PROBE path; the
+    judgement that it was "not observably behavior-changing" was formed there
+    and does not carry to the work path, where the path is decisive. This is
+    the join every proxied route goes through, so embedder/reranker bases
+    ending in /v1 are covered too, not just chat.
+
+    Pure and total so a mutation check can bite it."""
+    base = str(target_base).rstrip("/")
+    rel = str(rel_url)
+    if base.endswith("/v1") and rel.startswith("/v1/"):
+        rel = rel[len("/v1"):]
+    return f"{base}{rel}"
+
+
 async def _probe_backend_alive(session, backend: str) -> bool:
     """2s liveness probe of the backend's own health surface. llama.cpp serves
     /health; OpenAI-compatible fallback is /v1/models. True = answered."""
@@ -569,6 +595,13 @@ async def _probe_backend_alive(session, backend: str) -> bool:
         try:
             url = f"{backend}{path}" if path else _v1_models_probe_url(backend)
             async with session.get(url, timeout=ClientTimeout(total=2.0)) as r:
+                # 404 means "not served HERE", never "this backend is down" --
+                # so fall through to the next candidate rather than accepting
+                # it. Accepting 404 is what let a backend whose every real
+                # call 404s report itself ok on /health while REM looped on it
+                # for 45 minutes (measured, fresh Debian 13 install).
+                if r.status == 404:
+                    continue
                 if r.status < 500:
                     return True
         except Exception:
@@ -1333,7 +1366,7 @@ class AsyncHiveMindProxy:
                 llm_body, LLM_BACKEND_MODELS.get(llm_backend),
                 LLM_BACKEND_EXTRAS.get(llm_backend), _body_obj=body_obj)
 
-        target_url = f"{target_base}{request.rel_url}"
+        target_url = _upstream_url(target_base, request.rel_url)
         log.debug("→ %s %s", request.method, target_url)
 
         # P-6 (Model_Attributes_Routing_Plan_2026-08-18): X-SM-LLM-* headers
