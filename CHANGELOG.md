@@ -5,6 +5,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.24] — 2026-08-22
+
+### Fixed — the documented cloud-backend configuration could never work, and failed silently
+
+- **The gateway doubled `/v1` when forwarding to a backend whose base already ends in `/v1`.**
+  Every OpenAI-compatible cloud provider publishes such a base — including the DeepSeek example
+  this project ships in `.env.example` — while the daemons address the gateway at
+  `/v1/chat/completions`. The join produced `/v1/v1/chat/completions`, which providers answer with
+  404. Measured live on a fresh install: 404 on the doubled path, 200 on the correct one, with the
+  same credential.
+- **It failed invisibly, which is the worse half.** A 404 is never billed, so neither the token
+  counters nor the provider's own dashboard showed anything wrong, while `/health` reported the
+  backend `ok`, both dreaming daemons reported `running`, and full install verification passed.
+  The only symptom was that dreaming never produced anything — on a 30-second retry loop, forever.
+- **A 404 no longer counts as "backend alive".** The liveness probe accepted any status below 500,
+  so a backend whose every real call 404s reported itself healthy. A 404 now means "not served
+  here" and falls through to the next probe candidate instead of being accepted.
+
+The de-duplication lives at the join every proxied route passes through, so a base ending in `/v1`
+is handled for embeddings and reranking too, not only chat. Local backends are unaffected: a
+`http://localhost:5000` base carries no `/v1`, which is why this never surfaced on a development
+host and only appeared on the first install configured verbatim from the shipped example.
+
 ## [0.9.23] — 2026-08-22
 
 ### Fixed — the install path, measured on a bare Debian 13 box with a discrete GPU
