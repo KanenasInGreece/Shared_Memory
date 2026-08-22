@@ -5,6 +5,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.26] — 2026-08-22
+
+### Added — searches now record how much text the reranker was actually given
+
+- **`rerank_payload_chars` and `rerank_payload_docs` on every search result**, alongside the existing
+  `ranked` flag, plus cumulative `rerank_payload_chars_total` / `rerank_payload_docs_total` on
+  `/memory/telemetry`. The count is taken after the per-document clamp, so it is what was really sent
+  rather than what the records happen to contain.
+- **Why it was missing mattered.** A capacity sweep across differently-sized hosts produced a finding
+  that could not be resolved, because nothing recorded the payload size per request: with only a
+  latency and a configured cap, the fixed per-request overhead — embedding, two database round trips,
+  candidate batching, HTTP — cannot be separated from the effect of document length. The capacity
+  model carries no fixed-overhead term for exactly that reason, and below roughly 2000 characters it
+  crosses from conservative to optimistic, which is the one direction a safety bound must not err.
+- **A fallback records what it would have sent.** When the reranker is unreachable and results are
+  served in vector order, the payload is still counted, so a zero never has to be read as either
+  "nothing was sent" or "not measured" — those are now distinguishable states.
+
+Purely additive: no existing key is renamed or restructured, `api_version` is unchanged, and the
+counting is arithmetic over data already in hand — no extra query, no new failure mode in the search
+path.
+
 ## [0.9.25] — 2026-08-22
 
 ### Added — install verification now exercises the reasoning backend, not just its liveness probe
