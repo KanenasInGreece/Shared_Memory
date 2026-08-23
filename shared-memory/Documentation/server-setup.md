@@ -47,12 +47,12 @@ git clone <repo-url> shared-memory-GitHub
 cd shared-memory-GitHub
 
 # 2. Configure credentials.
-cp .env.example .env
+cp shared-memory/.env.example shared-memory/.env
 #    Fill in: NEO4J_PASSWORD, PG_PASSWORD, TAVILY_API_KEY
 #    Optional: MEMORY_LOG_LEVEL, AUDIT_LOG_PATH, PROXY_BIND, WRITE_QUIESCE_SEC
 
 # 3. Start the database + inference layer.
-docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml up -d
+docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env up -d
 
 # 4. Apply all schema migrations (idempotent — safe to re-run).
 uv run --with psycopg2-binary python shared-memory/migrations/apply.py
@@ -228,7 +228,7 @@ Two ways skew surfaces:
 
 1. **Caller-facing** — any agent can run the doctor command:
    ```bash
-   python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
+   uv run --with httpx python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
    ```
    It prints `compat: ok | incompatible | unknown` and, on skew, names which side
    to upgrade. The same warning is appended to error output when a request fails.

@@ -6,6 +6,7 @@
 #   bash shared-memory/scripts/update_framework.sh              # upgrade in place
 #   bash shared-memory/scripts/update_framework.sh --from-restore
 #   bash shared-memory/scripts/update_framework.sh --dry-run    # print, run nothing
+#   bash shared-memory/scripts/update_framework.sh --no-domain-backfill  # everything except step 6
 #
 # Env overrides: GATEWAY_URL, GATEWAY_UNIT, GATEWAY_RESTART_CMD.
 #
@@ -54,12 +55,14 @@ die() { red "✗ $*"; exit 1; }
 FROM_RESTORE=0
 DRY_RUN=0
 SKIP_BACKUP=0
+NO_DOMAIN_BACKFILL=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --from-restore) FROM_RESTORE=1; shift ;;
-        --dry-run)      DRY_RUN=1; shift ;;
-        --skip-backup)  SKIP_BACKUP=1; shift ;;
-        -h|--help)      sed -n '2,30p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        --from-restore)       FROM_RESTORE=1; shift ;;
+        --dry-run)            DRY_RUN=1; shift ;;
+        --skip-backup)        SKIP_BACKUP=1; shift ;;
+        --no-domain-backfill) NO_DOMAIN_BACKFILL=1; shift ;;
+        -h|--help)      awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; exit 0 ;;
         *)              die "unknown argument: $1" ;;
     esac
 done
@@ -341,7 +344,16 @@ fi
 # it already had been. A preview nobody can act on is decoration, so the preview
 # now belongs to --dry-run (where it is the whole point) and a real run applies
 # once. The applied run reports what it did, which is the record that matters.
-if [[ "$DRY_RUN" == "1" ]]; then
+#
+# ⛔ --no-domain-backfill declines the migration for THIS run only — default
+# behaviour is unchanged, and every step after this one keeps its number
+# (the skip idiom below still increments `step`; it just never calls run()).
+if [[ "$NO_DOMAIN_BACKFILL" == "1" ]]; then
+    step=$((step + 1))
+    echo; ylw "── Step $step: domain backfill"
+    echo "   SKIPPED — --no-domain-backfill given. No repair rows were enqueued;"
+    echo "   re-run without the flag when you are ready to apply it."
+elif [[ "$DRY_RUN" == "1" ]]; then
     run "domain backfill — preview (enqueues nothing)" \
         uv run --with psycopg2-binary python \
         "$REPO_ROOT/shared-memory/scripts/backfill_domain_of.py"
