@@ -5,6 +5,35 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.32] — 2026-08-23
+
+### Fixed — following the documented install order left a fresh host running with authentication off
+
+- **Tokens for local agents are now minted in Phase 8, after each agent's package is installed.**
+  The mint writes a token straight into an agent's skill directory and refuses when that directory
+  does not exist — deliberately, because the alternative is a credential minter that creates
+  directories. But the directories were created in Phase 8, documented to run *after* Phase 6, so on
+  a genuinely fresh host Phase 6 refused every local agent and produced an **empty `AGENT_TOKENS`**.
+- **An empty `AGENT_TOKENS` parses the same as an absent one, and both mean auth off** — so an
+  operator following the documented order ended up with an unauthenticated gateway. Phase 6 now mints
+  only the remote and registry identities it can actually deliver, and says plainly that the CLI
+  agents are minted later; Phase 8 creates each directory, installs the package, then mints that one
+  agent. Nothing was ever silently discarded — the refusal has been loud and carried its own recovery
+  since 0.9.27 — but the order guaranteed the refusal on every fresh install.
+- **Phase 6 no longer claims something that cannot happen on a fresh host.** It stated that the mint
+  "writes each LOCAL agent's token straight into that agent's own skill `.env`", which is impossible
+  before any skill directory exists.
+
+### Fixed — a verification step that its own failure mode satisfied
+
+- **Phase 7 now distinguishes "auth configured" from "auth off" by the payload's shape.** It used to
+  tell the operator to expect `"auth_required":true` from `/health` — but an auth-off install serves
+  the *full* payload to everyone, so the expected value was produced unconditionally by the very
+  state the check should have caught. On an auth-configured install an anonymous caller gets exactly
+  `{status, version, api_version}` and no `auth_required` key at all; on an auth-off install every
+  caller gets the full payload with `auth_required` spelled out as false. One unauthenticated request
+  now separates them, which also means the check works before any token has been minted.
+
 ## [0.9.31] — 2026-08-23
 
 ### Fixed — a backup manifest field that could only ever say zero

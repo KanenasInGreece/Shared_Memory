@@ -227,13 +227,35 @@ uv run --with psycopg2-binary python shared-memory/migrations/verify_schema_init
 uv run --with neo4j python shared-memory/migrations/verify_neo4j_init.py
 ```
 
-### Phase 6 — Mint agent tokens
+### Phase 6 — Mint remote and registry agent tokens
 
 ```bash
 bash shared-memory/scripts/bootstrap_tokens.sh
 ```
 
-Appends `AGENT_TOKENS` (digest form) and a read-only `AGENT_ROLES` line for `monitor` to the framework `.env`. generate_tokens.py's write-through mint flow (PR A2) writes each LOCAL agent's token straight into that agent's own skill `.env` (mode 600) — nothing is printed here to save. A REMOTE agent's token needs `--reveal <name>` passed to `bootstrap_tokens.sh` itself on this SAME invocation (a later, separate reveal mints a fresh token for every agent — a full rotation, not a free peek). ⚠ **The reveal invocation is the one command the HUMAN runs in their own terminal, never you** — the script prints the raw token, and an agent transcript turns "shown once" into "stored forever" (the script's own warning; verified the hard way — a token revealed through an agent session had to be rotated). Hand the user the exact command line and step back. One distinct token per agent, never shared. The script refuses to overwrite an existing registry; `--force` rotates **all** tokens (destructive — rule 2).
+Appends `AGENT_TOKENS` (digest form) and a read-only `AGENT_ROLES` line for `monitor` to the
+framework `.env`. **This phase mints only remote and registry identities — `lm_studio` (takes its
+token from `mcp.json`'s own env block, never a skill `.env`), `antigravity` (ambiguous between
+`~/.gemini/skills/` and a Claude-family path, deliberately left unguessed) and `monitor` (the
+dashboard lives in a sibling repo this script has no install path for).** Each local CLI agent
+(`claude`, `codex`, `gemini`, `grok`) is REFUSED here, loudly, by name — its skill directory does
+not exist yet, because Phase 8 (which installs it) has not run — and that refusal is **expected,
+not an error**: nothing needs fixing at this phase for those agents; Phase 8 mints each of them
+right after installing its package (`decision:1473`, grounded on `fact:1472`). An earlier version
+of this file minted here for every agent, before Phase 8 had created a single skill directory —
+on a genuinely fresh host that refused all four local agents and left `AGENT_TOKENS=` empty, which
+the gateway parses identically to auth being deliberately off (`.env.example`'s S-05 note); an
+operator following the documented order ended up with an unauthenticated gateway without ever
+being told so.
+
+A REMOTE agent's token still needs `--reveal <name>` passed to `bootstrap_tokens.sh` itself on
+this SAME invocation (a later, separate reveal mints a fresh token for every agent — a full
+rotation, not a free peek). ⚠ **The reveal invocation is the one command the HUMAN runs in their
+own terminal, never you** — the script prints the raw token, and an agent transcript turns "shown
+once" into "stored forever" (the script's own warning; verified the hard way — a token revealed
+through an agent session had to be rotated). Hand the user the exact command line and step back.
+One distinct token per agent, never shared. The script refuses to overwrite an existing registry;
+`--force` rotates **all** tokens (destructive — rule 2).
 
 ### Phase 7 — Start the gateway and verify
 
@@ -242,8 +264,7 @@ Smoke-test in the foreground first:
 ```bash
 uv run --no-project --with-requirements requirements-gateway.lock \
   python shared-memory/scripts/hive_mind_proxy.py 8888
-curl -s http://localhost:8888/health                       # anonymous: liveness only
-curl -s -H "Authorization: Bearer <a-phase-6-token>" http://localhost:8888/health   # full payload
+curl -s http://localhost:8888/health
 ```
 
 **Dependency pinning is the default — say so when you start the gateway.** The lock pins the
@@ -255,12 +276,35 @@ their call, not yours. `requirements-gateway.lock` is deliberately narrower than
 `requirements.txt` (the gateway process must not carry `psycopg2`) — never substitute the full
 `requirements.lock` here.
 
-**`/health` has two shapes once Phase 6 minted tokens (S-10):** an anonymous caller gets exactly
-`{"status","version","api_version"}` — enough for liveness, nothing more — and every richer field
-needs a bearer token. So: from the bare curl expect just `"status":"ok"`; from the authenticated
-one expect `"auth_required":true`, `"embedder":"ok"`, `"daemon":"running"`, `"rem_daemon":"running"`.
-(`"llm":"down"` only blocks dreaming, not saves/search — check the reasoning LLM from Q3.) An
-install that skipped tokens (auth off) serves the full payload to everyone, unchanged.
+**Read the JSON SHAPE of that one anonymous call — never the HTTP status, and do not wait until a
+local agent has a token to run this check.** `/health` answers HTTP 200 in BOTH states below, and
+even a REJECTED bearer token still gets back the anonymous shape at 200 — the gateway serves the
+anonymous payload rather than refusing, so **status codes never distinguish "auth configured" from
+"auth off"; only the payload shape does.** Two, and only two, shapes are possible from the bare
+curl above:
+
+- **Exactly three keys** — `{"status","version","api_version"}`, no `auth_required` field present
+  at all — means **auth IS configured**: something (Phase 6's remote/registry mint, or an earlier
+  `--add`) already minted at least one token, and every richer field is now gated behind a bearer.
+  This is the state to want once any agent is registered, and it no longer depends on Phase 8
+  having run — Phase 6 alone gets you here on any install that mints `monitor`/`lm_studio`/
+  `antigravity`. Once a specific credential exists (a Phase 6 `--reveal`, or after Phase 8 mints a
+  local agent), confirm THAT credential actually authenticates:
+  `curl -s -H "Authorization: Bearer <token>" http://localhost:8888/health` must come back with
+  `"auth_required":true` plus the full payload (`"embedder":"ok"`, `"daemon":"running"`,
+  `"rem_daemon":"running"`; `"llm":"down"` only blocks dreaming, not saves/search — check the
+  reasoning LLM from Q3). If nothing has been minted yet at this point in the sequence, note that
+  and come back to this authenticated check after Phase 8.
+- **The full payload already, from the bare curl, unauthenticated** — dozens of keys, INCLUDING
+  `"auth_required":false` spelled out in the JSON itself — means **auth is OFF**: no token has
+  ever been minted (or `bootstrap_tokens.sh` was never run), and every caller who can reach `:8888`
+  gets the complete operational payload, forever, with no token able to restore the slimming later
+  (`resolve_identity()` has nothing to match against an empty registry). This is a legitimate,
+  deliberate choice for a single-operator box with no other network path to `:8888` — but it is a
+  **choice**, and the operator must say so explicitly before setup is treated as complete. ⛔ Never
+  read "no auth configured" as "auth verified" just because the check came back 200 — if this
+  wasn't the intended outcome, run Phase 6 (or `bootstrap_tokens.sh` directly) and restart the
+  gateway before moving on.
 
 Then make it survive logout/reboot with the shipped `systemd --user` unit — a terminal-launched gateway dies with its session:
 
@@ -273,7 +317,40 @@ curl -s http://localhost:8888/health
 
 ### Phase 8 — Install the skill into each agent
 
-For every agent from Q5, follow README §10 (§10a for remote/laptop clients): create the agent's skill dir (Antigravity CLI uses the legacy `~/.gemini/skills/` path), install the skill package, and write that agent's own `AGENT_TOKEN` into the skill `.env` (template: `shared-memory-skill/shared-memory/.env.example`). An MCP host (LM Studio is the exercised example) instead registers `mcp/vector-skill.py` through its config (template: `mcp/mcp.json` — fill the `YOUR_*` placeholders) and needs a full restart after token changes; the connector is client-deployable, so on a machine without the repo install a copy of the `mcp/` folder and point the host's config at it (see `mcp/README.md`).
+For every **local** agent from Q5 (`claude`, `codex`, `gemini`, `grok`, or `antigravity` on its
+legacy `~/.gemini/skills/` path), three steps, in this order (README §10, §10a for remote/laptop
+clients) — **mint follows the directory, never the reverse**, because `--add` refuses a directory
+that does not exist yet and `sync_skills.sh` only populates a directory the registry already
+names, so neither step can bootstrap the other:
+
+```bash
+mkdir -p <skill-dir>                                            # e.g. ~/.codex/skills/shared-memory
+bash shared-memory/scripts/bootstrap_tokens.sh --add <agent> --install-path <skill-dir>/.env
+bash shared-memory/scripts/sync_skills.sh                       # or update_skill.sh from a remote/laptop client
+```
+
+**This is where a local agent's token is actually minted** (`decision:1473` — Phase 6 above mints
+only remote/registry identities). `--add` mints exactly this one agent's token, write-throughs it
+into `<skill-dir>/.env` (mode 600, S-01) as the file's only content so far, and merges its digest
+into the gateway `AGENT_TOKENS` line **in place** — every OTHER agent's digest is reproduced
+byte-identical, so working through Q5's agents one at a time this way is additive, never a
+rotation. `sync_skills.sh` (or `update_skill.sh`, run from inside the skill directory on a
+remote/laptop client) then installs the rest of the skill package into the now-existing,
+now-registered directory — it MERGES `.env.example`'s defaults into the live `.env` rather than
+overwriting it, so the token `--add` just wrote survives. `--add` REFUSES outright if `<agent>` is
+already registered — there is no single-agent rotation, only `bootstrap_tokens.sh --force` for
+everyone — so if this phase is ever re-run for an agent already fully installed, that refusal is
+expected and means nothing to fix; move on to the next agent. **Restart the gateway after
+minting** (`systemctl --user restart hive-mind-gateway.service`, or re-run Phase 7's
+`install_service.sh`) so it loads the updated `AGENT_TOKENS` before this phase's own end-to-end
+check below.
+
+An MCP host (LM Studio is the exercised example) is not a local write-through target at all — it
+has no fixed local install path, so it is one of the remote/registry identities Phase 6 already
+minted a token for. Register `mcp/vector-skill.py` through its config (template: `mcp/mcp.json` —
+fill the `YOUR_*` placeholders) with that token, and give it a full restart after any token
+change; the connector is client-deployable, so on a machine without the repo install a copy of the
+`mcp/` folder and point the host's config at it (see `mcp/README.md`).
 
 **What "the skill package" is — `shared-memory-skill/shared-memory/MANIFEST.txt` is the authority, not a list in this file.** It currently ships `SKILL.md`, `CONSTITUTION_SNIPPET.md`, `.env.example`, `scripts/memory_bridge.py`, `scripts/update_skill.sh` and `Documentation/schema.md`. Install all of it: two later phases depend on files an "just SKILL.md and the script" install would leave out — Phase 8b copies its block from `CONSTITUTION_SNIPPET.md` *in the skill directory*, and Phase 8c and every future update run `scripts/update_skill.sh` *from there*. The reliable way to get it right is to let the tooling do it: create the directory with `memory_bridge.py` in place, then run `update_skill.sh` (or `sync_skills.sh` on the gateway host), which reads the manifest so a file added to the package later needs no change here.
 
@@ -312,8 +389,9 @@ should ask its user rather than invent. The full field schemas and CLI wording l
 
 A skill tells an agent *how* to call the memory; it cannot make the agent *reach for it*. That
 standing behavior lives in each agent's own constitution file. **The `AGENT_INSTALLS` registry
-(Phase 6, `generate_tokens.py`) is the actual roster of installed agents as of v0.9.27 — an agent
-added later via `--add` needs no framework release to be supported by THAT mechanism.** This
+(`generate_tokens.py` — Phase 6 seeds the remote/registry identities, Phase 8's `--add` registers
+each local agent as its package installs) is the actual roster of installed agents as of v0.9.27 —
+an agent added later via `--add` needs no framework release to be supported by THAT mechanism.** This
 section stays prose rather than deriving its list from the registry (a documentation phase has no
 programmatic view of it), so treat the paths below as illustrative of the ones this framework
 ships a thin-client skill to, not exhaustive — nothing in this repo tracks a constitution-file path
