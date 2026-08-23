@@ -23,6 +23,36 @@ Everything here runs on the **gateway host** — the one machine that owns the d
 
 ## First-time setup
 
+### Before Phase 0 — Obtain the source
+
+Every phase below runs commands inside this repository, the interview included — Q2 asks you to
+check paths in the compose file. So the checkout comes first. You are almost certainly reading this
+file from inside one already: if `shared-memory/scripts/install_framework.sh` resolves from your
+working directory, you are done here — say so and move on.
+
+```bash
+git clone https://github.com/KanenasInGreece/Shared_Memory.git && cd Shared_Memory
+```
+
+The alternative matters for one reason: a release tarball needs no root, and `git` may. Where git is
+not installed, cloning means finding an admin; unpacking a tag archive does not. Take the current tag
+from the [releases page](https://github.com/KanenasInGreece/Shared_Memory/releases/latest) — and note
+where it lands, because GitHub names the directory for the tag minus the leading `v`:
+
+```bash
+curl -L https://github.com/KanenasInGreece/Shared_Memory/archive/refs/tags/vX.Y.Z.tar.gz | tar xz
+cd Shared_Memory-X.Y.Z
+```
+
+That buys a user without sudo the run up to Phase 2, where they can read exactly which steps still
+need one, instead of being stopped before Phase 1. It does not make the install rootless — Phase 3's
+Docker packages need root either way.
+
+It costs something later, though: the documented upgrade path is `git pull`, so a tarball install
+starts fine and cannot be maintained the documented way. Settle that with the user now — install git,
+or agree that upgrades mean fetching a fresh tarball by hand. Say which; Phase 2 needs the answer,
+because preflight reports the missing `git` as a failure and that is the one ✗ it may pass.
+
 ### Phase 0 — Interview the user
 
 Collect these answers before touching anything. Defaults in brackets are safe to offer.
@@ -141,7 +171,22 @@ first, with a repo-root `.env` honoured as a pre-0.6 fallback.
 bash shared-memory/scripts/preflight.sh
 ```
 
-Verifies Docker + compose v2, `uv`, and a populated `.env`; warns on low RAM/disk (16 GB RAM and ~30 GB disk are the common floor; a GPU is optional — the three measured example configurations are README §3). Resolve every ✗ before continuing.
+Verifies Docker + compose v2, `uv`, `git` and a populated `.env`; warns on low RAM/disk (16 GB RAM and ~30 GB disk are the common floor; a GPU is optional — the three measured example configurations are README §3). Resolve every ✗ before continuing.
+
+**One ✗ may be accepted, and only one.** A host that took the tarball route *because* it has no `git` will not have it, and
+preflight reports that as a failure — correctly, because `git pull` is the upgrade path. It does not
+block the install. If the user has agreed to upgrade by fetching a fresh tarball, note the agreement
+and continue past that single ✗; otherwise install git first. Nothing else on the Required list is
+negotiable, and do not extend this to any other ✗.
+
+It also checks the smaller tools the shipped scripts run. `curl`, `python3` and `timeout` are
+failures: all three sit on postflight's verification path and postflight guards none of them, so
+without one an install cannot be proven.
+
+Under *Recommended* it reports the four that only backup and restore need — `gzip`, `gunzip`,
+`sha256sum`, `flock` — and `node`, which no framework script runs at all. Node is there because the
+agents that consume the skill are node programs and `mcp/mcp.json` launches two servers with `npx`;
+ignore that line on a gateway-only host.
 
 **The disk warning is about docker's data-root, not the checkout — a different concern from Q1's
 `NEO4J_HOST_DIR`/`PG_DATA_DIR`.** `preflight.sh` measures free space on
@@ -168,6 +213,8 @@ and **delete `/etc/sudoers.d/99-<user>-temp` at the end of the session** — off
 
 **Which steps actually need root**, enumerated so a temporary-sudo grant can cover all of them in
 one window instead of being discovered piecemeal mid-install:
+- Before Phase 0 — installing `git`, only if you clone and the host has none; the tarball route
+  avoids it.
 - Phase 3 — installing the Docker Engine + Compose v2 packages themselves (`apt`/`dnf install …`).
 - Phase 3 — `systemctl enable --now docker`, `usermod -aG docker $USER` (group membership needs a
   fresh login/shell to take effect — do not expect it to apply to the CURRENT shell).
@@ -571,6 +618,12 @@ dropped/reset connection (not a timeout): check
 is reported-only (decision:1424) — nothing here caps or restarts the container.
 
 ### Upgrade (gateway host)
+
+**If this host took the tarball route** (no `git` — see *Before Phase 0*), `git pull` will fail here
+because there is no repository. Fetch the new tag's tarball, unpack it beside the old tree and carry
+`shared-memory/.env` across, then run everything below from the new directory. Record which upgrade
+route this host uses as a comment at the top of `shared-memory/.env`, so the next agent reading only
+this section is not left running `git pull` in a directory that was never a checkout.
 
 ```bash
 git pull

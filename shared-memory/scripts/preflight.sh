@@ -132,6 +132,30 @@ else
     need "git: your distro's package is fine (apt install git / dnf install git)"
 fi
 
+# Tools the shipped scripts actually execute, beyond docker/uv/git above.
+# curl, python3 and timeout all sit on postflight.sh's verification path and it
+# guards none of them, so without any one an install cannot be proven. (Their
+# roles differ — curl makes the gateway calls, python3 parses the responses,
+# timeout bounds the bridge probes — so do not collapse them into one claim.) The feature-scoped ones are
+# checked further down, under Recommended, where an optional finding belongs.
+# (jq is not here because its only consumer, ops/install_llm_backends.sh, is an
+# optional install helper — not because that script self-checks. Several do:
+# backup.sh and restore.sh self-check python3 and sha256sum too, and both are
+# checked anyway. The discriminator is whether the CONSUMER is on the path to a
+# working install, never whether the script guards itself.)
+for _tool in curl python3 timeout; do
+    if command -v "$_tool" >/dev/null 2>&1; then
+        ok "$_tool"
+    else
+        case "$_tool" in
+          curl)    bad "curl not found — postflight.sh verifies the install through it and ops/backup.sh drives the gateway with it (update_skill.sh too); nothing here can be verified without it" ;;
+          python3) bad "python3 not found — postflight.sh, ops/backup.sh and ops/restore.sh call it directly, so uv's own interpreter does not satisfy this" ;;
+          timeout) bad "timeout not found — postflight.sh wraps its memory_bridge.py probes in it and guards it nowhere, so each probe returns 127 with empty output and postflight reports a parse failure that reads like a slow gateway" ;;
+        esac
+        need "$_tool: your distro's package (apt install $_tool / dnf install $_tool)"
+    fi
+done
+
 # Read one key from .env without sourcing it — values may contain spaces or
 # other characters bash `source` would mis-parse (e.g. PROJECT_ALIASES).
 read_env() { grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2-; }
@@ -266,6 +290,45 @@ elif nvtop_out=$("${NVTOP_BIN:-nvtop}" -s 2>/dev/null) && [[ "$nvtop_out" == *de
 else
     warn "nvtop is installed but sees NO GPU — GPU-aware dreaming is inert. On AMD this is usually a missing libdrm-amdgpu1 (nvtop dlopens it); it normally arrives with Mesa, which a container-encoder host does not otherwise need. Verify with: ${NVTOP_BIN:-nvtop} -s"
     need "libdrm for your GPU vendor, so nvtop can see it (AMD: libdrm-amdgpu1) — then confirm '${NVTOP_BIN:-nvtop} -s' lists a device"
+fi
+
+# Backup and restore stand on four small tools, and the gateway needs none of
+# them. Each line names what stops working so "proceed anyway" is a choice
+# rather than a surprise on the day a restore is actually needed. All four are
+# hard dependencies of ops/backup.sh and ops/restore.sh: those scripts die on a
+# missing sha256sum by their own check, and simply fail mid-run on the others.
+for _tool in gzip gunzip sha256sum flock; do
+    if command -v "$_tool" >/dev/null 2>&1; then
+        ok "$_tool"
+    else
+        case "$_tool" in
+          gzip)      warn "gzip not found — ops/backup.sh writes the Neo4j dump through it and ops/restore.sh verifies it with 'gzip -t'; backup and restore will not run. Everything else works." ;;
+          gunzip)    warn "gunzip not found — ops/restore.sh decompresses the Neo4j dump with it; a backup can still be TAKEN, but not restored on this host." ;;
+          sha256sum) warn "sha256sum not found — ops/backup.sh and ops/restore.sh both die on its absence by their own check; it is what proves a dump was not corrupted or swapped." ;;
+          flock)     warn "flock not found — ops/backup.sh takes its 'another backup is already running' lock with it; backups lose their concurrency guard." ;;
+        esac
+        need "$_tool (optional): needed by ops/backup.sh and ops/restore.sh only"
+    fi
+done
+
+# No framework or helper script runs node — the things that do are the agents
+# and the MCP host, and mcp/mcp.json's two example servers launch through npx.
+# So a gateway-only host needs none of it, while a host that will also run an
+# agent or that MCP config needs all of it, and the operator should learn which
+# they have here rather than at Phase 8. Same failure shape as uv above: the
+# upstream installer at https://nodejs.org/en/download lands user-local, and an
+# agent spawns profile-free shells that never read the profile exposing it.
+if command -v node >/dev/null 2>&1; then
+    _sys_path_n="$(getconf PATH 2>/dev/null || echo /usr/bin:/bin)"
+    if env -i PATH="$_sys_path_n" sh -c 'command -v node' >/dev/null 2>&1; then
+        ok "node ($(node --version 2>/dev/null)) — also on the system default PATH"
+    else
+        warn "node ($(node --version 2>/dev/null)) resolves only via your shell profile, not the system default PATH ($_sys_path_n). Agents that spawn profile-free shells will not find it — the same shape as the uv warning above. Harmless if this host only runs the gateway."
+    fi
+elif command -v npm >/dev/null 2>&1; then
+    warn "npm present but node is not on PATH — an agent host needs both"
+else
+    warn "node not found — no framework script needs it, but the agents that consume this skill do, and mcp/mcp.json launches two servers with npx. Install per https://nodejs.org/en/download if this host will run an agent or that MCP config; ignore this line on a gateway-only host."
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────

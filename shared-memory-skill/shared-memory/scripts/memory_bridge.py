@@ -29,7 +29,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.9.32"
+VERSION = "0.9.33"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v3: review-edges / label-edges require the gateway's /memory/relations/* routes.
@@ -379,6 +379,45 @@ def _request_headers() -> dict:
         headers["Authorization"] = f"Bearer {token}"
     return headers
 
+
+def _token_presented() -> bool:
+    """Whether this client actually sent a credential on a request just now.
+
+    Derived from _request_headers() rather than re-reading AGENT_TOKEN, so the
+    two can never disagree about what was on the wire — the equality is asserted
+    against the real header, not against a second copy of the lookup (fact:1309).
+    """
+    return "Authorization" in _request_headers()
+
+
+def _auth_error() -> dict:
+    """The ONE 401 reply, phrased for the failure that actually happened.
+
+    A 401 with NO Authorization header sent is a MISSING credential, not a
+    rejected one: this client never presented anything for the gateway to
+    reject. Saying "rejected" in that case sends the operator off to compare a
+    token value against the gateway's AGENT_TOKENS registry, when the real
+    answer is that no token was configured at all — a different fix, in a
+    different file. Both branches still name AGENT_TOKEN and this agent's own
+    .env, because that is the remedy either way.
+    """
+    if _token_presented():
+        return {"status": "error",
+                "message": ("Coordinator rejected this agent's token. Check that AGENT_TOKEN "
+                            "in this agent's .env matches an entry in the gateway's "
+                            "AGENT_TOKENS.")}
+    return {"status": "error",
+            "message": ("No AGENT_TOKEN was sent and this gateway requires authentication. "
+                        "Set AGENT_TOKEN in this agent's .env.")}
+
+
+def _auth_log_hint() -> dict:
+    """Log payload for the 401 sites that record one. Which sites log is
+    deliberately UNCHANGED here; only the wording follows the branch above."""
+    if _token_presented():
+        return {"hint": "Check AGENT_TOKEN in .env matches an entry in gateway AGENT_TOKENS"}
+    return {"hint": "No AGENT_TOKEN was sent; this gateway requires auth — set it in this agent's .env"}
+
 logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
 
 # ── Audit logging ─────────────────────────────────────────────────────────────
@@ -553,10 +592,8 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
                 headers=_request_headers(),
             )
             if r.status_code == 401:
-                _append_log("memory_bridge", 2, "auth_failed",
-                            {"hint": "Check AGENT_TOKEN in .env matches an entry in gateway AGENT_TOKENS"})
-                return {"status": "error",
-                        "message": "Coordinator rejected token. Set AGENT_TOKEN in this agent's .env."}
+                _append_log("memory_bridge", 2, "auth_failed", _auth_log_hint())
+                return _auth_error()
             result = r.json()
     except Exception as exc:
         _append_log("memory_bridge", 2, "coordinator_down", {"content_preview": content[:100]}, content)
@@ -601,8 +638,7 @@ async def supersede_fact(pg_id: int, by: int | None = None) -> dict:
                 headers=_request_headers(),
             )
             if r.status_code == 401:
-                return {"status": "error",
-                        "message": "Coordinator rejected token. Set AGENT_TOKEN in this agent's .env."}
+                return _auth_error()
             result = r.json()
     except Exception as exc:
         return await _warn_on_skew(_coordinator_unavailable(exc))
@@ -620,8 +656,7 @@ async def review_hold(summary_id: int, pg_id: int) -> dict:
                 headers=_request_headers(),
             )
             if r.status_code == 401:
-                return {"status": "error",
-                        "message": "Coordinator rejected token. Set AGENT_TOKEN in this agent's .env."}
+                return _auth_error()
             result = r.json()
     except Exception as exc:
         return await _warn_on_skew(_coordinator_unavailable(exc))
@@ -640,8 +675,7 @@ async def fetch_review_edges(family: str = "entity_relation", limit: int = 20) -
                 headers=_request_headers(),
             )
             if r.status_code == 401:
-                return {"status": "error",
-                        "message": "Coordinator rejected token. Set AGENT_TOKEN in this agent's .env."}
+                return _auth_error()
             if r.status_code == 403:
                 return {"status": "error",
                         "message": "This token may not review/label relation edges "
@@ -666,8 +700,7 @@ async def apply_edge_labels(labels: dict, promote: list | None = None) -> dict:
                 headers=_request_headers(),
             )
             if r.status_code == 401:
-                return {"status": "error",
-                        "message": "Coordinator rejected token. Set AGENT_TOKEN in this agent's .env."}
+                return _auth_error()
             if r.status_code == 403:
                 return {"status": "error",
                         "message": "This token may not review/label relation edges "
@@ -781,10 +814,8 @@ async def search_and_rerank(query: str, limit: int = 5, project: str = None,
                 headers=_request_headers(),
             )
             if r.status_code == 401:
-                _append_log("memory_bridge", 2, "auth_failed",
-                            {"hint": "Check AGENT_TOKEN in .env matches an entry in gateway AGENT_TOKENS"})
-                return {"status": "error",
-                        "message": "Coordinator rejected token. Set AGENT_TOKEN in this agent's .env."}
+                _append_log("memory_bridge", 2, "auth_failed", _auth_log_hint())
+                return _auth_error()
             result = r.json()
     except Exception as exc:
         return await _warn_on_skew(_coordinator_unavailable(exc, ceiling))
@@ -801,10 +832,8 @@ def query_graph(cypher: str, params: dict = None) -> list | dict:
                 headers=_request_headers(),
             )
         if r.status_code == 401:
-            _append_log("memory_bridge", 2, "auth_failed",
-                        {"hint": "Check AGENT_TOKEN in .env matches an entry in gateway AGENT_TOKENS"})
-            return {"status": "error",
-                    "message": "Coordinator rejected token. Set AGENT_TOKEN in this agent's .env."}
+            _append_log("memory_bridge", 2, "auth_failed", _auth_log_hint())
+            return _auth_error()
         result = r.json()
     except Exception as exc:
         return _coordinator_unavailable(exc)
@@ -821,8 +850,7 @@ def get_telemetry() -> dict:
                 headers=_request_headers(),
             )
         if r.status_code == 401:
-            return {"status": "error",
-                    "message": "Coordinator rejected token. Set AGENT_TOKEN in this agent's .env."}
+            return _auth_error()
         return r.json()
     except Exception as exc:
         return _coordinator_unavailable(exc)
@@ -1277,10 +1305,8 @@ async def save_retrospective_artifact(
                 headers=_request_headers(),
             )
             if r.status_code == 401:
-                _append_log("memory_bridge", 2, "auth_failed",
-                            {"hint": "Check AGENT_TOKEN in .env matches an entry in gateway AGENT_TOKENS"})
-                return {"status": "error",
-                        "message": "Coordinator rejected token. Set AGENT_TOKEN in this agent's .env."}
+                _append_log("memory_bridge", 2, "auth_failed", _auth_log_hint())
+                return _auth_error()
             return r.json()
     except httpx.ConnectError as exc:
         return _coordinator_unavailable(exc)
