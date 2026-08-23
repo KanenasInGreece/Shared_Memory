@@ -228,6 +228,86 @@ s/^DROP CONSTRAINT ([^ ;]+);/DROP CONSTRAINT \1 IF EXISTS;/' \
   cypher-shell -u "$NEO4J_USER" \
   && grn "  ✓ neo4j restored" || die "cypher-shell replay failed"
 
+# ── Restore the framework logs BESIDE the live ones, never into them ─────────
+#
+# ⛔ LOG FILES ARE PER-HOST HISTORY, NOT SHARED STATE. The stores are replaced
+# wholesale because the corpus is the same corpus wherever it runs. Logs are not:
+# they are this machine's record of what happened on it. Unpacking another host's
+# credential and gateway audit trails into the live files would interleave a
+# different machine's events as if they were local — an audit trail that contains
+# events that never happened here is worse than one that is merely short, because
+# it is confidently wrong.
+#
+# So they land in a sidecar the monitor can read and a human can distinguish. The
+# live logs are untouched.
+logs_sha="$(json_get logs_sha256 < "$MANIFEST")"
+if [[ -n "$logs_sha" && -f "$BASE.logs.tar.gz" ]]; then
+  if [[ "$(sha256sum "$BASE.logs.tar.gz" | awk '{print $1}')" != "$logs_sha" ]]; then
+    die "logs archive sha256 mismatch — refusing to unpack a corrupt artifact"
+  fi
+  # ⛔ NOT INSIDE THE LIVE LOG DIRECTORY. A sidecar under $LOG_DIR/restored/ was
+  # the first idea and it is wrong: the monitor's logs_reader and logrotate both
+  # work over that directory, so restored files could be read as live ones — the
+  # exact contamination the sidecar exists to prevent, just one level down.
+  _live_logs="${SHARED_MEMORY_LOG_DIR:-$HOME/.shared-memory/logs}"
+  _logs_dest="$(dirname "$_live_logs")/restored-logs/$(basename "${MANIFEST%.manifest.json}")"
+  mkdir -p "$_logs_dest"
+  if tar xzf "$BASE.logs.tar.gz" -C "$_logs_dest" 2>/dev/null; then
+    # ...and every file carries the prefix too, so a file that is ever COPIED
+    # out of here still says what it is. A directory name only labels a file
+    # while the file stays in the directory.
+    while IFS= read -r -d '' f; do
+      _b="$(basename "$f")"
+      case "$_b" in restored-*) continue ;; esac
+      mv "$f" "$(dirname "$f")/restored-$_b" 2>/dev/null || true
+    done < <(find "$_logs_dest" -type f -print0 2>/dev/null)
+    # ── A CONTRACT THE MONITOR CAN CODE AGAINST ──────────────────────────
+    #
+    # Keeping restored logs out of the live directory stops them being read as
+    # local events — and, on its own, also stops them being read at ALL. The
+    # monitor's logs_reader scans the live directory; it has no reason to guess
+    # this path. So the location is made discoverable and self-describing rather
+    # than merely safe:
+    #
+    #   <state>/restored-logs/latest        -> the most recent restored set
+    #   <state>/restored-logs/<set>/RESTORED.json
+    #
+    # A reader follows `latest`, reads RESTORED.json to learn these are another
+    # host's events and when they were restored, and labels them accordingly.
+    # ⛔ Anything reading this MUST present it as restored history, never as this
+    # machine's own — that distinction is the whole reason it is not merged.
+    python3 - "$_logs_dest/RESTORED.json" "$(basename "${MANIFEST%.manifest.json}")" \
+             "$MANIFEST" <<'PYJSON' 2>/dev/null || true
+import json, sys, datetime
+dest, setname, manifest = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    src = json.load(open(manifest))
+except Exception:
+    src = {}
+json.dump({
+    "set": setname,
+    "restored_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "source_created": src.get("created"),
+    "source_pg_db": src.get("pg_db"),
+    "source_neo4j_nodes": src.get("neo4j_nodes"),
+    "is_local_history": False,
+    "note": ("Logs from ANOTHER deployment, restored beside the live ones. "
+             "Present as restored history; never as events that happened here."),
+}, open(dest, "w"), indent=2)
+PYJSON
+    ln -sfn "$_logs_dest" "$(dirname "$_logs_dest")/latest" 2>/dev/null || true
+    grn "  ✓ logs restored to $_logs_dest"
+    echo "    every file is prefixed 'restored-'; the LIVE logs are untouched, and"
+    echo "    this directory is outside the one the monitor and logrotate read."
+    echo "    Discoverable at: $(dirname "$_logs_dest")/latest  (see RESTORED.json)"
+  else
+    ylw "  ! could not unpack the logs archive — continuing; the stores are restored"
+  fi
+else
+  echo "  i no logs in this set — the source host's operational history is not"
+  echo "    included. A monitor here will show the corpus but no prior warnings."
+fi
+
 # ── Report post-restore counts vs the manifest ───────────────────────────────
 post_rows="$($DOCKER exec --env-file "$_PG_ENV_FILE" "$PG_CONTAINER" \
   psql -U "$PG_USER" -d "$PG_DB" -tAc 'SELECT count(*) FROM technical_docs' 2>/dev/null || echo '?')"

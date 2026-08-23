@@ -28,6 +28,7 @@ import subprocess
 import gzip
 import json
 import hashlib
+import tarfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -92,13 +93,25 @@ exit 0
 """
 
 
-def _make_set(backup_dir: Path, name: str = "sm-backup-test") -> None:
+def _make_set(backup_dir: Path, name: str = "sm-backup-test", with_logs: bool = False) -> None:
     backup_dir.mkdir(parents=True, exist_ok=True)
     pgdump = backup_dir / f"{name}.pgdump"
     cypher = backup_dir / f"{name}.cypher.gz"
     pgdump.write_bytes(b"FAKE-PGDUMP")
     cypher.write_bytes(gzip.compress(FAKE_EXPORT.encode()))
-    (backup_dir / f"{name}.manifest.json").write_text(json.dumps({
+    logs_extra = {}
+    if with_logs:
+        srcdir = backup_dir.parent / "_logsrc" / "logs"
+        srcdir.mkdir(parents=True, exist_ok=True)
+        (srcdir / "credential-audit.jsonl").write_text('{"event":"from the OTHER host"}\n')
+        tarpath = backup_dir / f"{name}.logs.tar.gz"
+        with tarfile.open(tarpath, "w:gz") as t:
+            t.add(srcdir, arcname="logs")
+        logs_extra = {
+            "logs_file": f"{name}.logs.tar.gz",
+            "logs_sha256": hashlib.sha256(tarpath.read_bytes()).hexdigest(),
+        }
+    (backup_dir / f"{name}.manifest.json").write_text(json.dumps({**logs_extra,
         "name": name,
         "pg_db": "agent_data",
         "pg_file": f"{name}.pgdump",
@@ -110,7 +123,7 @@ def _make_set(backup_dir: Path, name: str = "sm-backup-test") -> None:
     }))
 
 
-def _run_restore(tmp_path, args, nodes="3", pg_rows="7"):
+def _run_restore(tmp_path, args, nodes="3", pg_rows="7", with_logs=False):
     fake_root = tmp_path / "repo"
     ops = fake_root / "shared-memory" / "ops"
     ops.mkdir(parents=True)
@@ -125,7 +138,7 @@ def _run_restore(tmp_path, args, nodes="3", pg_rows="7"):
     capture = tmp_path / "capture"
     capture.mkdir()
     backups = tmp_path / "backups"
-    _make_set(backups)
+    _make_set(backups, with_logs=with_logs)
 
     env = dict(os.environ)
     env.update({
@@ -299,3 +312,85 @@ def test_rewritten_schema_statements_keep_a_valid_shape(tmp_path):
             assert re.match(
                 r"^CREATE ([A-Z]+ )?INDEX IF NOT EXISTS FOR \(\w+:\w+\) ON .+;$",
                 line), f"malformed index after rewrite: {line}"
+
+
+# ── Restored logs must never become live logs ────────────────────────────────
+#
+# The monitor reads the framework log directory directly (its logs_reader), and
+# no backup contained it — so a restored deployment showed a healthy corpus and
+# could not surface a single warning. Backing them up is the fix; unpacking them
+# into the live files would have been a worse bug than the one being fixed,
+# because an audit trail carrying another machine's events as if they were local
+# is confidently wrong rather than merely short.
+
+
+def _live_logs(tmp_path):
+    d = tmp_path / ".shared-memory" / "logs"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "credential-audit.jsonl").write_text('{"event":"THIS host"}\n')
+    return d
+
+
+def test_restored_logs_do_not_overwrite_the_live_ones(tmp_path):
+    """THE guard. The live audit trail must read exactly as it did before."""
+    live = _live_logs(tmp_path)
+    before = (live / "credential-audit.jsonl").read_text()
+
+    _run_restore(tmp_path, ["--force"], with_logs=True)
+
+    assert (live / "credential-audit.jsonl").read_text() == before
+    assert "from the OTHER host" not in (live / "credential-audit.jsonl").read_text()
+
+
+def test_restored_logs_land_outside_the_directory_the_monitor_reads(tmp_path):
+    """A sidecar INSIDE the live log directory was the first idea and is wrong:
+    logs_reader and logrotate both work over that directory."""
+    live = _live_logs(tmp_path)
+    _run_restore(tmp_path, ["--force"], with_logs=True)
+
+    restored = tmp_path / ".shared-memory" / "restored-logs"
+    assert restored.exists(), "restored logs were not written to the sidecar"
+    assert not (live / "restored").exists(), "sidecar is inside the live log dir"
+    # Nothing new appeared in the live directory at all.
+    assert {f.name for f in live.iterdir()} == {"credential-audit.jsonl"}
+
+
+def test_every_restored_log_file_carries_the_prefix(tmp_path):
+    """A directory name labels a file only while the file stays in it."""
+    _live_logs(tmp_path)
+    _run_restore(tmp_path, ["--force"], with_logs=True)
+
+    restored = tmp_path / ".shared-memory" / "restored-logs"
+    # RESTORED.json is deliberately NOT prefixed: it is the marker a reader
+    # looks up by a stable name to learn that everything beside it is another
+    # host's history. Prefixing the label would defeat the label.
+    files = [f for f in restored.rglob("*")
+             if f.is_file() and f.name != "RESTORED.json"]
+    assert files, "nothing was extracted"
+    for f in files:
+        assert f.name.startswith("restored-"), f"unprefixed restored log: {f}"
+
+
+def test_the_restored_set_is_discoverable_and_self_describing(tmp_path):
+    """Keeping restored logs out of the live directory stops them being read as
+    local events — and, alone, also stops them being read at all. A reader needs
+    a stable path and a statement of what it is looking at."""
+    _live_logs(tmp_path)
+    _run_restore(tmp_path, ["--force"], with_logs=True)
+
+    latest = tmp_path / ".shared-memory" / "restored-logs" / "latest"
+    assert latest.exists(), "no 'latest' pointer for a reader to follow"
+    marker = json.loads((latest / "RESTORED.json").read_text())
+    assert marker["is_local_history"] is False
+    assert marker["set"]
+
+
+def test_a_set_without_logs_restores_and_says_so(tmp_path):
+    """Every set written before log capture has none; absence is normal, and the
+    operator is told what a monitor here will therefore be missing."""
+    _live_logs(tmp_path)
+    res, _, _ = _run_restore(tmp_path, ["--force"], with_logs=False)
+
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "no logs in this set" in (res.stdout + res.stderr)
+    assert not (tmp_path / ".shared-memory" / "restored-logs").exists()

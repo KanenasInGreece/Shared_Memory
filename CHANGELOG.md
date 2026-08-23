@@ -5,6 +5,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.37] — 2026-08-23
+
+### Fixed — a restored host had the corpus and no way to say anything was wrong
+
+- **A backup set now carries the framework logs.** It was the two stores and nothing else, so a
+  restored deployment came up with the corpus and no operational history: the credential audit trail,
+  the gateway audit trail, the dreaming metrics and the daily logs live only in the framework log
+  directory and were in no backup. The monitor reads that directory directly, so a restored host
+  showed a healthy corpus and could not surface a single warning — it had nothing to read. On a real
+  install the whole directory is 2.4 MB against a 21 MB dump; size was never the reason. Opt out with
+  `BACKUP_INCLUDE_LOGS=0`.
+- **Restored logs land beside the live ones, never inside them.** The stores are replaced wholesale
+  because the corpus is the same corpus wherever it runs. Logs are not: they are one machine's record
+  of what happened on it, and unpacking another host's audit trails into the live files would
+  interleave events that never happened here — an audit trail that is confidently wrong, which is
+  worse than one that is merely short.
+- **Safe and findable are two requirements.** A sidecar inside the live log directory would have been
+  read as local by the monitor and by logrotate; moving it out without a pointer would have meant
+  nothing could find it at all. Restored sets land under `restored-logs/`, every file carries a
+  `restored-` prefix so a copy taken out of there still says what it is, and a stable `latest`
+  pointer with a `RESTORED.json` states plainly that this is another host's history.
+- **Absence stays normal.** Every set written before this has no logs artifact, and both `--verify`
+  and restore read that the way they read any other older field.
+
+---
+
 ## [0.9.36] — 2026-08-23
 
 ### Added — the framework can be uninstalled
