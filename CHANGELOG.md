@@ -5,6 +5,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.38] — 2026-08-24
+
+### Fixed — an upgrade you can decline, and a runbook whose commands actually run
+
+- **`update_framework.sh` can now be told not to migrate.** Step 6 ran the domain backfill with
+  `--apply` and no way to say no. How much it touches depends entirely on the host — nothing at all on
+  a fresh install, several hundred records on an established one — and a routine upgrade should not
+  force a data migration on an operator who is not ready for one. `--no-domain-backfill` declines it
+  for that run. Without the flag nothing changes, so no existing upgrade behaves differently.
+- **The flag is deliberately not `--skip-backfill`.** That name is two characters from the existing
+  `--skip-backup`, which guards the opposite risk. The dangerous typo is not the one that gets
+  rejected — it is the one that still parses, lands on the other real flag, and skips the
+  pre-migration backup while running the migration unprotected.
+- **Skipping a step no longer renumbers the ones after it.** The skip branch advances the step counter
+  explicitly, so step 7 and step 8 keep the numbers the documentation gives them.
+- **`--help` had been cutting off its own exit contract.** It prints a fixed range of header lines, and
+  the range had already fallen behind the header; the sentence stating when the script exits zero was
+  being truncated before this change. The range now matches the header.
+
+### Fixed — three documented commands that could not work as printed
+
+- **The manual gateway runbook named a file that does not exist.** `cp .env.example .env` pointed at
+  the repository root; the file lives at `shared-memory/.env.example`, and the framework env file is
+  `shared-memory/.env` — the root path is only a fallback.
+- **Its compose invocation omitted `--env-file`,** so it aborted on the `NEO4J_HOST_DIR` and
+  `PG_DATA_DIR` substitutions the compose file requires.
+- **Its doctor example ran the bridge under a bare `python`,** which fails on the script's `httpx`
+  import.
+- In all three cases the README already documented the same step correctly. This was two published
+  surfaces disagreeing with each other, not an open question — found by reading the published
+  documentation cold, on a host that had nothing else to go on.
+
+---
+
 ## [0.9.37] — 2026-08-23
 
 ### Fixed — a restored host had the corpus and no way to say anything was wrong
