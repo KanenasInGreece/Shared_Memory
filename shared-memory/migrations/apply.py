@@ -122,6 +122,30 @@ def pending(files: list[Path], latest: str | None) -> list[Path]:
     return [f for f in files if f.name > latest]
 
 
+def ahead(files: list[Path], applied: set[str]) -> set[str]:
+    """Migrations the DATABASE has applied that this CHECKOUT does not contain.
+
+    The counterpart to `pending`. That one answers "what has this database not
+    had yet"; this one answers the question nobody was asking until a restore
+    made it real: "has this database already gone somewhere this code cannot
+    follow?"
+
+    It is DERIVED, never stored. The ledger travels inside the dump (see the
+    module docstring), so a restored database states its own level without any
+    help from a manifest field, a version stamp, or anything else that could
+    disagree with the schema it claims to describe.
+
+    Why this is not covered by `pending`: selection there is by POSITION, so a
+    ledger at 035 against a checkout topping out at 030 yields an EMPTY pending
+    list — indistinguishable from up to date. The database is a dozen releases
+    ahead of the code about to run against it and the tool reports success.
+    Set membership is what separates the two states, and only here.
+
+    Pure — no I/O — so the rule is directly testable without a database.
+    """
+    return applied - {f.name for f in files}
+
+
 def needs_adoption(framework_present: bool, applied: set[str]) -> bool:
     """Whether this database must be adopted before anything may run.
 
@@ -205,6 +229,31 @@ def main() -> int:
             applied = _applied(cur)
             latest = latest_applied(cur)
 
+        # ── Forward-only: refuse a database this checkout cannot follow ─────
+        # Reached in practice by restoring a backup onto an older tree, which
+        # is exactly the case the ledger-in-the-dump design makes detectable.
+        # Left unchecked, `pending` returns [] and the run reports "Up to date"
+        # at a filename this code has never seen — the one outcome the ledger
+        # exists to make impossible. --status is exempt: it is the diagnostic
+        # you run to FIND this, so it reports the state instead of refusing.
+        unknown = ahead(files, applied)
+        if unknown and not status:
+            print(
+                f"This database is AHEAD of this checkout.\n\n"
+                f"Its ledger records {len(unknown)} migration(s) that do not exist "
+                f"here:\n\n"
+                + "".join(f"    {n}\n" for n in sorted(unknown))
+                + f"\nThe database is at {latest}; this tree's newest migration is "
+                f"{files[-1].name}. Migrations are forward-only, so there is "
+                f"nothing safe to run: the schema has already moved past what "
+                f"this code knows how to produce.\n\n"
+                f"Fix the CHECKOUT, not the database — update this tree to a "
+                f"release that contains the migrations above, then re-run. If "
+                f"this database came from a restore, the dump was taken on a "
+                f"newer deployment than the one restoring it.",
+                file=sys.stderr)
+            return 3
+
         if adopt:
             with conn:
                 with conn.cursor() as cur:
@@ -227,6 +276,15 @@ def main() -> int:
             print(f"ledger: {len(applied)} applied, {len(todo)} pending")
             for f in files:
                 print(f"  [{'x' if f.name in applied else ' '}] {f.name}")
+            # Ledger rows with no file on disk appear in NEITHER loop above —
+            # both iterate `files`. Report them explicitly or the ahead state
+            # stays invisible in the one command meant to diagnose it.
+            unknown = ahead(files, applied)
+            if unknown:
+                print(f"\n  AHEAD: {len(unknown)} applied migration(s) not in "
+                      f"this checkout — this database is newer than this code:")
+                for n in sorted(unknown):
+                    print(f"    {n}")
             return 0
 
         # A populated database with an EMPTY ledger has had every migration

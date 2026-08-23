@@ -195,3 +195,26 @@ if [[ -n "$man_nodes" && "$post_nodes" == "$man_nodes" ]]; then
 else
   ylw "Restore complete — verify node counts above (a mismatch can be normal if the backup ran without full quiesce)."
 fi
+
+# ── The restore is HALF the operation ────────────────────────────────────────
+#
+# The data is back, but it is back at whatever schema level the dump was taken
+# at — and that is very unlikely to be the level the gateway about to read it
+# expects. `schema_migrations` travels INSIDE the dump, so the database now
+# states its own level correctly; nothing has yet moved it forward to the code.
+#
+# Saying nothing here is how a restored deployment ends up running an older
+# schema under a newer gateway with no error anywhere: this script's last line
+# used to read "Restore complete", which an operator reasonably takes as done.
+echo
+ylw "⚠ The data is restored, but NOT yet migrated to the running code's level."
+ylw "  A dump carries its own schema_migrations ledger, so this database is at the"
+ylw "  level it was backed up at — not necessarily the level this gateway expects."
+echo
+ylw "  Finish the operation:"
+ylw "    bash shared-memory/scripts/update_framework.sh --from-restore"
+echo
+ylw "  That runs the forward-only migration path (Postgres ledger, Neo4j constraints,"
+ylw "  project identity, restart, domain backfill) and proves the result with"
+ylw "  postflight. It REFUSES if this dump came from a NEWER deployment than this"
+ylw "  checkout — migrations are forward-only and the schema cannot be moved back."

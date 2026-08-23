@@ -116,3 +116,59 @@ def test_a_fresh_database_is_never_asked_to_adopt():
     """No framework schema means the migrations genuinely have not run."""
     assert apply_mod.needs_adoption(False, set()) is False
     assert apply_mod.pending(FILES, None) == FILES
+
+
+# ── Forward-only: a database that has gone somewhere this code cannot follow ──
+#
+# `pending` answers "what has this database not had yet". It cannot answer "has
+# this database already passed this code", because its selection is by POSITION:
+# a ledger at 031 against a checkout topping out at 022 orders after every file,
+# so pending is EMPTY — byte-identical to an up-to-date database. The tool then
+# reports success and an older gateway starts against a newer schema.
+#
+# The state is derived from the ledger that travels inside the dump, so it needs
+# no manifest field and no version stamp — nothing that could disagree with the
+# schema it describes.
+
+AHEAD_LEDGER = {"001_a.sql", "002_b.sql", "007_c.sql", "021_d.sql", "022_e.sql",
+                "030_f.sql", "031_g.sql"}
+
+
+def test_a_database_ahead_of_the_checkout_is_detected():
+    """The restore case: a dump from a newer deployment, replayed onto this tree."""
+    assert apply_mod.ahead(FILES, AHEAD_LEDGER) == {"030_f.sql", "031_g.sql"}
+
+
+def test_the_ahead_state_is_invisible_to_the_selection_rule():
+    """THE regression, and the reason `ahead` has to exist as its own rule.
+
+    Both databases produce an EMPTY pending list. Only set membership tells them
+    apart, so each side is asserted by VALUE — pinning the two pending results
+    equal to each other would pass just as happily if both were wrong.
+    """
+    up_to_date = {f.name for f in FILES}
+
+    assert apply_mod.pending(FILES, "022_e.sql") == []       # genuinely finished
+    assert apply_mod.pending(FILES, "031_g.sql") == []       # a dozen releases ahead
+
+    assert apply_mod.ahead(FILES, up_to_date) == set()
+    assert apply_mod.ahead(FILES, AHEAD_LEDGER) == {"030_f.sql", "031_g.sql"}
+
+
+def test_an_up_to_date_database_is_not_ahead():
+    assert apply_mod.ahead(FILES, {f.name for f in FILES}) == set()
+
+
+def test_a_database_behind_the_checkout_is_not_ahead():
+    """Behind is the ordinary case every upgrade is: pending has work, and
+    nothing in the ledger is unknown to this tree."""
+    behind = {"001_a.sql", "002_b.sql"}
+    assert apply_mod.ahead(FILES, behind) == set()
+    assert [f.name for f in apply_mod.pending(FILES, "002_b.sql")] == [
+        "007_c.sql", "021_d.sql", "022_e.sql"
+    ]
+
+
+def test_a_fresh_database_is_not_ahead():
+    """An empty ledger is the adoption question's territory, never this one."""
+    assert apply_mod.ahead(FILES, set()) == set()
