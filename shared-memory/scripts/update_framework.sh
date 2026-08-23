@@ -160,6 +160,30 @@ if [[ "$DRY_RUN" == "0" && "$rc" == "3" ]]; then
   Nothing was migrated. Update the CHECKOUT to a release containing those
   migrations and re-run — the schema cannot be moved backwards."
 fi
+if [[ "$DRY_RUN" == "0" && "$rc" == "2" ]]; then
+    # A populated database with an EMPTY ledger. Restoring an OLD dump is the
+    # most likely way to arrive here, not the rarest: the ledger itself only
+    # arrived in v0.8.35, so every backup taken before that carries the full
+    # framework schema and no record of how it got there.
+    #
+    # ⛔ THIS SCRIPT MUST NOT DECIDE. apply.py refuses precisely because the two
+    # available guesses are both destructive: adopting silently would skip a
+    # genuinely new migration forever, and running them all would re-execute
+    # migrations against a schema they were never written for — one of which
+    # deletes rows on a key a later migration changed. The operator chooses,
+    # once, having looked.
+    die "this database has the framework schema but NO migration ledger (apply.py
+  exit 2, message above). Nothing was migrated.
+
+  If it came from a backup taken before v0.8.35, that is expected — the ledger
+  did not exist yet, and those migrations HAVE been applied. Record that once,
+  WITHOUT re-running them, then re-run this script:
+
+      uv run --with psycopg2-binary python shared-memory/migrations/apply.py --adopt
+
+  ⛔ Do not adopt a database you cannot vouch for. Adoption marks every migration
+  present today as done; anything genuinely missing stays missing, silently."
+fi
 [[ "$DRY_RUN" == "0" && "$rc" != "0" ]] && die "apply.py failed (exit $rc) — stopping before the graph half."
 
 # ── Step 3: Neo4j — the graph's ENTIRE forward-migration ─────────────────────
