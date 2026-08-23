@@ -591,3 +591,67 @@ def test_tracked_client_copies_are_byte_identical():
             "copy, so the source edit is UNTESTED. Run: bash "
             "shared-memory/scripts/sync_skills.sh"
         )
+
+
+# ── 401 says which failure happened: missing token vs rejected token ─────────
+# A 401 with no Authorization header sent is a MISSING credential, not a
+# rejected one. The old single message said "Coordinator rejected token" in
+# both cases, sending the operator to compare a token value against the
+# gateway's AGENT_TOKENS when nothing had been configured to compare.
+
+def test_auth_error_says_rejected_when_a_token_was_actually_sent(monkeypatch):
+    monkeypatch.setenv("AGENT_TOKEN", "tok_testtoken123")
+    msg = memory_bridge._auth_error()["message"]
+    assert memory_bridge._auth_error()["status"] == "error"
+    assert "rejected" in msg.lower()
+    assert "AGENT_TOKENS" in msg, "the rejected branch must name the gateway registry to compare against"
+
+
+def test_auth_error_says_missing_when_no_token_was_sent(monkeypatch):
+    monkeypatch.delenv("AGENT_TOKEN", raising=False)
+    monkeypatch.setattr(memory_bridge, "_AGENT_TOKEN_FROM_FILE", "")
+    msg = memory_bridge._auth_error()["message"]
+    assert "rejected" not in msg.lower(), (
+        "nothing was sent, so nothing was rejected — this is the defect the branch exists to fix"
+    )
+    assert "no agent_token was sent" in msg.lower()
+    assert "AGENT_TOKEN" in msg, "both branches must still name the variable to set"
+
+
+def test_auth_log_hint_follows_the_same_branch(monkeypatch):
+    monkeypatch.delenv("AGENT_TOKEN", raising=False)
+    monkeypatch.setattr(memory_bridge, "_AGENT_TOKEN_FROM_FILE", "")
+    assert "no agent_token" in memory_bridge._auth_log_hint()["hint"].lower()
+    monkeypatch.setenv("AGENT_TOKEN", "tok_testtoken123")
+    assert "matches an entry" in memory_bridge._auth_log_hint()["hint"]
+
+
+def test_token_presented_is_derived_from_the_real_header(monkeypatch):
+    """Asserted against _request_headers() itself, never a second reading of
+    AGENT_TOKEN — an equality between two copies of the same lookup would let
+    the pair drift together (fact:1309)."""
+    monkeypatch.setenv("AGENT_TOKEN", "tok_testtoken123")
+    assert memory_bridge._token_presented() is True
+    monkeypatch.delenv("AGENT_TOKEN", raising=False)
+    monkeypatch.setattr(memory_bridge, "_AGENT_TOKEN_FROM_FILE", "")
+    assert memory_bridge._token_presented() is False
+
+
+def test_no_401_site_inlines_its_own_message():
+    """Guard: every 401 handler routes through _auth_error(). An inline dict
+    would silently reintroduce the unconditional 'rejected' wording at one
+    site while the helper's tests kept passing."""
+    path = os.path.join(os.path.dirname(__file__), "..",
+                        "shared-memory", "scripts", "memory_bridge.py")
+    src = open(path, encoding="utf-8").read()
+    lines = src.split("\n")
+    sites = [i for i, l in enumerate(lines) if "status_code == 401" in l]
+    assert sites, "no 401 handling found at all"
+    for i in sites:
+        window = "\n".join(lines[i + 1:i + 3])
+        assert "_auth_error()" in window, (
+            f"line {i + 2} handles a 401 without _auth_error(): {lines[i + 1].strip()[:70]}"
+        )
+    assert "Coordinator rejected token" not in src, (
+        "the old unconditional message is back; _auth_error() owns that text"
+    )

@@ -5,6 +5,50 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.33] — 2026-08-23
+
+### Added — the agent install path never said how to get the code
+
+- **A new step before Phase 0 obtains the source.** `AGENTS.md` opens by promising to get this repo
+  installed, then went straight to the interview and on to writing `.env` — while the interview
+  itself already assumes the checkout, since Q2 has the agent check paths in the compose file.
+- **The release tarball is the one prerequisite a user without sudo can route around.** Installing
+  `git` may need an admin; unpacking a tag archive does not, which buys an unprivileged user the run
+  up to Phase 2 and a clear view of what still needs one. Both routes now carry a command, including
+  the extract directory GitHub actually creates. `preflight.sh` still reports a missing `git` as a
+  failure, correctly, because the documented upgrade path is `git pull`.
+
+### Added — preflight checks the tools the scripts run, and says what each one costs
+
+- **`curl`, `python3` and `timeout` now fail preflight.** All three carry postflight's verification
+  path and postflight guards none of them, so a host missing one used to pass preflight and then fail
+  later, reporting whatever the script was doing rather than the missing tool. A missing `timeout` is
+  the clearest case: the probes it wraps return 127 with empty output, and postflight reports a parse
+  failure that reads like a slow gateway.
+- **`gzip`, `gunzip`, `sha256sum` and `flock` warn under *Recommended*** and name what stops working.
+  The gateway runs without them; only `ops/backup.sh` and `ops/restore.sh` do not.
+- **`node` is reported, and explicitly not as a framework dependency.** No framework or helper script
+  runs it. The agents that consume the skill do, and `mcp/mcp.json` launches two of its servers with
+  `npx` — so a gateway-only host needs none of it while an agent host needs all of it. As with `uv`
+  in 0.9.30, the upstream installer lands it user-local where a profile-free agent shell may miss it.
+- Tests pin each message against the code, so a message cannot drift into naming a script that no
+  longer calls the tool.
+
+### Fixed — a 401 that blamed the token when no token had been sent
+
+- **Both clients now say which of the two failures actually happened.** `memory_bridge.py` answered
+  every 401 with "Coordinator rejected token" — including when it had sent no `Authorization` header
+  at all, which pointed the operator at comparing a token value against the gateway's `AGENT_TOKENS`
+  when nothing had been configured to compare. The missing-credential case now says so plainly, and
+  both branches still name the variable to set and the file to set it in.
+- **`vector-skill.py` carried the same wording and the same defect**, and is fixed alongside it, so
+  the two front doors stay at parity.
+- Nine call sites in `memory_bridge.py` had each inlined their own copy of that message. They now
+  route through one helper, guarded by a test that fails if an inline message ever returns. Which
+  sites log an auth failure is deliberately unchanged.
+
+---
+
 ## [0.9.32] — 2026-08-23
 
 ### Fixed — following the documented install order left a fresh host running with authentication off

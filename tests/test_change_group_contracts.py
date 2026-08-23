@@ -247,3 +247,24 @@ def test_agents_md_pipes_the_right_number_of_answers_into_install_framework():
         f"{piped_confirm_count} literal y/n answers ('y'/'n', not '%s') — update "
         "AGENTS.md's Phase 1 piped-answer line to match."
     )
+
+
+def test_agents_md_download_command_carries_no_hardcoded_version():
+    """The Before-Phase-0 tarball command is the one line a stranger
+    copy-pastes before anything else exists on the host. A pinned version there
+    is correct on the day it ships and silently wrong at the next release —
+    it would download a stale tag while the `cd` still happens to work.
+
+    AGENTS.md is deliberately NOT in _VERSION_PINS: adding it would make a
+    version bump land in five places, and the four-place rule is the operator's
+    to change. So the command stays version-free and this guards that.
+    """
+    src = _read("AGENTS.md")
+    urls = re.findall(r"archive/refs/tags/(\S+?)\.tar\.gz", src)
+    assert urls, "the tarball download command vanished from AGENTS.md"
+    for tag in urls:
+        assert not re.fullmatch(r"v\d+\.\d+\.\d+", tag), (
+            f"AGENTS.md pins the release tag '{tag}' in a download URL. Nothing "
+            f"bumps it, so it goes stale at the next release — use the vX.Y.Z "
+            f"placeholder and point the reader at the releases page."
+        )

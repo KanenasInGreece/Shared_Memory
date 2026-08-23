@@ -119,7 +119,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.9.32"
+VERSION = "0.9.33"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server
@@ -269,13 +269,25 @@ def _auth_rejected(tool: str) -> str:
     """The ONE 401 response. Six tools used to inline their own copy of this
     message and so never logged the failure — and the write tools were the six,
     which is the worse half to lose from the audit trail. `tool` is the calling
-    tool's own name, so the log says which call was rejected."""
+    tool's own name, so the log says which call was rejected.
+
+    Branches on whether a credential was actually SENT: a 401 with no
+    Authorization header is a MISSING token, not a rejected one, and telling
+    the operator it was "rejected" points them at comparing a value against
+    the gateway registry when nothing was ever configured to compare.
+    """
+    presented = "Authorization" in _auth_headers()
+    where = ("this client's own .env (beside this script, or wherever "
+             "VECTOR_SKILL_ENV points), or in the MCP host's env block")
+    if presented:
+        _append_log(tool, 2, "auth_failed",
+                    {"hint": "Check AGENT_TOKEN matches a gateway AGENT_TOKENS entry"})
+        return (f"Error: the gateway rejected this client's token. Set AGENT_TOKEN in "
+                f"{where}. It must match an entry in the gateway's AGENT_TOKENS.")
     _append_log(tool, 2, "auth_failed",
-                {"hint": "Check AGENT_TOKEN matches a gateway AGENT_TOKENS entry"})
-    return ("Error: the gateway rejected this client's token. Set AGENT_TOKEN in "
-            "this client's own .env (beside this script, or wherever "
-            "VECTOR_SKILL_ENV points), or in the MCP host's env block. It must "
-            "match an entry in the gateway's AGENT_TOKENS.")
+                {"hint": "No AGENT_TOKEN was sent; the gateway requires auth"})
+    return (f"Error: no AGENT_TOKEN was sent and the gateway requires "
+            f"authentication. Set AGENT_TOKEN in {where}.")
 
 
 def _valid_ref(ref: str) -> bool:
