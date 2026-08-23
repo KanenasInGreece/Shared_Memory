@@ -627,8 +627,17 @@ bash shared-memory/scripts/postflight.sh
 **everyone** — neither is what you want for one new agent. `--add` (v0.9.27) is the purpose-built
 additive mint: it registers exactly one new agent's `AGENT_INSTALLS` entry, mints its token,
 write-throughs it into that agent's skill `.env` (mode 600), and updates `AGENT_TOKENS` +
-`AGENT_INSTALLS` in `shared-memory/.env` **in place** — every other agent's digest byte-identical,
-untouched.
+`AGENT_INSTALLS` — and `AGENT_ROLES` when the agent needs one — in `shared-memory/.env` **in
+place**, every other agent's digest byte-identical, untouched.
+
+⛔ **A READ-ONLY IDENTITY IS ALWAYS MINTED READ-ONLY.** `generate_tokens.py`'s `READ_ONLY_AGENTS`
+list is authoritative on **every** mint path: `--add monitor` writes `monitor:read` into
+`AGENT_ROLES`, confining that token to `GET /health`, `GET /memory/telemetry` and read-only Cypher
+on `POST /memory/graph` — every other route answers 403. Pass `--role read|full|admin` to confine an
+agent that is *not* on that list; **widening one that is, is refused before anything is minted.**
+Absence from `AGENT_ROLES` means full read/write, so a missing entry is not a neutral default — it
+is the widest one. *(Until v0.9.35 only the BULK mint emitted this line, so `--add monitor` produced
+a write-capable token for a dashboard that must never have one.)*
 
 ⚠ **The required order — two individually-correct guards are jointly circular otherwise:**
 `--add` REFUSES a target directory that does not exist yet (deliberate — D19: never mint a token
@@ -743,21 +752,57 @@ because there is no repository. Fetch the new tag's tarball, unpack it beside th
 route this host uses as a comment at the top of `shared-memory/.env`, so the next agent reading only
 this section is not left running `git pull` in a directory that was never a checkout.
 
+**Use the script. It is the procedure.**
+
 ```bash
-git pull
-uv run --with psycopg2-binary python shared-memory/migrations/apply.py   # BEFORE restart
-uv run --with psycopg2-binary --with neo4j python \
-    shared-memory/scripts/reconcile_project_identity.py --apply          # graph half of a migration
-uv run --with neo4j python shared-memory/migrations/verify_neo4j_init.py # Neo4j has NO ledger
-systemctl --user restart hive-mind-gateway.service
-curl -s http://localhost:8888/health                                     # api_version, status ok
-uv run --with psycopg2-binary python \
-    shared-memory/scripts/backfill_domain_of.py                          # AFTER restart, dry-run first — see below
-uv run --with psycopg2-binary python \
-    shared-memory/scripts/backfill_domain_of.py --apply                  # then APPLY — dry-run alone enqueues nothing
-bash shared-memory/scripts/sync_skills.sh                                # refresh installed skills
-bash shared-memory/scripts/postflight.sh                                 # verify end to end (Phase 9)
+export AGENT_TOKEN=<an agent token>      # postflight needs it, or A1/A5/A8 skip and it exits 1
+bash shared-memory/scripts/update_framework.sh --dry-run   # see every step, run nothing
+bash shared-memory/scripts/update_framework.sh             # do it, and prove it
 ```
+
+**After a restore, the same script finishes the job** — `ops/restore.sh` brings the data back at
+whatever schema level the dump was taken at, and nothing has yet moved it forward to this code:
+
+```bash
+bash shared-memory/scripts/update_framework.sh --from-restore
+```
+
+⭐ **Upgrade and restore are ONE procedure with two entry points.** An upgrade is new *code* arriving
+at existing *data*; a restore is existing *data* arriving at running *code*. Everything between is
+identical, which is why `--from-restore` is a flag and not a second script: it skips fetching code
+(restore has just supplied the data instead) and skips the pre-migration backup (the dump you just
+restored **is** the safeguard set). Every guard below applies to both.
+
+⭐ **THE DATABASE STATES ITS OWN LEVEL — never read a version out of a backup manifest.**
+`schema_migrations` is a table *inside* the database, and `pg_dump -Fc` carries it, so a restored
+database announces exactly how far it got. A version stamped into the manifest would be a **derived**
+value and a second source of truth that can drift from the schema it claims to describe.
+
+⛔ **Forward-only, and now enforced.** `apply.py` **refuses with exit 3** when the database's ledger
+names migrations this checkout does not contain — the restore-onto-older-code case. Before this it
+reported `Up to date at <a filename this code has never seen>` and exited 0, because selection is by
+position and a database twelve releases ahead produces an empty pending list, indistinguishable from
+one that is finished. `apply.py --status` reports the same state without refusing. **The fix is
+always to update the CHECKOUT; the schema cannot be moved backwards.**
+
+**What the script runs, in this order, each step gated on the last succeeding:**
+
+| # | Step | Why it is here |
+|---|---|---|
+| 0 | `git pull --ff-only` | skipped with `--from-restore`. Refuses a **detached HEAD** and refuses a tarball tree, rather than failing in a way that reads as broken tooling |
+| 1 | `ops/backup.sh` | migration is the one step nothing can undo. Uses the shipped script so it is the same artifact `restore.sh` can read |
+| 2 | `apply.py` | Postgres, ledger-driven, forward-only (exit 3 = database ahead) |
+| 3 | `verify_neo4j_init.py --apply` | **Neo4j has no ledger** — this is the graph's entire forward-migration |
+| 4 | `reconcile_project_identity.py --apply` | graph half of migration 027; no migration can run it |
+| 5 | restart + wait for `/health` | the running gateway must BE the migrated code |
+| 6 | `backfill_domain_of.py`, then `--apply` | **after** the restart — see the guard below |
+| 7 | `sync_skills.sh` | after the restart, so it cannot print a false incompatibility warning |
+| 8 | `postflight.sh` | an update is not complete until this passes |
+
+⚠ **Step 7 is after step 5 deliberately.** Run before the restart, `update_skill.sh` compares the new
+client against the *old* gateway and prints `⚠ Updated to X but still incompatible. The GATEWAY
+itself …` — alarming, self-resolving one step later, and observed on two hosts. The ordering removes
+the false alarm rather than rewording it.
 
 ⚠ **`backfill_domain_of.py` runs AFTER the restart, and that ordering is a guard rather than a
 preference.** It enqueues a narrow repair row that only a gateway from v0.8.47 understands; an older

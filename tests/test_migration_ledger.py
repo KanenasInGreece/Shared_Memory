@@ -116,3 +116,172 @@ def test_a_fresh_database_is_never_asked_to_adopt():
     """No framework schema means the migrations genuinely have not run."""
     assert apply_mod.needs_adoption(False, set()) is False
     assert apply_mod.pending(FILES, None) == FILES
+
+
+# ── Forward-only: a database that has gone somewhere this code cannot follow ──
+#
+# `pending` answers "what has this database not had yet". It cannot answer "has
+# this database already passed this code", because its selection is by POSITION:
+# a ledger at 031 against a checkout topping out at 022 orders after every file,
+# so pending is EMPTY — byte-identical to an up-to-date database. The tool then
+# reports success and an older gateway starts against a newer schema.
+#
+# The state is derived from the ledger that travels inside the dump, so it needs
+# no manifest field and no version stamp — nothing that could disagree with the
+# schema it describes.
+
+AHEAD_LEDGER = {"001_a.sql", "002_b.sql", "007_c.sql", "021_d.sql", "022_e.sql",
+                "030_f.sql", "031_g.sql"}
+
+
+def test_a_database_ahead_of_the_checkout_is_detected():
+    """The restore case: a dump from a newer deployment, replayed onto this tree."""
+    assert apply_mod.ahead(FILES, AHEAD_LEDGER) == {"030_f.sql", "031_g.sql"}
+
+
+def test_the_ahead_state_is_invisible_to_the_selection_rule():
+    """THE regression, and the reason `ahead` has to exist as its own rule.
+
+    Both databases produce an EMPTY pending list. Only set membership tells them
+    apart, so each side is asserted by VALUE — pinning the two pending results
+    equal to each other would pass just as happily if both were wrong.
+    """
+    up_to_date = {f.name for f in FILES}
+
+    assert apply_mod.pending(FILES, "022_e.sql") == []       # genuinely finished
+    assert apply_mod.pending(FILES, "031_g.sql") == []       # a dozen releases ahead
+
+    assert apply_mod.ahead(FILES, up_to_date) == set()
+    assert apply_mod.ahead(FILES, AHEAD_LEDGER) == {"030_f.sql", "031_g.sql"}
+
+
+def test_an_up_to_date_database_is_not_ahead():
+    assert apply_mod.ahead(FILES, {f.name for f in FILES}) == set()
+
+
+def test_a_database_behind_the_checkout_is_not_ahead():
+    """Behind is the ordinary case every upgrade is: pending has work, and
+    nothing in the ledger is unknown to this tree."""
+    behind = {"001_a.sql", "002_b.sql"}
+    assert apply_mod.ahead(FILES, behind) == set()
+    assert [f.name for f in apply_mod.pending(FILES, "002_b.sql")] == [
+        "007_c.sql", "021_d.sql", "022_e.sql"
+    ]
+
+
+def test_a_fresh_database_is_not_ahead():
+    """An empty ledger is the adoption question's territory, never this one."""
+    assert apply_mod.ahead(FILES, set()) == set()
+
+
+# ── The TOOL must refuse, not merely the helper ──────────────────────────────
+#
+# Review finding (Test & Verification): the tests above prove `ahead()` returns
+# the right set, and nothing proved `apply.py` acts on it. A bug that computed
+# `unknown` correctly and then skipped the refusal — a misplaced `return`, an
+# `if` that became unreachable, the check moved below the adopt branch — would
+# have left every test green while the tool happily migrated a database it
+# cannot follow. The invariant is that the TOOL refuses.
+#
+# Driven through main() with a stub connection: no database, but the real
+# argument parsing, the real ordering of the checks, and the real exit codes.
+
+
+class _FakeCursor:
+    def __init__(self, applied, framework):
+        self._applied, self._framework, self._last = applied, framework, ""
+
+    def execute(self, sql, params=None):
+        self._last = " ".join(sql.split())
+
+    def fetchone(self):
+        if "to_regclass" in self._last:
+            return (self._framework,)
+        if "max(filename)" in self._last:
+            return (max(self._applied) if self._applied else None,)
+        return (None,)
+
+    def fetchall(self):
+        return [(f,) for f in sorted(self._applied)]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeConn:
+    def __init__(self, applied, framework=True):
+        self._applied, self._framework = applied, framework
+
+    def cursor(self):
+        return _FakeCursor(self._applied, self._framework)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def close(self):
+        pass
+
+
+def _run_main(monkeypatch, argv, applied, framework=True):
+    monkeypatch.setattr(apply_mod, "_load_env", lambda *a, **k: None)
+    monkeypatch.setattr(apply_mod.psycopg2, "connect",
+                        lambda *a, **k: _FakeConn(applied, framework))
+    monkeypatch.setattr(apply_mod, "migration_files", lambda: FILES)
+    monkeypatch.setattr(apply_mod.sys, "argv", ["apply.py", *argv])
+    return apply_mod.main()
+
+
+def test_the_tool_exits_3_when_the_database_is_ahead(monkeypatch, capsys):
+    """THE regression, at the level that matters: the command refuses."""
+    rc = _run_main(monkeypatch, [], AHEAD_LEDGER)
+    err = capsys.readouterr().err
+
+    assert rc == 3
+    assert "AHEAD of this checkout" in err
+    assert "030_f.sql" in err and "031_g.sql" in err
+
+
+def test_the_tool_exits_0_when_the_database_is_at_this_level(monkeypatch):
+    """The false-positive control. A refusal that fires on a correct database
+    is indistinguishable from one that works, so both sides are pinned."""
+    assert _run_main(monkeypatch, [], {f.name for f in FILES}) == 0
+
+
+def test_status_reports_the_ahead_state_and_returns_3(monkeypatch, capsys):
+    """--status never refuses to run, but it must not report success either:
+    a scheduled check gating on it would read a divergent database as healthy."""
+    rc = _run_main(monkeypatch, ["--status"], AHEAD_LEDGER)
+    out = capsys.readouterr().out
+
+    assert rc == 3
+    assert "AHEAD" in out
+    assert "030_f.sql" in out
+
+
+def test_status_names_the_adoption_state_instead_of_calling_it_fresh(monkeypatch, capsys):
+    """Review finding (Adversarial): --status returned before the adoption check,
+    so a populated database with an empty ledger printed every migration as
+    pending — indistinguishable from a fresh install, and the pending list is
+    precisely what must NOT be run."""
+    rc = _run_main(monkeypatch, ["--status"], set(), framework=True)
+    out = capsys.readouterr().out
+
+    assert rc == 2
+    assert "NEEDS ADOPTION" in out
+    assert "NOT a list of work to do" in out
+
+
+def test_status_on_a_genuinely_fresh_database_is_clean(monkeypatch, capsys):
+    """Counterweight: an empty ledger with NO framework schema really is a fresh
+    install, and must not be mislabelled as needing adoption."""
+    rc = _run_main(monkeypatch, ["--status"], set(), framework=False)
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "NEEDS ADOPTION" not in out

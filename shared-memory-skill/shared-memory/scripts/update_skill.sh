@@ -259,15 +259,53 @@ fi
 
 echo ""
 echo "Verifying compatibility..."
-if python3 "$SCRIPT_DIR/memory_bridge.py" doctor; then
-    echo "Update complete — now at $REMOTE_VERSION, compat: ok."
-else
+# ⛔ RUN IT THE DOCUMENTED WAY. The published invocation is
+#   uv run --with httpx python .../memory_bridge.py doctor
+# and the invocation line IS the contract. This step used to call a bare
+# `python3`, which only works where httpx happens to be importable globally —
+# true on a developer box, false on a clean install. So the check passed
+# wherever it was written and failed wherever it mattered.
+if command -v uv >/dev/null 2>&1; then
+    doctor_out="$(uv run --with httpx python "$SCRIPT_DIR/memory_bridge.py" doctor 2>&1)"
     status=$?
+else
+    # No uv: try anyway, so a host that has httpx installed system-wide still
+    # gets a real verdict rather than a refusal.
+    doctor_out="$(python3 "$SCRIPT_DIR/memory_bridge.py" doctor 2>&1)"
+    status=$?
+fi
+echo "$doctor_out"
+
+if [ "$status" -eq 0 ]; then
+    echo "Update complete — now at $REMOTE_VERSION, compat: ok."
+elif printf '%s' "$doctor_out" | grep -q '"compat"[[:space:]]*:'; then
+    # The client RAN and returned a verdict, so the version comparison is real.
+    # ⚠ Matched as a JSON KEY (`"compat":`), not the bare word. A traceback that
+    # merely MENTIONS compat — a source line like diag["compat"], a KeyError, a
+    # path containing it — would otherwise be read as a verdict and bring the
+    # false gateway accusation straight back. The key form cannot appear in a
+    # traceback without the client having actually printed the object.
     echo ""
     echo "⚠ Updated to $REMOTE_VERSION but still incompatible. The GATEWAY itself"
     echo "  needs upgrading — that happens on its own host (git pull + restart),"
     echo "  not here. See Documentation/server-setup.md. Until then, treat save/"
     echo "  save_decision/save_retrospective as unsafe; search remains fine"
     echo "  (read-only)."
+    exit "$status"
+else
+    # The client never got far enough to have an opinion about the gateway.
+    # Saying "the gateway needs upgrading" here is a false accusation against a
+    # component that was never contacted — and it is the message an operator
+    # acts on. `doctor` exits 1 for a version verdict AND for an interpreter
+    # crash, so the two are told apart by whether a verdict was actually
+    # printed, not by the exit code.
+    echo ""
+    echo "⚠ Updated to $REMOTE_VERSION, but the compatibility check could not RUN."
+    echo "  This says nothing about the gateway — the client failed before"
+    echo "  reaching it. The usual cause is a missing dependency: memory_bridge.py"
+    echo "  needs httpx, which the documented invocation supplies via"
+    echo "  'uv run --with httpx'. Install uv, or make httpx importable, then:"
+    echo "    uv run --with httpx python $SCRIPT_DIR/memory_bridge.py doctor"
+    echo "  The skill files themselves updated fine; only the check was skipped."
     exit "$status"
 fi

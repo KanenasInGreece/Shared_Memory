@@ -5,6 +5,86 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.35] — 2026-08-23
+
+### Fixed — being read-only was a promise made at mint time, not a rule the gateway kept
+
+- **The read-only roster is now enforced on every request.** It lived in the token minter, so an
+  identity was read-only only because whoever minted it had written `name:read` into `AGENT_ROLES`.
+  The gateway believed that line, and **absence from it means full read/write** — so an agent
+  registered before the rule was honoured on a given path, an interrupted write, or an older tool
+  rewriting the line all silently widened a read-only identity. A guarantee a file edit can switch
+  off is not a guarantee. The roster now lives in one module the minter and the gateway both read,
+  and the gateway applies it to every authenticated request: a read-only identity is confined
+  whatever the file says, including when the file says nothing.
+- **It is a roster, not a special case for one name.** An identity is confined in code, through
+  `SHARED_MEMORY_READ_ONLY_AGENTS`, or by an operator's own `name:read` declaration — the roster
+  cannot enumerate names this framework has never shipped, so a declaration is the other way in.
+  All three are enforced. Startup logs the roles actually applied, and warns when an agent is
+  confined by the roster but not declared in the file, because that file is what an operator reads.
+- **A bulk mint no longer erases confinements it did not know about.** It rebuilt `AGENT_ROLES`
+  from the roster alone, deleting operator-declared entries — including the backup credential
+  restricted to `/admin/*`, which absence from that line widens to full access. It merges now.
+- **The registry is written in one pass, behind a lock.** Three sequential read-modify-write calls
+  meant an interruption could leave a new agent holding a token with no role, which is the widest
+  outcome available; and two concurrent mints each read the same baseline, so the later write
+  discarded the earlier agent while its token had already been written to disk.
+
+### Fixed — a restore could leave the two stores disagreeing, and only when forced
+
+- **`restore.sh --force` clears the graph before Postgres is overwritten, not after.** A clear that
+  failed part way — a timeout, a dropped connection — used to leave Postgres holding the restored
+  corpus and Neo4j holding a partly-emptied old one. That is the split-brain a quiesced backup
+  exists to prevent, manufactured by the restore itself. The only failure it can now produce is
+  "nothing was overwritten yet".
+- **The exported schema statements are made idempotent as they are replayed.** The export emits bare
+  `CREATE CONSTRAINT` and `CREATE INDEX`, so replaying onto a store that already has them aborted
+  the transaction — and a store that already has them is precisely what `--force` is used on. The
+  rewrite happens in stream rather than at export time, deliberately: fixing the exporter would help
+  only backups taken afterwards, and every set already on disk would stay unrestorable onto a live
+  host.
+
+### Added — the framework upgrade is a procedure you can run, and a restore says it is unfinished
+
+- **`update_framework.sh`.** Install had four scripts, the client had two, and bringing a deployment
+  forward was eight commands of prose — including an ordering guard whose violation blanks the
+  content of every record it touches. Prose cannot refuse and cannot be run. Upgrade and restore
+  turn out to be one procedure entered from opposite sides, so `--from-restore` is a flag rather
+  than a second script.
+- **Every step fails closed.** Steps that nobody had remembered to check now stop the run: a failed
+  fetch used to migrate the old code and report success, and a failed restart left the previous
+  gateway answering the health probe, after which the domain backfill enqueued repair rows that an
+  older worker turns into blanked records. The restart is verified by **version**, not by liveness,
+  which is the one thing an old process cannot fake.
+- **`ops/restore.sh` no longer ends at "Restore complete".** A restored database sits at whatever
+  schema level its dump was taken at, under a gateway expecting a newer one, and the closing line
+  read as if the job were done. It now says the data is not yet migrated and names the command that
+  finishes it.
+
+### Fixed — migrations are forward-only, and now say so
+
+- **`apply.py` refuses a database ahead of the checkout.** Selection is by position, so a ledger a
+  dozen releases ahead produced an empty pending list — indistinguishable from being up to date —
+  and the tool printed `Up to date` at a filename it had never seen. The state is derived from the
+  ledger, which travels inside the dump, so a restored database states its own level without a
+  manifest field that could drift from the schema it claims to describe.
+- **`--status` reports what it could not say before.** It returned before the adoption check, so a
+  populated database whose migrations had all run printed every migration as pending — reading
+  exactly like a fresh install, when that pending list is the one thing that must not be run. It
+  also returns codes a scheduled check can gate on: 3 ahead, 2 needs adoption, 0 actionable.
+
+### Fixed — a check that blamed a component it never reached
+
+- **`update_skill.sh` runs the documented invocation.** It called a bare `python3`, while the
+  published command supplies httpx through `uv` — so the check passed wherever httpx happened to be
+  importable globally and failed on every clean install. And `doctor` exits 1 both for a version
+  verdict and for an interpreter crash, so a missing local dependency was reported as "the GATEWAY
+  itself needs upgrading" about a gateway that was healthy. It now reports a gateway verdict only
+  when the client actually returned one, matched on the JSON key rather than a word a traceback can
+  contain.
+
+---
+
 ## [0.9.34] — 2026-08-23
 
 ### Fixed — the install verification could never check an external reasoning backend

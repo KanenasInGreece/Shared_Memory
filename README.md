@@ -115,7 +115,7 @@ common setup mistake.
 | Runs on | **every** agent, every host (incl. remote laptops) | the **one** gateway host |
 | Talks to DB/GPU? | No — HTTP to `:8888` only | Yes — owns Postgres, Neo4j, GPU |
 | Distributed by | `sync_skills.sh` (thin client only) | this repo, via `git` |
-| Upgraded by | re-sync the skill | `git pull` → `migrations/apply.py` → restart gateway |
+| Upgraded by | re-sync the skill | `scripts/update_framework.sh` — one command, with a backup and a proof |
 
 **Installing the skill is not installing the framework.** The skill is a thin HTTP client; the
 daemons never run from a skill directory. Daemon and **schema** changes reach a hive through
@@ -672,10 +672,25 @@ bash shared-memory/scripts/init_db.sh        # both stores, run inside the conta
 
 Under the hood: `schema_init.sql` (generated from the migration chain — never hand-edit it)
 takes an empty Postgres to the full schema; `neo4j_init.cypher` creates the uniqueness
-constraints. Upgrading an existing installation is one command, additive, data-preserving:
+constraints. Upgrading an existing installation is one command — it takes a backup first,
+migrates both stores, restarts the gateway and proves the result:
 
 ```bash
-uv run --with psycopg2-binary python shared-memory/migrations/apply.py
+bash shared-memory/scripts/update_framework.sh          # --dry-run prints every step, runs nothing
+```
+
+`apply.py` is the Postgres half of that, and it is worth knowing on its own, because the database
+is its own ledger: `schema_migrations` is a table *inside* the database, so it travels with a
+`pg_dump` and a restored copy states its own level without being told. That makes the awkward case
+detectable — a dump taken on a newer deployment than the one restoring it. Migrations are
+forward-only, so `apply.py` refuses it (exit 3) instead of reporting success at a filename it has
+never seen. The fix is always to move the checkout forward; a schema does not go backwards.
+
+The same script finishes a restore, which is the same procedure entered from the other side — data
+arriving at running code rather than code arriving at existing data:
+
+```bash
+bash shared-memory/scripts/update_framework.sh --from-restore
 ```
 
 Two verifiers prove what re-running files cannot — that a fresh install matches a live one, and

@@ -166,14 +166,65 @@ if [[ "$FORCE" -ne 1 && ( "$pg_rows" != "0" || "$neo_nodes" != "0" ) ]]; then
 fi
 [[ "$FORCE" -eq 1 ]] && ylw "  ! --force: overwriting existing data (technical_docs=$pg_rows, neo4j nodes=$neo_nodes)"
 
+# ── Neo4j: --force must REPLACE, exactly as it already does for Postgres ─────
+#
+# pg_restore runs with --clean --if-exists, so the Postgres half genuinely
+# replaces what is there. The Neo4j half did not, and that asymmetry produced
+# two failures that only appear on a target that is not empty — i.e. precisely
+# the target --force exists for:
+#
+#   1. The APOC export emits bare `CREATE CONSTRAINT <name> FOR …` and
+#      `CREATE [RANGE|POINT|…] INDEX FOR …` with no IF NOT EXISTS. Replaying
+#      onto a store that already has them aborts the open transaction with
+#      "An equivalent constraint already exists" — and it aborts AFTER Postgres
+#      has been overwritten, leaving the two stores divergent. That is the exact
+#      state quiescing a backup exists to prevent, manufactured during a restore.
+#   2. Even with the schema statements fixed, the replay never CLEARED the graph,
+#      so a forced restore MERGED the incoming graph into the existing one
+#      instead of replacing it. Node counts would then exceed the manifest and
+#      the closing comparison below would report a mismatch it could not explain.
+#
+# Measured on a real set (2615 nodes / 9560 rels, 38 schema statements): the
+# rewrite guards 38 of 38, changes no data line, and is idempotent.
+#
+# ⛔ ORDERING: THE DESTRUCTIVE PREPARATION HAPPENS BEFORE ANYTHING IS OVERWRITTEN.
+# The clear used to sit next to the Neo4j replay, i.e. AFTER pg_restore had
+# already replaced Postgres. A clear that then failed — a timeout, a dropped
+# connection, heap pressure part-way through the batches — left Postgres holding
+# the restored corpus and Neo4j holding a partly-emptied old one, and the script
+# died there. That is the split-brain a quiesced backup exists to prevent,
+# manufactured by the restore itself.
+# Doing it here means the only failure this can produce is "nothing was
+# overwritten yet", which is recoverable by re-running.
+if [[ "$FORCE" -eq 1 && "$neo_nodes" != "0" ]]; then
+  echo "Clearing Neo4j before replay (--force) ..."
+  # Batched: one transaction holding a whole corpus is how a restore runs the
+  # heap out on a large graph. Constraints and indexes are deliberately LEFT
+  # ALONE — the export recreates the ones it owns, and dropping the rest would
+  # discard schema this set never knew about.
+  $DOCKER exec -i --env-file "$_NEO4J_ENV_FILE" "$NEO4J_CONTAINER" \
+    cypher-shell -u "$NEO4J_USER" \
+    'CALL { MATCH (n) DETACH DELETE n } IN TRANSACTIONS OF 10000 ROWS' \
+    >/dev/null || die "could not clear Neo4j before a forced restore — refusing to
+  replay on top of existing data, which would merge two graphs into one"
+  grn "  ✓ neo4j cleared ($neo_nodes node(s) removed)"
+fi
+
 # ── Restore Postgres (source of truth) first, then Neo4j ─────────────────────
 echo "Restoring Postgres → $PG_DB ..."
 $DOCKER exec -i --env-file "$_PG_ENV_FILE" "$PG_CONTAINER" \
   pg_restore -U "$PG_USER" -d "$PG_DB" --clean --if-exists --no-owner < "$BASE.pgdump" \
   && grn "  ✓ postgres restored" || die "pg_restore failed"
 
+
 echo "Restoring Neo4j (replaying cypher export) ..."
-gunzip -c "$BASE.cypher.gz" | $DOCKER exec -i --env-file "$_NEO4J_ENV_FILE" "$NEO4J_CONTAINER" \
+# The schema statements are made idempotent IN STREAM rather than at export
+# time, deliberately: a fix in backup.sh would only help sets taken after it,
+# and every set already on disk would stay unrestorable onto a live host.
+gunzip -c "$BASE.cypher.gz" \
+  | sed -E '/^CREATE (CONSTRAINT|([A-Z]+ )?INDEX)/ { /IF NOT EXISTS/! s/ FOR / IF NOT EXISTS FOR /; }
+s/^DROP CONSTRAINT ([^ ;]+);/DROP CONSTRAINT \1 IF EXISTS;/' \
+  | $DOCKER exec -i --env-file "$_NEO4J_ENV_FILE" "$NEO4J_CONTAINER" \
   cypher-shell -u "$NEO4J_USER" \
   && grn "  ✓ neo4j restored" || die "cypher-shell replay failed"
 
@@ -195,3 +246,26 @@ if [[ -n "$man_nodes" && "$post_nodes" == "$man_nodes" ]]; then
 else
   ylw "Restore complete — verify node counts above (a mismatch can be normal if the backup ran without full quiesce)."
 fi
+
+# ── The restore is HALF the operation ────────────────────────────────────────
+#
+# The data is back, but it is back at whatever schema level the dump was taken
+# at — and that is very unlikely to be the level the gateway about to read it
+# expects. `schema_migrations` travels INSIDE the dump, so the database now
+# states its own level correctly; nothing has yet moved it forward to the code.
+#
+# Saying nothing here is how a restored deployment ends up running an older
+# schema under a newer gateway with no error anywhere: this script's last line
+# used to read "Restore complete", which an operator reasonably takes as done.
+echo
+ylw "⚠ The data is restored, but NOT yet migrated to the running code's level."
+ylw "  A dump carries its own schema_migrations ledger, so this database is at the"
+ylw "  level it was backed up at — not necessarily the level this gateway expects."
+echo
+ylw "  Finish the operation:"
+ylw "    bash shared-memory/scripts/update_framework.sh --from-restore"
+echo
+ylw "  That runs the forward-only migration path (Postgres ledger, Neo4j constraints,"
+ylw "  project identity, restart, domain backfill) and proves the result with"
+ylw "  postflight. It REFUSES if this dump came from a NEWER deployment than this"
+ylw "  checkout — migrations are forward-only and the schema cannot be moved back."

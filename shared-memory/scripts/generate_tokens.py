@@ -103,11 +103,22 @@ import tempfile
 # --force rotation just because it is absent from this fixed list.
 AGENTS = ["claude", "gemini", "grok", "codex", "lm_studio", "antigravity", "monitor"]
 
-# Read-only identities: registered like any agent, but confined by AGENT_ROLES
-# to GET /health, GET /memory/telemetry, and POST /memory/graph (read-only
-# Cypher). "monitor" is the shared-memory-monitor dashboard — a read-only ops
-# client that must not borrow a write-capable agent token.
-READ_ONLY_AGENTS = ["monitor"]
+# Read-only identities: registered like any agent, but confined to GET /health,
+# GET /memory/telemetry, and POST /memory/graph (read-only Cypher).
+#
+# ⛔ THE ROSTER LIVES IN agent_roles.py, NOT HERE. It used to be defined in this
+# file, which made the guarantee a minting convention: the gateway believed
+# whatever AGENT_ROLES said, and an identity registered before the rule was
+# honoured — or a line rewritten by an older tool — kept full access silently.
+# The gateway now enforces the same roster on every request, so this module and
+# the gateway can no longer disagree about who is read-only.
+from agent_roles import (                                    # noqa: E402
+    READ_ONLY_AGENTS, VALID_ROLES, read_only_agents,
+    role_for_mint, enforce_roster,
+)
+
+# Kept as a module-local alias: this name is the one the CLI and the tests call.
+role_for = role_for_mint
 
 # SEED DEFAULTS offered at first bootstrap ONLY — one per CLI agent this
 # framework ships a thin-client skill to (mirrors sync_skills.sh's default
@@ -306,6 +317,27 @@ def _parse_agent_tokens_line(raw: str) -> "dict[str, str]":
         if len(parts) == 3 and parts[1].strip().lower() == "sha256":
             entries[parts[0].strip()] = pair
     return entries
+
+
+def _parse_agent_roles_line(raw: str) -> "dict[str, str]":
+    """Parse an AGENT_ROLES= value into {name: role}.
+
+    Same hand-rolled shape as _parse_agent_tokens_line, and for the same reason:
+    an --add must MERGE into whatever is already registered, never replace it.
+    Emitting a roles line built only from the agent being added would silently
+    drop `backup:admin` — turning the one credential confined to /admin/* into a
+    full-access token, which is the exact inverse of what this line is for.
+    Entries that are not a clean name:role pair are skipped, as elsewhere here.
+    """
+    roles: dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or ":" not in pair:
+            continue
+        name, role = (p.strip() for p in pair.split(":", 1))
+        if name and role:
+            roles[name] = role
+    return roles
 
 
 def _resolve_roster(env_path: str) -> "list[str]":
@@ -664,8 +696,21 @@ def mint(
     print("=== Gateway .env — add this line (digest form; safe to print/paste) ===")
     print("AGENT_TOKENS=" + ",".join(final_entries.values()))
     print()
-    print("=== Gateway .env — optional read-only roles ===")
-    print("AGENT_ROLES=" + ",".join(f"{a}:read" for a in READ_ONLY_AGENTS))
+    # ⛔ MERGE, NEVER REBUILD. This line used to be generated from the roster
+    # alone, so a bulk mint ERASED every operator-declared confinement it did
+    # not know about — most damagingly `backup:admin`, the one credential
+    # restricted to /admin/*, which absence from AGENT_ROLES widens to full
+    # read/write. The additive path was fixed first; this is the same defect on
+    # the other path, and it is the more destructive of the two because a bulk
+    # mint rewrites the whole roster in one go.
+    _existing_roles = _parse_agent_roles_line(
+        _read_env_raw_value(env_path, "AGENT_ROLES") or "")
+    _merged_roles = dict(_existing_roles)
+    for _a in read_only_agents():
+        _merged_roles.setdefault(_a, "read")
+    _merged_roles = enforce_roster(_merged_roles)
+    print("=== Gateway .env — merged roles (read-only roster + what you declared) ===")
+    print("AGENT_ROLES=" + ",".join(f"{n}:{r}" for n, r in _merged_roles.items()))
     print("# read-role agents may reach only GET /health, GET /memory/telemetry,")
     print("# and POST /memory/graph (read-only Cypher). All other routes → 403.")
     print()
@@ -695,6 +740,7 @@ def mint(
 
 def add_agent(
     name: str, install_path: "str | None" = None, env_path: "str | None" = None,
+    role: "str | None" = None,
 ) -> "tuple[int, str | None]":
     """Additive mint (roster growth without rotation, item 2): mint exactly
     ONE new token for `name`, leaving every OTHER agent's digest in
@@ -726,6 +772,20 @@ def add_agent(
     """
     if env_path is None:
         env_path = _DEFAULT_GATEWAY_ENV
+    # Least privilege is decided BEFORE anything is minted, written or
+    # registered, so a refusal here leaves no trace — same contract as every
+    # other refusal in this function.
+    try:
+        # `declared` matters: an agent the operator already confined with
+        # `name:read` must not be widened by a later mint, even though it is not
+        # on the code roster — the roster cannot enumerate names this framework
+        # has never heard of.
+        _declared_now = _parse_agent_roles_line(
+            _read_env_raw_value(env_path, "AGENT_ROLES") or "").get(name)
+        effective_role = role_for(name, role, declared=_declared_now)
+    except ValueError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 1, None
     try:
         _validate_registry_field(name, "agent name")
         if install_path is not None:
@@ -816,6 +876,23 @@ def add_agent(
 
     print("=== Gateway .env — merged AGENT_TOKENS= line (write this in place) ===")
     print("AGENT_TOKENS=" + ",".join(merged_entries.values()))
+
+    if effective_role is not None:
+        # MERGED, never replaced: dropping an existing backup:admin entry here
+        # would silently widen the one credential confined to /admin/*.
+        merged_roles = _parse_agent_roles_line(
+            _read_env_raw_value(env_path, "AGENT_ROLES") or "")
+        merged_roles[name] = effective_role
+        # Repair drift while we are rewriting the line anyway: a roster identity
+        # registered before this rule existed is still declared wrong in the
+        # file. The gateway confines it regardless, but the .env should not lie.
+        merged_roles = enforce_roster(merged_roles)
+        print()
+        print("=== Gateway .env — merged AGENT_ROLES= line (write this in place) ===")
+        print("AGENT_ROLES=" + ",".join(f"{n}:{r}" for n, r in merged_roles.items()))
+        if effective_role == "read":
+            print(f"# {name} is a READ-ONLY identity: GET /health, GET /memory/telemetry")
+            print("# and read-only Cypher on POST /memory/graph. Every other route → 403.")
 
     if install_path is not None:
         merged_installs = dict(installs)
@@ -956,6 +1033,15 @@ def main(argv=None) -> int:
              "printf '%s' <token> | generate_tokens.py --digest <name>",
     )
     ap.add_argument(
+        "--role", metavar="ROLE", choices=list(VALID_ROLES),
+        help="Role for the agent being added with --add: read | full | admin. "
+             "Roles only ever NARROW access. Omit it and the role is derived: "
+             "a name in READ_ONLY_AGENTS always gets 'read', anything else "
+             "gets full access (no AGENT_ROLES entry). ⛔ A read-only identity "
+             "cannot be widened here — --role full on one is REFUSED before "
+             "anything is minted.",
+    )
+    ap.add_argument(
         "--add", metavar="NAME",
         help="Additive mint: register exactly ONE new agent without "
              "rotating anyone else's existing token (every other digest in "
@@ -985,7 +1071,8 @@ def main(argv=None) -> int:
         return convert_digests(args.convert_digests)
 
     if args.add is not None:
-        rc, token = add_agent(args.add, install_path=args.install_path)
+        rc, token = add_agent(args.add, install_path=args.install_path,
+                              role=args.role)
         if rc != 0:
             return rc
         unknown = [n for n in args.reveal if n != args.add]
