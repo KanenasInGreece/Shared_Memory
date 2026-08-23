@@ -5,6 +5,52 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.36] — 2026-08-23
+
+### Added — the framework can be uninstalled
+
+- **`uninstall_framework.sh`, with three levels and no default.** There was no uninstall at all: no
+  script, and nothing in the docs. Tearing a host down meant improvising, which is how two machines
+  end up in states no surface describes. `--level` is required, because the safe default for an
+  operation with no undo is to say what you mean. `service` stops the gateway being a service and
+  removes every agent's skill directory — which is where its raw token lives — and is reversible.
+  `data` adds the stores, their bind-mounted directories and the gateway `.env`. `all` adds the model
+  weights, because a level called "all" that quietly preserves them is not "all".
+- **A backup gate on the irreversible levels**, evaluated before the dry run exits, so a preview
+  reports "it would refuse" rather than hiding it.
+- **`~/.shared-memory` survives every level.** It holds the backup sets, the credential audit trail,
+  the capacity measurement history and every postflight baseline — and **none of those are in a
+  backup**: a set is exactly a pgdump, a cypher export and a manifest. That directory is the only
+  copy in existence. An audit trail an uninstall can erase is not an audit trail, and the
+  measurements describe the machine rather than the installation.
+- **The stores' data directories are removed from inside a container.** They are bind mounts owned by
+  the containers' uid: `docker compose down -v` does not touch them, and the operator usually cannot
+  delete them either — so an uninstall could report success while the corpus sat on disk. Failure is
+  now loud, with sudo named as the fallback.
+- **Credentials the operator placed by hand are reported, never deleted.** An uninstall has no
+  business removing an API key it did not create, and equally none leaving one behind silently.
+
+### Fixed — a registered token nobody could receive
+
+- **A bulk mint says when a token cannot be delivered.** Three of the seven default agents have no
+  seeded install path, so their digests are registered and their tokens written nowhere. That part is
+  deliberate; saying nothing about it was not. Worse, the report told the operator to run
+  `generate_tokens.py --reveal <name>` afterwards — which, run later, is a **full rotation of every
+  agent**. The guidance printed beside a fresh credential destroyed all the others.
+- **`--remint` re-issues one agent.** Recovering a single undelivered token used to cost every other
+  agent's credential, because `--add` refuses an existing name and `--force` rotates the fleet.
+  Refusing an accidental rotation should never have made a deliberate re-issue impossible.
+
+### Fixed — a check that named a component it never compared against
+
+- **An unreachable gateway is no longer reported as an outdated one.** The client runs, reaches
+  nothing, and reports `compat: unknown` — which is not a version comparison. Calling that "the
+  GATEWAY needs upgrading" accuses a healthy gateway of being old when it is simply not running, or
+  is at a different address. Third variant of the same misattribution, and the one that shipped in
+  the release that fixed the other two.
+
+---
+
 ## [0.9.35] — 2026-08-23
 
 ### Fixed — being read-only was a promise made at mint time, not a rule the gateway kept

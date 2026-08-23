@@ -623,6 +623,31 @@ bash shared-memory/scripts/postflight.sh
 
 ### Add an agent later (no token rotation)
 
+⛔ **A BULK MINT CAN REGISTER A TOKEN NOBODY EVER RECEIVES.** The default roster mints for
+`lm_studio`, `antigravity` and `monitor`, none of which has a seeded install path — their tokens are
+minted, their digests are registered, and nothing is written anywhere. They are **REMOTE**: the only
+delivery is `--reveal <name>` **on that same invocation**. Miss it and the `.env` shows an agent that
+cannot authenticate, which is worse than an agent that is plainly absent. The mint now says so, per
+agent and again in a closing block — and `--remint` below is how you recover one without rotating the
+fleet. *(Until v0.9.36 the report told you to run `generate_tokens.py --reveal <name>` afterwards.
+That command is a **full rotation of every agent**, so the advice printed beside a fresh credential
+destroyed all the others.)*
+
+**Re-issuing ONE agent's token — `--remint`.** For an agent that is already registered but whose token
+was never delivered (or was lost), this mints a replacement for **that name only**, leaving every other
+digest byte-identical:
+
+```bash
+bash shared-memory/scripts/bootstrap_tokens.sh --remint monitor --reveal monitor
+# or, when the agent has a local skill directory:
+bash shared-memory/scripts/bootstrap_tokens.sh --remint codex --install-path ~/.codex/skills/shared-memory/.env
+```
+
+⚠ It **invalidates that agent's current token**, so pair it with `--reveal` or `--install-path` — the
+agent must receive the new one. ⚠ **Restart the gateway afterwards: auth is startup-frozen.**
+⛔ Run `--reveal` yourself, never through an agent — a transcript turns "shown once" into "stored
+forever".
+
 `bootstrap_tokens.sh` (bare) refuses to touch an existing registry and `--force` rotates
 **everyone** — neither is what you want for one new agent. `--add` (v0.9.27) is the purpose-built
 additive mint: it registers exactly one new agent's `AGENT_INSTALLS` entry, mints its token,

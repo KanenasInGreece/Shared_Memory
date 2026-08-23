@@ -396,3 +396,62 @@ def test_every_registry_line_lands_in_one_write(tmp_path):
         assert len(live) == 1, f"{key}: expected one live line, got {live}"
     assert "monitor:sha256:" in text
     assert "monitor:read" in text
+
+
+def test_remint_reissues_one_agent_without_touching_the_others(tmp_path):
+    """The missing operation. A bulk mint registers remote agents whose tokens
+    are never delivered, and the only recovery was --force — rotating EVERY
+    agent to recover one. Refusing accidental rotation must not also make
+    deliberate re-issue impossible.
+    """
+    a_dir = tmp_path / "a_skill"; a_dir.mkdir()
+    b_dir = tmp_path / "b_skill"; b_dir.mkdir()
+    fake_root = _make_fake_root(tmp_path, {})
+    _env_path(fake_root).parent.mkdir(parents=True, exist_ok=True)
+    _env_path(fake_root).write_text("PG_PASSWORD=fake\n")
+
+    assert _run(fake_root, ["--add", "alpha", "--install-path", str(a_dir / ".env")]).returncode == 0
+    assert _run(fake_root, ["--add", "beta", "--install-path", str(b_dir / ".env")]).returncode == 0
+    before = _env_path(fake_root).read_text()
+    beta_digest = next(p for p in
+                       next(l for l in before.splitlines() if l.startswith("AGENT_TOKENS="))
+                       .split(",") if p.startswith("beta:"))
+    alpha_token_before = (a_dir / ".env").read_text()
+
+    res = _run(fake_root, ["--remint", "alpha", "--install-path", str(a_dir / ".env")])
+
+    assert res.returncode == 0, res.stderr
+    after = _env_path(fake_root).read_text()
+    assert beta_digest in after, "--remint rotated an agent it was not asked to touch"
+    assert (a_dir / ".env").read_text() != alpha_token_before, "alpha was not re-issued"
+
+
+def test_remint_refuses_an_agent_that_is_not_registered(tmp_path):
+    """--remint re-issues; --add registers. Conflating them would let a typo
+    quietly create an agent nobody meant to exist."""
+    d = tmp_path / "skill"; d.mkdir()
+    fake_root = _make_fake_root(tmp_path, {})
+    _env_path(fake_root).parent.mkdir(parents=True, exist_ok=True)
+    _env_path(fake_root).write_text("PG_PASSWORD=fake\n")
+
+    res = _run(fake_root, ["--remint", "ghost", "--install-path", str(d / ".env")])
+
+    assert res.returncode != 0
+    assert "not registered" in (res.stdout + res.stderr)
+
+
+def test_add_points_at_remint_instead_of_a_fleet_rotation(tmp_path):
+    """The refusal used to say "there is no single-agent rotation", leaving
+    --force (rotate everyone) as the only documented way forward."""
+    d = tmp_path / "skill"; d.mkdir()
+    fake_root = _make_fake_root(tmp_path, {})
+    _env_path(fake_root).parent.mkdir(parents=True, exist_ok=True)
+    _env_path(fake_root).write_text(
+        f"AGENT_TOKENS=codex:sha256:{_digest('tok_codex')}\n")
+
+    res = _run(fake_root, ["--add", "codex", "--install-path", str(d / ".env")])
+
+    assert res.returncode != 0
+    out = res.stdout + res.stderr
+    assert "--remint codex" in out
+    assert "there is no single-agent rotation" not in out
