@@ -972,3 +972,117 @@ def test_mint_no_partial_failure_block_when_everything_succeeds(tmp_path):
     _result, out = _capture(gt.mint, env_path=str(env_path))
 
     assert "PARTIAL FAILURE" not in out
+
+
+# ── Least privilege must hold on EVERY mint path ─────────────────────────────
+#
+# Operator rule (2026-08-23): "monitor always has a READ only token."
+#
+# It did not. READ_ONLY_AGENTS exists, and the BULK mint printed
+# AGENT_ROLES=monitor:read from it — but the ADDITIVE path (add_agent) printed
+# only AGENT_TOKENS and AGENT_INSTALLS, and bootstrap_tokens.sh greps for
+# exactly the lines it is given. Absence from AGENT_ROLES means FULL read/write
+# (coordinator._load_agent_roles), so `--add monitor` minted a write-capable
+# token for a dashboard whose own definition says it "must not borrow a
+# write-capable agent token". The policy was data in one place and nothing in
+# the other.
+
+
+def test_a_read_only_agent_always_gets_the_read_role():
+    """The rule itself, as a pure function — no gateway, no .env, no database.
+    That it was never expressible this way is why the gap survived."""
+    gt = load_generate_tokens()
+    for name in gt.READ_ONLY_AGENTS:
+        assert gt.role_for(name) == "read"
+
+
+def test_an_ordinary_agent_gets_no_role_entry():
+    """Full access is the ABSENCE of an entry, not an entry saying 'full'.
+    Asserting None here pins that shape: emitting `claude:full` would also
+    'work' and would quietly change what an unlisted name means."""
+    gt = load_generate_tokens()
+    assert gt.role_for("claude") is None
+
+
+def test_a_read_only_agent_cannot_be_widened_by_an_explicit_role():
+    """'Always' has to mean always, or the roster is a default with a bypass."""
+    gt = load_generate_tokens()
+    with pytest.raises(ValueError):
+        gt.role_for("monitor", "full")
+    with pytest.raises(ValueError):
+        gt.role_for("monitor", "admin")
+    # ...but restating the truth is fine.
+    assert gt.role_for("monitor", "read") == "read"
+
+
+def test_an_unknown_role_name_is_refused():
+    gt = load_generate_tokens()
+    with pytest.raises(ValueError):
+        gt.role_for("codex", "superuser")
+
+
+def test_add_of_a_read_only_agent_emits_the_roles_line(tmp_path, capsys):
+    """THE regression. Without this line bootstrap_tokens.sh writes nothing to
+    AGENT_ROLES, and the gateway reads absence as full read/write."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    env_path.write_text("AGENT_TOKENS=claude:sha256:" + ("a" * 64) + "\n")
+
+    rc, token = gt.add_agent("monitor", install_path=None, env_path=str(env_path))
+    out = capsys.readouterr().out
+
+    assert rc == 0 and token
+    roles = [l for l in out.split("\n") if l.startswith("AGENT_ROLES=")]
+    assert roles, "no AGENT_ROLES line — the additive path is back to full access"
+    assert "monitor:read" in roles[0]
+
+
+def test_add_merges_into_existing_roles_and_never_drops_backup_admin(tmp_path, capsys):
+    """A roles line rebuilt from just the new agent would silently widen the
+    backup credential — the one token confined to /admin/*. Merge, never replace."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "AGENT_TOKENS=claude:sha256:" + ("a" * 64) + "\n"
+        "AGENT_ROLES=backup:admin\n"
+    )
+
+    rc, _ = gt.add_agent("monitor", install_path=None, env_path=str(env_path))
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    line = next(l for l in out.split("\n") if l.startswith("AGENT_ROLES="))
+    assert "backup:admin" in line
+    assert "monitor:read" in line
+
+
+def test_add_of_an_ordinary_agent_emits_no_roles_line(tmp_path, capsys):
+    """No entry means full access, and that must stay the DEFAULT shape — an
+    --add that started emitting `name:full` for everyone would make the roles
+    line grow without ever narrowing anything."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    env_path.write_text("AGENT_TOKENS=claude:sha256:" + ("a" * 64) + "\n")
+
+    rc, _ = gt.add_agent("codex", install_path=None, env_path=str(env_path))
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert not [l for l in out.split("\n") if l.startswith("AGENT_ROLES=")]
+
+
+def test_add_refuses_to_widen_a_read_only_agent_and_mints_nothing(tmp_path, capsys):
+    """The refusal must precede the mint, same contract as every other refusal
+    in add_agent — a refused --add leaves no trace at all."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    env_path.write_text("AGENT_TOKENS=claude:sha256:" + ("a" * 64) + "\n")
+
+    rc, token = gt.add_agent("monitor", install_path=None,
+                             env_path=str(env_path), role="full")
+    out = capsys.readouterr()
+
+    assert rc == 1
+    assert token is None
+    assert not [l for l in (out.out + out.err).split("\n")
+                if l.startswith("AGENT_TOKENS=")]

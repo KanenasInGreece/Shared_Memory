@@ -231,3 +231,79 @@ def test_bulk_mint_refuses_without_force_when_already_registered(tmp_path):
     assert proc.returncode == 0  # refuses quietly (exit 0), same as before this build
     assert "refusing to regenerate" in proc.stdout
     assert _env_path(fake_root).read_text() == before
+
+
+# ── The shipped bash must actually WRITE the roles line ──────────────────────
+#
+# generate_tokens.py printing AGENT_ROLES is only half the fix: bootstrap_tokens.sh
+# greps for exactly the lines it knows about, and it used to know about
+# AGENT_TOKENS and AGENT_INSTALLS only. These drive the REAL script, because the
+# gap being closed lived in the bash, not in the Python.
+
+
+def test_add_of_the_monitor_writes_the_read_role_into_the_env(tmp_path):
+    """Operator rule: monitor always has a read-only token. Absence from
+    AGENT_ROLES means FULL read/write in the gateway, so a missing line here is
+    a write-capable dashboard."""
+    mon_dir = tmp_path / "monitor_skill"
+    mon_dir.mkdir()
+    fake_root = _make_fake_root(tmp_path, {})
+    _env_path(fake_root).parent.mkdir(parents=True, exist_ok=True)
+    _env_path(fake_root).write_text(
+        f"AGENT_TOKENS=claude:sha256:{_digest('tok_claude')}\n")
+
+    res = _run(fake_root, ["--add", "monitor", "--install-path", str(mon_dir / ".env")])
+
+    assert res.returncode == 0, res.stderr
+    after = _env_path(fake_root).read_text()
+    roles = [l for l in after.splitlines() if l.startswith("AGENT_ROLES=")]
+    assert len(roles) == 1, f"expected exactly one live AGENT_ROLES line, got {roles}"
+    assert "monitor:read" in roles[0]
+
+
+def test_add_of_the_monitor_preserves_an_existing_backup_admin_entry(tmp_path):
+    """The backup credential is the one token confined to /admin/*. A roles line
+    rebuilt from only the new agent would widen it to full access."""
+    mon_dir = tmp_path / "monitor_skill"
+    mon_dir.mkdir()
+    fake_root = _make_fake_root(tmp_path, {})
+    _env_path(fake_root).parent.mkdir(parents=True, exist_ok=True)
+    _env_path(fake_root).write_text(
+        f"AGENT_TOKENS=claude:sha256:{_digest('tok_claude')}\n"
+        "AGENT_ROLES=backup:admin\n")
+
+    res = _run(fake_root, ["--add", "monitor", "--install-path", str(mon_dir / ".env")])
+
+    assert res.returncode == 0, res.stderr
+    roles = next(l for l in _env_path(fake_root).read_text().splitlines()
+                 if l.startswith("AGENT_ROLES="))
+    assert "backup:admin" in roles, "the admin-confined credential was dropped"
+    assert "monitor:read" in roles
+
+
+def test_add_of_an_ordinary_agent_writes_no_roles_line(tmp_path):
+    """Full access is the absence of an entry; --add must not start emitting one
+    for every agent, which would grow the line without narrowing anything."""
+    d = tmp_path / "cursor_skill"
+    d.mkdir()
+    fake_root = _make_fake_root(tmp_path, {})
+    _env_path(fake_root).parent.mkdir(parents=True, exist_ok=True)
+    _env_path(fake_root).write_text(
+        f"AGENT_TOKENS=claude:sha256:{_digest('tok_claude')}\n")
+
+    res = _run(fake_root, ["--add", "cursor", "--install-path", str(d / ".env")])
+
+    assert res.returncode == 0, res.stderr
+    assert not [l for l in _env_path(fake_root).read_text().splitlines()
+                if l.startswith("AGENT_ROLES=")]
+
+
+def test_role_without_add_is_refused(tmp_path):
+    fake_root = _make_fake_root(tmp_path, {})
+    _env_path(fake_root).parent.mkdir(parents=True, exist_ok=True)
+    _env_path(fake_root).write_text("PG_PASSWORD=fake\n")
+
+    res = _run(fake_root, ["--role", "read"])
+
+    assert res.returncode != 0
+    assert "--role only makes sense together with --add" in (res.stdout + res.stderr)

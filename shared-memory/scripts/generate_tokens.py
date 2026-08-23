@@ -308,6 +308,69 @@ def _parse_agent_tokens_line(raw: str) -> "dict[str, str]":
     return entries
 
 
+VALID_ROLES = ("read", "full", "admin")
+
+
+def _parse_agent_roles_line(raw: str) -> "dict[str, str]":
+    """Parse an AGENT_ROLES= value into {name: role}.
+
+    Same hand-rolled shape as _parse_agent_tokens_line, and for the same reason:
+    an --add must MERGE into whatever is already registered, never replace it.
+    Emitting a roles line built only from the agent being added would silently
+    drop `backup:admin` — turning the one credential confined to /admin/* into a
+    full-access token, which is the exact inverse of what this line is for.
+    Entries that are not a clean name:role pair are skipped, as elsewhere here.
+    """
+    roles: dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or ":" not in pair:
+            continue
+        name, role = (p.strip() for p in pair.split(":", 1))
+        if name and role:
+            roles[name] = role
+    return roles
+
+
+def role_for(name: str, explicit: "str | None" = None) -> "str | None":
+    """The role a newly minted agent must carry, or None for ordinary full access.
+
+    ⛔ READ_ONLY_AGENTS IS AUTHORITATIVE, NOT A DEFAULT. A name on that list
+    ALWAYS gets `read`, on every mint path, and an explicit --role cannot widen
+    it. The operator's rule is "monitor always has a read-only token", and a
+    rule that any flag can quietly switch off is not that rule — it is a
+    suggestion with a bypass.
+
+    Why this function exists at all: least privilege used to be carried by the
+    BULK mint alone, which prints AGENT_ROLES for every read-only name, while
+    the ADDITIVE path (add_agent) printed only AGENT_TOKENS and AGENT_INSTALLS.
+    Absence from AGENT_ROLES means FULL read/write (coordinator._load_agent_roles),
+    so `--add monitor` produced a write-capable token for a dashboard whose own
+    definition here says it "must not borrow a write-capable agent token".
+
+    Pure — no I/O — so the rule is testable without a gateway, a .env, or a
+    database, which is what let the original asymmetry go unnoticed.
+
+    Raises ValueError on an unknown role name, and on an attempt to widen a
+    read-only agent. Both are refusals BEFORE anything is minted.
+    """
+    if explicit is not None:
+        explicit = explicit.strip().lower()
+        if explicit not in VALID_ROLES:
+            raise ValueError(
+                f"unknown role {explicit!r} — expected one of {', '.join(VALID_ROLES)}")
+        if name in READ_ONLY_AGENTS and explicit != "read":
+            raise ValueError(
+                f"{name!r} is a read-only identity (READ_ONLY_AGENTS) and always "
+                f"gets the 'read' role — refusing --role {explicit}. If this agent "
+                f"genuinely needs write access it must be removed from "
+                f"READ_ONLY_AGENTS deliberately, in code, not widened at mint time.")
+        return explicit
+    if name in READ_ONLY_AGENTS:
+        return "read"
+    return None
+
+
 def _resolve_roster(env_path: str) -> "list[str]":
     """The names to mint for in a BULK mint: every name already registered
     in the gateway .env's AGENT_TOKENS, UNION the default AGENTS list --
@@ -695,6 +758,7 @@ def mint(
 
 def add_agent(
     name: str, install_path: "str | None" = None, env_path: "str | None" = None,
+    role: "str | None" = None,
 ) -> "tuple[int, str | None]":
     """Additive mint (roster growth without rotation, item 2): mint exactly
     ONE new token for `name`, leaving every OTHER agent's digest in
@@ -726,6 +790,14 @@ def add_agent(
     """
     if env_path is None:
         env_path = _DEFAULT_GATEWAY_ENV
+    # Least privilege is decided BEFORE anything is minted, written or
+    # registered, so a refusal here leaves no trace — same contract as every
+    # other refusal in this function.
+    try:
+        effective_role = role_for(name, role)
+    except ValueError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 1, None
     try:
         _validate_registry_field(name, "agent name")
         if install_path is not None:
@@ -816,6 +888,19 @@ def add_agent(
 
     print("=== Gateway .env — merged AGENT_TOKENS= line (write this in place) ===")
     print("AGENT_TOKENS=" + ",".join(merged_entries.values()))
+
+    if effective_role is not None:
+        # MERGED, never replaced: dropping an existing backup:admin entry here
+        # would silently widen the one credential confined to /admin/*.
+        merged_roles = _parse_agent_roles_line(
+            _read_env_raw_value(env_path, "AGENT_ROLES") or "")
+        merged_roles[name] = effective_role
+        print()
+        print("=== Gateway .env — merged AGENT_ROLES= line (write this in place) ===")
+        print("AGENT_ROLES=" + ",".join(f"{n}:{r}" for n, r in merged_roles.items()))
+        if effective_role == "read":
+            print(f"# {name} is a READ-ONLY identity: GET /health, GET /memory/telemetry")
+            print("# and read-only Cypher on POST /memory/graph. Every other route → 403.")
 
     if install_path is not None:
         merged_installs = dict(installs)
@@ -956,6 +1041,15 @@ def main(argv=None) -> int:
              "printf '%s' <token> | generate_tokens.py --digest <name>",
     )
     ap.add_argument(
+        "--role", metavar="ROLE", choices=list(VALID_ROLES),
+        help="Role for the agent being added with --add: read | full | admin. "
+             "Roles only ever NARROW access. Omit it and the role is derived: "
+             "a name in READ_ONLY_AGENTS always gets 'read', anything else "
+             "gets full access (no AGENT_ROLES entry). ⛔ A read-only identity "
+             "cannot be widened here — --role full on one is REFUSED before "
+             "anything is minted.",
+    )
+    ap.add_argument(
         "--add", metavar="NAME",
         help="Additive mint: register exactly ONE new agent without "
              "rotating anyone else's existing token (every other digest in "
@@ -985,7 +1079,8 @@ def main(argv=None) -> int:
         return convert_digests(args.convert_digests)
 
     if args.add is not None:
-        rc, token = add_agent(args.add, install_path=args.install_path)
+        rc, token = add_agent(args.add, install_path=args.install_path,
+                              role=args.role)
         if rc != 0:
             return rc
         unknown = [n for n in args.reveal if n != args.add]

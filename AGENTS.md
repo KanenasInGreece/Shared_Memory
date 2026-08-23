@@ -627,8 +627,17 @@ bash shared-memory/scripts/postflight.sh
 **everyone** — neither is what you want for one new agent. `--add` (v0.9.27) is the purpose-built
 additive mint: it registers exactly one new agent's `AGENT_INSTALLS` entry, mints its token,
 write-throughs it into that agent's skill `.env` (mode 600), and updates `AGENT_TOKENS` +
-`AGENT_INSTALLS` in `shared-memory/.env` **in place** — every other agent's digest byte-identical,
-untouched.
+`AGENT_INSTALLS` — and `AGENT_ROLES` when the agent needs one — in `shared-memory/.env` **in
+place**, every other agent's digest byte-identical, untouched.
+
+⛔ **A READ-ONLY IDENTITY IS ALWAYS MINTED READ-ONLY.** `generate_tokens.py`'s `READ_ONLY_AGENTS`
+list is authoritative on **every** mint path: `--add monitor` writes `monitor:read` into
+`AGENT_ROLES`, confining that token to `GET /health`, `GET /memory/telemetry` and read-only Cypher
+on `POST /memory/graph` — every other route answers 403. Pass `--role read|full|admin` to confine an
+agent that is *not* on that list; **widening one that is, is refused before anything is minted.**
+Absence from `AGENT_ROLES` means full read/write, so a missing entry is not a neutral default — it
+is the widest one. *(Until v0.9.35 only the BULK mint emitted this line, so `--add monitor` produced
+a write-capable token for a dashboard that must never have one.)*
 
 ⚠ **The required order — two individually-correct guards are jointly circular otherwise:**
 `--add` REFUSES a target directory that does not exist yet (deliberate — D19: never mint a token

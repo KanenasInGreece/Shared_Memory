@@ -95,6 +95,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --force)         force=1; shift ;;
         --add)           add_name="${2:?--add needs an agent name}"; shift 2 ;;
+        --role)          add_role="${2:?--role needs a role name}"; shift 2 ;;
         --install-path)  install_path="${2:?--install-path needs a path}"; shift 2 ;;
         --reveal)        reveal_args+=(--reveal "${2:?--reveal needs an agent name}"); shift 2 ;;
         *)               red "✗ unknown argument: $1"; exit 1 ;;
@@ -103,6 +104,12 @@ done
 
 if [[ -n "$install_path" && -z "$add_name" ]]; then
     red "✗ --install-path only makes sense together with --add"
+    exit 1
+fi
+if [[ -n "${add_role:-}" && -z "$add_name" ]]; then
+    # A bulk mint derives every role from READ_ONLY_AGENTS. Accepting --role
+    # there would look like it applied to all of them.
+    red "✗ --role only makes sense together with --add"
     exit 1
 fi
 if [[ -n "$add_name" && "$force" -eq 1 ]]; then
@@ -123,6 +130,7 @@ if [[ -n "$add_name" ]]; then
     echo "Adding agent '$add_name' ..."
     add_flags=(--add "$add_name")
     [[ -n "$install_path" ]] && add_flags+=(--install-path "$install_path")
+    [[ -n "${add_role:-}" ]] && add_flags+=(--role "$add_role")
 
     rc=0
     out="$(cd "$REPO_ROOT" && uv run python shared-memory/scripts/generate_tokens.py \
@@ -136,15 +144,24 @@ if [[ -n "$add_name" ]]; then
 
     tokens_line="$(grep -E '^AGENT_TOKENS=' <<<"$out" || true)"
     installs_line="$(grep -E '^AGENT_INSTALLS=' <<<"$out" || true)"
+    # AGENT_ROLES is emitted only when the new agent actually needs a role — a
+    # read-only identity (READ_ONLY_AGENTS), or an explicit --role. It carries
+    # LEAST PRIVILEGE, and absence from it means FULL read/write in the gateway,
+    # so failing to write it hands a dashboard a write-capable token. That is
+    # exactly what this path used to do: the bulk mint printed the line and the
+    # additive mint did not, so nobody noticed the roster was only half honoured.
+    roles_line="$(grep -E '^AGENT_ROLES=' <<<"$out" || true)"
     [[ -n "$tokens_line" ]] || { red "✗ generate_tokens.py --add produced no AGENT_TOKENS line"; exit 1; }
 
     replace_registry_line "AGENT_TOKENS" "$tokens_line"
     [[ -n "$installs_line" ]] && replace_registry_line "AGENT_INSTALLS" "$installs_line"
+    [[ -n "$roles_line" ]] && replace_registry_line "AGENT_ROLES" "$roles_line"
 
     echo
     grn "✓ AGENT_TOKENS updated in $ENV_FILE — '$add_name' added, every other"
     grn "  agent's digest is unchanged."
     [[ -n "$installs_line" ]] && grn "✓ AGENT_INSTALLS updated in $ENV_FILE"
+    [[ -n "$roles_line" ]] && grn "✓ AGENT_ROLES updated in $ENV_FILE — '$add_name' is role-confined"
     echo
     ylw "Restart the gateway to load the new AGENT_TOKENS."
     exit 0
