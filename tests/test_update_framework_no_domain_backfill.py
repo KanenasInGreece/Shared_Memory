@@ -158,6 +158,36 @@ def test_step_numbering_after_backfill_is_unchanged_either_way(tmp_path):
     assert tail_with, "no steps were recorded after the domain backfill step"
 
 
+# ── TV-4: interaction with --from-restore ────────────────────────────────
+# --from-restore skips step 0 (fetching code) but otherwise runs the same
+# procedure -- the domain-backfill selection logic in step 6 does not read
+# FROM_RESTORE at all, so the flag must behave identically whether or not
+# --from-restore is also given. Untested before this review.
+
+def test_no_domain_backfill_skips_with_from_restore_too(tmp_path):
+    repo = _make_sandbox(tmp_path)
+    proc = _run(repo, "--dry-run", "--skip-backup", "--from-restore", "--no-domain-backfill")
+    out = _strip_ansi(proc.stdout)
+    assert proc.returncode == 0, out
+    assert "SKIPPED — --no-domain-backfill given" in out
+    assert "backfill_domain_of.py" not in out, (
+        "--no-domain-backfill did not skip the backfill when combined with "
+        "--from-restore"
+    )
+
+
+def test_domain_backfill_still_runs_with_from_restore_and_no_flag(tmp_path):
+    repo = _make_sandbox(tmp_path)
+    proc = _run(repo, "--dry-run", "--skip-backup", "--from-restore")
+    out = _strip_ansi(proc.stdout)
+    assert proc.returncode == 0, out
+    assert "backfill_domain_of.py" in out, (
+        "--from-restore alone (no --no-domain-backfill) unexpectedly "
+        "suppressed the default backfill"
+    )
+    assert "SKIPPED — --no-domain-backfill given" not in out
+
+
 # ── 5. an unknown argument is still rejected ─────────────────────────────
 
 def test_unknown_argument_still_rejected(tmp_path):
@@ -173,7 +203,20 @@ def test_unknown_argument_still_rejected(tmp_path):
 def test_help_documents_the_flag_and_keeps_exit_contract():
     """Not sandboxed -- --help exits inside the argument-parsing loop, before
     any REPO_ROOT/.env work happens, so it is safe to run directly against
-    the real script without a sandbox."""
+    the real script without a sandbox.
+
+    TV-3/TV-5 (Test_Verification_Review.md): the OLD version of this test
+    asserted only a substring from the MIDDLE of the header ("Exit 0 only
+    when postflight passes.") -- a sentence that survives even if the FINAL
+    header line gets silently truncated by a future one-line header growth,
+    because it isn't the last thing printed. That is exactly the failure
+    already observed once (the sed range hard-coded '2,32p'). --help itself
+    was changed to a dynamic boundary (an awk scan that prints every leading
+    '#' line and stops at the first non-'#' line, so it can never truncate
+    regardless of header length) -- this test now pins that fix from the
+    OUTPUT side, by asserting the LAST line of the header comment block
+    specifically, so a regression to a hard-coded range (or any other
+    truncation) is caught structurally rather than by coincidence."""
     proc = subprocess.run(
         ["bash", str(_REAL_SCRIPT), "--help"],
         capture_output=True, text=True, timeout=15,
@@ -182,5 +225,22 @@ def test_help_documents_the_flag_and_keeps_exit_contract():
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "--no-domain-backfill" in out
     assert "Exit 0 only when postflight passes." in out, (
-        "the --help sed range no longer reaches the exit-contract sentence"
+        "the --help output no longer reaches the exit-contract sentence"
+    )
+
+    # The header comment block's own LAST line, read directly from the
+    # script rather than hard-coded here, so this test tracks the header
+    # even if it grows or shrinks.
+    header_lines = []
+    for line in _REAL_SCRIPT.read_text().splitlines()[1:]:  # skip shebang
+        if not line.startswith("#"):
+            break
+        header_lines.append(line)
+    last_header_line = header_lines[-1].removeprefix("#").removeprefix(" ")
+    assert last_header_line, "could not determine the header's last line"
+    assert last_header_line in out, (
+        f"--help output is missing the LAST line of the header comment "
+        f"block ({last_header_line!r}) -- this is exactly the truncation "
+        f"TV-3/TV-5 describes: a mid-header substring can pass while the "
+        f"tail is silently cut off\nfull output:\n{out}"
     )

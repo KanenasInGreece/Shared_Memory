@@ -62,7 +62,7 @@ while [[ $# -gt 0 ]]; do
         --dry-run)            DRY_RUN=1; shift ;;
         --skip-backup)        SKIP_BACKUP=1; shift ;;
         --no-domain-backfill) NO_DOMAIN_BACKFILL=1; shift ;;
-        -h|--help)      sed -n '2,32p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        -h|--help)      awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; exit 0 ;;
         *)              die "unknown argument: $1" ;;
     esac
 done
