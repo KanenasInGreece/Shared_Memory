@@ -88,6 +88,35 @@ echo
 
 [[ -f "$ENV_FILE" ]] || die "no .env found — this is not a configured deployment"
 
+# ── Preconditions, checked BEFORE anything is fetched or dumped ──────────────
+#
+# These are the cheapest and most certain checks in the whole script, and they
+# used to run LAST — by failing at the first `uv run`, which is step 2. In
+# upgrade mode that means a `git pull` and a FULL BACKUP had already happened
+# before the run died on a missing binary. Cost paid, nothing achieved.
+#
+# ⚠ `uv` is the one that actually bites, and not because hosts lack it: the
+# upstream installer puts it in ~/.local/bin, which a LOGIN shell resolves and a
+# PROFILE-FREE shell does not. An agent driving this over ssh, or from a
+# systemd unit, gets "uv: command not found" on a host where the operator can
+# run uv perfectly well by hand. That is the DEFAULT outcome of a correct
+# install, so it is named here rather than treated as a broken machine.
+missing=""
+for tool in uv curl; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+done
+if [[ -n "$missing" ]]; then
+    die "missing on PATH:$missing — nothing has been fetched, dumped or migrated.
+
+  If this shell is non-interactive (ssh, cron, a systemd unit) the tool may be
+  installed but unreachable: the upstream uv installer writes ~/.local/bin/uv,
+  which only a login shell puts on PATH. Check with:
+
+      ls -l ~/.local/bin/uv
+
+  and if it is there, export PATH=\"\$HOME/.local/bin:\$PATH\" before re-running."
+fi
+
 # ── Step 0: fetch the new code (upgrade entry point only) ────────────────────
 #
 # Skipped after a restore: the checkout is already the code we intend to run,
