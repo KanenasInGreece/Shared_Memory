@@ -87,11 +87,55 @@ def test_mint_prints_digest_form_agent_tokens_line(tmp_path):
 
 
 def test_mint_no_local_path_reports_remote_not_local_install(tmp_path):
+    """A remote agent must be reported as remote, and the report must not hand
+    the operator a command that rotates the fleet.
+
+    ⛔ THIS TEST USED TO ASSERT `generate_tokens.py --reveal <name>` APPEARED —
+    it was pinning the defect. This file's own docstring says --reveal shows a
+    token only from the SAME invocation, so that command run afterwards is a
+    FULL ROTATION of every agent. The guidance printed beside a freshly minted
+    credential told the operator to destroy every other agent's token, and read
+    like a retrieval step while doing it.
+    """
     gt = load_generate_tokens()
     gt.LOCAL_SKILL_ENV_PATHS = {}  # nobody is local
     _tokens, out = _capture(gt.mint)
     for name in gt.AGENTS:
-        assert f"generate_tokens.py --reveal {name}" in out
+        assert "REMOTE" in out
+        # The operator must learn the token was registered but not delivered.
+        assert "NOT DELIVERED" in out
+    # ...and must NOT be told to run the fleet-rotating command.
+    for name in gt.AGENTS:
+        assert f"generate_tokens.py --reveal {name}" not in out, (
+            "the report offers a bare --reveal as a retrieval step; run later "
+            "that is a full rotation of every agent")
+
+
+def test_mint_names_every_undeliverable_agent_in_one_block(tmp_path):
+    """A credential nobody can obtain must not be findable only by reading
+    twenty lines of per-agent report. Absence from this block is what "every
+    agent can authenticate" looks like."""
+    gt = load_generate_tokens()
+    gt.LOCAL_SKILL_ENV_PATHS = {}
+    _tokens, out = _capture(gt.mint)
+
+    assert "REGISTERED BUT UNDELIVERABLE" in out
+    for name in gt.AGENTS:
+        assert name in out.split("REGISTERED BUT UNDELIVERABLE", 1)[1]
+    assert "--remint" in out, "no recovery path offered that avoids a fleet rotation"
+
+
+def test_mint_does_not_flag_a_revealed_agent_as_undeliverable(tmp_path):
+    """The counterweight: an agent revealed on this run HAS been delivered, and
+    listing it would train the operator to ignore the block."""
+    gt = load_generate_tokens()
+    gt.LOCAL_SKILL_ENV_PATHS = {}
+    _tokens, out = _capture(gt.mint, revealing=["monitor"])
+
+    tail = out.split("REGISTERED BUT UNDELIVERABLE", 1)
+    if len(tail) > 1:
+        block = tail[1].split("Fix now with", 1)[0]
+        assert "monitor" not in block
 
 
 def test_mint_preserves_other_keys_in_existing_env_file(tmp_path):

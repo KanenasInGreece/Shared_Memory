@@ -115,6 +115,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --force)         force=1; shift ;;
         --add)           add_name="${2:?--add needs an agent name}"; shift 2 ;;
+        --remint)        remint_name="${2:?--remint needs an agent name}"; shift 2 ;;
         --role)          add_role="${2:?--role needs a role name}"; shift 2 ;;
         --install-path)  install_path="${2:?--install-path needs a path}"; shift 2 ;;
         --reveal)        reveal_args+=(--reveal "${2:?--reveal needs an agent name}"); shift 2 ;;
@@ -122,17 +123,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -n "$install_path" && -z "$add_name" ]]; then
-    red "✗ --install-path only makes sense together with --add"
+if [[ -n "$install_path" && -z "$add_name" && -z "${remint_name:-}" ]]; then
+    red "✗ --install-path only makes sense together with --add or --remint"
     exit 1
 fi
-if [[ -n "${add_role:-}" && -z "$add_name" ]]; then
+if [[ -n "${add_role:-}" && -z "$add_name" && -z "${remint_name:-}" ]]; then
     # A bulk mint derives every role from READ_ONLY_AGENTS. Accepting --role
     # there would look like it applied to all of them.
-    red "✗ --role only makes sense together with --add"
+    red "✗ --role only makes sense together with --add or --remint"
     exit 1
 fi
-if [[ -n "$add_name" && "$force" -eq 1 ]]; then
+if [[ ( -n "$add_name" || -n "${remint_name:-}" ) && "$force" -eq 1 ]]; then
     red "✗ --add and --force are mutually exclusive — --add never rotates anyone,"
     red "  --force always rotates everyone. Run them separately."
     exit 1
@@ -170,9 +171,21 @@ fi
 command -v uv >/dev/null 2>&1 || { red "✗ uv not found on PATH — install uv first (preflight.sh checks this)."; exit 1; }
 
 # ── Additive mint: grow the roster by one, never rotate ─────────────────────
-if [[ -n "$add_name" ]]; then
-    echo "Adding agent '$add_name' ..."
-    add_flags=(--add "$add_name")
+if [[ -n "$add_name" || -n "${remint_name:-}" ]]; then
+    if [[ -n "$add_name" && -n "${remint_name:-}" ]]; then
+        red "✗ --add and --remint are mutually exclusive: one registers a NEW"
+        red "  agent, the other re-issues an existing one."
+        exit 1
+    fi
+    if [[ -n "$add_name" ]]; then
+        echo "Adding agent '$add_name' ..."
+        add_flags=(--add "$add_name")
+    else
+        add_name="$remint_name"          # shared reporting below
+        echo "Re-issuing token for existing agent '$remint_name' ..."
+        echo "  ⚠ this INVALIDATES its current token — the agent must receive the new one."
+        add_flags=(--remint "$remint_name")
+    fi
     [[ -n "$install_path" ]] && add_flags+=(--install-path "$install_path")
     [[ -n "${add_role:-}" ]] && add_flags+=(--role "$add_role")
 
@@ -182,7 +195,7 @@ if [[ -n "$add_name" ]]; then
     echo "$out"
 
     if [[ "$rc" -ne 0 ]]; then
-        red "✗ --add refused — nothing was minted, written, or registered (see above)."
+        red "✗ refused — nothing was minted, written, or registered (see above)."
         exit "$rc"
     fi
 
@@ -195,7 +208,7 @@ if [[ -n "$add_name" ]]; then
     # exactly what this path used to do: the bulk mint printed the line and the
     # additive mint did not, so nobody noticed the roster was only half honoured.
     roles_line="$(grep -E '^AGENT_ROLES=' <<<"$out" || true)"
-    [[ -n "$tokens_line" ]] || { red "✗ generate_tokens.py --add produced no AGENT_TOKENS line"; exit 1; }
+    [[ -n "$tokens_line" ]] || { red "✗ generate_tokens.py produced no AGENT_TOKENS line"; exit 1; }
 
     replace_registry_lines \
         "AGENT_TOKENS"   "$tokens_line" \

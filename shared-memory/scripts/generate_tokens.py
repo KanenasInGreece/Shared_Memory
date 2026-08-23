@@ -571,6 +571,7 @@ def _write_agent_token_file(path: str, token: str) -> bool:
 
 def mint(
     env_path: "str | None" = None, roster: "list[str] | None" = None,
+    revealing: "list[str] | None" = None,
 ) -> "tuple[dict, dict, list]":
     """Mint a fresh token for every agent in `roster` (default: resolved by
     _resolve_roster() -- AGENTS union whatever's already registered),
@@ -648,8 +649,21 @@ def mint(
             token = _mint_one()
             tokens[a] = token
             digests[a] = _digest(token)
-            lines.append(f"  {a:15}  REMOTE / no local install found — reveal with:")
-            lines.append(f"                   generate_tokens.py --reveal {a}")
+            # ⛔ THIS LINE USED TO SAY "reveal with: generate_tokens.py --reveal <a>".
+            # That command, run afterwards, is a FULL FLEET ROTATION — this
+            # file's own docstring says so: --reveal only ever shows a token
+            # from the SAME invocation. So the guidance printed next to a
+            # freshly minted credential told the operator to do the one thing
+            # that destroys every other agent's token, and it read like a
+            # retrieval step.
+            lines.append(f"  {a:15}  REMOTE — token minted and REGISTERED, but NOT DELIVERED")
+            if a in (revealing or []):
+                lines.append("                   (revealed on this run — capture it now)")
+            else:
+                lines.append("                   ⛔ NOT revealed on this run: this token cannot be")
+                lines.append("                      retrieved later. Re-run this mint adding")
+                lines.append(f"                      --reveal {a}, or use --remint {a} --reveal {a}")
+                lines.append("                      to re-mint JUST this agent without rotating anyone.")
             continue
 
         token = _mint_one()
@@ -723,6 +737,24 @@ def mint(
         print(line)
     print()
     print("Each agent must use its own distinct token — never share tokens across agents.")
+    # An undelivered credential is the kind of thing that must not be findable
+    # only by reading twenty lines of per-agent report. Absence from this block
+    # is what "every agent can authenticate" looks like.
+    _undelivered = [a for a in roster
+                    if installs.get(a) is None and a not in (revealing or [])]
+    if _undelivered:
+        print()
+        print("⛔ REGISTERED BUT UNDELIVERABLE — these agents have a digest in")
+        print("   AGENT_TOKENS and NO WAY TO OBTAIN THEIR TOKEN:")
+        for a in _undelivered:
+            print(f"     {a}")
+        print()
+        print("   They will authenticate against nothing. The .env will show them")
+        print("   as provisioned, which is the misleading part. Fix now with:")
+        print(f"     generate_tokens.py --remint <name> --reveal <name>")
+        print("   (--remint re-mints ONE agent; it never touches anyone else.)")
+        print()
+
 
     if failures:
         print()
@@ -740,7 +772,7 @@ def mint(
 
 def add_agent(
     name: str, install_path: "str | None" = None, env_path: "str | None" = None,
-    role: "str | None" = None,
+    role: "str | None" = None, replace: bool = False,
 ) -> "tuple[int, str | None]":
     """Additive mint (roster growth without rotation, item 2): mint exactly
     ONE new token for `name`, leaving every OTHER agent's digest in
@@ -796,12 +828,31 @@ def add_agent(
 
     existing_raw = _read_env_raw_value(env_path, "AGENT_TOKENS") or ""
     existing_entries = _parse_agent_tokens_line(existing_raw)
-    if name in existing_entries:
+    # ── Registration guard, inverted by `replace` ───────────────────────────
+    #
+    # --add refuses an existing name: silently rotating a live agent's token
+    # would break it with no warning. That guard is right and stays.
+    #
+    # What it USED to imply was wrong, though: "there is no single-agent
+    # rotation" left --force (rotate EVERYONE) as the only way to recover one
+    # agent's token. A bulk mint registers remote agents whose tokens are never
+    # delivered, so recovering one of them cost every other agent's credential.
+    # Refusing accidental rotation must not also make deliberate re-issue
+    # impossible — that is what --remint is, and it touches nobody else.
+    if replace and name not in existing_entries:
+        print(
+            f"✗ {name!r} is not registered — --remint re-issues an EXISTING "
+            "agent's token. Use --add for a new agent.",
+            file=sys.stderr,
+        )
+        return 1, None
+    if not replace and name in existing_entries:
         print(
             f"✗ {name!r} is already registered in AGENT_TOKENS — --add never "
-            "silently rotates an existing agent's token. There is no "
-            "single-agent rotation; to replace it, rotate EVERY agent "
-            "deliberately: bootstrap_tokens.sh --force.",
+            "silently rotates an existing agent's token.\n"
+            f"  To re-issue THIS agent only (every other digest untouched):\n"
+            f"      generate_tokens.py --remint {name} --reveal {name}\n"
+            "  To rotate the whole fleet deliberately: bootstrap_tokens.sh --force.",
             file=sys.stderr,
         )
         return 1, None
@@ -822,9 +873,16 @@ def add_agent(
         # letting a second mint silently overwrite the first agent's token
         # and start authenticating AS the second agent (the gateway stamps
         # `source` from token identity -- silent provenance corruption).
+        # ⚠ On a RE-ISSUE the agent's own registered path is not a clobber —
+        # overwriting its own token file is the entire point. Excluding only
+        # `name` keeps the guard's real job intact: writing on top of a
+        # DIFFERENT agent's live token would make this agent start
+        # authenticating as that one (the gateway stamps `source` from token
+        # identity, so it is silent provenance corruption, not just a lost key).
         clobbered = [
             n for n, p in installs.items()
             if n in existing_entries and _same_registered_file(p, install_path)
+            and not (replace and n == name)
         ]
         if clobbered:
             print(
@@ -1033,6 +1091,16 @@ def main(argv=None) -> int:
              "printf '%s' <token> | generate_tokens.py --digest <name>",
     )
     ap.add_argument(
+        "--remint", metavar="NAME",
+        help="Re-issue the token for ONE agent that is ALREADY registered, "
+             "leaving every other agent's digest byte-identical. This is the "
+             "recovery path for a token that was registered but never "
+             "delivered (a remote agent minted without --reveal). It DOES "
+             "invalidate that agent's current token, so pair it with "
+             "--reveal NAME or --install-path so the agent receives the new "
+             "one. Use --add for an agent that is not registered yet.",
+    )
+    ap.add_argument(
         "--role", metavar="ROLE", choices=list(VALID_ROLES),
         help="Role for the agent being added with --add: read | full | admin. "
              "Roles only ever NARROW access. Omit it and the role is derived: "
@@ -1070,15 +1138,34 @@ def main(argv=None) -> int:
     if args.convert_digests is not None:
         return convert_digests(args.convert_digests)
 
-    if args.add is not None:
-        rc, token = add_agent(args.add, install_path=args.install_path,
-                              role=args.role)
+    # --add and --remint share every step after the mint itself: the same
+    # refusal handling, the same one-name --reveal contract, the same warning.
+    # They differ only in whether the name must already be registered, so the
+    # post-processing below is deliberately NOT duplicated per branch — that is
+    # how the two paths drift apart, which is the defect this release keeps
+    # finding elsewhere in this very file.
+    if args.add is not None or args.remint:
+        if args.add is not None and args.remint:
+            print("✗ --add and --remint are mutually exclusive: one registers a "
+                  "NEW agent, the other re-issues an existing one.", file=sys.stderr)
+            return 1
+        if args.add is not None:
+            rc, token = add_agent(args.add, install_path=args.install_path,
+                                  role=args.role)
+        else:
+            rc, token = add_agent(args.remint, install_path=args.install_path,
+                                  role=args.role, replace=True)
         if rc != 0:
             return rc
-        unknown = [n for n in args.reveal if n != args.add]
+        # The single-agent paths mint exactly one name, so --reveal can only
+        # ever serve that one. Written against whichever flag was used rather
+        # than --add alone, or --remint NAME --reveal NAME — the documented
+        # recovery for an undelivered token — would refuse itself.
+        _minted_name = args.add or args.remint
+        unknown = [n for n in args.reveal if n != _minted_name]
         if unknown:
             print(
-                f"✗ --add only mints {args.add!r} on this invocation -- "
+                f"✗ this invocation only mints {_minted_name!r} -- "
                 f"--reveal cannot show a token for: {', '.join(unknown)}",
                 file=sys.stderr,
             )
@@ -1088,7 +1175,7 @@ def main(argv=None) -> int:
             print("⚠ REVEALING raw token value(s) below — run this yourself, NEVER through")
             print("  an agent. Agent transcripts are durable: piping this output through an")
             print("  agent turns \"shown once\" into \"stored forever\".")
-            print(f"  {args.add}: AGENT_TOKEN={token}")
+            print(f"  {_minted_name}: AGENT_TOKEN={token}")
         return 0
 
     roster = _resolve_roster(_DEFAULT_GATEWAY_ENV)
@@ -1098,7 +1185,8 @@ def main(argv=None) -> int:
               f"(known: {', '.join(roster)})", file=sys.stderr)
         return 1
 
-    tokens, _digests, failures = mint(env_path=_DEFAULT_GATEWAY_ENV, roster=roster)
+    tokens, _digests, failures = mint(env_path=_DEFAULT_GATEWAY_ENV, roster=roster,
+                                      revealing=args.reveal)
 
     if args.reveal:
         print()
