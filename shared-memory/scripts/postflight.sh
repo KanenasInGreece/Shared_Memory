@@ -280,7 +280,7 @@ auth_on=0
 
 gateway_down=0
 token_missing=0
-anon_health="$(curl -s --max-time 15 "$GATEWAY_URL/health" || true)"
+anon_health="$(curl -s --compressed --max-time 15 "$GATEWAY_URL/health" || true)"
 health_full=""   # the full-shape payload (authenticated, or anonymous on auth-off) — A6 reads it
 
 if [[ -z "$anon_health" ]]; then
@@ -302,7 +302,7 @@ else
             # Token via curl config on stdin, not argv — argv is world-readable
             # in /proc/<pid>/cmdline for the request's lifetime (same reasoning
             # as init_db.sh's NEO4J_PASSWORD idiom).
-            health_full="$(curl -s --max-time 15 -K - "$GATEWAY_URL/health" <<< "header = \"Authorization: Bearer $AGENT_TOKEN\"" || true)"
+            health_full="$(curl -s --compressed --max-time 15 -K - "$GATEWAY_URL/health" <<< "header = \"Authorization: Bearer $AGENT_TOKEN\"" || true)"
             missing="$(printf '%s' "$health_full" | python3 -c '
 import json, sys
 try:
@@ -1011,14 +1011,14 @@ print(json.dumps({
             # Token via curl config on stdin, never argv — same idiom as A1
             # (argv is world-readable in /proc/<pid>/cmdline for the
             # request's lifetime).
-            a8_status="$(curl -s --max-time "$CLIENT_TIMEOUT" -K - \
+            a8_status="$(curl -s --compressed --max-time "$CLIENT_TIMEOUT" -K - \
                     -H "Content-Type: application/json" \
                     --data-binary @"$a8_body_file" \
                     -o "$a8_resp_file" -w '%{http_code}' \
                     "$GATEWAY_URL/v1/chat/completions" \
                     <<< "header = \"Authorization: Bearer $AGENT_TOKEN\"" 2>/dev/null)"
         else
-            a8_status="$(curl -s --max-time "$CLIENT_TIMEOUT" \
+            a8_status="$(curl -s --compressed --max-time "$CLIENT_TIMEOUT" \
                     -H "Content-Type: application/json" \
                     --data-binary @"$a8_body_file" \
                     -o "$a8_resp_file" -w '%{http_code}' \

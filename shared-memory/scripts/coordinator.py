@@ -142,7 +142,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.33"
+FRAMEWORK_VERSION = "0.9.34"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -2223,6 +2223,16 @@ class MemoryCoordinator:
         # writing it twice would duplicate a derivable value.
         self._rerank_payload_chars_total = 0
         self._rerank_payload_docs_total = 0
+        # Observed-maximum tracker (operator ruling, 2026-08-23, on top of
+        # fact:1441): a capacity SIGNAL needs the worst case a real search
+        # actually produced, not an average -- a sum+count only ever gives a
+        # mean. Updated at the SAME increment site as the pair above so it
+        # stays aligned with the identical population (both outcome paths,
+        # via `ranked`). Monotonic non-decreasing for this process's
+        # lifetime BY DESIGN: it can only rise, so one outlier search pins it
+        # until the next restart -- for a capacity signal that is the safe
+        # direction (it never becomes less conservative), never a defect.
+        self._rerank_payload_chars_max = 0
         # Backup quiesce: dedicated connection holding the EXCLUSIVE advisory lock
         # (None = not held), plus the TTL auto-resume task.
         self._quiesce_conn: Any = None
@@ -6353,6 +6363,11 @@ class MemoryCoordinator:
             # absence.
             self._rerank_payload_chars_total += rerank_payload_chars
             self._rerank_payload_docs_total += rerank_payload_docs
+            # Same increment site as the pair above -- see this counter's
+            # __init__ comment for why a max (not just the sum/count mean)
+            # matters for a capacity signal.
+            if rerank_payload_chars > self._rerank_payload_chars_max:
+                self._rerank_payload_chars_max = rerank_payload_chars
             reranked = False
             try:
                 rr = await client.post(
@@ -7170,6 +7185,12 @@ class MemoryCoordinator:
         # cost from the fixed per-request overhead fact:1441 could not.
         snap["rerank_payload_chars_total"] = self._rerank_payload_chars_total
         snap["rerank_payload_docs_total"] = self._rerank_payload_docs_total
+        # NEW (operator ruling, 2026-08-23): observed maximum, not just the
+        # sum -- a capacity signal needs the worst real payload seen, which
+        # a sum+count mean cannot give. Monotonic non-decreasing for this
+        # process's lifetime (see the counter's own __init__ comment) —
+        # this is the safe direction for a capacity signal, never a defect.
+        snap["rerank_payload_chars_max"] = self._rerank_payload_chars_max
 
         # Credential-use audit trail signal (PR A3) — in-process counters, no
         # I/O, so no try/except: same reset-on-restart contract as the

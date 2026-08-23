@@ -395,3 +395,82 @@ async def test_payload_totals_accumulate_across_success_and_fallback():
     # The companion pair (successes+fallbacks) is exactly the "how many
     # searches were measured" count — proving no third counter is needed.
     assert (snap["rerank_successes_total"] + snap["rerank_fallbacks_total"]) == 2
+
+
+# ── Observed maximum (operator ruling, 2026-08-23) ──────────────────────────
+#
+# A capacity signal needs the worst real payload seen, not the mean a
+# sum+count pair implies -- these tests prove _rerank_payload_chars_max
+# tracks the MAX across searches, not the sum, the last value, or the count.
+
+@pytest.mark.asyncio
+async def test_zero_searches_reports_zero_payload_max():
+    c, _, _ = _coordinator_with_mocks()
+    snap = await _telemetry(c)
+    assert snap["rerank_payload_chars_max"] == 0
+
+
+@pytest.mark.asyncio
+async def test_payload_max_tracks_the_larger_of_two_searches_not_the_sum():
+    """Search 1 sends 3 short docs, search 2 sends 1 long (but still under
+    the per-doc clamp) doc whose total is bigger than search 1's total.
+    rerank_payload_chars_max must equal search 2's total -- NOT
+    search1+search2 (that would be the sum, already covered by the _total
+    counter) and NOT search 1's total (that would mean the tracker never
+    updated after the first write)."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+
+    mock_conn.fetch = AsyncMock(return_value=_candidates(3, content="short"))
+    body1 = await _search(c, _ok_rerank_response(3), limit=3)
+    small_total = body1["results"][0]["rerank_payload_chars"]
+
+    mock_conn.fetch = AsyncMock(return_value=_candidates(1, content="y" * 5000))
+    body2 = await _search(c, _ok_rerank_response(1), limit=1)
+    big_total = body2["results"][0]["rerank_payload_chars"]
+
+    assert big_total > small_total, (
+        "test setup invariant -- search 2 must be the larger of the two "
+        "for this test to actually exercise the max, not just agree with "
+        "whichever ran last"
+    )
+
+    snap = await _telemetry(c)
+    assert snap["rerank_payload_chars_max"] == big_total
+    assert snap["rerank_payload_chars_total"] == small_total + big_total, (
+        "the TOTAL still sums both searches -- only the new max counter "
+        "picks out the larger one"
+    )
+
+
+@pytest.mark.asyncio
+async def test_payload_max_does_not_regress_after_a_smaller_search():
+    """Once the max has been set by a large search, a SUBSEQUENT smaller
+    search must not pull it back down -- monotonic non-decreasing for the
+    process's lifetime, exactly as the counter's own comment states."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+
+    mock_conn.fetch = AsyncMock(return_value=_candidates(1, content="y" * 5000))
+    body1 = await _search(c, _ok_rerank_response(1), limit=1)
+    big_total = body1["results"][0]["rerank_payload_chars"]
+
+    mock_conn.fetch = AsyncMock(return_value=_candidates(1, content="tiny"))
+    await _search(c, _ok_rerank_response(1), limit=1)
+
+    snap = await _telemetry(c)
+    assert snap["rerank_payload_chars_max"] == big_total
+
+
+@pytest.mark.asyncio
+async def test_payload_max_counts_a_fallback_payload_too():
+    """I-B2 applies to the max tracker as well: a fallback search still
+    counts what it WOULD have sent, so a big fallback payload must still
+    set the max even though the reranker was never actually reached."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+    mock_conn.fetch = AsyncMock(return_value=_candidates(1, content="y" * 5000))
+    failing = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+    body = await _search(c, failing, limit=1)
+    fallback_total = body["results"][0]["rerank_payload_chars"]
+
+    snap = await _telemetry(c)
+    assert snap["rerank_payload_chars_max"] == fallback_total
+    assert fallback_total > 0

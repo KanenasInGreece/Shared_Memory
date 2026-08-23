@@ -2311,17 +2311,21 @@ async def _probe_capability(session) -> dict:
     return out
 
 
-async def _capability_probe_daemon(proxy, stop_event) -> None:
+async def _capability_probe_daemon(proxy, stop_event, coordinator=None) -> None:
     """Refresh the capability snapshot on a slow cadence, forever.
 
     Wrapped so a probe failure can never propagate: this is an OBSERVABILITY
     path, and an unguarded exception here would take down the thing it exists
-    to report on (the trap named in CLAUDE.md's Group 3)."""
+    to report on (the trap named in CLAUDE.md's Group 3).
+
+    `coordinator` (optional — the running MemoryCoordinator instance, when
+    the caller has one) is threaded through to _maybe_derive_capacity so the
+    measured-payload basis can read its cumulative rerank counters."""
     global _capability
     while not stop_event.is_set():
         try:
             _capability = await _probe_capability(proxy.session)
-            await _maybe_derive_capacity(_capability)
+            await _maybe_derive_capacity(_capability, coordinator)
         except Exception as exc:
             log.warning("capability probe failed: %s", exc)
         try:
@@ -2472,6 +2476,60 @@ CAPACITY_SEARCH_OVERHEAD_S         = _capacity_env_number("CAPACITY_SEARCH_OVERH
 # your own validated tolerance.
 CAPACITY_TOLERABLE_WAIT_S = _capacity_env_number("CAPACITY_TOLERABLE_WAIT_S", 30.0, float)
 
+# Measured-payload basis (operator rulings, 2026-08-23): s_mean_s above
+# projects onto a fixed THEORETICAL worst case -- 20 x RERANK_MAX_DOC_CHARS
+# (encoder_config's own search_candidate_floor x rerank_max_doc_chars) --
+# 491,520 chars, a payload no real query on the reference workstation
+# produces. Measured there: 8 real searches against a 1377-record corpus
+# had a MEAN of 71,139 rerank_payload_chars and topped out (MAX) at
+# 101,240 -- the max is 0.21x the theoretical basis and 1.42x the mean
+# (NOT "~4.9x the mean": 4.9x is theoretical-over-observed-max, the
+# opposite ratio; an earlier draft of this comment had this backwards).
+# The resulting s_mean_s of 36.4s tripped single_search_exceeds_wait
+# against real search times measured at 2.78-10.84s wall.
+# CAPACITY_TOLERABLE_WAIT_S itself is not the problem -- see its own
+# comment above; this is what gets compared against it.
+#
+# RULING 1: the basis that replaces the theoretical one is the OBSERVED
+# MAXIMUM, not the mean -- this is a CAPACITY signal, and an average-case
+# basis would under-project a search at the observed max by the same 1.42x
+# just measured, exactly the direction a safety bound must never err in.
+# Using the max still clears the false alarm with room to spare (it
+# projects to roughly 7.5s here, comfortably under the 30s
+# CAPACITY_TOLERABLE_WAIT_S default) while staying conservative. The mean
+# is still computed and reported alongside (s_mean_measured_s) as cheap,
+# useful context -- it is NEVER what feeds queue_bound or
+# single_search_exceeds_wait; only the max-based s_max_measured_s does
+# (see payload_basis in the derived record for which one actually drove a
+# given reading).
+#
+# When the coordinator (fact:1441's payload counters, reused verbatim --
+# see _capacity_payload_stats) has served at least this many real searches
+# this process's lifetime, the derivation trusts the observed max over the
+# fixed theoretical one. Below this count -- including every fresh
+# install, which has zero -- it falls back to the theoretical basis
+# unchanged. UNMEASURED: no data here justifies 5 over 3 or 10; it exists
+# only so a single one-off search right after startup is never treated as
+# representative. Fails open like every CAPACITY_* setting.
+#
+# The observed max is MONOTONIC non-decreasing for this process's
+# lifetime -- it can only rise, so one outlier search pins
+# s_max_measured_s until the next gateway restart. For a capacity signal
+# that is the safe direction (it never becomes less conservative over
+# time), never a defect -- but it is a real property a reader should know
+# rather than discover.
+#
+# STALENESS ACROSS A CONFIG CHANGE: _encoder_config_fingerprint includes
+# rerank_max_doc_chars/search_candidate_floor, so raising either fires a
+# fresh derivation (config_change trigger) while the coordinator's payload
+# counters still hold pre-change traffic -- a record can read
+# payload_basis "measured" against a max observed under the OLD config.
+# No reset hook exists for this (the counters are process-lifetime, not
+# config-lifetime); a reader comparing records across a config change
+# should treat payload_basis "measured" readings from before/after the
+# change as not directly comparable.
+CAPACITY_PAYLOAD_MIN_SAMPLES = _capacity_env_number("CAPACITY_PAYLOAD_MIN_SAMPLES", 5, int)
+
 # "Outside a x2 band" for the probe_drift trigger: fires when the current
 # reranker chars/s is more than this factor above OR below the basis
 # reading stored in the last derivation record. Exactly at the factor is
@@ -2503,6 +2561,39 @@ _capacity_latest_loaded_from_disk = False   # memoizes the one lazy disk read
 # compares against whatever the LOG says, not against this process's own
 # prior state) from every later cycle (trigger config_change / probe_drift).
 _capacity_first_probe_done = False
+
+# B-1 fix (reviewer HIGH, operator 2026-08-23): the payload_threshold_
+# crossed trigger (see _maybe_derive_capacity) used to be gated by a
+# PROCESS-LOCAL one-shot latch, exactly like _capacity_first_probe_done
+# above. That was wrong for this specific trigger: a process-local latch
+# resets on every restart, but the comparison it gated (whether the STORED
+# record still says "theoretical") is read from the durable, cross-process
+# LOG -- so after any restart with unchanged hardware/config (no
+# fingerprint mismatch, hence no other trigger fires either), the stored
+# record already said "measured" from the PREVIOUS process's life, the
+# latch's "last basis is still theoretical" half of the guard was already
+# false, and the trigger could never fire again for the rest of this
+# install's life -- even as the new process's own observed max grew past
+# what the dead process ever saw. That is staleness in the UNSAFE
+# direction for a capacity signal: it under-reports the worst payload,
+# exactly what the max basis exists to prevent (reviewer's live
+# reproduction: process 1 measured/max 100,000 -> restart -> 12 real
+# searches, observed max 150,000 -> zero new records).
+#
+# Fix: no process-local latch at all. The trigger now re-arms itself by
+# comparing LIVE state against the DURABLE stored record's own
+# payload_max_chars_measured (see _maybe_derive_capacity) -- it fires
+# again exactly when the live observed max exceeds whatever is already on
+# disk, regardless of which process wrote that disk record or how long ago.
+# This is restart-safe by construction (a fresh process's live max is
+# compared against the SAME durable value a long-running process would be
+# compared against) and storm-safe without a latch: immediately after a
+# successful derivation the stored max equals the live max, so the same
+# reading never re-fires -- only a NEW, larger reading does, which is
+# inherently sparse. It is also retry-safe (B-2): a failed append leaves
+# the stored record unchanged, so the very next cycle re-evaluates the
+# identical comparison and tries again, rather than a spent latch
+# permanently forfeiting the one attempt it had.
 
 
 def _capacity_neo4j_allowance_bytes() -> int | None:
@@ -2688,41 +2779,161 @@ def _capacity_drift_outside_band(current: float | None, basis: float | None,
     return ratio > band_factor or ratio < (1.0 / band_factor)
 
 
+def _capacity_payload_stats(coordinator) -> dict:
+    """Read-only snapshot of the coordinator's own cumulative rerank
+    payload counters (fact:1441 — coordinator._rerank_payload_chars_total /
+    _rerank_payload_docs_total / _rerank_payload_chars_max, plus
+    _rerank_successes / _rerank_failures for the sample count, all already
+    accumulated for GET /memory/telemetry — reused verbatim here, not a
+    second collection mechanism).
+
+    `coordinator` may be None (a caller that never wired it through, or
+    every existing test in this suite, none of which pass one) — that is
+    the same as "zero samples", never an error. Every attribute read is
+    guarded: a mocked/partial coordinator missing one, or a non-numeric
+    value on any of them, degrades to zero rather than raising -- this is
+    an observability derivation and must fail open like the rest of this
+    module (Group 3)."""
+    samples = chars_total = docs_total = chars_max = 0
+    if coordinator is not None:
+        try:
+            successes = int(getattr(coordinator, "_rerank_successes", 0) or 0)
+            failures = int(getattr(coordinator, "_rerank_failures", 0) or 0)
+            samples = successes + failures
+            chars_total = int(getattr(coordinator, "_rerank_payload_chars_total", 0) or 0)
+            docs_total = int(getattr(coordinator, "_rerank_payload_docs_total", 0) or 0)
+            chars_max = int(getattr(coordinator, "_rerank_payload_chars_max", 0) or 0)
+        except (TypeError, ValueError):
+            samples = chars_total = docs_total = chars_max = 0
+    mean_chars_per_search = (chars_total / samples) if samples > 0 else None
+    max_chars_per_search = chars_max if samples > 0 and chars_max > 0 else None
+    return {
+        "samples": samples,
+        "chars_total": chars_total,
+        "docs_total": docs_total,
+        "mean_chars_per_search": mean_chars_per_search,
+        "max_chars_per_search": max_chars_per_search,
+    }
+
+
 def _build_capacity_record(capability: dict | None, fingerprint: dict,
-                            trigger: str) -> dict:
+                            trigger: str, coordinator=None) -> dict:
     """Assemble one capacity derivation record. `capability` is the SAME
     dict _probe_capability() produced this cycle (capability_snapshot()'s
-    shape) — s_mean reuses its reranker.projected_full_payload_s verbatim
-    rather than recomputing a second model.
+    shape) — s_mean_s reuses its reranker.projected_full_payload_s verbatim
+    rather than recomputing a second model; this field's meaning is
+    UNCHANGED and always equals that theoretical projection, exactly as
+    before this change, regardless of `coordinator` — every caller that
+    predates this parameter (including every existing test) gets identical
+    output.
 
     NOTE on the probe's own model vs the real candidate pool: the probe
     projects onto 20 x RERANK_MAX_DOC_CHARS (see _probe_capability), a fixed
-    worst-case count. The REAL per-search candidate pool is
-    max(SEARCH_CANDIDATE_FLOOR, limit) + 2 (coordinator.py's Tier-1 fetch:
-    the vector-search LIMIT plus the Tier-3 summary and the deep-dive
-    lookup that ride along). s_mean here is the probe's own number,
-    unmodified — encoder_config.search_candidate_floor is recorded
-    alongside it so a reader can see how far the fixed model sits from a
-    caller who requests more than the floor."""
+    worst-case count that measurement on the reference workstation showed
+    is ~4.9x the largest real payload observed and ~6.9x the mean (operator
+    rulings, 2026-08-23 — see CAPACITY_PAYLOAD_MIN_SAMPLES's module-level
+    comment for the numbers and the corrected ratios). The REAL per-search
+    candidate pool is max(SEARCH_CANDIDATE_FLOOR, limit) + 2
+    (coordinator.py's Tier-1 fetch: the vector-search LIMIT plus the Tier-3
+    summary and the deep-dive lookup that ride along).
+
+    `coordinator` (optional — None on a fresh install, a process that
+    hasn't wired it through, or any caller that predates this parameter)
+    supplies the OBSERVED payload stats via _capacity_payload_stats. When
+    at least CAPACITY_PAYLOAD_MIN_SAMPLES real searches have been served,
+    the derived record's queue_bound and single_search_exceeds_wait are
+    computed from the observed MAXIMUM payload (s_max_measured_s) instead
+    of the fixed theoretical one — a capacity signal must stay
+    worst-case, so the average (s_mean_measured_s, still reported as cheap
+    informational context) never feeds these two fields. s_mean_s ITSELF
+    is never touched, so a reader who only ever looked at s_mean_s keeps
+    seeing exactly what it always meant.
+
+    Why it is still safe to leave queue_bound/single_search_exceeds_wait
+    under their existing names even though the basis feeding them can now
+    change: `payload_basis` ships in the SAME record and is mandatory
+    (never omitted), so a reader can always tell which basis actually
+    drove a given value — a name is only a problem to reuse when its
+    meaning changes SILENTLY; here it cannot, because the record is
+    self-describing. `payload_basis_sample_count` always reports the true
+    sample count regardless of which basis was used (NOT 0 on
+    "theoretical" — an earlier draft of this comment said otherwise; the
+    code was already right, only the comment was wrong)."""
     reranker = (capability or {}).get("reranker") or {}
     embedder = (capability or {}).get("embedder") or {}
-    s_mean = reranker.get("projected_full_payload_s")
+    # UNCHANGED meaning: the fixed theoretical full-payload projection,
+    # verbatim from the probe, exactly as before this change.
+    s_mean_theoretical = reranker.get("projected_full_payload_s")
+    reranker_chars_per_s = reranker.get("throughput_chars_s")
+
+    payload_stats = _capacity_payload_stats(coordinator)
+    have_enough_samples = payload_stats["samples"] >= CAPACITY_PAYLOAD_MIN_SAMPLES
+    have_throughput = bool(reranker_chars_per_s and reranker_chars_per_s > 0)
+
+    # Informational only (ruling 1) -- computed whenever there is enough
+    # data to trust it, but NEVER feeds queue_bound/single_search_exceeds_
+    # wait. Reported purely as useful context alongside the max.
+    s_mean_measured = None
+    try:
+        if (have_enough_samples and have_throughput
+                and payload_stats["mean_chars_per_search"] is not None):
+            s_mean_measured = round(
+                payload_stats["mean_chars_per_search"] / reranker_chars_per_s, 1)
+    except (TypeError, ZeroDivisionError):
+        s_mean_measured = None
+
+    # RULING 1: the basis. A capacity signal must stay worst-case, so this
+    # -- not the mean above -- is what feeds queue_bound/single_search_
+    # exceeds_wait once trusted.
+    s_max_measured = None
+    try:
+        if (have_enough_samples and have_throughput
+                and payload_stats["max_chars_per_search"] is not None):
+            s_max_measured = round(
+                payload_stats["max_chars_per_search"] / reranker_chars_per_s, 1)
+    except (TypeError, ZeroDivisionError):
+        s_max_measured = None
+
+    if s_max_measured is not None:
+        payload_basis = "measured"
+        effective_s_mean = s_max_measured
+    else:
+        payload_basis = "theoretical"
+        effective_s_mean = s_mean_theoretical
+
     # H1: queue_bound is measured against the operator's own tolerable-wait
     # setting, NOT client_ceiling_s -- client_ceiling_s is still computed
     # and reported below (informative: what the client will itself time out
     # at) but no longer feeds this calculation. See CAPACITY_TOLERABLE_WAIT_S's
     # module-level comment for why the old formula was circular.
+    #
+    # Operator ruling (2026-08-23): queue_bound and single_search_exceeds_
+    # wait are now derived from `effective_s_mean` -- the observed-MAX
+    # basis when CAPACITY_PAYLOAD_MIN_SAMPLES is met, else the same
+    # theoretical basis these two fields always used. Their CONTRACT ("is
+    # a single search's projected rerank time within the operator's
+    # tolerable wait") is unchanged; what changes is which population the
+    # basis describes (worst-case theoretical vs worst-case OBSERVED,
+    # never the average -- see ruling 1 above). s_mean_s (below) is never
+    # altered, precisely so a fixed meaning stays available even while
+    # these two derived fields adopt the better input -- see
+    # _build_capacity_record's own docstring for why reusing these names is
+    # still honest (payload_basis is mandatory and always present).
     client_ceiling = _capacity_client_ceiling_s(capability)
-    queue_bound = _capacity_queue_bound(s_mean, CAPACITY_TOLERABLE_WAIT_S)
+    queue_bound = _capacity_queue_bound(effective_s_mean, CAPACITY_TOLERABLE_WAIT_S)
     # M10: makes explicit what queue_bound == 0 means, since "not yet
     # measured" (None) and "one search already exceeds the tolerable wait"
     # (0) would otherwise both read as "no usable number".
     single_search_exceeds_wait = (
-        None if not s_mean or s_mean <= 0
-        else s_mean > CAPACITY_TOLERABLE_WAIT_S
+        None if not effective_s_mean or effective_s_mean <= 0
+        else effective_s_mean > CAPACITY_TOLERABLE_WAIT_S
     )
     mem_total = fingerprint.get("hardware", {}).get("mem_total_bytes")
     recommended_mem_limit = _capacity_recommended_mem_limit_bytes(mem_total)
+    mean_chars_measured = payload_stats["mean_chars_per_search"]
+    if mean_chars_measured is not None:
+        mean_chars_measured = round(mean_chars_measured, 1)
+    max_chars_measured = payload_stats["max_chars_per_search"]
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "trigger": trigger,
@@ -2738,7 +2949,52 @@ def _build_capacity_record(capability: dict | None, fingerprint: dict,
             "probed_at": (capability or {}).get("probed_at"),
         },
         "derived": {
-            "s_mean_s": s_mean,
+            # UNCHANGED meaning -- see this function's docstring. Always the
+            # theoretical full-payload projection, regardless of basis.
+            "s_mean_s": s_mean_theoretical,
+            # NEW (additive, ruling 1): the projection computed over the
+            # coordinator's OBSERVED MAXIMUM rerank payload instead of the
+            # theoretical worst case. This -- NOT s_mean_measured_s below
+            # -- is what feeds queue_bound/single_search_exceeds_wait when
+            # payload_basis is "measured". None until CAPACITY_PAYLOAD_
+            # MIN_SAMPLES real searches have been served this process's
+            # lifetime (always None with no coordinator wired through --
+            # e.g. a fresh install, or any pre-existing caller of this
+            # function). MONOTONIC non-decreasing for this process's
+            # lifetime -- see CAPACITY_PAYLOAD_MIN_SAMPLES's module-level
+            # comment for why that is the safe direction, not a defect.
+            "s_max_measured_s": s_max_measured,
+            # NEW (additive): the same projection over the OBSERVED MEAN
+            # instead -- cheap, useful CONTEXT only. Never feeds
+            # queue_bound/single_search_exceeds_wait (ruling 1: an
+            # average-case basis would under-project a search at the
+            # observed max). Same None-until-enough-samples gating as
+            # s_max_measured_s above.
+            "s_mean_measured_s": s_mean_measured,
+            # NEW (additive): which basis actually fed queue_bound /
+            # single_search_exceeds_wait THIS record. A reader must never
+            # have to guess -- this field is why reusing the existing
+            # names for those two fields is still honest (see docstring).
+            "payload_basis": payload_basis,
+            # NEW (additive): real searches (rerank_successes_total +
+            # rerank_fallbacks_total at the coordinator) THIS PROCESS has
+            # served, reported UNCONDITIONALLY -- true regardless of
+            # whether payload_basis is "measured" or "theoretical" (a
+            # "theoretical" reading can still carry a nonzero count below
+            # CAPACITY_PAYLOAD_MIN_SAMPLES; it is never forced to 0).
+            "payload_basis_sample_count": payload_stats["samples"],
+            # NEW (additive): the observed mean rerank_payload_chars per
+            # real search this process has served. None on zero samples --
+            # never a false 0, which would read as "measured a zero-byte
+            # payload" rather than "nothing observed yet".
+            "payload_mean_chars_measured": mean_chars_measured,
+            # NEW (additive, ruling 1): the observed MAXIMUM
+            # rerank_payload_chars per real search -- the raw number behind
+            # s_max_measured_s. None on zero samples, same discipline as
+            # the mean above. MONOTONIC non-decreasing for this process's
+            # lifetime (see CAPACITY_PAYLOAD_MIN_SAMPLES's module-level
+            # comment).
+            "payload_max_chars_measured": max_chars_measured,
             "client_ceiling_s": client_ceiling,
             "queue_bound": queue_bound,
             # N2 (fix round 2): the tolerance queue_bound was actually
@@ -2918,11 +3174,15 @@ def _log_capacity_change(trigger: str, last: dict | None, record: dict) -> None:
     )
 
 
-async def _maybe_derive_capacity(capability: dict) -> None:
+async def _maybe_derive_capacity(capability: dict, coordinator=None) -> None:
     """Called every capability-probe cycle. Decides which of the passive
     triggers (if any) fires, derives + stores + logs on a hit, and NEVER
     raises — this rides the same observability path _probe_capability does,
-    so a bug here must not take down the probe daemon (Group 3)."""
+    so a bug here must not take down the probe daemon (Group 3).
+
+    `coordinator` (optional) is passed straight through to
+    _build_capacity_record so the measured-payload basis can read its
+    cumulative rerank counters — see that function's docstring."""
     global _capacity_first_probe_done
     try:
         fingerprint = _capacity_fingerprint()
@@ -3016,9 +3276,91 @@ async def _maybe_derive_capacity(capability: dict) -> None:
             if basis_status != "ok" and current_status == "ok":
                 trigger = "basis_recovery"
 
+        # Ruling 2 (operator, 2026-08-23), fixed for B-1/B-2/B-3 (reviewer,
+        # 2026-08-23): without this, the feature added by rulings elsewhere
+        # in this module is INERT in normal operation -- verified live: a
+        # fresh theoretical/samples-0 baseline plus six real searches left
+        # the stored record reading theoretical/samples 0, because a
+        # capacity record is only ever (re)computed on one of the triggers
+        # above, and at each of those moments the payload counters are at
+        # or near zero. "measured" was reachable only incidentally, if a
+        # probe_drift/config_change happened to fire after traffic had
+        # already accumulated.
+        #
+        # Checked LAST, only when nothing else already decided to fire this
+        # cycle -- it never fights or reorders first_derivation /
+        # gateway_start_fingerprint_mismatch / config_change / probe_drift /
+        # basis_recovery above; it only ever fills a cycle those would
+        # otherwise leave silent.
+        #
+        # B-1 (HIGH, fixed): the original version of this trigger gated on
+        # a PROCESS-LOCAL one-shot latch plus "the stored basis is still
+        # theoretical". After any restart with unchanged hardware/config
+        # (no fingerprint mismatch -> no other trigger fires either), the
+        # stored record already said "measured" from the PREVIOUS process's
+        # life -- so guard (b) was permanently false for the rest of this
+        # install's life, even as the NEW process's own observed max grew
+        # past what the dead process ever saw. That is staleness in the
+        # UNSAFE direction for a capacity signal (under-reporting the worst
+        # payload) -- exactly what the max basis exists to prevent.
+        #
+        # Fixed by dropping the process-local latch AND the "theoretical
+        # only" restriction entirely. The trigger now compares LIVE state
+        # against the DURABLE stored record's own payload_max_chars_
+        # measured, regardless of which process wrote that stored record or
+        # how long ago: it fires whenever the live observed max EXCEEDS the
+        # max already on disk (or the disk has none yet, i.e. still
+        # theoretical). This is:
+        #   - restart-safe by construction: a freshly restarted process
+        #     with fresh (zero) counters is compared against the exact same
+        #     durable value a long-running process would be compared
+        #     against, so "a restarted process with a larger observed max"
+        #     re-derives correctly -- there is no process-local memory to
+        #     go stale.
+        #   - storm-safe without any latch: immediately after a successful
+        #     derivation the stored max equals the live max, so the
+        #     identical reading can never re-fire on the next cycle -- only
+        #     a NEW, larger reading does, which is inherently sparse (the
+        #     max is monotonic per process, so within one process this
+        #     fires at most once per new high-water mark; across a restart
+        #     it fires again only if the new process's traffic genuinely
+        #     exceeds the old one's worst case).
+        #   - a smaller live max than the stored one deliberately does NOT
+        #     re-fire and does NOT regress the stored value -- the stored
+        #     max stays the more conservative (larger, safer) figure until
+        #     real traffic actually exceeds it. This is not a residual bug:
+        #     the capacity signal must never UNDER-report, and a real
+        #     historical worst-case number is not "wrong" merely because
+        #     the process that observed it has since restarted.
+        #   - B-2 (MEDIUM, fixed as a consequence): retry-safe with no
+        #     special-casing needed. A failed _append_capacity_record leaves
+        #     the durable max unchanged, so the very next cycle re-evaluates
+        #     the identical "live > stored" comparison and tries again --
+        #     there is no one-shot flag to have been spent prematurely.
+        #   - B-3 (LOW, fixed): requiring live_payload["max_chars_per_
+        #     search"] is not None closes the all-empty-payload edge case
+        #     (chars_max stays 0 despite samples > 0) that used to satisfy
+        #     the old guards and still yield "theoretical".
+        # Still gated on current_status == "ok", a positive current
+        # throughput reading, and enough samples -- the same preconditions
+        # _build_capacity_record itself needs to actually produce a
+        # "measured" basis, checked here too so a doomed-to-fail attempt is
+        # never even tried (e.g. a reranker probe that is momentarily down).
+        if trigger is None and last is not None:
+            live_payload = _capacity_payload_stats(coordinator)
+            current_throughput = current_reranker.get("throughput_chars_s")
+            if (live_payload["samples"] >= CAPACITY_PAYLOAD_MIN_SAMPLES
+                    and current_status == "ok"
+                    and current_throughput and current_throughput > 0
+                    and live_payload["max_chars_per_search"] is not None):
+                last_max = (last.get("derived") or {}).get(
+                    "payload_max_chars_measured")
+                if last_max is None or live_payload["max_chars_per_search"] > last_max:
+                    trigger = "payload_threshold_crossed"
+
         if trigger is None:
             return
-        record = _build_capacity_record(capability, fingerprint, trigger)
+        record = _build_capacity_record(capability, fingerprint, trigger, coordinator)
         await _append_capacity_record(record)
         global _capacity_latest
         _capacity_latest = record
@@ -3761,7 +4103,7 @@ async def main() -> None:
     # Backend capability probe — measures whether the critical backends can
     # actually SERVE, not merely whether they answer /health.
     capability_task   = asyncio.create_task(
-        _capability_probe_daemon(proxy, stop_event))
+        _capability_probe_daemon(proxy, stop_event, coordinator))
     # A2: periodic lifecycle token-count sum lines (no-op unless
     # TOKEN_LIFECYCLE_SUM_INTERVAL_S is set) — the unconditional shutdown
     # emission happens later in the drain sequence below regardless.
