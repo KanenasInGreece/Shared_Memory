@@ -5,6 +5,50 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.31] — 2026-08-23
+
+### Fixed — a backup manifest field that could only ever say zero
+
+- **`pg_toc_entries` was computed on the host, where the tooling does not live.** `backup.sh` ran
+  `command -v pg_restore` on the machine, while Postgres runs in a container — so the check always
+  failed, the `|| echo 0` branch always fired, and every manifest this framework has ever written
+  recorded `0`. Measured: a real 22 MB set whose manifest says `0` actually holds **189** entries.
+  It is now counted inside the database container, using the same idiom the rest of the script
+  already uses to reach Postgres. `--verify`'s own copy of the broken check is fixed with it — it had
+  been silently skipping the cross-check forever.
+- **A recorded `0` is treated as "predates a working count", not as a real value** — it is the only
+  number the old code could produce, so every backup set made before this release still verifies
+  cleanly instead of turning into a false mismatch.
+- **The manifest now records whether the set was quiesced**, and how — a full drain or a drain that
+  timed out. An operator holding a backup could not previously tell whether client writes were shed
+  when it was taken, while `restore.sh`'s own closing message already warned that a count mismatch
+  "can be normal if the backup ran without full quiesce". Older manifests read as **unknown**, never
+  as "not quiesced".
+
+### Changed — the agent install path drives the installer instead of re-implementing it
+
+- **Phase 1 now runs `install_framework.sh` rather than mirroring what it does.** The agent path had
+  hand-copied the file write and directory creation and never picked up the `chown` the script
+  performs for Neo4j's `import`/`plugins` dirs — so agent-driven installs silently skipped it and the
+  container crash-loops on "/import is not accessible". That was the second instance of one class: an
+  agent path that mirrors a helper's side effects stays correct only until the helper grows a new one.
+  Driving the script means this phase changes when the script changes. A test pins the documented
+  answer sequence against the prompts the script actually issues, deriving both sides rather than
+  restating either, so the coupling cannot drift silently.
+- **Phase 8b names opencode's constitution file** (`~/.config/opencode/AGENTS.md`), says the
+  `AGENT_INSTALLS` registry is the real roster and the prose list only illustrative, and warns that a
+  repository clone on the same machine is **never** the copy to install from — only the installed
+  skill's own file, whose path is now stated explicitly. A same-machine clone can sit on a different
+  tag than the last sync, so copying from it installs something the skill does not ship.
+- **Phase 0 asks about the GPU** (a GPU host could silently end up CPU-only), Phase 1 reads the render
+  group with `stat` instead of assuming the name `video` (wrong on Debian), Phase 2 covers docker's
+  `data-root` sizing, and Phase 3 says which steps cross the root boundary.
+- **Adding an agent has a documented order.** `--add` refuses a target directory that does not exist
+  (so a minted token is never silently discarded) while sync only creates paths the registry already
+  names — two correct guards that are jointly circular. The runbook now says: create the directory,
+  mint, then sync.
+- **README and `AGENTS.md` say eight assertions**, matching the contract since 0.9.25.
+
 ## [0.9.30] — 2026-08-22
 
 ### Fixed — an agent could not run the skill on a machine where you can run it yourself

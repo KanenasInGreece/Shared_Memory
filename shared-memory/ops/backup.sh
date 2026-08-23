@@ -110,13 +110,21 @@ command -v python3     >/dev/null || die "python3 not found (needed for JSON par
 command -v sha256sum   >/dev/null || die "sha256sum not found"
 
 # Pull one scalar out of a JSON object on stdin (dotted path). Empty on any
-# miss/parse error — robust to an empty or non-JSON response (no stack trace).
+# miss/parse error, OR on a key that is genuinely absent — robust to an empty
+# or non-JSON response (no stack trace) AND indistinguishable from "this
+# manifest predates the field", which is deliberate: callers must treat
+# absence as unknown, never coerce it to a false/zero value. bool is a
+# subclass of int in Python, so it is special-cased to "true"/"false" text —
+# without this, a JSON `false` would print as the ambiguous Python "False".
 json_get() { python3 -c 'import sys,json
 try:
     d=json.load(sys.stdin)
     for k in sys.argv[1].split("."):
         d=d.get(k,{}) if isinstance(d,dict) else {}
-    print(d if isinstance(d,(int,float,str)) else "")
+    if isinstance(d, bool):
+        print(str(d).lower())
+    else:
+        print(d if isinstance(d,(int,float,str)) else "")
 except Exception:
     print("")' "$1" 2>/dev/null; }
 
@@ -189,6 +197,13 @@ cleanup_secrets_dir() {
 # _SECRETS_DIR/_AUTH_HEADER_FILE/_NEO4J_ENV_FILE/_PG_ENV_FILE above) is
 # already defined earlier in the script — QUIESCED was the one gap.
 QUIESCED=0
+# Set alongside QUIESCED, by quiesce() below, so the manifest can record HOW
+# a quiesced backup was quiesced: "full" (200 — daemons drained cleanly) or
+# "timeout" (202 — the drain wait ran out; a daemon MAY have written during
+# the dump). Empty when QUIESCED=0 (quiesce never engaged at all). resume()
+# does not touch this — do_backup reads it before resume() runs, same as it
+# must read QUIESCED itself before resume() zeroes that.
+QUIESCE_MODE=""
 
 # One trap, active for the whole script (not just do_backup): resume() is a
 # no-op unless quiesce() actually succeeded (QUIESCED guard), and
@@ -207,8 +222,8 @@ quiesce() {
     -d "{\"state\":\"quiesce\",\"max_seconds\":$BACKUP_QUIESCE_MAX_SECONDS}")" || return 1
   code="$(tail -n1 <<<"$resp")"; body="$(sed '$d' <<<"$resp")"
   case "$code" in
-    200) QUIESCED=1; grn "  ✓ quiesced — client writes shed, daemons drained" ;;
-    202) QUIESCED=1; ylw "  ! quiesced — daemon drain TIMED OUT; a daemon may write during the dump ($(json_get daemons <<<"$body"))" ;;
+    200) QUIESCED=1; QUIESCE_MODE="full";    grn "  ✓ quiesced — client writes shed, daemons drained" ;;
+    202) QUIESCED=1; QUIESCE_MODE="timeout"; ylw "  ! quiesced — daemon drain TIMED OUT; a daemon may write during the dump ($(json_get daemons <<<"$body"))" ;;
     *)   ylw "  ! quiesce request returned HTTP $code"; return 1 ;;
   esac
   return 0
@@ -258,6 +273,23 @@ dump_postgres() {  # $1 = dest path
   $DOCKER exec --env-file "$_PG_ENV_FILE" "$PG_CONTAINER" \
     pg_dump -U "$PG_USER" -Fc "$PG_DB" > "$1.tmp" 2>/dev/null \
     && mv "$1.tmp" "$1" || { rm -f "$1.tmp"; return 1; }
+}
+
+# List a .pgdump archive's table-of-contents entry count via the CONTAINER's
+# pg_restore. This does NOT run pg_restore on the host: Postgres runs only in
+# $PG_CONTAINER, the host carries no postgres client tools, and the previous
+# form of this check (`command -v pg_restore` on the host) always failed —
+# silently falling through to a hardcoded 0 in every manifest this framework
+# has ever written (measured: a real set's manifest said 0, listing the same
+# dump inside the container reported 189). The archive lives on the HOST
+# filesystem (dump_postgres streams pg_dump's stdout out of the container to
+# a host path), so it is piped IN via stdin (`docker exec -i`) rather than
+# passed as a path pg_restore would have to find inside the container.
+# --list only parses the archive's header/TOC — it opens no database
+# connection and needs no credentials, so this needs no --env-file, unlike
+# every other Postgres call in this script.
+pgdump_toc() {  # $1 = path to a .pgdump file → TOC entry count on stdout, or empty on failure
+  $DOCKER exec -i "$PG_CONTAINER" pg_restore --list < "$1" 2>/dev/null | grep -cvE '^;|^$'
 }
 
 # Resolve Neo4j's configured import dir (where APOC writes) so we read the export
@@ -332,11 +364,51 @@ do_verify() {
 
   # 2. structural integrity
   if gzip -t "$base.cypher.gz" 2>/dev/null; then grn "  ✓ cypher.gz gzip integrity OK"; else red "  ✗ cypher.gz corrupt"; fail=1; fi
-  if command -v pg_restore >/dev/null; then
-    if pg_restore --list "$base.pgdump" >/dev/null 2>&1; then grn "  ✓ pgdump archive readable (pg_restore --list)"; else red "  ✗ pgdump archive unreadable"; fail=1; fi
+  # pg_restore --list runs via the CONTAINER, same as the manifest's own
+  # pg_toc_entries computation (pgdump_toc, above) — the host carries no
+  # postgres client tools, so a host-side `command -v pg_restore` check here
+  # always failed and this archive-readable check silently never ran on any
+  # of our own installs. Re-derive the count live and, when the manifest
+  # carries one (a manifest written before this fix has none — absence is
+  # unknown, never treated as a mismatch), cross-check it: a live count that
+  # disagrees with what was recorded at backup time is a real integrity
+  # signal now that both sides come from the same tool.
+  local live_toc manifest_toc
+  live_toc="$(pgdump_toc "$base.pgdump")"
+  manifest_toc="$(json_get pg_toc_entries < "$manifest")"
+  if [[ "$live_toc" =~ ^[0-9]+$ ]]; then
+    # A recorded "0" is not a genuinely observed zero-entry archive — it is
+    # the ONLY value the pre-fix host-side check could ever write (`command
+    # -v pg_restore` always failed on the host, so the `|| echo 0` branch
+    # always fired), so it means the same thing absence does: this manifest
+    # predates a working count. Treating it as a real recorded value would
+    # turn every backup set made before this fix into a false MISMATCH.
+    if [[ -n "$manifest_toc" && "$manifest_toc" != "0" ]]; then
+      if [[ "$live_toc" == "$manifest_toc" ]]; then
+        grn "  ✓ pgdump archive readable, TOC entries $live_toc (matches manifest)"
+      else
+        red "  ✗ pgdump TOC entries $live_toc, manifest recorded $manifest_toc — MISMATCH"; fail=1
+      fi
+    else
+      grn "  ✓ pgdump archive readable via container pg_restore, TOC entries $live_toc (manifest predates a working count — nothing to cross-check)"
+    fi
   else
-    ylw "  ! pg_restore not on host — skipped archive TOC check (sha256 still validated)"
+    red "  ✗ pgdump archive unreadable (container pg_restore --list failed)"; fail=1
   fi
+
+  # 3. quiesce state — informational only, never fails verification (an
+  # unquiesced backup is a valid, restorable backup; restore.sh's own
+  # closing message already says a count mismatch "can be normal if the
+  # backup ran without full quiesce" — this makes that possibility visible
+  # up front instead of only after a confusing post-restore count).
+  local quiesced quiesce_mode
+  quiesced="$(json_get quiesced < "$manifest")"
+  quiesce_mode="$(json_get quiesce_mode < "$manifest")"
+  case "$quiesced" in
+    true)  grn "  i quiesced at backup time (${quiesce_mode:-full drain})" ;;
+    false) ylw "  i NOT quiesced at backup time — a daemon may have written during the dump" ;;
+    *)     ylw "  i quiesce state unknown (manifest predates this field)" ;;
+  esac
 
   echo
   [[ "$fail" -eq 0 ]] && { grn "Backup set VERIFIED."; return 0; } || die "Backup set FAILED verification."
@@ -361,6 +433,11 @@ do_backup() {
   # Counts captured under quiesce for the manifest.
   local nodes rels; nodes="$(neo4j_count 'MATCH (n) RETURN count(n)')"; rels="$(neo4j_count 'MATCH ()-[r]->() RETURN count(r)')"
 
+  # Capture the quiesce state for the manifest BEFORE resume() zeroes QUIESCED
+  # (QUIESCE_MODE is untouched by resume(), but read it here too so both
+  # values are snapshotted together at the same point in the flow).
+  local was_quiesced="$QUIESCED" quiesce_mode="$QUIESCE_MODE"
+
   # Dump Postgres FIRST (source of truth + outbox), then Neo4j.
   dump_postgres "$base.pgdump"   || die "pg_dump failed"
   grn "  ✓ postgres dumped"
@@ -373,15 +450,19 @@ do_backup() {
   local pg_sha neo_sha pg_toc
   pg_sha="$(sha256sum "$base.pgdump"    | awk '{print $1}')"
   neo_sha="$(sha256sum "$base.cypher.gz" | awk '{print $1}')"
-  pg_toc="$(command -v pg_restore >/dev/null && pg_restore --list "$base.pgdump" 2>/dev/null | grep -cvE '^;|^$' || echo 0)"
+  pg_toc="$(pgdump_toc "$base.pgdump")"
+  [[ "$pg_toc" =~ ^[0-9]+$ ]] || { ylw "  ! could not list pgdump TOC via the container — recording pg_toc_entries as null (sha256/gzip integrity still validated)"; pg_toc=""; }
   python3 - "$base.manifest.json" <<PY
 import json, sys
 json.dump({
   "name": "$name", "created": "$(date -Iseconds)",
   "pg_db": "$PG_DB",
-  "pg_file": "$name.pgdump", "pg_sha256": "$pg_sha", "pg_toc_entries": int("$pg_toc" or 0),
+  "pg_file": "$name.pgdump", "pg_sha256": "$pg_sha",
+  "pg_toc_entries": int("$pg_toc") if "$pg_toc" else None,
   "neo4j_file": "$name.cypher.gz", "neo4j_sha256": "$neo_sha",
   "neo4j_nodes": "${nodes:-}", "neo4j_rels": "${rels:-}",
+  "quiesced": bool($was_quiesced),
+  "quiesce_mode": "$quiesce_mode" or None,
 }, open(sys.argv[1], "w"), indent=2)
 PY
   grn "  ✓ manifest written"

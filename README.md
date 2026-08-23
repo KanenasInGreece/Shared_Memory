@@ -317,9 +317,10 @@ idempotent and safe to re-run.
 
 9. **Verify the install.** Back on the gateway host:
    `export AGENT_TOKEN=...` (any token from step 5), then
-   `bash shared-memory/scripts/postflight.sh` — seven assertions that prove the stack end to
-   end, from health payload shapes to a canary save traced into both stores, and a baseline
-   JSON of this hardware's save/search timings for later comparison. The contract it checks
+   `bash shared-memory/scripts/postflight.sh` — eight assertions that prove the stack end to
+   end, from health payload shapes to a canary save traced into both stores, a real completion
+   driven through the reasoning backend, and a baseline JSON of this hardware's save/search
+   timings for later comparison. The contract it checks
    is [`shared-memory/Documentation/postflight.md`](shared-memory/Documentation/postflight.md);
    re-run it after every upgrade.
 
