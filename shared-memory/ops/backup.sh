@@ -91,6 +91,11 @@ NEO4J_USER="${NEO4J_USER:-neo4j}"
 NEO4J_IMPORT_DIR="${NEO4J_IMPORT_DIR:-/var/lib/neo4j/import}"
 BACKUP_DIR="${BACKUP_DIR:-$HOME/.shared-memory/backups}"
 BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
+# The framework's own logs: credential + gateway audit trails, dreaming metrics,
+# daily logs. Captured by default — they exist nowhere else, and the monitor
+# reads this directory to surface warnings.
+BACKUP_INCLUDE_LOGS="${BACKUP_INCLUDE_LOGS:-1}"
+LOG_DIR="${SHARED_MEMORY_LOG_DIR:-$HOME/.shared-memory/logs}"
 BACKUP_LOCKFILE="${BACKUP_LOCKFILE:-$HOME/.shared-memory/backup.lock}"
 # Both the drain wait AND the quiesce TTL: /admin/backup blocks up to this long
 # waiting for the dream daemons to drain, then returns 202 and holds the fence for
@@ -364,6 +369,20 @@ do_verify() {
 
   # 2. structural integrity
   if gzip -t "$base.cypher.gz" 2>/dev/null; then grn "  ✓ cypher.gz gzip integrity OK"; else red "  ✗ cypher.gz corrupt"; fail=1; fi
+  local logs_sha_m; logs_sha_m="$(json_get logs_sha256 < "$manifest")"
+  if [[ -n "$logs_sha_m" ]]; then
+    if [[ ! -f "$base.logs.tar.gz" ]]; then
+      red "  ✗ manifest claims a logs artifact but $base.logs.tar.gz is missing"; fail=1
+    elif [[ "$(sha256sum "$base.logs.tar.gz" | awk '{print $1}')" == "$logs_sha_m" ]]; then
+      grn "  ✓ logs archive sha256 OK"
+    else
+      red "  ✗ logs archive sha256 MISMATCH"; fail=1
+    fi
+  else
+    # Absence is normal: every set written before logs were captured has none.
+    echo "  i no logs artifact in this set (predates log capture, or disabled)"
+  fi
+
   # pg_restore --list runs via the CONTAINER, same as the manifest's own
   # pg_toc_entries computation (pgdump_toc, above) — the host carries no
   # postgres client tools, so a host-side `command -v pg_restore` check here
@@ -448,6 +467,33 @@ do_backup() {
 
   # Manifest LAST — its presence marks the set complete (verify keys off it).
   local pg_sha neo_sha pg_toc
+  # ── The framework logs are the FOURTH artifact ─────────────────────────────
+  #
+  # A set used to be exactly the two stores, which meant a restored host came up
+  # with the corpus and NO operational history: the credential audit trail, the
+  # gateway audit trail, the dreaming metrics and the daily logs all live only in
+  # $LOG_DIR and were in no backup. The monitor reads that directory directly
+  # (its logs_reader), so a restored deployment showed a healthy corpus and could
+  # not surface a single warning — it had nothing to read.
+  #
+  # 2.4 MB against a 21 MB dump on a real install: the cost is not the reason
+  # this was ever left out. Opt out with BACKUP_INCLUDE_LOGS=0 for a deployment
+  # that does not want audit trails leaving the host.
+  logs_sha=""; logs_bytes=""
+  if [[ "$BACKUP_INCLUDE_LOGS" == "1" && -d "$LOG_DIR" ]]; then
+    if tar czf "$base.logs.tar.gz" -C "$(dirname "$LOG_DIR")" "$(basename "$LOG_DIR")" 2>/dev/null; then
+      logs_sha="$(sha256sum "$base.logs.tar.gz" | awk '{print $1}')"
+      logs_bytes="$(stat -c%s "$base.logs.tar.gz" 2>/dev/null || echo '')"
+      grn "  ✓ logs captured ($(du -h "$base.logs.tar.gz" | awk '{print $1}'))"
+    else
+      # Never fatal: the corpus is the thing that cannot be reconstructed. A
+      # missing logs artifact is recorded as absent, which restore reads the same
+      # way it reads a set written before this existed.
+      ylw "  ! could not capture $LOG_DIR — continuing without it"
+      rm -f "$base.logs.tar.gz"
+    fi
+  fi
+
   pg_sha="$(sha256sum "$base.pgdump"    | awk '{print $1}')"
   neo_sha="$(sha256sum "$base.cypher.gz" | awk '{print $1}')"
   pg_toc="$(pgdump_toc "$base.pgdump")"
@@ -463,6 +509,9 @@ json.dump({
   "neo4j_nodes": "${nodes:-}", "neo4j_rels": "${rels:-}",
   "quiesced": bool($was_quiesced),
   "quiesce_mode": "$quiesce_mode" or None,
+  "logs_file": "$name.logs.tar.gz" if "$logs_sha" else None,
+  "logs_sha256": "$logs_sha" or None,
+  "logs_bytes": int("$logs_bytes") if "$logs_bytes" else None,
 }, open(sys.argv[1], "w"), indent=2)
 PY
   grn "  ✓ manifest written"
