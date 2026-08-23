@@ -173,3 +173,77 @@ def test_agents_md_states_postflights_actual_exit_condition():
         "but AGENTS.md's Phase 9 section does not say the same thing -- "
         "it is quoting a stale assertion range again."
     )
+
+
+def test_agents_md_pipes_the_right_number_of_answers_into_install_framework():
+    """GROUP 5. AGENTS.md's Phase 1 no longer hand-mirrors install_framework.sh
+    (D11 fix, fix round) -- it DRIVES it via piped stdin, feeding N
+    newline-delimited answers in the order the script's prompts appear. That
+    killed the "hand-copied step list drifts from what the script actually
+    does" class, but replaced it with an UNPROTECTED coupling: nothing
+    checked that N, or the mix of plain-answer vs y/n prompts, still matches
+    what the script asks. Unlike a wrong VALUE, a desynced COUNT fails
+    SILENTLY -- if the script gains, loses or reorders a prompt, answer 4
+    (a password) lands wherever prompt 4 now is, with no error at all.
+
+    Both sides are derived from their own source, never hardcoded here: the
+    script side by structurally counting its own `ask`/`ask_secret` call
+    sites and top-level `read -r -p` calls (excluding the already-exists
+    overwrite prompt, which fires ONLY when shared-memory/.env already
+    exists -- a path AGENTS.md's documented flow explicitly skips itself
+    for -- and excluding the `read` lines INSIDE the ask()/ask_secret()
+    function BODIES, which are counted once per call site below instead of
+    once per definition); the doc side by parsing the literal printf format
+    string AGENTS.md actually pipes into the script.
+    """
+    script = _read("shared-memory", "scripts", "install_framework.sh")
+
+    stripped = re.sub(r'if \[ -f "\$ENV_FILE" \]; then\n.*?\nfi\n', "", script,
+                       count=1, flags=re.S)
+    assert stripped != script, (
+        "install_framework.sh's already-exists overwrite block has changed "
+        "shape — update this test's regex before trusting its result")
+
+    stripped = re.sub(r"^ask\(\) \{.*?\n\}\n", "", stripped, count=1, flags=re.M | re.S)
+    stripped = re.sub(r"^ask_secret\(\) \{.*?\n\}\n", "", stripped, count=1, flags=re.M | re.S)
+    assert "read -r -p \"$1 [$2]: \"" not in stripped and "read -r -s -p \"$1: \"" not in stripped, (
+        "ask()/ask_secret()'s function bodies were not stripped — update this test's regex")
+
+    script_sequence = []
+    for m in re.finditer(r"\$\(ask_secret\b|\$\(ask\b|read -r -s -p |read -r -p ", stripped):
+        tok = m.group(0)
+        script_sequence.append(
+            "confirm" if tok.startswith("read") else
+            "secret" if "ask_secret" in tok else "value"
+        )
+    assert script_sequence, "no prompts extracted from install_framework.sh — the regex has rotted"
+
+    agents = _read("AGENTS.md")
+    m = re.search(
+        r"printf '([^']*)'[^\n]*\\\n\s*\|\s*bash shared-memory/scripts/install_framework\.sh",
+        agents,
+    )
+    assert m, (
+        "AGENTS.md's Phase 1 no longer pipes a printf'd answer sequence into "
+        "install_framework.sh the way this test expects — either update the "
+        "regex, or Phase 1 has reverted to hand-mirroring the script again "
+        "(the exact class the D11 fix this test guards exists to prevent)."
+    )
+    piped = [t for t in m.group(1).split(r"\n") if t != ""]
+    piped_confirm_count = sum(1 for t in piped if t != "%s")
+    script_confirm_count = sum(1 for t in script_sequence if t == "confirm")
+
+    assert len(piped) == len(script_sequence), (
+        f"install_framework.sh's fresh-.env path now issues {len(script_sequence)} "
+        f"prompts (types, in order: {script_sequence}), but AGENTS.md's Phase 1 "
+        f"printf line pipes {len(piped)} answers into it. The script's prompt "
+        "sequence changed — update AGENTS.md's Phase 1 piped-answer line (and "
+        "its explanatory prose) to match, in the same order, or an answer will "
+        "silently land in the wrong field."
+    )
+    assert piped_confirm_count == script_confirm_count, (
+        f"install_framework.sh's fresh-.env path now asks {script_confirm_count} "
+        f"y/n-style questions, but AGENTS.md's Phase 1 printf line pipes "
+        f"{piped_confirm_count} literal y/n answers ('y'/'n', not '%s') — update "
+        "AGENTS.md's Phase 1 piped-answer line to match."
+    )
