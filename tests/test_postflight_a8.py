@@ -639,3 +639,51 @@ def test_a6_baseline_corpus_size_is_null_when_undeterminable(tmp_path):
 def test_a6_prints_corpus_size_summary_line():
     text = POSTFLIGHT.read_text()
     assert "A6 corpus size at this baseline" in text
+
+
+def test_every_postflight_curl_declares_it_accepts_compression():
+    """A8 blamed the backend for postflight's own missing flag.
+
+    MEASURED on a host whose only reasoning backend is an external API:
+    DeepSeek gzips its responses, the gateway proxies the encoding through,
+    and A8's curl wrote gzip bytes to its response file. It then found no
+    content and reported "gateway returned HTTP 200 but no usable completion
+    content — healthy backend(s) at request time: <the API>", naming the
+    backend for a defect that was entirely local. A direct call with
+    --compressed to the same gateway, same model, same moment, returned
+    content 'ok' with finish_reason 'stop'.
+
+    It passed on the reference workstation throughout, because a local
+    llama-server does not gzip — so this is invisible until an install
+    routes A8 at an external backend, which is exactly the configuration
+    A8 exists to prove.
+
+    memory_bridge.py is unaffected: httpx negotiates and decodes content
+    encoding on its own. Only postflight's raw curl had to ask.
+
+    ⚠ The matcher anchors on the WORD curl, not on `curl -s`. An earlier
+    version keyed on `curl -s` and let three real forms through —
+    `curl --silent`, `curl -fsSL` (which update_skill.sh actually uses) and
+    `curl  -s` with two spaces. It also counted `--compressed` anywhere in
+    the file, so prose mentions alone could have satisfied it.
+    """
+    path = os.path.join(os.path.dirname(__file__), "..",
+                        "shared-memory", "scripts", "postflight.sh")
+    raw = open(path, encoding="utf-8").read()
+    # Join backslash continuations so a multi-line invocation is one unit.
+    joined = re.sub(r"\\\n\s*", " ", raw)
+
+    invocations = []
+    for line in joined.split("\n"):
+        if line.lstrip().startswith("#"):
+            continue
+        # `curl` at a command position: start, or after a shell operator.
+        if re.search(r"(?:^|[|;&(]|\$\()\s*!?\s*curl\b", line):
+            invocations.append(line.strip())
+
+    assert invocations, "no curl invocation found in postflight.sh at all"
+    missing = [i for i in invocations if "--compressed" not in i]
+    assert not missing, (
+        "postflight curl invocation(s) without --compressed — a gzipping "
+        f"backend makes these read as an empty response: {missing}"
+    )

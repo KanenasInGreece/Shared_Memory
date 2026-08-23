@@ -5,6 +5,55 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.34] — 2026-08-23
+
+### Fixed — the install verification could never check an external reasoning backend
+
+- **`postflight.sh` now asks for compressed responses.** It used `--compressed` nowhere, and a
+  hosted API gzips where a local `llama-server` does not — so A8 wrote gzip bytes to its response
+  file, found no content, and reported "HTTP 200 but no usable completion content", **naming the
+  backend for a defect that was entirely local**. A direct request to the same gateway, same model,
+  same moment returned a normal completion. The check passed everywhere it was ever run, because it
+  only fails when pointed at exactly the configuration it exists to prove.
+
+### Changed — the sudo grant for an unattended install is scoped, validated and self-removing
+
+- **The runbook no longer asks for unrestricted root.** It described installing
+  `<user> ALL=(ALL) NOPASSWD: ALL` — passwordless root for the account, not the install, with
+  cleanup depending on the agent remembering. It now generates a scoped grant covering only the
+  steps the same file enumerates as needing root, validates it with `visudo -cf` before installing
+  it, writes it `0440`, and makes the file say what created it and how to remove it.
+- **It is honest about what the scoping does and does not buy.** A package-manager entry runs
+  maintainer scripts as root and is a root shell in disguise; docker-group membership and a `tee`
+  into `sysctl.d` are each one step from root; only two of the five are genuinely narrow. Handing
+  the user each command remains the default and the safer path.
+- **Binaries are resolved on the target host, not guessed.** Paths differ by distribution —
+  `usermod`, `sysctl` and `visudo` live in `/usr/bin` on Fedora and `/usr/sbin` on Debian and
+  Ubuntu, and Debian keeps `sbin` off a normal user's `PATH` entirely, so a lookup that works for
+  the operator finds nothing for the tools the grant needs. They are now resolved the way the root
+  shell that will run them resolves them, and a missing one stops with its own name.
+- Docker's own install commands are taken from Docker's current instructions per distribution, and
+  the Neo4j ownership step the installer falls back to is now covered as well.
+
+### Changed — the capacity signal is measured against payloads that actually occur
+
+- **The projected service time now rests on the largest payload really observed**, not on a
+  theoretical maximum no query produces. On the reference machine that theoretical basis was roughly
+  five times the biggest real search and seven times the average, which made the gateway report that
+  a single search exceeded a tolerable wait while real searches completed in seconds. The tolerance
+  itself was never the problem and is unchanged.
+- **The record says which basis it used**, with the sample count and observed maximum behind it, so
+  a reader never has to guess. Until enough searches have been seen it falls back to the theoretical
+  basis and says so. The average is reported alongside as context and gates nothing.
+- **A new derivation is taken whenever a larger payload appears than the stored record knows about.**
+  An earlier attempt keyed this to process-local state and so could fire only once per installation:
+  after any restart it went permanently quiet while continuing to report a sample count and a
+  maximum belonging to a process that no longer existed — and lower than reality, which is the
+  dangerous direction for a capacity bound. Comparing against the durable record instead makes it
+  restart-safe, and firings stay rare because new high-water marks are rare.
+
+---
+
 ## [0.9.33] — 2026-08-23
 
 ### Added — the agent install path never said how to get the code

@@ -203,21 +203,28 @@ copy. To move it: stop docker, set `"data-root": "/new/path"` in `/etc/docker/da
 
 Raise inotify limits per README §4 (needs sudo — give the user the commands to run if you cannot). On Fedora/RHEL with SELinux, keep the `:z` suffixes on the compose volume mounts.
 
-**Sudo for an agent-driven install:** several steps here need root (package install, inotify, dir ownership). Either hand the user each command to run in their own terminal, or ask them to grant the session temporary passwordless sudo — from a real terminal (an agent session has no TTY for the password prompt):
+**Sudo for an agent-driven install:** several steps here need root (package install, inotify, dir
+ownership, one Docker-group membership). The default, and the safer path, is to hand the user each
+command below and let them type it themselves in their own terminal — nothing needs a standing
+grant when the operator is present to answer a password prompt a handful of times. Reach for a
+temporary sudo grant only when the install is genuinely unattended and the agent must drive Phase 3
+itself; even then, scope the grant to the commands actually needed rather than to the account.
 
-```bash
-ssh -t <host> "echo '<user> ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/99-<user>-temp"
-```
-
-and **delete `/etc/sudoers.d/99-<user>-temp` at the end of the session** — offer that cleanup unprompted. On Fedora/RHEL, docker itself is the first thing needing it: the distro ships podman, and the helper scripts call the docker CLI.
-
-**Which steps actually need root**, enumerated so a temporary-sudo grant can cover all of them in
-one window instead of being discovered piecemeal mid-install:
-- Before Phase 0 — installing `git`, only if you clone and the host has none; the tarball route
-  avoids it.
-- Phase 3 — installing the Docker Engine + Compose v2 packages themselves (`apt`/`dnf install …`).
+**Which steps actually need root**, enumerated so a scoped grant can cover exactly these instead of
+discovering them piecemeal mid-install:
+- Before Phase 0 — installing `git`, only if you clone and the host has none (`apt install git` /
+  `dnf install git`, per `preflight.sh`'s own remedy); the tarball route avoids it.
+- Phase 1, only as a fallback — `install_framework.sh` chowns Neo4j's `import`/`plugins` dirs to
+  uid 7474 itself, falling back to a rootless `docker run … chown` if plain `chown` fails, and only
+  printing `sudo chown -R 7474:7474 "$NEO4J_HOST_DIR"/{import,plugins}` for the human to run if
+  neither works.
+- Phase 3 — Docker's own repository bootstrap and the package install itself (the exact commands
+  are in the grant script below, since they differ by distro).
 - Phase 3 — `systemctl enable --now docker`, `usermod -aG docker $USER` (group membership needs a
-  fresh login/shell to take effect — do not expect it to apply to the CURRENT shell).
+  fresh login/shell to take effect — do not expect it to apply to the CURRENT shell). Treat that
+  membership as one step from full root: anyone who can reach the docker socket can mount the host
+  filesystem into a container and read or write it as root. This project does not currently support
+  a rootless-Docker alternative, so there is no narrower option to recommend here.
 - Phase 3 — raising inotify limits (`sysctl`, per README §4).
 - Phase 3, only if `docker.io` was ever installed on this host — `apt purge docker-buildx`,
   `dpkg --configure -a` (the recovery two paragraphs up).
@@ -227,6 +234,117 @@ one window instead of being discovered piecemeal mid-install:
 
 Everything else in this file — `docker compose`, `docker exec`, the Python/bash helper scripts, the
 skill itself — runs as the ordinary user; do not `sudo` anything not on this list.
+
+**A scoped grant, derived on the target host rather than guessed.** Identify the distro from
+`/etc/os-release` (`ID`, falling back to `ID_LIKE`) — this repo tests Debian, Ubuntu and Fedora, so
+anything else stops rather than guessing a package manager or a repository URL. Resolve every
+binary the grant needs, by name, before building anything, so a missing tool fails as itself rather
+than as a downstream `visudo` parse error — and resolve each one under a PATH with the sbin
+directories prepended, not the invoking user's bare `PATH`: every one of these runs as root once
+`sudo` invokes it, and root's PATH includes sbin, so looking them up any other way asks the wrong
+question (Debian keeps sbin off a normal user's `PATH` entirely; `usermod`/`sysctl`/`visudo` are
+invisible to plain `command -v` there even though they're on disk). Save this as a script and run
+it on the target host, from a real terminal (an agent session has no TTY for the sudo password
+prompt), from the repo root:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ -r /etc/os-release ]] || { echo "cannot identify this host: /etc/os-release is missing" >&2; exit 1; }
+. /etc/os-release
+DISTRO=""
+case "$ID" in
+  ubuntu) DISTRO=ubuntu ;; debian) DISTRO=debian ;; fedora) DISTRO=fedora ;;
+  *) case " ${ID_LIKE:-} " in
+       *" ubuntu "*) DISTRO=ubuntu ;; *" debian "*) DISTRO=debian ;; *" fedora "*) DISTRO=fedora ;;
+     esac ;;
+esac
+[[ -n "$DISTRO" ]] || { echo "unrecognized distro (ID=${ID:-unset}) — hand the user each root command instead" >&2; exit 1; }
+
+COMMON_BINS="systemctl usermod tee sysctl chown loginctl visudo"
+case "$DISTRO" in
+  debian|ubuntu) DISTRO_BINS="apt install curl chmod dpkg" ;;
+  fedora)        DISTRO_BINS="dnf" ;;
+esac
+for b in $COMMON_BINS $DISTRO_BINS; do
+  path="$(PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH" command -v "$b")" || \
+    { echo "required tool not found: $b" >&2; exit 1; }
+  printf -v "BIN_${b^^}" '%s' "$path"
+done
+
+NEO4J_HOST_DIR="$(grep '^NEO4J_HOST_DIR=' shared-memory/.env | cut -d= -f2- || true)"
+[[ -n "$NEO4J_HOST_DIR" ]] || { echo "NEO4J_HOST_DIR not in shared-memory/.env — run Phase 1 first" >&2; exit 1; }
+GRANT_USER="$(id -un)"
+STAGE="$(mktemp -d)"; chmod 700 "$STAGE"           # private dir — no predictable /tmp path to race
+SUDOERS_FILE="$STAGE/99-shared-memory-temp"
+
+{
+  echo "# Shared Memory Framework: temporary install grant, created $(date -Is) by $GRANT_USER"
+  echo "# for an agent-driven install of this repo ($DISTRO). Remove once Phase 3 (and the"
+  echo "# Phase 7 linger fallback, if it fired) are done:"
+  echo "#   sudo rm /etc/sudoers.d/99-shared-memory-temp"
+  echo
+
+  if [[ "$DISTRO" == fedora ]]; then
+    echo "Cmnd_Alias SM_INSTALL_PKGS = $BIN_DNF config-manager addrepo --from-repofile https\\://download.docker.com/linux/fedora/docker-ce.repo, \\"
+    echo "    $BIN_DNF install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin, $BIN_DNF install git"
+  else
+    echo "Cmnd_Alias SM_INSTALL_PKGS = $BIN_APT update, $BIN_APT install ca-certificates curl, \\"
+    echo "    $BIN_INSTALL -m 0755 -d /etc/apt/keyrings, \\"
+    echo "    $BIN_CURL -fsSL https\\://download.docker.com/linux/$DISTRO/gpg -o /etc/apt/keyrings/docker.asc, \\"
+    echo "    $BIN_CHMOD a+r /etc/apt/keyrings/docker.asc, \\"
+    echo "    $BIN_TEE /etc/apt/sources.list.d/docker.sources, \\"
+    echo "    $BIN_APT install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin, \\"
+    echo "    $BIN_APT install git, $BIN_APT purge docker-buildx, $BIN_DPKG --configure -a"
+  fi
+
+  echo "Cmnd_Alias SM_DOCKER_SETUP = $BIN_SYSTEMCTL enable --now docker, $BIN_USERMOD -aG docker $GRANT_USER"
+  echo "Cmnd_Alias SM_INOTIFY = $BIN_TEE /etc/sysctl.d/90-inotify.conf, \\"
+  echo "    $BIN_TEE -a /etc/sysctl.d/90-inotify.conf, $BIN_SYSCTL -p /etc/sysctl.d/90-inotify.conf"
+  echo "Cmnd_Alias SM_NEO4J_CHOWN = $BIN_CHOWN -R 7474\\:7474 $NEO4J_HOST_DIR/import $NEO4J_HOST_DIR/plugins"
+  echo "Cmnd_Alias SM_LINGER = $BIN_LOGINCTL enable-linger $GRANT_USER"
+  echo "$GRANT_USER ALL=(root) NOPASSWD: SM_INSTALL_PKGS, SM_DOCKER_SETUP, SM_INOTIFY, SM_NEO4J_CHOWN, SM_LINGER"
+} > "$SUDOERS_FILE"
+
+"$BIN_VISUDO" -cf "$SUDOERS_FILE" && \
+  sudo install -m 0440 -o root -g root "$SUDOERS_FILE" /etc/sudoers.d/99-shared-memory-temp
+rm -rf "$STAGE"
+```
+
+A literal `:` in a sudoers command argument (a URL's `https://`, `chown`'s `uid:gid`) must be
+backslash-escaped or `visudo` rejects the whole file with a syntax error — both are escaped above,
+confirmed by feeding the generated output to `visudo -cf` on each of the three `DISTRO` branches.
+`visudo -cf` only checks grammar, not that a referenced binary exists, so the per-name `command -v`
+loop above is the actual defense against a wrong or missing path, not the validation step — verified
+by removing each required binary from `PATH` in turn and confirming the script names that binary
+specifically, rather than surfacing a `visudo` column-offset error days later.
+
+The Debian, Ubuntu and Fedora command sequences above are Docker's currently-documented ones per
+distro (<https://docs.docker.com/engine/install/>, re-fetched 2026-08-23) — Ubuntu and Debian share
+every command except the GPG key's path segment (`.../linux/ubuntu/gpg` vs `.../linux/debian/gpg`,
+handled by `$DISTRO` above), and Fedora's own form has already changed once (from a plain
+`--add-repo` flag to `config-manager addrepo --from-repofile`), so re-diff against that URL if a
+fresh install stalls on a step here that no longer matches. Both `apt install` and `dnf install` are
+run exactly as documented, with no `-y`; that means they prompt for confirmation, which an
+unattended agent must supply itself (e.g. pipe `yes`) — the grant makes the command reachable
+without a password, not non-interactive.
+
+Don't oversell what this buys: `SM_INSTALL_PKGS` is a root shell in disguise regardless of which
+package names it's scoped to — installing anything runs that package's own maintainer scripts as
+root. `SM_DOCKER_SETUP` and `SM_INOTIFY` are one step from root, not narrow — docker-group
+membership is root via the socket, and the `tee`/`sysctl -p` pair can set *any* kernel parameter
+through that one file, not just the two inotify limits. `SM_NEO4J_CHOWN` and `SM_LINGER` are the
+narrow tier, though `SM_NEO4J_CHOWN` is an arbitrary-ownership-change primitive bounded to uid/gid
+7474, not a guarantee it only ever touches those two directories — `chown -R` follows symlinks
+placed under them and retargets whatever those point to.
+
+Remove the grant once Phase 3 (and the Phase 7 linger fallback, if it was used) are done — the
+header comment repeats this command so the file is self-identifying even without this doc:
+
+```bash
+sudo rm /etc/sudoers.d/99-shared-memory-temp
+```
 
 ⛔ **Install Docker Engine + Compose v2 from Docker's own repository — <https://docs.docker.com/engine/install/> — on every distro.** That is the packaging our installs run and the only one this project tests against; a distro's own docker packages may work but are not the tested path. (Recorded fallbacks, with provenance: Fedora's repos carry `moby-engine` + `docker-compose`, measured on Fedora 43; Debian 13 ships compose v2 under the legacy package name `docker-compose`, measured on Debian 13. The `podman-docker` shim remains untested.)
 
