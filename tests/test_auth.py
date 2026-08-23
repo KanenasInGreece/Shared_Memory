@@ -690,3 +690,90 @@ async def test_unknown_token_401_carries_gateway_fault_origin_header():
         await mod.auth_middleware(req, _noop_handler)
     assert exc_info.value.headers.get("X-SM-Fault-Origin") == "gateway"
     assert exc_info.value.headers.get("WWW-Authenticate") == 'Bearer error="invalid_token"'
+
+
+# ── The read-only roster is ENFORCED, not merely declared ─────────────────────
+#
+# Operator ruling, 2026-08-23: "always read only, enforced", and then — because
+# the roster will grow — "we may have other agents read only. so keep the code
+# enforcing anything that is supposed to be read only."
+#
+# The defect this replaces: READ_ONLY_AGENTS lived only in generate_tokens.py, so
+# being read-only was a MINTING CONVENTION. The gateway believed AGENT_ROLES, and
+# absence from that line means FULL read/write — so an identity registered before
+# the rule was honoured on a given path, a partial write, or an older tool
+# rewriting the line all silently WIDENED a read-only agent. A guarantee a file
+# edit can switch off is not a guarantee.
+#
+# These tests assert the REQUIREMENT (a roster agent cannot write) rather than
+# the mechanism, so they survive any reshuffling of where the roster is stored.
+
+
+@pytest.mark.asyncio
+async def test_roster_agent_is_denied_writes_with_no_agent_roles_entry():
+    """THE regression. No declaration at all — the widest possible file state."""
+    from aiohttp.web_exceptions import HTTPForbidden
+    mod = load_coordinator("monitor:tok_m", agent_roles="")
+    req = _make_request("/memory/save", auth_header="Bearer tok_m", method="POST")
+    with pytest.raises(HTTPForbidden):
+        await mod.auth_middleware(req, _noop_handler)
+
+
+@pytest.mark.asyncio
+async def test_roster_agent_is_denied_writes_even_when_declared_full():
+    """A .env that claims the monitor is unconfined does not make it so."""
+    from aiohttp.web_exceptions import HTTPForbidden
+    mod = load_coordinator("monitor:tok_m", agent_roles="monitor:full")
+    req = _make_request("/memory/save", auth_header="Bearer tok_m", method="POST")
+    with pytest.raises(HTTPForbidden):
+        await mod.auth_middleware(req, _noop_handler)
+
+
+@pytest.mark.asyncio
+async def test_roster_agent_is_denied_writes_even_when_declared_admin():
+    from aiohttp.web_exceptions import HTTPForbidden
+    mod = load_coordinator("monitor:tok_m", agent_roles="monitor:admin")
+    req = _make_request("/memory/save", auth_header="Bearer tok_m", method="POST")
+    with pytest.raises(HTTPForbidden):
+        await mod.auth_middleware(req, _noop_handler)
+
+
+@pytest.mark.asyncio
+async def test_roster_agent_still_reaches_its_read_routes_with_no_entry():
+    """Enforcement must confine, not lock out — the monitor still has a job."""
+    mod = load_coordinator("monitor:tok_m", agent_roles="")
+    req = _make_request("/memory/telemetry", auth_header="Bearer tok_m", method="GET")
+    resp = await mod.auth_middleware(req, _noop_handler)
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_an_agent_confined_by_the_environment_roster_is_enforced(monkeypatch):
+    """The roster is extensible: a deployment confines an identity this
+    framework has never heard of, without editing a shipped file."""
+    from aiohttp.web_exceptions import HTTPForbidden
+    monkeypatch.setenv("SHARED_MEMORY_READ_ONLY_AGENTS", "dashboard")
+    mod = load_coordinator("dashboard:tok_d", agent_roles="")
+    req = _make_request("/memory/save", auth_header="Bearer tok_d", method="POST")
+    with pytest.raises(HTTPForbidden):
+        await mod.auth_middleware(req, _noop_handler)
+
+
+@pytest.mark.asyncio
+async def test_an_operator_declared_read_agent_is_still_confined():
+    """Declaration remains a way in — the roster cannot enumerate every name."""
+    from aiohttp.web_exceptions import HTTPForbidden
+    mod = load_coordinator("dashboard:tok_d", agent_roles="dashboard:read")
+    req = _make_request("/memory/save", auth_header="Bearer tok_d", method="POST")
+    with pytest.raises(HTTPForbidden):
+        await mod.auth_middleware(req, _noop_handler)
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_agent_is_not_confined_by_the_roster():
+    """The counterweight: enforcement must not quietly confine everyone. Without
+    this, pinning every agent to 'read' would pass every test above."""
+    mod = load_coordinator("claude:tok_c", agent_roles="")
+    req = _make_request("/memory/save", auth_header="Bearer tok_c", method="POST")
+    resp = await mod.auth_middleware(req, _noop_handler)
+    assert resp.status == 200

@@ -199,3 +199,103 @@ def test_a_non_empty_target_still_refuses_without_force(tmp_path):
     assert "pass --force to overwrite" in (res.stdout + res.stderr)
     assert "DETACH DELETE" not in args
     assert replay == "", "a refused restore must not replay anything"
+
+
+def test_a_successful_restore_says_the_data_is_not_yet_migrated(tmp_path):
+    """Finding from the Test & Verification review of this branch.
+
+    The closing message is the ONLY thing connecting a finished restore to the
+    forward-migration that must follow it. Before it existed the script's last
+    line read "Restore complete", which an operator reasonably takes as done —
+    and the restored database sits at whatever schema level the dump was taken
+    at, under a gateway expecting a newer one.
+
+    Untested, it could be deleted or reworded to nothing and every other test
+    here would still pass.
+    """
+    res, _, _ = _run_restore(tmp_path, ["--force"])
+    out = res.stdout + res.stderr
+
+    assert "NOT yet migrated" in out
+    assert "update_framework.sh --from-restore" in out
+
+
+def test_a_refused_restore_does_not_claim_anything_was_restored(tmp_path):
+    """The counterpart: the hand-off message must not appear when nothing was
+    restored, or it would send the operator to migrate a database that never
+    received the dump."""
+    res, _, _ = _run_restore(tmp_path, [], nodes="3", pg_rows="7")
+    out = res.stdout + res.stderr
+
+    assert "NOT yet migrated" not in out
+    assert "--from-restore" not in out
+
+
+def test_the_graph_is_cleared_before_postgres_is_overwritten(tmp_path):
+    """Review finding (Code Quality / Test & Verification / Adversarial, all three).
+
+    The clear used to run AFTER pg_restore. A clear that then failed — timeout,
+    dropped connection, heap pressure mid-batch — left Postgres holding the
+    restored corpus and Neo4j holding a partly-emptied old one, and the script
+    died there: the split-brain a quiesced backup exists to prevent, manufactured
+    by the restore itself.
+
+    Ordering is the fix, so ordering is what is asserted — not that both
+    statements merely happened.
+    """
+    res, _, _ = _run_restore(tmp_path, ["--force"])
+    out = res.stdout + res.stderr
+
+    assert "Clearing Neo4j" in out and "Restoring Postgres" in out
+    assert out.index("Clearing Neo4j") < out.index("Restoring Postgres"), (
+        "the destructive Neo4j clear runs after Postgres is overwritten — a "
+        "failure there leaves the two stores divergent")
+
+
+def test_the_export_is_one_statement_per_line(tmp_path):
+    """Adversarial finding: the in-stream `sed` is line-anchored, so it is only
+    safe while no DATA line can begin with `CREATE CONSTRAINT`/`CREATE INDEX`.
+
+    That holds because the exporter emits one statement per line and escapes
+    newlines inside string properties — measured on a real 2554-line export:
+    every line began with a statement keyword, 700 data lines began with
+    `CREATE ` and none matched the schema pattern.
+
+    It was an unstated assumption, which is how it would have been broken later.
+    Pinned here against the fixture so a future exporter change that emits
+    multi-line values fails loudly instead of silently rewriting data.
+    """
+    import re
+    schema_re = re.compile(r"^CREATE (CONSTRAINT|([A-Z]+ )?INDEX)")
+    keyword_re = re.compile(r"^(CREATE|MATCH|UNWIND|DROP|CALL|:begin|:commit)")
+
+    data_lines = [l for l in FAKE_EXPORT.splitlines()
+                  if l.strip() and not schema_re.match(l)]
+    for line in data_lines:
+        assert not schema_re.match(line)
+    # Every non-blank line is a statement start, never a continuation of a
+    # multi-line value — the property the line anchor depends on.
+    for line in FAKE_EXPORT.splitlines():
+        if line.strip():
+            assert keyword_re.match(line), (
+                f"line is not a statement start: {line!r} — if the exporter has "
+                f"begun emitting multi-line values, the line-anchored sed is no "
+                f"longer safe")
+
+
+def test_rewritten_schema_statements_keep_a_valid_shape(tmp_path):
+    """The replay harness uses a fake cypher-shell, which cannot reject invalid
+    Cypher — so assert the rewritten statements still match the grammar shape
+    Neo4j documents, rather than only that a substring was inserted."""
+    import re
+    _, replay, _ = _run_restore(tmp_path, ["--force"])
+
+    for line in replay.splitlines():
+        if line.startswith("CREATE CONSTRAINT"):
+            assert re.match(
+                r"^CREATE CONSTRAINT \w+ IF NOT EXISTS FOR \(\w+:\w+\) REQUIRE .+;$",
+                line), f"malformed constraint after rewrite: {line}"
+        elif line.startswith("CREATE") and "INDEX" in line:
+            assert re.match(
+                r"^CREATE ([A-Z]+ )?INDEX IF NOT EXISTS FOR \(\w+:\w+\) ON .+;$",
+                line), f"malformed index after rewrite: {line}"

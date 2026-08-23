@@ -53,6 +53,7 @@ from aiohttp import web
 from neo4j import AsyncGraphDatabase
 
 from log_hygiene import AsyncLineWriter
+from agent_roles import effective_role, read_only_agents
 from ontology import (
     ONT, sanitize_entity_names, sanitize_entity_name,
     KNOWN_LABELS, KNOWN_RELATIONSHIPS, fact_kind_from_source_ref,
@@ -937,7 +938,7 @@ def _audit(agent: str, method: str, path: str, status: int,
         record = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "agent": agent,
-            "role": _AGENT_ROLES.get(agent, "full"),
+            "role": effective_role(agent, _AGENT_ROLES.get(agent)),
             "method": method,
             "path": path,
             "status": status,
@@ -1535,7 +1536,7 @@ async def auth_middleware(request: web.Request, handler):
         # shed 503 + Retry-After so the dump sees a quiet DB. Reads always flow — so a
         # leaked monitor token cannot save/supersede/proxy, and a leaked backup token
         # can only pause/resume backups.
-        role  = _AGENT_ROLES.get(agent_name, "full")
+        role  = effective_role(agent_name, _AGENT_ROLES.get(agent_name))
         route = (request.method, request.path.rstrip("/") or "/")
         if role == "read" and not _read_role_permits(request):
             raise web.HTTPForbidden(
@@ -2292,10 +2293,29 @@ class MemoryCoordinator:
                 "coordinator auth enabled — %d agent(s): %s",
                 len(_AGENT_TOKENS), ", ".join(sorted(_AGENT_TOKENS.values())),
             )
-            if _AGENT_ROLES:
+            # Log the roles ACTUALLY APPLIED, not the ones declared. A roster
+            # identity is confined even with no AGENT_ROLES entry, and a startup
+            # line showing only the file's contents would tell the operator a
+            # read-only agent is unconfined at the exact moment they check.
+            _applied = {n: effective_role(n, _AGENT_ROLES.get(n))
+                        for n in set(_AGENT_TOKENS.values()) | set(_AGENT_ROLES)}
+            _confined = {n: r for n, r in _applied.items() if r != "full"}
+            if _confined:
                 log.info(
-                    "coordinator read-only roles: %s",
-                    ", ".join(f"{n}={r}" for n, r in sorted(_AGENT_ROLES.items())),
+                    "coordinator applied roles: %s",
+                    ", ".join(f"{n}={r}" for n, r in sorted(_confined.items())),
+                )
+            _unwritten = [n for n in read_only_agents()
+                          if n in set(_AGENT_TOKENS.values())
+                          and _AGENT_ROLES.get(n) != "read"]
+            if _unwritten:
+                # Enforced anyway — but the .env disagrees with reality, and an
+                # operator reading that file would draw the wrong conclusion.
+                log.warning(
+                    "coordinator: %s registered but NOT declared read-only in "
+                    "AGENT_ROLES — confined by the roster regardless; re-run "
+                    "bootstrap_tokens.sh --add to make the .env state the truth",
+                    ", ".join(sorted(_unwritten)),
                 )
             log.info("NOTE: MCP clients (LM Studio) must be fully restarted after .env changes")
         else:

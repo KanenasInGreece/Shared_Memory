@@ -278,8 +278,13 @@ echo "$doctor_out"
 
 if [ "$status" -eq 0 ]; then
     echo "Update complete — now at $REMOTE_VERSION, compat: ok."
-elif printf '%s' "$doctor_out" | grep -q '"compat"'; then
+elif printf '%s' "$doctor_out" | grep -q '"compat"[[:space:]]*:'; then
     # The client RAN and returned a verdict, so the version comparison is real.
+    # ⚠ Matched as a JSON KEY (`"compat":`), not the bare word. A traceback that
+    # merely MENTIONS compat — a source line like diag["compat"], a KeyError, a
+    # path containing it — would otherwise be read as a verdict and bring the
+    # false gateway accusation straight back. The key form cannot appear in a
+    # traceback without the client having actually printed the object.
     echo ""
     echo "⚠ Updated to $REMOTE_VERSION but still incompatible. The GATEWAY itself"
     echo "  needs upgrading — that happens on its own host (git pull + restart),"

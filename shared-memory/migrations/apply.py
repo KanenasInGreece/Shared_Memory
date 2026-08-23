@@ -35,6 +35,13 @@ the schema it claims to describe — which is the failure this whole file is abo
 A migration and its ledger row are written in ONE transaction, so a half-applied
 migration can never be recorded as done and then skipped forever after.
 
+EXIT CODES (a contract — scheduled checks gate on these):
+  0  this checkout can act on this database
+  2  the framework schema exists but the ledger is empty — needs --adopt
+  3  the database has applied migrations this checkout does not contain
+`--status` reports the same states without refusing to do anything, and returns
+the same codes so a monitor does not have to parse prose.
+
 ADOPTING AN EXISTING DATABASE. A database created before this ledger has no
 record of its migrations — but it has certainly had all of them applied, because
 the previous tool ran every migration on every invocation. `--adopt` records the
@@ -285,6 +292,30 @@ def main() -> int:
                       f"this checkout — this database is newer than this code:")
                 for n in sorted(unknown):
                     print(f"    {n}")
+            # ⛔ --status USED TO RETURN HERE, BEFORE THE ADOPTION CHECK BELOW.
+            # A populated database with an empty ledger therefore printed
+            # "(nothing applied)" with every migration marked pending — reading
+            # exactly like a fresh install, when in fact those migrations HAVE
+            # run and re-running them is the failure this ledger exists to
+            # prevent. The one command an operator uses to find out what state a
+            # database is in was the one command that could not say.
+            adoption = needs_adoption(framework, applied)
+            if adoption:
+                print("\n  NEEDS ADOPTION: the framework schema exists but the "
+                      "ledger is empty.")
+                print("    Those migrations have already run — this database "
+                      "predates migration tracking (v0.8.35).")
+                print("    The pending list above is NOT a list of work to do.")
+                print("    Record them as applied, without running them:")
+                print("        ... apply.py --adopt")
+            # Exit code, so a scheduled check can gate on this rather than
+            # parsing prose. Mirrors the apply path: 3 = ahead, 2 = needs
+            # adoption, 0 = a state this checkout can act on. --status still
+            # never REFUSES — it always prints the full picture first.
+            if unknown:
+                return 3
+            if adoption:
+                return 2
             return 0
 
         # A populated database with an EMPTY ledger has had every migration

@@ -51,6 +51,13 @@ BRIDGE_CRASHES = """import sys
 raise ModuleNotFoundError("No module named 'httpx'")
 """
 
+# A crash whose traceback MENTIONS compat. Review finding: matching the bare word
+# would read this as a gateway verdict and bring the false accusation back.
+BRIDGE_CRASHES_MENTIONING_COMPAT = """import sys
+diag = {}
+print(diag["compat"])
+"""
+
 BRIDGE_REPORTS_SKEW = """import sys
 print('{\\n  "compat": "client too old",\\n  "gateway_api_version": 5\\n}')
 sys.exit(1)
@@ -139,13 +146,33 @@ def test_a_client_that_cannot_run_is_not_reported_as_a_stale_gateway(tmp_path):
 
 
 def test_a_client_that_cannot_run_names_the_real_cause(tmp_path):
-    """An operator acts on this message, so it has to point at the dependency
-    and hand over the documented invocation."""
+    """An operator acts on this message, so it has to hand over a runnable next
+    step. Asserted as the REQUIREMENT — the message names the dependency the
+    documented invocation supplies — rather than pinning a hardcoded word, which
+    would pass just as happily if the advice became wrong."""
     res, _ = _run(tmp_path, BRIDGE_CRASHES)
     out = res.stdout + res.stderr
 
-    assert "httpx" in out
-    assert "uv run --with httpx" in out
+    assert "could not RUN" in out
+    # Whatever dependency the invocation supplies must be the one named.
+    import re
+    m = re.search(r"uv run --with (\S+)", out)
+    assert m, "no runnable next step offered"
+    assert m.group(1) in out.split("could not RUN", 1)[1]
+
+
+def test_a_crash_that_merely_mentions_compat_is_not_a_gateway_verdict(tmp_path):
+    """Review finding (all three reviewers): the branch decided on a substring.
+    A traceback containing the word compat would be read as a verdict, restoring
+    the exact false accusation this change exists to remove. Matching the JSON
+    KEY is what separates 'the client printed an object' from 'the client
+    happened to say the word'."""
+    res, _ = _run(tmp_path, BRIDGE_CRASHES_MENTIONING_COMPAT)
+    out = res.stdout + res.stderr
+
+    assert "The GATEWAY itself" not in out, (
+        "a client crash mentioning 'compat' was reported as a stale gateway")
+    assert "could not RUN" in out
 
 
 def test_a_real_version_verdict_still_blames_the_gateway(tmp_path):

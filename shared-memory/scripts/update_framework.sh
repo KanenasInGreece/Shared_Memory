@@ -65,11 +65,39 @@ while [[ $# -gt 0 ]]; do
 done
 
 step=0
+# ⛔ run() DIES ON FAILURE. It used to return the exit code and leave checking to
+# the caller, and three steps never checked — `git pull`, the gateway restart,
+# and the domain backfill. Each failure then carried on:
+#   * a failed pull migrated the OLD code while reporting success;
+#   * a failed restart left the previous gateway answering, so the health wait
+#     passed and the backfill enqueued rows against an OLD worker — the exact
+#     content-blanking hazard this script's own comments warn about;
+#   * a failed backfill was simply skipped past.
+# Gating by default means a step added later is safe unless it opts out, which is
+# the opposite of the trap above. Use run_soft() where the caller genuinely
+# inspects the code (apply.py's exit 2/3) or tolerates failure (skill sync).
 run() {
+    local label="$1"; shift
     step=$((step + 1))
     echo
-    ylw "── Step $step: $1"
-    shift
+    ylw "── Step $step: $label"
+    printf '   %s\n' "$*"
+    if [[ "$DRY_RUN" == "1" ]]; then
+        echo "   (dry run — not executed)"
+        return 0
+    fi
+    "$@" || die "step $step FAILED: $label
+  Command: $*
+  Nothing after this step has run."
+}
+
+# Same output, but returns the exit code instead of dying — for callers that
+# distinguish between failure modes themselves.
+run_soft() {
+    local label="$1"; shift
+    step=$((step + 1))
+    echo
+    ylw "── Step $step: $label"
     printf '   %s\n' "$*"
     if [[ "$DRY_RUN" == "1" ]]; then
         echo "   (dry run — not executed)"
@@ -181,7 +209,7 @@ fi
 # a database whose ledger names migrations this checkout does not contain — the
 # restore-onto-older-code case, which used to report "Up to date" at a filename
 # this code has never seen.
-run "Postgres migrations (apply.py — forward-only)" \
+run_soft "Postgres migrations (apply.py — forward-only)" \
     uv run --with psycopg2-binary python "$REPO_ROOT/shared-memory/migrations/apply.py"
 rc=$?
 if [[ "$DRY_RUN" == "0" && "$rc" == "3" ]]; then
@@ -223,7 +251,7 @@ fi
 # nobody else. A missing uniqueness constraint is SILENT — MERGE keeps working
 # and the only symptom is a duplicate graph node under a race. This is not optional and
 # not redundant with apply.py, which cannot reach Neo4j at all.
-run "Neo4j constraints (no ledger exists — verify every time)" \
+run_soft "Neo4j constraints (no ledger exists — verify every time)" \
     uv run --with neo4j python "$REPO_ROOT/shared-memory/migrations/verify_neo4j_init.py" --apply
 rc=$?
 [[ "$DRY_RUN" == "0" && "$rc" != "0" ]] && die "Neo4j constraint check FAILED (exit $rc) even with --apply.
@@ -238,7 +266,7 @@ rc=$?
 # and enrich. What stops is CROSS-PROJECT SYNTHESIS: the fold gate fails closed
 # on any node lacking an identity, which presents as a system with nothing to fold
 # rather than as an error. Idempotent; read-only without --apply.
-run "stamp project identity onto :Project nodes (graph half of migration 027)" \
+run_soft "stamp project identity onto :Project nodes (graph half of migration 027)" \
     uv run --with psycopg2-binary --with neo4j python \
     "$REPO_ROOT/shared-memory/scripts/reconcile_project_identity.py" --apply
 rc=$?
@@ -268,7 +296,33 @@ if [[ "$DRY_RUN" == "0" ]]; then
     done
     curl -sf --max-time 5 "$GATEWAY_URL/health" >/dev/null 2>&1 \
         || die "gateway did not come back after restart — check: journalctl --user -u $GATEWAY_UNIT -n 50"
-    grn "   ✓ gateway responding: $(curl -s --max-time 5 "$GATEWAY_URL/health")"
+
+    # ⛔ "SOMETHING ANSWERS" IS NOT "THE NEW CODE IS RUNNING". If the restart
+    # command fails — a typo in GATEWAY_RESTART_CMD, a unit that refuses to stop,
+    # a supervisor that silently keeps the old process — the PREVIOUS gateway is
+    # still listening and answers this check happily. Every later step then runs
+    # against it, and step 6 enqueues repair rows only a current worker
+    # understands: an older one falls through to its ordinary fact branch and
+    # BLANKS THE CONTENT of every record it touches. So compare versions, which
+    # is the one thing an old process cannot fake.
+    _running="$(curl -s --max-time 5 "$GATEWAY_URL/health" \
+        | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    _expected="$(sed -n 's/^FRAMEWORK_VERSION[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$REPO_ROOT/shared-memory/scripts/coordinator.py" | head -1)"
+    if [[ -z "$_running" || -z "$_expected" ]]; then
+        die "could not read the gateway version (running='$_running',
+  checkout='$_expected'). Refusing to continue: the next step enqueues rows that
+  an older worker would use to blank record content."
+    fi
+    if [[ "$_running" != "$_expected" ]]; then
+        die "the gateway answering $GATEWAY_URL is version $_running, but this
+  checkout is $_expected — the restart did NOT replace the running process.
+  The schema is migrated; the gateway is not. Refusing to continue, because the
+  next step enqueues repair rows that an older worker turns into blanked records.
+  Check:  systemctl --user status $GATEWAY_UNIT
+          journalctl --user -u $GATEWAY_UNIT -n 50"
+    fi
+    grn "   ✓ gateway restarted and running $_running (matches this checkout)"
 fi
 
 # ── Step 6: domain backfill — AFTER the restart, and that is a GUARD ──────────
@@ -282,13 +336,20 @@ fi
 # permission to write — so early is safe but pointless, and this ordering makes
 # "safe but pointless" into "correct".
 #
-# Dry run first so the operator sees what WOULD be enqueued, then apply.
-run "domain backfill — preview (enqueues nothing)" \
-    uv run --with psycopg2-binary python \
-    "$REPO_ROOT/shared-memory/scripts/backfill_domain_of.py"
-run "domain backfill — apply" \
-    uv run --with psycopg2-binary python \
-    "$REPO_ROOT/shared-memory/scripts/backfill_domain_of.py" --apply
+# ⚠ The preview used to run here and --apply on the very next line, with no
+# pause between them: an operator could read what WOULD be enqueued only after
+# it already had been. A preview nobody can act on is decoration, so the preview
+# now belongs to --dry-run (where it is the whole point) and a real run applies
+# once. The applied run reports what it did, which is the record that matters.
+if [[ "$DRY_RUN" == "1" ]]; then
+    run "domain backfill — preview (enqueues nothing)" \
+        uv run --with psycopg2-binary python \
+        "$REPO_ROOT/shared-memory/scripts/backfill_domain_of.py"
+else
+    run "domain backfill — apply (AFTER the restart; see the guard above)" \
+        uv run --with psycopg2-binary python \
+        "$REPO_ROOT/shared-memory/scripts/backfill_domain_of.py" --apply
+fi
 
 # ── Step 7: refresh the installed client skills ──────────────────────────────
 #
@@ -297,7 +358,7 @@ run "domain backfill — apply" \
 # incompatible. The GATEWAY itself ..." — alarming, self-resolving one step
 # later, and observed on two hosts. Ordering removes the false alarm rather than
 # rewording it.
-run "refresh installed agent skills" bash "$REPO_ROOT/shared-memory/scripts/sync_skills.sh"
+run_soft "refresh installed agent skills" bash "$REPO_ROOT/shared-memory/scripts/sync_skills.sh"
 rc=$?
 if [[ "$DRY_RUN" == "0" && "$rc" != "0" ]]; then
     # Not fatal: the gateway is already migrated and correct. But never silent —
@@ -319,7 +380,7 @@ if [[ "$DRY_RUN" == "0" && -z "${AGENT_TOKEN:-}" ]]; then
     ylw "Update finished, but UNVERIFIED. An update is not complete until postflight passes."
     exit 1
 fi
-run "postflight — verify end to end" bash "$REPO_ROOT/shared-memory/scripts/postflight.sh"
+run_soft "postflight — verify end to end" bash "$REPO_ROOT/shared-memory/scripts/postflight.sh"
 rc=$?
 
 echo

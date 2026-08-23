@@ -166,12 +166,6 @@ if [[ "$FORCE" -ne 1 && ( "$pg_rows" != "0" || "$neo_nodes" != "0" ) ]]; then
 fi
 [[ "$FORCE" -eq 1 ]] && ylw "  ! --force: overwriting existing data (technical_docs=$pg_rows, neo4j nodes=$neo_nodes)"
 
-# ── Restore Postgres (source of truth) first, then Neo4j ─────────────────────
-echo "Restoring Postgres → $PG_DB ..."
-$DOCKER exec -i --env-file "$_PG_ENV_FILE" "$PG_CONTAINER" \
-  pg_restore -U "$PG_USER" -d "$PG_DB" --clean --if-exists --no-owner < "$BASE.pgdump" \
-  && grn "  ✓ postgres restored" || die "pg_restore failed"
-
 # ── Neo4j: --force must REPLACE, exactly as it already does for Postgres ─────
 #
 # pg_restore runs with --clean --if-exists, so the Postgres half genuinely
@@ -192,6 +186,16 @@ $DOCKER exec -i --env-file "$_PG_ENV_FILE" "$PG_CONTAINER" \
 #
 # Measured on a real set (2615 nodes / 9560 rels, 38 schema statements): the
 # rewrite guards 38 of 38, changes no data line, and is idempotent.
+#
+# ⛔ ORDERING: THE DESTRUCTIVE PREPARATION HAPPENS BEFORE ANYTHING IS OVERWRITTEN.
+# The clear used to sit next to the Neo4j replay, i.e. AFTER pg_restore had
+# already replaced Postgres. A clear that then failed — a timeout, a dropped
+# connection, heap pressure part-way through the batches — left Postgres holding
+# the restored corpus and Neo4j holding a partly-emptied old one, and the script
+# died there. That is the split-brain a quiesced backup exists to prevent,
+# manufactured by the restore itself.
+# Doing it here means the only failure this can produce is "nothing was
+# overwritten yet", which is recoverable by re-running.
 if [[ "$FORCE" -eq 1 && "$neo_nodes" != "0" ]]; then
   echo "Clearing Neo4j before replay (--force) ..."
   # Batched: one transaction holding a whole corpus is how a restore runs the
@@ -205,6 +209,13 @@ if [[ "$FORCE" -eq 1 && "$neo_nodes" != "0" ]]; then
   replay on top of existing data, which would merge two graphs into one"
   grn "  ✓ neo4j cleared ($neo_nodes node(s) removed)"
 fi
+
+# ── Restore Postgres (source of truth) first, then Neo4j ─────────────────────
+echo "Restoring Postgres → $PG_DB ..."
+$DOCKER exec -i --env-file "$_PG_ENV_FILE" "$PG_CONTAINER" \
+  pg_restore -U "$PG_USER" -d "$PG_DB" --clean --if-exists --no-owner < "$BASE.pgdump" \
+  && grn "  ✓ postgres restored" || die "pg_restore failed"
+
 
 echo "Restoring Neo4j (replaying cypher export) ..."
 # The schema statements are made idempotent IN STREAM rather than at export

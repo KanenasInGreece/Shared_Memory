@@ -74,18 +74,38 @@ ylw() { printf '\033[33m%s\033[0m\n' "$*"; }
 # before writing the fresh one means re-running this script against an
 # OLDER .env that still carries that stale placeholder converges to exactly
 # one live assignment, same as a fresh install would.
-replace_registry_line() {
-    local key="$1" value_line="$2" tmp
-    tmp="$(mktemp "${ENV_FILE}.XXXXXX")"
-    grep -vE "^[[:space:]]*#?[[:space:]]*${key}=" "$ENV_FILE" > "$tmp" || true
-    printf '%s\n' "$value_line" >> "$tmp"
-    # Preserve the original file mode — mktemp's own default (0600) is
-    # already restrictive, but this file also holds PG_PASSWORD/
-    # NEO4J_PASSWORD/every provider key, so match whatever the operator's
-    # install already had rather than assume.
+# ⛔ WRITE EVERY REGISTRY LINE IN ONE PASS. These used to be three sequential
+# read-modify-write calls (AGENT_TOKENS, then AGENT_INSTALLS, then AGENT_ROLES),
+# which had two failure modes, both found by review:
+#
+#   * Interruption between them leaves the file half-updated. The worst ordering
+#     is the one that existed: a new agent gets its TOKEN written and its ROLE
+#     not — and absence from AGENT_ROLES means FULL read/write, so a crash mid-run
+#     hands out an unconfined credential.
+#   * Two concurrent runs each read the same baseline and each rename their own
+#     temp file over the result, so the later one silently discards the earlier
+#     agent entirely.
+#
+# One temp file, all keys applied, one rename — plus the lock below, which is
+# what makes "read the baseline" and "replace it" a single operation rather than
+# two an interleaving run can slip between.
+replace_registry_lines() {
+    # Args: key1 line1 [key2 line2 ...]. A key whose line is empty is skipped,
+    # so a caller need not know which optional registries were produced.
+    local tmp; tmp="$(mktemp "${ENV_FILE}.XXXXXX")"
+    cp "$ENV_FILE" "$tmp"
+    while [[ $# -gt 0 ]]; do
+        local key="$1" value_line="$2"; shift 2
+        [[ -z "$value_line" ]] && continue
+        local inner; inner="$(mktemp "${ENV_FILE}.XXXXXX")"
+        grep -vE "^[[:space:]]*#?[[:space:]]*${key}=" "$tmp" > "$inner" || true
+        printf '%s\n' "$value_line" >> "$inner"
+        mv "$inner" "$tmp"
+    done
     chmod --reference="$ENV_FILE" "$tmp" 2>/dev/null || true
     mv "$tmp" "$ENV_FILE"
 }
+
 
 force=0
 add_name=""
@@ -120,6 +140,30 @@ fi
 
 [[ -f "$ENV_FILE" ]] || { red "✗ .env not found at $ENV_FILE — run: bash shared-memory/scripts/install_framework.sh"; exit 1; }
 
+# ── One minter at a time ─────────────────────────────────────────────────────
+#
+# Minting is read-modify-write on a shared file: generate_tokens.py reads the
+# current AGENT_TOKENS, merges one entry, and prints a full replacement line
+# this script then writes back. Two concurrent runs both read the same baseline
+# and the later write silently DISCARDS the earlier agent — it is registered
+# nowhere, while its token has already been written into that agent's skill .env
+# (mode 600). The result is a credential that exists on disk and authenticates
+# against nothing, which reads as a broken agent rather than a lost write.
+#
+# The lock spans read AND write, because locking only the write would still let
+# two runs read the same baseline. Non-blocking with a clear message: a second
+# operator should be told to wait, not left watching a silent hang.
+_LOCKFILE="${ENV_FILE}.mintlock"
+exec 8>"$_LOCKFILE" 2>/dev/null || true
+if command -v flock >/dev/null 2>&1; then
+    flock -n 8 || {
+        red "✗ another bootstrap_tokens.sh is minting against $ENV_FILE right now."
+        red "  Wait for it to finish and re-run — concurrent mints drop one"
+        red "  agent's registration while still writing its token to disk."
+        exit 1
+    }
+fi
+
 # Presence check before first use (defensive-bash rule from the sister
 # project's install review) — a curated message beats bash's bare
 # "uv: command not found" halfway through the run.
@@ -153,9 +197,10 @@ if [[ -n "$add_name" ]]; then
     roles_line="$(grep -E '^AGENT_ROLES=' <<<"$out" || true)"
     [[ -n "$tokens_line" ]] || { red "✗ generate_tokens.py --add produced no AGENT_TOKENS line"; exit 1; }
 
-    replace_registry_line "AGENT_TOKENS" "$tokens_line"
-    [[ -n "$installs_line" ]] && replace_registry_line "AGENT_INSTALLS" "$installs_line"
-    [[ -n "$roles_line" ]] && replace_registry_line "AGENT_ROLES" "$roles_line"
+    replace_registry_lines \
+        "AGENT_TOKENS"   "$tokens_line" \
+        "AGENT_INSTALLS" "$installs_line" \
+        "AGENT_ROLES"    "$roles_line"
 
     echo
     grn "✓ AGENT_TOKENS updated in $ENV_FILE — '$add_name' added, every other"
@@ -192,13 +237,14 @@ roles_line="$(grep -E '^AGENT_ROLES='  <<<"$out" || true)"
 installs_line="$(grep -E '^AGENT_INSTALLS=' <<<"$out" || true)"
 [[ -n "$tokens_line" ]] || { red "✗ generate_tokens.py produced no AGENT_TOKENS line"; exit 1; }
 
-replace_registry_line "AGENT_TOKENS" "$tokens_line"
-[[ -n "$roles_line" ]] && replace_registry_line "AGENT_ROLES" "$roles_line"
-[[ -n "$installs_line" ]] && replace_registry_line "AGENT_INSTALLS" "$installs_line"
+replace_registry_lines \
+    "AGENT_TOKENS"   "$tokens_line" \
+    "AGENT_INSTALLS" "$installs_line" \
+    "AGENT_ROLES"    "$roles_line"
 
 echo
 grn "✓ AGENT_TOKENS written to $ENV_FILE (digest form)"
-[[ -n "$roles_line" ]] && grn "✓ AGENT_ROLES (read-only monitor) written"
+[[ -n "$roles_line" ]] && grn "✓ AGENT_ROLES (read-only roster + your declarations) written"
 [[ -n "$installs_line" ]] && grn "✓ AGENT_INSTALLS (install-path registry) written"
 
 echo
