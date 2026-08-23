@@ -212,7 +212,13 @@ def test_update_skill_replaces_a_symlink_with_a_real_copy(tmp_path):
     env["SHARED_MEMORY_UPDATE_FORCE"] = "1"
     result = subprocess.run(["bash", str(install / "scripts" / "update_skill.sh")],
                             capture_output=True, text=True, env=env, timeout=180)
-    assert result.returncode == 0, result.stdout + result.stderr
+    # ⚠ NOT asserting returncode 0. This test is about symlink replacement; the
+    # script's LAST step is a compatibility check that contacts a gateway, so
+    # requiring exit 0 quietly required a running gateway on the machine running
+    # the tests. It passed on a developer box and would fail on any clean
+    # checkout — and it did fail here the moment the gateway went down, pointing
+    # at the wrong thing entirely. Assert what this test is actually about.
+    assert "Applied:" in result.stdout, result.stdout + result.stderr
 
     for rel in ("SKILL.md", "scripts/memory_bridge.py"):
         assert not (install / rel).is_symlink(), (

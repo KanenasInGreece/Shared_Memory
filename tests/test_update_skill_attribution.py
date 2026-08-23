@@ -63,6 +63,13 @@ print('{\\n  "compat": "client too old",\\n  "gateway_api_version": 5\\n}')
 sys.exit(1)
 """
 
+BRIDGE_UNREACHABLE = """import json, sys
+print(json.dumps({"reachable": False,
+                  "error": "All connection attempts failed",
+                  "compat": "unknown"}, indent=2))
+sys.exit(1)
+"""
+
 BRIDGE_OK = """import sys
 print('{\\n  "compat": "ok"\\n}')
 sys.exit(0)
@@ -211,3 +218,30 @@ def test_without_uv_it_still_attempts_rather_than_refusing(tmp_path):
 
     assert uv_calls == ""
     assert "compat: ok" in out
+
+
+def test_an_unreachable_gateway_is_not_reported_as_an_outdated_one(tmp_path):
+    """The THIRD variant of the same misattribution, found the day the second was
+    shipped: the client ran and printed a verdict, but the verdict is "I could
+    not reach it" — compat is "unknown", not a version comparison.
+
+    Keying on the presence of a compat key alone was not enough. Reporting this
+    as "the GATEWAY needs upgrading" accuses a healthy gateway of being old when
+    it is simply not running, or is at a different address.
+    """
+    res, _ = _run(tmp_path, BRIDGE_UNREACHABLE)
+    out = res.stdout + res.stderr
+
+    assert "could not be REACHED" in out
+    assert "The GATEWAY itself" not in out, (
+        "an unreachable gateway was reported as an outdated one")
+
+
+def test_an_unreachable_gateway_message_points_at_liveness_not_version(tmp_path):
+    """An operator acts on this: it must send them to check the service is up,
+    not to perform an upgrade that would change nothing."""
+    res, _ = _run(tmp_path, BRIDGE_UNREACHABLE)
+    out = res.stdout + res.stderr
+
+    assert "systemctl" in out or "/health" in out
+    assert "needs upgrading" not in out

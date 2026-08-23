@@ -156,11 +156,6 @@ echo "  repo checkout     $REPO_ROOT"
 echo "                    this script runs from inside it; the final rm -rf is yours."
 echo
 
-if [[ "$DRY_RUN" == "1" ]]; then
-    grn "Dry run — nothing was removed."
-    exit 0
-fi
-
 # ── The backup gate. Irreversible levels refuse to start unencumbered. ───────
 if [[ "$LEVEL" != "service" && "$NO_BACKUP" != "1" ]]; then
     _sets="$(find "$BACKUP_DIR" -maxdepth 1 -name '*.manifest.json' 2>/dev/null | wc -l | tr -d ' ')"
@@ -178,6 +173,13 @@ if [[ "$LEVEL" != "service" && "$NO_BACKUP" != "1" ]]; then
     ylw "  ! not verified here — run 'bash shared-memory/ops/backup.sh --verify' if unsure."
 fi
 
+# A dry run reports the gate's verdict too. "What would happen" includes "it
+# would refuse" — a preview that hides the refusal is not a preview.
+if [[ "$DRY_RUN" == "1" ]]; then
+    grn "Dry run — nothing was removed."
+    exit 0
+fi
+
 if [[ "$ASSUME_YES" != "1" ]]; then
     echo
     read -r -p "Type the level ('$LEVEL') to confirm: " _answer
@@ -187,7 +189,19 @@ fi
 echo
 # ── service ──────────────────────────────────────────────────────────────────
 echo "Removing the service ..."
-if command -v systemctl >/dev/null 2>&1; then
+# ⛔ `systemctl --user` TALKS TO THE SESSION BUS, NOT TO $HOME. Pointing HOME at
+# a sandbox does NOT sandbox it: the calls below reach the real user's systemd
+# instance whatever HOME says. Measured the hard way — a test running this
+# script under a temporary HOME stopped and disabled the live gateway on the
+# development machine, and disabled linger with it.
+#
+# So the service is touched only when THIS install's unit file is actually
+# present. That is also the correct rule on its own terms: an installation that
+# never installed a service has no service to remove, and stopping a unit this
+# tree did not install is reaching outside the thing being uninstalled.
+if [[ ! -f "$UNIT_PATH" ]]; then
+    ylw "  ! no unit at $UNIT_PATH — this install has no service; leaving systemd alone"
+elif command -v systemctl >/dev/null 2>&1; then
     systemctl --user stop    "$GATEWAY_UNIT" 2>/dev/null || true
     systemctl --user disable "$GATEWAY_UNIT" 2>/dev/null || true
     rm -f "$UNIT_PATH"

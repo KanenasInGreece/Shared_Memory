@@ -278,8 +278,26 @@ echo "$doctor_out"
 
 if [ "$status" -eq 0 ]; then
     echo "Update complete — now at $REMOTE_VERSION, compat: ok."
+elif printf '%s' "$doctor_out" | grep -q '"reachable"[[:space:]]*:[[:space:]]*false'; then
+    # ⛔ THE THIRD VARIANT OF THE SAME MISTAKE. The client ran and printed a
+    # verdict, but the verdict is "I could not reach the gateway" — compat comes
+    # back "unknown", not a version comparison. Reporting that as "the GATEWAY
+    # needs upgrading" accuses a healthy gateway of being old when it is simply
+    # not running, or is at a different address. Same failure as blaming it for
+    # a missing local dependency: naming a component the check never actually
+    # compared against.
+    echo ""
+    echo "⚠ Updated to $REMOTE_VERSION, but the gateway could not be REACHED."
+    echo "  This says nothing about its version — the client never got an answer."
+    echo "  Check that it is running and that this client points at the right"
+    echo "  address (COORDINATOR_URL in this skill's .env):"
+    echo "    systemctl --user status hive-mind-gateway.service"
+    echo "    curl -s http://localhost:8888/health"
+    echo "  The skill files updated fine; only the check could not complete."
+    exit "$status"
 elif printf '%s' "$doctor_out" | grep -q '"compat"[[:space:]]*:'; then
-    # The client RAN and returned a verdict, so the version comparison is real.
+    # The client RAN, REACHED the gateway, and returned a version verdict — so
+    # the comparison is real and the gateway is the right thing to name.
     # ⚠ Matched as a JSON KEY (`"compat":`), not the bare word. A traceback that
     # merely MENTIONS compat — a source line like diag["compat"], a KeyError, a
     # path containing it — would otherwise be read as a verdict and bring the

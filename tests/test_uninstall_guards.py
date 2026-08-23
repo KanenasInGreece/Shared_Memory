@@ -80,7 +80,10 @@ def test_level_is_required(tmp_path):
 
 def test_an_unknown_level_is_refused(tmp_path):
     root, _s, _d, _m = _fake_install(tmp_path)
-    res = _run(root, ["--level", "everything"], tmp_path / "home")
+    # --dry-run is redundant here (an unknown level is refused while parsing
+    # arguments), and passed anyway: the rule below is absolute, and a rule with
+    # a "this one is obviously fine" exception is not enforceable.
+    res = _run(root, ["--level", "everything", "--dry-run"], tmp_path / "home")
 
     assert res.returncode != 0
     assert "unknown level" in (res.stdout + res.stderr)
@@ -130,14 +133,39 @@ def test_the_repo_checkout_is_never_removed_by_the_script(tmp_path):
 
 
 def test_a_destructive_level_refuses_without_a_backup(tmp_path):
-    """The gate that makes an irreversible operation safe to hand to an agent."""
+    """The gate that makes an irreversible operation safe to hand to an agent.
+
+    ⛔ RUN WITH --dry-run, AND THAT IS NOT COSMETIC. An earlier version of this
+    test passed `--level data --yes`, relying on the gate to stop it. When the
+    gate was MUTATION-CHECKED — removed, to prove this test dies without it —
+    the test ran the real teardown and stopped and disabled the live gateway on
+    the development machine: `systemctl --user` talks to the session bus, so a
+    redirected HOME does not sandbox it.
+
+    The gate is evaluated BEFORE the dry-run exit precisely so it can be proved
+    without ever entering the destructive path. Nothing in this file may run a
+    level for real; that belongs on a sacrificial host.
+    """
     root, state, _d, _m = _fake_install(tmp_path)
     (state / "backups" / "sm-backup-x.manifest.json").unlink()
 
-    res = _run(root, ["--level", "data", "--yes"], tmp_path / "home")
+    res = _run(root, ["--level", "data", "--dry-run"], tmp_path / "home")
 
     assert res.returncode != 0
     assert "no backup set found" in (res.stdout + res.stderr)
+
+
+def test_no_test_in_this_file_runs_a_destructive_level(tmp_path):
+    """Structural, not aspirational: assert the file itself never invokes the
+    script without --dry-run. A future test added in haste is exactly how the
+    incident above happened."""
+    src = Path(__file__).read_text()
+    import re
+    for call in re.findall(r'_run\(root, \[(.*?)\]', src, re.S):
+        if "--level" in call:
+            assert "--dry-run" in call, (
+                f"a destructive invocation without --dry-run: [{call}] — "
+                "uninstall levels are exercised on a sacrificial host, not here")
 
 
 def test_service_level_does_not_require_a_backup(tmp_path):
