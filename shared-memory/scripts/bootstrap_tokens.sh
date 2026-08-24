@@ -119,6 +119,7 @@ while [[ $# -gt 0 ]]; do
         --role)          add_role="${2:?--role needs a role name}"; shift 2 ;;
         --install-path)  install_path="${2:?--install-path needs a path}"; shift 2 ;;
         --reveal)        reveal_args+=(--reveal "${2:?--reveal needs an agent name}"); shift 2 ;;
+        -h|--help)       awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"; exit 0 ;;
         *)               red "✗ unknown argument: $1"; exit 1 ;;
     esac
 done

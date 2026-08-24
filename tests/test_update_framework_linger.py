@@ -660,3 +660,60 @@ def test_no_message_ever_points_at_a_step_number(tmp_path):
     assert "see step" not in lower, out
     assert "step 8 above" not in lower, out
     assert "step 9 above" not in lower, out
+
+
+# ── RULING 5 (fix/uninstall-reverse-and-help): "yes" and "not-applicable"
+# verdicts used to print NOTHING at any terminal path -- only "no" was ever
+# reported, even though the v0.9.39 CHANGELOG already claimed all three were.
+# A passing check and a check that silently never ran looked identical. The
+# fix adds a brief (single-line, non-red) confirmation for "yes" via a new
+# `_linger_brief()` helper, called from an `else` branch alongside every
+# existing `if [[ "$LINGER_VERDICT" == "no" ]]` site. These tests prove the
+# brief line actually reaches the two closing-banner terminal paths already
+# covered above by the "quiet" tests -- "quiet" meant "no *warning*", not
+# "no output at all", and that distinction was never actually exercised
+# until now.
+
+
+def test_live_run_linger_yes_closing_banner_shows_the_brief_confirmation(tmp_path):
+    """The mirror of test_live_run_linger_on_closing_banner_is_quiet: no
+    WARNING is manufactured (that test still holds unchanged), but the
+    verdict must not be silent either -- a reader must be able to see the
+    check ran and passed, not merely infer it from the absence of a
+    complaint."""
+    _skip_unless_ambient_user_has_real_linger()
+    repo, log_path = _make_live_sandbox(tmp_path)
+    env = _stub_path_env(tmp_path, log_path)
+    _write_loginctl_stub(env, "yes")
+
+    proc = _run_live(repo, env, "--skip-backup")
+    out = _strip_ansi(proc.stdout + proc.stderr)
+
+    assert proc.returncode == 0, out
+    assert "Update complete and VERIFIED" in out, out
+    assert "linger is NOT enabled" not in out, out  # still no false warning
+    trailer = out.rsplit("Update complete and VERIFIED", 1)[1]
+    assert "linger check: enabled" in trailer, (
+        f"a passing linger check produced NO confirmation at the closing "
+        f"banner -- indistinguishable from a check that never ran:\n{out}"
+    )
+
+
+def test_live_run_linger_yes_postflight_failure_die_path_shows_the_brief_confirmation(tmp_path):
+    """Same property on the die() terminal path, which builds its message
+    differently (the "no" branch embeds linger text INSIDE the die() string
+    itself, so the "yes"/not-applicable" branch has to print its own line
+    BEFORE calling die -- easy to get backwards)."""
+    _skip_unless_ambient_user_has_real_linger()
+    repo, log_path = _make_live_sandbox(tmp_path)
+    env = _stub_path_env(tmp_path, log_path)
+    _write_loginctl_stub(env, "yes")
+    _write_postflight_stub(repo, log_path, rc=1)
+
+    proc = _run_live(repo, env, "--skip-backup")
+    out = _strip_ansi(proc.stdout + proc.stderr)
+
+    assert proc.returncode == 1, out
+    assert "postflight FAILED" in out, out
+    assert "linger is NOT enabled" not in out, out
+    assert "linger check: enabled" in out, out

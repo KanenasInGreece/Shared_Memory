@@ -50,6 +50,14 @@ for _arg in "$@"; do
   case "$_arg" in
     --prune)   PRUNE=1 ;;
     --install) INSTALL_MISSING=1 ;;
+    -h|--help)
+      awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
+      exit 0
+      ;;
+    *)
+      echo "✗ unknown argument: $_arg (try --help)" >&2
+      exit 1
+      ;;
   esac
 done
 

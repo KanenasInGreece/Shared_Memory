@@ -45,7 +45,7 @@ while [[ $# -gt 0 ]]; do
     -dr|--dry-run) MODE="dry-run" ;;
     --verify)      MODE="verify"; [[ $# -gt 1 && "$2" != -* ]] && { VERIFY_TARGET="$2"; shift; } ;;
     --env)         ENV_FILE="${2:?--env needs a path}"; shift ;;
-    -h|--help)     sed -n '2,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help)     awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown argument: $1 (try --help)" >&2; exit 2 ;;
   esac
   shift

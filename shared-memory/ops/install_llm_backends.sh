@@ -15,6 +15,24 @@
 
 set -euo pipefail
 
+# ⛔ RULING 4: every operator-facing script accepts -h/--help (prints its own
+# header, exits 0, does nothing else) and refuses any argument it does not
+# recognise — this script previously had no argument parsing at all, so any
+# flag (including --help) was silently ignored and the interactive prompts
+# ran anyway.
+for _arg in "$@"; do
+    case "$_arg" in
+        -h|--help)
+            awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"
+            exit 0
+            ;;
+        *)
+            printf '\033[31m%s\033[0m\n' "✗ unknown argument: $_arg (this script takes none — see --help)" >&2
+            exit 1
+            ;;
+    esac
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # …/shared-memory/ops
 FRAMEWORK_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"                 # …/shared-memory
 ENV_FILE="$FRAMEWORK_DIR/.env"
