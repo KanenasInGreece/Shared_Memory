@@ -5,6 +5,36 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.51] — 2026-08-24
+
+### Added — each encoder chooses its own device
+
+- **Per-encoder CPU/GPU placement.** The compose stack's GPU switch was pair-wise: both encoders
+  on the card or neither. Measured on a 4 GB card, the embedder belongs on the GPU and the
+  reranker does not — a split that could only be reached by hand-starting one service, drifting
+  from the declared state. Four replica variables (`EMBEDDER_CPU_REPLICAS`,
+  `EMBEDDER_GPU_REPLICAS`, `RERANKER_CPU_REPLICAS`, `RERANKER_GPU_REPLICAS`) now decide each
+  encoder, each defaulting to the old pair-wise variable so an existing install renders
+  byte-identically. The installer asks which encoder, if any, goes on the GPU (Q3b), derives
+  the render group id from the device node, and writes all four variables; `preflight.sh`
+  refuses a configuration that would start both variants of one encoder on the same port.
+
+### Fixed
+
+- **The coordinator validates its encoder URLs at start** — a base without an http(s) scheme
+  fails startup naming the variable; a base carrying a path warns (the endpoint path is
+  appended); both resolved endpoints are logged once, credential-scrubbed, after logging is
+  configured.
+- **`backup.sh` says why it could not quiesce** — no token, gateway unreachable, or a token
+  without the admin role — and what to do, instead of one message for all three.
+- README §17 no longer contradicts itself about what a 4 GB card holds: the embedder fits,
+  the reranker's context window does not.
+
+*(Independent review: 0 Critical, 2 High, 5 Medium, 7 Low — all integrated; delta review
+clean with four new Lows carried to the next cycle.)*
+
+---
+
 ## [0.9.50] — 2026-08-24
 
 ### Fixed — one setting now moves the encoders, for the coordinator too
