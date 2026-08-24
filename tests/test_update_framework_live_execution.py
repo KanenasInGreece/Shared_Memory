@@ -78,13 +78,50 @@ def _make_exec(path: Path, body: str) -> None:
 def _make_live_sandbox(tmp_path: Path):
     """A throwaway repo root wired up so a REAL (non-dry-run) run of
     update_framework.sh can reach its own final "postflight passed" line
-    without ever touching real infrastructure. Returns (repo, log_path)."""
+    without ever touching real infrastructure. Returns (repo, log_path).
+
+    The repo is given a real branch (deterministically named "main" --
+    pinned via `symbolic-ref HEAD` rather than trusting whatever
+    init.defaultBranch this workstation happens to have), one commit, and a
+    real local "remote" -- a bare repo at tmp_path/remote.git -- with
+    upstream tracking configured via `git push -u`. This is what a real
+    upgrade host looks like (a branch that pulls from a configured, live
+    remote), and it is what test_update_framework_branch_guard.py's Ruling-A
+    tests mutate (deleting a branch from remote.git to reproduce "PR merged,
+    remote branch deleted") and Ruling-B tests build on (checking out and
+    pushing a second, non-main branch that still exists on the remote). It
+    also keeps the DEFAULT sandbox (branch main, tracked, present on the
+    remote) passing cleanly through the new pre-pull guard in step 0, so
+    every test in THIS file that doesn't care about branch state is
+    unaffected by it."""
     repo = tmp_path / "repo"
     scripts_dir = repo / "shared-memory" / "scripts"
     scripts_dir.mkdir(parents=True)
     (repo / "shared-memory" / ".env").write_text("DUMMY=1\n")
 
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    # Pin the initial branch name explicitly -- do not trust this
+    # workstation's own init.defaultBranch (older git defaults to "master").
+    subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/main"],
+                    cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "sandbox@example.invalid"],
+                    cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "sandbox"],
+                    cwd=repo, check=True)
+    (repo / "seed.txt").write_text("seed\n")
+    subprocess.run(["git", "add", "seed.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
+
+    # A real local "remote" -- a bare repo, never a network location -- so
+    # `git ls-remote --heads origin <branch>` (RULING A's primary
+    # instrument) and `git rev-parse --abbrev-ref @{upstream}` behave exactly
+    # like they would against a real GitHub remote, entirely offline.
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(remote)],
+                    cwd=repo, check=True)
+    subprocess.run(["git", "push", "-q", "-u", "origin", "main"],
+                    cwd=repo, check=True)
 
     link = scripts_dir / "update_framework.sh"
     link.symlink_to(_REAL_SCRIPT.resolve())
@@ -124,20 +161,28 @@ def _stub_path_env(tmp_path: Path, log_path: Path) -> dict:
     stub_dir = tmp_path / "stubbin"
     stub_dir.mkdir(exist_ok=True)
 
-    # "symbolic-ref" is delegated to the REAL git (read-only, scoped to the
-    # sandbox's own throwaway .git) so branch resolution behaves like a real
-    # checkout. It is never $1 -- the script calls `git -C "$REPO_ROOT"
-    # symbolic-ref ...`, so the match has to scan all args, not just the
-    # first. Anything else (`pull --ff-only`) is logged and reports success
-    # without touching any remote.
+    # "symbolic-ref", "rev-parse" and "ls-remote" are delegated to the REAL
+    # git -- all three are read-only and scoped to the sandbox's own
+    # throwaway .git plus its local (file-path, never network) "origin"
+    # remote, so branch resolution and the RULING-A pre-pull guard (which
+    # calls `rev-parse --abbrev-ref @{upstream}` and
+    # `ls-remote --heads origin <branch>`) behave exactly like a real
+    # checkout. None of the three is ever $1 -- the script calls
+    # `git -C "$REPO_ROOT" <subcommand> ...`, so the match has to scan all
+    # args, not just the first. Anything else (`pull --ff-only`) is logged
+    # and reports success without touching any remote -- `pull` is
+    # deliberately NOT in this list, so the actual fetch/merge stays fully
+    # stubbed regardless of the sandbox's real git state.
     _make_exec(
         stub_dir / "git",
         f'#!/usr/bin/env bash\n'
         f'echo "git $*" >> "{log_path}"\n'
         f'for arg in "$@"; do\n'
-        f'    if [[ "$arg" == "symbolic-ref" ]]; then\n'
-        f'        exec "{real_git}" "$@"\n'
-        f'    fi\n'
+        f'    case "$arg" in\n'
+        f'        symbolic-ref|rev-parse|ls-remote)\n'
+        f'            exec "{real_git}" "$@"\n'
+        f'            ;;\n'
+        f'    esac\n'
         f'done\n'
         f'exit 0\n',
     )
@@ -156,12 +201,53 @@ def _stub_path_env(tmp_path: Path, log_path: Path) -> dict:
         f'echo \'{{"status":"ok","version":"{_DUMMY_VERSION}"}}\'\n'
         f'exit 0\n',
     )
+    # The linger-check step (U1) calls `loginctl show-user ... --property=
+    # Linger`. Default this stub to a quiet "yes" so the tests in THIS file
+    # (which do not care about linger) stay deterministic regardless of the
+    # real host's own linger state, rather than falling through to a real
+    # `loginctl` on PATH. test_update_framework_linger.py overwrites this
+    # exact file with other verdicts for its own scenarios.
+    _make_exec(
+        stub_dir / "loginctl",
+        f'#!/usr/bin/env bash\n'
+        f'echo "loginctl $*" >> "{log_path}"\n'
+        f'case "$1" in\n'
+        f'    show-user) echo "Linger=yes"; exit 0 ;;\n'
+        f'    *) exit 0 ;;\n'
+        f'esac\n',
+    )
 
     env = dict(os.environ)
+    # Never let a real GATEWAY_URL/GATEWAY_UNIT/GATEWAY_RESTART_CMD exported
+    # in the harness's OWN environment leak into the sandboxed run. The
+    # script honours all three from the environment and runs
+    # `bash -c "$GATEWAY_RESTART_CMD"` unconditionally in step 5 -- a
+    # developer or CI runner with GATEWAY_RESTART_CMD set to something that
+    # touches a real service (systemctl is stubbed on PATH here, but e.g.
+    # `sudo systemctl restart ...` is not) would have this suite act on the
+    # REAL production gateway. Popping them forces every run to fall back to
+    # the script's own defaults, which this harness's stubs are built to
+    # answer to.
+    for _leaky in ("GATEWAY_URL", "GATEWAY_UNIT", "GATEWAY_RESTART_CMD"):
+        env.pop(_leaky, None)
     env["PATH"] = f"{stub_dir}{os.pathsep}{env.get('PATH', '')}"
-    # Skip step 8's early "AGENT_TOKEN not exported" exit so the run reaches
-    # (stubbed) postflight and completes with rc=0 — proving later steps
-    # fire, not just that the script stops partway through.
+    # check_linger()'s PRIMARY instrument is /var/lib/systemd/linger/<user> --
+    # a real filesystem path, not something PATH-stubbing can intercept.
+    # RULING 3 (this branch) removed the $LINGER_DIR environment seam that
+    # used to point this at a sandbox path the tests controlled -- it was a
+    # live-environment backdoor (export LINGER_DIR=/tmp silently bypassed
+    # the whole check on a REAL run), so check_linger() now only accepts the
+    # directory as a function parameter, and production's one call site
+    # passes none. A full end-to-end run of the real script therefore always
+    # consults the REAL /var/lib/systemd/linger on whatever host runs this
+    # suite -- none of the tests in THIS file assert on the linger verdict
+    # text, so this is harmless here regardless of what it reads; the tests
+    # that DO care about a specific verdict (test_update_framework_linger.py)
+    # control it via $USER instead -- see that file for why.
+    # Skip the AGENT_TOKEN-not-exported early exit (unrelated to step
+    # numbering -- it is a precondition on step 8, "prove it") so the run
+    # reaches (stubbed) postflight and completes with rc=0 — proving later
+    # steps fire, not just that the script stops partway through.
     env["AGENT_TOKEN"] = "test-token"
     return env
 
@@ -225,3 +311,50 @@ def test_live_run_with_flag_never_invokes_backfill(tmp_path):
     assert "sync_skills.sh" in log_text, "step 7 (sync_skills.sh) never ran"
     assert "postflight.sh" in log_text, "step 8 (postflight.sh) never ran"
     assert "Update complete and VERIFIED" in out, out
+
+
+# ── Ruling 3: a real GATEWAY_URL/GATEWAY_UNIT/GATEWAY_RESTART_CMD exported in
+#    the environment this suite runs under must NEVER reach the sandboxed
+#    script. `systemctl` is stubbed on PATH here, but a restart command like
+#    `sudo systemctl restart hive-mind-gateway.service` runs `sudo` for real
+#    -- a leaked value would have this suite act on a REAL production unit. ──
+
+def test_leaky_gateway_env_vars_do_not_reach_the_sandboxed_run(tmp_path, monkeypatch):
+    """A caller (developer shell, CI runner) with GATEWAY_RESTART_CMD/
+    GATEWAY_URL/GATEWAY_UNIT exported for their OWN real deployment -- e.g. a
+    privileged `sudo systemctl restart ...` -- must not have those values
+    survive into the harness's env. monkeypatch sets them in THIS process's
+    os.environ (restored automatically at teardown), exactly mirroring a
+    real caller shell; _stub_path_env() builds `env = dict(os.environ)`
+    internally and must pop all three before anything reaches the
+    subprocess."""
+    monkeypatch.setenv(
+        "GATEWAY_RESTART_CMD", "sudo systemctl restart hive-mind-gateway.service"
+    )
+    monkeypatch.setenv("GATEWAY_URL", "http://production-host:8888")
+    monkeypatch.setenv("GATEWAY_UNIT", "hive-mind-gateway.service")
+
+    repo, log_path = _make_live_sandbox(tmp_path)
+    env = _stub_path_env(tmp_path, log_path)
+
+    # _stub_path_env() must have stripped these BEFORE they ever reach the
+    # subprocess -- assert on the env dict actually handed to _run_live().
+    assert "GATEWAY_RESTART_CMD" not in env, (
+        "GATEWAY_RESTART_CMD leaked into the sandboxed run's environment -- "
+        "a real 'sudo systemctl restart ...' would execute for real"
+    )
+    assert "GATEWAY_URL" not in env
+    assert "GATEWAY_UNIT" not in env
+
+    proc = _run_live(repo, env, "--skip-backup")
+    out = _strip_ansi(proc.stdout + proc.stderr)
+    log_text = log_path.read_text()
+
+    assert proc.returncode == 0, out
+    assert "Update complete and VERIFIED" in out, out
+    # The stubbed systemctl ran (via the script's own default restart
+    # command against the stub GATEWAY_UNIT default), never a real `sudo`.
+    assert "sudo" not in log_text, (
+        f"a 'sudo'-prefixed restart command reached the log -- the leaked "
+        f"env var was not actually stripped:\n{log_text}"
+    )

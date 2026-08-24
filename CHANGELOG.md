@@ -5,6 +5,42 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.39] — 2026-08-24
+
+### Fixed — an update that can say what is wrong with the host
+
+- **A gateway that dies at logout looked healthy.** Without linger, systemd tears down the user
+  manager when the last session ends and takes the gateway with it. The next login starts it again,
+  so `systemctl --user is-active` is answered by the manager the asker just started: it reports
+  `active` while nothing is listening on the port. The failure is only observable *after* a session
+  ends, and every check the framework ships runs *inside* one.
+- **Install already refused to finish without linger; nothing re-checked afterwards.** A host
+  installed before that gate existed took every subsequent upgrade and stayed broken, reporting
+  active throughout. The update now reads the persistent linger marker — which needs no session and
+  cannot be fooled by the asker's own — and reports `yes`, `no`, or `not applicable`.
+- **The verdict reaches every way the run can end**, including the postflight-failure path, which is
+  the run an operator is least likely to scroll back through. A warning printed once in the middle of
+  a transcript and then followed by a green banner is decorative.
+- **It says which user it is about**, because `USER` is inherited and is not always the user that owns
+  the gateway. And it declines to assert what it has not established: a host whose gateway is not a
+  `systemd --user` service is told what would follow *if* it were, not that its gateway is about to die.
+- **An upgrade on a branch whose upstream was deleted died on git's own error** — the failure this
+  script's documentation promises it prevents. It refused a detached HEAD and a tarball tree and had
+  nothing to say about a third case that a squash-and-delete workflow produces routinely. It now
+  refuses in the same voice as the other two, and never switches branches on the operator's behalf.
+- **It says plainly when the checkout is not on `main`,** at the start and again at the end. Pulling a
+  stale branch and upgrading to the latest release are different things that previously looked
+  identical — and on a branch that still exists, the second would have exited zero having moved nothing.
+- **Being unable to reach the remote is not evidence that a branch was deleted.** The two are
+  distinguished by exit status, the lookup is bounded so a hanging remote cannot stall an upgrade, and
+  the unreachable case proceeds rather than refusing.
+- **`--dry-run` predicts refusals instead of performing them.** A dry run now reports what a real run
+  would refuse to do and still exits zero, which is the entire point of asking.
+- **`AGENTS.md` described a migration that previews before applying.** It has not done that since
+  0.9.35.
+
+---
+
 ## [0.9.38] — 2026-08-24
 
 ### Fixed — an upgrade you can decline, and a runbook whose commands actually run

@@ -139,6 +139,9 @@ fi
 echo
 echo "  Verify:  systemctl --user status hive-mind-gateway.service"
 echo "           curl -s localhost:8888/health"
+echo "           loginctl show-user $USER --property=Linger   (expect Linger=yes —"
+echo "           'systemctl status' can read active/running from THIS session even after"
+echo "           linger is lost; only the linger flag protects the gateway past logout)"
 echo "  Logs:    journalctl --user -u hive-mind-gateway.service -f"
 echo
 echo "  Note: the gateway needs the Docker stack + tokens from earlier Quick Start"

@@ -57,12 +57,40 @@ def _make_sandbox(tmp_path: Path) -> Path:
     """A throwaway repo root: bare git init, dummy .env, and a symlink to
     the real script at the path its own REPO_ROOT math expects -- never a
     copy, so there is no chance of the sandboxed run drifting from the
-    shipped source."""
+    shipped source.
+
+    Also gives the sandbox a real branch (pinned "main", never whatever
+    init.defaultBranch this workstation happens to have), one commit, and a
+    local ("origin") bare remote with upstream tracking configured via
+    `git push -u`. Step 0's pre-`git pull` guard (RULING A / fact-driven
+    fix alongside test_update_framework_branch_guard.py) refuses BEFORE
+    `git pull` -- even under --dry-run, since it is plain script logic
+    outside run()'s own DRY_RUN gate -- when the current branch has no
+    upstream, or when it does but the branch is gone from the remote. A
+    sandbox with neither a remote nor upstream tracking would trip that
+    refusal on every test in this file, none of which are about branch
+    state at all -- see test_update_framework_branch_guard.py for the
+    guard's own dedicated tests."""
     repo = tmp_path / "repo"
     scripts_dir = repo / "shared-memory" / "scripts"
     scripts_dir.mkdir(parents=True)
     (repo / "shared-memory" / ".env").write_text("DUMMY=1\n")
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/main"],
+                    cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "sandbox@example.invalid"],
+                    cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "sandbox"],
+                    cwd=repo, check=True)
+    (repo / "seed.txt").write_text("seed\n")
+    subprocess.run(["git", "add", "seed.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(remote)],
+                    cwd=repo, check=True)
+    subprocess.run(["git", "push", "-q", "-u", "origin", "main"],
+                    cwd=repo, check=True)
     link = scripts_dir / "update_framework.sh"
     link.symlink_to(_REAL_SCRIPT.resolve())
     return repo

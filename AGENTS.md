@@ -821,7 +821,7 @@ always to update the CHECKOUT; the schema cannot be moved backwards.**
 | 3 | `verify_neo4j_init.py --apply` | **Neo4j has no ledger** — this is the graph's entire forward-migration |
 | 4 | `reconcile_project_identity.py --apply` | graph half of migration 027; no migration can run it |
 | 5 | restart + wait for `/health` | the running gateway must BE the migrated code |
-| 6 | `backfill_domain_of.py`, then `--apply` | **after** the restart — see the guard below; declinable with `--no-domain-backfill` (default still applies it) |
+| 6 | `backfill_domain_of.py --apply` | **after** the restart — see the guard below; declinable with `--no-domain-backfill` (default still applies it) |
 | 7 | `sync_skills.sh` | after the restart, so it cannot print a false incompatibility warning |
 | 8 | `postflight.sh` | an update is not complete until this passes |
 
@@ -835,11 +835,14 @@ preference.** It enqueues a narrow repair row that only a gateway from v0.8.47 u
 worker does not recognise the row type, falls through to its ordinary fact branch, and blanks the
 content of every record it touches. The script refuses to enqueue against a gateway that is too old —
 including one it cannot reach, because an unknown version is not permission to write — so running it
-early is safe but pointless. It is **dry-run by default**; nothing is enqueued without `--apply` —
-the upgrade snippet above runs it once without the flag to show what WOULD be enqueued, then again
-with `--apply` to actually enqueue it, because the upgrade flow needs the row applied, not previewed.
-It is also only needed on a deployment whose records already carry a `domain` in their metadata: a
-new install has none, and every save from here on writes its own edge.
+early is safe but pointless. It is **dry-run by default**; nothing is enqueued without `--apply`. Since
+v0.9.35 the preview belongs to plain `backfill_domain_of.py` (no flag) alone — under it the report
+prints and the function returns before anything is enqueued — and a real (`--apply`) run enqueues
+**once, with no separate preview step**: the same counts the preview would have shown are printed by
+the applied run itself, before it enqueues. The upgrade flow (`update_framework.sh`, step 6 above)
+therefore invokes it exactly once, with `--apply`; there is no second invocation to read a preview
+from. It is also only needed on a deployment whose records already carry a `domain` in their metadata:
+a new install has none, and every save from here on writes its own edge.
 
 ⚠ **`reconcile_project_identity.py` is the graph half of a Postgres migration, and no migration can
 run it for you.** A project's identity is a registry row id; the `:Project` node carries that id so the

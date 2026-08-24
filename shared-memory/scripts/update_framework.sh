@@ -52,6 +52,46 @@ grn() { printf '\033[32m%s\033[0m\n' "$*"; }
 ylw() { printf '\033[33m%s\033[0m\n' "$*"; }
 die() { red "✗ $*"; exit 1; }
 
+# ── RULING 1: dry-run-aware refusal for the pre-`git pull` branch guard ─────
+# --dry-run is documented as "print, run nothing" -- the way an operator
+# finds out what WOULD happen. A refusal inside the guard below must never
+# become the thing that makes a dry run itself fail. Under --dry-run, print
+# the same message as an unmistakably PREDICTED outcome and return non-zero
+# to the caller (which skips only the blocked step) instead of exiting; a
+# real run still calls die() and stops exactly as it always has. Used ONLY
+# by the branch guard in step 0 -- every other refusal in this script keeps
+# calling die() directly.
+refuse() {
+    if [[ "$DRY_RUN" == "1" ]]; then
+        red "✗ [DRY RUN — PREDICTED: a real run would refuse here] $*"
+        return 1
+    fi
+    die "$*"
+}
+
+# ── RULING B: which branch this run pulled, made VISIBLE rather than silent ──
+#
+# Step 0's own "fetch new code (branch: $branch)" line names the branch, but
+# it is one line early in a long run, easy to scroll past — and nothing
+# repeats it at the end, where an operator actually checks whether the update
+# succeeded. "Upgrade to main" never verified you were ON main: a host
+# running a feature branch that still exists on the remote would pull it
+# forward and exit 0, having upgraded nothing to the release, with no message
+# anywhere saying so. This is measured, not refused outright — running a
+# branch deliberately is legitimate — but the operator must not be able to
+# mistake "pulled a stale branch" for "upgraded to the latest release".
+# $UPDATE_BRANCH is set once, in step 0, and this notice is called again at
+# every terminal path near the closing banner (same pattern as the linger
+# verdict below), so it survives to the end regardless of which path the run
+# takes.
+UPDATE_BRANCH=""
+_branch_notice() {
+    [[ -n "$UPDATE_BRANCH" && "$UPDATE_BRANCH" != "main" ]] || return 0
+    ylw "   ⚠ this checkout is on branch '$UPDATE_BRANCH', not main. Pulling it forward"
+    ylw "     moves '$UPDATE_BRANCH' to ITS OWN latest commit — NOT to the latest release."
+    ylw "     If you intend to upgrade to the released code, check out main and re-run."
+}
+
 FROM_RESTORE=0
 DRY_RUN=0
 SKIP_BACKUP=0
@@ -109,6 +149,113 @@ run_soft() {
     "$@"
 }
 
+# ── Linger check (update path): READ the persistent flag, never enable it ────
+#
+# A host can report `systemctl --user is-active` = active while nothing
+# listens on :8888, because without linger systemd tears down the user
+# manager the moment the last session ends and takes the gateway with it —
+# the next login starts it again, so a check run INSIDE a session can never
+# observe the failure by itself. install_service.sh enables linger on first
+# install and verifies it there; nothing re-checks an ALREADY-INSTALLED host
+# — a host installed before this existed, or one whose linger flag was later
+# flipped off by an admin or tool that doesn't know what depends on it, gets
+# no warning. This function only READS the flag. Enabling it stays owned by
+# install_service.sh — duplicating that logic here would give the two copies
+# a chance to drift.
+#
+# Verdict is printed to stdout as exactly one of: yes | no | not-applicable.
+#
+# PRIMARY instrument: /var/lib/systemd/linger/<user>. systemd-logind creates
+# this file the instant linger is enabled and removes it the instant it is
+# disabled, so its existence IS the flag (verified on this host: world-
+# readable, zero-byte, named for the user) — a plain existence test needs no
+# privilege and, whenever the parent directory itself exists, cannot be
+# misread. This replaces an earlier design that keyed the verdict on
+# "did loginctl exit 0", which is wrong: `loginctl show-user <user>
+# --property=Linger` exits 1 with "User ID N is not logged in or lingering"
+# for a user with no session AND no linger — logind DID answer, definitively
+# NO, and treating every nonzero exit as "logind didn't answer" turned that
+# into a silent `not-applicable` on exactly the population this check exists
+# for (a cron job, `systemd-run`, `sudo -u svc ...` — no session, no linger).
+#
+# SECONDARY / corroborating instrument: loginctl, consulted only when the
+# linger directory itself does not exist (this host may simply never have
+# had linger enabled for anyone, or may not run logind at all — the file
+# test alone can't distinguish those). Its rc!=0 output is read literally:
+# "is not logged in or lingering" is a definitive negative, not a failure to
+# answer; anything else unrecognised (unknown user, no D-Bus, logind not
+# running) is genuinely unanswered and reported as not-applicable. Bounded
+# with `timeout` — a check documented as read-only and non-fatal must not be
+# able to stall an upgrade on a wedged or absent D-Bus.
+#
+# ── RULING 3: the linger directory is a FUNCTION PARAMETER, never an
+# environment read. An earlier version read "${LINGER_DIR:-...}" straight
+# from the live environment, so `export LINGER_DIR=/tmp` silently bypassed
+# the whole check on a REAL production run — a test seam reachable from
+# outside the test suite is a backdoor, not a seam. The call site below
+# (LINGER_VERDICT="$(check_linger)") passes no argument at all, so a
+# production run always resolves the literal default; the environment now
+# has zero influence over the verdict. Tests that need the file-presence
+# branch without root pass the path explicitly as $1 instead.
+#
+# Self-contained: this function depends on NO script-level state (no colors,
+# no run_soft, no DRY_RUN, no $step) so it can be extracted between the
+# markers and run standalone — which is exactly what the test suite does.
+# >>> LINGER_CHECK
+check_linger() {
+    local who="${USER:-$(id -un)}"
+    local linger_dir="${1:-/var/lib/systemd/linger}"
+
+    if [[ -d "$linger_dir" ]]; then
+        if [[ -e "$linger_dir/$who" ]]; then
+            echo "yes"
+        else
+            echo "no"
+        fi
+        return 0
+    fi
+
+    command -v loginctl >/dev/null 2>&1 || { echo "not-applicable"; return 0; }
+
+    local out rc
+    out="$(timeout 5 loginctl show-user "$who" --property=Linger 2>&1)"
+    rc=$?
+
+    if [[ "$rc" -eq 0 ]]; then
+        if [[ -z "$out" ]]; then
+            echo "not-applicable"
+        elif echo "$out" | grep -qx "Linger=yes"; then
+            echo "yes"
+        else
+            echo "no"
+        fi
+        return 0
+    fi
+
+    # rc != 0. logind can still have answered a DEFINITIVE negative: "User ID
+    # N is not logged in or lingering" means linger is OFF, not that logind
+    # failed to respond. Anything else (unknown user, no D-Bus, logind not
+    # running) is genuinely unanswered.
+    if echo "$out" | grep -q "is not logged in or lingering"; then
+        echo "no"
+    else
+        echo "not-applicable"
+    fi
+}
+# <<< LINGER_CHECK
+
+# ── Linger verdict — measured HERE, in the preamble, before anything that
+# can die (the missing-.env check right below, the missing-tool check, the
+# migrations, the restart). Read-only and free, so measuring it costs
+# nothing regardless of what happens next; the point is that whichever
+# terminal path this run actually takes — the success banner, the dry-run
+# banner, the AGENT_TOKEN early exit, or a postflight-failure `die` — it
+# already has a verdict to report. This is NOT a numbered step: it changes
+# no state, so it does not belong in the step count, and no later message
+# may point at "Step N" for it.
+_linger_who="${USER:-$(id -un)}"
+LINGER_VERDICT="$(check_linger)"
+
 echo "Shared Memory — framework update"
 echo "  repo    : $REPO_ROOT"
 echo "  env     : $ENV_FILE"
@@ -162,16 +309,91 @@ fi
 if [[ "$FROM_RESTORE" == "0" ]]; then
     if [[ -d "$REPO_ROOT/.git" ]]; then
         branch="$(git -C "$REPO_ROOT" symbolic-ref --quiet --short HEAD || true)"
+        # pull_blocked tracks a refuse() that fired under --dry-run (which
+        # returns rather than exiting) so the block below knows to skip
+        # 'git pull' without also skipping the rest of the dry run. On a
+        # real run refuse() calls die() and this variable is never read.
+        pull_blocked=0
         if [[ -z "$branch" ]]; then
-            die "this checkout is on a DETACHED HEAD — 'git pull' has no branch to
+            refuse "this checkout is on a DETACHED HEAD — 'git pull' has no branch to
   update. Check out the release branch or tag you intend to run, then re-run.
-  (Or use the tarball route and re-run with --from-restore semantics.)"
+  (Or use the tarball route and re-run with --from-restore semantics.)" || pull_blocked=1
+        else
+            UPDATE_BRANCH="$branch"
+            _branch_notice
+
+            # ⛔ RULING A: refuse BEFORE 'git pull', the same voice and structure as
+            # the detached-HEAD and tarball refusals above — rather than letting
+            # 'git pull --ff-only' die with git's own raw
+            #   "...but no such ref was fetched"
+            # which reads as broken tooling, not as the (nameable, recoverable)
+            # state it actually is. (Measured: a host whose checkout sat on a
+            # MERGED feature branch hit exactly this — this repo squash-merges
+            # and DELETES the branch when its PR merges, so the local upstream
+            # config still names a ref that no longer exists on the remote, and
+            # fetch returns nothing for it.)
+            #
+            # Two distinct bad states, two cheap read-only instruments:
+            #   * never tracked at all  -> `rev-parse --abbrev-ref @{upstream}` fails
+            #   * tracked, but deleted on the remote (the measured case) -> the local
+            #     remote-tracking ref survives a plain fetch (nothing prunes it), so
+            #     @{upstream} still resolves; `ls-remote --heads origin <branch>` is
+            #     what actually detects the deletion, because it asks the remote
+            #     directly instead of trusting a local ref that could be stale.
+            #
+            # ⛔ NEVER auto-switch branches here. Which branch to run is the
+            # operator's decision, not the script's — refuse and explain, then let
+            # them choose.
+            upstream="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null || true)"
+            if [[ -z "$upstream" ]]; then
+                refuse "branch '$branch' has no upstream configured — 'git pull' has nothing
+  to pull FROM. Set one (git branch --set-upstream-to=origin/$branch $branch)
+  or check out the branch you intend to run, then re-run.
+  (Or use the tarball route and re-run with --from-restore semantics.)" || pull_blocked=1
+            else
+                # ── RULING 2: distinguish "the remote answered and the branch
+                # is absent" from "the remote never answered" — the SAME
+                # defect class the linger check above already exists to fix:
+                # treating "no answer" as a definitive negative. `git
+                # ls-remote --exit-code --heads` returns exactly 2 when the
+                # remote was reached and found no matching ref (a DEFINITIVE
+                # negative — refuse); any other non-zero code is a
+                # transport/network failure (offline, a proxy, a slow or
+                # unreachable remote) and must NOT be read as "branch
+                # deleted" — that would false-refuse every offline upgrade.
+                # Verified locally: exit 0 branch present, exit 2 remote
+                # reached/branch absent, exit 128 unreachable remote (bad
+                # path or bad host) — never 2. Bounded by `timeout`, the same
+                # pattern as the linger check's `timeout 5 loginctl`, so a
+                # hanging remote cannot stall an upgrade OR a dry run.
+                timeout 10 git -C "$REPO_ROOT" ls-remote --exit-code --heads origin "$branch" \
+                    >/dev/null 2>&1
+                ls_rc=$?
+                if [[ "$ls_rc" -eq 2 ]]; then
+                    refuse "branch '$branch' no longer exists on origin — most likely its PR was
+  merged (this repo squash-merges and deletes the branch on merge). 'git pull'
+  cannot resolve an upstream that is gone, and would fail here with git's own
+  raw ref error instead of telling you this. Check out the branch you
+  actually intend to run — main, unless you have a specific reason not to —
+  then re-run.
+  (Or use the tarball route and re-run with --from-restore semantics.)" || pull_blocked=1
+                elif [[ "$ls_rc" -ne 0 ]]; then
+                    ylw "   ⚠ could not verify branch '$branch' still exists on origin (git
+     ls-remote exited $ls_rc — likely offline, behind a proxy, or the remote
+     is slow/unreachable, not a definitive answer). Proceeding without that
+     check: 'git pull' will produce its own honest error if the branch
+     really is gone."
+                fi
+            fi
         fi
-        run "fetch new code (branch: $branch)" git -C "$REPO_ROOT" pull --ff-only
+
+        if [[ "$pull_blocked" == "0" ]]; then
+            run "fetch new code (branch: $branch)" git -C "$REPO_ROOT" pull --ff-only
+        fi
     else
-        die "no .git here — this host took the TARBALL route. Unpack the new
+        refuse "no .git here — this host took the TARBALL route. Unpack the new
   tag's tarball beside this tree, carry shared-memory/.env across, and run this
-  script from the NEW directory. There is nothing for 'git pull' to do."
+  script from the NEW directory. There is nothing for 'git pull' to do." || true
     fi
 fi
 
@@ -379,15 +601,33 @@ if [[ "$DRY_RUN" == "0" && "$rc" != "0" ]]; then
     ylw "     Re-run it by hand and check each agent's version before trusting them."
 fi
 
-# ── Step 8: prove it ─────────────────────────────────────────────────────────
+# ── Step 8: prove it ──────────────────────────────────────────────────────────
 #
 # ⚠ postflight NEEDS AGENT_TOKEN EXPORTED or A1/A5/A8 skip and it exits 1. That
 # is documented behaviour, not a defect — but it is also the single most common
 # way this step "fails" for a reason that has nothing to do with the update.
+#
+# The linger verdict measured in the preamble is reported inline at every
+# terminal path below rather than pointing at a step number — it is not a
+# step, so there is no "Step N" for a message to point at. The claim is
+# phrased CONDITIONALLY ("if the gateway runs as a systemd --user service")
+# because linger only matters to that deployment shape; this script also
+# supports a gateway run under a different init, a container, or a bare
+# process (see the GATEWAY_RESTART_CMD comment near the top), and on those a
+# `no` verdict is real but describes nothing this operator's own session
+# controls — asserting the kill as fact would be false on that host.
 if [[ "$DRY_RUN" == "0" && -z "${AGENT_TOKEN:-}" ]]; then
     ylw "   ! AGENT_TOKEN is not exported — postflight's A1/A5/A8 will SKIP and it"
     ylw "     will exit 1. Export an agent token and run postflight yourself:"
     ylw "       AGENT_TOKEN=<token> bash shared-memory/scripts/postflight.sh"
+    _branch_notice
+    if [[ "$LINGER_VERDICT" == "no" ]]; then
+        echo
+        red "   ✗ Also: linger is NOT enabled for $_linger_who on this host. If the gateway"
+        red "     runs as a systemd --user service, it will still be killed on session end"
+        red "     even once postflight has been run. Fix:"
+        echo "       sudo loginctl enable-linger $_linger_who"
+    fi
     echo
     ylw "Update finished, but UNVERIFIED. An update is not complete until postflight passes."
     exit 1
@@ -398,10 +638,32 @@ rc=$?
 echo
 if [[ "$DRY_RUN" == "1" ]]; then
     grn "Dry run complete — nothing was executed."
+    _branch_notice
+    if [[ "$LINGER_VERDICT" == "no" ]]; then
+        red "  linger is NOT enabled for $_linger_who on this host. If the gateway runs as a"
+        red "  systemd --user service, it will not survive your session ending. Fix:"
+        echo "    sudo loginctl enable-linger $_linger_who"
+    fi
 elif [[ "$rc" == "0" ]]; then
     grn "Update complete and VERIFIED — postflight passed."
+    _branch_notice
+    if [[ "$LINGER_VERDICT" == "no" ]]; then
+        red "  BUT linger is NOT enabled for $_linger_who on this host. If the gateway runs"
+        red "  as a systemd --user service, it will be killed when this session ends. Fix:"
+        echo "    sudo loginctl enable-linger $_linger_who"
+    fi
     ylw "Recommended: take a second backup now, so a known-good set exists at the new level."
 else
-    die "postflight FAILED (exit $rc). The code and schema have moved; the system is
+    _branch_notice
+    if [[ "$LINGER_VERDICT" == "no" ]]; then
+        die "postflight FAILED (exit $rc). The code and schema have moved; the system is
+  NOT verified. Read the failures above before using this deployment.
+
+  Also: linger is NOT enabled for $_linger_who on this host. If the gateway
+  runs as a systemd --user service, it will still be killed on session end
+  even once postflight passes. Fix:  sudo loginctl enable-linger $_linger_who"
+    else
+        die "postflight FAILED (exit $rc). The code and schema have moved; the system is
   NOT verified. Read the failures above before using this deployment."
+    fi
 fi
