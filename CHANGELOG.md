@@ -5,6 +5,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.49] — 2026-08-24
+
+### Fixed — a mistyped memory request now fails and says why
+
+- **The MCP connector's `review_edges` works for the first time.** It sent GET to a POST-only
+  route, so every call fell through the gateway's catch-all into the reasoning-LLM pool —
+  surfacing as a misleading "Backend unreachable" 503 on a host whose backend was down, and
+  never returning the review surface anywhere. It now POSTs the same body the CLI client
+  always has.
+- **The gateway refuses wrong framework requests loudly instead of forwarding them to an
+  LLM.** A wrong method on a real route answers 405 with an `Allow` header; an unknown path
+  under `/memory/` or `/admin/` answers 404 — both in the error-reply contract's voice, both
+  stating explicitly that nothing was forwarded to any LLM backend. Before this, any mistyped
+  memory request was silently signed toward a reasoning backend — burning pool health and, in
+  the worst case, letting an external model answer from general knowledge as if it were
+  memory. The known-route snapshot is derived from the router itself and excludes the
+  catch-all by its wildcard method, so registration order carries no correctness weight.
+- **A contract test pins every client call to a registered route.** It AST-extracts each
+  HTTP call from both clients — receivers derived from their httpx bindings, not a
+  hard-coded name — and validates method + path against the gateway's real routing table,
+  so the next method mismatch fails in CI instead of in an LLM's answer.
+
+---
+
 ## [0.9.48] — 2026-08-24
 
 ### Added — the install registry learns what an install IS, not only where it lives

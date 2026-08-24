@@ -140,7 +140,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.9.48"
+VERSION = "0.9.49"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server
@@ -1291,9 +1291,9 @@ async def review_edges(family: str = "entity_relation", limit: int = 20) -> str:
         return f"Error: family must be one of {', '.join(RELATION_FAMILIES)}"
     try:
         async with httpx.AsyncClient(timeout=CALL_TIMEOUT) as client:
-            r = await client.get(
+            r = await client.post(
                 f"{COORDINATOR_BASE}/memory/relations/review",
-                params={"family": family, "limit": limit},
+                json={"family": family, "limit": limit},
                 headers=_auth_headers())
             return json.dumps(_reply_json(r, "review_edges", forbidden_hint=_EDGE_REVIEW_FORBIDDEN_HINT), indent=2, default=str)
     except GatewayReplyError as exc:
