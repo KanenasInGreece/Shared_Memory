@@ -67,12 +67,17 @@ ylw() { printf '\033[33m%s\033[0m\n' "$*"; }
 # misdiagnosis class: a script that dies for a reason it misreports).
 command -v docker >/dev/null 2>&1 || { red "✗ docker not found on PATH — install Docker first (preflight.sh checks this)."; exit 1; }
 # Read keys without sourcing — .env values may contain spaces (e.g.
-# PROJECT_ALIASES) that bash `source` would mis-parse. Postgres needs no
-# password here: docker exec runs as the in-container postgres superuser
-# (local trust auth). Only Neo4j's cypher-shell needs the password.
+# PROJECT_ALIASES) that bash `source` would mis-parse. Schema/constraint work
+# below still runs as the in-container postgres superuser over the local
+# socket (peer trust, no password) for Postgres, and with the password for
+# Neo4j's cypher-shell — PG_PASSWORD itself is read here only for the
+# AUTHENTICATED_CONNECTIVITY_CHECK near the end, which deliberately does NOT
+# use peer trust (see that block for why).
 read_env() { grep -E "^$1=" "$ENV_FILE" | tail -1 | cut -d= -f2-; }
 NEO4J_PASSWORD="$(read_env NEO4J_PASSWORD)"
 [[ -n "$NEO4J_PASSWORD" ]] || { red "✗ NEO4J_PASSWORD not set in .env"; exit 1; }
+PG_PASSWORD="$(read_env PG_PASSWORD)"
+[[ -n "$PG_PASSWORD" ]] || { red "✗ PG_PASSWORD not set in .env"; exit 1; }
 # Export so `docker exec -e NEO4J_PASSWORD` (no value) passes it through from
 # this process's environment — the password never appears on any argv (a
 # world-readable /proc/<pid>/cmdline), unlike `cypher-shell -p <password>`.
@@ -247,8 +252,6 @@ echo "Applying neo4j_init.cypher → Neo4j ..."
 if docker exec -e NEO4J_PASSWORD -i "$NEO4J_CONTAINER" cypher-shell -u neo4j \
        --fail-at-end < "$MIGRATIONS_DIR/neo4j_init.cypher"; then
     grn "✓ Neo4j constraints applied"
-    echo
-    grn "Both stores initialised. Next: bootstrap_tokens.sh, then start the gateway."
 else
     echo
     red "✗ One or more Neo4j constraints could not be applied."
@@ -261,3 +264,73 @@ else
     ylw "  if this instance is meant to be a single-purpose framework store."
     exit 1
 fi
+
+# ── Authenticated connectivity — the SAME credential path the gateway uses ──
+#
+# Everything above that touched Postgres ran as the in-container superuser
+# over the local socket — pg_hba.conf's `local ... trust` line, which checks
+# no password at all. That is exactly how a STALE data directory (measured,
+# fact:1515 F7/F8) stayed invisible: a directory that predates this install
+# and was never re-initialised still carries a PREVIOUS cluster's password
+# ("Skipping initialization" in the container log confirms it), so every
+# check above this line passes while the credential the GATEWAY actually
+# authenticates with — TCP, from the host, with this .env's PG_PASSWORD — is
+# wrong. init_db.sh reported green; the gateway then crash-looped on
+# asyncpg.InvalidPasswordError, with the mismatch discovered only there.
+#
+# The fix: authenticate the SAME way the gateway will, once, now that the
+# schema/constraint work above is done — giving F7 its early detection,
+# inside this script rather than in the gateway's crash loop later.
+# pg_hba.conf routes a Unix-socket connection through `trust` and a TCP
+# connection through the password method the image was started with —
+# passing `-h 127.0.0.1` from inside this docker exec forces that same
+# password-checked path, with no psql, psycopg2 or `uv` needed on the HOST:
+# the mechanic this file already uses throughout (docker exec into the
+# container that already has the client).
+#
+# Neo4j never had this gap — cypher-shell above already connects over bolt
+# WITH NEO4J_PASSWORD, so a stale Neo4j data directory already fails loudly
+# during "Applying neo4j_init.cypher" — the check below re-confirms it
+# explicitly anyway, so both stores are verified the same way on purpose,
+# rather than one being verified only as a side effect of unrelated work.
+# >>> AUTHENTICATED_CONNECTIVITY_CHECK
+pg_authenticated_check() {
+    PGPASSWORD="$PG_PASSWORD" docker exec -e PGPASSWORD -i "$PG_CONTAINER" \
+        psql -q -t -A -h 127.0.0.1 -U postgres -d "$PG_DB" -c "SELECT 1" >/dev/null 2>&1
+}
+
+neo4j_authenticated_check() {
+    docker exec -e NEO4J_PASSWORD "$NEO4J_CONTAINER" cypher-shell -u neo4j \
+        "RETURN 1" >/dev/null 2>&1
+}
+
+authenticated_connectivity_check() {
+    local store="$1" fn="$2"
+    if "$fn"; then
+        grn "✓ $store authenticated with this .env's credentials (host-facing path, same as the gateway)"
+        return 0
+    fi
+    red "✗ $store REFUSED this .env's credentials over the password-checked"
+    red "  connection the gateway will actually use to reach it."
+    ylw "  Likely cause: this data directory pre-existed this install — a previous"
+    ylw "  cluster's credentials are still in force. Reusing an old data directory"
+    ylw "  silently keeps its old password; this .env's password is simply not it."
+    ylw "  This is a data-directory problem, not a credentials problem — do not edit"
+    ylw "  the .env to make this pass. Point the data directory at a genuinely fresh"
+    ylw "  location, restore the matching backup set (shared-memory/ops/restore.sh),"
+    ylw "  or clear the stale data first:"
+    ylw "      bash shared-memory/scripts/uninstall_framework.sh --level data"
+    return 1
+}
+# <<< AUTHENTICATED_CONNECTIVITY_CHECK
+
+echo "Verifying host-facing authentication (the same credential path the gateway uses) ..."
+_auth_failures=0
+authenticated_connectivity_check "Postgres" pg_authenticated_check || _auth_failures=$((_auth_failures + 1))
+authenticated_connectivity_check "Neo4j"    neo4j_authenticated_check || _auth_failures=$((_auth_failures + 1))
+if [[ "$_auth_failures" -gt 0 ]]; then
+    exit 1
+fi
+
+echo
+grn "Both stores initialised. Next: bootstrap_tokens.sh, then start the gateway."
