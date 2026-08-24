@@ -1214,16 +1214,25 @@ class AsyncHiveMindProxy:
         /pool/status, is picked up automatically, so a future route added
         anywhere in the app is covered without touching this method.
 
-        MUST be called after attach_coordinator() and the /health,
-        /pool/status registrations, and BEFORE the catch-all route
-        ("*", "/{tail:.*}") is added — calling it after the catch-all would
-        capture the catch-all's own wildcard resource as if it were a real
-        framework route, defeating the guard entirely. Calling it at this
-        point in startup is what excludes the catch-all "automatically",
-        rather than by name/identity filtering.
+        Called after attach_coordinator() and the /health, /pool/status
+        registrations. The catch-all route ("*", "/{tail:.*}") is excluded
+        by its wildcard METHOD below, not by registration order — so the
+        snapshot is correct whether it is taken before or after the
+        catch-all is added. main() still calls this before adding the
+        catch-all purely as a readable convention.
         """
         known: dict = {}
         for route in router.routes():
+            if route.method == "*":
+                # A wildcard-method registration — the catch-all proxy route
+                # ("*", "/{tail:.*}") — is by definition not a specific
+                # framework route: snapshotting it would mark every path
+                # "known" and blanket-405 the LLM passthrough. Filtering by
+                # method makes the snapshot correct regardless of WHEN it is
+                # taken relative to the catch-all's registration, so the
+                # startup ordering is a convention, not a correctness
+                # requirement.
+                continue
             resource = route.resource
             if resource is None:
                 continue

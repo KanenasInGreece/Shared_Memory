@@ -99,9 +99,13 @@ def _build_real_gateway_app(g) -> web.Application:
 def _build_proxy_with_known_routes(g, *, with_catchall: bool = False):
     app = _build_real_gateway_app(g)
     proxy = g.AsyncHiveMindProxy()
-    proxy.set_known_routes(app.router)
     if with_catchall:
+        # Deliberately the WORST-CASE order: the catch-all is already
+        # registered when the snapshot is taken. set_known_routes() must be
+        # correct anyway (its wildcard-method filter, not startup ordering,
+        # is what excludes the catch-all) — RG-2/RG-3 review fix.
         app.router.add_route("*", "/{tail:.*}", proxy.handle_proxy)
+    proxy.set_known_routes(app.router)
     return app, proxy
 
 
@@ -226,18 +230,30 @@ def test_route_view_derived_from_router_not_hand_written(monkeypatch):
 
 
 def test_catchall_excluded_from_known_routes(monkeypatch):
-    """set_known_routes(), called (as main() calls it) BEFORE the catch-all is
-    registered, must never treat the catch-all's own wildcard as a known
-    route — else the guard would blanket-405 every LLM passthrough path."""
+    """The snapshot must exclude the catch-all's wildcard resource EVEN WHEN
+    it is taken after the catch-all is registered (the helper registers it
+    first on purpose) — the guard's correctness must come from
+    set_known_routes() itself, never from main()'s call ordering. A swapped
+    ordering in main() must be harmless; removing the wildcard-method filter
+    must kill this test (RG-2/RG-3 review fix)."""
     g = _fresh_gateway(monkeypatch)
     _, proxy = _build_proxy_with_known_routes(g, with_catchall=True)
-    for entry in proxy._known_routes.values():
-        assert entry["methods"] != {"*"}
-    # and the behavioural proof: an LLM-pool path is still a no-op today
+    for key, entry in proxy._known_routes.items():
+        assert "*" not in entry["methods"], (
+            f"wildcard method captured for {key} — the catch-all leaked into "
+            "the known-routes snapshot")
+        assert "tail" not in key, (
+            f"catch-all resource {key} leaked into the known-routes snapshot")
+    # Behavioural proof in the same worst-case order: the LLM passthrough
+    # still dispatches, and the guard still refuses what it should.
     session = _CapturingSession()
     proxy.session = session
     asyncio.run(proxy.handle_proxy(_req("POST", "/v1/embeddings")))
     assert session.captured is not None
+    resp = asyncio.run(proxy.handle_proxy(_req("GET", "/memory/save")))
+    assert resp.status == 405 and resp.headers["Allow"] == "POST"
+    resp = asyncio.run(proxy.handle_proxy(_req("GET", "/memory/no-such-route")))
+    assert resp.status == 404
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -344,7 +360,21 @@ def _extractor_finds_every_call_site(src_path: str, calls: list) -> None:
     that answers what was asked — prove the AST extractor didn't silently
     drop (or double-count) a call site, via an independent textual count."""
     src = open(src_path).read()
-    independent_count = len(re.findall(r"\bclient\.(?:get|post)\(", src))
+    tree = ast.parse(src)
+    names = set()
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.AsyncWith, ast.With)):
+            for item in n.items:
+                ce = item.context_expr
+                fn = ce.func if isinstance(ce, ast.Call) else None
+                label = fn.attr if isinstance(fn, ast.Attribute) else (
+                    fn.id if isinstance(fn, ast.Name) else "")
+                if "client" in label.lower() and isinstance(
+                        item.optional_vars, ast.Name):
+                    names.add(item.optional_vars.id)
+    independent_count = sum(
+        len(re.findall(rf"\b{re.escape(n)}\.(?:get|post)\(", src))
+        for n in names)
     assert len(calls) == independent_count, (
         f"{src_path}: AST extractor found {len(calls)} client.get/post call(s), "
         f"independent regex count found {independent_count} — the extractor "
