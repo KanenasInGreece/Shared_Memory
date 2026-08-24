@@ -107,24 +107,49 @@ services:
   # move it; thread count is not.
   #
   # Retriever: BGE-M3
-  # ── THE ENCODER CHOICE: CPU pair (default) or GPU pair, one yaml ───────────
-  # Exactly ONE of the two pairs below should have replicas 1 — they bind the
-  # same ports, so 1/1 fails loudly on the second bind rather than silently.
-  # CPU_ENCODER_REPLICAS defaults to 1: a fresh install always gets working
-  # encoders with no special hardware. GPU_ENCODER_REPLICAS=1 (+ CPU=0) moves
-  # both onto a Vulkan-capable card — see the measured numbers in README §17.
-  # The one-GPU compromise, plainly: a card with enough VRAM for your reasoning
-  # model is usually better spent on the MODEL backend; a small card (~4 GB)
-  # is best spent on the encoders, which fit in ~2 GB and repay it in search
-  # latency. Always the operator's call — these knobs state it, in .env.
-  # Setting BOTH pairs to 0 means the encoders are hosted outside the stack
-  # entirely (bare llama-server, another machine): then EMBEDDER_URL /
-  # RERANKER_URL must point at whatever serves them, or saves are refused.
+  # ── THE ENCODER CHOICE: CPU pair (default), GPU pair, or PER-SERVICE ───────
+  # Exactly ONE of {CPU, GPU} should be live for a given encoder at a time —
+  # each pair binds the same port (8070 for the two retrievers, 8071 for the
+  # two rerankers), so 1/1 on either port fails loudly on the second bind
+  # rather than silently. preflight.sh also checks this ahead of `up` and
+  # reports it loudly (see the encoder section there).
+  #
+  # Two knobs, layered — compose has no conditionals, so the per-service var
+  # defaults to the pair-wise one via a NESTED ${VAR:-${OTHER:-default}}
+  # substitution (verified with `docker compose config` on Compose v2/v5.4):
+  #   CPU_ENCODER_REPLICAS / GPU_ENCODER_REPLICAS   — the PAIR-WISE switch,
+  #     unchanged from before per-service existed: moves BOTH encoders
+  #     together. CPU defaults to 1 (a fresh install always gets working
+  #     encoders with no special hardware); GPU defaults to 0.
+  #   EMBEDDER_CPU_REPLICAS / EMBEDDER_GPU_REPLICAS
+  #   RERANKER_CPU_REPLICAS / RERANKER_GPU_REPLICAS — the PER-SERVICE switch.
+  #     Each defaults to the matching pair-wise var, so an install that has
+  #     only ever set CPU_ENCODER_REPLICAS/GPU_ENCODER_REPLICAS keeps
+  #     behaving EXACTLY as before — the per-service vars are opt-in. Set one
+  #     explicitly to split the pair, e.g. the measured-good mixed
+  #     arrangement on a 4 GB card (embedder GPU, reranker CPU):
+  #       EMBEDDER_GPU_REPLICAS=1
+  #       EMBEDDER_CPU_REPLICAS=0
+  #       RERANKER_GPU_REPLICAS=0
+  #       RERANKER_CPU_REPLICAS=1
+  #     (GPU_ENCODER_REPLICAS/CPU_ENCODER_REPLICAS can be left at their
+  #     defaults — the per-service vars above override them individually,
+  #     and no longer need the `--scale` flags this used to require, which
+  #     drifted from the declared state on every future `up`.)
+  #     Measured on a 4 GB Polaris host: the embedder on GPU is right (671 MB
+  #     VRAM); the reranker on GPU at the 8192 context window overflows
+  #     device memory. install_framework.sh's interview (Q3b) asks where each
+  #     encoder is served and writes whichever vars the answer needs.
+  #
+  # Setting every CPU/GPU var for an encoder to 0 means that encoder is
+  # hosted outside the stack entirely (bare llama-server, another machine):
+  # then EMBEDDER_URL / RERANKER_URL must point at whatever serves it, or
+  # saves are refused.
   retriever-api:
     image: ghcr.io/ggml-org/llama.cpp:server
     container_name: llama-retriever
     deploy:
-      replicas: ${CPU_ENCODER_REPLICAS:-1}
+      replicas: ${EMBEDDER_CPU_REPLICAS:-${CPU_ENCODER_REPLICAS:-1}}
     ports: ["${INFERENCE_BIND:-127.0.0.1}:8070:8070"]
     volumes:
       - ${LLM_MODELS_DIR:-./models}:/models:ro,z
@@ -144,9 +169,11 @@ services:
   reranker-api:
     image: ghcr.io/ggml-org/llama.cpp:server
     container_name: llama-reranker
-    # Same knob as retriever-api above — the pair moves together.
+    # Same knobs as retriever-api above — RERANKER_CPU_REPLICAS defaults to
+    # the pair-wise CPU_ENCODER_REPLICAS, so the pair still moves together
+    # unless a per-service var overrides it.
     deploy:
-      replicas: ${CPU_ENCODER_REPLICAS:-1}
+      replicas: ${RERANKER_CPU_REPLICAS:-${CPU_ENCODER_REPLICAS:-1}}
     ports: ["${INFERENCE_BIND:-127.0.0.1}:8071:8071"]
     volumes:
       - ${LLM_MODELS_DIR:-./models}:/models:ro,z
@@ -164,13 +191,17 @@ services:
 
   # ── GPU encoder pair — same models, same ports, Vulkan image ───────────────
   # Off by default (replicas 0). Enable with GPU_ENCODER_REPLICAS=1 and
-  # CPU_ENCODER_REPLICAS=0 in shared-memory/.env. Vulkan is deliberate: one
-  # image covers Intel, AMD and NVIDIA (swap the tag for a CUDA build if you
-  # prefer CUDA — nothing else changes). ENCODER_GPU_INDEX pins WHICH card:
-  # llama.cpp enumerates Vulkan devices in driver order, not PCI order — read
-  # the startup log before trusting an index. Both encoders share one card on
-  # purpose. Once on a GPU, raise RERANK_MAX_DOC_CHARS to match EMBED_MAX_CHARS:
-  # the CPU-latency reason for narrowing the reranker's view is gone.
+  # CPU_ENCODER_REPLICAS=0 in shared-memory/.env for the pair, or
+  # EMBEDDER_GPU_REPLICAS=1 (+ EMBEDDER_CPU_REPLICAS=0) to move only this one
+  # — see the per-service section on retriever-api above. Vulkan is
+  # deliberate: one image covers Intel, AMD and NVIDIA (swap the tag for a
+  # CUDA build if you prefer CUDA — nothing else changes). ENCODER_GPU_INDEX
+  # pins WHICH card: llama.cpp enumerates Vulkan devices in driver order, not
+  # PCI order — read the startup log before trusting an index. Both encoders
+  # share one card on purpose (they need not both run there — see the
+  # per-service split above). Once the embedder is on a GPU, raise
+  # RERANK_MAX_DOC_CHARS to match EMBED_MAX_CHARS if the reranker joins it
+  # too: the CPU-latency reason for narrowing the reranker's view is gone.
   # Two containers, not one, is NOT an accident: the embedder is on the critical
   # write path (a save is refused rather than stored without a vector), the
   # reranker degrades to vector order — one shared lifecycle would let a
@@ -179,7 +210,7 @@ services:
     image: ghcr.io/ggml-org/llama.cpp:server-vulkan
     container_name: llama-retriever-gpu
     deploy:
-      replicas: ${GPU_ENCODER_REPLICAS:-0}
+      replicas: ${EMBEDDER_GPU_REPLICAS:-${GPU_ENCODER_REPLICAS:-0}}
     ports: ["${INFERENCE_BIND:-127.0.0.1}:8070:8070"]
     devices:
       - /dev/dri:/dev/dri
@@ -204,8 +235,13 @@ services:
   reranker-api-gpu:
     image: ghcr.io/ggml-org/llama.cpp:server-vulkan
     container_name: llama-reranker-gpu
+    # RERANKER_GPU_REPLICAS defaults to the pair-wise GPU_ENCODER_REPLICAS —
+    # see the per-service section on retriever-api above. This is the
+    # service to LEAVE ON CPU on a small (~4 GB) card: measured, its
+    # 8192-token context window overflows device memory there while the
+    # embedder (671 MB VRAM) is fine.
     deploy:
-      replicas: ${GPU_ENCODER_REPLICAS:-0}
+      replicas: ${RERANKER_GPU_REPLICAS:-${GPU_ENCODER_REPLICAS:-0}}
     ports: ["${INFERENCE_BIND:-127.0.0.1}:8071:8071"]
     devices:
       - /dev/dri:/dev/dri

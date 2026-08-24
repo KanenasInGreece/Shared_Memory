@@ -84,6 +84,42 @@ ask_secret() {  # prompt → echoes answer (input hidden), or exits 1
 NEO4J_HOST_DIR="$(ask 'Neo4j host data dir'        "$HOME/databases/neo4j")"
 PG_DATA_DIR="$(ask 'Postgres data dir'             "$HOME/databases/postgres")"
 LLM_MODELS_DIR="$(ask 'GGUF models dir (blank if using LM Studio)' '')"
+
+# ── Q3b (AGENTS.md): per-service encoder device split ──────────────────────
+# Two plain VALUE prompts (same shape as the three dirs above, via ask()) so
+# this stays a FIXED, unconditional-length sequence — never branching on an
+# earlier answer — which is what lets AGENTS.md's Phase 1 drive the whole
+# script with one fixed printf of piped answers
+# (tests/test_change_group_contracts.py enforces the two stay in sync).
+# Defaulting to "cpu" for both and writing NOTHING to .env unless one is
+# answered "gpu" means accepting the default (Enter, Enter) reproduces
+# TODAY's behaviour exactly: the pair-wise CPU_ENCODER_REPLICAS/
+# GPU_ENCODER_REPLICAS already in the template decide, same as before this
+# question existed. Asked even when LLM_MODELS_DIR is blank (encoders hosted
+# elsewhere) — harmless there since the default writes nothing.
+echo
+echo "  Measured on a 4 GB card: the embedder fits comfortably (671 MB VRAM);"
+echo "  the reranker's 8192-token context window overflows a small card's"
+echo "  device memory. Only matters if you use the bundled compose encoders."
+EMBEDDER_DEVICE="$(ask 'Embedder device (cpu/gpu)' 'cpu')"
+RERANKER_DEVICE="$(ask 'Reranker device (cpu/gpu) — not recommended on a small card' 'cpu')"
+EMBEDDER_CPU_REPLICAS=""
+EMBEDDER_GPU_REPLICAS=""
+RERANKER_CPU_REPLICAS=""
+RERANKER_GPU_REPLICAS=""
+case "$EMBEDDER_DEVICE" in
+  gpu) EMBEDDER_GPU_REPLICAS=1; EMBEDDER_CPU_REPLICAS=0 ;;
+  cpu) ;;
+  *) echo "  ⚠ unrecognised embedder device '$EMBEDDER_DEVICE' — treating as cpu" >&2
+     EMBEDDER_DEVICE="cpu" ;;
+esac
+case "$RERANKER_DEVICE" in
+  gpu) RERANKER_GPU_REPLICAS=1; RERANKER_CPU_REPLICAS=0 ;;
+  cpu) ;;
+  *) echo "  ⚠ unrecognised reranker device '$RERANKER_DEVICE' — treating as cpu" >&2
+     RERANKER_DEVICE="cpu" ;;
+esac
+
 # The compose file passes the Neo4j password as NEO4J_AUTH=neo4j/<password>,
 # a '/'-delimited string — a password containing '/' silently breaks parsing
 # and the container restart-loops on "… is invalid" (measured on a fresh
@@ -116,6 +152,7 @@ _ncpu="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null \
          || sysctl -n hw.ncpu 2>/dev/null || echo 8)"
 LLAMA_CPU_THREADS="$(( _ncpu / 2 + 1 ))"
 [ "$LLAMA_CPU_THREADS" -lt 1 ] && LLAMA_CPU_THREADS=1
+
 # S-07: NEO4J_HOST_DIR/PG_DATA_DIR/LLM_MODELS_DIR/LLAMA_CPU_THREADS are plain
 # config — safe to export at the top level, and install_service.sh /
 # install_llm_backends.sh (spawned below, neither of which needs a DB
@@ -148,6 +185,27 @@ export NEO4J_HOST_DIR PG_DATA_DIR LLM_MODELS_DIR LLAMA_CPU_THREADS
   ' "$EXAMPLE" > "$ENV_FILE"
 )
 chmod 600 "$ENV_FILE"
+
+# EMBEDDER_DEVICE/RERANKER_DEVICE and the per-service replica vars are
+# COMMENTED OUT in the template (like CPU_ENCODER_REPLICAS/
+# GPU_ENCODER_REPLICAS above them), so the awk substitution above — which
+# only rewrites lines already live in the template — cannot fill them in.
+# Append instead, and only when Q3b actually moved something off "cpu" —
+# both at the default means nothing to add: the pair-wise defaults already
+# in the template govern, exactly as before this question existed.
+if [ "$EMBEDDER_DEVICE" = "gpu" ] || [ "$RERANKER_DEVICE" = "gpu" ]; then
+  {
+    echo ""
+    echo "# ── Per-service encoder device split (Q3b, install_framework.sh) ──"
+    echo "EMBEDDER_DEVICE=$EMBEDDER_DEVICE"
+    [ -n "$EMBEDDER_CPU_REPLICAS" ]  && echo "EMBEDDER_CPU_REPLICAS=$EMBEDDER_CPU_REPLICAS"
+    [ -n "$EMBEDDER_GPU_REPLICAS" ]  && echo "EMBEDDER_GPU_REPLICAS=$EMBEDDER_GPU_REPLICAS"
+    echo "RERANKER_DEVICE=$RERANKER_DEVICE"
+    [ -n "$RERANKER_CPU_REPLICAS" ]  && echo "RERANKER_CPU_REPLICAS=$RERANKER_CPU_REPLICAS"
+    [ -n "$RERANKER_GPU_REPLICAS" ]  && echo "RERANKER_GPU_REPLICAS=$RERANKER_GPU_REPLICAS"
+  } >> "$ENV_FILE"
+  echo "  ✓ Encoder device split written: EMBEDDER_DEVICE=$EMBEDDER_DEVICE RERANKER_DEVICE=$RERANKER_DEVICE"
+fi
 
 mkdir -p "$NEO4J_HOST_DIR"/{data,logs,import,plugins} "$PG_DATA_DIR"
 

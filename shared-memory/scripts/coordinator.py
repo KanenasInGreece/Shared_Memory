@@ -42,6 +42,7 @@ import re
 import socket
 import struct
 import time
+import urllib.parse
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -1679,12 +1680,51 @@ NEO4J_ACQUIRE_TIMEOUT = _env_float("NEO4J_ACQUIRE_TIMEOUT", 30.0)
 # localhost (measured on a LAN embedder: passthrough answered from the remote,
 # saves kept using the local container). The port is a default, never an assumption.
 def _encoder_url(env_name: str, default_base: str, path: str) -> str:
-    """Full endpoint for an encoder backend: env-overridable BASE + fixed PATH."""
+    """Full endpoint for an encoder backend: env-overridable BASE + fixed PATH.
+
+    Validated at the same time it is derived (module import/reload) so a bad
+    value is caught before the process ever accepts traffic, rather than
+    surfacing as an opaque connection error on the first save/search:
+      - the resolved BASE must be an http(s) URL — anything else (a bare
+        host, a typo'd scheme, a leftover placeholder) fails LOUDLY, naming
+        env_name, rather than producing a confusing httpx/aiohttp exception
+        deep inside _embed()/_rerank() on the first real request.
+      - a base that already ends in "/v1" only WARNS (never fails): the path
+        this function appends already starts with "/v1/...", so a base of
+        "http://host:port/v1" resolves to "http://host:port/v1/v1/embeddings"
+        — reachable in principle if the deployer really did mean to double
+        it, so this is a footgun warning, not a refusal.
+    """
     base = (os.environ.get(env_name) or default_base).strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(base)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"{env_name} must be an http(s) URL, got {base!r} "
+            f"(scheme {parsed.scheme!r}) — check {env_name} in shared-memory/.env"
+        )
+    if base.endswith("/v1"):
+        log.warning(
+            "%s (%s) already ends in /v1 — the resolved endpoint will be "
+            "%s%s, doubling the /v1 segment. Strip the trailing /v1 from %s.",
+            env_name, scrub_url_credentials(base), scrub_url_credentials(base),
+            path, env_name,
+        )
     return f"{base}{path}"
 
 EMBED_URL  = _encoder_url("EMBEDDER_URL", "http://localhost:8070", "/v1/embeddings")
 RERANK_URL = _encoder_url("RERANKER_URL", "http://localhost:8071", "/v1/reranking")
+
+# Logged ONCE at module import/reload (never per-request) — review finding F6,
+# PR #307: both endpoints are now operator-supplied (EMBEDDER_URL/RERANKER_URL),
+# so an operator debugging a 503 should be able to see exactly what this
+# process resolved them to without guessing at env precedence, and scrubbed
+# the same way the failure-path messages already are (see _embed()'s
+# scrub_url_credentials use) so a credential embedded in the URL never lands
+# in a log file even on the success path.
+log.info(
+    "encoder endpoints resolved: EMBED_URL=%s RERANK_URL=%s",
+    scrub_url_credentials(EMBED_URL), scrub_url_credentials(RERANK_URL),
+)
 
 EMBED_RETRIES = 4
 EMBED_BACKOFF = 0.5      # seconds × attempt number  (0.5 s, 1 s, 1.5 s, 2 s)

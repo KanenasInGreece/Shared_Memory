@@ -188,10 +188,53 @@ fi
 # Encoder model files — an inference container with a wrong/missing model path
 # is the most common `unhealthy` in Phase 4 (AGENTS.md), and it is checkable
 # now: the .env names the dir and the compose defaults name the subpaths.
+#
+# EFFECTIVE replicas — mirrors postgres_neo4j_limits.yaml's own nested default
+# (${EMBEDDER_GPU_REPLICAS:-${GPU_ENCODER_REPLICAS:-0}}) in bash, so this
+# script's picture of "what will actually start" matches what `docker compose
+# up` will actually do, per-service override included, not just the pair-wise
+# knobs a per-service install may have moved past.
 if [[ -f "$ENV_FILE" ]]; then
     cpu_reps="$(read_env CPU_ENCODER_REPLICAS)"; cpu_reps="${cpu_reps:-1}"
     gpu_reps="$(read_env GPU_ENCODER_REPLICAS)"; gpu_reps="${gpu_reps:-0}"
-    if [[ "$cpu_reps" != "0" || "$gpu_reps" != "0" ]]; then
+    emb_cpu="$(read_env EMBEDDER_CPU_REPLICAS)";   emb_cpu="${emb_cpu:-$cpu_reps}"
+    emb_gpu="$(read_env EMBEDDER_GPU_REPLICAS)";   emb_gpu="${emb_gpu:-$gpu_reps}"
+    rer_cpu="$(read_env RERANKER_CPU_REPLICAS)";   rer_cpu="${rer_cpu:-$cpu_reps}"
+    rer_gpu="$(read_env RERANKER_GPU_REPLICAS)";   rer_gpu="${rer_gpu:-$gpu_reps}"
+
+    # Double-start guard: the CPU and GPU variant of the SAME encoder bind the
+    # SAME port (8070 for both retrievers, 8071 for both rerankers) — compose
+    # itself fails loudly on the second bind when this happens, but that
+    # failure surfaces mid-`up`, after Postgres/Neo4j are already starting.
+    # Catching it here, before anything starts, is louder and earlier.
+    if [[ "$emb_cpu" != "0" && "$emb_gpu" != "0" ]]; then
+        bad "embedder would double-start: EMBEDDER_CPU_REPLICAS=$emb_cpu AND EMBEDDER_GPU_REPLICAS=$emb_gpu both resolve non-zero — both bind :8070; set exactly one to 0"
+    fi
+    if [[ "$rer_cpu" != "0" && "$rer_gpu" != "0" ]]; then
+        bad "reranker would double-start: RERANKER_CPU_REPLICAS=$rer_cpu AND RERANKER_GPU_REPLICAS=$rer_gpu both resolve non-zero — both bind :8071; set exactly one to 0"
+    fi
+
+    # EMBEDDER_DEVICE/RERANKER_DEVICE are the human-readable record of INTENT
+    # install_framework.sh writes alongside the replica pair (shared-memory/
+    # .env.example) — cross-check it against what the replicas actually
+    # resolve to, so a stale DEVICE comment next to a hand-edited replica pair
+    # is caught instead of silently believed.
+    emb_device="$(read_env EMBEDDER_DEVICE)"
+    if [[ -n "$emb_device" ]]; then
+        emb_resolved="cpu"; [[ "$emb_gpu" != "0" ]] && emb_resolved="gpu"
+        if [[ "$emb_device" != "$emb_resolved" ]]; then
+            warn "EMBEDDER_DEVICE=$emb_device but the replica vars resolve to $emb_resolved (EMBEDDER_CPU_REPLICAS=$emb_cpu EMBEDDER_GPU_REPLICAS=$emb_gpu) — one of the two was edited without the other"
+        fi
+    fi
+    rer_device="$(read_env RERANKER_DEVICE)"
+    if [[ -n "$rer_device" ]]; then
+        rer_resolved="cpu"; [[ "$rer_gpu" != "0" ]] && rer_resolved="gpu"
+        if [[ "$rer_device" != "$rer_resolved" ]]; then
+            warn "RERANKER_DEVICE=$rer_device but the replica vars resolve to $rer_resolved (RERANKER_CPU_REPLICAS=$rer_cpu RERANKER_GPU_REPLICAS=$rer_gpu) — one of the two was edited without the other"
+        fi
+    fi
+
+    if [[ "$emb_cpu" != "0" || "$emb_gpu" != "0" || "$rer_cpu" != "0" || "$rer_gpu" != "0" ]]; then
         models_dir="$(read_env LLM_MODELS_DIR)"
         embed_sub="$(read_env EMBED_MODEL_SUBPATH)"
         embed_sub="${embed_sub:-gpustack/bge-m3-GGUF/bge-m3-Q8_0.gguf}"
