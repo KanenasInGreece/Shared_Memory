@@ -5,6 +5,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.45] — 2026-08-24
+
+### Fixed — an uninstall that can say it failed
+
+- **`uninstall --level data` claimed a teardown it never performed.** It ran
+  `docker compose down -v` without `--env-file`, interpolation failed, the failure vanished into
+  a pipe, and "✓ compose stack down, volumes removed" printed unconditionally — leaving four
+  containers running on deleted bind-mounts. Measured live: the next fresh install inherited the
+  stale Postgres cluster and its old password, and the gateway crash-looped. The down now
+  carries `--env-file` (with a safe, honest env-less fallback for re-runs after partial
+  uninstalls), its exit code is checked, and teardown-and-verify runs **before** anything
+  irreversible is deleted, so a failed down halts the uninstall instead of gutting a live stack.
+- **Success is measured, not assumed — and the measurement itself fails closed.** After the
+  down, the uninstall checks `docker ps -a` against the compose file's own container names and
+  names any leftover loudly. If the container list cannot be parsed at all, it refuses to claim
+  a verified teardown rather than passing on an empty check.
+- **`init_db.sh` now proves the credentials the system will actually use.** Its checks ran
+  in-container under socket peer trust, so a stale cluster with a different password still read
+  as green. One authenticated TCP check per store now runs with the `.env` credentials — a
+  mismatch fails the init loudly, naming the pre-existing data directory as the likely origin
+  and pointing at the uninstall/backup paths instead of suggesting credential edits.
+- `--level data` also removes `.env.mintlock`, at both locations the env file can live.
+
+---
+
 ## [0.9.44] — 2026-08-24
 
 ### Fixed — a first upgrade that knows where the database came from
