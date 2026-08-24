@@ -455,3 +455,93 @@ def test_add_points_at_remint_instead_of_a_fleet_rotation(tmp_path):
     out = res.stdout + res.stderr
     assert "--remint codex" in out
     assert "there is no single-agent rotation" not in out
+
+
+# ── --mcp: the install KIND reaches the persisted registry line ──────────────
+#
+# The shipped bash is where this can silently go wrong: bootstrap_tokens.sh
+# builds the flag list it forwards to generate_tokens.py, and greps that
+# script's stdout for exactly the registry lines it knows about. A flag added to
+# the Python and not forwarded by the bash produces a mint that succeeds, a
+# registry line that looks right, and an install kind that is simply absent —
+# after which sync delivers the CLI skill package into a walled MCP directory.
+
+def test_add_with_mcp_persists_the_kind_in_agent_installs(tmp_path):
+    walled = tmp_path / "walled_mcp"; walled.mkdir()
+    fake_root = _make_fake_root(tmp_path, {})
+    _env_path(fake_root).parent.mkdir(parents=True, exist_ok=True)
+    _env_path(fake_root).write_text(
+        f"AGENT_TOKENS=claude:sha256:{_digest('tok_claude')}\n")
+
+    res = _run(fake_root, ["--add", "opencode", "--mcp",
+                           "--install-path", str(walled / ".env")])
+
+    assert res.returncode == 0, res.stdout + res.stderr
+    installs = [l for l in _env_path(fake_root).read_text().splitlines()
+                if l.startswith("AGENT_INSTALLS=")]
+    assert len(installs) == 1, f"expected one live AGENT_INSTALLS line, got {installs}"
+    assert f"opencode:mcp:{walled / '.env'}" in installs[0], (
+        f"--mcp did not reach the persisted registry: {installs[0]}")
+    assert "AGENT_TOKEN=" in (walled / ".env").read_text()
+
+
+def test_add_without_mcp_persists_the_two_field_form(tmp_path):
+    """The default is not merely 'skill' — it is the two-field SPELLING, so a
+    registry of ordinary installs is untouched by a release that added kinds."""
+    d = tmp_path / "cli_skill"; d.mkdir()
+    fake_root = _make_fake_root(tmp_path, {})
+    _env_path(fake_root).parent.mkdir(parents=True, exist_ok=True)
+    _env_path(fake_root).write_text(
+        f"AGENT_TOKENS=claude:sha256:{_digest('tok_claude')}\n")
+
+    res = _run(fake_root, ["--add", "codex", "--install-path", str(d / ".env")])
+
+    assert res.returncode == 0, res.stdout + res.stderr
+    line = next(l for l in _env_path(fake_root).read_text().splitlines()
+                if l.startswith("AGENT_INSTALLS="))
+    assert f"codex:{d / '.env'}" in line and ":skill:" not in line, line
+
+
+def test_remint_with_mcp_keeps_the_kind_on_re_issue(tmp_path):
+    """Re-homing an already-registered identity onto a walled directory is the
+    measured re-homing case. Dropping --mcp on the re-issue would downgrade the entry to a
+    CLI skill install while the operator believes nothing changed."""
+    walled = tmp_path / "walled_mcp"; walled.mkdir()
+    fake_root = _make_fake_root(tmp_path, {})
+    _env_path(fake_root).parent.mkdir(parents=True, exist_ok=True)
+    _env_path(fake_root).write_text(
+        f"AGENT_TOKENS=opencode:sha256:{_digest('tok_opencode')}\n")
+
+    res = _run(fake_root, ["--remint", "opencode", "--mcp",
+                           "--install-path", str(walled / ".env")])
+
+    assert res.returncode == 0, res.stdout + res.stderr
+    line = next(l for l in _env_path(fake_root).read_text().splitlines()
+                if l.startswith("AGENT_INSTALLS="))
+    assert f"opencode:mcp:{walled / '.env'}" in line, line
+
+
+def test_mcp_without_an_install_path_is_refused_before_minting(tmp_path):
+    fake_root = _make_fake_root(tmp_path, {})
+    _env_path(fake_root).parent.mkdir(parents=True, exist_ok=True)
+    _env_path(fake_root).write_text(
+        f"AGENT_TOKENS=claude:sha256:{_digest('tok_claude')}\n")
+    before = _env_path(fake_root).read_text()
+
+    res = _run(fake_root, ["--add", "opencode", "--mcp"])
+
+    assert res.returncode != 0
+    assert "--install-path" in (res.stdout + res.stderr)
+    assert _env_path(fake_root).read_text() == before, (
+        "a refused --mcp still wrote to the gateway .env")
+
+
+def test_mcp_without_add_or_remint_is_refused(tmp_path):
+    fake_root = _make_fake_root(tmp_path, {})
+    _env_path(fake_root).parent.mkdir(parents=True, exist_ok=True)
+    _env_path(fake_root).write_text("PG_PASSWORD=fake\n")
+
+    res = _run(fake_root, ["--mcp"])
+
+    assert res.returncode != 0
+    assert "--mcp only makes sense together with --add" in (res.stdout + res.stderr)

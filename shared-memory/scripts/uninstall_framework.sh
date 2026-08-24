@@ -107,19 +107,40 @@ BACKUP_DIR="$(env_get BACKUP_DIR)"; BACKUP_DIR="${BACKUP_DIR:-$HOME/.shared-memo
 STATE_DIR="$HOME/.shared-memory"
 UNIT_PATH="$HOME/.config/systemd/user/$GATEWAY_UNIT"
 
-# Agent skill directories: the REGISTRY first, because an install path is owned
+# Agent install directories: the REGISTRY first, because an install path is owned
 # information about this host and not something a naming convention reproduces.
 # The historical four are added only when they actually exist on disk.
-mapfile -t _registry_dirs < <(
+#
+# ⚠ AGENT_INSTALLS entries have TWO arities — `name:path` (kind `skill`, the
+# permanent meaning of the two-field form) and `name:kind:path`. Stripping only
+# the name and calling dirname on the rest turned `opencode:mcp:/w/.env` into
+# the literal directory `mcp:`, so an MCP install's walled directory — which
+# holds that agent's raw token, the very thing this inventory warns about —
+# was neither listed nor removed, and a nonsense path was listed instead.
+mapfile -t _registry_entries < <(
     grep -E '^AGENT_INSTALLS=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- \
-    | tr ',' '\n' | sed -n 's/^[^:]*:\(.*\)$/\1/p' | xargs -r -n1 dirname 2>/dev/null)
-SKILL_DIRS=()
-for d in "${_registry_dirs[@]:-}"; do [[ -n "$d" && -d "$d" ]] && SKILL_DIRS+=("$d"); done
+    | tr ',' '\n' | sed -n 's/^[[:space:]]*[^:]*:[[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p')
+_registry_dirs=(); _registry_kinds=()
+for _e in ${_registry_entries[@]+"${_registry_entries[@]}"}; do
+    _k="skill"
+    case "$_e" in
+        skill:*) _e="${_e#skill:}" ;;
+        mcp:*)   _k="mcp"; _e="${_e#mcp:}" ;;
+    esac
+    [[ -n "$_e" ]] || continue
+    _registry_dirs+=("$(dirname "$_e")"); _registry_kinds+=("$_k")
+done
+SKILL_DIRS=(); SKILL_KINDS=()
+_i=0
+for d in ${_registry_dirs[@]+"${_registry_dirs[@]}"}; do
+    [[ -n "$d" && -d "$d" ]] && { SKILL_DIRS+=("$d"); SKILL_KINDS+=("${_registry_kinds[$_i]}"); }
+    _i=$((_i + 1))
+done
 for d in "$HOME/.claude/skills/shared-memory" "$HOME/.codex/skills/shared-memory" \
          "$HOME/.gemini/skills/shared-memory" "$HOME/.grok/skills/shared-memory"; do
     [[ -d "$d" ]] || continue
     _dup=0; for s in ${SKILL_DIRS[@]+"${SKILL_DIRS[@]}"}; do [[ "$s" == "$d" ]] && _dup=1; done
-    [[ "$_dup" == "0" ]] && SKILL_DIRS+=("$d")
+    [[ "$_dup" == "0" ]] && { SKILL_DIRS+=("$d"); SKILL_KINDS+=("skill"); }
 done
 
 _size() { [[ -e "$1" ]] && du -sh "$1" 2>/dev/null | awk '{print $1}' || echo "-"; }
@@ -135,7 +156,15 @@ echo "  systemd linger    disabled for $USER (re-enable with loginctl enable-lin
 if [[ ${#SKILL_DIRS[@]} -eq 0 ]]; then
     echo "  agent skills      (none found)"
 else
-    for d in "${SKILL_DIRS[@]}"; do echo "  agent skill dir   $d   ($(_size "$d"))  ⚠ contains that agent's raw token"; done
+    _i=0
+    for d in "${SKILL_DIRS[@]}"; do
+        if [[ "${SKILL_KINDS[$_i]:-skill}" == "mcp" ]]; then
+            echo "  MCP connector dir $d   ($(_size "$d"))  ⚠ contains that agent's raw token"
+        else
+            echo "  agent skill dir   $d   ($(_size "$d"))  ⚠ contains that agent's raw token"
+        fi
+        _i=$((_i + 1))
+    done
 fi
 if [[ "$LEVEL" == "data" || "$LEVEL" == "all" ]]; then
     echo "  containers        docker compose -f $(basename "$COMPOSE_FILE") down -v  (volumes included)"
@@ -255,10 +284,13 @@ fi
     echo "      EXISTING install. --install recreates + populates each directory named"
     echo "      in AGENT_INSTALLS= in $ENV_FILE — that registry entry survives this"
     echo "      uninstall level, so this step needs no agent name.)"
-    echo "  3. Per agent (name + skill-dir path: see AGENT_INSTALLS= in $ENV_FILE):"
-    echo "       bash shared-memory/scripts/bootstrap_tokens.sh --remint <name> --install-path <skill-dir>/.env"
+    echo "  3. Per agent (name + install path: see AGENT_INSTALLS= in $ENV_FILE):"
+    echo "       bash shared-memory/scripts/bootstrap_tokens.sh --remint <name> --install-path <dir>/.env"
     echo "     (--remint with no --install-path mints a token nobody receives — always"
-    echo "      pass it. Requires step 2 to have already created <skill-dir>.)"
+    echo "      pass it. Requires step 2 to have already created <dir>.)"
+    echo "     For an entry written name:mcp:path — an MCP connector install — add --mcp"
+    echo "     so it re-registers as one; without it the entry reverts to a CLI skill"
+    echo "     install and the next sync delivers the wrong package there."
     echo "  4. systemctl --user restart $GATEWAY_UNIT"
     echo "     (the gateway from step 1 is still running the OLD AGENT_TOKENS digests;"
     echo "      this loads what step 3 wrote — bootstrap_tokens.sh says so itself.)"

@@ -34,6 +34,18 @@
 # below (all-or-nothing). --install-path is optional — omit it for a
 # remote agent and pass --reveal instead.
 #
+#   bash shared-memory/scripts/bootstrap_tokens.sh --add opencode --mcp \
+#       --install-path ~/.config/opencode/shared-memory-mcp/.env
+#
+# --mcp registers the install as an MCP CONNECTOR install rather than a CLI
+# skill install (AGENT_INSTALLS entry `name:mcp:path`). The path is still an
+# .env FILE — the walled connector directory's own — and it is what
+# sync_skills.sh then uses to deliver the CONNECTOR package there
+# (vector-skill.py, CONSTITUTION_SNIPPET_MCP.md, system-prompt.md) instead of
+# the CLI skill package. An entry with no kind (`name:path`) is a CLI skill
+# install, permanently; nothing rewrites an existing line. --mcp requires
+# --install-path and only combines with --add / --remint.
+#
 # IMPORTANT: --reveal only shows a token from THIS invocation's mint. Running
 # generate_tokens.py --reveal <name> separately, LATER, as a bulk mint, mints
 # a FRESH set of tokens for every agent in the roster — a full rotation, not
@@ -111,6 +123,7 @@ force=0
 add_name=""
 install_path=""
 reveal_args=()
+install_kind_flag=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --force)         force=1; shift ;;
@@ -118,6 +131,7 @@ while [[ $# -gt 0 ]]; do
         --remint)        remint_name="${2:?--remint needs an agent name}"; shift 2 ;;
         --role)          add_role="${2:?--role needs a role name}"; shift 2 ;;
         --install-path)  install_path="${2:?--install-path needs a path}"; shift 2 ;;
+        --mcp)           install_kind_flag=(--mcp); shift ;;
         --reveal)        reveal_args+=(--reveal "${2:?--reveal needs an agent name}"); shift 2 ;;
         -h|--help)       awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"; exit 0 ;;
         *)               red "✗ unknown argument: $1"; exit 1 ;;
@@ -126,6 +140,22 @@ done
 
 if [[ -n "$install_path" && -z "$add_name" && -z "${remint_name:-}" ]]; then
     red "✗ --install-path only makes sense together with --add or --remint"
+    exit 1
+fi
+if [[ "${#install_kind_flag[@]}" -gt 0 && -z "$add_name" && -z "${remint_name:-}" ]]; then
+    # An install kind describes ONE registration. A bulk mint re-emits the whole
+    # registry, each entry already carrying its own kind — accepting --mcp there
+    # would read as "convert them all".
+    red "✗ --mcp only makes sense together with --add or --remint"
+    exit 1
+fi
+if [[ "${#install_kind_flag[@]}" -gt 0 && -z "$install_path" ]]; then
+    # Refused HERE as well as in generate_tokens.py, deliberately: this is the
+    # documented front door, and an operator who omits the path should be told
+    # before a mint is even attempted rather than by a Python refusal two layers
+    # down that looks like a script error.
+    red "✗ --mcp needs --install-path <walled-dir>/.env — an install kind says"
+    red "  what to deliver WHERE, and without a registered path there is nowhere."
     exit 1
 fi
 if [[ -n "${add_role:-}" && -z "$add_name" && -z "${remint_name:-}" ]]; then
@@ -189,6 +219,7 @@ if [[ -n "$add_name" || -n "${remint_name:-}" ]]; then
     fi
     [[ -n "$install_path" ]] && add_flags+=(--install-path "$install_path")
     [[ -n "${add_role:-}" ]] && add_flags+=(--role "$add_role")
+    [[ "${#install_kind_flag[@]}" -gt 0 ]] && add_flags+=("${install_kind_flag[@]}")
 
     rc=0
     out="$(cd "$REPO_ROOT" && uv run python shared-memory/scripts/generate_tokens.py \
