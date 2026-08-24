@@ -124,6 +124,10 @@ exactly as a human would (`read`/`read -s` consume the next line from a pipe the
 Generate the two passwords yourself first (ground rule 1 — hex only, never base64: a `/` breaks the
 compose file's `NEO4J_AUTH=neo4j/<password>` parsing and the container restart-loops on "… is
 invalid", though the script itself also rejects one and re-prompts, so this is belt-and-suspenders).
+The script also refuses any password of 8 characters or fewer (including empty) and re-prompts —
+`openssl rand -hex 20` is always well over that, so this never bites the flow below — and if stdin
+runs out before a valid password is given (nothing left to feed it, not just a short answer) it fails
+loudly with a nonzero exit instead of writing a blank one.
 **Skip this phase entirely if `shared-memory/.env` already exists** (resuming a stopped setup) —
 re-running the script would hit its own overwrite prompt instead of the directory prompts, which is
 not what a resume wants.
