@@ -5,6 +5,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.46] — 2026-08-24
+
+### Fixed — a Quick Start whose token step can succeed
+
+- **The manual Quick Start's steps were ordered so that step 5 could not produce a usable
+  token.** The mint refuses a local agent whose skill directory does not exist — deliberately —
+  but those directories were created by step 8, three steps later, and step 9 then required "any
+  token from step 5". Measured: a cold agent following the published path arrived at
+  verification with zero usable tokens. The skill install now comes first (step 5), the mint
+  after it (step 6), then the reasoning LLM and the gateway — the only order in which every step
+  can succeed, since the mint needs the skill directories and the gateway freezes auth at
+  startup.
+- **The delegation advice and the token step stop contradicting each other.** The fast-path box
+  recommended handing all ten steps to an agent while the mint script itself warns that
+  `--reveal` must never run through one; following both as written put a live token into an
+  agent transcript. The fast path now carves out `--reveal` as an operator step, and the mint
+  step says it in bold: run it yourself, in your own terminal — a token that passes through an
+  agent's transcript is stored forever.
+
+---
+
 ## [0.9.45] — 2026-08-24
 
 ### Fixed — an uninstall that can say it failed
