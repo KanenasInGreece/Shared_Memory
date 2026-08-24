@@ -98,7 +98,9 @@ turns saved facts into shared knowledge.
 > framework."* Part 1 of [`AGENTS.md`](AGENTS.md) interviews you for the required choices — data
 > folders, model files, your reasoning-LLM address and port, which agents get tokens — then
 > drives the same steps 1–10 below for you: writing `.env` from the template, minting tokens,
-> running the postflight verification. The same file carries the day-2 runbooks, so "stop the framework" or
+> running the postflight verification. One exception it will tell you about: if any of your
+> agents are REMOTE, the `--reveal` that prints their token is an operator step — run it
+> yourself in your own terminal, never through the agent doing the setup. The same file carries the day-2 runbooks, so "stop the framework" or
 > "upgrade the framework" work as agent requests too.
 
 **The manual path — the numbered steps below.** They're what the agent runs on your behalf:
@@ -121,8 +123,8 @@ common setup mistake.
 daemons never run from a skill directory. Daemon and **schema** changes reach a hive through
 `git` on the gateway host — never through a skill download. The operations runbook lives in
 [`shared-memory/Documentation/server-setup.md`](shared-memory/Documentation/server-setup.md).
-Steps 1–7 below are operations (gateway host); steps 8 and 10 are usage (any agent); step 9 —
-the postflight verification — runs on the gateway host again, with any minted token.
+Steps 1–4 and 6–8 below are operations (gateway host); steps 5 and 10 are usage (any agent);
+step 9 — the postflight verification — runs on the gateway host again, with any minted token.
 
 **Version contract:** client and gateway are decoupled and may drift, so compatibility is
 enforced by an `api_version` exchanged on `GET /health`. Run `memory_bridge.py doctor` to check
@@ -293,30 +295,32 @@ idempotent and safe to re-run.
    > default schema uses BGE-M3 at 1024 dimensions; the dimension does not matter — consistency
    > does.
 
-5. **Generate agent tokens.** `bash shared-memory/scripts/bootstrap_tokens.sh` mints one token
+5. **Install the skill into your agent.** The skill is a thin client — only `memory_bridge.py`
+   ships with it. Copy `SKILL.md` + `memory_bridge.py` into the agent's skills directory
+   ([§19](#19-tokens-and-agents); remote clients → [§20](#20-remote-clients)). Shortcut: tell
+   your agent — *"clone this repo and install the shared-memory skill per README §19."*
+
+6. **Generate agent tokens.** `bash shared-memory/scripts/bootstrap_tokens.sh` mints one token
    per agent, appends `AGENT_TOKENS` (digest form) to the gateway `.env`, and writes each LOCAL
-   agent's token straight into its own skill `.env` (mode 600) — nothing is printed here to
-   save. A REMOTE agent's token needs `--reveal <name>` on this same invocation (a later,
-   separate run is a full rotation) ([§19](#19-tokens-and-agents)). One distinct token per
+   agent's token straight into the skill `.env` you installed in step 5 (mode 600) — nothing is
+   printed here to save. A REMOTE agent's token needs `--reveal <name>` on this same invocation
+   (a later, separate run is a full rotation) — **and `--reveal` is yours to run, in your own
+   terminal, never through an agent: a token that passes through an agent's transcript is
+   stored forever** ([§19](#19-tokens-and-agents)). One distinct token per
    agent — never shared.
 
-6. **Start the reasoning LLM** on `:5000` — LM Studio or any OpenAI-compatible server
+7. **Start the reasoning LLM** on `:5000` — LM Studio or any OpenAI-compatible server
    ([§17](#17-inference-the-encoders-and-the-reasoning-llm)).
 
-7. **Start the gateway.**
+8. **Start the gateway.**
    `uv run --with aiohttp --with asyncpg --with neo4j --with httpx --with json-repair python shared-memory/scripts/hive_mind_proxy.py 8888`
    — this also launches the REM and NREM daemons ([§18](#18-the-gateway)). Verify:
    `curl http://localhost:8888/health` should report `"status":"ok"`, `"auth_required":true` and
    `"embedder":"ok"` before you save anything. For a gateway that survives logout and reboot,
    install the `systemd --user` unit in [`shared-memory/ops/`](shared-memory/ops/).
 
-8. **Install the skill into your agent.** The skill is a thin client — only `memory_bridge.py`
-   ships with it. Copy `SKILL.md` + `memory_bridge.py` into the agent's skills directory
-   ([§19](#19-tokens-and-agents); remote clients → [§20](#20-remote-clients)). Shortcut: tell
-   your agent — *"clone this repo and install the shared-memory skill per README §19."*
-
 9. **Verify the install.** Back on the gateway host:
-   `export AGENT_TOKEN=...` (any token from step 5), then
+   `export AGENT_TOKEN=...` (any token from step 6), then
    `bash shared-memory/scripts/postflight.sh` — eight assertions that prove the stack end to
    end, from health payload shapes to a canary save traced into both stores, a real completion
    driven through the reasoning backend, and a baseline JSON of this hardware's save/search
