@@ -472,19 +472,24 @@ async def test_read_role_allows_graph():
 
 
 @pytest.mark.asyncio
+async def test_read_role_allows_search():
+    """Search is a READ: the quiesce classification in coordinator.py already
+    says so, and the allowed read-only Cypher can reach every record search
+    can. Measured 2026-08-24: the first read-only MCP client on the fleet was
+    403'd on search while graph_query would have answered — this pins the
+    alignment. Mutation target: dropping ("POST", "/memory/search") from
+    _READ_ROLE_ROUTES must kill exactly this test."""
+    mod = load_coordinator("monitor:tok_m", agent_roles="monitor:read")
+    req = _make_request("/memory/search", auth_header="Bearer tok_m", method="POST")
+    resp = await mod.auth_middleware(req, _noop_handler)
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
 async def test_read_role_denies_save():
     from aiohttp.web_exceptions import HTTPForbidden
     mod = load_coordinator("monitor:tok_m", agent_roles="monitor:read")
     req = _make_request("/memory/save", auth_header="Bearer tok_m", method="POST")
-    with pytest.raises(HTTPForbidden):
-        await mod.auth_middleware(req, _noop_handler)
-
-
-@pytest.mark.asyncio
-async def test_read_role_denies_search():
-    from aiohttp.web_exceptions import HTTPForbidden
-    mod = load_coordinator("monitor:tok_m", agent_roles="monitor:read")
-    req = _make_request("/memory/search", auth_header="Bearer tok_m", method="POST")
     with pytest.raises(HTTPForbidden):
         await mod.auth_middleware(req, _noop_handler)
 

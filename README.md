@@ -945,15 +945,43 @@ printf 'AGENT_TOKEN=tok_...\nCOORDINATOR_URL=http://localhost:8888\n' > ~/.gemin
 Docker, databases, models and `nvtop` stay on the host; the remote machine needs none of them.
 The identity is the token: the graph knows which machine contributed which fact.
 
-## 21. LM Studio and MCP hosts
+## 21. The MCP install: any MCP host, one connector
 
 The MCP surface is the second front door to the same gateway: any MCP host can mount the memory
 this way, and the connector is client-deployable like the CLI skill — install a copy where the
-MCP host runs, give it a token and a route to the gateway. LM Studio is the example we have
-exercised end to end, not a default the surface assumes. The connector lives in the
+MCP host runs, give it a token and a route to the gateway. LM Studio and a coding agent
+(opencode, read-only role) are the examples we have exercised end to end, not defaults the
+surface assumes. The connector lives in the
 [`mcp/`](mcp/) folder — server, system prompt and config template together, with its own
 [`mcp/README.md`](mcp/README.md) covering what it exposes, how it deploys and how it
 authenticates.
+
+Coding agents that speak MCP — opencode is the one running here — mount the same connector
+without any `mcp.json`: register it as a local MCP server in the agent's own config, and keep
+the token out of that config entirely by pointing `VECTOR_SKILL_ENV` at a client-only `.env`
+that holds nothing but this agent's `AGENT_TOKEN`. Mint that token with the additive path
+(`bootstrap_tokens.sh --add <name> --install-path <dir>/.env`, `--role read` if the agent
+should only ever search) and the file lands at mode 600 without the value passing through
+anyone's hands. The shape, in opencode's `opencode.jsonc`:
+
+```jsonc
+"mcp": {
+  "shared-memory": {
+    "type": "local",
+    "command": ["uv", "run", "--with", "fastmcp", "--with", "httpx",
+                "--with", "python-dotenv", "python", "/path/to/mcp/vector-skill.py"],
+    "environment": {
+      "COORDINATOR_URL": "http://localhost:8888",
+      "VECTOR_SKILL_ENV": "/path/to/private/dir/.env"
+    }
+  }
+}
+```
+
+Give the agent the search-first conduct from [`mcp/system-prompt.md`](mcp/system-prompt.md) in
+whatever instruction file it reads — that file is the MCP counterpart of the CLI skill's
+constitution snippet, and the tool names it teaches (`hybrid_search_and_rerank`,
+`graph_query`) are exactly what the server exposes.
 
 Register `mcp/vector-skill.py` in `mcp.json` with the coordinator URL and the `lm_studio` token in
 the `env` block — the token is not optional; without it every call 401s. Restart LM Studio

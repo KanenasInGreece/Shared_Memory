@@ -24,13 +24,22 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory"
 
 
 def load_generate_tokens():
-    """Fresh module each call -- LOCAL_SKILL_ENV_PATHS is mutated per-test."""
+    """Fresh module each call -- LOCAL_SKILL_ENV_PATHS is mutated per-test.
+
+    ISOLATION IS THE LOADER'S JOB, not per-test discipline (measured 2026-08-24:
+    three tests calling mint() bare resolved _DEFAULT_GATEWAY_ENV to the REAL
+    gateway .env on a configured machine, unioned the LIVE registry through
+    _resolve_roster, and ROTATED a real agent's token file at its real
+    AGENT_INSTALLS path -- the fact:1471 hazard reached through the test suite.
+    A test that needs a registry sets _DEFAULT_GATEWAY_ENV to a tmp_path file
+    explicitly; the default here must be a path that CANNOT exist)."""
     path = os.path.join(
         os.path.dirname(__file__), "..", "shared-memory", "scripts", "generate_tokens.py",
     )
     spec = importlib.util.spec_from_file_location("generate_tokens_test_mod", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    mod._DEFAULT_GATEWAY_ENV = "/nonexistent/generate-tokens-test-gateway.env"
     return mod
 
 

@@ -5,6 +5,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.47] — 2026-08-24
+
+### Fixed — the second front door, exercised for real
+
+- **A read-only token can now search.** The read role's allowlist permitted telemetry and
+  read-only Cypher but refused `/memory/search` — measured the day the first read-only MCP
+  client went live, 403'd on the most read-like operation there is. Search joins the allowlist;
+  it applies the visibility filter (stricter than the Cypher route already allowed), so no
+  exposure widens.
+- **The MCP connector survives a missing `python-dotenv`.** Its env loader silently no-opped
+  without the parser dependency, leaving the client tokenless and reporting an auth error for a
+  dependency problem — a defect class this codebase has met before. A manual parser now takes
+  over, same semantics as the migrations tool that never had this failure.
+- **MCP error parity completed:** edge-review 403s carry the operator-grade role hint the CLI
+  client already gave; audit-log writes moved off the event loop onto a single ordered worker
+  thread; the connector resolves its own path through symlinks; every write tool's docstring now
+  says plainly that a read-only token gets an honest 403 — before the call, not after.
+- **The test suite can no longer rotate live tokens.** Mint-flow tests calling `mint()` bare
+  resolved the real gateway env on a configured machine, unioned the live registry, and rewrote
+  a real agent's token file — found when it invalidated a freshly minted token. The test loader
+  now isolates by default; a test that needs a registry builds one in tmp.
+- README: the MCP section is named for what it is (any MCP host, one connector), depicts the
+  coding-agent install path with the token outside the host's config, and records that both LM
+  Studio and a read-only coding agent have exercised the surface end to end.
+
+---
+
 ## [0.9.46] — 2026-08-24
 
 ### Fixed — a Quick Start whose token step can succeed

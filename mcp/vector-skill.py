@@ -30,6 +30,7 @@ MCP tools: hybrid_search_and_rerank, save_artifact, archive_reasoning_trace,
 save_decision, save_retrospective, supersede, review_hold, check_memory_health,
 memory_telemetry, record_lineage, graph_query, review_edges, label_edges.
 """
+import concurrent.futures
 import json
 import logging
 import os
@@ -81,12 +82,30 @@ def _looks_like_server_env(path: str) -> bool:
 
 
 _ENV_PATH = os.environ.get("VECTOR_SKILL_ENV", "").strip() or os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), ".env")
+    os.path.dirname(os.path.realpath(__file__)), ".env")
+def _load_env_manually(path: str) -> None:
+    """Fallback parser for when python-dotenv is absent. An env loader must
+    NEVER silently no-op because its parser dependency is missing — that class
+    once made two verifiers report a CREDENTIALS error for a missing DEPENDENCY.
+    Same setdefault semantics as migrations/apply.py, which has never had this
+    failure: real env vars win over file values."""
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                os.environ.setdefault(key.strip(), val.strip())
+    except OSError:
+        pass  # absent file = rely on externally-set env vars, same as dotenv
+
+
 try:
     from dotenv import load_dotenv
 except ImportError:
-    pass  # python-dotenv not installed; rely on env vars being set externally
-else:
+    load_dotenv = None  # fall back to the manual parser below
+if True:
     if os.path.isfile(_ENV_PATH) and _looks_like_server_env(_ENV_PATH):
         sys.stderr.write(
             f"[rag-orchestrator] refusing to load {_ENV_PATH}: it holds "
@@ -95,8 +114,10 @@ else:
             "own directory with its own .env containing only AGENT_TOKEN (and "
             "optionally COORDINATOR_URL / AGENT_ID), set VECTOR_SKILL_ENV to that "
             "file, or inject AGENT_TOKEN via the MCP host's own env block.\n")
-    else:
+    elif load_dotenv is not None:
         load_dotenv(_ENV_PATH)
+    else:
+        _load_env_manually(_ENV_PATH)
 
 # Configure logging to stderr for MCP visibility
 logging.basicConfig(level=logging.INFO)
@@ -119,7 +140,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.9.46"
+VERSION = "0.9.47"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server
@@ -227,6 +248,18 @@ def _auth_headers() -> dict:
 _CONTENT_SIZE_WARN_BYTES = 10 * 1024
 
 
+_LOG_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="sm-audit-log")
+
+
+def _append_line(path: str, line: str) -> None:
+    try:
+        with open(path, "a") as f:
+            f.write(line)
+    except OSError as e:
+        print(f"[WARN] shared-memory: audit log unavailable ({e})", file=sys.stderr)
+
+
 def _append_log(tool: str, min_level: int, event: str, data: dict, content: str = None) -> None:
     log_level = int(os.environ.get("MEMORY_LOG_LEVEL", "0"))
     if log_level < min_level:
@@ -239,8 +272,12 @@ def _append_log(tool: str, min_level: int, event: str, data: dict, content: str 
             entry["content"] = content
             if len(content.encode()) > _CONTENT_SIZE_WARN_BYTES:
                 entry["content_size_warn"] = f"content is {len(content.encode())} bytes — reduce log level to avoid large logs"
-        with open(os.path.join(log_dir, f"{tool}.log"), "a") as f:
-            f.write(json.dumps(entry) + "\n")
+        # Offloaded to a single worker thread: these handlers are async and a
+        # sync append on the event loop stalls every concurrent tool call for
+        # the duration of a disk write. One thread preserves entry ordering.
+        _LOG_EXECUTOR.submit(_append_line,
+                             os.path.join(log_dir, f"{tool}.log"),
+                             json.dumps(entry) + "\n")
     except OSError as e:
         print(f"[WARN] shared-memory: audit log unavailable ({e})", file=sys.stderr)
     except Exception:
@@ -379,7 +416,11 @@ def _gateway_message(r) -> str | None:
     return None
 
 
-def _reply_json(r, tool: str) -> dict:
+_EDGE_REVIEW_FORBIDDEN_HINT = ("This token may not review/label relation edges "
+                               "— edge adjudication needs an operator-grade role.")
+
+
+def _reply_json(r, tool: str, forbidden_hint: str | None = None) -> dict:
     """Decode a gateway response ONLY after branching on its status class.
 
     THE RULE (fact:1503). A non-2xx aiohttp page is plain text — ``"403:
@@ -406,6 +447,8 @@ def _reply_json(r, tool: str) -> dict:
         detail = _gateway_message(r) or _body_snippet(r)
         head = (f"Error: the gateway refused this request (HTTP 403): {detail}"
                 if detail else "Error: the gateway refused this request (HTTP 403).")
+        if forbidden_hint:
+            head = f"{head} {forbidden_hint}"
         raise GatewayReplyError(
             f"{head} — the gateway ANSWERED and the credential was ACCEPTED, so this is "
             f"an authorization refusal, not an authentication failure and not a "
@@ -562,6 +605,9 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5, project: str = ""
 @mcp.tool()
 async def save_artifact(content: str, metadata_json: str = "{}") -> str:
     """
+
+    Requires a write-capable agent token: a read-only token receives an
+    honest HTTP 403 role refusal from the gateway — expected, do not retry.
     Stores an artifact in shared memory via the Hive-Mind Gateway.
 
     Routes through the Memory Coordinator (POST /memory/save) — no direct DB
@@ -698,6 +744,9 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
 async def archive_reasoning_trace(session_id: str, task: str, steps: list,
                                   project: str = "") -> str:
     """
+
+    Requires a write-capable agent token: a read-only token receives an
+    honest HTTP 403 role refusal from the gateway — expected, do not retry.
     Archive the agent's reasoning path as a memory record.
 
     `steps` is a list of dicts: [{'thought': ..., 'tool': ..., 'result': ...}].
@@ -778,6 +827,9 @@ async def save_decision(
     new_domain: bool = False,
 ) -> str:
     """
+
+    Requires a write-capable agent token: a read-only token receives an
+    honest HTTP 403 role refusal from the gateway — expected, do not retry.
     Save an architectural or design decision with full PROV-O provenance.
 
     Routes through the Memory Coordinator so the Decision→Human→Project→AIAgent
@@ -944,6 +996,9 @@ async def save_retrospective(
     elicited: bool = False,
 ) -> str:
     """
+
+    Requires a write-capable agent token: a read-only token receives an
+    honest HTTP 403 role refusal from the gateway — expected, do not retry.
     Record an outcome for an existing Decision as a full retrospective record
     (own searchable record + Retrospective node behind the decision's
     HAD_OUTCOME trigger edge).
@@ -1020,6 +1075,9 @@ async def save_retrospective(
 @mcp.tool()
 async def supersede(pg_id: int, by: int = 0) -> str:
     """
+
+    Requires a write-capable agent token: a read-only token receives an
+    honest HTTP 403 role refusal from the gateway — expected, do not retry.
     Retract / supersede an existing FACT (decision 381/384). Decisions and
     retrospectives are refused with HTTP 400: supersession is the fact
     lifecycle. To overturn a decision call save_retrospective against it with
@@ -1067,6 +1125,9 @@ async def supersede(pg_id: int, by: int = 0) -> str:
 @mcp.tool()
 async def review_hold(summary_id: int, pg_id: int) -> str:
     """
+
+    Requires a write-capable agent token: a read-only token receives an
+    honest HTTP 403 role refusal from the gateway — expected, do not retry.
     Mark a summary's flagged stale source as reviewed-and-held (decision 384).
 
     When a search result carries a stale_sources warning (a summary/insight was
@@ -1166,6 +1227,9 @@ async def memory_telemetry() -> str:
 @mcp.tool()
 async def record_lineage(ref: str) -> str:
     """
+
+    Requires a write-capable agent token: a read-only token receives an
+    honest HTTP 403 role refusal from the gateway — expected, do not retry.
     "What happened to this record?" — its state, its dream-cycle stamps
     (applied → rem_reviewed → consolidated), and which summary it was folded
     into, with the fact→summary latency.
@@ -1231,7 +1295,7 @@ async def review_edges(family: str = "entity_relation", limit: int = 20) -> str:
                 f"{COORDINATOR_BASE}/memory/relations/review",
                 params={"family": family, "limit": limit},
                 headers=_auth_headers())
-            return json.dumps(_reply_json(r, "review_edges"), indent=2, default=str)
+            return json.dumps(_reply_json(r, "review_edges", forbidden_hint=_EDGE_REVIEW_FORBIDDEN_HINT), indent=2, default=str)
     except GatewayReplyError as exc:
         return exc.message
     except Exception as exc:
@@ -1241,6 +1305,9 @@ async def review_edges(family: str = "entity_relation", limit: int = 20) -> str:
 @mcp.tool()
 async def label_edges(labels_json: str, promote: list = None) -> str:
     """
+
+    Requires a write-capable agent token: a read-only token receives an
+    honest HTTP 403 role refusal from the gateway — expected, do not retry.
     Record operator labels on proposed edges — the calibration signal.
 
     `labels_json` maps adjudication id to verdict, e.g.
@@ -1259,7 +1326,7 @@ async def label_edges(labels_json: str, promote: list = None) -> str:
                 f"{COORDINATOR_BASE}/memory/relations/label",
                 json={"labels": labels, "promote": promote or []},
                 headers=_auth_headers())
-            return json.dumps(_reply_json(r, "label_edges"), indent=2, default=str)
+            return json.dumps(_reply_json(r, "label_edges", forbidden_hint=_EDGE_REVIEW_FORBIDDEN_HINT), indent=2, default=str)
     except GatewayReplyError as exc:
         return exc.message
     except Exception as exc:

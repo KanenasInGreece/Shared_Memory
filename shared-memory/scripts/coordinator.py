@@ -143,7 +143,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.46"
+FRAMEWORK_VERSION = "0.9.47"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -411,6 +411,13 @@ def _lookup_agent_by_token(token: str) -> "str | None":
 _READ_ROLE_ROUTES: set[tuple[str, str]] = {
     ("GET",  "/memory/telemetry"),
     ("POST", "/memory/graph"),
+    # Search is a READ — this file's own quiesce classification already says so
+    # ("Reads (search/graph/telemetry/status) and /health always flow"), and the
+    # allowed read-only Cypher on /memory/graph can reach every record search
+    # can, so admitting search widens no exposure. Measured 2026-08-24: the
+    # first read-only MCP client on the fleet was 403'd on the most read-like
+    # operation there is, while graph_query would have answered.
+    ("POST", "/memory/search"),
 }
 
 # Client WRITE routes — shed (503 + Retry-After) while a backup quiesce is active.

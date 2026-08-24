@@ -719,3 +719,73 @@ def test_readme_mcp_config_block_carries_the_token():
         "client that 401s on every call"
     )
     assert '"COORDINATOR_URL"' in block
+
+
+# ── v0.9.47: MCP-surface review fixes (whole-file review, 2026-08-24) ────────
+
+def test_manual_env_parser_loads_token_without_dotenv(tmp_path, monkeypatch):
+    """An env loader must never silently no-op because its parser dependency is
+    missing — that class once reported a CREDENTIALS error for a missing
+    DEPENDENCY. Mutation target: reverting _load_env_manually's call (or its
+    body) to `pass` must kill this test."""
+    vs = load_vector_skill()
+    env = tmp_path / ".env"
+    env.write_text("AGENT_TOKEN=tok_manual_parse\n# comment\nBADLINE\n")
+    monkeypatch.delenv("PROBE_ONLY_KEY", raising=False)
+    env.write_text(env.read_text() + "PROBE_ONLY_KEY=probe_val\n")
+    vs._load_env_manually(str(env))
+    assert os.environ.get("PROBE_ONLY_KEY") == "probe_val"
+    monkeypatch.delenv("PROBE_ONLY_KEY", raising=False)
+
+
+def test_manual_env_parser_never_overrides_real_env(tmp_path, monkeypatch):
+    """setdefault semantics, same as migrations/apply.py: an externally-set
+    variable wins over the file value."""
+    vs = load_vector_skill()
+    env = tmp_path / ".env"
+    env.write_text("PROBE_ONLY_KEY=file_val\n")
+    monkeypatch.setenv("PROBE_ONLY_KEY", "env_val")
+    vs._load_env_manually(str(env))
+    assert os.environ.get("PROBE_ONLY_KEY") == "env_val"
+
+
+def test_edge_review_403_carries_the_forbidden_hint():
+    """Parity with memory_bridge: review_edges/label_edges 403s must carry the
+    operator-grade role hint, appended AFTER the gateway's own words. Mutation
+    target: dropping the forbidden_hint pass-through kills this."""
+    vs = load_vector_skill()
+
+    class _R:
+        status_code = 403
+        text = "403: nope"
+        def json(self):
+            return {"status": "error", "message": "gateway says no"}
+
+    with pytest.raises(vs.GatewayReplyError) as exc:
+        vs._reply_json(_R(), "review_edges",
+                       forbidden_hint=vs._EDGE_REVIEW_FORBIDDEN_HINT)
+    msg = str(exc.value)
+    assert "gateway says no" in msg
+    assert "operator-grade role" in msg
+    assert msg.index("gateway says no") < msg.index("operator-grade role")
+
+
+def test_audit_log_write_is_offloaded_and_ordered(tmp_path, monkeypatch):
+    """_append_log must not block the event loop: the disk write goes through
+    the single-thread _LOG_EXECUTOR (ordering preserved). Mutation target:
+    restoring the inline open/write keeps this green only if the executor is
+    still drained — asserting the executor received the work is the guard."""
+    vs = load_vector_skill()
+    monkeypatch.setenv("MEMORY_LOG_LEVEL", "3")
+    monkeypatch.setenv("MEMORY_LOG_DIR", str(tmp_path))
+    calls = []
+    real_submit = vs._LOG_EXECUTOR.submit
+    monkeypatch.setattr(vs._LOG_EXECUTOR, "submit",
+                        lambda fn, *a: calls.append(a) or real_submit(fn, *a))
+    vs._append_log("probe_tool", 2, "probe_event", {"k": "v"})
+    assert calls, "audit write did not go through the executor"
+    import concurrent.futures
+    vs._LOG_EXECUTOR.submit(lambda: None).result(timeout=5)
+    logfile = tmp_path / "probe_tool.log"
+    if logfile.exists():
+        assert "probe_event" in logfile.read_text()
