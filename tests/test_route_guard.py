@@ -84,7 +84,12 @@ def _build_real_gateway_app(g) -> web.Application:
     only needs the handler ATTRIBUTES to exist for registration, it never
     calls them."""
     app = web.Application()
-    mock_coordinator = MagicMock()
+    # AsyncMock, not MagicMock: attach() registers coordinator.handle_* as
+    # aiohttp route handlers, and aiohttp warns ("bare functions are
+    # deprecated") when a registered handler isn't a coroutine function —
+    # cosmetic only (never invoked in these tests), but AsyncMock's
+    # auto-speccing attributes are coroutine functions, so it's free to avoid.
+    mock_coordinator = AsyncMock()
     g.attach_coordinator(app, mock_coordinator)
     app.router.add_get("/health", g.handle_health)
     app.router.add_get("/pool/status", g.handle_pool_status)
@@ -209,7 +214,10 @@ def test_route_view_derived_from_router_not_hand_written(monkeypatch):
     router, so a route this test never lists anywhere is still caught."""
     g = _fresh_gateway(monkeypatch)
     app = web.Application()
-    app.router.add_put("/some/new/framework/route", lambda r: None)
+
+    async def _stub_handler(request):
+        return web.json_response({})
+    app.router.add_put("/some/new/framework/route", _stub_handler)
     proxy = g.AsyncHiveMindProxy()
     proxy.set_known_routes(app.router)
     resp = asyncio.run(proxy.handle_proxy(_req("GET", "/some/new/framework/route")))
