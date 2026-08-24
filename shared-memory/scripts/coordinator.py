@@ -143,7 +143,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.49"
+FRAMEWORK_VERSION = "0.9.50"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -1670,8 +1670,21 @@ NEO4J_ACQUIRE_TIMEOUT = _env_float("NEO4J_ACQUIRE_TIMEOUT", 30.0)
 # route through its own auth middleware (which would require a valid token
 # for an internal call).  External agents still go through :8888 and must
 # authenticate; the coordinator is trusted and bypasses that layer.
-EMBED_URL  = "http://localhost:8070/v1/embeddings"
-RERANK_URL = "http://localhost:8071/v1/reranking"
+#
+# The backend BASE is the same env the gateway's routing map reads
+# (EMBEDDER_URL / RERANKER_URL, hive_mind_proxy.py) — one setting moves BOTH the
+# passthrough and the coordinator's own save/search calls. Before this the two
+# were literals here, so pointing EMBEDDER_URL at a remote host redirected only
+# the raw /v1/embeddings passthrough while every real embedding still went to
+# localhost (measured on a LAN embedder: passthrough answered from the remote,
+# saves kept using the local container). The port is a default, never an assumption.
+def _encoder_url(env_name: str, default_base: str, path: str) -> str:
+    """Full endpoint for an encoder backend: env-overridable BASE + fixed PATH."""
+    base = (os.environ.get(env_name) or default_base).strip().rstrip("/")
+    return f"{base}{path}"
+
+EMBED_URL  = _encoder_url("EMBEDDER_URL", "http://localhost:8070", "/v1/embeddings")
+RERANK_URL = _encoder_url("RERANKER_URL", "http://localhost:8071", "/v1/reranking")
 
 EMBED_RETRIES = 4
 EMBED_BACKOFF = 0.5      # seconds × attempt number  (0.5 s, 1 s, 1.5 s, 2 s)
@@ -2430,7 +2443,7 @@ class MemoryCoordinator:
         return await self._locks.get(entity)
 
     async def _embed(self, text: str, client: httpx.AsyncClient) -> list[float]:
-        """Embed text via the gateway with exponential-backoff retry."""
+        """Embed text directly at EMBED_URL (env-derived) with exponential-backoff retry."""
         if len(text) > EMBED_MAX_CHARS:
             log.warning("embed input %d chars > %d — truncating to fit BGE-M3 8192-ctx "
                         "(full text kept in Tier 1)", len(text), EMBED_MAX_CHARS)
@@ -6364,7 +6377,7 @@ class MemoryCoordinator:
             # created_at column is absent — recency simply degrades to off.
             createds = [r.get("created_at") for r in candidates]
 
-            # Rerank — direct to port 8071 to avoid circular proxy call.
+            # Rerank — direct to RERANK_URL (env-derived) to avoid a circular proxy call.
             # Decisions/retrospectives are scored WITH their recording date
             # prepended (recency-aware: the newest retro is the current verdict).
             # ⛔ TIER-3 NARRATIVES ARE CANDIDATES, NOT GUARANTEED POSITIONS.

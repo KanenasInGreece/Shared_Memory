@@ -5,6 +5,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.50] — 2026-08-24
+
+### Fixed — one setting now moves the encoders, for the coordinator too
+
+- **`EMBEDDER_URL` / `RERANKER_URL` reach the coordinator's own save and search calls.** The
+  gateway's routing map read them, but the coordinator held two literals (`localhost:8070`,
+  `localhost:8071`) for the embedding and reranking it performs itself — so pointing
+  `EMBEDDER_URL` at a remote encoder redirected only the raw `/v1/embeddings` passthrough while
+  every real save and search kept embedding on the local container. Measured on a LAN embedder:
+  the passthrough answered from the remote host, the saves did not. Both endpoints now derive
+  from the same env base the gateway uses (`_encoder_url`), with the local ports as defaults;
+  `.env.example` states that the variables are base URLs and that there is no second place to
+  point. Four tests pin the defaults, the override, and the empty-value fallback.
+
+---
+
 ## [0.9.49] — 2026-08-24
 
 ### Fixed — a mistyped memory request now fails and says why
