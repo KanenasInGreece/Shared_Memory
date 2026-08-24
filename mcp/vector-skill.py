@@ -119,7 +119,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.9.41"
+VERSION = "0.9.42"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server
@@ -201,8 +201,9 @@ async def _gateway_capability() -> dict | None:
     if _CAPABILITY_CACHE is None:
         try:
             async with httpx.AsyncClient(timeout=HEALTH_PROBE_TIMEOUT_S) as client:
-                health = (await client.get(f"{COORDINATOR_BASE}/health",
-                                           headers=_auth_headers())).json()
+                health = _reply_json(await client.get(f"{COORDINATOR_BASE}/health",
+                                                      headers=_auth_headers()),
+                                     "_gateway_capability")
             block = health.get("backend_capability")
             _CAPABILITY_CACHE = block if isinstance(block, dict) else {}
         except Exception:
@@ -254,7 +255,14 @@ def _unavailable(exc: Exception, ceiling: float | None = None) -> str:
     A read timeout is a DIFFERENT fault and gets its own message: httpx's
     ReadTimeout stringifies to nothing, so folding it in here told the reader to
     start a service that was already running (fact:1112).
+
+    Structural guard, not a courtesy: a GatewayReplyError means the gateway
+    ANSWERED, so it can never be reported as unreachable — even from a call
+    site that forgot its own `except GatewayReplyError` clause. This is the
+    last place fact:1503's defect could re-enter.
     """
+    if isinstance(exc, GatewayReplyError):
+        return exc.message
     if isinstance(exc, httpx.TimeoutException):
         waited = f"{ceiling:.0f}s" if ceiling else "the client timeout"
         return (f"Error: gateway did not answer within {waited} — it is most likely "
@@ -288,6 +296,136 @@ def _auth_rejected(tool: str) -> str:
                 {"hint": "No AGENT_TOKEN was sent; the gateway requires auth"})
     return (f"Error: no AGENT_TOKEN was sent and the gateway requires "
             f"authentication. Set AGENT_TOKEN in {where}.")
+
+
+class GatewayReplyError(Exception):
+    """The gateway ANSWERED, and its answer was not a 2xx JSON payload.
+
+    Carries the ready-to-return tool string. Mirrors memory_bridge's class of
+    the same name — Group 1: two front doors, one gateway, one error contract.
+
+    ``logged_event`` names the audit event the RAISE SITE already wrote, or is
+    None when it wrote nothing. Centralising the decode routed 401 through this
+    exception instead of an early return, and a catch block that logs
+    unconditionally would then record ONE refused call TWICE — ``auth_failed``
+    from _auth_rejected and ``save_rejected`` behind it, where before the 401
+    logged ``auth_failed`` alone. Deliberately an ATTRIBUTE and not a phrase
+    read back out of the message: keying the audit trail on message text would
+    tie it to wording that exists to be improved.
+    """
+
+    def __init__(self, message: str, *, logged_event: str | None = None):
+        super().__init__(message)
+        self.message = message
+        self.logged_event = logged_event
+
+
+def _body_snippet(r, limit: int = 200) -> str:
+    """A short, whitespace-collapsed piece of the response body, or "". Never
+    raises: this runs on the error path, where a second failure would replace a
+    diagnosis with a traceback."""
+    try:
+        # Same hazard as _gateway_message: this is gateway-controlled text on
+        # its way to a terminal or log — strip control characters before the
+        # whitespace collapse and the cap (the non-JSON error page is exactly
+        # the attacker-shaped body this path exists for).
+        return " ".join(_clean_gateway_text(r.text or "").split())[:limit]
+    except Exception:
+        return ""
+
+
+# The gateway's own words are reflected into this client's audit log and into
+# the operator's terminal — and COORDINATOR_BASE is an env-overridable default,
+# so the endpoint that produced them is not axiomatically trusted. Two limits
+# apply before the string is used anywhere.
+#
+# MEASURED, not guessed: the longest message any deployed middleware refusal
+# emits is 378 characters, so a 600-character cap preserves every legitimate
+# message whole and truncates only a body no deployed path can produce.
+_GATEWAY_MESSAGE_MAX = 600
+
+
+def _clean_gateway_text(msg: str) -> str:
+    """Strip ASCII control characters (newline and tab kept) and cap the length.
+
+    A message printed to a terminal is not inert: an ANSI escape can clear the
+    screen or rewrite the line the operator is reading, and a BEL is not a
+    diagnosis. Stripping runs BEFORE the cap so the cap counts characters the
+    reader will actually see. Mirrors memory_bridge's helper of the same name —
+    Group 1: two front doors, one error contract.
+    """
+    cleaned = "".join(
+        ch for ch in msg
+        if ch in ("\n", "\t") or (ord(ch) >= 32 and ord(ch) != 127)
+    )
+    return cleaned.strip()[:_GATEWAY_MESSAGE_MAX]
+
+
+def _gateway_message(r) -> str | None:
+    """The gateway's own ``message`` when the body is JSON and carries one.
+    Guarded end to end: a decode failure is a RESULT here, never an exception
+    that escapes into the transport handler.
+
+    The message is capped and control-stripped on the way out — see
+    ``_clean_gateway_text``."""
+    try:
+        body = r.json()
+    except Exception:
+        return None
+    if isinstance(body, dict):
+        msg = body.get("message") or body.get("error")
+        if isinstance(msg, str) and msg.strip():
+            return _clean_gateway_text(msg) or None
+    return None
+
+
+def _reply_json(r, tool: str) -> dict:
+    """Decode a gateway response ONLY after branching on its status class.
+
+    THE RULE (fact:1503). A non-2xx aiohttp page is plain text — ``"403:
+    Read-only token: this route requires a write-capable agent token"`` — and
+    ``json.loads`` of ANY such page raises ``JSONDecodeError``. Decoding before
+    the status class is branched on therefore turns every unenumerated status
+    into a decode exception, which the transport handler then reports as an
+    unreachable gateway: a live gateway refusing on authorization read as a
+    dead one. This surface carried the identical idiom at twelve sites; the fix
+    is one rule applied at all of them, not another per-site guard.
+
+    Raises GatewayReplyError (already-phrased tool string) on every non-2xx and
+    on an unparseable 2xx; returns the decoded payload otherwise.
+    """
+    # _auth_rejected writes `auth_failed` in BOTH of its sub-branches, so the
+    # 401 is already in the audit log by the time this is raised — which is what
+    # `logged_event` tells the catch block.
+    if r.status_code == 401:
+        raise GatewayReplyError(_auth_rejected(tool), logged_event="auth_failed")
+
+    # The gateway's OWN words come FIRST, before this client's framing — see the
+    # matching comment in memory_bridge._reply_json.
+    if r.status_code == 403:
+        detail = _gateway_message(r) or _body_snippet(r)
+        head = (f"Error: the gateway refused this request (HTTP 403): {detail}"
+                if detail else "Error: the gateway refused this request (HTTP 403).")
+        raise GatewayReplyError(
+            f"{head} — the gateway ANSWERED and the credential was ACCEPTED, so this is "
+            f"an authorization refusal, not an authentication failure and not a "
+            f"transport fault.")
+
+    if r.status_code >= 400:
+        detail = _gateway_message(r) or _body_snippet(r) or "(empty body)"
+        raise GatewayReplyError(
+            f"Error: the gateway answered HTTP {r.status_code}: {detail} — it is UP at "
+            f"{COORDINATOR_BASE} and refused or failed this request.")
+
+    try:
+        return r.json()
+    except Exception as exc:
+        raise GatewayReplyError(
+            f"Error: the gateway answered HTTP {r.status_code} at {COORDINATOR_BASE} "
+            f"with a body this client could not parse as JSON ({exc}). The gateway is "
+            f"LIVE and ANSWERED — this is a malformed reply, not a transport fault. "
+            f"Body began: "
+            f"{_body_snippet(r, 120) or '(empty)'}") from exc
 
 
 def _valid_ref(ref: str) -> bool:
@@ -406,10 +544,10 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5, project: str = ""
                 json=body,
                 headers=_auth_headers(),
             )
-            if r.status_code == 401:
-                return _auth_rejected("hybrid_search_and_rerank")
-            r.raise_for_status()
-            payload = r.json()
+            payload = _reply_json(r, "hybrid_search_and_rerank")
+    except GatewayReplyError as exc:
+        logger.error(f"Search refused: {exc.message}")
+        return exc.message
     except Exception as exc:
         logger.error(f"Search failed: {exc}")
         return _unavailable(exc, ceiling)
@@ -522,9 +660,18 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> str:
                 json={"content": content, "metadata": m_data, "agent_id": agent_id},
                 headers=_auth_headers(),
             )
-            if r.status_code == 401:
-                return _auth_rejected("save_artifact")
-            result = r.json()
+            result = _reply_json(r, "save_artifact")
+    except GatewayReplyError as exc:
+        # ONE refused save is ONE audit line. Before the decode was centralised
+        # a 401 returned here early, logging `auth_failed` alone and no
+        # `save_rejected`; _auth_rejected still writes that line, so this path
+        # must not add a second. Every OTHER class — 403, other 4xx, 5xx, a
+        # malformed 2xx — logs `save_rejected` here, and that IS new signal:
+        # those replies used to be logged as `gateway_down`, which was a lie
+        # about a gateway that had answered.
+        if exc.logged_event is None:
+            _append_log("vector_skill", 2, "save_rejected", {"message": exc.message}, content)
+        return exc.message
     except Exception as exc:
         _append_log("vector_skill", 2, "gateway_down", {"content_preview": content[:100]}, content)
         return (
@@ -768,9 +915,9 @@ async def save_decision(
                 json={"content": content, "metadata": metadata, "agent_id": agent_id},
                 headers=_auth_headers(),
             )
-            if r.status_code == 401:
-                return _auth_rejected("save_decision")
-            result = r.json()
+            result = _reply_json(r, "save_decision")
+    except GatewayReplyError as exc:
+        return exc.message
     except Exception as exc:
         return (
             f"Error: Memory coordinator unreachable at {coordinator_url} — "
@@ -853,9 +1000,9 @@ async def save_retrospective(
                 json=payload,
                 headers=_auth_headers(),
             )
-            if r.status_code == 401:
-                return _auth_rejected("save_retrospective")
-            result = r.json()
+            result = _reply_json(r, "save_retrospective")
+    except GatewayReplyError as exc:
+        return exc.message
     except Exception as exc:
         return (
             f"Error: Memory coordinator unreachable at {coordinator_url} — "
@@ -904,9 +1051,9 @@ async def supersede(pg_id: int, by: int = 0) -> str:
                 json=payload,
                 headers=_auth_headers(),
             )
-            if r.status_code == 401:
-                return _auth_rejected("supersede")
-            result = r.json()
+            result = _reply_json(r, "supersede")
+    except GatewayReplyError as exc:
+        return exc.message
     except Exception as exc:
         return (
             f"Error: Memory coordinator unreachable at {coordinator_url} — "
@@ -938,9 +1085,9 @@ async def review_hold(summary_id: int, pg_id: int) -> str:
                 json={"summary_id": summary_id, "pg_id": pg_id},
                 headers=_auth_headers(),
             )
-            if r.status_code == 401:
-                return _auth_rejected("review_hold")
-            result = r.json()
+            result = _reply_json(r, "review_hold")
+    except GatewayReplyError as exc:
+        return exc.message
     except Exception as exc:
         return (
             f"Error: Memory coordinator unreachable at {coordinator_url} — "
@@ -972,9 +1119,9 @@ async def check_memory_health() -> str:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(f"{COORDINATOR_BASE}/health",
                                     headers=_auth_headers())
-        if resp.status_code == 401:
-            return _auth_rejected("check_memory_health")
-        payload = resp.json()
+        payload = _reply_json(resp, "check_memory_health")
+    except GatewayReplyError as exc:
+        return exc.message
     except Exception as exc:
         return json.dumps({"status": "unreachable",
                            "gateway": COORDINATOR_BASE,
@@ -1007,11 +1154,9 @@ async def memory_telemetry() -> str:
             resp = await client.get(
                 f"{coordinator_url}/memory/telemetry", headers=_auth_headers()
             )
-        if resp.status_code == 401:
-            return _auth_rejected("memory_telemetry")
-        if resp.status_code >= 400:
-            return f"Error: coordinator returned HTTP {resp.status_code}."
-        return json.dumps(resp.json(), indent=2)
+        return json.dumps(_reply_json(resp, "memory_telemetry"), indent=2)
+    except GatewayReplyError as exc:
+        return exc.message
     except Exception as e:
         return f"Error: gateway unreachable — {e}"
 
@@ -1039,9 +1184,9 @@ async def record_lineage(ref: str) -> str:
         async with httpx.AsyncClient(timeout=CALL_TIMEOUT) as client:
             r = await client.get(f"{COORDINATOR_BASE}/memory/status/{ref}",
                                  headers=_auth_headers())
-            if r.status_code == 401:
-                return _auth_rejected("record_lineage")
-            return json.dumps(r.json(), indent=2, default=str)
+            return json.dumps(_reply_json(r, "record_lineage"), indent=2, default=str)
+    except GatewayReplyError as exc:
+        return exc.message
     except Exception as exc:
         return _unavailable(exc)
 
@@ -1060,9 +1205,9 @@ async def graph_query(cypher: str) -> str:
             r = await client.post(f"{COORDINATOR_BASE}/memory/graph",
                                   json={"cypher": cypher, "params": {}},
                                   headers=_auth_headers())
-            if r.status_code == 401:
-                return _auth_rejected("graph_query")
-            payload = r.json()
+            payload = _reply_json(r, "graph_query")
+    except GatewayReplyError as exc:
+        return exc.message
     except Exception as exc:
         return _unavailable(exc)
     return json.dumps(payload.get("records", payload), indent=2, default=str)
@@ -1086,9 +1231,9 @@ async def review_edges(family: str = "entity_relation", limit: int = 20) -> str:
                 f"{COORDINATOR_BASE}/memory/relations/review",
                 params={"family": family, "limit": limit},
                 headers=_auth_headers())
-            if r.status_code == 401:
-                return _auth_rejected("review_edges")
-            return json.dumps(r.json(), indent=2, default=str)
+            return json.dumps(_reply_json(r, "review_edges"), indent=2, default=str)
+    except GatewayReplyError as exc:
+        return exc.message
     except Exception as exc:
         return _unavailable(exc)
 
@@ -1114,9 +1259,9 @@ async def label_edges(labels_json: str, promote: list = None) -> str:
                 f"{COORDINATOR_BASE}/memory/relations/label",
                 json={"labels": labels, "promote": promote or []},
                 headers=_auth_headers())
-            if r.status_code == 401:
-                return _auth_rejected("label_edges")
-            return json.dumps(r.json(), indent=2, default=str)
+            return json.dumps(_reply_json(r, "label_edges"), indent=2, default=str)
+    except GatewayReplyError as exc:
+        return exc.message
     except Exception as exc:
         return _unavailable(exc)
 

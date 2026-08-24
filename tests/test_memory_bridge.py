@@ -38,7 +38,8 @@ async def test_save_artifact_bad_metadata_json():
 
 @pytest.mark.asyncio
 async def test_save_artifact_success():
-    mock_resp = MagicMock(json=lambda: {"status": "success", "pg_id": MOCK_PG_ID})
+    mock_resp = MagicMock(status_code=200,
+                          json=lambda: {"status": "success", "pg_id": MOCK_PG_ID})
     with patch("httpx.AsyncClient.post", return_value=mock_resp):
         result = await memory_bridge.save_artifact(MOCK_CONTENT, '{"source":"test","entities":["E1"]}')
     assert result["status"] == "success"
@@ -46,7 +47,8 @@ async def test_save_artifact_success():
 
 @pytest.mark.asyncio
 async def test_save_artifact_coordinator_error_response():
-    mock_resp = MagicMock(json=lambda: {"status": "error", "message": "internal error"})
+    mock_resp = MagicMock(status_code=200,
+                          json=lambda: {"status": "error", "message": "internal error"})
     with patch("httpx.AsyncClient.post", return_value=mock_resp):
         result = await memory_bridge.save_artifact(MOCK_CONTENT)
     assert result["status"] == "error"
@@ -56,7 +58,8 @@ async def test_search_and_rerank_full_success():
     mock_results = [{"pg_id": MOCK_PG_ID, "content": MOCK_CONTENT, "score": 0.95,
                      "tier": "fact", "score_normalized": 0.72, "matched_entities": [],
                      "graph_context": []}]
-    mock_resp = MagicMock(json=lambda: {"status": "success", "results": mock_results})
+    mock_resp = MagicMock(status_code=200,
+                          json=lambda: {"status": "success", "results": mock_results})
     with patch("httpx.AsyncClient.post", return_value=mock_resp):
         results = await memory_bridge.search_and_rerank(MOCK_QUERY)
     assert len(results) == 1
@@ -252,7 +255,7 @@ def test_dotenv_scope_operator_export_still_wins_over_file(tmp_path, monkeypatch
 # ── Version contract — check_gateway_compat ───────────────────────────────────
 
 def _health(payload):
-    return MagicMock(json=lambda: payload)
+    return MagicMock(status_code=200, json=lambda: payload)
 
 
 @pytest.mark.asyncio
@@ -637,21 +640,55 @@ def test_token_presented_is_derived_from_the_real_header(monkeypatch):
     assert memory_bridge._token_presented() is False
 
 
-def test_no_401_site_inlines_its_own_message():
-    """Guard: every 401 handler routes through _auth_error(). An inline dict
-    would silently reintroduce the unconditional 'rejected' wording at one
-    site while the helper's tests kept passing."""
+def test_status_class_branching_lives_in_exactly_one_place():
+    """Guard: the status-class branch is a RULE, not a per-site idiom.
+
+    Successor to the old per-401-site guard, which pinned the same intention
+    one status code at a time — and so said nothing about 403 or any other
+    status, which is exactly how fact:1503's defect shipped. Every response
+    site now calls _reply_json(), so the branch (and _auth_error()'s two
+    sub-branches with it) exists once and can only regress once.
+    """
     path = os.path.join(os.path.dirname(__file__), "..",
                         "shared-memory", "scripts", "memory_bridge.py")
     src = open(path, encoding="utf-8").read()
     lines = src.split("\n")
+
     sites = [i for i, l in enumerate(lines) if "status_code == 401" in l]
-    assert sites, "no 401 handling found at all"
-    for i in sites:
-        window = "\n".join(lines[i + 1:i + 3])
-        assert "_auth_error()" in window, (
-            f"line {i + 2} handles a 401 without _auth_error(): {lines[i + 1].strip()[:70]}"
-        )
+    assert len(sites) == 1, (
+        f"a 401 is branched on at {len(sites)} places; _reply_json() is the only "
+        f"one that may — lines {[i + 1 for i in sites]}"
+    )
+    helper = next(i for i, l in enumerate(lines) if l.startswith("def _reply_json("))
+    assert helper < sites[0], "the surviving 401 branch is not inside _reply_json()"
+    assert "_auth_error()" in "\n".join(lines[sites[0]:sites[0] + 5]), (
+        "the 401 branch no longer routes through _auth_error()"
+    )
     assert "Coordinator rejected token" not in src, (
         "the old unconditional message is back; _auth_error() owns that text"
+    )
+
+
+def test_no_response_is_decoded_before_its_status_class_is_known():
+    """Guard: `.json()` on a gateway response appears ONLY inside the helpers.
+
+    A single re-introduced `result = r.json()` beside a request is the whole
+    defect of fact:1503 back again: any status the site did not enumerate is
+    fed to the decoder, raises JSONDecodeError, and is reported as an
+    unreachable gateway.
+    """
+    path = os.path.join(os.path.dirname(__file__), "..",
+                        "shared-memory", "scripts", "memory_bridge.py")
+    lines = open(path, encoding="utf-8").read().split("\n")
+    allowed = {"_gateway_message", "_reply_json"}
+    current = None
+    offenders = []
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith("def ") or stripped.startswith("async def "):
+            current = stripped.split("(")[0].split()[-1]
+        if ".json()" in line and current not in allowed:
+            offenders.append((i + 1, current, line.strip()[:70]))
+    assert not offenders, (
+        f"a gateway response is decoded outside the status-class helper: {offenders}"
     )

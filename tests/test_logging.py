@@ -169,7 +169,8 @@ async def test_save_logs_bad_metadata_type(tmp_path, monkeypatch):
 async def test_save_logs_no_entities_warning(tmp_path, monkeypatch):
     monkeypatch.setenv("MEMORY_LOG_LEVEL", "1")
     monkeypatch.setenv("MEMORY_LOG_PATH", str(tmp_path))
-    mock_resp = MagicMock(json=lambda: {"status": "success", "pg_id": MOCK_PG_ID})
+    mock_resp = MagicMock(status_code=200,
+                          json=lambda: {"status": "success", "pg_id": MOCK_PG_ID})
     with patch("httpx.AsyncClient.post", return_value=mock_resp):
         result = await memory_bridge.save_artifact("content", '{"source":"test"}')
     assert result["status"] == "success"
@@ -181,7 +182,8 @@ async def test_save_logs_no_entities_warning(tmp_path, monkeypatch):
 async def test_save_logs_success_at_level_3(tmp_path, monkeypatch):
     monkeypatch.setenv("MEMORY_LOG_LEVEL", "3")
     monkeypatch.setenv("MEMORY_LOG_PATH", str(tmp_path))
-    mock_resp = MagicMock(json=lambda: {"status": "success", "pg_id": MOCK_PG_ID})
+    mock_resp = MagicMock(status_code=200,
+                          json=lambda: {"status": "success", "pg_id": MOCK_PG_ID})
     with patch("httpx.AsyncClient.post", return_value=mock_resp):
         result = await memory_bridge.save_artifact("content", '{"source":"test","entities":["E1"]}')
     assert result["status"] == "success"

@@ -143,7 +143,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.41"
+FRAMEWORK_VERSION = "0.9.42"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -1458,6 +1458,27 @@ def _credentials_snapshot() -> dict:
     }
 
 
+def _error_body(message: str) -> dict:
+    """Keyword arguments that give an aiohttp HTTPException the SAME JSON error
+    body every handler in this file already returns: {"status", "message"}.
+
+    Why this exists (fact:1503). aiohttp renders an unadorned HTTPException as
+    a plain-text page — ``"403: Read-only token: this route requires a
+    write-capable agent token"``. A client that decodes before branching on the
+    status class hands that page to ``json.loads`` and gets
+    ``JSONDecodeError: Extra data: line 1 column 4 (char 3)``, which reads as a
+    transport fault, not an authorization refusal — a live gateway reported as
+    a dead one. The status line (``reason``) is unchanged; only the BODY gains
+    the shape the rest of the gateway already speaks, so a client can read the
+    refusal instead of guessing at it.
+
+    Additive on the error path only: no 2xx payload changes shape, so this is
+    not an API_VERSION event.
+    """
+    return {"text": json.dumps({"status": "error", "message": message}),
+            "content_type": "application/json"}
+
+
 @web.middleware
 async def auth_middleware(request: web.Request, handler):
     """DEFAULT DENY, and the single identity → govern → audit choke point.
@@ -1484,6 +1505,8 @@ async def auth_middleware(request: web.Request, handler):
     if GATEWAY_INFLIGHT_MAX and _inflight >= GATEWAY_INFLIGHT_MAX:
         raise web.HTTPServiceUnavailable(
             reason="gateway at capacity", headers={"Retry-After": "1"},
+            **_error_body("Gateway at capacity — too many requests in flight; "
+                          "retry after the Retry-After interval."),
         )
 
     # SEC-A5-05a (PR A5 fix round): a request that reaches this point WAS
@@ -1523,6 +1546,7 @@ async def auth_middleware(request: web.Request, handler):
                 # origin 401 from an upstream one only by the header's ABSENCE —
                 # and absence is exactly what a stripping intermediary produces.
                 headers={"WWW-Authenticate": www_authenticate, "X-SM-Fault-Origin": "gateway"},
+                **_error_body("Authorization: a valid Bearer token is required."),
             )
         request["authenticated_agent"] = agent_name
         # Person axis: stamp the kernel-attested principal (OS account + connection
@@ -1541,22 +1565,42 @@ async def auth_middleware(request: web.Request, handler):
         if role == "read" and not _read_role_permits(request):
             raise web.HTTPForbidden(
                 reason="Read-only token: this route requires a write-capable agent token",
+                **_error_body("Read-only token: this route requires a write-capable "
+                              "agent token. The credential is VALID — it is confined to "
+                              "the read allowlist, so this is a role refusal, not an "
+                              "authentication failure."),
             )
         if route in _ADMIN_ROUTES:
             if role != "admin":
-                raise web.HTTPForbidden(reason="This route requires an admin-role token")
+                raise web.HTTPForbidden(
+                    reason="This route requires an admin-role token",
+                    **_error_body("This route requires an admin-role token. The "
+                                  "credential is VALID but does not carry the admin role."),
+                )
         else:
             if role == "admin":
-                raise web.HTTPForbidden(reason="Admin token is confined to /admin/* routes")
+                raise web.HTTPForbidden(
+                    reason="Admin token is confined to /admin/* routes",
+                    **_error_body("Admin token is confined to /admin/* routes. The "
+                                  "credential is VALID — use a write-capable agent token "
+                                  "for this route."),
+                )
             if _backup_quiesce and route in _WRITE_ROUTES:
                 raise web.HTTPServiceUnavailable(
                     reason="backup in progress — writes are briefly paused",
                     headers={"Retry-After": str(BACKUP_RETRY_AFTER)},
+                    **_error_body("Backup in progress — writes are briefly paused so the "
+                                  "dump sees a quiet database. Reads are unaffected; "
+                                  "retry after the Retry-After interval."),
                 )
             if GATEWAY_REQUIRE_PRINCIPAL and route in _WRITE_ROUTES and principal is None:
                 raise web.HTTPForbidden(
                     reason="writes require a kernel-attested principal — connect over the "
                            "gateway Unix socket (GATEWAY_UDS_PATH), not TCP",
+                    **_error_body("Writes require a kernel-attested principal — connect "
+                                  "over the gateway Unix socket (GATEWAY_UDS_PATH), not "
+                                  "TCP. The credential is VALID; the TRANSPORT is what "
+                                  "this route refuses."),
                 )
 
         started    = asyncio.get_running_loop().time()
@@ -1576,6 +1620,9 @@ async def auth_middleware(request: web.Request, handler):
             status = 503
             raise web.HTTPServiceUnavailable(
                 reason="database pool saturated", headers={"Retry-After": "1"},
+                **_error_body("Database pool saturated past POOL_ACQUIRE_TIMEOUT — the "
+                              "gateway is UP and shedding rather than hanging; retry "
+                              "after the Retry-After interval."),
             )
         except web.HTTPException as exc:
             status = exc.status
