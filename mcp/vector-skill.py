@@ -1291,9 +1291,9 @@ async def review_edges(family: str = "entity_relation", limit: int = 20) -> str:
         return f"Error: family must be one of {', '.join(RELATION_FAMILIES)}"
     try:
         async with httpx.AsyncClient(timeout=CALL_TIMEOUT) as client:
-            r = await client.get(
+            r = await client.post(
                 f"{COORDINATOR_BASE}/memory/relations/review",
-                params={"family": family, "limit": limit},
+                json={"family": family, "limit": limit},
                 headers=_auth_headers())
             return json.dumps(_reply_json(r, "review_edges", forbidden_hint=_EDGE_REVIEW_FORBIDDEN_HINT), indent=2, default=str)
     except GatewayReplyError as exc:
