@@ -203,6 +203,7 @@ async def test_mcp_archive_reasoning_trace_rejects_empty():
 async def test_mcp_save_decision_success():
     """save_decision routes through coordinator and returns pg_id on success."""
     mock_response = MagicMock()
+    mock_response.status_code = 200
     mock_response.json = lambda: {"status": "success", "pg_id": 77}
 
     with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
@@ -234,6 +235,7 @@ async def test_mcp_save_decision_grounded_in_and_elicited():
     Studio agent had no way to ground a decision in supporting facts or mark
     a field elicited at all, regardless of intent."""
     mock_response = MagicMock()
+    mock_response.status_code = 200
     mock_response.json = lambda: {"status": "success", "pg_id": 78}
 
     with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
@@ -256,6 +258,7 @@ async def test_mcp_save_decision_omits_grounded_in_and_elicited_when_absent():
     """Defaults stay silent — no empty grounded_in/elicited keys clutter every
     plain decision save."""
     mock_response = MagicMock()
+    mock_response.status_code = 200
     mock_response.json = lambda: {"status": "success", "pg_id": 79}
 
     with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
@@ -279,6 +282,7 @@ async def test_mcp_save_decision_stores_an_alternative_containing_a_comma_whole(
     capture surface must not accept a value it cannot faithfully represent."""
     alt = "use explicit Neo4j transactions for atomicity (APOC not available, auto-commit is the existing pattern)"
     mock_response = MagicMock()
+    mock_response.status_code = 200
     mock_response.json = lambda: {"status": "success", "pg_id": 80}
 
     with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
@@ -296,6 +300,7 @@ async def test_mcp_save_decision_stores_an_alternative_containing_a_comma_whole(
 async def test_mcp_save_decision_treats_a_lone_string_as_one_alternative():
     """Under-splitting is the safe direction — it never invents an option."""
     mock_response = MagicMock()
+    mock_response.status_code = 200
     mock_response.json = lambda: {"status": "success", "pg_id": 81}
 
     with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
@@ -323,8 +328,15 @@ async def test_mcp_save_decision_coordinator_down():
 
 @pytest.mark.asyncio
 async def test_mcp_save_decision_coordinator_returns_400():
-    """save_decision surfaces coordinator error messages (e.g. missing required fields)."""
+    """save_decision surfaces coordinator error messages (e.g. missing required fields).
+
+    The status code is now the one this test's name always claimed — 400, not
+    the 200 an unset mock attribute silently implied. A validation refusal must
+    reach the caller carrying the gateway's own words, whatever the status
+    class it arrives under.
+    """
     mock_response = MagicMock()
+    mock_response.status_code = 400
     mock_response.json = lambda: {
         "status": "error",
         "message": "decision save missing required fields: ['rationale']",
@@ -344,6 +356,7 @@ async def test_mcp_save_retrospective_success():
     target decision's pg_id plus this record's own pg_id. No prior test
     covered this tool at all."""
     mock_response = MagicMock()
+    mock_response.status_code = 200
     mock_response.json = lambda: {"status": "success", "pg_id": 91, "target_pg_id": 43}
 
     with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
@@ -364,6 +377,7 @@ async def test_mcp_save_retrospective_grounded_in_and_elicited():
     """save_retrospective must expose grounded_in/elicited too — same capture-
     surface parity gap as save_decision, same fix."""
     mock_response = MagicMock()
+    mock_response.status_code = 200
     mock_response.json = lambda: {"status": "success", "pg_id": 92, "target_pg_id": 43}
 
     with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:

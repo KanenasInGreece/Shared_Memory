@@ -354,8 +354,8 @@ async def _gateway_capability() -> dict | None:
     if _CAPABILITY_CACHE is None:
         try:
             async with _async_client(HEALTH_PROBE_TIMEOUT_S) as client:
-                health = (await client.get(f"{COORDINATOR_BASE}/health",
-                                           headers=_request_headers())).json()
+                health = _reply_json(await client.get(f"{COORDINATOR_BASE}/health",
+                                                      headers=_request_headers()))
             block = health.get("backend_capability")
             _CAPABILITY_CACHE = block if isinstance(block, dict) else {}
         except Exception:
@@ -460,6 +460,122 @@ def _append_log(tool: str, min_level: int, event: str, data: dict, content: str 
 
 # ── Coordinator HTTP helpers ──────────────────────────────────────────────────
 
+class GatewayReplyError(Exception):
+    """The gateway ANSWERED, and its answer was not a 2xx JSON payload.
+
+    Carries the client-facing error dict so every call site returns one shape.
+    It exists so that a reply which is not a success payload can never be
+    mistaken for a transport failure: it is raised INSIDE the request's
+    ``try``, and every site catches it BEFORE the generic handler that reports
+    an unreachable gateway.
+    """
+
+    def __init__(self, payload: dict):
+        super().__init__(payload.get("message", ""))
+        self.payload = payload
+
+
+def _body_snippet(r, limit: int = 200) -> str:
+    """A short, whitespace-collapsed piece of the response body, or "".
+
+    Never raises: this runs on the error path, where a second failure would
+    replace a diagnosis with a traceback.
+    """
+    try:
+        return " ".join((r.text or "").split())[:limit]
+    except Exception:
+        return ""
+
+
+def _gateway_message(r) -> str | None:
+    """The gateway's own ``message`` when the body is JSON and carries one.
+
+    Guarded end to end: the whole point of this module's error contract is
+    that a decode failure is a RESULT here, never an exception that escapes
+    into the transport handler.
+    """
+    try:
+        body = r.json()
+    except Exception:
+        return None
+    if isinstance(body, dict):
+        msg = body.get("message") or body.get("error")
+        if isinstance(msg, str) and msg.strip():
+            return msg.strip()
+    return None
+
+
+# Route-specific tail for the relation-adjudication endpoints. It is APPENDED to
+# the gateway's own refusal rather than replacing it: which token was refused is
+# the gateway's to say, what the route is FOR is the client's. Before this, the
+# two 403 sites that carried it discarded the gateway's reason entirely.
+_EDGE_REVIEW_FORBIDDEN_HINT = ("This token may not review/label relation edges "
+                               "(operator-grade route). Use a write-capable agent token.")
+
+
+def _reply_json(r, *, log_auth: bool = False, forbidden_hint: str | None = None) -> dict:
+    """Decode a gateway response ONLY after branching on its status class.
+
+    THE RULE (fact:1503). A non-2xx aiohttp page is plain text — ``"403:
+    Read-only token: this route requires a write-capable agent token"`` — and
+    ``json.loads`` of ANY such page raises ``JSONDecodeError: Extra data: line
+    1 column 4 (char 3)``. Decoding before the status class is branched on
+    therefore turns EVERY unenumerated status into a decode exception, which
+    the transport handler then reports as "coordinator unreachable — is
+    hive_mind_proxy.py running?". A live gateway refusing on authorization was
+    read as a dead gateway; three wrong diagnoses followed. The defect is a
+    CLASS, not a 403 special case, so the fix is a single rule applied at
+    every response site rather than another per-site guard (v0.9.33 patched
+    one site; the class shipped again).
+
+    401 keeps ``_auth_error()``'s two sub-branches verbatim (sent vs not
+    sent). 403 surfaces the gateway's OWN message, so a read-only role refusal
+    says exactly that instead of sending the operator to inspect auth setup.
+    Any other >= 400 names the status and quotes the body. A 2xx whose body
+    will not parse says the gateway is LIVE and its reply malformed — which is
+    a different fault with a different fix from an unreachable one.
+
+    Raises GatewayReplyError on every non-2xx and on an unparseable 2xx;
+    returns the decoded payload otherwise.
+    """
+    if r.status_code == 401:
+        if log_auth:
+            _append_log("memory_bridge", 2, "auth_failed", _auth_log_hint())
+        raise GatewayReplyError(_auth_error())
+
+    # The gateway's OWN words come FIRST, before this client's framing. Readers
+    # downstream truncate (postflight A5 slices a search error to 200 chars), and
+    # a preamble long enough to push the actual refusal past the cut restores the
+    # defect one level up — the operator still cannot see WHY.
+    if r.status_code == 403:
+        detail = _gateway_message(r) or _body_snippet(r)
+        head = f"Gateway refused this request (HTTP 403): {detail}" if detail else \
+               "Gateway refused this request (HTTP 403)."
+        message = (f"{head} — the gateway ANSWERED and the credential was ACCEPTED, so "
+                   f"this is an authorization refusal, not an authentication failure "
+                   f"and not a transport fault.")
+        if forbidden_hint:
+            message += f" {forbidden_hint}"
+        raise GatewayReplyError({"status": "error", "message": message})
+
+    if r.status_code >= 400:
+        detail = _gateway_message(r) or _body_snippet(r) or "(empty body)"
+        raise GatewayReplyError({"status": "error", "message": (
+            f"Gateway answered HTTP {r.status_code}: {detail} — it is UP at "
+            f"{COORDINATOR_BASE} and refused or failed this request."
+        )})
+
+    try:
+        return r.json()
+    except Exception as exc:
+        raise GatewayReplyError({"status": "error", "message": (
+            f"Gateway answered HTTP {r.status_code} at {COORDINATOR_BASE} with a body this "
+            f"client could not parse as JSON ({exc}). The gateway is LIVE and ANSWERED "
+            f"— this is a malformed reply, not a transport fault. Body began: "
+            f"{_body_snippet(r, 120) or '(empty)'}"
+        )}) from exc
+
+
 def _coordinator_unavailable(exc: Exception, ceiling: float | None = None) -> dict:
     """Map a transport failure to a message that names the RIGHT cause.
 
@@ -468,7 +584,15 @@ def _coordinator_unavailable(exc: Exception, ceiling: float | None = None) -> di
     "unreachable — is hive_mind_proxy.py running? ()" sent readers to inspect a
     daemon that had answered /health 3 ms earlier (fact:1112). The same shape as
     the v0.8.45 verifiers reporting a credentials error for a missing dependency.
+
+    Structural guard, not a courtesy: a GatewayReplyError means the gateway
+    ANSWERED, so it can never be reported as unreachable — even from a call
+    site that forgot its own `except GatewayReplyError` clause. This function
+    is the last place the defect of fact:1503 could re-enter, so the rule is
+    enforced here too rather than relying on eleven call sites staying correct.
     """
+    if isinstance(exc, GatewayReplyError):
+        return exc.payload
     if isinstance(exc, httpx.TimeoutException):
         waited = f"{ceiling:.0f}s" if ceiling else "the client timeout"
         return {
@@ -498,7 +622,12 @@ async def check_gateway_compat() -> dict:
     """
     try:
         async with _async_client(3.0) as client:
-            h = (await client.get(f"{COORDINATOR_BASE}/health")).json()
+            h = _reply_json(await client.get(f"{COORDINATOR_BASE}/health"))
+    except GatewayReplyError as exc:
+        # The gateway ANSWERED — `reachable` says so, or `doctor` would send the
+        # operator to restart a service that is running and merely refusing.
+        return {"reachable": True, "error": exc.payload.get("message", str(exc)),
+                "compat": "unknown"}
     except Exception as exc:
         return {"reachable": False, "error": str(exc), "compat": "unknown"}
 
@@ -591,10 +720,11 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
                 json={"content": content, "metadata": metadata, "agent_id": AGENT_ID},
                 headers=_request_headers(),
             )
-            if r.status_code == 401:
-                _append_log("memory_bridge", 2, "auth_failed", _auth_log_hint())
-                return _auth_error()
-            result = r.json()
+            result = _reply_json(r, log_auth=True)
+    except GatewayReplyError as exc:
+        _append_log("memory_bridge", 2, "save_failed",
+                    {"response": exc.payload, "content_preview": content[:100]}, content)
+        return exc.payload
     except Exception as exc:
         _append_log("memory_bridge", 2, "coordinator_down", {"content_preview": content[:100]}, content)
         return await _warn_on_skew(_coordinator_unavailable(exc))
@@ -637,9 +767,9 @@ async def supersede_fact(pg_id: int, by: int | None = None) -> dict:
                 json=payload,
                 headers=_request_headers(),
             )
-            if r.status_code == 401:
-                return _auth_error()
-            result = r.json()
+            result = _reply_json(r)
+    except GatewayReplyError as exc:
+        return exc.payload
     except Exception as exc:
         return await _warn_on_skew(_coordinator_unavailable(exc))
     return result
@@ -655,9 +785,9 @@ async def review_hold(summary_id: int, pg_id: int) -> dict:
                 json={"summary_id": summary_id, "pg_id": pg_id},
                 headers=_request_headers(),
             )
-            if r.status_code == 401:
-                return _auth_error()
-            result = r.json()
+            result = _reply_json(r)
+    except GatewayReplyError as exc:
+        return exc.payload
     except Exception as exc:
         return await _warn_on_skew(_coordinator_unavailable(exc))
     return result
@@ -674,13 +804,9 @@ async def fetch_review_edges(family: str = "entity_relation", limit: int = 20) -
                 json={"family": family, "limit": limit},
                 headers=_request_headers(),
             )
-            if r.status_code == 401:
-                return _auth_error()
-            if r.status_code == 403:
-                return {"status": "error",
-                        "message": "This token may not review/label relation edges "
-                                   "(operator-grade route). Use a write-capable agent token."}
-            result = r.json()
+            result = _reply_json(r, forbidden_hint=_EDGE_REVIEW_FORBIDDEN_HINT)
+    except GatewayReplyError as exc:
+        return exc.payload
     except Exception as exc:
         return await _warn_on_skew(_coordinator_unavailable(exc))
     return result
@@ -699,13 +825,9 @@ async def apply_edge_labels(labels: dict, promote: list | None = None) -> dict:
                 json=payload,
                 headers=_request_headers(),
             )
-            if r.status_code == 401:
-                return _auth_error()
-            if r.status_code == 403:
-                return {"status": "error",
-                        "message": "This token may not review/label relation edges "
-                                   "(operator-grade route). Use a write-capable agent token."}
-            result = r.json()
+            result = _reply_json(r, forbidden_hint=_EDGE_REVIEW_FORBIDDEN_HINT)
+    except GatewayReplyError as exc:
+        return exc.payload
     except Exception as exc:
         return await _warn_on_skew(_coordinator_unavailable(exc))
     return result
@@ -813,10 +935,9 @@ async def search_and_rerank(query: str, limit: int = 5, project: str = None,
                 json=body,
                 headers=_request_headers(),
             )
-            if r.status_code == 401:
-                _append_log("memory_bridge", 2, "auth_failed", _auth_log_hint())
-                return _auth_error()
-            result = r.json()
+            result = _reply_json(r, log_auth=True)
+    except GatewayReplyError as exc:
+        return exc.payload
     except Exception as exc:
         return await _warn_on_skew(_coordinator_unavailable(exc, ceiling))
 
@@ -831,10 +952,9 @@ def query_graph(cypher: str, params: dict = None) -> list | dict:
                 json={"cypher": cypher, "params": params or {}},
                 headers=_request_headers(),
             )
-        if r.status_code == 401:
-            _append_log("memory_bridge", 2, "auth_failed", _auth_log_hint())
-            return _auth_error()
-        result = r.json()
+        result = _reply_json(r, log_auth=True)
+    except GatewayReplyError as exc:
+        return exc.payload
     except Exception as exc:
         return _coordinator_unavailable(exc)
 
@@ -849,9 +969,9 @@ def get_telemetry() -> dict:
                 f"{COORDINATOR_BASE}/memory/telemetry",
                 headers=_request_headers(),
             )
-        if r.status_code == 401:
-            return _auth_error()
-        return r.json()
+        return _reply_json(r)
+    except GatewayReplyError as exc:
+        return exc.payload
     except Exception as exc:
         return _coordinator_unavailable(exc)
 
@@ -1304,10 +1424,9 @@ async def save_retrospective_artifact(
                 json=payload,
                 headers=_request_headers(),
             )
-            if r.status_code == 401:
-                _append_log("memory_bridge", 2, "auth_failed", _auth_log_hint())
-                return _auth_error()
-            return r.json()
+            return _reply_json(r, log_auth=True)
+    except GatewayReplyError as exc:
+        return exc.payload
     except httpx.ConnectError as exc:
         return _coordinator_unavailable(exc)
 
@@ -1466,7 +1585,9 @@ async def main() -> None:
                     f"{COORDINATOR_BASE}/memory/status/{pid}",
                     headers=_request_headers(),
                 )
-                print(json.dumps(r.json(), indent=2))
+                print(json.dumps(_reply_json(r), indent=2))
+        except GatewayReplyError as exc:
+            print(json.dumps(exc.payload, indent=2))
         except httpx.ConnectError as exc:
             print(json.dumps(_coordinator_unavailable(exc)))
         return
