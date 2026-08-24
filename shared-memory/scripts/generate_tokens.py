@@ -54,6 +54,17 @@ them and prints only names, digests, and destination paths.
     overwritten. Prints the MERGED AGENT_TOKENS= (and, with --install-path,
     AGENT_INSTALLS=) line for bootstrap_tokens.sh to write in place.
 
+  uv run python shared-memory/scripts/generate_tokens.py --add opencode --mcp \
+      --install-path ~/.config/opencode/shared-memory-mcp/.env
+    The same additive mint, registering an MCP CONNECTOR install instead of a
+    CLI skill install (AGENT_INSTALLS kind `mcp`, written as
+    `name:mcp:path`). The registered path is still an .env FILE — the walled
+    connector directory's own. What the kind buys is delivery: sync_skills.sh
+    ships the CONNECTOR package there (vector-skill.py,
+    CONSTITUTION_SNIPPET_MCP.md, system-prompt.md) and never the CLI skill
+    package. An entry with no kind (`name:path`) is a CLI skill install,
+    permanently — nothing rewrites an existing line.
+
   uv run python shared-memory/scripts/generate_tokens.py --reveal codex
     Mints as normal, but ALSO prints the codex token's raw value —
     labelled with a loud warning. Run this yourself; NEVER pipe it through
@@ -284,26 +295,98 @@ def _same_registered_file(path_a: str, path_b: str) -> bool:
     return os.path.realpath(path_a) == os.path.realpath(path_b)
 
 
-def _parse_agent_installs(raw: str) -> "dict[str, str]":
-    """Parse an AGENT_INSTALLS= value: comma-separated name:path entries.
-    Split on the FIRST colon only (str.partition), so a path containing a
-    colon of its own still parses whole — mirrors _load_agent_tokens()'s own
-    "everything after the first colon is the value" rule in coordinator.py
-    for the equivalent case in AGENT_TOKENS."""
-    installs: dict[str, str] = {}
+# ── Install KINDS: what a registered path is a path TO ───────────────────────
+#
+# An AGENT_INSTALLS entry is `name:path` (two fields) or `name:kind:path`
+# (three). The two-field form parses as kind="skill" FOREVER — it is not a
+# legacy spelling to be migrated, it is the shorthand for the default kind, and
+# nothing in this framework ever rewrites an existing line to add ":skill:".
+# That is why _format_agent_installs() below EMITS the two-field form for the
+# default kind: a bulk mint re-prints the whole registry, and a mint that
+# gratuitously restyled every entry would make a rotation look like a schema
+# change in the operator's own `git diff` of their .env.
+#
+# The kinds differ in what the registered path IS and therefore in what
+# sync_skills.sh must DELIVER to it:
+#   skill — a CLI agent's skill .env; its parent dir receives the thin-client
+#           skill package (SKILL.md, memory_bridge.py, …), driven by MANIFEST.txt.
+#   mcp   — an MCP connector's WALLED DIRECTORY .env; its parent dir receives
+#           the connector package (vector-skill.py, CONSTITUTION_SNIPPET_MCP.md,
+#           system-prompt.md) and NEVER the CLI package. Delivering the CLI
+#           package into an MCP install is a real, measured hazard, not a
+#           hypothetical: the registry cannot tell the two apart without this
+#           field, so it dumped SKILL.md and memory_bridge.py into a connector's
+#           walled directory.
+#
+# ⚠ Disambiguation is unambiguous BY CONSTRUCTION, not by luck: a registered
+# path can never contain ':' at all (_validate_registry_field refuses it as a
+# delimiter), so a three-field entry's middle field is a kind or the entry is
+# malformed. A pre-validation legacy path that DOES carry a colon still parses
+# whole, because a middle field that is not a known kind is treated as part of
+# the path — see _split_install_entry().
+INSTALL_KINDS = ("skill", "mcp")
+DEFAULT_INSTALL_KIND = "skill"
+
+
+def _split_install_entry(rest: str) -> "tuple[str, str]":
+    """Split the part of an AGENT_INSTALLS entry AFTER the agent name into
+    (kind, path). Two arities, one rule: if what precedes the next colon is a
+    KNOWN kind and something follows it, that is the kind; otherwise the whole
+    remainder is the path and the kind is the default.
+
+    Written as "known kind" rather than "has three fields" deliberately. A
+    legacy path containing a colon of its own (registrable before
+    _validate_registry_field forbade the character) would otherwise have its
+    first path segment eaten as a bogus kind, and the install would silently
+    become a truncated prefix — the exact failure the FIRST-colon-only rule
+    existed to prevent."""
+    head, sep, tail = rest.partition(":")
+    if sep and head.strip() in INSTALL_KINDS and tail.strip():
+        return head.strip(), tail.strip()
+    return DEFAULT_INSTALL_KIND, rest.strip()
+
+
+def _parse_agent_installs(raw: str) -> "dict[str, tuple[str, str]]":
+    """Parse an AGENT_INSTALLS= value: comma-separated `name:path` or
+    `name:kind:path` entries, into {name: (kind, path)}.
+
+    The agent NAME is split on the FIRST colon only (str.partition) — mirrors
+    _load_agent_tokens()'s own "everything after the first colon is the value"
+    rule in coordinator.py for the equivalent case in AGENT_TOKENS. What that
+    leaves is handed to _split_install_entry(), which decides whether the next
+    field is an install kind or the start of the path."""
+    installs: dict[str, tuple[str, str]] = {}
     for pair in raw.split(","):
         pair = pair.strip()
         if not pair:
             continue
-        name, sep, path = pair.partition(":")
-        name, path = name.strip(), path.strip()
-        if not sep or not name or not path:
+        name, sep, rest = pair.partition(":")
+        name, rest = name.strip(), rest.strip()
+        if not sep or not name or not rest:
             continue
-        installs[name] = path
+        kind, path = _split_install_entry(rest)
+        if not path:
+            continue
+        installs[name] = (kind, path)
     return installs
 
 
-def _load_agent_installs_registry(env_path: str) -> "tuple[dict[str, str], bool]":
+def _format_agent_installs(installs: "dict[str, tuple[str, str]]") -> str:
+    """Render {name: (kind, path)} back into an AGENT_INSTALLS= value.
+
+    ⛔ The default kind is emitted in the TWO-field form. Round-tripping a
+    registry of ordinary skill installs must be byte-identical — see the
+    INSTALL_KINDS comment: a mint is not a migration."""
+    parts = []
+    for name, (kind, path) in installs.items():
+        if kind == DEFAULT_INSTALL_KIND:
+            parts.append(f"{name}:{path}")
+        else:
+            parts.append(f"{name}:{kind}:{path}")
+    return ",".join(parts)
+
+
+def _load_agent_installs_registry(env_path: str) -> "tuple[dict[str, tuple[str, str]], bool]":
     """Read the AGENT_INSTALLS registry from the gateway .env.
 
     Returns (installs, registry_present). registry_present is True the
@@ -313,7 +396,9 @@ def _load_agent_installs_registry(env_path: str) -> "tuple[dict[str, str], bool]
     False (no line, or no file) is the ONLY state in which
     LOCAL_SKILL_ENV_PATHS's guessed paths are allowed to seed anything —
     every mint after that reads the registry and nothing else (see the
-    module-level LOCAL_SKILL_ENV_PATHS docstring)."""
+    module-level LOCAL_SKILL_ENV_PATHS docstring).
+
+    Entries are {name: (kind, path)} — see INSTALL_KINDS."""
     raw = _read_env_raw_value(env_path, "AGENT_INSTALLS")
     if raw is None:
         return {}, False
@@ -648,12 +733,17 @@ def mint(
     roster = _resolve_roster(env_path) if roster is None else roster
     installs, registry_present = _load_agent_installs_registry(env_path)
     if not registry_present:
-        installs = dict(LOCAL_SKILL_ENV_PATHS)  # first-bootstrap seed, once
+        # First-bootstrap seed, once. Every seeded guess is a CLI skill install
+        # by construction — LOCAL_SKILL_ENV_PATHS holds nothing else, and an MCP
+        # connector's walled directory is never a path a naming convention could
+        # produce.
+        installs = {n: (DEFAULT_INSTALL_KIND, p)
+                    for n, p in LOCAL_SKILL_ENV_PATHS.items()}
     existing_entries = _parse_agent_tokens_line(_read_env_raw_value(env_path, "AGENT_TOKENS") or "")
 
     tokens: dict[str, str] = {}
     digests: dict[str, str] = {}
-    persisted_installs: dict[str, str] = {}
+    persisted_installs: dict[str, tuple[str, str]] = {}
     failures: list[tuple[str, str]] = []
     lines: list[str] = []  # per-agent report lines, printed after the header blocks
 
@@ -665,11 +755,14 @@ def mint(
                           "(nothing was revoked)")
         else:
             lines.append(f"  {name:15}  REFUSED — {reason}")
+            _kind, _path = installs.get(name, (DEFAULT_INSTALL_KIND, "<path>"))
+            _kind_flag = " --mcp" if _kind == "mcp" else ""
             lines.append(f"                   install the {name} skill package first, then re-run:")
-            lines.append(f"                   generate_tokens.py --add {name} --install-path {installs.get(name, '<path>')}")
+            lines.append(f"                   generate_tokens.py --add {name}{_kind_flag} --install-path {_path}")
 
     for a in roster:
-        path = installs.get(a)
+        entry = installs.get(a)
+        path = entry[1] if entry else None
 
         if path is None:
             token = _mint_one()
@@ -728,8 +821,9 @@ def mint(
 
         tokens[a] = token
         digests[a] = _digest(token)
-        persisted_installs[a] = path
-        lines.append(f"  {a:15}  written → {path}  (mode 600)")
+        persisted_installs[a] = entry
+        _kind_note = "" if entry[0] == DEFAULT_INSTALL_KIND else f"  [{entry[0]}]"
+        lines.append(f"  {a:15}  written → {path}  (mode 600){_kind_note}")
 
     # Final AGENT_TOKENS entries: every successful mint's fresh digest, plus
     # -- for a FAILED agent that was already registered -- its existing
@@ -764,7 +858,7 @@ def mint(
     print("# and POST /memory/graph (read-only Cypher). All other routes → 403.")
     print()
     print("=== Gateway .env — install-path registry (sync exactly what's registered) ===")
-    print("AGENT_INSTALLS=" + ",".join(f"{n}:{p}" for n, p in persisted_installs.items()))
+    print("AGENT_INSTALLS=" + _format_agent_installs(persisted_installs))
     print()
 
     print("=== Per-agent tokens — written through, never printed ===")
@@ -810,6 +904,7 @@ def mint(
 def add_agent(
     name: str, install_path: "str | None" = None, env_path: "str | None" = None,
     role: "str | None" = None, replace: bool = False,
+    install_kind: str = DEFAULT_INSTALL_KIND,
 ) -> "tuple[int, str | None]":
     """Additive mint (roster growth without rotation, item 2): mint exactly
     ONE new token for `name`, leaving every OTHER agent's digest in
@@ -841,6 +936,24 @@ def add_agent(
     """
     if env_path is None:
         env_path = _DEFAULT_GATEWAY_ENV
+    # The install KIND decides what sync_skills.sh later DELIVERS to this path,
+    # so an unknown one must never be registered — it would parse back as part
+    # of a path and silently produce a nonsense target. Checked before anything
+    # is minted, like every other refusal here.
+    if install_kind not in INSTALL_KINDS:
+        print(f"✗ unknown install kind {install_kind!r} — expected one of "
+              f"{', '.join(INSTALL_KINDS)}", file=sys.stderr)
+        return 1, None
+    # A non-default kind describes a DELIVERY TARGET. Registering one without a
+    # path records a preference about a place that does not exist: the agent is
+    # REMOTE, sync has nothing to deliver to, and the kind would be silently
+    # dropped along with the absent path.
+    if install_kind != DEFAULT_INSTALL_KIND and install_path is None:
+        print(f"✗ --{install_kind} needs --install-path — an install kind says what to "
+              f"deliver WHERE, and without a registered path there is nowhere. For a "
+              f"remote MCP host with no local directory, register it with no kind and "
+              f"deliver its token with --reveal (operator-run).", file=sys.stderr)
+        return 1, None
     # Least privilege is decided BEFORE anything is minted, written or
     # registered, so a refusal here leaves no trace — same contract as every
     # other refusal in this function.
@@ -884,10 +997,26 @@ def add_agent(
         )
         return 1, None
     if not replace and name in existing_entries:
+        # ⛔ THIS MESSAGE USED TO NAME `--remint <name> --reveal <name>` AS THE
+        # PRIMARY RECOVERY. Measured on a live MCP conversion (finding 6):
+        # an agent following the documented `--add` hits exactly this refusal,
+        # reads the next line, and is steered straight into --reveal — which is
+        # OPERATOR-ONLY, because a revealed token lands in a transcript and a
+        # transcript is stored forever. A program message an agent will act on
+        # must lead with the path an agent may actually take: WRITE-THROUGH,
+        # where the plaintext goes to a file (mode 600) and is never printed.
+        # --reveal is still named, as what it is: the operator's own-terminal
+        # alternative for an agent with no local directory to write into.
+        _kind_flag = "" if install_kind == DEFAULT_INSTALL_KIND else f" --{install_kind}"
+        _path_hint = install_path or "<install-dir>/.env"
         print(
             f"✗ {name!r} is already registered in AGENT_TOKENS — --add never "
             "silently rotates an existing agent's token.\n"
-            f"  To re-issue THIS agent only (every other digest untouched):\n"
+            f"  To re-issue THIS agent only (every other digest untouched), writing\n"
+            f"  the new token straight into its own .env — never printing it:\n"
+            f"      generate_tokens.py --remint {name}{_kind_flag} --install-path {_path_hint}\n"
+            f"  If {name} has NO local directory to write into, an OPERATOR (never an\n"
+            f"  agent — a transcript stores a revealed token forever) can run instead:\n"
             f"      generate_tokens.py --remint {name} --reveal {name}\n"
             "  To rotate the whole fleet deliberately: bootstrap_tokens.sh --force.",
             file=sys.stderr,
@@ -917,7 +1046,7 @@ def add_agent(
         # authenticating as that one (the gateway stamps `source` from token
         # identity, so it is silent provenance corruption, not just a lost key).
         clobbered = [
-            n for n, p in installs.items()
+            n for n, (_k, p) in installs.items()
             if n in existing_entries and _same_registered_file(p, install_path)
             and not (replace and n == name)
         ]
@@ -991,15 +1120,26 @@ def add_agent(
 
     if install_path is not None:
         merged_installs = dict(installs)
-        merged_installs[name] = install_path
+        merged_installs[name] = (install_kind, install_path)
         print()
         print("=== Gateway .env — merged AGENT_INSTALLS= line (write this in place) ===")
-        print("AGENT_INSTALLS=" + ",".join(f"{n}:{p}" for n, p in merged_installs.items()))
+        print("AGENT_INSTALLS=" + _format_agent_installs(merged_installs))
         print()
-        print(f"  {name:15}  written → {install_path}  (mode 600)")
+        _kind_note = "" if install_kind == DEFAULT_INSTALL_KIND else f"  [{install_kind}]"
+        print(f"  {name:15}  written → {install_path}  (mode 600){_kind_note}")
+        if install_kind == "mcp":
+            print("  Registered as an MCP install: sync_skills.sh delivers the CONNECTOR")
+            print("  package here (vector-skill.py, CONSTITUTION_SNIPPET_MCP.md,")
+            print("  system-prompt.md) and never the CLI skill package.")
     else:
         print()
-        print(f"  {name:15}  REMOTE / no install path given — reveal with:")
+        print(f"  {name:15}  REMOTE / no install path given.")
+        print("                   Prefer the write-through form when this agent HAS a")
+        print("                   local directory — it never prints the token:")
+        print(f"                     generate_tokens.py --remint {name} --install-path <dir>/.env")
+        print("                   Otherwise an OPERATOR must reveal it, in their OWN")
+        print("                   terminal — never through an agent, whose transcript")
+        print("                   turns \"shown once\" into \"stored forever\":")
         # ⛔ This used to say "--add {name} --reveal {name}". By the time this
         # line prints, {name} IS already registered (this mint just added or
         # re-issued it) — a subsequent --add of the same name hits the
@@ -1163,11 +1303,36 @@ def main(argv=None) -> int:
     )
     ap.add_argument(
         "--install-path", metavar="PATH",
-        help="With --add: this agent's skill .env path (e.g. "
-             "~/.codex/skills/shared-memory/.env), recorded in the "
-             "AGENT_INSTALLS registry. Ignored without --add.",
+        help="With --add/--remint: this agent's .env FILE path — a CLI agent's "
+             "skill .env (e.g. ~/.codex/skills/shared-memory/.env), or with "
+             "--mcp an MCP connector's walled-directory .env (e.g. "
+             "~/.config/opencode/shared-memory-mcp/.env). Recorded in the "
+             "AGENT_INSTALLS registry. It is a FILE, never a directory: the "
+             "mint splits it into dirname/basename and writes the leaf. "
+             "Ignored without --add/--remint.",
+    )
+    ap.add_argument(
+        "--mcp", action="store_true",
+        help="Register this agent's install as an MCP CONNECTOR install "
+             "(AGENT_INSTALLS kind 'mcp') rather than a CLI skill install. "
+             "sync_skills.sh then delivers the connector package "
+             "(vector-skill.py, CONSTITUTION_SNIPPET_MCP.md, system-prompt.md) "
+             "into that directory and NEVER the CLI skill package. Requires "
+             "--install-path. Without this flag an entry is a CLI skill "
+             "install, which is also what every two-field legacy entry means.",
     )
     args = ap.parse_args(argv)
+    install_kind = "mcp" if args.mcp else DEFAULT_INSTALL_KIND
+
+    if args.mcp and args.add is None and not args.remint:
+        # An install kind is a property of ONE registration. A bulk mint
+        # re-emits the whole registry, where each entry already carries its own
+        # kind — accepting --mcp there would read as "make them all MCP".
+        print("✗ --mcp only makes sense together with --add or --remint: it "
+              "declares what ONE registered install is, and a bulk mint carries "
+              "each entry's kind forward from the registry already.",
+              file=sys.stderr)
+        return 1
 
     if args.digest is not None:
         raw_token = sys.stdin.read().strip()
@@ -1193,10 +1358,11 @@ def main(argv=None) -> int:
             return 1
         if args.add is not None:
             rc, token = add_agent(args.add, install_path=args.install_path,
-                                  role=args.role)
+                                  role=args.role, install_kind=install_kind)
         else:
             rc, token = add_agent(args.remint, install_path=args.install_path,
-                                  role=args.role, replace=True)
+                                  role=args.role, replace=True,
+                                  install_kind=install_kind)
         if rc != 0:
             return rc
         # The single-agent paths mint exactly one name, so --reveal can only

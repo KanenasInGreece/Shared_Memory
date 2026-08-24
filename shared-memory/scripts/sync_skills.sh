@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
-# sync_skills.sh — distribute the *thin client* skill to all agent install paths.
+# sync_skills.sh — distribute the *thin client* to every registered install.
+#
+# TWO INSTALL KINDS, from the AGENT_INSTALLS registry (`name:path` = kind
+# `skill`, permanently; `name:kind:path` for anything else):
+#   skill — a CLI agent's skill directory. Phases 1 and 2 below, unchanged.
+#   mcp   — an MCP connector's walled directory. Receives the CONNECTOR package
+#           (vector-skill.py, CONSTITUTION_SNIPPET_MCP.md, system-prompt.md),
+#           never the CLI package and never mcp.json. See sync_mcp_install().
+#
+# ⛔ SYNC DELIVERS; IT NEVER CONFIGURES A HOST. No constitution file is spliced,
+# no MCP host config is edited, no system prompt is set. It says which
+# deliverable the host's kind calls for and leaves the applying to Phase 8/8b.
 #
 # Run this after changing the client (memory_bridge.py, SKILL.md, or any file
 # in shared-memory-skill/shared-memory/):
@@ -77,10 +88,23 @@ for _cand in "${SHARED_MEMORY_ENV_FILE:-}" "$SRC/.env" "$REPO/.env"; do
   [ -n "$_cand" ] && [ -f "$_cand" ] && { _registry_env="$_cand"; break; }
 done
 
-# AGENT_INSTALLS is name:path, comma-separated, split on the FIRST colon only
-# (a path may legitimately contain one). The registry records each agent's
-# skill .env; the directory this script syncs is that file's parent.
+# AGENT_INSTALLS is `name:path` or `name:kind:path`, comma-separated. The agent
+# NAME is split off on the FIRST colon only (a legacy path may legitimately
+# contain one); what remains is a KNOWN kind plus a path, or — the two-field
+# form, which is permanent and never rewritten — a bare path meaning kind
+# `skill`. This mirrors generate_tokens.py's _split_install_entry() exactly;
+# the two parsers must agree, because the mint writes what this reads.
+#
+# The kind decides WHAT IS DELIVERED, and getting it wrong is not cosmetic:
+#   skill — the CLI thin-client package, driven by MANIFEST.txt.
+#   mcp   — the CONNECTOR package into a walled directory. Before this kind
+#           existed, an MCP install registered its `.env` here like any other
+#           agent and sync dumped SKILL.md + memory_bridge.py into the walled
+#           directory: a CLI skill nothing there can run, next to a live token.
+#
+# The registry records each install's .env; the directory synced is its parent.
 registry_dirs=()
+registry_kinds=()
 if [ -n "$_registry_env" ]; then
   _raw="$(sed -n 's/^[[:space:]]*AGENT_INSTALLS=//p' "$_registry_env" | tail -n1)"
   _raw="${_raw%\"}"; _raw="${_raw#\"}"
@@ -90,13 +114,36 @@ if [ -n "$_registry_env" ]; then
       _pair="$(printf '%s' "$_pair" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
       [ -z "$_pair" ] && continue
       case "$_pair" in *:*) ;; *) continue ;; esac
-      _envpath="${_pair#*:}"
+      _rest="${_pair#*:}"
+      [ -z "$_rest" ] && continue
+      _kind="skill"
+      _envpath="$_rest"
+      case "$_rest" in
+        skill:*) _kind="skill"; _envpath="${_rest#skill:}" ;;
+        mcp:*)   _kind="mcp";   _envpath="${_rest#mcp:}" ;;
+      esac
       [ -z "$_envpath" ] && continue
       registry_dirs+=("$(dirname "$_envpath")")
+      registry_kinds+=("$_kind")
     done
     IFS="$_old_ifs"
   fi
 fi
+
+# The kind for a target directory, defaulting to `skill` for anything the
+# registry does not name (the historical hardcoded four, and every
+# SHARED_MEMORY_SYNC_AGENTS entry — both predate kinds and are CLI installs).
+_kind_for_dir() {
+  local _want="$1" _i=0
+  while [ "$_i" -lt "${#registry_dirs[@]}" ]; do
+    if [ "${registry_dirs[$_i]}" = "$_want" ]; then
+      printf '%s' "${registry_kinds[$_i]}"
+      return 0
+    fi
+    _i=$((_i + 1))
+  done
+  printf '%s' "skill"
+}
 
 # ── Phase 1: framework source → tracked skill copy (the distribution source) ─
 #
@@ -190,7 +237,7 @@ elif [ "${#registry_dirs[@]}" -gt 0 ]; then
     [ "$_dup" = "0" ] && AGENTS+=("$_d") && _carried=$((${_carried:-0} + 1))
   done
   echo "Targets: ${#registry_dirs[@]} from the AGENT_INSTALLS registry + ${_carried:-0} unregistered install(s) already on disk"
-  printf '  %s\n' "${AGENTS[@]}"
+  for _a in "${AGENTS[@]}"; do echo "  [$(_kind_for_dir "$_a")] $_a"; done
   echo ""
 else
   AGENTS=("${_default_dirs[@]}")
@@ -221,9 +268,17 @@ fi
 # operator syncing to nothing but --install targets that do not exist yet has
 # nothing here to warn about (yet).
 #
-# Non-fatal by design: sync's job is delivery, and a host without any CLI
-# agent depending on the skill (e.g. LM Studio / MCP only) is not broken by
-# this at all.
+# ⚠ THIS APPLIES TO MCP INSTALLS TOO, AND MORE SHARPLY. This comment used to
+# say an MCP-only host "is not broken by this at all" — measured wrong on a live
+# conversion: an MCP host spawns its stdio server from a non-interactive,
+# non-login shell, exactly like a CLI agent spawns the skill, and the shipped
+# config template invokes a bare `uv`. On a host where uv sits in
+# $HOME/.local/bin (the outcome of the recommended installer) that server never
+# starts, and the host reports a dead MCP server rather than a PATH problem. The
+# fix in an MCP config is to name uv by ABSOLUTE path.
+#
+# Non-fatal by design: sync's job is delivery, and a host that reaches uv some
+# other way is not broken by this at all.
 _any_install_exists=0
 for _d in "${AGENTS[@]}"; do
   [ -d "$_d" ] && _any_install_exists=1 && break
@@ -236,18 +291,160 @@ if [ "$_any_install_exists" = "1" ] && command -v uv >/dev/null 2>&1; then
     echo "  install this project recommends (curl -LsSf"
     echo "  https://astral.sh/uv/install.sh | sh puts uv under \$HOME/.local/bin and"
     echo "  counts on your profile to expose it), not a misconfiguration. Any AGENT"
-    echo "  installed below that spawns a non-interactive, non-login shell to run"
-    echo "  this skill will be UNABLE to find uv — and the failure is SILENT: the"
-    echo "  agent answers some other way (or saves nothing) instead of reporting a"
-    echo "  broken memory system. Fix EITHER (keeps the upstream installer either"
-    echo "  way): symlink uv onto a directory already on the system default PATH,"
-    echo "  e.g. sudo ln -s \"\$(command -v uv)\" /usr/local/bin/uv — or set PATH"
-    echo "  inside the affected agent's own configuration."
+    echo "  or MCP HOST installed below spawns a non-interactive, non-login shell to"
+    echo "  run this client, and will be UNABLE to find uv. For a CLI agent the"
+    echo "  failure is SILENT — it answers some other way (or saves nothing) instead"
+    echo "  of reporting a broken memory system; for an MCP host the server simply"
+    echo "  never starts, reported as a dead MCP server rather than a PATH problem."
+    echo "  Fix ANY of these (all keep the upstream installer): symlink uv onto a"
+    echo "  directory already on the system default PATH, e.g."
+    echo "  sudo ln -s \"\$(command -v uv)\" /usr/local/bin/uv — set PATH inside the"
+    echo "  affected agent's own configuration — or, for an MCP host, name uv by"
+    echo "  ABSOLUTE path in its config's command line instead of a bare \"uv\"."
     echo ""
   fi
 fi
 
+# ── MCP connector delivery (AGENT_INSTALLS kind `mcp`) ──────────────────────
+#
+# ⛔ THREE FILES, AND DELIBERATELY NOT A FOURTH.
+#   vector-skill.py            the connector itself
+#   CONSTITUTION_SNIPPET_MCP.md  the standing rules, for an AGENT host's own
+#                              constitution file (Phase 8b splices it — SYNC
+#                              NEVER DOES; see the note printed below)
+#   system-prompt.md           the same rules wrapped for an LLM SERVER's
+#                              system-prompt field (the LM Studio case)
+#
+# ⛔ NEVER mcp.json. It is a TEMPLATE: `YOUR_*` placeholders and a
+# `/path/to/your/...` repo path. Copied into a live install it looks like
+# configuration and is not — and a host that read it would try to authenticate
+# with the literal string YOUR_LM_STUDIO_AGENT_TOKEN.
+# ⛔ NEVER the CLI skill package. That is the whole reason the kind exists.
+MCP_FILES=(vector-skill.py CONSTITUTION_SNIPPET_MCP.md system-prompt.md)
+
+sync_mcp_install() {
+  local dir="$1" rel src changed=0
+
+  for rel in "${MCP_FILES[@]}"; do
+    src="$REPO/mcp/$rel"
+    if [ ! -f "$src" ]; then
+      echo "  ⚠ $rel missing from $REPO/mcp — not delivered"
+      continue
+    fi
+    if [ ! -L "$dir/$rel" ] && cmp -s "$src" "$dir/$rel"; then
+      echo "=  $rel already current: $dir"
+    else
+      was_link=""
+      [ -L "$dir/$rel" ] && was_link=" (replaced a symlink into the repo)"
+      rm -f "$dir/$rel"
+      cp "$src" "$dir/$rel"
+      echo "✓ $rel REFRESHED (was stale or absent)$was_link: $dir"
+      changed=1
+    fi
+  done
+
+  # ⚠ The token .env is NEVER written here — same posture as the CLI path,
+  # where update_skill.sh MERGES .env.example's defaults into a live .env
+  # rather than copying over it. An MCP install's .env holds exactly one thing
+  # that matters, the AGENT_TOKEN the mint wrote through, and this script has
+  # no version of it to merge in. So: not copied, not templated, not touched —
+  # only its mode is checked below.
+  if [ -f "$dir/.env" ]; then
+    mode="$(stat -c %a "$dir/.env" 2>/dev/null || stat -f %Lp "$dir/.env" 2>/dev/null || echo "")"
+    if [ "$mode" != "600" ]; then
+      chmod 600 "$dir/.env"
+      echo "  ✓ .env mode tightened to 600 (was ${mode:-unknown}): $dir"
+    fi
+  else
+    echo "  ⚠ no .env in $dir — this install has no token yet. Mint one with:"
+    echo "      bash shared-memory/scripts/bootstrap_tokens.sh --add <name> --mcp \\"
+    echo "          --install-path $dir/.env"
+  fi
+
+  # ⚠ A CLI package sitting in an MCP install is REPORTED, never deleted. It is
+  # what a pre-kind sync left behind, and it is dead weight next to a live
+  # token — but removing files nobody asked to remove is not sync's call.
+  _strays=""
+  for rel in SKILL.md MANIFEST.txt CONSTITUTION_SNIPPET.md scripts/memory_bridge.py \
+             scripts/update_skill.sh Documentation/schema.md mcp.json; do
+    [ -e "$dir/$rel" ] && _strays="$_strays $rel"
+  done
+  if [ -n "$_strays" ]; then
+    echo "  ⚠ CLI-skill / template files found in this MCP install:$_strays"
+    echo "    A sync that predates AGENT_INSTALLS kinds delivered them here. They are"
+    echo "    inert (no MCP host runs them) but they sit beside a live token. Remove"
+    echo "    them yourself when you have looked at them — sync will not."
+  fi
+
+  # Sanity WITHOUT reading the token: byte-compile the delivered connector.
+  # The documented verify step is check_memory_health, which is an MCP tool
+  # call — it needs a running host and spends the credential, so it can neither
+  # run here nor be run by an installing agent. py_compile answers the narrower
+  # question this step actually owns: did a complete, parseable file land.
+  if command -v python3 >/dev/null 2>&1; then
+    if python3 -m py_compile "$dir/vector-skill.py" 2>/dev/null; then
+      echo "  ✓ vector-skill.py byte-compiles"
+    else
+      echo "  ⚠ vector-skill.py FAILED to byte-compile — the copy is incomplete or corrupt:"
+      python3 -m py_compile "$dir/vector-skill.py" || true
+    fi
+    # py_compile drops a 775 __pycache__ next to a 600 file in a 700 dir.
+    rm -rf "$dir/__pycache__"
+  else
+    echo "  (python3 not on PATH — skipped the byte-compile check)"
+  fi
+
+  # Modes LAST, so anything created above is caught: dir 700, files 600.
+  chmod 700 "$dir" 2>/dev/null || echo "  ⚠ could not chmod 700 $dir"
+  for rel in "${MCP_FILES[@]}"; do
+    [ -f "$dir/$rel" ] && { chmod 600 "$dir/$rel" 2>/dev/null || echo "  ⚠ could not chmod 600 $dir/$rel"; }
+  done
+  echo "  ✓ modes enforced: directory 700, delivered files 600"
+
+  # Gateway compatibility. The CLI path runs `memory_bridge.py doctor`, which
+  # authenticates; there is no equivalent CLI mode on the connector, and a
+  # probe that authenticated would have to READ THE TOKEN FILE — which this
+  # script must never do. So the same comparison is made from the unauthenticated
+  # /health payload: gateway api_version against the api_version of the file
+  # just delivered. Non-fatal in every branch; a delivery is not wrong because a
+  # gateway is down.
+  _probe_url="${COORDINATOR_URL:-http://localhost:8888}"
+  _client_api="$(sed -n 's/^API_VERSION = \([0-9][0-9]*\).*/\1/p' "$dir/vector-skill.py" | head -n1)"
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "  (curl not on PATH — skipped the gateway compatibility probe)"
+  elif _health="$(curl -fsS --connect-timeout 3 --max-time 8 "$_probe_url/health" 2>/dev/null)"; then
+    _gw_api="$(printf '%s' "$_health" | sed -n 's/.*"api_version"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
+    if [ -z "$_gw_api" ] || [ -z "$_client_api" ]; then
+      echo "  ⚠ compat UNKNOWN — reached $_probe_url but could not read both api_versions."
+    elif [ "$_gw_api" = "$_client_api" ]; then
+      echo "  ✓ compat ok — connector and gateway both speak api_version $_client_api"
+    else
+      echo "  ⚠ INCOMPATIBLE — connector speaks api_version $_client_api, gateway $_gw_api."
+      echo "    Upgrade whichever is behind; until then treat saves as unsafe."
+    fi
+  else
+    echo "  ⚠ gateway not reachable at $_probe_url — compat UNKNOWN. This says nothing"
+    echo "    about its version: no answer was received. The files delivered fine."
+  fi
+
+  # ⛔ SYNC NEVER CONFIGURES THE HOST. It delivers; a human or an agent following
+  # Phase 8/8b applies. Say which deliverable belongs to which kind of host, so
+  # "sync said done" is never mistaken for "the host is wired up".
+  echo "  → This install is DELIVERED, not CONFIGURED. Still owed, by hand:"
+  echo "     • AGENT host (its own constitution file): propose splicing the"
+  echo "       marker-delimited block from CONSTITUTION_SNIPPET_MCP.md — ask first"
+  echo "       (AGENTS.md Phase 8b), never write it silently."
+  echo "     • LLM SERVER (a system-prompt field, e.g. LM Studio): paste"
+  echo "       system-prompt.md into the model's system prompt."
+  echo "     • Point the host's MCP config at $dir/vector-skill.py — an ABSOLUTE"
+  echo "       uv path, since an MCP host spawns a non-login shell."
+  echo "     • Restart BOTH the MCP host (it reads its env once, at spawn) and the"
+  echo "       gateway if a token was minted since it started (auth is startup-frozen)."
+  return 0
+}
+
 for dir in "${AGENTS[@]}"; do
+  _dir_kind="$(_kind_for_dir "$dir")"
   if [ ! -d "$dir" ]; then
     # ⛔ --install CREATES A DIRECTORY ONLY FOR AN AGENT THE REGISTRY NAMES.
     # Without it this script only ever UPDATES an existing install, which is
@@ -279,6 +476,16 @@ for dir in "${AGENTS[@]}"; do
     echo "⛔ REFUSING $dir — it is a symlink to $(readlink "$dir")."
     echo "   Copying into it would write into the source tree. Replace it with a"
     echo "   real directory:  rm '$dir' && mkdir -p '$dir'  then re-run."
+    continue
+  fi
+
+  # ── Kind fork. Everything below this point is the CLI skill package path,
+  # byte-for-byte the behaviour it has always had; an `mcp` target takes the
+  # connector path instead and never sees a line of it. ───────────────────────
+  if [ "$_dir_kind" = "mcp" ]; then
+    echo "── $(basename "$dir") (MCP connector install) ──"
+    sync_mcp_install "$dir"
+    echo ""
     continue
   fi
 
@@ -388,6 +595,12 @@ DAEMON_SCRIPTS=(
 if [ "$PRUNE" -eq 1 ]; then
   for dir in "${AGENTS[@]}"; do
     [ -d "$dir" ] || continue
+    # An MCP install never had a scripts/ directory to leave daemons in. Its own
+    # leftovers (a CLI package a pre-kind sync delivered there) are REPORTED by
+    # sync_mcp_install and removed by a human — --prune's contract is "daemon
+    # copies older installs left behind", and silently widening it to delete
+    # files next to a live token is not that.
+    [ "$(_kind_for_dir "$dir")" = "mcp" ] && continue
     # SAFETY: if scripts/ is itself a directory symlink to the canonical repo
     # scripts dir, then "$dir/scripts/<daemon>" resolves to the REAL repo file —
     # rm -f would delete the framework's own daemons. Skip the whole dir; an

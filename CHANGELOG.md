@@ -5,6 +5,36 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.48] — 2026-08-24
+
+### Added — the install registry learns what an install IS, not only where it lives
+
+- **`AGENT_INSTALLS` entries now carry an install kind** — `name:kind:path`, `skill` or `mcp`;
+  the two-field form parses as `skill` forever, so no existing registry line changes meaning.
+  `bootstrap_tokens.sh --add/--remint` gain `--mcp` to register a connector install at its
+  walled directory's `.env`.
+- **`sync_skills.sh` delivers by kind.** A `skill` install updates exactly as before. An `mcp`
+  install receives copies of the connector package only — `vector-skill.py`, the new
+  `CONSTITUTION_SNIPPET_MCP.md`, `system-prompt.md` — never `mcp.json` (a template) and never
+  the CLI package; the connector copy is compile-checked, modes are enforced (700/600), and the
+  sync says plainly what it delivered and what the host operator still applies themselves.
+- **A constitution block in MCP vocabulary.** `mcp/CONSTITUTION_SNIPPET_MCP.md` states the
+  standing rules by the tool names an MCP agent actually has (search-first, quote the ref,
+  honest role 403s are not retryable, no database MCP beside the gateway); `system-prompt.md`
+  becomes the LLM-server wrapper carrying the same rules — an agent host splices the snippet,
+  an LLM-server host pastes the wrapper as its system prompt.
+
+### Fixed
+
+- **The already-registered mint refusal no longer steers a caller toward `--reveal`.** It now
+  leads with the write-through re-mint (`--remint <name> --install-path <file>`); revealing a
+  token stays an operator's own-terminal act.
+- **Uninstall removes MCP installs.** The registry parse in `uninstall_framework.sh` read only
+  the two-field form, so a connector's walled directory — the one holding that agent's token —
+  was neither inventoried nor removed. Both arities parse now.
+
+---
+
 ## [0.9.47] — 2026-08-24
 
 ### Fixed — the second front door, exercised for real

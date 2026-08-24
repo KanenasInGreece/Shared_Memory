@@ -529,12 +529,66 @@ minting** (`systemctl --user restart hive-mind-gateway.service`, or re-run Phase
 `install_service.sh`) so it loads the updated `AGENT_TOKENS` before this phase's own end-to-end
 check below.
 
-An MCP host (LM Studio is the exercised example) is not a local write-through target at all — it
-has no fixed local install path, so it is one of the remote/registry identities Phase 6 already
-minted a token for. Register `mcp/vector-skill.py` through its config (template: `mcp/mcp.json` —
-fill the `YOUR_*` placeholders) with that token, and give it a full restart after any token
-change; the connector is client-deployable, so on a machine without the repo install a copy of the
-`mcp/` folder and point the host's config at it (see `mcp/README.md`).
+#### Phase 8, MCP variant — an MCP host with a WALLED install directory
+
+An MCP host used to be treated as remote by definition ("no fixed local install path", token
+delivered by `--reveal`). That is only true of a host on another machine. A host on THIS machine —
+opencode is the exercised example, LM Studio is the other one — gets a **walled install
+directory** and is registered exactly like any local agent, with one extra flag. Same three steps,
+same order, same reason (mint follows the directory, never the reverse):
+
+```bash
+install -d -m 700 <walled-dir>        # e.g. ~/.config/opencode/shared-memory-mcp
+bash shared-memory/scripts/bootstrap_tokens.sh --add <agent> --mcp --install-path <walled-dir>/.env
+bash shared-memory/scripts/sync_skills.sh
+```
+
+⚠ **`--install-path` is a FILE, not a directory** — `<walled-dir>/.env`. The mint splits it into
+dirname + basename and writes the leaf; handed the directory itself it has nothing to write.
+
+**What `--mcp` buys.** It records the registry entry as `name:mcp:path` instead of `name:path`, and
+that kind is what `sync_skills.sh` reads to decide what to DELIVER. Without it the entry is a CLI
+skill install, and sync dumps `SKILL.md` + `memory_bridge.py` into the walled directory — a skill
+no MCP host can run, sitting beside a live token. (An entry with no kind stays a CLI skill install
+permanently; nothing rewrites an existing line, and no migration is needed.)
+
+**What sync delivers to an `mcp` install — three files, and deliberately not a fourth:**
+`vector-skill.py` (the connector), `CONSTITUTION_SNIPPET_MCP.md` (the standing rules as a
+marker-delimited block, for Phase 8b) and `system-prompt.md` (the same rules wrapped for an LLM
+server's system-prompt field). It then byte-compiles the connector copy, removes the
+`__pycache__` that leaves behind, enforces directory 700 / files 600, and probes the gateway's
+`/health` for an `api_version` match. ⛔ **Never `mcp.json`** — it is a template full of `YOUR_*`
+placeholders and a `/path/to/your/...` repo path; adapt it into the host's own config instead.
+The token `.env` is never copied or overwritten, only mode-checked.
+
+**Sync delivers; it never configures the host.** Its output names what is still owed, and who
+applies it:
+
+| Host kind | The deliverable that applies | Who applies it |
+|---|---|---|
+| **Agent host** (its own constitution file: `~/.config/opencode/AGENTS.md`, …) | `CONSTITUTION_SNIPPET_MCP.md` — splice the marker-delimited block | Phase 8b, **ask first**, never silently |
+| **LLM server** (a system-prompt field — LM Studio) | `system-prompt.md` — paste into the model's system prompt | the operator, in that host's UI |
+| Both | the host's MCP config → the WALLED COPY's `vector-skill.py`, plus `VECTOR_SKILL_ENV` pointing at the walled `.env` | the operator or an installing agent |
+
+⚠ **Name `uv` by ABSOLUTE path in the host's MCP config.** An MCP host spawns its stdio server from
+a non-interactive, non-login shell, and the recommended installer puts `uv` under
+`$HOME/.local/bin` — a bare `"uv"` in the config simply never starts, reported as a dead MCP
+server rather than a PATH problem. `sync_skills.sh` warns when this host's `uv` is profile-only.
+
+⚠ **Restart TWO things, and the gateway is the one that gets forgotten.** The MCP host reads its
+environment once, at spawn. And auth is **startup-frozen**: the mint writes the new digest into the
+gateway `.env` while the running gateway keeps the old one, so an install reported "done" without
+`systemctl --user restart hive-mind-gateway.service` is a 401 on the next session.
+
+⚠ **Already registered?** `--add` refuses a name already in `AGENT_TOKENS` — deliberately, since
+there is no silent single-agent rotation. Re-homing an existing identity onto a walled directory is
+`--remint <name> --mcp --install-path <walled-dir>/.env`, which write-throughs the new token and
+touches nobody else. ⛔ Do NOT reach for `--reveal`: it prints a live token, so it is
+operator-only, in the operator's own terminal, never through an agent.
+
+A host on ANOTHER machine is still genuinely remote: it has no local directory here, so it stays
+one of Phase 6's registry identities, its token delivered by an operator-run `--reveal`, and a copy
+of the `mcp/` folder is placed on that machine by hand (see `mcp/README.md`).
 
 **What "the skill package" is — `shared-memory-skill/shared-memory/MANIFEST.txt` is the authority, not a list in this file.** It currently ships `SKILL.md`, `CONSTITUTION_SNIPPET.md`, `.env.example`, `scripts/memory_bridge.py`, `scripts/update_skill.sh` and `Documentation/schema.md`. Install all of it: two later phases depend on files an "just SKILL.md and the script" install would leave out — Phase 8b copies its block from `CONSTITUTION_SNIPPET.md` *in the skill directory*, and Phase 8c and every future update run `scripts/update_skill.sh` *from there*. The reliable way to get it right is to let the tooling do it: create the directory with `memory_bridge.py` in place, then run `update_skill.sh` (or `sync_skills.sh` on the gateway host), which reads the manifest so a file added to the package later needs no change here.
 
@@ -604,6 +658,15 @@ copy and would report it current regardless — a wrong install that silently re
 installed skill directory is the only source of truth for this step; a repository checkout is a
 development tree, never an install.
 
+⚠ **An agent wired through MCP takes the OTHER snippet.** For an install registered `--mcp`, the
+file to copy from is `CONSTITUTION_SNIPPET_MCP.md` in that install's own walled directory, with
+its own marker (`<!-- shared-memory:mcp-constitution-snippet vN -->`). It says the same standing
+rules in the vocabulary that agent actually has — MCP tool names, and a role that decides which
+writes succeed — because the CLI block's "use the shared memory skill" names something an MCP host
+does not have and cannot run. The two markers are distinct, so an agent may only ever hold one.
+*(An MCP host that is an LLM SERVER rather than an agent has no constitution file at all: it takes
+`system-prompt.md` in the model's system-prompt field instead, and this phase does not apply.)*
+
 Do not regenerate or paraphrase the block — copying it verbatim keeps it marker-delimited
 and versioned (`<!-- shared-memory:constitution-snippet vN -->`), which is what lets a later
 update (Phase 8c below) detect drift and re-propose instead of duplicating it.
@@ -618,7 +681,9 @@ for instance). After running `update_skill.sh` for an agent that already has the
 freshly-updated `CONSTITUTION_SNIPPET.md`. If they differ, **propose** replacing the old
 marker-delimited block with the new one (show what changed and why) — never overwrite it silently.
 If the agent's constitution file has no marker-delimited block at all, treat it as never having
-been offered and fall back to Phase 8b.
+been offered and fall back to Phase 8b. For an `mcp`-kind install the same check runs against
+`CONSTITUTION_SNIPPET_MCP.md` and its own `mcp-constitution-snippet` marker, refreshed by
+`sync_skills.sh` rather than `update_skill.sh`.
 
 ### Phase 9 — Verify the install (postflight)
 

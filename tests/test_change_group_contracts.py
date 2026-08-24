@@ -71,6 +71,52 @@ def test_the_client_copies_pin_the_same_api_version():
         f"{shipped.group(1)} — one of the two front doors is on the wrong contract")
 
 
+# Marker-delimited constitution blocks. These carry their OWN version line —
+# not the release version — because they advance independently of it: a wording
+# fix bumps the block, a gateway fix does not. The pin they owe the contract is
+# a well-formed, findable marker, since that is what a later upgrade pass
+# find-and-replaces instead of appending a second copy of the block.
+_SNIPPET_PINS = {
+    ("shared-memory", "CONSTITUTION_SNIPPET.md"): "constitution-snippet",
+    ("shared-memory-skill", "shared-memory", "CONSTITUTION_SNIPPET.md"):
+        "constitution-snippet",
+    ("mcp", "CONSTITUTION_SNIPPET_MCP.md"): "mcp-constitution-snippet",
+}
+
+
+def test_every_constitution_snippet_carries_a_findable_version_marker():
+    """GROUP 1. Both client surfaces ship a marker-delimited constitution block
+    — the CLI skill's, and (as of the MCP install kind) the connector's. A
+    malformed or missing marker fails SILENTLY: Phase 8c cannot find the
+    installed block, so every upgrade appends a second copy under the first
+    instead of replacing it, and the drift check keeps reporting current."""
+    for parts, name in _SNIPPET_PINS.items():
+        text = _read(*parts)
+        where = "/".join(parts)
+        opened = re.search(rf"<!--\s*shared-memory:{name}\s+v(\d+)\s*-->", text)
+        assert opened, f"{where}: no `shared-memory:{name} vN` opening marker"
+        close = f"<!-- /shared-memory:{name} -->"
+        assert close in text, f"{where}: no closing marker `{close}`"
+        assert text.index(close) > opened.end(), (
+            f"{where}: the closing marker precedes the opening one — a "
+            "find-and-replace would swallow the rest of the operator's file")
+
+
+def test_the_two_tracked_cli_snippet_copies_pin_the_same_version():
+    """GROUP 1. The CLI snippet exists twice (source + tracked skill copy) and
+    Phase 8c compares an INSTALLED block against the copy in the install. Two
+    sources that disagree mean the drift check answers about whichever one the
+    reader happened to open."""
+    pattern = r"<!--\s*shared-memory:constitution-snippet\s+v(\d+)\s*-->"
+    src = re.search(pattern, _read("shared-memory", "CONSTITUTION_SNIPPET.md"))
+    shipped = re.search(
+        pattern, _read("shared-memory-skill", "shared-memory", "CONSTITUTION_SNIPPET.md"))
+    assert src and shipped
+    assert src.group(1) == shipped.group(1), (
+        f"the constitution snippet copies disagree on version: source v{src.group(1)}, "
+        f"shipped v{shipped.group(1)} — run sync_skills.sh")
+
+
 # ── GROUP 4 — storage and schema ─────────────────────────────────────────────
 
 def _migration_files() -> list:
