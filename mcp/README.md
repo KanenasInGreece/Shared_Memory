@@ -16,7 +16,7 @@ this folder runs daemons, touches a database, or holds server credentials.
 
 `vector-skill.py` is a **thin client**: every operation is an authenticated HTTP call to the
 Hive-Mind Gateway. It opens no ports (stdio transport — the MCP host spawns it and pipes to it),
-holds no database drivers, and enforces nothing the gateway does not enforce — auth, read
+holds no database drivers, and enforces nothing the gateway does not enforce — beyond refusing to SEND what the gateway would certainly reject (a save without its required provenance fields fails fast client-side, before any credential is spent) — auth, read
 authorization, locking, idempotency and consolidation all live server-side. That is deliberate:
 a direct database MCP registered alongside it would bypass all of those, which is why
 `system-prompt.md` forbids one and the shipped template contains none.
