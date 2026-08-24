@@ -21,9 +21,11 @@ them and prints only names, digests, and destination paths.
        prints only the destination path — never the token value.
     3. For every agent with no registered install path — a genuinely
        remote agent, or one this script has no fixed local path for (LM
-       Studio takes AGENT_TOKEN from mcp.json's own env block; the monitor
-       dashboard lives in its own repo) — nothing is written or printed;
-       use --reveal to see that one token, on the SAME invocation.
+       Studio takes AGENT_TOKEN from mcp.json's own env block) — nothing is
+       written or printed; use --reveal to see that one token, on the SAME
+       invocation. Without --reveal that agent is named, LOUDLY, as
+       REGISTERED BUT UNDELIVERABLE, with the exact recovery command
+       (--remint <name> --reveal <name>, which rotates nobody else).
     4. For every agent with a REGISTERED install path whose skill
        directory does NOT YET exist (install-path hardening, fresh-host
        finding D19): REFUSES that one agent outright — prints the exact
@@ -101,7 +103,23 @@ import tempfile
 # registered in the gateway .env's AGENT_TOKENS too (see _resolve_roster()
 # below), so an agent added later via --add is never silently dropped from a
 # --force rotation just because it is absent from this fixed list.
-AGENTS = ["claude", "gemini", "grok", "codex", "lm_studio", "antigravity", "monitor"]
+#
+# ⛔ "monitor" IS DELIBERATELY ABSENT (ruled). It used to sit here, and the
+# result was that EVERY fresh install registered a digest for it that
+# structurally could not be delivered: the monitor dashboard lives in a sibling
+# repo, so it has no LOCAL_SKILL_ENV_PATHS entry and is classified REMOTE, and
+# the documented bulk invocation carries no --reveal — so its plaintext was
+# discarded at birth while its digest landed in AGENT_TOKENS. That is D19's own
+# rule broken by the default path ("never mint a token into a digest registry
+# that nobody actually received, which is worse than not minting at all"), and
+# it was unrecoverable by --add afterwards (already registered → refused).
+# The monitor is now minted ON DEMAND, when the operator actually wants one:
+#     generate_tokens.py --add monitor --reveal monitor
+# ⚠ This changes only what a FRESH registry gets by default. An install that
+# ALREADY has monitor registered keeps it across a --force rotation, because
+# _resolve_roster() unions this list with every name already in AGENT_TOKENS —
+# removing a name from here must never revoke a credential already in use.
+AGENTS = ["claude", "gemini", "grok", "codex", "lm_studio", "antigravity"]
 
 # Read-only identities: registered like any agent, but confined to GET /health,
 # GET /memory/telemetry, and POST /memory/graph (read-only Cypher).
@@ -127,8 +145,10 @@ role_for = role_for_mint
 # own env block, never a skill .env; "antigravity" and "gemini" both
 # plausibly resolve to ~/.gemini/skills/shared-memory — ambiguous, so left
 # OUT rather than guessed (a wrong guess here writes a token into the wrong
-# install); "monitor" (the dashboard) lives in a sibling repo whose install
-# path this script has no visibility into.
+# install). "monitor" (the dashboard) lives in a sibling repo whose install
+# path this script has no visibility into — which is exactly why it is no
+# longer on the default AGENTS roster either (see that constant): a name with
+# no path here and no --reveal is minted UNDELIVERABLE.
 #
 # Install-path hardening (D19/roster fix, ruled): an install path is OWNED
 # information about a host, not something a naming convention can be trusted
@@ -595,6 +615,12 @@ def mint(
     Per agent, in `roster` order:
       - no registered path              -> REMOTE: token minted, digest
         registered, nothing written; --reveal is the only delivery path.
+        WITHOUT --reveal this is reported as UNDELIVERABLE -- loudly, per
+        agent AND again in a closing block -- naming the recovery command
+        (--remint <name> --reveal <name>, which rotates nobody else).
+        This is why "monitor" was taken off the default AGENTS roster: on
+        a fresh install the documented bulk invocation carries no --reveal,
+        so every install registered a monitor digest nobody ever received.
       - registered path, write succeeds -> written through (mode 600,
         atomically -- see _write_agent_token_file), digest registered,
         AGENT_INSTALLS entry carried forward.
@@ -660,10 +686,19 @@ def mint(
             if a in (revealing or []):
                 lines.append("                   (revealed on this run — capture it now)")
             else:
-                lines.append("                   ⛔ NOT revealed on this run: this token cannot be")
-                lines.append("                      retrieved later. Re-run this mint adding")
-                lines.append(f"                      --reveal {a}, or use --remint {a} --reveal {a}")
-                lines.append("                      to re-mint JUST this agent without rotating anyone.")
+                # Fires for ANY remote-classified agent processed without
+                # --reveal (lm_studio, antigravity, whatever is registered
+                # later) — never for one name specially. The digest lands in
+                # AGENT_TOKENS and the plaintext is discarded at birth, so the
+                # .env reads "provisioned" for an identity that can never
+                # authenticate. Say the word, and name the ONE command that
+                # fixes it without rotating the fleet.
+                lines.append("                   ⛔ UNDELIVERABLE — this token was written NOWHERE and")
+                lines.append("                      can never be retrieved: its digest is registered,")
+                lines.append("                      its plaintext is already gone. Recovery (re-mints")
+                lines.append("                      ONLY this agent, rotates nobody — run it YOURSELF,")
+                lines.append("                      never through an agent):")
+                lines.append(f"                        generate_tokens.py --remint {a} --reveal {a}")
             continue
 
         token = _mint_one()
@@ -750,8 +785,10 @@ def mint(
             print(f"     {a}")
         print()
         print("   They will authenticate against nothing. The .env will show them")
-        print("   as provisioned, which is the misleading part. Fix now with:")
-        print(f"     generate_tokens.py --remint <name> --reveal <name>")
+        print("   as provisioned, which is the misleading part. Fix now with")
+        print("   (operator-run — NEVER through an agent, a transcript stores it forever):")
+        for a in _undelivered:
+            print(f"     generate_tokens.py --remint {a} --reveal {a}")
         print("   (--remint re-mints ONE agent; it never touches anyone else.)")
         print()
 

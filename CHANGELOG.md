@@ -5,6 +5,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.43] — 2026-08-24
+
+### Fixed — no more tokens nobody can receive
+
+- **Every fresh install minted a `monitor` token that structurally could not be delivered.** The
+  default bulk roster included `monitor`, which is remote-classified (the dashboard lives in a
+  sibling repo), so its plaintext was discarded at birth — violating the framework's own rule
+  that a digest nobody received is worse than no digest at all. `monitor` is no longer in the
+  default roster; mint it on demand with `--add monitor --reveal monitor` (operator-run). Its
+  read-only confinement is unchanged and still applies on that path.
+- **Existing installs are unaffected** — the roster union keeps any already-registered agent,
+  `monitor` included, across a `--force` rotation. Pinned by test in both directions.
+- **The bulk mint now says so, loudly, per agent:** any remote-classified agent minted without
+  `--reveal` is labelled UNDELIVERABLE in the per-agent report, with the exact recovery command
+  for that agent — and the framing states it is operator-run, never through an agent.
+
+---
+
 ## [0.9.42] — 2026-08-24
 
 ### Fixed — an authorization refusal that says so, instead of a dead gateway

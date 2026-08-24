@@ -127,15 +127,24 @@ def test_mint_names_every_undeliverable_agent_in_one_block(tmp_path):
 
 def test_mint_does_not_flag_a_revealed_agent_as_undeliverable(tmp_path):
     """The counterweight: an agent revealed on this run HAS been delivered, and
-    listing it would train the operator to ignore the block."""
+    listing it would train the operator to ignore the block.
+
+    ⚠ Names a REMOTE agent that is actually on the default roster
+    (`lm_studio`). This test used to say "monitor", which stopped being on the
+    roster when the undeliverable-by-default defect was fixed — leaving the
+    assertion true for the wrong reason (a name that is never processed at all
+    can hardly be listed) and the test vacuous."""
     gt = load_generate_tokens()
     gt.LOCAL_SKILL_ENV_PATHS = {}
-    _tokens, out = _capture(gt.mint, revealing=["monitor"])
+    _tokens, out = _capture(gt.mint, revealing=["lm_studio"])
 
     tail = out.split("REGISTERED BUT UNDELIVERABLE", 1)
-    if len(tail) > 1:
-        block = tail[1].split("Fix now with", 1)[0]
-        assert "monitor" not in block
+    assert len(tail) > 1, (
+        "the other remote agents on the roster were minted without --reveal, "
+        "so the block must be printed — otherwise this test proves nothing"
+    )
+    block = tail[1].split("Fix now with", 1)[0]
+    assert "lm_studio" not in block
 
 
 def test_mint_preserves_other_keys_in_existing_env_file(tmp_path):
@@ -1200,3 +1209,160 @@ def test_following_the_printed_remote_add_recovery_advice_actually_works(tmp_pat
     assert "codex: AGENT_TOKEN=" in out2, (
         f"--remint codex --reveal codex did not reveal codex's token:\n{out2}"
     )
+
+
+# ── The default roster must never register a token nobody can receive ────────
+#
+# MEASURED DEFECT (operator-ruled fix): "monitor" sat on the default AGENTS
+# roster, but the monitor dashboard lives in a sibling repo — it has no
+# LOCAL_SKILL_ENV_PATHS entry, so it is classified REMOTE, and the documented
+# bulk invocation (AGENTS.md Phase 6 / bootstrap_tokens.sh, bare) carries no
+# --reveal. So EVERY fresh install minted a monitor token, registered its
+# digest in AGENT_TOKENS, and discarded the plaintext at birth — the framework's
+# own D19 rule ("never mint a token into a digest registry that nobody actually
+# received, which is worse than not minting at all") broken by its default path,
+# and unrecoverable by --add afterwards (already registered → refused).
+#
+# The fix has two halves, and the second is the one that generalises: the
+# roster no longer defaults to a name that cannot be delivered, and ANY
+# remote-classified agent minted without --reveal is now named UNDELIVERABLE,
+# loudly, with the --remint recovery command that rotates nobody else.
+
+
+def test_default_roster_is_pinned_by_value_and_excludes_the_monitor():
+    """Pinned BY VALUE, not by `"monitor" not in AGENTS`: an equality assertion
+    against a list literal is what makes a future re-addition of ANY
+    undeliverable-by-default name a failing test rather than a silent one."""
+    gt = load_generate_tokens()
+    assert gt.AGENTS == [
+        "claude", "gemini", "grok", "codex", "lm_studio", "antigravity",
+    ]
+
+
+def test_a_fresh_registry_mints_no_monitor(tmp_path):
+    """The FRESH-install half: no AGENT_TOKENS on disk at all → the resolved
+    bulk roster is exactly the default list, with no monitor in it, so no
+    monitor digest can reach a fresh AGENT_TOKENS line."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"          # no gateway .env at all
+    gt.LOCAL_SKILL_ENV_PATHS = {}
+
+    roster = gt._resolve_roster(str(env_path))
+    assert "monitor" not in roster
+    assert roster == gt.AGENTS
+
+    (_tokens, digests, _failures), out = _capture(gt.mint, env_path=str(env_path))
+
+    assert "monitor" not in digests
+    tokens_line = next(l for l in out.splitlines() if l.startswith("AGENT_TOKENS="))
+    assert "monitor:sha256:" not in tokens_line
+
+
+def test_an_existing_registry_keeps_monitor_across_a_force_rotation(tmp_path):
+    """⚠ THE REGRESSION THIS FIX MUST NOT CAUSE. _resolve_roster() unions the
+    fixed AGENTS list with every name already registered in the gateway .env's
+    AGENT_TOKENS — precisely so that removing a name from the default list can
+    never revoke a credential an existing install is already using. An install
+    that already has monitor registered must still get a fresh monitor token
+    from a --force rotation (which calls this same bulk mint path).
+
+    Delivered via --reveal here, exactly as the operator would run a rotation
+    that includes a remote agent — the point is that the NAME survives the
+    roster change, not that a rotation can deliver without --reveal.
+    """
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    stale_digest = _digest("tok_monitor_from_an_older_install")
+    env_path.write_text(
+        f"AGENT_TOKENS=claude:sha256:{_digest('tok_claude')},"
+        f"monitor:sha256:{stale_digest}\n"
+    )
+    gt.LOCAL_SKILL_ENV_PATHS = {}
+
+    roster = gt._resolve_roster(str(env_path))
+    assert "monitor" in roster, (
+        "an already-registered agent was dropped from the rotation roster — "
+        "a --force rotation would silently stop trusting it"
+    )
+
+    (tokens, digests, _failures), out = _capture(
+        gt.mint, env_path=str(env_path), roster=roster, revealing=["monitor"],
+    )
+
+    assert "monitor" in tokens, "the rotation minted nothing for a registered agent"
+    tokens_line = next(l for l in out.splitlines() if l.startswith("AGENT_TOKENS="))
+    assert f"monitor:sha256:{digests['monitor']}" in tokens_line
+    assert stale_digest not in tokens_line, "a rotation must issue a FRESH digest"
+
+
+# ── The undeliverable warning: remote + no --reveal, and nothing else ────────
+
+
+def test_bulk_mint_warns_undeliverable_for_a_remote_agent_without_reveal(tmp_path):
+    """Not monitor-specific: fires for whatever is remote-classified on this
+    roster. Asserts the recovery command is the one that WORKS afterwards
+    (--remint re-issues an EXISTING name; --add refuses it).
+
+    ⚠ Asserts on the PER-AGENT report specifically — the text BEFORE the
+    closing summary block — not on the whole of stdout. A first draft asserted
+    `"UNDELIVERABLE" in out`, and a mutation check found it toothless: the
+    closing block prints that same word and the same `--remint` command, so
+    deleting the per-agent warning entirely left the test green. The two
+    surfaces are asserted separately below for exactly that reason.
+    """
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    gt.LOCAL_SKILL_ENV_PATHS = {}          # lm_studio is remote, like every name here
+
+    _result, out = _capture(
+        gt.mint, env_path=str(env_path), roster=["lm_studio"],
+    )
+
+    halves = out.split("REGISTERED BUT UNDELIVERABLE", 1)
+    assert len(halves) == 2, "the closing summary block was not printed at all"
+    per_agent, closing_block = halves
+
+    assert "UNDELIVERABLE" in per_agent, (
+        "a remote agent minted without --reveal was registered silently in the "
+        "per-agent report — its digest is in AGENT_TOKENS and its plaintext is "
+        "already gone"
+    )
+    assert "generate_tokens.py --remint lm_studio --reveal lm_studio" in per_agent, (
+        "the per-agent warning does not name the recovery command for THIS agent"
+    )
+    assert "generate_tokens.py --remint lm_studio --reveal lm_studio" in closing_block, (
+        "the closing block names no per-agent recovery command — it used to "
+        "print a literal '<name>' placeholder"
+    )
+
+
+def test_bulk_mint_does_not_warn_undeliverable_for_a_local_agent(tmp_path):
+    """The counterweight, half one: a written-through local agent HAS its
+    token. Warning on it would train the operator to scroll past the block."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    claude_dir = tmp_path / "claude_skill"
+    claude_dir.mkdir()
+    gt.LOCAL_SKILL_ENV_PATHS = {"claude": str(claude_dir / ".env")}
+
+    (tokens, _digests, _failures), out = _capture(
+        gt.mint, env_path=str(env_path), roster=["claude"],
+    )
+
+    assert f"AGENT_TOKEN={tokens['claude']}" in (claude_dir / ".env").read_text()
+    assert "UNDELIVERABLE" not in out
+
+
+def test_bulk_mint_does_not_warn_undeliverable_for_a_remote_agent_with_reveal(tmp_path):
+    """The counterweight, half two: --reveal on the SAME invocation IS the
+    delivery path for a remote agent, so there is nothing to warn about."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    gt.LOCAL_SKILL_ENV_PATHS = {}
+
+    _result, out = _capture(
+        gt.mint, env_path=str(env_path), roster=["lm_studio"],
+        revealing=["lm_studio"],
+    )
+
+    assert "UNDELIVERABLE" not in out
