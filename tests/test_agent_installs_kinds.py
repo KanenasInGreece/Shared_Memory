@@ -260,3 +260,67 @@ def test_uninstall_reads_both_arities(tmp_path):
     )
     assert rows == [("skill", "/a/skills/shared-memory"),
                     ("mcp", "/w/shared-memory-mcp")], rows
+
+
+# ── The two parsers must AGREE — one line, two languages ────────────────────
+#
+# generate_tokens.py WRITES the registry line and sync_skills.sh READS it, in
+# Python and bash respectively. Two implementations of one grammar is the
+# classic two-front-doors drift: each is individually tested above and in
+# test_mcp_install_delivery.py, and neither test would notice them disagreeing.
+# The consequence of a disagreement is not a parse error but a MIS-DELIVERY —
+# the mint registers an entry one way and sync reads it the other, so the wrong
+# package lands in a directory holding a live token.
+
+def _bash_registry_parse(line: str, tmp_path) -> list:
+    """Run sync_skills.sh's REAL registry-parsing block against a fixture .env.
+
+    Lifted out of the shipped script rather than invoked, because invoking sync
+    would also DELIVER. The lift is guarded: the extraction below asserts on
+    text that only exists in the real parser, so this cannot quietly decay into
+    a test of a reimplementation."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    env_file = tmp_path / "gateway.env"
+    env_file.write_text(line if line.endswith("\n") else line + "\n")
+    script = os.path.join(_REPO, "shared-memory", "scripts", "sync_skills.sh")
+    with open(script, encoding="utf-8") as fh:
+        source = fh.read()
+    start = source.index("registry_dirs=()\nregistry_kinds=()")
+    end = source.index("# The kind for a target directory")
+    snippet = source[start:end]
+    assert "registry_kinds+=" in snippet, "lifted the wrong block — fixture is stale"
+    proc = subprocess.run(
+        ["bash", "-c",
+         f'_registry_env={env_file!s}\n{snippet}\n'
+         'for i in "${!registry_dirs[@]}"; do '
+         'printf "%s\\t%s\\n" "${registry_kinds[$i]}" "${registry_dirs[$i]}"; done'],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return [tuple(l.split("\t")) for l in proc.stdout.splitlines() if l.strip()]
+
+
+_PARSER_CORPUS = [
+    "AGENT_INSTALLS=claude:/home/a/.claude/skills/shared-memory/.env",
+    "AGENT_INSTALLS=opencode:mcp:/home/a/.config/h/shared-memory-mcp/.env",
+    "AGENT_INSTALLS=codex:skill:/home/a/.codex/skills/shared-memory/.env",
+    "AGENT_INSTALLS=claude:/a/.env,opencode:mcp:/b/.env,codex:/c/.env",
+    "AGENT_INSTALLS=weird:/od:d/x/.env",              # legacy colon in the path
+    "AGENT_INSTALLS=x:sidecar:/p/.env",               # unknown middle field
+    "AGENT_INSTALLS= claude:/a/.env , opencode:mcp:/b/.env ",   # padded entries
+]
+
+
+def test_the_python_and_bash_registry_parsers_agree(tmp_path):
+    gt = load_generate_tokens()
+    for i, line in enumerate(_PARSER_CORPUS):
+        raw = line.split("=", 1)[1]
+        py = [(kind, os.path.dirname(path))
+              for _name, (kind, path) in gt._parse_agent_installs(raw).items()]
+        sh = _bash_registry_parse(line, tmp_path / f"case{i}")
+        assert py == sh, (
+            f"the mint's parser and sync's parser disagree on {line!r}:\n"
+            f"  generate_tokens.py -> {py}\n"
+            f"  sync_skills.sh     -> {sh}\n"
+            "One writes this line and the other reads it, so a disagreement "
+            "delivers the wrong package into a directory holding a live token.")
