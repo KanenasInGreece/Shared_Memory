@@ -17,3 +17,4 @@ Local_Documentation/
 research/
 .claude/
 .playwright-mcp/
+.env.mintlock
