@@ -52,7 +52,7 @@ import httpx
 from aiohttp import web
 from neo4j import AsyncGraphDatabase
 
-from log_hygiene import AsyncLineWriter
+from log_hygiene import AsyncLineWriter, scrub_url_credentials
 from agent_roles import effective_role, read_only_agents
 from ontology import (
     ONT, sanitize_entity_names, sanitize_entity_name,
@@ -2462,14 +2462,19 @@ class MemoryCoordinator:
                 return r.json()["data"][0]["embedding"]
             except Exception as exc:
                 if attempt == EMBED_RETRIES:
+                    # The encoder URL is operator-supplied and may carry
+                    # userinfo; an httpx error renders the full URL, and this
+                    # message is the client-visible 503 body — scrub it.
                     raise RuntimeError(
-                        f"Embedding failed after {EMBED_RETRIES} attempts — "
-                        f"is hive_mind_proxy running? ({exc})"
+                        f"Embedding failed after {EMBED_RETRIES} attempts at the "
+                        f"embedder {scrub_url_credentials(EMBED_URL)} — is it "
+                        f"running and is EMBEDDER_URL right? "
+                        f"({scrub_url_credentials(str(exc))})"
                     ) from exc
                 wait = EMBED_BACKOFF * attempt
                 log.warning(
                     "embed attempt %d/%d failed (%s) — retry in %.1f s",
-                    attempt, EMBED_RETRIES, exc, wait,
+                    attempt, EMBED_RETRIES, scrub_url_credentials(str(exc)), wait,
                 )
                 await asyncio.sleep(wait)
 
@@ -2510,12 +2515,14 @@ class MemoryCoordinator:
                 if attempt == EMBED_RETRIES:
                     raise RuntimeError(
                         f"Batch embedding failed after {EMBED_RETRIES} attempts "
-                        f"({len(clamped)} inputs): {exc}"
+                        f"({len(clamped)} inputs) at the embedder "
+                        f"{scrub_url_credentials(EMBED_URL)}: "
+                        f"{scrub_url_credentials(str(exc))}"
                     ) from exc
                 wait = EMBED_BACKOFF * attempt
                 log.warning(
                     "batch embed attempt %d/%d failed (%s) — retry in %.1f s",
-                    attempt, EMBED_RETRIES, exc, wait,
+                    attempt, EMBED_RETRIES, scrub_url_credentials(str(exc)), wait,
                 )
                 await asyncio.sleep(wait)
 
@@ -6503,7 +6510,7 @@ class MemoryCoordinator:
                         "see the capacity record on authenticated /health "
                         "for this host's derived limits"
                     )
-                log.warning(msg, type(exc).__name__, exc, len(rerank_docs))
+                log.warning(msg, type(exc).__name__, scrub_url_credentials(str(exc)), len(rerank_docs))
                 self._rerank_failures += 1
                 self._rerank_fallback_last_ts = datetime.now(timezone.utc).isoformat()
                 # ⛔ THE FALLBACK DROPS TIER-3 ENTIRELY, and that is deliberate.
