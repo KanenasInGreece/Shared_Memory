@@ -1,0 +1,398 @@
+"""route-guard (fact:1535, corrects fact:1534's HIGH): a mistyped or
+wrong-method framework request must FAIL AND SAY WHY — never fall through
+the catch-all into a reasoning-LLM dispatch. mcp/vector-skill.py's
+review_edges did exactly this (GET where the gateway registers POST-only),
+and the request was silently forwarded to the LLM pool as if it were a chat
+completion.
+
+Three parts:
+  Part 1 — mcp/vector-skill.py review_edges: GET -> POST (client unit,
+           mocked transport).
+  Part 2 — hive_mind_proxy.AsyncHiveMindProxy._route_guard / set_known_routes:
+           405 on a known path + wrong method, 404 on an unregistered path
+           under a reserved framework prefix, byte-for-byte unchanged
+           passthrough for everything else.
+  Part 3 — the contract test: every HTTP call BOTH clients make must exist,
+           with that method, in the gateway's registered route set — proven
+           (below) to catch the exact review_edges defect this PR fixes.
+"""
+import ast
+import asyncio
+import importlib
+import importlib.util
+import json
+import os
+import re
+import sys
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import make_mocked_request
+
+REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+SCRIPTS_DIR = os.path.join(REPO_ROOT, "shared-memory", "scripts")
+if SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, SCRIPTS_DIR)
+
+VECTOR_SKILL_PATH = os.path.join(REPO_ROOT, "mcp", "vector-skill.py")
+# The framework-side source of truth (shared-memory-skill/ is the delivered
+# copy, held in parity by test_sync_skills.py) — this is the file the
+# gateway host actually runs against.
+MEMORY_BRIDGE_SRC_PATH = os.path.join(SCRIPTS_DIR, "memory_bridge.py")
+
+
+def _fresh_gateway(monkeypatch):
+    """Reload coordinator + hive_mind_proxy fresh, matching the isolation
+    idiom in tests/test_routing_fix_round.py."""
+    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    import secure_env
+    secure_env._secrets.pop("AGENT_TOKENS", None)
+    import coordinator
+    importlib.reload(coordinator)
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    return g
+
+
+def _req(method: str, path: str, headers: dict | None = None, body: bytes = b""):
+    """Same shape as tests/test_routing_fix_round.py's `_req` — a dict
+    subclass so request['authenticated_agent']-style reads default to None.
+    `content_length` is needed by the ROUTING_MAP (embeddings/reranking)
+    buffering branch in handle_proxy, which the guard's no-op tests exercise."""
+    class _Req(dict):
+        pass
+    r = _Req()
+    r.method = method
+    r.path = path
+    r.rel_url = path
+    r.headers = headers or {}
+    r.can_read_body = True
+    r.content_length = len(body)
+
+    async def read():
+        return body
+    r.read = read
+    return r
+
+
+def _build_real_gateway_app(g) -> web.Application:
+    """The gateway's actual registered route set (attach_coordinator +
+    /health + /pool/status), EXCLUDING the catch-all — exactly what
+    set_known_routes() is meant to see, and exactly what main() builds
+    before adding the catch-all route. `coordinator` is a MagicMock: attach()
+    only needs the handler ATTRIBUTES to exist for registration, it never
+    calls them."""
+    app = web.Application()
+    mock_coordinator = MagicMock()
+    g.attach_coordinator(app, mock_coordinator)
+    app.router.add_get("/health", g.handle_health)
+    app.router.add_get("/pool/status", g.handle_pool_status)
+    return app
+
+
+def _build_proxy_with_known_routes(g, *, with_catchall: bool = False):
+    app = _build_real_gateway_app(g)
+    proxy = g.AsyncHiveMindProxy()
+    proxy.set_known_routes(app.router)
+    if with_catchall:
+        app.router.add_route("*", "/{tail:.*}", proxy.handle_proxy)
+    return app, proxy
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Part 2 — the gateway guard
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_wrong_method_on_relations_review_405(monkeypatch):
+    g = _fresh_gateway(monkeypatch)
+    _, proxy = _build_proxy_with_known_routes(g)
+    resp = asyncio.run(proxy.handle_proxy(_req("GET", "/memory/relations/review")))
+    assert resp.status == 405
+    assert resp.headers["Allow"] == "POST"
+    body = json.loads(resp.body.decode())
+    assert "GET" in body["error"]
+    assert "/memory/relations/review" in body["error"]
+    assert "NOT forwarded" in body["error"]
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_unknown_path_under_memory_prefix_404(monkeypatch, method):
+    g = _fresh_gateway(monkeypatch)
+    _, proxy = _build_proxy_with_known_routes(g)
+    resp = asyncio.run(proxy.handle_proxy(_req(method, "/memory/no-such-route")))
+    assert resp.status == 404
+    body = json.loads(resp.body.decode())
+    assert "/memory/no-such-route" in body["error"]
+    assert "NOT forwarded" in body["error"]
+
+
+def test_unknown_path_under_admin_prefix_404(monkeypatch):
+    g = _fresh_gateway(monkeypatch)
+    _, proxy = _build_proxy_with_known_routes(g)
+    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/admin/no-such-route")))
+    assert resp.status == 404
+    assert "/admin/no-such-route" in json.loads(resp.body.decode())["error"]
+
+
+def test_wrong_method_on_health_405(monkeypatch):
+    g = _fresh_gateway(monkeypatch)
+    _, proxy = _build_proxy_with_known_routes(g)
+    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/health")))
+    assert resp.status == 405
+    assert resp.headers["Allow"] == "GET, HEAD"
+
+
+def test_wrong_method_on_memory_telemetry_405(monkeypatch):
+    g = _fresh_gateway(monkeypatch)
+    _, proxy = _build_proxy_with_known_routes(g)
+    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/memory/telemetry")))
+    assert resp.status == 405
+    assert resp.headers["Allow"] == "GET, HEAD"
+
+
+def test_dynamic_status_route_wrong_method_405(monkeypatch):
+    """/memory/status/{pg_id} is a DynamicResource — the guard must match it
+    by resource PATTERN, not string equality, per the brief."""
+    g = _fresh_gateway(monkeypatch)
+    _, proxy = _build_proxy_with_known_routes(g)
+    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/memory/status/42")))
+    assert resp.status == 405
+    assert resp.headers["Allow"] == "GET, HEAD"
+
+
+class _CapturingSession:
+    """Records the (method, url) handed to .request() and raises — proving
+    control reached the real upstream-dispatch code, never intercepted by
+    the guard. Mirrors the _RaisingSession idiom in test_routing_fix_round.py."""
+    closed = False
+
+    def __init__(self):
+        self.captured = None
+
+    def request(self, method, url, **kw):
+        self.captured = (method, url)
+        raise RuntimeError("captured — proves dispatch reached the upstream call")
+
+
+def test_v1_embeddings_still_dispatches_unchanged(monkeypatch):
+    """A non-framework path (ROUTING_MAP passthrough) must reach exactly the
+    same upstream-call attempt as before the guard existed — the guard is a
+    pure no-op here, guard field populated exactly as it is in production."""
+    g = _fresh_gateway(monkeypatch)
+    _, proxy = _build_proxy_with_known_routes(g)
+    session = _CapturingSession()
+    proxy.session = session
+    resp = asyncio.run(proxy.handle_proxy(_req("POST", "/v1/embeddings")))
+    assert session.captured is not None, "guard intercepted a non-framework path"
+    assert session.captured[1].startswith(g.EMBEDDER_URL)
+    assert resp.status not in (404, 405)
+
+
+def test_v1_chat_completions_still_dispatches_unchanged(monkeypatch):
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000"}]))
+    g = _fresh_gateway(monkeypatch)
+    _, proxy = _build_proxy_with_known_routes(g)
+    session = _CapturingSession()
+    proxy.session = session
+    body = json.dumps({"messages": [{"role": "user", "content": "hi"}],
+                        "model": "local-model"}).encode()
+    req = _req("POST", "/v1/chat/completions", body=body)
+    resp = asyncio.run(proxy.handle_proxy(req))
+    assert session.captured is not None, "guard intercepted the LLM-pool path"
+    assert session.captured[1].startswith("http://a:5000")
+    assert resp.status not in (404, 405)
+
+
+def test_route_view_derived_from_router_not_hand_written(monkeypatch):
+    """decision:1032 class — set_known_routes must derive from the actual
+    router, so a route this test never lists anywhere is still caught."""
+    g = _fresh_gateway(monkeypatch)
+    app = web.Application()
+    app.router.add_put("/some/new/framework/route", lambda r: None)
+    proxy = g.AsyncHiveMindProxy()
+    proxy.set_known_routes(app.router)
+    resp = asyncio.run(proxy.handle_proxy(_req("GET", "/some/new/framework/route")))
+    assert resp.status == 405
+    assert resp.headers["Allow"] == "PUT"
+
+
+def test_catchall_excluded_from_known_routes(monkeypatch):
+    """set_known_routes(), called (as main() calls it) BEFORE the catch-all is
+    registered, must never treat the catch-all's own wildcard as a known
+    route — else the guard would blanket-405 every LLM passthrough path."""
+    g = _fresh_gateway(monkeypatch)
+    _, proxy = _build_proxy_with_known_routes(g, with_catchall=True)
+    for entry in proxy._known_routes.values():
+        assert entry["methods"] != {"*"}
+    # and the behavioural proof: an LLM-pool path is still a no-op today
+    session = _CapturingSession()
+    proxy.session = session
+    asyncio.run(proxy.handle_proxy(_req("POST", "/v1/embeddings")))
+    assert session.captured is not None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Part 1 — MCP review_edges client fix
+# ══════════════════════════════════════════════════════════════════════════
+
+def _load_vector_skill():
+    pytest.importorskip("fastmcp")
+    spec = importlib.util.spec_from_file_location(
+        "vector_skill_route_guard_test", VECTOR_SKILL_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.asyncio
+async def test_mcp_review_edges_posts_not_gets():
+    vs = _load_vector_skill()
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json = lambda: {"status": "success", "family": "entity_relation",
+                                  "rows": [], "calibration": {}}
+    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post, \
+         patch("httpx.AsyncClient.get") as mock_get:
+        result = await vs.review_edges("entity_relation", 5)
+    mock_get.assert_not_called()
+    mock_post.assert_called_once()
+    assert mock_post.call_args.args[0].endswith("/memory/relations/review")
+    assert mock_post.call_args.kwargs["json"] == {"family": "entity_relation", "limit": 5}
+    assert json.loads(result)["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_mcp_review_edges_mirrors_memory_bridge_payload_keys():
+    """Same body shape as memory_bridge.fetch_review_edges — the reference
+    implementation this fix mirrors (see tests/test_review_edges.py's
+    test_fetch_review_edges_posts_right_endpoint_and_payload)."""
+    vs = _load_vector_skill()
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json = lambda: {"status": "success", "family": "evidential",
+                                  "rows": [], "calibration": {}}
+    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
+        await vs.review_edges("evidential", 7)
+    assert mock_post.call_args.kwargs["json"] == {"family": "evidential", "limit": 7}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Part 3 — the contract test
+# ══════════════════════════════════════════════════════════════════════════
+
+def _extract_client_http_calls(src_path: str) -> list[tuple[str, str]]:
+    """AST-extract every (METHOD, path_template) an httpx client call makes,
+    reading `client.get(...)` / `client.post(...)` calls where the first
+    positional arg is an f-string. The f-string's FIRST interpolation is
+    always the base-URL variable (COORDINATOR_BASE, or a local alias of it —
+    both clients use this shape throughout) and is dropped; any LATER
+    interpolation is a dynamic path segment, rendered as the wildcard "{*}"
+    (matches aiohttp's `{name}` dynamic resources one-for-one, since both
+    are exactly one path segment)."""
+    src = open(src_path).read()
+    tree = ast.parse(src)
+    calls: list[tuple[str, str]] = []
+
+    def render_path(node):
+        if isinstance(node, ast.JoinedStr):
+            parts, seen_base = [], False
+            for v in node.values:
+                if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                    parts.append(v.value)
+                elif isinstance(v, ast.FormattedValue):
+                    if not seen_base:
+                        seen_base = True
+                    else:
+                        parts.append("{*}")
+                else:
+                    parts.append("{*}")
+            return "".join(parts)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        return None
+
+    class V(ast.NodeVisitor):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            func = node.func
+            if not isinstance(func, ast.Attribute) or func.attr not in ("get", "post"):
+                return
+            if not (isinstance(func.value, ast.Name) and func.value.id == "client"):
+                return
+            if not node.args:
+                return
+            template = render_path(node.args[0])
+            if template is None or not template.startswith("/"):
+                return
+            calls.append((func.attr.upper(), template))
+
+    V().visit(tree)
+    return calls
+
+
+def _extractor_finds_every_call_site(src_path: str, calls: list) -> None:
+    """Instrument check (fact:1321 class): a query that runs is not a query
+    that answers what was asked — prove the AST extractor didn't silently
+    drop (or double-count) a call site, via an independent textual count."""
+    src = open(src_path).read()
+    independent_count = len(re.findall(r"\bclient\.(?:get|post)\(", src))
+    assert len(calls) == independent_count, (
+        f"{src_path}: AST extractor found {len(calls)} client.get/post call(s), "
+        f"independent regex count found {independent_count} — the extractor "
+        f"silently dropped or double-counted a call site.")
+
+
+async def _resolve(app: web.Application, method: str, path: str) -> bool:
+    req = make_mocked_request(method, path, app=app)
+    match_info = await app.router.resolve(req)
+    return getattr(match_info, "http_exception", "missing") is None
+
+
+def _router_accepts(app: web.Application, method: str, template: str) -> bool:
+    path = template.replace("{*}", "42")
+    return asyncio.run(_resolve(app, method, path))
+
+
+def test_vector_skill_calls_all_registered(monkeypatch):
+    g = _fresh_gateway(monkeypatch)
+    app = _build_real_gateway_app(g)
+    calls = _extract_client_http_calls(VECTOR_SKILL_PATH)
+    _extractor_finds_every_call_site(VECTOR_SKILL_PATH, calls)
+    assert calls, "extractor found nothing — the pattern probably drifted"
+    for method, template in calls:
+        assert _router_accepts(app, method, template), (
+            f"mcp/vector-skill.py calls {method} {template!r}, which the "
+            f"gateway's registered route set does not accept")
+
+
+def test_memory_bridge_calls_all_registered(monkeypatch):
+    g = _fresh_gateway(monkeypatch)
+    app = _build_real_gateway_app(g)
+    calls = _extract_client_http_calls(MEMORY_BRIDGE_SRC_PATH)
+    _extractor_finds_every_call_site(MEMORY_BRIDGE_SRC_PATH, calls)
+    assert calls, "extractor found nothing — the pattern probably drifted"
+    for method, template in calls:
+        assert _router_accepts(app, method, template), (
+            f"memory_bridge.py calls {method} {template!r}, which the "
+            f"gateway's registered route set does not accept")
+
+
+def test_contract_catches_the_review_edges_defect_it_fixed(monkeypatch):
+    """Proof the check has teeth (measured, re-runnable): the EXACT pre-fix
+    call shape — GET /memory/relations/review — must be rejected by the same
+    router-resolution the two tests above use for the real client calls,
+    and the fixed shape (POST) must be accepted. A check that has only ever
+    passed has not been tested (this build also ran this exact assertion by
+    hand against the unfixed mcp/vector-skill.py source before the Part 1
+    fix landed — see HANDOFF.md)."""
+    g = _fresh_gateway(monkeypatch)
+    app = _build_real_gateway_app(g)
+    assert not _router_accepts(app, "GET", "/memory/relations/review")
+    assert _router_accepts(app, "POST", "/memory/relations/review")
+
+
+def test_contract_catches_an_unregistered_future_call(monkeypatch):
+    g = _fresh_gateway(monkeypatch)
+    app = _build_real_gateway_app(g)
+    assert not _router_accepts(app, "POST", "/memory/does-not-exist")
