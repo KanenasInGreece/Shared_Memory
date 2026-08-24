@@ -5,6 +5,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.44] — 2026-08-24
+
+### Fixed — a first upgrade that knows where the database came from
+
+- **A fresh install's first-ever upgrade died on a missing migration ledger, with a wrong
+  diagnosis.** `init_db.sh` initializes from `schema_init.sql`, which deliberately omits
+  `schema_migrations`, and nothing adopted the ledger at install time — so the first update
+  refused with a message claiming the database "predates migration tracking" and came from a
+  pre-v0.8.35 backup, false for a database born yesterday. Fresh installs now end with a
+  populated ledger: `init_db.sh` adopts it right after creating the schema, idempotently,
+  degrading to a loud warning with the exact remedy command when it cannot.
+- **Adoption is gated to schema this run actually created.** A pre-existing database — a
+  restored backup of any vintage included — is never auto-adopted, because recording unapplied
+  migrations as done is worse than refusing; that case gets a pointer to `apply.py`'s own
+  guidance, whose no-ledger message now names both origins honestly.
+- **`--dry-run` stops pretending.** When its own step-0 preview predicts a refusal, the
+  enumeration now says the real run stops there instead of listing steps it would never reach;
+  and the domain-backfill step's preview now shows the real `--apply` invocation — measured the
+  same day enqueueing 318 rows that the old preview described as "enqueues nothing" — and names
+  the `--no-domain-backfill` opt-out.
+- **The detached-HEAD refusal names the remedy.** `git checkout main`, concretely, in the
+  message and in the AGENTS.md upgrade runbook — measured: a cold agent following the published
+  docs stalled exactly there, on a host whose install had checked out the release tag.
+
+---
+
 ## [0.9.43] — 2026-08-24
 
 ### Fixed — no more tokens nobody can receive
