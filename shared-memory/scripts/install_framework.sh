@@ -86,39 +86,77 @@ PG_DATA_DIR="$(ask 'Postgres data dir'             "$HOME/databases/postgres")"
 LLM_MODELS_DIR="$(ask 'GGUF models dir (blank if using LM Studio)' '')"
 
 # ── Q3b (AGENTS.md): per-service encoder device split ──────────────────────
-# Two plain VALUE prompts (same shape as the three dirs above, via ask()) so
-# this stays a FIXED, unconditional-length sequence — never branching on an
-# earlier answer — which is what lets AGENTS.md's Phase 1 drive the whole
+# Three plain VALUE prompts (same shape as the three dirs above, via ask())
+# so this stays a FIXED, unconditional-length sequence — never branching on
+# an earlier answer — which is what lets AGENTS.md's Phase 1 drive the whole
 # script with one fixed printf of piped answers
 # (tests/test_change_group_contracts.py enforces the two stay in sync).
-# Defaulting to "cpu" for both and writing NOTHING to .env unless one is
-# answered "gpu" means accepting the default (Enter, Enter) reproduces
-# TODAY's behaviour exactly: the pair-wise CPU_ENCODER_REPLICAS/
-# GPU_ENCODER_REPLICAS already in the template decide, same as before this
-# question existed. Asked even when LLM_MODELS_DIR is blank (encoders hosted
-# elsewhere) — harmless there since the default writes nothing.
+# Defaulting to "cpu" for both device answers and writing NOTHING to .env
+# unless one is answered "gpu" means accepting the default (Enter, Enter,
+# Enter) reproduces TODAY's behaviour exactly: the pair-wise
+# CPU_ENCODER_REPLICAS/GPU_ENCODER_REPLICAS already in the template decide,
+# same as before this question existed. Asked even when LLM_MODELS_DIR is
+# blank (encoders hosted elsewhere) — harmless there since the default
+# writes nothing.
+#
+# M4 ruling (PR #308 review, operator-adjudicated): NO separate
+# EMBEDDER_DEVICE/RERANKER_DEVICE var is written — that would be a
+# PERSISTED DERIVED VALUE (decision:1032) whose only consumer was a
+# drift-checker for the divergence its own existence created. The answer to
+# "cpu"/"gpu" here decides ONLY the four replica vars below; nothing else
+# reads or writes a device string.
 echo
 echo "  Measured on a 4 GB card: the embedder fits comfortably (671 MB VRAM);"
 echo "  the reranker's 8192-token context window overflows a small card's"
 echo "  device memory. Only matters if you use the bundled compose encoders."
 EMBEDDER_DEVICE="$(ask 'Embedder device (cpu/gpu)' 'cpu')"
 RERANKER_DEVICE="$(ask 'Reranker device (cpu/gpu) — not recommended on a small card' 'cpu')"
-EMBEDDER_CPU_REPLICAS=""
-EMBEDDER_GPU_REPLICAS=""
-RERANKER_CPU_REPLICAS=""
-RERANKER_GPU_REPLICAS=""
+# L3: case-insensitive ("GPU"/"Gpu" must mean the same as "gpu") — normalise
+# before the case match, not after, so an unrecognised answer is judged on
+# its normalised form too.
+EMBEDDER_DEVICE="$(printf '%s' "$EMBEDDER_DEVICE" | tr '[:upper:]' '[:lower:]')"
+RERANKER_DEVICE="$(printf '%s' "$RERANKER_DEVICE" | tr '[:upper:]' '[:lower:]')"
 case "$EMBEDDER_DEVICE" in
-  gpu) EMBEDDER_GPU_REPLICAS=1; EMBEDDER_CPU_REPLICAS=0 ;;
-  cpu) ;;
+  gpu|cpu) ;;
   *) echo "  ⚠ unrecognised embedder device '$EMBEDDER_DEVICE' — treating as cpu" >&2
      EMBEDDER_DEVICE="cpu" ;;
 esac
 case "$RERANKER_DEVICE" in
-  gpu) RERANKER_GPU_REPLICAS=1; RERANKER_CPU_REPLICAS=0 ;;
-  cpu) ;;
+  gpu|cpu) ;;
   *) echo "  ⚠ unrecognised reranker device '$RERANKER_DEVICE' — treating as cpu" >&2
      RERANKER_DEVICE="cpu" ;;
 esac
+# M3: write ALL FOUR per-service replica vars whenever the block below is
+# written at all — never only the ones for the encoder that moved. An
+# install that answers embedder=gpu, reranker=cpu must not rely on a
+# pair-wise fallback line for the reranker's replicas; the rendered compose
+# must match the two answers with nothing left implicit.
+EMBEDDER_CPU_REPLICAS=1; EMBEDDER_GPU_REPLICAS=0
+RERANKER_CPU_REPLICAS=1; RERANKER_GPU_REPLICAS=0
+[ "$EMBEDDER_DEVICE" = "gpu" ] && { EMBEDDER_CPU_REPLICAS=0; EMBEDDER_GPU_REPLICAS=1; }
+[ "$RERANKER_DEVICE" = "gpu" ] && { RERANKER_CPU_REPLICAS=0; RERANKER_GPU_REPLICAS=1; }
+
+# M2: GPU_RENDER_GID — the packaged compose default ("video") is WRONG on
+# Debian (render node group is "render", gid 992, measured on a fresh
+# Debian 13 install — AGENTS.md's post-install prose already carried this
+# warning; it was never wired into the interactive install). A THIRD
+# unconditional value prompt (same fixed-shape reasoning as the two device
+# prompts above) rather than a conditional one gated on "gpu was chosen" —
+# a prompt whose very presence depended on an earlier answer would break
+# AGENTS.md's fixed-length piped-answer sequence exactly the way a nested
+# y/n gate did in an earlier draft of Q3b. Pre-filled with the REAL value
+# when the render node is visible (`stat -c '%g' /dev/dri/renderD128`, the
+# documented method) so accepting the default on a host that actually has
+# one just works; the prompt itself IS the ".env.example guidance" fallback
+# on a host where the device is not visible (no card, wrong permissions,
+# containerised dev environment). Only written to .env when a GPU was
+# actually chosen for at least one encoder — irrelevant otherwise.
+_gpu_render_gid_default="video"
+if [ -e /dev/dri/renderD128 ]; then
+  _detected_gid="$(stat -c '%g' /dev/dri/renderD128 2>/dev/null || echo '')"
+  [ -n "$_detected_gid" ] && _gpu_render_gid_default="$_detected_gid"
+fi
+GPU_RENDER_GID="$(ask 'Render-node group id for the encoder GPU (only matters if either answer above is gpu)' "$_gpu_render_gid_default")"
 
 # The compose file passes the Neo4j password as NEO4J_AUTH=neo4j/<password>,
 # a '/'-delimited string — a password containing '/' silently breaks parsing
@@ -186,25 +224,27 @@ export NEO4J_HOST_DIR PG_DATA_DIR LLM_MODELS_DIR LLAMA_CPU_THREADS
 )
 chmod 600 "$ENV_FILE"
 
-# EMBEDDER_DEVICE/RERANKER_DEVICE and the per-service replica vars are
+# The per-service replica vars (and GPU_RENDER_GID/ENCODER_GPU_INDEX) are
 # COMMENTED OUT in the template (like CPU_ENCODER_REPLICAS/
 # GPU_ENCODER_REPLICAS above them), so the awk substitution above — which
 # only rewrites lines already live in the template — cannot fill them in.
 # Append instead, and only when Q3b actually moved something off "cpu" —
 # both at the default means nothing to add: the pair-wise defaults already
-# in the template govern, exactly as before this question existed.
+# in the template govern, exactly as before this question existed. M3: once
+# writing at all, write ALL FOUR replica vars (never only the moved
+# encoder's), so the rendered compose matches the two answers on its own.
 if [ "$EMBEDDER_DEVICE" = "gpu" ] || [ "$RERANKER_DEVICE" = "gpu" ]; then
   {
     echo ""
     echo "# ── Per-service encoder device split (Q3b, install_framework.sh) ──"
-    echo "EMBEDDER_DEVICE=$EMBEDDER_DEVICE"
-    [ -n "$EMBEDDER_CPU_REPLICAS" ]  && echo "EMBEDDER_CPU_REPLICAS=$EMBEDDER_CPU_REPLICAS"
-    [ -n "$EMBEDDER_GPU_REPLICAS" ]  && echo "EMBEDDER_GPU_REPLICAS=$EMBEDDER_GPU_REPLICAS"
-    echo "RERANKER_DEVICE=$RERANKER_DEVICE"
-    [ -n "$RERANKER_CPU_REPLICAS" ]  && echo "RERANKER_CPU_REPLICAS=$RERANKER_CPU_REPLICAS"
-    [ -n "$RERANKER_GPU_REPLICAS" ]  && echo "RERANKER_GPU_REPLICAS=$RERANKER_GPU_REPLICAS"
+    echo "EMBEDDER_CPU_REPLICAS=$EMBEDDER_CPU_REPLICAS"
+    echo "EMBEDDER_GPU_REPLICAS=$EMBEDDER_GPU_REPLICAS"
+    echo "RERANKER_CPU_REPLICAS=$RERANKER_CPU_REPLICAS"
+    echo "RERANKER_GPU_REPLICAS=$RERANKER_GPU_REPLICAS"
+    echo "GPU_RENDER_GID=$GPU_RENDER_GID"
+    echo "ENCODER_GPU_INDEX=0"
   } >> "$ENV_FILE"
-  echo "  ✓ Encoder device split written: EMBEDDER_DEVICE=$EMBEDDER_DEVICE RERANKER_DEVICE=$RERANKER_DEVICE"
+  echo "  ✓ Encoder device split written: embedder=$EMBEDDER_DEVICE reranker=$RERANKER_DEVICE GPU_RENDER_GID=$GPU_RENDER_GID"
 fi
 
 mkdir -p "$NEO4J_HOST_DIR"/{data,logs,import,plugins} "$PG_DATA_DIR"

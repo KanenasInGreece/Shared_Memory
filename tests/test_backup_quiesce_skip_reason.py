@@ -70,9 +70,14 @@ json_get() { echo ""; }
 def _run(env_extra: dict) -> subprocess.CompletedProcess:
     """Run quiesce() standalone with the given extra shell vars exported,
     then print rc/QUIESCED/QUIESCE_MODE/QUIESCE_SKIP_REASON so the test can
-    assert on them without needing the rest of backup.sh's machinery."""
+    assert on them without needing the rest of backup.sh's machinery.
+
+    L6 (PR #308 review): the composed harness runs under `set -uo pipefail`,
+    matching backup.sh:28's own setting -- without it, an unset-variable
+    regression in quiesce() that would ABORT the real script (set -u) could
+    pass this test silently instead."""
     source = _extract_quiesce_source()
-    script = _QCURL_STUB + "\n" + source + '''
+    script = "set -uo pipefail\n" + _QCURL_STUB + "\n" + source + '''
 QUIESCED=0
 QUIESCE_MODE=""
 QUIESCE_SKIP_REASON=""

@@ -720,7 +720,8 @@ Intel, AMD and NVIDIA), off by default — the choice is two `.env` lines, `GPU_
 and `CPU_ENCODER_REPLICAS=0`, and what you run never diverges from what ships. If you have one
 GPU to allocate, the compromise is plain: a card with enough VRAM for your reasoning model is
 usually better spent on the model backend, while a small card — 4 GB, say — is best spent on
-the encoders, which fit in about 2 GB and repay it in search latency. Your call, always. That
+the embedder, which fits in about 2 GB and repays it in search latency — not the reranker, whose
+context window does not fit there (measured below). Your call, always. That
 pair-wise switch moves both encoders together; `EMBEDDER_GPU_REPLICAS`/`EMBEDDER_CPU_REPLICAS`
 and `RERANKER_GPU_REPLICAS`/`RERANKER_CPU_REPLICAS` move one at a time instead, for a card too
 small for both — measured on a 4 GB card, the embedder fits (671 MB) but the reranker's

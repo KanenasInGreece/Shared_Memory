@@ -149,29 +149,96 @@ def test_v1_suffix_warns_and_still_resolves_with_doubled_path(caplog, monkeypatc
     with caplog.at_level(logging.WARNING, logger="coordinator"):
         mod = _reloaded(monkeypatch, EMBEDDER_URL="http://embedder.internal:8070/v1")
     assert mod.EMBED_URL == "http://embedder.internal:8070/v1/v1/embeddings"
-    assert "already ends in /v1" in caplog.text
+    assert "already carries a path" in caplog.text
     assert "EMBEDDER_URL" in caplog.text
 
 
-def test_no_v1_warning_for_a_normal_base(caplog, monkeypatch):
+def test_no_path_warning_for_a_normal_base(caplog, monkeypatch):
     with caplog.at_level(logging.WARNING, logger="coordinator"):
         _reloaded(monkeypatch, EMBEDDER_URL="http://embedder.internal:8070")
-    assert "already ends in /v1" not in caplog.text
+    assert "already carries a path" not in caplog.text
 
 
-def test_endpoints_logged_once_at_startup_scrubbed(caplog, monkeypatch):
-    """The resolved endpoints must appear in the startup log exactly once,
-    scrubbed the same way the failure-path messages already are -- a
-    credential embedded in the URL must never reach the log even on the
-    success path."""
+def test_l4_full_endpoint_pasted_as_base_also_warns(caplog, monkeypatch):
+    """L4 (PR #308 review): the ORIGINAL check only matched a base ending in
+    exactly '/v1' -- a plausible copy-paste of the FULL endpoint as the base
+    (http://h:8070/v1/embeddings, e.g. copied straight out of an error
+    message or this file's own docstrings) carries a path that does NOT end
+    in '/v1' and used to warn nothing, silently doubling the whole path."""
+    with caplog.at_level(logging.WARNING, logger="coordinator"):
+        mod = _reloaded(monkeypatch, EMBEDDER_URL="http://embedder.internal:8070/v1/embeddings")
+    assert mod.EMBED_URL == "http://embedder.internal:8070/v1/embeddings/v1/embeddings"
+    assert "already carries a path" in caplog.text
+    assert "EMBEDDER_URL" in caplog.text
+
+
+# ── log_encoder_endpoints() — scrubbing + idempotence (unit-level) ────────────
+#
+# Testing the FUNCTION's own logging behaviour with caplog is fine here (it
+# is explicitly, directly invoked -- nothing about module-import ordering is
+# in play). What caplog CANNOT prove is the M1 defect this function exists to
+# fix: whether the line is actually visible under the real gateway's logging
+# configuration. That needs a real subprocess with real basicConfig, below.
+
+def test_log_encoder_endpoints_scrubs_and_fires_once(caplog, monkeypatch):
     with caplog.at_level(logging.INFO, logger="coordinator"):
         mod = _reloaded(
             monkeypatch,
             EMBEDDER_URL="http://svc:s3cr3t-token@embedder.internal:8070",
         )
+        caplog.clear()  # module import/reload logged nothing -- start fresh
+        mod.log_encoder_endpoints()
+        mod.log_encoder_endpoints()  # second call: must NOT log again
     startup_lines = [r.message for r in caplog.records if "encoder endpoints resolved" in r.message]
     assert len(startup_lines) == 1
     line = startup_lines[0]
     assert "s3cr3t" not in line and "svc:" not in line
     assert "embedder.internal:8070" in line
     assert mod.EMBED_URL == "http://svc:s3cr3t-token@embedder.internal:8070/v1/embeddings"
+
+
+def test_module_import_alone_never_logs_the_startup_line(caplog, monkeypatch):
+    """The regression this whole fix round is about: importing/reloading
+    coordinator must NOT by itself emit the startup INFO line any more --
+    only an explicit log_encoder_endpoints() call (from
+    MemoryCoordinator.start(), in real use) does."""
+    with caplog.at_level(logging.INFO, logger="coordinator"):
+        _reloaded(monkeypatch, EMBEDDER_URL="http://embedder.internal:8070")
+    assert "encoder endpoints resolved" not in caplog.text
+
+
+# ── M1 regression proof — real subprocess, real basicConfig, real stderr ──────
+
+def test_m1_encoder_endpoints_line_visible_in_a_real_gateway_process(monkeypatch, tmp_path):
+    """Import hive_mind_proxy (which imports coordinator, THEN calls
+    logging.basicConfig()) in a fresh subprocess, then call
+    log_encoder_endpoints() exactly the way MemoryCoordinator.start() does,
+    and grep the subprocess's REAL stderr -- no caplog, no synthetic
+    handler. This is the test the review's M1 finding asked for: the
+    original test used caplog.at_level(), which installs its OWN handler
+    and would have passed even under the old defect (the INFO call sitting
+    at module import, before basicConfig ever ran)."""
+    import subprocess
+    import sys as _sys
+
+    scripts_dir = os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = scripts_dir
+    env["SECURE_ENV_FILE"] = ""
+    env["CREDENTIAL_AUDIT_LOG_PATH"] = str(tmp_path / "credential-audit.jsonl")
+    env["CAPACITY_LOG_PATH"] = str(tmp_path / "capacity-derivations.jsonl")
+    env["EMBEDDER_URL"] = "http://embedder.internal:8070"
+    env["RERANKER_URL"] = "http://reranker.internal:8071"
+    script = (
+        "import hive_mind_proxy\n"
+        "import coordinator\n"
+        "coordinator.log_encoder_endpoints()\n"
+    )
+    proc = subprocess.run(
+        [_sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    assert "encoder endpoints resolved" in proc.stderr
+    assert "embedder.internal:8070" in proc.stderr
+    assert "reranker.internal:8071" in proc.stderr

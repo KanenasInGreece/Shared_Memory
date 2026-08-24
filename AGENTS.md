@@ -65,10 +65,10 @@ Collect these answers before touching anything. Defaults in brackets are safe to
   LM Studio web search. Say what each answer does and does not gate.
 - **Any question may be deferred.** Q1/Q2/Q6 block Phase 4 (the stores need paths and passwords);
   everything else can be decided later: Q3/Q4 can be filled in after first start (dreaming simply
-  waits), Q3b defaults to Q2's pair-wise choice if left unanswered (both `EMBEDDER_DEVICE` and
-  `RERANKER_DEVICE` unset is exactly today's behavior — never a blocker), Q5 agents can be added
-  later (see the *Add an agent later* runbook), Q7 is optional from day one. When the user defers,
-  say exactly what will work in the meantime and what won't.
+  waits), Q3b defaults to Q2's pair-wise choice if left unanswered (accepting "cpu" for both writes
+  nothing extra — exactly today's behavior, never a blocker), Q5 agents can be added later (see the
+  *Add an agent later* runbook), Q7 is optional from day one. When the user defers, say exactly what
+  will work in the meantime and what won't.
 - **"Can we pick this up after?" — yes, always.** Every phase is idempotent and ends with a check,
   so setup resumes cleanly from wherever it stopped: re-run the phase checks top to bottom and
   continue from the first failure. Offer to write a one-line note of where you stopped so the next
@@ -79,7 +79,7 @@ Collect these answers before touching anything. Defaults in brackets are safe to
 | 1 | Where should database data live on disk? [`~/databases/neo4j`, `~/databases/postgres`] | `NEO4J_HOST_DIR`, `PG_DATA_DIR` |
 | 2 | Use the **bundled embedder + reranker containers** (recommended; started by compose, CPU-only by default), or an existing endpoint? If bundled: which folder holds your GGUF model files? **Does this host have a spare GPU you want the encoder pair to use instead?** (Phase 4 has the trade-off — a GPU is otherwise easy to leave silently unused, or double-booked with the reasoning LLM. Q3b below covers moving only ONE of the two.) | `LLM_MODELS_DIR`; if GPU: `GPU_ENCODER_REPLICAS`/`CPU_ENCODER_REPLICAS`, `GPU_RENDER_GID` |
 | 3 | Where is your **reasoning LLM** served? Any OpenAI-compatible endpoint works (LM Studio, llama.cpp server, etc.) [`http://localhost:5000`]. More than one backend, local or remote? List them all. **Does any of them need an API credential** (a paid cloud endpoint, e.g. DeepSeek/xAI/OpenRouter)? If so, ask only for the **name** of the env var they'll export it under — never the key itself. | default `:5000` route, `LLM_BACKENDS`, or `LLM_BACKENDS_JSON` |
-| 3b | Same question as Q3, but for the **embedder and reranker**: local compose stack (Q2's default), an existing endpoint on another host (`EMBEDDER_URL`/`RERANKER_URL`), or LM Studio? **If either is local compose AND this host has a GPU (Q2), which encoder goes on it — embedder, reranker, or both?** Measured guidance to give: on a small (~4 GB) card the **embedder** fits comfortably (671 MB VRAM measured) but the **reranker at the 8192-token context window overflows device memory** — the safe default recommendation on a small card is embedder-on-GPU, reranker-on-CPU, not the pair moving together. A larger card can take both (Q2's pair-wise switch already covers that case). | `EMBEDDER_DEVICE`/`RERANKER_DEVICE` (`cpu`\|`gpu`, one per encoder) and the matching `EMBEDDER_CPU_REPLICAS`/`EMBEDDER_GPU_REPLICAS`/`RERANKER_CPU_REPLICAS`/`RERANKER_GPU_REPLICAS`; or `EMBEDDER_URL`/`RERANKER_URL` if hosted elsewhere |
+| 3b | Only if Q2 put the encoders on the bundled compose stack: **which encoder(s), if any, go on this host's GPU** — embedder, reranker, both, or neither (stay on CPU)? This is a SPLIT of Q2's pair-wise choice, not a repeat of it — Q2 already asked bundled-vs-existing-endpoint. Measured guidance to give: on a small (~4 GB) card the **embedder** fits comfortably (671 MB VRAM measured) but the **reranker at the 8192-token context window overflows device memory** — the safe default recommendation on a small card is embedder-on-GPU, reranker-on-CPU, not the pair moving together. A larger card can take both (Q2's pair-wise switch already covers that case). | `EMBEDDER_CPU_REPLICAS`/`EMBEDDER_GPU_REPLICAS`/`RERANKER_CPU_REPLICAS`/`RERANKER_GPU_REPLICAS` (all four, always — never only the moved encoder's); `GPU_RENDER_GID` too, auto-derived, when either answer is gpu |
 | 4 | Which model family is it? Gemma → `DREAM_TEMPERATURE=0.6`; Mistral-3 Instruct / Qwen → `0.1`; Mistral-3 Reasoning → `1.0`; DeepSeek (online) → `0.6`, **with thinking disabled** via the backend entry's `extra_body` — in thinking mode DeepSeek silently ignores temperature | `DREAM_TEMPERATURE` |
 | 5 | Which **agents** will use the memory? (Claude Code / Codex CLI / Grok / Antigravity CLI / LM Studio / a read-only monitor) | token minting + Phase 8 targets |
 | 6 | DB passwords: shall I generate strong random ones? (recommended) | `NEO4J_PASSWORD`, `PG_PASSWORD` |
@@ -141,18 +141,23 @@ PG_DIR=<from Q1>                         # e.g. $HOME/databases/postgres
 MODELS_DIR=<from Q2, blank if using LM Studio>
 EMB_DEV=<from Q3b, "cpu" or "gpu">       # blank/Enter also means "cpu"
 RER_DEV=<from Q3b, "cpu" or "gpu">       # blank/Enter also means "cpu"
+RENDER_GID=<from Q3b, only if either above is "gpu"> # blank/Enter accepts the
+                                          # auto-detected value when the host
+                                          # has one (stat -c '%g' /dev/dri/renderD128)
 NEO4J_PW="$(openssl rand -hex 20)"
 PG_PW="$(openssl rand -hex 20)"
-# 7 answers for the dirs/encoder-devices/passwords, then "n" to each of the two
-# TRAILING prompts (systemd service install, LLM-backend helper) — Phase 7 and
-# the LLM_BACKENDS / LLM_BACKENDS_JSON edit below handle those explicitly, with
-# more context than the script's own generic prompt gives. The two encoder-
-# device prompts are ALWAYS asked (unconditionally, same fixed-length sequence
-# every time) — answering "cpu"/"cpu" (or leaving both blank) reproduces
-# today's pair-wise-only behaviour exactly and writes nothing extra to .env.
-# printf is a shell builtin, so none of this — including the passwords — ever
-# appears on a process's own argv.
-printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\nn\nn\n' "$NEO4J_DIR" "$PG_DIR" "$MODELS_DIR" "$EMB_DEV" "$RER_DEV" "$NEO4J_PW" "$PG_PW" \
+# 8 answers for the dirs/encoder-devices/render-gid/passwords, then "n" to
+# each of the two TRAILING prompts (systemd service install, LLM-backend
+# helper) — Phase 7 and the LLM_BACKENDS / LLM_BACKENDS_JSON edit below
+# handle those explicitly, with more context than the script's own generic
+# prompt gives. All three encoder prompts are ALWAYS asked (unconditionally,
+# same fixed-length sequence every time) — answering "cpu"/"cpu" (or leaving
+# both blank) reproduces today's pair-wise-only behaviour exactly and writes
+# nothing extra to .env; RENDER_GID is asked either way too but only written
+# when a GPU was actually chosen for at least one encoder. printf is a shell
+# builtin, so none of this — including the passwords — ever appears on a
+# process's own argv.
+printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\nn\nn\n' "$NEO4J_DIR" "$PG_DIR" "$MODELS_DIR" "$EMB_DEV" "$RER_DEV" "$RENDER_GID" "$NEO4J_PW" "$PG_PW" \
   | bash shared-memory/scripts/install_framework.sh
 git check-ignore shared-memory/.env          # MUST print the path
 ```
@@ -166,8 +171,11 @@ script does not ask about RAM, and the shipped defaults refuse to start when hea
 exceed physical RAM.
 
 Uncomment/set `DREAM_TEMPERATURE` (Q4) and, for multiple LLM backends, `LLM_BACKENDS` (Q3). **If Q2
-turned up a GPU for the encoders**, uncomment/set `GPU_ENCODER_REPLICAS=1` + `CPU_ENCODER_REPLICAS=0`
-(Phase 4 has the trade-off) and `GPU_RENDER_GID` — read the actual value with
+or Q3b turned up a GPU for the encoders**, uncomment/set `GPU_ENCODER_REPLICAS=1` +
+`CPU_ENCODER_REPLICAS=0` for Q2's pair-wise choice (Phase 4 has the trade-off) — Q3b's per-service
+split, if driven via the printf above, already wrote its own `*_REPLICAS` vars and `GPU_RENDER_GID`
+automatically, so this is a confirm-and-backstop step for that path, not a first-time need. Either
+way, `GPU_RENDER_GID` should hold the actual value — read it with
 `stat -c '%g' /dev/dri/renderD128` rather than trusting the packaged default: on Debian the render
 node's group is `render` (gid 992 there, measured on a fresh Debian 13 install), not `video`. If the
 user's reasoning server **validates model names** (a named-model server, a routing proxy, a hosted

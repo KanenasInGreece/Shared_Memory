@@ -1,5 +1,11 @@
-"""Per-service encoder device switch (compose knobs) — EMBEDDER_DEVICE /
-RERANKER_DEVICE's underlying mechanism.
+"""Per-service encoder device switch — the four EMBEDDER_CPU_REPLICAS /
+EMBEDDER_GPU_REPLICAS / RERANKER_CPU_REPLICAS / RERANKER_GPU_REPLICAS
+compose knobs.
+
+(There is no separate EMBEDDER_DEVICE/RERANKER_DEVICE var — M4 ruling, PR
+#308 review: a persisted derived value whose only consumer was a
+drift-checker for the divergence its own existence created. These four
+replica vars ARE the device choice.)
 
 Compose has no conditionals, so the switch is expressed as a NESTED default:
 each per-service replica var (EMBEDDER_CPU_REPLICAS, EMBEDDER_GPU_REPLICAS,

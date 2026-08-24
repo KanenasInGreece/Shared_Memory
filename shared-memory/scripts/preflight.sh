@@ -175,7 +175,33 @@ done
 
 # Read one key from .env without sourcing it — values may contain spaces or
 # other characters bash `source` would mis-parse (e.g. PROJECT_ALIASES).
-read_env() { grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2-; }
+#
+# Normalises the raw grep/cut output the same way an operator's editor (or a
+# CRLF-saving one) or a trailing inline comment would leave it, so the value
+# this script COMPARES matches the value docker compose actually resolves —
+# not a stricter, unquoted, no-comment ideal of it. Three real spellings,
+# each of which renders CORRECTLY through compose but previously failed
+# preflight's double-start guard with a raw string compare (H1, PR #308
+# review, reproduced against the real compose file):
+#   EMBEDDER_CPU_REPLICAS="0"          (matched double quotes)
+#   EMBEDDER_CPU_REPLICAS=0 # keep off (trailing inline comment)
+#   EMBEDDER_CPU_REPLICAS=0\r          (CRLF-saved .env)
+# Order matters: strip the CR first (it would otherwise hide inside the
+# trailing-comment/quote match), then the inline comment, then one layer of
+# MATCHED surrounding quotes — mismatched or partial quoting is left as-is
+# rather than guessed at.
+read_env() {
+    local raw
+    raw="$(grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2-)"
+    raw="${raw%$'\r'}"
+    raw="$(printf '%s' "$raw" | sed -E 's/[[:space:]]+#.*$//')"
+    if [[ ${#raw} -ge 2 && "${raw:0:1}" == '"' && "${raw: -1}" == '"' ]]; then
+        raw="${raw:1:${#raw}-2}"
+    elif [[ ${#raw} -ge 2 && "${raw:0:1}" == "'" && "${raw: -1}" == "'" ]]; then
+        raw="${raw:1:${#raw}-2}"
+    fi
+    printf '%s' "$raw"
+}
 
 if [[ -f "$ENV_FILE" ]]; then
     ok ".env present ($ENV_FILE)"
@@ -207,32 +233,32 @@ if [[ -f "$ENV_FILE" ]]; then
     # itself fails loudly on the second bind when this happens, but that
     # failure surfaces mid-`up`, after Postgres/Neo4j are already starting.
     # Catching it here, before anything starts, is louder and earlier.
-    if [[ "$emb_cpu" != "0" && "$emb_gpu" != "0" ]]; then
+    #
+    # A value that is not a plain non-negative integer AFTER normalising
+    # cannot be safely compared — warn and SKIP this encoder's verdict rather
+    # than guess: compose itself already fails loudly on a bad `replicas:`
+    # value at `up` time (verified: a non-integer/duplicate-name value is
+    # rejected at `config` time), so silence here is not a missed guard.
+    _is_int() { [[ "$1" =~ ^[0-9]+$ ]]; }
+    emb_numeric=1
+    if ! _is_int "$emb_cpu"; then warn "EMBEDDER_CPU_REPLICAS resolved to '$emb_cpu', not a plain integer — skipping the embedder double-start check (compose will fail loudly on this value)"; emb_numeric=0; fi
+    if ! _is_int "$emb_gpu"; then warn "EMBEDDER_GPU_REPLICAS resolved to '$emb_gpu', not a plain integer — skipping the embedder double-start check (compose will fail loudly on this value)"; emb_numeric=0; fi
+    if [[ "$emb_numeric" == "1" && "$emb_cpu" != "0" && "$emb_gpu" != "0" ]]; then
         bad "embedder would double-start: EMBEDDER_CPU_REPLICAS=$emb_cpu AND EMBEDDER_GPU_REPLICAS=$emb_gpu both resolve non-zero — both bind :8070; set exactly one to 0"
     fi
-    if [[ "$rer_cpu" != "0" && "$rer_gpu" != "0" ]]; then
+    rer_numeric=1
+    if ! _is_int "$rer_cpu"; then warn "RERANKER_CPU_REPLICAS resolved to '$rer_cpu', not a plain integer — skipping the reranker double-start check (compose will fail loudly on this value)"; rer_numeric=0; fi
+    if ! _is_int "$rer_gpu"; then warn "RERANKER_GPU_REPLICAS resolved to '$rer_gpu', not a plain integer — skipping the reranker double-start check (compose will fail loudly on this value)"; rer_numeric=0; fi
+    if [[ "$rer_numeric" == "1" && "$rer_cpu" != "0" && "$rer_gpu" != "0" ]]; then
         bad "reranker would double-start: RERANKER_CPU_REPLICAS=$rer_cpu AND RERANKER_GPU_REPLICAS=$rer_gpu both resolve non-zero — both bind :8071; set exactly one to 0"
     fi
 
-    # EMBEDDER_DEVICE/RERANKER_DEVICE are the human-readable record of INTENT
-    # install_framework.sh writes alongside the replica pair (shared-memory/
-    # .env.example) — cross-check it against what the replicas actually
-    # resolve to, so a stale DEVICE comment next to a hand-edited replica pair
-    # is caught instead of silently believed.
-    emb_device="$(read_env EMBEDDER_DEVICE)"
-    if [[ -n "$emb_device" ]]; then
-        emb_resolved="cpu"; [[ "$emb_gpu" != "0" ]] && emb_resolved="gpu"
-        if [[ "$emb_device" != "$emb_resolved" ]]; then
-            warn "EMBEDDER_DEVICE=$emb_device but the replica vars resolve to $emb_resolved (EMBEDDER_CPU_REPLICAS=$emb_cpu EMBEDDER_GPU_REPLICAS=$emb_gpu) — one of the two was edited without the other"
-        fi
-    fi
-    rer_device="$(read_env RERANKER_DEVICE)"
-    if [[ -n "$rer_device" ]]; then
-        rer_resolved="cpu"; [[ "$rer_gpu" != "0" ]] && rer_resolved="gpu"
-        if [[ "$rer_device" != "$rer_resolved" ]]; then
-            warn "RERANKER_DEVICE=$rer_device but the replica vars resolve to $rer_resolved (RERANKER_CPU_REPLICAS=$rer_cpu RERANKER_GPU_REPLICAS=$rer_gpu) — one of the two was edited without the other"
-        fi
-    fi
+    # M4 ruling (PR #308 review, operator-adjudicated): there is no
+    # EMBEDDER_DEVICE/RERANKER_DEVICE var to cross-check against the
+    # replicas — it was a persisted derived value (decision:1032) whose
+    # only purpose was surviving this exact drift check, and install_
+    # framework.sh no longer writes it. The double-start guard above is the
+    # only encoder-config verdict this section reaches.
 
     if [[ "$emb_cpu" != "0" || "$emb_gpu" != "0" || "$rer_cpu" != "0" || "$rer_gpu" != "0" ]]; then
         models_dir="$(read_env LLM_MODELS_DIR)"
