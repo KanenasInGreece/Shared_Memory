@@ -3,10 +3,12 @@
 # init_db.sh — initialise both stores for a fresh Shared Memory install.
 #
 #   Postgres : applies schema_init.sql (tables, indexes, vector extension),
-#              then populates the migration ledger (schema_migrations) so
-#              the FIRST-ever `apply.py` upgrade run does not refuse this
-#              vouchable, just-created database (see the ADOPT_LEDGER block
-#              below).
+#              then — ONLY when this run created that schema from nothing,
+#              never against a database that already had it (e.g. a restored
+#              pre-v0.8.35 backup) — populates the migration ledger
+#              (schema_migrations) so the FIRST-ever `apply.py` upgrade run
+#              does not refuse this vouchable, just-created database (see the
+#              SCHEMA_PREEXISTENCE and ADOPT_LEDGER blocks below).
 #   Neo4j    : applies neo4j_init.cypher (uniqueness constraints)
 #
 # Runs the clients INSIDE the compose containers (postgres-vector / neo4j-memory)
@@ -90,6 +92,65 @@ done
 docker exec "$PG_CONTAINER" pg_isready -U postgres -d "$PG_DB" >/dev/null 2>&1 \
     || { red "✗ Postgres did not become ready within ${WAIT_TIMEOUT}s"; exit 1; }
 
+# ── Did the framework schema already exist, BEFORE this run touches it? ──────
+#
+# CRITICAL (Ops & Release Integrity review, verified by the merger). This
+# script is documented idempotent and schema_init.sql is `IF NOT EXISTS`, so
+# running init_db.sh against a RESTORED pre-v0.8.35 backup silently succeeds
+# without altering the old tables at all — indistinguishable, from the
+# ADOPT_LEDGER block's own point of view further down, from a database this
+# run just created. An unconditional adopt_ledger() call there would then
+# record EVERY current migration as already applied on a database that is
+# genuinely missing every post-v0.8.35 alteration — bypassing apply.py's own
+# needs_adoption() safety stance and corrupting migration state permanently.
+#
+# The fix is to ask the question BEFORE schema_init.sql runs, while it is
+# still answerable: does `technical_docs` (apply.py's own `_FRAMEWORK_TABLE`
+# discriminator) already exist? A restored backup of any vintage has it; a
+# truly fresh, empty database does not. `to_regclass()` never errors on an
+# absent relation, so this is safe to run against a database with no
+# framework objects at all — same in-container psql the rest of this script
+# already uses, no new dependency.
+#
+# Defaults CONSERVATIVELY: only an explicit "f" (Postgres confirming the
+# table is absent) is read as fresh. Anything else — "t", or output this
+# script did not expect — is treated as "the schema pre-existed", which
+# only ever costs a skipped auto-adopt (still recoverable by hand via
+# apply.py --adopt), never a wrongly-adopted ledger. A `docker exec`/`psql`
+# failure here is not swallowed — it propagates via `set -e`, exactly like
+# every other docker/psql call in this script.
+# >>> SCHEMA_PREEXISTENCE
+schema_preexisted() {
+    local out
+    out="$(docker exec -i "$PG_CONTAINER" psql -q -t -A -U postgres -d "$PG_DB" \
+        -c "SELECT to_regclass('technical_docs') IS NOT NULL")"
+    [[ "$out" == "f" ]] && echo 0 || echo 1
+}
+
+# Whether schema_migrations exists AND already has at least one row. Two
+# queries because SQL cannot lazily skip a FROM clause on a table that may
+# not exist — referencing schema_migrations at all when to_regclass() says
+# it is absent fails at parse time, not merely at runtime, even inside an
+# AND. Defaults toward "0" (unpopulated) on anything but a confirmed "t" —
+# the caller's only use of this is deciding whether to print an advisory
+# pointer, so erring toward printing it costs nothing but a few extra lines.
+ledger_populated() {
+    local exists_out
+    exists_out="$(docker exec -i "$PG_CONTAINER" psql -q -t -A -U postgres -d "$PG_DB" \
+        -c "SELECT to_regclass('schema_migrations') IS NOT NULL")"
+    if [[ "$exists_out" != "t" ]]; then
+        echo 0
+        return 0
+    fi
+    local rows_out
+    rows_out="$(docker exec -i "$PG_CONTAINER" psql -q -t -A -U postgres -d "$PG_DB" \
+        -c "SELECT EXISTS(SELECT 1 FROM schema_migrations)")"
+    [[ "$rows_out" == "t" ]] && echo 1 || echo 0
+}
+# <<< SCHEMA_PREEXISTENCE
+
+SCHEMA_PREEXISTED="$(schema_preexisted)"
+
 # ── Apply Postgres schema ─────────────────────────────────────────────────────
 # client_min_messages=warning silences the "already exists, skipping" NOTICE
 # spam that IF NOT EXISTS emits on a re-run.
@@ -99,19 +160,29 @@ docker exec -e PGOPTIONS='-c client_min_messages=warning' -i "$PG_CONTAINER" \
     < "$MIGRATIONS_DIR/schema_init.sql" >/dev/null
 grn "✓ Postgres schema applied"
 
-# ── Populate the migration ledger — the ONE moment adoption is automatic ─────
+# ── Populate the migration ledger — but ONLY when THIS run created the ──────
+# ── schema from nothing (SCHEMA_PREEXISTED, computed above) ─────────────────
 #
-# schema_init.sql just created the framework schema, but deliberately does NOT
-# create schema_migrations itself (see its own header) — that leaves a bare
-# fresh install with the framework tables present and no ledger, which
-# apply.py cannot tell apart from a pre-v0.8.35 backup it must refuse to touch
-# until an operator vouches for it (exit 2, "predates migration tracking").
-# For a database schema_init.sql just created, THIS run IS the vouching:
-# schema_init.sql is generated FROM the migration files
-# (generate_schema_init.py), so recording every migration file as already
-# applied restates what just happened here, seconds ago — not a guess about
-# an unknown database's history. apply.py's stance toward a database it did
-# NOT just create is unchanged: --adopt is never called automatically for one.
+# schema_init.sql deliberately does NOT create schema_migrations itself (see
+# its own header) — that leaves a bare fresh install with the framework
+# tables present and no ledger, which apply.py cannot tell apart from a
+# pre-v0.8.35 backup it must refuse to touch until an operator vouches for it
+# (exit 2, "predates migration tracking"). For a database schema_init.sql
+# just created, THIS run IS the vouching: schema_init.sql is generated FROM
+# the migration files (generate_schema_init.py), so recording every
+# migration file as already applied restates what just happened here,
+# seconds ago — not a guess about an unknown database's history.
+#
+# ⛔ That vouching is ONLY valid when SCHEMA_PREEXISTED == 0. A restored
+# pre-v0.8.35 backup already has the framework schema, so schema_init.sql's
+# `IF NOT EXISTS` silently no-ops against it — calling adopt_ledger() there
+# would record every current migration as applied on a database genuinely
+# missing every post-v0.8.35 alteration, which is exactly the corruption
+# apply.py's own needs_adoption() refusal exists to prevent. apply.py's
+# stance toward a database this run did NOT just create is therefore
+# unchanged: --adopt is never called automatically for one — the operator
+# is pointed at it instead, and only when it would actually help (the ledger
+# is genuinely empty; a database that already has one stays quiet on re-run).
 #
 # Runs on the HOST, not via `docker exec` — apply.py connects out via
 # psycopg2 (matching how update_framework.sh invokes it), and Postgres's port
@@ -135,7 +206,23 @@ adopt_ledger() {
     fi
 }
 # <<< ADOPT_LEDGER
-adopt_ledger
+
+# >>> LEDGER_GATE_DECISION
+if [[ "$SCHEMA_PREEXISTED" == "0" ]]; then
+    adopt_ledger
+elif [[ "$(ledger_populated)" == "0" ]]; then
+    # The schema was already here before this run, AND it has no ledger —
+    # apply.py's own guidance (Fix B) already explains both origins this
+    # state can have and when --adopt is safe; point at it rather than
+    # duplicating that prose here.
+    ylw "⚠ This database's framework schema already existed before this run —"
+    ylw "  its migration ledger is empty. Whether it is safe to adopt is not"
+    ylw "  this script's call (see apply.py's own guidance, which covers both"
+    ylw "  origins this can be):"
+    ylw "      uv run --with psycopg2-binary python $MIGRATIONS_DIR/apply.py --status"
+    ylw "      uv run --with psycopg2-binary python $MIGRATIONS_DIR/apply.py --adopt"
+fi
+# <<< LEDGER_GATE_DECISION
 
 # ── Wait for Neo4j ────────────────────────────────────────────────────────────
 echo "Waiting for Neo4j ($NEO4J_CONTAINER) ..."

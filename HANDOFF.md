@@ -250,3 +250,129 @@ satisfied — nothing to move).
 - All four fixes are independent by file region within `update_framework.sh` (fix C
   touches step-0 + step-6; fix D touches only the detached-HEAD string inside step 0) —
   reviewed as one PR since they came from one measured session, per the brief.
+
+---
+
+## REVIEW INTEGRATION — second commit, on top of the branch above
+
+Branch rebased onto `main`/v0.9.43 (`39d9333`) by the merger before this integration;
+worked on the branch as it stood, pulled nothing. This is a **second commit** on
+`fix/first-upgrade-fresh-install` (not an amend) — the original build and this
+review-driven fix are separately inspectable, matching this repo's review-cycle
+tracing convention (`fact:1315`): a finding gets its own fix-trace rather than being
+folded silently into the record it corrects.
+
+### THE FINDING (Critical, Ops & Release Integrity review, verified by the merger)
+
+`adopt_ledger()` was called **unconditionally** at the end of `init_db.sh`, right after
+`schema_init.sql` ran. Because `init_db.sh` is documented idempotent and
+`schema_init.sql` is `IF NOT EXISTS`, running `init_db.sh` against a **restored
+pre-v0.8.35 backup** silently succeeds without touching the old tables at all — and the
+unconditional `adopt_ledger()` call would then record **every current migration** as
+already applied on a database that is genuinely missing every post-v0.8.35 alteration.
+That bypasses `apply.py`'s own `needs_adoption()` safety stance and corrupts migration
+state **permanently** (a wrongly-populated `schema_migrations` row for a migration that
+never ran is not detectable later — the ledger claims it happened).
+
+### THE GATE — implemented exactly as ruled
+
+`shared-memory/scripts/init_db.sh`, new region between `# >>> SCHEMA_PREEXISTENCE` and
+`# <<< LEDGER_GATE_DECISION` (spans across the existing `# >>> ADOPT_LEDGER` block too —
+the three pieces are one composition):
+
+1. **Before** `schema_init.sql` runs — while the question is still answerable — a new
+   `schema_preexisted()` function checks, via the same in-container `psql` the script
+   already uses, whether `technical_docs` (apply.py's own `_FRAMEWORK_TABLE`
+   discriminator) already exists in the target database:
+   `SELECT to_regclass('technical_docs') IS NOT NULL`. Recorded into
+   `SCHEMA_PREEXISTED` (`0` = fresh, `1` = pre-existing). Defaults **conservatively**:
+   only an explicit `f` (Postgres confirming absence) reads as fresh; anything else —
+   `t`, or unexpected output — reads as pre-existing, which only ever costs a *skipped*
+   auto-adopt (still recoverable by hand), never a wrongly-adopted ledger.
+2. `schema_init.sql` runs as before (unchanged).
+3. The call site (previously a bare `adopt_ledger`) is now gated:
+   - `SCHEMA_PREEXISTED == 0` → `adopt_ledger()` fires, exactly as before this fix.
+   - `SCHEMA_PREEXISTED == 1` and the ledger is genuinely empty (checked by a new
+     `ledger_populated()` function — `schema_migrations` absent, or present with zero
+     rows; two separate `to_regclass`/`EXISTS` queries because SQL cannot lazily skip a
+     `FROM` clause on a table that may not exist) → **do not adopt**. Print a short
+     pointer at `apply.py --status` / `apply.py --adopt` instead — reusing Fix B's own
+     dual-origin explanation rather than duplicating that prose here.
+   - `SCHEMA_PREEXISTED == 1` and the ledger is already populated (the ordinary
+     idempotent re-run of `init_db.sh` against an already-tracked deployment) → stay
+     completely quiet, neither adopting nor printing anything new.
+
+`apply.py`'s own stance toward a database this run did **not** just create remains
+exactly as it always was — `--adopt` is still never invoked automatically for one; the
+gate only changes when `init_db.sh` is willing to invoke it *for* the operator.
+
+### TESTS — `tests/test_init_db_ledger_adoption.py` extended (11 tests total, +4 new)
+
+Existing 7 tests updated where the call site's shape changed
+(`test_the_function_is_actually_called_after_schema_applied` now looks for the indented
+`    adopt_ledger` call inside the gate's `if` branch, not a bare top-level one) and
+otherwise kept as-is — they test `adopt_ledger()` in isolation and remain valid.
+
+New composition-level extraction: `_extract_gate_source()` lifts the **whole**
+contiguous region from `# >>> SCHEMA_PREEXISTENCE` through `# <<< LEDGER_GATE_DECISION`
+— deliberately including the real "Apply Postgres schema" `docker exec` call in the
+middle, since the review finding is about the *composition*, not any one function in
+isolation, and testing three stitched-together separate extractions would risk testing
+a reimplementation rather than the shipped code. A new stubbed `docker` (`_docker_stub_body`)
+answers the three psql queries by env var (`TECHNICAL_DOCS_PREEXISTS` /
+`LEDGER_TABLE_EXISTS` / `LEDGER_HAS_ROWS`) and consumes-and-succeeds on the real
+`schema_init.sql` apply call in between; the existing `uv` stub is reused unchanged.
+
+- **(a) fresh-DB path adopts** — `test_a_genuinely_fresh_database_adopts`
+  (`TECHNICAL_DOCS_PREEXISTS=f`): the gate reaches `adopt_ledger()`, ledger populated.
+  Composition-level counterpart to the existing `test_uv_present_and_adopt_succeeds_reports_success`,
+  which tests `adopt_ledger()` alone.
+- **(b) pre-existing-schema-without-ledger does NOT adopt** —
+  `test_a_preexisting_schema_with_no_ledger_does_not_adopt` (THE measured Critical case:
+  `TECHNICAL_DOCS_PREEXISTS=t`, `LEDGER_TABLE_EXISTS=f`, `uv` stub set to *succeed* if
+  wrongly called). Pinned by value: `"uv "` must not appear anywhere in the invocation
+  log at all (no `apply.py --adopt` call, full stop), `"Migration ledger populated"`
+  must not appear in stdout, and the pointer text (`"already existed before this run"`,
+  `apply.py --status`, `apply.py --adopt`) must appear instead.
+- **Bonus control** — `test_a_preexisting_schema_with_a_populated_ledger_stays_quiet`
+  (pre-existing schema, ledger already populated): neither adopts nor prints the
+  pointer — proves the idempotent re-run case (the common one in practice) stays quiet
+  rather than nagging on every `init_db.sh` re-run.
+- `test_gate_markers_present_in_the_right_order` — the three marker pairs exist exactly
+  once and in the right relative order, so a future edit can't silently break the
+  extraction the other tests depend on.
+
+### MUTATION CHECK (c) — exactly as ruled
+
+Reverted the gate to unconditional (`sed`/Python-scripted): inserted a bare `adopt_ledger`
+call before the `if`, and changed the `if` condition to `"$SCHEMA_PREEXISTED" == "99"`
+(never true) so the `elif`/pointer branch could never fire either — i.e. reproduced the
+ORIGINAL pre-review-finding bug (adopt always fires, unconditionally).
+
+Result: **both** `test_a_preexisting_schema_with_no_ledger_does_not_adopt` (the named
+test) **and** the bonus control `test_a_preexisting_schema_with_a_populated_ledger_stays_quiet`
+died — both assert `"uv " not in log_text`, and the mutation makes `adopt_ledger` (which
+invokes `uv`) fire unconditionally regardless of pre-existence or ledger state, so both
+correctly caught it. All 9 other tests in the file (isolated `adopt_ledger()` tests,
+`test_a_genuinely_fresh_database_adopts`, marker tests, header test) stayed green,
+confirming the mutation's blast radius matched expectations — only the two
+pre-existing-schema scenarios should react to removing the gate.
+
+Restored via scratchpad copy-back (`/tmp/claude-1000/.../scratchpad/mutbak2/init_db.sh.gated`)
+— never `git checkout --`. `diff -q` confirmed byte-identical restoration; `bash -n`
+confirmed syntax; `git status --short shared-memory/scripts/init_db.sh` showed only the
+expected modified-vs-HEAD state (no stray diff from the mutation) after restore.
+
+### Suite count
+
+Full suite from the worktree root: **2516 passed, 1 skipped** (rebase baseline stated as
+2512/1; +4 new tests from this integration = 2516, matches exactly). No regressions, no
+test deleted, all green. `shared-memory/.env` still does not exist in this worktree —
+canary trivially satisfied, nothing to move. No live database, docker, or service
+touched at any point.
+
+### Same forbidden-files rules as the original brief — unchanged
+
+Only `shared-memory/scripts/init_db.sh` and `tests/test_init_db_ledger_adoption.py`
+touched for this integration. No version files, CHANGELOG, `sync_skills.sh`,
+`generate_tokens.py`/`bootstrap_tokens.sh`, or `.env` touched.
