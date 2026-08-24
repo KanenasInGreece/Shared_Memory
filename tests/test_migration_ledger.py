@@ -285,3 +285,57 @@ def test_status_on_a_genuinely_fresh_database_is_clean(monkeypatch, capsys):
 
     assert rc == 0
     assert "NEEDS ADOPTION" not in out
+
+
+# ── Fix B (corpus fact:1511/1512): the exit-2 no-ledger message must name
+# BOTH origins, not just the pre-v0.8.35 backup — a database schema_init.sql
+# just created on a FRESH install lands in this exact state (the framework
+# schema exists, the ledger does not), and is the COMMON origin, not the rare
+# one. The old message's "predates migration tracking (v0.8.35)" / "came from
+# a backup" framing gave a stranger running a fresh install no way to know
+# their own brand-new database is safe to adopt. Both branches that print
+# this explanation — the real refusal (rc == 2, stderr) and --status's
+# advisory printout (rc == 2, stdout) — must say so.
+
+def test_the_refusal_message_names_the_fresh_install_origin(monkeypatch, capsys):
+    """The real (non --status) refusal path -- reached by any invocation
+    that is not --status when needs_adoption() is True."""
+    rc = _run_main(monkeypatch, [], set(), framework=True)
+    err = capsys.readouterr().err
+
+    assert rc == 2
+    # Both origins named, not just the backup one.
+    assert "backup" in err.lower() and "v0.8.35" in err
+    assert "fresh install" in err.lower() or "FRESH INSTALL" in err
+    assert "schema_init.sql" in err
+    # The old, misleading single-origin framing must not survive verbatim —
+    # this asserts the fix, not merely an addition alongside stale text.
+    assert "This database predates migration tracking" not in err
+    # The remedy itself is unchanged: still --adopt, never re-running.
+    assert "apply.py --adopt" in err
+
+
+def test_the_status_advisory_also_names_the_fresh_install_origin(monkeypatch, capsys):
+    """--status's own "NEEDS ADOPTION" printout carries the same explanation
+    as the real refusal -- a reader who runs --status first must not be told
+    a narrower story than the one they'd get from a real run."""
+    rc = _run_main(monkeypatch, ["--status"], set(), framework=True)
+    out = capsys.readouterr().out
+
+    assert rc == 2
+    assert "NEEDS ADOPTION" in out
+    assert "backup" in out.lower() and "v0.8.35" in out
+    assert "fresh install" in out.lower() or "FRESH INSTALL" in out
+    assert "schema_init.sql" in out
+
+
+def test_a_genuinely_ahead_database_still_refuses_before_adoption_wording(monkeypatch, capsys):
+    """Control: the fresh-install wording only belongs to the adoption
+    message. An AHEAD database (rc == 3) must never print it — that refusal
+    is a different state with a different fix (update the checkout)."""
+    rc = _run_main(monkeypatch, [], AHEAD_LEDGER)
+    err = capsys.readouterr().err
+
+    assert rc == 3
+    assert "fresh install" not in err.lower()
+    assert "schema_init.sql" not in err

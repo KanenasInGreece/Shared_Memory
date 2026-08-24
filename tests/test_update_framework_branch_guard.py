@@ -232,10 +232,21 @@ def test_main_branch_produces_no_notice(tmp_path):
 # inside it would make --dry-run exit non-zero on a branch with no upstream
 # or an unreachable remote -- exactly backwards for a flag documented as
 # "print, run nothing". Under --dry-run the guard must print the same
-# refusal as an unmistakably PREDICTED outcome and let the rest of the dry
-# run's step previews keep printing, exiting 0.
+# refusal as an unmistakably PREDICTED outcome — refuse() returns rather
+# than exiting, via pull_blocked.
+#
+# ── RULING C (corpus fact:1511/1512, fix C): a predicted refusal must STOP
+# the dry run's own enumeration right there, not let it go on printing steps
+# 1+ as "(dry run — not executed)" as though a real run would reach them. A
+# REAL run hitting this same refusal calls die() and the process exits
+# immediately — nothing after step 0 ever runs. The OLD version of these two
+# tests (superseded here) asserted the opposite on purpose ("the dry run kept
+# going past the guard... backfill_domain_of.py in out") — that was the
+# measured defect (fresh-install-test finding (2)): a dry run that implied
+# the real run gets further than it does. The fix makes --dry-run's own
+# enumeration match what die() actually does: stop, and say so.
 
-def test_dry_run_no_upstream_predicts_refusal_but_exits_zero_and_continues(tmp_path):
+def test_dry_run_no_upstream_predicts_refusal_and_stops_enumerating(tmp_path):
     repo, log_path = _make_live_sandbox(tmp_path)
     env = _stub_path_env(tmp_path, log_path)
 
@@ -248,28 +259,32 @@ def test_dry_run_no_upstream_predicts_refusal_but_exits_zero_and_continues(tmp_p
     out = _strip_ansi(proc.stdout + proc.stderr)
     log_text = log_path.read_text()
 
-    assert proc.returncode == 0, out
+    assert proc.returncode != 0, out
     assert "has no upstream configured" in out, out
     assert "PREDICTED" in out, out
-    assert "Dry run complete" in out, out
-    # The dry run kept going past the guard: later steps still printed
-    # their own previews rather than the run stopping dead at step 0.
-    assert "backfill_domain_of.py" in out, (
-        f"a predicted refusal under --dry-run must not truncate the rest "
-        f"of the run's step previews:\n{out}"
+    assert "the real run stops here" in out, out
+    # The dry run must NOT go on to preview later steps as if a real run
+    # would reach them -- a real run never does, it dies at the refusal.
+    assert "backfill_domain_of.py" not in out, (
+        f"a predicted refusal under --dry-run kept enumerating later steps "
+        f"as if a real run would reach them:\n{out}"
     )
-    # git pull must never actually run -- the guard still blocks the ONE
-    # step it exists to block, it just doesn't kill the whole dry run.
+    assert "Dry run complete" not in out, (
+        f"the unconditional success banner must not print when the dry run "
+        f"itself predicted a refusal:\n{out}"
+    )
+    # git pull must never actually run.
     assert not any(
         line.startswith("git ") and " pull " in f" {line} "
         for line in log_text.splitlines()
     ), f"'git pull' was invoked despite the predicted refusal:\n{log_text}"
 
 
-def test_dry_run_detached_head_predicts_refusal_but_exits_zero(tmp_path):
-    """Same RULING 1 guarantee for the OTHER die() this guard used to have
-    -- the detached-HEAD refusal, which fires before UPDATE_BRANCH is even
-    set."""
+def test_dry_run_detached_head_predicts_refusal_and_stops_enumerating(tmp_path):
+    """Same RULING C guarantee for the OTHER refuse() this guard has -- the
+    detached-HEAD refusal, which fires before UPDATE_BRANCH is even set. Also
+    pins fix D: the remedy names `main` concretely rather than the generic
+    'the release branch or tag you intend to run'."""
     repo, log_path = _make_live_sandbox(tmp_path)
     env = _stub_path_env(tmp_path, log_path)
 
@@ -278,10 +293,55 @@ def test_dry_run_detached_head_predicts_refusal_but_exits_zero(tmp_path):
     proc = _run_live(repo, env, "--dry-run", "--skip-backup")
     out = _strip_ansi(proc.stdout + proc.stderr)
 
-    assert proc.returncode == 0, out
+    assert proc.returncode != 0, out
     assert "DETACHED HEAD" in out, out
     assert "PREDICTED" in out, out
+    assert "git checkout main" in out, out
+    assert "the real run stops here" in out, out
+    assert "backfill_domain_of.py" not in out, (
+        f"a predicted refusal under --dry-run kept enumerating later steps:\n{out}"
+    )
+    assert "Dry run complete" not in out, out
+
+
+def test_dry_run_remote_branch_deleted_predicts_refusal_and_stops_enumerating(tmp_path):
+    """RULING A's measured case (PR merged, remote branch deleted), under
+    --dry-run: same truncation guarantee as the other two refusal states."""
+    repo, log_path = _make_live_sandbox(tmp_path)
+    remote = tmp_path / "remote.git"
+    env = _stub_path_env(tmp_path, log_path)
+
+    _checkout_new_branch(repo, "fix/some-merged-feature-dry-run")
+    _push_upstream(repo, "fix/some-merged-feature-dry-run")
+    _delete_branch_on_remote(remote, "fix/some-merged-feature-dry-run")
+
+    proc = _run_live(repo, env, "--dry-run", "--skip-backup")
+    out = _strip_ansi(proc.stdout + proc.stderr)
+
+    assert proc.returncode != 0, out
+    assert "no longer exists on origin" in out, out
+    assert "PREDICTED" in out, out
+    assert "the real run stops here" in out, out
+    assert "backfill_domain_of.py" not in out, out
+    assert "Dry run complete" not in out, out
+
+
+# ── Control: a refusal-free dry run must still enumerate everything ─────────
+# (unaffected by RULING C -- proves the truncation is scoped to an actual
+# predicted refusal, not a side effect of --dry-run itself.)
+
+def test_dry_run_with_a_healthy_branch_still_enumerates_every_step(tmp_path):
+    repo, log_path = _make_live_sandbox(tmp_path)
+    env = _stub_path_env(tmp_path, log_path)
+
+    proc = _run_live(repo, env, "--dry-run", "--skip-backup")
+    out = _strip_ansi(proc.stdout + proc.stderr)
+
+    assert proc.returncode == 0, out
     assert "Dry run complete" in out, out
+    assert "backfill_domain_of.py" in out, (
+        f"a dry run with no predicted refusal must still preview every step:\n{out}"
+    )
 
 
 # ── RULING 2 (this branch): "no answer" is NOT "branch deleted" ─────────────

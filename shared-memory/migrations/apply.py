@@ -50,6 +50,17 @@ it once per pre-existing deployment, and run it BEFORE adding any new migration
 file: anything present at adopt time is marked done without ever having run. A
 fresh database needs none of this — with no framework tables present every
 migration is genuinely pending, and they are applied in order.
+
+A SECOND origin lands here too, and it is not rare: a database created by THIS
+checkout's own schema_init.sql. That file is generated FROM the migrations
+(generate_schema_init.py) but deliberately does not create schema_migrations
+itself, so a brand-new install has the framework schema and an empty ledger —
+exactly the shape this refusal exists to catch, even though nothing here needs
+adopting blind. `init_db.sh` calls `--adopt` itself immediately after creating
+the schema, because that is the one moment adopting is not a guess: the schema
+was created HERE, by THIS run, from the migrations this checkout ships. Reaching
+this refusal by hand still means one of the two origins above — decide which
+before running `--adopt`.
 """
 
 import os
@@ -303,8 +314,13 @@ def main() -> int:
             if adoption:
                 print("\n  NEEDS ADOPTION: the framework schema exists but the "
                       "ledger is empty.")
-                print("    Those migrations have already run — this database "
-                      "predates migration tracking (v0.8.35).")
+                print("    Those migrations have already run. Two origins produce "
+                      "this state: a backup taken before v0.8.35 (the ledger did "
+                      "not exist yet), OR a database schema_init.sql just created "
+                      "on a fresh install (it deliberately does not create the "
+                      "ledger itself) — a database created that way is safe to "
+                      "adopt: schema_init.sql IS every migration file, generated "
+                      "from them.")
                 print("    The pending list above is NOT a list of work to do.")
                 print("    Record them as applied, without running them:")
                 print("        ... apply.py --adopt")
@@ -333,15 +349,27 @@ def main() -> int:
         # because migration 002's dedup is separately guarded.
         if needs_adoption(framework, applied):
             print(
-                "This database predates migration tracking: the framework schema "
-                "exists but no migration ledger does.\n\n"
-                "The previous tool re-ran every migration on every invocation, so "
-                "these migrations HAVE been applied. Record that once, without "
-                "running them again:\n\n"
+                "This database has the framework schema but NO migration ledger.\n\n"
+                "Two origins produce this state, and both mean these migrations "
+                "HAVE been applied:\n\n"
+                "  1. A backup taken before v0.8.35 — the ledger did not exist yet, "
+                "and the previous tool re-ran every migration on every invocation.\n"
+                "  2. A FRESH INSTALL — this is the common case, not the rare one. "
+                "schema_init.sql (what init_db.sh applies) is generated FROM the "
+                "migration files and deliberately does not create schema_migrations "
+                "itself, so a brand-new database lands here too. A database created "
+                "this way IS safe to adopt: schema_init.sql IS every migration file "
+                "in this checkout, applied at once.\n\n"
+                "Record that once, without running them again:\n\n"
                 "    ... apply.py --adopt\n\n"
                 "Then re-run this command. Re-running the migrations instead is "
                 "NOT safe: each was written against the schema as it stood at the "
-                "time, and one deletes rows on a key a later migration changed.",
+                "time, and one deletes rows on a key a later migration changed.\n\n"
+                "⛔ Do not adopt a database you cannot vouch for. Adoption marks "
+                "every migration present today as done; anything genuinely missing "
+                "stays missing, silently. A database from origin (2) above — "
+                "created by THIS checkout's own schema_init.sql — is exactly the "
+                "case you CAN vouch for.",
                 file=sys.stderr)
             return 2
 

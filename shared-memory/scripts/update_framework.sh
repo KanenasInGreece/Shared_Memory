@@ -320,18 +320,23 @@ fi
 # the top of .env; this refuses rather than guessing, because `git pull` in a
 # directory that was never a checkout fails in a way that reads as broken tooling
 # rather than as the wrong procedure. (Measured: it failed on a detached HEAD.)
+# pull_blocked tracks a refuse() that fired under --dry-run (which returns
+# rather than exiting) so the block below knows to skip 'git pull' — and, past
+# the end of this whole step-0 block, so a --dry-run run can stop enumerating
+# right there instead of previewing steps 1+ as if a real run would reach
+# them. On a real run refuse() calls die() and this variable is never read:
+# the process has already exited. Declared here, before the .git check, so
+# BOTH branches below (real checkout and tarball tree) share one flag.
+pull_blocked=0
 if [[ "$FROM_RESTORE" == "0" ]]; then
     if [[ -d "$REPO_ROOT/.git" ]]; then
         branch="$(git -C "$REPO_ROOT" symbolic-ref --quiet --short HEAD || true)"
-        # pull_blocked tracks a refuse() that fired under --dry-run (which
-        # returns rather than exiting) so the block below knows to skip
-        # 'git pull' without also skipping the rest of the dry run. On a
-        # real run refuse() calls die() and this variable is never read.
-        pull_blocked=0
         if [[ -z "$branch" ]]; then
             refuse "this checkout is on a DETACHED HEAD — 'git pull' has no branch to
-  update. Check out the release branch or tag you intend to run, then re-run.
-  (Or use the tarball route and re-run with --from-restore semantics.)" || pull_blocked=1
+  update. This framework's release branch is main: run 'git checkout main' to
+  return to it, then re-run. (If you deliberately want a specific pinned tag
+  rather than the moving branch, check that tag out instead — or use the
+  tarball route and re-run with --from-restore semantics.)" || pull_blocked=1
         else
             UPDATE_BRANCH="$branch"
             _branch_notice
@@ -407,8 +412,21 @@ if [[ "$FROM_RESTORE" == "0" ]]; then
     else
         refuse "no .git here — this host took the TARBALL route. Unpack the new
   tag's tarball beside this tree, carry shared-memory/.env across, and run this
-  script from the NEW directory. There is nothing for 'git pull' to do." || true
+  script from the NEW directory. There is nothing for 'git pull' to do." || pull_blocked=1
     fi
+fi
+
+# ── RULING C: a --dry-run that predicted a refusal above must not go on to
+# enumerate steps 1+ as "(dry run — not executed)" — a REAL run would have
+# died() at the refusal itself and never reached them. Stop the dry run's own
+# enumeration at the same point, so what it prints matches what a real run
+# would actually attempt. Reachable ONLY under --dry-run: on a real run,
+# refuse() calls die() and exits before pull_blocked is ever read here.
+if [[ "$pull_blocked" == "1" ]]; then
+    echo
+    red "✗ [DRY RUN] the real run stops here — step 0 would refuse (see above)."
+    red "  Steps 1 onward are UNREACHABLE from this state and were not evaluated."
+    exit 1
 fi
 
 # ── Step 1: safeguard the data BEFORE any migration touches it ───────────────
@@ -471,9 +489,11 @@ if [[ "$DRY_RUN" == "0" && "$rc" == "2" ]]; then
     die "this database has the framework schema but NO migration ledger (apply.py
   exit 2, message above). Nothing was migrated.
 
-  If it came from a backup taken before v0.8.35, that is expected — the ledger
-  did not exist yet, and those migrations HAVE been applied. Record that once,
-  WITHOUT re-running them, then re-run this script:
+  apply.py's own message above names both origins this reaches from — a backup
+  taken before v0.8.35, or an install whose init_db.sh predates the automatic
+  adoption step it now runs right after creating the schema. Either way those
+  migrations HAVE been applied. Record that once, WITHOUT re-running them, then
+  re-run this script:
 
       uv run --with psycopg2-binary python shared-memory/migrations/apply.py --adopt
 
@@ -575,11 +595,18 @@ fi
 # permission to write — so early is safe but pointless, and this ordering makes
 # "safe but pointless" into "correct".
 #
-# ⚠ The preview used to run here and --apply on the very next line, with no
-# pause between them: an operator could read what WOULD be enqueued only after
-# it already had been. A preview nobody can act on is decoration, so the preview
-# now belongs to --dry-run (where it is the whole point) and a real run applies
-# once. The applied run reports what it did, which is the record that matters.
+# ⚠ Since v0.9.35 a real run applies ONCE (no separate preview step first) —
+# the applied run reports what it did, which is the record that matters.
+#
+# ⛔ --dry-run must state what a REAL run actually does, not what an unflagged
+# invocation of the underlying script would do on its own. A real run of THIS
+# step always passes --apply (see the `else` branch below) — measured live: a
+# real run enqueued several hundred outbox rows on a deployment carrying
+# pre-domain-axis records. Showing the bare (preview-only) invocation here
+# under --dry-run would understate that: an operator reading "enqueues
+# nothing" would not expect a write. The command line and label below now
+# match the `else` branch exactly except for the label text, so what prints
+# under --dry-run is the command a real run would execute, not a milder one.
 #
 # ⛔ --no-domain-backfill declines the migration for THIS run only — default
 # behaviour is unchanged, and every step after this one keeps its number
@@ -590,9 +617,9 @@ if [[ "$NO_DOMAIN_BACKFILL" == "1" ]]; then
     echo "   SKIPPED — --no-domain-backfill given. No repair rows were enqueued;"
     echo "   re-run without the flag when you are ready to apply it."
 elif [[ "$DRY_RUN" == "1" ]]; then
-    run "domain backfill — preview (enqueues nothing)" \
+    run "domain backfill — a REAL run APPLIES this by default (writes domain rows via the outbox; pass --no-domain-backfill to skip it for one run)" \
         uv run --with psycopg2-binary python \
-        "$REPO_ROOT/shared-memory/scripts/backfill_domain_of.py"
+        "$REPO_ROOT/shared-memory/scripts/backfill_domain_of.py" --apply
 else
     run "domain backfill — apply (AFTER the restart; see the guard above)" \
         uv run --with psycopg2-binary python \
