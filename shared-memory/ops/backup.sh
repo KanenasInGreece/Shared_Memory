@@ -209,6 +209,16 @@ QUIESCED=0
 # does not touch this — do_backup reads it before resume() runs, same as it
 # must read QUIESCED itself before resume() zeroes that.
 QUIESCE_MODE=""
+# Set by quiesce() on every path that returns 1 (skipped/failed), so the
+# "proceeding WITHOUT quiesce" message can say WHICH of the three distinct
+# reasons it was — measured on a documented upgrade run: the message used to
+# fold "gateway unreachable" and "no admin token" into one string, and an
+# operator reading it afterward could not tell which had actually happened,
+# or whether they had a token at all vs. one that was simply rejected.
+# Declared here (defined before the trap, `set -u`) for the same reason
+# QUIESCED/QUIESCE_MODE are — do_backup reads it, never on_exit, but keeping
+# every variable that flow can reach defined this early costs nothing.
+QUIESCE_SKIP_REASON=""
 
 # One trap, active for the whole script (not just do_backup): resume() is a
 # no-op unless quiesce() actually succeeded (QUIESCED guard), and
@@ -219,20 +229,40 @@ on_exit() { resume; cleanup_secrets_dir; }
 trap on_exit EXIT INT TERM
 
 # ── Quiesce handshake ────────────────────────────────────────────────────────
+# Three DISTINCT ways this can fail to engage, each needing a different
+# operator fix — quiesce() names which one in QUIESCE_SKIP_REASON before
+# returning 1, so do_backup's "proceeding WITHOUT quiesce" message can say it:
+#   (1) no admin token           — BACKUP_ADMIN_TOKEN was never set
+#   (2) gateway unreachable      — the curl call itself failed (down host,
+#                                   wrong GATEWAY_URL, network)
+#   (3) token lacks the role     — a token WAS presented and the gateway WAS
+#                                   reachable, but it answered 401 (rejected/
+#                                   expired) or 403 (valid, not admin-role)
+# >>> QUIESCE_FN
 quiesce() {
-  [[ -z "$BACKUP_ADMIN_TOKEN" ]] && return 1
+  if [[ -z "$BACKUP_ADMIN_TOKEN" ]]; then
+    QUIESCE_SKIP_REASON="no admin token — BACKUP_ADMIN_TOKEN is unset; mint one with bootstrap_tokens.sh --add (role=admin) and set it in shared-memory/.env"
+    return 1
+  fi
   local resp code body
-  resp="$(qcurl -w $'\n%{http_code}' -X POST "$GATEWAY_URL/admin/backup" \
+  if ! resp="$(qcurl -w $'\n%{http_code}' -X POST "$GATEWAY_URL/admin/backup" \
     -H "@$_AUTH_HEADER_FILE" -H 'Content-Type: application/json' \
-    -d "{\"state\":\"quiesce\",\"max_seconds\":$BACKUP_QUIESCE_MAX_SECONDS}")" || return 1
+    -d "{\"state\":\"quiesce\",\"max_seconds\":$BACKUP_QUIESCE_MAX_SECONDS}")"; then
+    QUIESCE_SKIP_REASON="gateway unreachable at $GATEWAY_URL — check it is running (systemctl --user status hive-mind-gateway.service) and that GATEWAY_URL is correct"
+    return 1
+  fi
   code="$(tail -n1 <<<"$resp")"; body="$(sed '$d' <<<"$resp")"
   case "$code" in
     200) QUIESCED=1; QUIESCE_MODE="full";    grn "  ✓ quiesced — client writes shed, daemons drained" ;;
     202) QUIESCED=1; QUIESCE_MODE="timeout"; ylw "  ! quiesced — daemon drain TIMED OUT; a daemon may write during the dump ($(json_get daemons <<<"$body"))" ;;
-    *)   ylw "  ! quiesce request returned HTTP $code"; return 1 ;;
+    401) QUIESCE_SKIP_REASON="BACKUP_ADMIN_TOKEN was rejected (HTTP 401 — invalid or expired); re-mint it with bootstrap_tokens.sh"; return 1 ;;
+    403) QUIESCE_SKIP_REASON="BACKUP_ADMIN_TOKEN lacks the admin role (HTTP 403) — re-run bootstrap_tokens.sh --add with role=admin for this token"; return 1 ;;
+    "")  QUIESCE_SKIP_REASON="gateway unreachable at $GATEWAY_URL (no HTTP response)"; return 1 ;;
+    *)   QUIESCE_SKIP_REASON="quiesce request returned HTTP $code from $GATEWAY_URL"; ylw "  ! quiesce request returned HTTP $code"; return 1 ;;
   esac
   return 0
 }
+# <<< QUIESCE_FN
 resume() {
   [[ "$QUIESCED" -eq 1 ]] || return 0
   dcurl -X POST "$GATEWAY_URL/admin/backup" \
@@ -445,8 +475,8 @@ do_backup() {
   # Quiesce (best-effort unless required).
   if quiesce; then drain_outbox
   else
-    if [[ "$BACKUP_QUIESCE_REQUIRED" == "1" ]]; then die "quiesce required but unavailable (set BACKUP_ADMIN_TOKEN / check gateway)"; fi
-    ylw "  ! proceeding WITHOUT quiesce (gateway unreachable or no admin token) — online dumps, restore self-heals"
+    if [[ "$BACKUP_QUIESCE_REQUIRED" == "1" ]]; then die "quiesce required but unavailable: ${QUIESCE_SKIP_REASON:-reason unknown}"; fi
+    ylw "  ! proceeding WITHOUT quiesce (${QUIESCE_SKIP_REASON:-reason unknown}) — online dumps, restore self-heals"
   fi
 
   # Counts captured under quiesce for the manifest.

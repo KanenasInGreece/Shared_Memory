@@ -42,6 +42,7 @@ import re
 import socket
 import struct
 import time
+import urllib.parse
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -1679,12 +1680,72 @@ NEO4J_ACQUIRE_TIMEOUT = _env_float("NEO4J_ACQUIRE_TIMEOUT", 30.0)
 # localhost (measured on a LAN embedder: passthrough answered from the remote,
 # saves kept using the local container). The port is a default, never an assumption.
 def _encoder_url(env_name: str, default_base: str, path: str) -> str:
-    """Full endpoint for an encoder backend: env-overridable BASE + fixed PATH."""
+    """Full endpoint for an encoder backend: env-overridable BASE + fixed PATH.
+
+    Validated at the same time it is derived (module import/reload) so a bad
+    value is caught before the process ever accepts traffic, rather than
+    surfacing as an opaque connection error on the first save/search:
+      - the resolved BASE must be an http(s) URL — anything else (a bare
+        host, a typo'd scheme, a leftover placeholder) fails LOUDLY, naming
+        env_name, rather than producing a confusing httpx/aiohttp exception
+        deep inside _embed()/_rerank() on the first real request.
+      - a base carrying ANY path segment only WARNS (never fails): the path
+        this function appends always starts with "/v1/...", so ANY existing
+        path on the base — not only a base ending in exactly "/v1" — gets a
+        second path appended after it. L4 (PR #308 review): the original
+        check only matched a base ending in "/v1" literally, so a plausible
+        copy-paste like "http://h:8070/v1/embeddings" (the full endpoint,
+        pasted as if it were the base) silently doubled the whole path with
+        no warning at all.
+    """
     base = (os.environ.get(env_name) or default_base).strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(base)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"{env_name} must be an http(s) URL, got {base!r} "
+            f"(scheme {parsed.scheme!r}) — check {env_name} in shared-memory/.env"
+        )
+    if parsed.path:
+        log.warning(
+            "%s (%s) already carries a path (%r) — the resolved endpoint "
+            "will be %s%s, appending onto whatever is already there. "
+            "%s should normally be just scheme://host[:port], with no path.",
+            env_name, scrub_url_credentials(base), parsed.path,
+            scrub_url_credentials(base), path, env_name,
+        )
     return f"{base}{path}"
 
 EMBED_URL  = _encoder_url("EMBEDDER_URL", "http://localhost:8070", "/v1/embeddings")
 RERANK_URL = _encoder_url("RERANKER_URL", "http://localhost:8071", "/v1/reranking")
+
+# M1 (PR #308 review): this USED to log right here, at module import — but
+# hive_mind_proxy.py imports coordinator (line 55) BEFORE its own
+# logging.basicConfig() call (line ~85), and a named logger's .info() before
+# basicConfig is dropped (root defaults to WARNING; Python's "lastResort"
+# handler is WARNING-and-above only). Verified in isolation: the /v1 WARNING
+# above survives that gap (it reaches lastResort), the INFO line did not —
+# it never appeared in the running gateway's own journal, which is exactly
+# the debugging surface review finding F6 (PR #307) added it for. Moved to
+# a plain function, called once from MemoryCoordinator.start() — which only
+# ever runs from hive_mind_proxy's real startup path, strictly after
+# basicConfig has configured the root logger — instead of firing at import.
+_encoder_endpoints_logged = False
+
+def log_encoder_endpoints() -> None:
+    """Log the resolved encoder endpoints once per process, scrubbed the same
+    way the failure-path messages already are (see _embed()'s
+    scrub_url_credentials use) so a credential embedded in the URL never
+    lands in a log file even on the success path. Idempotent — a second
+    call is a no-op, so a caller does not need to track whether it already
+    fired."""
+    global _encoder_endpoints_logged
+    if _encoder_endpoints_logged:
+        return
+    _encoder_endpoints_logged = True
+    log.info(
+        "encoder endpoints resolved: EMBED_URL=%s RERANK_URL=%s",
+        scrub_url_credentials(EMBED_URL), scrub_url_credentials(RERANK_URL),
+    )
 
 EMBED_RETRIES = 4
 EMBED_BACKOFF = 0.5      # seconds × attempt number  (0.5 s, 1 s, 1.5 s, 2 s)
@@ -2328,6 +2389,14 @@ class MemoryCoordinator:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
+        # M1 (PR #308 review): logged HERE, not at module import — this only
+        # ever runs from the real gateway startup path, strictly after
+        # hive_mind_proxy.py's logging.basicConfig() has configured the root
+        # logger, so the INFO line is actually visible in the journal. See
+        # log_encoder_endpoints()'s docstring for the import-time defect this
+        # replaces (a caplog-forced test hid it: the fixture installs its own
+        # handler, so it never observed the real, unconfigured logger).
+        log_encoder_endpoints()
         self._pool = await asyncpg.create_pool(
             PG_DSN, min_size=POOL_MIN, max_size=POOL_MAX,
             init=self._init_connection,

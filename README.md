@@ -170,8 +170,10 @@ search fell from ~30 to under 5 seconds (~6×), and the reranker — which on a 
 time out — answers in under a second. GPU support is whatever your encoder server supports:
 the shipped GPU pair is llama.cpp's Vulkan image — one image for Intel, AMD and NVIDIA, swap
 the tag for CUDA — and hosting the encoders outside the stack with vLLM, LM Studio or bare
-`llama-server` is equally legitimate; the gateway only needs endpoints that answer. The LLM
-stays online; ①'s caveat pointers apply unchanged.
+`llama-server` is equally legitimate; the gateway only needs endpoints that answer. On a card
+where the pair does not both fit, `EMBEDDER_GPU_REPLICAS`/`RERANKER_GPU_REPLICAS` move ONE
+encoder at a time instead of the pair together ([§17](#17-inference-the-encoders-and-the-reasoning-llm)).
+The LLM stays online; ①'s caveat pointers apply unchanged.
 *Example minimum: 4–8 threads · 16 GB RAM · 4 GB VRAM · 30 GB disk.*
 
 **③ Everything local.** A local reasoning LLM, the cloud an option rather than a necessity —
@@ -718,7 +720,12 @@ Intel, AMD and NVIDIA), off by default — the choice is two `.env` lines, `GPU_
 and `CPU_ENCODER_REPLICAS=0`, and what you run never diverges from what ships. If you have one
 GPU to allocate, the compromise is plain: a card with enough VRAM for your reasoning model is
 usually better spent on the model backend, while a small card — 4 GB, say — is best spent on
-the encoders, which fit in about 2 GB and repay it in search latency. Your call, always.
+the embedder, which fits in about 2 GB and repays it in search latency — not the reranker, whose
+context window does not fit there (measured below). Your call, always. That
+pair-wise switch moves both encoders together; `EMBEDDER_GPU_REPLICAS`/`EMBEDDER_CPU_REPLICAS`
+and `RERANKER_GPU_REPLICAS`/`RERANKER_CPU_REPLICAS` move one at a time instead, for a card too
+small for both — measured on a 4 GB card, the embedder fits (671 MB) but the reranker's
+8192-token context window does not (`shared-memory/.env.example` has the full knob list).
 On CPU, `RERANK_MAX_DOC_CHARS` bounds what the
 reranker scores — a concession, not a free win: capping at 2,000 chars kept about half of
 reranking's improvement in our measurements. Run the encoders however you please — Docker, bare
