@@ -30,7 +30,7 @@ from multidict import CIMultiDict
 # every secret it held. It is now the shared split loader also used by
 # rem_loop.py and consolidation_loop.py — see secure_env.py.
 from secure_env import load_split_env, get_secret, is_secret_key  # noqa: E402
-from log_hygiene import append_secure, secure_path, FILE_MODE  # noqa: E402
+from log_hygiene import append_secure, secure_path, scrub_url_credentials, FILE_MODE  # noqa: E402
 # M9 (fix round): _chmod_created_ancestors is a private log_hygiene member --
 # the only thing this module needs from it that has no public equivalent
 # (secure_path's own dir-hardening is entangled with its append-mode open,
@@ -111,8 +111,11 @@ _rem_healthy:    bool = False  # True while the REM subprocess is alive
 # the ports this stack happens to use are a default, never an assumption. Clients
 # still only ever call the gateway (the 1024-dim mandate is unchanged); this is
 # where the gateway itself forwards to.
-EMBEDDER_URL = os.environ.get("EMBEDDER_URL", "http://localhost:8070").rstrip("/")
-RERANKER_URL = os.environ.get("RERANKER_URL", "http://localhost:8071").rstrip("/")
+# `or`, not a get() default: an EMPTY value (EMBEDDER_URL= in .env) means "the
+# default", the same reading the coordinator gives the same variable — the two
+# consumers must never disagree on where the encoder is.
+EMBEDDER_URL = (os.environ.get("EMBEDDER_URL") or "http://localhost:8070").strip().rstrip("/")
+RERANKER_URL = (os.environ.get("RERANKER_URL") or "http://localhost:8071").strip().rstrip("/")
 ROUTING_MAP = {
     "/v1/embeddings": EMBEDDER_URL,
     "/v1/reranking":  RERANKER_URL,
@@ -1069,24 +1072,9 @@ HOP_BY_HOP = frozenset({
 
 
 def _scrub_url_credentials(text: str) -> str:
-    """Security review O-6: strip userinfo (user:pass@) and the query string
-    from any http(s) URL found in `text` before it reaches a client-visible
-    body or the gateway log. A ClientError's own __str__ can render the full
-    request URL (aiohttp's InvalidURL does), and a real provider pattern
-    puts a credential in a URL — a `?key=...` query parameter, or userinfo —
-    so echoing that text verbatim is a provider-key leakage path. Only the
-    scheme/host/port/path survive; never raises (a malformed "URL" that
-    urlsplit chokes on is replaced outright rather than echoed unscrubbed)."""
-    def _scrub(m: "re.Match") -> str:
-        try:
-            parsed = urllib.parse.urlsplit(m.group(0))
-            netloc = parsed.hostname or ""
-            if parsed.port:
-                netloc += f":{parsed.port}"
-            return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
-        except Exception:
-            return "<url-redacted>"
-    return re.sub(r"https?://\S+", _scrub, text)
+    """Security review O-6 — see log_hygiene.scrub_url_credentials (shared with
+    the coordinator since v0.9.50, when its encoder URLs became operator-supplied)."""
+    return scrub_url_credentials(text)
 
 
 def _safe_request_id(request) -> "str | None":

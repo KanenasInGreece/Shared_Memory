@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -177,3 +179,26 @@ class AsyncLineWriter:
                 except BaseException:
                     pass
                 self._task = None
+
+
+def scrub_url_credentials(text: str) -> str:
+    """Security review O-6: strip userinfo (user:pass@) and the query string
+    from any http(s) URL found in `text` before it reaches a client-visible
+    body or a log. An exception's own __str__ can render the full request URL
+    (aiohttp's InvalidURL and httpx's HTTPStatusError both do), and a real
+    provider pattern puts a credential in a URL — a `?key=...` query parameter,
+    or userinfo — so echoing that text verbatim is a key-leakage path. Shared
+    here because BOTH the gateway (LLM backends) and the coordinator (its own
+    EMBEDDER_URL / RERANKER_URL calls) render such errors; the coordinator
+    cannot import the gateway module. Only scheme/host/port/path survive; never
+    raises (a "URL" urlsplit chokes on is replaced outright, not echoed)."""
+    def _scrub(m: "re.Match") -> str:
+        try:
+            parsed = urllib.parse.urlsplit(m.group(0))
+            netloc = parsed.hostname or ""
+            if parsed.port:
+                netloc += f":{parsed.port}"
+            return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+        except Exception:
+            return "<url-redacted>"
+    return re.sub(r"https?://\S+", _scrub, text)

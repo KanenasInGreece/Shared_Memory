@@ -5,6 +5,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.50] — 2026-08-24
+
+### Fixed — one setting now moves the encoders, for the coordinator too
+
+- **`EMBEDDER_URL` / `RERANKER_URL` reach the coordinator's own save and search calls.** The
+  gateway's routing map read them, but the coordinator held two literals (`localhost:8070`,
+  `localhost:8071`) for the embedding and reranking it performs itself — so pointing
+  `EMBEDDER_URL` at a remote encoder redirected only the raw `/v1/embeddings` passthrough while
+  every real save and search kept embedding on the local container. Measured on a LAN embedder:
+  the passthrough answered from the remote host, the saves did not. Both endpoints now derive
+  from the same env base the gateway uses (`_encoder_url`), with the local ports as defaults;
+  `.env.example` states that the variables are base URLs and that there is no second place to
+  point. Four tests pin the defaults, the override, and the empty-value fallback.
+- **Encoder errors cannot leak a credential placed in the URL.** With the encoder URLs now
+  operator-supplied, an `httpx` error string renders the full request URL — `user:pass@`
+  included — and that string was the body of the 503 a client sees. The O-6 scrubber moved
+  from the gateway into `log_hygiene.py` and now covers the coordinator's three encoder
+  error sites too; the message names the encoder host and `EMBEDDER_URL` instead of asking
+  whether the gateway is running (it never called the gateway for this). The gateway's
+  routing map and the coordinator also read an *empty* `EMBEDDER_URL=` identically now
+  (both fall back to the local default; the gateway previously routed to `''`). Three more
+  tests: the two consumers agree, the 503 body carries the host but never the userinfo,
+  and the module is restored after every reload. *(Independent review of PR #307: 1 High,
+  3 Medium, 2 Low — all integrated except a startup URL-shape check, deferred.)*
+
+---
+
 ## [0.9.49] — 2026-08-24
 
 ### Fixed — a mistyped memory request now fails and says why
