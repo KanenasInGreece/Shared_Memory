@@ -131,6 +131,19 @@ CREDENTIALED_BACKEND_ALLOWED_ROUTES = frozenset({
     ("POST", "/v1/embeddings"),
     ("POST", "/v1/reranking"),
 })
+# fact:1535 (route-guard): a mistyped or wrong-method framework request must
+# FAIL AND SAY WHY, not fall through the catch-all into a reasoning-LLM
+# dispatch (mcp/vector-skill.py's review_edges did exactly this — GET where
+# the gateway registers POST-only — and the request was silently forwarded
+# to the LLM pool as if it were a chat completion). RESERVED_ROUTE_PREFIXES
+# is the ONLY hand-written table this guard uses: which path namespaces are
+# framework-owned, so an unrecognised path under one of them is a mistyped
+# framework call (404) rather than a legitimate LLM-passthrough path (which
+# is everything NOT under these prefixes, and keeps today's behaviour). The
+# actual known ROUTES — and their allowed methods — are never hand-written;
+# see AsyncHiveMindProxy.set_known_routes(), which derives them from the
+# app router itself (decision:1032 class — never write what can be derived).
+RESERVED_ROUTE_PREFIXES = ("/memory/", "/admin/")
 # Embeddings/reranking bodies at or under this size get buffered (not streamed),
 # which is what makes the stale-connection retry possible for them. Every real
 # caller (coordinator._embed) sends one text field capped at EMBED_MAX_CHARS
@@ -1182,6 +1195,48 @@ UPSTREAM_DISCONNECT = (ServerDisconnectedError,)
 class AsyncHiveMindProxy:
     def __init__(self):
         self.session: ClientSession | None = None
+        # Populated by set_known_routes() at startup, once, from the app
+        # router — see that method's docstring and the route-guard fields
+        # this backs: {key: {"pattern": re.Pattern | None, "methods": set[str]}}.
+        # A key is a PlainResource's exact path, or a DynamicResource's
+        # formatter string (e.g. "/memory/status/{pg_id}") — either way it's
+        # only ever used as a dict key, never matched by string equality for
+        # the dynamic case (that's what "pattern" is for).
+        self._known_routes: dict = {}
+
+    def set_known_routes(self, router: "web.UrlDispatcher") -> None:
+        """Snapshot the framework's registered routes (method + path pattern)
+        for the wrong-method/unknown-path guard in handle_proxy.
+
+        Derived from the router itself, never a hand-written table
+        (decision:1032 class — never write what can be derived): every
+        /memory/* and /admin/* route attach() registers, plus /health and
+        /pool/status, is picked up automatically, so a future route added
+        anywhere in the app is covered without touching this method.
+
+        MUST be called after attach_coordinator() and the /health,
+        /pool/status registrations, and BEFORE the catch-all route
+        ("*", "/{tail:.*}") is added — calling it after the catch-all would
+        capture the catch-all's own wildcard resource as if it were a real
+        framework route, defeating the guard entirely. Calling it at this
+        point in startup is what excludes the catch-all "automatically",
+        rather than by name/identity filtering.
+        """
+        known: dict = {}
+        for route in router.routes():
+            resource = route.resource
+            if resource is None:
+                continue
+            info = resource.get_info()
+            # PlainResource → {"path": "/memory/save"}; DynamicResource →
+            # {"formatter": "/memory/status/{pg_id}", "pattern": re.Pattern}.
+            # (Measured against aiohttp 3.14 — see HANDOFF.md.)
+            key = info.get("path", info.get("formatter"))
+            if key is None:
+                continue
+            entry = known.setdefault(key, {"pattern": info.get("pattern"), "methods": set()})
+            entry["methods"].add(route.method)
+        self._known_routes = known
 
     async def start_session(self) -> None:
         connector = TCPConnector(
@@ -1243,7 +1298,70 @@ class AsyncHiveMindProxy:
             }
         return result
 
+    def _route_guard(self, request: web.Request) -> "web.Response | None":
+        """fact:1535 — run BEFORE any ROUTING_MAP/LLM dispatch decision.
+
+        handle_proxy is the catch-all handler: by construction, aiohttp only
+        ever reaches it for a (method, path) pair no specific resource
+        accepted — either because the path matches a real framework
+        resource but the METHOD doesn't (aiohttp's own router can't surface
+        that as 405 here, because the catch-all's method="*" absorbs every
+        method once a specific resource declines to match), or because the
+        path is genuinely unregistered. This tells the two apart using the
+        route view set_known_routes() derived from the router itself:
+
+        - Path matches a known resource, method doesn't → 405, Allow header
+          naming the accepted method(s), body says the request was NOT
+          forwarded to any LLM backend (same voice as the 401/403 replies
+          coordinator.auth_middleware raises — fact:1503 class: informative,
+          says explicitly what did NOT happen, so a retry can be safe).
+        - Path doesn't match any known resource, but starts with a reserved
+          framework prefix (/memory/, /admin/) → 404, same voice.
+        - Anything else → None (today's ROUTING_MAP/LLM behaviour, unchanged
+          — the LM Studio passthrough for /v1/chat/completions and any
+          non-framework path is a supported contract, not a mistyped call).
+        """
+        path = request.path
+        methods = None
+        for key, entry in self._known_routes.items():
+            pattern = entry["pattern"]
+            if pattern is not None:
+                if pattern.fullmatch(path):
+                    methods = entry["methods"]
+                    break
+            elif key == path:
+                methods = entry["methods"]
+                break
+
+        if methods is not None:
+            allow = ", ".join(sorted(methods))
+            return web.json_response(
+                {"error": f"Method {request.method} not allowed on {path}. "
+                          f"This framework route accepts: {allow}. The "
+                          f"request was NOT forwarded to any LLM backend — "
+                          f"correct the method and retry."},
+                status=405,
+                headers={"Allow": allow, "X-SM-Fault-Origin": "gateway"},
+            )
+        if path.startswith(RESERVED_ROUTE_PREFIXES):
+            return web.json_response(
+                {"error": f"No such framework route: {path}. This path is "
+                          f"not registered under the framework's reserved "
+                          f"prefix. The request was NOT forwarded to any LLM "
+                          f"backend — correct the path and retry."},
+                status=404,
+                headers={"X-SM-Fault-Origin": "gateway"},
+            )
+        return None
+
     async def handle_proxy(self, request: web.Request) -> web.StreamResponse:
+        # fact:1535 route-guard — runs before ANYTHING else in this method,
+        # including the S-14 header stripping below: a mistyped/wrong-method
+        # framework request must fail and say why, never reach dispatch.
+        guard_response = self._route_guard(request)
+        if guard_response is not None:
+            return guard_response
+
         # Route on path: embeddings/reranking have fixed targets; everything else
         # is a reasoning-LLM request, dispatched through the backend POOL so the
         # gateway owns parallelisation. The optional X-SM-LLM-Role header is set
@@ -4062,6 +4180,11 @@ async def main() -> None:
     attach_coordinator(app, coordinator)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/pool/status", handle_pool_status)
+    # fact:1535 route-guard: snapshot the known framework routes from the
+    # router itself, AFTER every real route above is registered and BEFORE
+    # the catch-all below — see set_known_routes()'s docstring for why the
+    # ordering is what excludes the catch-all from the snapshot.
+    proxy.set_known_routes(app.router)
     app.router.add_route("*", "/{tail:.*}", proxy.handle_proxy)
 
     runner = web.AppRunner(app)
