@@ -158,7 +158,7 @@ def test_without_flag_backfill_still_runs_by_default(tmp_path):
 
 
 # ── 3b. the dry-run preview states what a REAL run actually does ────────
-# Scope addendum (measured live, d9400): a REAL run always passes --apply to
+# Scope addendum (measured live, on the Debian test host): a REAL run always passes --apply to
 # backfill_domain_of.py by default (unless --no-domain-backfill is given) and
 # enqueues outbox rows. The OLD dry-run preview showed the bare, --apply-less
 # invocation under a "preview (enqueues nothing)" label -- true of THAT
