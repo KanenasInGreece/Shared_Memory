@@ -217,6 +217,80 @@ not exist in this worktree at all (gitignored, never present), so the mtime
 canary is trivially satisfied — nothing was read, written, or executed
 against it.
 
+## Second commit — review integration (Ops-14, Critical)
+
+The Ops & Release Integrity review found the post-condition verification
+itself FAILS OPEN: `mapfile -t containers < <(grep -E '^[[:space:]]*container_name:'
+"$COMPOSE_FILE" | sed ...)` yields an **empty array** whenever the compose
+file's syntax changes, it's renamed, or it's simply missing by the time this
+runs — the leftover-detection loop then iterates zero times, finds zero
+leftovers, and the function prints `✓ compose stack down, verified gone`.
+That is the exact unearned-checkmark class this whole branch exists to
+remove (F4/F5's original shape: a green result nobody actually measured),
+reintroduced one layer up, inside the very function that was supposed to
+close it.
+
+**Fix:** immediately after the `mapfile`, in `compose_down_and_verify()`
+(`shared-memory/scripts/uninstall_framework.sh`, ~line 321), an empty
+`$containers` array is now refused as a verification **failure**, not read
+as "nothing to check":
+```
+if [[ ${#containers[@]} -eq 0 ]]; then
+    red "  ✗ could not parse any container_name: entries from $COMPOSE_FILE --"
+    red "    the teardown CANNOT be verified. This does not mean nothing is"
+    red "    running: it means this function has no list to check docker ps"
+    red "    against. Check by hand:"
+    red "        docker ps -a"
+    return 1
+fi
+```
+Returns 1, which flows into the same failure path a failed `down` already
+uses (the caller's `if ! compose_down_and_verify; then ... exit 1; fi` — no
+new branch needed there). No fallback heuristic (guessing container names
+from the image list, or similar) — an honest "cannot verify" beats a clever
+guess, per the ruling.
+
+**Tests** (`tests/test_uninstall_compose_down.py`, +2, now 12 in that file):
+- `test_empty_container_list_refuses_to_claim_success` — (a) from the
+  ruling: a compose fixture with zero `container_name:` lines
+  (`_NO_CONTAINER_NAMES_COMPOSE`) must produce an absent success line, the
+  "could not parse any container_name" / "CANNOT be verified" / `docker ps
+  -a` wording present (pinned by value), and a nonzero return — and confirms
+  the down itself DID run first (this is a verification failure, not a down
+  failure).
+- `test_empty_container_list_is_distinct_from_a_leftover_failure` — the
+  "STILL PRESENT" leftover wording must not appear, so an operator can tell
+  the two failure modes apart.
+
+**Mutation evidence:** scratchpad-backed up `uninstall_framework.sh`
+(`cp` to the scratchpad dir, never `git checkout --`), replaced the new
+`if [[ ${#containers[@]} -eq 0 ]]; then` with `if false; then`, reran
+`tests/test_uninstall_compose_down.py`: exactly
+`test_empty_container_list_refuses_to_claim_success` died (asserted
+`returncode != 0`, got the old unconditional success line and exit 0); all
+11 other tests in that file — including
+`test_empty_container_list_is_distinct_from_a_leftover_failure`, every
+leftover-container test, and every success-path test — stayed green, as the
+ruling specified. Restored via `cp` from the scratchpad backup;
+`git status`/syntax-checked clean afterward.
+
+**Fallout caught and fixed:** `tests/test_uninstall_mintlock.py`'s fixture
+compose file (`postgres_neo4j_limits.yaml` written by its own `_fake_install`)
+previously declared `services: {}` — zero `container_name:` entries. With
+the new guard in place this correctly started refusing that fixture's
+teardown as unverifiable, which made all four of that file's non-dry-run
+scenarios fail before ever reaching the mintlock-removal code (an honest
+regression, not a flaky one — the guard was doing exactly its job against a
+fixture that no longer matched reality). Fixed by giving that fixture's
+compose file two real `container_name:` entries
+(`neo4j-memory`/`postgres-vector`, matching its already-empty `DOCKER_PS_OUTPUT`
+stub so no leftover is found), restoring all 5 of that file's tests to green
+without touching its actual mintlock-removal assertions.
+
+**Suite:** full run from the worktree root — **2543 passed, 1 skipped**
+(prior state after commit 1: 2541 passed/1 skipped; +2 new tests, 0
+regressions once the mintlock fixture was updated).
+
 ## Nothing proposed for README.md
 
 Checked: README.md and AGENTS.md mention `init_db.sh` only as "idempotent" /

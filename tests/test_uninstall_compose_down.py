@@ -323,3 +323,64 @@ def test_the_real_compose_file_container_names_are_discoverable(tmp_path):
     assert "neo4j-memory" in names
     assert "postgres-vector" in names
     assert len(names) >= 2
+
+
+# ── Ops & Release Integrity review, Critical (Ops-14), merger-verified ─────
+#
+# compose_down_and_verify()'s post-condition check FAILS OPEN when the
+# container_name: list it parses out of $COMPOSE_FILE comes back EMPTY (the
+# compose file's syntax changed, it was renamed, or it is simply missing by
+# the time this runs): the leftover-detection loop below then iterates zero
+# times, finds zero leftovers, and the function claims VERIFIED success --
+# the exact unearned checkmark this whole function exists to remove,
+# reintroduced one layer up in its own verification step. The fix refuses to
+# claim success on an empty parse; it reports "cannot verify" as a FAILURE.
+
+_NO_CONTAINER_NAMES_COMPOSE = """\
+name: shared-memory
+services:
+  neo4j:
+    image: neo4j:5-community
+  postgres:
+    image: pgvector/pgvector:pg17
+"""
+
+
+def test_empty_container_list_refuses_to_claim_success(tmp_path):
+    """(a) A compose file with zero container_name: lines must NOT be read
+    as "nothing to check" -- it must be refused as unverifiable, by value:
+    the success line absent, the cannot-verify wording present, nonzero."""
+    proc, log_path = _run(
+        tmp_path, env_file_present=True, compose_text=_NO_CONTAINER_NAMES_COMPOSE,
+        env_overrides={"DOCKER_DOWN_RC": "0", "DOCKER_PS_OUTPUT": ""},
+    )
+    out = _strip_ansi(proc.stdout + proc.stderr)
+    log_text = log_path.read_text()
+
+    assert proc.returncode != 0, out
+    assert "compose stack down, verified gone" not in out, (
+        f"success was claimed despite an unparseable container list:\n{out}"
+    )
+    assert "could not parse any container_name" in out, out
+    assert "CANNOT be verified" in out, out
+    assert "docker ps -a" in out, "the operator must be told how to check by hand"
+    # And the down itself DID run (this is a verification failure, not a
+    # down failure) -- confirms the guard fires after a real, successful
+    # down, not instead of attempting one.
+    assert any("down" in line for line in log_text.splitlines()), log_text
+
+
+def test_empty_container_list_is_distinct_from_a_leftover_failure(tmp_path):
+    """The wording must not be confusable with the leftover-container
+    failure path -- an operator reading the output needs to know WHICH
+    problem they have."""
+    proc, _log = _run(
+        tmp_path, env_file_present=True, compose_text=_NO_CONTAINER_NAMES_COMPOSE,
+        env_overrides={"DOCKER_DOWN_RC": "0", "DOCKER_PS_OUTPUT": ""},
+    )
+    out = _strip_ansi(proc.stdout + proc.stderr)
+
+    assert "STILL PRESENT" not in out, (
+        "an unparseable list must not be reported as a leftover-container "
+        f"failure -- they are different problems:\n{out}"
+    )

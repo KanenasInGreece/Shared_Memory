@@ -73,9 +73,19 @@ def _fake_install(tmp_path, *, with_mintlock: bool, with_env: bool = True):
         mintlock_path.write_text("")  # flock target -- content is irrelevant
 
     # A real compose file must exist for the "docker or compose file absent"
-    # branch to be skipped and compose_down_and_verify() to actually run.
+    # branch to be skipped and compose_down_and_verify() to actually run. It
+    # must also declare at least one container_name: -- since Ops-14 (empty
+    # parsed list is refused as an unverifiable teardown, never read as
+    # "nothing to check"), an empty services: block here would make the down
+    # verification fail and this file's tests never reach the mintlock code
+    # at all.
     (root / "shared-memory" / "ops" / "postgres_neo4j_limits.yaml").write_text(
-        "name: shared-memory\nservices: {}\n"
+        "name: shared-memory\n"
+        "services:\n"
+        "  neo4j:\n"
+        "    container_name: neo4j-memory\n"
+        "  postgres:\n"
+        "    container_name: postgres-vector\n"
     )
 
     bin_dir = tmp_path / "bin"

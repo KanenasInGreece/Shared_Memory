@@ -320,6 +320,25 @@ compose_down_and_verify() {
 
     mapfile -t containers < <(grep -E '^[[:space:]]*container_name:' "$COMPOSE_FILE" \
         | sed -E 's/^[[:space:]]*container_name:[[:space:]]*//')
+
+    # Ops & Release Integrity review, Critical (Ops-14), merger-verified.
+    # FAILS OPEN otherwise: an empty $containers array (compose file syntax
+    # changed, renamed, or missing entirely by the time this runs) makes the
+    # loop below iterate zero times, find zero leftovers, and claim VERIFIED
+    # success -- the exact unearned checkmark this whole function exists to
+    # remove, reintroduced one layer up in its own verification step. An
+    # empty parse is refused as a verification FAILURE, not treated as "zero
+    # containers to check". No fallback heuristic (guessing container names)
+    # -- an honest "cannot verify" beats a clever guess.
+    if [[ ${#containers[@]} -eq 0 ]]; then
+        red "  ✗ could not parse any container_name: entries from $COMPOSE_FILE --"
+        red "    the teardown CANNOT be verified. This does not mean nothing is"
+        red "    running: it means this function has no list to check docker ps"
+        red "    against. Check by hand:"
+        red "        docker ps -a"
+        return 1
+    fi
+
     local present
     present="$(docker ps -a --format '{{.Names}}' 2>/dev/null)"
     for name in "${containers[@]}"; do
