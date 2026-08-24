@@ -402,11 +402,11 @@ uv run --with neo4j python shared-memory/migrations/verify_neo4j_init.py
 bash shared-memory/scripts/bootstrap_tokens.sh
 ```
 
-Appends `AGENT_TOKENS` (digest form) and a read-only `AGENT_ROLES` line for `monitor` to the
-framework `.env`. **This phase mints only remote and registry identities — `lm_studio` (takes its
-token from `mcp.json`'s own env block, never a skill `.env`), `antigravity` (ambiguous between
-`~/.gemini/skills/` and a Claude-family path, deliberately left unguessed) and `monitor` (the
-dashboard lives in a sibling repo this script has no install path for).** Each local CLI agent
+Appends `AGENT_TOKENS` (digest form) and a read-only `AGENT_ROLES` line (which pre-declares
+`monitor:read`, so the dashboard is confined the moment it is ever registered) to the framework
+`.env`. **This phase mints only remote and registry identities — `lm_studio` (takes its
+token from `mcp.json`'s own env block, never a skill `.env`) and `antigravity` (ambiguous between
+`~/.gemini/skills/` and a Claude-family path, deliberately left unguessed).** Each local CLI agent
 (`claude`, `codex`, `gemini`, `grok`) is REFUSED here, loudly, by name — its skill directory does
 not exist yet, because Phase 8 (which installs it) has not run — and that refusal is **expected,
 not an error**: nothing needs fixing at this phase for those agents; Phase 8 mints each of them
@@ -425,6 +425,21 @@ once" into "stored forever" (the script's own warning; verified the hard way —
 through an agent session had to be rotated). Hand the user the exact command line and step back.
 One distinct token per agent, never shared. The script refuses to overwrite an existing registry;
 `--force` rotates **all** tokens (destructive — rule 2).
+
+⛔ **`monitor` is NOT minted here, deliberately.** It used to be on the default roster, which meant
+every fresh install registered a `monitor` digest whose plaintext was discarded at birth — the
+dashboard lives in a sibling repo, so it has no install path to write through to, and this bare
+invocation carries no `--reveal`. That is exactly what D19 forbids ("never mint a token into a
+digest registry that nobody actually received, which is worse than not minting at all"), and
+`--add` then refused it as already registered. Mint it **only if the operator wants the dashboard**,
+on demand, with the reveal on the same invocation — again, a command the **human** runs:
+
+```bash
+bash shared-memory/scripts/bootstrap_tokens.sh --add monitor --reveal monitor
+```
+
+Its `monitor:read` confinement is applied on that path too (`READ_ONLY_AGENTS` is authoritative on
+every mint path — see the runbook below).
 
 ### Phase 7 — Start the gateway and verify
 
@@ -456,8 +471,8 @@ curl above:
   at all — means **auth IS configured**: something (Phase 6's remote/registry mint, or an earlier
   `--add`) already minted at least one token, and every richer field is now gated behind a bearer.
   This is the state to want once any agent is registered, and it no longer depends on Phase 8
-  having run — Phase 6 alone gets you here on any install that mints `monitor`/`lm_studio`/
-  `antigravity`. Once a specific credential exists (a Phase 6 `--reveal`, or after Phase 8 mints a
+  having run — Phase 6 alone gets you here on any install that mints `lm_studio`/`antigravity`.
+  Once a specific credential exists (a Phase 6 `--reveal`, or after Phase 8 mints a
   local agent), confirm THAT credential actually authenticates:
   `curl -s -H "Authorization: Bearer <token>" http://localhost:8888/health` must come back with
   `"auth_required":true` plus the full payload (`"embedder":"ok"`, `"daemon":"running"`,
@@ -627,22 +642,25 @@ bash shared-memory/scripts/postflight.sh
 
 ### Add an agent later (no token rotation)
 
-⛔ **A BULK MINT CAN REGISTER A TOKEN NOBODY EVER RECEIVES.** The default roster mints for
-`lm_studio`, `antigravity` and `monitor`, none of which has a seeded install path — their tokens are
+⛔ **A BULK MINT CAN REGISTER A TOKEN NOBODY EVER RECEIVES.** The default roster still mints for
+`lm_studio` and `antigravity`, neither of which has a seeded install path — their tokens are
 minted, their digests are registered, and nothing is written anywhere. They are **REMOTE**: the only
 delivery is `--reveal <name>` **on that same invocation**. Miss it and the `.env` shows an agent that
-cannot authenticate, which is worse than an agent that is plainly absent. The mint now says so, per
-agent and again in a closing block — and `--remint` below is how you recover one without rotating the
-fleet. *(Until v0.9.36 the report told you to run `generate_tokens.py --reveal <name>` afterwards.
-That command is a **full rotation of every agent**, so the advice printed beside a fresh credential
-destroyed all the others.)*
+cannot authenticate, which is worse than an agent that is plainly absent. The mint says so per agent,
+in the word **UNDELIVERABLE**, and again in a closing block that names `--remint <name> --reveal
+<name>` for each one — the recovery that does not rotate the fleet. *(Until v0.9.36 the report told
+you to run `generate_tokens.py --reveal <name>` afterwards. That command is a **full rotation of
+every agent**, so the advice printed beside a fresh credential destroyed all the others. And until
+this release `monitor` was on that roster too — a dashboard in a sibling repo, undeliverable by
+construction, registered on **every** fresh install; it is now minted on demand instead, see
+Phase 6.)*
 
 **Re-issuing ONE agent's token — `--remint`.** For an agent that is already registered but whose token
 was never delivered (or was lost), this mints a replacement for **that name only**, leaving every other
 digest byte-identical:
 
 ```bash
-bash shared-memory/scripts/bootstrap_tokens.sh --remint monitor --reveal monitor
+bash shared-memory/scripts/bootstrap_tokens.sh --remint lm_studio --reveal lm_studio
 # or, when the agent has a local skill directory:
 bash shared-memory/scripts/bootstrap_tokens.sh --remint codex --install-path ~/.codex/skills/shared-memory/.env
 ```
