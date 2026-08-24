@@ -5,6 +5,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.42] — 2026-08-24
+
+### Fixed — an authorization refusal that says so, instead of a dead gateway
+
+- **An auth or role refusal was reported as "coordinator unreachable".** The gateway's auth
+  middleware answered 401/403/503 with plain-text bodies while every other reply is JSON; the
+  client decoded bodies before looking at the status class, so any unenumerated status turned
+  into a JSON decode error and the generic handler blamed a dead gateway — sending the operator
+  to debug a process that was running perfectly. Measured live: a fresh install's verification
+  failed with "is hive_mind_proxy.py running?" when the true answer was a read-only token being
+  refused a write.
+- The middleware's eight error raises now carry the same JSON body shape the rest of the gateway
+  already speaks (status codes, status lines, `WWW-Authenticate` and `Retry-After` unchanged).
+- The client now branches on status class before any decode, in exactly one place: 401 keeps its
+  two honest wordings, 403 leads with the gateway's own sentence, other errors name the HTTP
+  status and body, and a malformed reply from a live gateway is called that — the word
+  "unreachable" is reserved for transport failures that actually establish it. A structural
+  guard makes it impossible to label an answered reply unreachable. Same rule applied to the
+  MCP client at parity (twelve sites).
+- 21 new tests against a real loopback server, mutation-checked; postflight now surfaces the
+  gateway's actual refusal through the untouched A4/A5 lines.
+
+---
+
 ## [0.9.41] — 2026-08-24
 
 ### Fixed — an installer that refuses a blank password

@@ -535,3 +535,249 @@ async def test_a_read_only_token_save_reports_the_role_refusal_end_to_end(monkey
     assert "unreachable" not in msg.lower(), (
         "this is the sentence that produced three wrong diagnoses")
     assert "hive_mind_proxy" not in msg
+
+
+# ── CLIENT — one refused call is ONE audit line (finding CQ-F1-01) ───────────
+# Centralising the decode moved the 401 log inside _reply_json and routed the
+# 401 through the same catch block as every other refusal, so a single rejected
+# credential started writing two audit lines in the CLI client and a new one in
+# the MCP client. The pre-change semantics are the contract: a 401 is ONE line,
+# and every other class keeps the save_failed / save_rejected line — which is
+# deliberate NEW signal, replacing a `coordinator_down` / `gateway_down` entry
+# that was a lie about a gateway that had answered.
+
+
+class _AuditRecorder:
+    """Stands in for `_append_log` and keeps every event name it is handed.
+
+    Deliberately records regardless of `min_level`: the question is which audit
+    lines the code DECIDES to write, not which a particular MEMORY_LOG_LEVEL
+    would let through, and counting the decisions is the stricter test.
+    """
+
+    def __init__(self):
+        self.events: list[str] = []
+
+    def __call__(self, tool, min_level, event, data, content=None):
+        self.events.append(event)
+
+    def count(self, event: str) -> int:
+        return self.events.count(event)
+
+
+@pytest.mark.asyncio
+async def test_a_401_save_logs_auth_failed_once_and_never_save_failed(monkeypatch):
+    """CLI front door. A rejected credential is ONE `auth_failed` line — the
+    count is asserted BY VALUE, because "at least one" would pass on the
+    double-log this pins against.
+
+    Executes _reply_json's 401 branch and save_artifact's GatewayReplyError
+    catch, with the status distinction carried on the exception.
+    """
+    recorder = _AuditRecorder()
+    monkeypatch.setattr(memory_bridge, "_append_log", recorder)
+
+    with _StubGateway(401, _aiohttp_plaintext_page(401, "Authorization required"),
+                      "text/plain; charset=utf-8",
+                      {"WWW-Authenticate": 'Bearer error="invalid_token"'}) as gw:
+        _point_client_at(monkeypatch, gw.url)
+        monkeypatch.setenv("AGENT_TOKEN", "tok_presented")
+        result = await memory_bridge.save_artifact("canary", '{"source":"test"}')
+
+    assert result["message"] == _401_SENT
+    assert recorder.count("auth_failed") == 1, (
+        f"a 401 must write exactly one auth_failed line, got {recorder.events}")
+    assert recorder.count("save_failed") == 0, (
+        f"a 401 already logged as auth_failed must NOT also log save_failed — "
+        f"one refused save, one audit line: {recorder.events}")
+    assert recorder.count("coordinator_down") == 0
+
+
+@pytest.mark.asyncio
+async def test_a_403_save_still_logs_save_failed(monkeypatch):
+    """The other half of the ruling. 403 is NOT already logged, so it keeps its
+    `save_failed` line — the signal that replaced the `coordinator_down` entry
+    a role refusal used to produce. Removing the double-log must not take this
+    with it.
+
+    Executes _reply_json's 403 branch and save_artifact's catch.
+    """
+    recorder = _AuditRecorder()
+    monkeypatch.setattr(memory_bridge, "_append_log", recorder)
+
+    with _StubGateway(403, _aiohttp_plaintext_page(403, READ_ONLY_REASON),
+                      "text/plain; charset=utf-8") as gw:
+        _point_client_at(monkeypatch, gw.url)
+        result = await memory_bridge.save_artifact("canary", '{"source":"test"}')
+
+    assert "Read-only token" in result["message"]
+    assert recorder.count("save_failed") == 1, (
+        f"a 403 is new signal and must be recorded once: {recorder.events}")
+    assert recorder.count("auth_failed") == 0, (
+        "a 403 is an authorization refusal — logging it as an auth failure "
+        "sends the operator to inspect the credential that was ACCEPTED")
+    assert recorder.count("coordinator_down") == 0
+
+
+@pytest.mark.asyncio
+async def test_mcp_401_save_logs_auth_failed_once_and_never_save_rejected(monkeypatch):
+    """MCP front door, Group 1 parity. Before the centralised decode this path
+    returned early on 401 with `auth_failed` alone and no `save_rejected`; that
+    is the semantics restored here.
+
+    Executes vector-skill _reply_json's 401 branch and save_artifact's catch.
+    """
+    recorder = _AuditRecorder()
+    monkeypatch.setattr(vector_skill, "_append_log", recorder)
+
+    with _StubGateway(401, _aiohttp_plaintext_page(401, "Authorization required"),
+                      "text/plain; charset=utf-8",
+                      {"WWW-Authenticate": 'Bearer error="invalid_token"'}) as gw:
+        _point_client_at(monkeypatch, gw.url, module=vector_skill)
+        result = await vector_skill.save_artifact(
+            "canary", '{"source":"test-model","project":"shared-memory-GitHub"}')
+
+    assert "Error:" in result
+    assert recorder.count("auth_failed") == 1, (
+        f"a 401 must write exactly one auth_failed line, got {recorder.events}")
+    assert recorder.count("save_rejected") == 0, (
+        f"the pre-change 401 path logged no save_rejected at all: {recorder.events}")
+    assert recorder.count("gateway_down") == 0
+
+
+@pytest.mark.asyncio
+async def test_mcp_403_save_still_logs_save_rejected(monkeypatch):
+    """Executes vector-skill _reply_json's 403 branch and save_artifact's catch."""
+    recorder = _AuditRecorder()
+    monkeypatch.setattr(vector_skill, "_append_log", recorder)
+
+    with _StubGateway(403, _aiohttp_plaintext_page(403, READ_ONLY_REASON),
+                      "text/plain; charset=utf-8") as gw:
+        _point_client_at(monkeypatch, gw.url, module=vector_skill)
+        result = await vector_skill.save_artifact(
+            "canary", '{"source":"test-model","project":"shared-memory-GitHub"}')
+
+    assert "Read-only token" in result
+    assert recorder.count("save_rejected") == 1, (
+        f"a 403 is new signal and must be recorded once: {recorder.events}")
+    assert recorder.count("auth_failed") == 0
+    assert recorder.count("gateway_down") == 0
+
+
+# ── CLIENT — the gateway's message is reflected, so it is bounded (SEC-F1-01) ─
+# COORDINATOR_BASE is an env-overridable default: the endpoint whose `message`
+# both clients splice into audit lines and terminal output is not axiomatically
+# trusted. Cap by VALUE and strip the characters a terminal ACTS on.
+
+class _JsonReply:
+    """A 403 whose JSON body carries whatever message a test wants to reflect."""
+
+    status_code = 403
+    text = ""
+
+    def __init__(self, message):
+        self._message = message
+
+    def json(self):
+        return {"status": "error", "message": self._message}
+
+
+@pytest.mark.parametrize("module", [memory_bridge, vector_skill],
+                         ids=["cli", "mcp"])
+def test_a_gateway_message_is_capped_at_600_characters(module):
+    """The cap is pinned BY VALUE at both front doors. 600 is measured headroom
+    — the longest message any deployed middleware refusal emits is 378
+    characters — so a change to this number is a change to a measured claim and
+    has to be argued, not absorbed.
+
+    Executes _clean_gateway_text's truncation via _gateway_message.
+    """
+    assert module._GATEWAY_MESSAGE_MAX == 600
+    out = module._gateway_message(_JsonReply("A" * 700))
+    assert len(out) == 600, f"an over-long message reached the log at {len(out)} chars"
+    assert out == "A" * 600
+    # The boundary itself: a message exactly at the cap is NOT truncated.
+    assert module._gateway_message(_JsonReply("B" * 600)) == "B" * 600
+    # And the longest message a deployed refusal can produce survives whole.
+    assert len(module._gateway_message(_JsonReply("C" * 378))) == 378
+
+
+@pytest.mark.parametrize("module", [memory_bridge, vector_skill],
+                         ids=["cli", "mcp"])
+def test_control_characters_never_reach_the_operators_terminal(module):
+    """A message printed to a terminal is not inert: ESC[2J clears the screen
+    and BEL is not a diagnosis. Newline and tab stay — they are formatting a
+    multi-line refusal legitimately uses.
+
+    Executes _clean_gateway_text's control-character strip via _gateway_message.
+    """
+    out = module._gateway_message(
+        _JsonReply("Read-only\x1b[2J\x07token\x00 refused\r\nline two\tcolumn"))
+
+    assert "\x1b" not in out, "an ANSI escape reached the reflected message"
+    assert "\x07" not in out
+    assert "\x00" not in out
+    assert "\r" not in out
+    assert not any(ord(ch) < 32 and ch not in "\n\t" for ch in out), (
+        f"a control character survived: {out!r}")
+    assert "\x7f" not in out
+    assert "Read-only" in out and "token" in out and "refused" in out
+    assert "\n" in out and "\t" in out, (
+        "newline and tab are formatting, not payload — stripping them would "
+        "mangle a legitimate multi-line refusal")
+
+
+@pytest.mark.parametrize("module", [memory_bridge, vector_skill],
+                         ids=["cli", "mcp"])
+def test_a_message_that_is_only_control_characters_is_no_message(module):
+    """Cleaning can empty a string that was non-empty. The caller falls back to
+    the body snippet then, rather than splicing "" in as the gateway's reason.
+
+    Executes _gateway_message's post-clean emptiness branch.
+    """
+    assert module._gateway_message(_JsonReply("\x1b\x07\x00")) is None
+
+
+def test_a_non_json_error_body_cannot_carry_an_ansi_escape_to_the_terminal():
+    """_body_snippet is the same hazard as _gateway_message one path over: a
+    NON-JSON error page is gateway-controlled text headed for a terminal, and
+    str.split() collapses whitespace without touching ESC or BEL. Mutation
+    target: removing _clean_gateway_text from _body_snippet must kill this."""
+    import memory_bridge as mb
+
+    class _R:
+        status_code = 502
+        text = "bad \x1b[2Jgateway\x07 page"
+        def json(self):
+            raise ValueError("not json")
+
+    try:
+        mb._reply_json(_R())
+        raise AssertionError("expected GatewayReplyError")
+    except mb.GatewayReplyError as exc:
+        msg = exc.payload["message"]
+    assert "\x1b" not in msg and "\x07" not in msg
+    assert "bad" in msg and "gateway" in msg
+
+
+def test_mcp_a_non_json_error_body_cannot_carry_an_ansi_escape():
+    import importlib.util, pathlib
+    spec = importlib.util.find_spec("vector_skill") if False else None
+    import sys
+    vs = sys.modules.get("vector_skill")
+    if vs is None:
+        root = pathlib.Path(__file__).resolve().parent.parent
+        spec = importlib.util.spec_from_file_location(
+            "vector_skill_snippet_probe", root / "mcp" / "vector-skill.py")
+        vs = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(vs)
+
+    class _R:
+        status_code = 502
+        text = "bad \x1b[2Jgateway\x07 page"
+        def json(self):
+            raise ValueError("not json")
+
+    out = vs._body_snippet(_R())
+    assert "\x1b" not in out and "\x07" not in out
+    assert "bad" in out and "gateway" in out

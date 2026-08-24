@@ -29,7 +29,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.9.41"
+VERSION = "0.9.42"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v3: review-edges / label-edges require the gateway's /memory/relations/* routes.
@@ -468,11 +468,22 @@ class GatewayReplyError(Exception):
     mistaken for a transport failure: it is raised INSIDE the request's
     ``try``, and every site catches it BEFORE the generic handler that reports
     an unreachable gateway.
+
+    ``logged_event`` names the audit event the RAISE SITE already wrote, or is
+    None when it wrote nothing. Centralising the decode moved some logging
+    inside ``_reply_json``, and a catch block that logs unconditionally would
+    then record ONE refused call TWICE — a 401 as both ``auth_failed`` and
+    ``save_failed``, where before it was a single ``auth_failed`` line. The
+    catch block therefore asks the exception what has already been recorded.
+    Deliberately an ATTRIBUTE and not a phrase read back out of the message:
+    keying the audit trail on message text would tie it to wording that exists
+    to be improved.
     """
 
-    def __init__(self, payload: dict):
+    def __init__(self, payload: dict, *, logged_event: str | None = None):
         super().__init__(payload.get("message", ""))
         self.payload = payload
+        self.logged_event = logged_event
 
 
 def _body_snippet(r, limit: int = 200) -> str:
@@ -482,9 +493,40 @@ def _body_snippet(r, limit: int = 200) -> str:
     replace a diagnosis with a traceback.
     """
     try:
-        return " ".join((r.text or "").split())[:limit]
+        # Same hazard as _gateway_message: this is gateway-controlled text on
+        # its way to a terminal or log — strip control characters before the
+        # whitespace collapse and the cap (the non-JSON error page is exactly
+        # the attacker-shaped body this path exists for).
+        return " ".join(_clean_gateway_text(r.text or "").split())[:limit]
     except Exception:
         return ""
+
+
+# The gateway's own words are reflected into this agent's audit log and into
+# the operator's terminal — and COORDINATOR_BASE is an env-overridable default,
+# so the endpoint that produced them is not axiomatically trusted. Two limits
+# apply before the string is used anywhere.
+#
+# MEASURED, not guessed: the longest message any deployed middleware refusal
+# emits is 378 characters, so a 600-character cap preserves every legitimate
+# message whole and truncates only a body no deployed path can produce.
+_GATEWAY_MESSAGE_MAX = 600
+
+
+def _clean_gateway_text(msg: str) -> str:
+    """Strip ASCII control characters (newline and tab kept) and cap the length.
+
+    A message printed to a terminal is not inert: an ANSI escape can clear the
+    screen or rewrite the line the operator is reading, and a BEL is not a
+    diagnosis. Stripping runs BEFORE the cap so the cap counts characters the
+    reader will actually see rather than characters that were about to be
+    removed.
+    """
+    cleaned = "".join(
+        ch for ch in msg
+        if ch in ("\n", "\t") or (ord(ch) >= 32 and ord(ch) != 127)
+    )
+    return cleaned.strip()[:_GATEWAY_MESSAGE_MAX]
 
 
 def _gateway_message(r) -> str | None:
@@ -493,6 +535,9 @@ def _gateway_message(r) -> str | None:
     Guarded end to end: the whole point of this module's error contract is
     that a decode failure is a RESULT here, never an exception that escapes
     into the transport handler.
+
+    The message is capped and control-stripped on the way out — see
+    ``_clean_gateway_text``.
     """
     try:
         body = r.json()
@@ -501,7 +546,7 @@ def _gateway_message(r) -> str | None:
     if isinstance(body, dict):
         msg = body.get("message") or body.get("error")
         if isinstance(msg, str) and msg.strip():
-            return msg.strip()
+            return _clean_gateway_text(msg) or None
     return None
 
 
@@ -538,10 +583,14 @@ def _reply_json(r, *, log_auth: bool = False, forbidden_hint: str | None = None)
     Raises GatewayReplyError on every non-2xx and on an unparseable 2xx;
     returns the decoded payload otherwise.
     """
+    # ONE name for the line written and the line reported: the event the catch
+    # block is told about IS the event this branch wrote, never a second literal
+    # that could drift away from it.
     if r.status_code == 401:
-        if log_auth:
-            _append_log("memory_bridge", 2, "auth_failed", _auth_log_hint())
-        raise GatewayReplyError(_auth_error())
+        logged = "auth_failed" if log_auth else None
+        if logged:
+            _append_log("memory_bridge", 2, logged, _auth_log_hint())
+        raise GatewayReplyError(_auth_error(), logged_event=logged)
 
     # The gateway's OWN words come FIRST, before this client's framing. Readers
     # downstream truncate (postflight A5 slices a search error to 200 chars), and
@@ -722,8 +771,17 @@ async def save_artifact(content: str, metadata_json: str = "{}") -> dict:
             )
             result = _reply_json(r, log_auth=True)
     except GatewayReplyError as exc:
-        _append_log("memory_bridge", 2, "save_failed",
-                    {"response": exc.payload, "content_preview": content[:100]}, content)
+        # ONE refused save is ONE audit line. A 401 was already written as
+        # `auth_failed` inside _reply_json, which is exactly what this path
+        # logged before the decode was centralised; adding `save_failed` behind
+        # it would double-count every rejected credential in the audit trail.
+        # Every OTHER class — 403, other 4xx, 5xx, a malformed 2xx — logs
+        # `save_failed` here, and that IS new signal: those replies used to be
+        # logged as `coordinator_down`, which was a lie about a gateway that
+        # had answered.
+        if exc.logged_event is None:
+            _append_log("memory_bridge", 2, "save_failed",
+                        {"response": exc.payload, "content_preview": content[:100]}, content)
         return exc.payload
     except Exception as exc:
         _append_log("memory_bridge", 2, "coordinator_down", {"content_preview": content[:100]}, content)
