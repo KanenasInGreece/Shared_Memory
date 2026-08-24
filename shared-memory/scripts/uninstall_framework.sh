@@ -49,8 +49,17 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-ENV_FILE="$REPO_ROOT/shared-memory/.env"
-[[ -f "$ENV_FILE" ]] || ENV_FILE="$REPO_ROOT/.env"
+# Same two candidates, same order, as every other loader in this project
+# (apply.py's _load_env(), bootstrap_tokens.sh, ...): shared-memory/.env,
+# falling back to the pre-0.6 repo-root path. Kept as an ARRAY too (not just
+# the resolved $ENV_FILE below) because the mintlock cleanup further down
+# must check both candidates regardless of which one currently exists — once
+# $ENV_FILE itself is gone (a re-run after a partial uninstall), resolution
+# below silently shifts to the OTHER candidate, and a mintlock stranded at
+# the first one would never be found again if only $ENV_FILE were checked.
+_ENV_CANDIDATES=("$REPO_ROOT/shared-memory/.env" "$REPO_ROOT/.env")
+ENV_FILE="${_ENV_CANDIDATES[0]}"
+[[ -f "$ENV_FILE" ]] || ENV_FILE="${_ENV_CANDIDATES[1]}"
 
 GATEWAY_UNIT="${GATEWAY_UNIT:-hive-mind-gateway.service}"
 COMPOSE_FILE="${COMPOSE_FILE:-$REPO_ROOT/shared-memory/ops/postgres_neo4j_limits.yaml}"
@@ -136,6 +145,9 @@ if [[ "$LEVEL" == "data" || "$LEVEL" == "all" ]]; then
     echo "                      does NOT remove them, and this user usually cannot either;"
     echo "                      a throwaway root container does it, sudo is the fallback."
     echo "  gateway env       $ENV_FILE   ⚠ holds every credential this install has"
+    for _cand in "${_ENV_CANDIDATES[@]}"; do
+        [[ -f "${_cand}.mintlock" ]] && echo "  mint lock         ${_cand}.mintlock"
+    done
     echo "  (host state at $STATE_DIR is KEPT — see below)"
 fi
 if [[ "$LEVEL" == "all" ]]; then
@@ -254,10 +266,106 @@ fi
 }
 
 # ── data ─────────────────────────────────────────────────────────────────────
+# >>> COMPOSE_DOWN_AND_VERIFY
+# The compose file requires NEO4J_HOST_DIR / PG_DATA_DIR to interpolate at all
+# (postgres_neo4j_limits.yaml's `${VAR:?set ... in shared-memory/.env}` guards)
+# — EVERY `docker compose` invocation against it, `down` included, needs those
+# values or config parsing fails before docker touches a single container.
+# Measured (fact:1515): invoking `down -v` without `--env-file` failed exactly
+# that way, and the caller's `2>&1 | tail -3` discarded the exit code and
+# printed success regardless — four `restart: always` containers kept running
+# while the next block below deleted their data directories out from under
+# them.
+#
+# So: (1) always pass --env-file when $ENV_FILE exists, the same shape the
+# install side already uses (install_framework.sh / preflight.sh / AGENTS.md
+# all print `-f ... --env-file ...`). (2) When it does not — a re-run after a
+# partial uninstall already removed it — fall back to explicit dummy values
+# for ONLY the two required-but-unused-by-`down` keys, just enough to satisfy
+# compose's interpolation gate. This is an honest fallback, not a workaround:
+# `down -v` never mounts or reads those paths, and this compose file declares
+# no top-level `volumes:` at all — every volume in it is a bind mount, so `-v`
+# has nothing of its own to remove either way (the real data dirs are handled
+# by remove_data_dir() below, from the .env's actual values, while they still
+# exist). The dummy values exist only so compose's config parser lets `down`
+# run at all when the file that would have supplied real ones is gone.
+# (3) CHECK the exit code — never swallow it behind a pipe again. (4) then
+# MEASURE that the containers are actually gone (`docker ps -a`, matched
+# against the compose file's own `container_name:` list) before saying so —
+# compose exiting 0 is not proof by itself.
+compose_down_and_verify() {
+    local down_out down_rc containers name leftover=()
+
+    if [[ -f "$ENV_FILE" ]]; then
+        down_out="$(docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" down -v 2>&1)"
+        down_rc=$?
+    else
+        ylw "  ! $ENV_FILE not found — env-less down. This can still stop and remove"
+        ylw "    this stack's containers (addressed by their fixed container_name:,"
+        ylw "    not by the missing values) but has no way to know the real bind-mount"
+        ylw "    paths; that costs nothing here — 'down -v' only ever removes named"
+        ylw "    Docker volumes, and this stack declares none, so it was never how the"
+        ylw "    data directories got removed."
+        down_out="$(NEO4J_HOST_DIR="${NEO4J_HOST_DIR:-/uninstall-env-file-missing}" \
+                    PG_DATA_DIR="${PG_DATA_DIR:-/uninstall-env-file-missing}" \
+                    docker compose -f "$COMPOSE_FILE" down -v 2>&1)"
+        down_rc=$?
+    fi
+
+    if [[ "$down_rc" -ne 0 ]]; then
+        red "  ✗ docker compose down FAILED (exit $down_rc) — nothing below this ran:"
+        printf '%s\n' "$down_out" | tail -10 | sed 's/^/    /'
+        return 1
+    fi
+
+    mapfile -t containers < <(grep -E '^[[:space:]]*container_name:' "$COMPOSE_FILE" \
+        | sed -E 's/^[[:space:]]*container_name:[[:space:]]*//')
+
+    # Ops & Release Integrity review, Critical (Ops-14), merger-verified.
+    # FAILS OPEN otherwise: an empty $containers array (compose file syntax
+    # changed, renamed, or missing entirely by the time this runs) makes the
+    # loop below iterate zero times, find zero leftovers, and claim VERIFIED
+    # success -- the exact unearned checkmark this whole function exists to
+    # remove, reintroduced one layer up in its own verification step. An
+    # empty parse is refused as a verification FAILURE, not treated as "zero
+    # containers to check". No fallback heuristic (guessing container names)
+    # -- an honest "cannot verify" beats a clever guess.
+    if [[ ${#containers[@]} -eq 0 ]]; then
+        red "  ✗ could not parse any container_name: entries from $COMPOSE_FILE --"
+        red "    the teardown CANNOT be verified. This does not mean nothing is"
+        red "    running: it means this function has no list to check docker ps"
+        red "    against. Check by hand:"
+        red "        docker ps -a"
+        return 1
+    fi
+
+    local present
+    present="$(docker ps -a --format '{{.Names}}' 2>/dev/null)"
+    for name in "${containers[@]}"; do
+        grep -qxF -- "$name" <<<"$present" && leftover+=("$name")
+    done
+    if [[ ${#leftover[@]} -gt 0 ]]; then
+        red "  ✗ compose exited 0 but ${#leftover[@]} container(s) are STILL PRESENT:"
+        for name in "${leftover[@]}"; do red "      $name"; done
+        return 1
+    fi
+
+    grn "  ✓ compose stack down, verified gone (docker ps -a), volumes removed"
+    return 0
+}
+# <<< COMPOSE_DOWN_AND_VERIFY
+
 echo "Removing containers and volumes ..."
 if command -v docker >/dev/null 2>&1 && [[ -f "$COMPOSE_FILE" ]]; then
-    docker compose -f "$COMPOSE_FILE" down -v 2>&1 | tail -3
-    grn "  ✓ compose stack down, volumes removed"
+    if ! compose_down_and_verify; then
+        echo
+        red "Uninstall INCOMPLETE (level: $LEVEL) — the compose stack could not be"
+        red "brought down and verified gone (see above). Data directories and"
+        red "$ENV_FILE were NOT touched — deleting them while containers may still be"
+        red "running is exactly the failure this check exists to prevent."
+        red "Fix the problem above and re-run."
+        exit 1
+    fi
 else
     ylw "  ! docker or compose file absent — skipping ($COMPOSE_FILE)"
 fi
@@ -311,6 +419,20 @@ done
 # no benefit — and capacity history has already been lost once on this project.
 
 [[ -f "$ENV_FILE" ]] && rm -f "$ENV_FILE" && echo "  ✓ removed $ENV_FILE (every credential this install had)"
+
+# bootstrap_tokens.sh's read-modify-write lock on $ENV_FILE (see its own
+# comment at _LOCKFILE=). It has no purpose once the .env it guards is gone,
+# and — unlike $ENV_FILE above — nothing else in this script incidentally
+# removed it, so a prior --level data run left it stranded on disk forever.
+#
+# Checked against BOTH candidates, not just the resolved $ENV_FILE: once
+# .env is gone, resolution above silently shifts to the OTHER candidate, so
+# a re-run after a partial uninstall (.env already gone, mintlock still
+# sitting where that .env used to be) would otherwise look in the wrong
+# place and never find it.
+for _cand in "${_ENV_CANDIDATES[@]}"; do
+    [[ -f "${_cand}.mintlock" ]] && rm -f "${_cand}.mintlock" && echo "  ✓ removed ${_cand}.mintlock (bootstrap_tokens.sh's mint lock)"
+done
 
 # ── all ──────────────────────────────────────────────────────────────────────
 if [[ "$LEVEL" == "all" ]]; then

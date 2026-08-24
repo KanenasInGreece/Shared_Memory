@@ -1,378 +1,315 @@
-# HANDOFF — fix/first-upgrade-fresh-install
+# HANDOFF — fix/uninstall-that-can-say-it-failed
 
-Builder run implementing four ruled fixes from today's measured upgrade-test findings
-(corpus `fact:1511` / `fact:1512`). Branch `fix/first-upgrade-fresh-install`, one commit,
-built from `main` @ `0c44cd1` (v0.9.42). Full suite: 2506 passed / 1 skipped (baseline
-2488 passed / 1 skipped — 18 new tests, all additions, nothing removed).
+Fixes the five defects in the measured cascade (corpus `fact:1515`): F3/F5/F4 in
+`uninstall_framework.sh`, F7/F8 in `init_db.sh`, F6 (mintlock) in
+`uninstall_framework.sh`. Branch `fix/uninstall-that-can-say-it-failed`, one commit.
+No version bump, no CHANGELOG, no `sync_skills.sh` run (builder scope).
 
-## Fix A — fresh installs end with a populated migration ledger
+Files touched: `shared-memory/scripts/uninstall_framework.sh`,
+`shared-memory/scripts/init_db.sh`, three new test files. `install_framework.sh`,
+`AGENTS.md`, `README.md` **not touched** — nothing in them describes the uninstall
+behavior in enough detail to go stale, and `init_db.sh`'s "idempotent" claim in
+both docs stays true (the new check adds a verification step, doesn't change
+what it applies or how many times it's safe to run).
 
-**Where it landed:** `shared-memory/scripts/init_db.sh`, immediately after the
-`✓ Postgres schema applied` line and before the Neo4j section begins.
+## Fix 1+2+3 (F3/F5/F4) — `compose_down_and_verify()`
 
-**Why there, not `install_framework.sh`:** `install_framework.sh` never runs
-`init_db.sh` itself — it only prints the command for the operator to run afterward
-(`Initialise both schemas: bash shared-memory/scripts/init_db.sh`). `init_db.sh` is the
-one script that actually creates `schema_init.sql`'s tables, so it is the only place
-that knows, first-hand, that a fresh schema was just born — which is exactly the
-"vouchable" condition the fix requires (auto-adopt only immediately after THIS run
-created the schema, never for an unknown pre-existing database).
+New function, marker-wrapped `# >>> COMPOSE_DOWN_AND_VERIFY` / `# <<<` around
+line 257 of `uninstall_framework.sh` (replaces the old 4-line block that piped
+`down`'s output through `tail -3`, discarding the exit code).
 
-**Mechanism gap it crosses, and how:** the rest of `init_db.sh` runs both DB clients
-*inside* the compose containers via `docker exec` (documented in the file's own header)
-so the host needs neither `psql` nor `cypher-shell`. `apply.py` instead connects **out**
-via `psycopg2` from the host (matching how `update_framework.sh` already invokes it) —
-so the new `adopt_ledger()` function runs on the **host**, via `uv run --with
-psycopg2-binary`, not via `docker exec`. This works because
-`ops/postgres_neo4j_limits.yaml` publishes Postgres to `127.0.0.1:5432` by default, and
-`apply.py`'s own default DSN targets exactly that.
+**Env-file present (the normal case):** `docker compose -f "$COMPOSE_FILE"
+--env-file "$ENV_FILE" down -v` — same shape the install side already prints
+(`install_framework.sh:178`, `preflight.sh:354`, `AGENTS.md`). This alone fixes
+the measured cascade, since in the actual incident `.env` was still present at
+this point (it gets removed later in the script).
 
-**Idempotency / safety:**
-- `apply.py --adopt` is unconditionally idempotent — it always
-  `INSERT ... ON CONFLICT (filename) DO NOTHING` for every migration file and returns 0,
-  regardless of whether the ledger is empty or already populated. Verified by reading
-  the `if adopt:` branch (`shared-memory/migrations/apply.py`); no new guard was needed.
-- `adopt_ledger()` degrades to a **warning, never a failure**, when `uv` is absent from
-  PATH or when `apply.py --adopt` itself fails (e.g. Postgres unreachable from the host)
-  — the Postgres/Neo4j schema work has already succeeded by that point; ledger adoption
-  is a convenience layered on top, not a new hard requirement of `init_db.sh`.
-- `apply.py`'s stance toward a database it did **not** just create is unchanged —
-  nothing calls `--adopt` automatically for any other path.
+**Env-file absent — the "re-run after partial uninstall" fallback.** The
+compose file (`shared-memory/ops/postgres_neo4j_limits.yaml`) requires
+`NEO4J_HOST_DIR` / `PG_DATA_DIR` to interpolate at all
+(`${VAR:?set ... in shared-memory/.env}`), and that requirement is checked by
+compose's config parser for *every* subcommand including `down`, not just `up`
+— so `down` cannot even start without some value for those two keys. The
+fallback supplies explicit dummy values (`/uninstall-env-file-missing`) for
+**only those two keys**, nothing else. This is safe, not a workaround, because:
+`down -v` never mounts or reads bind-mount paths, and this compose file
+declares **no top-level `volumes:` key at all** — every volume in it is an
+inline bind mount, so `-v` has no named Docker volume of its own to remove
+either way. The real data directories are removed separately, later in the
+script, by `remove_data_dir()`, using the *actual* `NEO4J_HOST_DIR`/`PG_DATA_DIR`
+values read from `.env` while it still existed (`env_get()`, near the top of
+the script) — the dummy values in the fallback never touch that code path.
 
-**Known limitation, not fixed here (pre-existing, out of scope):** `apply.py` does not
-read `PG_DB`/`PG_CONTAINER` overrides for its own DSN — only `PG_CONN`/`PG_PASSWORD`. An
-operator who overrides `PG_DB` away from `agent_data` when running `init_db.sh` needs to
-also set `PG_CONN` for `adopt_ledger()`'s `apply.py --adopt` call to reach the right
-database. This limitation already existed for `update_framework.sh`'s own `apply.py`
-call; not introduced or worsened by this fix.
+Containers are addressed by their pinned `container_name:` (compose's
+`name: shared-memory` project field also stays fixed regardless of cwd), so an
+env-less `down` still finds and stops/removes the real containers; it just
+can't know the real data paths, which it was never going to touch anyway.
 
-**Test:** `tests/test_init_db_ledger_adoption.py` (7 tests, new file). Extracts the
-`adopt_ledger()` function body between `# >>> ADOPT_LEDGER` / `# <<< ADOPT_LEDGER`
-markers (same idiom as `tests/test_install_service_linger.py`'s `enable_linger()`
-extraction) and runs it standalone with a PATH-stubbed `uv`. Notably had to solve a
-determinism trap: on this workstation `uv` is symlinked into `/usr/bin`, the same
-directory as `bash` — an earlier draft that added `dirname(bash)` to PATH to satisfy the
-stub's `#!/usr/bin/env bash` shebang silently leaked the REAL `uv` back in for the
-"uv absent" scenario. Fixed by giving the stub script an absolute-path shebang
-(`#!{bash_bin}`) instead, so PATH can stay exactly `bin_dir` (with or without the stub)
-in every scenario — no directory needs adding to make `uv` resolvable-or-not
-deterministically.
+**Exit code (F5):** checked directly (`down_rc=$?`), no pipe. On failure:
+prints the last 10 lines of compose's own stderr/stdout and returns 1 —
+nothing below it runs, so data directories and `$ENV_FILE` stay untouched.
 
-- `test_the_function_is_actually_called_after_schema_applied` — pins that the shipped
-  script actually calls `adopt_ledger` after schema success (not merely defines it), and
-  before Neo4j begins.
-- `test_uv_present_and_adopt_succeeds_reports_success` / `..._fails_warns_but_does_not_fail_the_script`
-  / `test_uv_absent_warns_and_names_the_manual_command` — the three outcome branches.
-- `test_header_documents_the_new_step` — the file's own header prose mentions the ledger.
+**Post-condition verification (F4):** after a 0 exit, `docker ps -a --format
+'{{.Names}}'` is checked against the container names discovered by grepping
+`container_name:` out of `$COMPOSE_FILE` itself (not a hardcoded copy that
+could drift — `test_container_list_is_read_from_the_compose_file_not_hardcoded`
+pins this against the *shipped* file too: `neo4j-memory`, `postgres-vector`,
+plus the two encoder pairs). Any survivor is named in red output and the
+function returns 1. Only on a **verified-empty** `docker ps -a` does it print
+`✓ compose stack down, verified gone` and return 0 — this exact string is the
+only thing that unblocks the rest of the `data`/`all` teardown.
 
-**Mutation check:** commented out the `adopt_ledger` call line in `init_db.sh` (kept the
-function definition). `test_the_function_is_actually_called_after_schema_applied` died;
-the other 6 tests in the file stayed green (they test the function in isolation, proving
-the mutation coverage is specifically on the CALL, not the function body). Restored via
-scratchpad backup copy-back (never `git checkout --`); `git status` confirmed clean
-(back to the pre-mutation modified state) after restore.
-
-## Fix B — `apply.py`'s exit-2 message names both origins
-
-**Where:** `shared-memory/migrations/apply.py` — the module docstring's "ADOPTING AN
-EXISTING DATABASE" section, the real refusal path (`needs_adoption(...)` branch inside
-`main()`, non-`--status`), and the `--status` advisory printout. All three now state
-plainly that a database created by `schema_init.sql` (the fresh-install case) is a
-second, common origin for this state — not just a pre-v0.8.35 backup — and that it is
-"exactly the case you CAN vouch for." Also touched `update_framework.sh`'s own `die()`
-text at the equivalent point (it printed a second, narrower copy of the same
-explanation) so it does not contradict the corrected `apply.py` message printed just
-above it.
-
-**Test:** `tests/test_migration_ledger.py`, three new tests using the file's existing
-`_run_main()` stub-connection harness (`_FakeConn`/`_FakeCursor`, no real database):
-- `test_the_refusal_message_names_the_fresh_install_origin` — real (non-`--status`)
-  path, `rc == 2`, asserts both origins present on stderr AND that the OLD single-origin
-  framing ("This database predates migration tracking") no longer survives verbatim —
-  pins the fix, not merely an addition alongside stale text.
-- `test_the_status_advisory_also_names_the_fresh_install_origin` — same for `--status`'s
-  stdout printout.
-- `test_a_genuinely_ahead_database_still_refuses_before_adoption_wording` — control: the
-  `rc == 3` (AHEAD) path must never carry this wording; it is a different state with a
-  different fix.
-
-**Mutation check:** `sed`-replaced the string `"A FRESH INSTALL"` inside the refusal
-message with unrelated text. `test_the_refusal_message_names_the_fresh_install_origin`
-died (the other two origin tests are on different code paths/strings and correctly
-stayed green — only that message's own assertion should die from that mutation).
-Restored from scratchpad backup; `git status` clean.
-
-## Fix C — `--dry-run` stops enumerating once step 0 predicts a refusal
-
-**Where:** `shared-memory/scripts/update_framework.sh`, step 0 (the pre-`git pull`
-branch guard). `pull_blocked` is now declared once, before the `.git`-vs-tarball branch
-(previously only declared inside the `.git` branch, leaving the tarball route's own
-`refuse()` unable to signal it — fixed the tarball branch's `|| true` to `|| pull_blocked=1`
-too, for the same honesty reason, since it is the same code path and the same
-finding). Immediately after the whole step-0 block, a new check:
-
-```bash
-if [[ "$pull_blocked" == "1" ]]; then
-    echo
-    red "✗ [DRY RUN] the real run stops here — step 0 would refuse (see above)."
-    red "  Steps 1 onward are UNREACHABLE from this state and were not evaluated."
-    exit 1
+The caller (`echo "Removing containers and volumes ..."` onward) now does:
+```
+if ! compose_down_and_verify; then
+    ... "Uninstall INCOMPLETE" ... ; exit 1
 fi
 ```
+replacing the old unconditional `grn "✓ compose stack down, volumes removed"`.
 
-This is reachable **only** under `--dry-run` — on a real run, `refuse()` calls `die()`
-and the process has already exited before this line could ever be read. Matches the
-KNOWN TRAP warning about `run()`'s DRY_RUN early return: this fix does **not** touch
-`run()`/`run_soft()` at all — it prevents them from ever being called again after a
-predicted refusal, by exiting the whole script first.
+## Fix 5 (F6) — mintlock removal, both candidate paths
 
-**This directly REVERSES a previously-intentional design** (RULING 1's old comment:
-"let the rest of the dry run's step previews keep printing, exiting 0"), which two
-existing tests asserted as correct behaviour. Both were rewritten in place (not left
-alongside new ones) since they pinned the exact defect this fix closes:
-`test_dry_run_no_upstream_predicts_refusal_and_stops_enumerating` and
-`test_dry_run_detached_head_predicts_refusal_and_stops_enumerating` in
-`tests/test_update_framework_branch_guard.py` — renamed, and now assert `returncode != 0`,
-absence of `backfill_domain_of.py` (a later step) in the output, and absence of the
-unconditional "Dry run complete" banner. Added a third refusal-state test
-(`test_dry_run_remote_branch_deleted_predicts_refusal_and_stops_enumerating`, the RULING
-A measured case) and a control (`test_dry_run_with_a_healthy_branch_still_enumerates_every_step`)
-proving the truncation is scoped to an actual predicted refusal, not a side effect of
-`--dry-run` itself.
+`bootstrap_tokens.sh`'s `_LOCKFILE="${ENV_FILE}.mintlock"` had no cleanup
+anywhere. Added removal alongside the existing `$ENV_FILE` removal (`data`/`all`
+only — `service` exits before reaching this code, so it never touches either
+file, matching the existing "service is fully reversible" contract).
 
-### Fix C addendum (scope addition from a live measurement mid-build)
+**One thing I found and fixed beyond the literal ask:** `ENV_FILE` resolution
+(`shared-memory/.env`, falling back to repo-root `.env` if the first doesn't
+exist) is *dynamic* — it re-evaluates based on which file currently exists. On
+a genuine re-run after a partial uninstall (first run removed `.env` but died
+before reaching mintlock, or removed it in an earlier version of this script),
+`$ENV_FILE` on the second run silently resolves to the *other* candidate, and
+a mintlock stranded next to the now-gone first candidate would never be found.
+Fixed by introducing `_ENV_CANDIDATES=("$REPO_ROOT/shared-memory/.env"
+"$REPO_ROOT/.env")` near the top (same two paths, same order, as
+`apply.py`'s `_load_env()` and every other loader in this project) and looping
+over **both** candidates for mintlock removal (and the "WILL BE REMOVED"
+inventory display), independent of which one `$ENV_FILE` currently resolves
+to. `test_partial_uninstall_rerun_env_already_gone_mintlock_still_cleared`
+covers exactly this. `$ENV_FILE` itself is untouched — still resolves the same
+way it always did for the actual `.env` removal and every other use.
 
-The coordinator flagged a second instance of the same defect class in the same file:
-the domain-backfill step (step 6) labelled its dry-run preview "preview (enqueues
-nothing)" and invoked `backfill_domain_of.py` **without** `--apply` — but a real run
-always passes `--apply` by default (measured live: 318 outbox rows enqueued on one
-deployment) unless `--no-domain-backfill` is given. Fixed by making the dry-run and
-real-run branches invoke the **identical command** (both now carry `--apply`), with the
-dry-run label rewritten to state plainly that a real run applies by default, what that
-means (a write via the outbox), and the opt-out flag:
+## Fix 4 (F7/F8) — `authenticated_connectivity_check()` in `init_db.sh`
 
+New functions, marker-wrapped `# >>> AUTHENTICATED_CONNECTIVITY_CHECK` /
+`# <<<`, placed **after** both the Postgres schema apply and the Neo4j
+constraint apply (per the build brief's explicit ordering — not interleaved
+with the v0.9.44 `SCHEMA_PREEXISTENCE`/`ADOPT_LEDGER`/`LEDGER_GATE_DECISION`
+gate, which is untouched). Right before the final `Both stores initialised`
+line, which now only prints if both checks pass.
+
+**What it connects to and how (the part that needed investigation).**
+Everything else in `init_db.sh` that touches Postgres runs `docker exec ...
+psql -U postgres` with **no `-h`**, which resolves to a Unix-domain-socket
+connection inside the container. Postgres's own `pg_hba.conf` (written by the
+official image's entrypoint) routes a `local` (socket) connection through
+`trust` — no password checked, ever — and routes a `host` (TCP) connection
+through whatever `POSTGRES_HOST_AUTH_METHOD` the image started with (default
+`scram-sha-256`, since this compose file never overrides it). Adding **just
+`-h 127.0.0.1`** to a `docker exec ... psql` call routes it through the TCP
+loopback *inside the container*, hitting the password-checked `host` rule —
+the exact authentication class the gateway itself is subject to when it
+connects from the host to the published port, without needing any new
+dependency (no psql/psycopg2/`uv` on the host — same `docker exec` idiom this
+file already uses throughout):
 ```
-"domain backfill — a REAL run APPLIES this by default (writes domain rows via the
- outbox; pass --no-domain-backfill to skip it for one run)"
+PGPASSWORD="$PG_PASSWORD" docker exec -e PGPASSWORD -i "$PG_CONTAINER" \
+    psql -q -t -A -h 127.0.0.1 -U postgres -d "$PG_DB" -c "SELECT 1"
 ```
+`PG_PASSWORD` is newly read from `.env` (`read_env PG_PASSWORD`, refused if
+empty, mirroring the existing `NEO4J_PASSWORD` check) — it was never read at
+all before this fix.
 
-**Tests:** `tests/test_update_framework_no_domain_backfill.py`, two new tests —
-`test_dry_run_preview_shows_the_apply_flag_a_real_run_would_use` and
-`test_dry_run_preview_states_it_applies_by_default_and_names_the_opt_out`. A code
-comment cross-references `test_update_framework_live_execution.py`'s existing
-`test_live_run_without_flag_invokes_backfill_with_apply` (which independently pins the
-REAL run's actual `--apply` invocation) rather than duplicating that assertion here.
+I looked at `verify_schema_init.py` / `apply.py` (host-side `psycopg2`, `uv
+run --with psycopg2-binary`) and `verify_neo4j_init.py` (host-side `neo4j`
+driver, `uv run --with neo4j`) as the two established host-facing patterns.
+Went with the `docker exec -h 127.0.0.1` route instead of either: it adds
+**zero** new dependencies to a script whose whole design point (its own
+docstring) is "the host needs neither psql nor cypher-shell" — pulling in
+`uv`+`psycopg2-binary` here would contradict that, and would also introduce a
+"what if `uv` is absent" branch that the build brief didn't ask for and that
+would have to decide, arbitrarily, whether a *missing test tool* counts as an
+auth failure. `docker exec` is unconditionally required already (line 68).
 
-**Mutation checks (two, both in `update_framework.sh`):**
-1. Changed the guard condition from `"$pull_blocked" == "1"` to `"$pull_blocked" == "99"`
-   (never true). All three refusal-state dry-run tests died
-   (`test_dry_run_no_upstream_predicts_refusal_and_stops_enumerating`,
-   `..._detached_head_...`, `..._remote_branch_deleted_...`); the control test
-   (`test_dry_run_with_a_healthy_branch_still_enumerates_every_step`) and all other files
-   stayed green. Restored from scratchpad backup; `git status` clean.
-2. Reverted the domain-backfill dry-run branch back to the old label/command (dropped
-   `--apply`, restored "preview (enqueues nothing)"). Both addendum tests died; all other
-   tests in the file (flag-skip, step-numbering, `--from-restore` interaction) stayed
-   green — proving the mutation coverage is specific to the dry-run command/label text,
-   not a broad regression. Restored from scratchpad backup; `git status` clean.
+**Neo4j did not have this gap.** `cypher-shell` (used everywhere else in this
+file for Neo4j) has no unauthenticated mode — it always connects over bolt
+with real credentials (`NEO4J_PASSWORD`, exported and forwarded the same way
+this fix forwards `PGPASSWORD`). A stale Neo4j data directory already fails
+loudly today, mid-script, during "Applying neo4j_init.cypher". I added
+`neo4j_authenticated_check()` anyway, calling the same `cypher-shell -u neo4j
+"RETURN 1"` already used by the readiness-wait loop just above it, so that:
+(a) both stores are verified by the same explicit, equally-worded mechanism
+rather than one being correct only as a side effect of unrelated work, and
+(b) a Postgres-only failure and a Neo4j-only failure both name which store
+failed (`test_one_store_failing_still_reports_that_store_by_name`).
 
-## Fix D — detached-HEAD remedy names `main`; AGENTS.md documents it
+**Failure wording** (pinned by value in tests) names the likely cause and
+points away from editing credentials:
+> `✗ Postgres REFUSED this .env's credentials over the password-checked
+> connection the gateway will actually use to reach it.`
+> `Likely cause: this data directory pre-existed this install — a previous
+> cluster's credentials are still in force. ... This is a data-directory
+> problem, not a credentials problem — do not edit the .env to make this
+> pass. ... or clear the stale data first: uninstall_framework.sh --level data`
 
-**Where:** `shared-memory/scripts/update_framework.sh`'s detached-HEAD `refuse()`
-message now reads *"This framework's release branch is main: run `git checkout main` to
-return to it... (If you deliberately want a specific pinned tag instead of the moving
-branch, check that tag out instead — or use the tarball route...)"* — replacing the old
-generic "Check out the release branch or tag you intend to run" (which named no ref at
-all). `AGENTS.md`'s `### Upgrade (gateway host)` section gained a matching paragraph
-right after the existing tarball-route paragraph, explaining the likely cause (`git
-checkout <tag>` right after cloning — a defensible reading of "install the release"
-that this repo doesn't actually want) and the same recovery, `git checkout main`.
+Exits 1 on either store failing (`_auth_failures` counter, both checks always
+run so a Postgres failure doesn't hide a Neo4j one), before the final success
+line.
 
-**README.md was NOT touched**, per the build brief. Proposed wording, for the merger to
-weigh (README currently gives no tag-checkout instruction at Quick Start step 1, so
-nothing there actively induces the detached-HEAD state — this is a defensive addition,
-not a bug-in-README fix):
+## Tests + mutation evidence
 
-> *(Optional addition to README §3 Quick Start, step 1, after "Clone the repo...")*
-> Stay on the default branch (`main`) after cloning — it **is** the release branch.
-> Checking out a release tag directly leaves the repo on a detached HEAD, which
-> `update_framework.sh` will refuse to `git pull` from later; `git checkout main`
-> recovers it.
+`tests/test_uninstall_compose_down.py` (10 tests) — extracts
+`compose_down_and_verify()` between its markers, PATH-stubbed `docker`
+(argv-recording, scriptable `down` exit code / output and `ps -a` output via
+env vars `DOCKER_DOWN_RC`/`DOCKER_DOWN_OUT`/`DOCKER_PS_OUTPUT`). Mutation-killed:
+- `test_env_file_present_down_is_invoked_with_env_file_and_compose_file` —
+  died when `--env-file "$ENV_FILE"` was stripped from the down invocation
+  (line ~300). Confirms fix 1.
+- `test_down_failure_is_not_reported_as_success_and_exits_nonzero` — died when
+  the `if [[ "$down_rc" -ne 0 ]]` check (line 315) was replaced with `if
+  false`. Confirms fix 2's guard is load-bearing.
+- `test_leftover_container_after_a_clean_exit_is_named_and_fails`,
+  `test_two_leftover_containers_are_both_named`,
+  `test_container_list_is_read_from_the_compose_file_not_hardcoded` — all
+  three died when the `if [[ ${#leftover[@]} -gt 0 ]]` check (line 328) was
+  replaced with `if false`. Confirms fix 3's guard.
+- Restored from scratchpad backup after each mutation; `git status` /
+  `git diff --stat` confirmed identical to the pre-mutation state each time.
 
-**Test:** `tests/test_detached_head_recovery_documented.py` (4 tests, new file).
-Extracts the exact `refuse(...)` string literal from `update_framework.sh` via regex
-(not hardcoded here) and the `### Upgrade (gateway host)` section of `AGENTS.md`, then:
-- `test_the_refusal_names_main_as_the_concrete_remedy` — `git checkout main` present,
-  tag alternative preserved.
-- `test_the_old_unnamed_remedy_wording_does_not_survive_verbatim` — pins the fix, not an
-  addition alongside stale text.
-- `test_agents_md_documents_the_detached_head_case` — scoped to the Upgrade section
-  specifically (not "anywhere in the file").
-- `test_agents_md_and_the_script_name_the_same_remedy` — **cross-check**: both sides
-  must name the identical ref, extracted independently from each source, so a future
-  rename of the release branch can't update one and silently leave the other stale.
+`tests/test_uninstall_mintlock.py` (5 tests) — runs the **full script**
+non-dry-run at `--level data`/`all`/`service` (safe: the fixture never creates
+a systemd unit file, so the script's own `[[ ! -f "$UNIT_PATH" ]]` guard skips
+`systemctl` entirely before it could reach the real session bus — the exact
+hazard `test_uninstall_guards.py`'s own comment documents; `docker` is
+PATH-stubbed to a no-op success). Mutation-killed:
+- `test_level_data_removes_the_mintlock_alongside_the_env_file`,
+  `test_level_all_also_removes_the_mintlock`,
+  `test_partial_uninstall_rerun_env_already_gone_mintlock_still_cleared` — all
+  three died when the `for _cand in ...; do rm -f ...; done` loop body (line
+  ~414) was replaced with a no-op `:`. Confirms fix 5, including the
+  both-candidates fix (the third test specifically exercises the candidate
+  the naive single-`$ENV_FILE`-check version would have missed).
+- `test_level_service_never_touches_the_env_file_or_the_mintlock` and
+  `test_no_mintlock_present_is_not_an_error` correctly stayed green under the
+  same mutation (they assert *absence* of removal in scenarios where nothing
+  should be removed either way) — expected, not a gap.
 
-Also cross-pinned for free: `test_dry_run_detached_head_predicts_refusal_and_stops_enumerating`
-(fix C's test file) asserts `"git checkout main" in out` on the live dry-run output, so
-fix D is independently verified from two different test files reading two different
-sources.
+`tests/test_init_db_authenticated_check.py` (10 tests) — extracts all three
+`AUTHENTICATED_CONNECTIVITY_CHECK` functions, PATH-stubbed `docker` answering
+by matching `SELECT 1` / `RETURN 1` in the logged argv, exit codes via
+`PG_AUTH_RC`/`NEO4J_AUTH_RC`. Mutation-killed:
+- `test_pg_check_success_reports_authenticated` — died (assertion on `-h
+  127.0.0.1` in the logged argv) when `-h 127.0.0.1` was removed from
+  `pg_authenticated_check()`, reverting it to the same peer-trust path every
+  other Postgres call in this script uses. This is the mutation that matters
+  most: it proves the test would have caught the *original* F8 defect (an
+  authenticated-check that silently isn't).
+- `test_both_checks_are_invoked_after_neo4j_constraints_and_gate_the_final_message`
+  — died when the two `authenticated_connectivity_check "Postgres"
+  .../ "Neo4j" ...` call lines (~329-330) were replaced with a no-op. Confirms
+  the checks are actually wired into the script, not just defined.
+- Restored from scratchpad backup after each; verified via `git status`.
 
-**Mutation checks (two, run separately):**
-1. `update_framework.sh` side: `sed` replaced `git checkout main` with `git checkout
-   MUTATED_wrong_ref`. `test_the_refusal_names_main_as_the_concrete_remedy` and
-   `test_agents_md_and_the_script_name_the_same_remedy` died, as did the
-   cross-pinned `test_dry_run_detached_head_predicts_refusal_and_stops_enumerating` in
-   the branch-guard test file. Restored from scratchpad backup; `git status` clean.
-2. `AGENTS.md` side: changed the recovery line's ref to `git checkout somewhere-else`.
-   `test_agents_md_documents_the_detached_head_case` and
-   `test_agents_md_and_the_script_name_the_same_remedy` died. Restored from scratchpad
-   backup; `git status` clean.
+Full suite from repo root: **2541 passed, 1 skipped** (baseline was 2516
+passed / 1 skipped; +25 new tests, 0 regressions). `shared-memory/.env` does
+not exist in this worktree at all (gitignored, never present), so the mtime
+canary is trivially satisfied — nothing was read, written, or executed
+against it.
 
-## Test summary
+## Second commit — review integration (Ops-14, Critical)
 
-18 new tests across 5 files (2 new, 3 extended), baseline 2488 passed / 1 skipped →
-final 2506 passed / 1 skipped, all green, no regressions, no test deleted. Every guard
-was mutation-checked individually (7 mutations total across the four fixes, see above),
-each restored via scratchpad copy-back — never `git checkout --` — with `git status`
-confirmed clean after each restore. No live database, docker, or service was touched at
-any point; `shared-memory/.env` does not exist in this worktree at all (canary trivially
-satisfied — nothing to move).
+The Ops & Release Integrity review found the post-condition verification
+itself FAILS OPEN: `mapfile -t containers < <(grep -E '^[[:space:]]*container_name:'
+"$COMPOSE_FILE" | sed ...)` yields an **empty array** whenever the compose
+file's syntax changes, it's renamed, or it's simply missing by the time this
+runs — the leftover-detection loop then iterates zero times, finds zero
+leftovers, and the function prints `✓ compose stack down, verified gone`.
+That is the exact unearned-checkmark class this whole branch exists to
+remove (F4/F5's original shape: a green result nobody actually measured),
+reintroduced one layer up, inside the very function that was supposed to
+close it.
+
+**Fix:** immediately after the `mapfile`, in `compose_down_and_verify()`
+(`shared-memory/scripts/uninstall_framework.sh`, ~line 321), an empty
+`$containers` array is now refused as a verification **failure**, not read
+as "nothing to check":
+```
+if [[ ${#containers[@]} -eq 0 ]]; then
+    red "  ✗ could not parse any container_name: entries from $COMPOSE_FILE --"
+    red "    the teardown CANNOT be verified. This does not mean nothing is"
+    red "    running: it means this function has no list to check docker ps"
+    red "    against. Check by hand:"
+    red "        docker ps -a"
+    return 1
+fi
+```
+Returns 1, which flows into the same failure path a failed `down` already
+uses (the caller's `if ! compose_down_and_verify; then ... exit 1; fi` — no
+new branch needed there). No fallback heuristic (guessing container names
+from the image list, or similar) — an honest "cannot verify" beats a clever
+guess, per the ruling.
+
+**Tests** (`tests/test_uninstall_compose_down.py`, +2, now 12 in that file):
+- `test_empty_container_list_refuses_to_claim_success` — (a) from the
+  ruling: a compose fixture with zero `container_name:` lines
+  (`_NO_CONTAINER_NAMES_COMPOSE`) must produce an absent success line, the
+  "could not parse any container_name" / "CANNOT be verified" / `docker ps
+  -a` wording present (pinned by value), and a nonzero return — and confirms
+  the down itself DID run first (this is a verification failure, not a down
+  failure).
+- `test_empty_container_list_is_distinct_from_a_leftover_failure` — the
+  "STILL PRESENT" leftover wording must not appear, so an operator can tell
+  the two failure modes apart.
+
+**Mutation evidence:** scratchpad-backed up `uninstall_framework.sh`
+(`cp` to the scratchpad dir, never `git checkout --`), replaced the new
+`if [[ ${#containers[@]} -eq 0 ]]; then` with `if false; then`, reran
+`tests/test_uninstall_compose_down.py`: exactly
+`test_empty_container_list_refuses_to_claim_success` died (asserted
+`returncode != 0`, got the old unconditional success line and exit 0); all
+11 other tests in that file — including
+`test_empty_container_list_is_distinct_from_a_leftover_failure`, every
+leftover-container test, and every success-path test — stayed green, as the
+ruling specified. Restored via `cp` from the scratchpad backup;
+`git status`/syntax-checked clean afterward.
+
+**Fallout caught and fixed:** `tests/test_uninstall_mintlock.py`'s fixture
+compose file (`postgres_neo4j_limits.yaml` written by its own `_fake_install`)
+previously declared `services: {}` — zero `container_name:` entries. With
+the new guard in place this correctly started refusing that fixture's
+teardown as unverifiable, which made all four of that file's non-dry-run
+scenarios fail before ever reaching the mintlock-removal code (an honest
+regression, not a flaky one — the guard was doing exactly its job against a
+fixture that no longer matched reality). Fixed by giving that fixture's
+compose file two real `container_name:` entries
+(`neo4j-memory`/`postgres-vector`, matching its already-empty `DOCKER_PS_OUTPUT`
+stub so no leftover is found), restoring all 5 of that file's tests to green
+without touching its actual mintlock-removal assertions.
+
+**Suite:** full run from the worktree root — **2543 passed, 1 skipped**
+(prior state after commit 1: 2541 passed/1 skipped; +2 new tests, 0
+regressions once the mintlock fixture was updated).
+
+## Nothing proposed for README.md
+
+Checked: README.md and AGENTS.md mention `init_db.sh` only as "idempotent" /
+"applies schema" (both still true) and never mention `uninstall_framework.sh`
+at all. Nothing in either document needed a wording change.
 
 ## For the merger
 
-- Version bump, CHANGELOG, `sync_skills.sh` are explicitly NOT done here (builder scope
-  excludes version files/CHANGELOG per the build-cycle workflow, `fact:1184`/`decision:1320`).
-- The README wording above is a proposal only — weigh whether it's worth adding given
-  README currently doesn't itself suggest checking out a tag.
-- Fix A's `PG_DB`/`PG_CONTAINER` override limitation (noted above) is pre-existing in
-  `apply.py`'s DSN resolution, not introduced by this change — flagging for awareness,
-  not asking for a fix in this cycle.
-- All four fixes are independent by file region within `update_framework.sh` (fix C
-  touches step-0 + step-6; fix D touches only the detached-HEAD string inside step 0) —
-  reviewed as one PR since they came from one measured session, per the brief.
-
----
-
-## REVIEW INTEGRATION — second commit, on top of the branch above
-
-Branch rebased onto `main`/v0.9.43 (`39d9333`) by the merger before this integration;
-worked on the branch as it stood, pulled nothing. This is a **second commit** on
-`fix/first-upgrade-fresh-install` (not an amend) — the original build and this
-review-driven fix are separately inspectable, matching this repo's review-cycle
-tracing convention (`fact:1315`): a finding gets its own fix-trace rather than being
-folded silently into the record it corrects.
-
-### THE FINDING (Critical, Ops & Release Integrity review, verified by the merger)
-
-`adopt_ledger()` was called **unconditionally** at the end of `init_db.sh`, right after
-`schema_init.sql` ran. Because `init_db.sh` is documented idempotent and
-`schema_init.sql` is `IF NOT EXISTS`, running `init_db.sh` against a **restored
-pre-v0.8.35 backup** silently succeeds without touching the old tables at all — and the
-unconditional `adopt_ledger()` call would then record **every current migration** as
-already applied on a database that is genuinely missing every post-v0.8.35 alteration.
-That bypasses `apply.py`'s own `needs_adoption()` safety stance and corrupts migration
-state **permanently** (a wrongly-populated `schema_migrations` row for a migration that
-never ran is not detectable later — the ledger claims it happened).
-
-### THE GATE — implemented exactly as ruled
-
-`shared-memory/scripts/init_db.sh`, new region between `# >>> SCHEMA_PREEXISTENCE` and
-`# <<< LEDGER_GATE_DECISION` (spans across the existing `# >>> ADOPT_LEDGER` block too —
-the three pieces are one composition):
-
-1. **Before** `schema_init.sql` runs — while the question is still answerable — a new
-   `schema_preexisted()` function checks, via the same in-container `psql` the script
-   already uses, whether `technical_docs` (apply.py's own `_FRAMEWORK_TABLE`
-   discriminator) already exists in the target database:
-   `SELECT to_regclass('technical_docs') IS NOT NULL`. Recorded into
-   `SCHEMA_PREEXISTED` (`0` = fresh, `1` = pre-existing). Defaults **conservatively**:
-   only an explicit `f` (Postgres confirming absence) reads as fresh; anything else —
-   `t`, or unexpected output — reads as pre-existing, which only ever costs a *skipped*
-   auto-adopt (still recoverable by hand), never a wrongly-adopted ledger.
-2. `schema_init.sql` runs as before (unchanged).
-3. The call site (previously a bare `adopt_ledger`) is now gated:
-   - `SCHEMA_PREEXISTED == 0` → `adopt_ledger()` fires, exactly as before this fix.
-   - `SCHEMA_PREEXISTED == 1` and the ledger is genuinely empty (checked by a new
-     `ledger_populated()` function — `schema_migrations` absent, or present with zero
-     rows; two separate `to_regclass`/`EXISTS` queries because SQL cannot lazily skip a
-     `FROM` clause on a table that may not exist) → **do not adopt**. Print a short
-     pointer at `apply.py --status` / `apply.py --adopt` instead — reusing Fix B's own
-     dual-origin explanation rather than duplicating that prose here.
-   - `SCHEMA_PREEXISTED == 1` and the ledger is already populated (the ordinary
-     idempotent re-run of `init_db.sh` against an already-tracked deployment) → stay
-     completely quiet, neither adopting nor printing anything new.
-
-`apply.py`'s own stance toward a database this run did **not** just create remains
-exactly as it always was — `--adopt` is still never invoked automatically for one; the
-gate only changes when `init_db.sh` is willing to invoke it *for* the operator.
-
-### TESTS — `tests/test_init_db_ledger_adoption.py` extended (11 tests total, +4 new)
-
-Existing 7 tests updated where the call site's shape changed
-(`test_the_function_is_actually_called_after_schema_applied` now looks for the indented
-`    adopt_ledger` call inside the gate's `if` branch, not a bare top-level one) and
-otherwise kept as-is — they test `adopt_ledger()` in isolation and remain valid.
-
-New composition-level extraction: `_extract_gate_source()` lifts the **whole**
-contiguous region from `# >>> SCHEMA_PREEXISTENCE` through `# <<< LEDGER_GATE_DECISION`
-— deliberately including the real "Apply Postgres schema" `docker exec` call in the
-middle, since the review finding is about the *composition*, not any one function in
-isolation, and testing three stitched-together separate extractions would risk testing
-a reimplementation rather than the shipped code. A new stubbed `docker` (`_docker_stub_body`)
-answers the three psql queries by env var (`TECHNICAL_DOCS_PREEXISTS` /
-`LEDGER_TABLE_EXISTS` / `LEDGER_HAS_ROWS`) and consumes-and-succeeds on the real
-`schema_init.sql` apply call in between; the existing `uv` stub is reused unchanged.
-
-- **(a) fresh-DB path adopts** — `test_a_genuinely_fresh_database_adopts`
-  (`TECHNICAL_DOCS_PREEXISTS=f`): the gate reaches `adopt_ledger()`, ledger populated.
-  Composition-level counterpart to the existing `test_uv_present_and_adopt_succeeds_reports_success`,
-  which tests `adopt_ledger()` alone.
-- **(b) pre-existing-schema-without-ledger does NOT adopt** —
-  `test_a_preexisting_schema_with_no_ledger_does_not_adopt` (THE measured Critical case:
-  `TECHNICAL_DOCS_PREEXISTS=t`, `LEDGER_TABLE_EXISTS=f`, `uv` stub set to *succeed* if
-  wrongly called). Pinned by value: `"uv "` must not appear anywhere in the invocation
-  log at all (no `apply.py --adopt` call, full stop), `"Migration ledger populated"`
-  must not appear in stdout, and the pointer text (`"already existed before this run"`,
-  `apply.py --status`, `apply.py --adopt`) must appear instead.
-- **Bonus control** — `test_a_preexisting_schema_with_a_populated_ledger_stays_quiet`
-  (pre-existing schema, ledger already populated): neither adopts nor prints the
-  pointer — proves the idempotent re-run case (the common one in practice) stays quiet
-  rather than nagging on every `init_db.sh` re-run.
-- `test_gate_markers_present_in_the_right_order` — the three marker pairs exist exactly
-  once and in the right relative order, so a future edit can't silently break the
-  extraction the other tests depend on.
-
-### MUTATION CHECK (c) — exactly as ruled
-
-Reverted the gate to unconditional (`sed`/Python-scripted): inserted a bare `adopt_ledger`
-call before the `if`, and changed the `if` condition to `"$SCHEMA_PREEXISTED" == "99"`
-(never true) so the `elif`/pointer branch could never fire either — i.e. reproduced the
-ORIGINAL pre-review-finding bug (adopt always fires, unconditionally).
-
-Result: **both** `test_a_preexisting_schema_with_no_ledger_does_not_adopt` (the named
-test) **and** the bonus control `test_a_preexisting_schema_with_a_populated_ledger_stays_quiet`
-died — both assert `"uv " not in log_text`, and the mutation makes `adopt_ledger` (which
-invokes `uv`) fire unconditionally regardless of pre-existence or ledger state, so both
-correctly caught it. All 9 other tests in the file (isolated `adopt_ledger()` tests,
-`test_a_genuinely_fresh_database_adopts`, marker tests, header test) stayed green,
-confirming the mutation's blast radius matched expectations — only the two
-pre-existing-schema scenarios should react to removing the gate.
-
-Restored via scratchpad copy-back (`/tmp/claude-1000/.../scratchpad/mutbak2/init_db.sh.gated`)
-— never `git checkout --`. `diff -q` confirmed byte-identical restoration; `bash -n`
-confirmed syntax; `git status --short shared-memory/scripts/init_db.sh` showed only the
-expected modified-vs-HEAD state (no stray diff from the mutation) after restore.
-
-### Suite count
-
-Full suite from the worktree root: **2516 passed, 1 skipped** (rebase baseline stated as
-2512/1; +4 new tests from this integration = 2516, matches exactly). No regressions, no
-test deleted, all green. `shared-memory/.env` still does not exist in this worktree —
-canary trivially satisfied, nothing to move. No live database, docker, or service
-touched at any point.
-
-### Same forbidden-files rules as the original brief — unchanged
-
-Only `shared-memory/scripts/init_db.sh` and `tests/test_init_db_ledger_adoption.py`
-touched for this integration. No version files, CHANGELOG, `sync_skills.sh`,
-`generate_tokens.py`/`bootstrap_tokens.sh`, or `.env` touched.
+- Version bump (patch), CHANGELOG entry, `sync_skills.sh` (not needed here —
+  no skill/client-surface files touched) are all yours per scope.
+- Consider whether the fix-4 Neo4j check (fully redundant with existing
+  behavior, added for symmetry/explicitness) is worth keeping vs. trimming —
+  I judged it worth the ~15 lines for consistent operator-facing wording and
+  test coverage parity between the two stores, but it's a judgment call, not
+  a forced one.
+- The `_ENV_CANDIDATES` array refactor in `uninstall_framework.sh` (top of
+  file) is slightly wider than a literal reading of fix 5 required — flagging
+  it explicitly since it changes how `ENV_FILE` itself is *constructed*
+  (same two paths, same order, same resulting value — just now built from an
+  array `_ENV_CANDIDATES[0]`/`[1]` instead of two bare literals). Worth a
+  second look; I don't believe it changes `$ENV_FILE`'s value in any scenario,
+  only what mintlock-removal additionally checks.
