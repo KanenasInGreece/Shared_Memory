@@ -5,6 +5,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.41] — 2026-08-24
+
+### Fixed — an installer that refuses a blank password
+
+- **The install's password prompts accepted an empty string in silence.** Pressing Enter at the
+  Neo4j or Postgres password prompt — the very gesture the preceding bracketed-default prompts
+  train — wrote `NEO4J_PASSWORD=` / `PG_PASSWORD=` as literal empty strings, and the install
+  reported success. The prompts now refuse any password of 8 characters or fewer and ask again,
+  explaining what was wrong.
+- **A pipe that ran dry no longer completes an install on blank credentials.** Feeding the
+  installer from a script that supplies too few answers used to fall through every remaining
+  prompt on empty defaults. If input runs out before a valid password is given, the install now
+  stops with a nonzero exit naming the step, instead of finishing with credentials nobody chose.
+- The validation lives in a marker-delimited block with its own extracted unit tests, each guard
+  mutation-checked (inverting the length check and removing the end-of-input guard each kill
+  named tests). Suite: 2454 passed, 1 skipped.
+
+---
+
 ## [0.9.40] — 2026-08-24
 
 ### Fixed — scripts that answer `--help` instead of acting on it

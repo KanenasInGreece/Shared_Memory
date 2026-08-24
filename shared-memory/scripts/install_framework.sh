@@ -43,9 +43,43 @@ fi
 ask() {  # prompt default  → echoes answer (default if blank)
   local v; read -r -p "$1 [$2]: " v; printf '%s' "${v:-$2}"
 }
-ask_secret() {  # prompt → echoes answer (input hidden)
-  local v; read -r -s -p "$1: " v; echo >&2; printf '%s' "$v"
+# >>> ASK_SECRET
+# Prompts for a DB password (hidden input) and never returns until it has a
+# valid one — never a blank/short value silently written to .env (framework
+# fact:1499 CRITICAL 1: pressing Enter used to write NEO4J_PASSWORD= /
+# PG_PASSWORD= as literal empty strings, and the install still reported
+# success). "Valid" means strictly more than 8 characters; 8-or-fewer is
+# refused, including the empty string.
+#
+# On a REAL answer being available — an interactive terminal, or a script
+# feeding scripted lines on a pipe — `read` succeeds and returns whatever it
+# got, so an invalid entry (empty or too short) loops back for another try:
+# this is the RE-PROMPT case, and covers both a human pressing Enter and an
+# automated caller feeding a too-short placeholder.
+#
+# On EXHAUSTED input (stdin closed, or a pipe with no more lines left) `read`
+# itself fails — bash's own signal that there is no one left to answer. That
+# is exactly the measured failure mode this guards: piping stdin with nothing
+# left ran the whole install silently on an empty/default password. Here it
+# is instead a hard, loud, nonzero-exit failure that names the step, rather
+# than a silent fall-through to the empty string.
+ask_secret() {  # prompt → echoes answer (input hidden), or exits 1
+  local v
+  while :; do
+    if ! read -r -s -p "$1: " v; then
+      echo >&2
+      echo "✗ $1: no more input on stdin — refusing to write a blank or unconfirmed password. Re-run this script from an interactive terminal (or a pipe that supplies a valid password) and answer the prompt." >&2
+      return 1
+    fi
+    echo >&2
+    if [ "${#v}" -gt 8 ]; then
+      printf '%s' "$v"
+      return 0
+    fi
+    echo "  ✗ $1 must be more than 8 characters (got ${#v}) — try again." >&2
+  done
 }
+# <<< ASK_SECRET
 
 NEO4J_HOST_DIR="$(ask 'Neo4j host data dir'        "$HOME/databases/neo4j")"
 PG_DATA_DIR="$(ask 'Postgres data dir'             "$HOME/databases/postgres")"
