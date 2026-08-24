@@ -12,8 +12,11 @@
 #   service  the gateway stops being a service, and no agent can reach it.
 #            systemd user unit, linger, and EVERY agent's skill directory
 #            (which is where its raw AGENT_TOKEN lives). Containers, data and
-#            .env are untouched — this level is reversible by re-running
-#            install_service.sh + sync_skills.sh.
+#            .env are untouched — this level is reversible; the exact working
+#            procedure (install_service.sh, sync_skills.sh --install, then a
+#            per-agent bootstrap_tokens.sh --remint ... --install-path, then a
+#            gateway restart) is printed at the end of a real run of this
+#            level, not duplicated here where it could drift out of sync.
 #
 #   data     everything above, plus the stores and the credentials: containers
 #            and volumes, the Neo4j/Postgres data directories, and
@@ -64,7 +67,7 @@ while [[ $# -gt 0 ]]; do
         --dry-run)   DRY_RUN=1; shift ;;
         --yes|-y)    ASSUME_YES=1; shift ;;
         --no-backup) NO_BACKUP=1; shift ;;
-        -h|--help)   sed -n '2,45p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        -h|--help)   awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; exit 0 ;;
         *)           die "unknown argument: $1" ;;
     esac
 done
@@ -233,8 +236,20 @@ fi
     echo
     grn "Uninstall complete (level: service)."
     echo "The stores, credentials and corpus are untouched. Reverse with:"
-    echo "  bash shared-memory/ops/install_service.sh && bash shared-memory/scripts/sync_skills.sh"
-    echo "  (each agent then needs its token re-issued: bootstrap_tokens.sh --remint <name>)"
+    echo "  1. bash shared-memory/ops/install_service.sh"
+    echo "     (recreates the systemd unit + linger, starts the gateway)"
+    echo "  2. bash shared-memory/scripts/sync_skills.sh --install"
+    echo "     (plain sync_skills.sh SKIPS a deleted directory — it only updates an"
+    echo "      EXISTING install. --install recreates + populates each directory named"
+    echo "      in AGENT_INSTALLS= in $ENV_FILE — that registry entry survives this"
+    echo "      uninstall level, so this step needs no agent name.)"
+    echo "  3. Per agent (name + skill-dir path: see AGENT_INSTALLS= in $ENV_FILE):"
+    echo "       bash shared-memory/scripts/bootstrap_tokens.sh --remint <name> --install-path <skill-dir>/.env"
+    echo "     (--remint with no --install-path mints a token nobody receives — always"
+    echo "      pass it. Requires step 2 to have already created <skill-dir>.)"
+    echo "  4. systemctl --user restart $GATEWAY_UNIT"
+    echo "     (the gateway from step 1 is still running the OLD AGENT_TOKENS digests;"
+    echo "      this loads what step 3 wrote — bootstrap_tokens.sh says so itself.)"
     exit 0
 }
 

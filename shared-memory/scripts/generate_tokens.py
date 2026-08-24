@@ -963,7 +963,12 @@ def add_agent(
     else:
         print()
         print(f"  {name:15}  REMOTE / no install path given — reveal with:")
-        print(f"                   generate_tokens.py --add {name} --reveal {name}")
+        # ⛔ This used to say "--add {name} --reveal {name}". By the time this
+        # line prints, {name} IS already registered (this mint just added or
+        # re-issued it) — a subsequent --add of the same name hits the
+        # already-registered refusal above (line ~851) instead of revealing
+        # anything. --remint is the one that re-issues an EXISTING name.
+        print(f"                   generate_tokens.py --remint {name} --reveal {name}")
 
     return 0, token
 

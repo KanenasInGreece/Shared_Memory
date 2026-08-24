@@ -20,6 +20,23 @@
 #   bash ~/.claude/skills/shared-memory/scripts/update_skill.sh
 set -uo pipefail
 
+# ⛔ RULING 4: every operator-facing script accepts -h/--help (prints its own
+# header, exits 0, does nothing else) and refuses any argument it does not
+# recognise — this script previously had no argument parsing at all, so any
+# flag (including --help) was silently ignored and the self-update ran anyway.
+for _arg in "$@"; do
+    case "$_arg" in
+        -h|--help)
+            awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"
+            exit 0
+            ;;
+        *)
+            echo "✗ unknown argument: $_arg (this script takes none — see --help)" >&2
+            exit 1
+            ;;
+    esac
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(dirname "$SCRIPT_DIR")"
 # Overridable so this script is actually testable against a local mock server

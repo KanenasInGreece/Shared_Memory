@@ -92,6 +92,20 @@ _branch_notice() {
     ylw "     If you intend to upgrade to the released code, check out main and re-run."
 }
 
+# ── RULING 5: the linger verdict's "yes" and "not-applicable" branches used to
+# print NOTHING — only "no" was reported. The v0.9.39 CHANGELOG says this
+# check "reports yes, no, or not applicable", which was untrue: a passing
+# check and a check that never ran looked identical to the operator. "no"
+# stays loud with its remedy (unchanged below); this covers the other two
+# with one brief line each — enough to show the check ran, not enough to be
+# noisy about a state that needs no action.
+_linger_brief() {
+    case "$LINGER_VERDICT" in
+        yes)             echo "   ✓ linger check: enabled for $_linger_who." ;;
+        not-applicable)  echo "   · linger check: not applicable on this host." ;;
+    esac
+}
+
 FROM_RESTORE=0
 DRY_RUN=0
 SKIP_BACKUP=0
@@ -627,6 +641,8 @@ if [[ "$DRY_RUN" == "0" && -z "${AGENT_TOKEN:-}" ]]; then
         red "     runs as a systemd --user service, it will still be killed on session end"
         red "     even once postflight has been run. Fix:"
         echo "       sudo loginctl enable-linger $_linger_who"
+    else
+        _linger_brief
     fi
     echo
     ylw "Update finished, but UNVERIFIED. An update is not complete until postflight passes."
@@ -643,6 +659,8 @@ if [[ "$DRY_RUN" == "1" ]]; then
         red "  linger is NOT enabled for $_linger_who on this host. If the gateway runs as a"
         red "  systemd --user service, it will not survive your session ending. Fix:"
         echo "    sudo loginctl enable-linger $_linger_who"
+    else
+        _linger_brief
     fi
 elif [[ "$rc" == "0" ]]; then
     grn "Update complete and VERIFIED — postflight passed."
@@ -651,6 +669,8 @@ elif [[ "$rc" == "0" ]]; then
         red "  BUT linger is NOT enabled for $_linger_who on this host. If the gateway runs"
         red "  as a systemd --user service, it will be killed when this session ends. Fix:"
         echo "    sudo loginctl enable-linger $_linger_who"
+    else
+        _linger_brief
     fi
     ylw "Recommended: take a second backup now, so a known-good set exists at the new level."
 else
@@ -663,6 +683,7 @@ else
   runs as a systemd --user service, it will still be killed on session end
   even once postflight passes. Fix:  sudo loginctl enable-linger $_linger_who"
     else
+        _linger_brief
         die "postflight FAILED (exit $rc). The code and schema have moved; the system is
   NOT verified. Read the failures above before using this deployment."
     fi

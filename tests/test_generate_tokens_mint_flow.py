@@ -1130,3 +1130,73 @@ def test_add_refuses_to_widen_a_read_only_agent_and_mints_nothing(tmp_path, caps
     assert token is None
     assert not [l for l in (out.out + out.err).split("\n")
                 if l.startswith("AGENT_TOKENS=")]
+
+
+# ── RULING 1.3 (fix/uninstall-reverse-and-help) — the REMOTE recovery advice
+# printed by a single-agent add_agent() mint (no install_path) must name a
+# command that actually WORKS the next time it is run. It used to say
+# "generate_tokens.py --add {name} --reveal {name}" -- but by the time that
+# line prints, {name} IS ALREADY REGISTERED (this very mint just added or
+# re-issued it), so a later --add of the same name hits the
+# already-registered refusal (test_add_refuses_when_already_registered
+# above) instead of revealing anything. --remint is the one that re-issues
+# an EXISTING name -- see test_add_refuses_when_already_registered's own
+# error text ("--add never silently rotates ... Use --remint"), which
+# already agreed with this and was simply not applied to this one call site.
+
+def test_remote_add_recovery_advice_uses_remint_not_add(tmp_path, capsys):
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    env_path.write_text("AGENT_TOKENS=claude:sha256:" + ("a" * 64) + "\n")
+
+    rc, token = gt.add_agent("codex", install_path=None, env_path=str(env_path))
+    out = capsys.readouterr().out
+
+    assert rc == 0 and token
+    assert "generate_tokens.py --remint codex --reveal codex" in out, (
+        f"recovery advice for an undelivered REMOTE agent must name --remint "
+        f"(re-issues an EXISTING name), not --add (refuses one):\n{out}"
+    )
+    assert "generate_tokens.py --add codex --reveal codex" not in out, (
+        f"the OLD, broken advice is still being printed -- following it would "
+        f"hit the already-registered refusal instead of revealing anything:\n{out}"
+    )
+
+
+def test_following_the_printed_remote_add_recovery_advice_actually_works(tmp_path, monkeypatch):
+    """Not just a string match: prove the EXACT command the report prints
+    actually succeeds when run through main() -- the real CLI surface
+    bootstrap_tokens.sh invokes -- which the OLD --add form did not (it hits
+    test_add_refuses_when_already_registered's refusal instead).
+
+    generate_tokens.py itself never writes AGENT_TOKENS= into env_path --
+    it only PRINTS the merged line for bootstrap_tokens.sh's own
+    replace_registry_lines() to persist (see bootstrap_tokens.sh). This test
+    applies that same merged line back to env_path between the two
+    invocations, exactly as the real two-script pipeline does, so the second
+    call sees codex as genuinely registered.
+    """
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    monkeypatch.setattr(gt, "_DEFAULT_GATEWAY_ENV", str(env_path))
+    env_path.write_text("AGENT_TOKENS=claude:sha256:" + ("a" * 64) + "\n")
+
+    # First mint: generate_tokens.py --add codex   (no --install-path -> REMOTE)
+    rc, out = _capture(gt.main, ["--add", "codex"])
+    assert rc == 0, out
+    assert "generate_tokens.py --remint codex --reveal codex" in out
+
+    # bootstrap_tokens.sh's replace_registry_lines() step: persist the merged
+    # AGENT_TOKENS= line this mint printed.
+    tokens_line = next(l for l in out.splitlines() if l.startswith("AGENT_TOKENS="))
+    env_path.write_text(tokens_line + "\n")
+
+    # Now follow the printed advice literally, against the SAME env file:
+    # generate_tokens.py --remint codex --reveal codex
+    rc2, out2 = _capture(gt.main, ["--remint", "codex", "--reveal", "codex"])
+    assert rc2 == 0, (
+        f"the printed recovery command FAILED when actually run:\n{out2}"
+    )
+    assert "codex: AGENT_TOKEN=" in out2, (
+        f"--remint codex --reveal codex did not reveal codex's token:\n{out2}"
+    )

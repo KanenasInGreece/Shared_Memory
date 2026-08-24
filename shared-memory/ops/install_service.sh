@@ -12,6 +12,25 @@
 
 set -euo pipefail
 
+# ⛔ RULING 2 (measured on a real host): this script used to have NO argument
+# parsing at all — unknown flags were silently swallowed and the script always
+# ran, so probing it with --help (the most ordinary thing an operator does to
+# an unfamiliar script) created the systemd unit, enabled + started the
+# gateway, and enabled linger. -h/--help must exit 0 having done nothing, and
+# any other unrecognised argument must refuse rather than proceed.
+for _arg in "$@"; do
+    case "$_arg" in
+        -h|--help)
+            awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"
+            exit 0
+            ;;
+    esac
+done
+if [[ $# -gt 0 ]]; then
+    printf '\033[31m%s\033[0m\n' "✗ unknown argument: $1 (this script takes none — see --help)"
+    exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # …/shared-memory/ops
 FRAMEWORK_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"                 # …/shared-memory
 REPO_DIR="$(cd "$FRAMEWORK_DIR/.." && pwd)"                   # repo root

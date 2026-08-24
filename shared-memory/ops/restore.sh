@@ -40,7 +40,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --force)   FORCE=1 ;;
     --env)     ENV_FILE="${2:?--env needs a path}"; shift ;;
-    -h|--help) sed -n '2,33p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"; exit 0 ;;
     -*)        echo "unknown argument: $1 (try --help)" >&2; exit 2 ;;
     *)         TARGET="$1" ;;
   esac

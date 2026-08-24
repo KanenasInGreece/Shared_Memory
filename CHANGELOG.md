@@ -5,6 +5,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.40] — 2026-08-24
+
+### Fixed — scripts that answer `--help` instead of acting on it
+
+- **`install_service.sh` had no argument parsing at all.** Every flag was swallowed and the script ran
+  regardless, so probing it with `--help` — the most ordinary thing anyone does to an unfamiliar
+  script — created the systemd unit, started the service and enabled linger. It now prints its header
+  and exits, and refuses an argument it does not recognise rather than proceeding.
+- **The same flag now behaves the same way everywhere.** `bootstrap_tokens.sh` rejected `--help`,
+  `sync_skills.sh` and `install_service.sh` ignored it and ran, and `update_framework.sh` honoured it.
+  Four behaviours across one surface is a guess the operator has to make per script.
+- **The uninstall's own "reverse with" text did not restore a working agent.** Followed literally it
+  left the agent registered with a token delivered nowhere, and its fallback advice named a command
+  that refuses an already-registered name. Every step is now checked against the scripts rather than
+  assumed: `sync_skills.sh` needs `--install` to recreate a directory it otherwise skips, the re-mint
+  needs an install path or the plaintext goes nowhere, and the gateway needs restarting because auth
+  is frozen at startup.
+- **The mint's own recovery advice pointed at a command that cannot work.** By the time it prints, the
+  name is already registered, so the `--add` it suggested hits the already-registered refusal. It now
+  names the flag that re-issues an existing name.
+- **Two more scripts printed a line of their own body as help.** The hardcoded line range fixed in
+  `update_framework.sh` had drifted the other way here, so the dynamic boundary now applies to every
+  script that prints its header — and a test asserts no help output contains a line of body.
+- **A passing linger check was silent,** so a check that succeeded and a check that never ran looked
+  identical. It now states which of the three answers it found, briefly, and stays loud only on `no`.
+
+---
+
 ## [0.9.39] — 2026-08-24
 
 ### Fixed — an update that can say what is wrong with the host
