@@ -157,6 +157,50 @@ def test_without_flag_backfill_still_runs_by_default(tmp_path):
     assert "SKIPPED — --no-domain-backfill given" not in out
 
 
+# ── 3b. the dry-run preview states what a REAL run actually does ────────
+# Scope addendum (measured live, d9400): a REAL run always passes --apply to
+# backfill_domain_of.py by default (unless --no-domain-backfill is given) and
+# enqueues outbox rows. The OLD dry-run preview showed the bare, --apply-less
+# invocation under a "preview (enqueues nothing)" label -- true of THAT
+# invocation in isolation, false about what the real run does. Both mode
+# selections must now print the SAME command line (both carry --apply), so
+# a dry run never shows a milder invocation than the one a real run reaches.
+
+def test_dry_run_preview_shows_the_apply_flag_a_real_run_would_use(tmp_path):
+    repo = _make_sandbox(tmp_path)
+    proc = _run(repo, "--dry-run", "--skip-backup")
+    out = _strip_ansi(proc.stdout)
+    assert proc.returncode == 0, out
+    assert "backfill_domain_of.py --apply" in out, (
+        "the dry-run preview does not show the --apply flag a real run "
+        "would actually pass -- it understates what the real run does\n"
+        f"{out}"
+    )
+
+
+def test_dry_run_preview_states_it_applies_by_default_and_names_the_opt_out(tmp_path):
+    repo = _make_sandbox(tmp_path)
+    proc = _run(repo, "--dry-run", "--skip-backup")
+    out = _strip_ansi(proc.stdout)
+    assert proc.returncode == 0, out
+    assert "APPLIES" in out, (
+        f"the dry-run label does not state that a real run applies the "
+        f"backfill by default:\n{out}"
+    )
+    assert "--no-domain-backfill" in out, (
+        f"the dry-run label does not name the documented opt-out flag:\n{out}"
+    )
+
+
+# NOTE: test_update_framework_live_execution.py's
+# test_live_run_without_flag_invokes_backfill_with_apply independently pins
+# the REAL (non-dry-run) invocation as `backfill_domain_of.py ... --apply` --
+# the same substring test_dry_run_preview_shows_the_apply_flag_a_real_run_would_use
+# above asserts for the DRY-RUN preview, so the two together prove the
+# preview matches what a real run actually executes rather than merely
+# containing some --apply invocation.
+
+
 # ── 4. step numbers for steps AFTER step 6 are identical either way ─────
 
 def test_step_numbering_after_backfill_is_unchanged_either_way(tmp_path):

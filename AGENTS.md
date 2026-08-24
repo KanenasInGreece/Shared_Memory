@@ -799,6 +799,13 @@ because there is no repository. Fetch the new tag's tarball, unpack it beside th
 route this host uses as a comment at the top of `shared-memory/.env`, so the next agent reading only
 this section is not left running `git pull` in a directory that was never a checkout.
 
+**If this host is on a DETACHED HEAD**, step 0 refuses rather than trying to `git pull` with no branch
+to update — most often reached by running `git checkout <tag>` right after cloning, a defensible
+reading of "install the release" that this repo does not actually want: the release branch is `main`
+(tags mark a point on it; they are not meant to be checked out and left). Recover with
+`git checkout main`, then re-run. Deliberately want a specific pinned tag instead of the moving branch?
+Check that tag out instead, or use the tarball route above.
+
 **Use the script. It is the procedure.**
 
 ```bash

@@ -2,12 +2,19 @@
 #
 # init_db.sh — initialise both stores for a fresh Shared Memory install.
 #
-#   Postgres : applies schema_init.sql (tables, indexes, vector extension)
+#   Postgres : applies schema_init.sql (tables, indexes, vector extension),
+#              then populates the migration ledger (schema_migrations) so
+#              the FIRST-ever `apply.py` upgrade run does not refuse this
+#              vouchable, just-created database (see the ADOPT_LEDGER block
+#              below).
 #   Neo4j    : applies neo4j_init.cypher (uniqueness constraints)
 #
 # Runs the clients INSIDE the compose containers (postgres-vector / neo4j-memory)
 # via `docker exec`, so the host needs neither psql nor cypher-shell. Both files
-# are idempotent (IF NOT EXISTS), so this is safe to re-run.
+# are idempotent (IF NOT EXISTS), so this is safe to re-run. The ledger step is
+# the one exception: it runs on the HOST via `uv` (matching how apply.py is
+# invoked everywhere else), and degrades to a warning — never a hard failure —
+# when `uv` is not on PATH, so a host without it still finishes initialisation.
 #
 #   bash shared-memory/scripts/init_db.sh
 #
@@ -91,6 +98,44 @@ docker exec -e PGOPTIONS='-c client_min_messages=warning' -i "$PG_CONTAINER" \
     psql -q -v ON_ERROR_STOP=1 -U postgres -d "$PG_DB" \
     < "$MIGRATIONS_DIR/schema_init.sql" >/dev/null
 grn "✓ Postgres schema applied"
+
+# ── Populate the migration ledger — the ONE moment adoption is automatic ─────
+#
+# schema_init.sql just created the framework schema, but deliberately does NOT
+# create schema_migrations itself (see its own header) — that leaves a bare
+# fresh install with the framework tables present and no ledger, which
+# apply.py cannot tell apart from a pre-v0.8.35 backup it must refuse to touch
+# until an operator vouches for it (exit 2, "predates migration tracking").
+# For a database schema_init.sql just created, THIS run IS the vouching:
+# schema_init.sql is generated FROM the migration files
+# (generate_schema_init.py), so recording every migration file as already
+# applied restates what just happened here, seconds ago — not a guess about
+# an unknown database's history. apply.py's stance toward a database it did
+# NOT just create is unchanged: --adopt is never called automatically for one.
+#
+# Runs on the HOST, not via `docker exec` — apply.py connects out via
+# psycopg2 (matching how update_framework.sh invokes it), and Postgres's port
+# is published to the host by ops/postgres_neo4j_limits.yaml. --adopt is
+# idempotent (ON CONFLICT DO NOTHING for every file), so re-running this
+# script is always safe, including against an already-adopted ledger.
+# >>> ADOPT_LEDGER
+adopt_ledger() {
+    if ! command -v uv >/dev/null 2>&1; then
+        ylw "⚠ uv not found on PATH — could not populate the migration ledger automatically."
+        ylw "  Run this once, from the host, before the first upgrade:"
+        ylw "      uv run --with psycopg2-binary python $MIGRATIONS_DIR/apply.py --adopt"
+        return 0
+    fi
+    if uv run --with psycopg2-binary python "$MIGRATIONS_DIR/apply.py" --adopt >/dev/null; then
+        grn "✓ Migration ledger populated (schema_migrations, adopted from schema_init.sql)"
+    else
+        ylw "⚠ Could not populate the migration ledger automatically (apply.py --adopt failed)."
+        ylw "  Postgres schema is still fine; run this by hand before the first upgrade:"
+        ylw "      uv run --with psycopg2-binary python $MIGRATIONS_DIR/apply.py --adopt"
+    fi
+}
+# <<< ADOPT_LEDGER
+adopt_ledger
 
 # ── Wait for Neo4j ────────────────────────────────────────────────────────────
 echo "Waiting for Neo4j ($NEO4J_CONTAINER) ..."
