@@ -147,7 +147,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.54"
+FRAMEWORK_VERSION = "0.9.55"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -1826,9 +1826,9 @@ POOL_ACQUIRE_TIMEOUT = _env_float("POOL_ACQUIRE_TIMEOUT", 5.0)
 
 # The pgvector floor for `hnsw.iterative_scan` (decision:1584, fact:1583).
 # Below it a selective axis filter (--project/--domain) can return ZERO rows
-# past ~75k-300k records: HNSW hands the reranker its candidate set before
-# the post-filter narrows it, and a selective filter can empty that set
-# entirely. Migration 036's expression index fixes the Seq-Scan regression
+# past ~75k-300k records: HNSW returns its ef_search candidates and the SQL
+# WHERE post-filter then removes them, and a selective filter can empty that
+# set entirely. Migration 036's expression index fixes the Seq-Scan regression
 # that shows up from ~15k rows; this session setting is the other half —
 # see start()'s version probe and _init_connection below.
 PGVECTOR_ITERATIVE_SCAN_MIN = (0, 8)
