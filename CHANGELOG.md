@@ -5,6 +5,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.53] — 2026-08-25
+
+### Fixed — the client never waits less than it knows it should
+
+- **Ignorance no longer lowers the search ceiling.** Both front doors (`memory_bridge.py`,
+  `mcp/vector-skill.py`) derive their search wait from the gateway's published encoder cost.
+  A backend whose probe was failing, stale, absent or malformed used to contribute zero, so a
+  busy reranker collapsed the wait to the 30-second floor against a 100–260 s search. Unknown
+  cost now floors the ceiling at the 120 s fallback; the gateway's own measured numbers
+  (`capacity.derived.client_ceiling_s`, `s_max_measured_s`, `s_mean_s`) can only raise it, never
+  lower it; `SEARCH_TIMEOUT_S` still overrides everything; the 300 s maximum still clamps.
+  Both doors agree with the server's mirror on every shape, pinned by value.
+- **Unranked results say so.** When the gateway served vector order because the reranker
+  timed out, every row already carried `ranked: false`; the CLI now prints one stderr line
+  ("N of M results are UNRANKED …") and the MCP door prepends the same sentence. Stdout JSON is
+  unchanged. A carried, stale encoder projection is likewise noted with its age.
+- **`doctor` names the token's `agent` and `role`** when the gateway reports them (from
+  0.9.54), and distinguishes an older gateway from a token that was not accepted.
+- **`--help` documents `SEARCH_TIMEOUT_S` and `SHARED_MEMORY_PROJECT`**, and the SKILL.md
+  version examples move with every release (the test now refuses a stale one).
+
+### Changed — README hardware minimums are the measured ones
+
+- Tier ① (no GPU) and ② (small GPU) now carry the 2026-08-24/25 measurements: the CPU
+  reranker settles at ~8 GiB, the CPU embedder ~5–6 GiB; 16 GB with swap or 20 GB without
+  for CPU-only; 16 GB RAM plus ≥2 GB VRAM with the embedder on the card and the reranker on
+  CPU — verified on a 2013 Xeon E3-1230 v3 VM and an i5-9400F with a 4 GB RX 580.
+
 ## [0.9.52] — 2026-08-25
 
 ### Fixed — a measured encoder cost no longer vanishes from `/health` when the encoder is busy

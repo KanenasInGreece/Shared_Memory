@@ -30,6 +30,7 @@ MCP tools: hybrid_search_and_rerank, save_artifact, archive_reasoning_trace,
 save_decision, save_retrospective, supersede, review_hold, check_memory_health,
 memory_telemetry, record_lineage, graph_query, review_edges, label_edges.
 """
+import asyncio
 import concurrent.futures
 import json
 import logging
@@ -140,7 +141,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.9.52"
+VERSION = "0.9.53"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server
@@ -174,62 +175,152 @@ SEARCH_SAFETY_FACTOR      = float(os.environ.get("SEARCH_SAFETY_FACTOR", "1.5"))
 SEARCH_OVERHEAD_S         = float(os.environ.get("SEARCH_OVERHEAD_S", "15"))
 
 
-def search_ceiling(capability: dict | None) -> float:
+def search_ceiling(capability: dict | None, capacity: dict | None = None) -> float:
     """Client-side search timeout in seconds, derived from the gateway's own
-    published backend sizing (``backend_capability`` on GET /health).
+    published backend sizing (``backend_capability`` on GET /health), and —
+    when the gateway has one — its own measured worst case (``capacity`` on
+    GET /health).
 
     Pure → unit-testable with no gateway present. MUST stay behaviourally
     identical to ``memory_bridge.search_ceiling``; a parity test compares the two
     across the shipped defaults, the fallback, and both clamps.
+
+    fact:1560 (grounded on decision:1114): a MIXED capability block — one
+    backend probes fine while the other reports ``status: "failing"`` (or
+    ``projection_stale: true``) with no positive projection of its own — floors
+    the derivation at ``SEARCH_TIMEOUT_FALLBACK_S``, never
+    ``SEARCH_TIMEOUT_FLOOR_S``. The known backend's number is only a LOWER
+    bound on the true cost; a failing backend's true cost is unknown, not zero.
+
+    R2-N3 (PR-A delta review): a backend block that is ABSENT entirely, an
+    empty ``{}``, or not a dict at all (malformed) is the SAME ignorance as an
+    explicit ``status: "failing"`` — the server mirror gets the identical rule.
+
+    This is narrower than "every backend must report a positive projection": a
+    block that IS a well-formed, non-empty dict — carrying a plain
+    ``status: "error"``, or ``"ok"`` with no projection at all — does NOT trip
+    the fallback floor by itself; only the three states above do (T-05/R2-N3,
+    PR #310 review). Our own gateway's probe never actually produces that
+    narrower gap today, but this function also has to make sense of an older,
+    third-party or future gateway's /health, so that shape is exercised and
+    pinned as documented behaviour rather than assumed unreachable.
+
+    When ``capacity`` carries the gateway's own measured numbers
+    (``capacity["derived"]``), three of its fields are folded in too — never
+    smaller, this only ever RAISES the ceiling:
+
+      * ``client_ceiling_s`` — the server's own already-derived ceiling;
+        compared as-is.
+      * ``s_mean_s`` — the theoretical full-payload projection the GATEWAY
+        itself computed, always present once the gateway has probed at all
+        (T-02, PR #310 review: the field that would have sized fact:1560's own
+        measured case correctly).
+      * ``s_max_measured_s`` — a PROJECTION too, the same kind of number as
+        ``projected_full_payload_s``, but over the coordinator's own observed
+        MAXIMUM rerank payload; ``None`` until real search traffic has been
+        served this process's lifetime, unlike ``s_mean_s``.
+
+    ``s_mean_s``/``s_max_measured_s`` are not yet safety-scaled for THIS
+    client, so each gets the same ``SEARCH_SAFETY_FACTOR``/
+    ``SEARCH_OVERHEAD_S`` treatment as the theoretical projection before
+    comparison; ``client_ceiling_s`` is already derived and is compared as-is.
     """
     if SEARCH_TIMEOUT_S > 0:
         return SEARCH_TIMEOUT_S
 
-    projected, probed = 0.0, False
+    projected, probed, unknown = 0.0, False, False
     for backend in ("reranker", "embedder"):
         block = (capability or {}).get(backend)
-        if not isinstance(block, dict):
+        if not isinstance(block, dict) or not block:
+            # R2-N3 (PR-A delta review): an ABSENT, empty {} or non-dict
+            # block is the SAME ignorance as an explicit `status: "failing"`
+            # — this backend's real cost is unknown, not zero, exactly as if
+            # it had said so. (The server mirror gets the identical rule.)
+            unknown = True
             continue
         try:
             value = float(block.get("projected_full_payload_s") or 0)
         except (TypeError, ValueError):
-            continue
+            value = 0.0
         if value > 0:
             projected += value
             probed = True
-    if not probed:
-        return SEARCH_TIMEOUT_FALLBACK_S
+        elif block.get("status") == "failing" or block.get("projection_stale"):
+            unknown = True   # this backend's real cost is unknown, not zero
 
-    # Postgres vector search, the graph traversal and response assembly sit
-    # outside both probes, so they are ADDED rather than scaled.
-    derived = projected * SEARCH_SAFETY_FACTOR + SEARCH_OVERHEAD_S
-    return max(SEARCH_TIMEOUT_FLOOR_S, min(derived, SEARCH_TIMEOUT_MAX_S))
+    if not probed:
+        derived = SEARCH_TIMEOUT_FALLBACK_S
+    else:
+        # Postgres vector search, the graph traversal and response assembly sit
+        # outside both probes, so they are ADDED rather than scaled.
+        floor = SEARCH_TIMEOUT_FALLBACK_S if unknown else SEARCH_TIMEOUT_FLOOR_S
+        derived = max(floor, projected * SEARCH_SAFETY_FACTOR + SEARCH_OVERHEAD_S)
+
+    capacity_derived = (capacity or {}).get("derived")
+    if isinstance(capacity_derived, dict):
+        client_ceiling_s = capacity_derived.get("client_ceiling_s")
+        if isinstance(client_ceiling_s, (int, float)) and client_ceiling_s > 0:
+            derived = max(derived, client_ceiling_s)
+        s_max_measured_s = capacity_derived.get("s_max_measured_s")
+        if isinstance(s_max_measured_s, (int, float)) and s_max_measured_s > 0:
+            derived = max(derived, s_max_measured_s * SEARCH_SAFETY_FACTOR + SEARCH_OVERHEAD_S)
+        # T-02 (fact:1560): the gateway's own full-payload projection, always
+        # present once ANY probe has run.
+        s_mean_s = capacity_derived.get("s_mean_s")
+        if isinstance(s_mean_s, (int, float)) and s_mean_s > 0:
+            derived = max(derived, s_mean_s * SEARCH_SAFETY_FACTOR + SEARCH_OVERHEAD_S)
+
+    return min(derived, SEARCH_TIMEOUT_MAX_S)
 
 
 _CAPABILITY_CACHE: dict | None = None
+_CAPACITY_CACHE: dict | None = None
+# CQ-03 (PR #310 review): guards against two searches starting in the same
+# instant both seeing an empty cache and both firing a /health request.
+_HEALTH_FETCH_LOCK = asyncio.Lock()
 
 
-async def _gateway_capability() -> dict | None:
-    """GET /health once per process and return its ``backend_capability`` block.
-    Never raises: sizing the search must never be the thing that fails it.
+async def _fetch_health_blocks() -> None:
+    """GET /health once per process and cache both ``backend_capability`` and
+    ``capacity`` from it — ONE request feeds both caches, never two. Never
+    raises: sizing the search must never be the thing that fails it.
 
     Sends this client's own auth headers (S-10, PR A5): ``backend_capability``
     moved behind auth along with the rest of /health's operational detail, so
     an unauthenticated call here would always land on the anonymous-slim
     shape and silently fall back to the constant ceiling on every
     authenticated install."""
-    global _CAPABILITY_CACHE
-    if _CAPABILITY_CACHE is None:
+    global _CAPABILITY_CACHE, _CAPACITY_CACHE
+    if _CAPABILITY_CACHE is not None:
+        return   # already attempted this process — do not retry
+    async with _HEALTH_FETCH_LOCK:
+        if _CAPABILITY_CACHE is not None:
+            return   # a concurrent waiter already filled it while we queued
         try:
             async with httpx.AsyncClient(timeout=HEALTH_PROBE_TIMEOUT_S) as client:
                 health = _reply_json(await client.get(f"{COORDINATOR_BASE}/health",
                                                       headers=_auth_headers()),
-                                     "_gateway_capability")
+                                     "_fetch_health_blocks")
             block = health.get("backend_capability")
             _CAPABILITY_CACHE = block if isinstance(block, dict) else {}
+            capacity = health.get("capacity")
+            _CAPACITY_CACHE = capacity if isinstance(capacity, dict) else None
         except Exception:
             _CAPABILITY_CACHE = {}      # tried and got nothing; do not retry
+            _CAPACITY_CACHE = None
+
+
+async def _gateway_capability() -> dict | None:
+    """The cached ``backend_capability`` block — see ``_fetch_health_blocks``."""
+    await _fetch_health_blocks()
     return _CAPABILITY_CACHE or None
+
+
+async def _gateway_capacity() -> dict | None:
+    """The cached ``capacity`` block — see ``_fetch_health_blocks``. None on an
+    older/unreachable gateway, or one with no derivation yet."""
+    await _fetch_health_blocks()
+    return _CAPACITY_CACHE
 
 
 def _auth_headers() -> dict:
@@ -541,6 +632,38 @@ def _render_results(results: list, elapsed: float) -> str:
 
 # ── Retrieval ────────────────────────────────────────────────────────────────
 
+def _unranked_warning(results) -> str | None:
+    """T-07 (PR #310 review): the SHARED core sentence — must return the
+    identical string as ``memory_bridge._unranked_warning`` for the identical
+    input; a parity test holds the two in step. Each door decorates it in its
+    own idiom (a bare stderr line there, a ``NOTE: …`` prefix here)."""
+    if not isinstance(results, list):
+        return None
+    unranked = sum(1 for row in results if isinstance(row, dict) and row.get("ranked") is False)
+    if not unranked:
+        return None
+    return (f"{unranked} of {len(results)} results are UNRANKED — the reranker "
+            f"timed out, this is vector order (see backend_capability on /health)")
+
+
+def _stale_projection_note(capability: dict | None) -> str | None:
+    """Mirrors ``memory_bridge._stale_projection_note`` exactly (B1/T-02,
+    PR #310 review) — see there for the rationale."""
+    if not isinstance(capability, dict):
+        return None
+    notes = []
+    for backend in ("reranker", "embedder"):
+        block = capability.get(backend)
+        if not isinstance(block, dict) or not block.get("projection_stale"):
+            continue
+        age = block.get("projection_age_s")
+        if isinstance(age, (int, float)) and age > 0:
+            notes.append(f"{backend} projection stale for {age:.0f}s")
+        else:
+            notes.append(f"{backend} projection stale")
+    return "; ".join(notes) if notes else None
+
+
 @mcp.tool()
 async def hybrid_search_and_rerank(query: str, limit: int = 5, project: str = "",
                                    domains: list[str] | str = "",
@@ -563,11 +686,15 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5, project: str = ""
     (e.g. "2026-08-01T00:00:00") — records created at/after it. An unknown
     project/domain name is not refused, it simply matches nothing (the read
     path never blocks on registry state).
+
+    The wait for this call is sized from the gateway's own published backend
+    capability, not a constant — set SEARCH_TIMEOUT_S (env) to pin an explicit
+    override instead.
     """
     logger.info(f"Search: {query[:50]}...")
     start = datetime.now()
     # Sized from the gateway's own published cost, never from a constant.
-    ceiling = search_ceiling(await _gateway_capability())
+    ceiling = search_ceiling(await _gateway_capability(), await _gateway_capacity())
     body = {"query": query, "limit": limit, "agent_id": AGENT_ID}
     if project:
         body["project"] = project
@@ -598,8 +725,19 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5, project: str = ""
     results = payload.get("results", payload)
     if isinstance(results, dict) and results.get("status") == "error":
         return f"Error: {results.get('message', 'search failed')}"
-    return _render_results(results if isinstance(results, list) else [],
-                           (datetime.now() - start).total_seconds())
+    results_list = results if isinstance(results, list) else []
+    rendered = _render_results(results_list, (datetime.now() - start).total_seconds())
+    # This tool returns rendered text, not a dict/list — so the unranked
+    # warning is a line prepended to that text rather than a `note` field.
+    warning = _unranked_warning(results_list)
+    if warning:
+        rendered = f"NOTE: {warning}\n\n" + rendered
+    stale_note = _stale_projection_note(await _gateway_capability())
+    if stale_note:
+        rendered = (f"NOTE: {stale_note} — the ceiling above still used its "
+                    f"last number as a lower bound (see backend_capability on "
+                    f"/health)\n\n" + rendered)
+    return rendered
 
 
 @mcp.tool()
@@ -1159,6 +1297,39 @@ async def review_hold(summary_id: int, pg_id: int) -> str:
     return f"Error: {result.get('message', result)}"
 
 
+ROLE_REPORTING_MIN_VERSION = "0.9.54"  # R2-01: the server half (agent/role
+# on authenticated /health) does not exist on 0.9.52 -- it ships in PR #311.
+
+
+def _gateway_predates(version: str | None, minimum: str = ROLE_REPORTING_MIN_VERSION) -> bool | None:
+    """Whether ``version`` names a gateway release strictly before ``minimum``.
+    None when unparseable — treated the same as "predates" by the caller.
+    Mirrors ``memory_bridge._gateway_predates`` exactly (T-04, PR #310 review)."""
+    try:
+        parsed = tuple(int(p) for p in str(version).split("."))
+        floor = tuple(int(p) for p in minimum.split("."))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return parsed < floor
+
+
+def _role_diagnosis(payload: dict) -> str:
+    """T-04 (PR #310 review): three distinguishable reasons `role` can be
+    missing — see ``memory_bridge._role_diagnosis`` for the full rationale.
+    1) present → verbatim. 2) absent + gateway predates ROLE_REPORTING_MIN_VERSION
+    (or unparseable version) → the gateway never sends it. 3) absent + gateway
+    current → this caller's own token was not accepted (anonymous-slim reply)."""
+    if "role" in payload:
+        return payload.get("role")
+    predates = _gateway_predates(payload.get("version"))
+    if predates is False:
+        return "not reported (token not accepted — anonymous payload)"
+    gw = payload.get("version")
+    if gw is not None:
+        return f"not reported (gateway {gw} predates {ROLE_REPORTING_MIN_VERSION})"
+    return f"not reported (gateway version unknown, predates {ROLE_REPORTING_MIN_VERSION} assumed)"
+
+
 @mcp.tool()
 async def check_memory_health() -> str:
     """
@@ -1189,6 +1360,11 @@ async def check_memory_health() -> str:
                            "error": str(exc),
                            "hint": "systemctl --user start hive-mind-gateway.service"},
                           indent=2)
+    # `agent`/`role` ride on the AUTHENTICATED /health payload (a server change
+    # this PR does not build). `agent` is surfaced only when present — it
+    # passes through verbatim below; `role` always gets a line via the
+    # three-way diagnosis in `_role_diagnosis` (T-04, PR #310 review).
+    payload["role"] = _role_diagnosis(payload)
     payload["client"] = {"tool": "vector-skill", "version": VERSION,
                          "api_version": API_VERSION}
     gw_api = payload.get("api_version")

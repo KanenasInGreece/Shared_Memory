@@ -120,3 +120,28 @@ def test_the_worked_examples_state_the_current_contract():
         f"SKILL.md's worked examples do not show api_version "
         f"{memory_bridge.API_VERSION}"
     )
+
+
+def test_no_stale_version_string_remains_in_the_worked_examples():
+    """R2-04 (PR #310 review round 2 delta), fact:1309: an equality/presence
+    check is HALF a guard -- confirming the CURRENT version appears
+    somewhere does not catch a SECOND worked example that still shows a
+    stale one. SKILL.md carries the version at two separate worked examples
+    (the /health curl output and the --version output) and a version bump
+    that updates only one of them passed the presence-only check above.
+
+    Scoped to the JSON-shaped `"version": "X.Y.Z"` worked-example VALUE
+    specifically -- prose citing a historical version ("moved behind auth in
+    v0.9.9", "required as of v0.9.3") is a different claim (when a feature
+    shipped, not what the client is now) and must not be flagged."""
+    import memory_bridge
+    skill = _read(SKILL)
+    found = re.findall(r'"version"\s*:\s*"(0\.9\.\d+)"', skill)
+    assert found, 'no worked example carries a "version": "X.Y.Z" value at all'
+    stale = sorted(set(v for v in found if v != memory_bridge.VERSION))
+    assert not stale, (
+        f"SKILL.md's worked examples still show version(s) {stale} alongside "
+        f"the current {memory_bridge.VERSION} — every worked example must "
+        "move together on a version bump, not just one of them."
+    )
+

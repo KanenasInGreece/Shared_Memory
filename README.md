@@ -150,35 +150,43 @@ why these are example minimums, not prescriptions.
 
 **① No GPU at all.** The framework itself is a CPU/RAM affair: Postgres and Neo4j used
 ~2.5 GB working memory here (the compose file caps them at 4 + 8 GB), the gateway and daemons
-~half a gigabyte, the two CPU encoders 0.6 GB each — though under sustained heavy search the
-reranker's cache can grow toward its 8 GB default cap, so we account for it in the suggested minimum specs. 
-The reasoning LLM is an **online provider**: one `LLM_BACKENDS_JSON` entry, and the dreaming runs
-externally; an overnight of dreaming measured ~18,000 tokens, under a cent. The privacy
-trade-off that entry represents, and the knobs that state your answer, live in
-[§17](#17-inference-the-encoders-and-the-reasoning-llm); the custody measures around the
-provider key — where it lives, what stands between the network and it — are in §17's
-tested-configuration passage, [§19](#19-tokens-and-agents) and [SECURITY.md](SECURITY.md).
+~half a gigabyte — but the two CPU encoders cost far more at full-length payloads than a quick
+smoke test suggests. The reranker's steady state after the first few heavy searches is
+**~8 GiB RSS** — not a cap it can grow toward, that IS where it settles — and the embedder
+**~5–6 GiB**, both measured at the framework's own full 8192-token encoder geometry; with
+Neo4j + Postgres + the gateway alongside them that is **~16–17 GB** total, so give the box
+room. The reasoning LLM is an **online provider**: one `LLM_BACKENDS_JSON` entry, and the
+dreaming runs — and bills — externally; an overnight of dreaming measured ~18,000 tokens,
+under a cent. The privacy trade-off that entry represents, and the knobs that state your
+answer, live in [§17](#17-inference-the-encoders-and-the-reasoning-llm); the custody measures
+around the provider key — where it lives, what stands between the network and it — are in
+§17's tested-configuration passage, [§19](#19-tokens-and-agents) and [SECURITY.md](SECURITY.md).
 With no LLM configured nothing dies: saves, search and the graph keep working; summaries and
 insights queue durably until a backend appears. Searches on CPU encoders took ~30 seconds here.
-This configuration has also been verified end to end on a deliberately modest VM — 6 vCPUs of
-a 2013 Xeon E3-1230 v3, 14 GB RAM, 30 GB disk, Ubuntu Server 26.04 with Docker — where the full
-install passed postflight with a 5.5 s realistic save, ~5 GB steady-state with the whole stack
-up, and searches measured at both ends of the reranking trade: ~1.3 s unranked vector order,
-~70 s with the reranker scoring the full default payload (22 candidates, uncapped documents) on
-that CPU — `RERANK_MAX_DOC_CHARS`([§17](#17-inference-the-encoders-and-the-reasoning-llm)) is the dial between those two points.
-*Example minimum: 4–8 threads · 16 GB RAM · no GPU · 30 GB disk.*
+This configuration has also been verified end to end on the same deliberately modest VM — 6
+vCPUs of a 2013 Xeon E3-1230 v3, 30 GB disk, Ubuntu Server 26.04 with Docker — reprovisioned at
+**14 GB RAM** with the embedder served remotely: **2 GB of headroom held through a full search
+battery, zero OOM, zero restarts.** On that CPU, searches measured ~1.3 s in unranked vector
+order and ~70 s with the reranker scoring the full default payload (22 candidates, uncapped
+documents). `RERANK_MAX_DOC_CHARS`
+([§17](#17-inference-the-encoders-and-the-reasoning-llm)) is the dial between those two points.
+*Example minimum: 6–8 threads · 16 GB RAM with swap, 20 GB without · no GPU · 30 GB disk.*
 
-**② A small GPU (~4 GB).** Everything in ①, plus two `.env` lines (`GPU_ENCODER_REPLICAS=1`,
-`CPU_ENCODER_REPLICAS=0`) move the encoders onto the card: the pair fits in ~2 GB measured,
-search fell from ~30 to under 5 seconds (~6×), and the reranker — which on a loaded CPU can
-time out — answers in under a second. GPU support is whatever your encoder server supports:
+**② A small GPU (~4 GB).** Everything in ①, but the pair does not reliably fit together on a
+card this size: **both encoders held only at short (~1,500-token) payloads and collapsed at
+the framework's actual full-length texts.** The tested split moves just the embedder onto the
+card and leaves the reranker on CPU — one `.env` line each (`EMBEDDER_GPU_REPLICAS=1` /
+`RERANKER_CPU_REPLICAS=1`): the embedder needs **~0.7 GB VRAM** at full geometry, and host RAM
+sat at **13.5–13.9 GB** on a 15 GB box (swap +1 GB). Tested hardware: an Intel i5-9400F (2019,
+6 cores) + AMD Radeon RX 580 4 GB (2017). GPU support is whatever your encoder server supports:
 the shipped GPU pair is llama.cpp's Vulkan image — one image for Intel, AMD and NVIDIA, swap
 the tag for CUDA — and hosting the encoders outside the stack with vLLM, LM Studio or bare
-`llama-server` is equally legitimate; the gateway only needs endpoints that answer. On a card
-where the pair does not both fit, `EMBEDDER_GPU_REPLICAS`/`RERANKER_GPU_REPLICAS` move ONE
-encoder at a time instead of the pair together ([§17](#17-inference-the-encoders-and-the-reasoning-llm)).
+`llama-server` is equally legitimate; the gateway only needs endpoints that answer. On a larger
+card where the pair DOES both fit, `EMBEDDER_GPU_REPLICAS`/`RERANKER_GPU_REPLICAS` still move
+ONE encoder at a time instead of the pair together
+([§17](#17-inference-the-encoders-and-the-reasoning-llm)).
 The LLM stays online; ①'s caveat pointers apply unchanged.
-*Example minimum: 4–8 threads · 16 GB RAM · 4 GB VRAM · 30 GB disk.*
+*Example minimum: 6–8 threads · 16 GB RAM · ≥2 GB VRAM · 30 GB disk.*
 
 **③ Everything local.** A local reasoning LLM, the cloud an option rather than a necessity —
 and it takes less than you might fear: **16 GB RAM and one 12 GB card run the whole thing.**
