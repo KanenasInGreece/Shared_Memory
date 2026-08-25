@@ -5,6 +5,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.54] — 2026-08-25
+
+### Changed — projects and domains resolve by concept, at save and at search
+
+- **One normalised key for the axes.** A project or domain name arriving at save is resolved by
+  exact name, then active alias, then by key (lower-case, alphanumerics only — the key the
+  spelling guard has always used), then by alias key; the record is stored under the canonical
+  and the response says so (`project_resolved`, `domains_resolved`, null when nothing moved).
+  A `new_project`/`new_domain` that is merely a spelling of a registered name or alias is
+  refused as before; an all-punctuation name is refused with `project_unnameable` /
+  `domain_unnameable` instead of reaching the database. Unknown names are still refused with
+  proposals — nothing is guessed.
+- **Search filters match the concept, not the string.** `project` and `domains` filters resolve
+  the same way and match the canonical, every active alias and any key-equivalent spelling, on
+  all candidate paths; an unresolvable value matches nothing, never errors, and the response
+  carries `filters_resolved` (absent when unfiltered, so `api_version` does not move). A
+  registry-read failure is reported there as `error` and counted in
+  `axis_registry_read_failures_total`.
+- **The database now states the invariant.** Migration 035 adds `axis_normalize(text)` and a
+  trigger-maintained `normalized_key` column on `projects` and `project_domains` with plain
+  UNIQUE constraints — two registered names never share a key — backfilled with pre-checks that
+  name any colliding pair, and widens the alias-namespace triggers of 024/028 to the key.
+- **`/health` names the caller.** An authenticated request also receives `agent` and `role`
+  (the effective role); the anonymous payload and auth-off installs are unchanged.
+
+### Fixed — the fresh-install generator emitted objects out of order
+
+- `generate_schema_init.py` wrote indexes before the functions they call, so a regenerated
+  `schema_init.sql` would have aborted every fresh install. It now emits functions, then tables
+  and indexes, then foreign keys, then triggers; `verify_schema_init.py` diffs indexes and
+  functions between a fresh install and the live database (68/68 here); and the change-group
+  guards fail the suite when a migration's functions, indexes or UNIQUE constraints are missing
+  from `schema_init.sql`.
+
 ## [0.9.53] — 2026-08-25
 
 ### Fixed — the client never waits less than it knows it should
