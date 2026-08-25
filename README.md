@@ -1097,21 +1097,44 @@ chain and its verifiers under `shared-memory/migrations/`, the client contract i
 
 ## 25. Honest state
 
-A working system with known edges, named rather than polished over:
+A working system with known edges, named rather than polished over. This list is re-checked
+against the code on every documentation pass — the last pass found three of five entries
+stale, two of them claiming something as missing that had shipped — so read it as a dated
+statement, not a permanent one.
 
-- **External content is a real risk.** Anything saved becomes trusted context for every agent.
-  The synthesis passes treat content as data-not-instructions and the insight builder
-  neutralises protocol-shaped lines, but raw facts return verbatim from search. Do not ingest
-  web-retrieved content at volume; ingestion-boundary sanitisation is planned.
-- **Consolidation quality is not yet measured.** The syntheses are structurally faithful by
-  construction; there is no quantitative signal yet separating sharp abstraction from lossy
-  blur.
-- **The entity vocabulary is logged, not yet gated.** Names are operator-chosen by rule and
-  stamped by origin; the registry that would enforce curation is commissioned, not built.
-- **Authentication is bearer-token today.** Proof-of-possession keys — the person
-  cryptographically authorising the agent — are designed and upcoming, with the audit trail
-  promoted to a durable, non-repudiable record behind them.
-- **Scale:** axis filtering earns a database index as corpora grow; known and queued.
+- **External content: the boundary is the agent, and the framework hardens what it can.**
+  The gateway has no fetch path of its own; a record exists only because an authenticated
+  agent read something and chose to save it. From there the synthesis passes treat content as
+  data-not-instructions, the insight builder neutralises protocol-shaped lines before a model
+  sees them, the graph refuses labels and relationships outside its known set, and the entity
+  gate stops a record from minting vocabulary on its own. What the framework does **not** do,
+  by design, is edit a record: raw facts return verbatim from search, because Tier 1 *is* the
+  record. So treat every retrieved record as data, save web-retrieved content deliberately and
+  never at volume, and know the limit: a protocol-shaped line can be flagged at the door, but
+  prose that reads like an instruction cannot be told from a quoted finding about one — this
+  corpus holds such findings. Flagging (never rewriting) marker lines at save time is the one
+  narrow ingestion-side measure still open.
+- **Consolidation is reproducible; its quality is not measured.** Thematic folds are
+  deterministic — the same inputs refolded on two different hosts produced byte-identical
+  summaries, and the two hosts' encoders agreed to cosine 0.9987–1.0 — so structural
+  faithfulness holds by construction. What has no number yet is whether a fold is a sharp
+  abstraction or a lossy blur. The measurement is designed (lift over a deterministic
+  baseline, human judgement on the disagreement set) and has not been run.
+- **The entity vocabulary is gated at save — the cleanup behind the gate is not done.** A
+  save naming an entity outside the registry is refused with the exact protocol for minting
+  it, and minting is the operator's act. Names that entered before the gate existed are still
+  in the graph as they were spelled then; merging them is curation, not code, and is in
+  progress.
+- **Authentication is bearer-token plus kernel-attested person identity.** Agents present a
+  token the gateway knows by digest. On the local socket the gateway also reads the
+  connecting person from the kernel (`SO_PEERCRED`) and stamps it server-side — never
+  claimed by the client — and can be told to require it for writes. What is still ahead is
+  proof-of-possession keys over the network, and the audit trail promoted to a durable,
+  non-repudiable record behind them.
+- **Scale:** axis filters (`project`, `domain`) run unindexed over the record table's
+  metadata; at this corpus's size it is invisible, and the corpus size at which it stops
+  being invisible is not measured. An expression index is the fix, queued for the moment a
+  corpus makes it visible.
 
 ## 26. Direction
 
