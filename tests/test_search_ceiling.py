@@ -239,3 +239,168 @@ async def test_sizing_never_fails_the_search(client, monkeypatch):
 
     assert await client._gateway_capability() is None
     assert client.search_ceiling(None) == client.SEARCH_TIMEOUT_FALLBACK_S
+
+
+# ── B1 (fact:1560, grounded on decision:1114) ─────────────────────────────────
+# "Ignorance must not resolve to the number already known to be too small" —
+# extended from "nothing probed at all" (S2 above) to the MIXED case: one
+# backend probes fine, the other reports its cost is UNKNOWN. The known
+# backend's number is only a LOWER bound on the true cost; treating the
+# failing backend as contributing zero let the derivation fall all the way to
+# SEARCH_TIMEOUT_FLOOR_S (30s) — the exact number already known to be too
+# small — while genuinely not knowing what the failing backend costs.
+
+@pytest.mark.parametrize("client", CLIENTS)
+@pytest.mark.parametrize("bad_block", [
+    pytest.param({"status": "failing"}, id="status-failing"),
+    pytest.param({"projection_stale": True}, id="projection-stale"),
+    pytest.param({"status": "failing", "projection_stale": True}, id="both"),
+])
+def test_s7_mixed_probed_and_failing_backend_floors_at_fallback_not_floor(client, bad_block):
+    """One backend probes to a tiny number, the other's cost is UNKNOWN. The
+    floor under the derivation must be SEARCH_TIMEOUT_FALLBACK_S (120), never
+    SEARCH_TIMEOUT_FLOOR_S (30) — this is the defect this unit fixes."""
+    capability = {
+        "reranker": {"projected_full_payload_s": 1.0, "status": "ok"},
+        "embedder": bad_block,
+    }
+    ceiling = client.search_ceiling(capability)
+    assert ceiling == client.SEARCH_TIMEOUT_FALLBACK_S
+    assert ceiling > client.SEARCH_TIMEOUT_FLOOR_S
+
+
+@pytest.mark.parametrize("client", CLIENTS)
+def test_s7b_known_cost_above_fallback_still_wins_over_the_fallback_floor(client):
+    """The fallback is a FLOOR, not a cap — when the known backend alone
+    already projects above it, that larger number must still win."""
+    capability = {
+        "reranker": {"projected_full_payload_s": 200.0, "status": "ok"},
+        "embedder": {"status": "failing"},
+    }
+    # 200.0 * 1.5 + 15 = 315, clamped to SEARCH_TIMEOUT_MAX_S (300).
+    assert client.search_ceiling(capability) == client.SEARCH_TIMEOUT_MAX_S
+
+
+@pytest.mark.parametrize("client", CLIENTS)
+def test_s7c_both_backends_healthy_is_unaffected(client):
+    """A plain "error"/absent status (not "failing", not stale) never trips
+    the unknown-cost floor — only the two states the gateway actually uses to
+    say a backend's real cost is unknown do."""
+    capability = {
+        "reranker": {"projected_full_payload_s": 0.01, "status": "ok"},
+        "embedder": {"projected_full_payload_s": 0.01, "status": "ok"},
+    }
+    assert client.search_ceiling(capability) == client.SEARCH_TIMEOUT_FLOOR_S
+
+
+# ── B1 capacity fold — the gateway's own MEASURED worst case ────────────────
+
+CAPACITY_HIGH_CEILING = {"derived": {"client_ceiling_s": 90.0}}
+CAPACITY_HIGH_S_MAX = {"derived": {"s_max_measured_s": 50.0}}
+
+
+@pytest.mark.parametrize("client", CLIENTS)
+def test_s8_capacity_client_ceiling_s_raises_the_ceiling_when_higher(client):
+    """The theoretical projection here clamps to the 30s floor; the server's
+    own already-derived client_ceiling_s (90.0) must win because it's larger."""
+    capability = {"reranker": {"projected_full_payload_s": 1.0, "status": "ok"},
+                  "embedder": {"projected_full_payload_s": 1.0, "status": "ok"}}
+    assert client.search_ceiling(capability, CAPACITY_HIGH_CEILING) == 90.0
+
+
+@pytest.mark.parametrize("client", CLIENTS)
+def test_s8b_capacity_s_max_measured_s_gets_the_same_safety_scaling(client):
+    """s_max_measured_s is a raw reranker-seconds figure — not yet scaled for
+    THIS client — so it gets the same SAFETY_FACTOR/OVERHEAD_S treatment as
+    the theoretical projection: 50.0 * 1.5 + 15 = 90.0."""
+    capability = {"reranker": {"projected_full_payload_s": 1.0, "status": "ok"}}
+    assert client.search_ceiling(capability, CAPACITY_HIGH_S_MAX) == 90.0
+
+
+@pytest.mark.parametrize("client", CLIENTS)
+def test_s8c_capacity_never_lowers_the_ceiling(client):
+    """The server measurement is a floor a client can be RAISED to, never a
+    cap it gets lowered to — a bigger theoretical projection still wins."""
+    capability = {"reranker": {"projected_full_payload_s": 200.0, "status": "ok"}}
+    low_capacity = {"derived": {"client_ceiling_s": 40.0}}
+    assert (client.search_ceiling(capability, low_capacity)
+            == client.search_ceiling(capability, None))
+
+
+@pytest.mark.parametrize("client", CLIENTS)
+def test_s8d_capacity_alone_is_still_clamped_to_max(client):
+    huge_capacity = {"derived": {"client_ceiling_s": 100000.0}}
+    assert client.search_ceiling(None, huge_capacity) == client.SEARCH_TIMEOUT_MAX_S
+
+
+@pytest.mark.parametrize("client", CLIENTS)
+@pytest.mark.parametrize("capacity", [
+    pytest.param(None, id="none"),
+    pytest.param({}, id="empty"),
+    pytest.param({"derived": "not-a-dict"}, id="malformed-derived"),
+    pytest.param({"derived": {"client_ceiling_s": "abc"}}, id="unparseable"),
+    pytest.param({"derived": {"client_ceiling_s": -5.0}}, id="negative"),
+    pytest.param({"derived": {"client_ceiling_s": 0}}, id="zero"),
+])
+def test_s8e_malformed_or_absent_capacity_is_ignored(client, capacity):
+    capability = {"reranker": {"projected_full_payload_s": 1.0, "status": "ok"},
+                  "embedder": {"projected_full_payload_s": 1.0, "status": "ok"}}
+    assert (client.search_ceiling(capability, capacity)
+            == client.search_ceiling(capability, None))
+
+
+@pytest.mark.parametrize("client", CLIENTS)
+def test_s9_explicit_override_wins_over_capacity_too(client, monkeypatch):
+    """SEARCH_TIMEOUT_S is the operator's escape hatch — it must beat the
+    capacity fold exactly as it beats the derivation and both clamps (S3)."""
+    monkeypatch.setattr(client, "SEARCH_TIMEOUT_S", 42.0)
+    huge_capacity = {"derived": {"client_ceiling_s": 999.0}}
+    assert client.search_ceiling(None, huge_capacity) == 42.0
+
+
+@pytest.mark.parametrize("capacity", [
+    pytest.param(None, id="none"),
+    pytest.param(CAPACITY_HIGH_CEILING, id="client_ceiling_s"),
+    pytest.param(CAPACITY_HIGH_S_MAX, id="s_max_measured_s"),
+])
+def test_s5c_both_front_doors_derive_the_same_ceiling_with_capacity(capacity):
+    """S5, extended to the capacity parameter added in B1."""
+    assert (memory_bridge.search_ceiling(LIVE_CAPABILITY, capacity)
+            == vector_skill.search_ceiling(LIVE_CAPABILITY, capacity))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client", CLIENTS)
+async def test_capability_and_capacity_share_one_health_request(client, monkeypatch):
+    """B1c: _gateway_capacity() must not cost a second /health round trip —
+    both blocks are cached from the SAME fetch, exactly like the coordinator's
+    own capability probe is a single call reused for both."""
+    monkeypatch.setattr(client, "_CAPABILITY_CACHE", None)
+    monkeypatch.setattr(client, "_CAPACITY_CACHE", None, raising=False)
+    payload = {"backend_capability": LIVE_CAPABILITY,
+              "capacity": {"derived": {"client_ceiling_s": 55.0}}}
+    calls = {"n": 0}
+
+    class _Health:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        async def get(self, *_a, **_kw):
+            calls["n"] += 1
+            return type("R", (), {"status_code": 200,
+                                  "json": staticmethod(lambda: payload)})()
+
+    if client is memory_bridge:
+        monkeypatch.setattr(client, "_async_client", lambda _t: _Health())
+    else:
+        monkeypatch.setattr(client.httpx, "AsyncClient", lambda **_k: _Health())
+
+    capability = await client._gateway_capability()
+    capacity = await client._gateway_capacity()
+
+    assert calls["n"] == 1
+    assert capability == LIVE_CAPABILITY
+    assert capacity == {"derived": {"client_ceiling_s": 55.0}}

@@ -174,18 +174,36 @@ SEARCH_SAFETY_FACTOR      = float(os.environ.get("SEARCH_SAFETY_FACTOR", "1.5"))
 SEARCH_OVERHEAD_S         = float(os.environ.get("SEARCH_OVERHEAD_S", "15"))
 
 
-def search_ceiling(capability: dict | None) -> float:
+def search_ceiling(capability: dict | None, capacity: dict | None = None) -> float:
     """Client-side search timeout in seconds, derived from the gateway's own
-    published backend sizing (``backend_capability`` on GET /health).
+    published backend sizing (``backend_capability`` on GET /health), and —
+    when the gateway has one — its own measured worst case (``capacity`` on
+    GET /health).
 
     Pure → unit-testable with no gateway present. MUST stay behaviourally
     identical to ``memory_bridge.search_ceiling``; a parity test compares the two
     across the shipped defaults, the fallback, and both clamps.
+
+    fact:1560 (grounded on decision:1114): a MIXED capability block — one
+    backend probes fine while the other reports ``status: "failing"`` (or
+    ``projection_stale: true``) with no positive projection of its own — floors
+    the derivation at ``SEARCH_TIMEOUT_FALLBACK_S``, never
+    ``SEARCH_TIMEOUT_FLOOR_S``. The known backend's number is only a LOWER
+    bound on the true cost; a failing backend's true cost is unknown, not zero.
+
+    When ``capacity`` carries the gateway's own measured numbers
+    (``capacity["derived"]``), its ``client_ceiling_s`` and ``s_max_measured_s``
+    are folded in too — the server's measured worst case wins when it is
+    larger. ``s_max_measured_s`` is a raw reranker-seconds figure (not yet
+    safety-scaled for THIS client), so it gets the same
+    ``SEARCH_SAFETY_FACTOR``/``SEARCH_OVERHEAD_S`` treatment as the theoretical
+    projection before comparison; ``client_ceiling_s`` is already derived and is
+    compared as-is.
     """
     if SEARCH_TIMEOUT_S > 0:
         return SEARCH_TIMEOUT_S
 
-    projected, probed = 0.0, False
+    projected, probed, unknown = 0.0, False, False
     for backend in ("reranker", "embedder"):
         block = (capability or {}).get(backend)
         if not isinstance(block, dict):
@@ -193,43 +211,75 @@ def search_ceiling(capability: dict | None) -> float:
         try:
             value = float(block.get("projected_full_payload_s") or 0)
         except (TypeError, ValueError):
-            continue
+            value = 0.0
         if value > 0:
             projected += value
             probed = True
-    if not probed:
-        return SEARCH_TIMEOUT_FALLBACK_S
+        elif block.get("status") == "failing" or block.get("projection_stale"):
+            unknown = True   # this backend's real cost is unknown, not zero
 
-    # Postgres vector search, the graph traversal and response assembly sit
-    # outside both probes, so they are ADDED rather than scaled.
-    derived = projected * SEARCH_SAFETY_FACTOR + SEARCH_OVERHEAD_S
-    return max(SEARCH_TIMEOUT_FLOOR_S, min(derived, SEARCH_TIMEOUT_MAX_S))
+    if not probed:
+        derived = SEARCH_TIMEOUT_FALLBACK_S
+    else:
+        # Postgres vector search, the graph traversal and response assembly sit
+        # outside both probes, so they are ADDED rather than scaled.
+        floor = SEARCH_TIMEOUT_FALLBACK_S if unknown else SEARCH_TIMEOUT_FLOOR_S
+        derived = max(floor, projected * SEARCH_SAFETY_FACTOR + SEARCH_OVERHEAD_S)
+
+    capacity_derived = (capacity or {}).get("derived")
+    if isinstance(capacity_derived, dict):
+        client_ceiling_s = capacity_derived.get("client_ceiling_s")
+        if isinstance(client_ceiling_s, (int, float)) and client_ceiling_s > 0:
+            derived = max(derived, client_ceiling_s)
+        s_max_measured_s = capacity_derived.get("s_max_measured_s")
+        if isinstance(s_max_measured_s, (int, float)) and s_max_measured_s > 0:
+            derived = max(derived, s_max_measured_s * SEARCH_SAFETY_FACTOR + SEARCH_OVERHEAD_S)
+
+    return min(derived, SEARCH_TIMEOUT_MAX_S)
 
 
 _CAPABILITY_CACHE: dict | None = None
+_CAPACITY_CACHE: dict | None = None
 
 
-async def _gateway_capability() -> dict | None:
-    """GET /health once per process and return its ``backend_capability`` block.
-    Never raises: sizing the search must never be the thing that fails it.
+async def _fetch_health_blocks() -> None:
+    """GET /health once per process and cache both ``backend_capability`` and
+    ``capacity`` from it — ONE request feeds both caches, never two. Never
+    raises: sizing the search must never be the thing that fails it.
 
     Sends this client's own auth headers (S-10, PR A5): ``backend_capability``
     moved behind auth along with the rest of /health's operational detail, so
     an unauthenticated call here would always land on the anonymous-slim
     shape and silently fall back to the constant ceiling on every
     authenticated install."""
-    global _CAPABILITY_CACHE
-    if _CAPABILITY_CACHE is None:
-        try:
-            async with httpx.AsyncClient(timeout=HEALTH_PROBE_TIMEOUT_S) as client:
-                health = _reply_json(await client.get(f"{COORDINATOR_BASE}/health",
-                                                      headers=_auth_headers()),
-                                     "_gateway_capability")
-            block = health.get("backend_capability")
-            _CAPABILITY_CACHE = block if isinstance(block, dict) else {}
-        except Exception:
-            _CAPABILITY_CACHE = {}      # tried and got nothing; do not retry
+    global _CAPABILITY_CACHE, _CAPACITY_CACHE
+    if _CAPABILITY_CACHE is not None:
+        return   # already attempted this process — do not retry
+    try:
+        async with httpx.AsyncClient(timeout=HEALTH_PROBE_TIMEOUT_S) as client:
+            health = _reply_json(await client.get(f"{COORDINATOR_BASE}/health",
+                                                  headers=_auth_headers()),
+                                 "_fetch_health_blocks")
+        block = health.get("backend_capability")
+        _CAPABILITY_CACHE = block if isinstance(block, dict) else {}
+        capacity = health.get("capacity")
+        _CAPACITY_CACHE = capacity if isinstance(capacity, dict) else None
+    except Exception:
+        _CAPABILITY_CACHE = {}      # tried and got nothing; do not retry
+        _CAPACITY_CACHE = None
+
+
+async def _gateway_capability() -> dict | None:
+    """The cached ``backend_capability`` block — see ``_fetch_health_blocks``."""
+    await _fetch_health_blocks()
     return _CAPABILITY_CACHE or None
+
+
+async def _gateway_capacity() -> dict | None:
+    """The cached ``capacity`` block — see ``_fetch_health_blocks``. None on an
+    older/unreachable gateway, or one with no derivation yet."""
+    await _fetch_health_blocks()
+    return _CAPACITY_CACHE
 
 
 def _auth_headers() -> dict:
@@ -563,11 +613,15 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5, project: str = ""
     (e.g. "2026-08-01T00:00:00") — records created at/after it. An unknown
     project/domain name is not refused, it simply matches nothing (the read
     path never blocks on registry state).
+
+    The wait for this call is sized from the gateway's own published backend
+    capability, not a constant — set SEARCH_TIMEOUT_S (env) to pin an explicit
+    override instead.
     """
     logger.info(f"Search: {query[:50]}...")
     start = datetime.now()
     # Sized from the gateway's own published cost, never from a constant.
-    ceiling = search_ceiling(await _gateway_capability())
+    ceiling = search_ceiling(await _gateway_capability(), await _gateway_capacity())
     body = {"query": query, "limit": limit, "agent_id": AGENT_ID}
     if project:
         body["project"] = project
@@ -598,8 +652,17 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5, project: str = ""
     results = payload.get("results", payload)
     if isinstance(results, dict) and results.get("status") == "error":
         return f"Error: {results.get('message', 'search failed')}"
-    return _render_results(results if isinstance(results, list) else [],
-                           (datetime.now() - start).total_seconds())
+    results_list = results if isinstance(results, list) else []
+    rendered = _render_results(results_list, (datetime.now() - start).total_seconds())
+    # This tool returns rendered text, not a dict/list — so the unranked
+    # warning is a line prepended to that text rather than a `note` field.
+    unranked = sum(1 for row in results_list
+                   if isinstance(row, dict) and row.get("ranked") is False)
+    if unranked:
+        rendered = (f"NOTE: {unranked} of {len(results_list)} results are "
+                    f"UNRANKED — the reranker timed out, this is vector order "
+                    f"(see backend_capability on /health).\n\n" + rendered)
+    return rendered
 
 
 @mcp.tool()
@@ -1189,6 +1252,11 @@ async def check_memory_health() -> str:
                            "error": str(exc),
                            "hint": "systemctl --user start hive-mind-gateway.service"},
                           indent=2)
+    # `agent`/`role` ride on the AUTHENTICATED /health payload (a server change
+    # this PR does not build). `agent` is surfaced only when present — it
+    # passes through verbatim below; `role` always gets a line, so an
+    # older/anonymous gateway reads as an absence rather than silence.
+    payload.setdefault("role", "unknown (gateway < 0.9.52)")
     payload["client"] = {"tool": "vector-skill", "version": VERSION,
                          "api_version": API_VERSION}
     gw_api = payload.get("api_version")

@@ -976,7 +976,7 @@ is the right starting state. Sections are registered through ingress the same wa
 
 ⚠ **Run the Neo4j check on every upgrade, and do not assume it is redundant.** `apply.py` covers Postgres only, and Postgres has a migration ledger that records what has been applied. **Neo4j has none** — `neo4j_init.cypher` is a one-time manual step, so a long-lived instance enforces whatever constraint set was true the day someone last ran it, and a constraint added to the file in a later release reaches new installs and nobody else. A missing uniqueness constraint is silent: `MERGE` keeps working and the only symptom is a duplicate node appearing under a race. Add `--apply` to create what is missing; it exits 1 when a declared constraint is not in force, so it is safe to gate on. *(This is not hypothetical — the deployment this framework was built on was enforcing one of the seven declared constraints, and a plain index on `Entity.name` was blocking a second. `--apply` handles that case; re-running `neo4j_init.cypher` does not.)*
 
-Clients and gateway may drift; `memory_bridge.py doctor` names which side to upgrade on `api_version` skew.
+Clients and gateway may drift; `memory_bridge.py doctor` names which side to upgrade on `api_version` skew. `doctor` also names the token's own `agent`/`role` when the authenticated gateway reports them; an older gateway (< 0.9.52) is named honestly as `role: unknown` rather than a silently blank field.
 
 ### Backup / restore
 
