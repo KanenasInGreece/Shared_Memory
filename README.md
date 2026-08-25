@@ -728,6 +728,23 @@ The full schema — every table, label and relationship — is documented in
 [`shared-memory/Documentation/schema.md`](shared-memory/Documentation/schema.md). Graph label
 names are configurable in `shared-memory/ontology.yaml`; the machinery does not depend on your vocabulary.
 
+### Filtered search at scale — measured
+
+A `--project`/`--domain` filter on `POST /memory/search` was measured, on a throwaway copy,
+against a Seq Scan and an empty-result failure mode as the corpus grows. A majority-selectivity
+filter went from a 519 ms Seq Scan at 74,200 rows to 16 ms with an expression index; a
+minority-selectivity filter (1.8% of rows) went from 128 ms at 74,200 rows to 0 matching rows at
+296,800 rows under HNSW alone — the same filter, on the same data, silently wrong rather than
+slow, because HNSW hands over its candidate set before the post-filter narrows it. Migration
+`036_axis_filter_indexes.sql` adds a B-tree expression index on `(metadata->>'project')`, the
+column the filter actually compares against, plus a GIN index on the domains array (added by the
+same reasoning, unmeasured). The gateway sets `hnsw.iterative_scan = relaxed_order` per pooled
+connection whenever the installed pgvector is >= 0.8 — with it, the minority filter above returned
+22 rows in 217 ms at 296,800 rows instead of 0 — and reports the installed pgvector version and
+whether iterative scan is active on authenticated `/health`. The bundled compose image is pinned
+to `pgvector/pgvector:0.8.6-pg17` for that floor. CPU-host latencies are unmeasured — the numbers
+above are from the 12-core reference workstation (Postgres itself uses no GPU).
+
 ## 17. Inference: the encoders and the reasoning LLM
 
 Two small encoders serve the write and search paths — BGE-M3 embeds, BGE-Reranker-v2-m3 ranks —
@@ -1097,21 +1114,41 @@ chain and its verifiers under `shared-memory/migrations/`, the client contract i
 
 ## 25. Honest state
 
-A working system with known edges, named rather than polished over:
+A working system with known edges, named rather than polished over. This list is re-checked
+against the code on every documentation pass — the last pass found three of five entries
+stale, two of them claiming something as missing that had shipped — so read it as a dated
+statement, not a permanent one.
 
-- **External content is a real risk.** Anything saved becomes trusted context for every agent.
-  The synthesis passes treat content as data-not-instructions and the insight builder
-  neutralises protocol-shaped lines, but raw facts return verbatim from search. Do not ingest
-  web-retrieved content at volume; ingestion-boundary sanitisation is planned.
-- **Consolidation quality is not yet measured.** The syntheses are structurally faithful by
-  construction; there is no quantitative signal yet separating sharp abstraction from lossy
-  blur.
-- **The entity vocabulary is logged, not yet gated.** Names are operator-chosen by rule and
-  stamped by origin; the registry that would enforce curation is commissioned, not built.
-- **Authentication is bearer-token today.** Proof-of-possession keys — the person
-  cryptographically authorising the agent — are designed and upcoming, with the audit trail
-  promoted to a durable, non-repudiable record behind them.
-- **Scale:** axis filtering earns a database index as corpora grow; known and queued.
+- **External content: the boundary is the agent, and the framework hardens what it can.**
+  The gateway has no fetch path of its own; a record exists only because an authenticated
+  agent read something and chose to save it. From there the synthesis passes treat content as
+  data-not-instructions, the insight builder neutralises protocol-shaped lines before a model
+  sees them, the graph refuses labels and relationships outside its known set, and the entity
+  gate stops a record from minting vocabulary on its own. What the framework does **not** do,
+  by design, is edit a record: raw facts return verbatim from search, because Tier 1 *is* the
+  record. So treat every retrieved record as data, save web-retrieved content deliberately and
+  never at volume, and know the limit: a protocol-shaped line can be flagged at the door, but
+  prose that reads like an instruction cannot be told from a quoted finding about one — this
+  corpus holds such findings. Flagging (never rewriting) marker lines at save time is the one
+  narrow ingestion-side measure still open.
+- **Consolidation is reproducible; its quality is not measured.** Thematic folds are
+  deterministic — the same inputs refolded on two different hosts produced byte-identical
+  summaries, and the two hosts' encoders agreed to cosine 0.9987–1.0 — so structural
+  faithfulness holds by construction. What has no number yet is whether a fold is a sharp
+  abstraction or a lossy blur. The measurement is designed (lift over a deterministic
+  baseline, human judgement on the disagreement set) and has not been run.
+- **The entity vocabulary is gated at save — the cleanup behind the gate is not done.** A
+  save naming an entity outside the registry is refused with the exact protocol for minting
+  it, and minting is the operator's act. Names that entered before the gate existed are still
+  in the graph as they were spelled then; merging them is curation, not code, and is in
+  progress.
+- **Authentication is bearer-token plus kernel-attested person identity.** Agents present a
+  token the gateway knows by digest. On the local socket the gateway also reads the
+  connecting person from the kernel (`SO_PEERCRED`) and stamps it server-side — never
+  claimed by the client — and can be told to require it for writes. What is still ahead is
+  proof-of-possession keys over the network, and the audit trail promoted to a durable,
+  non-repudiable record behind them.
+
 
 ## 26. Direction
 

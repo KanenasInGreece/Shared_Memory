@@ -147,7 +147,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.54"
+FRAMEWORK_VERSION = "0.9.55"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -1824,6 +1824,31 @@ POOL_MIN = _env_int("POOL_MIN", 2)
 POOL_MAX = _env_int("POOL_MAX", 20)
 POOL_ACQUIRE_TIMEOUT = _env_float("POOL_ACQUIRE_TIMEOUT", 5.0)
 
+# The pgvector floor for `hnsw.iterative_scan` (decision:1584, fact:1583).
+# Below it a selective axis filter (--project/--domain) can return ZERO rows
+# past ~75k-300k records: HNSW returns its ef_search candidates and the SQL
+# WHERE post-filter then removes them, and a selective filter can empty that
+# set entirely. Migration 036's expression index fixes the Seq-Scan regression
+# that shows up from ~15k rows; this session setting is the other half —
+# see start()'s version probe and _init_connection below.
+PGVECTOR_ITERATIVE_SCAN_MIN = (0, 8)
+
+
+def _parse_pgvector_version(raw: "str | None") -> "tuple[int, int] | None":
+    """"0.8.2" -> (0, 8); "1.0.0" -> (1, 0); None or unparseable -> None.
+
+    Only major.minor matter — iterative_scan is a 0.8 feature, not a patch-
+    level one. Never raises: an unrecognised string degrades to None, which
+    reads as "iterative scan unavailable", the safe direction (it never
+    enables a session setting a genuinely-older server would reject).
+    """
+    if not raw:
+        return None
+    m = re.match(r"(\d+)\.(\d+)", raw)
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)))
+
 OUTBOX_POLL_INTERVAL = 2.0   # seconds between outbox drain cycles
 OUTBOX_BATCH_SIZE    = 20    # rows processed per cycle
 OUTBOX_MAX_RETRIES   = 5     # row marked 'failed' after this many Neo4j errors
@@ -2379,6 +2404,11 @@ class MemoryCoordinator:
         self._neo4j: Any = None
         self._locks = BoundedKeyedLocks(LOCKS_MAX_SIZE)
         self._outbox_task: asyncio.Task | None = None
+        # pgvector extension version, and whether hnsw.iterative_scan applies
+        # (decision:1584/fact:1583) — probed once in start(), BEFORE the pool
+        # exists (see there for why). None/False until that probe runs.
+        self.pgvector_version: str | None = None
+        self.hnsw_iterative_scan: bool = False
         # Rerank outcome counters. The reranker is a separate process on the
         # search path with a FALLBACK, so its total failure is silent by
         # construction — it degrades to vector order and still answers. These
@@ -2453,6 +2483,41 @@ class MemoryCoordinator:
         # replaces (a caplog-forced test hid it: the fixture installs its own
         # handler, so it never observed the real, unconfigured logger).
         log_encoder_endpoints()
+        # pgvector version probe — on a STANDALONE connection, BEFORE the pool
+        # is created, so self.hnsw_iterative_scan is already correct by the
+        # time _init_connection runs for the pool's own warm-up connections.
+        # Probing AFTER create_pool() (e.g. via the first acquired connection,
+        # the way the outbox recovery below does) would leave the first
+        # POOL_MIN connections permanently without the SET below — they are
+        # created and initialised during create_pool() itself, before any
+        # query against them could have told us whether to apply it.
+        try:
+            _probe = await asyncpg.connect(PG_DSN)
+            try:
+                _raw_version = await _probe.fetchval(
+                    "SELECT extversion FROM pg_extension WHERE extname='vector'"
+                )
+            finally:
+                await _probe.close()
+        except Exception:
+            log.warning("pgvector version probe failed — treating as unknown "
+                        "(hnsw.iterative_scan stays disabled)", exc_info=True)
+            _raw_version = None
+        self.pgvector_version = _raw_version
+        _parsed = _parse_pgvector_version(_raw_version)
+        self.hnsw_iterative_scan = (
+            _parsed is not None and _parsed >= PGVECTOR_ITERATIVE_SCAN_MIN)
+        log.info("pgvector extension version %s — hnsw.iterative_scan %s",
+                 _raw_version or "unknown",
+                 "enabled" if self.hnsw_iterative_scan else "disabled")
+        if not self.hnsw_iterative_scan:
+            log.warning(
+                "pgvector %s is below the 0.8 floor for hnsw.iterative_scan — "
+                "a selective axis filter (--project/--domain) can return EMPTY "
+                "results at scale once HNSW hands over its candidate set before "
+                "the post-filter narrows it (decision:1584); upgrade to "
+                "pgvector >= 0.8 to fix", _raw_version or "unknown")
+
         self._pool = await asyncpg.create_pool(
             PG_DSN, min_size=POOL_MIN, max_size=POOL_MAX,
             init=self._init_connection,
@@ -2542,9 +2607,26 @@ class MemoryCoordinator:
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    @staticmethod
-    async def _init_connection(conn: asyncpg.Connection) -> None:
-        """Register JSONB codec so columns decode to Python dicts, not raw strings."""
+    async def _init_connection(self, conn: asyncpg.Connection) -> None:
+        """Register JSONB codec so columns decode to Python dicts, not raw
+        strings — then, when this coordinator's pgvector probe (start())
+        found the extension at >= 0.8, set `hnsw.iterative_scan = relaxed_
+        order` for the session so a selective axis filter's HNSW candidate
+        handoff keeps searching instead of handing over an empty post-filter
+        result (decision:1584/fact:1583).
+
+        A bound method (not @staticmethod, as this used to be) precisely so
+        it can read `self.hnsw_iterative_scan` — asyncpg calls this once per
+        pooled connection, on creation, and self.hnsw_iterative_scan is fixed
+        before the pool exists (see start()), so every connection this ever
+        runs for — warm-up or later growth — sees the same answer.
+
+        The SET is wrapped separately from the codec registration: a session
+        GUC that fails to apply (an unexpected server error, a build without
+        the setting) is logged once and must not fail the whole connection —
+        the codec above is required for correct decoding everywhere, this is
+        a performance/correctness improvement for one query shape.
+        """
         await conn.set_type_codec(
             "jsonb",
             encoder=json.dumps,
@@ -2552,6 +2634,13 @@ class MemoryCoordinator:
             schema="pg_catalog",
             format="text",
         )
+        if self.hnsw_iterative_scan:
+            try:
+                await conn.execute("SET hnsw.iterative_scan = relaxed_order")
+            except Exception:
+                log.warning("failed to SET hnsw.iterative_scan on a pooled "
+                            "connection — that connection keeps the default "
+                            "(strict) HNSW scan for its lifetime", exc_info=True)
 
     def _acquire(self):
         """Acquire a pooled connection, bounded by POOL_ACQUIRE_TIMEOUT.

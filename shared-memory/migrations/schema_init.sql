@@ -657,7 +657,9 @@ CREATE TABLE IF NOT EXISTS technical_docs (
 CREATE INDEX IF NOT EXISTS technical_docs_agent_id_idx ON public.technical_docs USING btree (agent_id);
 CREATE UNIQUE INDEX IF NOT EXISTS technical_docs_content_hash_key ON public.technical_docs USING btree (content_hash);
 CREATE INDEX IF NOT EXISTS technical_docs_created_at_idx ON public.technical_docs USING btree (created_at);
+CREATE INDEX IF NOT EXISTS technical_docs_domains_gin_idx ON public.technical_docs USING gin (((metadata -> 'domains'::text)));
 CREATE INDEX IF NOT EXISTS technical_docs_embedding_idx ON public.technical_docs USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS technical_docs_project_expr_idx ON public.technical_docs USING btree (((metadata ->> 'project'::text)));
 CREATE INDEX IF NOT EXISTS technical_docs_scope_idx ON public.technical_docs USING btree (scope);
 CREATE INDEX IF NOT EXISTS technical_docs_superseded_by_idx ON public.technical_docs USING btree (superseded_by) WHERE (superseded_by IS NOT NULL);
 CREATE INDEX IF NOT EXISTS technical_docs_visibility_idx ON public.technical_docs USING btree (visibility);

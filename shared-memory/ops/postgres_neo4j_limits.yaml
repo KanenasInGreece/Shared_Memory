@@ -9,7 +9,10 @@ name: shared-memory
 services:
 #---------- STORAGE LAYER ---------
   neo4j:
-    image: neo4j:5-community
+    # Pinned exact: 5.26 is the LTS line (supported to 2028-06). Bump
+    # deliberately, never float back to `neo4j:5-community` — a floating tag
+    # silently moves which 5.x minor you run.
+    image: neo4j:5.26.30-community
     container_name: neo4j-memory
     # Loopback by default, same rule and same shape as INFERENCE_BIND below:
     # a bare "7474:7474" publishes on ALL interfaces, putting the store that
@@ -59,7 +62,14 @@ services:
     restart: always
 
   postgres:
-    image: pgvector/pgvector:pg17
+    # Pinned exact. Floor is pgvector >= 0.8 for `hnsw.iterative_scan`
+    # (coordinator.py's own GUC floor stays >= 0.8, as briefed), and >= 0.8.4
+    # for the HNSW-vacuum index-corruption fixes (pgvector CHANGELOG
+    # 0.8.3/0.8.4). PostgreSQL 17.11 carries the 2026-08-13 security release
+    # (pg_dump CVE-2026-19385, psql \unrestrict CVE-2026-18408). Bump this tag
+    # deliberately, never float it back to `pg17` — a floating tag also
+    # silently moves the PostgreSQL minor underneath it.
+    image: pgvector/pgvector:0.8.6-pg17
     container_name: postgres-vector
     ports:
       - "${DB_BIND:-127.0.0.1}:5432:5432"
