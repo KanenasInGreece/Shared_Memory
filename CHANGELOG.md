@@ -5,6 +5,39 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.59] — 2026-08-26
+
+### Fixed — the capability probe retries while an encoder is down; nvtop's blind spot is a permission, not an API
+
+**Ten minutes of empty searches after a reboot, over a sixty-second cold start.** The gateway
+measures its encoders with a capability probe on a deliberately slow cadence — ten minutes, because
+a probe costs inference time on the backends that serve traffic. It slept that full interval after
+*every* probe, including one that found the encoders still loading their weights. On a host where the
+encoders take a minute to come up, the first probe landed thirty seconds too early, `/health` read
+`degraded` and search answered `[]` until the next probe, nine and a half minutes after the encoders
+were ready. The sleep is now a function of the last outcome: a backend that is **failing** — unreachable,
+non-2xx, or an exception — is re-probed every `CAPABILITY_PROBE_RETRY_S` (15 s, env-overridable);
+one that is serving, including one that is serving *too slowly*, waits the full interval as before,
+since a fast re-probe would add load to exactly the encoder that is struggling. The branch is a pure
+function with its own tests, mutation-checked.
+
+**The startup banner named the shipped ports, not the configured ones.** It now logs the resolved
+`EMBEDDER_URL` and `RERANKER_URL`.
+
+**nvtop reads 0% for a containerised encoder because of *who* runs it, not *how* it submits work.**
+The 0.9.58 README said Level Zero submissions were not counted. Measured since: the same load reads
+0% when `nvtop` runs as the gateway user and 99% when it runs as root, because `nvtop` reads each
+GPU process's `/proc/<pid>/fdinfo` and a container's processes are root's. The consequence is wider
+than one vendor: any inference server in a container on a card the dreaming daemons gate on is
+invisible to them. The README now states the mechanism and the remedy (`setcap
+cap_dac_read_search,cap_sys_ptrace,cap_perfmon+ep` on `nvtop` — measured: the first two named by
+its README are not enough, the fd directory is a DAC check — re-applied after package updates, or run
+the container as the gateway's user). The same section's llama-server cache figures were corrected to the measured
+values (6.6–7.8 GiB per process under an 8 GiB ceiling, ~14 GiB for the pair), and an untested claim
+about the A770 was reduced to what is recorded.
+
+---
+
 ## [0.9.58] — 2026-08-26
 
 ### Added — the encoders can be served by vLLM; the one shim that needs, and a measured Intel Arc example
