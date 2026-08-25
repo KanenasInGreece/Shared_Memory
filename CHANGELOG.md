@@ -5,6 +5,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.52] — 2026-08-25
+
+### Fixed — a measured encoder cost no longer vanishes from `/health` when the encoder is busy
+
+- **The capability probe keeps its last good reading.** The gateway probes each encoder on a
+  cycle and publishes `projected_full_payload_s`, the number every client sizes its search wait
+  from. When a probe timed out — which is exactly what happens while the reranker is working a
+  real request — the whole block was replaced with `status: failing` and the projection
+  disappeared, so clients fell to a 30-second floor against a search that costs 100–260 s on a
+  CPU reranker. Measured overnight on two CPU-reranker hosts: 19 of 19 and 41 of 43 searches
+  aborted client-side while the gateway finished every one of them. The probe daemon now merges
+  each reading onto the previous snapshot: a failing cycle carries the measured numbers forward
+  and says so — `projection_stale: true`, `last_ok_at`, and `projection_age_s` computed at read
+  time — while verdicts (`serves_full_payload`) are never carried, only measurements. A backend
+  that has never been measured still invents nothing.
+- **The server-side ceiling mirror applies the same rule.** `capacity.derived.client_ceiling_s`
+  treats a failing, stale, absent or malformed backend block as an unknown cost, so it never
+  drops below the fallback; the parity test now pins the measured shape (embedder 1.8 s, reranker
+  failing) at 120 s by value on both sides.
+- **Durable capacity records date their inputs honestly.** `capacity.probe` carries
+  `reranker_measured_at` / `embedder_measured_at` and `probe_stale`, so a carried number in
+  `capacity.jsonl` is never stamped with the cycle that merely repeated it. All new keys are
+  additive; nothing is renamed.
+
 ## [0.9.51] — 2026-08-24
 
 ### Added — each encoder chooses its own device
