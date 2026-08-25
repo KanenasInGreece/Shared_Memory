@@ -2426,6 +2426,72 @@ async def _probe_capability(session) -> dict:
     return out
 
 
+# The measured set a successful probe cycle produces for one backend. These
+# keys travel TOGETHER: throughput and the latency it was computed from are
+# one coherent reading, and the projection/ceiling/verdict are derived from
+# that same reading — carrying half of them forward would publish a mix of
+# two different cycles under one block.
+_PROJECTION_CARRY_KEYS = ("projected_full_payload_s", "ceiling_s",
+                          "serves_full_payload", "throughput_chars_s",
+                          "latency_s")
+
+
+def _merge_capability_projection(previous: dict | None, fresh: dict) -> dict:
+    """A projection, once measured, never DISAPPEARS from /health; it only
+    ages and says so.
+
+    The defect this exists for (fact:1560): the probe daemon replaced the
+    module-level snapshot WHOLESALE every cycle, and a failing probe writes
+    only `status`/`error` — so `projected_full_payload_s` vanished from a
+    backend's block at exactly the moment the backend was busy. Clients size
+    their search timeout from that block (memory_bridge.search_ceiling), so
+    they fell back to the 30 s floor while the gateway kept working the same
+    request for minutes. An absent number read as "nothing to worry about"
+    when the truth was "the last thing we measured was alarming".
+
+    So: a cycle that MEASURED a projection publishes it fresh and stamps
+    `projection_stale: False`; a cycle that failed keeps the last measured
+    values of that block, stamps `projection_stale: True` and `last_ok_at`
+    (when the surviving numbers were actually taken), and leaves this
+    cycle's own `status`/`error` in place. A backend that has NEVER measured
+    keeps today's shape and gets `projection_stale: None` — "never measured"
+    is a third state, and no number is invented to fill it.
+
+    "Measured" means the block carries `projected_full_payload_s`, which
+    includes a `too_slow` verdict: that reading succeeded, it was just slow,
+    and a slow-but-real projection is precisely the value a client must not
+    lose. Mutates and returns `fresh` (the dict _probe_capability just
+    built); `previous` is only read."""
+    if not isinstance(fresh, dict):
+        return fresh
+    for backend in ("reranker", "embedder"):
+        block = fresh.get(backend)
+        if not isinstance(block, dict):
+            continue
+        if block.get("projected_full_payload_s") is not None:
+            block["projection_stale"] = False
+            block["last_ok_at"] = fresh.get("probed_at")
+            continue
+        prev_block = (previous or {}).get(backend)
+        if (not isinstance(prev_block, dict)
+                or prev_block.get("projected_full_payload_s") is None):
+            # Never measured — nothing to carry, and nothing to invent.
+            block["projection_stale"] = None
+            continue
+        for key in _PROJECTION_CARRY_KEYS:
+            if key in prev_block:
+                block[key] = prev_block[key]
+            else:
+                block.pop(key, None)
+        block["projection_stale"] = True
+        # `previous` may itself already be a carried-forward block, so the
+        # stamp is chained: the age reported is the age of the NUMBERS, not
+        # of the cycle that last carried them.
+        block["last_ok_at"] = (prev_block.get("last_ok_at")
+                               or (previous or {}).get("probed_at"))
+    return fresh
+
+
 async def _capability_probe_daemon(proxy, stop_event, coordinator=None) -> None:
     """Refresh the capability snapshot on a slow cadence, forever.
 
@@ -2435,11 +2501,17 @@ async def _capability_probe_daemon(proxy, stop_event, coordinator=None) -> None:
 
     `coordinator` (optional — the running MemoryCoordinator instance, when
     the caller has one) is threaded through to _maybe_derive_capacity so the
-    measured-payload basis can read its cumulative rerank counters."""
+    measured-payload basis can read its cumulative rerank counters.
+
+    ⛔ The fresh reading is MERGED onto the previous snapshot, never assigned
+    over it — see _merge_capability_projection for why a wholesale
+    replacement made a measured projection disappear on the cycle it
+    mattered most."""
     global _capability
     while not stop_event.is_set():
         try:
-            _capability = await _probe_capability(proxy.session)
+            _capability = _merge_capability_projection(
+                _capability, await _probe_capability(proxy.session))
             await _maybe_derive_capacity(_capability, coordinator)
         except Exception as exc:
             log.warning("capability probe failed: %s", exc)
@@ -3120,6 +3192,15 @@ def _build_capacity_record(capability: dict | None, fingerprint: dict,
             # self-describing even if the operator's setting changes later.
             "tolerable_wait_s": CAPACITY_TOLERABLE_WAIT_S,
             "single_search_exceeds_wait": single_search_exceeds_wait,
+            # NEW (additive): whether the reranker projection this record was
+            # derived FROM was measured on this cycle (False), carried
+            # forward from an earlier one because this cycle's probe failed
+            # (True), or never measured at all (None). The numbers above no
+            # longer collapse to their not-yet-measured fallbacks on a
+            # failing cycle -- see _merge_capability_projection -- so this
+            # flag is what tells a reader that a real projection is AGEING
+            # rather than fresh. Nothing above is renamed or re-meant.
+            "reranker_projection_stale": reranker.get("projection_stale"),
             "recommended_reranker_mem_limit_bytes": recommended_mem_limit,
         },
     }
