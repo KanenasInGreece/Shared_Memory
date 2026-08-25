@@ -5,6 +5,44 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.55] — 2026-08-25
+
+### Changed — filtered search stays correct at scale; runtime dependencies pinned to a measured baseline
+
+**Axis filters at scale.** A `--project` / `--domain` search filter is applied to the HNSW candidate set, and on a
+throwaway copy of the corpus multiplied to 15k, 74k and 297k records the two failure modes were measured rather than
+assumed: from ~15k rows the planner, with no statistics on `metadata->>'project'`, abandons the vector index for a
+sequential scan (117 ms at 15k, 519 ms at 74k for the largest project); and between ~75k and ~300k rows a selective
+filter under HNSW returns **no rows at all** for a project with 5,200 eligible records — a silent empty result. Migration
+036 adds an expression index on `(metadata->>'project')` — keyed on the stored value the alias-expanded filter binds
+against, never on `normalized_key` — and a GIN on `(metadata->'domains')` (by analogy, unmeasured). The coordinator now
+sets `hnsw.iterative_scan = relaxed_order` on every pooled connection when pgvector ≥ 0.8 is installed, reads the
+installed pgvector version at startup, reports it on authenticated `/health` as `pgvector: {version, iterative_scan}`,
+and logs a warning instead when the extension is older. Measured after the change: 28–30 ms for every filter shape at
+297k rows, and the previously empty query returns its 22 rows in 217 ms. CPU-host latencies are unmeasured.
+
+**Runtime dependencies pinned — and why.** The framework had never pinned or checked a runtime dependency: the compose
+file named `pgvector/pgvector:pg17` and `neo4j:5-community`, both floating, and the first dependency-currency check
+found the live stack two PostgreSQL security releases behind and missing pgvector's HNSW-vacuum corruption fixes. The
+baseline is now exact and stated:
+
+| Component | Was (live) | Now pinned | Why |
+|---|---|---|---|
+| PostgreSQL | 17.9 (floating `pg17`) | **17.11** via `pgvector/pgvector:0.8.6-pg17` | 17.10 (2026-05-14) fixed 11 CVEs incl. CVE-2026-6473 (server integer wraparound, 8.8); 17.11 (2026-08-13) fixed CVE-2026-19385 (`pg_dump` heap overflow, 8.8) and CVE-2026-18408 (`psql \unrestrict` restore-time execution, 8.8) — `update_framework.sh` runs `pg_dump` and `psql` for backup and restore |
+| pgvector | 0.8.2 | **0.8.6** (same tag) | 0.8.3/0.8.4 fix HNSW index corruption during vacuum; ≥ 0.8 is the floor for `hnsw.iterative_scan`; no behaviour change to iterative scan, `ef_search` or results across 0.8.2→0.8.6 |
+| Neo4j | 5.26.26 (floating `5-community`) | **5.26.30-community** | 5.26 is the LTS line (supported to 2028-06); latest patch; 5.26.27–30 notes to be reviewed at the next check |
+| APOC, GDS | fetched at container start, unrecorded | unchanged | recorded as the next check's item |
+| llama.cpp server images | floating | unchanged | pinned only after an encoder-host test |
+
+Pins are exact from here on; every future move is recorded here with its reason (`decision:1586`). Licences were
+read at the same time: everything the framework couples to is permissive except Neo4j Community and Graph Data
+Science (GPLv3), both reached as separate processes over Bolt through the Apache-2.0 driver and never redistributed —
+a `THIRD_PARTY.md` stating each component, its licence and the coupling follows in the next docs release.
+
+**Docs.** *Honest state* (§25) re-verified against the code: the entity gate and the kernel-attested person identity are recorded as shipped, the external-content boundary is stated as the agent, consolidation as reproducible-but-unmeasured, and the scale entry is retired in favour of the measured §16 section above.
+
+---
+
 ## [0.9.54] — 2026-08-25
 
 ### Changed — projects and domains resolve by concept, at save and at search
