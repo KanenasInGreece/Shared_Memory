@@ -171,15 +171,43 @@ async def test_cli_doctor_surfaces_agent_and_role_when_present():
 
 
 @pytest.mark.asyncio
-async def test_cli_doctor_role_unknown_fallback_when_absent():
-    """An older gateway (< 0.9.52) never sends agent/role at all — doctor
-    must say so rather than silently omitting the line."""
-    payload = {"status": "ok", "version": "0.9.51",
+async def test_cli_doctor_role_predates_when_gateway_is_genuinely_old():
+    """T-04 (PR #310 review), case 2: the gateway's OWN reported version is
+    below ROLE_REPORTING_MIN_VERSION — it genuinely never sends `role`."""
+    payload = {"status": "ok", "version": "0.9.40",
               "api_version": memory_bridge.API_VERSION}
     with patch("httpx.AsyncClient.get", return_value=_health(payload)):
         diag = await memory_bridge.check_gateway_compat()
     assert "agent" not in diag   # only shown when present
-    assert diag["role"] == "unknown (gateway < 0.9.52)"
+    assert diag["role"] == "not reported (gateway 0.9.40 predates 0.9.52)"
+
+
+@pytest.mark.asyncio
+async def test_cli_doctor_role_anonymous_when_gateway_is_current():
+    """T-04 (PR #310 review), case 3: gateway_version says CURRENT (>=
+    0.9.52) but `role` is absent — that combination is not "old gateway", it
+    is "this token was not accepted" (anonymous-slim payload on a current
+    gateway). The old single fallback text asserted the version floor even
+    here, contradicting gateway_version in the SAME payload."""
+    payload = {"status": "ok", "version": "0.9.52",
+              "api_version": memory_bridge.API_VERSION}
+    with patch("httpx.AsyncClient.get", return_value=_health(payload)):
+        diag = await memory_bridge.check_gateway_compat()
+    assert diag["gateway_version"] == "0.9.52"
+    assert "agent" not in diag
+    assert diag["role"] == "not reported (token not accepted — anonymous payload)"
+
+
+@pytest.mark.asyncio
+async def test_cli_doctor_role_unparseable_version_treated_as_predates():
+    """No parseable version at all (very old, pre-version-contract gateway,
+    or a malformed string) is treated the same as "predates" — conservative,
+    since a gateway too old to report even a parseable version is certainly
+    too old to report role."""
+    payload = {"status": "ok"}   # no `version` key
+    with patch("httpx.AsyncClient.get", return_value=_health(payload)):
+        diag = await memory_bridge.check_gateway_compat()
+    assert diag["role"] == "not reported (gateway version unknown, predates 0.9.52 assumed)"
 
 
 @pytest.mark.asyncio
@@ -197,12 +225,186 @@ async def test_mcp_check_memory_health_surfaces_agent_and_role_when_present():
 
 
 @pytest.mark.asyncio
-async def test_mcp_check_memory_health_role_unknown_fallback_when_absent():
-    payload = {"status": "ok", "version": "0.9.51", "api_version": vector_skill.API_VERSION}
+async def test_mcp_check_memory_health_role_predates_when_gateway_is_genuinely_old():
+    """T-04, case 2, MCP door."""
+    payload = {"status": "ok", "version": "0.9.40", "api_version": vector_skill.API_VERSION}
     mock_response = MagicMock(status_code=200, json=lambda: payload)
     with patch("httpx.AsyncClient.get", return_value=mock_response):
         result = await vector_skill.check_memory_health()
     import json as _json
     parsed = _json.loads(result)
     assert "agent" not in parsed
-    assert parsed["role"] == "unknown (gateway < 0.9.52)"
+    assert parsed["role"] == "not reported (gateway 0.9.40 predates 0.9.52)"
+
+
+@pytest.mark.asyncio
+async def test_mcp_check_memory_health_role_anonymous_when_gateway_is_current():
+    """T-04, case 3, MCP door: current gateway, absent role → this token was
+    not accepted, not "old gateway"."""
+    payload = {"status": "ok", "version": "0.9.52", "api_version": vector_skill.API_VERSION}
+    mock_response = MagicMock(status_code=200, json=lambda: payload)
+    with patch("httpx.AsyncClient.get", return_value=mock_response):
+        result = await vector_skill.check_memory_health()
+    import json as _json
+    parsed = _json.loads(result)
+    assert parsed["version"] == "0.9.52"
+    assert "agent" not in parsed
+    assert parsed["role"] == "not reported (token not accepted — anonymous payload)"
+
+
+@pytest.mark.asyncio
+async def test_mcp_check_memory_health_role_unparseable_version_treated_as_predates():
+    payload = {"status": "ok", "api_version": vector_skill.API_VERSION}   # no version key
+    mock_response = MagicMock(status_code=200, json=lambda: payload)
+    with patch("httpx.AsyncClient.get", return_value=mock_response):
+        result = await vector_skill.check_memory_health()
+    import json as _json
+    parsed = _json.loads(result)
+    assert parsed["role"] == "not reported (gateway version unknown, predates 0.9.52 assumed)"
+
+
+# ── T-03 (PR #310 review): the auth header is load-bearing — pin it ─────────
+# Removing `headers=_request_headers()`/`_auth_headers()` from either
+# /health fetch leaves the suite fully green (measured by the review) since
+# every stub accepted `*_a, **_kw` and never inspected what was sent. On an
+# auth-configured install that silently and permanently pins EVERY client at
+# the constant fallback and EVERY doctor at the "old gateway" line — exactly
+# the "unknown cost" case this whole PR exists to fix, just forever instead
+# of only when the gateway is genuinely old/unreachable.
+
+@pytest.mark.asyncio
+async def test_cli_health_fetch_sends_auth_headers(monkeypatch):
+    monkeypatch.setenv("COORDINATOR_UDS", "")
+    monkeypatch.setenv("AGENT_TOKEN", "tok_test_t03_cli")
+    monkeypatch.setattr(memory_bridge, "_CAPABILITY_CACHE", None)
+    monkeypatch.setattr(memory_bridge, "_CAPACITY_CACHE", None, raising=False)
+
+    captured = {}
+
+    async def fake_get(self, url, *, headers=None, **kw):
+        captured["headers"] = headers
+        return _health({})
+
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx.AsyncClient, "get", fake_get)
+
+    await memory_bridge._gateway_capability()
+
+    assert captured.get("headers") is not None, "no headers kwarg reached the /health GET at all"
+    assert captured["headers"].get("Authorization") == "Bearer tok_test_t03_cli"
+
+
+@pytest.mark.asyncio
+async def test_cli_doctor_health_fetch_sends_auth_headers(monkeypatch):
+    """check_gateway_compat's own /health GET, separately from
+    _fetch_health_blocks — both fetches carry the header, tested separately
+    since they are two different call sites."""
+    monkeypatch.setenv("COORDINATOR_UDS", "")
+    monkeypatch.setenv("AGENT_TOKEN", "tok_test_t03_doctor")
+    captured = {}
+
+    async def fake_get(self, url, *, headers=None, **kw):
+        captured["headers"] = headers
+        return _health({"status": "ok"})
+
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx.AsyncClient, "get", fake_get)
+
+    await memory_bridge.check_gateway_compat()
+
+    assert captured.get("headers") is not None
+    assert captured["headers"].get("Authorization") == "Bearer tok_test_t03_doctor"
+
+
+@pytest.mark.asyncio
+async def test_mcp_health_fetch_sends_auth_headers(monkeypatch):
+    monkeypatch.setenv("AGENT_TOKEN", "tok_test_t03_mcp")
+    monkeypatch.setattr(vector_skill, "_CAPABILITY_CACHE", None)
+    monkeypatch.setattr(vector_skill, "_CAPACITY_CACHE", None, raising=False)
+
+    captured = {}
+
+    async def fake_get(self, url, *, headers=None, **kw):
+        captured["headers"] = headers
+        return MagicMock(status_code=200, json=lambda: {})
+
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx.AsyncClient, "get", fake_get)
+
+    await vector_skill._gateway_capability()
+
+    assert captured.get("headers") is not None
+    assert captured["headers"].get("Authorization") == "Bearer tok_test_t03_mcp"
+
+
+@pytest.mark.asyncio
+async def test_mcp_doctor_health_fetch_sends_auth_headers(monkeypatch):
+    monkeypatch.setenv("AGENT_TOKEN", "tok_test_t03_mcp_doctor")
+    captured = {}
+
+    async def fake_get(self, url, *, headers=None, **kw):
+        captured["headers"] = headers
+        return MagicMock(status_code=200, json=lambda: {"status": "ok"})
+
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx.AsyncClient, "get", fake_get)
+
+    await vector_skill.check_memory_health()
+
+    assert captured.get("headers") is not None
+    assert captured["headers"].get("Authorization") == "Bearer tok_test_t03_mcp_doctor"
+
+
+# ── T-09: the all-unranked case ──────────────────────────────────────────────
+
+def test_unranked_warning_all_unranked():
+    results = [{"pg_id": 1, "ranked": False}, {"pg_id": 2, "ranked": False},
+               {"pg_id": 3, "ranked": False}]
+    warning = memory_bridge._unranked_warning(results)
+    assert warning == "3 of 3 results are UNRANKED — the reranker timed out, this is vector order (see backend_capability on /health)"
+
+
+@pytest.mark.asyncio
+async def test_mcp_search_note_when_all_unranked():
+    payload = {"results": [
+        {"pg_id": 1, "ref": "fact:1", "record_type": "fact", "content": "a",
+         "ranked": False, "score": 0.5},
+    ]}
+    mock_response = MagicMock(status_code=200, json=lambda: payload)
+    with patch("httpx.AsyncClient.post", return_value=mock_response):
+        result = await vector_skill.hybrid_search_and_rerank(MOCK_QUERY)
+    assert result.startswith("NOTE: 1 of 1 results are UNRANKED")
+
+
+# ── T-07: both doors share the identical unranked SENTENCE ──────────────────
+
+@pytest.mark.parametrize("results", [
+    [],
+    [{"pg_id": 1, "ranked": True}],
+    [{"pg_id": 1, "ranked": True}, {"pg_id": 2, "ranked": False}],
+    [{"pg_id": 1, "ranked": False}, {"pg_id": 2, "ranked": False}, {"pg_id": 3}],
+    {"status": "error", "message": "x"},
+])
+def test_unranked_warning_parity_between_both_doors(results):
+    assert memory_bridge._unranked_warning(results) == vector_skill._unranked_warning(results)
+
+
+# ── T-08: --help / usage text actually mentions the two env vars ────────────
+
+def test_top_level_docstring_mentions_env_overrides():
+    assert "SEARCH_TIMEOUT_S" in memory_bridge.__doc__
+    assert "SHARED_MEMORY_PROJECT" in memory_bridge.__doc__
+
+
+def test_search_subparser_help_mentions_search_timeout_s():
+    help_text = memory_bridge._search_argparser().format_help()
+    assert "SEARCH_TIMEOUT_S" in help_text
+
+
+def test_save_subparser_help_mentions_shared_memory_project():
+    help_text = memory_bridge._save_argparser().format_help()
+    assert "SHARED_MEMORY_PROJECT" in help_text
+
+
+def test_mcp_search_docstring_mentions_search_timeout_s():
+    assert "SEARCH_TIMEOUT_S" in vector_skill.hybrid_search_and_rerank.__doc__

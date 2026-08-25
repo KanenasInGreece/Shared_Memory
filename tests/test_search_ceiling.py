@@ -38,6 +38,7 @@ The invariants:
       told the reader to check a daemon that was running.
 """
 
+import asyncio
 import importlib.util
 import pytest
 pytest.importorskip("fastmcp")
@@ -282,12 +283,58 @@ def test_s7b_known_cost_above_fallback_still_wins_over_the_fallback_floor(client
 
 
 @pytest.mark.parametrize("client", CLIENTS)
-def test_s7c_both_backends_healthy_is_unaffected(client):
-    """A plain "error"/absent status (not "failing", not stale) never trips
-    the unknown-cost floor — only the two states the gateway actually uses to
-    say a backend's real cost is unknown do."""
+def test_s7c_two_explicitly_healthy_backends_land_on_the_plain_floor(client):
+    """T-06 (PR #310 review): the previous name/docstring here claimed
+    coverage of "error"/absent status that the body never exercised (both
+    blocks were `status: "ok"` with positive projections). Renamed to
+    describe what it actually tests: the ordinary two-healthy-backends case
+    sits on SEARCH_TIMEOUT_FLOOR_S, unaffected by the unknown-cost guard.
+    The "error"/absent/no-projection shapes get their own tests below
+    (test_s7d/e/f, T-05)."""
     capability = {
         "reranker": {"projected_full_payload_s": 0.01, "status": "ok"},
+        "embedder": {"projected_full_payload_s": 0.01, "status": "ok"},
+    }
+    assert client.search_ceiling(capability) == client.SEARCH_TIMEOUT_FLOOR_S
+
+
+# ── T-05 (PR #310 review): shapes the guard does NOT trip on, pinned as ─────
+# documented behaviour rather than assumed unreachable. The brief's invariant
+# ("no state yields a ceiling below the fallback unless every backend reports
+# a positive projection") does not literally hold for these three — a
+# MIXED capability where one backend probes fine and the OTHER's block is
+# absent/malformed/plain-"error"/"ok"-without-a-projection (none of which is
+# the two EXPLICIT "I don't know" signals `status: "failing"` or
+# `projection_stale`) still lands on the plain floor, not the fallback.
+# Measured: this combination is NOT reachable from our own gateway's probe
+# today (`_probe_capability` always writes both blocks, only ever as
+# `ok`/`too_slow`/`failing`, never `ok` with no projection) — it is reachable
+# from an older/third-party/future gateway, which is exactly the population
+# `search_ceiling` also has to degrade safely for. Instrument check applied
+# (data before decision, on the reviewer's own measurement): confirmed by
+# reading `hive_mind_proxy._probe_capability` rather than assumed.
+
+@pytest.mark.parametrize("client", CLIENTS)
+def test_s7d_documented_reranker_key_entirely_absent_lands_on_plain_floor(client):
+    capability = {"embedder": {"projected_full_payload_s": 0.01, "status": "ok"}}
+    assert client.search_ceiling(capability) == client.SEARCH_TIMEOUT_FLOOR_S
+
+
+@pytest.mark.parametrize("client", CLIENTS)
+def test_s7e_documented_ok_status_with_no_projection_lands_on_plain_floor(client):
+    capability = {
+        "reranker": {"status": "ok", "serves_full_payload": False},  # no projected_full_payload_s
+        "embedder": {"projected_full_payload_s": 0.01, "status": "ok"},
+    }
+    assert client.search_ceiling(capability) == client.SEARCH_TIMEOUT_FLOOR_S
+
+
+@pytest.mark.parametrize("client", CLIENTS)
+def test_s7f_documented_plain_error_status_lands_on_plain_floor(client):
+    """`status: "error"` is not `status: "failing"` — only the latter (plus
+    `projection_stale`) is one of the two explicit unknown-cost signals."""
+    capability = {
+        "reranker": {"status": "error"},
         "embedder": {"projected_full_payload_s": 0.01, "status": "ok"},
     }
     assert client.search_ceiling(capability) == client.SEARCH_TIMEOUT_FLOOR_S
@@ -297,6 +344,7 @@ def test_s7c_both_backends_healthy_is_unaffected(client):
 
 CAPACITY_HIGH_CEILING = {"derived": {"client_ceiling_s": 90.0}}
 CAPACITY_HIGH_S_MAX = {"derived": {"s_max_measured_s": 50.0}}
+CAPACITY_HIGH_S_MEAN = {"derived": {"s_mean_s": 50.0}}
 
 
 @pytest.mark.parametrize("client", CLIENTS)
@@ -315,6 +363,44 @@ def test_s8b_capacity_s_max_measured_s_gets_the_same_safety_scaling(client):
     the theoretical projection: 50.0 * 1.5 + 15 = 90.0."""
     capability = {"reranker": {"projected_full_payload_s": 1.0, "status": "ok"}}
     assert client.search_ceiling(capability, CAPACITY_HIGH_S_MAX) == 90.0
+
+
+@pytest.mark.parametrize("client", CLIENTS)
+def test_s8b2_capacity_s_mean_s_gets_the_same_safety_scaling(client):
+    """B1/T-02 (PR #310 review): s_mean_s is the gateway's own full-payload
+    projection — always present once the gateway has probed at all, unlike
+    s_max_measured_s which needs real search traffic first. Same treatment:
+    50.0 * 1.5 + 15 = 90.0."""
+    capability = {"reranker": {"projected_full_payload_s": 1.0, "status": "ok"}}
+    assert client.search_ceiling(capability, CAPACITY_HIGH_S_MEAN) == 90.0
+
+
+@pytest.mark.parametrize("client", CLIENTS)
+def test_s8b3_t02_fact_1560_measured_case_is_now_sized_correctly(client):
+    """T-02 (PR #310 review), THE central finding: on the host fact:1560
+    measured (reranker failing, embedder probed ~1.8s), the ORIGINAL fold
+    (client_ceiling_s + s_max_measured_s only) contributed NOTHING — the
+    broken server mirror (T-01, out of scope here — server file) still
+    returns 30.0 for client_ceiling_s, and s_max_measured_s is None before
+    real search traffic. s_mean_s (259.9 on d9400, fact:1560's own number)
+    is the one field that sizes it correctly. Verified: 259.9 * 1.5 + 15 =
+    404.85, clamped to SEARCH_TIMEOUT_MAX_S (300) — far closer to the
+    measured 96-260s reality than the pre-fix 120s fallback, let alone the
+    original defect's 30s floor."""
+    capability = {
+        "reranker": {"status": "failing", "error": "TimeoutError"},
+        "embedder": {"projected_full_payload_s": 1.8, "status": "ok"},
+    }
+    capacity = {"derived": {
+        "client_ceiling_s": 30.0,   # T-01: the unfixed server mirror's output
+        "s_max_measured_s": None,   # no real search traffic yet
+        "s_mean_s": 259.9,          # fact:1560's own measured d9400 number
+    }}
+    assert client.search_ceiling(capability, capacity) == client.SEARCH_TIMEOUT_MAX_S
+    # And specifically: it is the s_mean_s fold doing the work, not the
+    # unknown-cost fallback alone (120.0) — pin the value, not just an
+    # inequality (fact:1309).
+    assert client.search_ceiling(capability, capacity) > client.SEARCH_TIMEOUT_FALLBACK_S
 
 
 @pytest.mark.parametrize("client", CLIENTS)
@@ -341,6 +427,10 @@ def test_s8d_capacity_alone_is_still_clamped_to_max(client):
     pytest.param({"derived": {"client_ceiling_s": "abc"}}, id="unparseable"),
     pytest.param({"derived": {"client_ceiling_s": -5.0}}, id="negative"),
     pytest.param({"derived": {"client_ceiling_s": 0}}, id="zero"),
+    pytest.param({"derived": {"s_mean_s": "abc"}}, id="s_mean_s-unparseable"),
+    pytest.param({"derived": {"s_mean_s": -5.0}}, id="s_mean_s-negative"),
+    pytest.param({"derived": {"s_mean_s": 0}}, id="s_mean_s-zero"),
+    pytest.param({"derived": {"s_mean_s": None}}, id="s_mean_s-none"),
 ])
 def test_s8e_malformed_or_absent_capacity_is_ignored(client, capacity):
     capability = {"reranker": {"projected_full_payload_s": 1.0, "status": "ok"},
@@ -362,6 +452,7 @@ def test_s9_explicit_override_wins_over_capacity_too(client, monkeypatch):
     pytest.param(None, id="none"),
     pytest.param(CAPACITY_HIGH_CEILING, id="client_ceiling_s"),
     pytest.param(CAPACITY_HIGH_S_MAX, id="s_max_measured_s"),
+    pytest.param(CAPACITY_HIGH_S_MEAN, id="s_mean_s"),
 ])
 def test_s5c_both_front_doors_derive_the_same_ceiling_with_capacity(capacity):
     """S5, extended to the capacity parameter added in B1."""
@@ -404,3 +495,43 @@ async def test_capability_and_capacity_share_one_health_request(client, monkeypa
     assert calls["n"] == 1
     assert capability == LIVE_CAPABILITY
     assert capacity == {"derived": {"client_ceiling_s": 55.0}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client", CLIENTS)
+async def test_concurrent_first_calls_still_fire_exactly_one_health_request(client, monkeypatch):
+    """CQ-03 (PR #310 review): two searches starting in the same instant must
+    not both see an empty cache and both fire a /health request — the
+    asyncio.Lock around the fetch-and-fill serializes them, and the second
+    waiter finds the cache already filled after it acquires the lock."""
+    monkeypatch.setattr(client, "_CAPABILITY_CACHE", None)
+    monkeypatch.setattr(client, "_CAPACITY_CACHE", None, raising=False)
+    monkeypatch.setattr(client, "_HEALTH_FETCH_LOCK", asyncio.Lock())
+    payload = {"backend_capability": LIVE_CAPABILITY, "capacity": None}
+    calls = {"n": 0}
+
+    class _SlowHealth:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        async def get(self, *_a, **_kw):
+            calls["n"] += 1
+            await asyncio.sleep(0.05)   # widens the race window on purpose
+            return type("R", (), {"status_code": 200,
+                                  "json": staticmethod(lambda: payload)})()
+
+    if client is memory_bridge:
+        monkeypatch.setattr(client, "_async_client", lambda _t: _SlowHealth())
+    else:
+        monkeypatch.setattr(client.httpx, "AsyncClient", lambda **_k: _SlowHealth())
+
+    results = await asyncio.gather(
+        client._gateway_capability(), client._gateway_capability(),
+        client._gateway_capability(), client._gateway_capability(),
+    )
+
+    assert calls["n"] == 1
+    assert all(r == LIVE_CAPABILITY for r in results)

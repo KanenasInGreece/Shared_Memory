@@ -166,9 +166,10 @@ insights queue durably until a backend appears. Searches on CPU encoders took ~3
 This configuration has also been verified end to end on the same deliberately modest VM — 6
 vCPUs of a 2013 Xeon E3-1230 v3, 30 GB disk, Ubuntu Server 26.04 with Docker — reprovisioned at
 **14 GB RAM** with the embedder served remotely: **2 GB of headroom held through a full search
-battery, zero OOM, zero restarts.** `RERANK_MAX_DOC_CHARS`
-([§17](#17-inference-the-encoders-and-the-reasoning-llm)) is the dial that trades reranker
-memory and time for score quality.
+battery, zero OOM, zero restarts.** On that CPU, searches measured ~1.3 s in unranked vector
+order and ~70 s with the reranker scoring the full default payload (22 candidates, uncapped
+documents). `RERANK_MAX_DOC_CHARS`
+([§17](#17-inference-the-encoders-and-the-reasoning-llm)) is the dial between those two points.
 *Example minimum: 6–8 threads · 16 GB RAM with swap, 20 GB without · no GPU · 30 GB disk.*
 
 **② A small GPU (~4 GB).** Everything in ①, but the pair does not reliably fit together on a

@@ -319,20 +319,47 @@ def search_ceiling(capability: dict | None, capacity: dict | None = None) -> flo
     (or ``projection_stale: true``) with no positive projection of its own. The
     known backend's number is still only a LOWER bound on the true cost; a
     failing backend's true cost is unknown, not zero. So when any backend block
-    is in that state, the floor under the derivation is
-    ``SEARCH_TIMEOUT_FALLBACK_S``, never ``SEARCH_TIMEOUT_FLOOR_S`` — ignorance
-    of PART of the cost must not resolve to the number already known to be too
-    small, exactly as ignorance of ALL of it does.
+    carries one of those two EXPLICIT "I don't know" signals, the floor under
+    the derivation is ``SEARCH_TIMEOUT_FALLBACK_S``, never
+    ``SEARCH_TIMEOUT_FLOOR_S`` — ignorance of PART of the cost must not resolve
+    to the number already known to be too small, exactly as ignorance of ALL of
+    it does.
+
+    This is narrower than "every backend must report a positive projection": a
+    block that is simply ABSENT, malformed, carries a plain ``status: "error"``,
+    or is ``"ok"`` with no projection at all does NOT trip the fallback floor by
+    itself — only the two explicit signals above do (T-05, PR #310 review). Our
+    own gateway's probe (``hive_mind_proxy._probe_capability``) never actually
+    produces that narrower gap today — it always writes both blocks, and only
+    ever as ``ok``/``too_slow``/``failing``, never ``ok`` with no projection —
+    but this function also has to make sense of an older, third-party or future
+    gateway's /health, so those shapes are exercised and pinned as documented
+    behaviour below rather than assumed unreachable.
 
     When ``capacity`` carries the gateway's own measured numbers
-    (``capacity["derived"]``), its ``client_ceiling_s`` and ``s_max_measured_s``
-    are folded in too — the server's measured worst case wins over the client's
-    theoretical projection when it is larger. ``s_max_measured_s`` is a raw
-    reranker-seconds figure the server measured directly (not yet safety-scaled
-    for THIS client), so it gets the same ``SEARCH_SAFETY_FACTOR``/
+    (``capacity["derived"]``), three of its fields are folded in too — the
+    server's measured/derived worst case wins over the client's own theoretical
+    projection whenever it is larger (never smaller: this only ever RAISES the
+    ceiling):
+
+      * ``client_ceiling_s`` — the server's own already-derived ceiling;
+        compared as-is.
+      * ``s_mean_s`` — the theoretical full-payload projection the GATEWAY
+        itself computed, always present once the gateway has probed at all
+        (T-02, PR #310 review: this is the one field that would have sized
+        fact:1560's own measured 96-260s case correctly on the host that
+        measured it — folding it in is what closes that gap rather than
+        merely improving on it).
+      * ``s_max_measured_s`` — a PROJECTION too, the same kind of number as
+        ``projected_full_payload_s``, but computed over the coordinator's own
+        observed MAXIMUM rerank payload instead of the theoretical full-payload
+        one; ``None`` until real search traffic has been served this process's
+        lifetime, unlike ``s_mean_s`` above.
+
+    ``s_mean_s`` and ``s_max_measured_s`` are not yet safety-scaled for THIS
+    client, so each gets the same ``SEARCH_SAFETY_FACTOR``/
     ``SEARCH_OVERHEAD_S`` treatment as the theoretical projection before being
-    compared; ``client_ceiling_s`` is the server's own already-derived ceiling
-    and is compared as-is.
+    compared.
 
     ``SEARCH_TIMEOUT_S`` wins outright when set: the operator's escape hatch, and
     the only way to get a constant back.
@@ -372,12 +399,25 @@ def search_ceiling(capability: dict | None, capacity: dict | None = None) -> flo
         s_max_measured_s = capacity_derived.get("s_max_measured_s")
         if isinstance(s_max_measured_s, (int, float)) and s_max_measured_s > 0:
             derived = max(derived, s_max_measured_s * SEARCH_SAFETY_FACTOR + SEARCH_OVERHEAD_S)
+        # T-02 (fact:1560): the gateway's own full-payload projection, always
+        # present once ANY probe has run — unlike s_max_measured_s above,
+        # which needs real search traffic first. This is the field that would
+        # have sized fact:1560's measured case correctly; see the docstring.
+        s_mean_s = capacity_derived.get("s_mean_s")
+        if isinstance(s_mean_s, (int, float)) and s_mean_s > 0:
+            derived = max(derived, s_mean_s * SEARCH_SAFETY_FACTOR + SEARCH_OVERHEAD_S)
 
     return min(derived, SEARCH_TIMEOUT_MAX_S)
 
 
 _CAPABILITY_CACHE: dict | None = None
 _CAPACITY_CACHE: dict | None = None
+# CQ-03 (PR #310 review): guards the fetch-and-fill below against the race
+# where two searches start in the same instant, both see an empty cache, and
+# both fire a /health request. Module-level construction is safe without a
+# running loop on the Python versions this project targets — the gateway's
+# own equivalent (hive_mind_proxy._health_probe_lock) does the same.
+_HEALTH_FETCH_LOCK = asyncio.Lock()
 
 
 async def _fetch_health_blocks() -> None:
@@ -400,17 +440,20 @@ async def _fetch_health_blocks() -> None:
     global _CAPABILITY_CACHE, _CAPACITY_CACHE
     if _CAPABILITY_CACHE is not None:
         return   # already attempted this process — do not retry
-    try:
-        async with _async_client(HEALTH_PROBE_TIMEOUT_S) as client:
-            health = _reply_json(await client.get(f"{COORDINATOR_BASE}/health",
-                                                  headers=_request_headers()))
-        block = health.get("backend_capability")
-        _CAPABILITY_CACHE = block if isinstance(block, dict) else {}
-        capacity = health.get("capacity")
-        _CAPACITY_CACHE = capacity if isinstance(capacity, dict) else None
-    except Exception:
-        _CAPABILITY_CACHE = {}      # tried and got nothing; do not retry
-        _CAPACITY_CACHE = None
+    async with _HEALTH_FETCH_LOCK:
+        if _CAPABILITY_CACHE is not None:
+            return   # a concurrent waiter already filled it while we queued
+        try:
+            async with _async_client(HEALTH_PROBE_TIMEOUT_S) as client:
+                health = _reply_json(await client.get(f"{COORDINATOR_BASE}/health",
+                                                      headers=_request_headers()))
+            block = health.get("backend_capability")
+            _CAPABILITY_CACHE = block if isinstance(block, dict) else {}
+            capacity = health.get("capacity")
+            _CAPACITY_CACHE = capacity if isinstance(capacity, dict) else None
+        except Exception:
+            _CAPABILITY_CACHE = {}      # tried and got nothing; do not retry
+            _CAPACITY_CACHE = None
 
 
 async def _gateway_capability() -> dict | None:
@@ -725,6 +768,52 @@ def _coordinator_unavailable(exc: Exception, ceiling: float | None = None) -> di
     }
 
 
+ROLE_REPORTING_MIN_VERSION = "0.9.52"
+
+
+def _gateway_predates(version: str | None, minimum: str = ROLE_REPORTING_MIN_VERSION) -> bool | None:
+    """Whether ``version`` names a gateway release strictly before ``minimum``.
+
+    ``None`` when ``version`` cannot be parsed as dotted integers — an old,
+    pre-version-contract gateway or a malformed string. The caller treats that
+    the same as "predates": a gateway too old to even report a parseable
+    version is certainly too old to report `role` (T-04, PR #310 review).
+    """
+    try:
+        parsed = tuple(int(p) for p in str(version).split("."))
+        floor = tuple(int(p) for p in minimum.split("."))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return parsed < floor
+
+
+def _role_diagnosis(h: dict) -> str:
+    """T-04 (PR #310 review): THREE distinguishable reasons `role` can be
+    missing from a /health payload, not one generic "unknown" — the old single
+    fallback text asserted a version floor even when `gateway_version` in the
+    SAME payload said the gateway was current, which is a false diagnosis
+    exactly when it matters most (an operator running `doctor` to find out
+    why their own token isn't working).
+
+      1. `role` present → surfaced verbatim.
+      2. `role` absent AND the gateway's own reported version predates
+         ROLE_REPORTING_MIN_VERSION (or reports no parseable version at all)
+         → the gateway genuinely never sends this field.
+      3. `role` absent AND the gateway version is current → this caller's
+         token was not accepted, so the gateway served the anonymous-slim
+         /health shape, which has no `role` key regardless of gateway age.
+    """
+    if "role" in h:
+        return h.get("role")
+    predates = _gateway_predates(h.get("version"))
+    if predates is False:
+        return "not reported (token not accepted — anonymous payload)"
+    gw = h.get("version")
+    if gw is not None:
+        return f"not reported (gateway {gw} predates {ROLE_REPORTING_MIN_VERSION})"
+    return f"not reported (gateway version unknown, predates {ROLE_REPORTING_MIN_VERSION} assumed)"
+
+
 async def check_gateway_compat() -> dict:
     """GET /health and compare the wire contract. Pure diagnostic; never raises.
 
@@ -756,9 +845,11 @@ async def check_gateway_compat() -> dict:
     # `agent`/`role` ride on the AUTHENTICATED /health payload (a server change
     # this PR does not build) — sent here so doctor can surface them once a
     # token is configured; an anonymous/older gateway simply omits both.
+    # `role`'s three-way diagnosis is `_role_diagnosis` — see its docstring
+    # (T-04, PR #310 review).
     if "agent" in h:
         diag["agent"] = h.get("agent")
-    diag["role"] = h.get("role") if "role" in h else "unknown (gateway < 0.9.52)"
+    diag["role"] = _role_diagnosis(h)
     if srv is None:
         diag["compat"]  = "unknown"
         diag["warning"] = (
@@ -1079,7 +1170,14 @@ def _unranked_warning(results) -> str | None:
     positional result printed silently in that state reads as ranked when it
     is not; the JSON to stdout carries the per-row truth already, this is
     just the operator-facing headline. None when ``results`` is not a list of
-    rows (an error payload, an empty result) or nothing is unranked."""
+    rows (an error payload, an empty result) or nothing is unranked.
+
+    T-07 (PR #310 review): the returned SENTENCE (no leading/trailing
+    decoration) is the shared core both front doors present — MCP's
+    equivalent ``vector_skill._unranked_warning`` must return the identical
+    string for the identical input; a parity test holds the two in step
+    exactly like ``search_ceiling``'s S5. Each door decorates it in its own
+    idiom (a bare stderr line here, a ``NOTE: …`` prefix there)."""
     if not isinstance(results, list):
         return None
     unranked = sum(1 for row in results if isinstance(row, dict) and row.get("ranked") is False)
@@ -1087,6 +1185,94 @@ def _unranked_warning(results) -> str | None:
         return None
     return (f"{unranked} of {len(results)} results are UNRANKED — the reranker "
             f"timed out, this is vector order (see backend_capability on /health)")
+
+
+def _stale_projection_note(capability: dict | None) -> str | None:
+    """B1/T-02 (PR #310 review): a backend whose block carries
+    ``projection_stale: true`` still has its number USED by ``search_ceiling``
+    when it has one (only a `status: "failing"`/stale block with NO number is
+    treated as unknown-cost) — but nothing said so out loud. This names which
+    backend and, when the gateway reports ``projection_age_s`` (PR-A), for how
+    long. None when nothing is stale — the common case pays nothing."""
+    if not isinstance(capability, dict):
+        return None
+    notes = []
+    for backend in ("reranker", "embedder"):
+        block = capability.get(backend)
+        if not isinstance(block, dict) or not block.get("projection_stale"):
+            continue
+        age = block.get("projection_age_s")
+        if isinstance(age, (int, float)) and age > 0:
+            notes.append(f"{backend} projection stale for {age:.0f}s")
+        else:
+            notes.append(f"{backend} projection stale")
+    return "; ".join(notes) if notes else None
+
+
+def _search_argparser() -> "argparse.ArgumentParser":
+    """T-08 (PR #310 review): pulled out of ``main()``'s inline dispatch so a
+    test can call ``.format_help()``/read ``.description`` directly, rather
+    than the B4 documentation unit (SEARCH_TIMEOUT_S mention below) having
+    zero test coverage because nothing could reach the parser without also
+    running the search action."""
+    p = argparse.ArgumentParser(
+        prog="memory_bridge.py search", add_help=False,
+        description="Search shared memory. The wait is sized from the "
+                    "gateway's own published backend capability, not a "
+                    "constant — set SEARCH_TIMEOUT_S (env) to pin an "
+                    "explicit override instead.",
+    )
+    p.add_argument("limit", nargs="?", type=int, default=5)
+    # Same flag pattern as save's --domain: repeatable, never comma-split,
+    # OR semantics at the gateway.
+    p.add_argument("--project", default=None, metavar="NAME",
+                   help="restrict to records BELONGING to this project — a "
+                        "named place is a FILTER, not query text. An "
+                        "unregistered name is not refused, it simply "
+                        "matches nothing.")
+    p.add_argument("--domain", action="append", default=None, metavar="NAME",
+                   dest="domains",
+                   help="restrict to records in this SECTION of the "
+                        "project. REPEAT for several (OR semantics — any "
+                        "match qualifies). Same 'filter, not query text' "
+                        "rule as --project.")
+    p.add_argument("--since", default=None, metavar="ISO_DATE",
+                   help="restrict to records created at/after this ISO "
+                        "date or datetime, e.g. 2026-08-01 or "
+                        "2026-08-01T00:00:00. A named time is a FILTER, "
+                        "not query text.")
+    return p
+
+
+def _save_argparser() -> "argparse.ArgumentParser":
+    """T-08 (PR #310 review): see ``_search_argparser`` — same reason."""
+    p = argparse.ArgumentParser(
+        prog="memory_bridge.py save",
+        description="Save a fact, optionally superseding an existing one. "
+                    "project is derived from the working directory (walking "
+                    "up to the nearest .git/CLAUDE.md/AGENTS.md) unless "
+                    "SHARED_MEMORY_PROJECT (env) overrides it — for callers "
+                    "saving from outside the project root.",
+    )
+    p.add_argument("content", help="Fact content")
+    p.add_argument("metadata", nargs="?", default="{}", help="Metadata JSON (optional)")
+    p.add_argument("--supersedes", type=int, default=None,
+                   help="pg_id of an existing fact this save supersedes "
+                        "(soft-retire: old fact kept, flagged, hidden from search)")
+    # Repeatable, never comma-split. A separator that can occur inside a
+    # value is not a delimiter — the lesson --alternatives taught, applied
+    # before this surface can repeat it.
+    p.add_argument("--domain", action="append", default=None, metavar="NAME",
+                   help="a registered SECTION of this project, e.g. --domain "
+                        "operations. REPEAT the flag for several; the value is "
+                        "stored verbatim and never split. Sections are "
+                        "project-local, so the same word under another project "
+                        "is a different section. Optional — a record with none "
+                        "is filed under its project, which is always correct. "
+                        "An unregistered name returns 400 domain_unknown with "
+                        "near matches; add \"new_domain\": true to the metadata "
+                        "to register it, after asking the operator.")
+    return p
 
 
 def query_graph(cypher: str, params: dict = None) -> list | dict:
@@ -1754,66 +1940,21 @@ async def main() -> None:
             }))
             sys.exit(1)
         query = sys.argv[2]
-        p = argparse.ArgumentParser(
-            prog="memory_bridge.py search", add_help=False,
-            description="Search shared memory. The wait is sized from the "
-                        "gateway's own published backend capability, not a "
-                        "constant — set SEARCH_TIMEOUT_S (env) to pin an "
-                        "explicit override instead.",
-        )
-        p.add_argument("limit", nargs="?", type=int, default=5)
-        # Same flag pattern as save's --domain: repeatable, never comma-split,
-        # OR semantics at the gateway.
-        p.add_argument("--project", default=None, metavar="NAME",
-                       help="restrict to records BELONGING to this project — a "
-                            "named place is a FILTER, not query text. An "
-                            "unregistered name is not refused, it simply "
-                            "matches nothing.")
-        p.add_argument("--domain", action="append", default=None, metavar="NAME",
-                       dest="domains",
-                       help="restrict to records in this SECTION of the "
-                            "project. REPEAT for several (OR semantics — any "
-                            "match qualifies). Same 'filter, not query text' "
-                            "rule as --project.")
-        p.add_argument("--since", default=None, metavar="ISO_DATE",
-                       help="restrict to records created at/after this ISO "
-                            "date or datetime, e.g. 2026-08-01 or "
-                            "2026-08-01T00:00:00. A named time is a FILTER, "
-                            "not query text.")
+        p = _search_argparser()
         sargs = p.parse_args(sys.argv[3:])
         results = await search_and_rerank(query, sargs.limit, project=sargs.project,
                                            domains=sargs.domains, since=sargs.since)
         warning = _unranked_warning(results)
         if warning:
             print(warning, file=sys.stderr)
+        stale_note = _stale_projection_note(await _gateway_capability())
+        if stale_note:
+            print(f"NOTE: {stale_note} — the ceiling above still used its last "
+                  f"number as a lower bound (see backend_capability on /health)",
+                  file=sys.stderr)
         print(json.dumps(results, indent=2))
     elif action == "save":
-        p = argparse.ArgumentParser(
-            prog="memory_bridge.py save",
-            description="Save a fact, optionally superseding an existing one. "
-                        "project is derived from the working directory (walking "
-                        "up to the nearest .git/CLAUDE.md/AGENTS.md) unless "
-                        "SHARED_MEMORY_PROJECT (env) overrides it — for callers "
-                        "saving from outside the project root.",
-        )
-        p.add_argument("content", help="Fact content")
-        p.add_argument("metadata", nargs="?", default="{}", help="Metadata JSON (optional)")
-        p.add_argument("--supersedes", type=int, default=None,
-                       help="pg_id of an existing fact this save supersedes "
-                            "(soft-retire: old fact kept, flagged, hidden from search)")
-        # Repeatable, never comma-split. A separator that can occur inside a
-        # value is not a delimiter — the lesson --alternatives taught, applied
-        # before this surface can repeat it.
-        p.add_argument("--domain", action="append", default=None, metavar="NAME",
-                       help="a registered SECTION of this project, e.g. --domain "
-                            "operations. REPEAT the flag for several; the value is "
-                            "stored verbatim and never split. Sections are "
-                            "project-local, so the same word under another project "
-                            "is a different section. Optional — a record with none "
-                            "is filed under its project, which is always correct. "
-                            "An unregistered name returns 400 domain_unknown with "
-                            "near matches; add \"new_domain\": true to the metadata "
-                            "to register it, after asking the operator.")
+        p = _save_argparser()
         sargs = p.parse_args(sys.argv[2:])
         metadata = sargs.metadata
         if sargs.supersedes is not None or sargs.domain:
