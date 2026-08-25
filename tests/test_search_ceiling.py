@@ -290,7 +290,9 @@ def test_s7c_two_explicitly_healthy_backends_land_on_the_plain_floor(client):
     describe what it actually tests: the ordinary two-healthy-backends case
     sits on SEARCH_TIMEOUT_FLOOR_S, unaffected by the unknown-cost guard.
     The "error"/absent/no-projection shapes get their own tests below
-    (test_s7d/e/f, T-05)."""
+    (test_s7d-h, T-05/R2-N3 — absent/empty/malformed now floor at the
+    fallback, not the plain floor; only a well-formed non-empty dict with a
+    non-triggering status still lands here)."""
     capability = {
         "reranker": {"projected_full_payload_s": 0.01, "status": "ok"},
         "embedder": {"projected_full_payload_s": 0.01, "status": "ok"},
@@ -298,30 +300,64 @@ def test_s7c_two_explicitly_healthy_backends_land_on_the_plain_floor(client):
     assert client.search_ceiling(capability) == client.SEARCH_TIMEOUT_FLOOR_S
 
 
-# ── T-05 (PR #310 review): shapes the guard does NOT trip on, pinned as ─────
-# documented behaviour rather than assumed unreachable. The brief's invariant
-# ("no state yields a ceiling below the fallback unless every backend reports
-# a positive projection") does not literally hold for these three — a
-# MIXED capability where one backend probes fine and the OTHER's block is
-# absent/malformed/plain-"error"/"ok"-without-a-projection (none of which is
-# the two EXPLICIT "I don't know" signals `status: "failing"` or
-# `projection_stale`) still lands on the plain floor, not the fallback.
-# Measured: this combination is NOT reachable from our own gateway's probe
-# today (`_probe_capability` always writes both blocks, only ever as
-# `ok`/`too_slow`/`failing`, never `ok` with no projection) — it is reachable
-# from an older/third-party/future gateway, which is exactly the population
-# `search_ceiling` also has to degrade safely for. Instrument check applied
-# (data before decision, on the reviewer's own measurement): confirmed by
-# reading `hive_mind_proxy._probe_capability` rather than assumed.
+# ── R2-N3 (PR-A delta review): absent/empty/non-dict IS unknown-cost too ────
+# An earlier round of this file documented ABSENT/malformed backend blocks as
+# NOT tripping the fallback floor (T-05) — PR-A's delta review overturned that
+# for three of the four shapes: a block that is ABSENT entirely, an empty
+# `{}`, or not a dict at all (malformed) is now the SAME ignorance as an
+# explicit `status: "failing"`. Only a WELL-FORMED, NON-EMPTY dict carrying a
+# plain `status: "error"` or `"ok"` with no projection remains outside the
+# guard (test_s7e/f below) — those are exercised and pinned as documented
+# behaviour for the same reason T-05 gave: not reachable from our own
+# gateway's probe today, but the function has to make sense of an older,
+# third-party or future gateway's /health too.
 
 @pytest.mark.parametrize("client", CLIENTS)
-def test_s7d_documented_reranker_key_entirely_absent_lands_on_plain_floor(client):
+def test_s7d_reranker_key_entirely_absent_now_floors_at_fallback(client):
+    """R2-N3: an absent key is ignorance, not zero cost — same bucket as
+    `status: "failing"`. (Previously documented as landing on the plain
+    floor; that was the shape R2-N3 overturned.)"""
     capability = {"embedder": {"projected_full_payload_s": 0.01, "status": "ok"}}
-    assert client.search_ceiling(capability) == client.SEARCH_TIMEOUT_FLOOR_S
+    ceiling = client.search_ceiling(capability)
+    assert ceiling == client.SEARCH_TIMEOUT_FALLBACK_S
+    assert ceiling > client.SEARCH_TIMEOUT_FLOOR_S
+
+
+@pytest.mark.parametrize("client", CLIENTS)
+def test_s7g_empty_dict_block_now_floors_at_fallback(client):
+    """R2-N3: `{}` is a well-formed dict by `isinstance`, but it carries no
+    information at all — the same ignorance as an absent key, not the same
+    as a populated-but-non-triggering block (test_s7e/f)."""
+    capability = {
+        "reranker": {},
+        "embedder": {"projected_full_payload_s": 0.01, "status": "ok"},
+    }
+    ceiling = client.search_ceiling(capability)
+    assert ceiling == client.SEARCH_TIMEOUT_FALLBACK_S
+    assert ceiling > client.SEARCH_TIMEOUT_FLOOR_S
+
+
+@pytest.mark.parametrize("client", CLIENTS)
+def test_s7h_non_dict_block_mixed_with_a_probed_sibling_floors_at_fallback(client):
+    """R2-N3: a malformed (non-dict) block alongside a genuinely probed
+    sibling — S2 already covered "everything is malformed" (falls through the
+    `not probed` branch regardless of `unknown`); this is the MIXED case that
+    branch does not exercise."""
+    capability = {
+        "reranker": "not-a-dict",
+        "embedder": {"projected_full_payload_s": 1.0, "status": "ok"},
+    }
+    ceiling = client.search_ceiling(capability)
+    assert ceiling == client.SEARCH_TIMEOUT_FALLBACK_S
+    assert ceiling > client.SEARCH_TIMEOUT_FLOOR_S
 
 
 @pytest.mark.parametrize("client", CLIENTS)
 def test_s7e_documented_ok_status_with_no_projection_lands_on_plain_floor(client):
+    """NOT covered by R2-N3: a well-formed, NON-EMPTY dict with a plain "ok"
+    status and no projection still lands on the plain floor — only an
+    absent/empty/non-dict block, or an explicit failing/stale signal, floors
+    at the fallback."""
     capability = {
         "reranker": {"status": "ok", "serves_full_payload": False},  # no projected_full_payload_s
         "embedder": {"projected_full_payload_s": 0.01, "status": "ok"},
@@ -331,8 +367,8 @@ def test_s7e_documented_ok_status_with_no_projection_lands_on_plain_floor(client
 
 @pytest.mark.parametrize("client", CLIENTS)
 def test_s7f_documented_plain_error_status_lands_on_plain_floor(client):
-    """`status: "error"` is not `status: "failing"` — only the latter (plus
-    `projection_stale`) is one of the two explicit unknown-cost signals."""
+    """`status: "error"` is not `status: "failing"`, and the block is
+    well-formed and non-empty — NOT covered by R2-N3 either."""
     capability = {
         "reranker": {"status": "error"},
         "embedder": {"projected_full_payload_s": 0.01, "status": "ok"},
@@ -360,8 +396,11 @@ def test_s8_capacity_client_ceiling_s_raises_the_ceiling_when_higher(client):
 def test_s8b_capacity_s_max_measured_s_gets_the_same_safety_scaling(client):
     """s_max_measured_s is a raw reranker-seconds figure — not yet scaled for
     THIS client — so it gets the same SAFETY_FACTOR/OVERHEAD_S treatment as
-    the theoretical projection: 50.0 * 1.5 + 15 = 90.0."""
-    capability = {"reranker": {"projected_full_payload_s": 1.0, "status": "ok"}}
+    the theoretical projection: 50.0 * 1.5 + 15 = 90.0. Both backends probed
+    (R2-N3: an absent one would itself floor at the fallback, muddying what
+    this test isolates)."""
+    capability = {"reranker": {"projected_full_payload_s": 1.0, "status": "ok"},
+                  "embedder": {"projected_full_payload_s": 1.0, "status": "ok"}}
     assert client.search_ceiling(capability, CAPACITY_HIGH_S_MAX) == 90.0
 
 
@@ -370,8 +409,9 @@ def test_s8b2_capacity_s_mean_s_gets_the_same_safety_scaling(client):
     """B1/T-02 (PR #310 review): s_mean_s is the gateway's own full-payload
     projection — always present once the gateway has probed at all, unlike
     s_max_measured_s which needs real search traffic first. Same treatment:
-    50.0 * 1.5 + 15 = 90.0."""
-    capability = {"reranker": {"projected_full_payload_s": 1.0, "status": "ok"}}
+    50.0 * 1.5 + 15 = 90.0. Both backends probed (R2-N3: see test_s8b)."""
+    capability = {"reranker": {"projected_full_payload_s": 1.0, "status": "ok"},
+                  "embedder": {"projected_full_payload_s": 1.0, "status": "ok"}}
     assert client.search_ceiling(capability, CAPACITY_HIGH_S_MEAN) == 90.0
 
 

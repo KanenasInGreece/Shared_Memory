@@ -192,14 +192,18 @@ def search_ceiling(capability: dict | None, capacity: dict | None = None) -> flo
     ``SEARCH_TIMEOUT_FLOOR_S``. The known backend's number is only a LOWER
     bound on the true cost; a failing backend's true cost is unknown, not zero.
 
+    R2-N3 (PR-A delta review): a backend block that is ABSENT entirely, an
+    empty ``{}``, or not a dict at all (malformed) is the SAME ignorance as an
+    explicit ``status: "failing"`` — the server mirror gets the identical rule.
+
     This is narrower than "every backend must report a positive projection": a
-    block that is simply ABSENT, malformed, carries a plain ``status: "error"``,
-    or is ``"ok"`` with no projection at all does NOT trip the fallback floor by
-    itself — only the two explicit signals above do (T-05, PR #310 review). Our
-    own gateway's probe never actually produces that narrower gap today, but
-    this function also has to make sense of an older, third-party or future
-    gateway's /health, so those shapes are exercised and pinned as documented
-    behaviour rather than assumed unreachable.
+    block that IS a well-formed, non-empty dict — carrying a plain
+    ``status: "error"``, or ``"ok"`` with no projection at all — does NOT trip
+    the fallback floor by itself; only the three states above do (T-05/R2-N3,
+    PR #310 review). Our own gateway's probe never actually produces that
+    narrower gap today, but this function also has to make sense of an older,
+    third-party or future gateway's /health, so that shape is exercised and
+    pinned as documented behaviour rather than assumed unreachable.
 
     When ``capacity`` carries the gateway's own measured numbers
     (``capacity["derived"]``), three of its fields are folded in too — never
@@ -227,7 +231,12 @@ def search_ceiling(capability: dict | None, capacity: dict | None = None) -> flo
     projected, probed, unknown = 0.0, False, False
     for backend in ("reranker", "embedder"):
         block = (capability or {}).get(backend)
-        if not isinstance(block, dict):
+        if not isinstance(block, dict) or not block:
+            # R2-N3 (PR-A delta review): an ABSENT, empty {} or non-dict
+            # block is the SAME ignorance as an explicit `status: "failing"`
+            # — this backend's real cost is unknown, not zero, exactly as if
+            # it had said so. (The server mirror gets the identical rule.)
+            unknown = True
             continue
         try:
             value = float(block.get("projected_full_payload_s") or 0)

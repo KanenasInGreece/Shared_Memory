@@ -319,21 +319,28 @@ def search_ceiling(capability: dict | None, capacity: dict | None = None) -> flo
     (or ``projection_stale: true``) with no positive projection of its own. The
     known backend's number is still only a LOWER bound on the true cost; a
     failing backend's true cost is unknown, not zero. So when any backend block
-    carries one of those two EXPLICIT "I don't know" signals, the floor under
+    carries one of those EXPLICIT "I don't know" signals, the floor under
     the derivation is ``SEARCH_TIMEOUT_FALLBACK_S``, never
     ``SEARCH_TIMEOUT_FLOOR_S`` — ignorance of PART of the cost must not resolve
     to the number already known to be too small, exactly as ignorance of ALL of
     it does.
 
+    R2-N3 (PR-A delta review): a backend block that is ABSENT entirely, an
+    empty ``{}``, or not a dict at all (malformed) is the SAME ignorance as an
+    explicit ``status: "failing"`` — a caller that sent no block, or sent
+    nothing usable, told us nothing about that backend's cost, which is exactly
+    what "unknown" means. The server mirror gets the identical rule.
+
     This is narrower than "every backend must report a positive projection": a
-    block that is simply ABSENT, malformed, carries a plain ``status: "error"``,
-    or is ``"ok"`` with no projection at all does NOT trip the fallback floor by
-    itself — only the two explicit signals above do (T-05, PR #310 review). Our
-    own gateway's probe (``hive_mind_proxy._probe_capability``) never actually
-    produces that narrower gap today — it always writes both blocks, and only
-    ever as ``ok``/``too_slow``/``failing``, never ``ok`` with no projection —
-    but this function also has to make sense of an older, third-party or future
-    gateway's /health, so those shapes are exercised and pinned as documented
+    block that IS a well-formed, non-empty dict — carrying a plain
+    ``status: "error"``, or ``"ok"`` with no projection at all — does NOT trip
+    the fallback floor by itself; only the three states above do (T-05/R2-N3,
+    PR #310 review). Our own gateway's probe
+    (``hive_mind_proxy._probe_capability``) never actually produces that
+    narrower gap today — it always writes both blocks, and only ever as
+    ``ok``/``too_slow``/``failing``, never ``ok`` with no projection — but this
+    function also has to make sense of an older, third-party or future
+    gateway's /health, so that shape is exercised and pinned as documented
     behaviour below rather than assumed unreachable.
 
     When ``capacity`` carries the gateway's own measured numbers
@@ -370,7 +377,12 @@ def search_ceiling(capability: dict | None, capacity: dict | None = None) -> flo
     projected, probed, unknown = 0.0, False, False
     for backend in ("reranker", "embedder"):
         block = (capability or {}).get(backend)
-        if not isinstance(block, dict):
+        if not isinstance(block, dict) or not block:
+            # R2-N3 (PR-A delta review): an ABSENT, empty {} or non-dict
+            # block is the SAME ignorance as an explicit `status: "failing"`
+            # — this backend's real cost is unknown, not zero, exactly as if
+            # it had said so. (The server mirror gets the identical rule.)
+            unknown = True
             continue
         try:
             value = float(block.get("projected_full_payload_s") or 0)
