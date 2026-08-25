@@ -2335,8 +2335,50 @@ CAPABILITY_PROBE_DOC_CHARS = int(
 _capability: dict = {"status": "unknown", "probed_at": None}
 
 
+def _projection_age_s(last_ok_at, now=None) -> float | None:
+    """Seconds since the surviving numbers were actually measured. None when
+    the backend has never been measured, or when the stamp is unparseable —
+    an unknown age is never reported as 0.0, which would read as "just
+    measured". Clamped at 0.0 so a clock skew publishes "just measured"
+    rather than a negative age no renderer knows what to do with."""
+    if not last_ok_at:
+        return None
+    try:
+        measured = datetime.fromisoformat(last_ok_at)
+    except (TypeError, ValueError):
+        return None
+    if measured.tzinfo is None:
+        measured = measured.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    return round(max(0.0, (now - measured).total_seconds()), 1)
+
+
 def capability_snapshot() -> dict:
-    return dict(_capability)
+    """The published view of the capability probe — what /health serialises
+    as `backend_capability`.
+
+    A-2 (ADV-2): each backend block also carries `projection_age_s`, computed
+    HERE rather than at merge time, so the age is the age at the moment of
+    READING. There is deliberately NO age cap: an old projection is still the
+    only measurement anyone has, and capping it back to absence would restore
+    the very defect this feature removes. Computing it at read time also means
+    a probe daemon that has stopped running shows a monotonically growing age
+    instead of a frozen one — a stalled instrument becomes visible rather than
+    looking like a quiet system.
+
+    The per-backend blocks are COPIED before the computed key is added: the
+    carried projection is now the only copy of a number meant to outlive its
+    cycle, so a caller must not be able to reach in and edit it."""
+    snap = dict(_capability)
+    now = datetime.now(timezone.utc)
+    for backend in ("reranker", "embedder"):
+        block = snap.get(backend)
+        if not isinstance(block, dict):
+            continue
+        block = dict(block)
+        block["projection_age_s"] = _projection_age_s(block.get("last_ok_at"), now)
+        snap[backend] = block
+    return snap
 
 
 async def _probe_capability(session) -> dict:
@@ -2426,36 +2468,49 @@ async def _probe_capability(session) -> dict:
     return out
 
 
-# The measured set a successful probe cycle produces for one backend. These
+# The MEASURED set a successful probe cycle produces for one backend. These
 # keys travel TOGETHER: throughput and the latency it was computed from are
-# one coherent reading, and the projection/ceiling/verdict are derived from
+# one coherent reading, and the projection and its ceiling are derived from
 # that same reading — carrying half of them forward would publish a mix of
 # two different cycles under one block.
+#
+# ⛔ `serves_full_payload` is deliberately NOT here (operator ruling A-1 on
+# ADV-1). It is not a reading, it is a VERDICT in the present tense — "this
+# backend can serve a full payload inside the caller's timeout" — and
+# publishing it as `true` beside `status: "failing"` prints an affirmative
+# green next to a backend that answered nothing, demoted only by a sibling
+# key no renderer is obliged to show. Only measured NUMBERS are carried; the
+# verdict goes to null while the reading ages (see _merge_capability_
+# projection).
 _PROJECTION_CARRY_KEYS = ("projected_full_payload_s", "ceiling_s",
-                          "serves_full_payload", "throughput_chars_s",
-                          "latency_s")
+                          "throughput_chars_s", "latency_s")
 
 
 def _merge_capability_projection(previous: dict | None, fresh: dict) -> dict:
-    """A projection, once measured, never DISAPPEARS from /health; it only
-    ages and says so.
+    """A projection, once measured, never DISAPPEARS from /health WITHIN A
+    PROCESS LIFETIME; it only ages and says so. (The carry is in-memory: a
+    gateway restart legitimately starts again from "unknown" rather than
+    trusting a number measured before whatever caused the restart.)
 
     The defect this exists for (fact:1560): the probe daemon replaced the
     module-level snapshot WHOLESALE every cycle, and a failing probe writes
     only `status`/`error` — so `projected_full_payload_s` vanished from a
     backend's block at exactly the moment the backend was busy. Clients size
     their search timeout from that block (memory_bridge.search_ceiling), so
-    they fell back to the 30 s floor while the gateway kept working the same
-    request for minutes. An absent number read as "nothing to worry about"
-    when the truth was "the last thing we measured was alarming".
+    they fell back to a fixed default (CAPACITY_SEARCH_TIMEOUT_FALLBACK_S,
+    120 s — NOT the 30 s floor, which only clamps a derived value) while the
+    gateway kept working the same request for minutes. An absent number read
+    as "nothing to worry about" when the truth was "the last thing we
+    measured was alarming".
 
     So: a cycle that MEASURED a projection publishes it fresh and stamps
     `projection_stale: False`; a cycle that failed keeps the last measured
-    values of that block, stamps `projection_stale: True` and `last_ok_at`
-    (when the surviving numbers were actually taken), and leaves this
-    cycle's own `status`/`error` in place. A backend that has NEVER measured
-    keeps today's shape and gets `projection_stale: None` — "never measured"
-    is a third state, and no number is invented to fill it.
+    NUMBERS of that block, nulls the `serves_full_payload` verdict, stamps
+    `projection_stale: True` and `last_ok_at` (when the surviving numbers
+    were actually taken), and leaves this cycle's own `status`/`error` in
+    place. A backend that has NEVER measured keeps today's shape and gets
+    `projection_stale: None` — "never measured" is a third state, and no
+    number is invented to fill it.
 
     "Measured" means the block carries `projected_full_payload_s`, which
     includes a `too_slow` verdict: that reading succeeded, it was just slow,
@@ -2483,6 +2538,11 @@ def _merge_capability_projection(previous: dict | None, fresh: dict) -> dict:
                 block[key] = prev_block[key]
             else:
                 block.pop(key, None)
+        # A-1 (ADV-1): the VERDICT does not travel with the reading. It is
+        # explicitly null — not absent — so a renderer sees "we no longer
+        # claim this" rather than reading a missing key as false, and never
+        # sees a green verdict on a backend that just failed to answer.
+        block["serves_full_payload"] = None
         block["projection_stale"] = True
         # `previous` may itself already be a carried-forward block, so the
         # stamp is chained: the age reported is the age of the NUMBERS, not
@@ -2875,11 +2935,29 @@ def _capacity_client_ceiling_s(capability: dict | None) -> float:
     """Server-side mirror of memory_bridge.search_ceiling() — see that
     function's docstring for the reasoning; this must stay semantically
     identical (a parity test asserts it) so queue_bound is computed against
-    the timeout the client will genuinely apply, not a server guess."""
+    the timeout the client will genuinely apply, not a server guess.
+
+    A-5 (T-01): that includes the PARTIAL-ignorance rule the clients apply.
+    When one backend reports a positive projection and the other reports
+    `status: "failing"` (or a `projection_stale` block with no projection of
+    its own), the known backend's number is only a LOWER bound on the true
+    cost — the failing backend's cost is unknown, not zero. So the floor
+    under the derivation becomes CAPACITY_SEARCH_TIMEOUT_FALLBACK_S rather
+    than CAPACITY_SEARCH_TIMEOUT_FLOOR_S: ignorance of PART of the cost must
+    not resolve to a number already known to be too small, exactly as
+    ignorance of ALL of it does not. Before this, the fact:1560 shape (an
+    embedder that probed in 1.8 s beside a reranker that answered nothing)
+    produced 30 s here while the client produced 120 s — the mirror's own
+    parity test never saw the case the mechanism exists for.
+
+    The clients additionally fold in the gateway's published `capacity`
+    block; this mirror does not, and must not — it IS the function that
+    produces `capacity.derived.client_ceiling_s`, so reading it back here
+    would be circular. Parity is over the capability input."""
     if CAPACITY_SEARCH_TIMEOUT_S > 0:
         return CAPACITY_SEARCH_TIMEOUT_S
 
-    projected, probed = 0.0, False
+    projected, probed, unknown = 0.0, False, False
     for backend in ("reranker", "embedder"):
         block = (capability or {}).get(backend)
         if not isinstance(block, dict):
@@ -2887,16 +2965,23 @@ def _capacity_client_ceiling_s(capability: dict | None) -> float:
         try:
             value = float(block.get("projected_full_payload_s") or 0)
         except (TypeError, ValueError):
-            continue
+            # A malformed projection is an UNKNOWN cost, not a zero one —
+            # fall through to the flag check rather than skipping the block.
+            value = 0.0
         if value > 0:
             projected += value
             probed = True
-    if not probed:
-        return CAPACITY_SEARCH_TIMEOUT_FALLBACK_S
+        elif block.get("status") == "failing" or block.get("projection_stale"):
+            unknown = True   # this backend's real cost is unknown, not zero
 
-    derived = projected * CAPACITY_SEARCH_SAFETY_FACTOR + CAPACITY_SEARCH_OVERHEAD_S
-    return max(CAPACITY_SEARCH_TIMEOUT_FLOOR_S,
-               min(derived, CAPACITY_SEARCH_TIMEOUT_MAX_S))
+    if not probed:
+        derived = CAPACITY_SEARCH_TIMEOUT_FALLBACK_S
+    else:
+        floor = (CAPACITY_SEARCH_TIMEOUT_FALLBACK_S if unknown
+                 else CAPACITY_SEARCH_TIMEOUT_FLOOR_S)
+        derived = max(floor, projected * CAPACITY_SEARCH_SAFETY_FACTOR
+                      + CAPACITY_SEARCH_OVERHEAD_S)
+    return min(derived, CAPACITY_SEARCH_TIMEOUT_MAX_S)
 
 
 def _capacity_queue_bound(s_mean: float | None, tolerable_wait_s: float) -> int | None:
@@ -3001,6 +3086,18 @@ def _capacity_payload_stats(coordinator) -> dict:
         "mean_chars_per_search": mean_chars_per_search,
         "max_chars_per_search": max_chars_per_search,
     }
+
+
+def _probe_measured_at(capability: dict | None, block: dict) -> str | None:
+    """When the throughput reported for one backend was actually measured.
+
+    `last_ok_at` is the authority whenever the block has one (the merge
+    stamps it on every probed block, fresh or carried). Falling back to the
+    snapshot's own `probed_at` keeps this honest for a capability dict that
+    never went through the merge — a caller predating it, or a record
+    rebuilt from an older log."""
+    stamp = block.get("last_ok_at") if isinstance(block, dict) else None
+    return stamp or (capability or {}).get("probed_at")
 
 
 def _build_capacity_record(capability: dict | None, fingerprint: dict,
@@ -3134,6 +3231,18 @@ def _build_capacity_record(capability: dict | None, fingerprint: dict,
             "reranker_status": reranker.get("status"),
             "embedder_chars_per_s": embedder.get("throughput_chars_s"),
             "probed_at": (capability or {}).get("probed_at"),
+            # A-3 (ADV-5, Group 3): once a reading can be CARRIED from an
+            # earlier cycle, `<backend>_chars_per_s` stamped with this
+            # cycle's `probed_at` alone would silently change meaning under
+            # an unchanged name -- in a record that is appended to the
+            # durable capacity.jsonl log. So each throughput now travels
+            # with the timestamp it was actually MEASURED at (equal to
+            # `probed_at` on a fresh cycle, earlier on a carried one), and
+            # `probe_stale` says outright that this block mixes cycles.
+            "reranker_measured_at": _probe_measured_at(capability, reranker),
+            "embedder_measured_at": _probe_measured_at(capability, embedder),
+            "probe_stale": bool(reranker.get("projection_stale")
+                                or embedder.get("projection_stale")),
         },
         "derived": {
             # UNCHANGED meaning -- see this function's docstring. Always the
@@ -3192,15 +3301,16 @@ def _build_capacity_record(capability: dict | None, fingerprint: dict,
             # self-describing even if the operator's setting changes later.
             "tolerable_wait_s": CAPACITY_TOLERABLE_WAIT_S,
             "single_search_exceeds_wait": single_search_exceeds_wait,
-            # NEW (additive): whether the reranker projection this record was
-            # derived FROM was measured on this cycle (False), carried
-            # forward from an earlier one because this cycle's probe failed
-            # (True), or never measured at all (None). The numbers above no
-            # longer collapse to their not-yet-measured fallbacks on a
-            # failing cycle -- see _merge_capability_projection -- so this
-            # flag is what tells a reader that a real projection is AGEING
-            # rather than fresh. Nothing above is renamed or re-meant.
-            "reranker_projection_stale": reranker.get("projection_stale"),
+            # A-4 (ADV-6): there is deliberately NO staleness flag in this
+            # block. `capacity` on /health is the last DERIVED record, and
+            # derivation fires on rare triggers -- so during an outage this
+            # block is frozen at its last healthy derivation and a flag here
+            # would read "fresh" during exactly the outage it exists to
+            # expose. Liveness of the projection is reported ONLY where it is
+            # actually re-evaluated every cycle: `backend_capability.<backend>
+            # .projection_stale` / `.projection_age_s`. Within THIS record,
+            # `probe.probe_stale` above describes the reading it was derived
+            # from, alongside `timestamp` (when the record was derived).
             "recommended_reranker_mem_limit_bytes": recommended_mem_limit,
         },
     }
