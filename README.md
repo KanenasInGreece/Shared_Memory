@@ -1153,11 +1153,10 @@ statement, not a permanent one.
   faithfulness holds by construction. What has no number yet is whether a fold is a sharp
   abstraction or a lossy blur. The measurement is designed (lift over a deterministic
   baseline, human judgement on the disagreement set) and has not been run.
-- **The entity vocabulary is gated at save — the cleanup behind the gate is not done.** A
-  save naming an entity outside the registry is refused with the exact protocol for minting
-  it, and minting is the operator's act. Names that entered before the gate existed are still
-  in the graph as they were spelled then; merging them is curation, not code, and is in
-  progress.
+- **The entity vocabulary is gated at save.** A save naming an entity outside the registry is
+  refused with the exact protocol for minting it, and minting is the operator's act — a new
+  concept enters the graph only when someone says so, and a misspelling never becomes one. That
+  is what is in force on every install; nothing about it depends on history.
 - **Authentication is bearer-token plus kernel-attested person identity.** Agents present a
   token the gateway knows by digest. On the local socket the gateway also reads the
   connecting person from the kernel (`SO_PEERCRED`) and stamps it server-side — never
