@@ -732,6 +732,32 @@ arriving at running code rather than code arriving at existing data:
 bash shared-memory/scripts/update_framework.sh --from-restore
 ```
 
+### Update and uninstall — tested procedures, not promises
+
+You are not stuck on the version you installed, and you are not stuck with the installation.
+Both directions are scripts the framework ships and runs on its own test hosts at every release:
+
+- **Update** (`update_framework.sh`) takes a backup first (quiesced when an admin token is set,
+  online otherwise — it says which), pulls the released code, applies the Postgres migrations and
+  re-verifies the Neo4j constraints, restarts the gateway **by version**, re-syncs every installed
+  skill, and ends with the postflight verification — an update that has not passed postflight
+  reports itself as *unverified*, exit 1, rather than as done. `--dry-run` prints every step and runs
+  nothing. It was exercised on a fresh VM and on a bare-metal host, by an agent, from these
+  instructions, and the defects that surfaced were fixed in the versions that followed.
+  ⚠ One gap, known and stated: the update path does not yet recreate the containers when the
+  compose file's image pins move — after an update that changes a pin, run the `docker compose …
+  pull` and `up -d` lines from [§15](#15-the-stack-docker-compose) and, for pgvector,
+  `ALTER EXTENSION vector UPDATE`. Closing that gap is queued.
+- **Uninstall** (`uninstall_framework.sh --level service|data|all`) is tiered, and `--level` is
+  required because the safe default for an irreversible operation is to say what you mean.
+  `service` stops the gateway and removes the agents' skill directories, touching no data — and is
+  reversible. `data` also removes the containers, volumes, data directories and `.env`; `all` adds
+  the model weights. **The irreversible levels refuse to start unless a backup set exists** (or you
+  say `--no-backup` for a host you mean to throw away), and `--dry-run` shows the refusal too. What
+  is never removed at any level: `~/.shared-memory` — the backup sets, the credential audit trail and
+  the capacity history belong to the host, not the installation — and the checkout itself, whose
+  removal is printed for you to run deliberately.
+
 Two verifiers prove what re-running files cannot — that a fresh install matches a live one, and
 that the graph constraints are actually in force:
 
@@ -995,6 +1021,13 @@ Installing a client is copying two files into the agent's skills directory:
 | Codex CLI | `~/.codex/skills/shared-memory/` | `$shared-memory` |
 | Antigravity CLI | `~/.gemini/skills/shared-memory/` | `/activate shared-memory` |
 | LM Studio / MCP hosts | `mcp/mcp.json` → `mcp/vector-skill.py` | MCP tools |
+| opencode | MCP connector in `opencode.jsonc` ([§21](#21-the-mcp-install-any-mcp-host-one-connector)) — no skill copy | MCP tools |
+
+**opencode, tested both ways round.** As a *client* it mounts the memory through the MCP connector
+— exercised on the reference workstation and on a test host, read-only and write roles — and there
+is no skill-directory install for it: the connector is its path. As an *installer* it was the agent
+that set the framework up on the bare-metal test host from `AGENTS.md`, and later ran the
+documented upgrade there and verified the fixes by inspecting state rather than trusting output.
 
 Put the agent's `AGENT_TOKEN` in the skill's `.env`, then verify from any shell:
 

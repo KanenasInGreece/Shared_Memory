@@ -815,6 +815,21 @@ docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared
 
 Stopping only the inference containers (`docker stop llama-retriever llama-reranker`) degrades saves/search (embedding mandate → 503) — stop the gateway too, or don't stop the embedder. Facts already saved are never lost by a stop; dreaming resumes where it left off.
 
+### Uninstall (tiered; the irreversible levels are gated on a backup)
+
+```bash
+bash shared-memory/scripts/uninstall_framework.sh --level service --dry-run   # preview; shows a refusal too
+bash shared-memory/scripts/uninstall_framework.sh --level service             # stop gateway, remove skill dirs — reversible
+bash shared-memory/scripts/uninstall_framework.sh --level data                # + containers, volumes, data dirs, .env — NOT reversible
+bash shared-memory/scripts/uninstall_framework.sh --level all                 # + model weights
+```
+
+`--level` is required — there is no default. `data` and `all` refuse to start unless a backup set
+exists in `BACKUP_DIR` (`bash shared-memory/ops/backup.sh` first); `--no-backup` is the explicit
+opt-out for a disposable host. Ask the operator which level they mean and show the dry run before
+the real run. `~/.shared-memory` (backups, audit trail, capacity history) and the checkout are never
+removed by the script; it prints the checkout's `rm -rf` for the operator to run themselves.
+
 ### Status / health
 
 ```bash
