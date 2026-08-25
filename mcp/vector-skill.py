@@ -1297,7 +1297,8 @@ async def review_hold(summary_id: int, pg_id: int) -> str:
     return f"Error: {result.get('message', result)}"
 
 
-ROLE_REPORTING_MIN_VERSION = "0.9.52"
+ROLE_REPORTING_MIN_VERSION = "0.9.54"  # R2-01: the server half (agent/role
+# on authenticated /health) does not exist on 0.9.52 -- it ships in PR #311.
 
 
 def _gateway_predates(version: str | None, minimum: str = ROLE_REPORTING_MIN_VERSION) -> bool | None:

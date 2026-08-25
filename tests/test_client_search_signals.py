@@ -43,6 +43,11 @@ memory_bridge = _load(
 )
 vector_skill = _load("vector_skill_signals", "mcp", "vector-skill.py")
 
+CLIENTS = [
+    pytest.param(memory_bridge, id="cli"),
+    pytest.param(vector_skill, id="mcp"),
+]
+
 
 # ── B2: pure helper, memory_bridge._unranked_warning ──────────────────────────
 
@@ -159,11 +164,43 @@ def _health(payload):
     return MagicMock(status_code=200, json=lambda: payload)
 
 
+# R2-01 (PR #310 review round 2 delta) fixtures. agent/role ship on the
+# AUTHENTICATED /health payload in a LATER server PR (0.9.54) than the one
+# merged so far (0.9.52, PR-A). So the "predates" role case is not
+# hypothetical -- it is the shape a valid token gets against TODAY's real
+# merged gateway. The two fixtures below are distinguishable by BOTH version
+# AND shape, matching what handle_health actually sends: a full authenticated
+# body (many operational keys) is what a valid-but-pre-0.9.54 token receives;
+# the anonymous-slim triple is what a rejected/absent token receives
+# regardless of gateway version.
+
+def _authenticated_full_payload(version, api_version, **extra):
+    """A realistic AUTHENTICATED /health body on a gateway that predates
+    ROLE_REPORTING_MIN_VERSION: full operational detail, just no agent/role
+    keys yet (they don't exist server-side before 0.9.54)."""
+    payload = {
+        "status": "ok",
+        "version": version,
+        "api_version": api_version,
+        "backend_capability": {"reranker": {"status": "ok"}, "embedder": {"status": "ok"}},
+        "capacity": None,
+        "daemon": {"rem": {"status": "running"}, "consolidation": {"status": "idle"}},
+    }
+    payload.update(extra)
+    return payload
+
+
+def _anonymous_slim_payload(version, api_version):
+    """The REAL anonymous-slim shape `handle_health` sends an unauthenticated
+    or rejected-token caller: exactly {status, version, api_version}, none of
+    the operational detail above -- regardless of how current the gateway is."""
+    return {"status": "ok", "version": version, "api_version": api_version}
+
+
 @pytest.mark.asyncio
 async def test_cli_doctor_surfaces_agent_and_role_when_present():
-    payload = {"status": "ok", "version": "0.9.52",
-              "api_version": memory_bridge.API_VERSION,
-              "agent": "claude-code", "role": "write"}
+    payload = _authenticated_full_payload("0.9.54", memory_bridge.API_VERSION,
+                                          agent="claude-code", role="write")
     with patch("httpx.AsyncClient.get", return_value=_health(payload)):
         diag = await memory_bridge.check_gateway_compat()
     assert diag["agent"] == "claude-code"
@@ -172,28 +209,26 @@ async def test_cli_doctor_surfaces_agent_and_role_when_present():
 
 @pytest.mark.asyncio
 async def test_cli_doctor_role_predates_when_gateway_is_genuinely_old():
-    """T-04 (PR #310 review), case 2: the gateway's OWN reported version is
-    below ROLE_REPORTING_MIN_VERSION — it genuinely never sends `role`."""
-    payload = {"status": "ok", "version": "0.9.40",
-              "api_version": memory_bridge.API_VERSION}
+    """T-04/R2-01: 0.9.52 is TODAY's real merged gateway version (PR-A) --
+    it genuinely does not ship `role` yet (that's PR #311, 0.9.54). A valid
+    token still gets the FULL authenticated shape, just without agent/role."""
+    payload = _authenticated_full_payload("0.9.52", memory_bridge.API_VERSION)
     with patch("httpx.AsyncClient.get", return_value=_health(payload)):
         diag = await memory_bridge.check_gateway_compat()
     assert "agent" not in diag   # only shown when present
-    assert diag["role"] == "not reported (gateway 0.9.40 predates 0.9.52)"
+    assert diag["role"] == "not reported (gateway 0.9.52 predates 0.9.54)"
 
 
 @pytest.mark.asyncio
 async def test_cli_doctor_role_anonymous_when_gateway_is_current():
-    """T-04 (PR #310 review), case 3: gateway_version says CURRENT (>=
-    0.9.52) but `role` is absent — that combination is not "old gateway", it
-    is "this token was not accepted" (anonymous-slim payload on a current
-    gateway). The old single fallback text asserted the version floor even
-    here, contradicting gateway_version in the SAME payload."""
-    payload = {"status": "ok", "version": "0.9.52",
-              "api_version": memory_bridge.API_VERSION}
+    """T-04/R2-01, case 3: gateway_version says CURRENT (>= 0.9.54) but the
+    payload is the SLIM anonymous shape -- that combination is not "old
+    gateway", it is "this token was not accepted". Distinguishable by shape
+    as well as version, matching what the real server actually sends."""
+    payload = _anonymous_slim_payload("0.9.54", memory_bridge.API_VERSION)
     with patch("httpx.AsyncClient.get", return_value=_health(payload)):
         diag = await memory_bridge.check_gateway_compat()
-    assert diag["gateway_version"] == "0.9.52"
+    assert diag["gateway_version"] == "0.9.54"
     assert "agent" not in diag
     assert diag["role"] == "not reported (token not accepted — anonymous payload)"
 
@@ -201,20 +236,19 @@ async def test_cli_doctor_role_anonymous_when_gateway_is_current():
 @pytest.mark.asyncio
 async def test_cli_doctor_role_unparseable_version_treated_as_predates():
     """No parseable version at all (very old, pre-version-contract gateway,
-    or a malformed string) is treated the same as "predates" — conservative,
+    or a malformed string) is treated the same as "predates" -- conservative,
     since a gateway too old to report even a parseable version is certainly
     too old to report role."""
     payload = {"status": "ok"}   # no `version` key
     with patch("httpx.AsyncClient.get", return_value=_health(payload)):
         diag = await memory_bridge.check_gateway_compat()
-    assert diag["role"] == "not reported (gateway version unknown, predates 0.9.52 assumed)"
+    assert diag["role"] == "not reported (gateway version unknown, predates 0.9.54 assumed)"
 
 
 @pytest.mark.asyncio
 async def test_mcp_check_memory_health_surfaces_agent_and_role_when_present():
-    payload = {"status": "ok", "version": "0.9.52",
-              "api_version": vector_skill.API_VERSION,
-              "agent": "vector-skill-agent", "role": "read"}
+    payload = _authenticated_full_payload("0.9.54", vector_skill.API_VERSION,
+                                          agent="vector-skill-agent", role="read")
     mock_response = MagicMock(status_code=200, json=lambda: payload)
     with patch("httpx.AsyncClient.get", return_value=mock_response):
         result = await vector_skill.check_memory_health()
@@ -226,28 +260,29 @@ async def test_mcp_check_memory_health_surfaces_agent_and_role_when_present():
 
 @pytest.mark.asyncio
 async def test_mcp_check_memory_health_role_predates_when_gateway_is_genuinely_old():
-    """T-04, case 2, MCP door."""
-    payload = {"status": "ok", "version": "0.9.40", "api_version": vector_skill.API_VERSION}
+    """T-04/R2-01, MCP door: today's real merged gateway version (0.9.52),
+    full authenticated shape, no agent/role yet."""
+    payload = _authenticated_full_payload("0.9.52", vector_skill.API_VERSION)
     mock_response = MagicMock(status_code=200, json=lambda: payload)
     with patch("httpx.AsyncClient.get", return_value=mock_response):
         result = await vector_skill.check_memory_health()
     import json as _json
     parsed = _json.loads(result)
     assert "agent" not in parsed
-    assert parsed["role"] == "not reported (gateway 0.9.40 predates 0.9.52)"
+    assert parsed["role"] == "not reported (gateway 0.9.52 predates 0.9.54)"
 
 
 @pytest.mark.asyncio
 async def test_mcp_check_memory_health_role_anonymous_when_gateway_is_current():
-    """T-04, case 3, MCP door: current gateway, absent role → this token was
-    not accepted, not "old gateway"."""
-    payload = {"status": "ok", "version": "0.9.52", "api_version": vector_skill.API_VERSION}
+    """T-04/R2-01, case 3, MCP door: current gateway, SLIM anonymous shape ->
+    this token was not accepted, not "old gateway"."""
+    payload = _anonymous_slim_payload("0.9.54", vector_skill.API_VERSION)
     mock_response = MagicMock(status_code=200, json=lambda: payload)
     with patch("httpx.AsyncClient.get", return_value=mock_response):
         result = await vector_skill.check_memory_health()
     import json as _json
     parsed = _json.loads(result)
-    assert parsed["version"] == "0.9.52"
+    assert parsed["version"] == "0.9.54"
     assert "agent" not in parsed
     assert parsed["role"] == "not reported (token not accepted — anonymous payload)"
 
@@ -260,7 +295,7 @@ async def test_mcp_check_memory_health_role_unparseable_version_treated_as_preda
         result = await vector_skill.check_memory_health()
     import json as _json
     parsed = _json.loads(result)
-    assert parsed["role"] == "not reported (gateway version unknown, predates 0.9.52 assumed)"
+    assert parsed["role"] == "not reported (gateway version unknown, predates 0.9.54 assumed)"
 
 
 # ── T-03 (PR #310 review): the auth header is load-bearing — pin it ─────────
@@ -408,3 +443,112 @@ def test_save_subparser_help_mentions_shared_memory_project():
 
 def test_mcp_search_docstring_mentions_search_timeout_s():
     assert "SEARCH_TIMEOUT_S" in vector_skill.hybrid_search_and_rerank.__doc__
+
+
+# R2-02 (PR #310 review round 2 delta): _stale_projection_note had ZERO test
+# coverage -- M7 (making it return None unconditionally in all three files)
+# left the suite fully green. The two fixtures below are the REAL shapes
+# PR-A's merged server produces via `_merge_capability_projection()` /
+# `_projection_age_s()`, not hand-written minimal dicts (same fixtures as
+# tests/test_search_ceiling.py's R2-02 block, duplicated here per this
+# suite's own convention -- LIVE_CAPABILITY is duplicated the same way).
+
+_R2_02_STALE_WITH_CARRIED = {
+    "status": "ok",
+    "probed_at": "2026-08-25T12:00:00+00:00",
+    "reranker": {
+        "probe_chars": 4000,
+        "status": "failing",
+        "error": "TimeoutError",
+        "projected_full_payload_s": 127.0,
+        "ceiling_s": 921.6,
+        "throughput_chars_s": 3870,
+        "latency_s": 1.03,
+        "serves_full_payload": None,
+        "projection_stale": True,
+        "last_ok_at": "2026-08-25T10:42:29.900000+00:00",
+        "projection_age_s": 4650.1,
+    },
+    "embedder": {
+        "probe_chars": 1000,
+        "status": "ok",
+        "projected_full_payload_s": 6.3,
+        "ceiling_s": 122.9,
+        "throughput_chars_s": 3906,
+        "latency_s": 0.26,
+        "serves_full_payload": True,
+        "projection_stale": False,
+        "last_ok_at": "2026-08-25T12:00:00+00:00",
+        "projection_age_s": 0.0,
+    },
+}
+
+_R2_02_NEVER_MEASURED = {
+    "status": "unknown",
+    "probed_at": None,
+    "reranker": {
+        "probe_chars": 4000,
+        "status": "failing",
+        "error": "ConnectError",
+        "serves_full_payload": None,
+        "projection_stale": None,   # PR-A's third state: never measured
+    },
+    "embedder": {
+        "probe_chars": 1000,
+        "status": "failing",
+        "error": "ConnectError",
+        "serves_full_payload": None,
+        "projection_stale": None,
+    },
+}
+
+
+@pytest.mark.parametrize("client", CLIENTS)
+def test_stale_projection_note_present_with_carried_stale_number(client):
+    """The real fact:1560 shape: reranker carries a stale-but-real number
+    (age 4650.1s) forward through a failing cycle. Byte-identical on both
+    doors -- the note text itself is part of what T-07's lesson says must be
+    pinned, not just its presence."""
+    note = client._stale_projection_note(_R2_02_STALE_WITH_CARRIED)
+    assert note == "reranker projection stale for 4650s"
+
+
+@pytest.mark.parametrize("client", CLIENTS)
+def test_stale_projection_note_silent_on_projection_stale_null(client):
+    """PR-A's third state -- `projection_stale: None` (never measured) -- is
+    NOT the same as stale; there is nothing to say "stale" about."""
+    assert client._stale_projection_note(_R2_02_NEVER_MEASURED) is None
+
+
+@pytest.mark.parametrize("client", CLIENTS)
+def test_stale_projection_note_silent_on_fresh(client):
+    """A backend that was just measured (`projection_stale: False`) with a
+    real, current projection gets no note -- freshness is silent, only
+    staleness speaks. Uses the embedder half of the real fixture above in
+    isolation, so a capability block with ONLY a fresh backend is covered
+    too (the mixed fixture always pairs it with the stale reranker)."""
+    fresh_only = {"embedder": dict(_R2_02_STALE_WITH_CARRIED["embedder"])}
+    assert client._stale_projection_note(fresh_only) is None
+
+
+@pytest.mark.parametrize("client", CLIENTS)
+def test_stale_projection_note_none_on_absent_or_malformed_capability(client):
+    assert client._stale_projection_note(None) is None
+    assert client._stale_projection_note({}) is None
+    assert client._stale_projection_note("not-a-dict") is None
+
+
+@pytest.mark.parametrize("capability", [
+    pytest.param(_R2_02_STALE_WITH_CARRIED, id="stale-with-carried"),
+    pytest.param(_R2_02_NEVER_MEASURED, id="never-measured"),
+    pytest.param(None, id="none"),
+    pytest.param({}, id="empty"),
+    pytest.param({"reranker": {"projection_stale": True, "projection_age_s": 12.4},
+                  "embedder": {"projection_stale": True}}, id="both-stale-one-ageless"),
+])
+def test_stale_projection_note_parity_between_both_doors(capability):
+    """T-07's lesson, re-applied: the two doors never import each other, so
+    this is the only thing holding the copies in step."""
+    assert (memory_bridge._stale_projection_note(capability)
+            == vector_skill._stale_projection_note(capability))
+

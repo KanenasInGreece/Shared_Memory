@@ -575,3 +575,84 @@ async def test_concurrent_first_calls_still_fire_exactly_one_health_request(clie
 
     assert calls["n"] == 1
     assert all(r == LIVE_CAPABILITY for r in results)
+
+
+
+# R2-02 (PR #310 review round 2 delta): the two REAL shapes PR-A's merged
+# server actually produces via `_merge_capability_projection()` /
+# `_projection_age_s()` -- not hand-written minimal dicts. Both pinned by
+# VALUE, not just parity (fact:1309).
+
+FACT_1560_STALE_WITH_CARRIED = {
+    "status": "ok",
+    "probed_at": "2026-08-25T12:00:00+00:00",
+    "reranker": {
+        "probe_chars": 4000,
+        "status": "failing",
+        "error": "TimeoutError",
+        "projected_full_payload_s": 127.0,   # carried from the last OK cycle
+        "ceiling_s": 921.6,
+        "throughput_chars_s": 3870,
+        "latency_s": 1.03,
+        "serves_full_payload": None,          # the verdict does NOT travel
+        "projection_stale": True,
+        "last_ok_at": "2026-08-25T10:42:29.900000+00:00",
+        "projection_age_s": 4650.1,
+    },
+    "embedder": {
+        "probe_chars": 1000,
+        "status": "ok",
+        "projected_full_payload_s": 6.3,
+        "ceiling_s": 122.9,
+        "throughput_chars_s": 3906,
+        "latency_s": 0.26,
+        "serves_full_payload": True,
+        "projection_stale": False,
+        "last_ok_at": "2026-08-25T12:00:00+00:00",
+        "projection_age_s": 0.0,
+    },
+}
+
+FACT_1560_NEVER_MEASURED = {
+    "status": "unknown",
+    "probed_at": None,
+    "reranker": {
+        "probe_chars": 4000,
+        "status": "failing",
+        "error": "ConnectError",
+        "serves_full_payload": None,
+        "projection_stale": None,   # PR-A's third state: never measured
+    },
+    "embedder": {
+        "probe_chars": 1000,
+        "status": "failing",
+        "error": "ConnectError",
+        "serves_full_payload": None,
+        "projection_stale": None,
+    },
+}
+
+
+@pytest.mark.parametrize("client", CLIENTS)
+def test_r2_02_stale_with_carried_number_ceiling_is_214_95(client):
+    """The carried 127.0 (reranker) is USED, not treated as unknown -- a
+    stale-but-real number still costs money; only a TRULY unknown cost floors
+    at the fallback. (127.0 + 6.3) * 1.5 + 15 = 214.95."""
+    assert client.search_ceiling(FACT_1560_STALE_WITH_CARRIED) == pytest.approx(214.95)
+
+
+@pytest.mark.parametrize("client", CLIENTS)
+def test_r2_02_never_measured_ceiling_is_120_via_the_failing_signal(client):
+    """projection_stale: None (never measured) carries no number to use, so
+    the explicit status: "failing" signal on both backends floors at the
+    fallback -- same value as the mixed case, reached via "nothing has ever
+    been measured" rather than "a measurement stopped being fresh"."""
+    assert (client.search_ceiling(FACT_1560_NEVER_MEASURED)
+            == client.SEARCH_TIMEOUT_FALLBACK_S == 120.0)
+
+
+def test_r2_02_both_real_shapes_parity_between_doors():
+    assert (memory_bridge.search_ceiling(FACT_1560_STALE_WITH_CARRIED)
+            == vector_skill.search_ceiling(FACT_1560_STALE_WITH_CARRIED))
+    assert (memory_bridge.search_ceiling(FACT_1560_NEVER_MEASURED)
+            == vector_skill.search_ceiling(FACT_1560_NEVER_MEASURED))
