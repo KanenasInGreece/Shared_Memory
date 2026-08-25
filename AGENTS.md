@@ -912,6 +912,23 @@ bash shared-memory/scripts/update_framework.sh             # do it, and prove it
 bash shared-memory/scripts/update_framework.sh --no-domain-backfill  # decline step 6 for THIS run only
 ```
 
+**After the script finishes, treat a stack-drift verdict as a step, not an aside.**
+`update_framework.sh` never touches the containers by design — it only runs
+`reconcile_stack.sh --dry-run` (read-only) and reports the verdict on its own closing banner
+(the words "stack reconcile REQUIRED" appear there when drift is present). An operating agent
+should:
+
+1. **Read the drift report** the update just printed, or run
+   `bash shared-memory/scripts/reconcile_stack.sh --dry-run` yourself — read-only, changes nothing.
+2. **If any row reads `DRIFT`, STOP and ASK the operator** — show them the drift table and the exact
+   command (`bash shared-memory/scripts/reconcile_stack.sh`) rather than running it yourself. It
+   recreates the database containers; that is the operator's call, never an agent's to make alone.
+3. **Run `bash shared-memory/scripts/reconcile_stack.sh` only on the operator's explicit word** —
+   never silently as part of "update the framework"; it is a separate, standalone step (see the
+   *Reconcile the stack to the shipped pins* runbook below). A `floating` row (a pinned tag with no
+   version in it, e.g. today's llama.cpp images) is never something to reconcile — there is no pin
+   to reconcile it to, and it must never be read as drift.
+
 **After a restore, the same script finishes the job** — `ops/restore.sh` brings the data back at
 whatever schema level the dump was taken at, and nothing has yet moved it forward to this code:
 
@@ -992,6 +1009,30 @@ is the right starting state. Sections are registered through ingress the same wa
 ⚠ **Run the Neo4j check on every upgrade, and do not assume it is redundant.** `apply.py` covers Postgres only, and Postgres has a migration ledger that records what has been applied. **Neo4j has none** — `neo4j_init.cypher` is a one-time manual step, so a long-lived instance enforces whatever constraint set was true the day someone last ran it, and a constraint added to the file in a later release reaches new installs and nobody else. A missing uniqueness constraint is silent: `MERGE` keeps working and the only symptom is a duplicate node appearing under a race. Add `--apply` to create what is missing; it exits 1 when a declared constraint is not in force, so it is safe to gate on. *(This is not hypothetical — the deployment this framework was built on was enforcing one of the seven declared constraints, and a plain index on `Entity.name` was blocking a second. `--apply` handles that case; re-running `neo4j_init.cypher` does not.)*
 
 Clients and gateway may drift; `memory_bridge.py doctor` names which side to upgrade on `api_version` skew. `doctor` also names the token's own `agent`/`role` once a gateway reports them (0.9.54+) — a gateway that genuinely predates that is named `role: not reported (gateway <version> predates 0.9.54)`; a current gateway with no `role` in the reply means THIS token was not accepted, named `role: not reported (token not accepted — anonymous payload)`.
+
+### Reconcile the stack to the shipped pins
+
+`update_framework.sh` moves code, schema and skills forward but never the containers — a released
+image pin (pgvector, neo4j) moving does not, by ruling, recreate anything on its own. That stays a
+standalone script the operator runs when they choose, never a step the update path takes for you:
+a host may have other legacy problems to work through first, and recreating a database container
+is not something to do silently.
+
+```bash
+bash shared-memory/scripts/reconcile_stack.sh --dry-run   # table only, changes nothing, exit 2 if drift
+bash shared-memory/scripts/reconcile_stack.sh             # shows the table, then asks before reconciling
+bash shared-memory/scripts/reconcile_stack.sh --yes       # skips the confirmation prompt
+```
+
+**Dry-run first, show the table to the operator, run only on their word.** The table compares the
+pinned image in `shared-memory/ops/postgres_neo4j_limits.yaml` against what each running container
+was actually created from (`in sync` / `DRIFT` / `floating` — a pinned tag with no version in it,
+e.g. today's llama.cpp images, can never be reconciled to a pin and never counts as drift), plus the
+Postgres pgvector extension's own SQL-reported version against what the running image carries. On
+confirmation it pulls the pinned images, runs `docker compose ... up -d`, waits for Postgres, and
+runs `ALTER EXTENSION vector UPDATE` (idempotent). It never edits `.env`, never runs a migration, and
+never restarts the gateway — the gateway reconnects to Postgres/Neo4j on its own; check with
+`curl -s $GATEWAY_URL/health` (default `http://localhost:8888`).
 
 ### Backup / restore
 

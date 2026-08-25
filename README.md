@@ -695,6 +695,9 @@ docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared
 docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env ps   # inference healthy, stores Up
 ```
 
+When a later release moves an image pin, `bash shared-memory/scripts/reconcile_stack.sh` shows the
+drift against what is actually running and, on your say-so, closes it — see [§16](#16-databases-initialise-verify-upgrade).
+
 Place your GGUF files where the compose mounts expect them (or edit the mount and `-m` paths) —
 both models are on Hugging Face, and the download commands (with the exact layout the compose
 defaults name) are in `shared-memory/.env.example` next to `LLM_MODELS_DIR`. `preflight.sh`
@@ -744,10 +747,9 @@ Both directions are scripts the framework ships and runs on its own test hosts a
   reports itself as *unverified*, exit 1, rather than as done. `--dry-run` prints every step and runs
   nothing. It was exercised on a fresh VM and on a bare-metal host, by an agent, from these
   instructions, and the defects that surfaced were fixed in the versions that followed.
-  ⚠ One gap, known and stated: the update path does not yet recreate the containers when the
-  compose file's image pins move — after an update that changes a pin, run the `docker compose …
-  pull` and `up -d` lines from [§15](#15-the-stack-docker-compose) and, for pgvector,
-  `ALTER EXTENSION vector UPDATE`. Closing that gap is queued.
+  The update path does not move the containers by design: when a release moves an image pin,
+  `reconcile_stack.sh` shows the drift and, on your say-so, pulls the pinned images, recreates the
+  containers and updates the pgvector extension.
 - **Uninstall** (`uninstall_framework.sh --level service|data|all`) is tiered, and `--level` is
   required because the safe default for an irreversible operation is to say what you mean.
   `service` stops the gateway and removes the agents' skill directories, touching no data — and is
