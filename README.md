@@ -255,10 +255,13 @@ vendor's repository is its own exercise — do it before installing the framewor
 PATH of a service or an agent process — which is why an agent can fail to run the skill on a machine
 where you run it fine.
 
-**Reasoning LLM (your choice, on `:5000`):** any OpenAI-compatible local endpoint works. We run
-**google/gemma-4-12b** — tested for REM enrichment and NREM consolidation. Load it text-only;
-set `DREAM_TEMPERATURE=0.6` (Gemma degrades at lower temperatures). On the 8 GB tier a 7–8B
-model is the practical pick. Model choice affects graph quality — see
+**Reasoning LLM (your choice — local on `:5000`, or an online provider):** any OpenAI-compatible
+endpoint works. Tested end to end for REM enrichment and NREM consolidation: **google/gemma-4-12b**
+(load it text-only; set `DREAM_TEMPERATURE=0.6`, Gemma degrades at lower temperatures) and
+**Qwen3-14B** at Q4 locally, and **DeepSeek** (`deepseek-chat`) as an online provider through
+`LLM_BACKENDS_JSON` — a full dreaming run there measured 30 requests, ~106,000 tokens, under two
+minutes, zero failures. On the 8 GB tier a 7–8B model is the practical pick. Model choice affects
+graph quality — see
 [*GraphRAG's Hidden Cost*](https://www.linkedin.com/pulse/graphrags-hidden-cost-youre-always-paying-question-when-motsenigos-w81pc/).
 
 **Optional — [`nvtop`](https://github.com/Syllo/nvtop):** if installed, the dreaming daemons
