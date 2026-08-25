@@ -5,7 +5,7 @@
 Coding agents already have good local memory. Markdown files, project notes and indexed
 documentation work well — as long as the knowledge stays inside that project.
 
-The insight for me came when I opened the same agent in a different repository. It couldn't
+However, when I opened the same agent in a different repository, it couldn't
 reuse one of its own architectural insights from the previous project — not because the model
 had forgotten, but because its memory was tied to the old workspace.
 
@@ -83,12 +83,16 @@ things in* — a complete first-time setup that points to the chapter with the d
 step, so nothing is repeated.
 
 **Is this for you?** If everything you need fits in one chat window with one assistant, you
-don't need this — a plain file is about as good. This is for when you run more than one AI tool,
-or work across more than one project, and want what one of them figures out to already be there
-the next time any of them is asked. If that's you, the setup below costs about an hour, most of
-it unattended.
+don't need this. However, if you have more than one project, or use more than one AI tool/agent,
+you may want a structured way to share, facts, decisions, insights, retrospectives the next time *any* of them is asked, 
+no matter the project. What where the alternatives we considered? On which facts was this decision overturned? 
+Moreover, a file becomes stale: is everything in here current? what is related to what? 
+This framework removes stale facts from the results:  what you get is what holds -- you know if it has withstood the test of use and time.
+If you feel this is for you, the setup below costs less than an hour, most of it unattended, handled by your agent. 
+It can then be backed up, moved to another machine, or shared accross a network -- framework exists on a linux server, or main workstation, 
+while you access it on your VPN from a laptop on the road! Or run everything from your laptop if it meets min specs!
 
-**What you are standing up:** a local GraphRAG memory shared by every AI tool on your machine —
+**What you are setting up:** a memory shared by every AI tool on your machine —
 CLI agents and LM Studio alike. They talk only to one gateway on `127.0.0.1:8888`; the gateway
 owns Postgres (vectors + facts) and Neo4j (the graph), and runs the REM/NREM sleep cycle that
 turns saved facts into shared knowledge.
