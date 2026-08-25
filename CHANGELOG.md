@@ -31,6 +31,11 @@ the one-line fix (`<name>:mcp:<path>`), rather than delivering the wrong package
 Records: portable lesson `fact:1594` (from the debrief `fact:1591` / `retro:1593`); finding
 `fact:1595`. No schema change, no pin move; the gateway restart is for the version only.
 
+**Verified live.** Deployed to the reference workstation and both test hosts the same evening; `postflight.sh`
+passed on both test hosts (A1–A5, A8 skipped where no reasoning backend is configured), on the pinned
+PostgreSQL 17.11 / pgvector 0.8.6 / Neo4j 5.26.30 stack with migration 036 in place — the first token-verified
+postflights since the v0.9.55 pin move.
+
 ---
 
 ## [0.9.56] — 2026-08-25

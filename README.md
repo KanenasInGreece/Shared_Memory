@@ -738,7 +738,9 @@ bash shared-memory/scripts/update_framework.sh --from-restore
 ### Update and uninstall — tested procedures, not promises
 
 You are not stuck on the version you installed, and you are not stuck with the installation.
-Both directions are scripts the framework ships and runs on its own test hosts at every release:
+Both directions are scripts the framework ships and runs on its own test hosts at every release — the
+last update, which moved the database image pins, ended with postflight passing on both test hosts and
+the reference workstation ([§23](#23-testing)):
 
 - **Update** (`update_framework.sh`) takes a backup first (quiesced when an admin token is set,
   online otherwise — it says which), pulls the released code, applies the Postgres migrations and
@@ -1153,6 +1155,16 @@ things out. To reproduce the exact dependency versions this framework is develop
 against, `requirements.lock` pins the full runtime tree (hashes included, audited for known
 CVEs at generation time): `uv venv && uv pip sync requirements.lock`. The floors live in
 `requirements.txt`; dev extras in `requirements-dev.txt`.
+
+**Live verification — what the mocked suite cannot prove, `postflight.sh` does on a running
+install** ([§3](#3-quick-start) step 9): liveness and payload shape, the client/gateway contract,
+fresh-install schema parity against the live database, the write and read paths, a performance
+baseline, and a real completion through the reasoning backend (skipped, never failing, where none is
+configured). It is run on the reference workstation and on both test hosts at every release; after
+the v0.9.55–0.9.57 releases — which moved the database images to PostgreSQL 17.11, pgvector 0.8.6
+and Neo4j 5.26.30 and added the axis-filter indexes — it passed on all three (2026-08-25), in
+re-baseline mode on the two test hosts whose corpora already carry live summaries. The token it needs
+is exported in the operator's own shell; it never passes through an agent.
 
 ---
 
