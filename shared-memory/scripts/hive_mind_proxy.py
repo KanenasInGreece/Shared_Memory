@@ -4039,6 +4039,17 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
             checks["project_identity"] = None
             checks["domain_identity"] = None
 
+        # pgvector version + hnsw.iterative_scan (decision:1584/fact:1583) —
+        # flat additive key, read straight off the coordinator's own startup
+        # probe (coordinator.py start()); never re-probed here, so /health
+        # stays DB-free like the rest of this block. "version": null means the
+        # probe failed or the extension was unreadable — that is itself the
+        # signal (iterative_scan is then always False, the safe default).
+        checks["pgvector"] = {
+            "version": getattr(coordinator, "pgvector_version", None),
+            "iterative_scan": bool(getattr(coordinator, "hnsw_iterative_scan", False)),
+        }
+
     return checks
 
 
