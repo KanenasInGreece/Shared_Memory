@@ -642,6 +642,52 @@ if [[ "$DRY_RUN" == "0" && "$rc" != "0" ]]; then
     ylw "     Re-run it by hand and check each agent's version before trusting them."
 fi
 
+# ── Stack pin drift check — READ-ONLY, informational, and NEVER gates this
+# script or runs the reconcile itself. v0.9.55 moved the compose image pins
+# (pgvector, neo4j) and this script does not — and by ruling never will —
+# recreate containers on its own: a host may have other legacy problems to
+# work through first, and recreating a database container is not something
+# to do silently inside "update the framework". reconcile_stack.sh is the
+# standalone script the operator runs on their own word.
+#
+# Measured HERE, after this run's own steps and before postflight, not as a
+# numbered step (same reasoning as the linger verdict above: read-only,
+# changes no state, so nothing after this is affected by measuring it) — but
+# the VERDICT is read by every terminal path below, exactly like
+# LINGER_VERDICT/_linger_brief, so it survives to whichever banner this run
+# actually reaches. Any failure to even RUN reconcile_stack.sh (docker
+# missing, the script itself absent) reports "unknown" — never surfaced as
+# drift, never surfaced as clean, and never fatal here: this check must not
+# be the thing that makes an update fail.
+STACK_DRIFT_VERDICT="unknown"    # unknown | none | drift
+STACK_DRIFT_TABLE=""
+if [[ -x "$REPO_ROOT/shared-memory/scripts/reconcile_stack.sh" ]]; then
+    STACK_DRIFT_TABLE="$(bash "$REPO_ROOT/shared-memory/scripts/reconcile_stack.sh" --dry-run 2>&1)"
+    _drift_rc=$?
+    case "$_drift_rc" in
+        0) STACK_DRIFT_VERDICT="none" ;;
+        2) STACK_DRIFT_VERDICT="drift" ;;
+    esac
+fi
+
+# Prints the drift table and the two commands to close it — ONLY when drift
+# was actually found. A no-op otherwise, so every terminal path below can
+# call it unconditionally.
+_stack_drift_notice() {
+    [[ "$STACK_DRIFT_VERDICT" == "drift" ]] || return 0
+    echo
+    ylw "   ══════════════════════════════════════════════════════════════════"
+    ylw "   STACK UPDATE REQUIRED — the shipped image pins moved and this"
+    ylw "   update did not touch the containers by design."
+    ylw "   ══════════════════════════════════════════════════════════════════"
+    while IFS= read -r _drift_line; do
+        printf '   %s\n' "$_drift_line"
+    done <<< "$STACK_DRIFT_TABLE"
+    ylw "   Run:    bash shared-memory/scripts/reconcile_stack.sh --dry-run"
+    ylw "   Then:   bash shared-memory/scripts/reconcile_stack.sh"
+    echo
+}
+
 # ── Step 8: prove it ──────────────────────────────────────────────────────────
 #
 # ⚠ postflight NEEDS AGENT_TOKEN EXPORTED or A1/A5/A8 skip and it exits 1. That
@@ -671,8 +717,13 @@ if [[ "$DRY_RUN" == "0" && -z "${AGENT_TOKEN:-}" ]]; then
     else
         _linger_brief
     fi
+    _stack_drift_notice
     echo
-    ylw "Update finished, but UNVERIFIED. An update is not complete until postflight passes."
+    if [[ "$STACK_DRIFT_VERDICT" == "drift" ]]; then
+        ylw "Update finished, but UNVERIFIED — stack reconcile REQUIRED. An update is not complete until postflight passes."
+    else
+        ylw "Update finished, but UNVERIFIED. An update is not complete until postflight passes."
+    fi
     exit 1
 fi
 run_soft "postflight — verify end to end" bash "$REPO_ROOT/shared-memory/scripts/postflight.sh"
@@ -689,8 +740,13 @@ if [[ "$DRY_RUN" == "1" ]]; then
     else
         _linger_brief
     fi
+    _stack_drift_notice
 elif [[ "$rc" == "0" ]]; then
-    grn "Update complete and VERIFIED — postflight passed."
+    if [[ "$STACK_DRIFT_VERDICT" == "drift" ]]; then
+        grn "Update complete and VERIFIED — postflight passed — stack reconcile REQUIRED."
+    else
+        grn "Update complete and VERIFIED — postflight passed."
+    fi
     _branch_notice
     if [[ "$LINGER_VERDICT" == "no" ]]; then
         red "  BUT linger is NOT enabled for $_linger_who on this host. If the gateway runs"
@@ -699,9 +755,11 @@ elif [[ "$rc" == "0" ]]; then
     else
         _linger_brief
     fi
+    _stack_drift_notice
     ylw "Recommended: take a second backup now, so a known-good set exists at the new level."
 else
     _branch_notice
+    _stack_drift_notice
     if [[ "$LINGER_VERDICT" == "no" ]]; then
         die "postflight FAILED (exit $rc). The code and schema have moved; the system is
   NOT verified. Read the failures above before using this deployment.

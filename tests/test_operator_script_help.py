@@ -59,6 +59,7 @@ SCRIPTS = [
     REPO_ROOT / "shared-memory" / "scripts" / "init_db.sh",
     REPO_ROOT / "shared-memory" / "scripts" / "install_framework.sh",
     REPO_ROOT / "shared-memory" / "scripts" / "update_skill.sh",
+    REPO_ROOT / "shared-memory" / "scripts" / "reconcile_stack.sh",
     REPO_ROOT / "shared-memory" / "ops" / "install_service.sh",
     REPO_ROOT / "shared-memory" / "ops" / "install_llm_backends.sh",
     REPO_ROOT / "shared-memory" / "ops" / "backup.sh",
