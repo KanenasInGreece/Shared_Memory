@@ -396,3 +396,164 @@ def test_cache_never_serves_a_stale_api_version_across_a_restart(monkeypatch):
 # off). Removing the `async with _health_probe_lock:` coalescing (SEC-A5-
 # 05b) makes test_concurrent_misses_are_coalesced_into_one_probe fail
 # (get_calls triples instead of matching one fan-out).
+
+
+# ── A-4: `agent` and `role` on the AUTHENTICATED payload only ────────────────
+#
+# A client holding a token could not learn either without attempting a write and
+# reading the refusal — and a read-only token's 403 looks like a permissions bug
+# to anyone who did not already know the token was confined. These keys let
+# `doctor` say it plainly. Every test below also pins what must NOT change: the
+# anonymous slim shape and the auth-off full shape are the same as they were.
+
+
+def test_an_authenticated_write_token_is_told_who_it_is_and_what_it_may_do(monkeypatch):
+    monkeypatch.delenv("AGENT_ROLES", raising=False)
+    monkeypatch.delenv("SHARED_MEMORY_READ_ONLY_AGENTS", raising=False)
+    g = _load_gateway(monkeypatch, agent_tokens="claude:tok_a4_write")
+    assert g.AUTH_CONFIGURED_AT_STARTUP is True
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _HealthProbeSession()
+    req = _health_request(agent_token="tok_a4_write")
+    req.app = {"proxy": proxy}
+
+    body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
+    assert body["agent"] == "claude"
+    assert body["role"] == "write"
+
+
+def test_a_declared_read_only_token_is_told_it_is_read(monkeypatch):
+    """The case the key exists for. Without it, the only way to discover a
+    confined token is to attempt a write and read a 403 that reads like a bug."""
+    monkeypatch.setenv("AGENT_ROLES", "dashboard:read")
+    monkeypatch.delenv("SHARED_MEMORY_READ_ONLY_AGENTS", raising=False)
+    g = _load_gateway(monkeypatch, agent_tokens="dashboard:tok_a4_read")
+    assert g.AUTH_CONFIGURED_AT_STARTUP is True
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _HealthProbeSession()
+    req = _health_request(agent_token="tok_a4_read")
+    req.app = {"proxy": proxy}
+
+    body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
+    assert body["agent"] == "dashboard"
+    assert body["role"] == "read"
+
+
+def test_a_ROSTER_confined_identity_reads_read_even_with_no_declaration(monkeypatch):
+    """⛔ THE REASON THIS GOES THROUGH `effective_role` AND NOT A BARE
+    `_AGENT_ROLES` LOOKUP. `read_only_agents()` confines an identity REGARDLESS
+    of what AGENT_ROLES says — `monitor` is on the built-in roster — so a raw
+    map read reports `write` for a token the gateway 403s on every write route,
+    which is the exact false reassurance this key exists to remove.
+
+    MUTATION CHECK: replace `effective_role(...) == "read"` in
+    `_health_role_for` with `_AGENT_ROLES.get(agent_name) == "read"` and this
+    test dies while the declared-role test above still passes."""
+    monkeypatch.delenv("AGENT_ROLES", raising=False)   # nothing declared at all
+    monkeypatch.delenv("SHARED_MEMORY_READ_ONLY_AGENTS", raising=False)
+    g = _load_gateway(monkeypatch, agent_tokens="monitor:tok_a4_roster")
+    assert g.AUTH_CONFIGURED_AT_STARTUP is True
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _HealthProbeSession()
+    req = _health_request(agent_token="tok_a4_roster")
+    req.app = {"proxy": proxy}
+
+    body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
+    assert body["agent"] == "monitor"
+    assert body["role"] == "read"
+
+
+def test_an_anonymous_caller_is_told_NEITHER(monkeypatch):
+    """Adding an identity to a response served to someone who proved no identity
+    would be absurd. Named explicitly rather than left to the exact-set assertion
+    above, so a future key added to the slim payload cannot quietly bring these
+    two with it."""
+    g = _load_gateway(monkeypatch, agent_tokens="claude:tok_a4_anon")
+    assert g.AUTH_CONFIGURED_AT_STARTUP is True
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _HealthProbeSession()
+    req = _health_request()
+    req.app = {"proxy": proxy}
+
+    body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
+    assert "agent" not in body
+    assert "role" not in body
+    assert set(body.keys()) == {"status", "version", "api_version"}
+
+
+def test_an_invalid_token_is_told_NEITHER(monkeypatch):
+    """A presented-but-rejected token is anonymous here. It must not learn a
+    name — least of all its own guess being confirmed or denied."""
+    g = _load_gateway(monkeypatch, agent_tokens="claude:tok_a4_valid")
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _HealthProbeSession()
+    req = _health_request(agent_token="tok_a4_not_the_one")
+    req.app = {"proxy": proxy}
+
+    body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
+    assert "agent" not in body and "role" not in body
+
+
+def test_an_auth_off_install_is_told_NEITHER_and_keeps_its_full_payload(monkeypatch):
+    """⛔ ABSENT, NOT NULL, AND NOT A DEFAULT. There is no token registry on an
+    auth-off install, so every caller is the same unnamed everyone; emitting
+    `agent: null` / `role: "write"` would dress an absence up as an answer.
+    Absent means "this install has no identities", which is true and useful —
+    and the full payload it has always served is untouched."""
+    monkeypatch.delenv("AGENT_ROLES", raising=False)
+    g = _load_gateway(monkeypatch, agent_tokens="")
+    assert g.AUTH_CONFIGURED_AT_STARTUP is False
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _HealthProbeSession()
+    req = _health_request()
+    req.app = {"proxy": proxy}
+
+    body = json.loads(asyncio.run(g.handle_health(req)).body.decode())
+    assert "agent" not in body
+    assert "role" not in body
+    # Still the full payload for everyone, exactly as before.
+    for field in ("status", "version", "api_version", "daemon", "config",
+                  "embedder", "reranker", "llm"):
+        assert field in body, f"auth-off payload lost {field!r}"
+
+
+def test_the_identity_is_never_written_into_the_SHARED_health_cache(monkeypatch):
+    """The per-caller projection must not touch the cache every caller shares.
+
+    ⚠ THIS ASSERTS THE CACHE ITSELF, and the first version of this test did not
+    — it asserted a follow-up ANONYMOUS response and passed happily against an
+    in-place mutation, because the anonymous branch rebuilds its own three-key
+    dict and is immune. A guard that cannot fail is not a guard.
+
+    ⛔ AND THE HONEST REASON FOR THE COPY IS A CONTRACT, NOT A REPRODUCED LEAK.
+    `_health_probe_cached` has exactly one consumer today and both authenticated
+    callers overwrite the keys with their own values, so an in-place write is not
+    currently observable from outside — I tried to make it observable and could
+    not. What makes the copy right is that the cache is SHARED STATE whose own
+    docstring says the per-caller projection "is applied fresh on every call,
+    never cached itself", and a second consumer or a lazily-serialised response
+    would turn an unobservable write into a cross-identity disclosure. This test
+    exists so that stays true by construction rather than by that argument
+    having to be re-derived.
+
+    MUTATION CHECK: change the `{**checks, ...}` copy in `handle_health` to
+    `checks["agent"] = ...` and this dies.
+    """
+    g = _load_gateway(monkeypatch, agent_tokens="claude:tok_a4_cache")
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _HealthProbeSession()
+
+    authed = _health_request(agent_token="tok_a4_cache")
+    authed.app = {"proxy": proxy}
+    body = json.loads(asyncio.run(g.handle_health(authed)).body.decode())
+    assert body["agent"] == "claude"
+
+    cached = g._health_cache["checks"]
+    assert cached is not None, "the probe never populated the cache"
+    assert "agent" not in cached, "the caller's identity was written into the shared cache"
+    assert "role" not in cached

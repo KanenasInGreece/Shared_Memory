@@ -200,8 +200,21 @@ def test_phase7_check_keys_on_payload_shape_not_status_or_bare_auth_required_tru
     assert handler, "handle_health has moved or been renamed -- update this test"
     body = handler.group(0)
 
+    # ⚠ THE GATE'S SHAPE CHANGED IN v0.9.54 AND THIS GUARD FIRED, exactly as it
+    # is designed to: `handle_health` now resolves the identity ONCE into a
+    # local (it needs the name itself for the A-4 `agent`/`role` keys, not just
+    # its truthiness) and the slim gate tests that local. The CONTRACT is
+    # unchanged and is what these two lines pin: the identity is resolved only
+    # when auth is configured, and the slim payload is served exactly when auth
+    # is configured AND no identity resolved. Re-verified by hand before the
+    # regex was updated — which is the whole point of the guard failing loudly
+    # rather than matching loosely.
     assert re.search(
-        r"if AUTH_CONFIGURED_AT_STARTUP and not bool\(_safe_resolve_identity",
+        r"identity = _safe_resolve_identity\(request\) if AUTH_CONFIGURED_AT_STARTUP else None",
+        body,
+    ), "the identity resolution changed shape -- update the regex before trusting it"
+    assert re.search(
+        r"if AUTH_CONFIGURED_AT_STARTUP and not identity:",
         body,
     ), "the slim-response gate condition changed shape -- update the regex before trusting it"
     assert '"status": checks["status"], "version": checks["version"],' in body, (
