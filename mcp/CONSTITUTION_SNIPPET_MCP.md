@@ -24,27 +24,35 @@ regenerated per agent, and a regenerated block is one nothing can later
 find-and-replace. Everything install-specific lives in the MCP host's own
 config, never here.
 
-Marker-delimited and versioned (v1 below) so a later install/upgrade pass can
+Marker-delimited and versioned (v2 below) so a later install/upgrade pass can
 find-and-replace this exact block instead of duplicating it, and can detect
 drift by comparing the installed block's version marker against this file's --
 exactly as AGENTS.md Phase 8b/8c already do for the CLI snippet.
+(v1 -> v2: added an explicit trigger for history questions — "was X tested,
+tried, rejected or done" — because the v1 wording did not cover them and an
+agent answered one from a state instrument instead of the store, and that
+answer reached the public README.)
 
 ALWAYS propose this block for the operator to confirm or adjust before writing
 it into their agent's constitution file. Never write it silently, and never
 paraphrase it: copying it verbatim is what keeps the marker intact.
 -->
 
-<!-- shared-memory:mcp-constitution-snippet v1 -->
+<!-- shared-memory:mcp-constitution-snippet v2 -->
 ## Shared Memory — through your MCP tools
 The shared memory is a three-tier store other agents write to as well, reached
 through the `shared-memory` MCP server. It is the source of truth for project
-direction, prior decisions, and any claim that may since have been superseded;
-locally preloaded notes are supplementary scratch space, not authoritative.
+direction, prior decisions, any claim that may since have been superseded — or
+whether something was ever tested, tried, rejected or done: those are
+questions about history, and the current state of files can only confirm an
+answer, never give one; locally preloaded notes are supplementary scratch
+space, not authoritative.
 
 - **Search first, always.** Before reasoning about this workstation, its
-  projects, or a prior decision, call `hybrid_search_and_rerank`. This is a
-  precondition, not a judgement call to make first. If the results need more
-  graph depth than the automatic expansion returned, follow with `graph_query`
+  projects, a prior decision, or whether something was ever tested, tried,
+  rejected or done, call `hybrid_search_and_rerank`. This is a precondition,
+  not a judgement call to make first. If the results need more graph depth
+  than the automatic expansion returned, follow with `graph_query`
   (read-only Cypher) — depth is the reason to reach for it, not a second guess
   at the same question.
 - **Quote the `ref`, never a bare number.** A record id is unique only WITHIN
