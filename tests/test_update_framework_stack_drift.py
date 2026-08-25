@@ -327,3 +327,41 @@ def test_reconcile_stack_unexpected_failure_is_treated_as_unknown_not_fatal(tmp_
     assert "Update complete and VERIFIED" in out, out
     assert "stack reconcile REQUIRED" not in out, out
     assert "STACK UPDATE REQUIRED" not in out, out
+
+
+# ── The postflight-FAILED die() path carries the wording too ─────────────────
+
+def test_postflight_failed_die_line_carries_required_wording(tmp_path):
+    """The LAST line of a failed update is die()'s message. With drift present
+    it must carry 'stack reconcile REQUIRED' on that same line -- an operator
+    whose update just failed must not also miss that the stack moved."""
+    repo, log_path = _make_live_sandbox(tmp_path)
+    env = _stub_path_env(tmp_path, log_path)
+    _write_reconcile_stub(repo, log_path, rc=2)
+    _write_postflight_stub(repo, log_path, rc=1)
+
+    proc = _run_live(repo, env, "--skip-backup")
+    out = _strip_ansi(proc.stdout + proc.stderr)
+
+    assert proc.returncode != 0, out  # postflight failure still fails the update
+    failed_line = next(
+        line for line in out.splitlines() if "postflight FAILED" in line
+    )
+    assert "stack reconcile REQUIRED" in failed_line, (
+        f"the postflight-FAILED line did not carry 'stack reconcile REQUIRED':\n{failed_line!r}"
+    )
+    assert "STACK UPDATE REQUIRED" in out, out
+    assert _reconcile_invocations(log_path.read_text()) == ["reconcile_stack.sh --dry-run"]
+
+
+def test_postflight_failed_die_line_quiet_without_drift(tmp_path):
+    repo, log_path = _make_live_sandbox(tmp_path)
+    env = _stub_path_env(tmp_path, log_path)
+    _write_reconcile_stub(repo, log_path, rc=0)
+    _write_postflight_stub(repo, log_path, rc=1)
+
+    proc = _run_live(repo, env, "--skip-backup")
+    out = _strip_ansi(proc.stdout + proc.stderr)
+
+    assert proc.returncode != 0, out
+    assert "stack reconcile REQUIRED" not in out, out
