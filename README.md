@@ -44,8 +44,11 @@ life:
 - **Provenance throughout** — who decided, which AI assisted, on what evidence, under what
   conditions, and whether it held. Agent identity is verified by the server, never claimed by
   the client.
-- **A lightweight skill, a supporting framework.** The skill is portable — two files and a
-  token, installed into any agent on any machine. The framework is the support behind it, and
+- **Two front doors, one memory.** Coding agents come in through a portable skill — two files
+  and a token, installed into any agent on any machine. MCP hosts — LM Studio, or a coding agent
+  that speaks MCP — come in through a connector that is a first-class client of the same
+  gateway: same records, same provenance, same token model
+  ([§21](#21-the-mcp-install-any-mcp-host-one-connector)). The framework is the support behind both, and
   it can run remotely: one gateway host carries the stores, the models and the dreaming, while
   a project's state, vocabulary, reasoning and testing stay reachable by every session of every
   tool, over a tunnel from anywhere.
@@ -92,8 +95,9 @@ If you feel this is for you, the setup below costs less than an hour, most of it
 It can then be backed up, moved to another machine, or shared accross a network -- framework exists on a linux server, or main workstation, 
 while you access it on your VPN from a laptop on the road! Or run everything from your laptop if it meets min specs!
 
-**What you are setting up:** a memory shared by every AI tool on your machine —
-CLI agents and LM Studio alike. They talk only to one gateway on `127.0.0.1:8888`; the gateway
+**What you are setting up:** a memory shared by every AI tool on your machine — CLI agents
+through the skill, MCP hosts (LM Studio, MCP-speaking coding agents) through the connector.
+Both are clients of equal standing. They talk only to one gateway on `127.0.0.1:8888`; the gateway
 owns Postgres (vectors + facts) and Neo4j (the graph), and runs the REM/NREM sleep cycle that
 turns saved facts into shared knowledge.
 
@@ -137,111 +141,93 @@ it; on skew it names which side to upgrade.
 
 ### Resources & prerequisites
 
-**Hardware — three example configurations, not an exhaustive list.** Mixes are just as
-legitimate: one GPU for the encoders and another for a local LLM with an online provider
-beside them, or two online providers and no card at all — the `.env` states whatever you
-choose, and an agent following [AGENTS.md](AGENTS.md) can configure any shape here without
-improvising. The numbers are **minimums for the deployment alone** — databases, gateway,
-daemons, encoders, with headroom. The agents that will *use* the memory, and your desktop if
-this box has one, are not in them; budget those separately. Measurements come from a live
-install with a 1,300-record corpus on Fedora; macOS (where unified memory redraws the
-RAM/VRAM split entirely), Ubuntu or Windows/WSL shift the shares somewhat — which is exactly
-why these are example minimums, not prescriptions.
+Everything in this chapter is **measured on a machine we ran**, and says so; nothing here is a
+projection. The numbers are minimums for the **deployment alone** — databases, gateway, daemons,
+encoders, with headroom. The agents that *use* the memory, and a desktop if the box has one, are
+not in them: budget those separately. Two front doors share the deployment — the CLI skill and
+the MCP connector ([§21](#21-the-mcp-install-any-mcp-host-one-connector)) — and both are thin
+HTTP clients, so a client costs the host nothing beyond a Python process.
 
-**① No GPU at all.** The framework itself is a CPU/RAM affair: Postgres and Neo4j used
-~2.5 GB working memory here (the compose file caps them at 4 + 8 GB), the gateway and daemons
-~half a gigabyte — but the two CPU encoders cost far more at full-length payloads than a quick
-smoke test suggests. The reranker's steady state after the first few heavy searches is
-**~8 GiB RSS** — not a cap it can grow toward, that IS where it settles — and the embedder
-**~5–6 GiB**, both measured at the framework's own full 8192-token encoder geometry; with
-Neo4j + Postgres + the gateway alongside them that is **~16–17 GB** total, so give the box
-room. The reasoning LLM is an **online provider**: one `LLM_BACKENDS_JSON` entry, and the
-dreaming runs — and bills — externally; an overnight of dreaming measured ~18,000 tokens,
-under a cent. The privacy trade-off that entry represents, and the knobs that state your
-answer, live in [§17](#17-inference-the-encoders-and-the-reasoning-llm); the custody measures
-around the provider key — where it lives, what stands between the network and it — are in
-§17's tested-configuration passage, [§19](#19-tokens-and-agents) and [SECURITY.md](SECURITY.md).
-With no LLM configured nothing dies: saves, search and the graph keep working; summaries and
-insights queue durably until a backend appears. Searches on CPU encoders took ~30 seconds here.
-This configuration has also been verified end to end on the same deliberately modest VM — 6
-vCPUs of a 2013 Xeon E3-1230 v3, 30 GB disk, Ubuntu Server 26.04 with Docker — reprovisioned at
-**14 GB RAM** with the embedder served remotely: **2 GB of headroom held through a full search
-battery, zero OOM, zero restarts.** On that CPU, searches measured ~1.3 s in unranked vector
-order and ~70 s with the reranker scoring the full default payload (22 candidates, uncapped
-documents). `RERANK_MAX_DOC_CHARS`
-([§17](#17-inference-the-encoders-and-the-reasoning-llm)) is the dial between those two points.
-*Example minimum: 6–8 threads · 16 GB RAM with swap, 20 GB without · no GPU · 30 GB disk.*
+#### Minimums, by setup
 
-**② A small GPU (~4 GB).** Everything in ①, but the pair does not reliably fit together on a
-card this size: **both encoders held only at short (~1,500-token) payloads and collapsed at
-the framework's actual full-length texts.** The tested split moves just the embedder onto the
-card and leaves the reranker on CPU — one `.env` line each (`EMBEDDER_GPU_REPLICAS=1` /
-`RERANKER_CPU_REPLICAS=1`): the embedder needs **~0.7 GB VRAM** at full geometry, and host RAM
-sat at **13.5–13.9 GB** on a 15 GB box (swap +1 GB). Tested hardware: an Intel i5-9400F (2019,
-6 cores) + AMD Radeon RX 580 4 GB (2017). GPU support is whatever your encoder server supports:
-the shipped GPU pair is llama.cpp's Vulkan image — one image for Intel, AMD and NVIDIA, swap
-the tag for CUDA — and hosting the encoders outside the stack with vLLM, LM Studio or bare
-`llama-server` is equally legitimate; the gateway only needs endpoints that answer. On a larger
-card where the pair DOES both fit, `EMBEDDER_GPU_REPLICAS`/`RERANKER_GPU_REPLICAS` still move
-ONE encoder at a time instead of the pair together
-([§17](#17-inference-the-encoders-and-the-reasoning-llm)).
-The LLM stays online; ①'s caveat pointers apply unchanged.
-*Example minimum: 6–8 threads · 16 GB RAM · ≥2 GB VRAM · 30 GB disk.*
+| Setup | Where the pieces run | Least we ran it on — with the shipped defaults |
+|---|---|---|
+| **CPU only** | both encoders on CPU · reasoning LLM online, or none | 6–8 threads · **16 GB RAM** (the reranker settles at ~8 GiB RSS and the embedder at ~5–6 GiB at full 8192-token geometry; ~16–17 GB with the stores and gateway) · 30 GB disk |
+| **Small GPU (~4 GB)** | embedder on the card (**~0.7 GB VRAM**), reranker on CPU · LLM online | 6 cores · **16 GB RAM — stretched**: 13.5–13.9 GB in use on a 15 GB box, swap engaged · ≥2 GB VRAM · 30 GB disk. Both encoders on a card this size held only short (~1,500-token) payloads and collapsed at full-length texts — measured, do not try it |
+| **External LLM** | either encoder layout above · reasoning LLM at an online provider (`LLM_BACKENDS_JSON`, one entry) | adds nothing to the host: an overnight of dreaming measured ~18,000 tokens, under a cent. With no LLM configured nothing dies — saves, search and the graph keep working; summaries and insights queue until a backend appears |
+| **All external** *(partially tested)* | embedder served by another host on the LAN · LLM online · **reranker still local on CPU** | 6 vCPU · **14 GB RAM** · no GPU · 30 GB disk — holds with ~2 GB headroom. Only the embedder has been served remotely: the LAN host we used (LM Studio) exposes no rerank endpoint, so a fully external encoder pair is **untested** |
 
-**③ Everything local.** A local reasoning LLM, the cloud an option rather than a necessity —
-and it takes less than you might fear: **16 GB RAM and one 12 GB card run the whole thing.**
-With the model fully offloaded its host-side footprint measured a fifth of a gigabyte — VRAM
-is where it lives, and VRAM is dominated by model and context: our 14B at Q4 with a generous
-64K context measured 11.2 GB by itself, so on a single 12 GB card pair it with the encoders by
-trimming context, or run a 7–8B and fit everything with room to spare. With two cards the
-compromise states itself: the model takes the big one, the encoders the small one
-([§17](#17-inference-the-encoders-and-the-reasoning-llm)). Local content never leaves the
-machine unless a backend you marked `private_ok` exists to receive it. More RAM (32 GB) is
-comfort for a box that also runs your agents and a desktop — not a deployment requirement.
-*Example minimum: 8+ threads · 16 GB RAM · 8–12 GB VRAM · 40 GB disk.*
+**The hard floor under all four: ~8 GB RAM.** Neo4j checks its configured memory against
+physical RAM at startup; the shipped 2 GB heap + 2 GB pagecache refuse to boot under ~4 GB, and
+the CPU stack's working set lands near 6 GB. Measured, not projected: the 14 GB VM below was
+rebooted at 8 GB and passed the full install verification with the defaults untouched — 5.0 GB
+peak during the save burst, search stretching from ~7 to ~12 s under the tighter caches. What
+8 GB does *not* buy is sustained search: an overnight run — bulk ingest, the full dreaming cycle
+through to an insight, then a query barrage — grew the reranker's cache past what the box could
+give; the kernel killed it, Docker restarted it, and every search kept answering from vector
+order — unranked, with the Tier-3 summaries dropping out of the results. That degraded mode is
+the real price. For search-heavy use give it the 16 GB, a GPU for the encoders, or cap the
+reranker's cache (`RERANK_MAX_DOC_CHARS`, [§17](#17-inference-the-encoders-and-the-reasoning-llm)).
 
-**The hard floor under all three: ~8 GB RAM.** Neo4j checks its configured memory against
-physical RAM at startup and the shipped settings (2 GB heap + 2 GB pagecache) refuse to boot
-on less than ~4 GB — and the full CPU stack's measured working set lands near 6 GB — so 8 GB
-is the least that runs the defaults untouched. (Measured, no longer projected: the same VM
-that verified ① was rebooted at 8 GB and passed the full install verification with the
-defaults untouched — 5.0 GB peak during the save burst, search stretching from ~7 to ~12
-seconds under the tighter caches.) Know what 8 GB does and does not buy: an overnight
-stress run on that VM — bulk ingest, the full dreaming cycle through to an insight, then a
-query barrage — showed capture and dreaming entirely comfortable, while *sustained search*
-eventually grew the reranker's cache past what the box could give; the kernel killed it,
-Docker restarted it, and every search kept answering correctly from vector order — but
-unranked, and with the Tier-3 summaries dropping out of the results, which is the real
-price of degraded mode. For search-heavy use, give it the 16 GB of the example minimum, a
-GPU for the encoders, or a cap on the reranker's cache. Below 8 GB you are in ④ territory.
+**Everything local — a fourth shape we also run.** A local reasoning LLM beside the encoders:
+**16 GB RAM and one 12 GB card run the whole thing.** A fully offloaded model's host-side
+footprint measured a fifth of a gigabyte; VRAM is dominated by model and context — our 14B at Q4
+with a 64K context measured 11.2 GB by itself, so on one 12 GB card trim the context or run a
+7–8B and fit the encoders beside it. With two cards the split states itself: the model takes the
+big one, the encoders the small one. Local content never leaves the machine unless a backend you
+marked `private_ok` exists to receive it. *Example minimum: 8+ threads · 16 GB RAM · 8–12 GB
+VRAM · 40 GB disk.* More RAM (32 GB) is comfort for a box that also runs agents and a desktop.
 
-**④ Almost no machine at all.** To find out where the floor really is, we installed the
-framework on a 2018 budget laptop: two AMD cores, 3.2 GB of usable RAM, integrated graphics
-from the era when that phrase was an apology — deliberately far below every number in this
-chapter. It is not a supported configuration; it is a measured account of what breaks, in what
-order, and what the framework does about it.
+#### The machines behind the numbers
 
-The stack would not start as shipped — Neo4j checks its configured memory against physical RAM
-and refuses — and that refusal is the honest boundary of the defaults above. With the
-small-host values in `.env.example` (a quarter-gigabyte heap and pagecache), Neo4j runs in
-about 800 MB with both plugins loaded, Postgres asks for barely a hundred, and the whole
-storage layer fits. The CPU encoders were the real wall: on two slow cores a realistic
-three-kilobyte record blew past the save timeout — the gateway's own health endpoint diagnosed
-it, projecting the embedder at a fortieth of the assumed throughput. The surprise was the
-integrated GPU. The same Vulkan encoder image that serves discrete cards loaded BGE-M3 on a
-2015 Radeon iGPU and turned that failing save into an eleven-second success — the ~6× of
-configuration ② reproduced on the weakest plausible hardware. One caveat matters: an iGPU's
-memory *is* system RAM, pinned and unswappable, so the viable arrangement pairs the GPU
-embedder with the CPU reranker and lets searches degrade to vector order when the reranker
-falls behind — which the gateway does on its own, scores marked null rather than invented.
+Three deployment shapes are exercised continuously, and the table above is read off them. A
+*server* here means the gateway host; *clients* are wherever the skill or the MCP connector runs
+— the same box, or any machine with a route to `:8888` (a tunnel from a laptop on the road is a
+tested client path).
 
-What this buys you is not a production host. It is the knowledge that the floor is soft: every
-refusal on the way down was explicit, every degradation visible in telemetry, and a machine
-this small still saved, embedded at 1024 dimensions, synced both stores, and answered
-searches. If your hardware sits anywhere above the floor of configuration ①, nothing here is
-your problem — but if you ever wonder whether the old laptop in the drawer can host a memory,
-the answer is: with the knobs, barely, and it will tell you exactly which compromise it is
-making.
+- **Same workstation, server and clients together — the reference install.** Fedora, Intel Arc
+  B580 12 GB serving both encoders (`llama-server`, Vulkan, full 8192 geometry: 20 × 6K-char
+  documents reranked in 4.7 s), a second card for a local 14B reasoning model, 1,300-record
+  corpus, every CLI agent on the box as a client. The "everything local" numbers and the
+  CPU-only encoder footprints were measured here.
+- **Small GPU, external LLM — a 2019 desktop as server, an MCP coding agent as client on the
+  same host.** Intel i5-9400F (6 cores), 15 GB RAM + 16 GB swap, AMD Radeon RX 580 4 GB, Docker.
+  Embedder on the card (~672 MB VRAM; 500/3,000/6,000-char embeds in 0.06/0.19/0.38 s), reranker
+  on CPU (~106 s per 20 × 5.8K-char documents; RSS steps once from 3.9 to 7.9 GiB under a search
+  battery and stays there, swap +1 GB — a high-water mark, not a leak), reasoning at DeepSeek.
+  A night's battery: 21 saves at ~0.3 s each, REM and NREM through to completion, zero OOM,
+  zero restarts. opencode mounts the memory here through the MCP connector, read-only role.
+- **CPU only with a remote embedder — a deliberately old VM as server, remote clients.** 6 vCPU
+  of a 2013 Xeon E3-1230 v3, **14 GB RAM**, no swap, no GPU, 30 GB disk, Ubuntu Server 26.04
+  with Docker. Reranker on CPU, embedder served by an LM Studio box on the LAN (BGE-M3 Q8, the
+  same fixed model contract: cosine 0.9995–0.9997 against the local encoder on identical text;
+  ~5× faster on 6K-char inputs). Holds with 2.0–2.2 GB available through a full search battery,
+  zero OOM, zero restarts — at 11 GB the same VM restarted its reranker twice and lost the local
+  embedder to the OOM killer once, which is why the row says 14. Search: ~1.3 s in unranked
+  vector order, 79–81 s with the reranker scoring the full default payload. The client sizes
+  its wait from the gateway's own projection, so a slow host answers late rather than never.
+- **Below the floor — a 2018 budget laptop, for the record.** Two AMD cores, 3.2 GB usable RAM,
+  integrated graphics. Not a supported configuration; a measured account of what breaks and in
+  what order. The stack would not start as shipped (Neo4j's RAM check); with the small-host
+  values in `.env.example` the whole storage layer fits in about a gigabyte. The CPU encoders
+  were the wall — a 3 KB record blew past the save timeout, and the gateway's health endpoint
+  said so, projecting the embedder at a fortieth of the assumed throughput. The same Vulkan
+  encoder image then loaded BGE-M3 on the 2015 Radeon iGPU and turned that failing save into an
+  eleven-second success — with the caveat that an iGPU's memory *is* system RAM, pinned. Every
+  refusal on the way down was explicit and every degradation visible in telemetry.
+
+**Search latency is the number to watch on CPU hosts.** Reranking the full default payload
+(22 candidates, uncapped documents) costs ~5 s per document on a 6-core CPU and under a quarter
+second on a 12 GB card. `RERANK_MAX_DOC_CHARS` is the dial; the gateway reports its own capacity
+projection on `/health` and the client waits accordingly.
+
+#### To be tested
+
+- **WSL install** — To be tested...
+- **Podman install** — To be tested... -- will need different .yaml file
+  (the `podman-docker` shim and the design's independence from the daemon are discussed in
+  [§14](#14-os-prerequisites); no end-to-end install has been run).
+- **macOS** — unified memory redraws the RAM/VRAM split entirely; no run on record.
 
 **Disk, itemised (measured):** container images 1.8–3 GB (pgvector 0.6 + Neo4j 1.0 + llama.cpp
 0.2 CPU or 1.2 Vulkan) · encoder models 1.2 GB · database stores 0.8 GB at 1,300 records,
@@ -255,10 +241,10 @@ is).
 [`uv`](https://docs.astral.sh/uv/), installed from
 [Astral's own instructions](https://docs.astral.sh/uv/getting-started/installation/)
 (recommended — every command here uses it; or Python 3.11+ with `pip`) · a server for your
-reasoning LLM on `:5000`
-(LM Studio, or any OpenAI-compatible endpoint) — the embedder and reranker run as Docker
-containers from the compose file · at least one consumer: a CLI agent (Claude Code, Antigravity
-CLI, Grok, Codex CLI) and/or LM Studio via MCP.
+reasoning LLM on `:5000` (LM Studio, `llama-server`, or any OpenAI-compatible endpoint), or an
+online provider — the embedder and reranker run as Docker containers from the compose file · at
+least one consumer: a CLI agent through the skill (Claude Code, Antigravity CLI, Grok, Codex CLI)
+and/or an MCP host through the connector (LM Studio, opencode — [§21](#21-the-mcp-install-any-mcp-host-one-connector)).
 
 Both come from the vendors' own instructions rather than your distribution's packages — one baseline
 that behaves the same across Debian, Ubuntu and Fedora, and the default these steps assume. A distro
@@ -269,10 +255,13 @@ vendor's repository is its own exercise — do it before installing the framewor
 PATH of a service or an agent process — which is why an agent can fail to run the skill on a machine
 where you run it fine.
 
-**Reasoning LLM (your choice, on `:5000`):** any OpenAI-compatible local endpoint works. We run
-**google/gemma-4-12b** — tested for REM enrichment and NREM consolidation. Load it text-only;
-set `DREAM_TEMPERATURE=0.6` (Gemma degrades at lower temperatures). On the 8 GB tier a 7–8B
-model is the practical pick. Model choice affects graph quality — see
+**Reasoning LLM (your choice — local on `:5000`, or an online provider):** any OpenAI-compatible
+endpoint works. Tested end to end for REM enrichment and NREM consolidation: **google/gemma-4-12b**
+(load it text-only; set `DREAM_TEMPERATURE=0.6`, Gemma degrades at lower temperatures) and
+**Qwen3-14B** at Q4 locally, and **DeepSeek** (`deepseek-chat`) as an online provider through
+`LLM_BACKENDS_JSON` — a full dreaming run there measured 30 requests, ~106,000 tokens, under two
+minutes, zero failures. On the 8 GB tier a 7–8B model is the practical pick. Model choice affects
+graph quality — see
 [*GraphRAG's Hidden Cost*](https://www.linkedin.com/pulse/graphrags-hidden-cost-youre-always-paying-question-when-motsenigos-w81pc/).
 
 **Optional — [`nvtop`](https://github.com/Syllo/nvtop):** if installed, the dreaming daemons
