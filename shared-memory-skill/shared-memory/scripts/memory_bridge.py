@@ -37,7 +37,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.9.56"
+VERSION = "0.9.57"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v3: review-edges / label-edges require the gateway's /memory/relations/* routes.

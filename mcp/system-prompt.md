@@ -36,8 +36,10 @@ Everything after them is operational detail, not another rule.
 
 1. **Search first, always** — the full hierarchy is SEARCH-FIRST MANDATE below. In short: call
    `hybrid_search_and_rerank` before reasoning about this workstation, its projects, a prior
-   decision, or a claim that may since have been superseded. It is a precondition, not a
-   judgement call to make first.
+   decision, a claim that may since have been superseded, or whether something was ever tested,
+   tried, rejected or done — those are questions about history, and the current state of files
+   can only confirm an answer, never give one. It is a precondition, not a judgement call to make
+   first.
 2. **Quote the `ref`, never a bare number.** A record id is unique only WITHIN its table, so
    `fact:1234` and `summary:1234` are different records. Every result carries a qualified `ref` —
    pass that. A bare integer still resolves, against the facts table, which is exactly why one
@@ -58,7 +60,10 @@ as e.g. `rag-orchestrator` → `hybrid_search_and_rerank`, or `shared-memory_hyb
 — the same tool under the name your own tool list gives it.
 
 # SEARCH-FIRST MANDATE
-**Before answering any question about this workstation or its projects, call `rag-orchestrator` → `hybrid_search_and_rerank` first. No exceptions.**
+**Before answering any question about this workstation or its projects — including whether
+something was ever tested, tried, rejected or done: those are questions about history, and the
+current state of files can only confirm an answer, never give one — call `rag-orchestrator` →
+`hybrid_search_and_rerank` first. No exceptions.**
 
 1. **`rag-orchestrator` → `hybrid_search_and_rerank`** — always first. Returns Tier 3 community summaries + Tier 1 semantic hits + Neo4j graph expansion. If results are relevant, stop here.
 2. **`rag-orchestrator` → `graph_query`** — only if step 1 returned insufficient graph depth. Multi-hop paths and provenance chains that the automatic expansion did not reach: read-only Cypher, through the gateway.

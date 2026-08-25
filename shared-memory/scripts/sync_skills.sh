@@ -479,6 +479,24 @@ for dir in "${AGENTS[@]}"; do
     continue
   fi
 
+  # ⛔ A `skill`-KIND TARGET THAT ALREADY HOLDS A CONNECTOR IS REFUSED. An MCP
+  # walled directory registered in AGENT_INSTALLS with the two-field
+  # `name:path` form parses as kind `skill` forever (by design, backward
+  # compatibility), and the CLI package would then be copied ON TOP of the
+  # connector while the connector itself is never refreshed — measured on two
+  # hosts after v0.9.55: vector-skill.py stayed at 0.9.47 under a 0.9.56
+  # gateway and CONSTITUTION_SNIPPET_MCP.md never arrived (fact:1595). The
+  # presence of vector-skill.py is the tell; nothing else legitimately puts it
+  # in a skill directory.
+  if [ "$_dir_kind" != "mcp" ] && [ -f "$dir/vector-skill.py" ]; then
+    echo "⛔ REFUSING $dir — it holds vector-skill.py, so it is an MCP connector's"
+    echo "   walled directory, but AGENT_INSTALLS registers it as kind 'skill'"
+    echo "   (the two-field name:path form). The CLI package would be copied on"
+    echo "   top of the connector and the connector itself would never update."
+    echo "   Fix the entry in shared-memory/.env to  <name>:mcp:$dir/.env  and re-run."
+    continue
+  fi
+
   # ── Kind fork. Everything below this point is the CLI skill package path,
   # byte-for-byte the behaviour it has always had; an `mcp` target takes the
   # connector path instead and never sees a line of it. ───────────────────────
