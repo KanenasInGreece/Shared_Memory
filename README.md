@@ -737,8 +737,9 @@ Intel, AMD and NVIDIA), off by default — the choice is two `.env` lines, `GPU_
 and `CPU_ENCODER_REPLICAS=0`, and what you run never diverges from what ships. If you have one
 GPU to allocate, the compromise is plain: a card with enough VRAM for your reasoning model is
 usually better spent on the model backend, while a small card — 4 GB, say — is best spent on
-the embedder, which fits in about 2 GB and repays it in search latency — not the reranker, whose
-context window does not fit there (measured below). Your call, always. That
+the embedder, which needs about 0.7 GB at full geometry and repays it in search latency — not
+the reranker, whose 8192-token context does not fit beside it there (measured below). Your
+call, always. That
 pair-wise switch moves both encoders together; `EMBEDDER_GPU_REPLICAS`/`EMBEDDER_CPU_REPLICAS`
 and `RERANKER_GPU_REPLICAS`/`RERANKER_CPU_REPLICAS` move one at a time instead, for a card too
 small for both — measured on a 4 GB card, the embedder fits (671 MB) but the reranker's
@@ -747,7 +748,13 @@ On CPU, `RERANK_MAX_DOC_CHARS` bounds what the
 reranker scores — a concession, not a free win: capping at 2,000 chars kept about half of
 reranking's improvement in our measurements. Run the encoders however you please — Docker, bare
 `llama-server`, another machine; `EMBEDDER_URL` and `RERANKER_URL` say where the gateway looks,
-and the contract is only that an embedder actually answers at the embedder's address.
+and the contract is only that an embedder actually answers at the embedder's address. Serving
+the embedder from another machine is tested: an LM Studio host on the LAN carrying the same
+BGE-M3 returned vectors within cosine 0.9995–0.9997 of the local encoder's on identical text and
+answered ~5× faster on 6K-char inputs than a 6-vCPU local CPU container — with two limits worth
+knowing: that host exposes no rerank endpoint, so the reranker stayed local, and at 8 GB it
+evicts whichever model it is not using, so it can serve the embedder *or* a reasoning LLM, never
+both under dreaming's alternating calls.
 
 ```bash
 llama-server -m bge-m3-Q8_0.gguf --port 8070 --embedding -c 8192 -b 8192 -ub 8192
@@ -767,7 +774,10 @@ in a small local log, and is served on authenticated `/health`; postflight rende
 plain-language verdict. From it come three numbers: the projected worst-case rerank-stage
 service time, the sustainable queue depth against a tolerable wait
 (`CAPACITY_TOLERABLE_WAIT_S`, default 30 s — a measured, human-validated default, not a
-guess), and a proposed reranker memory limit, derived per host and never applied for you.
+guess), and a proposed reranker memory limit, derived per host and never applied for you. The client
+reads the same record: `memory_bridge.py` sizes its search wait from the gateway's projection,
+so on a slow CPU host a search answers late rather than being abandoned by its own timeout —
+the failure two test hosts showed before that was fixed.
 
 The division of labor is deliberate. **The probe measures what the machine can do. The
 policy defines how much latency you are willing to tolerate. The queue bound keeps operation
@@ -782,9 +792,15 @@ graceful fallback.
 
 The encoders are where a cheap GPU pays for itself, and we measured it rather than assumed it.
 Both models are 0.6 GiB Q8_0 files; with full offload and the 8K context above, the pair ran
-side by side on one mid-range card using roughly a gigabyte each including buffers — **any 4 GB
-card should hold both** (that last step is an estimate from the measured footprint, not yet run
-on such a card). Against the CPU containers on a 12-core desktop, end-to-end search fell from
+side by side on one 12 GB card using roughly a gigabyte each including buffers. **A 4 GB card
+does not hold both** — we thought it should, and then ran it: on a Radeon RX 580 the pair held
+only short (~1,500-token) payloads and collapsed at the framework's own full-length texts — the
+8192-token batch buffers overflowed device memory, ggml fell back to host RAM (reranker at
+7.9 GB resident, swap engaged) and every consolidation fold failed at the vectorise step while
+search still answered. The split that holds on that card is the embedder on the GPU (672 MB of
+VRAM, flat; 500/3,000/6,000-char embeds in 0.06/0.19/0.38 s) and the reranker on the CPU
+(~106 s per 20 × 5.8K-char documents on six cores) — one `.env` line each. Against the CPU
+containers on a 12-core desktop, end-to-end search fell from
 28–33 seconds to a **4.7-second mean over an 11-hour soak** — 102 searches, every 20 minutes,
 zero failures, zero drift — with the embedder at roughly 5× throughput and the reranker, which
 on a loaded CPU can time out outright, answering in under a second. Same vectors, too: CPU and
@@ -864,7 +880,9 @@ The VRAM-constrained configuration this section keeps gesturing at has now been 
 real: both local models stopped, one metered provider as the entire pool, overnight. The
 dreaming ran — enrichment routed to the provider and succeeded, folds formed — and the
 whole night, probes and debugging included, cost **eighteen thousand tokens: under a
-cent**. Enrichment of a typical record lands near one token per character of content, a
+cent**. A second provider on a second host confirmed the shape: one complete dreaming run —
+thirty requests, ~106,000 tokens, under two minutes, zero failures — and a night of saves,
+enrichment and consolidation through to insight on it. Enrichment of a typical record lands near one token per character of content, a
 few seconds of latency per call — numbers that do not matter to a background daemon and
 barely matter to a wallet. The security posture holds while it happens: the provider key
 lives in a mode-600 file outside the repo and is referenced by path (`*_API_KEY_FILE`),
