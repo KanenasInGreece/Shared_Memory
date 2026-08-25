@@ -247,10 +247,15 @@ user reports the vLLM encoders at 0% while the card is saturated (power draw 35 
 under load). Measured: the same load reads 99% when `nvtop` runs as root. The dreaming daemons read
 that figure through `gpu_load.py`, so an inference server in a container on a gated card is
 invisible to them. Grant `nvtop` the capabilities its README prescribes
-(`setcap cap_dac_read_search,cap_sys_ptrace,cap_perfmon+ep "$(command -v nvtop)"` — all three; the
-README's `cap_perfmon` alone is not enough, and the kernel ignores file capabilities under a systemd
-unit with `NoNewPrivileges=yes` — re-applied after every package update), or run the containers as
-the gateway's user, and confirm with `nvtop -s` under load.
+(`setcap cap_dac_read_search,cap_sys_ptrace,cap_perfmon+ep "$(command -v nvtop)"` — all three;
+nvtop's own README names only `cap_perfmon`, which is not enough, because listing another user's
+`/proc/<pid>/fd` is a permission check that `cap_dac_read_search` satisfies), re-applied after every
+package update, and confirm with `nvtop -s` under load. Two things about the *gateway's* copy of that
+reading: a unit with `NoNewPrivileges=yes` makes the kernel ignore file capabilities on anything it
+spawns, and a `systemd --user` unit cannot grant them itself (`AmbientCapabilities=` fails with
+`218/CAPABILITIES` — measured). So under a hardened user unit the reading reaches the daemons only if
+the containers run as the gateway's user (`--user`, plus the `render`/`video` groups), which is the
+cleaner fix in any case.
 
 #### The machines behind the numbers
 
