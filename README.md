@@ -728,6 +728,23 @@ The full schema — every table, label and relationship — is documented in
 [`shared-memory/Documentation/schema.md`](shared-memory/Documentation/schema.md). Graph label
 names are configurable in `shared-memory/ontology.yaml`; the machinery does not depend on your vocabulary.
 
+### Filtered search at scale — measured
+
+A `--project`/`--domain` filter on `POST /memory/search` was measured, on a throwaway copy,
+against a Seq Scan and an empty-result failure mode as the corpus grows. A majority-selectivity
+filter went from a 519 ms Seq Scan at 74,200 rows to 16 ms with an expression index; a
+minority-selectivity filter (1.8% of rows) went from 128 ms at 74,200 rows to 0 matching rows at
+296,800 rows under HNSW alone — the same filter, on the same data, silently wrong rather than
+slow, because HNSW hands over its candidate set before the post-filter narrows it. Migration
+`036_axis_filter_indexes.sql` adds a B-tree expression index on `(metadata->>'project')`, the
+column the filter actually compares against, plus a GIN index on the domains array (added by the
+same reasoning, unmeasured). The gateway sets `hnsw.iterative_scan = relaxed_order` per pooled
+connection whenever the installed pgvector is >= 0.8 — with it, the minority filter above returned
+22 rows in 217 ms at 296,800 rows instead of 0 — and reports the installed pgvector version and
+whether iterative scan is active on authenticated `/health`. The bundled compose image is pinned
+to `pgvector/pgvector:0.8.6-pg17` for that floor. CPU-host latencies are unmeasured — the numbers
+above are from the GPU-backed reference host.
+
 ## 17. Inference: the encoders and the reasoning LLM
 
 Two small encoders serve the write and search paths — BGE-M3 embeds, BGE-Reranker-v2-m3 ranks —
@@ -1111,7 +1128,6 @@ A working system with known edges, named rather than polished over:
 - **Authentication is bearer-token today.** Proof-of-possession keys — the person
   cryptographically authorising the agent — are designed and upcoming, with the audit trail
   promoted to a durable, non-repudiable record behind them.
-- **Scale:** axis filtering earns a database index as corpora grow; known and queued.
 
 ## 26. Direction
 
