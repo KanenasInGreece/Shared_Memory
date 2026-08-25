@@ -24,8 +24,15 @@
 --      instead of Postgres' key-only `DETAIL`.
 --   4. An apply-time SELF-CHECK against the SAME fixture list the Python side
 --      is asserted on, so the two definitions cannot drift apart silently.
---   5. CONTINUOUS enforcement of the alias rules on the KEY, by extending the
---      trigger functions migrations 024 and 028 already own.
+--   5. Enforcement of the alias rules on the KEY, in BOTH directions: an
+--      apply-time pre-check over the rows ALREADY in the tables, and continuous
+--      enforcement of every future write, by extending the trigger functions
+--      migrations 024 and 028 already own. They are complements — a trigger
+--      cannot see a violation that predates it, and a pre-check cannot see one
+--      written tomorrow.
+--   6. A pre-check for any legacy name that normalizes to the EMPTY string,
+--      before the trigger that would reject it can fire, so the operator gets a
+--      message about the row they hold rather than one aimed at a caller.
 --
 -- ⛔ WHY A TRIGGER-MAINTAINED COLUMN AND NOT A UNIQUE FUNCTIONAL INDEX. The
 -- functional index was the first shape of this migration and it was wrong twice
@@ -74,14 +81,22 @@
 -- the data collides, but because the DESIGN allows what it would refuse. What
 -- must actually hold is narrower: within one axis and one scope, a key must
 -- never resolve to two different canonicals. That is a cross-table rule no
--- constraint can see, so it is enforced CONTINUOUSLY by the trigger functions
--- 024 and 028 already own, extended here to compare on the key.
+-- constraint can see, so it is enforced in two places instead: a pre-check over
+-- the EXISTING rows (which an `ADD CONSTRAINT` would have done for free, had
+-- there been a constraint to add) and the trigger functions 024 and 028 already
+-- own, extended here to compare on the key for every future write.
 --
 -- MEASURED on the live deployment 2026-08-25, BEFORE this migration: 38
--- projects, 18 active project aliases, 0 key collisions; `project_domains` 0
+-- projects, 18 active project aliases, 0 key COLLISIONS; `project_domains` 0
 -- collisions within any project; `domain_aliases` 0 rows. Every statement below
 -- is expected to be a no-op on that data — and if it is not, that is the news,
 -- which is why nothing here is written to skip quietly.
+--
+-- ⚠ WHAT THAT MEASUREMENT DOES **NOT** COVER, said plainly rather than left to
+-- be assumed: nobody counted registered names that normalize to the EMPTY
+-- string, on that deployment or any other. The pre-check for them below is
+-- therefore written to be answerable rather than to confirm an expectation —
+-- fact:1338, a number nobody measured is not a number this file may claim.
 --
 -- IDEMPOTENT: every statement is re-runnable. The backfill is an UPDATE
 -- restricted to rows whose key is already wrong, so a re-run touches zero rows.
@@ -160,6 +175,65 @@ $$;
 -- and NOT NULL is added below once every row has a value.
 ALTER TABLE projects        ADD COLUMN IF NOT EXISTS normalized_key text;
 ALTER TABLE project_domains ADD COLUMN IF NOT EXISTS normalized_key text;
+
+-- ─── The unnameable-row pre-check — BEFORE the trigger can ever fire ─────────
+--
+-- ⛔ IT RUNS HERE, ABOVE THE TRIGGER, AND THE POSITION IS THE WHOLE POINT. A
+-- legacy name every character of which is punctuation — `---`, `...`, `___` —
+-- normalizes to the empty string. Nothing stopped one being registered:
+-- `projects` carries no blank-name CHECK at all (only the sentinel reservation),
+-- and `project_domains`' `btrim(name) <> ''` does not catch `---`, which is not
+-- blank. Left to the backfill, such a row fires the new BEFORE trigger and
+-- aborts the migration with the trigger's message — which is written for a
+-- CALLER registering a name ("name it with at least one letter or digit") and is
+-- useless to an OPERATOR holding a row that already exists and has records
+-- filed under it.
+--
+-- So the row is found first and reported the way a collision is (see the
+-- collision pre-check below, which established this shape): the name, the id,
+-- what has to be decided, and the query that lists the rest. And, as there, it
+-- REPAIRS NOTHING — renaming a project is an operation with a ledger, never a
+-- side effect of a migration.
+--
+-- ⚠ HOW MANY SUCH ROWS EXIST HERE IS NOT MEASURED. The header's "expected to be
+-- a no-op" covers key COLLISIONS, which were counted; no count of names keying
+-- to empty was taken on any deployment, and this check does not claim one
+-- (fact:1338 — an unmeasured number is a measurement claim in disguise). It is
+-- written to be a no-op if there are none and to be answerable if there are.
+DO $$
+DECLARE
+    bad_name text;
+    bad_id   bigint;
+BEGIN
+    SELECT name, id INTO bad_name, bad_id
+      FROM projects WHERE axis_normalize(name) = ''
+     ORDER BY id LIMIT 1;
+    IF bad_name IS NOT NULL THEN
+        RAISE EXCEPTION
+            'project % (id %) normalizes to the empty string — every character '
+            'is punctuation, whitespace or similar, so it has no axis key and '
+            'cannot be told apart from any other such name. Rename it to '
+            'something with at least one letter or digit (a deliberate operation '
+            'with its own tool and ledger), or retire it, then re-run. List them '
+            'all with: SELECT id, name FROM projects WHERE '
+            'axis_normalize(name) = '''' ORDER BY id;',
+            bad_name, bad_id;
+    END IF;
+
+    SELECT name, id INTO bad_name, bad_id
+      FROM project_domains WHERE axis_normalize(name) = ''
+     ORDER BY id LIMIT 1;
+    IF bad_name IS NOT NULL THEN
+        RAISE EXCEPTION
+            'section % (id %) normalizes to the empty string — every character '
+            'is punctuation, whitespace or similar, so it has no axis key. '
+            'Rename it to something with at least one letter or digit, or retire '
+            'it, then re-run. List them all with: SELECT id, project_id, name '
+            'FROM project_domains WHERE axis_normalize(name) = '''' ORDER BY id;',
+            bad_name, bad_id;
+    END IF;
+END;
+$$;
 
 -- ONE function for both registries. They enforce the same rule on the same
 -- column, and two functions would be two rules the day one of them is edited —
@@ -288,6 +362,133 @@ ALTER TABLE project_domains
 ALTER TABLE project_domains
     ADD CONSTRAINT project_domains_normalized_key_unique
     UNIQUE (project_id, normalized_key);
+
+-- ─── The alias rules over EXISTING rows — the other half, restored ───────────
+--
+-- ⛔ A TRIGGER AND A PRE-CHECK ARE COMPLEMENTS, NOT SUBSTITUTES, and an earlier
+-- draft of this migration traded one away. The widened triggers below fire on
+-- WRITES: they stop a colliding alias being created tomorrow and say nothing
+-- about one that is already in the table. A deployment holding a violating pair
+-- would have applied this migration cleanly and kept the violation — silently,
+-- until someone happened to rewrite that row — while the gateway's by-key
+-- resolution answered it by luck in the meantime.
+--
+-- The registries do not have this gap: they get a backfill, a pre-check AND an
+-- `ADD CONSTRAINT`, and adding a constraint VALIDATES the rows already there.
+-- Aliases have no constraint to add — the key rule is cross-table, which is why
+-- it lives in a trigger at all — so the existing-row half has to be this block.
+--
+-- Four shapes, the two ambiguities on each axis, each reported the way a
+-- collision is (C-5's pattern): both names, the shared key, what has to be
+-- decided, and the query that lists the rest. Nothing is repaired: which
+-- spelling means what is a data judgement with records hanging off it.
+DO $$
+DECLARE
+    a_name text;
+    b_name text;
+    k      text;
+BEGIN
+    SELECT a1.name, a2.name, axis_normalize(a1.name)
+      INTO a_name, b_name, k
+      FROM project_aliases pa1
+      JOIN aliases a1 ON a1.id = pa1.alias_id
+      JOIN project_aliases pa2 ON pa2.active AND pa2.id > pa1.id
+                              AND pa2.project_id <> pa1.project_id
+      JOIN aliases a2 ON a2.id = pa2.alias_id
+                     AND axis_normalize(a2.name) = axis_normalize(a1.name)
+     WHERE pa1.active
+     ORDER BY a1.name, a2.name
+     LIMIT 1;
+    IF a_name IS NOT NULL THEN
+        RAISE EXCEPTION
+            'active project aliases % and % both normalize to the axis key % but '
+            'point at DIFFERENT projects, so that key already resolves two ways '
+            'and by-key resolution would answer by luck. Retire whichever mapping '
+            'is wrong (set it inactive, with a reason), then re-run. '
+            'List every such pair with: SELECT a1.name, a2.name, axis_normalize(a1.name) '
+            'FROM project_aliases pa1 JOIN aliases a1 ON a1.id = pa1.alias_id '
+            'JOIN project_aliases pa2 ON pa2.active AND pa2.id > pa1.id AND '
+            'pa2.project_id <> pa1.project_id JOIN aliases a2 ON a2.id = '
+            'pa2.alias_id AND axis_normalize(a2.name) = axis_normalize(a1.name) '
+            'WHERE pa1.active ORDER BY 1,2;',
+            a_name, b_name, k;
+    END IF;
+
+    SELECT a.name, p.name, axis_normalize(a.name)
+      INTO a_name, b_name, k
+      FROM project_aliases pa
+      JOIN aliases a ON a.id = pa.alias_id
+      JOIN projects p ON p.id <> pa.project_id
+                     AND axis_normalize(p.name) = axis_normalize(a.name)
+     WHERE pa.active
+     ORDER BY a.name, p.name
+     LIMIT 1;
+    IF a_name IS NOT NULL THEN
+        RAISE EXCEPTION
+            'active alias % normalizes to the axis key %, which is also the key '
+            'of the registered project % that it does NOT point at — one key, '
+            'two answers (024/A1, now on the key rather than only the exact '
+            'string). Decide which the name means and retire the other mapping, '
+            'then re-run. List every such pair with: SELECT a.name, p.name, '
+            'axis_normalize(a.name) FROM project_aliases pa JOIN aliases a ON '
+            'a.id = pa.alias_id JOIN projects p ON p.id <> pa.project_id AND '
+            'axis_normalize(p.name) = axis_normalize(a.name) WHERE pa.active '
+            'ORDER BY 1,2;',
+            a_name, k, b_name;
+    END IF;
+
+    SELECT a1.name, a2.name, axis_normalize(a1.name)
+      INTO a_name, b_name, k
+      FROM domain_aliases da1
+      JOIN aliases a1 ON a1.id = da1.alias_id
+      JOIN domain_aliases da2 ON da2.active AND da2.id > da1.id
+                             AND da2.project_id = da1.project_id
+                             AND da2.domain_id <> da1.domain_id
+      JOIN aliases a2 ON a2.id = da2.alias_id
+                     AND axis_normalize(a2.name) = axis_normalize(a1.name)
+     WHERE da1.active
+     ORDER BY a1.name, a2.name
+     LIMIT 1;
+    IF a_name IS NOT NULL THEN
+        RAISE EXCEPTION
+            'active domain aliases % and % of one project both normalize to the '
+            'axis key % but point at DIFFERENT sections, so that key already '
+            'resolves two ways. Retire whichever mapping is wrong, then re-run. '
+            'List every such pair with: SELECT a1.name, a2.name, '
+            'axis_normalize(a1.name) FROM domain_aliases da1 JOIN aliases a1 ON '
+            'a1.id = da1.alias_id JOIN domain_aliases da2 ON da2.active AND '
+            'da2.id > da1.id AND da2.project_id = da1.project_id AND '
+            'da2.domain_id <> da1.domain_id JOIN aliases a2 ON a2.id = '
+            'da2.alias_id AND axis_normalize(a2.name) = axis_normalize(a1.name) '
+            'WHERE da1.active ORDER BY 1,2;',
+            a_name, b_name, k;
+    END IF;
+
+    SELECT a.name, d.name, axis_normalize(a.name)
+      INTO a_name, b_name, k
+      FROM domain_aliases da
+      JOIN aliases a ON a.id = da.alias_id
+      JOIN project_domains d ON d.project_id = da.project_id
+                            AND d.id <> da.domain_id
+                            AND axis_normalize(d.name) = axis_normalize(a.name)
+     WHERE da.active
+     ORDER BY a.name, d.name
+     LIMIT 1;
+    IF a_name IS NOT NULL THEN
+        RAISE EXCEPTION
+            'active domain alias % normalizes to the axis key %, which is also '
+            'the key of the registered section % of the same project that it '
+            'does NOT point at — one key, two answers (028/A1, on the key). '
+            'Decide which the name means and retire the other mapping, then '
+            're-run. List every such pair with: SELECT a.name, d.name, '
+            'axis_normalize(a.name) FROM domain_aliases da JOIN aliases a ON '
+            'a.id = da.alias_id JOIN project_domains d ON d.project_id = '
+            'da.project_id AND d.id <> da.domain_id AND axis_normalize(d.name) '
+            '= axis_normalize(a.name) WHERE da.active ORDER BY 1,2;',
+            a_name, k, b_name;
+    END IF;
+END;
+$$;
 
 -- ─── The alias rules, on the KEY, enforced CONTINUOUSLY ──────────────────────
 --

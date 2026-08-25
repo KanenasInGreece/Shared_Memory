@@ -3857,7 +3857,33 @@ class MemoryCoordinator:
         deliberate. Work legitimately starts with an idea, a fact, and a decision
         to act on it, before any project exists. What must not happen is that a
         project starts because a name was mistyped.
+
+        THREE checks now. The first is newer and cheaper than both, and it is the
+        gateway-side twin of a rule the DATABASE started enforcing in migration
+        035: a name every character of which is punctuation keys to the empty
+        string, so it can be told apart from nothing, and the registry's
+        BEFORE-write trigger RAISEs on it. Without this the refusal still
+        happened — as a raw Postgres error surfacing to the caller as a 5xx,
+        which is not a refusal an agent can act on. A gate the database enforces
+        and the ingress does not is a 500 waiting to be reported as an outage.
         """
+        # ⛔ FIRST, AND BEFORE ANY QUERY. It needs no registry: a name with no
+        # key is not a near-match of anything, cannot be confirmed distinct from
+        # anything, and has nothing to propose.
+        if not axis_key(supplied):
+            log.info("project registry: refused %r — normalizes to nothing",
+                     supplied)
+            return {
+                "status": "error",
+                "error": "project_unnameable",
+                "message": (
+                    f"project {_short(supplied)} normalizes to nothing — every "
+                    "character is punctuation, whitespace or similar, so there is "
+                    "no spelling left to register and it could never be told "
+                    "apart from any other such name. Name the project with at "
+                    "least one letter or digit."
+                ),
+            }
         async with self._acquire() as conn:
             rows = await conn.fetch(CONFUSABLE_SQL, supplied,
                                     CONFUSABLE_SIMILARITY, PROPOSAL_LIMIT)
@@ -4110,7 +4136,25 @@ class MemoryCoordinator:
         is a SPELLING of it and no confirmation can make it distinct; a merely
         confusable name is held once and can be confirmed by naming the section
         it means to differ from.
+
+        Plus the same unnameable check, for the same reason: migration 035's
+        BEFORE-write trigger covers `project_domains` as well, so without a
+        gateway-side twin an all-punctuation section name reaches the database
+        and comes back as a 5xx instead of a refusal the caller can answer.
         """
+        if not axis_key(name):
+            log.info("domain registry: refused %r in project %r — normalizes to "
+                     "nothing", name, project)
+            return {
+                "status": "error",
+                "error": "domain_unnameable",
+                "message": (
+                    f"domain {_short(name)} normalizes to nothing — every "
+                    "character is punctuation, whitespace or similar, so there is "
+                    "no spelling left to register. Name the section with at least "
+                    "one letter or digit."
+                ),
+            }
         async with self._acquire() as conn:
             rows = await conn.fetch(DOMAIN_CONFUSABLE_SQL, project_id, name,
                                     DOMAIN_CONFUSABLE_SIMILARITY,

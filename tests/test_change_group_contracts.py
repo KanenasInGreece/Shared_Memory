@@ -198,6 +198,25 @@ def _chain_drops() -> str:
     return "\n".join(_sql_body(f) for f in _migration_files())
 
 
+def _survives_the_chain(create_re: str, drop_re: str) -> bool:
+    """Does the chain LEAVE this object in place? Last statement about it wins.
+
+    ⛔ "DROPPED ANYWHERE" IS THE WRONG TEST, and the difference is not academic:
+    035 writes `DROP CONSTRAINT IF EXISTS x` immediately followed by
+    `ADD CONSTRAINT x`, which is how a constraint is re-added idempotently — a
+    guard reading only for a DROP would conclude x is gone and never check that
+    the artefact carries it. 009 does the same with an index it re-creates
+    tighter. So the whole chain is scanned in file order and the LAST statement
+    about the name decides, exactly as replaying the migrations would.
+    """
+    chain = _chain_drops()
+    events = [(m.start(), True) for m in re.finditer(create_re, chain, re.I)]
+    events += [(m.start(), False) for m in re.finditer(drop_re, chain, re.I)]
+    if not events:
+        return False
+    return max(events)[1]
+
+
 def test_every_index_a_migration_creates_reaches_the_fresh_install():
     """GROUP 4. The table guard above keys on `CREATE TABLE`, so a migration that
     creates no table — an index, a function, a column, a constraint — passes it
@@ -226,7 +245,10 @@ def test_every_index_a_migration_creates_reaches_the_fresh_install():
                 r"(?:\s+IF NOT EXISTS)?\s+([a-z0-9_]+)\s+ON\s+([a-z0-9_.]+)"
                 r"[^(]*\(([^)]*)\)", body, re.I):
             index, table, cols = match.group(1), match.group(2), match.group(3)
-            if re.search(rf"DROP INDEX(?:\s+IF EXISTS)?\s+{index}\b", chain, re.I):
+            if not _survives_the_chain(
+                    rf"CREATE(?:\s+UNIQUE)?\s+INDEX(?:\s+CONCURRENTLY)?"
+                    rf"(?:\s+IF NOT EXISTS)?\s+{index}\b",
+                    rf"DROP INDEX(?:\s+IF EXISTS)?\s+{index}\b"):
                 continue
             table = table.split(".")[-1]
             if any(re.search(
@@ -245,6 +267,45 @@ def test_every_index_a_migration_creates_reaches_the_fresh_install():
     )
 
 
+def test_every_unique_constraint_a_migration_adds_reaches_the_fresh_install():
+    """GROUP 4. The third carrier of an invariant, and the one this schema
+    actually uses now.
+
+    ⛔ WHY IT IS SEPARATE FROM THE INDEX GUARD, rather than folded into it. The
+    index guard matches `CREATE … INDEX`, and migration 035 — whose entire
+    purpose is a uniqueness invariant — contributes ZERO matches to it, because
+    it carries that invariant as `ADD CONSTRAINT … UNIQUE` on a trigger-maintained
+    column. A guard that covers "the way invariants used to be written" and not
+    "the way this one is" is a guard whose green means nothing about the change
+    that prompted it.
+
+    ⚠ The artefact spells them differently, and that is expected, not a bug: the
+    generator re-emits a UNIQUE constraint as `CREATE UNIQUE INDEX` of the SAME
+    NAME (see verify_schema_init.py's header). So the NAME is what is checked —
+    behaviour, not catalogue rows.
+    """
+    init = _schema_init_body()
+    missing = []
+    for fname in _migration_files():
+        body = _sql_body(fname)
+        for name in re.findall(
+                r"ADD\s+CONSTRAINT\s+([a-z0-9_]+)\s+UNIQUE", body, re.I):
+            if not _survives_the_chain(
+                    rf"ADD\s+CONSTRAINT\s+{name}\s+UNIQUE",
+                    rf"DROP\s+CONSTRAINT(?:\s+IF EXISTS)?\s+{name}\b"):
+                continue
+            if not re.search(rf"\b{name}\b", init, re.I):
+                missing.append(f"{name} (from {fname})")
+    assert not missing, (
+        f"these UNIQUE constraints exist in the migration chain but not in "
+        f"schema_init.sql: {sorted(set(missing))}. A fresh install would accept "
+        "rows the live database refuses — and on this schema a unique constraint "
+        "is how an axis invariant is carried, not a lookup speed. Run "
+        "migrations/generate_schema_init.py, then PROVE it with "
+        "verify_schema_init.py."
+    )
+
+
 def test_every_function_a_migration_creates_reaches_the_fresh_install():
     """GROUP 4. The same gap, for functions — and this is the half that bites
     hardest, because a function is what a trigger and an index EXPRESSION both
@@ -259,7 +320,9 @@ def test_every_function_a_migration_creates_reaches_the_fresh_install():
         for fn in re.findall(
                 r"CREATE(?:\s+OR\s+REPLACE)?\s+FUNCTION\s+([a-z0-9_]+)\s*\(",
                 body, re.I):
-            if re.search(rf"DROP FUNCTION(?:\s+IF EXISTS)?\s+{fn}\b", chain, re.I):
+            if not _survives_the_chain(
+                    rf"CREATE(?:\s+OR\s+REPLACE)?\s+FUNCTION\s+{fn}\s*\(",
+                    rf"DROP FUNCTION(?:\s+IF EXISTS)?\s+{fn}\b"):
                 continue
             if not re.search(rf"FUNCTION\s+(?:public\.)?{fn}\s*\(", init, re.I):
                 missing.append(f"{fn}() (from {fname})")

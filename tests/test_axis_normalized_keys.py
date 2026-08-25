@@ -446,6 +446,44 @@ async def test_an_exact_section_alias_declared_NEW_is_refused_too():
 
 
 @pytest.mark.asyncio
+async def test_declaring_an_ALL_PUNCTUATION_project_is_refused_at_INGRESS():
+    """⛔ THE GATEWAY-SIDE TWIN OF A DATABASE RULE. Migration 035's BEFORE-write
+    trigger RAISEs on a name that normalizes to nothing, so without this the
+    refusal still happens — as a raw Postgres error surfacing to the caller as a
+    5xx, which is not something an agent can answer. A gate the database enforces
+    and the ingress does not is a 500 waiting to be reported as an outage.
+
+    MUTATION CHECK: delete the `if not axis_key(supplied)` block in
+    `_new_project_refusal` and this dies — `---` registers."""
+    c = _project_coord(registered=("orbit-relay",))
+    err = await c._project_ingress_error(
+        {"source": "c", "project": "---", "new_project": True}, "c", {})
+    assert err["error"] == "project_unnameable"
+    c._register_project.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_unnameable_refusal_needs_no_registry_at_all():
+    """It runs before any query: a name with no key is not a near-match of
+    anything, cannot be confirmed distinct from anything, and has nothing to
+    propose. So it must still refuse when the registry is unreachable."""
+    c = _project_coord(registered=("orbit-relay",))
+    c._acquire = MagicMock(side_effect=RuntimeError("pool is gone"))
+    err = await c._project_ingress_error(
+        {"source": "c", "project": " ... ", "new_project": True}, "c", {})
+    assert err["error"] == "project_unnameable"
+
+
+@pytest.mark.asyncio
+async def test_declaring_an_ALL_PUNCTUATION_section_is_refused_at_INGRESS():
+    c = _domain_coord(registered=("graph-quality",))
+    err = await c._domain_ingress_error(
+        {"project": "p", "domain": "___", "new_domain": True}, "c", {})
+    assert err["error"] == "domain_unnameable"
+    c._register_domain.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_a_genuinely_new_project_still_registers_with_no_extra_step():
     """The guard must stay quiet for the ordinary case, or it trains the reflex
     to override it."""
@@ -984,11 +1022,12 @@ def test_the_alias_rules_are_enforced_CONTINUOUSLY_not_at_apply_time():
     assert "CREATE OR REPLACE FUNCTION assert_domain_alias_namespaces_disjoint()" in sql
     assert "axis_normalize(p.name) = axis_normalize(v_alias)" in sql
     assert "axis_normalize(a.name) = axis_normalize(NEW.name)" in sql
-    # The one-shot version is gone: its two RAISEs no longer exist, and the only
-    # DO blocks left are the fixture self-check and the collision pre-check.
-    assert "active project aliases normalizing to" not in sql
-    assert "active domain aliases normalizing to" not in sql
-    assert sql.count("DO $$") == 2
+    # ⚠ AND THE PRE-CHECK STANDS BESIDE THEM, not instead of them — see
+    # `test_the_alias_rules_ALSO_validate_the_rows_already_in_the_tables`. Four
+    # DO blocks: the fixture self-check, the unnameable-row check, the registry
+    # collision check, and the alias check over existing rows.
+    assert sql.count("DO $$") == 4
+    assert sql.count("CREATE TRIGGER") == 2   # only 035's own two
 
 
 def test_the_key_rule_excludes_the_aliass_own_target_and_the_exact_rule_does_not():
@@ -1003,6 +1042,64 @@ def test_the_key_rule_excludes_the_aliass_own_target_and_the_exact_rule_does_not
     # 024's and 028's original exact-string rules survive verbatim beside it.
     assert "alias % is also a registered project" in sql
     assert "alias % is also a registered domain of the same project" in sql
+
+
+def test_the_alias_rules_ALSO_validate_the_rows_already_in_the_tables():
+    """⛔ A TRIGGER AND A PRE-CHECK ARE COMPLEMENTS, NOT SUBSTITUTES, and an
+    earlier draft traded one away. The widened triggers fire on WRITES: they stop
+    a colliding alias being created tomorrow and say nothing about one already in
+    the table. A deployment holding a violating pair would have applied this
+    migration cleanly and kept the violation, silently, while the gateway's
+    by-key resolution answered it by luck.
+
+    The registries have no such gap — `ADD CONSTRAINT` validates existing rows.
+    Aliases have no constraint to add (the rule is cross-table), so the
+    existing-row half has to be an explicit pre-check.
+    """
+    sql = _migration_sql()
+    assert "The alias rules over EXISTING rows" in sql
+    # All four shapes: the two ambiguities on each axis.
+    assert "active project aliases % and % both normalize to the axis key %" in sql
+    assert "which is also the key of the registered project %" in sql.replace(
+        "'\n            '", "")
+    assert "active domain aliases % and % of one project both normalize" in sql
+    assert "the key of the registered section %" in sql.replace(
+        "'\n            '", "")
+    # C-5's shape: every one names the pair and hands over the query.
+    assert sql.count("List every such pair with") >= 6
+
+
+def test_each_alias_pre_check_repairs_nothing():
+    """Which spelling means what is a data judgement with records hanging off
+    it — never something a migration may answer by picking."""
+    sql = _migration_sql()
+    assert "Retire whichever mapping is wrong" in sql
+    assert "Decide which the name means and retire the other mapping" in sql
+
+
+def test_a_legacy_name_with_an_EMPTY_key_fails_before_the_trigger_can_fire():
+    """⛔ THE POSITION IS THE POINT. Left to the backfill, a legacy `---` fires
+    the new BEFORE trigger and aborts with the TRIGGER's message — written for a
+    caller registering a name ("name it with at least one letter or digit") and
+    useless to an operator holding a row that already exists with records filed
+    under it. So the row is found first, and reported the way a collision is."""
+    sql = _migration_sql()
+    pre_check = sql.index("The unnameable-row pre-check")
+    trigger_fn = sql.index("CREATE OR REPLACE FUNCTION axis_registry_before_write()")
+    backfill = sql.index("UPDATE projects\n   SET normalized_key")
+    assert pre_check < trigger_fn < backfill
+    assert "normalizes to the empty string" in sql
+    assert "SELECT id, name FROM projects WHERE " in sql
+    assert "SELECT id, project_id, name " in sql
+
+
+def test_the_empty_key_population_is_stated_as_UNMEASURED():
+    """⚠ fact:1338 — the header's "expected to be a no-op" was measured for key
+    COLLISIONS and for nothing else. A file that let that sentence cover the
+    empty-key case too would be claiming a number nobody took."""
+    sql = _migration_sql()
+    assert "nobody counted registered names that normalize to the EMPTY" in sql
+    assert "fact:1338" in sql
 
 
 def test_there_is_deliberately_no_key_unique_constraint_on_the_shared_alias_table():
