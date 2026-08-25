@@ -2327,6 +2327,15 @@ async def handle_pool_status(request: web.Request) -> web.Response:
 # the same backends that serve traffic, so it is deliberately infrequent.
 CAPABILITY_PROBE_INTERVAL_S = float(
     os.environ.get("CAPABILITY_PROBE_INTERVAL_S", "600"))
+# How soon the probe re-tries after a FAILING probe (backend unreachable,
+# non-2xx, or an exception): a backend that is not serving costs nothing to
+# ping, and waiting the full interval turned a 60 s encoder cold-start into a
+# ten-minute window of `degraded` and empty searches (fact:1609). A `too_slow`
+# backend IS serving, so it keeps the full interval — a fast re-probe there
+# would add load to exactly the encoder that is struggling. Unmeasured
+# default; bounds the post-recovery blind window to one retry interval.
+CAPABILITY_PROBE_RETRY_S = float(
+    os.environ.get("CAPABILITY_PROBE_RETRY_S", "15"))
 # The probe payload. Small enough to be cheap, large enough to be representative
 # — a one-token ping would measure nothing about the cost that actually matters.
 CAPABILITY_PROBE_DOCS = int(os.environ.get("CAPABILITY_PROBE_DOCS", "4"))
@@ -2589,9 +2598,28 @@ async def _capability_probe_daemon(proxy, stop_event, coordinator=None) -> None:
             log.warning("capability probe failed: %s", exc)
         try:
             await asyncio.wait_for(stop_event.wait(),
-                                   timeout=CAPABILITY_PROBE_INTERVAL_S)
+                                   timeout=_probe_sleep_s(_capability))
         except asyncio.TimeoutError:
             pass
+
+
+def _probe_sleep_s(capability: dict | None,
+                   interval_s: float | None = None,
+                   retry_s: float | None = None) -> float:
+    """INVARIANT: the probe interval is a function of the last probe's
+    outcome. A backend block whose status is `failing` (or a snapshot that
+    has never landed: `unknown` / absent) → the short retry interval;
+    otherwise (`ok`, `too_slow`) → the full interval. Pure, so the branch is
+    testable and mutation-checkable without a gateway."""
+    interval_s = CAPABILITY_PROBE_INTERVAL_S if interval_s is None else interval_s
+    retry_s = CAPABILITY_PROBE_RETRY_S if retry_s is None else retry_s
+    cap = capability or {}
+    blocks = [cap.get("reranker") or {}, cap.get("embedder") or {}]
+    if not any(b.get("status") for b in blocks):
+        return retry_s                      # never probed successfully
+    if any(b.get("status") == "failing" for b in blocks):
+        return retry_s
+    return interval_s
 
 
 # --------------------------------------------------------------------------- #
@@ -4514,7 +4542,8 @@ async def main() -> None:
             uds_site = None
 
     log.info("### Hive-Mind Proxy on :%d [aiohttp]", PORT)
-    log.info("### /v1/embeddings->8070 | /v1/reranking->8071 | default->5000")
+    log.info("### /v1/embeddings->%s | /v1/reranking->%s | default->LLM pool",
+             EMBEDDER_URL, RERANKER_URL)
 
     stop_event = asyncio.Event()
     watchdog_task     = asyncio.create_task(_watchdog_daemon(stop_event))

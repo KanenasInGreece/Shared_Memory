@@ -181,23 +181,21 @@ VRAM · 40 GB disk.* More RAM (32 GB) is comfort for a box that also runs agents
 #### Serving the encoders with vLLM instead of llama.cpp
 
 The shipped default serves both encoders with `llama-server`, and every number above was measured
-on that. **vLLM works too, on any accelerator vLLM itself supports** — this part is not
-hardware-specific, and the piece of glue below is needed by anyone who serves the *reranker* that
-way, whatever card is underneath.
+on that. vLLM serves the same two models on any accelerator it supports; the only framework-side
+piece is a small path shim for the reranker, described here because anyone serving the reranker
+with vLLM needs it, whatever the card.
 
 **The embedder needs nothing.** vLLM already serves `/v1/embeddings` at the path the gateway
 expects, so `EMBEDDER_URL` points straight at it.
 
-**The reranker needs a one-line translation.** The gateway posts to `/v1/reranking`; vLLM serves
-`/v1/rerank`. That is the *only* disagreement — everything else about the call already lines up: a
-body carrying no `model` field is accepted, `results[].index` is the position in the array you
-submitted rather than a sorted rank, `relevance_score` is the field the coordinator reads, and
-`top_n` is honoured. So the shim rewrites the path and touches nothing else. It ships as
-`shared-memory/scripts/rerank_shim.py`, refuses any path it was not built to map rather than
-forwarding blind, and takes four env-overridable settings (`SHIM_VLLM_URL`, `SHIM_HOST`,
+**The reranker needs a path translation.** The gateway posts to `/v1/reranking`; vLLM serves
+`/v1/rerank`. Everything else already lines up — a body without `model` is accepted,
+`results[].index` is the submitted position, `relevance_score` is the field the coordinator reads,
+`top_n` is honoured — so `shared-memory/scripts/rerank_shim.py` rewrites the path and nothing else,
+and refuses any path it was not built to map. Four env settings (`SHIM_VLLM_URL`, `SHIM_HOST`,
 `SHIM_PORT`, `SHIM_TIMEOUT_S`). Run it, point `RERANKER_URL` at it, restart the gateway. It binds
-loopback on purpose: no encoder in this stack carries authentication, so a wider bind publishes an
-unauthenticated reranking endpoint on every interface of the host.
+loopback on purpose: no encoder in this stack carries authentication, and a wider bind would publish
+an unauthenticated reranking endpoint on every interface of the host.
 
 Two things hold whatever the hardware. **A vLLM process serves one model**, so an encoder pair needs
 two of them. And vLLM wants **Hugging Face weights, not GGUF** — `BAAI/bge-m3` (4.3 GB) and
@@ -223,14 +221,13 @@ models, same payloads, only the serving engine different:
 | a search end to end, through the delivered client | 8.53 s | **0.68 s** median |
 | four searches at once | — | 1.35 s median |
 | VRAM, both encoders | 1.3 GB | 5.2 GB of 11.9 |
-| host RAM per encoder process | ~8 GiB, and still growing after two days | flat: +35 MiB across 105 full-size reranks |
+| host RAM per encoder process | 6.6–7.8 GiB, up to the 8 GiB cache ceiling | flat: +35 MiB across 105 full-size reranks |
 
-That last row is the one that surprised us. `llama-server` holds a prompt cache in host RAM —
-`--cache-ram`, 8192 MiB by default — which a cross-encoder and an embedder can never get a hit from,
-because the text is different every time. Two encoders were holding ~16 GB of it. vLLM holds a fixed
-footprint and does not move under load: a 319-second barrage of 105 maximum-size reranks (56.8
-million characters), 288 embeds and 24 real searches left VRAM unchanged to the megabyte, produced no
-errors, and triggered no kernel GPU resets.
+The last row is the `llama-server` prompt cache, held in host RAM (`--cache-ram`, 8192 MiB by
+default) and of little use to encoders, whose input differs on nearly every request; the two
+processes held ~14 GiB of it between them. vLLM's footprint is fixed and does not move under load:
+a 319-second barrage of 105 maximum-size reranks (56.8 million characters), 288 embeds and 24 real
+searches left VRAM unchanged to the megabyte, with no errors and no kernel GPU resets.
 
 **The Intel-specific parts.** The image is `intel/vllm:0.21.0-xpu` (28.8 GB on disk; vLLM 0.21.1,
 torch 2.11 with native XPU support, no IPEX). Pass **`--device /dev/dri` *and*
@@ -240,14 +237,18 @@ pass that directory and without it oneCCL cannot enumerate the GPU and the engin
 **ceiling, not a reservation**, for a pooling model — there is no KV cache to fill, so 0.3 and 0.6
 produced an identical footprint. Set it low if the card is shared; it will not be claimed.
 
-⚠ **Per-card, not per-vendor.** Measured on a B580. On the same machine an A770 is tested-failing for
-vLLM, and Level Zero enumerates only the B580 — so this is not a general "Arc" answer. And it does
-nothing at all for an AMD card or a CPU-only host, which is where reranking actually hurts.
+⚠ **Per-card, not per-vendor.** Measured on a B580 only; the A770 in the same machine is parked for
+an unrelated driver fault and was not tried. This is not a general "Arc" answer, and it does nothing
+for an AMD card or a CPU-only host.
 
-⚠ **`nvtop` reports 0% utilisation for this path** even when the card is saturated. The work is real
-and the power draw shows it (35 W idle to ~200 W under load), but the utilisation field stays at
-zero, because Level Zero submissions are not counted the way Vulkan ones are. Nothing in the
-framework depends on that today, but do not read a GPU-busy figure and believe it.
+⚠ **`nvtop` counts only the GPU work it is allowed to see.** It reads each GPU-holding process's
+`/proc/<pid>/fdinfo`, and a container's processes run as root by default — so `nvtop` run as your
+user reports the vLLM encoders at 0% while the card is saturated (power draw 35 W idle to ~200 W
+under load). Measured: the same load reads 99% when `nvtop` runs as root. The dreaming daemons read
+that figure through `gpu_load.py`, so an inference server in a container on a gated card is
+invisible to them. Grant `nvtop` the capabilities its README prescribes
+(`setcap cap_perfmon,cap_sys_ptrace+ep "$(command -v nvtop)"`, re-applied after every package
+update), or run the containers as the gateway's user, and confirm with `nvtop -s` under load.
 
 #### The machines behind the numbers
 
@@ -367,7 +368,9 @@ graph quality — see
 [*GraphRAG's Hidden Cost*](https://www.linkedin.com/pulse/graphrags-hidden-cost-youre-always-paying-question-when-motsenigos-w81pc/).
 
 **Optional — [`nvtop`](https://github.com/Syllo/nvtop):** if installed, the dreaming daemons
-yield while your GPU is busy, so consolidation never competes with active inference.
+yield while your GPU is busy, so consolidation never competes with active inference. It only sees
+GPU work from processes it may inspect: an inference server in a container (root by default) reads
+as idle unless `nvtop` carries `cap_perfmon,cap_sys_ptrace` or the container runs as your user.
 
 ### Steps
 
