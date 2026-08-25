@@ -119,6 +119,23 @@ DOMAIN_EXISTS_SQL = (
 # registers as a new section.
 DOMAIN_NAMES_SQL = "SELECT name FROM project_domains WHERE project_id = $1"
 
+# The by-name and by-key lookup in one indexed statement, scoped to a project —
+# the domain twin of `PROJECT_NAME_OR_KEY_SQL`, reading the `normalized_key`
+# column migration 035 maintains by trigger. See that constant for why the key is
+# a STORED value rather than an expression over `name`.
+#
+# ⚠ IT TAKES ARRAYS, and the project version does not, because a record and a
+# search filter both name SEVERAL sections at once. A single-value form here
+# would have to be called once per section — one round trip each on the ingress
+# path — or, worse, be called once with the first value and quietly leave the
+# rest unresolved. (It was written that way first; the second failure is what
+# this shape prevents.)
+DOMAIN_NAME_OR_KEY_SQL = (
+    "SELECT name FROM project_domains"
+    " WHERE project_id = $1"
+    "   AND (name = ANY($2::text[]) OR normalized_key = ANY($3::text[]))"
+)
+
 # Proposals for a value that missed. TRIGRAM over the name, UNION'd with a
 # description match, both scoped to the project.
 #
@@ -168,6 +185,30 @@ DOMAIN_ALIAS_RESOLVE_SQL = (
     "  JOIN aliases a ON a.id = da.alias_id"
     "  JOIN project_domains d ON d.id = da.domain_id"
     " WHERE da.active AND da.project_id = $1 AND a.name = $2"
+)
+
+# Every ACTIVE alias of every section of ONE project, as (alias → canonical).
+#
+# The set form of `DOMAIN_ALIAS_RESOLVE_SQL`, and it exists for the two callers
+# that must reason about spellings rather than look one up: the by-key ingress
+# step, which asks "does any retired spelling of a section key the same as what
+# you sent?", and the search filter, which asks "what else in the corpus means
+# this section?". Neither can be expressed as a single-name lookup.
+#
+# Project-scoped like every statement in this module — a domain alias is only
+# ever meaningful inside its project, and the junction carries `project_id`
+# precisely so this query does not have to join back through the domain to find
+# out which project it belongs to.
+#
+# ⚠ Both columns are LABELLED for the reason `ACTIVE_ALIASES_SQL` documents:
+# they are both called `name` in their own tables, and asyncpg keys rows by
+# column name.
+DOMAIN_ALIASES_SQL = (
+    "SELECT a.name AS alias, d.name AS canonical"
+    "  FROM domain_aliases da"
+    "  JOIN aliases a ON a.id = da.alias_id"
+    "  JOIN project_domains d ON d.id = da.domain_id"
+    " WHERE da.active AND da.project_id = $1"
 )
 
 DOMAIN_REGISTER_SQL = (

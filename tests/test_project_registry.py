@@ -212,11 +212,23 @@ async def test_second_submission_form_2_declares_a_new_project():
 # scored 0.500 and no pair reached 0.6, while typos of a registered name scored
 # 0.78–1.00 and separator/case variants scored exactly 1.00.
 
-def _coord_near(near, registered=()):
-    """A coordinator whose confusable lookup answers from a fixed list."""
+def _coord_near(near, registered=(), aliases=None):
+    """A coordinator whose confusable lookup answers from a fixed list.
+
+    ⚠ THE STUB DISPATCHES ON THE STATEMENT, not on call order. Three different
+    queries now reach this connection — the confusable neighbours, every
+    registered name, and every active alias — and a stub that answered all of
+    them with one canned list made a test pass by handing the alias reader rows
+    shaped like project names.
+    """
     coord = _coord(registered=registered)
+    alias_rows = [{"alias": a, "canonical": c}
+                  for a, c in (aliases or {}).items()]
     conn = MagicMock()
-    conn.fetch = AsyncMock(return_value=[{"name": n} for n in near])
+    conn.fetch = AsyncMock(side_effect=lambda sql, *a: (
+        alias_rows if "project_aliases" in sql
+        else [{"name": n} for n in near]
+    ))
     conn.fetchval = AsyncMock(return_value=None)
     acq = MagicMock()
     acq.__aenter__ = AsyncMock(return_value=conn)
@@ -477,7 +489,13 @@ async def test_a_project_spelling_variant_below_the_floor_is_still_refused():
     check is ever fed the trigram neighbours again."""
     c = _coord(registered=("alpha_service",))
     conn = c._acquire.return_value.__aenter__.return_value
-    conn.fetch = AsyncMock(side_effect=[[], [{"name": "alpha_service"}]])
+    # Dispatched on the statement, never on call order: the refusal now also
+    # reads the active aliases, and an ordered side_effect would have made
+    # ADDING a query look like a broken guard.
+    conn.fetch = AsyncMock(side_effect=lambda sql, *a: (
+        [] if "similarity" in sql or "project_aliases" in sql
+        else [{"name": "alpha_service"}]
+    ))
     err = await c._project_ingress_error(
         {"project": "Alpha-Service", "new_project": True}, "claude")
     assert err["error"] == "project_spelling_variant"

@@ -31,6 +31,10 @@ from multidict import CIMultiDict
 # rem_loop.py and consolidation_loop.py — see secure_env.py.
 from secure_env import load_split_env, get_secret, is_secret_key  # noqa: E402
 from log_hygiene import append_secure, secure_path, scrub_url_credentials, FILE_MODE  # noqa: E402
+# A-4: the ROLE RULE, from the module that owns it — never a bare _AGENT_ROLES
+# lookup, which cannot see read_only_agents() and would report a confined
+# identity as write-capable.
+from agent_roles import effective_role  # noqa: E402
 # M9 (fix round): _chmod_created_ancestors is a private log_hygiene member --
 # the only thing this module needs from it that has no public equivalent
 # (secure_path's own dir-hardening is entangled with its append-mode open,
@@ -4074,6 +4078,24 @@ async def _health_probe_cached(proxy: "AsyncHiveMindProxy", coordinator) -> dict
         return checks
 
 
+def _health_role_for(agent_name: str) -> str:
+    """`read` or `write` for an authenticated /health caller (A-4).
+
+    Two-valued by ruling, over a three-valued underlying vocabulary: it
+    answers the question a client actually has — *may I write?* — rather than
+    exposing the roster's internal spelling.
+
+    It goes through `effective_role`, never a bare `_AGENT_ROLES` lookup, and
+    that is the whole reason this is a function. `read_only_agents()` confines
+    an identity REGARDLESS of what AGENT_ROLES declares, so a raw read of the
+    map would report `write` for an identity the gateway 403s on every write
+    route — the exact false reassurance this key exists to remove.
+    """
+    return ("read"
+            if effective_role(agent_name, _AGENT_ROLES.get(agent_name)) == "read"
+            else "write")
+
+
 async def handle_health(request: web.Request) -> web.Response:
     """GET /health — liveness for everyone; the full operational payload
     (backend roster, per-backend pool state, capability probes, daemon/
@@ -4105,6 +4127,30 @@ async def handle_health(request: web.Request) -> web.Response:
     (or ANY caller on an auth-off install): today's full payload,
     byte-compatible.
 
+    A-4 — WHO AM I, AND WHAT MAY I DO? Two additive keys, `agent` and
+    `role`, on the AUTHENTICATED payload only. A client holding a token
+    could not previously learn either without attempting a write and reading
+    the refusal, which is a poor way to find out: a read-only token gets a
+    403 that looks like a permissions bug to anyone who did not already know
+    the token was confined. `doctor` can now say it plainly.
+
+    ⛔ THE OTHER TWO SHAPES ARE UNCHANGED, and that is the whole constraint.
+    An ANONYMOUS caller on an auth-configured install still gets the
+    three-key slim payload — adding an identity to a response served to
+    someone who proved no identity would be absurd, and the slimming
+    contract test asserts that shape exactly. An AUTH-OFF install still gets
+    today's full payload with NEITHER key: there is no token registry there,
+    so every caller is the same unnamed everyone, and emitting `agent: null`
+    / `role: "write"` would dress an absence up as an answer. Absent means
+    "this install has no identities", which is true and useful.
+
+    ⚠ `role` is two-valued by ruling — `read` for an identity confined to
+    the read allowlist, `write` for everyone else. An `admin` token reaches
+    here (`/health` is in `_UNPROTECTED_PATHS`, so the role gate never runs
+    on it) and reports `write`, which OVERSTATES it: an admin token is
+    confined to `/admin/*` and cannot save either. Raised as a finding
+    rather than answered here — the vocabulary is the operator's.
+
     HTTP 200: embedder + reranker both reachable (save/search path healthy).
     HTTP 503: at least one critical backend is down — computed identically
     for every caller; an anonymous caller learns the VERDICT, not why.
@@ -4114,12 +4160,38 @@ async def handle_health(request: web.Request) -> web.Response:
     critical_ok = checks["status"] == "ok"
     status_code = 200 if critical_ok else 503
 
-    if AUTH_CONFIGURED_AT_STARTUP and not bool(_safe_resolve_identity(request)):
+    # Resolved HERE rather than read off `request["authenticated_agent"]`,
+    # because /health is in `_UNPROTECTED_PATHS`: auth_middleware returns
+    # early on it and never stashes a name, so the only way to know who is
+    # asking is to resolve it. On an auth-off install it is not even
+    # attempted — `resolve_identity()` cannot match anything against an empty
+    # registry, and asking would only produce a None meaning "no identities
+    # exist here", not "you are anonymous".
+    identity = _safe_resolve_identity(request) if AUTH_CONFIGURED_AT_STARTUP else None
+    if AUTH_CONFIGURED_AT_STARTUP and not identity:
         return web.json_response(
             {"status": checks["status"], "version": checks["version"],
              "api_version": checks["api_version"]},
             status=status_code,
         )
+    if identity:
+        # ⛔ A COPY, NEVER A MUTATION. `checks` is the TTL cache, SHARED by
+        # every caller inside the window (see _health_probe_cached), and its
+        # docstring states the contract this obeys: the per-caller projection
+        # is applied fresh on every call and is never cached itself.
+        #
+        # ⚠ SAID HONESTLY, because the first draft of this comment claimed a
+        # leak it could not produce: an in-place write is NOT observable from
+        # outside today. There is one consumer, the anonymous branch above
+        # rebuilds its own three keys and is immune, and two authenticated
+        # callers each overwrite with their own values. What makes the copy
+        # right is that writing per-caller identity into shared state is only
+        # safe by accident — a second consumer, or a response serialised after
+        # an await, turns it into a cross-identity disclosure with no other
+        # change. The test pins the CACHE CONTENTS rather than a response,
+        # because a response cannot see the difference.
+        checks = {**checks, "agent": identity,
+                  "role": _health_role_for(identity)}
     return web.json_response(checks, status=status_code)
 
 

@@ -159,6 +159,205 @@ def test_every_table_a_migration_creates_reaches_the_fresh_install():
     )
 
 
+def _schema_init_body() -> str:
+    """The fresh-install artefact, read through an env override.
+
+    `SCHEMA_INIT_PATH` exists so the two guards below can be pointed at a
+    REGENERATED copy in a scratch directory and shown to pass, without touching
+    the tracked artefact. Regeneration needs a live database and is the merger's
+    step; proving the guard bites and then un-bites must not.
+    """
+    override = os.environ.get("SCHEMA_INIT_PATH")
+    if override:
+        with open(override, encoding="utf-8") as fh:
+            return fh.read()
+    return _read("shared-memory", "migrations", "schema_init.sql")
+
+
+def _sql_body(fname: str) -> str:
+    """One migration with its `--` comments removed.
+
+    ⚠ THE INSTRUMENT NEEDED THIS BEFORE ITS FINDINGS WERE WORTH ANYTHING. Scanned
+    raw, the guards below reported an index named `are`, out of the prose
+    sentence "indexes are …" in a comment. A guard that reports things that do
+    not exist trains its reader to ignore it, so the comment stripping is not
+    tidiness — it is what makes a hit mean something.
+    """
+    body = _read("shared-memory", "migrations", fname)
+    return re.sub(r"--[^\n]*", "", body)
+
+
+def _chain_drops() -> str:
+    """Every migration's SQL, comments stripped, concatenated.
+
+    ⛔ A DROP IS CHAIN-WIDE, NEVER FILE-LOCAL, and assuming otherwise produced
+    three false hits on the first run: 002 creates an index that 007 drops, 007
+    creates one that 029 drops. An object is in the fresh install if the CHAIN as
+    a whole leaves it there, which is exactly what the generator introspects.
+    """
+    return "\n".join(_sql_body(f) for f in _migration_files())
+
+
+def _survives_the_chain(create_re: str, drop_re: str) -> bool:
+    """Does the chain LEAVE this object in place? Last statement about it wins.
+
+    ⛔ "DROPPED ANYWHERE" IS THE WRONG TEST, and the difference is not academic:
+    035 writes `DROP CONSTRAINT IF EXISTS x` immediately followed by
+    `ADD CONSTRAINT x`, which is how a constraint is re-added idempotently — a
+    guard reading only for a DROP would conclude x is gone and never check that
+    the artefact carries it. 009 does the same with an index it re-creates
+    tighter. So the whole chain is scanned in file order and the LAST statement
+    about the name decides, exactly as replaying the migrations would.
+    """
+    chain = _chain_drops()
+    events = [(m.start(), True) for m in re.finditer(create_re, chain, re.I)]
+    events += [(m.start(), False) for m in re.finditer(drop_re, chain, re.I)]
+    if not events:
+        return False
+    return max(events)[1]
+
+
+def test_every_index_a_migration_creates_reaches_the_fresh_install():
+    """GROUP 4. The table guard above keys on `CREATE TABLE`, so a migration that
+    creates no table — an index, a function, a column, a constraint — passes it
+    trivially while `schema_init.sql` silently lacks everything it added. That is
+    not hypothetical: it is how a migration whose whole content was an index and
+    two functions could ship with the artefact un-regenerated and the entire
+    suite green.
+
+    ⚠ WHAT THIS CANNOT SEE, so nobody mistakes it for the real check: it compares
+    NAMES in two files. Whether the index in the artefact has the same DEFINITION
+    as the live one is a live diff, and that lives in `verify_schema_init.py`
+    (which now compares index definitions, after this class of miss).
+
+    ⚠ AN INDEX ALSO DIES WITH ITS COLUMN. 027 drops `project_aliases.project`
+    and with it the index 024 built on that column, without any `DROP INDEX`
+    statement existing anywhere — so a guard that looked only for `DROP INDEX`
+    reported a fourth phantom. A dropped column is checked for too.
+    """
+    init = _schema_init_body()
+    chain = _chain_drops()
+    missing = []
+    for fname in _migration_files():
+        body = _sql_body(fname)
+        for match in re.finditer(
+                r"CREATE(?:\s+UNIQUE)?\s+INDEX(?:\s+CONCURRENTLY)?"
+                r"(?:\s+IF NOT EXISTS)?\s+([a-z0-9_]+)\s+ON\s+([a-z0-9_.]+)"
+                r"[^(]*\(([^)]*)\)", body, re.I):
+            index, table, cols = match.group(1), match.group(2), match.group(3)
+            if not _survives_the_chain(
+                    rf"CREATE(?:\s+UNIQUE)?\s+INDEX(?:\s+CONCURRENTLY)?"
+                    rf"(?:\s+IF NOT EXISTS)?\s+{index}\b",
+                    rf"DROP INDEX(?:\s+IF EXISTS)?\s+{index}\b"):
+                continue
+            table = table.split(".")[-1]
+            if any(re.search(
+                    rf"ALTER TABLE\s+{table}\s+DROP COLUMN(?:\s+IF EXISTS)?\s+{col}\b",
+                    chain, re.I)
+                   for col in re.findall(r"[a-z0-9_]+", cols, re.I)):
+                continue
+            if not re.search(rf"\b{index}\b", init, re.I):
+                missing.append(f"{index} (from {fname})")
+    assert not missing, (
+        f"these indexes exist in the migration chain but not in schema_init.sql: "
+        f"{sorted(set(missing))}. A fresh install would not have them — and an "
+        "index is how this schema now carries an invariant, not merely a lookup "
+        "speed. Run migrations/generate_schema_init.py, then PROVE it with "
+        "verify_schema_init.py."
+    )
+
+
+def test_every_unique_constraint_a_migration_adds_reaches_the_fresh_install():
+    """GROUP 4. The third carrier of an invariant, and the one this schema
+    actually uses now.
+
+    ⛔ WHY IT IS SEPARATE FROM THE INDEX GUARD, rather than folded into it. The
+    index guard matches `CREATE … INDEX`, and migration 035 — whose entire
+    purpose is a uniqueness invariant — contributes ZERO matches to it, because
+    it carries that invariant as `ADD CONSTRAINT … UNIQUE` on a trigger-maintained
+    column. A guard that covers "the way invariants used to be written" and not
+    "the way this one is" is a guard whose green means nothing about the change
+    that prompted it.
+
+    ⚠ The artefact spells them differently, and that is expected, not a bug: the
+    generator re-emits a UNIQUE constraint as `CREATE UNIQUE INDEX` of the SAME
+    NAME (see verify_schema_init.py's header). So the NAME is what is checked —
+    behaviour, not catalogue rows.
+    """
+    init = _schema_init_body()
+    missing = []
+    for fname in _migration_files():
+        body = _sql_body(fname)
+        for name in re.findall(
+                r"ADD\s+CONSTRAINT\s+([a-z0-9_]+)\s+UNIQUE", body, re.I):
+            if not _survives_the_chain(
+                    rf"ADD\s+CONSTRAINT\s+{name}\s+UNIQUE",
+                    rf"DROP\s+CONSTRAINT(?:\s+IF EXISTS)?\s+{name}\b"):
+                continue
+            if not re.search(rf"\b{name}\b", init, re.I):
+                missing.append(f"{name} (from {fname})")
+    assert not missing, (
+        f"these UNIQUE constraints exist in the migration chain but not in "
+        f"schema_init.sql: {sorted(set(missing))}. A fresh install would accept "
+        "rows the live database refuses — and on this schema a unique constraint "
+        "is how an axis invariant is carried, not a lookup speed. Run "
+        "migrations/generate_schema_init.py, then PROVE it with "
+        "verify_schema_init.py."
+    )
+
+
+def test_every_function_a_migration_creates_reaches_the_fresh_install():
+    """GROUP 4. The same gap, for functions — and this is the half that bites
+    hardest, because a function is what a trigger and an index EXPRESSION both
+    call. A fresh install missing one does not merely lack a feature; it fails to
+    install at all, in a single transaction, creating nothing.
+    """
+    init = _schema_init_body()
+    chain = _chain_drops()
+    missing = []
+    for fname in _migration_files():
+        body = _sql_body(fname)
+        for fn in re.findall(
+                r"CREATE(?:\s+OR\s+REPLACE)?\s+FUNCTION\s+([a-z0-9_]+)\s*\(",
+                body, re.I):
+            if not _survives_the_chain(
+                    rf"CREATE(?:\s+OR\s+REPLACE)?\s+FUNCTION\s+{fn}\s*\(",
+                    rf"DROP FUNCTION(?:\s+IF EXISTS)?\s+{fn}\b"):
+                continue
+            if not re.search(rf"FUNCTION\s+(?:public\.)?{fn}\s*\(", init, re.I):
+                missing.append(f"{fn}() (from {fname})")
+    assert not missing, (
+        f"these functions exist in the migration chain but not in "
+        f"schema_init.sql: {sorted(set(missing))}. A fresh install would abort "
+        "the moment a trigger or an index expression named one. Run "
+        "migrations/generate_schema_init.py, then PROVE it with "
+        "verify_schema_init.py."
+    )
+
+
+def test_the_generator_emits_functions_before_tables_and_triggers_after():
+    """GROUP 4. SECTION ORDER in the generated artefact, asserted on the
+    generator's own source rather than on a database.
+
+    Functions used to be emitted LAST, after every table and index, because a
+    trigger cannot precede the function it names. That is true of triggers and
+    silently false of INDEXES: an index whose expression CALLS a function needs
+    the function first, so the artefact aborted on `function ... does not exist`
+    — on a fresh install only, the one path nobody re-inspects. The fix is a
+    SPLIT, and this asserts the split stays split.
+    """
+    src = _read("shared-memory", "migrations", "generate_schema_init.py")
+    body = src[src.index("def generate("):]
+    fn_at = body.index("render_functions(cur)")
+    tbl_at = body.index("for table in fetch_tables(cur)")
+    trg_at = body.index("render_triggers(cur)")
+    assert fn_at < tbl_at, (
+        "generate() emits tables (and their indexes) before functions — an index "
+        "expression calling a schema function would abort a fresh install")
+    assert tbl_at < trg_at, (
+        "generate() emits triggers before their tables")
+
+
 def test_the_migration_chain_has_no_gaps_or_duplicate_numbers():
     """GROUP 4. Migrations are applied in filename order and recorded once each,
     so a duplicated number means two files race for one ledger slot and a gap

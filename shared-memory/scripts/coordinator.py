@@ -65,21 +65,24 @@ from project_axis import (
     PROJECT_SQL, PROJECT_EXISTS_SQL, PROJECT_ID_SQL, PROJECT_PROPOSALS_SQL,
     PROPOSAL_SIMILARITY, PROPOSAL_LIMIT, SENTINEL,
     CONFUSABLE_SQL, CONFUSABLE_SIMILARITY, PROJECT_NAMES_SQL,
+    PROJECT_NAME_OR_KEY_SQL,
     same_spelling, spelling_variant_of, unconfirmed_confusables,
     fold_eligible, resolve_project, project_for_graph, project_merge_cypher,
+    axis_key, resolve_axis_value, expand_axis_spellings,
+    VIA_EXACT, VIA_ALIAS, VIA_NORMALISED,
 )
 from domain_axis import (
     DOMAIN_EXISTS_SQL, DOMAIN_PROPOSALS_SQL, DOMAIN_PROPOSAL_SIMILARITY,
     DOMAIN_PROPOSAL_LIMIT, DOMAIN_CONFUSABLE_SQL, DOMAIN_CONFUSABLE_SIMILARITY,
     DOMAIN_ALIAS_RESOLVE_SQL, DOMAIN_REGISTER_SQL, DOMAIN_KEYS,
-    DOMAIN_NAMES_SQL,
+    DOMAIN_NAMES_SQL, DOMAIN_ALIASES_SQL, DOMAIN_NAME_OR_KEY_SQL,
     domain_merge_cypher, names_a_domain, resolve_domains,
 )
 from insight_gate import walk_group_reached_set, passes_insight_gate
 from project_promotion import (
     promote_record, sole_project, METHOD_GROUNDING,
 )
-from project_alias import ALIAS_RESOLVE_SQL
+from project_alias import ALIAS_RESOLVE_SQL, ACTIVE_ALIASES_SQL
 from secure_env import get_secret
 
 log = logging.getLogger("coordinator")
@@ -144,7 +147,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.53"
+FRAMEWORK_VERSION = "0.9.54"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -2097,7 +2100,7 @@ def _visibility_filter(viewer: str | None, viewer_scope: str | None,
     return "(" + " OR ".join(clauses) + ")", params
 
 
-def _axis_filter_predicate(start: int, project: str | None,
+def _axis_filter_predicate(start: int, project: "str | list[str] | None",
                             domains: list[str] | None,
                             since: datetime | None) -> tuple[str, list]:
     """Build the optional project/domains/since AND-predicate `handle_search`
@@ -2113,9 +2116,22 @@ def _axis_filter_predicate(start: int, project: str | None,
     — an unfiltered search's query text and arg list are byte-for-byte
     unchanged from before this predicate existed.
 
-    `project` matches the canonical top-level `metadata->>'project'` string.
-    `domains` matches the canonical top-level `metadata->'domains'` JSON array
-    with OR semantics (`?|` — true when ANY named domain is present) — the
+    `project` matches the top-level `metadata->>'project'` string against a SET
+    of spellings (`= ANY`), and `domains` matches the top-level
+    `metadata->'domains'` JSON array against the union of every filter entry's
+    spellings. BOTH ARE ALREADY EXPANDED BY THE CALLER — `handle_search`
+    resolves what the searcher typed to a canonical and hands in every stored
+    spelling that means it (`expand_axis_spellings`). A str is accepted for
+    `project` and treated as a one-element set, which is what an unresolvable
+    value degrades to: the literal string, matching whatever carries it —
+    exactly the behaviour before the expansion existed.
+
+    ⚠ THE EXPANSION IS THE CALLER'S, AND MUST STAY THERE. It costs two registry
+    reads; doing it here would put them inside a pure function called once per
+    candidate query (five of them) and turn one lookup into five.
+
+    `domains` matches with OR semantics (`?|` — true when ANY named domain is
+    present) — the
     CANONICAL KEY ONLY (decision:1214), never the older singular `domain`
     string or the `decision` blob. A pre-1214 thematic community_summaries row
     (still written with singular `domain`) legitimately does not match a
@@ -2133,14 +2149,25 @@ def _axis_filter_predicate(start: int, project: str | None,
     let a partial filter's empty result read as authoritative. This function
     does not re-check the cap; it trusts its caller.
 
+    ⛔ THE CAP IS ON WHAT THE CALLER SUPPLIED, NEVER ON THE EXPANDED SET, and
+    that distinction is load-bearing rather than pedantic. The cap exists to
+    bound what an UNTRUSTED caller can make the database scan; the expansion is
+    the SERVER's own answer, derived from its own registry, and is bounded by
+    how many spellings that registry holds. Applying the cap after expansion
+    would let a deployment that has recorded a few renames silently lose filter
+    entries — a partial filter whose empty result reads as authoritative, which
+    is the precise failure the cap was written to prevent.
+
     `start` is the next free asyncpg positional index (`$N`).
     """
     clauses: list[str] = []
     params: list = []
     idx = start
-    if project:
-        clauses.append(f"metadata->>'project' = ${idx}")
-        params.append(project)
+    projects = [project] if isinstance(project, str) else list(project or [])
+    projects = [p for p in projects if isinstance(p, str) and p]
+    if projects:
+        clauses.append(f"metadata->>'project' = ANY(${idx}::text[])")
+        params.append(projects)
         idx += 1
     if domains:
         clauses.append(f"metadata->'domains' ?| ${idx}::text[]")
@@ -2153,6 +2180,26 @@ def _axis_filter_predicate(start: int, project: str | None,
     if not clauses:
         return "", []
     return " AND " + " AND ".join(clauses), params
+
+
+def _with_filters_resolved(body: dict, filters_resolved) -> dict:
+    """Attach the axis-filter account to a search response — or leave it alone.
+
+    ONE function for all three of `handle_search`'s exits (reranked, empty, and
+    the keyword fallback), because the account has to be on all of them or it is
+    worse than absent: an empty result is exactly the answer whose reader most
+    needs to know which spellings were searched, and the keyword fallback is
+    exactly the path a reader is least likely to have tested.
+
+    ⚠ ADDITIVE, AND ABSENT RATHER THAN NULL WHEN NO FILTER WAS SUPPLIED. An
+    unfiltered search's body is byte-for-byte what it was before this key
+    existed, so `api_version` does not move: a client that knows nothing about
+    the key sees nothing new, and one that looks for it can tell "no filter" from
+    "a filter that resolved to nothing" without a second field.
+    """
+    if filters_resolved:
+        body["filters_resolved"] = filters_resolved
+    return body
 
 
 def _coerce_jsonb_obj(value):
@@ -2344,6 +2391,15 @@ class MemoryCoordinator:
         # disagree — same contract as _credential_last_ts. ISO-8601 UTC, None
         # until the first fallback in this process.
         self._rerank_fallback_last_ts: str | None = None
+        # Axis registry reads that FAILED (PR-C). A failed read is not a quiet
+        # degrade: by-key resolution stops answering and a search filter matches
+        # only the literal string, so the answer CHANGES while looking exactly
+        # like the ordinary "that name is not registered" case. This is the only
+        # signal that separates the two from outside one request — the paired
+        # `filters_resolved.error` says it inside one. Same flat-additive shape
+        # and reset-on-restart contract as the rerank pair above (fact:1314).
+        self._axis_registry_read_failures = 0
+        self._axis_registry_read_failure_last_ts: str | None = None
         # Payload-size instrument (fact:1441) — cumulative chars/docs actually
         # handed to the reranker across every search this process has served,
         # regardless of outcome (a fallback still counts what it WOULD have
@@ -3643,10 +3699,35 @@ class MemoryCoordinator:
 
     # ── POST /memory/save ─────────────────────────────────────────────────────
 
-    async def _project_ingress_error(self, metadata: dict, agent_id: str) -> dict | None:
+    @staticmethod
+    def _rewrite_project(metadata: dict, supplied: str, canonical: str) -> None:
+        """Move a record onto the CANONICAL project name, in every carrier.
+
+        EVERY carrier holding the supplied spelling moves — not just the field
+        the resolution was read from. Rewriting one and not the other leaves a
+        record whose Postgres metadata and graph axis disagree about which
+        project it belongs to. Only fields equal to the resolved spelling are
+        touched, so a carrier naming a different project is never clobbered.
+        """
+        if metadata.get("project") == supplied:
+            metadata["project"] = canonical
+        blob = metadata.get("decision")
+        if isinstance(blob, dict) and blob.get("project") == supplied:
+            blob["project"] = canonical
+
+    async def _project_ingress_error(self, metadata: dict, agent_id: str,
+                                     report: dict | None = None) -> dict | None:
         """The whole project-ingress rule (P4, P9). Returns the 400 body, or None
         when the save may proceed. Registers the project as a side effect when the
         caller declares it new — that IS the acceptance.
+
+        `report`, when given, is filled with `project_resolved` — `{supplied,
+        canonical, via}` — whenever the value stored differs from the value
+        sent. It is an OUT PARAMETER rather than a second return value on
+        purpose: this method's contract is "the 400 body, or None", every
+        caller and every test reads it that way, and widening the return type
+        to carry an advisory would make forty call sites unpack a tuple to learn
+        nothing they asked for.
         """
         # Scope: RETROSPECTIVES only. They arrive on their own endpoint and
         # inherit the project of the decision they judge, which passed this
@@ -3673,6 +3754,43 @@ class MemoryCoordinator:
         if await self._project_registered(supplied):
             return None
 
+        # P9 — the second submission is ACCEPTED, in any of its three forms: pick
+        # a proposal (now a registry hit), declare a new project, or park it on
+        # the sentinel. There is deliberately NO round counter on the server: the
+        # bound comes from those three forms all succeeding, not from per-caller
+        # state a gateway would have to keep and expire. What the gateway never
+        # does, however many times it is asked, is accept an unregistered name.
+        #
+        # ⛔ IT IS ANSWERED HERE — AFTER THE REGISTRY, BEFORE EVERY OTHER STEP —
+        # AND THE POSITION IS THE RULE. A caller that DECLARES a new project is
+        # asserting that no such project exists. When the name is a retired
+        # spelling, or a separator/case variant of a live or retired one, that
+        # assertion is FALSE and the caller must be told, loudly, with the
+        # spelling to use. Resolving it quietly would store the record correctly
+        # and destroy the only signal that an agent believes it is creating
+        # projects that already exist — which is how every retired spelling in
+        # this registry arrived. A save that makes no such claim gets the
+        # opposite treatment below: its spelling is simply resolved, because it
+        # never claimed anything about the registry in the first place.
+        #
+        # ⚠ It sits AFTER the exact-registry check above, and only there: a
+        # `new_project` flag on a name that is already registered verbatim is a
+        # redundant flag, not a false claim, and has always been accepted.
+        if metadata.get("new_project") is True:
+            # ⛔ A DECLARATION IS NOT A DEFENCE. The agent that sets this flag is
+            # the same agent that makes the spelling error, so accepting the
+            # claim on its own guards nothing: the operator says "go ahead with
+            # this idea", meaning THIS project, and a plausible variant becomes a
+            # second one. So the claim faces the checks below before it registers.
+            refusal = await self._new_project_refusal(supplied, metadata)
+            if refusal is not None:
+                return refusal
+            await self._register_project(supplied, agent_id)
+            log.info("project registry: %r registered by %s (new_project, "
+                     "record type %s)", supplied, agent_id,
+                     metadata.get("type") or "fact")
+            return None
+
         # A retired spelling resolves to the name that replaced it, and the
         # record is stored under the CANONICAL name. This is what makes a rename
         # durable: a folder on another machine still carries the old name, and
@@ -3683,39 +3801,35 @@ class MemoryCoordinator:
         if canonical is not None:
             log.info("project alias: %r → %r (record stored as the canonical name)",
                      supplied, canonical)
-            # EVERY carrier holding the retired spelling moves — not just the
-            # field the alias was read from. Rewriting one and not the other
-            # leaves a record whose Postgres metadata and graph axis disagree
-            # about which project it belongs to. Only fields equal to the
-            # resolved spelling are touched, so a carrier naming a different
-            # project is never clobbered.
-            if metadata.get("project") == supplied:
-                metadata["project"] = canonical
-            if isinstance(metadata.get("decision"), dict) and \
-                    metadata["decision"].get("project") == supplied:
-                metadata["decision"]["project"] = canonical
+            self._rewrite_project(metadata, supplied, canonical)
+            if report is not None:
+                report["project_resolved"] = {
+                    "supplied": supplied, "canonical": canonical,
+                    "via": VIA_ALIAS,
+                }
             return None
 
-        # P9 — the second submission is ACCEPTED, in any of its three forms: pick
-        # a proposal (now a registry hit), declare a new project, or park it on
-        # the sentinel. There is deliberately NO round counter on the server: the
-        # bound comes from those three forms all succeeding, not from per-caller
-        # state a gateway would have to keep and expire. What the gateway never
-        # does, however many times it is asked, is accept an unregistered name.
-        if metadata.get("new_project") is True:
-            # ⛔ A DECLARATION IS NOT A DEFENCE. The agent that sets this flag is
-            # the same agent that makes the spelling error, so accepting the
-            # claim on its own guards nothing: the operator says "go ahead with
-            # this idea", meaning THIS project, and a plausible variant becomes a
-            # second one. Every retired spelling in this registry arrived that
-            # way. So the claim faces the two checks below before it registers.
-            refusal = await self._new_project_refusal(supplied, metadata)
-            if refusal is not None:
-                return refusal
-            await self._register_project(supplied, agent_id)
-            log.info("project registry: %r registered by %s (new_project, "
-                     "record type %s)", supplied, agent_id,
-                     metadata.get("type") or "fact")
+        # Steps 3 and 4 — THE SAME NAME, SPELLED DIFFERENTLY (decision:1015,
+        # fact:1047, fact:1490). A registry that answers only exact strings makes
+        # `Shared_Memory` and `shared-memory` two unrelated events: one is a
+        # project and the other is a stranger, and the caller is asked to pick a
+        # proposal that is character-for-character what it already meant. The key
+        # is what fact:1047's spelling guard has always compared on — this simply
+        # stops the guard being the only thing that knows it.
+        #
+        # It runs LAST because exact answers must never be reachable through a
+        # key: a value already on file is answered by itself, and only a value
+        # that is on file NOWHERE gets normalised.
+        registered, aliases, _err = await self._project_spellings(supplied)
+        canonical, via = resolve_axis_value(supplied, registered, aliases)
+        if canonical is not None:
+            log.info("project key: %r → %r (via %s; record stored as the "
+                     "canonical name)", supplied, canonical, via)
+            self._rewrite_project(metadata, supplied, canonical)
+            if report is not None and canonical != supplied:
+                report["project_resolved"] = {
+                    "supplied": supplied, "canonical": canonical, "via": via,
+                }
             return None
 
         return await self._project_rejection("project_unknown", supplied)
@@ -3743,7 +3857,33 @@ class MemoryCoordinator:
         deliberate. Work legitimately starts with an idea, a fact, and a decision
         to act on it, before any project exists. What must not happen is that a
         project starts because a name was mistyped.
+
+        THREE checks now. The first is newer and cheaper than both, and it is the
+        gateway-side twin of a rule the DATABASE started enforcing in migration
+        035: a name every character of which is punctuation keys to the empty
+        string, so it can be told apart from nothing, and the registry's
+        BEFORE-write trigger RAISEs on it. Without this the refusal still
+        happened — as a raw Postgres error surfacing to the caller as a 5xx,
+        which is not a refusal an agent can act on. A gate the database enforces
+        and the ingress does not is a 500 waiting to be reported as an outage.
         """
+        # ⛔ FIRST, AND BEFORE ANY QUERY. It needs no registry: a name with no
+        # key is not a near-match of anything, cannot be confirmed distinct from
+        # anything, and has nothing to propose.
+        if not axis_key(supplied):
+            log.info("project registry: refused %r — normalizes to nothing",
+                     supplied)
+            return {
+                "status": "error",
+                "error": "project_unnameable",
+                "message": (
+                    f"project {_short(supplied)} normalizes to nothing — every "
+                    "character is punctuation, whitespace or similar, so there is "
+                    "no spelling left to register and it could never be told "
+                    "apart from any other such name. Name the project with at "
+                    "least one letter or digit."
+                ),
+            }
         async with self._acquire() as conn:
             rows = await conn.fetch(CONFUSABLE_SQL, supplied,
                                     CONFUSABLE_SIMILARITY, PROPOSAL_LIMIT)
@@ -3755,19 +3895,39 @@ class MemoryCoordinator:
             # floor of 0.6 — so a pure spelling variant registered as new,
             # which is precisely the event this guard exists to prevent.
             all_names = [r["name"] for r in await conn.fetch(PROJECT_NAMES_SQL)]
+            # ⚠ AND OVER THE RETIRED SPELLINGS TOO. A name that was aliased away
+            # is a name this deployment has ALREADY adjudicated, so a variant of
+            # it is the same mistake as a variant of a live name — and it is the
+            # likelier one, because the retired spelling is what the machine that
+            # still carries the old folder name will send. The refusal points at
+            # the project the alias resolves to, never at the alias, because the
+            # alias is not somewhere a record may be saved.
+            alias_map = {r["alias"]: r["canonical"]
+                         for r in await conn.fetch(ACTIVE_ALIASES_SQL)}
         near = [r["name"] for r in rows]
 
         variant = spelling_variant_of(supplied, all_names)
+        aliased = None
+        if variant is None:
+            aliased = spelling_variant_of(supplied, list(alias_map))
+            if aliased is not None:
+                variant = alias_map[aliased]
         if variant is not None:
-            log.info("project registry: refused %r — a spelling of registered %r",
-                     supplied, variant)
+            log.info("project registry: refused %r — a spelling of %s %r",
+                     supplied, "retired" if aliased else "registered", variant)
+            retired = (
+                f" {_short(aliased)} is a RETIRED spelling of it and is already "
+                "resolved on save, so no new registration is needed."
+                if aliased else ""
+            )
             return {
                 "status": "error",
                 "error": "project_spelling_variant",
                 "message": (
                     f"project {_short(supplied)} differs from the registered project "
                     f"{_short(variant)} only in separators or capitalisation, so it is a "
-                    f"SPELLING of it and not a new project. Save under {_short(variant)}. "
+                    f"SPELLING of it and not a new project. Save under {_short(variant)}."
+                    f"{retired} "
                     "If the project genuinely needs to be renamed, that is a "
                     "deliberate operation with its own tool and ledger, never a "
                     "side effect of a save."
@@ -3798,11 +3958,16 @@ class MemoryCoordinator:
     # ── Domain ingress (P17, migration 028) ──────────────────────────────────
 
     async def _domain_ingress_error(
-        self, metadata: dict, agent_id: str
+        self, metadata: dict, agent_id: str, report: dict | None = None,
     ) -> dict | None:
         """The whole domain-ingress rule. Returns the 400 body, or None when the
         save may proceed. Registers a domain the caller declares new, exactly as
         the project protocol does — that IS the acceptance.
+
+        `report`, when given, collects `domains_resolved` — one `{supplied,
+        canonical, via}` entry per value the gateway REWROTE, and nothing for
+        the ones it accepted as sent. An out parameter, for the reason
+        `_project_ingress_error` documents.
 
         ⚠ IT RUNS AFTER THE PROJECT CHECK, and the order is a dependency rather
         than a preference: a domain is a section of a project, so there is
@@ -3883,14 +4048,14 @@ class MemoryCoordinator:
 
         for name in supplied:
             error = await self._domain_value_error(
-                name, project, project_id, metadata, agent_id)
+                name, project, project_id, metadata, agent_id, report)
             if error is not None:
                 return error
         return None
 
     async def _domain_value_error(
         self, name: str, project: str, project_id: int,
-        metadata: dict, agent_id: str,
+        metadata: dict, agent_id: str, report: dict | None = None,
     ) -> dict | None:
         """One domain value, through the same protocol a project name faces.
 
@@ -3903,13 +4068,12 @@ class MemoryCoordinator:
         if await self._domain_registered(project_id, name):
             return None
 
-        canonical = await self._resolve_domain_alias(project_id, name)
-        if canonical is not None:
-            log.info("domain alias: %r → %r in project %r (record stored as the "
-                     "canonical name)", name, canonical, project)
-            self._rewrite_domain(metadata, name, canonical)
-            return None
-
+        # The `new_domain` claim is answered HERE, after the registry and before
+        # every other step — the project axis' ordering rule, for the same
+        # reason. Declaring a section NEW while naming a retired spelling of one,
+        # or a separator/case variant of a live or retired one, is a false claim
+        # about the registry, and the caller is told rather than quietly
+        # corrected.
         if metadata.get("new_domain") is True:
             refusal = await self._new_domain_refusal(name, project, project_id, metadata)
             if refusal is not None:
@@ -3919,7 +4083,48 @@ class MemoryCoordinator:
                      "(new_domain)", name, project, agent_id)
             return None
 
+        canonical = await self._resolve_domain_alias(project_id, name)
+        if canonical is not None:
+            log.info("domain alias: %r → %r in project %r (record stored as the "
+                     "canonical name)", name, canonical, project)
+            self._rewrite_domain(metadata, name, canonical)
+            self._note_domain_resolved(report, name, canonical, VIA_ALIAS)
+            return None
+
+        # Steps 3 and 4, scoped to this project's sections — the project axis'
+        # by-key resolution, on the axis where it matters MORE. A section name is
+        # an ordinary word typed by different people at different times, so
+        # `graph-quality` and `graph quality` are the same section far more often
+        # than `Alpha-Service` and `alpha service` are the same project. Same
+        # ordering rule: exact answers first, and a `new_domain` declaration is
+        # answered above so a false claim is told rather than silently resolved.
+        registered, aliases, _err = await self._domain_spellings(project_id, name)
+        resolved, via = resolve_axis_value(name, registered, aliases)
+        if resolved is not None:
+            log.info("domain key: %r → %r in project %r (via %s; record stored "
+                     "as the canonical name)", name, resolved, project, via)
+            self._rewrite_domain(metadata, name, resolved)
+            if resolved != name:
+                self._note_domain_resolved(report, name, resolved, via)
+            return None
+
         return await self._domain_rejection(name, project, project_id)
+
+    @staticmethod
+    def _note_domain_resolved(report, supplied: str, canonical: str,
+                              via: str) -> None:
+        """Append one rewrite to the save response's `domains_resolved`.
+
+        A LIST rather than a map, because a record may name several sections and
+        the caller needs to know which of the values IT sent moved — a map keyed
+        on the canonical would lose that when two supplied spellings resolve to
+        one section.
+        """
+        if report is None:
+            return
+        report.setdefault("domains_resolved", []).append(
+            {"supplied": supplied, "canonical": canonical, "via": via}
+        )
 
     async def _new_domain_refusal(
         self, name: str, project: str, project_id: int, metadata: dict,
@@ -3931,7 +4136,25 @@ class MemoryCoordinator:
         is a SPELLING of it and no confirmation can make it distinct; a merely
         confusable name is held once and can be confirmed by naming the section
         it means to differ from.
+
+        Plus the same unnameable check, for the same reason: migration 035's
+        BEFORE-write trigger covers `project_domains` as well, so without a
+        gateway-side twin an all-punctuation section name reaches the database
+        and comes back as a 5xx instead of a refusal the caller can answer.
         """
+        if not axis_key(name):
+            log.info("domain registry: refused %r in project %r — normalizes to "
+                     "nothing", name, project)
+            return {
+                "status": "error",
+                "error": "domain_unnameable",
+                "message": (
+                    f"domain {_short(name)} normalizes to nothing — every "
+                    "character is punctuation, whitespace or similar, so there is "
+                    "no spelling left to register. Name the section with at least "
+                    "one letter or digit."
+                ),
+            }
         async with self._acquire() as conn:
             rows = await conn.fetch(DOMAIN_CONFUSABLE_SQL, project_id, name,
                                     DOMAIN_CONFUSABLE_SIMILARITY,
@@ -3940,9 +4163,19 @@ class MemoryCoordinator:
             # see the identical note on the project axis above.
             all_names = [r["name"]
                          for r in await conn.fetch(DOMAIN_NAMES_SQL, project_id)]
+            # The project axis' rule, for the same reason: a section that was
+            # aliased away has already been adjudicated on this project, so a
+            # variant of the retired spelling is the same mistake as a variant
+            # of a live one.
+            alias_map = {r["alias"]: r["canonical"]
+                         for r in await conn.fetch(DOMAIN_ALIASES_SQL, project_id)}
         near = [r["name"] for r in rows]
 
         variant = spelling_variant_of(name, all_names)
+        if variant is None:
+            aliased = spelling_variant_of(name, list(alias_map))
+            if aliased is not None:
+                variant = alias_map[aliased]
         if variant is not None:
             log.info("domain registry: refused %r — a spelling of %r in project %r",
                      name, variant, project)
@@ -4570,6 +4803,101 @@ class MemoryCoordinator:
                         name, exc)
             return None
 
+    def _note_registry_read_failure(self, axis: str, exc: Exception) -> str:
+        """Record a registry read that failed, and return the reason to disclose.
+
+        ⛔ A DEGRADE THAT CHANGES THE ANSWER MUST BE VISIBLE. When the registry
+        cannot be read, by-key resolution becomes a no-op and a search filter
+        resolves to nothing — which is indistinguishable, in the response, from
+        the legitimate case of a name nobody registered. A journal warning is not
+        enough: nobody reads the gateway's journal while looking at an empty
+        search result, and Group 3's question is "can this be seen FAILING?".
+
+        So it COUNTS (telemetry `axis_registry_read_failures`, additive, with a
+        last-event timestamp per fact:1314's shape) and it RETURNS a short reason
+        the caller puts in `filters_resolved.error`. Two audiences, deliberately:
+        the counter is for the monitor, the string is for whoever is looking at
+        this one answer and needs to know it is not authoritative.
+        """
+        self._axis_registry_read_failures += 1
+        self._axis_registry_read_failure_last_ts = \
+            datetime.now(timezone.utc).isoformat()
+        log.warning("%s registry read failed — by-key resolution is a no-op for "
+                    "this call, and a filter on it matches only the literal "
+                    "string: %s", axis, exc)
+        return f"{axis}_registry_unavailable"
+
+    async def _project_spellings(self, supplied: str) -> tuple[list, dict, str | None]:
+        """`(matching project names, {alias: canonical}, error)`. Never raises.
+
+        Everything that could answer "what does THIS spelling mean?", and nothing
+        else: the registry rows whose `name` or whose stored `normalized_key`
+        matches — at most two, both indexed — plus every active alias.
+
+        ⚠ THE KEY IS READ, NOT COMPUTED, IN SQL. Migration 035 maintains
+        `projects.normalized_key` by trigger and puts a UNIQUE constraint on it,
+        so this is an indexed equality on a value the database owns rather than a
+        scan over a normalising expression. The alias half is still a full read,
+        because `aliases` deliberately carries no key column: 024 permits one
+        spelling to alias on both axes, so a key-unique constraint there would
+        forbid what the design allows, and the ambiguity rule is enforced by
+        trigger instead.
+
+        ⛔ UNCACHED, deliberately, for the third time in this file (see
+        `_project_identity`, `_domain_identity`, `_entity_vocab_resolve`): a
+        cache here would hold a stale answer across precisely the operation the
+        registry exists to survive — a rename — and no measurement justifies a
+        size or a TTL (fact:1338: an unmeasured cache parameter is a measurement
+        claim in disguise).
+
+        A failure degrades to `([], {}, reason)`, which makes every by-key step a
+        no-op and leaves the exact-match behaviour that shipped before it — but
+        SAYS SO, which the first version of this did not. A read path must not
+        start blocking on registry state because a query failed, and a save must
+        not turn a transient database fault into a rejected record.
+        """
+        try:
+            async with self._acquire() as conn:
+                names = [r["name"] for r in await conn.fetch(
+                    PROJECT_NAME_OR_KEY_SQL, supplied, axis_key(supplied))]
+                aliases = {r["alias"]: r["canonical"]
+                           for r in await conn.fetch(ACTIVE_ALIASES_SQL)}
+            return names, aliases, None
+        except Exception as exc:
+            return [], {}, self._note_registry_read_failure("project", exc)
+
+    async def _domain_spellings(
+        self, project_id, supplied,
+    ) -> tuple[list, dict, str | None]:
+        """The domain twin, scoped to ONE project.
+
+        It takes a `project_id` for the reason every statement in `domain_axis`
+        does: a section is identified WITHIN its project, and a by-name-alone
+        lookup on this axis is the one way it reproduces the defect the project
+        registry was built to remove. No project id means there is no scope to
+        resolve in — that is not a failure and reports no error.
+
+        `supplied` is one name or MANY: a record and a search filter both name
+        several sections at once, and answering only the first would leave the
+        rest silently unresolved.
+        """
+        if project_id is None:
+            return [], {}, None
+        wanted = [supplied] if isinstance(supplied, str) else list(supplied or [])
+        wanted = [n for n in wanted if isinstance(n, str) and n.strip()]
+        if not wanted:
+            return [], {}, None
+        try:
+            async with self._acquire() as conn:
+                names = [r["name"] for r in await conn.fetch(
+                    DOMAIN_NAME_OR_KEY_SQL, project_id, wanted,
+                    [axis_key(n) for n in wanted])]
+                aliases = {r["alias"]: r["canonical"]
+                           for r in await conn.fetch(DOMAIN_ALIASES_SQL, project_id)}
+            return names, aliases, None
+        except Exception as exc:
+            return [], {}, self._note_registry_read_failure("domain", exc)
+
     async def _register_project(self, name: str, agent_id: str) -> None:
         """Register a project the caller declared new (P9's second form).
 
@@ -4759,7 +5087,14 @@ class MemoryCoordinator:
         # RETROSPECTIVES stay out, and that one IS a scope statement rather than
         # an oversight: they arrive on their own endpoint and inherit the project
         # of the decision they judge — a decision that passed this very check.
-        project_error = await self._project_ingress_error(metadata, agent_id)
+        # What the two axis gates REWROTE, collected for the response. A save
+        # that is rewritten and not told about it is a save whose caller keeps
+        # sending the same spelling forever and never learns where its record
+        # actually landed — the same reasoning that put `entities_rewritten` on
+        # this response.
+        axis_report: dict = {}
+        project_error = await self._project_ingress_error(
+            metadata, agent_id, axis_report)
         if project_error is not None:
             return web.json_response(project_error, status=400)
 
@@ -4768,7 +5103,8 @@ class MemoryCoordinator:
         # canonical, so an aliased project reaches the right registry. A record
         # naming no domain passes straight through: most do, and that is correct
         # rather than untagged.
-        domain_error = await self._domain_ingress_error(metadata, agent_id)
+        domain_error = await self._domain_ingress_error(
+            metadata, agent_id, axis_report)
         if domain_error is not None:
             return web.json_response(domain_error, status=400)
 
@@ -5143,6 +5479,13 @@ class MemoryCoordinator:
             # by a mint race's winner (S-6/S-12) — so a caller can always see
             # what was actually stored, never infer it.
             "entities_rewritten": entities_rewritten,
+            # The axis twins of `entities_rewritten` (PR-C). Non-null only when
+            # the gateway stored the record under a DIFFERENT spelling from the
+            # one supplied — a retired name resolved through an alias, or a
+            # separator/case variant resolved on the axis key. A caller sending
+            # the canonical value already sees null and has nothing to reconcile.
+            "project_resolved": axis_report.get("project_resolved"),
+            "domains_resolved": axis_report.get("domains_resolved") or None,
         })
 
     # ── POST /memory/supersede ────────────────────────────────────────────────
@@ -6205,6 +6548,109 @@ class MemoryCoordinator:
             [entry for entries in out.values() for entry in entries])
         return out
 
+    async def _resolve_search_filters(
+        self, project: str | None, domains: list | None,
+    ) -> tuple:
+        """`(project spellings, domain spellings, filters_resolved)` for one search.
+
+        THE READ SIDE OF THE SAME RESOLUTION INGRESS DOES, and it exists because
+        the two sides had drifted into asking different questions. A save that
+        names a project by a retired or differently-punctuated spelling is stored
+        under the canonical one; a SEARCH naming it the same way matched the
+        literal string and therefore matched nothing — so the corpus answered
+        "there is nothing here" to a filter that was merely spelled the way the
+        asker's folder is spelled. One resolution, both directions.
+
+        What comes back:
+
+        * the spellings to bind into the predicate — the canonical, every active
+          alias of it, and every registered variant sharing its key;
+        * `filters_resolved`, the response's account of what the server did with
+          what it was given. Additive, and present only when a filter was
+          supplied, so an unfiltered search's body is unchanged.
+
+        ⛔ AN UNRESOLVABLE VALUE IS NOT AN ERROR AND IS NOT WIDENED. It degrades
+        to the literal string — exactly what the filter did before this existed
+        — with `canonical: null` saying so. The read path never blocks on
+        registry state: a searcher is allowed to probe for a name that is not
+        registered, and telling them "unknown project" would make search a
+        second gate on a registry only the write path is supposed to enforce.
+
+        ⚠ BUT A REGISTRY THAT COULD NOT BE READ IS A DIFFERENT EVENT, and it used
+        to look identical: both produced `canonical: null` and an answer computed
+        from the literal string. One of those is the truth about the corpus and
+        the other is the gateway saying it could not check — so a read failure
+        now sets `filters_resolved.error` and increments a telemetry counter. The
+        result is still served, because a degraded answer beats no answer; what
+        it must not do is pass for an authoritative one.
+
+        ⚠ DOMAINS RESOLVE ONLY INSIDE A RESOLVED PROJECT. A section is
+        identified by (project, name) and by nothing else, so with no project
+        filter — or one that resolves to nothing — there is no scope to look a
+        section up in, and every supplied domain stays the literal string. That
+        is the same absence `domain_axis` calls load-bearing: the one way this
+        axis reproduces the project axis' original defect is by letting a name
+        answer on its own.
+        """
+        if not project and not domains:
+            return None, None, None
+
+        resolved: dict = {}
+        project_values = None
+        canonical = None
+        # ⛔ A FAILED REGISTRY READ IS DISCLOSED, NOT SWALLOWED. When it fails the
+        # filter degrades to the literal string, which is indistinguishable from
+        # a genuinely unregistered name — so the reason is carried into the
+        # response beside the resolution it silently changed. One key for both
+        # axes: what a reader needs to know is that this answer is not
+        # authoritative, and which registry could not be read is in the value.
+        errors: list = []
+        if project:
+            registered, aliases, err = await self._project_spellings(project)
+            if err:
+                errors.append(err)
+            canonical, _via = resolve_axis_value(project, registered, aliases)
+            project_values = (expand_axis_spellings(canonical, registered, aliases)
+                              if canonical is not None else [project])
+            resolved["project"] = {
+                "supplied": project,
+                "canonical": canonical,
+                "matched": project_values,
+            }
+
+        domain_values = None
+        if domains:
+            project_id = (await self._project_identity(canonical)
+                          if canonical is not None else None)
+            d_registered, d_aliases, d_err = await self._domain_spellings(
+                project_id, domains)
+            if d_err:
+                errors.append(d_err)
+            entries: list = []
+            values: list = []
+            for name in domains:
+                d_canonical, _v = resolve_axis_value(name, d_registered, d_aliases)
+                matched = (expand_axis_spellings(d_canonical, d_registered, d_aliases)
+                           if d_canonical is not None else [name])
+                entries.append({"supplied": name, "canonical": d_canonical,
+                                "matched": matched})
+                # ONE flat array for the `?|` operator, which is OR over the
+                # whole set — so every spelling of every requested section goes
+                # in together and the filter's OR semantics are unchanged.
+                for spelling in matched:
+                    if spelling not in values:
+                        values.append(spelling)
+            domain_values = values
+            resolved["domains"] = entries
+
+        if errors:
+            # A STRING, not a boolean, and not a nested object: it says which
+            # registry could not be read, it is absent on the ordinary path, and
+            # it never restructures the keys beside it (fact:1314). The counted
+            # twin is telemetry `axis_registry_read_failures_total`.
+            resolved["error"] = "; ".join(dict.fromkeys(errors))
+        return project_values, domain_values, resolved
+
     async def handle_search(self, request: web.Request) -> web.Response:
         try:
             body = await request.json()
@@ -6286,6 +6732,13 @@ class MemoryCoordinator:
                     status=400,
                 )
 
+        # Resolve what the searcher TYPED to what the corpus HOLDS — once, here,
+        # for every candidate query below. The cap above is deliberately applied
+        # to the SUPPLIED list, before this line: what is bounded is what an
+        # untrusted caller can ask for, not what the server's own registry adds.
+        project_values, domain_values, filters_resolved = \
+            await self._resolve_search_filters(project, domains_filter)
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             try:
                 q_vec = await self._embed(query, client)
@@ -6298,7 +6751,7 @@ class MemoryCoordinator:
                 # silently drop its filter just because the embedder is down.
                 vis_sql, vis_params = _visibility_filter(viewer, scope, 3)
                 axis_sql, axis_params = _axis_filter_predicate(
-                    3 + len(vis_params), project, domains_filter, since_dt)
+                    3 + len(vis_params), project_values, domain_values, since_dt)
                 async with self._acquire() as conn:
                     rows = await conn.fetch(
                         f"""
@@ -6310,7 +6763,7 @@ class MemoryCoordinator:
                         """,
                         f"%{query}%", limit, *vis_params, *axis_params,
                     )
-                return web.json_response({
+                return web.json_response(_with_filters_resolved({
                     "status": "success",
                     "fallback": "keyword",
                     "results": [
@@ -6325,7 +6778,7 @@ class MemoryCoordinator:
                         }
                         for r in rows
                     ],
-                })
+                }, filters_resolved))
 
             async with self._acquire() as conn:
                 # Tier 3 — nearest active insight (cross-project principle,
@@ -6340,7 +6793,7 @@ class MemoryCoordinator:
                 # pre-006 fallback) — each is an independent query starting
                 # its own $1, so the same fragment/params apply to all three.
                 t3_axis_sql, t3_axis_params = _axis_filter_predicate(
-                    2 + len(vis_t3_params), project, domains_filter, since_dt)
+                    2 + len(vis_t3_params), project_values, domain_values, since_dt)
                 insight = None
                 try:
                     insight = await conn.fetchrow(
@@ -6409,7 +6862,7 @@ class MemoryCoordinator:
                 # Axis filters applied to the CANDIDATE SET before reranking —
                 # the reranker never sees a candidate that failed the filter.
                 axis_sql, axis_params = _axis_filter_predicate(
-                    len(args) + 1, project, domains_filter, since_dt)
+                    len(args) + 1, project_values, domain_values, since_dt)
                 args.extend(axis_params)
                 try:
                     candidates = await conn.fetch(
@@ -6444,7 +6897,8 @@ class MemoryCoordinator:
                     # filters on.
 
             if not candidates:
-                return web.json_response({"status": "success", "results": []})
+                return web.json_response(_with_filters_resolved(
+                    {"status": "success", "results": []}, filters_resolved))
 
             ids      = [r["id"]       for r in candidates]
             contents = [r["content"]  for r in candidates]
@@ -6890,7 +7344,8 @@ class MemoryCoordinator:
 
         # Latest-retro-as-verdict: same-decision retrospectives newest-first.
         final = _order_retros_latest_first(final)
-        return web.json_response({"status": "success", "results": final})
+        return web.json_response(_with_filters_resolved(
+            {"status": "success", "results": final}, filters_resolved))
 
     # ── POST /memory/graph ────────────────────────────────────────────────────
 
@@ -7334,6 +7789,18 @@ class MemoryCoordinator:
         snap["rerank_successes_total"] = self._rerank_successes
         snap["rerank_fallbacks_total"] = self._rerank_failures
         snap["rerank_fallbacks_last_ts"] = self._rerank_fallback_last_ts
+
+        # Axis registry read failures (PR-C) — the same shape, for the same
+        # reason. When the projects/domains registry cannot be read, the gateway
+        # still answers 200: by-key resolution silently becomes a no-op and a
+        # filtered search matches only the literal string it was given. From
+        # outside, that is identical to a name nobody registered. NEW KEYS, never
+        # a rename of an existing one; `..._total` is cumulative since process
+        # start and `..._last_ts` is stamped at the same increment so the pair
+        # cannot disagree.
+        snap["axis_registry_read_failures_total"] = self._axis_registry_read_failures
+        snap["axis_registry_read_failures_last_ts"] = \
+            self._axis_registry_read_failure_last_ts
 
         # Payload-size instrument (fact:1441) — same flat-additive style,
         # ADDED alongside the pair above rather than restructuring them.

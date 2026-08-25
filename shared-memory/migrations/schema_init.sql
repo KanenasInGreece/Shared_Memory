@@ -30,6 +30,314 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 CREATE EXTENSION IF NOT EXISTS vector;
 
+-- ─── Functions ─────────────────────────────────────────────────────────────
+-- FIRST, before any table or index: an index expression may CALL one of
+-- these, and the whole file is a single transaction.
+
+CREATE OR REPLACE FUNCTION public.assert_alias_namespaces_disjoint()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+    v_alias text;
+BEGIN
+    IF TG_TABLE_NAME = 'project_aliases' THEN
+        SELECT name INTO v_alias FROM aliases WHERE id = NEW.alias_id;
+        -- 024's original rule, on the exact string, unchanged.
+        IF NEW.active AND EXISTS (
+            SELECT 1 FROM projects p WHERE p.name = v_alias
+        ) THEN
+            RAISE EXCEPTION
+                'alias % is also a registered project — an alias and a canonical '
+                'name must never be the same string (A1)', v_alias;
+        END IF;
+        -- The same rule on the KEY, excluding the project this alias points at.
+        IF NEW.active AND EXISTS (
+            SELECT 1 FROM projects p
+             WHERE p.id <> NEW.project_id
+               AND axis_normalize(p.name) = axis_normalize(v_alias)
+        ) THEN
+            RAISE EXCEPTION
+                'alias % normalizes to the same axis key as a DIFFERENT '
+                'registered project — one key would resolve two ways, and the '
+                'gateway''s by-key resolution would answer by luck (A1)', v_alias;
+        END IF;
+        -- And two active aliases keying alike must not point at two projects.
+        IF NEW.active AND EXISTS (
+            SELECT 1 FROM project_aliases pa
+              JOIN aliases a ON a.id = pa.alias_id
+             WHERE pa.active
+               AND pa.id <> NEW.id
+               AND pa.project_id <> NEW.project_id
+               AND axis_normalize(a.name) = axis_normalize(v_alias)
+        ) THEN
+            RAISE EXCEPTION
+                'alias % normalizes to the same axis key as an active alias of '
+                'a DIFFERENT project — one key would resolve two ways (A1)',
+                v_alias;
+        END IF;
+    ELSE  -- projects
+        IF EXISTS (
+            SELECT 1 FROM project_aliases pa
+              JOIN aliases a ON a.id = pa.alias_id
+             WHERE pa.active AND a.name = NEW.name
+        ) THEN
+            RAISE EXCEPTION
+                'project % is already an active alias for another project — '
+                'register the canonical name instead (A1)', NEW.name;
+        END IF;
+        IF EXISTS (
+            SELECT 1 FROM project_aliases pa
+              JOIN aliases a ON a.id = pa.alias_id
+             WHERE pa.active
+               AND pa.project_id <> NEW.id
+               AND axis_normalize(a.name) = axis_normalize(NEW.name)
+        ) THEN
+            RAISE EXCEPTION
+                'project % normalizes to the same axis key as an active alias '
+                'for another project — register the canonical name instead (A1)',
+                NEW.name;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.assert_domain_alias_namespaces_disjoint()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+    v_alias text;
+BEGIN
+    IF TG_TABLE_NAME = 'domain_aliases' THEN
+        IF NOT NEW.active THEN
+            RETURN NEW;
+        END IF;
+        -- NEW.project_id, not a lookup through domain_id: the composite foreign
+        -- key already guarantees the two agree, so re-deriving it here would
+        -- only add a way for this rule and that key to disagree.
+        SELECT name INTO v_alias FROM aliases WHERE id = NEW.alias_id;
+        -- 028's original rule, on the exact string, unchanged.
+        IF EXISTS (
+            SELECT 1 FROM project_domains d
+             WHERE d.project_id = NEW.project_id
+               AND d.name = v_alias
+        ) THEN
+            RAISE EXCEPTION
+                'alias % is also a registered domain of the same project — an '
+                'alias and a canonical name must never be the same string '
+                'within one project (A1)', v_alias;
+        END IF;
+        -- The same rule on the KEY, excluding the section this alias points at
+        -- — retiring a spelling is exactly what produces an alias keying like a
+        -- live section, and that rename must stay possible.
+        IF EXISTS (
+            SELECT 1 FROM project_domains d
+             WHERE d.project_id = NEW.project_id
+               AND d.id <> NEW.domain_id
+               AND axis_normalize(d.name) = axis_normalize(v_alias)
+        ) THEN
+            RAISE EXCEPTION
+                'alias % normalizes to the same axis key as a DIFFERENT '
+                'registered section of this project — one key would resolve two '
+                'ways (A1)', v_alias;
+        END IF;
+        IF EXISTS (
+            SELECT 1 FROM domain_aliases da
+              JOIN aliases a ON a.id = da.alias_id
+             WHERE da.active
+               AND da.id <> NEW.id
+               AND da.project_id = NEW.project_id
+               AND da.domain_id <> NEW.domain_id
+               AND axis_normalize(a.name) = axis_normalize(v_alias)
+        ) THEN
+            RAISE EXCEPTION
+                'alias % normalizes to the same axis key as an active alias of a '
+                'DIFFERENT section of this project — one key would resolve two '
+                'ways (A1)', v_alias;
+        END IF;
+    ELSE  -- project_domains
+        -- 028's original rule, on the exact string, unchanged.
+        IF EXISTS (
+            SELECT 1 FROM domain_aliases da
+              JOIN aliases a ON a.id = da.alias_id
+              JOIN project_domains d ON d.id = da.domain_id
+             WHERE da.active
+               AND d.project_id = NEW.project_id
+               AND a.name = NEW.name
+        ) THEN
+            RAISE EXCEPTION
+                'domain % is already an active alias for another domain of this '
+                'project — register the canonical name instead (A1)', NEW.name;
+        END IF;
+        IF EXISTS (
+            SELECT 1 FROM domain_aliases da
+              JOIN aliases a ON a.id = da.alias_id
+              JOIN project_domains d ON d.id = da.domain_id
+             WHERE da.active
+               AND d.project_id = NEW.project_id
+               AND d.id <> NEW.id
+               AND axis_normalize(a.name) = axis_normalize(NEW.name)
+        ) THEN
+            RAISE EXCEPTION
+                'domain % normalizes to the same axis key as an active alias '
+                'for another domain of this project — register the canonical '
+                'name instead (A1)', NEW.name;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.axis_normalize(name text)
+ RETURNS text
+ LANGUAGE sql
+ IMMUTABLE PARALLEL SAFE STRICT
+AS $function$
+    SELECT regexp_replace(lower(name), '[^[:alnum:]]', '', 'g');
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.axis_registry_before_write()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+    NEW.normalized_key := axis_normalize(NEW.name);
+
+    IF NEW.normalized_key = '' THEN
+        RAISE EXCEPTION
+            '% "%" normalizes to the empty string — every character is '
+            'punctuation, whitespace or similar, so there is no spelling left '
+            'to register. Name it with at least one letter or digit.',
+            TG_TABLE_NAME, NEW.name;
+    END IF;
+
+    RETURN NEW;
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.entity_normalize(raw_name text)
+ RETURNS text
+ LANGUAGE sql
+ IMMUTABLE PARALLEL SAFE
+AS $function$
+    SELECT regexp_replace(lower(raw_name), '[^[:alnum:]]', '', 'g');
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.entity_vocab_aliases_before_write()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+    v_parent_exists boolean;
+BEGIN
+    NEW.normalized_alias := entity_normalize(NEW.alias);
+
+    IF NEW.normalized_alias = '' THEN
+        RAISE EXCEPTION
+            'alias "%" normalizes to the empty string — every character was '
+            'stripped, so it cannot be registered', NEW.alias;
+    END IF;
+
+    SELECT EXISTS (SELECT 1 FROM entity_vocabulary WHERE id = NEW.entity_id)
+      INTO v_parent_exists;
+    IF NOT v_parent_exists THEN
+        RAISE EXCEPTION
+            'entity_vocab_aliases.entity_id % does not reference a known '
+            'entity_vocabulary row', NEW.entity_id;
+    END IF;
+
+    -- Refused if this normalized value is already a DIFFERENT canonical's
+    -- identity. Equal to its OWN parent's key is fine — the ordinary case.
+    IF EXISTS (
+        SELECT 1 FROM entity_vocabulary v
+         WHERE v.normalized_key = NEW.normalized_alias
+           AND v.id <> NEW.entity_id
+    ) THEN
+        RAISE EXCEPTION
+            'alias "%" normalizes to "%", which is already a DIFFERENT '
+            'canonical entity''s identity — a normalized value must never '
+            'resolve to two different identities',
+            NEW.alias, NEW.normalized_alias;
+    END IF;
+
+    -- Refused if another alias ROW already claims this normalized value for
+    -- a DIFFERENT entity. `other.id <> NEW.id` excludes this row's own prior
+    -- state on UPDATE (e.g. re-pointing entity_id): on INSERT it is a no-op,
+    -- since no existing row can yet carry the id a fresh IDENTITY just
+    -- assigned — it is NOT the ambiguity check itself, which is the
+    -- `entity_id` comparison.
+    IF EXISTS (
+        SELECT 1 FROM entity_vocab_aliases other
+         WHERE other.normalized_alias = NEW.normalized_alias
+           AND other.entity_id <> NEW.entity_id
+           AND other.id <> NEW.id
+    ) THEN
+        RAISE EXCEPTION
+            'alias "%" normalizes to "%", which is already an alias of a '
+            'DIFFERENT entity — a normalized value must never resolve to '
+            'two different identities',
+            NEW.alias, NEW.normalized_alias;
+    END IF;
+
+    RETURN NEW;
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.entity_vocabulary_before_write()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+    NEW.normalized_key := entity_normalize(NEW.name);
+
+    IF NEW.normalized_key = '' THEN
+        RAISE EXCEPTION
+            'entity "%" normalizes to the empty string — every character was '
+            'stripped, so it cannot be registered as a canonical spelling',
+            NEW.name;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+          FROM entity_vocab_aliases a
+          JOIN entity_vocabulary parent ON parent.id = a.entity_id
+         WHERE a.normalized_alias = NEW.normalized_key
+           AND parent.normalized_key <> NEW.normalized_key
+    ) THEN
+        RAISE EXCEPTION
+            'entity "%" normalizes to "%", which is already registered as an '
+            'alias resolving to a DIFFERENT identity — a normalized value '
+            'must never resolve to two different identities',
+            NEW.name, NEW.normalized_key;
+    END IF;
+
+    RETURN NEW;
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.notify_new_artifact()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  -- The payload carries the row id so the daemon can act without re-querying
+  -- for what just changed. Postgres caps a notification payload at 8000 bytes,
+  -- which is why this sends an identifier and never the content.
+  PERFORM pg_notify('new_artifact', json_build_object('pg_id', NEW.id)::text);
+  RETURN NEW;
+END;
+$function$
+;
+
 -- ─── alias_adjudications ────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS alias_adjudications (
     id               BIGSERIAL PRIMARY KEY,
@@ -235,6 +543,7 @@ CREATE TABLE IF NOT EXISTS project_domains (
     description      TEXT,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     created_by       TEXT NOT NULL,
+    normalized_key   TEXT NOT NULL,
     CONSTRAINT project_domains_not_blank CHECK ((btrim(name) <> ''::text)),
     CONSTRAINT project_domains_sentinel_reserved CHECK ((name <> 'general_discussion'::text))
 );
@@ -242,6 +551,7 @@ CREATE TABLE IF NOT EXISTS project_domains (
 CREATE INDEX IF NOT EXISTS idx_project_domains_name_trgm ON public.project_domains USING gin (name gin_trgm_ops);
 CREATE UNIQUE INDEX IF NOT EXISTS project_domains_id_project ON public.project_domains USING btree (id, project_id);
 CREATE UNIQUE INDEX IF NOT EXISTS project_domains_name_unique ON public.project_domains USING btree (project_id, name);
+CREATE UNIQUE INDEX IF NOT EXISTS project_domains_normalized_key_unique ON public.project_domains USING btree (project_id, normalized_key);
 
 -- ─── project_promotions ─────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS project_promotions (
@@ -268,11 +578,13 @@ CREATE TABLE IF NOT EXISTS projects (
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     created_by       TEXT,
     id               BIGINT PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY,
+    normalized_key   TEXT NOT NULL,
     CONSTRAINT projects_sentinel_reserved CHECK ((name <> 'general_discussion'::text))
 );
 
 CREATE INDEX IF NOT EXISTS idx_projects_name_trgm ON public.projects USING gin (name gin_trgm_ops);
 CREATE UNIQUE INDEX IF NOT EXISTS projects_name_key ON public.projects USING btree (name);
+CREATE UNIQUE INDEX IF NOT EXISTS projects_normalized_key_unique ON public.projects USING btree (normalized_key);
 
 -- ─── refold_ledger ──────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS refold_ledger (
@@ -404,204 +716,10 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
--- ─── Functions ─────────────────────────────────────────────────────────────
-
-CREATE OR REPLACE FUNCTION public.assert_alias_namespaces_disjoint()
- RETURNS trigger
- LANGUAGE plpgsql
-AS $function$
-BEGIN
-    IF TG_TABLE_NAME = 'project_aliases' THEN
-        IF NEW.active AND EXISTS (
-            SELECT 1 FROM projects p
-              JOIN aliases a ON a.id = NEW.alias_id
-             WHERE p.name = a.name
-        ) THEN
-            RAISE EXCEPTION
-                'alias % is also a registered project — an alias and a canonical '
-                'name must never be the same string (A1)',
-                (SELECT name FROM aliases WHERE id = NEW.alias_id);
-        END IF;
-    ELSE  -- projects
-        IF EXISTS (
-            SELECT 1 FROM project_aliases pa
-              JOIN aliases a ON a.id = pa.alias_id
-             WHERE pa.active AND a.name = NEW.name
-        ) THEN
-            RAISE EXCEPTION
-                'project % is already an active alias for another project — '
-                'register the canonical name instead (A1)', NEW.name;
-        END IF;
-    END IF;
-    RETURN NEW;
-END;
-$function$
-;
-
-CREATE OR REPLACE FUNCTION public.assert_domain_alias_namespaces_disjoint()
- RETURNS trigger
- LANGUAGE plpgsql
-AS $function$
-DECLARE
-    v_alias text;
-BEGIN
-    IF TG_TABLE_NAME = 'domain_aliases' THEN
-        IF NOT NEW.active THEN
-            RETURN NEW;
-        END IF;
-        -- NEW.project_id, not a lookup through domain_id: the composite foreign
-        -- key already guarantees the two agree, so re-deriving it here would
-        -- only add a way for this rule and that key to disagree.
-        SELECT name INTO v_alias FROM aliases WHERE id = NEW.alias_id;
-        IF EXISTS (
-            SELECT 1 FROM project_domains d
-             WHERE d.project_id = NEW.project_id
-               AND d.name = v_alias
-        ) THEN
-            RAISE EXCEPTION
-                'alias % is also a registered domain of the same project — an '
-                'alias and a canonical name must never be the same string within '
-                'one project (A1)', v_alias;
-        END IF;
-    ELSE  -- project_domains
-        IF EXISTS (
-            SELECT 1 FROM domain_aliases da
-              JOIN aliases a ON a.id = da.alias_id
-              JOIN project_domains d ON d.id = da.domain_id
-             WHERE da.active
-               AND d.project_id = NEW.project_id
-               AND a.name = NEW.name
-        ) THEN
-            RAISE EXCEPTION
-                'domain % is already an active alias for another domain of this '
-                'project — register the canonical name instead (A1)', NEW.name;
-        END IF;
-    END IF;
-    RETURN NEW;
-END;
-$function$
-;
-
-CREATE OR REPLACE FUNCTION public.entity_normalize(raw_name text)
- RETURNS text
- LANGUAGE sql
- IMMUTABLE PARALLEL SAFE
-AS $function$
-    SELECT regexp_replace(lower(raw_name), '[^[:alnum:]]', '', 'g');
-$function$
-;
-
-CREATE OR REPLACE FUNCTION public.entity_vocab_aliases_before_write()
- RETURNS trigger
- LANGUAGE plpgsql
-AS $function$
-DECLARE
-    v_parent_exists boolean;
-BEGIN
-    NEW.normalized_alias := entity_normalize(NEW.alias);
-
-    IF NEW.normalized_alias = '' THEN
-        RAISE EXCEPTION
-            'alias "%" normalizes to the empty string — every character was '
-            'stripped, so it cannot be registered', NEW.alias;
-    END IF;
-
-    SELECT EXISTS (SELECT 1 FROM entity_vocabulary WHERE id = NEW.entity_id)
-      INTO v_parent_exists;
-    IF NOT v_parent_exists THEN
-        RAISE EXCEPTION
-            'entity_vocab_aliases.entity_id % does not reference a known '
-            'entity_vocabulary row', NEW.entity_id;
-    END IF;
-
-    -- Refused if this normalized value is already a DIFFERENT canonical's
-    -- identity. Equal to its OWN parent's key is fine — the ordinary case.
-    IF EXISTS (
-        SELECT 1 FROM entity_vocabulary v
-         WHERE v.normalized_key = NEW.normalized_alias
-           AND v.id <> NEW.entity_id
-    ) THEN
-        RAISE EXCEPTION
-            'alias "%" normalizes to "%", which is already a DIFFERENT '
-            'canonical entity''s identity — a normalized value must never '
-            'resolve to two different identities',
-            NEW.alias, NEW.normalized_alias;
-    END IF;
-
-    -- Refused if another alias ROW already claims this normalized value for
-    -- a DIFFERENT entity. `other.id <> NEW.id` excludes this row's own prior
-    -- state on UPDATE (e.g. re-pointing entity_id): on INSERT it is a no-op,
-    -- since no existing row can yet carry the id a fresh IDENTITY just
-    -- assigned — it is NOT the ambiguity check itself, which is the
-    -- `entity_id` comparison.
-    IF EXISTS (
-        SELECT 1 FROM entity_vocab_aliases other
-         WHERE other.normalized_alias = NEW.normalized_alias
-           AND other.entity_id <> NEW.entity_id
-           AND other.id <> NEW.id
-    ) THEN
-        RAISE EXCEPTION
-            'alias "%" normalizes to "%", which is already an alias of a '
-            'DIFFERENT entity — a normalized value must never resolve to '
-            'two different identities',
-            NEW.alias, NEW.normalized_alias;
-    END IF;
-
-    RETURN NEW;
-END;
-$function$
-;
-
-CREATE OR REPLACE FUNCTION public.entity_vocabulary_before_write()
- RETURNS trigger
- LANGUAGE plpgsql
-AS $function$
-BEGIN
-    NEW.normalized_key := entity_normalize(NEW.name);
-
-    IF NEW.normalized_key = '' THEN
-        RAISE EXCEPTION
-            'entity "%" normalizes to the empty string — every character was '
-            'stripped, so it cannot be registered as a canonical spelling',
-            NEW.name;
-    END IF;
-
-    IF EXISTS (
-        SELECT 1
-          FROM entity_vocab_aliases a
-          JOIN entity_vocabulary parent ON parent.id = a.entity_id
-         WHERE a.normalized_alias = NEW.normalized_key
-           AND parent.normalized_key <> NEW.normalized_key
-    ) THEN
-        RAISE EXCEPTION
-            'entity "%" normalizes to "%", which is already registered as an '
-            'alias resolving to a DIFFERENT identity — a normalized value '
-            'must never resolve to two different identities',
-            NEW.name, NEW.normalized_key;
-    END IF;
-
-    RETURN NEW;
-END;
-$function$
-;
-
-CREATE OR REPLACE FUNCTION public.notify_new_artifact()
- RETURNS trigger
- LANGUAGE plpgsql
-AS $function$
-BEGIN
-  -- The payload carries the row id so the daemon can act without re-querying
-  -- for what just changed. Postgres caps a notification payload at 8000 bytes,
-  -- which is why this sends an identifier and never the content.
-  PERFORM pg_notify('new_artifact', json_build_object('pg_id', NEW.id)::text);
-  RETURN NEW;
-END;
-$function$
-;
-
 -- ─── Triggers ──────────────────────────────────────────────────────────────
--- Created after the functions they call. DROP-then-CREATE because Postgres
--- has no CREATE TRIGGER IF NOT EXISTS and this file promises idempotency.
+-- LAST: after the tables they are attached to and the functions they call.
+-- DROP-then-CREATE because Postgres has no CREATE TRIGGER IF NOT EXISTS and
+-- this file promises idempotency.
 
 DROP TRIGGER IF EXISTS trg_domain_aliases_disjoint ON domain_aliases;
 CREATE TRIGGER trg_domain_aliases_disjoint BEFORE INSERT OR UPDATE ON public.domain_aliases FOR EACH ROW EXECUTE FUNCTION assert_domain_alias_namespaces_disjoint();
@@ -615,8 +733,14 @@ CREATE TRIGGER trg_entity_vocabulary_before_write BEFORE INSERT OR UPDATE ON pub
 DROP TRIGGER IF EXISTS trg_project_aliases_disjoint ON project_aliases;
 CREATE TRIGGER trg_project_aliases_disjoint BEFORE INSERT OR UPDATE ON public.project_aliases FOR EACH ROW EXECUTE FUNCTION assert_alias_namespaces_disjoint();
 
+DROP TRIGGER IF EXISTS trg_project_domains_axis_key ON project_domains;
+CREATE TRIGGER trg_project_domains_axis_key BEFORE INSERT OR UPDATE ON public.project_domains FOR EACH ROW EXECUTE FUNCTION axis_registry_before_write();
+
 DROP TRIGGER IF EXISTS trg_project_domains_disjoint ON project_domains;
 CREATE TRIGGER trg_project_domains_disjoint BEFORE INSERT OR UPDATE ON public.project_domains FOR EACH ROW EXECUTE FUNCTION assert_domain_alias_namespaces_disjoint();
+
+DROP TRIGGER IF EXISTS trg_projects_axis_key ON projects;
+CREATE TRIGGER trg_projects_axis_key BEFORE INSERT OR UPDATE ON public.projects FOR EACH ROW EXECUTE FUNCTION axis_registry_before_write();
 
 DROP TRIGGER IF EXISTS trg_projects_disjoint ON projects;
 CREATE TRIGGER trg_projects_disjoint BEFORE INSERT OR UPDATE ON public.projects FOR EACH ROW EXECUTE FUNCTION assert_alias_namespaces_disjoint();

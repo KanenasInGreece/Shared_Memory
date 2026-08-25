@@ -468,6 +468,21 @@ an unidentified project toward its "≥ 2 distinct projects" rule — it fails
 closed — and `GET /health` → `project_identity` reports the outstanding count so
 an incomplete upgrade is visible rather than presenting as a quiet corpus.
 
+### One normalised key per axis — `normalized_key` (migration 035)
+
+Both registries answered on exact strings until 035. `axis_normalize(text)` — lower-case, every
+non-alphanumeric character removed, the same key the gateway's `axis_key()` computes — is now a
+SQL function, and each registry carries a **trigger-maintained `normalized_key` column**:
+`projects (normalized_key)` is UNIQUE and `project_domains (project_id, normalized_key)` is
+UNIQUE, so two registered names can never share a key. Migration 035 backfills the column,
+pre-checks existing rows and names the colliding pair (and an empty-key legacy name) before any
+constraint is added, and widens the alias-namespace disjointness triggers from 024/028 to the
+key, excluding an alias's own target so a rename alias keys like the project it retires. The
+gateway resolves a supplied project or domain by exact name, active alias, key, then alias key,
+rewrites to the canonical and reports it (`project_resolved`, `domains_resolved`); search filters
+match the canonical, its active aliases and any key-equivalent spelling. No functional index is
+used anywhere — the column is the invariant carrier, as in 033.
+
 ### The entity vocabulary — `entity_vocabulary`, `entity_vocab_aliases` (migration 033)
 
 `entity_registry` (migration 030) is a flat set of exact strings — a lookup

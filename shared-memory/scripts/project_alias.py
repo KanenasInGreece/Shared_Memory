@@ -42,9 +42,17 @@ ALIAS_RESOLVE_SQL = (
     " WHERE a.name = {p} AND pa.active"
 )
 
-# Every active alias, for the tools that must not re-ask a settled question.
+# Every active alias, for the tools that must not re-ask a settled question —
+# and, since the by-key resolution step, for ingress and the search filter too.
+#
+# ⚠ THE TWO COLUMNS ARE LABELLED, and that is a correctness fix rather than a
+# tidy-up. Both are called `name` in their own tables, so a driver that returns
+# rows keyed BY COLUMN NAME (asyncpg does; psycopg2's default cursor does not)
+# sees one key twice and silently answers with whichever it kept — an alias map
+# that maps a name to itself. Positional access is unaffected, which is how
+# `sync_project_registry.py` has always read it.
 ACTIVE_ALIASES_SQL = (
-    "SELECT a.name, p.name"
+    "SELECT a.name AS alias, p.name AS canonical"
     " FROM project_aliases pa"
     " JOIN aliases a ON a.id = pa.alias_id"
     " JOIN projects p ON p.id = pa.project_id"

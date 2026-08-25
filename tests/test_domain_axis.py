@@ -60,8 +60,17 @@ def _coord(registered=(), aliases=None, near=()):
     c._register_domain = AsyncMock()
     c._domain_proposals = AsyncMock(return_value=["operations"])
 
+    # ⚠ DISPATCHES ON THE STATEMENT, not on call order — the section names, the
+    # confusable neighbours and the active domain aliases all come off this one
+    # connection now, and a single canned list handed the alias reader rows
+    # shaped like section names.
+    alias_rows = [{"alias": alias, "canonical": canonical}
+                  for (_pid, alias), canonical in (aliases or {}).items()]
     conn = MagicMock()
-    conn.fetch = AsyncMock(return_value=[{"name": n} for n in near])
+    conn.fetch = AsyncMock(side_effect=lambda sql, *a: (
+        alias_rows if "domain_aliases" in sql
+        else [{"name": n} for n in near]
+    ))
     conn.fetchval = AsyncMock(return_value=None)
     conn.execute = AsyncMock(return_value="DELETE 0")
     acq = MagicMock()
@@ -396,8 +405,14 @@ async def test_a_spelling_variant_below_the_similarity_floor_is_still_refused():
     prevent. `near` here is EMPTY on purpose: that is what a below-floor
     confusable query returns."""
     c = _coord(registered={(6, "testing")}, near=[])
+    # Dispatched on the statement, never on call order — the refusal reads the
+    # active domain aliases too now, and an ordered side_effect would have made
+    # ADDING a query look like a broken guard.
     c._acquire.return_value.__aenter__.return_value.fetch = AsyncMock(
-        side_effect=[[], [{"name": "testing"}]])   # confusables, then all names
+        side_effect=lambda sql, *a: (
+            [] if "similarity" in sql or "domain_aliases" in sql
+            else [{"name": "testing"}]
+        ))
     err = await c._domain_ingress_error(
         dict(_fact("Test_Ing"), new_domain=True), "claude")
     assert err["error"] == "domain_spelling_variant"
