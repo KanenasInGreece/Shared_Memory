@@ -181,9 +181,24 @@ def test_no_filters_returns_empty_sql_and_params():
 
 
 def test_project_only_predicate():
+    """A bare string is one spelling — the shape an UNRESOLVABLE filter degrades
+    to, and the reason the predicate accepts a str at all. It binds as a
+    one-element set, so the SQL a resolved filter produces and the SQL an
+    unresolved one produces differ only in what is in the array."""
     sql, params = _axis_filter_predicate(5, "alpha-project", None, None)
-    assert sql == " AND metadata->>'project' = $5"
-    assert params == ["alpha-project"]
+    assert sql == " AND metadata->>'project' = ANY($5::text[])"
+    assert params == [["alpha-project"]]
+
+
+def test_project_predicate_binds_the_whole_expanded_set():
+    """Every stored spelling that MEANS the canonical goes in ONE array. A
+    filter that matched only the canonical string would hide records written
+    before ingress started canonicalising — an empty answer that reads as
+    'there is nothing here' rather than 'you asked with today's spelling'."""
+    sql, params = _axis_filter_predicate(
+        2, ["alpha-project", "Alpha_Project", "alpha project"], None, None)
+    assert sql == " AND metadata->>'project' = ANY($2::text[])"
+    assert params == [["alpha-project", "Alpha_Project", "alpha project"]]
 
 
 def test_domains_only_predicate_or_semantics():
@@ -209,11 +224,11 @@ def test_combined_predicate_sequential_placeholders():
     dt = datetime.datetime(2026, 8, 1)
     sql, params = _axis_filter_predicate(10, "alpha", ["ops"], dt)
     assert sql == (
-        " AND metadata->>'project' = $10"
+        " AND metadata->>'project' = ANY($10::text[])"
         " AND metadata->'domains' ?| $11::text[]"
         " AND created_at >= $12::timestamptz"
     )
-    assert params == ["alpha", ["ops"], dt]
+    assert params == [["alpha"], ["ops"], dt]
 
 
 def test_falsy_project_and_empty_domains_are_no_filter():
@@ -241,8 +256,8 @@ async def test_project_filter_reaches_tier1_query():
     calls = _fetch_calls_matching(mock_conn, "FROM technical_docs")
     assert calls, "Tier-1 candidate query never ran"
     for call in calls:
-        assert "metadata->>'project' = $" in call.args[0]
-        assert "alpha" in call.args
+        assert "metadata->>'project' = ANY($" in call.args[0]
+        assert ["alpha"] in call.args
 
 
 @pytest.mark.asyncio
@@ -256,8 +271,8 @@ async def test_project_filter_reaches_both_tier3_queries():
         rows = _fetchrow_calls_matching(mock_conn, needle)
         assert rows, f"Tier-3 query for {needle!r} never ran"
         for call in rows:
-            assert "metadata->>'project' = $" in call.args[0]
-            assert "alpha" in call.args
+            assert "metadata->>'project' = ANY($" in call.args[0]
+            assert ["alpha"] in call.args
 
 
 @pytest.mark.asyncio
@@ -330,11 +345,11 @@ async def test_combined_filters_all_three_present_together():
 
     call = _fetch_calls_matching(mock_conn, "FROM technical_docs")[0]
     sql = call.args[0]
-    assert "metadata->>'project' = $" in sql
+    assert "metadata->>'project' = ANY($" in sql
     assert "metadata->'domains' ?| $" in sql
     assert "created_at >= $" in sql
     bound = call.args[1:]
-    assert "alpha" in bound
+    assert ["alpha"] in bound
     assert ["ops", "security"] in bound
     assert any(isinstance(b, datetime.datetime) for b in bound)
 
@@ -354,8 +369,8 @@ async def test_pre006_tier3_fallback_variant_also_carries_the_predicate():
     fallback_call = mock_conn.fetchrow.call_args_list[-1]
     sql = fallback_call.args[0]
     assert "kind" not in sql
-    assert "metadata->>'project' = $" in sql
-    assert "alpha" in fallback_call.args
+    assert "metadata->>'project' = ANY($" in sql
+    assert ["alpha"] in fallback_call.args
 
 
 @pytest.mark.asyncio
@@ -373,8 +388,8 @@ async def test_keyword_fallback_path_also_applies_the_filter():
     body = json.loads(resp.text)
     assert body["fallback"] == "keyword"
     call = mock_conn.fetch.call_args
-    assert "metadata->>'project' = $" in call.args[0]
-    assert "alpha" in call.args
+    assert "metadata->>'project' = ANY($" in call.args[0]
+    assert ["alpha"] in call.args
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -429,7 +444,17 @@ async def test_empty_filtered_match_returns_honest_empty_shape():
         {"query": "status", "limit": 5, "project": "nonexistent-project"},
         capture=capture)
 
-    assert result == {"status": "success", "results": []}
+    assert result["results"] == []
+    assert set(result) == {"status", "results", "filters_resolved"}
+    # An unresolvable filter says so rather than erroring, and says exactly what
+    # it searched for — `canonical: null` with the literal string as the one
+    # spelling matched. That distinction is the whole value of the field on an
+    # EMPTY answer: "nothing is filed there" and "that is not a place" look
+    # identical without it.
+    assert result["filters_resolved"] == {
+        "project": {"supplied": "nonexistent-project", "canonical": None,
+                    "matched": ["nonexistent-project"]},
+    }
     # No widen-and-retry: exactly one Tier-1 fetch call.
     assert len(_fetch_calls_matching(mock_conn, "FROM technical_docs")) == 1
     # Mutation check: an unfiltered fallback added after an empty candidate
@@ -514,7 +539,9 @@ async def test_domains_at_cap_passes():
     reranker = _reranker_mock(0)
     result = await _run_search(c, reranker,
                                {"query": "status", "limit": 5, "domains": domains})
-    assert result == {"status": "success", "results": []}
+    assert result["results"] == []
+    # All 16 supplied entries are accounted for, none dropped.
+    assert [e["supplied"] for e in result["filters_resolved"]["domains"]] == domains
     call = _fetch_calls_matching(mock_conn, "FROM technical_docs")[0]
     assert "metadata->'domains' ?| $" in call.args[0]
 
