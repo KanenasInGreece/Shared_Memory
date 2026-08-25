@@ -247,8 +247,10 @@ user reports the vLLM encoders at 0% while the card is saturated (power draw 35 
 under load). Measured: the same load reads 99% when `nvtop` runs as root. The dreaming daemons read
 that figure through `gpu_load.py`, so an inference server in a container on a gated card is
 invisible to them. Grant `nvtop` the capabilities its README prescribes
-(`setcap cap_perfmon,cap_sys_ptrace+ep "$(command -v nvtop)"`, re-applied after every package
-update), or run the containers as the gateway's user, and confirm with `nvtop -s` under load.
+(`setcap cap_dac_read_search,cap_sys_ptrace,cap_perfmon+ep "$(command -v nvtop)"` — all three; the
+README's `cap_perfmon` alone is not enough, and the kernel ignores file capabilities under a systemd
+unit with `NoNewPrivileges=yes` — re-applied after every package update), or run the containers as
+the gateway's user, and confirm with `nvtop -s` under load.
 
 #### The machines behind the numbers
 
@@ -370,7 +372,8 @@ graph quality — see
 **Optional — [`nvtop`](https://github.com/Syllo/nvtop):** if installed, the dreaming daemons
 yield while your GPU is busy, so consolidation never competes with active inference. It only sees
 GPU work from processes it may inspect: an inference server in a container (root by default) reads
-as idle unless `nvtop` carries `cap_perfmon,cap_sys_ptrace` or the container runs as your user.
+as idle unless `nvtop` carries `cap_dac_read_search,cap_sys_ptrace,cap_perfmon` or the container runs
+as your user.
 
 ### Steps
 
