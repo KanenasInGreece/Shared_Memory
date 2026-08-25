@@ -670,6 +670,11 @@ if [[ -x "$REPO_ROOT/shared-memory/scripts/reconcile_stack.sh" ]]; then
     esac
 fi
 
+# The words every terminal line carries when drift exists — including the
+# postflight-FAILED die paths below, so the LAST line always says it.
+_drift_suffix=""
+[[ "$STACK_DRIFT_VERDICT" == "drift" ]] && _drift_suffix=" — stack reconcile REQUIRED"
+
 # Prints the drift table and the two commands to close it — ONLY when drift
 # was actually found. A no-op otherwise, so every terminal path below can
 # call it unconditionally.
@@ -761,7 +766,7 @@ else
     _branch_notice
     _stack_drift_notice
     if [[ "$LINGER_VERDICT" == "no" ]]; then
-        die "postflight FAILED (exit $rc). The code and schema have moved; the system is
+        die "postflight FAILED (exit $rc)${_drift_suffix}. The code and schema have moved; the system is
   NOT verified. Read the failures above before using this deployment.
 
   Also: linger is NOT enabled for $_linger_who on this host. If the gateway
@@ -769,7 +774,7 @@ else
   even once postflight passes. Fix:  sudo loginctl enable-linger $_linger_who"
     else
         _linger_brief
-        die "postflight FAILED (exit $rc). The code and schema have moved; the system is
+        die "postflight FAILED (exit $rc)${_drift_suffix}. The code and schema have moved; the system is
   NOT verified. Read the failures above before using this deployment."
     fi
 fi

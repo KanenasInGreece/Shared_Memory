@@ -224,7 +224,7 @@ print_table() {
             pg_ext_sql="$(docker exec "$_PG_CNAME" psql -U postgres -d "$PG_DB_RESOLVED" -tAc \
                 "SELECT extversion FROM pg_extension WHERE extname='vector'" 2>/dev/null | tr -d '[:space:]')"
             pg_ext_file="$(docker exec "$_PG_CNAME" sh -c \
-                'ls /usr/share/postgresql/17/extension/vector--*.sql 2>/dev/null | sort -V | tail -1' 2>/dev/null)"
+                'ls /usr/share/postgresql/*/extension/vector--*.sql 2>/dev/null | sort -V | tail -1' 2>/dev/null)"
             pg_ext_img="$(printf '%s' "$pg_ext_file" | sed -E 's#.*/vector--##; s#\.sql$##')"
             if [[ -z "$pg_ext_sql" || -z "$pg_ext_img" ]]; then
                 status="unknown"
@@ -272,7 +272,8 @@ for row in "${DRIFT_ROWS[@]}"; do red "  - $row"; done
 echo
 ylw "Reconciling pulls the pinned images, recreates the containers above and"
 ylw "runs ALTER EXTENSION vector UPDATE. It does NOT edit .env, run a"
-ylw "migration, or restart the gateway."
+ylw "migration, or restart the gateway. Note: 'pull' also refreshes any"
+ylw "FLOATING image (rows marked floating) to whatever its tag points at now."
 
 if [[ "$ASSUME_YES" != "1" ]]; then
     echo
