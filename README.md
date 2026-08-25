@@ -178,16 +178,42 @@ big one, the encoders the small one. Local content never leaves the machine unle
 marked `private_ok` exists to receive it. *Example minimum: 8+ threads · 16 GB RAM · 8–12 GB
 VRAM · 40 GB disk.* More RAM (32 GB) is comfort for a box that also runs agents and a desktop.
 
-#### An alternate encoder backend — vLLM on an Intel Arc card
+#### Serving the encoders with vLLM instead of llama.cpp
 
-The shipped default serves both encoders with `llama-server` (llama.cpp, Vulkan), and that is
-what every number above was measured on. On an **Intel Arc** card there is a second option we
-now run on the reference workstation: serve the encoders with **vLLM** instead. It is not the
-default and it is not required — it is faster on this hardware, by a margin large enough to
-document.
+The shipped default serves both encoders with `llama-server`, and every number above was measured
+on that. **vLLM works too, on any accelerator vLLM itself supports** — this part is not
+hardware-specific, and the piece of glue below is needed by anyone who serves the *reranker* that
+way, whatever card is underneath.
 
-**Measured on the reference workstation, Arc B580 12 GB, same two models, same payloads, only
-the serving engine different:**
+**The embedder needs nothing.** vLLM already serves `/v1/embeddings` at the path the gateway
+expects, so `EMBEDDER_URL` points straight at it.
+
+**The reranker needs a one-line translation.** The gateway posts to `/v1/reranking`; vLLM serves
+`/v1/rerank`. That is the *only* disagreement — everything else about the call already lines up: a
+body carrying no `model` field is accepted, `results[].index` is the position in the array you
+submitted rather than a sorted rank, `relevance_score` is the field the coordinator reads, and
+`top_n` is honoured. So the shim rewrites the path and touches nothing else. It ships as
+`shared-memory/scripts/rerank_shim.py`, refuses any path it was not built to map rather than
+forwarding blind, and takes four env-overridable settings (`SHIM_VLLM_URL`, `SHIM_HOST`,
+`SHIM_PORT`, `SHIM_TIMEOUT_S`). Run it, point `RERANKER_URL` at it, restart the gateway. It binds
+loopback on purpose: no encoder in this stack carries authentication, so a wider bind publishes an
+unauthenticated reranking endpoint on every interface of the host.
+
+Two things hold whatever the hardware. **A vLLM process serves one model**, so an encoder pair needs
+two of them. And vLLM wants **Hugging Face weights, not GGUF** — `BAAI/bge-m3` (4.3 GB) and
+`BAAI/bge-reranker-v2-m3` (2.2 GB), the same models as the defaults in a different format and
+precision. Start both with `--runner pooling`: these are encoders, not generative models.
+
+⚠ **Moving the *embedder* to a different engine mixes vector populations.** vLLM's vectors are not
+bit-identical to llama.cpp's — on identical text the two agreed to a cosine of 0.9982 at the longest
+inputs, which cost one position swap in 760 pairs in a ranking test over real records. Small, but
+records written after the switch sit slightly apart from records written before it, and only a full
+re-embed puts that back. Moving **only the reranker** has no such cost: a reranker stores nothing.
+
+#### A measured example of that — Intel Arc B580
+
+This is the shape we run on the reference workstation, and the numbers are read off it. Same two
+models, same payloads, only the serving engine different:
 
 | | `llama-server` (Q8 GGUF, Vulkan) | vLLM (FP16, Level Zero) |
 |---|---|---|
@@ -200,52 +226,28 @@ the serving engine different:**
 | host RAM per encoder process | ~8 GiB, and still growing after two days | flat: +35 MiB across 105 full-size reranks |
 
 That last row is the one that surprised us. `llama-server` holds a prompt cache in host RAM —
-`--cache-ram`, 8192 MiB by default — which a cross-encoder and an embedder can never get a hit
-from, because the text is different every time. Two encoders were holding ~16 GB of it. vLLM
-holds a fixed footprint and does not move under load: a 319-second barrage of 105 maximum-size
-reranks (56.8 million characters), 288 embeds and 24 real searches left VRAM unchanged to the
-megabyte, produced no errors, and triggered no kernel GPU resets.
+`--cache-ram`, 8192 MiB by default — which a cross-encoder and an embedder can never get a hit from,
+because the text is different every time. Two encoders were holding ~16 GB of it. vLLM holds a fixed
+footprint and does not move under load: a 319-second barrage of 105 maximum-size reranks (56.8
+million characters), 288 embeds and 24 real searches left VRAM unchanged to the megabyte, produced no
+errors, and triggered no kernel GPU resets.
 
-**What it needs.**
+**The Intel-specific parts.** The image is `intel/vllm:0.21.0-xpu` (28.8 GB on disk; vLLM 0.21.1,
+torch 2.11 with native XPU support, no IPEX). Pass **`--device /dev/dri` *and*
+`-v /dev/dri/by-path:/dev/dri/by-path`** — the second is not optional, because `--device` does not
+pass that directory and without it oneCCL cannot enumerate the GPU and the engine never starts; add
+`-e CCL_ZE_IPC_EXCHANGE=sockets` alongside it. Note also that `--gpu-memory-utilization` behaves as a
+**ceiling, not a reservation**, for a pooling model — there is no KV cache to fill, so 0.3 and 0.6
+produced an identical footprint. Set it low if the card is shared; it will not be claimed.
 
-- **The image:** `intel/vllm:0.21.0-xpu` — 28.8 GB on disk, ships vLLM 0.21.1, torch 2.11 with
-  native XPU support (no IPEX).
-- **Two containers, not one.** A vLLM process serves exactly one model, so the embedder and the
-  reranker each need their own.
-- **Hugging Face weights, not GGUF:** `BAAI/bge-m3` (4.3 GB) and `BAAI/bge-reranker-v2-m3`
-  (2.2 GB). Same models as the shipped defaults, different format and precision.
-- **`--runner pooling`** on both. These are encoders, not generative models.
-- **`--device /dev/dri` *and* `-v /dev/dri/by-path:/dev/dri/by-path`.** The second is not
-  optional: `--device` does not pass that directory, and without it oneCCL fails to enumerate
-  the GPU and the engine never starts. `-e CCL_ZE_IPC_EXCHANGE=sockets` alongside it.
-- **`--gpu-memory-utilization` is a ceiling here, not a reservation.** For a pooling model there
-  is no KV cache to fill, so 0.3 and 0.6 produced an identical footprint. Set it low if the card
-  is shared; it will not be claimed.
+⚠ **Per-card, not per-vendor.** Measured on a B580. On the same machine an A770 is tested-failing for
+vLLM, and Level Zero enumerates only the B580 — so this is not a general "Arc" answer. And it does
+nothing at all for an AMD card or a CPU-only host, which is where reranking actually hurts.
 
-**The reranker needs a shim; the embedder does not.** vLLM already serves `/v1/embeddings` at
-the path the gateway expects, so `EMBEDDER_URL` points straight at it. Reranking is the one
-mismatch: the gateway posts to `/v1/reranking`, vLLM serves `/v1/rerank`. Everything else about
-that call already agrees — a body with no `model` field is accepted, `results[].index` is the
-position in the submitted array, `relevance_score` is the field the coordinator reads, and
-`top_n` is honoured. So the translation is a path rewrite and nothing more, and it ships as
-`shared-memory/scripts/rerank_shim.py`. Run it, point `RERANKER_URL` at it, restart the gateway.
-
-**Before you switch, three things worth knowing.**
-
-- **Intel only, and not every Intel card.** Measured on a B580. On the same machine an A770 is
-  tested-failing for vLLM, and Level Zero enumerates only the B580 — so this is not a general
-  "Arc" answer, it is a per-card one. It does nothing at all for an AMD card or a CPU-only host,
-  which is where reranking actually hurts.
-- **Switching the embedder mixes vector populations.** vLLM's vectors are not bit-identical to
-  llama.cpp's: on identical text the two agree to a cosine of 0.9982 at the longest inputs, and
-  in a ranking test over real records that cost one position swap in 760 pairs. Small, but
-  records written after the switch sit slightly apart from records written before it, and only a
-  full re-embed puts that back. Switching **only the reranker** has no such cost — a reranker
-  stores nothing.
-- **`nvtop` reports 0% utilisation for this path** even when the card is saturated. The work is
-  real and the power draw shows it (35 W idle to ~200 W under load), but the utilisation field
-  stays at zero, because Level Zero submissions are not counted the way Vulkan ones are. Nothing
-  in the framework depends on that today, but do not read a GPU-busy figure and believe it.
+⚠ **`nvtop` reports 0% utilisation for this path** even when the card is saturated. The work is real
+and the power draw shows it (35 W idle to ~200 W under load), but the utilisation field stays at
+zero, because Level Zero submissions are not counted the way Vulkan ones are. Nothing in the
+framework depends on that today, but do not read a GPU-busy figure and believe it.
 
 #### The machines behind the numbers
 
