@@ -695,6 +695,9 @@ docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared
 docker compose -f shared-memory/ops/postgres_neo4j_limits.yaml --env-file shared-memory/.env ps   # inference healthy, stores Up
 ```
 
+When a later release moves an image pin, `bash shared-memory/scripts/reconcile_stack.sh` shows the
+drift against what is actually running and, on your say-so, closes it — see [§16](#16-databases-initialise-verify-upgrade).
+
 Place your GGUF files where the compose mounts expect them (or edit the mount and `-m` paths) —
 both models are on Hugging Face, and the download commands (with the exact layout the compose
 defaults name) are in `shared-memory/.env.example` next to `LLM_MODELS_DIR`. `preflight.sh`
@@ -744,10 +747,9 @@ Both directions are scripts the framework ships and runs on its own test hosts a
   reports itself as *unverified*, exit 1, rather than as done. `--dry-run` prints every step and runs
   nothing. It was exercised on a fresh VM and on a bare-metal host, by an agent, from these
   instructions, and the defects that surfaced were fixed in the versions that followed.
-  ⚠ One gap, known and stated: the update path does not yet recreate the containers when the
-  compose file's image pins move — after an update that changes a pin, run the `docker compose …
-  pull` and `up -d` lines from [§15](#15-the-stack-docker-compose) and, for pgvector,
-  `ALTER EXTENSION vector UPDATE`. Closing that gap is queued.
+  The update path does not move the containers by design: when a release moves an image pin,
+  `reconcile_stack.sh` shows the drift and, on your say-so, pulls the pinned images, recreates the
+  containers and updates the pgvector extension.
 - **Uninstall** (`uninstall_framework.sh --level service|data|all`) is tiered, and `--level` is
   required because the safe default for an irreversible operation is to say what you mean.
   `service` stops the gateway and removes the agents' skill directories, touching no data — and is
@@ -1021,13 +1023,19 @@ Installing a client is copying two files into the agent's skills directory:
 | Codex CLI | `~/.codex/skills/shared-memory/` | `$shared-memory` |
 | Antigravity CLI | `~/.gemini/skills/shared-memory/` | `/activate shared-memory` |
 | LM Studio / MCP hosts | `mcp/mcp.json` → `mcp/vector-skill.py` | MCP tools |
-| opencode | MCP connector in `opencode.jsonc` ([§21](#21-the-mcp-install-any-mcp-host-one-connector)) — no skill copy | MCP tools |
+| opencode | **skill:** reads `~/.claude/skills/shared-memory/` (Claude Code's directory, by opencode's design) · **MCP:** connector in `opencode.jsonc` ([§21](#21-the-mcp-install-any-mcp-host-one-connector)) | `/shared-memory` via the skill · MCP tools |
 
-**opencode, tested both ways round.** As a *client* it mounts the memory through the MCP connector
-— exercised on the reference workstation and on a test host, read-only and write roles — and there
-is no skill-directory install for it: the connector is its path. As an *installer* it was the agent
-that set the framework up on the bare-metal test host from `AGENTS.md`, and later ran the
-documented upgrade there and verified the fixes by inspecting state rather than trusting output.
+**opencode, tested three ways.** As a *skill* client it reads Claude Code's skill directory by design
+— exercised on a test host where opencode is the only agent, and that is the condition: on a host
+that also runs Claude Code, the same behaviour makes opencode present **Claude Code's token** and
+write records as `claude`. Measured, and the containment is three layers deep: set
+`OPENCODE_DISABLE_CLAUDE_CODE=1` in opencode's environment, deny skills in its config
+(`"skill": {"*": "deny"}`), and deny reads of `~/.claude/**` (and every other agent's home and
+`~/.shared-memory/**`) in its permissions — then give it its own identity through the *MCP*
+connector, which is the second tested path (reference workstation and the test host, read-only and
+write roles). As an *installer* it set the framework up on the bare-metal test host from `AGENTS.md`,
+ran the documented upgrade there later, and verified the fixes by inspecting state rather than
+trusting output.
 
 Put the agent's `AGENT_TOKEN` in the skill's `.env`, then verify from any shell:
 

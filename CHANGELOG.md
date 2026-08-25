@@ -5,6 +5,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.56] — 2026-08-25
+
+### Added — `reconcile_stack.sh`: the compose image pins reach an installed host on the operator's say-so
+
+v0.9.55 pinned the database images exactly and said so — and then the documented update path carried
+code, schema and skills to two test hosts while leaving both on the old containers, because
+`update_framework.sh` has never touched the stack. That was measured, not assumed, and the operator ruled
+the fix: **not** a step inside the update — a host may have other problems to deal with first — but a
+script they run when they choose.
+
+`shared-memory/scripts/reconcile_stack.sh` shows the drift first, read-only: for every service the host's
+`.env` makes active, the image pinned in the shipped compose file against the image the running container
+was created from, and for pgvector the SQL-level extension version against the version the image carries.
+Version-less tags (the llama.cpp images, still unpinned) are reported as *floating*, never as in sync.
+`--dry-run` stops there (exit 2 on drift). On confirmation it runs the documented `docker compose … pull`
+and `up -d` against the shipped file and the host's `.env`, then `ALTER EXTENSION vector UPDATE`, prints the
+table again and exits non-zero if any drift remains. It never edits `.env`, never runs migrations and never
+restarts the gateway, which reconnects on its own. `update_framework.sh` now ends by running the same drift
+table read-only and, if the pins have moved, tells the operator which script to run — a report, not an
+action. `--help` performs nothing.
+
+Records: finding `fact:1588`, ruling `decision:1589` (grounded on `decision:1586`, the dependency-currency
+rule whose delivery half this is). README §16 and `AGENTS.md` carry the procedure.
+
+**Docs.** §19 states how opencode was tested — as a skill client (it reads Claude Code's skill directory by design, with the identity condition that carries and its three-layer containment), as an MCP client, and as the installing agent (PR #317, folded in).
+
+---
+
 ## [0.9.55] — 2026-08-25
 
 ### Changed — filtered search stays correct at scale; runtime dependencies pinned to a measured baseline

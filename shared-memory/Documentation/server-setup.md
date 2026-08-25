@@ -211,6 +211,11 @@ authenticated before A2. They are now dead weight; the daemons mint their own to
 fresh, in-memory, on every boot instead, so delete any such entries rather than
 converting them.
 
+Neither path above recreates the store containers when a release moves a compose image pin
+(pgvector, neo4j). `bash shared-memory/scripts/reconcile_stack.sh --dry-run` shows the drift, and
+`bash shared-memory/scripts/reconcile_stack.sh` closes it, only once you confirm — see AGENTS.md's
+*Reconcile the stack to the shipped pins* runbook.
+
 ---
 
 ## Version contract (client ↔ gateway)
