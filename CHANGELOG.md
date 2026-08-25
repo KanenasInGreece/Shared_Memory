@@ -5,6 +5,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.57] — 2026-08-25
+
+### Changed — the search-first rule names history questions; sync refuses to bury a connector
+
+**Constitution snippet v3, MCP snippet v2, `system-prompt.md` in parity.** The standing rule every
+agent installs said the shared memory is the source of truth for project direction, prior decisions
+and superseded claims. It did not say the same for *whether something was ever tested, tried, rejected
+or done* — and measured on this project, an agent asked exactly that answered from a directory listing
+while the record held the measurement; the wrong answer reached this README for one release. All three
+surfaces now carry the trigger in the same words: those are questions about history, and the current
+state of files can only confirm an answer, never give one. The version markers moved (`v2 → v3` for the
+CLI block, `v1 → v2` for the MCP block), so every installed block reads as drifted and the install
+runbook's compare-and-re-propose step (Phase 8b/8c) offers the new text — never writes it silently.
+A guard test pins the phrase on all three surfaces and the byte-identity of the two tracked CLI copies.
+
+**`sync_skills.sh` refuses a `skill`-kind target that already holds `vector-skill.py`.** An MCP
+connector's walled directory registered in `AGENT_INSTALLS` with the two-field `name:path` form
+parses as kind `skill` forever (by design, for backward compatibility) — and the CLI package was then
+copied on top of the connector on every sync while the connector itself never refreshed: measured on
+two hosts after v0.9.55, the connector sat at 0.9.47 under a 0.9.56 gateway and the MCP constitution
+snippet never arrived. The presence of `vector-skill.py` is the tell; sync now stops on it and prints
+the one-line fix (`<name>:mcp:<path>`), rather than delivering the wrong package again.
+
+Records: portable lesson `fact:1594` (from the debrief `fact:1591` / `retro:1593`); finding
+`fact:1595`. No schema change, no pin move; the gateway restart is for the version only.
+
+---
+
 ## [0.9.56] — 2026-08-25
 
 ### Added — `reconcile_stack.sh`: the compose image pins reach an installed host on the operator's say-so
