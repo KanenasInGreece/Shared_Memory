@@ -232,3 +232,22 @@ def test_mint_rule_in_prompt_states_the_unconditional_gate():
         assert not hasattr(mod, "REM_MAY_MINT_ENTITIES")
     finally:
         os.environ.pop("REM_MAY_MINT_ENTITIES", None)
+
+
+# ── A skill-kind target that already holds a connector is refused ────────────
+
+def test_skill_kind_target_holding_a_connector_is_refused_before_the_kind_fork():
+    """fact:1595: an MCP walled dir registered with the two-field `name:path`
+    form parses as kind `skill`; the CLI package then lands on top of the
+    connector and the connector never refreshes. The tell is vector-skill.py
+    in the target. The refusal must sit BEFORE the kind fork (so the skill
+    path never runs for it) and name the `:mcp:` remedy."""
+    with open(SCRIPT, encoding="utf-8") as fh:
+        text = fh.read()
+    guard = text.index("[ -f \"$dir/vector-skill.py\" ]")
+    fork = text.index("# ── Kind fork.")
+    assert guard < fork, "the connector guard must run before the kind fork"
+    refusal = text[guard:fork]
+    assert "REFUSING" in refusal
+    assert ":mcp:" in refusal, "the refusal must name the name:mcp:path remedy"
+    assert "continue" in refusal, "the refusal must skip the target, not fall through"
