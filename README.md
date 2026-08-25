@@ -229,8 +229,8 @@ projection on `/health` and the client waits accordingly.
   [§14](#14-os-prerequisites); no end-to-end install has been run).
 - **macOS** — unified memory redraws the RAM/VRAM split entirely; no run on record.
 
-**Disk, itemised (measured):** container images 1.8–3 GB (pgvector 0.6 + Neo4j 1.0 + llama.cpp
-0.2 CPU or 1.2 Vulkan) · encoder models 1.2 GB · database stores 0.8 GB at 1,300 records,
+**Disk, itemised (measured):** container images 1.8–3 GB (pgvector 0.6 GB + Neo4j 1.0 GB + llama.cpp
+0.2 GB CPU or 1.2 GB Vulkan) · encoder models 1.2 GB · database stores 0.8 GB at 1,300 records,
 growing with the corpus · your reasoning model if local (8.4 GB for the 14B example) · the OS
 itself (a headless Linux server installs in ~3 GB and idles under half a gigabyte of RAM; a
 desktop OS beside the deployment costs gigabytes of both — budget it as the separate thing it
@@ -245,6 +245,21 @@ reasoning LLM on `:5000` (LM Studio, `llama-server`, or any OpenAI-compatible en
 online provider — the embedder and reranker run as Docker containers from the compose file · at
 least one consumer: a CLI agent through the skill (Claude Code, Antigravity CLI, Grok, Codex CLI)
 and/or an MCP host through the connector (LM Studio, opencode — [§21](#21-the-mcp-install-any-mcp-host-one-connector)).
+
+**Runtime components — the shipped, pinned baseline (checked 2026-08-25).** The compose file names
+exact image tags, never floating ones, and these are requirements in their own right:
+
+| Component | Shipped pin | Floor, and why |
+|---|---|---|
+| PostgreSQL | **17.11** via `pgvector/pgvector:0.8.6-pg17` | 17.x; 17.11 carries the 2026-08-13 security release (`pg_dump` CVE-2026-19385, `psql \unrestrict` CVE-2026-18408 — paths the backup and restore scripts exercise) |
+| pgvector | **0.8.6** (same image) | **≥ 0.8** — `hnsw.iterative_scan` is what keeps a selective `--project`/`--domain` filter from returning nothing at scale ([§16](#16-databases-initialise-verify-upgrade)); ≥ 0.8.4 for the HNSW-vacuum corruption fixes. The gateway reads the installed version at startup and reports it on authenticated `/health` |
+| Neo4j | **5.26.30** Community, `neo4j:5.26.30-community` | the 5.26 **LTS** line (supported to 2028-06); APOC and Graph Data Science load at container start |
+| llama.cpp server images | `ghcr.io/ggml-org/llama.cpp:server` / `:server-vulkan` | still floating — pinned after an encoder-host test |
+
+A pin moves only deliberately, and every move is recorded in the `CHANGELOG` with its reason; a
+security fix in a path the framework exercises is taken at the next release regardless of the
+cycle. The policy, the licence position on each component and the current check are in
+[`SECURITY.md`](SECURITY.md) and [`THIRD_PARTY.md`](THIRD_PARTY.md).
 
 Both come from the vendors' own instructions rather than your distribution's packages — one baseline
 that behaves the same across Debian, Ubuntu and Fedora, and the default these steps assume. A distro
@@ -667,8 +682,9 @@ verifies it; by hand it is
 
 ## 15. The stack: Docker Compose
 
-`shared-memory/ops/postgres_neo4j_limits.yaml` defines four services: **postgres** (pgvector), **neo4j**
-(with APOC + the required GDS plugin), and the two llama.cpp inference containers —
+`shared-memory/ops/postgres_neo4j_limits.yaml` defines four services: **postgres** (pgvector, pinned
+`0.8.6-pg17`), **neo4j** (pinned `5.26.30-community`, with APOC + the required GDS plugin), and the two
+llama.cpp inference containers —
 **retriever-api** (BGE-M3 embedder, `:8070`) and **reranker-api** (BGE-Reranker-v2-m3, `:8071`).
 The file is `${VAR}`-parametrized: host paths and passwords come from `shared-memory/.env`
 (write it with `bash shared-memory/scripts/install_framework.sh`, or copy `.env.example` by
@@ -715,6 +731,32 @@ arriving at running code rather than code arriving at existing data:
 ```bash
 bash shared-memory/scripts/update_framework.sh --from-restore
 ```
+
+### Update and uninstall — tested procedures, not promises
+
+You are not stuck on the version you installed, and you are not stuck with the installation.
+Both directions are scripts the framework ships and runs on its own test hosts at every release:
+
+- **Update** (`update_framework.sh`) takes a backup first (quiesced when an admin token is set,
+  online otherwise — it says which), pulls the released code, applies the Postgres migrations and
+  re-verifies the Neo4j constraints, restarts the gateway **by version**, re-syncs every installed
+  skill, and ends with the postflight verification — an update that has not passed postflight
+  reports itself as *unverified*, exit 1, rather than as done. `--dry-run` prints every step and runs
+  nothing. It was exercised on a fresh VM and on a bare-metal host, by an agent, from these
+  instructions, and the defects that surfaced were fixed in the versions that followed.
+  ⚠ One gap, known and stated: the update path does not yet recreate the containers when the
+  compose file's image pins move — after an update that changes a pin, run the `docker compose …
+  pull` and `up -d` lines from [§15](#15-the-stack-docker-compose) and, for pgvector,
+  `ALTER EXTENSION vector UPDATE`. Closing that gap is queued.
+- **Uninstall** (`uninstall_framework.sh --level service|data|all`) is tiered, and `--level` is
+  required because the safe default for an irreversible operation is to say what you mean.
+  `service` stops the gateway and removes the agents' skill directories, touching no data — and is
+  reversible. `data` also removes the containers, volumes, data directories and `.env`; `all` adds
+  the model weights. **The irreversible levels refuse to start unless a backup set exists** (or you
+  say `--no-backup` for a host you mean to throw away), and `--dry-run` shows the refusal too. What
+  is never removed at any level: `~/.shared-memory` — the backup sets, the credential audit trail and
+  the capacity history belong to the host, not the installation — and the checkout itself, whose
+  removal is printed for you to run deliberately.
 
 Two verifiers prove what re-running files cannot — that a fresh install matches a live one, and
 that the graph constraints are actually in force:
@@ -979,6 +1021,13 @@ Installing a client is copying two files into the agent's skills directory:
 | Codex CLI | `~/.codex/skills/shared-memory/` | `$shared-memory` |
 | Antigravity CLI | `~/.gemini/skills/shared-memory/` | `/activate shared-memory` |
 | LM Studio / MCP hosts | `mcp/mcp.json` → `mcp/vector-skill.py` | MCP tools |
+| opencode | MCP connector in `opencode.jsonc` ([§21](#21-the-mcp-install-any-mcp-host-one-connector)) — no skill copy | MCP tools |
+
+**opencode, tested both ways round.** As a *client* it mounts the memory through the MCP connector
+— exercised on the reference workstation and on a test host, read-only and write roles — and there
+is no skill-directory install for it: the connector is its path. As an *installer* it was the agent
+that set the framework up on the bare-metal test host from `AGENTS.md`, and later ran the
+documented upgrade there and verified the fixes by inspecting state rather than trusting output.
 
 Put the agent's `AGENT_TOKEN` in the skill's `.env`, then verify from any shell:
 
@@ -1137,11 +1186,10 @@ statement, not a permanent one.
   faithfulness holds by construction. What has no number yet is whether a fold is a sharp
   abstraction or a lossy blur. The measurement is designed (lift over a deterministic
   baseline, human judgement on the disagreement set) and has not been run.
-- **The entity vocabulary is gated at save — the cleanup behind the gate is not done.** A
-  save naming an entity outside the registry is refused with the exact protocol for minting
-  it, and minting is the operator's act. Names that entered before the gate existed are still
-  in the graph as they were spelled then; merging them is curation, not code, and is in
-  progress.
+- **The entity vocabulary is gated at save.** A save naming an entity outside the registry is
+  refused with the exact protocol for minting it, and minting is the operator's act — a new
+  concept enters the graph only when someone says so, and a misspelling never becomes one. That
+  is what is in force on every install; nothing about it depends on history.
 - **Authentication is bearer-token plus kernel-attested person identity.** Agents present a
   token the gateway knows by digest. On the local socket the gateway also reads the
   connecting person from the kernel (`SO_PEERCRED`) and stamps it server-side — never

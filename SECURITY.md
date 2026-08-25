@@ -13,6 +13,36 @@ Include:
 
 You will receive a response within 72 hours. Once the issue is confirmed and a fix is available, a public disclosure will be coordinated with you.
 
+## Component Security Updates — the standing promise
+
+Two separate reviews guard a release, and they answer different questions. The **security review of
+this codebase** runs at every `x.y.5` release and on demand (cadence below). The **dependency-currency
+check** — adopted 2026-08-25 — asks whether the *components we ship pins for* have moved under us:
+
+- **Scope:** PostgreSQL, pgvector, Neo4j (with APOC and Graph Data Science), the llama.cpp server
+  images, and the Python runtime dependencies.
+- **Cadence:** at every `0.x.0` release and at every `x.y.5` security audit. A reviewer reads the
+  changelog delta between our pin and the latest stable *against the paths this framework exercises*
+  (the SQL it issues, HNSW and vacuum, Cypher and plugin calls, backup and restore tooling) and returns
+  findings with severity; the operator rules; a ruled upgrade goes to a test host first.
+- **Security overrides the cadence.** A published fix in a code path the framework exercises is taken
+  at the next release regardless of where the cycle stands, and the release notes name the path.
+- **Pins are exact tags, never floating.** A floating tag moves a database minor silently. A pinned
+  pgvector tag also pins the PostgreSQL minor beneath it, so the check reads both numbers.
+- **Every version move is recorded in the `CHANGELOG` with its reason** — old tag, new tag, and
+  security fix / correctness fix / feature floor. A silent pin bump is treated as a defect.
+- **LTS lines by default** where the vendor has one (Neo4j 5.26, supported to 2028-06).
+- **Licences are re-read at every move**, with how the framework couples to the component (separate
+  process, imported library, or linked plugin). A copyleft component is only ever coupled as a separate
+  process; a licence change on any component is a finding at the highest severity. The current table is
+  [`THIRD_PARTY.md`](THIRD_PARTY.md).
+
+**Baseline as of 2026-08-25 (v0.9.55):** `pgvector/pgvector:0.8.6-pg17` (PostgreSQL 17.11 — two
+security releases ahead of the 17.9 the floating tag had left in place, including `pg_dump`
+CVE-2026-19385 and `psql \unrestrict` CVE-2026-18408; pgvector 0.8.6, with the 0.8.3/0.8.4 HNSW-vacuum
+corruption fixes) and `neo4j:5.26.30-community`. The llama.cpp images remain floating until an
+encoder-host test has been run against a pinned build. Next check: the first of `v0.10.0` or `v0.9.x5`.
+
 ## Known Security Considerations
 
 ### Starlette BadHost (CVE-2026-48710) — mitigated
