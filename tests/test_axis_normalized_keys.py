@@ -255,6 +255,14 @@ def _project_coord(registered=(), aliases=None, near=()):
     def fetch(sql, *args):
         if "project_aliases" in sql:
             return alias_rows
+        if "normalized_key" in sql:
+            # The real statement: name OR stored key, both indexed (migration
+            # 035). Stubbed by REPRODUCING it over the fixture set rather than
+            # returning the whole registry, or the test would pass on a query
+            # that filters nothing.
+            name, key = args
+            return [{"name": n} for n in registered
+                    if n == name or axis_key(n) == key]
         if "similarity" in sql:
             return [{"name": n} for n in near]
         return [{"name": n} for n in registered]
@@ -394,6 +402,50 @@ async def test_declaring_a_key_variant_of_a_RETIRED_spelling_as_NEW_is_refused()
 
 
 @pytest.mark.asyncio
+async def test_declaring_an_EXACT_active_alias_as_NEW_is_refused():
+    """⛔ THE GUARD NOW SITS ABOVE THE ALIAS STEP, and this is why. A caller
+    declaring `new_project` while naming a retired spelling is asserting that no
+    such project exists — and the deployment adjudicated that exact string
+    already. It used to be resolved silently, so the claim was never contradicted
+    and the agent went on believing it had created something.
+
+    MUTATION CHECK: move the `new_project` block back below
+    `_resolve_project_alias` and this dies — the save succeeds, quietly."""
+    c = _project_coord(registered=("orbit-relay",),
+                       aliases={"Orbit_Relay_Old": "orbit-relay"})
+    err = await c._project_ingress_error(
+        {"source": "c", "project": "Orbit_Relay_Old", "new_project": True},
+        "c", {})
+    assert err["error"] == "project_spelling_variant"
+    assert "orbit-relay" in err["message"]
+    c._register_project.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_declaring_an_EXACT_registered_name_as_NEW_is_still_fine():
+    """⚠ THE OTHER HALF OF THE ORDERING, and the reason the guard sits AFTER the
+    registry check rather than first. A `new_project` flag on a name that is
+    already registered verbatim is a redundant flag, not a false claim, and has
+    always been accepted — the second record of a flow that declared the project
+    on its first."""
+    c = _project_coord(registered=("orbit-relay",))
+    assert await c._project_ingress_error(
+        {"source": "c", "project": "orbit-relay", "new_project": True},
+        "c", {}) is None
+    c._register_project.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_exact_section_alias_declared_NEW_is_refused_too():
+    c = _domain_coord(registered=("graph-quality",),
+                      aliases={"graphs": "graph-quality"})
+    err = await c._domain_ingress_error(
+        {"project": "p", "domain": "graphs", "new_domain": True}, "c", {})
+    assert err["error"] == "domain_spelling_variant"
+    c._register_domain.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_a_genuinely_new_project_still_registers_with_no_extra_step():
     """The guard must stay quiet for the ordinary case, or it trains the reflex
     to override it."""
@@ -427,6 +479,13 @@ def _domain_coord(registered=(), aliases=None, near=(), project_id=6):
     def fetch(sql, *args):
         if "domain_aliases" in sql:
             return alias_rows
+        if "normalized_key" in sql:
+            # ARRAYS, because a record names several sections at once — see
+            # DOMAIN_NAME_OR_KEY_SQL. Reproduced faithfully so a regression to a
+            # single-value form (which answers only the first section) fails here.
+            _pid, names, keys = args
+            return [{"name": n} for n in registered
+                    if n in names or axis_key(n) in keys]
         if "similarity" in sql:
             return [{"name": n} for n in near]
         return [{"name": n} for n in registered]
@@ -545,7 +604,10 @@ def _full_coord(registered=(), aliases=None):
     c._resolve_project_alias = AsyncMock(side_effect=lambda n: aliases.get(n))
     c._register_project = AsyncMock()
     c._project_proposals = AsyncMock(return_value=[])
-    c._project_spellings = AsyncMock(return_value=(list(registered), aliases))
+    c._project_spellings = AsyncMock(side_effect=lambda supplied: (
+        [n for n in registered
+         if n == supplied or axis_key(n) == axis_key(supplied)],
+        aliases, None))
     c._entity_vocab_resolve_many = AsyncMock(return_value={})
 
     conn = MagicMock()
@@ -605,15 +667,20 @@ async def test_the_save_response_is_null_when_nothing_was_rewritten():
 
 def _search_coord(registered=(), aliases=None, domains=(), domain_aliases=None):
     c = MemoryCoordinator()
-    c._project_spellings = AsyncMock(
-        return_value=(list(registered), dict(aliases or {})))
+    c._project_spellings = AsyncMock(side_effect=lambda supplied: (
+        [n for n in registered
+         if n == supplied or axis_key(n) == axis_key(supplied)],
+        dict(aliases or {}), None))
     # ⚠ THE STUB HONOURS THE SCOPE ARGUMENT. Returning the section set for a
     # None project id would fake the one thing this axis must not do — answer a
     # section name outside any project — and would let a test pass that the real
     # `_domain_spellings` fails.
-    c._domain_spellings = AsyncMock(side_effect=lambda pid: (
-        (list(domains), dict(domain_aliases or {})) if pid is not None
-        else ([], {})))
+    c._domain_spellings = AsyncMock(side_effect=lambda pid, supplied: (
+        ([n for n in domains
+          if n in supplied
+          or axis_key(n) in {axis_key(x) for x in supplied}],
+         dict(domain_aliases or {}), None)
+        if pid is not None else ([], {}, None)))
     c._project_identity = AsyncMock(return_value=6)
 
     conn = AsyncMock()
@@ -718,7 +785,7 @@ async def test_domains_stay_literal_with_no_project_to_scope_them_by():
         {"supplied": "Graph Quality", "canonical": None,
          "matched": ["Graph Quality"]},
     ]
-    c._domain_spellings.assert_awaited_once_with(None)
+    c._domain_spellings.assert_awaited_once_with(None, ["Graph Quality"])
 
 
 @pytest.mark.asyncio
@@ -777,6 +844,70 @@ async def test_the_keyword_fallback_reports_the_same_resolution():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# (7b) A registry that could not be READ is a different event from a name
+#      nobody registered — and it used to look identical
+# ══════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_a_failed_registry_read_is_disclosed_in_the_response():
+    """⛔ THE DEGRADE CHANGES THE ANSWER, so it must be visible. With the registry
+    unreadable, by-key resolution stops answering and the filter matches only the
+    literal string — which produced exactly the `canonical: null` a genuinely
+    unregistered name produces. One of those is the truth about the corpus; the
+    other is the gateway saying it could not check.
+
+    MUTATION CHECK: drop the `resolved["error"] = ...` line from
+    `_resolve_search_filters` and this dies with the two indistinguishable."""
+    c, conn = _search_coord(registered=("orbit-relay",))
+    c._project_spellings = AsyncMock(
+        side_effect=lambda supplied: ([], {}, "project_registry_unavailable"))
+    result = await _search(c, {"query": "status", "project": "Orbit_Relay"})
+    assert result["filters_resolved"]["error"] == "project_registry_unavailable"
+    assert result["filters_resolved"]["project"]["canonical"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_healthy_read_carries_no_error_key_at_all():
+    """Absent, not null — the ordinary answer must not grow a field that reads
+    as "something went wrong and it was fine"."""
+    c, conn = _search_coord(registered=("orbit-relay",))
+    result = await _search(c, {"query": "status", "project": "orbit-relay"})
+    assert "error" not in result["filters_resolved"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_registry_read_is_COUNTED_for_the_monitor():
+    """The counted twin of the disclosed string, and a different audience: the
+    monitor cannot see one request's response body. Flat additive keys with a
+    paired last-event timestamp, never a rename (fact:1314).
+
+    MUTATION CHECK: remove the increment from `_note_registry_read_failure` and
+    this dies while the response-level test still passes — which is the point of
+    having both."""
+    c = MemoryCoordinator()
+    assert c._axis_registry_read_failures == 0
+    assert c._axis_registry_read_failure_last_ts is None
+    reason = c._note_registry_read_failure("project", RuntimeError("pool gone"))
+    assert reason == "project_registry_unavailable"
+    assert c._axis_registry_read_failures == 1
+    assert c._axis_registry_read_failure_last_ts is not None
+
+
+@pytest.mark.asyncio
+async def test_every_supplied_domain_is_looked_up_not_merely_the_first():
+    """⚠ A REGRESSION THIS TEST EXISTS FOR. The scoped lookup was first written
+    to take ONE name, and the search path called it with `domains[0]` — so a
+    filter naming three sections resolved the first and silently left the rest
+    literal, which reads in the response as "those sections are unregistered"."""
+    c, conn = _search_coord(registered=("orbit-relay",),
+                            domains=("graph-quality", "operations"))
+    result = await _search(c, {"query": "status", "project": "orbit-relay",
+                               "domains": ["Graph_Quality", "Operations"]})
+    assert [e["canonical"] for e in result["filters_resolved"]["domains"]] == \
+        ["graph-quality", "operations"]
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # (8) Migration 035 — the invariant is structural, and one index is absent
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -791,23 +922,96 @@ def test_the_migration_declares_the_key_as_an_immutable_function():
 
 
 def test_two_registered_names_never_share_a_key_is_structural():
-    """The new invariant, as an index rather than as a hope. `projects` globally;
-    `project_domains` within its project, because two projects may both have a
-    `graph-quality` section and they are different sections."""
+    """The new invariant, as a CONSTRAINT on a trigger-maintained column rather
+    than as a unique functional index — migration 033's precedent.
+
+    ⛔ WHY NOT THE INDEX, which was this migration's first shape and read more
+    directly. Two reasons, both found in review and both about the one install
+    path nobody re-inspects: the generator emits indexes with their table and
+    functions afterwards, so a fresh install would have hit `axis_normalize does
+    not exist` and — one transaction — created NOTHING; and an IMMUTABLE function
+    over locale-dependent `[:alnum:]` backing a unique index silently splits old
+    entries from new ones when a collation or `pg_upgrade` moves underneath it,
+    with nothing re-checking. A stored column re-derives only on write.
+    """
     sql = _migration_sql()
-    assert "UNIQUE INDEX IF NOT EXISTS projects_axis_key_uniq" in sql
-    assert "ON projects (axis_normalize(name))" in sql
-    assert "UNIQUE INDEX IF NOT EXISTS project_domains_axis_key_uniq" in sql
-    assert "ON project_domains (project_id, axis_normalize(name))" in sql
+    assert "ADD COLUMN IF NOT EXISTS normalized_key text" in sql
+    assert "CREATE OR REPLACE FUNCTION axis_registry_before_write()" in sql
+    assert "NEW.normalized_key := axis_normalize(NEW.name)" in sql
+    assert "CREATE TRIGGER trg_projects_axis_key" in sql
+    assert "CREATE TRIGGER trg_project_domains_axis_key" in sql
+    assert "ADD CONSTRAINT projects_normalized_key_unique UNIQUE (normalized_key)" in sql
+    assert ("ADD CONSTRAINT project_domains_normalized_key_unique\n"
+            "    UNIQUE (project_id, normalized_key)") in sql
 
 
-def test_there_is_deliberately_no_unique_key_index_on_the_shared_alias_table():
+def test_the_schema_carries_no_unique_functional_index_at_all():
+    """⛔ NOT MERELY ABSENT FROM 035 — absent from the whole chain, which is what
+    makes the generator's ordering defect a latent trap rather than a live one.
+    A future migration adding the first one must think about install order."""
+    sql = _migration_sql()
+    assert "axis_normalize(name))" not in sql.replace(
+        "NEW.normalized_key := axis_normalize(NEW.name)", "")
+
+
+def test_the_backfill_is_a_no_op_on_re_run():
+    """Restricted to rows whose stored key is already wrong, so a second apply
+    rewrites nothing rather than every row to itself."""
+    sql = _migration_sql()
+    assert ("UPDATE projects\n   SET normalized_key = axis_normalize(name)\n"
+            " WHERE normalized_key IS DISTINCT FROM axis_normalize(name);") in sql
+
+
+def test_a_collision_names_the_PAIR_and_the_query_not_just_the_key():
+    """Postgres reports the duplicated KEY and leaves the operator to write the
+    join that finds WHICH TWO NAMES — at exactly the moment they are mid-migration
+    and the data question is urgent. So the pair is found first."""
+    sql = _migration_sql()
+    assert "are both registered and normalize to the same" in sql
+    assert "List every such pair with" in sql
+    assert "both normalize to the axis" in sql
+    # And it repairs nothing: which spelling wins is a data judgement.
+    assert "never something a migration may answer by picking" in sql
+
+
+def test_the_alias_rules_are_enforced_CONTINUOUSLY_not_at_apply_time():
+    """⛔ AN APPLY-TIME CHECK IS NOT AN INVARIANT. The first shape asserted the
+    alias rules once in a DO block and stopped, so nothing prevented a colliding
+    alias the next day. 024 and 028 already own the continuous mechanism for the
+    exact-string form of the same rules; 035 widens those to the key."""
+    sql = _migration_sql()
+    assert "CREATE OR REPLACE FUNCTION assert_alias_namespaces_disjoint()" in sql
+    assert "CREATE OR REPLACE FUNCTION assert_domain_alias_namespaces_disjoint()" in sql
+    assert "axis_normalize(p.name) = axis_normalize(v_alias)" in sql
+    assert "axis_normalize(a.name) = axis_normalize(NEW.name)" in sql
+    # The one-shot version is gone: its two RAISEs no longer exist, and the only
+    # DO blocks left are the fixture self-check and the collision pre-check.
+    assert "active project aliases normalizing to" not in sql
+    assert "active domain aliases normalizing to" not in sql
+    assert sql.count("DO $$") == 2
+
+
+def test_the_key_rule_excludes_the_aliass_own_target_and_the_exact_rule_does_not():
+    """⛔ THE ONE THING THAT WOULD HAVE BROKEN EVERY RENAME. Retiring a spelling
+    is exactly what produces an alias keying like a live project: renaming
+    `Orbit_Relay` to `orbit-relay` demotes the old name to an alias of the new
+    one, and those two ARE one key. Widening 024's comparison in place would have
+    refused that — the very operation the alias mechanism exists to support."""
+    sql = _migration_sql()
+    assert "p.id <> NEW.project_id" in sql
+    assert "d.id <> NEW.domain_id" in sql
+    # 024's and 028's original exact-string rules survive verbatim beside it.
+    assert "alias % is also a registered project" in sql
+    assert "alias % is also a registered domain of the same project" in sql
+
+
+def test_there_is_deliberately_no_key_unique_constraint_on_the_shared_alias_table():
     """⛔ `aliases` is a shared string-intern table, and migration 024 states in
     the table's own comment that one spelling may legitimately alias on BOTH
-    axes. A global key-unique index would forbid that by construction — not
-    because the data collides, but because the design allows what the index
-    would refuse. What must actually hold is narrower and cross-table, so it is
-    asserted at apply time instead."""
+    axes. A global key-unique constraint would forbid that by construction — not
+    because the data collides, but because the design allows what it would
+    refuse. What must actually hold is narrower and cross-table, so it is
+    enforced by trigger instead."""
     sql = _migration_sql()
     assert "ON aliases (axis_normalize" not in sql
-    assert "by-key resolution would answer by luck" in sql
+    assert "aliases_normalized_key" not in sql

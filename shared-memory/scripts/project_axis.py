@@ -78,6 +78,28 @@ PROJECT_EXISTS_SQL = "SELECT 1 FROM projects WHERE name = $1"
 # that can drift from the one every other caller uses.
 PROJECT_NAMES_SQL = "SELECT name FROM projects"
 
+# The by-key lookup, and the by-name lookup, in ONE indexed statement.
+#
+# ⚠ IT READS THE STORED COLUMN, not a normalising expression over `name`.
+# Migration 035 maintains `projects.normalized_key` with a BEFORE INSERT/UPDATE
+# trigger and puts a UNIQUE constraint on it, so the key is a value the database
+# owns, indexed, and re-derived only when a row is written. Computing the key in
+# the WHERE clause instead would scan, and would make this query's answer depend
+# on the SERVER's current locale rather than on what was stored when the name was
+# registered — which is exactly the drift a stored column removes.
+#
+# The key parameter is computed by `axis_key` on this side. That keeps ONE Python
+# definition of the key (the comparison stays where `same_spelling` lives) while
+# the MATCH happens against the database's own materialised value.
+#
+# Both halves in one statement because they answer one question — "what does this
+# spelling mean?" — and splitting them would cost a second round trip on the
+# ingress path for no gain. At most two rows come back: the exact row and the key
+# row, which are the same row whenever the caller sent the canonical name.
+PROJECT_NAME_OR_KEY_SQL = (
+    "SELECT name FROM projects WHERE name = $1 OR normalized_key = $2"
+)
+
 # The registry IDENTITY behind a name (migration 027). The name is a label a
 # client asserts and an operator types; this is the thing that does not move
 # when the label does, and it is what the graph node is keyed on.

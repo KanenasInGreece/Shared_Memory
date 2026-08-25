@@ -119,6 +119,23 @@ DOMAIN_EXISTS_SQL = (
 # registers as a new section.
 DOMAIN_NAMES_SQL = "SELECT name FROM project_domains WHERE project_id = $1"
 
+# The by-name and by-key lookup in one indexed statement, scoped to a project —
+# the domain twin of `PROJECT_NAME_OR_KEY_SQL`, reading the `normalized_key`
+# column migration 035 maintains by trigger. See that constant for why the key is
+# a STORED value rather than an expression over `name`.
+#
+# ⚠ IT TAKES ARRAYS, and the project version does not, because a record and a
+# search filter both name SEVERAL sections at once. A single-value form here
+# would have to be called once per section — one round trip each on the ingress
+# path — or, worse, be called once with the first value and quietly leave the
+# rest unresolved. (It was written that way first; the second failure is what
+# this shape prevents.)
+DOMAIN_NAME_OR_KEY_SQL = (
+    "SELECT name FROM project_domains"
+    " WHERE project_id = $1"
+    "   AND (name = ANY($2::text[]) OR normalized_key = ANY($3::text[]))"
+)
+
 # Proposals for a value that missed. TRIGRAM over the name, UNION'd with a
 # description match, both scoped to the project.
 #

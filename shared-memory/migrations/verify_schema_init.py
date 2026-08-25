@@ -168,11 +168,67 @@ def _unique_indexes(conn) -> set:
     return out
 
 
+def _indexes(conn) -> dict:
+    """{index name: (table, normalised definition)} for EVERY index in public.
+
+    ⛔ THE CLASS THIS FILE HAD NEVER COMPARED. `_unique_indexes` above looks like
+    an index check and is not one: it is computed on the FRESH side only, purely
+    to reconcile a UNIQUE constraint that the generator re-emits as an index.
+    Nothing here ever asked whether the two databases have the same indexes —
+    so an index the generator dropped was invisible to this verifier and to the
+    whole suite, which mattered the moment an index started carrying an
+    INVARIANT rather than a lookup speed.
+
+    Keyed on NAME because that is what a migration writes and what an operator
+    greps for, and carrying the DEFINITION because an index with the right name
+    over the wrong expression enforces nothing. `public.` is stripped so the two
+    databases' renderings are comparable.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT t.relname AS tbl, i.relname AS idx, pg_get_indexdef(i.oid) AS def
+          FROM pg_index x
+          JOIN pg_class i ON i.oid = x.indexrelid
+          JOIN pg_class t ON t.oid = x.indrelid
+          JOIN pg_namespace n ON n.oid = t.relnamespace
+         WHERE n.nspname = 'public'
+    """)
+    out = {}
+    for tbl, idx, definition in cur.fetchall():
+        out[idx] = (tbl, _norm((definition or "").replace("public.", "")))
+    return out
+
+
 def _routines(conn) -> set:
     cur = conn.cursor()
     cur.execute("""SELECT p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
                     WHERE n.nspname = 'public'""")
     return {r[0] for r in cur.fetchall()}
+
+
+def _routine_defs(conn) -> dict:
+    """{function name: normalised definition} for every function this schema
+    defines — extension-owned ones excluded, exactly as the generator excludes
+    them, or ~150 pgvector functions would drown the comparison.
+
+    Names alone were compared until now, so a function whose BODY the generator
+    rendered differently — or one a migration edited without the artefact being
+    regenerated — passed silently. A trigger calling the old body is a rule that
+    holds on upgraded deployments and not on new ones.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT p.proname, pg_get_functiondef(p.oid)
+          FROM pg_proc p
+          JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname = 'public'
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_depend d
+                WHERE d.objid = p.oid AND d.deptype = 'e'
+           )
+    """)
+    return {name: _norm((defn or "").replace("public.", ""))
+            for name, defn in cur.fetchall()}
 
 
 def _triggers(conn) -> set:
@@ -327,9 +383,39 @@ def main() -> int:
                     f"COLUMN TYPE on {tbl}.{col} differs: live is {live_render}, "
                     f"fresh is {fresh_render}")
 
+        # INDEXES — name and definition, live↔fresh. The class this verifier had
+        # never compared, and the one this schema now uses to carry invariants.
+        live_idx, fresh_idx = _indexes(live), _indexes(fresh)
+        missing_idx, differing_idx = [], []
+        for name, (tbl, definition) in sorted(live_idx.items()):
+            if tbl in EXPECTED_ABSENT_TABLES:
+                continue
+            if name not in fresh_idx:
+                missing_idx.append(f"{name} on {tbl}")
+            elif fresh_idx[name][1] != definition:
+                differing_idx.append(
+                    f"{name} on {tbl}:\n      live  {definition}"
+                    f"\n      fresh {fresh_idx[name][1]}")
+        if missing_idx:
+            problems.append(
+                "INDEXES missing from a fresh install: " + ", ".join(missing_idx)
+                + " — an index here may be carrying an invariant, not a lookup speed")
+        if differing_idx:
+            problems.append("INDEX DEFINITIONS differ:\n" + "\n".join(differing_idx))
+
         missing_routines = _routines(live) - _routines(fresh)
         if missing_routines:
             problems.append(f"FUNCTIONS missing: {sorted(missing_routines)}")
+        # And their BODIES — a function present under the right name with the
+        # wrong body is a trigger enforcing yesterday's rule.
+        live_fn, fresh_fn = _routine_defs(live), _routine_defs(fresh)
+        differing_fn = [
+            f"{name}:\n      live  {defn}\n      fresh {fresh_fn[name]}"
+            for name, defn in sorted(live_fn.items())
+            if name in fresh_fn and fresh_fn[name] != defn
+        ]
+        if differing_fn:
+            problems.append("FUNCTION DEFINITIONS differ:\n" + "\n".join(differing_fn))
         missing_triggers = _triggers(live) - _triggers(fresh)
         if missing_triggers:
             problems.append(f"TRIGGERS missing: {sorted(missing_triggers)}")
@@ -348,9 +434,14 @@ def main() -> int:
         absent_note    = (f"  (+{len(EXPECTED_ABSENT_TABLES)} expected-absent: "
                           f"{', '.join(sorted(EXPECTED_ABSENT_TABLES))} — apply.py's "
                           f"ledger, never dumped)") if EXPECTED_ABSENT_TABLES else ""
+        live_idx_counted = {n for n, (t, _d) in live_idx.items()
+                            if t not in EXPECTED_ABSENT_TABLES}
+        fresh_idx_counted = {n for n, (t, _d) in fresh_idx.items()
+                             if t not in EXPECTED_ABSENT_TABLES}
         print(f"\ntables {len(fresh_tables)}/{len(live_tables)} · "
               f"functions {len(_routines(fresh))}/{len(_routines(live))} · "
-              f"triggers {len(_triggers(fresh))}/{len(_triggers(live))} (fresh/live)"
+              f"triggers {len(_triggers(fresh))}/{len(_triggers(live))} · "
+              f"indexes {len(fresh_idx_counted)}/{len(live_idx_counted)} (fresh/live)"
               f"{absent_note}")
 
         if problems:

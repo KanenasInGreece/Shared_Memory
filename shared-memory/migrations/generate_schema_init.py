@@ -268,27 +268,55 @@ def fetch_triggers(cur) -> list[tuple[str, str, str]]:
     return [(r[0], r[1], r[2]) for r in cur.fetchall()]
 
 
-def render_functions_and_triggers(cur) -> list[str]:
-    """Functions first, then the triggers that call them — a trigger cannot be
-    created before the function it names exists."""
+def render_functions(cur) -> list[str]:
+    """Every schema-defined function, emitted BEFORE any table or index.
+
+    ⛔ THE POSITION IS THE POINT, and it was wrong until v0.9.52. Functions used
+    to be emitted at the END of the file, after every table and every index, on
+    the reasoning that a TRIGGER cannot be created before the function it names.
+    That reasoning is right about triggers and silently wrong about INDEXES: an
+    index whose expression CALLS a function needs the function to already exist,
+    so the moment this schema grew its first functional index the regenerated
+    file aborted on `function ... does not exist` — and because the whole file is
+    one transaction, a fresh install created NOTHING while an upgraded
+    deployment was fine. The failure lives only on the path nobody re-inspects.
+
+    ⚠ The fix is a SPLIT, not a hoist, because the two orderings pull opposite
+    ways: a function must precede an index that calls it, and a trigger must
+    follow the table it is attached to. So `generate()` emits functions →
+    tables+indexes → foreign keys → triggers, and this function and
+    `render_triggers` are the two halves that used to be one.
+    """
     functions = fetch_functions(cur)
-    triggers = fetch_triggers(cur)
-    if not functions and not triggers:
+    if not functions:
         return []
-    out: list[str] = []
-    if functions:
-        out.append("-- ─── Functions ─────────────────────────────────────────────────────────────")
-        out.append("")
-        # pg_get_functiondef already emits CREATE OR REPLACE, so this is
-        # re-runnable without a guard.
-        out.extend(f"{fn};\n" for fn in functions)
-    if triggers:
-        out.append("-- ─── Triggers ──────────────────────────────────────────────────────────────")
-        out.append("-- Created after the functions they call. DROP-then-CREATE because Postgres")
-        out.append("-- has no CREATE TRIGGER IF NOT EXISTS and this file promises idempotency.")
-        out.append("")
-        for name, table, defn in triggers:
-            out.append(f"DROP TRIGGER IF EXISTS {name} ON {table};\n{defn};\n")
+    out = [
+        "-- ─── Functions ─────────────────────────────────────────────────────────────",
+        "-- FIRST, before any table or index: an index expression may CALL one of",
+        "-- these, and the whole file is a single transaction.",
+        "",
+    ]
+    # pg_get_functiondef already emits CREATE OR REPLACE, so this is
+    # re-runnable without a guard.
+    out.extend(f"{fn};\n" for fn in functions)
+    return out
+
+
+def render_triggers(cur) -> list[str]:
+    """Every trigger, emitted LAST — after the tables they are attached to and
+    after the functions they call."""
+    triggers = fetch_triggers(cur)
+    if not triggers:
+        return []
+    out = [
+        "-- ─── Triggers ──────────────────────────────────────────────────────────────",
+        "-- LAST: after the tables they are attached to and the functions they call.",
+        "-- DROP-then-CREATE because Postgres has no CREATE TRIGGER IF NOT EXISTS and",
+        "-- this file promises idempotency.",
+        "",
+    ]
+    for name, table, defn in triggers:
+        out.append(f"DROP TRIGGER IF EXISTS {name} ON {table};\n{defn};\n")
     return out
 
 
@@ -429,6 +457,12 @@ def generate(conn) -> str:
         for ext in exts:
             sections.append(f"CREATE EXTENSION IF NOT EXISTS {ext};\n")
 
+    # ⛔ SECTION ORDER IS LOAD-BEARING: functions → tables+indexes → foreign
+    # keys → triggers. A function must exist before an index whose expression
+    # calls it; a trigger must come after the table it is on. See
+    # render_functions() for the fresh-install failure the old order produced.
+    sections.extend(render_functions(cur))
+
     for table in fetch_tables(cur):
         sections.append(f"-- ─── {table} {'─' * max(1, 75 - len(table))}")
         sections.append(render_table(cur, table))
@@ -439,7 +473,7 @@ def generate(conn) -> str:
         sections.append("")
 
     sections.extend(render_foreign_keys(cur))
-    sections.extend(render_functions_and_triggers(cur))
+    sections.extend(render_triggers(cur))
 
     sections.append("COMMIT;")
     return "\n".join(sections) + "\n"
