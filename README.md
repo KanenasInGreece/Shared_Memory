@@ -98,10 +98,11 @@ owns Postgres (vectors + facts) and Neo4j (the graph), and runs the REM/NREM sle
 turns saved facts into shared knowledge.
 
 > **The fast path — hand it to an agent.** Open your coding agent (Claude Code, Codex CLI,
-> Antigravity CLI, Grok, …) at the repo root and say: *"Read `AGENTS.md` and set up the
+> Antigravity CLI, Grok, opencode …) at the repo root and say: *"Read `AGENTS.md` and set up the
 > framework."* Part 1 of [`AGENTS.md`](AGENTS.md) interviews you for the required choices — data
-> folders, model files, your reasoning-LLM address and port, which agents get tokens — then
-> drives the same steps 1–10 below for you: writing `.env` from the template, minting tokens,
+> folders, model files, your reasoning-LLM address and port, if local, or the URL of your provider, if online LLM is used.
+> You decide which agents get tokens to use the framework— then the agent drives the same
+> steps 1–10 below for you: writing `.env` from the template, minting tokens,
 > running the postflight verification. One exception it will tell you about: if any of your
 > agents are REMOTE, the `--reveal` that prints their token is an operator step — run it
 > yourself in your own terminal, never through the agent doing the setup. The same file carries the day-2 runbooks, so "stop the framework" or
@@ -150,8 +151,8 @@ why these are example minimums, not prescriptions.
 **① No GPU at all.** The framework itself is a CPU/RAM affair: Postgres and Neo4j used
 ~2.5 GB working memory here (the compose file caps them at 4 + 8 GB), the gateway and daemons
 ~half a gigabyte, the two CPU encoders 0.6 GB each — though under sustained heavy search the
-reranker's cache can grow toward its 8 GB default cap, so give it room. The reasoning LLM is
-an **online provider**: one `LLM_BACKENDS_JSON` entry, and the dreaming runs — and bills —
+reranker's cache can grow toward its 8 GB default cap, so we account for it in the suggested minimum specs. 
+The reasoning LLM is an **online provider**: one `LLM_BACKENDS_JSON` entry, and the dreaming runs
 externally; an overnight of dreaming measured ~18,000 tokens, under a cent. The privacy
 trade-off that entry represents, and the knobs that state your answer, live in
 [§17](#17-inference-the-encoders-and-the-reasoning-llm); the custody measures around the
@@ -160,12 +161,11 @@ tested-configuration passage, [§19](#19-tokens-and-agents) and [SECURITY.md](SE
 With no LLM configured nothing dies: saves, search and the graph keep working; summaries and
 insights queue durably until a backend appears. Searches on CPU encoders took ~30 seconds here.
 This configuration has also been verified end to end on a deliberately modest VM — 6 vCPUs of
-a 2013 Xeon E3-1230 v3, 12 GB RAM, 30 GB disk, Ubuntu Server 26.04 with Docker — where the full
+a 2013 Xeon E3-1230 v3, 14 GB RAM, 30 GB disk, Ubuntu Server 26.04 with Docker — where the full
 install passed postflight with a 5.5 s realistic save, ~5 GB steady-state with the whole stack
 up, and searches measured at both ends of the reranking trade: ~1.3 s unranked vector order,
 ~70 s with the reranker scoring the full default payload (22 candidates, uncapped documents) on
-that CPU — real distinct scores, zero crashes at 12 GB. `RERANK_MAX_DOC_CHARS`
-([§17](#17-inference-the-encoders-and-the-reasoning-llm)) is the dial between those two points.
+that CPU — `RERANK_MAX_DOC_CHARS`([§17](#17-inference-the-encoders-and-the-reasoning-llm)) is the dial between those two points.
 *Example minimum: 4–8 threads · 16 GB RAM · no GPU · 30 GB disk.*
 
 **② A small GPU (~4 GB).** Everything in ①, plus two `.env` lines (`GPU_ENCODER_REPLICAS=1`,
