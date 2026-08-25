@@ -340,18 +340,34 @@ idempotent and safe to re-run.
 > or the shipped `systemd --user` timer. Rebuilding a host? Bring the databases up empty, then
 > `ops/restore.sh`. Full detail: [§22](#22-backups-and-restore).
 
-### Troubleshooting — the first failures you'll hit
+### Troubleshooting — problems you might run into
 
-| Symptom | Likely cause | Fix |
+Nothing below is a failure the shipped defaults produce on their own: every entry was met on a
+real install by a person or an agent, and each one has since been given a guard — a preflight
+line, a refusal with the remedy in it, or a documented step. This table exists so that when the
+guard speaks, you recognise what it is telling you. **An agent following [`AGENTS.md`](AGENTS.md)
+handles every install-time entry here on its own** — it has, on each of the installs these rows
+came from: the Docker source, `uv` on the agent's PATH, the Neo4j ownership and password shape,
+the small-host preset, the restart after minting, roles, project registration and the migration
+ledger are all steps it runs or checks. Two rows are yours: the first-boot network need for the
+Neo4j plugins, and the reranker dial, which is tuning after the install is proven.
+
+| Symptom | What is going on | What to do |
 |---|---|---|
-| **401 Unauthorized** | `AGENT_TOKEN` missing or unknown to the gateway | Re-check both `.env`s (§19). Restart the gateway after editing `AGENT_TOKENS`; restart LM Studio **fully** after changing its token. |
-| **503 on save/search** | Embedder/reranker down or `unhealthy` | `docker compose ps` first — an `unhealthy` service (usually a wrong model path, §15) is the cause. Then `curl :8888/health`. |
-| **Search returns HTTP 500** | Migrations not applied | Run `apply.py` (§16). Idempotent. |
-| **Silent DB failures (Fedora)** | inotify limits, or a mount missing `:z` | §14, §15. |
-| **Neo4j crash-loops: "/import is not accessible"** | mounted dirs not writable by the container user (uid 7474) | `sudo chown -R 7474:7474 $NEO4J_HOST_DIR/{data,logs,import,plugins}` (§14). Preflight checks this. |
-| **Neo4j crash-loops: "neo4j/… is invalid"** | password contains `/` — breaks `NEO4J_AUTH` parsing | Regenerate as hex (`openssl rand -hex 20`), update `.env`, recreate the container. |
-| **Neo4j: "Invalid memory configuration — exceeds physical memory"** | host RAM below the shipped heap+pagecache | Set the small-host preset in `.env` (§3 floor note, values in `.env.example`). |
-| *Bonus:* **agent "doesn't know" earlier facts** | the skill was never invoked | Activate it and ask the agent to search shared memory first. |
+| **`preflight.sh` fails on "docker not found"** (Fedora, RHEL) | The distribution ships podman; the helper scripts call the docker CLI. | Install Docker Engine + Compose v2 from Docker's own instructions (§14); preflight names the packages. The `podman-docker` shim is a path we expect to work but have not run end to end. |
+| **The skill "works for me" but not for the agent** — it answers from memory or saves nothing, with no error | `uv` was installed the upstream way, so it lives in `$HOME/.local/bin` and is only on the PATH when your shell profile loads; an agent spawning a profile-free shell cannot see it. This is the normal outcome of a correct install, not a misconfiguration. | Symlink `uv` onto the system PATH (`sudo ln -s "$(command -v uv)" /usr/local/bin/uv`) or set PATH in that agent's own configuration. Preflight warns about exactly this. |
+| **Neo4j crash-loops: "/import is not accessible"** | The container steps down to uid 7474 and cannot write — or, on a modern Fedora, cannot even traverse a `0700` home directory to reach — its mounted dirs. | `install_framework.sh` chowns the four dirs and preflight verifies them; by hand: `sudo chown -R 7474:7474 $NEO4J_HOST_DIR/{data,logs,import,plugins}` (§14). |
+| **Neo4j crash-loops: "neo4j/… is invalid"** | The password contains `/` (base64 output does), which `NEO4J_AUTH=neo4j/<password>` cannot carry. | Generate hex (`openssl rand -hex 20`), update `.env`, recreate the container. The installer's prompts accept hex only and refuse an empty entry. |
+| **Neo4j: "Invalid memory configuration — exceeds physical memory"** | Host RAM is below the shipped heap + pagecache (~8 GB is the no-override floor). | Set the small-host preset (`NEO4J_HEAP_INITIAL/MAX`, `NEO4J_PAGECACHE`) from `.env.example`; preflight's RAM check tells you which tier you are on. |
+| **Neo4j does not come up on first boot, no network** | `NEO4J_PLUGINS` fetches APOC and Graph Data Science at container start — first boot needs internet, and a crash-loop refetches on every retry. | Give the host a route out for the first start, or pre-place the plugin jars in `plugins/`. |
+| **401 Unauthorized** | `AGENT_TOKEN` missing from the agent's skill `.env`, or minted after the gateway last started — the registry is read at startup. | `doctor` names which side is at fault. Restart the gateway after minting (`bootstrap_tokens.sh` says so); restart LM Studio **fully** after changing its token (§19, §21). |
+| **"Gateway refused this request (HTTP 403): Read-only token…"** on save | The token is valid but minted with `--role read`; the gateway refuses the write and says why. | Use a write-capable identity for that agent, or accept that this one only searches. (Older clients reported this as "coordinator unreachable" — upgrade the skill if you see that.) |
+| **First save refused: `project_unknown`** | A fresh corpus has no registered projects; the gateway never registers one on the strength of a save. | Answer the refusal: confirm the spelling and re-send with `new_project` (the skill asks you first — see `SKILL.md`). Expected on every new install — it is the guard against a typo becoming a project. |
+| **503 on save/search** | Embedder or reranker down or `unhealthy` — usually a wrong model path. | `docker compose ps` first, then `curl :8888/health` (§15, §17). Saves abort rather than store a record without a vector. |
+| **Search answers, but slowly, or unranked** | On a CPU reranker the full default payload costs ~5 s per document; under load the gateway serves vector order and marks scores null rather than invent them. | `RERANK_MAX_DOC_CHARS` is the dial; `/health` shows the capacity projection the client sizes its wait from (§3 Resources, §17). |
+| **Upgrade runs `apply.py` and the migration ledger is empty** | An install older than v0.9.44 created the schema without recording which migrations it embodied. | `apply.py --adopt` once; `init_db.sh` now adopts at creation, so a fresh install never sees this. |
+| **Silent DB failures (Fedora)** | inotify limits, or a mount missing its `:z` label under SELinux. | §14, §15. |
+| *Bonus:* **the agent "doesn't know" earlier facts** | The skill was never invoked. | Activate it and ask the agent to search shared memory first. |
 
 > **Maintainers:** this chapter is the single source of setup truth. Any change that affects
 > setup must update Quick Start in the same change.
@@ -721,8 +737,9 @@ Intel, AMD and NVIDIA), off by default — the choice is two `.env` lines, `GPU_
 and `CPU_ENCODER_REPLICAS=0`, and what you run never diverges from what ships. If you have one
 GPU to allocate, the compromise is plain: a card with enough VRAM for your reasoning model is
 usually better spent on the model backend, while a small card — 4 GB, say — is best spent on
-the embedder, which fits in about 2 GB and repays it in search latency — not the reranker, whose
-context window does not fit there (measured below). Your call, always. That
+the embedder, which needs about 0.7 GB at full geometry and repays it in search latency — not
+the reranker, whose 8192-token context does not fit beside it there (measured below). Your
+call, always. That
 pair-wise switch moves both encoders together; `EMBEDDER_GPU_REPLICAS`/`EMBEDDER_CPU_REPLICAS`
 and `RERANKER_GPU_REPLICAS`/`RERANKER_CPU_REPLICAS` move one at a time instead, for a card too
 small for both — measured on a 4 GB card, the embedder fits (671 MB) but the reranker's
@@ -731,7 +748,13 @@ On CPU, `RERANK_MAX_DOC_CHARS` bounds what the
 reranker scores — a concession, not a free win: capping at 2,000 chars kept about half of
 reranking's improvement in our measurements. Run the encoders however you please — Docker, bare
 `llama-server`, another machine; `EMBEDDER_URL` and `RERANKER_URL` say where the gateway looks,
-and the contract is only that an embedder actually answers at the embedder's address.
+and the contract is only that an embedder actually answers at the embedder's address. Serving
+the embedder from another machine is tested: an LM Studio host on the LAN carrying the same
+BGE-M3 returned vectors within cosine 0.9995–0.9997 of the local encoder's on identical text and
+answered ~5× faster on 6K-char inputs than a 6-vCPU local CPU container — with two limits worth
+knowing: that host exposes no rerank endpoint, so the reranker stayed local, and at 8 GB it
+evicts whichever model it is not using, so it can serve the embedder *or* a reasoning LLM, never
+both under dreaming's alternating calls.
 
 ```bash
 llama-server -m bge-m3-Q8_0.gguf --port 8070 --embedding -c 8192 -b 8192 -ub 8192
@@ -751,7 +774,10 @@ in a small local log, and is served on authenticated `/health`; postflight rende
 plain-language verdict. From it come three numbers: the projected worst-case rerank-stage
 service time, the sustainable queue depth against a tolerable wait
 (`CAPACITY_TOLERABLE_WAIT_S`, default 30 s — a measured, human-validated default, not a
-guess), and a proposed reranker memory limit, derived per host and never applied for you.
+guess), and a proposed reranker memory limit, derived per host and never applied for you. The client
+reads the same record: `memory_bridge.py` sizes its search wait from the gateway's projection,
+so on a slow CPU host a search answers late rather than being abandoned by its own timeout —
+the failure two test hosts showed before that was fixed.
 
 The division of labor is deliberate. **The probe measures what the machine can do. The
 policy defines how much latency you are willing to tolerate. The queue bound keeps operation
@@ -766,9 +792,15 @@ graceful fallback.
 
 The encoders are where a cheap GPU pays for itself, and we measured it rather than assumed it.
 Both models are 0.6 GiB Q8_0 files; with full offload and the 8K context above, the pair ran
-side by side on one mid-range card using roughly a gigabyte each including buffers — **any 4 GB
-card should hold both** (that last step is an estimate from the measured footprint, not yet run
-on such a card). Against the CPU containers on a 12-core desktop, end-to-end search fell from
+side by side on one 12 GB card using roughly a gigabyte each including buffers. **A 4 GB card
+does not hold both** — we thought it should, and then ran it: on a Radeon RX 580 the pair held
+only short (~1,500-token) payloads and collapsed at the framework's own full-length texts — the
+8192-token batch buffers overflowed device memory, ggml fell back to host RAM (reranker at
+7.9 GB resident, swap engaged) and every consolidation fold failed at the vectorise step while
+search still answered. The split that holds on that card is the embedder on the GPU (672 MB of
+VRAM, flat; 500/3,000/6,000-char embeds in 0.06/0.19/0.38 s) and the reranker on the CPU
+(~106 s per 20 × 5.8K-char documents on six cores) — one `.env` line each. Against the CPU
+containers on a 12-core desktop, end-to-end search fell from
 28–33 seconds to a **4.7-second mean over an 11-hour soak** — 102 searches, every 20 minutes,
 zero failures, zero drift — with the embedder at roughly 5× throughput and the reranker, which
 on a loaded CPU can time out outright, answering in under a second. Same vectors, too: CPU and
@@ -848,7 +880,9 @@ The VRAM-constrained configuration this section keeps gesturing at has now been 
 real: both local models stopped, one metered provider as the entire pool, overnight. The
 dreaming ran — enrichment routed to the provider and succeeded, folds formed — and the
 whole night, probes and debugging included, cost **eighteen thousand tokens: under a
-cent**. Enrichment of a typical record lands near one token per character of content, a
+cent**. A second provider on a second host confirmed the shape: one complete dreaming run —
+thirty requests, ~106,000 tokens, under two minutes, zero failures — and a night of saves,
+enrichment and consolidation through to insight on it. Enrichment of a typical record lands near one token per character of content, a
 few seconds of latency per call — numbers that do not matter to a background daemon and
 barely matter to a wallet. The security posture holds while it happens: the provider key
 lives in a mode-600 file outside the repo and is referenced by path (`*_API_KEY_FILE`),
