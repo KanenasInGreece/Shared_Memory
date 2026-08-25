@@ -1023,13 +1023,19 @@ Installing a client is copying two files into the agent's skills directory:
 | Codex CLI | `~/.codex/skills/shared-memory/` | `$shared-memory` |
 | Antigravity CLI | `~/.gemini/skills/shared-memory/` | `/activate shared-memory` |
 | LM Studio / MCP hosts | `mcp/mcp.json` → `mcp/vector-skill.py` | MCP tools |
-| opencode | MCP connector in `opencode.jsonc` ([§21](#21-the-mcp-install-any-mcp-host-one-connector)) — no skill copy | MCP tools |
+| opencode | **skill:** reads `~/.claude/skills/shared-memory/` (Claude Code's directory, by opencode's design) · **MCP:** connector in `opencode.jsonc` ([§21](#21-the-mcp-install-any-mcp-host-one-connector)) | `/shared-memory` via the skill · MCP tools |
 
-**opencode, tested both ways round.** As a *client* it mounts the memory through the MCP connector
-— exercised on the reference workstation and on a test host, read-only and write roles — and there
-is no skill-directory install for it: the connector is its path. As an *installer* it was the agent
-that set the framework up on the bare-metal test host from `AGENTS.md`, and later ran the
-documented upgrade there and verified the fixes by inspecting state rather than trusting output.
+**opencode, tested three ways.** As a *skill* client it reads Claude Code's skill directory by design
+— exercised on a test host where opencode is the only agent, and that is the condition: on a host
+that also runs Claude Code, the same behaviour makes opencode present **Claude Code's token** and
+write records as `claude`. Measured, and the containment is three layers deep: set
+`OPENCODE_DISABLE_CLAUDE_CODE=1` in opencode's environment, deny skills in its config
+(`"skill": {"*": "deny"}`), and deny reads of `~/.claude/**` (and every other agent's home and
+`~/.shared-memory/**`) in its permissions — then give it its own identity through the *MCP*
+connector, which is the second tested path (reference workstation and the test host, read-only and
+write roles). As an *installer* it set the framework up on the bare-metal test host from `AGENTS.md`,
+ran the documented upgrade there later, and verified the fixes by inspecting state rather than
+trusting output.
 
 Put the agent's `AGENT_TOKEN` in the skill's `.env`, then verify from any shell:
 
