@@ -170,9 +170,12 @@ def test_never_measured_backend_stays_shapeless_and_invents_nothing(monkeypatch,
             block = merged[backend]
             assert "projected_full_payload_s" not in block
             assert "ceiling_s" not in block
-            assert "serves_full_payload" not in block
             assert block["projection_stale"] is None
             assert "last_ok_at" not in block
+            # R2-N6: "we make no claim" has ONE shape -- explicit null --
+            # whether the block never measured or is carrying an ageing
+            # reading. Two shapes for one meaning is a reader's trap.
+            assert block["serves_full_payload"] is None
 
 
 def test_last_ok_at_is_chained_not_reset_by_repeated_failures(monkeypatch, tmp_path):
@@ -448,8 +451,12 @@ def test_projection_age_seconds_since_last_ok_at(monkeypatch, tmp_path):
     assert g._projection_age_s(None, now) is None
     assert g._projection_age_s("", now) is None
     assert g._projection_age_s("not-a-timestamp", now) is None
-    # Clock skew: a future stamp reads as "just measured", never negative.
-    assert g._projection_age_s("2026-08-25T10:20:00+00:00", now) == 0.0
+    # R2-N7: a stamp in the FUTURE is an unknown age, not a fresh one. A
+    # clock stepped backwards would otherwise make the oldest possible
+    # reading read as the freshest -- 0.0 means "just measured" and must
+    # never be the answer to "I cannot tell".
+    assert g._projection_age_s("2026-08-25T10:20:00+00:00", now) is None
+    assert g._projection_age_s("2026-08-25T10:09:59+00:00", now) == 1.0
 
 
 def test_snapshot_publishes_a_live_age_that_grows_between_probes(monkeypatch, tmp_path):
@@ -603,6 +610,33 @@ def test_partial_ignorance_never_ceilings_below_the_fallback(monkeypatch, tmp_pa
     assert g._capacity_client_ceiling_s(junk_shape) == 120.0
 
 
+def test_ignorance_expressed_as_absence_raises_the_floor_too(monkeypatch, tmp_path):
+    """R2-N3. A backend block that is missing, empty, or not a dict says
+    NOTHING about what that backend costs -- and the whole point of this PR
+    is that "nothing" must stop reading as "nothing to worry about". Each
+    shape below returned 30.0 while the reranker's real cost was unknown."""
+    g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
+
+    absent = _fact_1560_shape()
+    del absent["reranker"]
+    assert g._capacity_client_ceiling_s(absent) == 120.0
+
+    empty = _fact_1560_shape()
+    empty["reranker"] = {}
+    assert g._capacity_client_ceiling_s(empty) == 120.0
+
+    not_a_dict = _fact_1560_shape()
+    not_a_dict["reranker"] = "unavailable"
+    assert g._capacity_client_ceiling_s(not_a_dict) == 120.0
+
+    null_block = _fact_1560_shape()
+    null_block["reranker"] = None
+    assert g._capacity_client_ceiling_s(null_block) == 120.0
+
+    # ...and a fully populated pair is still not treated as ignorant.
+    assert g._capacity_client_ceiling_s(_ok_reading()) == 37.5
+
+
 def test_full_ignorance_and_full_knowledge_are_unchanged(monkeypatch, tmp_path):
     """The new floor fires ONLY on partial ignorance -- the two ends of the
     range keep their existing values."""
@@ -628,7 +662,6 @@ def test_server_mirror_matches_the_client_on_the_fact_1560_shape(monkeypatch, tm
     g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
 
     import importlib.util
-    import inspect
     spec = importlib.util.spec_from_file_location(
         "memory_bridge_parity_1560",
         os.path.join(os.path.dirname(__file__), "..", "shared-memory-skill",
@@ -641,14 +674,20 @@ def test_server_mirror_matches_the_client_on_the_fact_1560_shape(monkeypatch, tm
     assert g._capacity_client_ceiling_s(shape) == 120.0          # the server, pinned
     assert memory_bridge.search_ceiling(_ok_reading()) == 37.5   # happy path agrees
 
-    if "capacity" not in inspect.signature(memory_bridge.search_ceiling).parameters:
+    # R2-N1: the gate branches on the client's BEHAVIOUR, never on a
+    # signature detail of an unmerged PR. A client that fires this rule under
+    # a different parameter name -- or none -- must be held to parity here,
+    # and only the one known pre-#310 value is allowed to skip. Anything else
+    # falls through to the assertion and fails loudly.
+    client_value = memory_bridge.search_ceiling(shape)
+    if client_value == 30.0:
         import pytest
         pytest.skip(
-            "client half of this rule is PR #310 (fix/client-ceiling-never-"
-            "below-fallback), not yet on this branch: the shipped client "
-            "returns 30.0 for the fact:1560 shape while this server now "
-            "returns 120.0. This assertion must GO GREEN, not stay skipped, "
-            "once #310 is merged -- if it is still skipping on main, the two "
-            "doors have diverged and nothing else is watching.")
-    assert memory_bridge.search_ceiling(shape) == 120.0
-    assert g._capacity_client_ceiling_s(shape) == memory_bridge.search_ceiling(shape)
+            "client predates PR #310 (fix/client-ceiling-never-below-"
+            "fallback): the shipped client returns 30.0 for the fact:1560 "
+            "shape while this server now returns 120.0. This assertion must "
+            "GO GREEN, not stay skipped, once #310 is merged -- if it is "
+            "still skipping on main, the two doors have diverged and nothing "
+            "else is watching.")
+    assert client_value == 120.0
+    assert g._capacity_client_ceiling_s(shape) == client_value == 120.0

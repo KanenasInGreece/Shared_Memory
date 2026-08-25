@@ -2336,11 +2336,14 @@ _capability: dict = {"status": "unknown", "probed_at": None}
 
 
 def _projection_age_s(last_ok_at, now=None) -> float | None:
-    """Seconds since the surviving numbers were actually measured. None when
-    the backend has never been measured, or when the stamp is unparseable —
-    an unknown age is never reported as 0.0, which would read as "just
-    measured". Clamped at 0.0 so a clock skew publishes "just measured"
-    rather than a negative age no renderer knows what to do with."""
+    """Seconds since the surviving numbers were actually measured.
+
+    None — never 0.0 — for every case where the age is UNKNOWN: never
+    measured, no stamp, an unparseable stamp, and (R2-N7) a stamp in the
+    future. 0.0 means "just measured", and a clock stepped backwards is the
+    one case where publishing that would be actively misleading: the oldest
+    possible reading would read as the freshest. One shape for "we do not
+    know how old this is"."""
     if not last_ok_at:
         return None
     try:
@@ -2350,7 +2353,8 @@ def _projection_age_s(last_ok_at, now=None) -> float | None:
     if measured.tzinfo is None:
         measured = measured.replace(tzinfo=timezone.utc)
     now = now or datetime.now(timezone.utc)
-    return round(max(0.0, (now - measured).total_seconds()), 1)
+    age = (now - measured).total_seconds()
+    return round(age, 1) if age >= 0 else None
 
 
 def capability_snapshot() -> dict:
@@ -2531,6 +2535,10 @@ def _merge_capability_projection(previous: dict | None, fresh: dict) -> dict:
         if (not isinstance(prev_block, dict)
                 or prev_block.get("projected_full_payload_s") is None):
             # Never measured — nothing to carry, and nothing to invent.
+            # R2-N6: the verdict is nulled here too, so "we make no claim"
+            # has ONE shape across both never-measured and ageing blocks
+            # rather than being absent in one and null in the other.
+            block["serves_full_payload"] = None
             block["projection_stale"] = None
             continue
         for key in _PROJECTION_CARRY_KEYS:
@@ -2950,6 +2958,15 @@ def _capacity_client_ceiling_s(capability: dict | None) -> float:
     produced 30 s here while the client produced 120 s — the mirror's own
     parity test never saw the case the mechanism exists for.
 
+    R2-N3 extends that to ignorance expressed as ABSENCE: a backend block
+    that is missing, empty or not a dict is unknown, not free. ⚠ This makes
+    the mirror STRICTER than the clients on those three shapes (the clients
+    key on `status`/`projection_stale` only, so they read absence as zero
+    cost and can floor at 30 s where this returns 120 s). The divergence is
+    in the SAFE direction — the server's queue_bound is computed against a
+    more generous ceiling than the client will apply — but it is a real
+    difference, and closing it belongs in the clients.
+
     The clients additionally fold in the gateway's published `capacity`
     block; this mirror does not, and must not — it IS the function that
     produces `capacity.derived.client_ceiling_s`, so reading it back here
@@ -2960,7 +2977,15 @@ def _capacity_client_ceiling_s(capability: dict | None) -> float:
     projected, probed, unknown = 0.0, False, False
     for backend in ("reranker", "embedder"):
         block = (capability or {}).get(backend)
-        if not isinstance(block, dict):
+        if not isinstance(block, dict) or not block:
+            # R2-N3: ignorance expressed as ABSENCE is still ignorance. A
+            # block that is missing, empty, or not a dict says nothing about
+            # what that backend costs — and treating "nothing" as "zero" is
+            # the same mistake this whole mechanism exists to remove. Not
+            # reachable from our own probe (it always writes both blocks);
+            # very reachable for a client reading a partial or older
+            # gateway's /health over the wire.
+            unknown = True
             continue
         try:
             value = float(block.get("projected_full_payload_s") or 0)
