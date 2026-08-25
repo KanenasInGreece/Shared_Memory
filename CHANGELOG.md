@@ -5,6 +5,60 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.58] — 2026-08-26
+
+### Added — the encoders can be served by vLLM; the one shim that needs, and a measured Intel Arc example
+
+**The default has not moved.** `llama-server` still serves both encoders, the compose file still
+brings them up, and every number in the README's resources chapter is still measured on that. This
+release documents that **vLLM works too, on any accelerator vLLM itself supports**, and ships the
+small piece of glue anyone serving the *reranker* that way needs — regardless of vendor. The Intel
+Arc measurements below are one worked example of it, not a requirement. An install that ignores all
+of this behaves exactly as before.
+
+**Why it is worth documenting — measured on one Arc B580.** With the same two models
+and the same payloads and only the serving engine different, reranking a real 22-document candidate
+set went from 9.43 s to 0.47 s, embedding a full-length input from 1.40 s to 0.08 s, and a search end
+to end through the delivered client from 8.53 s to 0.68 s. The host-RAM picture changes character
+rather than degree: `llama-server` keeps a prompt cache in host memory — `--cache-ram`, 8192 MiB by
+default — that a cross-encoder and an embedder can never get a hit from, because the text differs on
+every call, and two encoder processes were holding roughly 16 GB of it after two days of uptime. The
+vLLM pair holds a fixed footprint instead and does not move under load: a 319-second barrage of 105
+maximum-size reranks — 56.8 million characters, nearly five times the largest payload the gateway has
+ever really sent — plus 288 embeds and 24 live searches left VRAM unchanged to the megabyte, produced
+no errors, and triggered no kernel GPU resets.
+
+**`shared-memory/scripts/rerank_shim.py` — needed by any vLLM deployment, not just Intel ones.**
+Reranking is the only place the two engines disagree on the wire, and that disagreement is a property
+of vLLM rather than of any card. vLLM already serves `/v1/embeddings` where the gateway looks for it, so the embedder needs
+nothing; but it serves `/v1/rerank` where the gateway posts `/v1/reranking`. Everything else about
+that call already agrees — a body carrying no `model` field is accepted, `results[].index` is the
+position in the submitted array rather than a sorted rank, `relevance_score` is the field the
+coordinator reads, and `top_n` is honoured — so the translation is a path rewrite and nothing more,
+and the shim refuses any path it was not built to map rather than forwarding blind. Every address it
+uses is an env-overridable default, and it binds loopback deliberately: no encoder in this stack
+carries authentication, so a wider bind would publish an unauthenticated reranking endpoint on every
+interface. It warns at startup if you widen it. Nothing in the framework references it; it is inert
+unless an operator runs it.
+
+**What the README now says, including the parts that argue against it.** The new section under
+*Resources & prerequisites* carries the comparison, the image (`intel/vllm:0.21.0-xpu`), the fact
+that a vLLM process serves one model so the pair needs two containers, that the weights are Hugging
+Face safetensors rather than GGUF, that `--runner pooling` is required, that `--device /dev/dri` must
+be joined by a `/dev/dri/by-path` mount or oneCCL cannot enumerate the GPU at all, and that
+`--gpu-memory-utilization` behaves as a ceiling rather than a reservation for a pooling model. It
+also states the three reasons not to: it is Intel-only and in fact per-card, so it does nothing for
+an AMD card or a CPU-only host, which is where reranking actually hurts; switching the **embedder**
+mixes vector populations, since vLLM's vectors agree with llama.cpp's only to a cosine of 0.9982 at
+full length, and only a complete re-embed puts that back (switching the reranker alone costs nothing,
+because a reranker stores no state); and `nvtop` reports 0% utilisation for this path even while the
+card is saturated, so a GPU-busy figure read from it cannot be believed.
+
+**Also documented:** the four optional `SHIM_*` keys in `.env.example`, all as comments beside the
+existing `EMBEDDER_URL` / `RERANKER_URL` defaults, which are unchanged.
+
+---
+
 ## [0.9.57] — 2026-08-25
 
 ### Changed — the search-first rule names history questions; sync refuses to bury a connector
