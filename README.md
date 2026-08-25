@@ -251,7 +251,7 @@ framework depends on that today, but do not read a GPU-busy figure and believe i
 
 #### The machines behind the numbers
 
-Three deployment shapes are exercised continuously, and the table above is read off them. A
+Four deployment shapes are exercised continuously, and the table above is read off them. A
 *server* here means the gateway host; *clients* are wherever the skill or the MCP connector runs
 — the same box, or any machine with a route to `:8888` (a tunnel from a laptop on the road is a
 tested client path).
@@ -261,6 +261,22 @@ tested client path).
   documents reranked in 4.7 s), a second card for a local 14B reasoning model, 1,300-record
   corpus, every CLI agent on the box as a client. The "everything local" numbers and the
   CPU-only encoder footprints were measured here.
+- **The same workstation again, encoders served by vLLM — a second, separately tested shape.**
+  Same Fedora box and the same B580, but both encoders served by `intel/vllm:0.21.0-xpu` (two
+  containers, one model each) instead of `llama-server`, with `rerank_shim.py` in front of the
+  reranker. The llama.cpp shape above remains valid and is what the table's numbers come from;
+  this one is the alternative, measured alongside it. Reranking a real 22-document candidate set:
+  **0.47 s against 9.43 s**. A search end to end through the delivered client: **0.68 s median
+  against 8.53 s**, and 1.35 s with four searches running at once. **The RAM difference is the
+  larger story:** `llama-server` had been holding roughly **8 GiB per encoder process** in a
+  prompt cache neither an embedder nor a cross-encoder can ever get a hit from — about **16 GB
+  across the pair, and still growing after two days of uptime**. Stopping them returned it, which
+  we measured directly rather than inferred: **+8.06 GiB** and **+12.29 GiB** of available memory
+  against RSS figures of 7.96 and 7.82 GiB, while an untouched third `llama-server` on the other
+  card did not move a byte. The vLLM pair holds a fixed footprint instead — **+35 MiB across 105
+  maximum-size reranks**, and VRAM unchanged to the megabyte through a 319-second barrage. Net on
+  this box: **~16 GB of system RAM returned**, VRAM up from 1.3 to 5.2 GB of 11.9.
+
 - **Small GPU, external LLM — a 2019 desktop as server, an MCP coding agent as client on the
   same host.** Intel i5-9400F (6 cores), 15 GB RAM + 16 GB swap, AMD Radeon RX 580 4 GB, Docker.
   Embedder on the card (~672 MB VRAM; 500/3,000/6,000-char embeds in 0.06/0.19/0.38 s), reranker
@@ -873,7 +889,12 @@ GPU to allocate, the compromise is plain: a card with enough VRAM for your reaso
 usually better spent on the model backend, while a small card — 4 GB, say — is best spent on
 the embedder, which needs about 0.7 GB at full geometry and repays it in search latency — not
 the reranker, whose 8192-token context does not fit beside it there (measured below). Your
-call, always. That
+call, always. A third option exists on hardware vLLM
+supports: serve the encoders with **vLLM** rather than `llama-server`. The embedder needs nothing
+extra, but **vLLM serving the reranker needs `shared-memory/scripts/rerank_shim.py`** in front of
+it — vLLM answers on `/v1/rerank` and the gateway posts to `/v1/reranking`, and the shim rewrites
+that path and nothing else. See *Serving the encoders with vLLM instead of llama.cpp* in
+[§3](#resources--prerequisites) for the contract and the measured Arc example. That
 pair-wise switch moves both encoders together; `EMBEDDER_GPU_REPLICAS`/`EMBEDDER_CPU_REPLICAS`
 and `RERANKER_GPU_REPLICAS`/`RERANKER_CPU_REPLICAS` move one at a time instead, for a card too
 small for both — measured on a 4 GB card, the embedder fits (671 MB) but the reranker's
@@ -1245,7 +1266,7 @@ is exported in the operator's own shell; it never passes through an agent.
 
 Engineers are pointed at the code. The outbox that keeps two stores atomic, the idempotent save
 path, the gates and thresholds of the dreaming cycle, the exact telemetry contract — each is
-documented where it is implemented: the scripts under `shared-memory/scripts/`, the schema in
+documented where it is implemented: the scripts under `shared-memory/scripts/` (including `rerank_shim.py`, the optional path translator for serving the reranker with vLLM), the schema in
 [`Documentation/schema.md`](shared-memory/Documentation/schema.md), the operations runbook in
 [`Documentation/server-setup.md`](shared-memory/Documentation/server-setup.md), the migration
 chain and its verifiers under `shared-memory/migrations/`, the client contract in

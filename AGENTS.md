@@ -394,7 +394,10 @@ never pick silently. `ps` accordingly shows four containers — the inference pa
 (they carry healthchecks; which pair depends on the choice) and the two stores `Up` (they
 carry none; Phase 5's init is what proves them) — or two when **both** pairs are 0 because the
 encoders are hosted outside the stack entirely — then `EMBEDDER_URL`/`RERANKER_URL` must say
-where, or saves are refused.
+where, or saves are refused. ⚠ **If the operator is serving the encoders with vLLM, the reranker
+needs `shared-memory/scripts/rerank_shim.py` in front of it** and `RERANKER_URL` points at the
+shim, not at vLLM — vLLM answers on `/v1/rerank` while the gateway posts `/v1/reranking`. The
+embedder needs no shim. Runbook: *Serve the encoders with vLLM* below.
 
 Postgres (`:5432`), Neo4j (`:7474/:7687`), embedder (`:8070`), reranker (`:8071`). An `unhealthy` inference container is almost always a wrong model path (Phase 0 Q2).
 
@@ -793,6 +796,43 @@ bash shared-memory/scripts/bootstrap_tokens.sh --add <agent> --install-path <ski
 bash shared-memory/scripts/sync_skills.sh
 systemctl --user restart hive-mind-gateway.service
 ```
+
+### Serve the encoders with vLLM (any accelerator vLLM supports)
+
+Optional, and **only when the operator asks for it** — the bundled `llama-server` pair is the
+default and stays supported. Do not propose this silently; it changes which engine writes the
+vectors (see the warning at the end).
+
+1. **Weights.** vLLM needs Hugging Face format, not GGUF:
+   `hf download BAAI/bge-m3 --local-dir <dir>/bge-m3` and
+   `hf download BAAI/bge-reranker-v2-m3 --local-dir <dir>/bge-reranker-v2-m3`.
+2. **Two containers — a vLLM process serves ONE model.** Start each with `--runner pooling`
+   (these are encoders, not generative models), its own port, and `--served-model-name` set.
+   On Intel XPU the image is `intel/vllm:0.21.0-xpu`, and it needs **both** `--device /dev/dri`
+   **and** `-v /dev/dri/by-path:/dev/dri/by-path` plus `-e CCL_ZE_IPC_EXCHANGE=sockets` — without
+   the `by-path` mount oneCCL cannot enumerate the GPU and the engine never starts. On a shared
+   card set `--gpu-memory-utilization` low; for a pooling model it is a ceiling, not a
+   reservation, so it will not be claimed.
+3. **Free the ports the framework expects, or point it elsewhere.** If the bundled pair is
+   running, stop it (`CPU_ENCODER_REPLICAS=0` + `GPU_ENCODER_REPLICAS=0`, or stop the units).
+4. **Put the shim in front of the reranker** — the embedder does not need one:
+   ```bash
+   SHIM_VLLM_URL=http://127.0.0.1:<vllm-rerank-port> SHIM_PORT=8092 \
+     python3 shared-memory/scripts/rerank_shim.py
+   ```
+   It rewrites `/v1/reranking` → `/v1/rerank` and nothing else, refuses any other path, and binds
+   loopback on purpose (no encoder here carries authentication). For a permanent install give it a
+   service unit ordered **before** the gateway, so the gateway's first capability probe succeeds.
+5. **Point the framework at both** in `shared-memory/.env` — `EMBEDDER_URL` straight at vLLM,
+   `RERANKER_URL` at the **shim** — then restart the gateway (both are read at import).
+6. **Verify:** `curl -s localhost:8888/health` → `status ok`; then a real search and confirm every
+   row comes back `ranked: true`. A dead reranker degrades silently to vector order; a dead
+   embedder makes search return `[]` rather than an error, so check the rows, not just `/health`.
+
+⚠ **Tell the operator before switching the EMBEDDER.** vLLM's vectors are not bit-identical to
+llama.cpp's (measured: cosine 0.9982 at full-length inputs, one position swap in 760 pairs), so
+records written afterwards sit slightly apart from records written before, and only a full re-embed
+puts that back. Switching **only the reranker** carries no such cost — a reranker stores nothing.
 
 ### Start (e.g. after reboot)
 

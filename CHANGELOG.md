@@ -57,6 +57,17 @@ card is saturated, so a GPU-busy figure read from it cannot be believed.
 **Also documented:** the four optional `SHIM_*` keys in `.env.example`, all as comments beside the
 existing `EMBEDDER_URL` / `RERANKER_URL` defaults, which are unchanged.
 
+**Documentation follow-up (same release).** The vLLM-served workstation is now listed as its own
+deployment shape alongside the `llama-server` one it does not replace — both are exercised, and the
+entry carries the measured RAM story: roughly 8 GiB per encoder process held in a prompt cache
+neither encoder can hit, about 16 GB across the pair, returned as +8.06 and +12.29 GiB of available
+memory when they were stopped, against an untouched third process that did not move a byte. §17
+(inference) and §24 (where the mechanism lives) now point at the shim from where an operator
+actually reads about encoder placement, and `AGENTS.md` gains a *Serve the encoders with vLLM*
+runbook — weights, two containers, the shim in front of the reranker only, the ordering that lets
+the gateway's first capability probe succeed, and the instruction to warn the operator before
+switching the **embedder**, because that one mixes vector populations.
+
 ---
 
 ## [0.9.57] — 2026-08-25
