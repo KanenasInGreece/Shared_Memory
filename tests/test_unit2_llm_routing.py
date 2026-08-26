@@ -157,6 +157,10 @@ def test_routing_refusal_ignores_unrecognized_gateway_error(mod):
 
 
 # ── 2. rem_loop.py — role headers, per call site ──────────────────────────────
+#
+# Only a record OVER the summary threshold reaches an LLM call at all
+# (`decision:1664`), so every REM case below uses one.
+_REM_LONG = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
 
 @pytest.mark.asyncio
 async def test_rem_solo_call_sends_extract_role_header(monkeypatch):
@@ -167,7 +171,7 @@ async def test_rem_solo_call_sends_extract_role_header(monkeypatch):
         captured["headers"] = kwargs.get("headers", {})
         return _ok_resp('{"summary":"s","relationships":[]}')
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
-    await daemon._llm_process("content", rem_mod.KIND_FACT, [], {}, pg_id=1)
+    await daemon._llm_process(_REM_LONG, rem_mod.KIND_FACT, pg_id=1)
     assert captured["headers"].get("X-SM-LLM-Role") == "extract"
 
 
@@ -180,22 +184,9 @@ async def test_rem_batch_call_sends_extract_role_header(monkeypatch):
         captured["headers"] = kwargs.get("headers", {})
         return _ok_resp('{"idx":0,"relationships":[]}')
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
-    items = [{"pg_id": 1, "content": "c", "manifest": {}}]
-    await daemon._llm_process_batch(items, [])
+    items = [{"pg_id": 1, "content": _REM_LONG}]
+    await daemon._llm_process_batch(items)
     assert captured["headers"].get("X-SM-LLM-Role") == "extract"
-
-
-@pytest.mark.asyncio
-async def test_rem_verify_call_sends_verify_role_header(monkeypatch):
-    daemon, _ = _make_daemon()
-    monkeypatch.delenv("MOCK_LLM", raising=False)
-    captured = {}
-    async def _fake_post(self, url, **kwargs):
-        captured["headers"] = kwargs.get("headers", {})
-        return _ok_resp('{"idx":0,"confirm":true}')
-    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
-    await daemon._llm_verify_call("prompt", pg_id=1, n_edges=1)
-    assert captured["headers"].get("X-SM-LLM-Role") == "verify"
 
 
 # ── 3. rem_loop.py — U2-I1: routing refusal never charges rem_attempts ───────
@@ -212,7 +203,7 @@ async def test_rem_solo_routing_refusal_does_not_charge_an_attempt(monkeypatch):
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
 
     with patch.object(daemon, "_bump_rem_attempts", new=AsyncMock()) as bump:
-        ok = await daemon._process_fact(7, "content", rem_mod.KIND_FACT, [], {},
+        ok = await daemon._process_fact(7, _REM_LONG, rem_mod.KIND_FACT,
                                         None, asyncio.get_running_loop())
 
     assert ok is False
@@ -232,7 +223,7 @@ async def test_rem_solo_refusal_never_retries_the_widened_bound(monkeypatch):
         bounds.append(kwargs.get("json", {})["max_tokens"])
         return _RefusalResp()
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
-    result, _model = await daemon._llm_process("content", rem_mod.KIND_FACT, [], {}, pg_id=1)
+    result, _model = await daemon._llm_process(_REM_LONG, rem_mod.KIND_FACT, pg_id=1)
     assert result is None
     assert len(bounds) == 1, "a routing refusal must not trigger the widen-once retry ladder"
 
@@ -246,8 +237,8 @@ async def test_rem_batch_routing_refusal_charges_no_record(monkeypatch):
     async def _fake_post(self, url, **kwargs):
         return _RefusalResp(constraint="fit", role="extract")
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
-    items = [{"pg_id": i, "content": "c", "manifest": {}} for i in (1, 2, 3)]
-    results, timing, _model = await daemon._llm_process_batch(items, [])
+    items = [{"pg_id": i, "content": _REM_LONG} for i in (1, 2, 3)]
+    results, timing, _model = await daemon._llm_process_batch(items)
     assert results is None, "a refused CALL must be distinguishable from empty results"
     assert timing is None
     assert daemon._last_llm_failure == rem_mod.LLM_FAIL_ROUTING_REFUSED
@@ -265,29 +256,11 @@ async def test_rem_backend_at_capacity_gets_the_same_no_charge_treatment(monkeyp
                             role="extract", status_code=503)
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
     with patch.object(daemon, "_bump_rem_attempts", new=AsyncMock()) as bump:
-        ok = await daemon._process_fact(7, "content", rem_mod.KIND_FACT, [], {},
+        ok = await daemon._process_fact(7, _REM_LONG, rem_mod.KIND_FACT,
                                         None, asyncio.get_running_loop())
     assert ok is False
     bump.assert_not_awaited()
     assert daemon._last_llm_failure == rem_mod.LLM_FAIL_ROUTING_REFUSED
-
-
-@pytest.mark.asyncio
-async def test_rem_verify_loop_stops_after_the_first_refusal(monkeypatch):
-    """I-4's spirit: the gateway already said nothing eligible exists this
-    cycle — VERIFY_CALLS (2) more identical calls would only hammer it.
-    The k=3 self-consistency loop must stop after the FIRST refusal."""
-    daemon, _ = _make_daemon()
-    monkeypatch.delenv("MOCK_LLM", raising=False)
-    assert rem_mod.VERIFY_CALLS > 1, "test only distinguishes a real stop if VERIFY_CALLS > 1"
-    calls = []
-    async def _fake_post(self, url, **kwargs):
-        calls.append(1)
-        return _RefusalResp(constraint="role", role="verify")
-    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
-    votes, k = await daemon._verify_novel_edges("content", [{"name": "A", "rel_type": "MENTIONS"}], 1)
-    assert len(calls) == 1, "a refusal must stop the verify loop, not retry it VERIFY_CALLS times"
-    assert k == 1   # no confirmation was ever counted
 
 
 # ── 4. rem_loop.py — N-4: prompt_chars wired into telemetry ──────────────────
@@ -306,7 +279,7 @@ async def test_rem_solo_call_wires_prompt_chars(monkeypatch):
         recorded.update(kw)
         return {}
     monkeypatch.setattr(rem_mod, "record_llm_call", _spy)
-    await daemon._llm_process("some content for the prompt", rem_mod.KIND_FACT, [], {}, pg_id=1)
+    await daemon._llm_process(_REM_LONG, rem_mod.KIND_FACT, pg_id=1)
     assert recorded.get("prompt_chars") == len(sent["prompt"])
     assert recorded["prompt_chars"] > 0
 
@@ -325,27 +298,9 @@ async def test_rem_batch_call_wires_prompt_chars(monkeypatch):
         recorded.update(kw)
         return {}
     monkeypatch.setattr(rem_mod, "record_llm_call", _spy)
-    items = [{"pg_id": 1, "content": "c", "manifest": {}}]
-    await daemon._llm_process_batch(items, [])
+    items = [{"pg_id": 1, "content": _REM_LONG}]
+    await daemon._llm_process_batch(items)
     assert recorded.get("prompt_chars") == len(sent["prompt"])
-    assert recorded["prompt_chars"] > 0
-
-
-@pytest.mark.asyncio
-async def test_rem_verify_call_wires_prompt_chars(monkeypatch):
-    daemon, _ = _make_daemon()
-    monkeypatch.delenv("MOCK_LLM", raising=False)
-    async def _fake_post(self, url, **kwargs):
-        return _ok_resp('{"idx":0,"confirm":true}')
-    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
-    recorded = {}
-    def _spy(*a, **kw):
-        recorded.update(kw)
-        return {}
-    monkeypatch.setattr(rem_mod, "record_llm_call", _spy)
-    prompt = "verify this specific prompt text"
-    await daemon._llm_verify_call(prompt, pg_id=1, n_edges=1)
-    assert recorded.get("prompt_chars") == len(prompt)
     assert recorded["prompt_chars"] > 0
 
 

@@ -137,8 +137,10 @@ def test_the_p1_guard_discriminates_resolution_from_a_summary_key():
 def test_every_reader_actually_imports_the_module():
     """The mirror of the above: absence of a copy could also mean the reader
     stopped resolving a project at all."""
+    # rem_loop.py is deliberately ABSENT since `decision:1664`: REM summarises
+    # and writes no edges, so it resolves no project at all.
     expected = {
-        "coordinator.py", "consolidation_loop.py", "rem_loop.py",
+        "coordinator.py", "consolidation_loop.py",
         "migrate_retro_edges.py", "normalize_projects.py",
     }
     importers = {name for name, src in _scripts() if "from project_axis import" in src}

@@ -1804,8 +1804,8 @@ RELATION_FAMILIES: tuple[str, ...] = ("entity_relation", "evidential")
 # asserted_by values a machine minted — the ONLY values the guarded edge delete
 # may remove; an operator-asserted edge is never deleted by a label.
 RELATION_MACHINE_ASSERTED: tuple[str, ...] = ("rem", "rem_sweep")
-# Stamp carried by a judgement's COPY of a topic its evidence already had — see
-# _inherit_entities_from_facts (989). Mirrors relation_confidence.ASSERTED_INHERITED.
+# Stamp a machine writer puts on a COPY of an edge some other record already
+# had. Mirrors relation_confidence.ASSERTED_INHERITED.
 RELATION_ASSERTED_INHERITED = "inherited"
 RELCONF_CONSUME_THRESHOLD: dict[str, float] = {
     # 0.68 mirrors the WRITE floor exactly (989): what is trusted enough to
@@ -3492,12 +3492,11 @@ class MemoryCoordinator:
         assisted_by is set. All writes in one session — atomic on transient
         failures (MERGE is idempotent).
 
-        A decision MINTS NO ENTITIES. It INHERITS them by traversing its
-        grounding path to facts — see _inherit_entities_from_facts. The
+        A decision CARRIES NO ENTITIES — only facts do (`decision:1664`). The
         caller-supplied `entities` metadata stays in Postgres (Tier 1 pristine)
-        but is no longer projected into the graph: a decision's topics are
-        whatever its evidence is about, never a second free-text vocabulary
-        minted alongside it.
+        and is never projected into the graph: a decision's topics are whatever
+        its evidence is about, reached by walking its grounding path to the
+        facts, never a second free-text vocabulary minted alongside it.
         """
         decision = params.get("decision", {})
         grounded = params.get("grounded") or []
@@ -3611,9 +3610,9 @@ class MemoryCoordinator:
         fact_kind), link the target Decision via the HAD_OUTCOME trigger edge,
         then the typed grounding ROLE edges (shared writer). The target Decision
         is matched in its own statement so a missing decision leaves the record
-        intact (edge no-op). MENTIONS edges are NOT written here: a retrospective
-        mints no entity, it inherits the topics of the facts it grounds in — see
-        _inherit_entities_from_facts, which runs last for exactly that reason.
+        intact (edge no-op). MENTIONS edges are NOT written here: a
+        retrospective carries no entities — only facts do (`decision:1664`); its
+        topics are reached by walking to the facts its decision grounds in.
 
         Legacy (no 'v'): pg_id is the TARGET DECISION's id — a HAD_OUTCOME
         self-loop carrying rating/date/notes as edge properties. Kept until the

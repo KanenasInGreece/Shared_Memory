@@ -229,7 +229,7 @@ rationale, revocable) and the idempotency cache: a sweep skips pairs already jud
 ### `relation_adjudications` — machine-relation verdict + calibration ledger (migration 020)
 
 One ledger for BOTH machine-minted relation families: `entity_relation` (typed
-Entity→Entity edges from the evidence sweep / REM, name-keyed endpoints) and
+Entity→Entity edges from the evidence sweep, name-keyed endpoints) and
 `evidential` (record→record proposals such as `Decision INFORMED_BY Fact`,
 pg_id-keyed endpoints; `GROUNDED_IN` is never machine-minted so it never appears
 here). Every machine verdict lands here with its quantitative signals; operator
@@ -613,9 +613,10 @@ generator does faithfully introspect.
 ### Entity type sub-labels (Path A multi-label)
 
 Type specialisations applied **on top of** `:Entity` (e.g. `:Entity:Component`), so all existing
-`:Entity` queries keep working. **Staged rollout:** defined in `ontology.yaml` now; REM assigns them during
-enrichment (Stage 1.3) and a one-time backfill types the existing corpus (Stage 1.4). Person / Agent /
-Process reuse the provenance labels `Human` / `AIAgent` / `Activity` rather than minting parallel types.
+`:Entity` queries keep working. Defined in `ontology.yaml`; applied by a one-time backfill over the
+existing corpus. ⛔ **REM does not assign them** — it writes no labels at all (`decision:1664`). Person /
+Agent / Process reuse the provenance labels `Human` / `AIAgent` / `Activity` rather than minting
+parallel types.
 
 | Sub-label | Captures |
 |---|---|
@@ -636,7 +637,7 @@ Written by the outbox worker when `metadata["type"] == "decision"`.
 | `Human` | A person who owns or makes a decision (`decided_by` field) |
 | `AIAgent` | An AI tool that assisted in the decision (`assisted_by` list) |
 | `Project` | Project scope — the node every record's belonging edge points at. **Keyed on `project_id`, the registry identity (migration 027); `name` is a display label carried on the node, unique but renameable.** The fold gate counts distinct `project_id`, so a node with none is not counted — see `projects` below. |
-| `Domain` | A SECTION of one project (migration 028). **Keyed on `domain_id`, the registry identity**; `name` is a display label, unique only WITHIN its project — which is why there is deliberately no name constraint on this label. Never an `:Entity`, never the target of `MENTIONS`, never in REM's label table: it is a belonging axis, not a topic. |
+| `Domain` | A SECTION of one project (migration 028). **Keyed on `domain_id`, the registry identity**; `name` is a display label, unique only WITHIN its project — which is why there is deliberately no name constraint on this label. Never an `:Entity`, never the target of `MENTIONS`: it is a belonging axis, not a topic. |
 | `Activity` | A work session or task context (reserved; not yet written automatically) |
 | `Milestone` | A significant achievement marker (reserved; not yet written automatically) |
 
@@ -644,7 +645,7 @@ Written by the outbox worker when `metadata["type"] == "decision"`.
 
 | Relationship | Pattern | Written by |
 |---|---|---|
-| `MENTIONS` | `(:Fact)-[:MENTIONS]->(:Entity)` | Outbox worker — from `metadata["entities"]`; drives graph navigation and REM/entity-relation linking (Tier 3 consolidation itself keys on project+domain, not entities — fact 1215) |
+| `MENTIONS` | `(:Fact)-[:MENTIONS]->(:Entity)` | Outbox worker — from `metadata["entities"]`, at first write only; drives graph navigation and the entity-relation sweep (Tier 3 consolidation itself keys on project+domain, not entities — fact 1215) |
 | `REPORTS_ON` | `(:Fact)-[:REPORTS_ON]->(:Entity)` | Legacy alias; accepted by consolidation query. Use `MENTIONS` for new saves. |
 | `ALIASES` | `(:Entity)-[:ALIASES]-(:Entity)` | Soft synonym link between entity surface forms (`coordinator` ↔ `Coordinator`), v0.6.0. **Never merges nodes** — reversible. Consolidation + search traverse alias *components*: Neo4j GDS `gds.wcc` stamps `Entity.alias_component`, and clusters group on `coalesce(alias_component, elementId(e))`. Edges carry `method`/`score`/`confidence`. Written by the REM alias-writer (v0.6.1); until then created via the offline `entity_resolution_eval.py` harness. |
 | `SUMMARIZED_BY` | `(:Fact\|:Decision)-[:SUMMARIZED_BY]->(:CommunitySummary)` | Consolidation daemon after synthesis (Decision source = insight fold) |
@@ -672,14 +673,12 @@ Written by the outbox worker for `type:decision` saves.
 ### Judgement relations targeting `:Entity` — RETIRED, never minted by REM (v0.4.0 → retired E5/B1)
 
 ⛔ **These four relation types are judgement relations and are NEVER minted by
-`rem_loop.py`, or by anything else, as of E5 (v0.8.60) and confirmed permanent
-by the Dreaming Cycle v2 plan (§1, task B1).** They are first-write-only
-properties on the `Decision` record (`metadata.decision.considered` /
-`.rejected` / `.under_conditions` / `.produces_insight`, free text) and are
-**never** materialized as a graph edge to an `:Entity` node — a candidate name
-REM's decision-extras task proposes is unconditionally logged to
-`extras_dropped` and discarded, registry-known or not. Kept here as a record of
-a retired mechanism, not a current capability:
+`rem_loop.py`, or by anything else.** They are first-write-only properties on
+the `Decision` record (`metadata.decision.considered` / `.rejected` /
+`.under_conditions` / `.produces_insight`, free text) and are **never**
+materialized as a graph edge to an `:Entity` node. REM does not propose them
+either: it asks the model for a summary and nothing else (`decision:1664`).
+Kept here as a record of a retired mechanism, not a current capability:
 
 | Relationship | Pattern | Meaning (historical — never written since E5/B1) |
 |---|---|---|
@@ -718,7 +717,7 @@ always consumable.
 
 **`rem_processed` Fact property:** after REM enriches a Fact node, it sets `rem_processed = true`. NREM (`consolidation_loop.py`) requires this flag before including a Fact in a consolidation cluster — `WHERE coalesce(neighbor.rem_processed, false) = true`. A Fact whose Neo4j write is still pending in the outbox is never marked `rem_processed`.
 
-**Entity type registry:** REM builds a closed registry from all existing typed nodes (`Human`, `AIAgent`, `Project`, `Decision`, `Entity`) before each batch. Once a name is registered (e.g. "Xenofon → Human"), every occurrence in the batch uses the same label and a compatible relationship type. The LLM cannot reclassify existing nodes.
+**Entity linking is a first-write capability only.** REM builds no entity registry and proposes no relationship: it summarises a record and writes `rem_summary` (`decision:1664`). An entity reaches the graph when a person names it on a save.
 
 ### Retrospective write protocol (v2 — retro-as-record)
 
@@ -796,7 +795,7 @@ To create a Decision node, save with `metadata["type"] == "decision"` and a nest
 Required fields: `decided_by`, `project`, `rationale`. All others optional.
 
 **Entity Ingestion Protocol:**
-Supply `"entities": ["Name1", "Name2"]` in the metadata JSON when saving. The saver creates `Entity` nodes and `MENTIONS` relationships for each name. **Tier 3 consolidation no longer keys on entities** (fact 1215) — the NREM fold walks the `DOMAIN_OF`→`PROJECT_OF` spine (project+domain), so a fact saved without entities is stored, retrievable, and fully consolidatable. Entities still matter: they are the only way a new concept enters the graph, and they drive graph navigation and REM/entity-relation linking. Decision nodes also receive `MENTIONS` edges to their (inherited) entities. Optionally, `entities_provenance` (`{"<name>": "operator"|"agent"}`) stamps who named each one.
+Supply `"entities": ["Name1", "Name2"]` in the metadata JSON when saving. The saver creates `Entity` nodes and `MENTIONS` relationships for each name. **Tier 3 consolidation no longer keys on entities** (fact 1215) — the NREM fold walks the `DOMAIN_OF`→`PROJECT_OF` spine (project+domain), so a fact saved without entities is stored, retrievable, and fully consolidatable. Entities still matter: they are the only way a new concept enters the graph, and they drive graph navigation and the entity-relation sweep. ⛔ They are written at FIRST WRITE only — REM never adds one (`decision:1664`). Optionally, `entities_provenance` (`{"<name>": "operator"|"agent"}`) stamps who named each one.
 
 **Vector Indexes (1024 Dimensions):**
 - `entity_embedding_idx`

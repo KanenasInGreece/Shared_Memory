@@ -361,12 +361,14 @@ def test_the_backfill_never_gives_a_retrospective_an_asserted_row():
 
 
 def test_rem_can_never_mint_a_domain_node():
-    """D7. REM's label table is documented as "labels whose identity key IS
-    name", and a Domain's identity is a registry id — so it must not appear
-    there, or enrichment could create a section."""
+    """D7, now settled structurally rather than by a label table: REM writes no
+    edges and no labels at all (`decision:1664`), so there is no MERGE anywhere
+    in it for a Domain — or anything else — to be created by."""
+    import inspect
     import rem_loop
-    assert ONT.domain not in rem_loop._KNOWN_LABELS
-    assert ONT.domain_of not in rem_loop._KNOWN_LABELS
+    assert "MERGE" not in inspect.getsource(rem_loop), (
+        "rem_loop builds a MERGE again — REM must write no node and no edge")
+    assert not hasattr(rem_loop, "_KNOWN_LABELS")
 
 
 # ── Regressions found by checking LIVE data after the release ────────────────
