@@ -88,7 +88,7 @@ def test_adaptive_ceiling_output_bound_dominates(monkeypatch):
 
 def test_adaptive_ceiling_omitting_max_tokens_is_unchanged(monkeypatch):
     """The new parameter is additive — every pre-existing call site keeps its
-    exact previous ceiling, so REM/relation_sweep are untouched by this change."""
+    exact previous ceiling, so REM is untouched by this change."""
     dt = _fresh(monkeypatch)
     for prompt_chars, units in ((1000, 0), (80_000, 0), (4400, 79)):
         assert (dt.adaptive_ceiling(prompt_chars, units)

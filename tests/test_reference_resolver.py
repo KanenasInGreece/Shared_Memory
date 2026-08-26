@@ -1,8 +1,8 @@
 """Stage 1.2b reference resolution — pure extraction + deterministic classification.
 
-The LLM judge is config-gated I/O (mode=llm) and not exercised here; the resolver
-defaults to deterministic. Live motivation: 145/146 context-gated numeric refs in
-the corpus resolved to real records (e.g. "refines decision 381").
+Classification is deterministic — there is no judge and no I/O of any kind. Live
+motivation: 145/146 context-gated numeric refs in the corpus resolved to real
+records (e.g. "refines decision 381").
 """
 import os
 import sys
@@ -66,8 +66,8 @@ def test_deterministic_relation_other_pairings_reference():
     assert rr.deterministic_relation(ONT.fact, ONT.fact) == ONT.references
 
 
-def test_classify_defaults_to_deterministic_when_judge_disabled():
-    # Default mode is deterministic — no network call, returns the label-based rule.
+def test_classify_is_deterministic():
+    # No network call ever — returns the label-based rule.
     assert rr.classify_relation(ONT.decision, ONT.decision, "addendum to 257") == ONT.informed_by
     assert rr.classify_relation(ONT.fact, ONT.decision, "see 276") == ONT.references
 

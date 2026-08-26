@@ -5,6 +5,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.67] — 2026-08-26
+
+### Removed — the typed entity-to-entity evidence sweep, and the reference resolver's model judge
+
+`relation_sweep.py` proposed typed relations between entities (`DEPENDS_ON`, `PART_OF`, `IMPLEMENTS` and
+the rest) from co-occurrence, had a model adjudicate them, and wrote the accepted ones to the graph before
+anyone had seen them. Entities and what connects them are the person's own assertions, made when a record
+is saved; a process that adds such structure on its own is outside what this framework does, however
+carefully it was gated — and this one had never written an edge outside a test. The script, its tests,
+the `numpy` dependency that only it used, and the `REFERENCE_JUDGE_MODE=llm` option of the reference
+resolver (which let a model pick the relation type for a textual cross-reference) are removed. The
+deterministic reference resolver, run by hand with a dry run by default, is unchanged. Comments and
+documents that still described the sweep as a writer of edges now say that nothing mints machine-asserted
+edges. The calibration tooling that scored such edges (`review-edges`, `label-edges`, the adjudication
+ledger) still works on an empty ledger and is retired separately in the next release.
+
 ## [0.9.66] — 2026-08-26
 
 ### Changed — the enrichment pass writes no graph edges and no labels; it summarises

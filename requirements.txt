@@ -11,5 +11,4 @@ neo4j>=6.2.0           # Neo4j driver — coordinator.py, consolidation_loop.py
 fastmcp>=3.3.1         # MCP server — vector-skill.py (LM Studio only)
 python-dotenv>=1.2.2   # Load .env at startup — vector-skill.py (MCP host may not inherit shell env)
 starlette>=1.0.1       # Transitive via fastmcp; floor enforces BadHost fix (CVE-2026-48710)
-json-repair>=0.63.2    # Salvage LLM JSON slips — rem_loop.py, relation_sweep.py
-numpy>=2.5.2           # Vector math — relation_sweep.py
+json-repair>=0.63.2    # Salvage LLM JSON slips — rem_loop.py

@@ -255,7 +255,7 @@ NREM_FORCED_SLOT_WAIT = float(os.environ.get("NREM_FORCED_SLOT_WAIT", "1800"))
 NREM_FORCED_SLOT_POLL = 10.0
 
 
-# MUST-mirror: rem_loop.py and relation_sweep.py carry their own copies of
+# MUST-mirror: rem_loop.py carries its own copy of
 # _finish_reason/_truncated (single-file-per-venv convention) — keep in agreement.
 def _finish_reason(resp_json):
     """choices[0].finish_reason of an OpenAI-compatible completion response

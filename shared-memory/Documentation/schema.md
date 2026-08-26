@@ -229,26 +229,24 @@ rationale, revocable) and the idempotency cache: a sweep skips pairs already jud
 ### `relation_adjudications` — machine-relation verdict + calibration ledger (migration 020)
 
 One ledger for BOTH machine-minted relation families: `entity_relation` (typed
-Entity→Entity edges from the evidence sweep, name-keyed endpoints) and
-`evidential` (record→record proposals such as `Decision INFORMED_BY Fact`,
-pg_id-keyed endpoints; `GROUNDED_IN` is never machine-minted so it never appears
-here). Every machine verdict lands here with its quantitative signals; operator
-labels recorded on these rows are the ONLY calibration input — per-family
-reliability curves are computed from them, and a family's confidence thresholds
-act only once it is calibrated (~20 labels). Also the audit trail and the
-don't-re-ask idempotency cache. One CURRENT row per directed edge per family:
-a re-score updates the row in place and preserves the prior rung inside
-`signals.prior_rungs` (the evidential ladder: `rem_k3` proposal → `llm_sweep`
-re-score → operator label/promotion).
+Entity→Entity edges, name-keyed endpoints) and `evidential` (record→record
+proposals such as `Decision INFORMED_BY Fact`, pg_id-keyed endpoints;
+`GROUNDED_IN` is never machine-minted so it never appears here). Every machine
+verdict lands here with its quantitative signals; operator labels recorded on
+these rows are the ONLY calibration input — per-family reliability curves are
+computed from them, and a family's confidence thresholds act only once it is
+calibrated (~20 labels). Also the audit trail and the don't-re-ask idempotency
+cache. One CURRENT row per directed edge per family: a re-score updates the row
+in place and preserves the prior rung inside `signals.prior_rungs`.
 
-⛔ **The `evidential` family is DORMANT since the Dreaming Cycle v2 plan (§1.1,
-task B1).** REM's judgement-relation decommissioning stopped REM proposing
-record→record `INFORMED_BY`/evidential edges — the only writer of `method='rem_k3'`
-rows — so this table currently holds zero `evidential` rows and `relation_sweep.py
---evidential` (rung 2) finds nothing to re-score. `relation_confidence.
-FAMILY_EVIDENTIAL` and the rung-2 re-scoring pipeline are kept intact
-deliberately, as the operator-invoked surface a future non-spine ontology would
-turn back on — not wired to anything, not deleted.
+⛔ **BOTH families are now WRITERLESS.** The `evidential` family went dormant
+with the Dreaming Cycle v2 plan (§1.1, task B1) — REM's judgement-relation
+decommissioning stopped REM proposing record→record `INFORMED_BY`/evidential
+edges, the only writer of `method='rem_k3'` rows. The `entity_relation` family
+lost its writer when the evidence sweep was retired: no process in the framework
+mints a typed Entity→Entity edge any more. The calibration layer
+(`relation_confidence.py`, this table, the review/label surface) is kept intact
+deliberately and operates on an empty ledger, pending its own ruling.
 
 | Column | Type | Notes |
 |---|---|---|
@@ -693,20 +691,21 @@ written at first write, never by REM) — see "Typed decision grounding" below.
 
 **Typed decision grounding (v0.6.4):** the grounding edges that link a `Decision` to the *records it rests on* are role-typed — `GROUNDED_IN` (basis), `CONSIDERED`, `REJECTED`, `UNDER_CONDITIONS`, or `INFORMED_BY`, targeting `(:Fact\|:Decision)`. First write picks the relation from the operator-supplied role (`--grounded-in "42:considered"`) or, when omitted, from the grounded fact's `fact_kind` — a `discussion` defaults to `INFORMED_BY`, other kinds to `GROUNDED_IN` (advisory, never enforced). Each edge carries an **`asserted_by`** property (`operator` \| `system_default`). The target is matched by `pg_id` **across labels**, so grounding a decision in another decision links the real node rather than an empty placeholder.
 
-**Typed Entity→Entity relationships (REM rebuild):** the domain-layer relations
+**Typed Entity→Entity relationships:** the domain-layer relations
 (`DEPENDS_ON`, `PART_OF`, `IMPLEMENTS`, `PRODUCES`, `CONSUMES`, `RUNS_ON`,
-`CONFIGURES`, `DESCRIBES`, `VALIDATES`) are minted by the periodic **evidence
-sweep** (`relation_sweep.py`), never by the per-record save or enrichment path:
-candidate pairs come from co-occurrence across facts aggregated per alias
-component, are legality-gated by the ontology `DOMAIN_RANGE` map in both
-directions, LLM-adjudicated in batches against shared-fact evidence, and every
-verdict lands in `relation_adjudications`. `MENTIONS` remains the explicit
-neutral-weight fallback.
+`CONFIGURES`, `DESCRIBES`, `VALIDATES`) remain declared in `ontology.yaml` and
+legality-gated by the `DOMAIN_RANGE` map, but they have **no writer**: the
+periodic evidence sweep that used to mint them was retired, and neither the
+per-record save nor the enrichment path has ever written one. Nothing in the
+framework mints a machine-asserted Entity→Entity edge; whether the layer itself
+is retired is a separate open ruling. `MENTIONS` remains the explicit
+neutral-weight edge a save writes.
 
 **Universal machine-edge provenance (two-axis: who asserted × how evidenced):**
-every machine-minted edge carries `asserted_by` (`rem` = per-record enrichment,
-`rem_sweep` = evidence sweep), `confidence` (k-vote self-consistency for REM,
-adjudication score for the sweep), `model`, `run_id`, `created_at` — stamped
+this stamping describes PRE-EXISTING edges only — no writer of either stamp
+remains. A machine-minted edge carries `asserted_by` (`rem` = per-record
+enrichment, `rem_sweep` = the retired evidence sweep), `confidence`, `model`,
+`run_id`, `created_at` — stamped
 `ON CREATE` only, so an existing edge (in particular an operator-asserted one)
 is never re-stamped; operator promotion via the review flow flips
 `asserted_by` to `operator`. Pre-rebuild edges carry no `asserted_by` and are

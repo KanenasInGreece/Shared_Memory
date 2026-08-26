@@ -324,9 +324,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("REMDaemon")
 
 
-# MUST-mirror: consolidation_loop.py and relation_sweep.py carry their own
-# copies of _finish_reason/_truncated (single-file-per-venv convention, like
-# _load_env/_auth_headers) — keep all three in agreement.
+# MUST-mirror: consolidation_loop.py carries its own copy of
+# _finish_reason/_truncated (single-file-per-venv convention, like
+# _load_env/_auth_headers) — keep both in agreement.
 def _finish_reason(resp_json) -> str | None:
     """choices[0].finish_reason of an OpenAI-compatible completion response
     ('stop' | 'length' | ...). llama.cpp always sets it and the gateway passes

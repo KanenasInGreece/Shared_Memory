@@ -346,8 +346,8 @@ full notes are the record's Tier-1 content), not on the `HAD_OUTCOME` edge, whic
 
 ### Task 6 — Review & calibrate machine-proposed relation edges
 
-The evidence sweep mints typed graph edges **machine-asserted** with a confidence score (REM mints none — decision 1664); the operator's labels are the **only calibration oracle** — per-family reliability is computed from them, and until a family has ~20 labels it is **uncalibrated: its machine edges are invisible to synthesis**. Labeling is what unlocks them.
-- **Trigger:** a weekly stratified label pass per family — and **ALWAYS immediately after a first evidence-sweep run**, so calibration exists before any confidence threshold acts.
+No process mints machine-asserted graph edges any more — REM mints none (decision 1664) and the evidence sweep is retired — so this task is for the **pre-existing** machine edges still in the graph. The operator's labels are the **only calibration oracle**: per-family reliability is computed from them, and until a family has ~20 labels it is **uncalibrated: its machine edges are invisible to synthesis**. Labeling is what unlocks them.
+- **Trigger:** a stratified label pass per family while a family still holds unlabelled machine edges, so calibration exists before any confidence threshold acts.
 - **Label honestly:** `correct` means the relation **as typed and as directed** is true of the two endpoints — the right pair with the wrong relation or wrong direction is `incorrect`.
 - Labeling an *accepted* edge `incorrect` deletes the machine edge from the graph (operator-asserted edges are never deleted); the ledger row stays as audit and so it is never re-asked.
 - **`--promote` = operator assertion** (`asserted_by=operator`): the edge bypasses confidence thresholds permanently — promote only edges you would defend yourself.
@@ -595,7 +595,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness (anonymous — status/version/api_version only, v0.9.9 S-10):
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":4,"version":"0.9.66"}
+# → {"status":"ok","api_version":4,"version":"0.9.67"}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -667,7 +667,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.66", "api_version": 4, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.67", "api_version": 4, "tool": "shared-memory-framework"}`
 
 ### Updating This Skill
 

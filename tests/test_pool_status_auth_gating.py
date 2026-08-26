@@ -7,8 +7,8 @@ applies ONLY when AUTH_CONFIGURED_AT_STARTUP is true).
 
 Also covers the HARD REQUIREMENT: every real internal caller of /pool/status
 (pool_status.pool_has_free_slot(), consumed by rem_loop.py and
-consolidation_loop.py; relation_sweep.py's own direct probe) must send its
-daemon/agent token, so slot-awareness is never silently lost."""
+consolidation_loop.py) must send its daemon/agent token, so slot-awareness is
+never silently lost."""
 import asyncio
 import importlib
 import json
@@ -179,19 +179,6 @@ def test_every_pool_has_free_slot_call_site_in_rem_loop_sends_headers():
 def test_every_pool_has_free_slot_call_site_in_consolidation_loop_sends_headers():
     calls = _real_call_sites("consolidation_loop.py")
     assert len(calls) >= 4, f"expected >=4 pool_has_free_slot(...) call sites, found {len(calls)}"
-    for call in calls:
-        assert "headers=" in call, f"call site missing headers=: {call!r}"
-
-
-def test_relation_sweep_pool_probe_already_sends_headers():
-    """relation_sweep.py's direct /pool/status probe was already correct
-    before this fix round -- confirm it stays that way (regression guard,
-    not a new fix)."""
-    calls = []
-    for ln in _code_lines("relation_sweep.py"):
-        code = ln.split("#", 1)[0]
-        calls.extend(re.findall(r"httpx\.get\(POOL_STATUS_URL[^)]*\)", code))
-    assert calls, "expected relation_sweep.py's direct POOL_STATUS_URL probe"
     for call in calls:
         assert "headers=" in call, f"call site missing headers=: {call!r}"
 
