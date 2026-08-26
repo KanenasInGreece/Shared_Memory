@@ -5,6 +5,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.68] — 2026-08-27
+
+### Removed — the calibration layer for machine-proposed edges
+
+Since 0.9.66 nothing in the framework writes an edge a person did not assert, so the machinery that
+existed to score, review and label such edges has no subject left. Removed together: the confidence
+scorer (`relation_confidence.py`), the `relation_adjudications` ledger (migration 038 drops it; it
+held no rows), the `/memory/relations/review` and `/memory/relations/label` routes, the
+`review-edges` and `label-edges` commands on the CLI and the matching MCP tools (eleven tools
+remain), the consolidation daemon's calibration gate and its three telemetry fields
+(`edges_awaiting_calibration`, `machine_edges_consumed`, `calibration`), the typed entity-to-entity
+legality map in the ontology, and the `eval/` typing benchmark that tuned a prompt retired in 0.9.66.
+The `verify` routing role, which no caller sent, leaves the vocabulary; `extract` and `judge` stay.
+`API_VERSION` is unchanged: the removed routes were operator tooling, and clients and gateway update
+together. One consolidation telemetry detail changes shape: a fact-consolidation run that found
+nothing now records an explicit zero count for each outcome instead of `null`, so a deliberate empty
+pass is never mistaken for a run that never happened. `schema_init.sql` is regenerated from the live
+schema in the follow-up commit.
+
 ## [0.9.67] — 2026-08-26
 
 ### Removed — the typed entity-to-entity evidence sweep, and the reference resolver's model judge

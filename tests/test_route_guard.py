@@ -1,20 +1,19 @@
 """route-guard (fact:1535, corrects fact:1534's HIGH): a mistyped or
 wrong-method framework request must FAIL AND SAY WHY — never fall through
-the catch-all into a reasoning-LLM dispatch. mcp/vector-skill.py's
-review_edges did exactly this (GET where the gateway registers POST-only),
-and the request was silently forwarded to the LLM pool as if it were a chat
+the catch-all into a reasoning-LLM dispatch. A shipped MCP tool once did
+exactly this — GET against a path the gateway registers POST-only — and the
+request was silently forwarded to the LLM pool as if it were a chat
 completion.
 
-Three parts:
-  Part 1 — mcp/vector-skill.py review_edges: GET -> POST (client unit,
-           mocked transport).
-  Part 2 — hive_mind_proxy.AsyncHiveMindProxy._route_guard / set_known_routes:
+Two parts:
+  Part 1 — hive_mind_proxy.AsyncHiveMindProxy._route_guard / set_known_routes:
            405 on a known path + wrong method, 404 on an unregistered path
            under a reserved framework prefix, byte-for-byte unchanged
            passthrough for everything else.
-  Part 3 — the contract test: every HTTP call BOTH clients make must exist,
+  Part 2 — the contract test: every HTTP call BOTH clients make must exist,
            with that method, in the gateway's registered route set — proven
-           (below) to catch the exact review_edges defect this PR fixes.
+           (below) to catch the exact wrong-method defect this guard exists
+           for.
 """
 import ast
 import asyncio
@@ -110,18 +109,21 @@ def _build_proxy_with_known_routes(g, *, with_catchall: bool = False):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Part 2 — the gateway guard
+# Part 1 — the gateway guard
 # ══════════════════════════════════════════════════════════════════════════
 
-def test_wrong_method_on_relations_review_405(monkeypatch):
+def test_wrong_method_on_a_post_only_memory_route_405(monkeypatch):
+    """The shape the guard exists for: a GET at a path the gateway registers
+    POST-only. It must 405 and name the method AND the path, never fall
+    through to the LLM pool."""
     g = _fresh_gateway(monkeypatch)
     _, proxy = _build_proxy_with_known_routes(g)
-    resp = asyncio.run(proxy.handle_proxy(_req("GET", "/memory/relations/review")))
+    resp = asyncio.run(proxy.handle_proxy(_req("GET", "/memory/save")))
     assert resp.status == 405
     assert resp.headers["Allow"] == "POST"
     body = json.loads(resp.body.decode())
     assert "GET" in body["error"]
-    assert "/memory/relations/review" in body["error"]
+    assert "/memory/save" in body["error"]
     assert "NOT forwarded" in body["error"]
 
 
@@ -257,52 +259,7 @@ def test_catchall_excluded_from_known_routes(monkeypatch):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Part 1 — MCP review_edges client fix
-# ══════════════════════════════════════════════════════════════════════════
-
-def _load_vector_skill():
-    pytest.importorskip("fastmcp")
-    spec = importlib.util.spec_from_file_location(
-        "vector_skill_route_guard_test", VECTOR_SKILL_PATH)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-@pytest.mark.asyncio
-async def test_mcp_review_edges_posts_not_gets():
-    vs = _load_vector_skill()
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_response.json = lambda: {"status": "success", "family": "entity_relation",
-                                  "rows": [], "calibration": {}}
-    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post, \
-         patch("httpx.AsyncClient.get") as mock_get:
-        result = await vs.review_edges("entity_relation", 5)
-    mock_get.assert_not_called()
-    mock_post.assert_called_once()
-    assert mock_post.call_args.args[0].endswith("/memory/relations/review")
-    assert mock_post.call_args.kwargs["json"] == {"family": "entity_relation", "limit": 5}
-    assert json.loads(result)["status"] == "success"
-
-
-@pytest.mark.asyncio
-async def test_mcp_review_edges_mirrors_memory_bridge_payload_keys():
-    """Same body shape as memory_bridge.fetch_review_edges — the reference
-    implementation this fix mirrors (see tests/test_review_edges.py's
-    test_fetch_review_edges_posts_right_endpoint_and_payload)."""
-    vs = _load_vector_skill()
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_response.json = lambda: {"status": "success", "family": "evidential",
-                                  "rows": [], "calibration": {}}
-    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
-        await vs.review_edges("evidential", 7)
-    assert mock_post.call_args.kwargs["json"] == {"family": "evidential", "limit": 7}
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# Part 3 — the contract test
+# Part 2 — the contract test
 # ══════════════════════════════════════════════════════════════════════════
 
 def _extract_client_http_calls(src_path: str) -> list[tuple[str, str]]:
@@ -416,21 +373,72 @@ def test_memory_bridge_calls_all_registered(monkeypatch):
             f"gateway's registered route set does not accept")
 
 
-def test_contract_catches_the_review_edges_defect_it_fixed(monkeypatch):
-    """Proof the check has teeth (measured, re-runnable): the EXACT pre-fix
-    call shape — GET /memory/relations/review — must be rejected by the same
+def test_contract_catches_the_wrong_method_defect_it_exists_for(monkeypatch):
+    """Proof the check has teeth (measured, re-runnable): the defect FORM —
+    a GET at a path registered POST-only — must be rejected by the same
     router-resolution the two tests above use for the real client calls,
-    and the fixed shape (POST) must be accepted. A check that has only ever
-    passed has not been tested (this build also ran this exact assertion by
-    hand against the unfixed mcp/vector-skill.py source before the Part 1
-    fix landed — see HANDOFF.md)."""
+    while the right method is accepted. A check that has only ever passed
+    has not been tested."""
     g = _fresh_gateway(monkeypatch)
     app = _build_real_gateway_app(g)
-    assert not _router_accepts(app, "GET", "/memory/relations/review")
-    assert _router_accepts(app, "POST", "/memory/relations/review")
+    assert not _router_accepts(app, "GET", "/memory/save")
+    assert _router_accepts(app, "POST", "/memory/save")
 
 
 def test_contract_catches_an_unregistered_future_call(monkeypatch):
     g = _fresh_gateway(monkeypatch)
     app = _build_real_gateway_app(g)
     assert not _router_accepts(app, "POST", "/memory/does-not-exist")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Part 3 — the registered route set, pinned exhaustively
+# ══════════════════════════════════════════════════════════════════════════
+
+# Every (METHOD, path) the gateway registers. EXHAUSTIVE, and a set rather than
+# a subset check for the same reason the CLI action set is: the contract runs in
+# BOTH directions. A route appearing is a surface a token can now reach and an
+# auth table (`_WRITE_ROUTES`/`_READ_ROLE_ROUTES`/`_ADMIN_ROUTES`) that must
+# have an entry for it; a route disappearing is a client command that will start
+# 404-ing. Neither is visible in a diff of the file that registers them.
+_REGISTERED_ROUTES = {
+    ("POST", "/memory/save"),
+    ("POST", "/memory/retrospective"),
+    ("POST", "/memory/supersede"),
+    ("POST", "/memory/review_hold"),
+    ("POST", "/memory/search"),
+    ("POST", "/memory/graph"),
+    ("GET",  "/memory/status/{pg_id}"),
+    ("GET",  "/memory/telemetry"),
+    ("POST", "/admin/backup"),
+    ("GET",  "/health"),
+    ("GET",  "/pool/status"),
+}
+
+
+def _registered_route_set(app: web.Application) -> set:
+    """(METHOD, canonical path) per registered route.
+
+    The catch-all (method `*`) is excluded for the same reason
+    set_known_routes() excludes it. HEAD is excluded because aiohttp's
+    `add_get` registers a HEAD companion for free — it is not a surface
+    anyone declared, so pinning it would make this set a record of aiohttp's
+    internals rather than of the gateway's own decisions."""
+    out = set()
+    for route in app.router.routes():
+        if route.method in ("*", "HEAD"):
+            continue
+        out.add((route.method, route.resource.canonical))
+    return out
+
+
+def test_the_gateway_registers_exactly_this_route_set(monkeypatch):
+    g = _fresh_gateway(monkeypatch)
+    app = _build_real_gateway_app(g)
+    got = _registered_route_set(app)
+    assert got == _REGISTERED_ROUTES, (
+        f"registered routes are {sorted(got)}, pinned {sorted(_REGISTERED_ROUTES)}. "
+        "Adding a route means an auth-table entry and a client that calls it; "
+        "removing one means a client command that starts 404-ing. Update this "
+        "set deliberately, never to make the test pass."
+    )

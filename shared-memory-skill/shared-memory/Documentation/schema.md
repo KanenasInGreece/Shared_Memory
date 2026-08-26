@@ -226,45 +226,6 @@ rationale, revocable) and the idempotency cache: a sweep skips pairs already jud
 
 **Indexes:** `alias_adjudications_verdict_idx` on `(verdict)`.
 
-### `relation_adjudications` — machine-relation verdict + calibration ledger (migration 020)
-
-One ledger for BOTH machine-minted relation families: `entity_relation` (typed
-Entity→Entity edges, name-keyed endpoints) and `evidential` (record→record
-proposals such as `Decision INFORMED_BY Fact`, pg_id-keyed endpoints;
-`GROUNDED_IN` is never machine-minted so it never appears here). Every machine
-verdict lands here with its quantitative signals; operator labels recorded on
-these rows are the ONLY calibration input — per-family reliability curves are
-computed from them, and a family's confidence thresholds act only once it is
-calibrated (~20 labels). Also the audit trail and the don't-re-ask idempotency
-cache. One CURRENT row per directed edge per family: a re-score updates the row
-in place and preserves the prior rung inside `signals.prior_rungs`.
-
-⛔ **BOTH families are now WRITERLESS.** The `evidential` family went dormant
-with the Dreaming Cycle v2 plan (§1.1, task B1) — REM's judgement-relation
-decommissioning stopped REM proposing record→record `INFORMED_BY`/evidential
-edges, the only writer of `method='rem_k3'` rows. The `entity_relation` family
-lost its writer when the evidence sweep was retired: no process in the framework
-mints a typed Entity→Entity edge any more. The calibration layer
-(`relation_confidence.py`, this table, the review/label surface) is kept intact
-deliberately and operates on an empty ledger, pending its own ruling.
-
-| Column | Type | Notes |
-|---|---|---|
-| `family` | `TEXT` | `entity_relation` \| `evidential` (CHECK-enforced endpoint encoding per family) |
-| `src_name`, `tgt_name` | `TEXT` | Entity endpoints (entity_relation family; directed) |
-| `src_pg_id`, `tgt_pg_id` | `BIGINT` | Record endpoints (evidential family; directed) |
-| `rel_type` | `TEXT` | The typed relation; rejects use the sentinel `NONE` (never interpolated into Cypher) |
-| `verdict` | `TEXT` | `accept` \| `reject` |
-| `method` | `TEXT` | `llm_sweep` \| `rem_k3` \| `operator` |
-| `confidence` | `REAL` | 0..1; evidential `rem_k3` rows are capped BELOW the consumption threshold (born-below rule) |
-| `support` | `TEXT` | `graph_evidence` (≥2 corroborating facts) \| `text_only` |
-| `signals` | `JSONB` | co-occurrence count, sub-labels, vote share, `prior_rungs` history, … |
-| `operator_label` | `TEXT` | `correct` \| `incorrect` — the calibration oracle (review-edges flow) |
-| `promoted_at` | `TIMESTAMPTZ` | Operator promotion → live edge `asserted_by='operator'` |
-| `model`, `run_id`, `rationale` | `TEXT` | Audit: adjudicating model, sweep/cycle correlation id, short justification |
-
-**Indexes:** partial UNIQUE per family on the directed edge; `(family, operator_label, created_at)` for review/calibration reads.
-
 ---
 
 ### `decision_alternatives` — one row and one vector per option considered (migration 026)
@@ -693,26 +654,22 @@ written at first write, never by REM) — see "Typed decision grounding" below.
 
 **Typed Entity→Entity relationships:** the domain-layer relations
 (`DEPENDS_ON`, `PART_OF`, `IMPLEMENTS`, `PRODUCES`, `CONSUMES`, `RUNS_ON`,
-`CONFIGURES`, `DESCRIBES`, `VALIDATES`) remain declared in `ontology.yaml` and
-legality-gated by the `DOMAIN_RANGE` map, but they have **no writer**: the
-periodic evidence sweep that used to mint them was retired, and neither the
-per-record save nor the enrichment path has ever written one. Nothing in the
-framework mints a machine-asserted Entity→Entity edge; whether the layer itself
-is retired is a separate open ruling. `MENTIONS` remains the explicit
-neutral-weight edge a save writes.
+`CONFIGURES`, `DESCRIBES`, `VALIDATES`) have **no writer**: the periodic
+evidence sweep that used to mint them was retired, and neither the per-record
+save nor the enrichment path has ever written one. Nothing in the framework
+mints a machine-asserted Entity→Entity edge, so they are no longer configurable
+in `ontology.yaml` — the names stay pinned in `ontology.py` only so the
+compliance vocabulary still recognises the edges already in the graph.
+`MENTIONS` remains the explicit neutral-weight edge a save writes.
 
-**Universal machine-edge provenance (two-axis: who asserted × how evidenced):**
-this stamping describes PRE-EXISTING edges only — no writer of either stamp
-remains. A machine-minted edge carries `asserted_by` (`rem` = per-record
-enrichment, `rem_sweep` = the retired evidence sweep), `confidence`, `model`,
-`run_id`, `created_at` — stamped
-`ON CREATE` only, so an existing edge (in particular an operator-asserted one)
-is never re-stamped; operator promotion via the review flow flips
-`asserted_by` to `operator`. Pre-rebuild edges carry no `asserted_by` and are
-consumed at a fixed neutral prior (era-gated legacy class — no LLM backfill).
-Consolidation consumes a machine edge only when its family is CALIBRATED and
-its confidence clears the family threshold; operator and legacy edges are
-always consumable.
+**Machine-edge stamps on pre-existing edges:** no writer of either stamp
+remains, but edges minted before the retirement are still in the graph carrying
+`asserted_by` (`rem` = per-record enrichment, `rem_sweep` = the retired evidence
+sweep), `confidence`, `model`, `run_id`, `created_at`. Consolidation discovers
+clusters on the `(project, domain)` spine — `GROUNDED_IN`/`DOMAIN_OF`/
+`PROJECT_OF` — and never traverses these edges, so they are inert: nothing
+scores, promotes or consumes them. Edges written before provenance stamping
+exist carry no `asserted_by` at all.
 
 **`rem_processed` Fact property:** after REM enriches a Fact node, it sets `rem_processed = true`. NREM (`consolidation_loop.py`) requires this flag before including a Fact in a consolidation cluster — `WHERE coalesce(neighbor.rem_processed, false) = true`. A Fact whose Neo4j write is still pending in the outbox is never marked `rem_processed`.
 

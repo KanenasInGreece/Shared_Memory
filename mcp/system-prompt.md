@@ -181,25 +181,6 @@ The `graph_context` array on each Tier-1 result tells you who decided it, which 
 - **`graph_query`** — read-only Cypher for multi-hop paths and provenance chains the automatic expansion did not reach. `CREATE`, `DELETE`, `SET`, `MERGE`, `CALL`, `LOAD CSV`, `DROP` are blocked at two levels.
 - **`archive_reasoning_trace`** — persist a session's reasoning steps as a retrievable record. Use it when the *path* to a conclusion is the thing worth keeping, not just the conclusion.
 
-## Relation calibration — you can unblock this, and only an operator's labels can
-
-`review_edges` / `label_edges` review the typed graph edges that REM and the evidence sweep propose
-**machine-asserted** with a confidence score. Until a family has roughly 20 operator labels it is
-**uncalibrated, and its machine edges are invisible to synthesis** — so unreviewed edges are inert, not
-merely unverified. Labelling is what turns them on.
-
-- Label honestly: `correct` means the relation **as typed and as directed** is true of both endpoints.
-  The right pair with the wrong relation, or the right relation backwards, is `incorrect`.
-- Labelling an accepted edge `incorrect` deletes the machine edge; the ledger row remains as audit, so
-  it is never re-asked. Operator-asserted edges are never deleted.
-- `promote` is an operator assertion: the edge bypasses confidence thresholds permanently. Promote only
-  edges you would defend yourself.
-- The two families calibrate separately: `entity_relation` (Entity→Entity) and `evidential`
-  (record→record). Each `review_edges` call ends with that family's calibration line, so you always see
-  what the labels have or have not yet unlocked.
-
-This is operator work. Surface the rows and ask — never label on the operator's behalf.
-
 Telemetry is built into the gateway, so any agent can read it. The optional **Shared Memory Monitor** dashboard is just a visual layer over `memory_telemetry`; it authenticates with a dedicated read-only token (`AGENT_ROLES=monitor:read`) and never writes.
 
 # OUTPUT

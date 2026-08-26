@@ -69,7 +69,7 @@ def _body(**fields) -> bytes:
 
 def test_c1_full_roles_backend_counts_free_slot(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract", "verify", "judge"]},
+        {"url": "http://a:5000", "roles": ["extract", "judge"]},
     ]))
     g = _fresh(monkeypatch)
     assert g._counts_free_slot("http://a:5000") is True
@@ -95,9 +95,9 @@ def test_c1_serves_all_still_counts_and_private_false_roleless_does_not(monkeypa
 
 def test_c1_pool_status_free_slots_nonzero_for_all_declared_fleet(monkeypatch):
     """The exact probe from the security review: one idle backend declaring
-    all three dream roles must yield free_slots == 1, not 0."""
+    every dream role must yield free_slots == 1, not 0."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract", "verify", "judge"]},
+        {"url": "http://a:5000", "roles": ["extract", "judge"]},
     ]))
     g = _fresh(monkeypatch)
     resp = asyncio.run(g.handle_pool_status(_req({}, b"")))

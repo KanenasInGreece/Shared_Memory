@@ -1,9 +1,9 @@
 # Shared Memory Ontology Configuration
 #
-# This file configures ONLY the DOMAIN vocabulary — the entity sub-types and the
-# typed Entity→Entity relationships that describe what your facts and decisions are
-# ABOUT. Edit and GROW these as your domain evolves; they are applied at first-write
-# and during REM enrichment. Restart the daemons after editing (read at startup).
+# This file configures ONLY the DOMAIN vocabulary — the entity sub-types that
+# describe what your facts and decisions are ABOUT. Edit and GROW these as your
+# domain evolves; they are applied at first write. Restart the daemons after
+# editing (read at startup).
 # To use a non-default location: set SMEM_ONTOLOGY_PATH=/path/to/ontology.yaml
 #
 # ─────────────────────────────────────────────────────────────────────────────
@@ -22,9 +22,9 @@
 #
 #   ⚠ `Domain` above is the BELONGING AXIS — a registered SECTION of one project
 #   (`operations`, `infrastructure`) — and it is spine, pinned in code. It is not
-#   the "domain vocabulary" this file configures; that is the entity sub-types and
-#   typed relationships below, which describe what a record is ABOUT. One word,
-#   two jobs: belonging is spine, aboutness is yours.
+#   the "domain vocabulary" this file configures; that is the entity sub-types
+#   below, which describe what a record is ABOUT. One word, two jobs: belonging
+#   is spine, aboutness is yours.
 #
 #   Spine relationships (always present) — each 1-to-1 from a JSONB field:
 #     MENTIONS, REPORTS_ON (legacy), ALIASES, SUMMARIZED_BY, NEXT_STEP,
@@ -38,27 +38,14 @@
 #   framework rewrite.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# DOMAIN entity sub-types (Path A multi-label under :Entity). REM assigns these
-# during enrichment. Rename or extend to fit your domain.
+# DOMAIN entity sub-types (Path A multi-label under :Entity). Rename or extend to
+# fit your domain.
 labels:
   component: Component                  # software unit we build (module/class/script/daemon)
   system: System                        # service / datastore / framework / infra we run
   model: Model                          # AI/ML model
   concept: Concept                      # pattern / technique / principle / signal
   document: Document                    # spec / ADR / doc / research artifact
-
-# DOMAIN typed Entity→Entity relationships. REM picks one (gated by the domain-range
-# map) during enrichment; MENTIONS (spine) stays the fallback. Rename or extend.
-relationships:
-  depends_on: DEPENDS_ON                # needs / requires (build/config dependency)
-  part_of: PART_OF                      # composition / belongs-to
-  implements: IMPLEMENTS                # realises a concept / pattern
-  produces: PRODUCES                    # creates output / data / artifact
-  consumes: CONSUMES                    # uses another's output / data (runtime I/O)
-  runs_on: RUNS_ON                      # executes on / deployed on
-  configures: CONFIGURES                # controls / parametrises / governs
-  describes: DESCRIBES                  # documents / specifies (Document→X)
-  validates: VALIDATES                  # quality-gate / test / telemetry validates X
 
 # Framework consolidation tuning (mechanism parameters, NOT domain vocabulary).
 # Operator-tunable, but they parametrise the immutable dream cycle — not the schema.

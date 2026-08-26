@@ -41,13 +41,12 @@ spawn a stdio server and inject environment variables can mount the memory this 
 **agent** host (opencode) and an **LLM server** (LM Studio, README §21), which differ only in
 where the standing rules go.
 
-## Tools (13, at parity with the CLI skill)
+## Tools (11, at parity with the CLI skill)
 
 Retrieval and diagnostics: `hybrid_search_and_rerank`, `graph_query` (read-only Cypher),
 `record_lineage`, `memory_telemetry`, `check_memory_health`.
 Capture: `save_artifact`, `save_decision`, `save_retrospective`, `archive_reasoning_trace`.
 Record lifecycle: `supersede`, `review_hold`.
-Edge calibration: `review_edges`, `label_edges`.
 
 The full client contract — every field, refusal and the reasoning behind each — is
 [`shared-memory/SKILL.md`](../shared-memory/SKILL.md); the MCP tools mirror it.

@@ -295,10 +295,11 @@ async def test_divergent_active_row_still_folds(monkeypatch):
     assert daemon.get_embedding.await_count == 1
     assert finish["args"][1:5] == ("completed", 1, 1, 0)
     assert finish["kwargs"]["eligible_clusters"] == 1
-    # Nothing was skipped, so the key reports 0 via extra=None (the
-    # pre-stage-5 byte-identical ledger shape is preserved when nothing
-    # counted) — asserted so the key can never silently inflate.
-    assert finish["kwargs"]["extra"] is None
+    # Nothing was skipped, so the key reports 0 — PRESENT and zero, not absent.
+    # A census ran (eligible_clusters above), and an absent `extra` would say it
+    # did not (decision:1121/I7). Asserted exactly so the key can never silently
+    # inflate.
+    assert finish["kwargs"]["extra"]["unchanged_clusters"] == 0
 
 
 @pytest.mark.asyncio

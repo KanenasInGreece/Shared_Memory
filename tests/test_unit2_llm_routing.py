@@ -5,7 +5,7 @@ DESIGN section; Local_Documentation/ROUTING_UNIT2_BUILDER_BRIEF.md).
 Covers the three things Unit 2 adds on top of Unit 1's gateway:
 
 1. Every dream LLM call site sends the ONE new header, `X-SM-LLM-Role`, with
-   the role the plan's taxonomy assigns it (R-1: {extract, verify, judge} —
+   the role the plan's taxonomy assigns it (R-1: {extract, judge} —
    `summarize` is RESERVED and never sent).
 2. Each daemon RECOGNIZES the gateway's two structured routing refusals (422
    `no_eligible_backend` / 503 `backend_at_capacity`, both stamped

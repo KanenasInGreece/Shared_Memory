@@ -85,7 +85,6 @@ import time
 from datetime import datetime
 from neo4j import AsyncGraphDatabase
 from ontology import ONT, fact_kind_from_source_ref, origin_location
-import relation_confidence as rc_conf
 from insight_gate import (
     INSIGHT_AGE_CENSUS_K, walk_group_reached_set, passes_insight_gate,
     order_components, classify_identity,
@@ -644,10 +643,6 @@ class _CycleRec:
     __slots__ = ("attempted", "succeeded", "failed",
                  "eligible_clusters", "eligible_oldest_age",
                  "dead_lettered_clusters", "run_id",
-                 # Stage-5 confidence telemetry (extends the accounting
-                 # shape — the original fields are untouched).
-                 "edges_awaiting_calibration", "machine_edges_consumed",
-                 "calibration",
                  # ⛔ decision:1205 (v0.8.71) — preservation_retries/
                  # preservation_failures/preservation_failed RETIRED with the
                  # anchor-gate they counted; the insight path no longer has a
@@ -693,13 +688,6 @@ class _CycleRec:
         # consolidation_runs.id of THIS cycle — stamped onto each summary it writes
         # (community_summaries.run_id) for fact→summary→cycle lineage (Stage 2b).
         self.run_id = None
-        # Stage-5: machine edges excluded by the calibration gate ("filtered
-        # back" to the relation_adjudications review queue) vs consumed; the
-        # calibration snapshot ({family: calibrated_bool}, None until a gate
-        # was fetched).
-        self.edges_awaiting_calibration = 0
-        self.machine_edges_consumed = 0
-        self.calibration = None
         self.truncation_failures = 0
         self.truncation_failed = []
         self.slot_failures = 0
@@ -725,12 +713,23 @@ class _CycleRec:
         self.failed += max(0, attempted - succeeded)
 
     def extra(self):
-        """Stage-5 fields for the consolidation_runs ``extra`` JSONB — None when
-        the cycle never fetched a gate and nothing was counted (pre-stage-5
-        callers stay byte-identical in the ledger)."""
-        if self.calibration is None and not (
-            self.edges_awaiting_calibration or self.machine_edges_consumed
-            or self.truncation_failures or self.slot_failures
+        """Accounting fields for the consolidation_runs ``extra`` JSONB — None
+        only when this cycle neither ran a coverage census nor counted anything,
+        so a cycle with nothing to report stays byte-identical in the ledger.
+
+        ⛔ A CENSUS THAT RAN MUST BE VISIBLE EVEN WHEN EVERY COUNT IS ZERO
+        (decision:1121/I7): `dead_lettered_clusters`, `unchanged_clusters` and
+        `singleton_clusters` each promise "0 once a census has run this cycle",
+        and a truthiness guard cannot keep that promise on its own — three
+        zeroes read exactly like no census at all, which is how a deliberate
+        skip comes to look like a stall. `eligible_clusters` is the census's
+        own output and is None until it runs, so it is the signal, DERIVED
+        rather than duplicated into a second flag. Until the machine-edge
+        calibration layer was retired this held by accident: every insight
+        cycle fetched a calibration snapshot, and that non-None field alone
+        kept `extra` present."""
+        if self.eligible_clusters is None and not (
+            self.truncation_failures or self.slot_failures
             or self.truncation_failed or self.slot_failed
             or self.fold_dead_letter
             or self.dead_lettered_clusters
@@ -739,8 +738,6 @@ class _CycleRec:
         ):
             return None
         out = {
-            "edges_awaiting_calibration": self.edges_awaiting_calibration,
-            "machine_edges_consumed": self.machine_edges_consumed,
             "truncation_failures": self.truncation_failures,
             # Operator ruling (same PR as decision:1205) — SEPARATE from
             # truncation_failures: a SLOT/PRINCIPLE missing after its one
@@ -769,8 +766,6 @@ class _CycleRec:
             # stall.
             "singleton_clusters": self.singleton_clusters,
         }
-        if self.calibration is not None:
-            out["calibration"] = self.calibration
         if self.truncation_failed:
             out["truncation_failed"] = self.truncation_failed
         if self.slot_failed:
@@ -884,60 +879,6 @@ async def _post_nrem(client: httpx.AsyncClient, payload: dict,
 # Untagged facts collapse to this single bucket, reproducing the historic
 # one-summary-per-entity behaviour until agents start tagging their saves.
 DEFAULT_DOMAIN = "general"
-
-
-# ── Calibration gate (REM rebuild stage 5, decisions 718/726/727) ─────────────
-# Machine-asserted edges (asserted_by 'rem'/'rem_sweep') feed synthesis ONLY
-# when their family is CALIBRATED (enough operator labels in the
-# relation_adjudications ledger) AND their confidence clears the family
-# threshold. Operator edges ('operator'/'system_default') always pass; legacy
-# pre-rebuild edges (no asserted_by) are era-gated and ALWAYS consumable at the
-# fixed neutral prior (relation_confidence.LEGACY_MENTIONS_PRIOR) — the gate
-# filters MACHINE assertions, it never retroactively severs the existing graph.
-# relation_confidence.consumable() is the SOURCE OF TRUTH for this rule; the
-# Cypher edge predicates in the cluster finders mirror it and must be kept in
-# agreement with it.
-OPERATOR_ASSERTED = [rc_conf.ASSERTED_OPERATOR, rc_conf.ASSERTED_SYSTEM_DEFAULT]
-
-
-def _default_calibration_gate():
-    """Fail-closed gate: both families uncalibrated (machine edges excluded),
-    thresholds from relation_confidence. Used when the ledger is unreachable."""
-    return {
-        fam: {"calibrated": False, "threshold": rc_conf.CONSUME_THRESHOLD[fam]}
-        for fam in rc_conf.FAMILIES
-    }
-
-
-def fetch_calibration_gate():
-    """Per-family calibration snapshot from the relation_adjudications ledger —
-    fetched ONCE at the start of each consolidation pass (cheap; the pass caches
-    it and threads it through the cluster finders and fold bodies). Calibration
-    must be in place BEFORE assessing any cluster: an uncalibrated family's
-    machine-asserted edges do not feed synthesis. Failsafe: any DB error returns
-    the fail-closed default and the pass proceeds with machine edges excluded."""
-    gate = _default_calibration_gate()
-    try:
-        c = psycopg2.connect(PG_CONN, connect_timeout=5)
-        try:
-            for fam in rc_conf.FAMILIES:
-                st = rc_conf.calibration_state(c, fam)
-                gate[fam] = {
-                    "calibrated": bool(st["calibrated"]),
-                    "threshold": float(st["threshold"]),
-                }
-        finally:
-            c.close()
-    except Exception as e:
-        logger.warning(
-            "Calibration gate: ledger fetch failed (%s) — fail-closed this pass "
-            "(machine-asserted edges excluded from synthesis).", e)
-    logger.info(
-        "Calibration gate: entity_relation calibrated=%s (threshold %.2f), "
-        "evidential calibrated=%s (threshold %.2f).",
-        gate[rc_conf.FAMILY_ENTITY]["calibrated"], gate[rc_conf.FAMILY_ENTITY]["threshold"],
-        gate[rc_conf.FAMILY_EVIDENTIAL]["calibrated"], gate[rc_conf.FAMILY_EVIDENTIAL]["threshold"])
-    return gate
 
 
 def fold_record_line(record, content):
@@ -3122,14 +3063,9 @@ class ConsolidationDaemon:
 
         ``rows`` is the flat output of `_find_grounded_fact_groups`:
         ``{"pg_id", "content", "project", "domain"}`` — one row per (fact,
-        domain) pair. No ``gate``/``edge_stats`` params any more (v2, C1): the
-        v2 fact gate does not traverse MENTIONS/entity-link edges at all, so
-        the relation_confidence calibration snapshot has nothing to report for
-        this run type — a `fact_consolidation` run's `extra` therefore no
-        longer carries `calibration`/`edges_awaiting_calibration`/
-        `machine_edges_consumed` (those stay meaningful for the INSIGHT path,
-        `_fold_insight`, unaffected by this change). Monitor consumers of the
-        `fact_consolidation` run type should stop expecting those three keys.
+        domain) pair. The fact gate does not traverse MENTIONS/entity-link
+        edges at all — discovery runs on GROUNDED_IN/DOMAIN_OF/PROJECT_OF, the
+        structural spine — so no edge provenance enters this path.
         """
         loop = asyncio.get_running_loop()
         rec = _CycleRec()
@@ -3796,20 +3732,6 @@ class ConsolidationDaemon:
             return
         try:
             async with self._record_cycle("insight") as rec:
-                # General family-calibration telemetry snapshot — kept for
-                # /memory/telemetry visibility (unrelated daemons still read
-                # relation_confidence state). C4 no longer THREADS this into
-                # _fold_insight: the insight prompt stopped rendering
-                # grounding-edge lines (§3.2 — see generate_insight_slots), so
-                # `machine_edges_consumed`/`edges_awaiting_calibration` will
-                # only ever read 0 for insight runs from here on — that is
-                # not a metric inversion (0 correctly means "none rendered",
-                # which is now always true), it is a metric this cycle type
-                # can no longer populate. Flagged for the monitor in this
-                # PR's HANDOFF.md (Group 3).
-                gate = await loop.run_in_executor(None, fetch_calibration_gate)
-                rec.calibration = {fam: gate[fam]["calibrated"] for fam in gate}
-
                 # 0. Reconcile — re-apply unconfirmed graph markings, close rows.
                 try:
                     stuck = await loop.run_in_executor(None, lambda: fetch_unreconciled_insights(conn))

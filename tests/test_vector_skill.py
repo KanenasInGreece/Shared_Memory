@@ -443,13 +443,6 @@ async def test_mcp_record_lineage_requires_a_valid_ref():
     assert json.loads(ok)["exists"] is True
 
 
-@pytest.mark.asyncio
-async def test_mcp_review_edges_validates_family():
-    bad = await vector_skill.review_edges("not_a_family")
-    assert "Error" in bad
-    assert vector_skill.RELATION_FAMILIES == ("entity_relation", "evidential")
-
-
 # ── supersede / review_hold MCP tools (fact supersession, decision 381/384) ──
 
 @pytest.mark.asyncio
@@ -636,13 +629,35 @@ def _registered_tools() -> list:
     return names
 
 
+# Every tool the MCP server registers. EXHAUSTIVE, and a set rather than a
+# floor: a tool appearing is a surface an LM-Studio-driven model can call and a
+# gateway route that must accept it; a tool disappearing is a documented
+# capability that silently stops existing for those models while the CLI keeps
+# it. The CLI half of that parity is pinned in
+# test_change_group_contracts._CLI_ACTIONS.
+_MCP_TOOLS = {
+    "hybrid_search_and_rerank", "save_artifact", "archive_reasoning_trace",
+    "save_decision", "save_retrospective", "supersede", "review_hold",
+    "check_memory_health", "memory_telemetry", "record_lineage", "graph_query",
+}
+
+
+def test_the_mcp_server_registers_exactly_these_tools():
+    assert set(_registered_tools()) == _MCP_TOOLS, (
+        f"registered MCP tools are {sorted(_registered_tools())}, pinned "
+        f"{sorted(_MCP_TOOLS)}. Changing the tool surface is a Group 1 change: "
+        "update mcp/system-prompt.md, mcp/README.md's count, SKILL.md's parity "
+        "paragraph, and this set."
+    )
+
+
 def test_system_prompt_names_every_registered_mcp_tool():
-    """The MCP surface grew to 13 tools while its system prompt described 8 — so a
-    model driven by it never knew it could trace lineage, query the graph, or take
-    part in relation calibration. Adding a tool without documenting it makes the
-    tool unreachable in practice."""
+    """The MCP surface grew while its system prompt described 8 tools — so a
+    model driven by it never knew it could trace lineage or query the graph.
+    Adding a tool without documenting it makes the tool unreachable in
+    practice."""
     tools = _registered_tools()
-    assert len(tools) >= 13, f"expected the full tool surface, found {tools}"
+    assert len(tools) >= 11, f"expected the full tool surface, found {tools}"
     prompt = open(_repo("mcp", "system-prompt.md"), encoding="utf-8").read()
     missing = [t for t in tools if t not in prompt]
     assert not missing, f"system-prompt.md does not mention MCP tool(s): {missing}"
@@ -747,27 +762,6 @@ def test_manual_env_parser_never_overrides_real_env(tmp_path, monkeypatch):
     monkeypatch.setenv("PROBE_ONLY_KEY", "env_val")
     vs._load_env_manually(str(env))
     assert os.environ.get("PROBE_ONLY_KEY") == "env_val"
-
-
-def test_edge_review_403_carries_the_forbidden_hint():
-    """Parity with memory_bridge: review_edges/label_edges 403s must carry the
-    operator-grade role hint, appended AFTER the gateway's own words. Mutation
-    target: dropping the forbidden_hint pass-through kills this."""
-    vs = load_vector_skill()
-
-    class _R:
-        status_code = 403
-        text = "403: nope"
-        def json(self):
-            return {"status": "error", "message": "gateway says no"}
-
-    with pytest.raises(vs.GatewayReplyError) as exc:
-        vs._reply_json(_R(), "review_edges",
-                       forbidden_hint=vs._EDGE_REVIEW_FORBIDDEN_HINT)
-    msg = str(exc.value)
-    assert "gateway says no" in msg
-    assert "operator-grade role" in msg
-    assert msg.index("gateway says no") < msg.index("operator-grade role")
 
 
 def test_audit_log_write_is_offloaded_and_ordered(tmp_path, monkeypatch):

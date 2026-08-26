@@ -56,6 +56,38 @@ def test_all_four_version_pins_agree():
     )
 
 
+# The wire contract the gateway and every client currently speak. PINNED AS A
+# VALUE, not only as an equality: `a == b == c` lets all three move together to
+# a wrong number and still pass (fact:1309 — an equality assertion between two
+# expressions is half a guard). Bumping it is a deliberate act that edits this
+# line, four API_VERSION pins, and every client at once.
+_WIRE_API_VERSION = 4
+
+
+def test_the_gateway_and_both_clients_speak_the_same_wire_version():
+    """GROUP 1. `API_VERSION` is compared by each client against the gateway's
+    `/health`, and a disagreement makes the gateway log skew on every request.
+    The gateway↔client half of this had exactly one home, and it was inside a
+    test file retired with the calibration routes — so it is restored here,
+    beside the copy↔copy half it belongs with."""
+    pins = {}
+    for label, rel in (
+        ("coordinator", ("shared-memory", "scripts", "coordinator.py")),
+        ("memory_bridge", ("shared-memory", "scripts", "memory_bridge.py")),
+        ("shipped memory_bridge",
+         ("shared-memory-skill", "shared-memory", "scripts", "memory_bridge.py")),
+        ("vector-skill", ("mcp", "vector-skill.py")),
+    ):
+        m = re.search(r"^API_VERSION = (\d+)", _read(*rel), re.M)
+        assert m, f"API_VERSION pin missing from {label}"
+        pins[label] = int(m.group(1))
+    assert set(pins.values()) == {_WIRE_API_VERSION}, (
+        f"api_version disagreement or unannounced bump: {pins}, expected "
+        f"{_WIRE_API_VERSION} everywhere. A bump is a BREAKING protocol change: "
+        "move every pin together and update _WIRE_API_VERSION deliberately."
+    )
+
+
 def test_the_client_copies_pin_the_same_api_version():
     """GROUP 1. `api_version` is the WIRE contract and is compared by the client
     against the gateway. Two copies of the client exist, so they can drift apart
@@ -136,20 +168,28 @@ def test_every_table_a_migration_creates_reaches_the_fresh_install():
     needs the live diff `verify_schema_init.py` performs — but it does catch the
     coarsest and most likely omission: a migration adding a table, and nobody
     regenerating the artefact afterwards.
+
+    ⛔ THE DROP IS CHAIN-WIDE, exactly as it is for indexes and constraints
+    below. This guard used to read the DROP out of the SAME FILE as the CREATE,
+    which only ever described a migration building a scratch table and tidying
+    up after itself. A table one migration creates and a LATER one retires is
+    the ordinary shape — and under the file-local reading the guard demanded
+    that a correctly regenerated artefact still carry the dropped table, i.e. it
+    failed on the right answer. `_survives_the_chain` asks the question the
+    generator actually answers: does replaying every migration in order leave
+    this table in place?
     """
-    init = _read("shared-memory", "migrations", "schema_init.sql")
     missing = []
     for fname in _migration_files():
-        body = _read("shared-memory", "migrations", fname)
+        body = _sql_body(fname)
         for table in re.findall(
                 r"CREATE TABLE(?:\s+IF NOT EXISTS)?\s+([a-z0-9_]+)", body, re.I):
-            # A migration may create and later drop a scratch table; only assert
-            # tables the live schema still has, which is what the artefact must
-            # reproduce.
-            if re.search(rf"DROP TABLE(?:\s+IF EXISTS)?\s+{table}\b", body, re.I):
+            if not _survives_the_chain(
+                    rf"CREATE TABLE(?:\s+IF NOT EXISTS)?\s+{table}\b",
+                    rf"DROP TABLE(?:\s+IF EXISTS)?\s+{table}\b"):
                 continue
             if not re.search(rf"CREATE TABLE(?:\s+IF NOT EXISTS)?\s+{table}\b",
-                             init, re.I):
+                             _schema_init_body(), re.I):
                 missing.append(f"{table} (from {fname})")
     assert not missing, (
         f"these tables exist in the migration chain but not in schema_init.sql: "
@@ -512,4 +552,105 @@ def test_agents_md_download_command_carries_no_hardcoded_version():
             f"AGENTS.md pins the release tag '{tag}' in a download URL. Nothing "
             f"bumps it, so it goes stale at the next release — use the vX.Y.Z "
             f"placeholder and point the reader at the releases page."
+        )
+
+
+# ── GROUP 1 — the CLI action surface, pinned exhaustively ────────────────────
+
+# Every action `main()` dispatches on. EXHAUSTIVE ON PURPOSE, and the reason it
+# is a set rather than a floor: a floor only ever catches an action going
+# missing, and the failure this guards against runs the other way — a command
+# removed from the dispatcher but left standing in the usage string, or removed
+# from one client copy and not the other. Both halves of that are silent: the
+# user reads a command that no longer exists, or two front doors disagree about
+# what the product does. Updating this set is the deliberate act of changing the
+# client's advertised surface.
+_CLI_ACTIONS = {
+    "--version", "version", "-v",
+    "status", "lineage", "doctor", "health", "graph", "search", "save",
+    "supersede", "review-hold", "query", "save_decision", "save_retrospective",
+}
+
+# The subset the top-level usage line names. `--version`/`-v`/`health` are
+# aliases the usage line deliberately folds away; everything else must appear.
+_CLI_ACTIONS_IN_USAGE = {
+    "--version", "doctor", "status", "graph", "query", "search", "save",
+    "save_decision", "save_retrospective",
+}
+
+
+def _cli_dispatch_actions(src: str) -> set:
+    """Every string literal `main()` compares `action` against."""
+    found = set()
+    for m in re.finditer(r'action\s*==\s*"([^"]+)"', src):
+        found.add(m.group(1))
+    for m in re.finditer(r'action\s+in\s+\(([^)]*)\)', src):
+        found.update(re.findall(r'"([^"]+)"', m.group(1)))
+    return found
+
+
+def test_both_client_copies_dispatch_exactly_the_pinned_cli_actions():
+    """GROUP 1. Two front doors, one gateway — and the tracked copy under
+    `shared-memory-skill/` is what `sync_skills.sh` publishes, so a command that
+    exists in only one of them ships to some agents and not others."""
+    for rel in (("shared-memory", "scripts", "memory_bridge.py"),
+                ("shared-memory-skill", "shared-memory", "scripts", "memory_bridge.py")):
+        got = _cli_dispatch_actions(_read(*rel))
+        assert got == _CLI_ACTIONS, (
+            f"{'/'.join(rel)} dispatches {sorted(got)}, pinned {sorted(_CLI_ACTIONS)}. "
+            "Adding or removing a CLI action is a Group 1 change: update BOTH "
+            "client copies, the usage strings, SKILL.md, and this set."
+        )
+
+
+def test_the_usage_line_names_every_action_it_claims_and_no_other():
+    """GROUP 1. The usage string is the only place a user learns what the client
+    can do. A command listed there but not dispatched is a dead end; one
+    dispatched but unlisted is unreachable in practice."""
+    for rel in (("shared-memory", "scripts", "memory_bridge.py"),
+                ("shared-memory-skill", "shared-memory", "scripts", "memory_bridge.py")):
+        src = _read(*rel)
+        m = re.search(r"Usage: python memory_bridge\.py \[([^\]]+)\]", src)
+        assert m, f"{'/'.join(rel)}: the top-level usage line vanished"
+        listed = set(m.group(1).split("|"))
+        assert listed == _CLI_ACTIONS_IN_USAGE, (
+            f"{'/'.join(rel)} usage line lists {sorted(listed)}, pinned "
+            f"{sorted(_CLI_ACTIONS_IN_USAGE)}."
+        )
+        unknown = listed - _CLI_ACTIONS
+        assert not unknown, (
+            f"{'/'.join(rel)} usage line advertises {sorted(unknown)}, which "
+            "`main()` does not dispatch — a user reading it hits 'Unknown action'."
+        )
+
+
+# ── GROUP 4 — a table the chain retires leaves a numbered migration behind ───
+
+def test_a_table_the_chain_drops_is_dropped_by_its_own_migration():
+    """GROUP 4. A table may only leave the schema through a numbered migration,
+    never by editing the one that created it: an install that already applied
+    the CREATE has the table, and only a later numbered step removes it there.
+    So for every table the chain no longer leaves in place, the DROP must live
+    in a file NUMBERED HIGHER than the CREATE."""
+    creates, drops = {}, {}
+    for fname in _migration_files():
+        body = _sql_body(fname)
+        for table in re.findall(
+                r"CREATE TABLE(?:\s+IF NOT EXISTS)?\s+([a-z0-9_]+)", body, re.I):
+            creates.setdefault(table.lower(), fname)
+        for table in re.findall(
+                r"DROP TABLE(?:\s+IF EXISTS)?\s+([a-z0-9_]+)", body, re.I):
+            drops[table.lower()] = fname
+    retired = [
+        t for t in creates
+        if not _survives_the_chain(
+            rf"CREATE TABLE(?:\s+IF NOT EXISTS)?\s+{t}\b",
+            rf"DROP TABLE(?:\s+IF EXISTS)?\s+{t}\b")
+    ]
+    for table in retired:
+        assert table in drops, f"{table} is gone from the chain with no DROP"
+        assert drops[table] > creates[table], (
+            f"{table} is CREATEd in {creates[table]} and DROPped in "
+            f"{drops[table]} — the DROP must be in a later-numbered migration, "
+            "or an already-upgraded install never loses the table."
         )
