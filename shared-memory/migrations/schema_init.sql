@@ -603,41 +603,6 @@ CREATE TABLE IF NOT EXISTS refold_ledger (
 CREATE INDEX IF NOT EXISTS refold_ledger_open_pgid_idx ON public.refold_ledger USING btree (pg_id) WHERE (status = 'open'::text);
 CREATE INDEX IF NOT EXISTS refold_ledger_summary_idx ON public.refold_ledger USING btree (summary_id);
 
--- ─── relation_adjudications ─────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS relation_adjudications (
-    id               BIGSERIAL PRIMARY KEY,
-    family           TEXT NOT NULL,
-    src_name         TEXT,
-    tgt_name         TEXT,
-    src_pg_id        BIGINT,
-    tgt_pg_id        BIGINT,
-    rel_type         TEXT NOT NULL,
-    verdict          TEXT NOT NULL,
-    method           TEXT NOT NULL,
-    confidence       REAL,
-    support          TEXT,
-    signals          JSONB,
-    rationale        TEXT,
-    model            TEXT,
-    run_id           TEXT,
-    operator_label   TEXT,
-    operator_labeled_at TIMESTAMPTZ,
-    promoted_at      TIMESTAMPTZ,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT relation_adjudications_check CHECK ((((family = 'entity_relation'::text) AND (src_name IS NOT NULL) AND (tgt_name IS NOT NULL) AND (src_pg_id IS NULL) AND (tgt_pg_id IS NULL)) OR ((family = 'evidential'::text) AND (src_pg_id IS NOT NULL) AND (tgt_pg_id IS NOT NULL) AND (src_name IS NULL) AND (tgt_name IS NULL)))),
-    CONSTRAINT relation_adjudications_confidence_check CHECK (((confidence IS NULL) OR ((confidence >= (0.0)::double precision) AND (confidence <= (1.0)::double precision)))),
-    CONSTRAINT relation_adjudications_family_check CHECK ((family = ANY (ARRAY['entity_relation'::text, 'evidential'::text]))),
-    CONSTRAINT relation_adjudications_method_check CHECK ((method = ANY (ARRAY['llm_sweep'::text, 'rem_k3'::text, 'operator'::text]))),
-    CONSTRAINT relation_adjudications_operator_label_check CHECK (((operator_label IS NULL) OR (operator_label = ANY (ARRAY['correct'::text, 'incorrect'::text])))),
-    CONSTRAINT relation_adjudications_support_check CHECK (((support IS NULL) OR (support = ANY (ARRAY['text_only'::text, 'graph_evidence'::text])))),
-    CONSTRAINT relation_adjudications_verdict_check CHECK ((verdict = ANY (ARRAY['accept'::text, 'reject'::text])))
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS relation_adjudications_entity_uniq ON public.relation_adjudications USING btree (family, src_name, tgt_name, rel_type) WHERE (family = 'entity_relation'::text);
-CREATE UNIQUE INDEX IF NOT EXISTS relation_adjudications_record_uniq ON public.relation_adjudications USING btree (family, src_pg_id, tgt_pg_id, rel_type) WHERE (family = 'evidential'::text);
-CREATE INDEX IF NOT EXISTS relation_adjudications_review_idx ON public.relation_adjudications USING btree (family, operator_label, created_at);
-
 -- ─── technical_docs ─────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS technical_docs (
     id               SERIAL PRIMARY KEY,
