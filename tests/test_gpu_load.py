@@ -293,6 +293,52 @@ async def test_success_between_timeouts_resets_consecutive_hangs(monkeypatch, tm
     assert gpu_load._consecutive_hangs == 0
 
 
+@pytest.mark.asyncio
+async def test_malformed_snapshot_between_timeouts_also_resets_streak(monkeypatch, tmp_path):
+    """OPERATOR RULING (decision:1656 follow-up): a non-timeout failure cycle
+    (malformed JSON, decode error, missing-binary race -- the generic `except
+    Exception` branch in inference_gpu_busy) is not evidence of a persistent
+    hang, so it resets the hang streak exactly like a successful snapshot
+    does -- any cycle that ends in anything other than a snapshot timeout
+    resets the count. Only TIMEOUTS count toward the self-disable, and they
+    must now be genuinely consecutive -- a malformed snapshot interrupting a
+    run of timeouts must not let the streak silently carry across it.
+
+    MUTATION: remove the `_consecutive_hangs = 0` this ruling added to the
+    generic `except Exception` branch -> this test dies on the FIRST loop
+    iteration, at the assertion right after the first malformed cycle:
+    `tests/test_gpu_load.py:326: assert gpu_load._consecutive_hangs == 0`
+    fails with `assert 1 == 0` (the streak the preceding timeout set was
+    never cleared). Verified on a scratch copy -- see HANDOFF.md."""
+    hanging = _write_fake_nvtop(tmp_path, "exec sleep 5", name="hanging_nvtop")
+    malformed = _write_fake_nvtop(tmp_path, "echo 'not json'", name="malformed_nvtop")
+    monkeypatch.setenv("SLOT_AWARE", "1")
+    monkeypatch.setenv("NVTOP_TIMEOUT_SEC", "0.1")
+    monkeypatch.setenv("NVTOP_KILL_WAIT_SEC", "3.0")
+    monkeypatch.setenv("NVTOP_MAX_CONSECUTIVE_HANGS", "3")
+
+    # timeout -> malformed -> timeout -> malformed -> timeout
+    for _ in range(2):
+        monkeypatch.setenv("NVTOP_BIN", str(hanging))
+        assert await inference_gpu_busy() is False
+        monkeypatch.setenv("NVTOP_BIN", str(malformed))
+        assert await inference_gpu_busy() is False
+        assert gpu_load._consecutive_hangs == 0  # malformed cycle reset it
+    monkeypatch.setenv("NVTOP_BIN", str(hanging))
+    assert await inference_gpu_busy() is False
+
+    assert gpu_load._consecutive_hangs == 1
+    assert gpu_load.probe_status()["state"] == "ok"
+
+    # Two MORE, genuinely consecutive timeouts now trip the cap.
+    monkeypatch.setenv("NVTOP_BIN", str(hanging))
+    assert await inference_gpu_busy() is False
+    assert await inference_gpu_busy() is False
+
+    assert gpu_load.probe_status()["state"] == "disabled_after_hangs"
+    assert gpu_load.probe_status()["consecutive_hangs"] == 3
+
+
 # ── probe_status(): (d) additive telemetry, pure module state ────────────────
 
 def test_probe_status_unavailable_under_slot_aware_off(monkeypatch):
