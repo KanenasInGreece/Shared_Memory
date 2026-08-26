@@ -663,8 +663,8 @@ def _fold_script_two_decisions():
 # judgement's own Title+Rationale; grounding-edge detail is deferred to the
 # graph walk, `insight_cypher_query`). `relation_confidence`'s own
 # consumable()/calibration semantics are untouched and still tested above —
-# they now gate nothing inside THIS module, but `relation_sweep.py` and
-# `rem_loop.py` still consume them directly.
+# they now gate nothing inside THIS module, but `rem_loop.py` still consumes
+# them directly.
 
 
 # ── Thematic-fold fixtures (§3.1 — zero/low-inference, unrelated to insight) ──

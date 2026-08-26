@@ -895,7 +895,7 @@ def _counts_free_slot(url: str) -> bool:
     serves-all for the daemons' gating purposes; counting only the former
     (the original F-3 reading) silently zeroed free_slots for a fleet whose
     every backend declares roles — the very configuration M-5 steers
-    credentialed operators toward — and halted REM/NREM/relation_sweep with
+    credentialed operators toward — and halted REM/NREM with
     no warning anywhere. Partial-role fleets still count 0 (per-role slot
     accounting stays deferred) — require_valid_llm_routing_config() warns
     LOUDLY at startup for that case instead of leaving it silent."""
@@ -1136,10 +1136,10 @@ def _safe_resolve_identity(request) -> "str | None":
 # below) — are the sole non-admin identities allowed to steer LLM routing.
 _CONSOLIDATION_AGENT_NAME = "consolidation"
 _REM_DAEMON_AGENT_NAME    = "rem_daemon"
-# R-6 (decision:1357, closing the plan's R-2 item): standalone framework
-# tools that legitimately steer — relation_sweep sends X-SM-LLM-Role: judge
-# but runs outside the gateway process, so it can never hold a minted daemon
-# token — get in via an OPERATOR-DECLARED name allowlist, unioned here. The
+# R-6 (decision:1357, closing the plan's R-2 item): a standalone framework
+# tool that legitimately steers — it sends X-SM-LLM-Role but runs outside the
+# gateway process, so it can never hold a minted daemon token — gets in via
+# an OPERATOR-DECLARED name allowlist, unioned here. The
 # operator mints an ordinary agent token under one of these names and points
 # the tool at it. Deliberately a NAME list, never a role-based widening and
 # never admin (auth_middleware confines admin tokens to /admin/*): each
@@ -2276,9 +2276,8 @@ async def handle_pool_status(request: web.Request) -> web.Response:
     (SEC-A5-03: ONLY when AUTH_CONFIGURED_AT_STARTUP is true — an auth-off
     install keeps today's full payload). Every REAL internal caller sends
     its own token: pool_status.pool_has_free_slot() (rem_loop.py,
-    consolidation_loop.py) and relation_sweep.py's direct probe both attach
-    their daemon/agent Authorization header — see those modules'
-    _auth_headers(). An anonymous caller on an auth-configured install gets
+    consolidation_loop.py) attaches its daemon Authorization header — see
+    those modules' _auth_headers(). An anonymous caller on an auth-configured install gets
     an empty object; pool_status.py's `.get("free_slots", 1)` default then
     fail-opens exactly as it already does on any other unreachable/erroring
     gateway, rather than silently and permanently losing slot-awareness."""
@@ -4433,7 +4432,7 @@ def require_valid_llm_routing_config() -> None:
 
 def warn_if_dream_slots_impossible() -> None:
     """C-1 (decision:1357): if NO backend counts toward /pool/status
-    free_slots, every dream daemon (REM, NREM, relation_sweep) gates itself
+    free_slots, every dream daemon (REM, NREM) gates itself
     off a permanent 0 and simply never runs — with no LLM call ever made, no
     refusal counter ever fires, so without this warning the condition is
     invisible everywhere. A partial-role fleet (e.g. every backend scoped to
@@ -4446,7 +4445,7 @@ def warn_if_dream_slots_impossible() -> None:
     log.warning(
         "NO configured backend counts toward /pool/status free_slots (each "
         "either declares a partial `roles` list or is private_ok=false with "
-        "no full roles list). The dream daemons (REM/NREM/relation_sweep) "
+        "no full roles list). The dream daemons (REM/NREM) "
         "gate on free_slots and will NEVER run against this fleet. Fix: give "
         "at least one backend no `roles` field (with private_ok), or an "
         "explicit roles list covering all of %s.", sorted(ROUTING_ROLE_NAMES))

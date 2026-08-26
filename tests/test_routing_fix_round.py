@@ -337,9 +337,9 @@ def test_r5_role_422_body_shape_unchanged(monkeypatch):
 # ── R-6: operator-declared extra steer-permitted names ──────────────────────
 
 def test_r6_extra_steer_agent_name_unioned(monkeypatch):
-    monkeypatch.setenv("LLM_STEER_EXTRA_AGENT_NAMES", "relation_sweep, night_tool")
+    monkeypatch.setenv("LLM_STEER_EXTRA_AGENT_NAMES", "night_sweep, night_tool")
     g = _fresh(monkeypatch)
-    assert "relation_sweep" in g.DAEMON_AGENT_NAMES
+    assert "night_sweep" in g.DAEMON_AGENT_NAMES
     assert "night_tool" in g.DAEMON_AGENT_NAMES
     assert "consolidation" in g.DAEMON_AGENT_NAMES
     assert "rem_daemon" in g.DAEMON_AGENT_NAMES

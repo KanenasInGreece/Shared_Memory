@@ -5,7 +5,7 @@ Scans existing record content for textual cross-references (e.g. "refines decisi
 381", "addendum to pg_id 257"), resolves each to a real technical_docs id, and
 materialises a record→record edge in Neo4j: Decision→Decision = INFORMED_BY,
 otherwise REFERENCES (relationship type via reference_resolver.classify_relation,
-which honours REFERENCE_JUDGE_MODE). Safe + idempotent:
+which is deterministic — label-based, no LLM). Safe + idempotent:
   - MERGE (no duplicate edges); skips a pair that already has SUPERSEDES.
   - never creates SUPERSEDES (explicit-only).
   - both endpoints must exist as :Fact/:Decision nodes.
@@ -14,7 +14,7 @@ Dry-run is the DEFAULT. Nothing is written unless you pass --apply.
 Going forward, REM applies the same resolver incrementally (Stage 1.3).
 
 Usage (gateway host):
-    uv run --with psycopg2-binary --with neo4j --with httpx \
+    uv run --with psycopg2-binary --with neo4j \
         python shared-memory/scripts/resolve_references.py [--apply]
 """
 import argparse
@@ -66,16 +66,10 @@ def main() -> int:
 
     cur.execute("SELECT id, content FROM technical_docs WHERE superseded = false")
     plan = []  # (src, tgt, rel, cue, snippet)
-    import httpx
-    client = httpx.Client(timeout=30.0) if rr.judge_enabled() else None
-    try:
-        for sid, content in cur.fetchall():
-            for ref, cue, snippet in rr.extract_references(content, sid, valid_ids):
-                rel = rr.classify_relation(label_of(sid), label_of(ref), snippet, client=client)
-                plan.append((sid, ref, rel, cue, snippet))
-    finally:
-        if client:
-            client.close()
+    for sid, content in cur.fetchall():
+        for ref, cue, snippet in rr.extract_references(content, sid, valid_ids):
+            rel = rr.classify_relation(label_of(sid), label_of(ref), snippet)
+            plan.append((sid, ref, rel, cue, snippet))
     conn.close()
 
     if not plan:
@@ -85,8 +79,7 @@ def main() -> int:
     by_rel = {}
     for _, _, rel, _, _ in plan:
         by_rel[rel] = by_rel.get(rel, 0) + 1
-    judge = "llm:" + rr._URL if rr.judge_enabled() else "deterministic"
-    print(f"{len(plan)} resolvable reference(s); judgment={judge}; by type={by_rel}\n")
+    print(f"{len(plan)} resolvable reference(s); judgment=deterministic; by type={by_rel}\n")
     for sid, ref, rel, cue, snippet in plan[:30]:
         print(f"  ({label_of(sid)} {sid}) -[:{rel}]-> ({label_of(ref)} {ref})  cue={cue!r}")
     if len(plan) > 30:

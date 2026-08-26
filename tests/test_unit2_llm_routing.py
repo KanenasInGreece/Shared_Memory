@@ -40,14 +40,12 @@ sys.path.insert(0, os.path.dirname(__file__))   # tests/ itself, for cross-impor
 # rem_loop.py) rather than re-deriving them.
 from test_rem_loop import rem_mod, _make_daemon, _ok_resp          # noqa: E402
 from test_nrem_confidence import cl, daemon_with_fake_graph        # noqa: E402
-from test_relation_sweep import _cand, _evrow                      # noqa: E402
-import relation_sweep                                              # noqa: E402
 
 
-# ── Shared fake response: works for both httpx.AsyncClient.post (rem_loop /
-#    consolidation_loop) and sync httpx.post (relation_sweep) — httpx's own
-#    Response.json() is a sync method regardless of which client made the
-#    call, so one fake serves all three daemons. ──────────────────────────────
+# ── Shared fake response for httpx.AsyncClient.post (rem_loop /
+#    consolidation_loop) — httpx's own Response.json() is a sync method
+#    regardless of which client made the call, so one fake serves both
+#    daemons. ─────────────────────────────────────────────────────────────────
 
 class _RefusalResp:
     """Fakes the gateway's structured 422/503 routing refusal body."""
@@ -91,27 +89,26 @@ class _ProviderErrorResp:
 
 # ── 1. The pure _routing_refusal() helper — one copy per Unit 2 file ─────────
 # (No shared module is owned by Unit 2's file list — see HANDOFF.md — so the
-# helper is intentionally duplicated, not imported, across rem_loop.py,
-# consolidation_loop.py and relation_sweep.py. Parametrizing over all three
-# proves the duplicates agree.)
+# helper is intentionally duplicated, not imported, between rem_loop.py and
+# consolidation_loop.py. Parametrizing over both proves the duplicates agree.)
 
-_ROUTING_MODULES = [rem_mod, cl, relation_sweep]
+_ROUTING_MODULES = [rem_mod, cl]
 
 
-@pytest.mark.parametrize("mod", _ROUTING_MODULES, ids=["rem_loop", "consolidation_loop", "relation_sweep"])
+@pytest.mark.parametrize("mod", _ROUTING_MODULES, ids=["rem_loop", "consolidation_loop"])
 def test_routing_refusal_recognizes_no_eligible_backend(mod):
     refusal = mod._routing_refusal(_RefusalResp())
     assert refusal == {"error": "no_eligible_backend", "constraint": "role", "role": "extract"}
 
 
-@pytest.mark.parametrize("mod", _ROUTING_MODULES, ids=["rem_loop", "consolidation_loop", "relation_sweep"])
+@pytest.mark.parametrize("mod", _ROUTING_MODULES, ids=["rem_loop", "consolidation_loop"])
 def test_routing_refusal_recognizes_backend_at_capacity(mod):
     resp = _RefusalResp(error="backend_at_capacity", constraint=None, role=None, status_code=503)
     refusal = mod._routing_refusal(resp)
     assert refusal["error"] == "backend_at_capacity"
 
 
-@pytest.mark.parametrize("mod", _ROUTING_MODULES, ids=["rem_loop", "consolidation_loop", "relation_sweep"])
+@pytest.mark.parametrize("mod", _ROUTING_MODULES, ids=["rem_loop", "consolidation_loop"])
 def test_routing_refusal_never_fires_on_status_alone(mod):
     """A REAL provider 422/503 (no X-SM-Fault-Origin: gateway) must NEVER be
     misread as a routing refusal — recognition keys on the structured body +
@@ -120,7 +117,7 @@ def test_routing_refusal_never_fires_on_status_alone(mod):
     assert mod._routing_refusal(_ProviderErrorResp(503)) is None
 
 
-@pytest.mark.parametrize("mod", _ROUTING_MODULES, ids=["rem_loop", "consolidation_loop", "relation_sweep"])
+@pytest.mark.parametrize("mod", _ROUTING_MODULES, ids=["rem_loop", "consolidation_loop"])
 def test_routing_refusal_requires_the_gateway_origin_header_even_with_a_matching_body(mod):
     """Isolates the X-SM-Fault-Origin check from the error-field check: a
     body that HAPPENS to carry the exact gateway refusal shape (status +
@@ -136,13 +133,13 @@ def test_routing_refusal_requires_the_gateway_origin_header_even_with_a_matching
     assert mod._routing_refusal(resp2) is None
 
 
-@pytest.mark.parametrize("mod", _ROUTING_MODULES, ids=["rem_loop", "consolidation_loop", "relation_sweep"])
+@pytest.mark.parametrize("mod", _ROUTING_MODULES, ids=["rem_loop", "consolidation_loop"])
 def test_routing_refusal_ignores_unrelated_status(mod):
     resp = _RefusalResp(status_code=400)   # gateway-origin header, but not 422/503
     assert mod._routing_refusal(resp) is None
 
 
-@pytest.mark.parametrize("mod", _ROUTING_MODULES, ids=["rem_loop", "consolidation_loop", "relation_sweep"])
+@pytest.mark.parametrize("mod", _ROUTING_MODULES, ids=["rem_loop", "consolidation_loop"])
 def test_routing_refusal_ignores_unrecognized_gateway_error(mod):
     """X-SM-Fault-Origin: gateway present but the error field is neither of
     the two known refusal shapes — must not misclassify a third gateway-
@@ -395,87 +392,3 @@ async def test_nrem_insight_call_wires_prompt_chars(monkeypatch):
     await daemon.generate_insight_slots("E", rows)
     assert recorded.get("prompt_chars") == len(sent["prompt"])
     assert recorded["prompt_chars"] > 0
-
-
-# ── 6. relation_sweep.py — role header, refusal, no-charge ───────────────────
-
-def test_relation_sweep_batch_sends_judge_role_header(monkeypatch):
-    monkeypatch.delenv("MOCK_LLM", raising=False)
-    captured = {}
-    def _ok_fake_post(*a, **k):
-        captured["headers"] = k.get("headers", {})
-        class _R:
-            status_code = 200
-            headers = {}
-            def json(self):
-                return {"choices": [{"finish_reason": "stop", "message": {
-                    "content": '{"idx":0,"rel":"none","direction":"ab","confidence":0.9,"rationale":"r"}'}}]}
-            def raise_for_status(self):
-                pass
-        return _R()
-    monkeypatch.setattr(relation_sweep.httpx, "post", _ok_fake_post)
-    relation_sweep.adjudicate_batch([_cand()], {})
-    assert captured["headers"].get("X-SM-LLM-Role") == "judge"
-
-
-def test_relation_sweep_evidential_batch_sends_judge_role_header(monkeypatch):
-    monkeypatch.delenv("MOCK_LLM", raising=False)
-    captured = {}
-    def _fake_post(*a, **k):
-        captured["headers"] = k.get("headers", {})
-        class _R:
-            status_code = 200
-            headers = {}
-            def json(self):
-                return {"choices": [{"finish_reason": "stop", "message": {
-                    "content": '{"idx":0,"verdict":"accept","confidence":0.9,"rationale":"r"}'}}]}
-            def raise_for_status(self):
-                pass
-        return _R()
-    monkeypatch.setattr(relation_sweep.httpx, "post", _fake_post)
-    relation_sweep.adjudicate_evidential_batch([_evrow()], {})
-    assert captured["headers"].get("X-SM-LLM-Role") == "judge"
-
-
-def test_relation_sweep_batch_routing_refusal_skips_without_raising(monkeypatch, capsys):
-    """U2-I1 for relation_sweep: no attempt counter exists for candidates —
-    'skip without charging' means the candidate is simply left unresolved
-    (verdicts == {}) for a later sweep, loudly logged once, never raised."""
-    monkeypatch.delenv("MOCK_LLM", raising=False)
-    def _fake_post(*a, **k):
-        return _RefusalResp(constraint="privacy", role="judge")
-    monkeypatch.setattr(relation_sweep.httpx, "post", _fake_post)
-    verdicts, model = relation_sweep.adjudicate_batch([_cand()], {})
-    assert verdicts == {}
-    assert model == "local-model"
-    err = capsys.readouterr().err
-    assert "gateway routing refusal" in err
-    assert "constraint=privacy" in err
-
-
-def test_relation_sweep_evidential_batch_routing_refusal_skips_without_raising(monkeypatch, capsys):
-    monkeypatch.delenv("MOCK_LLM", raising=False)
-    def _fake_post(*a, **k):
-        return _RefusalResp(constraint="fit", role="judge", error="backend_at_capacity",
-                            status_code=503)
-    monkeypatch.setattr(relation_sweep.httpx, "post", _fake_post)
-    verdicts, model = relation_sweep.adjudicate_evidential_batch([_evrow()], {})
-    assert verdicts == {}
-    assert model == "local-model"
-    err = capsys.readouterr().err
-    assert "gateway routing refusal" in err
-
-
-def test_relation_sweep_real_provider_error_is_not_misread_as_a_refusal(monkeypatch, capsys):
-    """A genuine provider 422 (no X-SM-Fault-Origin: gateway) must fall
-    through to the ordinary failure path, never the routing-refusal skip."""
-    monkeypatch.delenv("MOCK_LLM", raising=False)
-    def _fake_post(*a, **k):
-        return _ProviderErrorResp(422)
-    monkeypatch.setattr(relation_sweep.httpx, "post", _fake_post)
-    verdicts, model = relation_sweep.adjudicate_batch([_cand()], {})
-    assert verdicts == {}
-    assert model == "local-model"
-    err = capsys.readouterr().err
-    assert "gateway routing refusal" not in err
-    assert "LLM batch failed" in err
