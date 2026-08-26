@@ -141,7 +141,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.9.61"
+VERSION = "0.9.62"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server
@@ -646,6 +646,23 @@ def _unranked_warning(results) -> str | None:
             f"timed out, this is vector order (see backend_capability on /health)")
 
 
+def _fallback_warning(payload: object) -> str | None:
+    """Mirrors ``memory_bridge._fallback_warning`` exactly (v0.9.62,
+    fact:1609) — a parity test holds the two in step. See there for the
+    rationale: the gateway serves a KEYWORD (substring) fallback rather than
+    failing the search when the embedder is unavailable, and this MUST fire
+    on an empty ``results: []`` too — the common shape a natural-language
+    query takes against a substring match. Input is the raw gateway payload
+    dict, not the unwrapped results list."""
+    if not isinstance(payload, dict) or payload.get("fallback") != "keyword":
+        return None
+    results = payload.get("results")
+    n = len(results) if isinstance(results, list) else 0
+    return (f"EMBEDDING UNAVAILABLE — keyword (substring) fallback served "
+            f"{n} result(s), unranked; the embedder is down or still "
+            f"starting (see embedder on /health)")
+
+
 def _stale_projection_note(capability: dict | None) -> str | None:
     """Mirrors ``memory_bridge._stale_projection_note`` exactly (B1/T-02,
     PR #310 review) — see there for the rationale."""
@@ -662,6 +679,52 @@ def _stale_projection_note(capability: dict | None) -> str | None:
         else:
             notes.append(f"{backend} projection stale")
     return "; ".join(notes) if notes else None
+
+
+async def _search_payload(query: str, limit: int = 5, project: str = "",
+                           domains: list[str] | str = "",
+                           since: str = "") -> dict | str:
+    """The HTTP call + error handling ``hybrid_search_and_rerank()`` used to
+    inline, pulled out so it can derive BOTH the unranked warning and
+    (v0.9.62, fact:1609) the keyword-fallback warning from the SAME call
+    instead of a second HTTP round trip.
+
+    Returns the decoded gateway payload (a dict) on a 2xx reply — success OR
+    a gateway-reported ``status: error`` body, both are legitimate JSON
+    answers. Returns an already-phrased error STRING — exactly what
+    ``hybrid_search_and_rerank`` returned directly before this split — when
+    the gateway could not be reached or refused the request outright
+    (``GatewayReplyError``/transport failure): those are a different fault
+    than a gateway-SERVED fallback and never carry a ``fallback`` marker, so
+    a caller need only branch on ``isinstance(payload, str)``."""
+    # Sized from the gateway's own published cost, never from a constant.
+    ceiling = search_ceiling(await _gateway_capability(), await _gateway_capacity())
+    body = {"query": query, "limit": limit, "agent_id": AGENT_ID}
+    if project:
+        body["project"] = project
+    _domains = ([d.strip() for d in domains if isinstance(d, str) and d.strip()]
+                if isinstance(domains, list)
+                else [d.strip() for d in (domains or "").split(",") if d.strip()])
+    if _domains:
+        body["domains"] = _domains
+    if since:
+        body["since"] = since
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(ceiling, connect=5.0)
+        ) as client:
+            r = await client.post(
+                f"{COORDINATOR_BASE}/memory/search",
+                json=body,
+                headers=_auth_headers(),
+            )
+            return _reply_json(r, "hybrid_search_and_rerank")
+    except GatewayReplyError as exc:
+        logger.error(f"Search refused: {exc.message}")
+        return exc.message
+    except Exception as exc:
+        logger.error(f"Search failed: {exc}")
+        return _unavailable(exc, ceiling)
 
 
 @mcp.tool()
@@ -693,42 +756,25 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5, project: str = ""
     """
     logger.info(f"Search: {query[:50]}...")
     start = datetime.now()
-    # Sized from the gateway's own published cost, never from a constant.
-    ceiling = search_ceiling(await _gateway_capability(), await _gateway_capacity())
-    body = {"query": query, "limit": limit, "agent_id": AGENT_ID}
-    if project:
-        body["project"] = project
-    _domains = ([d.strip() for d in domains if isinstance(d, str) and d.strip()]
-                if isinstance(domains, list)
-                else [d.strip() for d in (domains or "").split(",") if d.strip()])
-    if _domains:
-        body["domains"] = _domains
-    if since:
-        body["since"] = since
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(ceiling, connect=5.0)
-        ) as client:
-            r = await client.post(
-                f"{COORDINATOR_BASE}/memory/search",
-                json=body,
-                headers=_auth_headers(),
-            )
-            payload = _reply_json(r, "hybrid_search_and_rerank")
-    except GatewayReplyError as exc:
-        logger.error(f"Search refused: {exc.message}")
-        return exc.message
-    except Exception as exc:
-        logger.error(f"Search failed: {exc}")
-        return _unavailable(exc, ceiling)
+    payload = await _search_payload(query, limit, project=project,
+                                     domains=domains, since=since)
+    if isinstance(payload, str):
+        return payload
 
     results = payload.get("results", payload)
     if isinstance(results, dict) and results.get("status") == "error":
         return f"Error: {results.get('message', 'search failed')}"
     results_list = results if isinstance(results, list) else []
     rendered = _render_results(results_list, (datetime.now() - start).total_seconds())
-    # This tool returns rendered text, not a dict/list — so the unranked
-    # warning is a line prepended to that text rather than a `note` field.
+    # This tool returns rendered text, not a dict/list — so the unranked and
+    # fallback warnings are lines prepended to that text rather than `note`
+    # fields. Prepended in the OPPOSITE order the CLI door prints them (the
+    # fallback one first, THEN unranked) so the final top-to-bottom order —
+    # unranked, then fallback — matches the CLI's stderr order on the two
+    # front doors (nit d, delta review).
+    fallback_warning = _fallback_warning(payload)
+    if fallback_warning:
+        rendered = f"NOTE: {fallback_warning}\n\n" + rendered
     warning = _unranked_warning(results_list)
     if warning:
         rendered = f"NOTE: {warning}\n\n" + rendered

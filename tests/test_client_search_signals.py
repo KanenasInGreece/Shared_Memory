@@ -38,8 +38,14 @@ def _load(name, *parts):
 
 
 memory_bridge = _load(
+    # A-03 (delta review): this must import the SOURCE OF TRUTH, not the
+    # delivery copy — a guard removed only from `shared-memory/scripts/`
+    # would leave every test in this file green as long as nobody re-ran
+    # sync_skills.sh first. `test_tracked_client_copies_are_byte_identical`
+    # (tests/test_memory_bridge.py) is what already pins the two copies
+    # together; this file doesn't need to double as that check.
     "memory_bridge_signals",
-    "shared-memory-skill", "shared-memory", "scripts", "memory_bridge.py",
+    "shared-memory", "scripts", "memory_bridge.py",
 )
 vector_skill = _load("vector_skill_signals", "mcp", "vector-skill.py")
 
@@ -83,19 +89,23 @@ async def test_cli_search_prints_stderr_note_and_leaves_stdout_json_unchanged(ca
     results = [{"pg_id": 1, "content": "a", "ranked": True},
               {"pg_id": 2, "content": "b", "ranked": False}]
 
-    async def fake_search(*_a, **_kw):
-        return results
+    # v0.9.62: main() now calls `_search_payload` directly (not
+    # `search_and_rerank`) so it can derive both the unranked and the
+    # fallback warning from one payload without a second HTTP round trip.
+    async def fake_payload(*_a, **_kw):
+        return {"status": "success", "results": results}
 
     argv_backup = sys.argv
     try:
         sys.argv = ["memory_bridge.py", "search", "some query"]
-        with patch.object(memory_bridge, "search_and_rerank", side_effect=fake_search):
+        with patch.object(memory_bridge, "_search_payload", side_effect=fake_payload):
             await memory_bridge.main()
     finally:
         sys.argv = argv_backup
 
     captured = capsys.readouterr()
     assert "1 of 2 results are UNRANKED" in captured.err
+    assert "EMBEDDING UNAVAILABLE" not in captured.err
     assert captured.err.strip().count("\n") == 0   # exactly one line to stderr
     # stdout carries the JSON, unchanged — no warning text mixed in
     assert "UNRANKED" not in captured.out
@@ -107,13 +117,13 @@ async def test_cli_search_prints_stderr_note_and_leaves_stdout_json_unchanged(ca
 async def test_cli_search_prints_no_stderr_note_when_fully_ranked(capsys):
     results = [{"pg_id": 1, "content": "a", "ranked": True}]
 
-    async def fake_search(*_a, **_kw):
-        return results
+    async def fake_payload(*_a, **_kw):
+        return {"status": "success", "results": results}
 
     argv_backup = sys.argv
     try:
         sys.argv = ["memory_bridge.py", "search", "some query"]
-        with patch.object(memory_bridge, "search_and_rerank", side_effect=fake_search):
+        with patch.object(memory_bridge, "_search_payload", side_effect=fake_payload):
             await memory_bridge.main()
     finally:
         sys.argv = argv_backup
@@ -156,6 +166,129 @@ async def test_mcp_search_no_note_when_all_ranked():
     with patch("httpx.AsyncClient.post", return_value=mock_response):
         result = await vector_skill.hybrid_search_and_rerank(MOCK_QUERY)
     assert "UNRANKED" not in result
+
+
+# ── v0.9.62 (fact:1609): the keyword-fallback headline ───────────────────────
+# When the embedder is unavailable the gateway does not fail a search — it
+# serves a KEYWORD (substring) fallback and answers honestly with
+# {"status":"success","fallback":"keyword","results":[...]}. Both clients
+# used to strip the envelope down to the results list before this, so the
+# `fallback` marker never reached the operator; a natural-language query
+# almost never ILIKE-matches, so the common shape of that silence was an
+# EMPTY list — the one case `_unranked_warning` can never fire on.
+
+def _keyword_fallback_payload(n):
+    rows = [{"pg_id": i, "content": f"row {i}", "score": 0.0,
+              "score_normalized": 0.5} for i in range(n)]
+    return {"status": "success", "fallback": "keyword", "results": rows}
+
+
+# (a) pure helper — None cases
+
+def test_fallback_warning_none_on_normal_payload():
+    payload = {"status": "success", "results": [{"pg_id": 1}]}
+    assert memory_bridge._fallback_warning(payload) is None
+
+
+def test_fallback_warning_none_on_error_payload():
+    payload = {"status": "error", "message": "boom"}
+    assert memory_bridge._fallback_warning(payload) is None
+
+
+def test_fallback_warning_none_on_non_dict():
+    assert memory_bridge._fallback_warning([{"pg_id": 1}]) is None
+    assert memory_bridge._fallback_warning(None) is None
+    assert memory_bridge._fallback_warning("nope") is None
+
+
+# (b) fires, including the empty-list case that is the whole point
+
+def test_fallback_warning_fires_with_zero_results():
+    warning = memory_bridge._fallback_warning(_keyword_fallback_payload(0))
+    assert warning is not None
+    assert warning.startswith("EMBEDDING UNAVAILABLE")
+    assert "0 result(s)" in warning
+    assert "unranked" in warning
+    assert "embedder on /health" in warning
+
+
+def test_fallback_warning_fires_with_two_results():
+    warning = memory_bridge._fallback_warning(_keyword_fallback_payload(2))
+    assert warning is not None
+    assert "2 result(s)" in warning
+
+
+# (c) parity — both clients return the identical sentence for the identical input
+
+@pytest.mark.parametrize("payload", [
+    _keyword_fallback_payload(0),
+    _keyword_fallback_payload(2),
+    {"status": "success", "results": [{"pg_id": 1}]},
+    {"status": "error", "message": "boom"},
+    None,
+    [{"pg_id": 1}],
+])
+def test_fallback_warning_parity_between_clients(payload):
+    assert memory_bridge._fallback_warning(payload) == vector_skill._fallback_warning(payload)
+
+
+# (d) CLI door — stderr carries the headline, stdout JSON is exactly the (empty) results
+
+@pytest.mark.asyncio
+async def test_cli_search_prints_fallback_warning_on_empty_keyword_fallback(capsys):
+    payload = _keyword_fallback_payload(0)
+
+    async def fake_payload(*_a, **_kw):
+        return payload
+
+    argv_backup = sys.argv
+    try:
+        sys.argv = ["memory_bridge.py", "search", "some query"]
+        with patch.object(memory_bridge, "_search_payload", side_effect=fake_payload):
+            await memory_bridge.main()
+    finally:
+        sys.argv = argv_backup
+
+    captured = capsys.readouterr()
+    assert "EMBEDDING UNAVAILABLE" in captured.err
+    assert "0 result(s)" in captured.err
+    import json as _json
+    assert _json.loads(captured.out) == []
+
+
+# (e) MCP door — rendered text starts with the NOTE-prefixed headline
+
+@pytest.mark.asyncio
+async def test_mcp_search_prepends_fallback_note_on_empty_keyword_fallback():
+    payload = _keyword_fallback_payload(0)
+    mock_response = MagicMock(status_code=200, json=lambda: payload)
+    with patch("httpx.AsyncClient.post", return_value=mock_response):
+        result = await vector_skill.hybrid_search_and_rerank(MOCK_QUERY)
+    assert result.startswith("NOTE: EMBEDDING UNAVAILABLE")
+    assert "0 result(s)" in result
+
+
+@pytest.mark.asyncio
+async def test_mcp_search_note_order_matches_cli_when_both_fire():
+    """Nit (delta review): the CLI door prints the unranked line, then the
+    fallback line (two sequential stderr prints, top to bottom). The MCP door
+    builds its text by PREPENDING, so it must prepend fallback first and
+    unranked second to land on the SAME final top-to-bottom order — otherwise
+    the two front doors show the pair in opposite order."""
+    payload = {"status": "success", "fallback": "keyword", "results": [
+        {"pg_id": 1, "content": "a", "ranked": False},
+    ]}
+    mock_response = MagicMock(status_code=200, json=lambda: payload)
+    with patch("httpx.AsyncClient.post", return_value=mock_response):
+        result = await vector_skill.hybrid_search_and_rerank(MOCK_QUERY)
+
+    unranked_pos = result.find("UNRANKED")
+    fallback_pos = result.find("EMBEDDING UNAVAILABLE")
+    assert unranked_pos != -1 and fallback_pos != -1
+    assert unranked_pos < fallback_pos, (
+        "MCP shows the fallback note before the unranked note — "
+        "opposite of the CLI's stderr order"
+    )
 
 
 # ── B3: doctor / check_gateway_compat surfaces agent/role ────────────────────

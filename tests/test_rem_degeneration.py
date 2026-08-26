@@ -200,6 +200,39 @@ async def test_second_truncation_of_either_class_fails_the_unit(monkeypatch):
     parse.assert_not_called()  # N3: never parsed, even on final failure
 
 
+@pytest.mark.asyncio
+async def test_honest_double_truncation_error_advises_retry_not_bump(monkeypatch, caplog):
+    """v0.9.62 (fact:1609 + a live 2026-08-26 incident): an HONEST double
+    truncation (not classified degenerate either time) used to end its ERROR
+    line with "Raise REM_MAX_TOKENS_SOLO if this record is legitimately
+    large" — exactly the bump decision:1330 measured and rejected (a
+    repetition loop consumes ANY budget; the next pick-up completed the same
+    record in far fewer tokens). The line must now say the unit retries on a
+    later pick-up and must NOT advise the bump.
+
+    Mutation check: restoring the old "Raise REM_MAX_TOKENS_SOLO if this
+    record is legitimately large." wording on a scratch copy must fail this
+    test."""
+    daemon, _ = _make_daemon()
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    honest_body = '{"summary":"cut","relationships":[{"name":"AlphaCorp","rel_type":"MENTIONS"}'
+
+    async def _fake_post(self, url, **kwargs):
+        return _length_resp(honest_body)
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
+
+    with caplog.at_level("ERROR"):
+        result, _model = await daemon._llm_process(
+            "content", rem_mod.KIND_FACT, [], {}, pg_id=1)
+
+    assert result is None
+    error_lines = [r.message for r in caplog.records if r.levelname == "ERROR"]
+    joined = "\n".join(error_lines)
+    assert "decision:1330" in joined
+    assert "Raise REM_MAX_TOKENS_SOLO if" not in joined
+    assert "retry" in joined.lower() and "rem_attempts" in joined
+
+
 # ── 3. Logging: bounded specimen (N1) ───────────────────────────────────────────
 
 def test_truncation_specimen_is_the_bounded_tail():

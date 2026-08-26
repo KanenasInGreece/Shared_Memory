@@ -631,8 +631,11 @@ async def test_cli_search_passes_project_domain_since_through():
             "--project", "alpha", "--domain", "ops", "--domain", "security",
             "--since", "2026-08-01",
         ]
-        with patch.object(mb, "search_and_rerank",
-                          new=AsyncMock(return_value=[])) as mock_search:
+        # v0.9.62: main() now calls `_search_payload` directly (not
+        # `search_and_rerank`), so it can derive both the unranked and the
+        # fallback warning from one payload without a second HTTP round trip.
+        with patch.object(mb, "_search_payload",
+                          new=AsyncMock(return_value={"status": "success", "results": []})) as mock_search:
             await mb.main()
         assert mock_search.call_count == 1
         call = mock_search.call_args
@@ -648,14 +651,14 @@ async def test_cli_search_passes_project_domain_since_through():
 @pytest.mark.asyncio
 async def test_cli_search_without_filters_passes_none_through():
     """Old callers (bare query [+limit], no flags) must keep working exactly
-    as before — the new kwargs default to None and search_and_rerank omits
+    as before — the new kwargs default to None and _search_payload omits
     them from the wire body."""
     mb = load_memory_bridge()
     argv_backup = sys.argv
     try:
         sys.argv = ["memory_bridge.py", "search", "my query"]
-        with patch.object(mb, "search_and_rerank",
-                          new=AsyncMock(return_value=[])) as mock_search:
+        with patch.object(mb, "_search_payload",
+                          new=AsyncMock(return_value={"status": "success", "results": []})) as mock_search:
             await mb.main()
         call = mock_search.call_args
         assert call.args[0] == "my query"

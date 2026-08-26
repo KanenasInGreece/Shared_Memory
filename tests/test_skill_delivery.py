@@ -246,13 +246,65 @@ def test_a_missing_install_directory_is_skipped_not_created(tmp_path):
 # agent lives — which is exactly the fresh-install trap (a mint with nowhere to
 # write, and a sync that would never create the target) this closes.
 
-def _run_sync_with_registry(env_file, extra_args=()):
+def _run_sync_with_registry(env_file, extra_args=(), *, home):
+    # HOME must be sandboxed here, not just inherited: whenever the registry
+    # is non-empty sync_skills.sh's target list is a UNION of the registry
+    # PLUS any of the four historical default installs
+    # ($HOME/.claude|.codex|.gemini|.grok/skills/shared-memory) that already
+    # exist on disk (~lines 218-236) — so a caller that leaves HOME pointed
+    # at the real operator account silently writes the tracked skill copy
+    # into that operator's REAL installs the moment one of those four exists
+    # (fact:1640, measured: it moved
+    # ~/.claude/skills/shared-memory/scripts/memory_bridge.py's mtime).
+    # `home` is therefore a required keyword, always a tmp_path-rooted dir,
+    # mirroring test_registry_does_not_orphan_installs_that_predate_it.
     env = dict(os.environ)
     env.pop("SHARED_MEMORY_SYNC_AGENTS", None)   # registry must be what decides
     env["SHARED_MEMORY_ENV_FILE"] = str(env_file)
     env["SHARED_MEMORY_SYNC_SKIP_TRACKED"] = "1"
+    env["HOME"] = str(home)
     return subprocess.run(["bash", _SYNC, *extra_args], capture_output=True,
                           text=True, env=env, cwd=_REPO, timeout=180)
+
+
+def test_run_sync_with_registry_sandboxes_home(tmp_path, monkeypatch):
+    """fact:1640 regression, measured on a live host: without an explicit
+    `env["HOME"]` override, `_run_sync_with_registry` inherited HOME from the
+    ambient environment, and sync_skills.sh's registry branch UNIONS the
+    registry with any of the four historical default installs
+    ($HOME/.claude|.codex|.gemini|.grok/skills/shared-memory) that already
+    exist on disk — so three "isolated" tests were actually overwriting the
+    tracked skill copy into whichever of those four the machine running the
+    suite happened to have installed (moved
+    ~/.claude/skills/shared-memory/scripts/memory_bridge.py's mtime).
+
+    Never touches the real operator account: this monkeypatches HOME to point
+    at its OWN throwaway sentinel install (standing in for "whatever the
+    ambient environment happens to carry"), then calls the helper with a
+    DIFFERENT `home` for a registry naming a THIRD, unrelated install. If HOME
+    is properly sandboxed, the helper's explicit override wins and the
+    monkeypatched ambient HOME's sentinel install is never even looked at —
+    its SKILL.md must come back byte-for-byte unchanged.
+    """
+    ambient_home = tmp_path / "ambient-home"
+    sentinel_install = ambient_home / ".claude" / "skills" / "shared-memory"
+    sentinel_install.mkdir(parents=True)
+    sentinel_text = "SENTINEL — must not be touched by an isolated sync test\n"
+    (sentinel_install / "SKILL.md").write_text(sentinel_text)
+    monkeypatch.setenv("HOME", str(ambient_home))
+
+    registered = tmp_path / "registered" / "shared-memory"
+    registered.mkdir(parents=True)   # UPDATE-ONLY default: must pre-exist
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"AGENT_INSTALLS=known:{registered}/.env\n")
+
+    result = _run_sync_with_registry(env_file, home=tmp_path / "isolated-home")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (registered / "SKILL.md").is_file(), "the registered install was not synced"
+    assert (sentinel_install / "SKILL.md").read_text() == sentinel_text, (
+        "the ambient/inherited HOME's default install was rewritten — "
+        "_run_sync_with_registry is not sandboxing HOME"
+    )
 
 
 def test_sync_targets_come_from_the_agent_installs_registry(tmp_path):
@@ -264,7 +316,7 @@ def test_sync_targets_come_from_the_agent_installs_registry(tmp_path):
     env_file = tmp_path / ".env"
     env_file.write_text(f"AGENT_INSTALLS=custom:{install}/.env\n")
 
-    result = _run_sync_with_registry(env_file)
+    result = _run_sync_with_registry(env_file, home=tmp_path / "home")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "AGENT_INSTALLS registry" in result.stdout
     assert (install / "SKILL.md").is_file(), (
@@ -282,7 +334,7 @@ def test_a_path_containing_a_colon_still_parses_whole(tmp_path):
     env_file = tmp_path / ".env"
     env_file.write_text(f"AGENT_INSTALLS=weird:{install}/.env\n")
 
-    result = _run_sync_with_registry(env_file)
+    result = _run_sync_with_registry(env_file, home=tmp_path / "home")
     assert result.returncode == 0, result.stdout + result.stderr
     assert (install / "SKILL.md").is_file(), (
         "a path containing a colon was truncated by the registry parser"
@@ -296,12 +348,13 @@ def test_a_registered_directory_is_created_only_with_install(tmp_path):
     absent = tmp_path / "fresh" / "shared-memory"
     env_file = tmp_path / ".env"
     env_file.write_text(f"AGENT_INSTALLS=fresh:{absent}/.env\n")
+    home = tmp_path / "home"
 
-    without = _run_sync_with_registry(env_file)
+    without = _run_sync_with_registry(env_file, home=home)
     assert without.returncode == 0, without.stdout + without.stderr
     assert not absent.exists(), "sync created a directory without --install"
 
-    with_flag = _run_sync_with_registry(env_file, extra_args=("--install",))
+    with_flag = _run_sync_with_registry(env_file, extra_args=("--install",), home=home)
     assert with_flag.returncode == 0, with_flag.stdout + with_flag.stderr
     assert (absent / "SKILL.md").is_file(), (
         "--install did not create and populate a REGISTERED target"
