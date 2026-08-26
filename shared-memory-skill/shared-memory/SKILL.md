@@ -650,7 +650,7 @@ lands in v0.6.1, then climb as an alias-coverage signal),
 `telemetry.inference_busy` — the inference/GPU-busy signal (tri-state
 `"busy"|"idle"|"unknown"`, also top-level on `GET /health`; `"unknown"` means
 nvtop is absent or `SLOT_AWARE=0`, or the probe disabled itself after repeated
-hangs (see `/health` `gpu_probe`), never reported as a false `"idle"`; distinct
+hangs (see the raw `GET /health` key `gpu_probe`), never reported as a false `"idle"`; distinct
 from `health.llm`, which is pure `:5000` reachability), and
 `telemetry.consolidation` — the dream-cycle liveness/coverage signal:
 per cycle type the last fold outcome, a `stalled` verdict, consecutive failures,

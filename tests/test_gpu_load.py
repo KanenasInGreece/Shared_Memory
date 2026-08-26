@@ -33,6 +33,7 @@ def _reset_probe_state():
         gpu_load._consecutive_hangs = 0
         gpu_load._leaked_children = 0
         gpu_load._disabled_reason = None
+        gpu_load._env_parse_warned = set()
     _reset()
     yield
     _reset()
@@ -334,3 +335,126 @@ async def test_timeout_log_names_the_exception_class(monkeypatch, tmp_path, capl
     messages = [r.getMessage() for r in caplog.records]
     assert any("TimeoutError" in m for m in messages)
     assert not any(m.strip().endswith("()") for m in messages)
+
+
+# ── Fix round (merger rulings on the two post-build reviews) ─────────────────
+
+@pytest.mark.asyncio
+async def test_create_subprocess_raising_timeout_directly_returns_false(monkeypatch):
+    """F1 (MEDIUM): create_subprocess_exec itself can raise asyncio.TimeoutError
+    on a genuine race, BEFORE `proc` is ever assigned. Before this fix `proc`
+    was only ever bound inside the try, so a TimeoutError from
+    create_subprocess_exec itself left it unbound -- an UnboundLocalError
+    would escape inference_gpu_busy() and stale the whole /health snapshot in
+    the refresher (that failure mode is exactly what fact:1645's original bug
+    already showed the cost of: a probe that raises instead of returning
+    False). The fix is two parts: `proc = None` before the try (so the name
+    is always bound), and the `if proc is not None:` guard asserted here (so
+    a None proc is never handed to _reap_after_timeout, which expects a real
+    process object).
+
+    A bare "does it raise" test cannot tell the guard apart from the fix's
+    other half: with `proc = None` alone, calling
+    _reap_after_timeout(None, ...) without the guard raises AttributeError
+    inside that function's OWN outer `except Exception`, which swallows it --
+    so the call still returns False without raising, even with the guard
+    removed. This test instead spies on _reap_after_timeout to prove it is
+    never invoked at all when proc never got assigned.
+
+    Mutation: remove the `if proc is not None:` guard around the
+    _reap_after_timeout call in inference_gpu_busy's TimeoutError except
+    clause -- this test dies (the spy IS called, with proc=None). Verified on
+    a scratch copy -- see HANDOFF.md."""
+    monkeypatch.setenv("SLOT_AWARE", "1")
+    monkeypatch.setenv("NVTOP_BIN", "nvtop")
+    monkeypatch.setattr(gpu_load.shutil, "which", lambda _bin: "/usr/bin/nvtop")
+
+    async def _raise_timeout(*args, **kwargs):
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(gpu_load.asyncio, "create_subprocess_exec", _raise_timeout)
+
+    reap_calls = []
+
+    async def _spy_reap(proc, timeout, exc):
+        reap_calls.append(proc)
+
+    monkeypatch.setattr(gpu_load, "_reap_after_timeout", _spy_reap)
+
+    result = await inference_gpu_busy()  # must not raise
+
+    assert result is False
+    assert reap_calls == []  # never called when proc was never assigned
+
+
+@pytest.mark.asyncio
+async def test_cancellation_mid_snapshot_best_effort_kills_child(monkeypatch, tmp_path):
+    """F2 (MEDIUM): asyncio.CancelledError is a BaseException, so neither
+    except clause in inference_gpu_busy catches it -- a task cancellation
+    (e.g. gateway shutdown) mid create_subprocess_exec/communicate would
+    otherwise leave the nvtop child un-killed. The trailing `finally`'s
+    best-effort kill covers this. No hang-streak assertion here: a
+    cancellation is not a hang and must not be counted as one.
+
+    Mutation: remove the `finally` block's kill -- this test dies (the child
+    is still alive after the cancellation, past the 1s polling window).
+    Verified on a scratch copy -- see HANDOFF.md."""
+    fake_nvtop = _write_fake_nvtop(tmp_path, "exec sleep 5")
+    monkeypatch.setenv("SLOT_AWARE", "1")
+    monkeypatch.setenv("NVTOP_BIN", str(fake_nvtop))
+    # Long enough that only the cancellation (not the timeout) ends the call.
+    monkeypatch.setenv("NVTOP_TIMEOUT_SEC", "5.0")
+    calls = _capture_create_subprocess_exec(monkeypatch)
+
+    task = asyncio.create_task(inference_gpu_busy())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(calls) == 1
+    proc = calls[0]
+
+    # SIGKILL is sent synchronously in the `finally`, but the kernel's own
+    # bookkeeping (and pytest-asyncio's loop) is not synchronous with that
+    # call returning -- allow a short polling wait for the OS to catch up.
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + 1.0
+    while loop.time() < deadline:
+        try:
+            os.kill(proc.pid, 0)
+        except ProcessLookupError:
+            break
+        await asyncio.sleep(0.02)
+    else:
+        pytest.fail("child pid still answers os.kill(pid, 0) after a 1s wait")
+
+
+@pytest.mark.asyncio
+async def test_bad_env_value_falls_back_to_default_and_still_reaps(monkeypatch, tmp_path):
+    """F6 (Gemini): a non-numeric NVTOP_KILL_WAIT_SEC used to raise ValueError
+    INSIDE _reap_after_timeout's own defensive try, get swallowed by its
+    `except Exception`, and abort the reap BEFORE _consecutive_hangs was
+    incremented -- silently defeating rule 2's self-disable cap for as long
+    as the operator's typo stood. The new _env_float/_env_int helpers parse
+    before that try and fall back to the default instead.
+
+    Mutation: move the kill_wait/max_hangs parsing back inside the reap's
+    try block (i.e. revert to raw float()/int() calls there) -- this test
+    dies (_consecutive_hangs stays 0, the child is left un-reaped). Verified
+    on a scratch copy -- see HANDOFF.md."""
+    fake_nvtop = _write_fake_nvtop(tmp_path, "exec sleep 5")
+    monkeypatch.setenv("SLOT_AWARE", "1")
+    monkeypatch.setenv("NVTOP_BIN", str(fake_nvtop))
+    monkeypatch.setenv("NVTOP_TIMEOUT_SEC", "0.1")
+    monkeypatch.setenv("NVTOP_KILL_WAIT_SEC", "not-a-number")
+    calls = _capture_create_subprocess_exec(monkeypatch)
+
+    result = await inference_gpu_busy()
+
+    assert result is False
+    assert gpu_load._consecutive_hangs == 1  # the increment this bug used to skip
+    proc = calls[0]
+    with pytest.raises(ProcessLookupError):
+        os.kill(proc.pid, 0)
+    assert proc.returncode == -9
