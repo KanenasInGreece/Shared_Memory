@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 
@@ -268,7 +269,7 @@ def call_timing_summary(
     service_ms's pure-inference rate. It is present precisely where the server gives no timings.
     completion_tokens accepts int or float usage.completion_tokens (some providers send a float);
     bool is explicitly rejected (bool is a subclass of int in Python — True/False are not token
-    counts)."""
+    counts); NaN/±inf are also rejected (math.isfinite) rather than raising out of int()."""
     t = (resp_json or {}).get("timings") or {}
     pm, dm = t.get("prompt_ms"), t.get("predicted_ms")
     service_ms = (round(pm + dm, 1)
@@ -278,8 +279,13 @@ def call_timing_summary(
                      if wall_ms is not None and service_ms is not None else None)
     usage = (resp_json or {}).get("usage") or {}
     ct = usage.get("completion_tokens")
+    # json.loads accepts bare NaN/Infinity (a non-standard but real JSON extension
+    # some providers emit) — int(float('nan')) raises ValueError and int(float('inf'))
+    # raises OverflowError, either of which would violate this function's "never
+    # raises" contract and let a good LLM batch get discarded by the caller's
+    # try/except. math.isfinite() rejects both before int() ever sees them.
     completion_tokens = (int(ct) if isinstance(ct, (int, float)) and not isinstance(ct, bool)
-                          else None)
+                          and math.isfinite(ct) else None)
     tok_s_wall = (round(completion_tokens / wall_s, 2)
                   if isinstance(completion_tokens, int) and completion_tokens > 0
                   and isinstance(wall_s, (int, float)) and not isinstance(wall_s, bool)
