@@ -297,20 +297,19 @@ async def test_success_between_timeouts_resets_consecutive_hangs(monkeypatch, tm
 async def test_malformed_snapshot_between_timeouts_also_resets_streak(monkeypatch, tmp_path):
     """OPERATOR RULING (decision:1656 follow-up): a non-timeout failure cycle
     (malformed JSON, decode error, missing-binary race -- the generic `except
-    Exception` branch in inference_gpu_busy) is evidence the child RAN AND
-    EXITED, so it resets the hang streak exactly like a successful snapshot
-    does. Only TIMEOUTS count toward the self-disable, and they must now be
-    genuinely consecutive -- a malformed snapshot interrupting a run of
-    timeouts must not let the streak silently carry across it.
+    Exception` branch in inference_gpu_busy) is not evidence of a persistent
+    hang, so it resets the hang streak exactly like a successful snapshot
+    does -- any cycle that ends in anything other than a snapshot timeout
+    resets the count. Only TIMEOUTS count toward the self-disable, and they
+    must now be genuinely consecutive -- a malformed snapshot interrupting a
+    run of timeouts must not let the streak silently carry across it.
 
     MUTATION: remove the `_consecutive_hangs = 0` this ruling added to the
-    generic `except Exception` branch -> this test dies: without that reset,
-    the 3rd timeout in the sequence below is only the module's 5th call but
-    the 3rd cycle where the "hang" heuristic never got cleared, so
-    `_consecutive_hangs` reaches 3 there instead of after two MORE timeouts,
-    and `probe_status()["state"]` reads "disabled_after_hangs" instead of
-    "ok" at the checkpoint below. Verified on a scratch copy -- see
-    HANDOFF.md."""
+    generic `except Exception` branch -> this test dies on the FIRST loop
+    iteration, at the assertion right after the first malformed cycle:
+    `tests/test_gpu_load.py:326: assert gpu_load._consecutive_hangs == 0`
+    fails with `assert 1 == 0` (the streak the preceding timeout set was
+    never cleared). Verified on a scratch copy -- see HANDOFF.md."""
     hanging = _write_fake_nvtop(tmp_path, "exec sleep 5", name="hanging_nvtop")
     malformed = _write_fake_nvtop(tmp_path, "echo 'not json'", name="malformed_nvtop")
     monkeypatch.setenv("SLOT_AWARE", "1")

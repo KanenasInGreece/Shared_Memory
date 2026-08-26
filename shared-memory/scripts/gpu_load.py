@@ -36,10 +36,10 @@ over 17h, because the old code returned False on timeout without touching the
 child). On CANCELLATION (asyncio.CancelledError, e.g. gateway shutdown mid
 snapshot) the child is best-effort killed only — no await, no counting; see
 inference_gpu_busy's `finally`. After NVTOP_MAX_CONSECUTIVE_HANGS consecutive
-snapshot timeouts (any completed snapshot, even a malformed one, resets the
-count), the probe disables itself for the rest of the process lifetime rather
-than keep spawning children that are likely to hang the same way — permanent
-until the gateway restarts.
+snapshot timeouts (any cycle that ends in anything other than a snapshot
+timeout resets the count), the probe disables itself for the rest of the
+process lifetime rather than keep spawning children that are likely to hang
+the same way — permanent until the gateway restarts.
 
 Runs on the gateway host (coordinator.py), which is where inference actually
 gets served, including generation that remote clients route through the
@@ -64,15 +64,16 @@ log = logging.getLogger("gpu_load")
 #   NVTOP_KILL_WAIT_SEC=1.0         how long to wait for a SIGKILLed nvtop child to
 #                                   actually exit before counting it as leaked
 #                                   (D-state, unreapable)
-#   NVTOP_MAX_CONSECUTIVE_HANGS=3   consecutive snapshot timeouts (any completed
-#                                   snapshot, even a malformed one, resets the
-#                                   count) before the probe disables itself for
-#                                   the process lifetime (UNMEASURED default
-#                                   — see fact:1645)
+#   NVTOP_MAX_CONSECUTIVE_HANGS=3   consecutive snapshot timeouts (any cycle
+#                                   that ends in anything other than a
+#                                   snapshot timeout resets the count) before
+#                                   the probe disables itself for the process
+#                                   lifetime (UNMEASURED default — see
+#                                   fact:1645)
 DEFAULT_GPU_BUSY_PERCENT = 50
 
 _warned = False  # rate-limit the "nvtop unavailable" warning to once per process
-_consecutive_hangs = 0  # snapshot timeouts in a row; reset on any successful snapshot
+_consecutive_hangs = 0  # snapshot timeouts in a row; reset by any cycle that is not a snapshot timeout
 _leaked_children = 0  # nvtop children still in D state after SIGKILL+wait; monotonic
                       # for the process lifetime (reset-on-restart, like the rerank
                       # counters) — never awaited again once counted here
@@ -179,9 +180,12 @@ async def _reap_after_timeout(proc, timeout: float, exc: Exception) -> None:
             # its transport are local objects that get garbage-collected
             # normally, and the kernel process table entry simply stays in D
             # state until the machine reboots. Count it and never await it
-            # again -- rule 2's cap on the hang streak bounds how many are
-            # ever spawned in the first place. Read-then-write, no await in
-            # between: the capability-probe task shares this module.
+            # again -- but the cap bounds CONSECUTIVE timeouts only; an
+            # alternating hang/garbage-output pattern is not bounded by it, so
+            # _leaked_children is unbounded across that pattern. A ceiling on
+            # _leaked_children would be a separate trigger (not implemented;
+            # operator finding, decision:1656 follow-up). Read-then-write, no
+            # await in between: the capability-probe task shares this module.
             reaped = False
             _leaked_children += 1
 
@@ -199,8 +203,8 @@ async def _reap_after_timeout(proc, timeout: float, exc: Exception) -> None:
             _disabled_reason = "disabled_after_hangs"
             log.warning(
                 "GPU-aware dreaming DISABLED after %d consecutive nvtop snapshot "
-                "timeouts (any completed snapshot, even a malformed one, resets "
-                "the count) (NVTOP_TIMEOUT_SEC="
+                "timeouts (any cycle that ends in anything other than a "
+                "snapshot timeout resets the count) (NVTOP_TIMEOUT_SEC="
                 "%.1fs, NVTOP_KILL_WAIT_SEC=%.1fs, NVTOP_MAX_CONSECUTIVE_HANGS="
                 "%d, %d child(ren) leaked so far). This is PERMANENT until the "
                 "gateway restarts — no automatic re-arm. Investigate the nvtop "
@@ -263,16 +267,18 @@ async def inference_gpu_busy() -> bool:
         if proc is not None:
             await _reap_after_timeout(proc, timeout, exc)
         return False
-    except Exception as exc:  # missing binary race, malformed JSON, etc. — the
-        # process has already exited on this path, so no kill/wait is needed.
+    except Exception as exc:  # missing binary race, malformed JSON, etc. — no
+        # kill/wait is needed here: either the process already exited (a
+        # malformed-output or decode-error cycle) or it never started at all
+        # (create_subprocess_exec itself raised, e.g. FileNotFoundError).
         if not _warned:
             log.warning("nvtop snapshot failed (%s: %s) — GPU-aware dreaming disabled this cycle.",
                         type(exc).__name__, exc)
             _warned = True
-        # OPERATOR RULING (decision:1656 follow-up): the child ran and exited
-        # on this path (it just produced something the probe couldn't parse,
-        # or lost a missing-binary race) — that's evidence against a hang, so
-        # it resets the streak exactly like a successful snapshot does.
+        # A non-timeout failure is not evidence of a persistent hang, so it
+        # resets the streak (operator ruling, decision:1656 follow-up).
+        if _consecutive_hangs:
+            log.debug("non-timeout nvtop failure cleared a hang streak of %d.", _consecutive_hangs)
         _consecutive_hangs = 0
         return False
     finally:
@@ -293,10 +299,10 @@ async def inference_gpu_busy() -> bool:
                 pass
 
     # A full successful cycle clears any hang streak — only CONSECUTIVE
-    # snapshot timeouts count toward the self-disable in rule 2 (any completed
-    # snapshot, even a malformed one, resets the count — the generic `except
-    # Exception` branch above resets it the same way, and for the same reason:
-    # OPERATOR RULING, decision:1656 follow-up).
+    # snapshot timeouts count toward the self-disable in rule 2 (any cycle
+    # that ends in anything other than a snapshot timeout resets the count —
+    # the generic `except Exception` branch above resets it the same way, and
+    # for the same reason: OPERATOR RULING, decision:1656 follow-up).
     _consecutive_hangs = 0
 
     threshold = int(os.environ.get("GPU_BUSY_PERCENT", str(DEFAULT_GPU_BUSY_PERCENT)))
