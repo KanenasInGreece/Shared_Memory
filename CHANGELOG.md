@@ -5,6 +5,43 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.61] — 2026-08-26
+
+### Fixed — the gateway waits for Postgres at boot instead of crashing
+
+`MemoryCoordinator.start()` opened its connection pool exactly once. On a cold boot the shipped
+`systemd --user` unit orders the gateway only after `docker.service`, which says nothing about
+whether the Postgres container is *accepting connections* yet — so the first start crashed on
+`connection refused` and `Restart=on-failure` quietly brought it back five seconds later
+(`fact:1609`). The unit file even claimed "the daemons retry their own upstreams", which the
+coordinator did not. It now does: connection-refused / "database system is starting up" errors
+are retried every `PG_STARTUP_RETRY_S` (2 s) for up to `PG_STARTUP_WAIT_S` (60 s), each attempt
+logged, then the last error is re-raised so systemd remains the backstop. The window is a
+wall-clock deadline shared by the pgvector version probe and the pool (so a slow probe cannot
+silently leave `hnsw.iterative_scan` disabled), the retry interval is clamped to ≥ 0.1 s, and
+authentication and other non-startup errors are not retried. Both keys documented in `.env.example`; the unit-file
+comment now states the real behaviour.
+
+### Fixed — a crash from three weeks ago no longer reads as a current error
+
+`GET /memory/telemetry` → `consolidation.<cycle_type>.last_error` reported the most recent
+`crashed` run in the whole retention window, unbounded by any later success. On a live install it
+showed `OrphanedRun` (a daemon restart while a cycle was in flight) from 2026-08-03 next to
+`last_outcome: completed` with hundreds of successful runs in between, and `memory_bridge.py
+status` rendered it as `completed, err OrphanedRun`. **Telemetry contract — additive keys
+(monitor consumers):** `last_error` keeps `class`/`msg` and gains `age_seconds` (int) and
+`superseded` (true when a *completed* run is newer than the crash — deliberately not the
+stall verdict's `last_success`, which also counts a run that folded a cluster and then crashed). The CLI now prints `err <class>`
+only while the crash is unsuperseded, and `last err <class> <age> ago` otherwise.
+
+### Schema — migration 037 corrects the `rem_timing` column comment
+
+Migration 019's `COMMENT ON COLUMN technical_docs.rem_timing` enumerated a shape that has been
+two keys short since 0.9.60 (`completion_tokens`, `tok_s_wall`, the OpenAI-compatible fallback for
+backends that return no llama.cpp `timings`). Per the 0.9.60 review ruling (`decision:1624`, F5)
+the comment is re-issued by a new migration rather than edited in place; `Documentation/schema.md`
+now lists the column, which it had never done.
+
 ## [0.9.60] — 2026-08-26
 
 ### Fixed — external LLM backends no longer vanish from the latency rollup
