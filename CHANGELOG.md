@@ -5,6 +5,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.60] — 2026-08-26
+
+### Fixed — external LLM backends no longer vanish from the latency rollup
+
+`GET /memory/telemetry` → `latency.rem_ms.by_model` was built only from REM calls whose
+response carried llama.cpp's proprietary `timings` block. An OpenAI-compatible backend returns
+no such block, so its rows had `service_ms = null` and were filtered out of the rollup — the
+monitor's throughput/latency table showed nothing for any external model although the pool had
+routed work to it (`fact:1621`). A row is now included whenever it has a caller-observed
+`wall_ms`; the split that only a llama.cpp server can provide stays `null` where the server gave
+none, instead of erasing the model.
+
+**Telemetry contract — additive, flat keys (monitor consumers):** each `by_model` entry keeps
+`model`, `n`, `max_batch_size`, `service_ms {p50,p95}`, `contention_ms {p50,p95}` with unchanged
+values for server-timed models, and adds `wall_ms {p50,p95}` (present for every backend),
+`n_service` (rows that carried server timings), `backend` (modal backend URL) and
+`timing_source` (`"server"` when every row carried server timings, `"mixed"` when only some did, `"wall"` when none) — `n` counts rows with a wall time, `n_service` the rows behind the service percentiles. The `note` string changed. A model with wall data is
+never dropped. `technical_docs.rem_timing` additionally records `completion_tokens` and
+`tok_s_wall` — an *effective* tokens/s (completion ÷ wall, includes TTFT and network) for
+backends that give no server timings (NaN, infinity and booleans degrade to `null` — the summary never raises); `service_ms` comparisons across models remain
+local-only by construction.
+
+Rendering is a pure function (`render_rem_by_model`) so the wall-only case is unit-tested and
+mutation-checked; a test pins the SQL predicate so the old filter cannot return unnoticed.
+Verified against the live corpus: the two local models' percentiles are identical before and
+after; the external model surfaces with n=15, wall p50 4.9 s / p95 6.3 s.
+
 ## [0.9.59] — 2026-08-26
 
 ### Fixed — the capability probe retries while an encoder is down; nvtop's blind spot is a permission, not an API

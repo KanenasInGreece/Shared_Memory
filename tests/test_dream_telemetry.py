@@ -156,6 +156,91 @@ def test_call_timing_summary_missing_timings_yields_none(monkeypatch):
     assert t["model"] is None
 
 
+def test_call_timing_summary_openai_style_uses_usage_and_wall(monkeypatch):
+    # fact:1621 — an OpenAI-compatible external backend returns no llama.cpp
+    # `timings` block at all, only `usage.completion_tokens`. service_ms and
+    # contention_ms stay honestly None; wall_ms and the new tok_s_wall carry
+    # the signal for this backend instead of the row vanishing.
+    dt = _fresh(monkeypatch)
+    resp = {"model": "ext-model", "usage": {"completion_tokens": 266}}
+    t = dt.call_timing_summary(resp, 2.1, backend="https://api.example.com")
+    assert t["service_ms"] is None
+    assert t["contention_ms"] is None
+    assert t["wall_ms"] == 2100.0
+    assert t["completion_tokens"] == 266
+    assert t["tok_s_wall"] == 126.67
+    assert t["model"] == "ext-model"
+    assert t["backend"] == "https://api.example.com"
+
+
+def test_call_timing_summary_no_usage_yields_none_new_keys(monkeypatch):
+    # No usage block at all, or completion_tokens 0/absent, or wall_s None —
+    # the new keys must degrade to None without raising, never divide by zero.
+    dt = _fresh(monkeypatch)
+    t1 = dt.call_timing_summary({"model": "m"}, None)
+    assert t1["completion_tokens"] is None
+    assert t1["tok_s_wall"] is None
+
+    t2 = dt.call_timing_summary({"usage": {"completion_tokens": 0}}, 5.0)
+    assert t2["completion_tokens"] == 0
+    assert t2["tok_s_wall"] is None
+
+    t3 = dt.call_timing_summary({"usage": {"completion_tokens": 10}}, None)
+    assert t3["completion_tokens"] == 10
+    assert t3["tok_s_wall"] is None
+
+
+def test_call_timing_summary_accepts_float_completion_tokens(monkeypatch):
+    # Some OpenAI-compatible providers send usage.completion_tokens as a float.
+    dt = _fresh(monkeypatch)
+    resp = {"model": "ext-model", "usage": {"completion_tokens": 266.0}}
+    t = dt.call_timing_summary(resp, 2.1)
+    assert t["completion_tokens"] == 266
+    assert isinstance(t["completion_tokens"], int)
+    assert t["tok_s_wall"] == 126.67
+
+
+def test_call_timing_summary_rejects_bool_completion_tokens(monkeypatch):
+    # bool is a subclass of int in Python — True/False are not token counts
+    # and must not be laundered into completion_tokens=1/0.
+    dt = _fresh(monkeypatch)
+    resp = {"model": "ext-model", "usage": {"completion_tokens": True}}
+    t = dt.call_timing_summary(resp, 2.1)
+    assert t["completion_tokens"] is None
+    assert t["tok_s_wall"] is None
+
+
+def test_call_timing_summary_rejects_nan_completion_tokens(monkeypatch):
+    # json.loads accepts bare NaN as a non-standard JSON extension some
+    # providers emit. int(float('nan')) raises ValueError — this must not
+    # propagate out of call_timing_summary (the caller's batch try/except
+    # would discard an otherwise-good LLM batch on that exception).
+    dt = _fresh(monkeypatch)
+    resp = {"model": "ext-model", "usage": {"completion_tokens": float("nan")}}
+    t = dt.call_timing_summary(resp, 2.1)   # must not raise
+    assert t["completion_tokens"] is None
+    assert t["tok_s_wall"] is None
+
+
+def test_call_timing_summary_rejects_inf_completion_tokens(monkeypatch):
+    # int(float('inf')) raises OverflowError — same "never raises" contract.
+    dt = _fresh(monkeypatch)
+    resp = {"model": "ext-model", "usage": {"completion_tokens": float("inf")}}
+    t = dt.call_timing_summary(resp, 2.1)   # must not raise
+    assert t["completion_tokens"] is None
+    assert t["tok_s_wall"] is None
+
+
+def test_call_timing_summary_wall_s_bool_true_yields_none_tok_s_wall(monkeypatch):
+    # bool is a subclass of int/float-comparable in Python — wall_s=True must
+    # not be treated as wall_s=1.0 (the not-isinstance(wall_s, bool) guard).
+    dt = _fresh(monkeypatch)
+    resp = {"model": "ext-model", "usage": {"completion_tokens": 266}}
+    t = dt.call_timing_summary(resp, True)
+    assert t["completion_tokens"] == 266
+    assert t["tok_s_wall"] is None
+
+
 def test_writes_jsonl_when_path_set(monkeypatch, tmp_path):
     metrics = tmp_path / "dream-metrics.jsonl"
     dt = _fresh(monkeypatch, str(metrics))
