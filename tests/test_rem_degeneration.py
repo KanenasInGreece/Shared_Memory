@@ -38,6 +38,10 @@ REM_MAX_TOKENS_SOLO = rem_mod.REM_MAX_TOKENS_SOLO
 REM_TRUNCATION_RETRY_FACTOR = rem_mod.REM_TRUNCATION_RETRY_FACTOR
 REM_TRUNCATION_SPECIMEN_CHARS = rem_mod.REM_TRUNCATION_SPECIMEN_CHARS
 
+# Only a record OVER the summary threshold reaches an LLM call at all
+# (`decision:1664`), so every truncation case below uses one.
+_LONG = "x" * (rem_mod.REM_SUMMARY_THRESHOLD + 1)
+
 
 # ── Fixture bodies (generic entity names only) ────────────────────────────────
 # A repeated LONG string >=30 chars, used by the LONG-STRING-rule fixtures.
@@ -142,7 +146,7 @@ async def test_degenerate_truncation_retries_at_the_same_bound(monkeypatch):
     with patch.object(rem_mod, "_parse_llm_json",
                       wraps=rem_mod._parse_llm_json) as parse:
         result, _model = await daemon._llm_process(
-            "content", rem_mod.KIND_FACT, [], {}, pg_id=1)
+            _LONG, rem_mod.KIND_FACT, pg_id=1)
 
     assert bounds == [REM_MAX_TOKENS_SOLO, REM_MAX_TOKENS_SOLO]
     assert result == {"summary": "complete", "relationships": []}
@@ -168,7 +172,7 @@ async def test_honest_truncation_still_gets_the_widened_retry(monkeypatch):
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
 
     result, _model = await daemon._llm_process(
-        "content", rem_mod.KIND_FACT, [], {}, pg_id=1)
+        _LONG, rem_mod.KIND_FACT, pg_id=1)
 
     assert bounds == [REM_MAX_TOKENS_SOLO,
                       int(REM_MAX_TOKENS_SOLO * REM_TRUNCATION_RETRY_FACTOR)]
@@ -193,7 +197,7 @@ async def test_second_truncation_of_either_class_fails_the_unit(monkeypatch):
 
     with patch.object(rem_mod, "_parse_llm_json") as parse:
         result, _model = await daemon._llm_process(
-            "content", rem_mod.KIND_FACT, [], {}, pg_id=1)
+            _LONG, rem_mod.KIND_FACT, pg_id=1)
 
     assert result is None
     assert daemon._last_llm_failure == rem_mod.LLM_FAIL_TRUNCATED
@@ -223,7 +227,7 @@ async def test_honest_double_truncation_error_advises_retry_not_bump(monkeypatch
 
     with caplog.at_level("ERROR"):
         result, _model = await daemon._llm_process(
-            "content", rem_mod.KIND_FACT, [], {}, pg_id=1)
+            _LONG, rem_mod.KIND_FACT, pg_id=1)
 
     assert result is None
     error_lines = [r.message for r in caplog.records if r.levelname == "ERROR"]
@@ -294,7 +298,7 @@ async def test_truncated_call_warns_with_the_specimen(monkeypatch, caplog):
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
 
     with caplog.at_level("WARNING"):
-        await daemon._llm_process("content", rem_mod.KIND_FACT, [], {}, pg_id=99)
+        await daemon._llm_process(_LONG, rem_mod.KIND_FACT, pg_id=99)
 
     specimen_lines = [r.message for r in caplog.records if "specimen(last" in r.message]
     assert specimen_lines, "expected a WARN carrying the bounded specimen"
@@ -318,7 +322,7 @@ async def test_degenerate_metrics_row_carries_note_and_specimen(monkeypatch):
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
 
     with patch.object(rem_mod, "record_llm_call") as rec:
-        await daemon._llm_process("content", rem_mod.KIND_FACT, [], {}, pg_id=1)
+        await daemon._llm_process(_LONG, rem_mod.KIND_FACT, pg_id=1)
 
     degenerate_calls = [c for c in rec.call_args_list
                         if c.kwargs.get("note") == "degenerate"]
@@ -342,7 +346,7 @@ async def test_honest_truncated_metrics_row_carries_note(monkeypatch):
     monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
 
     with patch.object(rem_mod, "record_llm_call") as rec:
-        await daemon._llm_process("content", rem_mod.KIND_FACT, [], {}, pg_id=1)
+        await daemon._llm_process(_LONG, rem_mod.KIND_FACT, pg_id=1)
 
     honest_calls = [c for c in rec.call_args_list
                     if c.kwargs.get("note") == "truncated_honest"]

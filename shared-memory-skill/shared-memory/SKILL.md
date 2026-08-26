@@ -93,8 +93,8 @@ axes from the decision it judges.
 
 **`entities` — the concepts a FACT is about, and the only place a concept can enter the graph.**
 Tier 3 consolidation folds on **project+domain**, not entities (fact 1215) — an entity-less fact still
-consolidates. **What entities buy instead:** cluster keys for graph navigation and REM/entity-relation
-linking, for this fact and anything later grounded in or enriched against it. Name concepts, not
+consolidates. **What entities buy instead:** cluster keys for graph navigation, for this fact and
+anything later grounded in it. Name concepts, not
 sentences (`OutboxPattern`, not `must be done on the VM`); a phrase you type here becomes a permanent
 node, where the only way back is to supersede the fact. Judgements do **not** take these: a decision's
 topics are whatever its evidence is about, reached by walking its grounding.
@@ -187,7 +187,7 @@ Commit findings, decisions, and technical facts to long-term shared memory.
 
 **`source`** — the gateway stamps this with the authenticated token identity (`claude`, `gemini`, `lm_studio`, etc.); any client-supplied value is overridden. Pass any non-empty string to satisfy the schema — `entities` and `project` matter more. For non-authenticated (legacy) installs, pass the agent name explicitly.
 
-**`entities` is NOT required for Tier 3 consolidation — the fold keys on `project`+`domain` (fact 1215), so an entity-less fact is an honest, fully-consolidatable state, not a defect.** A FACT is still the only place a new concept can enter the graph at all, and entities still drive graph navigation and REM/entity-relation linking for this fact and anything later grounded in or enriched against it — that is what makes naming them worth doing, not a Tier 3 requirement.
+**`entities` is NOT required for Tier 3 consolidation — the fold keys on `project`+`domain` (fact 1215), so an entity-less fact is an honest, fully-consolidatable state, not a defect.** A FACT is still the only place a new concept can enter the graph at all, and entities still drive graph navigation for this fact and anything later grounded in it — that is what makes naming them worth doing, not a Tier 3 requirement. ⛔ They are written at FIRST WRITE only: enrichment adds none, because REM writes no edges and no labels (decision 1664).
 
 **Capture discipline (ruled, fact 1215): entities the operator did not name are NEVER added by the agent.** When none are given, ask once and accept none as the answer — do not keep asking, and do not infer one from the content to fill the field. One is enough when one is given. Name each as a **concept, not a sentence** (`OutboxPattern`, not `must be performed on the VM`) — and never as the project or section it belongs to: that is asking *where the record belongs*, and an entity answers *what the record is about* (the subject-vs-axis test). Stamp each entity's origin in `entities_provenance`, e.g. `'{"entities":["OutboxPattern"],"entities_provenance":{"OutboxPattern":"operator"}}'` in the metadata JSON — a value of `"operator"` or `"agent"` per named entity. Omitting it still saves; the response's `entities_provenance_note` names the gap so it is seen at capture time, not just on inspection. A mapping naming an entity outside the save's `entities` list, or a value that is not `operator`/`agent`, is refused (400 `entities_provenance_invalid`) — fix the mapping and re-send.
 
@@ -346,7 +346,7 @@ full notes are the record's Tier-1 content), not on the `HAD_OUTCOME` edge, whic
 
 ### Task 6 — Review & calibrate machine-proposed relation edges
 
-REM and the evidence sweep mint typed graph edges **machine-asserted** with a confidence score; the operator's labels are the **only calibration oracle** — per-family reliability is computed from them, and until a family has ~20 labels it is **uncalibrated: its machine edges are invisible to synthesis**. Labeling is what unlocks them.
+The evidence sweep mints typed graph edges **machine-asserted** with a confidence score (REM mints none — decision 1664); the operator's labels are the **only calibration oracle** — per-family reliability is computed from them, and until a family has ~20 labels it is **uncalibrated: its machine edges are invisible to synthesis**. Labeling is what unlocks them.
 - **Trigger:** a weekly stratified label pass per family — and **ALWAYS immediately after a first evidence-sweep run**, so calibration exists before any confidence threshold acts.
 - **Label honestly:** `correct` means the relation **as typed and as directed** is true of the two endpoints — the right pair with the wrong relation or wrong direction is `incorrect`.
 - Labeling an *accepted* edge `incorrect` deletes the machine edge from the graph (operator-asserted edges are never deleted); the ledger row stays as audit and so it is never re-asked.
@@ -595,7 +595,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness (anonymous — status/version/api_version only, v0.9.9 S-10):
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":4,"version":"0.9.65"}
+# → {"status":"ok","api_version":4,"version":"0.9.66"}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -667,7 +667,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.65", "api_version": 4, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.66", "api_version": 4, "tool": "shared-memory-framework"}`
 
 ### Updating This Skill
 

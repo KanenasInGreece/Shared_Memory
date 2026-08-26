@@ -207,33 +207,6 @@ def test_agents_md_names_every_file_the_manifest_ships():
     )
 
 
-# ── The REM prompt must state what the gate actually does ─────────────────────
-
-def test_mint_rule_in_prompt_states_the_unconditional_gate():
-    """A prompt that contradicts the code teaches the model the wrong contract —
-    the old line promised unknown names "will become generic Entity nodes" long
-    after they stopped doing so, and was then made to track an env flag. Decision
-    978 removed the flag, so the sentence must state the one behaviour there is,
-    and must not come back as a conditional.
-    """
-    import importlib.util as iu
-    scripts = os.path.normpath(os.path.join(ROOT, "shared-memory", "scripts"))
-    if scripts not in sys.path:
-        sys.path.insert(0, scripts)
-
-    os.environ["REM_MAY_MINT_ENTITIES"] = "1"     # retired: must be ignored
-    try:
-        spec = iu.spec_from_file_location(
-            "rem_loop_mint_rule", os.path.join(scripts, "rem_loop.py"))
-        mod = iu.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        assert "DROPPED, not created" in mod._ONTOLOGY_VOCAB
-        assert "WILL be created" not in mod._ONTOLOGY_VOCAB
-        assert not hasattr(mod, "REM_MAY_MINT_ENTITIES")
-    finally:
-        os.environ.pop("REM_MAY_MINT_ENTITIES", None)
-
-
 # ── A skill-kind target that already holds a connector is refused ────────────
 
 def test_skill_kind_target_holding_a_connector_is_refused_before_the_kind_fork():
