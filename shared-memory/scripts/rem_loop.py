@@ -2491,8 +2491,14 @@ class REMDaemon:
                     logger.error(
                         "REM: pg_id=%s solo enrichment TRUNCATED again at "
                         "max_tokens=%d (finish_reason=length) — failing the "
-                        "unit; no parse, no repair. Raise REM_MAX_TOKENS_SOLO "
-                        "if this record is legitimately large.",
+                        "unit; no parse, no repair. It will retry on a later "
+                        "pick-up (rem_attempts +1; dead-letters at "
+                        "REM_MAX_ATTEMPTS). If that later pick-up completes "
+                        "well UNDER the bound, both truncations were a "
+                        "repetition loop the classifier could not see — do "
+                        "NOT raise REM_MAX_TOKENS_SOLO (decision:1330). Raise "
+                        "it only if EVERY pick-up truncates with a "
+                        "differing, non-repeating tail.",
                         pg_id, retry_bound,
                     )
 

@@ -1146,8 +1146,16 @@ def format_label_outcomes(payload: dict) -> str:
     return "\n".join(lines) if lines else "(no outcomes)"
 
 
-async def search_and_rerank(query: str, limit: int = 5, project: str = None,
-                             domains: list = None, since: str = None) -> list | dict:
+async def _search_payload(query: str, limit: int = 5, project: str = None,
+                           domains: list = None, since: str = None) -> dict:
+    """The raw gateway payload for one search call — the HTTP call and error
+    handling `search_and_rerank()` used to inline, pulled out so a caller
+    that needs more than the bare results list (v0.9.62: the keyword-fallback
+    headline, `_fallback_warning`) can derive it from the SAME call instead
+    of a second HTTP round trip. Always a dict: the decoded success payload,
+    or this client's own error dict (`exc.payload` / `_coordinator_unavailable`
+    already return one) — never the bare results list `search_and_rerank`
+    unwraps it into."""
     # Sized from the gateway's own published cost, never from a constant — the
     # reranker dominates this call and its cost tracks the candidate payload.
     ceiling = search_ceiling(await _gateway_capability(), await _gateway_capacity())
@@ -1167,12 +1175,17 @@ async def search_and_rerank(query: str, limit: int = 5, project: str = None,
                 json=body,
                 headers=_request_headers(),
             )
-            result = _reply_json(r, log_auth=True)
+            return _reply_json(r, log_auth=True)
     except GatewayReplyError as exc:
         return exc.payload
     except Exception as exc:
         return await _warn_on_skew(_coordinator_unavailable(exc, ceiling))
 
+
+async def search_and_rerank(query: str, limit: int = 5, project: str = None,
+                             domains: list = None, since: str = None) -> list | dict:
+    result = await _search_payload(query, limit, project=project,
+                                    domains=domains, since=since)
     return result.get("results", result)
 
 
@@ -1198,6 +1211,35 @@ def _unranked_warning(results) -> str | None:
         return None
     return (f"{unranked} of {len(results)} results are UNRANKED — the reranker "
             f"timed out, this is vector order (see backend_capability on /health)")
+
+
+def _fallback_warning(payload) -> str | None:
+    """One line for stderr when the gateway served a KEYWORD (substring)
+    fallback because the embedder was unavailable — `coordinator.py` answers
+    that case honestly with ``{"status":"success","fallback":"keyword",
+    "results":[...]}`` rather than failing the search, but until this both
+    clients silently stripped the envelope and only the results list reached
+    the operator. A natural-language query almost never ILIKE-matches, so the
+    common shape of that silence was an EMPTY list reading as "nothing
+    known" — this MUST fire on ``results: []`` too, which is the one case
+    `_unranked_warning` (rows marked ``ranked: false``) can never catch (fact:1609).
+
+    Input is the RAW gateway payload (a dict, e.g. from `_search_payload`),
+    not the unwrapped results list `_unranked_warning` takes — the
+    ``fallback`` marker lives one level up from ``results``. None unless
+    `payload` is a dict with ``fallback == "keyword"``.
+
+    Mirrors `_unranked_warning`'s parity discipline (T-07, PR #310 review):
+    the returned SENTENCE is the shared core both front doors present —
+    `vector_skill._fallback_warning` must return the identical string for
+    the identical input; a parity test holds the two in step."""
+    if not isinstance(payload, dict) or payload.get("fallback") != "keyword":
+        return None
+    results = payload.get("results")
+    n = len(results) if isinstance(results, list) else 0
+    return (f"EMBEDDING UNAVAILABLE — keyword (substring) fallback served "
+            f"{n} result(s), unranked; the embedder is down or still "
+            f"starting (see embedder on /health)")
 
 
 def _stale_projection_note(capability: dict | None) -> str | None:
@@ -1965,11 +2007,15 @@ async def main() -> None:
         query = sys.argv[2]
         p = _search_argparser()
         sargs = p.parse_args(sys.argv[3:])
-        results = await search_and_rerank(query, sargs.limit, project=sargs.project,
-                                           domains=sargs.domains, since=sargs.since)
+        payload = await _search_payload(query, sargs.limit, project=sargs.project,
+                                         domains=sargs.domains, since=sargs.since)
+        results = payload.get("results", payload)
         warning = _unranked_warning(results)
         if warning:
             print(warning, file=sys.stderr)
+        fallback_warning = _fallback_warning(payload)
+        if fallback_warning:
+            print(fallback_warning, file=sys.stderr)
         stale_note = _stale_projection_note(await _gateway_capability())
         if stale_note:
             print(f"NOTE: {stale_note} — the ceiling above still used its last "
