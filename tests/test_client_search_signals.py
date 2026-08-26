@@ -38,8 +38,14 @@ def _load(name, *parts):
 
 
 memory_bridge = _load(
+    # A-03 (delta review): this must import the SOURCE OF TRUTH, not the
+    # delivery copy — a guard removed only from `shared-memory/scripts/`
+    # would leave every test in this file green as long as nobody re-ran
+    # sync_skills.sh first. `test_tracked_client_copies_are_byte_identical`
+    # (tests/test_memory_bridge.py) is what already pins the two copies
+    # together; this file doesn't need to double as that check.
     "memory_bridge_signals",
-    "shared-memory-skill", "shared-memory", "scripts", "memory_bridge.py",
+    "shared-memory", "scripts", "memory_bridge.py",
 )
 vector_skill = _load("vector_skill_signals", "mcp", "vector-skill.py")
 
@@ -260,6 +266,29 @@ async def test_mcp_search_prepends_fallback_note_on_empty_keyword_fallback():
         result = await vector_skill.hybrid_search_and_rerank(MOCK_QUERY)
     assert result.startswith("NOTE: EMBEDDING UNAVAILABLE")
     assert "0 result(s)" in result
+
+
+@pytest.mark.asyncio
+async def test_mcp_search_note_order_matches_cli_when_both_fire():
+    """Nit (delta review): the CLI door prints the unranked line, then the
+    fallback line (two sequential stderr prints, top to bottom). The MCP door
+    builds its text by PREPENDING, so it must prepend fallback first and
+    unranked second to land on the SAME final top-to-bottom order — otherwise
+    the two front doors show the pair in opposite order."""
+    payload = {"status": "success", "fallback": "keyword", "results": [
+        {"pg_id": 1, "content": "a", "ranked": False},
+    ]}
+    mock_response = MagicMock(status_code=200, json=lambda: payload)
+    with patch("httpx.AsyncClient.post", return_value=mock_response):
+        result = await vector_skill.hybrid_search_and_rerank(MOCK_QUERY)
+
+    unranked_pos = result.find("UNRANKED")
+    fallback_pos = result.find("EMBEDDING UNAVAILABLE")
+    assert unranked_pos != -1 and fallback_pos != -1
+    assert unranked_pos < fallback_pos, (
+        "MCP shows the fallback note before the unranked note — "
+        "opposite of the CLI's stderr order"
+    )
 
 
 # ── B3: doctor / check_gateway_compat surfaces agent/role ────────────────────

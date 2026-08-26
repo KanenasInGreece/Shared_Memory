@@ -1213,7 +1213,7 @@ def _unranked_warning(results) -> str | None:
             f"timed out, this is vector order (see backend_capability on /health)")
 
 
-def _fallback_warning(payload) -> str | None:
+def _fallback_warning(payload: object) -> str | None:
     """One line for stderr when the gateway served a KEYWORD (substring)
     fallback because the embedder was unavailable — `coordinator.py` answers
     that case honestly with ``{"status":"success","fallback":"keyword",

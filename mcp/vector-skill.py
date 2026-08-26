@@ -646,7 +646,7 @@ def _unranked_warning(results) -> str | None:
             f"timed out, this is vector order (see backend_capability on /health)")
 
 
-def _fallback_warning(payload) -> str | None:
+def _fallback_warning(payload: object) -> str | None:
     """Mirrors ``memory_bridge._fallback_warning`` exactly (v0.9.62,
     fact:1609) — a parity test holds the two in step. See there for the
     rationale: the gateway serves a KEYWORD (substring) fallback rather than
@@ -766,14 +766,18 @@ async def hybrid_search_and_rerank(query: str, limit: int = 5, project: str = ""
         return f"Error: {results.get('message', 'search failed')}"
     results_list = results if isinstance(results, list) else []
     rendered = _render_results(results_list, (datetime.now() - start).total_seconds())
-    # This tool returns rendered text, not a dict/list — so the unranked
-    # warning is a line prepended to that text rather than a `note` field.
-    warning = _unranked_warning(results_list)
-    if warning:
-        rendered = f"NOTE: {warning}\n\n" + rendered
+    # This tool returns rendered text, not a dict/list — so the unranked and
+    # fallback warnings are lines prepended to that text rather than `note`
+    # fields. Prepended in the OPPOSITE order the CLI door prints them (the
+    # fallback one first, THEN unranked) so the final top-to-bottom order —
+    # unranked, then fallback — matches the CLI's stderr order on the two
+    # front doors (nit d, delta review).
     fallback_warning = _fallback_warning(payload)
     if fallback_warning:
         rendered = f"NOTE: {fallback_warning}\n\n" + rendered
+    warning = _unranked_warning(results_list)
+    if warning:
+        rendered = f"NOTE: {warning}\n\n" + rendered
     stale_note = _stale_projection_note(await _gateway_capability())
     if stale_note:
         rendered = (f"NOTE: {stale_note} — the ceiling above still used its "
