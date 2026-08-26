@@ -24,7 +24,11 @@ Also covers:
     directly in the process's own exec environment.
   - File-read discipline: refuse-vs-warn on missing/unreadable/loose-mode/
     empty secret files (never raises; always falls through instead).
-  - Exactly one trailing newline stripped, never a full .strip()/.rstrip().
+  - ALL trailing CR/LF stripped (v0.9.63 — the run is a file-write artefact),
+    never a full .strip()/.rstrip(): spaces stay. Any OTHER control character
+    surviving that normalisation refuses the secret at LOAD, with a warning
+    naming the pointer, the path, the byte and its CHARACTER offset —
+    never the value and never its length.
 """
 import importlib
 import os
@@ -393,10 +397,105 @@ def test_loose_mode_secret_file_still_read_but_warns(monkeypatch, tmp_path, caps
     assert "group/world-accessible" in err
 
 
-def test_exactly_one_trailing_newline_is_stripped(monkeypatch, tmp_path):
-    secret_file = tmp_path / "multi_newline_secret"
-    secret_file.write_bytes(b"secret-with-blank-line\n\n")
+def _resolve_via_file(monkeypatch, tmp_path, raw: bytes, name: str = "secret_file"):
+    """Write `raw` verbatim to a tmp file, point PG_PASSWORD_FILE at it, and
+    run the loader. Returns what get_secret() resolved to (None = refused/
+    unset). Fake values only — never a real-looking provider key."""
+    secret_file = tmp_path / name
+    secret_file.write_bytes(raw)
     fake_file = _write_env_file(tmp_path, "")
+    monkeypatch.setattr(secure_env, "__file__", str(fake_file))
+    monkeypatch.setenv("PG_PASSWORD_FILE", str(secret_file))
+    monkeypatch.delenv("PG_PASSWORD", raising=False)
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+    secure_env.load_split_env()
+    return secret_file, secure_env.get_secret("PG_PASSWORD")
+
+
+@pytest.mark.parametrize("raw", [
+    b"sk-test\n",          # every editor / heredoc / `pass show >`
+    b"sk-test\r\n",        # a Windows paste, or a CRLF-saving editor
+    b"sk-test\n\n",        # `echo` into a file that already ended in \n
+    b"sk-test\r\n\r\n",    # both at once — the measured 2026-08-26 shape
+    b"sk-test",            # the printf recipe: nothing to strip
+])
+def test_all_trailing_cr_lf_are_stripped(monkeypatch, tmp_path, raw):
+    """v0.9.63: the trailing CR/LF RUN is a file-write artefact, not secret
+    content — strip all of it, not exactly one `\\n`. Stripping one left a
+    `\\r` in the value, which then reached an Authorization header and made
+    aiohttp refuse EVERY upstream request instead of failing once at load."""
+    _, value = _resolve_via_file(monkeypatch, tmp_path, raw)
+    assert value == "sk-test"
+
+
+def test_spaces_around_a_secret_are_preserved(monkeypatch, tmp_path):
+    """The standing invariant the CR/LF widening must NOT break: a space can
+    be part of a literal secret, so this is never `.strip()`/`.rstrip()`.
+    Pinned as an explicit VALUE, not an equality between two expressions."""
+    _, value = _resolve_via_file(monkeypatch, tmp_path, b" sk-test \n")
+    assert value == " sk-test "
+
+
+def test_an_internal_newline_is_not_a_write_artefact_and_is_refused(
+    monkeypatch, tmp_path
+):
+    """Only the TRAILING run is a write artefact. A newline with content
+    AFTER it is corruption (before v0.9.63 the loader carried it silently
+    into an Authorization header), so it takes the refusal path instead."""
+    _, value = _resolve_via_file(
+        monkeypatch, tmp_path, b"line-one\nline-two\n"
+    )
+    assert value is None
+
+
+@pytest.mark.parametrize("raw,expect_hex,expect_offset", [
+    (b"sk-\rtest\n", "\\x0d", 3),     # embedded CR — the measured failure
+    (b"sk-test\t\n", "\\x09", 7),     # trailing TAB: NOT a write artefact
+    (b"sk-\x00test\n", "\\x00", 3),   # NUL
+    (b"sk-\x1btest\n", "\\x1b", 3),   # ESC
+    (b"sk-\x7ftest\n", "\\x7f", 3),   # DEL
+])
+def test_control_character_refuses_the_secret_and_names_the_file(
+    monkeypatch, tmp_path, capsys, raw, expect_hex, expect_offset
+):
+    """Refuse ONCE at load, with a line an operator can act on: the pointer,
+    the path, the byte, its offset, and the fix. Never the secret itself,
+    and never the secret's LENGTH."""
+    secret_file, value = _resolve_via_file(monkeypatch, tmp_path, raw)
+
+    assert value is None
+    err = capsys.readouterr().err
+    assert "PG_PASSWORD_FILE" in err          # names the pointer/source
+    assert str(secret_file) in err            # names the FILE
+    assert expect_hex in err                  # names the offending byte
+    # The offset is an index into the DECODED string, not into the file's
+    # bytes — the two diverge on any multi-byte UTF-8 — so it must be
+    # labelled as a character offset, not left to read as a file position.
+    assert f"character offset {expect_offset}" in err
+    assert "printf '%s'" in err               # ...and the recipe
+    # No secret content, ever — not the whole value, not any fragment of it.
+    assert "sk-test" not in err
+    assert "sk-" not in err
+    # And no LENGTH either: this file is under the cap, so its size is the
+    # key's own length give or take the write artefact — a reconstruction
+    # aid the message does not need in order to be actionable. (The
+    # over-cap warning still prints a size; there the size IS the
+    # complaint. Pinned as the exact phrasing that would reintroduce it.)
+    assert "-byte file" not in err
+    # Pinned as a contiguous span, so a size (or anything else) reinserted
+    # between the offset and the refusal clause breaks this test.
+    assert (f"{expect_hex} at character offset {expect_offset} "
+            f"— refusing to use it") in err
+
+
+def test_control_character_refusal_falls_through_to_the_next_source(
+    monkeypatch, tmp_path
+):
+    """A refused file is 'unset', not 'fatal' — the caller's existing
+    fall-through is unchanged (here: the plaintext .env value below it)."""
+    secret_file = tmp_path / "corrupt_secret"
+    secret_file.write_bytes(b"sk-\rtest\n")
+    fake_file = _write_env_file(tmp_path, "PG_PASSWORD=fallback-plaintext\n")
     monkeypatch.setattr(secure_env, "__file__", str(fake_file))
     monkeypatch.setenv("PG_PASSWORD_FILE", str(secret_file))
     monkeypatch.delenv("PG_PASSWORD", raising=False)
@@ -404,9 +503,31 @@ def test_exactly_one_trailing_newline_is_stripped(monkeypatch, tmp_path):
 
     secure_env.load_split_env()
 
-    # Exactly ONE trailing newline stripped, not all trailing whitespace —
-    # the inner blank line survives.
-    assert secure_env.get_secret("PG_PASSWORD") == "secret-with-blank-line\n"
+    assert secure_env.get_secret("PG_PASSWORD") == "fallback-plaintext"
+
+
+def test_credentials_directory_refuses_control_characters_identically(
+    monkeypatch, tmp_path, capsys
+):
+    """One reader, one rule: `$CREDENTIALS_DIRECTORY` and `<KEY>_FILE` must
+    not diverge — a fix applied to one path only would leave the systemd
+    deployment shape carrying the defect."""
+    cred_dir = tmp_path / "creds"
+    cred_dir.mkdir()
+    (cred_dir / "pg_password").write_bytes(b"sk-\rtest\n")
+    fake_file = _write_env_file(tmp_path, "")
+    monkeypatch.setattr(secure_env, "__file__", str(fake_file))
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(cred_dir))
+    monkeypatch.delenv("PG_PASSWORD", raising=False)
+    monkeypatch.delenv("PG_PASSWORD_FILE", raising=False)
+
+    secure_env.load_split_env()
+
+    assert secure_env.get_secret("PG_PASSWORD") is None
+    err = capsys.readouterr().err
+    assert "$CREDENTIALS_DIRECTORY" in err
+    assert "\\x0d" in err
+    assert "sk-" not in err
 
 
 def test_unreadable_secret_file_falls_through_without_raising(monkeypatch, tmp_path):

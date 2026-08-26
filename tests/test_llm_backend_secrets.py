@@ -138,6 +138,64 @@ def test_backend_model_override_rewrites_request_body(monkeypatch):
     assert body["model"] == "custom-model-id"
 
 
+def test_backend_whose_keyfile_holds_a_control_character_is_excluded(
+    monkeypatch, tmp_path, caplog, capsys
+):
+    """End-to-end for v0.9.63 (measured live 2026-08-26): an operator writes
+    the key file with an editor/paste that leaves an embedded control
+    character. Before, the value reached the Authorization header and aiohttp
+    refused EVERY upstream request with "Forbidden control character detected
+    in headers" — per call, backend '?', nothing naming the key file. Now the
+    reader refuses ONCE at load and the backend takes the SAME exclusion path
+    an unset token_env already takes: excluded from the pool, one log line
+    naming it. Fake key value only."""
+    import logging
+    import secure_env
+    # This test is the only one here that drives secure_env's FILE tier, so
+    # it owns the in-process store for its duration — monkeypatch hands the
+    # original dict back at teardown, so a resolved value can never leak into
+    # a later test's view of get_secret().
+    monkeypatch.setattr(secure_env, "_secrets", {})
+
+    keyfile = tmp_path / "deepseek_api_key"
+    keyfile.write_bytes(b"sk-test\r-embedded-cr\n")   # fake, corrupt on purpose
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setenv("DEEPSEEK_API_KEY_FILE", str(keyfile))
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://local:5000"},
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY",
+         "model": "deepseek-chat", "private_ok": True},
+    ]))
+    import hive_mind_proxy as g
+    with caplog.at_level(logging.WARNING, logger="hive-proxy"):
+        importlib.reload(g)
+
+    assert g.LLM_BACKENDS == ["http://local:5000"]
+    assert "https://api.deepseek.com/v1" not in g.LLM_BACKENDS
+    # The pool log names the backend that was excluded and why. The wording
+    # must cover THIS cause too: the variable is not "not set" here — the key
+    # file exists and was read, and secure_env refused what was in it. An
+    # operator told only "not set" goes looking for a missing export instead
+    # of at the [secure_env] line that names the file they must rewrite.
+    _excl = [r.getMessage() for r in caplog.records
+             if "api.deepseek.com" in r.getMessage()
+             and "DEEPSEEK_API_KEY" in r.getMessage()
+             and "excluding this backend" in r.getMessage()]
+    assert _excl
+    assert any("refused by secure_env" in m for m in _excl)
+    assert not any("is not set in the gateway's own environment" in m
+                   for m in _excl)
+    # The reader's own line named the FILE — the thing the operator must fix.
+    err = capsys.readouterr().err
+    assert str(keyfile) in err
+    assert "\\x0d" in err
+    assert "printf '%s'" in err
+    # No secret content anywhere, in either surface.
+    assert "sk-test" not in err
+    assert not any("sk-test" in r.getMessage() for r in caplog.records)
+
+
 def test_all_json_backends_excluded_falls_back_not_crashes(monkeypatch):
     """Every entry needs a token_env that isn't set -> the pool must still be
     non-empty (falls back to LLM_BACKENDS/DEFAULT_TARGET) so _select_llm_backend

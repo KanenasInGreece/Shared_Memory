@@ -328,10 +328,20 @@ def _load_llm_backends() -> tuple[
                 # environment rather than the framework .env.
                 token = get_secret(token_env)
                 if not token:
+                    # Wording covers BOTH causes of a falsy value, because
+                    # v0.9.63 gave this branch a second one: unset (nothing
+                    # anywhere resolves the name) and REFUSED (a `_FILE` /
+                    # $CREDENTIALS_DIRECTORY secret was found but rejected —
+                    # over the size cap, empty, or holding a control
+                    # character). Saying only "not set" sends an operator
+                    # whose key file IS present looking for a missing export
+                    # instead of at the [secure_env] line that names the file.
                     log.warning(
                         "LLM backend %s configured with token_env=%s but that "
-                        "variable is not set in the gateway's own environment — "
-                        "excluding this backend from the pool.", url, token_env)
+                        "variable did not resolve to a usable secret (unset, or "
+                        "refused by secure_env — see the [secure_env] WARNING "
+                        "above) — excluding this backend from the pool.",
+                        url, token_env)
                     continue
             # Per-backend request-body overrides ("extra_body", the OpenAI-SDK
             # name for the same thing): keys merged into every chat payload

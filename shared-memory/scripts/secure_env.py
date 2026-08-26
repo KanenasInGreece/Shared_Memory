@@ -217,6 +217,21 @@ _SECRET_FILE_MAX_BYTES = int(
 )
 
 
+def _first_control_character(value: str) -> "tuple[int, str] | None":
+    """(offset, character) of the first C0 control character or DEL in
+    `value`, else None. Deliberately NOT `str.isprintable()` and not a
+    unicodedata category test: those also reject non-ASCII letters and
+    non-breaking spaces, which a secret may legitimately contain. The only
+    class this refuses is the one that cannot survive the journey a secret
+    read from a file actually makes — into an HTTP header value, where
+    aiohttp raises `ValueError: Forbidden control character detected in
+    headers` per request rather than at load."""
+    for offset, ch in enumerate(value):
+        if ord(ch) < 0x20 or ch == "\x7f":
+            return offset, ch
+    return None
+
+
 def _read_secret_file(path: Path, *, source: str) -> "str | None":
     """Read one secret value from `path` (SEC-06 i, PR A4). Never raises: an
     unreadable, missing, non-regular, oversized, or empty file WARNS to
@@ -290,10 +305,32 @@ def _read_secret_file(path: Path, *, source: str) -> "str | None":
     that, staying consistent rather than inventing a stricter rule for one
     ingestion path.
 
-    Strips EXACTLY ONE trailing newline (the standard secret-file
-    convention — e.g. Docker's own `printf` recipe) — never .strip() /
-    .rstrip(), which would also eat leading/trailing spaces that could be
-    part of the literal secret.
+    Strips ALL trailing CR/LF characters (a run of `\\r` and/or `\\n` in any
+    order) — and ONLY those two. Never .strip() / .rstrip(), which would
+    also eat leading/trailing spaces that could be part of the literal
+    secret; that reason is unchanged. What changed (v0.9.63) is the COUNT:
+    stripping exactly one `\\n` left a `\\r` behind on the single most common
+    way an operator produces this file. Every editor that saves with a
+    final newline, `echo`, `pass show > file`, a heredoc, and any Windows
+    or terminal paste appends one or more of these two characters — and
+    NEITHER can ever be part of a legitimate HTTP header value, which is
+    what a bearer token read through here becomes. So the run is a
+    file-write artefact by construction, not secret content.
+
+    Any OTHER control character that survives that normalisation
+    (`ord(ch) < 0x20` or DEL `\\x7f` — an EMBEDDED CR/LF, TAB, NUL, ESC)
+    is NOT an artefact of writing the file: it is a corrupt secret. The
+    read refuses it, returns None, and WARNS with the source, the path,
+    the offending byte as `\\xNN` and its CHARACTER offset (never the
+    value's length), plus the `printf` recipe
+    — never the secret's content. Measured cause (2026-08-26): a 37-byte
+    file holding a 35-char key put one surviving control character into
+    the `Authorization` header, and aiohttp rejected EVERY upstream
+    request with "Forbidden control character detected in headers",
+    per-request, with nothing naming the key file. Refusing at LOAD makes
+    the same misconfiguration one journal line that names the file, and
+    the caller's existing unresolved-secret path (a backend excluded from
+    the pool) takes it from there.
     """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
@@ -362,11 +399,35 @@ def _read_secret_file(path: Path, *, source: str) -> "str | None":
         return None
 
     raw = raw_bytes.decode("utf-8", errors="replace")
-    if raw.endswith("\n"):
-        raw = raw[:-1]
+    # Normalise the FILE-WRITE ARTEFACT (v0.9.63): every trailing CR and LF,
+    # in any order and any number — `\n`, `\r\n`, `\n\n`, `\r\n\r\n`. Only
+    # those two characters; a trailing SPACE or TAB is left exactly where it
+    # is, because a space can be part of a literal secret (see the docstring)
+    # and a tab is not a write artefact — it is corruption, refused below.
+    raw = raw.rstrip("\r\n")
     if not raw.strip():
         print(f"[secure_env] WARNING: {source} ({path}) is empty — treating "
               f"as unset", file=sys.stderr)
+        return None
+    bad = _first_control_character(raw)
+    if bad is not None:
+        offset, ch = bad
+        # NEVER the secret's content, and NEVER its length either: this file
+        # is under the cap, so its size is the key's own length give or take
+        # the artefact — a reconstruction aid an operator does not need to
+        # fix the file. (The over-cap warnings above DO print a size, but
+        # that is a different case: there the size IS the complaint, and the
+        # secret was refused before any of it was used.) `offset` is a
+        # CHARACTER index into the decoded string, not a byte offset — they
+        # differ the moment the file holds any multi-byte UTF-8 — so it is
+        # labelled as one rather than left to read as a file position.
+        print(f"[secure_env] WARNING: {source} ({path}) contains a control "
+              f"character \\x{ord(ch):02x} at character offset {offset} "
+              f"— refusing to use it, treating as "
+              f"unset. A secret read from a file must not contain control "
+              f"characters (they cannot appear in an HTTP header value). "
+              f"Rewrite the file with: printf '%s' '<key>' > {path}",
+              file=sys.stderr)
         return None
     return raw
 
