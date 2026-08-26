@@ -119,6 +119,11 @@ the framework's own files never hold the key either way.
    it is the only backend, the dreaming passes stop with no error anywhere.
    Choose the persistent path or automate the re-emit; do not leave it to
    memory.
+   ⚠ **Write the file with `printf '%s' '<key>' > <path>`** — no trailing
+   newline needed. Trailing CR/LF are tolerated (stripped on read), but any
+   *other* control character in the file — an embedded `\r`, a stray tab, a
+   NUL — refuses the key at load with one journal line naming the file, and
+   the backend is excluded from the pool rather than failing every request.
 2. **Point the gateway at it** — one line in `shared-memory/.env`:
    `DEEPSEEK_API_KEY_FILE=/absolute/path/to/keyfile` — the pointer is used
    verbatim, so `~` is **not** expanded here even though other path settings
