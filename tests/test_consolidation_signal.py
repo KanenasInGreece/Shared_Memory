@@ -380,6 +380,47 @@ async def test_last_error_is_none_when_no_crash_ever_recorded():
     assert out["insight"]["last_error"] is None
 
 
+def _strip_sql_line_comments(sql: str) -> str:
+    """Drop everything from the first `--` to end-of-line, per line -- a SQL
+    line comment, not a Python one (this text is the SQL string's own
+    content, embedded verbatim in the Python source `inspect.getsource`
+    returns). Needed before scanning for `AS <alias>` output columns: a
+    comment discussing the query in prose can legitimately contain the
+    substring "AS" as part of unrelated SQL syntax (e.g. explaining a
+    `CAST(x AS int)` elsewhere) or plain English, and that must never be
+    read as a real output alias."""
+    return "\n".join(line.split("--", 1)[0] for line in sql.splitlines())
+
+
+def _query_outer_select_aliases(method_src: str) -> set:
+    """Every `AS <alias>` the query's OUTER SELECT actually produces (plus
+    the leading bare `cycle_type` column, never `AS`-aliased), with SQL line
+    comments stripped first (NEW-3, merger final round)."""
+    outer_start = method_src.index('SELECT cycle_type,')
+    outer = method_src[outer_start:method_src.index("FROM ranked GROUP BY cycle_type", outer_start)]
+    aliases = set(re.findall(r"\bAS\s+(\w+)", _strip_sql_line_comments(outer)))
+    aliases.add("cycle_type")
+    return aliases
+
+
+def test_alias_scan_ignores_as_inside_a_sql_comment():
+    """NEW-3 (merger final round) -- proof that stripping `--` comments
+    actually matters: a comment mentioning `CAST(x AS int)` (real SQL syntax
+    that is NOT a query output column) must not leak `int` into the alias
+    set, and a comment that merely SAYS a real alias name in prose (without
+    it being genuinely `AS`-produced there) must not manufacture a phantom
+    entry either -- only the live `AS quantity` actually in code counts."""
+    synthetic = """
+              SELECT cycle_type,
+              -- some rows CAST(x AS int) before comparing -- prose noise
+              count(*) AS quantity
+              -- also mentions AS eligible_clusters in passing, not real code
+              FROM ranked GROUP BY cycle_type
+    """
+    aliases = _query_outer_select_aliases(synthetic)
+    assert aliases == {"cycle_type", "quantity"}
+
+
 def test_query_outer_select_aliases_match_the_fixture_exactly():
     """T6 (merger fix round) -- the whole suite stubs Postgres I/O with a
     fixed-shape fixture row (_no_census_row), so a genuine SQL alias typo or
@@ -391,10 +432,7 @@ def test_query_outer_select_aliases_match_the_fixture_exactly():
     Mutation-checked: deleting the `last_error_at` alias from the query on a
     scratch copy makes this fail (fixture keeps it, query no longer does)."""
     src = inspect.getsource(co.MemoryCoordinator._compute_consolidation_health)
-    outer_start = src.index('SELECT cycle_type,')
-    outer = src[outer_start:src.index("FROM ranked GROUP BY cycle_type", outer_start)]
-    aliases = set(re.findall(r"\bAS\s+(\w+)", outer))
-    aliases.add("cycle_type")
+    aliases = _query_outer_select_aliases(src)
     assert aliases == set(_no_census_row("insight").keys())
 
 

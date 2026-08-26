@@ -29,6 +29,7 @@ import importlib.util
 import logging
 import os
 import sys
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import asyncpg
@@ -173,9 +174,24 @@ async def test_window_exhausted_raises_after_the_expected_attempt_count(monkeypa
     that deletes the giveup check would spin the loop forever -- and since
     create_pool NEVER succeeds here, that is a genuine infinite loop, not
     just a slow one. `_install_fake_clock`'s `max_sleeps` cap turns that
-    failure mode into a fast, deterministic `RuntimeError` (caught by
-    `pytest.raises(ConnectionRefusedError)` failing on the wrong exception
-    type) instead of a hung test process."""
+    failure mode into a fast, deterministic `RuntimeError` instead of a
+    hung test process.
+
+    C2 (merger fix round, applied after this test was first written) wraps
+    each attempt in `asyncio.wait_for(..., timeout=max(0.0, deadline -
+    _monotonic()))`. deadline=4.0, retry=2.0, clock starts at 0 (probe
+    consumes none of it): t=0 real-fast-fail -> sleep(2) -> t=2
+    real-fast-fail -> sleep(2) -> t=4, remaining budget is EXACTLY 0, so
+    `wait_for(factory(), timeout=0.0)` cancels the scheduled call before
+    create_pool's mock body ever runs at all (asyncio's own timeout<=0
+    fast path: it schedules the coroutine as a Task, then immediately
+    cancels it without giving the event loop a turn to start it) --
+    raising `TimeoutError`, not `ConnectionRefusedError`, and leaving
+    create_pool's own `await_count` at 2, not 3. This is deterministic
+    (proven directly against the real asyncio.wait_for implementation, not
+    inferred), and is the CORRECT reading of "deadline is literally true":
+    once the budget is fully spent, a further attempt is not even STARTED,
+    let alone allowed to run to completion."""
     mod = load_coordinator()
     monkeypatch.setattr(mod, "PG_STARTUP_WAIT_S", 4.0)
     monkeypatch.setattr(mod, "PG_STARTUP_RETRY_S", 2.0)
@@ -186,11 +202,9 @@ async def test_window_exhausted_raises_after_the_expected_attempt_count(monkeypa
     _stub_post_pool_start(mod, monkeypatch)
 
     coord = mod.MemoryCoordinator()
-    with pytest.raises(ConnectionRefusedError):
+    with pytest.raises(TimeoutError):  # asyncio.TimeoutError is TimeoutError on 3.11+
         await coord.start()
-    # deadline=4.0, retry=2.0, clock starts at 0 (probe consumes none of it):
-    # t=0 fail->sleep(2), t=2 fail->sleep(2), t=4 fail->now>=deadline->raise.
-    assert create_pool.await_count == 3
+    assert create_pool.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -208,6 +222,47 @@ async def test_non_startup_error_is_not_retried(monkeypatch):
     with pytest.raises(asyncpg.InvalidPasswordError):
         await coord.start()
     assert create_pool.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_single_slow_attempt_is_cut_off_by_the_deadline(monkeypatch):
+    """C2 (Optional, adopted -- merger fix round). Before this, the deadline
+    was only true IN AGGREGATE across many fast failures -- a single attempt
+    that itself hangs (a TCP connect that never completes, not a fast fail)
+    could run right past `deadline` with nothing to stop it. Each attempt is
+    now wrapped in `asyncio.wait_for(factory(), timeout=max(0.0, deadline -
+    _monotonic()))`, so a slow attempt is cut off AT the remaining budget.
+
+    REAL timing here, deliberately NOT the fake clock -- `asyncio.wait_for`'s
+    own cancellation runs against the real event loop's timer, which
+    patching `_monotonic`/`asyncio.sleep` does not intercept. A factory that
+    takes 1.5s per attempt against a 2.0s bound must raise within the bound
+    (plus one scheduler tick) -- not run for two full attempts (3.0s), which
+    is what would happen without the `wait_for` wrap (first attempt
+    completes at 1.5s having failed on its own, a short retry sleep follows,
+    then the SECOND attempt would need another full 1.5s with nothing
+    cutting it off)."""
+    mod = load_coordinator()
+    monkeypatch.setattr(mod, "PG_STARTUP_WAIT_S", 2.0)
+    monkeypatch.setattr(mod, "PG_STARTUP_RETRY_S", 0.1)
+    monkeypatch.setattr(mod.asyncpg, "connect", AsyncMock(return_value=_fake_probe_conn()))
+
+    async def _slow_create_pool(*_a, **_kw):
+        await asyncio.sleep(1.5)
+        raise ConnectionRefusedError("refused")
+
+    create_pool = AsyncMock(side_effect=_slow_create_pool)
+    monkeypatch.setattr(mod.asyncpg, "create_pool", create_pool)
+    _stub_post_pool_start(mod, monkeypatch)
+
+    coord = mod.MemoryCoordinator()
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):  # asyncio.TimeoutError is TimeoutError on 3.11+
+        await coord.start()
+    elapsed = time.monotonic() - started
+    # The 2.0s bound plus one scheduler tick's slack -- well short of the
+    # naive 3.0s (two full 1.5s attempts) a missing wait_for wrap would take.
+    assert elapsed < 2.5
 
 
 @pytest.mark.asyncio
@@ -240,16 +295,29 @@ async def test_probe_transient_failure_retried_then_succeeds(monkeypatch):
 async def test_probe_and_pool_share_one_deadline(monkeypatch):
     """C3/C4 (merger fix round) -- the probe and create_pool must share ONE
     startup-wait deadline, computed once in start(). If the probe alone
-    exhausts the whole window (Postgres never comes up), create_pool must be
-    attempted exactly ONCE, on an already-expired deadline, and its
-    exception must propagate out of start() -- never a fresh, separate
-    budget that would let create_pool go on retrying (and possibly
-    eventually succeed) while hnsw_iterative_scan stays silently,
-    permanently disabled from the probe's own swallowed failure."""
+    exhausts the whole window (Postgres never comes up), create_pool must
+    NEVER get a fresh, separate budget of its own that would let it go on
+    retrying (and possibly eventually succeed) while hnsw_iterative_scan
+    stays silently, permanently disabled from the probe's own swallowed
+    failure -- its exception must propagate out of start() instead.
+
+    C2 (merger fix round, applied after this test was first written)
+    sharpens what "attempted exactly ONCE" even means here: by the time
+    create_pool is reached, the probe's own retries have already spent the
+    ENTIRE shared deadline (both consume the same clock), so create_pool's
+    own `wait_for(factory(), timeout=0.0)` cancels the scheduled call
+    before its mock body ever runs -- `create_pool.await_count` is 0, not
+    1, and the propagated exception is `TimeoutError` (from the immediate
+    cancellation), not `ConnectionRefusedError`. This is a STRONGER
+    demonstration of the shared-deadline invariant than "one attempt then
+    give up": create_pool does not even get that one live attempt."""
     mod = load_coordinator()
     monkeypatch.setattr(mod, "PG_STARTUP_WAIT_S", 4.0)
     monkeypatch.setattr(mod, "PG_STARTUP_RETRY_S", 2.0)
-    _install_fake_clock(mod, monkeypatch)
+    # NEW-1 (merger fix round): max_sleeps caps the fake-sleep count so a
+    # future regression that removes the deadline bound fails fast instead
+    # of hanging the suite (same rationale as the window-exhausted test).
+    _install_fake_clock(mod, monkeypatch, max_sleeps=20)
     # The probe NEVER succeeds -- consumes the entire shared window.
     monkeypatch.setattr(mod.asyncpg, "connect",
                          AsyncMock(side_effect=ConnectionRefusedError("refused")))
@@ -258,12 +326,12 @@ async def test_probe_and_pool_share_one_deadline(monkeypatch):
     _stub_post_pool_start(mod, monkeypatch)
 
     coord = mod.MemoryCoordinator()
-    with pytest.raises(ConnectionRefusedError):
+    with pytest.raises(TimeoutError):  # asyncio.TimeoutError is TimeoutError on 3.11+
         await coord.start()
     # The probe's own try/except Exception swallows its exhausted-window
     # failure ("treat as unknown") -- so start() reaches create_pool with the
-    # SAME deadline already at (or past) its limit: exactly one attempt.
-    assert create_pool.await_count == 1
+    # SAME deadline already fully spent: its own attempt never even starts.
+    assert create_pool.await_count == 0
 
 
 def test_retry_interval_clamped_to_a_floor(monkeypatch):

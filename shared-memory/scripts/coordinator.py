@@ -2484,12 +2484,22 @@ async def _connect_with_startup_wait(factory, deadline: float):
     `asyncpg.exceptions.TooManyConnectionsError`, which means the server IS
     up but has no room right now, not a startup race — is not retried and
     propagates on the first attempt.
+
+    C2 (Optional, adopted, merger fix round): each attempt is itself wrapped
+    in `asyncio.wait_for(..., timeout=max(0.0, deadline - _monotonic()))` so
+    the deadline is LITERALLY true even for a single hanging attempt (a TCP
+    connect that never completes, not merely a fast fail-then-retry) — a
+    slow attempt can no longer run past `deadline` on its own. The resulting
+    `asyncio.TimeoutError` lands in the same `except` clause below (still an
+    `OSError` subclass), so the give-up check fires exactly as it would for
+    any other retryable failure.
     """
     attempt = 0
     while True:
         attempt += 1
         try:
-            return await factory()
+            return await asyncio.wait_for(
+                factory(), timeout=max(0.0, deadline - _monotonic()))
         except (OSError, asyncpg.exceptions.CannotConnectNowError) as exc:
             now = _monotonic()
             if now >= deadline:
