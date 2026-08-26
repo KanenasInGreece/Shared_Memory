@@ -2389,6 +2389,43 @@ class BoundedKeyedLocks:
         return len(self._locks)
 
 
+def render_rem_by_model(rows) -> list[dict]:
+    """Pure row→dict rendering for the REM latency-by-model rollup.
+
+    ``rows`` is a sequence of mapping-like objects (asyncpg Record or dict)
+    carrying: model, n, n_service, max_batch, svc_p50, svc_p95, con_p50,
+    con_p95, wall_p50, wall_p95, backend.
+
+    Keeps the legacy keys (model, n, max_batch_size, service_ms, contention_ms)
+    exactly as before — server-timed rows are unchanged — and adds flat keys
+    so a wall-only row (no llama.cpp ``timings`` block, e.g. an OpenAI-compatible
+    external backend) still renders instead of vanishing from ``by_model``:
+      wall_ms       = caller-observed p50/p95, present for every backend.
+      n_service     = how many of this model's rows carried server timings.
+      backend       = the modal backend string for this model, or None.
+      timing_source = "server" when n_service > 0, else "wall".
+    Never invents a number: a None percentile stays None.
+    """
+    def _r(v):
+        return round(float(v), 1) if v is not None else None
+
+    out = []
+    for r in rows:
+        n_service = int(r["n_service"] or 0)
+        out.append({
+            "model": r["model"],
+            "n": r["n"],
+            "max_batch_size": r["max_batch"],
+            "service_ms":    {"p50": _r(r["svc_p50"]), "p95": _r(r["svc_p95"])},
+            "contention_ms": {"p50": _r(r["con_p50"]), "p95": _r(r["con_p95"])},
+            "wall_ms":       {"p50": _r(r["wall_p50"]), "p95": _r(r["wall_p95"])},
+            "n_service": n_service,
+            "backend": r["backend"],
+            "timing_source": "server" if n_service > 0 else "wall",
+        })
+    return out
+
+
 # ── Coordinator ───────────────────────────────────────────────────────────────
 
 class MemoryCoordinator:
@@ -8085,6 +8122,13 @@ class MemoryCoordinator:
         series is a model-evolution axis (decision 571):
           service_ms   = pure inference = MODEL + HARDWARE, load-invariant.
           contention_ms= queue behind a busy backend = CAPACITY (→ 0 as the pool grows).
+        A row is included whenever it has a wall_ms, not only when it carries the
+        llama.cpp-proprietary ``timings`` block: an OpenAI-compatible external backend
+        (fact:1621) returns no such block, so service_ms/contention_ms are null for it
+        while wall_ms/backend are populated — filtering on service_ms silently dropped
+        every external model from by_model. Rendering is done by the pure
+        ``render_rem_by_model`` so external backends now surface with wall-only timing
+        (timing_source="wall") instead of vanishing.
         The NREM whole-cycle COMPUTE window (consolidation_runs started_at→finished_at)
         is kept ALONGSIDE (decision 568), never fact→summary — that end-to-end is
         density-gate-dominated and survivorship-biased, an erroneous latency (fact 567).
@@ -8094,16 +8138,20 @@ class MemoryCoordinator:
 
         out: dict = {}
         async with self._acquire() as conn:
-            # REM: per-model service/contention percentiles over the durable rows.
+            # REM: per-model service/contention/wall percentiles over the durable rows.
             rem_rows = await conn.fetch(
                 "SELECT rem_timing->>'model' AS model, count(*) AS n,"
+                "  count((rem_timing->>'service_ms')) AS n_service,"
                 "  percentile_cont(0.5)  WITHIN GROUP (ORDER BY (rem_timing->>'service_ms')::float)    AS svc_p50,"
                 "  percentile_cont(0.95) WITHIN GROUP (ORDER BY (rem_timing->>'service_ms')::float)    AS svc_p95,"
                 "  percentile_cont(0.5)  WITHIN GROUP (ORDER BY (rem_timing->>'contention_ms')::float) AS con_p50,"
                 "  percentile_cont(0.95) WITHIN GROUP (ORDER BY (rem_timing->>'contention_ms')::float) AS con_p95,"
-                "  max((rem_timing->>'batch_size')::int) AS max_batch"
+                "  percentile_cont(0.5)  WITHIN GROUP (ORDER BY (rem_timing->>'wall_ms')::float)       AS wall_p50,"
+                "  percentile_cont(0.95) WITHIN GROUP (ORDER BY (rem_timing->>'wall_ms')::float)       AS wall_p95,"
+                "  max((rem_timing->>'batch_size')::int) AS max_batch,"
+                "  mode() WITHIN GROUP (ORDER BY rem_timing->>'backend') AS backend"
                 " FROM technical_docs"
-                " WHERE rem_timing IS NOT NULL AND (rem_timing->>'service_ms') IS NOT NULL"
+                " WHERE rem_timing IS NOT NULL AND (rem_timing->>'wall_ms') IS NOT NULL"
                 " GROUP BY rem_timing->>'model' ORDER BY n DESC"
             )
             # NREM whole-cycle compute window (kept alongside REM, decision 568).
@@ -8121,13 +8169,10 @@ class MemoryCoordinator:
                 "   AND finished_at >= now() - interval '7 days'"
             )
         out["rem_ms"] = {
-            "note": "service_ms = model/hardware (anchor); contention_ms = capacity",
-            "by_model": [
-                {"model": r["model"], "n": r["n"], "max_batch_size": r["max_batch"],
-                 "service_ms":    {"p50": _r(r["svc_p50"]), "p95": _r(r["svc_p95"])},
-                 "contention_ms": {"p50": _r(r["con_p50"]), "p95": _r(r["con_p95"])}}
-                for r in rem_rows
-            ],
+            "note": "service_ms = model/hardware (anchor, server timings only); "
+                    "contention_ms = capacity; wall_ms = caller-observed, present "
+                    "for every backend incl. external",
+            "by_model": render_rem_by_model(rem_rows),
         }
         out["nrem_cycle_seconds"] = (
             {"window_days": 7, "n": cyc["n"], "p50": _r(cyc["p50"]), "p95": _r(cyc["p95"]),

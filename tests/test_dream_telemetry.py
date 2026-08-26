@@ -156,6 +156,40 @@ def test_call_timing_summary_missing_timings_yields_none(monkeypatch):
     assert t["model"] is None
 
 
+def test_call_timing_summary_openai_style_uses_usage_and_wall(monkeypatch):
+    # fact:1621 — an OpenAI-compatible external backend returns no llama.cpp
+    # `timings` block at all, only `usage.completion_tokens`. service_ms and
+    # contention_ms stay honestly None; wall_ms and the new tok_s_wall carry
+    # the signal for this backend instead of the row vanishing.
+    dt = _fresh(monkeypatch)
+    resp = {"model": "ext-model", "usage": {"completion_tokens": 266}}
+    t = dt.call_timing_summary(resp, 2.1, backend="https://api.example.com")
+    assert t["service_ms"] is None
+    assert t["contention_ms"] is None
+    assert t["wall_ms"] == 2100.0
+    assert t["completion_tokens"] == 266
+    assert t["tok_s_wall"] == 126.67
+    assert t["model"] == "ext-model"
+    assert t["backend"] == "https://api.example.com"
+
+
+def test_call_timing_summary_no_usage_yields_none_new_keys(monkeypatch):
+    # No usage block at all, or completion_tokens 0/absent, or wall_s None —
+    # the new keys must degrade to None without raising, never divide by zero.
+    dt = _fresh(monkeypatch)
+    t1 = dt.call_timing_summary({"model": "m"}, None)
+    assert t1["completion_tokens"] is None
+    assert t1["tok_s_wall"] is None
+
+    t2 = dt.call_timing_summary({"usage": {"completion_tokens": 0}}, 5.0)
+    assert t2["completion_tokens"] == 0
+    assert t2["tok_s_wall"] is None
+
+    t3 = dt.call_timing_summary({"usage": {"completion_tokens": 10}}, None)
+    assert t3["completion_tokens"] == 10
+    assert t3["tok_s_wall"] is None
+
+
 def test_writes_jsonl_when_path_set(monkeypatch, tmp_path):
     metrics = tmp_path / "dream-metrics.jsonl"
     dt = _fresh(monkeypatch, str(metrics))

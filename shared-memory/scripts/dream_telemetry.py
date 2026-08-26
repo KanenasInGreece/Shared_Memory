@@ -260,7 +260,12 @@ def call_timing_summary(
                       folded into service_ms (fact 569).
     model tags the model-evolution axis; batch_size/prompt_chars carry the workload context that
     makes cross-model service_ms comparable. All best-effort — any missing input yields None, and
-    the caller persists whatever is present. Never raises."""
+    the caller persists whatever is present. Never raises.
+
+    completion_tokens/tok_s_wall (fact:1621) are the OpenAI-compatible fallback for backends that
+    return no ``timings`` block at all (external, non-llama.cpp providers): tok_s_wall is an
+    EFFECTIVE rate — completion_tokens / wall_s — so it includes TTFT and network time, unlike
+    service_ms's pure-inference rate. It is present precisely where the server gives no timings."""
     t = (resp_json or {}).get("timings") or {}
     pm, dm = t.get("prompt_ms"), t.get("predicted_ms")
     service_ms = (round(pm + dm, 1)
@@ -268,6 +273,12 @@ def call_timing_summary(
     wall_ms = round(wall_s * 1000.0, 1) if wall_s is not None else None
     contention_ms = (round(max(0.0, wall_ms - service_ms), 1)
                      if wall_ms is not None and service_ms is not None else None)
+    usage = (resp_json or {}).get("usage") or {}
+    ct = usage.get("completion_tokens")
+    completion_tokens = ct if isinstance(ct, int) else None
+    tok_s_wall = (round(completion_tokens / wall_s, 2)
+                  if isinstance(completion_tokens, int) and completion_tokens > 0
+                  and isinstance(wall_s, (int, float)) and wall_s > 0 else None)
     return {
         "service_ms": service_ms,
         "wall_ms": wall_ms,
@@ -277,6 +288,8 @@ def call_timing_summary(
         "backend": backend,
         "batch_size": batch_size,
         "prompt_chars": prompt_chars,
+        "completion_tokens": completion_tokens,
+        "tok_s_wall": tok_s_wall,
         "ts": round(time.time(), 3),
     }
 
