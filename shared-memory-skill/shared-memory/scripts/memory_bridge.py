@@ -660,7 +660,6 @@ def _gateway_message(r) -> str | None:
     return None
 
 
-
 def _reply_json(r, *, log_auth: bool = False) -> dict:
     """Decode a gateway response ONLY after branching on its status class.
 
