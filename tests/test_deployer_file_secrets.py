@@ -27,7 +27,8 @@ Also covers:
   - ALL trailing CR/LF stripped (v0.9.63 — the run is a file-write artefact),
     never a full .strip()/.rstrip(): spaces stay. Any OTHER control character
     surviving that normalisation refuses the secret at LOAD, with a warning
-    naming the pointer, the path, the byte and its offset — never the value.
+    naming the pointer, the path, the byte and its CHARACTER offset —
+    never the value and never its length.
 """
 import importlib
 import os
@@ -458,7 +459,8 @@ def test_control_character_refuses_the_secret_and_names_the_file(
     monkeypatch, tmp_path, capsys, raw, expect_hex, expect_offset
 ):
     """Refuse ONCE at load, with a line an operator can act on: the pointer,
-    the path, the byte, its offset, and the fix. Never the secret itself."""
+    the path, the byte, its offset, and the fix. Never the secret itself,
+    and never the secret's LENGTH."""
     secret_file, value = _resolve_via_file(monkeypatch, tmp_path, raw)
 
     assert value is None
@@ -466,11 +468,24 @@ def test_control_character_refuses_the_secret_and_names_the_file(
     assert "PG_PASSWORD_FILE" in err          # names the pointer/source
     assert str(secret_file) in err            # names the FILE
     assert expect_hex in err                  # names the offending byte
-    assert f"offset {expect_offset}" in err   # ...and where it is
+    # The offset is an index into the DECODED string, not into the file's
+    # bytes — the two diverge on any multi-byte UTF-8 — so it must be
+    # labelled as a character offset, not left to read as a file position.
+    assert f"character offset {expect_offset}" in err
     assert "printf '%s'" in err               # ...and the recipe
     # No secret content, ever — not the whole value, not any fragment of it.
     assert "sk-test" not in err
     assert "sk-" not in err
+    # And no LENGTH either: this file is under the cap, so its size is the
+    # key's own length give or take the write artefact — a reconstruction
+    # aid the message does not need in order to be actionable. (The
+    # over-cap warning still prints a size; there the size IS the
+    # complaint. Pinned as the exact phrasing that would reintroduce it.)
+    assert "-byte file" not in err
+    # Pinned as a contiguous span, so a size (or anything else) reinserted
+    # between the offset and the refusal clause breaks this test.
+    assert (f"{expect_hex} at character offset {expect_offset} "
+            f"— refusing to use it") in err
 
 
 def test_control_character_refusal_falls_through_to_the_next_source(

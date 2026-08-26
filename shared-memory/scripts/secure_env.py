@@ -321,7 +321,8 @@ def _read_secret_file(path: Path, *, source: str) -> "str | None":
     (`ord(ch) < 0x20` or DEL `\\x7f` — an EMBEDDED CR/LF, TAB, NUL, ESC)
     is NOT an artefact of writing the file: it is a corrupt secret. The
     read refuses it, returns None, and WARNS with the source, the path,
-    the offending byte as `\\xNN` and its offset, plus the `printf` recipe
+    the offending byte as `\\xNN` and its CHARACTER offset (never the
+    value's length), plus the `printf` recipe
     — never the secret's content. Measured cause (2026-08-26): a 37-byte
     file holding a 35-char key put one surviving control character into
     the `Authorization` header, and aiohttp rejected EVERY upstream
@@ -411,12 +412,18 @@ def _read_secret_file(path: Path, *, source: str) -> "str | None":
     bad = _first_control_character(raw)
     if bad is not None:
         offset, ch = bad
-        # NEVER the secret's content, and no length beyond the byte count the
-        # over-cap warnings above already print: the position and the byte are
-        # what let an operator fix the file, and neither reconstructs the key.
+        # NEVER the secret's content, and NEVER its length either: this file
+        # is under the cap, so its size is the key's own length give or take
+        # the artefact — a reconstruction aid an operator does not need to
+        # fix the file. (The over-cap warnings above DO print a size, but
+        # that is a different case: there the size IS the complaint, and the
+        # secret was refused before any of it was used.) `offset` is a
+        # CHARACTER index into the decoded string, not a byte offset — they
+        # differ the moment the file holds any multi-byte UTF-8 — so it is
+        # labelled as one rather than left to read as a file position.
         print(f"[secure_env] WARNING: {source} ({path}) contains a control "
-              f"character \\x{ord(ch):02x} at offset {offset} of the "
-              f"{len(raw_bytes)}-byte file — refusing to use it, treating as "
+              f"character \\x{ord(ch):02x} at character offset {offset} "
+              f"— refusing to use it, treating as "
               f"unset. A secret read from a file must not contain control "
               f"characters (they cannot appear in an HTTP header value). "
               f"Rewrite the file with: printf '%s' '<key>' > {path}",

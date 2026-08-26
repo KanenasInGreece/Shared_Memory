@@ -173,11 +173,19 @@ def test_backend_whose_keyfile_holds_a_control_character_is_excluded(
 
     assert g.LLM_BACKENDS == ["http://local:5000"]
     assert "https://api.deepseek.com/v1" not in g.LLM_BACKENDS
-    # The pool log names the backend that was excluded and why.
-    assert any("api.deepseek.com" in r.getMessage()
-               and "DEEPSEEK_API_KEY" in r.getMessage()
-               and "excluding this backend" in r.getMessage()
-               for r in caplog.records)
+    # The pool log names the backend that was excluded and why. The wording
+    # must cover THIS cause too: the variable is not "not set" here — the key
+    # file exists and was read, and secure_env refused what was in it. An
+    # operator told only "not set" goes looking for a missing export instead
+    # of at the [secure_env] line that names the file they must rewrite.
+    _excl = [r.getMessage() for r in caplog.records
+             if "api.deepseek.com" in r.getMessage()
+             and "DEEPSEEK_API_KEY" in r.getMessage()
+             and "excluding this backend" in r.getMessage()]
+    assert _excl
+    assert any("refused by secure_env" in m for m in _excl)
+    assert not any("is not set in the gateway's own environment" in m
+                   for m in _excl)
     # The reader's own line named the FILE — the thing the operator must fix.
     err = capsys.readouterr().err
     assert str(keyfile) in err
