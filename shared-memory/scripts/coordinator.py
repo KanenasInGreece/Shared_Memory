@@ -1832,7 +1832,10 @@ POOL_ACQUIRE_TIMEOUT = _env_float("POOL_ACQUIRE_TIMEOUT", 5.0)
 # systemd's Restart= stays the real backstop instead of masking a boot-order
 # problem as a crash loop.
 PG_STARTUP_WAIT_S  = _env_float("PG_STARTUP_WAIT_S", 60.0)
-PG_STARTUP_RETRY_S = _env_float("PG_STARTUP_RETRY_S", 2.0)
+# Clamped to a 0.1s floor: an operator-set 0 or negative value must not spin
+# the retry loop with no pacing at all (a busy-loop against a down DB) — see
+# _connect_with_startup_wait, which sleeps min(PG_STARTUP_RETRY_S, remaining).
+PG_STARTUP_RETRY_S = max(0.1, _env_float("PG_STARTUP_RETRY_S", 2.0))
 
 # The pgvector floor for `hnsw.iterative_scan` (decision:1584, fact:1583).
 # Below it a selective axis filter (--project/--domain) can return ZERO rows
@@ -2448,40 +2451,57 @@ def render_rem_by_model(rows) -> list[dict]:
     return out
 
 
-async def _connect_with_startup_wait(factory):
-    """Call `factory()` (a zero-arg async callable), retrying while Postgres
-    is still starting up (fact:1609).
+# Module attribute (not a bare `time.monotonic` call inline) so a test can
+# monkeypatch `coordinator._monotonic` directly instead of faking elapsed
+# time by counting mocked sleeps.
+_monotonic = time.monotonic
 
-    Retries ONLY on `OSError` (covers `ConnectionRefusedError` etc — the TCP
-    connect itself failed) or `asyncpg.exceptions.CannotConnectNowError`
-    ("the database system is starting up"). Any other exception — including
+
+async def _connect_with_startup_wait(factory, deadline: float):
+    """Call `factory()` (a zero-arg async callable), retrying while Postgres
+    is still starting up (fact:1609), bounded by a WALL-CLOCK `deadline` —
+    an absolute `_monotonic()` reading, not an accumulated-sleep count.
+
+    `deadline` is a parameter, not read from a module constant here, so that
+    `start()` can compute it ONCE and pass the SAME value to both call sites
+    (C3/C4, merger fix round): a Postgres that never comes up must not let
+    the pgvector probe spend the whole `PG_STARTUP_WAIT_S` budget and then
+    hand `create_pool` a fresh, separate budget of its own — that would leave
+    `hnsw_iterative_scan` silently, permanently disabled (the probe "gave up"
+    into its own except-Exception fallback) while the pool goes on to retry
+    for another full window and succeed. With one shared deadline, if the
+    probe alone exhausts it, `create_pool`'s first attempt already sees an
+    expired deadline and — if Postgres is genuinely still down — raises
+    immediately with no further retry, propagating out of `start()` instead
+    of leaving a permanently-degraded process running.
+
+    Retries ONLY on `OSError` (covers `ConnectionRefusedError`, and — since
+    `TimeoutError`/`asyncio.TimeoutError` has been an `OSError` subclass
+    since Python 3.11 — a connect that times out, which IS "not ready", and
+    is now safely bounded by wall clock rather than an open-ended retry) or
+    `asyncpg.exceptions.CannotConnectNowError` ("the database system is
+    starting up"). Any other exception — including
     `asyncpg.exceptions.TooManyConnectionsError`, which means the server IS
     up but has no room right now, not a startup race — is not retried and
     propagates on the first attempt.
-
-    Elapsed time is tracked as accumulated retry sleeps rather than a wall
-    clock read, so the bound is exact whether `asyncio.sleep` is the real
-    one or a test double that returns instantly.
     """
     attempt = 0
-    elapsed = 0.0
     while True:
         attempt += 1
         try:
             return await factory()
         except (OSError, asyncpg.exceptions.CannotConnectNowError) as exc:
-            if elapsed >= PG_STARTUP_WAIT_S:
+            now = _monotonic()
+            if now >= deadline:
                 log.warning(
-                    "Postgres still not accepting connections after %.1fs "
-                    "elapsed (%d attempts) — giving up: %s",
-                    elapsed, attempt, exc)
+                    "Postgres still not accepting connections after %d "
+                    "attempt(s) — giving up: %s", attempt, exc)
                 raise
+            sleep_s = min(PG_STARTUP_RETRY_S, deadline - now)
             log.warning(
-                "Postgres not ready yet (attempt %d, %.1fs elapsed) — "
-                "retrying in %.1fs: %s",
-                attempt, elapsed, PG_STARTUP_RETRY_S, exc)
-            await asyncio.sleep(PG_STARTUP_RETRY_S)
-            elapsed += PG_STARTUP_RETRY_S
+                "Postgres not ready yet (attempt %d) — retrying in %.1fs: %s",
+                attempt, sleep_s, exc)
+            await asyncio.sleep(sleep_s)
 
 
 # ── Coordinator ───────────────────────────────────────────────────────────────
@@ -2586,8 +2606,16 @@ class MemoryCoordinator:
         # POOL_MIN connections permanently without the SET below — they are
         # created and initialised during create_pool() itself, before any
         # query against them could have told us whether to apply it.
+        #
+        # ONE shared startup-wait deadline for BOTH the probe below and
+        # create_pool further down (C3/C4, merger fix round) — see
+        # _connect_with_startup_wait's docstring for why a separate budget
+        # per call site would leave hnsw_iterative_scan silently disabled
+        # forever instead of ever crashing start() when Postgres never comes up.
+        _pg_startup_deadline = _monotonic() + PG_STARTUP_WAIT_S
         try:
-            _probe = await _connect_with_startup_wait(lambda: asyncpg.connect(PG_DSN))
+            _probe = await _connect_with_startup_wait(
+                lambda: asyncpg.connect(PG_DSN), _pg_startup_deadline)
             try:
                 _raw_version = await _probe.fetchval(
                     "SELECT extversion FROM pg_extension WHERE extname='vector'"
@@ -2616,7 +2644,7 @@ class MemoryCoordinator:
         self._pool = await _connect_with_startup_wait(lambda: asyncpg.create_pool(
             PG_DSN, min_size=POOL_MIN, max_size=POOL_MAX,
             init=self._init_connection,
-        ))
+        ), _pg_startup_deadline)
         async with self._acquire() as conn:
             result = await conn.execute(
                 "UPDATE neo4j_outbox SET status='pending' WHERE status='in_progress'"
@@ -8271,6 +8299,19 @@ class MemoryCoordinator:
               max(last_success) AS last_success,
               (array_agg(outcome ORDER BY started_at DESC))[1] AS last_outcome,
               EXTRACT(EPOCH FROM now() - max(last_success))::int AS last_success_age,
+              -- C1 fix (merger ruling, fix round on fact:1609/1621): NOT the
+              -- same thing as last_success above. last_success is FILTERed on
+              -- `folds_succeeded > 0`, which a CRASHED run can also satisfy —
+              -- consolidation_loop writes a crashed row with rec.succeeded
+              -- already > 0 when the daemon folded at least one cluster before
+              -- dying. So `last_success` can be NEWER than a crash that is
+              -- itself the very row inflating it, and comparing last_error_at
+              -- against last_success would then call that crash "superseded"
+              -- seconds after it happened. last_completed_at is FILTERed on
+              -- `outcome = 'completed'` instead — a run that actually finished
+              -- clean — and is the only thing `superseded` below may compare
+              -- against.
+              max(finished_at) FILTER (WHERE outcome = 'completed') AS last_completed_at,
               -- Per-type timing + throughput (decision: price each cycle type
               -- separately). The whole-cycle timer is skewed by slot contention
               -- and cannot honestly price either daemon's slot cost, so average
@@ -8322,10 +8363,22 @@ class MemoryCoordinator:
               -- by hundreds of later successes, used to read identically to a
               -- CURRENT one (both surfaced as bare "err <class>"). Paired to
               -- the SAME row as last_error_class/last_error_msg above (same
-              -- FILTER predicate), so `superseded` below compares apples to
-              -- apples against `last_success`.
+              -- FILTER predicate). `superseded` below compares this against
+              -- last_completed_at, NEVER last_success — last_success is not
+              -- apples-to-apples here (see the C1 comment on last_completed_at
+              -- above: a crashed run can itself be what last_success reads as
+              -- newest, which would make a crash read as its own supersession).
               (array_agg(started_at ORDER BY started_at DESC)
                   FILTER (WHERE outcome = 'crashed'))[1] AS last_error_at,
+              -- O9 — age computed in SQL, the same way last_success_age is
+              -- above, rather than a Python `now() - last_error_at` subtraction
+              -- (which duplicated a clock read the DB had already taken and
+              -- risked client/server clock drift). Necessarily repeats the
+              -- array_agg/FILTER expression above rather than referencing
+              -- last_error_at by name — the SELECT list cannot reference its
+              -- own other output columns.
+              EXTRACT(EPOCH FROM now() - (array_agg(started_at ORDER BY started_at DESC)
+                  FILTER (WHERE outcome = 'crashed'))[1])::int AS last_error_age,
               (array_agg(eligible_clusters ORDER BY started_at DESC)
                   FILTER (WHERE eligible_clusters IS NOT NULL))[1] AS eligible_clusters,
               -- R1 fix: paired to the SAME row as eligible_clusters above —
@@ -8406,7 +8459,18 @@ class MemoryCoordinator:
             err = None
             if r and r["last_error_class"]:
                 last_error_at = r["last_error_at"]
-                last_success = r["last_success"]
+                # C1 fix (merger ruling): compare against last_completed_at,
+                # NEVER last_success. last_success is FILTERed on
+                # `folds_succeeded > 0`, which a run that itself CRASHED after
+                # folding at least one cluster also satisfies (consolidation_
+                # loop writes a crashed row with rec.succeeded already > 0) —
+                # so last_success can be exactly this crash's own finished_at,
+                # and comparing against it would call a seconds-old crash
+                # "superseded" by itself. last_completed_at is FILTERed on
+                # `outcome = 'completed'` — a run that actually finished
+                # clean — the only apples-to-apples comparison for
+                # "did a real success land after this crash".
+                last_completed_at = r["last_completed_at"]
                 # superseded: a real success has landed AFTER this crash — the
                 # crash is history, not a current condition. NOT the same test
                 # as `stalled` above (that gates on age vs threshold + backlog;
@@ -8415,11 +8479,13 @@ class MemoryCoordinator:
                 # already 0 in exactly this case) — this is about how the ONE
                 # most-recent crash, however old, should ever be *displayed*.
                 superseded = bool(
-                    last_success is not None and last_error_at is not None
-                    and last_success > last_error_at)
+                    last_completed_at is not None and last_error_at is not None
+                    and last_completed_at > last_error_at)
+                # O9: age computed in SQL (EXTRACT(EPOCH ...) against the same
+                # DB clock last_success_age already uses), not a second,
+                # Python-side `now() - last_error_at` subtraction.
                 age_seconds = (
-                    int((datetime.now(timezone.utc) - last_error_at).total_seconds())
-                    if last_error_at is not None else None)
+                    int(r["last_error_age"]) if r["last_error_age"] is not None else None)
                 err = {"class": r["last_error_class"], "msg": r["last_error_msg"],
                        "age_seconds": age_seconds, "superseded": superseded}
             out[ct] = {

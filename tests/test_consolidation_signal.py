@@ -82,7 +82,12 @@ def _no_census_row(cycle_type):
         "runs_24h": 0, "deferred_24h": 0, "idle_24h": 0,
         "folds_succeeded_24h": 0, "folds_attempted_24h": 0,
         "inflight": 0, "consec_fail": 0, "last_error_class": None,
-        "last_error_msg": None, "last_error_at": None, "eligible_clusters": None,
+        "last_error_msg": None, "last_error_at": None, "last_error_age": None,
+        # C1 (merger fix round) — the apples-to-apples comparator for
+        # `superseded`, distinct from `last_success` above (which a crashed-
+        # but-partially-folded run can also satisfy).
+        "last_completed_at": None,
+        "eligible_clusters": None,
         "eligible_oldest_age": None, "last_deferred_reason": None,
         # D1 (fact:1189) — dead_lettered_clusters, like eligible_clusters,
         # is NULL when no census has ever recorded it.
@@ -298,44 +303,99 @@ async def _run_health_with_row(row):
 @pytest.mark.asyncio
 async def test_last_error_superseded_false_when_crash_is_the_latest_event():
     """No success has landed since the crash (or none ever has) — the crash
-    is current, `superseded` must read False, and age_seconds must be
-    computed from `last_error_at`."""
+    is current, `superseded` must read False. age_seconds is SQL-computed
+    (O9, merger fix round) — the row supplies `last_error_age` directly,
+    exactly as the live query would."""
     now = datetime.now(timezone.utc)
     crash_at = now - timedelta(seconds=45)
     row = dict(_no_census_row("insight"), last_error_class="OrphanedRun",
                last_error_msg="reaped on restart", last_error_at=crash_at,
-               last_success=None)
+               last_error_age=45, last_completed_at=None)
     out = await _run_health_with_row(row)
     err = out["insight"]["last_error"]
     assert err["class"] == "OrphanedRun"
     assert err["superseded"] is False
-    assert 44 <= err["age_seconds"] <= 46
+    assert err["age_seconds"] == 45
 
 
 @pytest.mark.asyncio
 async def test_last_error_superseded_true_when_a_success_landed_after_it():
-    """A completed run landed AFTER the crash — the crash is history.
-    `superseded` must read True; age_seconds still reports how old the crash
-    itself is (not how old the success is)."""
+    """A run with outcome='completed' landed AFTER the crash — the crash is
+    history. `superseded` must read True; age_seconds reports the crash's
+    own SQL-computed age (last_error_age), untouched by success_at."""
     now = datetime.now(timezone.utc)
     crash_at = now - timedelta(days=23)
-    success_at = now - timedelta(days=1)
+    completed_at = now - timedelta(days=1)
     row = dict(_no_census_row("insight"), last_error_class="OrphanedRun",
                last_error_msg="reaped on restart", last_error_at=crash_at,
-               last_success=success_at)
+               last_error_age=23 * 86400, last_completed_at=completed_at)
     out = await _run_health_with_row(row)
     err = out["insight"]["last_error"]
     assert err["superseded"] is True
-    expected_age = int((now - crash_at).total_seconds())
-    assert abs(err["age_seconds"] - expected_age) <= 1
+    assert err["age_seconds"] == 23 * 86400
+
+
+@pytest.mark.asyncio
+async def test_last_error_not_superseded_by_a_crash_that_itself_folded():
+    """C1 (Critical, merger fix round) — the defect this guards: `last_success`
+    is FILTERed on `folds_succeeded > 0`, which a run that CRASHED after
+    folding at least one cluster ALSO satisfies (consolidation_loop writes a
+    crashed row with rec.succeeded already > 0). So a crash seconds old can
+    itself be the very row `last_success` reads as newest -- comparing
+    `last_error_at` against `last_success` would then call that crash
+    "superseded" by ITSELF, seconds after it happened.
+
+    Scenario: `last_success` is NEWER than `last_error_at` (the broken
+    comparator's condition for `superseded=True`), but `last_completed_at`
+    (an actual outcome='completed' row) is OLDER than the crash. The FIXED
+    comparator must read `superseded=False` here -- only `last_completed_at`
+    may ever answer "did a real success land after this crash".
+
+    Mutation check: reverting `last_completed_at` back to `last_success` in
+    the `superseded` comparison makes this test fail (it would then read
+    True, since last_success > last_error_at in this row)."""
+    now = datetime.now(timezone.utc)
+    crash_at = now - timedelta(seconds=10)
+    # The crash's OWN finished_at -- inflates last_success (folds_succeeded>0
+    # on the crashed row itself), landing a few seconds AFTER the crash's
+    # started_at used for last_error_at above.
+    row = dict(_no_census_row("insight"), last_error_class="OrphanedRun",
+               last_error_msg="died after one fold", last_error_at=crash_at,
+               last_error_age=10,
+               last_success=crash_at + timedelta(seconds=5),
+               # The last run that genuinely finished clean was an HOUR ago --
+               # strictly BEFORE the crash, not after it.
+               last_completed_at=now - timedelta(hours=1))
+    out = await _run_health_with_row(row)
+    err = out["insight"]["last_error"]
+    assert err["superseded"] is False
 
 
 @pytest.mark.asyncio
 async def test_last_error_is_none_when_no_crash_ever_recorded():
     row = dict(_no_census_row("insight"), last_error_class=None,
-               last_error_msg=None, last_error_at=None, last_success=None)
+               last_error_msg=None, last_error_at=None, last_error_age=None,
+               last_success=None, last_completed_at=None)
     out = await _run_health_with_row(row)
     assert out["insight"]["last_error"] is None
+
+
+def test_query_outer_select_aliases_match_the_fixture_exactly():
+    """T6 (merger fix round) -- the whole suite stubs Postgres I/O with a
+    fixed-shape fixture row (_no_census_row), so a genuine SQL alias typo or
+    a dropped column currently stays green here and would only surface as a
+    live KeyError in production. Parse every `AS <alias>` the query's OUTER
+    SELECT actually produces (plus the leading bare `cycle_type` column,
+    never `AS`-aliased) and assert it matches the fixture's key set exactly.
+
+    Mutation-checked: deleting the `last_error_at` alias from the query on a
+    scratch copy makes this fail (fixture keeps it, query no longer does)."""
+    src = inspect.getsource(co.MemoryCoordinator._compute_consolidation_health)
+    outer_start = src.index('SELECT cycle_type,')
+    outer = src[outer_start:src.index("FROM ranked GROUP BY cycle_type", outer_start)]
+    aliases = set(re.findall(r"\bAS\s+(\w+)", outer))
+    aliases.add("cycle_type")
+    assert aliases == set(_no_census_row("insight").keys())
 
 
 @pytest.mark.asyncio
