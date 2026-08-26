@@ -5,7 +5,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [0.9.64] — 2026-08-27
+## [0.9.64] — 2026-08-26
 
 ### Fixed — the GPU probe reaps the `nvtop` it spawns, and stops spawning after repeated hangs
 
