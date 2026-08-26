@@ -202,11 +202,16 @@ two of them. And vLLM wants **Hugging Face weights, not GGUF** — `BAAI/bge-m3`
 `BAAI/bge-reranker-v2-m3` (2.2 GB), the same models as the defaults in a different format and
 precision. Start both with `--runner pooling`: these are encoders, not generative models.
 
-⚠ **Moving the *embedder* to a different engine mixes vector populations.** vLLM's vectors are not
-bit-identical to llama.cpp's — on identical text the two agreed to a cosine of 0.9982 at the longest
-inputs, which cost one position swap in 760 pairs in a ranking test over real records. Small, but
-records written after the switch sit slightly apart from records written before it, and only a full
-re-embed puts that back. Moving **only the reranker** has no such cost: a reranker stores nothing.
+⚠ **Moving the *embedder* to a different engine mixes vector populations.** An embedding population
+is fixed by the weights *and* their precision *and* the engine *and* the device: change any one and
+the vectors move by roughly a thousandth in cosine. Measured against a CPU F16 reference on the same
+`bge-m3` weights, vLLM FP16 sat at 0.99995 on the longest inputs while llama.cpp's Vulkan path sat at
+0.9990 with F16 weights and 0.9986 with the Q8 GGUF — so the engine swap is not "drift away from the
+truth"; the llama.cpp population is the one further from it. What matters operationally is that
+records written after the switch sit slightly apart from records written before it (old-versus-new
+cosine 0.9984 at the longest inputs, five position swaps in 760 pairs over real records, top-5
+unchanged), and only a full re-embed puts that back — on the new engine, that re-embed is a fidelity
+upgrade. Moving **only the reranker** has no such cost: a reranker stores nothing.
 
 #### A measured example of that — Intel Arc B580
 
