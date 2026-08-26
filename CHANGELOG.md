@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.63] — 2026-08-26
+
+### Fixed — a provider key file with a stray CR/LF is refused at load with a message that names the file
+
+The `_FILE` / `$CREDENTIALS_DIRECTORY` secret reader stripped exactly one trailing newline. A key
+file written by an editor, `echo`, `pass show >` or a Windows paste can end in `\r\n` or two
+newlines, and the surviving control character went into the `Authorization` header — where
+aiohttp rejected every upstream request as a header-injection attempt. The backend had passed
+startup, so neither `/health` nor the journal named the key file; REM just logged `FAIL(http_500)`
+on every call. The reader now strips all trailing CR/LF (and only those — spaces inside a secret
+are still preserved), refuses any other control character at load with one warning that gives the
+pointer, the path, the byte and its offset and the `printf '%s'` recipe, and excludes that backend
+exactly as an unresolved `token_env` does. The walkthrough and `.env.example` now show how to write
+the file.
+
 ## [0.9.62] — 2026-08-26
 
 ### Fixed — a search served while the embedder is down now says so, on both front doors
