@@ -5,6 +5,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.65] — 2026-08-26
+
+### Changed — only consecutive `nvtop` timeouts count toward the probe's self-disable
+
+0.9.64 described the self-disable as firing after N "snapshot timeouts with no successful snapshot in
+between": a cycle that failed for any other reason — unparseable output, a missing-binary race —
+neither reset nor advanced the streak, so alternating timeouts and garbage could disable the probe
+while the warning called them consecutive. Ruling: a non-timeout failure is not evidence of a
+persistent hang. Any cycle that ends in anything other than a snapshot timeout now resets the count,
+the warning, the knob comments and `.env.example` say exactly that, and a debug line records each
+reset so a streak that never advances can be explained from the log. `gpu_probe.consecutive_hangs`
+on `/health` keeps its shape and now means "timeouts since the last non-timeout cycle". One
+consequence is stated rather than hidden: the cap bounds consecutive timeouts only, so a host that
+alternates a hang with a fast garbage exit is no longer bounded in leaked children by it — a
+separate ceiling on `leaked_children` would be the trigger that restores that bound, and is left as
+an open item.
+
 ## [0.9.64] — 2026-08-26
 
 ### Fixed — the GPU probe reaps the `nvtop` it spawns, and stops spawning after repeated hangs
