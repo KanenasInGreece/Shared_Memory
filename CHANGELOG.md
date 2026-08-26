@@ -5,6 +5,39 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.62] — 2026-08-26
+
+### Fixed — a search served while the embedder is down now says so, on both front doors
+
+When the embedding service is unavailable the gateway does not fail a search: it serves a keyword
+(substring) fallback and marks the reply `"fallback": "keyword"`. Both clients stripped that
+envelope and handed the caller only the results list — and since a natural-language query almost
+never substring-matches, what the operator saw during an embedder outage or the post-boot window
+was an empty `[]` reading as "nothing known" (`fact:1609`: search read as dead for ~10 minutes after
+a reboot). The CLI now prints one `EMBEDDING UNAVAILABLE — keyword (substring) fallback served N
+result(s), unranked …` line on stderr and the MCP tool prefixes the same sentence as a `NOTE:`,
+including when the list is empty. The stdout JSON contract is unchanged, the search still makes one
+HTTP call, and a parity test holds the two clients' sentence identical. `SKILL.md` documents it.
+
+### Changed — the REM double-truncation error stops advising the bound bump that was measured and rejected
+
+When a solo enrichment truncated twice, the ERROR line ended "Raise `REM_MAX_TOKENS_SOLO` if this
+record is legitimately large". A live case showed the record then completing on its next pick-up in
+869 tokens — both truncations were repetition loops, which a larger budget only feeds
+(`decision:1330`, `fact:1637`). The line now explains that the unit is retried on a later pick-up,
+how to read a later completion well under the bound, and when raising the bound is actually
+warranted. Wording only; no control-flow or telemetry change.
+
+### Fixed — running the test suite no longer installs the checkout's skill into your agents
+
+Three tests in `tests/test_skill_delivery.py` drove the real `sync_skills.sh` through the
+`AGENT_INSTALLS` registry without sandboxing `HOME`. Because the script deliberately unions the
+registry with every historical default install present on disk, those tests copied the tracked
+skill into `~/.claude`, `~/.codex`, `~/.gemini` and `~/.grok` of whoever ran `pytest` — from
+whatever branch was checked out, invisibly to `doctor` (`fact:1640`). The helper now runs under a
+temporary `HOME`, and a regression test with a sentinel default install proves the suite can no
+longer reach the real one.
+
 ## [0.9.61] — 2026-08-26
 
 ### Fixed — the gateway waits for Postgres at boot instead of crashing
