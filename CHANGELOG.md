@@ -5,6 +5,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.66] — 2026-08-26
+
+### Changed — the enrichment pass writes no graph edges and no labels; it summarises
+
+Project, domain and entity are the human axes of the graph: the person saving a record names them,
+and nothing has authority to add to, refuse or re-propose them afterwards. REM had lost the right to
+create entities in 0.8.27 but kept asking the model for entity names, relationship types, sub-types
+and — for a decision — considered and rejected alternatives, then threw most of it away at gates
+while still writing the occasional attribution or `MENTIONS` edge and every sub-label the model
+assigned. That machinery is removed, not fenced: the prompt asks for one thing, the summary; the
+write sets `rem_summary` and the processed marks and nothing else; the verification round-trip, the
+closed entity set, the capture manifest, the edge planner, the label tables and their knobs
+(`ENTITY_REGISTRY_LIMIT`, `ENTITY_PROMPT_K`, `ENTITY_SET_LIMIT`, `GROUNDING_EMBED_CAP`) are gone
+along with the tests that exercised them. A record too short to summarise now costs no model call at
+all and is still marked processed; an empty answer is treated as an answer rather than a parse
+failure. Degeneration detection and the retry ladder are unchanged. Edges the pass wrote in earlier
+releases are left in the graph for a separate, recorded operation. The evidence sweep for typed
+entity-to-entity relations is a different mechanism and is untouched here. `SKILL.md`, the schema
+document and the server-setup guide now describe entities as named once, when a record is saved.
+
 ## [0.9.65] — 2026-08-26
 
 ### Changed — only consecutive `nvtop` timeouts count toward the probe's self-disable
