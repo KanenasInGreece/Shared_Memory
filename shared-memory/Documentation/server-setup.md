@@ -98,7 +98,7 @@ All live in `shared-memory/scripts/` and run on the gateway host only.
 | `hive_mind_proxy.py` | The gateway. aiohttp server on `:8888`; routes memory ops to the coordinator and embeds/reranks to `:8070`/`:8071`. Spawns and watchdogs the daemons. |
 | `coordinator.py` | Owns all Postgres + Neo4j I/O — per-entity locks, outbox worker, auth middleware. Embedded in the gateway. |
 | `rem_loop.py` | REM daemon — idle summarisation: an LLM summary for a long record; writes no edges and no labels. |
-| `consolidation_loop.py` | NREM daemon — synthesises Tier‑3 community summaries once 5+ enriched facts share an entity hub. |
+| `consolidation_loop.py` | NREM daemon — synthesises Tier‑3 community summaries: grounded facts fold on the **(project, domain)** spine at density ≥ 3 (fact 1215), never on an entity hub. |
 | `gpu_load.py` | GPU‑busy probe (`nvtop --snapshot`), polled by the coordinator's health refresher to feed the `inference_busy` signal on `GET /health`; the dream-cycle daemons no longer gate on it directly. |
 | `ontology.py` | Loads `shared-memory/ontology.yaml` (repo-root fallback for older checkouts; `SMEM_ONTOLOGY_PATH` overrides); supplies Neo4j labels/relationship types. |
 | `generate_tokens.py` | Token minting helper (write-through mint flow, `--reveal`, `--convert-digests` — see below). |
