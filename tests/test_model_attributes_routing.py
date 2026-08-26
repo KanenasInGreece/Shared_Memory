@@ -81,12 +81,12 @@ def _body(**fields) -> bytes:
 
 def test_roles_ncontext_private_ok_max_inflight_parsed(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract", "verify"], "n_ctx": 8192,
+        {"url": "http://a:5000", "roles": ["extract", "judge"], "n_ctx": 8192,
          "max_inflight": 2, "price_per_mtok_in": 0.14, "price_per_mtok_out": 0.28},
         {"url": "http://b:4000"},
     ]))
     g = _fresh(monkeypatch)
-    assert g.LLM_BACKEND_ROLES["http://a:5000"] == frozenset({"extract", "verify"})
+    assert g.LLM_BACKEND_ROLES["http://a:5000"] == frozenset({"extract", "judge"})
     assert g.LLM_BACKEND_NCTX["http://a:5000"] == 8192
     assert g.LLM_BACKEND_MAX_INFLIGHT["http://a:5000"] == 2
     assert g.LLM_BACKEND_PRICE_IN["http://a:5000"] == 0.14
@@ -296,7 +296,7 @@ def test_explicit_roles_is_the_privacy_opt_in_even_when_private_ok_false(monkeyp
     ]))
     g = _fresh(monkeypatch)
     assert g._role_eligible("http://a:5000", "extract") is True
-    assert g._role_eligible("http://a:5000", "verify") is False
+    assert g._role_eligible("http://a:5000", "judge") is False
     assert g._role_eligible("http://a:5000", "") is False   # role-less: roles list ignored, private_ok gates
 
 
@@ -350,16 +350,16 @@ def test_i1a_affinity_hit_outside_eligible_set_is_a_miss(monkeypatch):
     anyway."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "http://a:5000", "roles": ["extract"]},
-        {"url": "http://b:4000", "roles": ["verify"]},
+        {"url": "http://b:4000", "roles": ["judge"]},
     ]))
     g = _fresh(monkeypatch)
     key = "affine-key-1"
     first = g._select_llm_backend("extract", key)
     assert first == "http://a:5000"
     g._llm_inflight[first] = 0
-    # Same affinity key, but now the traffic needs "verify" -- "a" (the
-    # cached affinity target) is NOT eligible for verify at all.
-    second = g._select_llm_backend("verify", key)
+    # Same affinity key, but now the traffic needs "judge" -- "a" (the
+    # cached affinity target) is NOT eligible for judge at all.
+    second = g._select_llm_backend("judge", key)
     assert second == "http://b:4000"
     assert second != first
 
@@ -373,7 +373,7 @@ def test_i1a_cold_fallback_never_widens_past_eligible(monkeypatch):
     be healthy."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "http://a:5000", "roles": ["extract"]},
-        {"url": "http://b:4000", "roles": ["verify"]},
+        {"url": "http://b:4000", "roles": ["judge"]},
     ]))
     g = _fresh(monkeypatch)
     import time
@@ -689,7 +689,7 @@ def test_i8_cap_never_widens_eligibility(monkeypatch):
     divert."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "http://a:5000", "roles": ["extract"], "max_inflight": 1},
-        {"url": "http://b:4000", "roles": ["verify"]},   # NOT eligible for extract, has capacity
+        {"url": "http://b:4000", "roles": ["judge"]},   # NOT eligible for extract, has capacity
     ]))
     g = _fresh(monkeypatch)
     g._llm_inflight["http://a:5000"] = 1   # AT cap, the only eligible backend for extract
@@ -764,7 +764,7 @@ def test_i7_llm_routing_and_token_usage_keys_present_for_authenticated_caller(mo
     checks = asyncio.run(_run())
     assert "llm_routing" in checks
     for key in ("routed_role_extract", "routed_role_extract_last_ts",
-                "routed_role_verify", "routed_role_judge",
+                "routed_role_judge", "routed_role_judge_last_ts",
                 "routing_no_eligible_backend", "routing_no_eligible_backend_last_ts",
                 "routing_fit_rejected", "routing_fit_rejected_last_ts"):
         assert key in checks["llm_routing"]

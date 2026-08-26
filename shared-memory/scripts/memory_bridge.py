@@ -14,8 +14,6 @@ CLI usage:
         --project "..." --rationale "..." --grounded-in "601:based_on,602" \
         [--source "..."] [--assisted-by "a,b"] [--confidence "high"] \
         [--alternatives "one option" --alternatives "another, with a comma"]
-    python memory_bridge.py review-edges [entity_relation|evidential] [N]
-    python memory_bridge.py label-edges "12=correct,13=incorrect" [--promote 12]
 
 Environment overrides (not CLI flags — set in the shell or the client .env):
     SEARCH_TIMEOUT_S       explicit override of the derived search wait; pins a
@@ -40,18 +38,12 @@ import httpx
 VERSION = "0.9.67"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
-# v3: review-edges / label-edges require the gateway's /memory/relations/* routes.
 # v4 (project registry): a fact save without a REGISTERED metadata.project is
 # rejected 400 carrying error=project_required|project_unknown plus near-match
 # proposals. BREAKING for any client that saved untagged facts. The second
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-
-# Relation-adjudication calibration families — MUST mirror
-# relation_confidence.FAMILIES on the gateway (the thin client never imports
-# server modules). Each family calibrates on its own operator-label curve.
-RELATION_FAMILIES = ("entity_relation", "evidential")
 
 # Retrospective outcome-state ratings — MUST mirror ontology.RETRO_RATINGS on
 # the gateway (the thin client never imports server modules). Outcome STATES,
@@ -668,15 +660,8 @@ def _gateway_message(r) -> str | None:
     return None
 
 
-# Route-specific tail for the relation-adjudication endpoints. It is APPENDED to
-# the gateway's own refusal rather than replacing it: which token was refused is
-# the gateway's to say, what the route is FOR is the client's. Before this, the
-# two 403 sites that carried it discarded the gateway's reason entirely.
-_EDGE_REVIEW_FORBIDDEN_HINT = ("This token may not review/label relation edges "
-                               "(operator-grade route). Use a write-capable agent token.")
 
-
-def _reply_json(r, *, log_auth: bool = False, forbidden_hint: str | None = None) -> dict:
+def _reply_json(r, *, log_auth: bool = False) -> dict:
     """Decode a gateway response ONLY after branching on its status class.
 
     THE RULE (fact:1503). A non-2xx aiohttp page is plain text — ``"403:
@@ -721,8 +706,6 @@ def _reply_json(r, *, log_auth: bool = False, forbidden_hint: str | None = None)
         message = (f"{head} — the gateway ANSWERED and the credential was ACCEPTED, so "
                    f"this is an authorization refusal, not an authentication failure "
                    f"and not a transport fault.")
-        if forbidden_hint:
-            message += f" {forbidden_hint}"
         raise GatewayReplyError({"status": "error", "message": message})
 
     if r.status_code >= 400:
@@ -1023,127 +1006,6 @@ async def review_hold(summary_id: int, pg_id: int) -> dict:
     except Exception as exc:
         return await _warn_on_skew(_coordinator_unavailable(exc))
     return result
-
-
-async def fetch_review_edges(family: str = "entity_relation", limit: int = 20) -> dict:
-    """Fetch the stratified unlabeled relation-adjudication sample for operator
-    review (POST /memory/relations/review) — the calibration elicitation flow.
-    Everything goes through the gateway; the client never touches the ledger."""
-    try:
-        async with _async_client(30.0) as client:
-            r = await client.post(
-                f"{COORDINATOR_BASE}/memory/relations/review",
-                json={"family": family, "limit": limit},
-                headers=_request_headers(),
-            )
-            result = _reply_json(r, forbidden_hint=_EDGE_REVIEW_FORBIDDEN_HINT)
-    except GatewayReplyError as exc:
-        return exc.payload
-    except Exception as exc:
-        return await _warn_on_skew(_coordinator_unavailable(exc))
-    return result
-
-
-async def apply_edge_labels(labels: dict, promote: list | None = None) -> dict:
-    """Apply operator labels {row_id: 'correct'|'incorrect'} (+ optional
-    promotions to operator-asserted) via POST /memory/relations/label."""
-    payload: dict = {"labels": labels}
-    if promote:
-        payload["promote"] = promote
-    try:
-        async with _async_client(60.0) as client:
-            r = await client.post(
-                f"{COORDINATOR_BASE}/memory/relations/label",
-                json=payload,
-                headers=_request_headers(),
-            )
-            result = _reply_json(r, forbidden_hint=_EDGE_REVIEW_FORBIDDEN_HINT)
-    except GatewayReplyError as exc:
-        return exc.payload
-    except Exception as exc:
-        return await _warn_on_skew(_coordinator_unavailable(exc))
-    return result
-
-
-def _parse_edge_labels(spec: str) -> dict:
-    """Parse the 'id=correct,id=incorrect' label grammar into {id_str: label}.
-    Pure — validation (int ids, label vocabulary) happens before the request."""
-    labels: dict = {}
-    for part in spec.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        rid, _, lab = part.partition("=")
-        labels[rid.strip()] = lab.strip().lower()
-    return labels
-
-
-def format_calibration_line(cal: dict) -> str:
-    """One line telling the operator what their labels have (not yet) unlocked."""
-    fam = cal.get("family", "?")
-    if cal.get("calibrated"):
-        return (f"family {fam}: {cal.get('labels')} labels — calibrated, "
-                f"threshold {cal.get('threshold')}")
-    return (f"family {fam}: {cal.get('labels', 0)}/{cal.get('min_labels', 20)} labels "
-            f"— UNCALIBRATED, machine edges not consumed by synthesis")
-
-
-def format_review_edges(payload: dict) -> str:
-    """Render the review sample human-readably: one block per ledger row (id,
-    verdict, confidence, src -rel-> tgt, method/support, rationale, and content
-    snippets for evidential rows) + the family calibration line."""
-    if payload.get("status") != "success":
-        return json.dumps(payload, indent=2)
-    rows = payload.get("rows") or []
-    lines = []
-    if not rows:
-        lines.append(f"No unlabeled {payload.get('family')} adjudications — nothing to review.")
-    else:
-        lines.append(f"Unlabeled {payload.get('family')} adjudications "
-                     '(label with: label-edges "id=correct,id=incorrect" [--promote id,id]):')
-        for r in rows:
-            conf = (f"{r['confidence']:.2f}"
-                    if isinstance(r.get("confidence"), (int, float)) else "  — ")
-            if r.get("src_name") is not None:
-                src, tgt = repr(r.get("src_name")), repr(r.get("tgt_name"))
-            else:
-                src, tgt = f"record {r.get('src_pg_id')}", f"record {r.get('tgt_pg_id')}"
-            lines.append(f"  id={r.get('id'):<5} [{r.get('verdict', '?'):<6}] conf={conf} "
-                         f"{src} -{r.get('rel_type')}-> {tgt}  "
-                         f"({r.get('method')}, support={r.get('support')})")
-            if r.get("rationale"):
-                lines.append(f"           rationale: {str(r['rationale'])[:160]}")
-            if r.get("src_snippet"):
-                lines.append(f"           src: {r['src_snippet']}")
-            if r.get("tgt_snippet"):
-                lines.append(f"           tgt: {r['tgt_snippet']}")
-    cal = payload.get("calibration") or {}
-    if cal:
-        lines.append(format_calibration_line(cal))
-    return "\n".join(lines)
-
-
-def format_label_outcomes(payload: dict) -> str:
-    """Per-row outcome lines for label-edges (labeled / edge_deleted / promoted)."""
-    if payload.get("status") != "success":
-        return json.dumps(payload, indent=2)
-    lines = []
-    for rid, out in sorted((payload.get("outcomes") or {}).items(),
-                           key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0):
-        parts = []
-        if out.get("labeled"):
-            parts.append(f"labeled {out['labeled']}")
-        if "edge_deleted" in out:
-            parts.append(f"machine edge(s) deleted: {out['edge_deleted']}")
-        if out.get("promoted"):
-            parts.append(f"PROMOTED to operator-asserted "
-                         f"(edges updated: {out.get('edges_updated', '?')})")
-        if out.get("edge_error"):
-            parts.append(f"WARNING: {out['edge_error']}")
-        if out.get("error"):
-            parts.append(f"ERROR: {out['error']}")
-        lines.append(f"  id {rid}: " + ", ".join(parts))
-    return "\n".join(lines) if lines else "(no outcomes)"
 
 
 async def _search_payload(query: str, limit: int = 5, project: str = None,
@@ -1930,7 +1792,7 @@ def _build_query(template: str, args) -> str:
 async def main() -> None:
     if len(sys.argv) < 2:
         print(json.dumps({
-            "error": "Usage: python memory_bridge.py [--version|doctor|status|graph|query|search|save|save_decision|save_retrospective|review-edges|label-edges] ..."
+            "error": "Usage: python memory_bridge.py [--version|doctor|status|graph|query|search|save|save_decision|save_retrospective] ..."
         }))
         sys.exit(1)
 
@@ -2243,54 +2105,8 @@ async def main() -> None:
             ),
             indent=2,
         ))
-    elif action == "review-edges":
-        p = argparse.ArgumentParser(
-            prog="memory_bridge.py review-edges",
-            description="Fetch a stratified sample of unlabeled machine relation "
-                        "verdicts for operator labeling (calibration oracle). "
-                        "Label the FIRST evidence-sweep batch immediately — before "
-                        "any confidence threshold acts.",
-        )
-        p.add_argument("family", nargs="?", default="entity_relation",
-                       choices=list(RELATION_FAMILIES),
-                       help="calibration family (default: entity_relation)")
-        p.add_argument("limit", nargs="?", type=int, default=20,
-                       help="rows to review (default 20, gateway caps at 100)")
-        p.add_argument("--json", action="store_true", help="machine-readable output")
-        sargs = p.parse_args(sys.argv[2:])
-        payload = await fetch_review_edges(sargs.family, sargs.limit)
-        if sargs.json:
-            print(json.dumps(payload, indent=2))
-        else:
-            print(format_review_edges(payload))
-    elif action == "label-edges":
-        p = argparse.ArgumentParser(
-            prog="memory_bridge.py label-edges",
-            description="Apply operator labels to relation-adjudication rows. "
-                        "'correct' = the relation AS TYPED AND DIRECTED is true; "
-                        "'incorrect' on an accepted row deletes the machine edge "
-                        "(operator-asserted edges are never deleted; the ledger row "
-                        "stays). --promote upgrades a correct edge to "
-                        "asserted_by=operator — it bypasses thresholds permanently.",
-        )
-        p.add_argument("labels", help='label spec: "12=correct,13=incorrect"')
-        p.add_argument("--promote", default="",
-                       help="comma-separated row ids to promote to operator-asserted "
-                            "(each must be labeled correct, now or already)")
-        sargs = p.parse_args(sys.argv[2:])
-        labels = _parse_edge_labels(sargs.labels)
-        bad = {rid: lab for rid, lab in labels.items()
-               if lab not in ("correct", "incorrect") or not rid.isdigit()}
-        if not labels or bad:
-            print(json.dumps({"status": "error",
-                              "message": f"invalid label spec near {bad or sargs.labels!r} — "
-                                         'use "id=correct,id=incorrect" (integer ids)'}))
-            sys.exit(1)
-        promote = [int(x) for x in sargs.promote.split(",") if x.strip().isdigit()]
-        result = await apply_edge_labels(labels, promote)
-        print(format_label_outcomes(result))
     else:
-        print(json.dumps({"error": f"Unknown action: {action}. Use graph|query|search|save|save_decision|save_retrospective|review-edges|label-edges"}))
+        print(json.dumps({"error": f"Unknown action: {action}. Use graph|query|search|save|save_decision|save_retrospective"}))
 
 
 if __name__ == "__main__":

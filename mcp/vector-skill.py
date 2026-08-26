@@ -28,7 +28,7 @@ this file holds rendering plus the MCP tool surface. Nothing else.
 
 MCP tools: hybrid_search_and_rerank, save_artifact, archive_reasoning_trace,
 save_decision, save_retrospective, supersede, review_hold, check_memory_health,
-memory_telemetry, record_lineage, graph_query, review_edges, label_edges.
+memory_telemetry, record_lineage, graph_query.
 """
 import asyncio
 import concurrent.futures
@@ -134,7 +134,6 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # Wire contract this MCP server speaks on its /memory/* gateway calls. Keep in
 # step with API_VERSION in coordinator.py / memory_bridge.py — the gateway logs
 # a warning (coordinator._check_client_version) if they disagree.
-# v3: review_edges / label_edges require the gateway's /memory/relations/* routes.
 # v4 (project registry): a fact save without a REGISTERED metadata.project is
 # rejected 400 carrying error=project_required|project_unknown plus near-match
 # proposals. BREAKING for any client that saved untagged facts. The second
@@ -146,8 +145,6 @@ CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server
 # modules, so they are restated here and kept in step by review).
-# relation_confidence.FAMILIES:
-RELATION_FAMILIES = ("entity_relation", "evidential")
 # ontology.RETRO_RATINGS — outcome STATES, not valence:
 RETRO_RATINGS = ("validated", "mixed", "refined", "pending", "reversed")
 # Record types that may qualify a reference. A record id is unique only WITHIN
@@ -507,11 +504,8 @@ def _gateway_message(r) -> str | None:
     return None
 
 
-_EDGE_REVIEW_FORBIDDEN_HINT = ("This token may not review/label relation edges "
-                               "— edge adjudication needs an operator-grade role.")
 
-
-def _reply_json(r, tool: str, forbidden_hint: str | None = None) -> dict:
+def _reply_json(r, tool: str) -> dict:
     """Decode a gateway response ONLY after branching on its status class.
 
     THE RULE (fact:1503). A non-2xx aiohttp page is plain text — ``"403:
@@ -538,8 +532,6 @@ def _reply_json(r, tool: str, forbidden_hint: str | None = None) -> dict:
         detail = _gateway_message(r) or _body_snippet(r)
         head = (f"Error: the gateway refused this request (HTTP 403): {detail}"
                 if detail else "Error: the gateway refused this request (HTTP 403).")
-        if forbidden_hint:
-            head = f"{head} {forbidden_hint}"
         raise GatewayReplyError(
             f"{head} — the gateway ANSWERED and the credential was ACCEPTED, so this is "
             f"an authorization refusal, not an authentication failure and not a "
@@ -1497,62 +1489,6 @@ async def graph_query(cypher: str) -> str:
     except Exception as exc:
         return _unavailable(exc)
     return json.dumps(payload.get("records", payload), indent=2, default=str)
-
-
-# ── Relation adjudication (API v3) ───────────────────────────────────────────
-
-@mcp.tool()
-async def review_edges(family: str = "entity_relation", limit: int = 20) -> str:
-    """
-    Fetch machine-proposed graph edges awaiting operator adjudication.
-
-    `family` is one of: entity_relation, evidential. Each family calibrates on
-    its own operator-label curve, so they are reviewed separately.
-    """
-    if family not in RELATION_FAMILIES:
-        return f"Error: family must be one of {', '.join(RELATION_FAMILIES)}"
-    try:
-        async with httpx.AsyncClient(timeout=CALL_TIMEOUT) as client:
-            r = await client.post(
-                f"{COORDINATOR_BASE}/memory/relations/review",
-                json={"family": family, "limit": limit},
-                headers=_auth_headers())
-            return json.dumps(_reply_json(r, "review_edges", forbidden_hint=_EDGE_REVIEW_FORBIDDEN_HINT), indent=2, default=str)
-    except GatewayReplyError as exc:
-        return exc.message
-    except Exception as exc:
-        return _unavailable(exc)
-
-
-@mcp.tool()
-async def label_edges(labels_json: str, promote: list = None) -> str:
-    """
-
-    Requires a write-capable agent token: a read-only token receives an
-    honest HTTP 403 role refusal from the gateway — expected, do not retry.
-    Record operator labels on proposed edges — the calibration signal.
-
-    `labels_json` maps adjudication id to verdict, e.g.
-    '{"12": "correct", "13": "incorrect"}'. `promote` optionally lists ids to
-    promote to operator-asserted edges.
-    """
-    try:
-        labels = json.loads(labels_json)
-        if not isinstance(labels, dict):
-            raise ValueError("labels_json must be a JSON object")
-    except Exception as exc:
-        return f"Error: could not parse labels_json ({exc})"
-    try:
-        async with httpx.AsyncClient(timeout=CALL_TIMEOUT) as client:
-            r = await client.post(
-                f"{COORDINATOR_BASE}/memory/relations/label",
-                json={"labels": labels, "promote": promote or []},
-                headers=_auth_headers())
-            return json.dumps(_reply_json(r, "label_edges", forbidden_hint=_EDGE_REVIEW_FORBIDDEN_HINT), indent=2, default=str)
-    except GatewayReplyError as exc:
-        return exc.message
-    except Exception as exc:
-        return _unavailable(exc)
 
 
 if __name__ == "__main__":

@@ -344,22 +344,6 @@ uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/s
 `rating`/`notes` live on the **Retrospective node** (`r.rating`, `r.content` — a 200-char snippet; the
 full notes are the record's Tier-1 content), not on the `HAD_OUTCOME` edge, which carries only `date`.
 
-### Task 6 — Review & calibrate machine-proposed relation edges
-
-No process mints machine-asserted graph edges any more — REM mints none (decision 1664) and the evidence sweep is retired — so this task is for the **pre-existing** machine edges still in the graph. The operator's labels are the **only calibration oracle**: per-family reliability is computed from them, and until a family has ~20 labels it is **uncalibrated: its machine edges are invisible to synthesis**. Labeling is what unlocks them.
-- **Trigger:** a stratified label pass per family while a family still holds unlabelled machine edges, so calibration exists before any confidence threshold acts.
-- **Label honestly:** `correct` means the relation **as typed and as directed** is true of the two endpoints — the right pair with the wrong relation or wrong direction is `incorrect`.
-- Labeling an *accepted* edge `incorrect` deletes the machine edge from the graph (operator-asserted edges are never deleted); the ledger row stays as audit and so it is never re-asked.
-- **`--promote` = operator assertion** (`asserted_by=operator`): the edge bypasses confidence thresholds permanently — promote only edges you would defend yourself.
-- Two families calibrate separately: `entity_relation` (typed Entity→Entity) and `evidential` (record→record, e.g. a decision informed by a fact — rows show a content snippet of each record).
-
-```
-uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py review-edges entity_relation 20
-uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py label-edges "12=correct,13=incorrect" --promote 12
-```
-
-Each `review-edges` run ends with the family's calibration line — e.g. `family entity_relation: 7/20 labels — UNCALIBRATED, machine edges not consumed by synthesis` — so you always see what your labels have (not yet) unlocked.
-
 ## Complete Workflow: Save → Consolidate → Retrieve → Retrospective
 
 This section is a concrete runbook for the full memory cycle. Copy-paste each block directly.
@@ -525,7 +509,7 @@ Tool: review_hold
 Args: {"summary_id": 12, "pg_id": 43}
 ```
 
-The MCP surface is at parity with the CLI, so anything above with a CLI equivalent has a tool: `graph_query`, `record_lineage` (pass a qualified `ref`), `memory_telemetry` and `check_memory_health` (the `status` / `doctor` pair), `review_edges` / `label_edges` for relation calibration, and `archive_reasoning_trace`. Same auth, same qualified-ref rules, same operator-involvement expectations as the CLI forms.
+The MCP surface is at parity with the CLI, so anything above with a CLI equivalent has a tool: `graph_query`, `record_lineage` (pass a qualified `ref`), `memory_telemetry` and `check_memory_health` (the `status` / `doctor` pair), and `archive_reasoning_trace`. Same auth, same qualified-ref rules, same operator-involvement expectations as the CLI forms.
 
 ---
 

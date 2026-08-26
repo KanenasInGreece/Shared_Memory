@@ -140,9 +140,9 @@ CREDENTIALED_BACKEND_ALLOWED_ROUTES = frozenset({
 })
 # fact:1535 (route-guard): a mistyped or wrong-method framework request must
 # FAIL AND SAY WHY, not fall through the catch-all into a reasoning-LLM
-# dispatch (mcp/vector-skill.py's review_edges did exactly this — GET where
-# the gateway registers POST-only — and the request was silently forwarded
-# to the LLM pool as if it were a chat completion). RESERVED_ROUTE_PREFIXES
+# dispatch. A shipped MCP tool once did exactly this — GET against a path the
+# gateway registers POST-only — and the request was silently forwarded to the
+# LLM pool as if it were a chat completion. RESERVED_ROUTE_PREFIXES
 # is the ONLY hand-written table this guard uses: which path namespaces are
 # framework-owned, so an unrecognised path under one of them is a mistyped
 # framework call (404) rather than a legitimate LLM-passthrough path (which
@@ -204,11 +204,12 @@ def _parse_backend(entry: str) -> tuple[str, float]:
 # Model-attributes routing (Model_Attributes_Routing_Plan_2026-08-18, REVISED
 # DESIGN). Descriptor schema, additive to the existing url/weight/token_env/
 # model/extra_body fields:
-#   roles          list from {extract, verify, judge} ("summarize" is
-#                  RESERVED — NREM narrative folds are zero-inference by
-#                  construction, the only NREM LLM path is insight folds =
-#                  "judge"). Absent = serves all (homogeneous-fleet degenerate
-#                  case, every existing install unchanged).
+#   roles          list from {extract, judge} — the two dream functions that
+#                  actually send a role: REM's per-record summary call sends
+#                  "extract", NREM's insight fold sends "judge". "summarize"
+#                  is RESERVED — NREM narrative folds are zero-inference by
+#                  construction. Absent = serves all (homogeneous-fleet
+#                  degenerate case, every existing install unchanged).
 #   n_ctx          int, the model's usable context in tokens. Absent = no fit
 #                  information (this backend always "fits").
 #   private_ok     bool. Default = (no token_env present) — an uncredentialed
@@ -220,7 +221,7 @@ def _parse_backend(entry: str) -> tuple[str, float]:
 #                  stored + surfaced on /health for the MONITOR to multiply.
 #                  NEVER used in any routing decision here — the gateway
 #                  stays price-agnostic (M-4 honesty note).
-ROUTING_ROLE_NAMES = frozenset({"extract", "verify", "judge"})
+ROUTING_ROLE_NAMES = frozenset({"extract", "judge"})
 RESERVED_ROLE_NAMES = frozenset({"summarize"})
 
 
@@ -3979,8 +3980,6 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
     checks["llm_routing"] = {
         "routed_role_extract": _llm_routed_by_role.get("extract", 0),
         "routed_role_extract_last_ts": _llm_routed_by_role_last_ts.get("extract"),
-        "routed_role_verify": _llm_routed_by_role.get("verify", 0),
-        "routed_role_verify_last_ts": _llm_routed_by_role_last_ts.get("verify"),
         "routed_role_judge": _llm_routed_by_role.get("judge", 0),
         "routed_role_judge_last_ts": _llm_routed_by_role_last_ts.get("judge"),
         "routing_no_eligible_backend": _routing_no_eligible_backend_count,
@@ -4400,8 +4399,8 @@ def require_valid_llm_routing_config() -> None:
             "FATAL: credentialed LLM backend(s) configured with neither "
             f"`roles` nor an explicit `private_ok`: {', '.join(needs_explicit_choice)}. "
             "Pick one in LLM_BACKENDS_JSON: private_ok: true (keep today's "
-            "serve-everything behavior) or roles: [\"extract\", \"verify\", "
-            "\"judge\"] (per-function opt-in, this backend never receives "
+            "serve-everything behavior) or roles: [\"extract\", \"judge\"] "
+            "(per-function opt-in, this backend never receives "
             "role-less/other-function traffic). See shared-memory/.env.example."
         )
 

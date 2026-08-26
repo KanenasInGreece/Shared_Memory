@@ -1,16 +1,11 @@
-"""Unit tests for NREM stage 5 of the REM rebuild — calibration-gated cluster
-assessment + the insight-slot payload-BY-CONSTRUCTION protocol
-(decision:1205, v0.8.71, retiring decisions 718/726/727's anchor gate).
+"""Unit tests for the NREM fold — the thematic Zettelkasten concatenation and
+the insight-slot payload-BY-CONSTRUCTION protocol (decision:1205, v0.8.71).
 
-Covers: the edge predicate the cluster finders carry (the Cypher mirror of
-relation_confidence.consumable — the Python function is the source of truth),
-the fail-closed uncalibrated gate, the excluded-machine-edge telemetry
-("filtered back" to the relation_adjudications review queue), type/kind
-differentiated fold blocks, grounding-edge evidence lines (operator vs
-MACHINE-PROPOSED, consumable-gated), the SLOT/PRINCIPLE parser and prompt
-builder (`parse_insight_slots` / `_build_insight_prompt` /
-`_insight_slot_items`), the missing-slot bounded-retry-then-fail-the-unit
-flow, the narrowed fold dead-letter query (truncation_failed only), and the
+Covers: type/kind differentiated fold blocks and the deterministic thematic
+fold, the SLOT/PRINCIPLE parser and prompt builder (`parse_insight_slots` /
+`_build_insight_prompt` / `_insight_slot_items`), the missing-slot
+bounded-retry-then-fail-the-unit flow, the `_CycleRec.extra()` accounting
+shape, the narrowed fold dead-letter query (truncation_failed only), and the
 MOCK_LLM end-to-end pass.
 
 All Postgres/Neo4j/LLM I/O is stubbed — no live infrastructure required.
@@ -27,12 +22,9 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
 import consolidation_loop as cl
-import relation_confidence as rc
 from consolidation_loop import (
     ConsolidationDaemon,
-    OPERATOR_ASSERTED,
     _CycleRec,
-    _default_calibration_gate,
     _assemble_insight_content,
     _build_insight_prompt,
     _insight_slot_items,
@@ -125,115 +117,6 @@ def daemon_with_fake_graph(results=None):
     daemon.driver = MagicMock()
     daemon.driver.session = MagicMock(return_value=_AsyncCtx(session))
     return daemon, session
-
-
-def _gate(entity=False, evidential=False):
-    g = _default_calibration_gate()
-    g[rc.FAMILY_ENTITY]["calibrated"] = entity
-    g[rc.FAMILY_EVIDENTIAL]["calibrated"] = evidential
-    return g
-
-
-# ── The Cypher gate mirrors relation_confidence.consumable (source of truth) ──
-
-def test_gate_semantics_match_consumable():
-    """The finder predicate `asserted_by IS NULL OR asserted_by IN operator OR
-    (calibrated AND confidence >= threshold)` must agree with consumable():
-    legacy and operator edges always pass; machine edges only when the family
-    is calibrated AND numeric confidence clears the threshold."""
-    thr = rc.CONSUME_THRESHOLD[rc.FAMILY_ENTITY]
-    # legacy (no asserted_by) — era-gated class, ALWAYS consumable
-    assert rc.consumable(rc.FAMILY_ENTITY, None, None, False)
-    # operator / system_default — always
-    assert rc.consumable(rc.FAMILY_ENTITY, "operator", None, False)
-    assert rc.consumable(rc.FAMILY_ENTITY, "system_default", None, False)
-    # machine, uncalibrated family — never, regardless of confidence
-    assert not rc.consumable(rc.FAMILY_ENTITY, "rem", 0.99, False)
-    # machine, calibrated, no confidence — never (Cypher: null >= x is not true)
-    assert not rc.consumable(rc.FAMILY_ENTITY, "rem", None, True)
-    # machine, calibrated, at/above threshold — passes; below — fails
-    assert rc.consumable(rc.FAMILY_ENTITY, "rem", thr, True)
-    assert not rc.consumable(rc.FAMILY_ENTITY, "rem_sweep", thr - 0.01, True)
-
-
-def test_inherited_edge_takes_its_source_standing_not_a_new_one():
-    """A judgement's COPY of its evidence's topic (989) is stated explicitly in
-    consumable() rather than falling through to the legacy branch. Copied from
-    an operator naming (no confidence) it is operator-grade; copied from a
-    machine edge it carries that score and is gated exactly as the original was.
-
-    The distinction is what stopped a machine name from reading as a first-write
-    one: before the stamp, an inherited edge was written BARE — the same
-    signature an operator naming leaves."""
-    thr = rc.CONSUME_THRESHOLD[rc.FAMILY_ENTITY]
-    inh = rc.ASSERTED_INHERITED
-    # copied from an operator naming → no confidence → operator-grade
-    assert rc.consumable(rc.FAMILY_ENTITY, inh, None, False)
-    # copied from a machine edge → gated on the family exactly like the source
-    assert rc.consumable(rc.FAMILY_ENTITY, inh, thr, True)
-    assert not rc.consumable(rc.FAMILY_ENTITY, inh, thr - 0.01, True)
-    assert not rc.consumable(rc.FAMILY_ENTITY, inh, thr, False)   # uncalibrated
-    # and it is NOT the legacy class: a scored copy in an uncalibrated family
-    # must not pass the way a bare pre-provenance edge does
-    assert rc.consumable(rc.FAMILY_ENTITY, None, thr, False)
-
-
-# ── The WRITE floor (989) — the gate that stopped being consumption-only ──────
-
-def test_write_admitted_floors_entity_family_and_fails_closed():
-    floor = rc.WRITE_FLOOR[rc.FAMILY_ENTITY]
-    # at/above the floor with real verification → written
-    assert rc.write_admitted(rc.FAMILY_ENTITY, 3, 3, floor)
-    assert rc.write_admitted(rc.FAMILY_ENTITY, 2, 3, floor + 0.01)
-    # below → withheld
-    assert not rc.write_admitted(rc.FAMILY_ENTITY, 1, 3, floor - 0.0001)
-    # no numeric confidence → withheld (never written "just in case")
-    assert not rc.write_admitted(rc.FAMILY_ENTITY, 3, 3, None)
-    # FAIL-CLOSED: k <= 1 means no verification call succeeded. votes/k is then
-    # 1.0 and vote_confidence would hand it the CEILING — the one input where
-    # the score is highest precisely because nothing checked it.
-    assert rc.vote_confidence(1, 1, "tested") == pytest.approx(0.95)
-    assert not rc.write_admitted(rc.FAMILY_ENTITY, 1, 1, 0.95)
-    assert not rc.write_admitted(rc.FAMILY_EVIDENTIAL, 1, 1, 0.95)
-
-
-def test_write_floor_never_applies_to_the_evidential_family():
-    """Evidential proposals are BORN capped below their own consumption
-    threshold (rung 1) so that adjudication promotes them, never the proposer.
-    A write floor above that cap would make every one of them unwritable at
-    birth — closing the ladder silently instead of leaving it visibly unbuilt."""
-    assert rc.FAMILY_EVIDENTIAL not in rc.WRITE_FLOOR
-    assert rc.EVIDENTIAL_BORN_BELOW_CAP < rc.WRITE_FLOOR[rc.FAMILY_ENTITY]
-    # a fully-confirmed evidential edge sits below the entity floor by design,
-    # and is still written
-    conf = rc.vote_confidence(3, 3, "tested", family=rc.FAMILY_EVIDENTIAL)
-    assert conf < rc.WRITE_FLOOR[rc.FAMILY_ENTITY]
-    assert rc.write_admitted(rc.FAMILY_EVIDENTIAL, 3, 3, conf)
-
-
-def test_default_gate_is_fail_closed():
-    g = _default_calibration_gate()
-    for fam in rc.FAMILIES:
-        assert g[fam]["calibrated"] is False
-        assert g[fam]["threshold"] == rc.CONSUME_THRESHOLD[fam]
-    assert OPERATOR_ASSERTED == ["operator", "system_default"]
-
-
-# ── ⛔ REMOVED (v2, C1): the entity-hub/MENTIONS calibration-gated cluster
-# finder (`_find_anchored_clusters`) and `run_global_sweep`'s matching entity
-# Cypher no longer exist — the v2 FACT GATE (Dreaming Cycle Plan to v2, §2.1)
-# discovers on (project, domain) via GROUNDED_IN/DOMAIN_OF/PROJECT_OF, never
-# on an entity/MENTIONS hub, so there is no more entity-link edge predicate to
-# calibrate for this run type. The four tests that lived here
-# (`test_anchored_finder_edge_predicate_and_params_uncalibrated`,
-# `test_anchored_finder_calibrated_params_pass_through`,
-# `test_anchored_finder_excluded_count_leaves_log_line`,
-# `test_global_sweep_query_carries_edge_predicate`) asserted on that removed
-# Cypher and are removed with it. `_find_grounded_fact_groups` (the v2
-# discovery method) and I1/I2/I8 are covered in test_nrem_axis_levels.py.
-# `relation_confidence`'s own semantics (consumable/write_admitted, tested
-# above) are untouched — they still gate the INSIGHT path's grounding-edge
-# rendering (`_fold_insight`, tested below).
 
 
 # ── decision:1205 — insight payload BY CONSTRUCTION (pure helpers) ────────────
@@ -656,17 +539,6 @@ def _fold_script_two_decisions():
     ]
 
 
-# ⛔ REMOVED (C4): `test_grounding_lines_render_and_gate_by_family` /
-# `test_grounding_excluded_edges_leave_log_line` — the stage-5
-# calibration-gated GROUNDING-line rendering they exercised is gone from
-# `_fold_insight` entirely (§3.2: the embedded text is strictly each
-# judgement's own Title+Rationale; grounding-edge detail is deferred to the
-# graph walk, `insight_cypher_query`). `relation_confidence`'s own
-# consumable()/calibration semantics are untouched and still tested above —
-# they now gate nothing inside THIS module, but `rem_loop.py` still consumes
-# them directly.
-
-
 # ── Thematic-fold fixtures (§3.1 — zero/low-inference, unrelated to insight) ──
 
 def _thematic_conn_script(insert_id=90):
@@ -770,10 +642,19 @@ async def test_thematic_fold_content_is_deterministic_concatenation_no_llm(monke
     meta = json.loads(insert[1])
     assert meta["entities"] == ["Widget"]
     assert "cypher_query" in meta and "1" in meta["cypher_query"] and "2" in meta["cypher_query"]
-    # No preservation-gate/truncation counters populate (nothing COULD fail
-    # this way any more) — extra() stays byte-identical to the pre-stage-5
-    # ledger shape.
-    assert finish["kwargs"]["extra"] is None
+    # No preservation-gate/truncation counters populate — nothing COULD fail
+    # this way any more, so every failure count is 0. They are PRESENT and
+    # zero, not absent: this cycle ran a coverage census (eligible_clusters
+    # below), and the census-partition keys promise "0 once a census has run"
+    # (decision:1121/I7). An absent `extra` here would say no census ran, which
+    # is how a deliberate skip comes to read as a stall.
+    assert finish["kwargs"]["extra"] == {
+        "truncation_failures": 0,
+        "slot_failures": 0,
+        "dead_lettered_clusters": 0,
+        "unchanged_clusters": 0,
+        "singleton_clusters": 0,
+    }
     assert finish["args"][2:5] == (1, 1, 0)
     assert finish["kwargs"]["eligible_clusters"] == 1
     # graph marking ran
@@ -982,8 +863,36 @@ async def test_mock_llm_insight_fold_writes_without_any_gate(monkeypatch):
 # ── _CycleRec.extra() shape ───────────────────────────────────────────────────
 
 def test_cyclerec_extra_none_when_untouched():
-    # Pre-stage-5 cycles (no gate fetched, nothing counted) stay ledger-identical.
+    # A cycle that counted nothing stays ledger-identical.
     assert _CycleRec().extra() is None
+
+
+def test_a_census_that_ran_reports_its_zeros_rather_than_vanishing():
+    """⛔ NEW INVARIANT. `dead_lettered_clusters`, `unchanged_clusters` and
+    `singleton_clusters` each promise "0 once a census has run this cycle"
+    (decision:1121/I7 — a deliberate skip must never read as a stall). A
+    truthiness guard alone cannot keep that promise: three zeroes and no
+    census produce the same `extra`, so an absent one says "no census" when a
+    census in fact ran and deferred nothing.
+
+    `eligible_clusters` is the census's own output and is None until it runs,
+    so it IS the signal — derived, not duplicated into a second flag
+    (decision:1032). Until the machine-edge calibration layer was retired this
+    held by accident: every insight cycle fetched a calibration snapshot, and
+    that one non-None field kept `extra` present.
+
+    Mutation target: drop `self.eligible_clusters is None and` from
+    `_CycleRec.extra()`'s guard and this dies."""
+    r = _CycleRec()
+    assert r.extra() is None            # no census, nothing counted
+    r.eligible_clusters = 0             # a census ran and found no backlog
+    assert r.extra() == {
+        "truncation_failures": 0,
+        "slot_failures": 0,
+        "dead_lettered_clusters": 0,
+        "unchanged_clusters": 0,
+        "singleton_clusters": 0,
+    }
 
 
 def test_cyclerec_extra_carries_stage5_fields_no_preservation_keys():
@@ -995,9 +904,6 @@ def test_cyclerec_extra_carries_stage5_fields_no_preservation_keys():
     a SLOT/PRINCIPLE missing after its bounded retry — a protocol failure,
     not a capacity one."""
     r = _CycleRec()
-    r.calibration = {"entity_relation": True, "evidential": False}
-    r.edges_awaiting_calibration = 4
-    r.machine_edges_consumed = 2
     r.truncation_failures = 1
     r.truncation_failed = ["decision:1,decision:2"]
     r.slot_failures = 1
@@ -1007,8 +913,6 @@ def test_cyclerec_extra_carries_stage5_fields_no_preservation_keys():
     assert "preservation_failures" not in extra
     assert "preservation_failed" not in extra
     assert extra == {
-        "edges_awaiting_calibration": 4,
-        "machine_edges_consumed": 2,
         "truncation_failures": 1,
         "slot_failures": 1,
         # D1 (fact:1189) — always present once extra() is non-None; 0 when
@@ -1022,38 +926,12 @@ def test_cyclerec_extra_carries_stage5_fields_no_preservation_keys():
         # contract: always present once extra() is non-None; 0 when this
         # cycle deferred no singleton components.
         "singleton_clusters": 0,
-        "calibration": {"entity_relation": True, "evidential": False},
         "truncation_failed": ["decision:1,decision:2"],
         "slot_failed": ["decision:3,decision:4"],
     }
     assert not hasattr(r, "preservation_retries")
     assert not hasattr(r, "preservation_failures")
     assert not hasattr(r, "preservation_failed")
-
-
-# ── fetch_calibration_gate (stubbed ledger) ───────────────────────────────────
-
-def test_fetch_calibration_gate_fail_closed_on_db_error(monkeypatch):
-    def _boom(*a, **k):
-        raise RuntimeError("pg down")
-    monkeypatch.setattr(cl.psycopg2, "connect", _boom)
-    gate = cl.fetch_calibration_gate()
-    assert gate == _default_calibration_gate()
-
-
-def test_fetch_calibration_gate_reads_ledger(monkeypatch):
-    # calibration_state runs one query per family; ≥ min labels → calibrated.
-    n = rc.CALIBRATION_MIN_LABELS
-    conn = StubConn(script=[
-        {"rowcount": 1, "rows": [(7, n, n - 1)]},   # entity family: n labels
-        {"rowcount": 1, "rows": [(7, 1, 1)]},       # evidential family: 1 label
-    ])
-    monkeypatch.setattr(cl.psycopg2, "connect", lambda *a, **k: conn)
-    gate = cl.fetch_calibration_gate()
-    assert gate[rc.FAMILY_ENTITY]["calibrated"] is True
-    assert gate[rc.FAMILY_EVIDENTIAL]["calibrated"] is False
-    assert gate[rc.FAMILY_ENTITY]["threshold"] == rc.CONSUME_THRESHOLD[rc.FAMILY_ENTITY]
-    assert conn.closed
 
 
 # ── Fix-wave: NREM truncation is a capacity failure, discarded before parsing ──
