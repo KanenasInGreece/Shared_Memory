@@ -380,12 +380,12 @@ def truncation_is_degenerate(body: str) -> bool:
     classifier only shortcuts an ALREADY-truncated call, it never gates one.
 
     OBJECT rule: any flat `{...}` object (whitespace-normalised) occurring
-    >=3 times. Measured on the probe-2 specimen: 120 of 123 `relationships`
-    entries were exact duplicates of 22 distinct triples, max one triple x12.
+    >=3 times. Measured on the probe-2 specimen: 120 of 123 repeated objects
+    were exact duplicates of 22 distinct ones, the worst repeated x12.
 
     LONG-STRING rule: any single quoted string >=30 chars occurring >=3
-    times — catches a Decision-extras / summary repetition loop the OBJECT
-    rule structurally cannot see.
+    times — catches a summary repetition loop the OBJECT rule structurally
+    cannot see.
 
     Both thresholds are operator-accepted as conservative-but-unmeasured
     (fact:1338): re-measure against the specimen corpus this change
@@ -459,10 +459,15 @@ def _parse_llm_json(candidate: str):
             logger.error("REM JSON parse+repair failed: %s / %s | payload=%.400s",
                          exc, exc2, candidate)
             return None
-        if isinstance(obj, dict) and obj:
+        if isinstance(obj, dict):
+            # An EMPTY dict counts as salvaged. It used to be rejected on the
+            # reasoning that a repair yielding nothing had failed — true when
+            # every result had to carry a field, false now: `{}` is a shape the
+            # caller can legitimately receive, and rejecting it charged the
+            # record a parse failure for an answer that parsed.
             logger.warning("REM JSON salvaged via json_repair (orig: %s)", exc)
             return obj
-        logger.error("REM JSON unrepairable (empty after repair): %s | payload=%.400s",
+        logger.error("REM JSON unrepairable (not an object after repair): %s | payload=%.400s",
                      exc, candidate)
         return None
 
@@ -1270,7 +1275,11 @@ class REMDaemon:
             return None, model
         # Strict parse first; salvage Gemma-4 JSON slips via json_repair (decision 491).
         parsed = _parse_llm_json(raw[start:end])
-        self._last_llm_failure = None if parsed else LLM_FAIL_PARSE
+        # `is not None`, never falsiness: an empty object is a PARSED object.
+        # Only _parse_llm_json returning None is a parse failure; a `{}` body is
+        # a complete answer that simply carries no summary, and the summary gate
+        # in _apply_fact_result is what charges the record for that.
+        self._last_llm_failure = None if parsed is not None else LLM_FAIL_PARSE
         return parsed, model
 
     # ── Batched LLM call (one call for N facts) ─────────────────────────────────

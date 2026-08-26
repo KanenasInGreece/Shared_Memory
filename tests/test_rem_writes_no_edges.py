@@ -314,3 +314,36 @@ def test_process_fact_end_to_end_marks_outbox_and_notifies_nrem(monkeypatch):
     assert not any("rem_summary" in c for c in cyphers)       # short → no summary
     assert any("rem_reviewed" in s for s in executed)         # outbox marked
     assert any("pg_notify" in s for s in executed)            # NREM notified
+
+
+# ── An empty object is a PARSED object, not a parse failure ───────────────────
+#
+# Under the old contract every result carried at least `"relationships": []`, so
+# an empty dict could only mean the parse had gone wrong. Now a model that has
+# nothing to add legitimately answers `{}`, and treating that as a failure would
+# charge the record an attempt every cycle until it dead-lettered.
+
+@pytest.mark.asyncio
+async def test_an_empty_parsed_object_is_not_a_parse_failure(monkeypatch):
+    monkeypatch.delenv("MOCK_LLM", raising=False)
+    daemon, _ = _make_daemon()
+
+    async def _fake_post(self, url, **kwargs):
+        return _ok_resp("{}")
+    monkeypatch.setattr("httpx.AsyncClient.post", _fake_post)
+
+    result, _model = await daemon._llm_process(LONG, rem_mod.KIND_FACT, pg_id=1)
+
+    assert result == {}
+    assert daemon._last_llm_failure is None, (
+        "an empty object parsed cleanly — it is not a parse failure")
+
+
+def test_a_salvaged_empty_object_is_returned_not_rejected():
+    """The json_repair salvage path: a body strict json.loads refuses, which
+    repair resolves to an empty object, is SALVAGED. Rejecting it returned None
+    and charged the record a parse failure for an answer that parsed."""
+    assert rem_mod._parse_llm_json("{ : }") == {}
+    # A non-object salvage is still a failure — the caller expects a dict.
+    assert rem_mod._parse_llm_json('{ "a" }') is None
+    assert rem_mod._parse_llm_json("not json at all !!!") is None
