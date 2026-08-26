@@ -18,3 +18,4 @@ research/
 .claude/
 .playwright-mcp/
 .env.mintlock
+HANDOFF.md

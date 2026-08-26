@@ -254,7 +254,7 @@ def _run_sync_with_registry(env_file, extra_args=(), *, home):
     # exist on disk (~lines 218-236) — so a caller that leaves HOME pointed
     # at the real operator account silently writes the tracked skill copy
     # into that operator's REAL installs the moment one of those four exists
-    # (A-01 CRITICAL, measured: it moved
+    # (fact:1640, measured: it moved
     # ~/.claude/skills/shared-memory/scripts/memory_bridge.py's mtime).
     # `home` is therefore a required keyword, always a tmp_path-rooted dir,
     # mirroring test_registry_does_not_orphan_installs_that_predate_it.
@@ -268,7 +268,7 @@ def _run_sync_with_registry(env_file, extra_args=(), *, home):
 
 
 def test_run_sync_with_registry_sandboxes_home(tmp_path, monkeypatch):
-    """A-01 CRITICAL regression, measured on a live host: without an explicit
+    """fact:1640 regression, measured on a live host: without an explicit
     `env["HOME"]` override, `_run_sync_with_registry` inherited HOME from the
     ambient environment, and sync_skills.sh's registry branch UNIONS the
     registry with any of the four historical default installs
