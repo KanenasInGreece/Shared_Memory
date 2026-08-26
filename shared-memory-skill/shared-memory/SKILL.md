@@ -595,7 +595,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness (anonymous — status/version/api_version only, v0.9.9 S-10):
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":4,"version":"0.9.63"}
+# → {"status":"ok","api_version":4,"version":"0.9.64"}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -649,7 +649,8 @@ needs nothing but its token. The `--json` payload also carries `telemetry.nrem`
 lands in v0.6.1, then climb as an alias-coverage signal),
 `telemetry.inference_busy` — the inference/GPU-busy signal (tri-state
 `"busy"|"idle"|"unknown"`, also top-level on `GET /health`; `"unknown"` means
-nvtop is absent or `SLOT_AWARE=0`, never reported as a false `"idle"`; distinct
+nvtop is absent or `SLOT_AWARE=0`, or the probe disabled itself after repeated
+hangs (see the raw `GET /health` key `gpu_probe`), never reported as a false `"idle"`; distinct
 from `health.llm`, which is pure `:5000` reachability), and
 `telemetry.consolidation` — the dream-cycle liveness/coverage signal:
 per cycle type the last fold outcome, a `stalled` verdict, consecutive failures,
@@ -666,7 +667,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.63", "api_version": 4, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.64", "api_version": 4, "tool": "shared-memory-framework"}`
 
 ### Updating This Skill
 

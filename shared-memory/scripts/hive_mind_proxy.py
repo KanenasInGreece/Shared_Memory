@@ -2946,8 +2946,14 @@ def _hardware_fingerprint() -> dict:
     except (OSError, ValueError, IndexError):
         pass   # non-Linux, unreadable, or unexpected format — stays None
     try:
-        from gpu_load import gpu_probe_available
-        out["gpu_present"] = bool(gpu_probe_available())
+        # Installation only (SLOT_AWARE on AND nvtop on PATH) -- NEVER
+        # gpu_probe_available(), which also reflects a runtime self-disable
+        # after repeated nvtop hangs. This fingerprint is PERSISTED; a
+        # process-lifetime self-disable is not a hardware fact and must not
+        # flip it (that would fire gateway_start_fingerprint_mismatch on the
+        # next restart even though nothing about the hardware changed).
+        from gpu_load import gpu_probe_installed
+        out["gpu_present"] = bool(gpu_probe_installed())
     except Exception:
         pass   # never let GPU detection block a fingerprint
     return out
@@ -3766,6 +3772,67 @@ _health_cache: dict = {"checks": None, "ts": 0.0}
 _health_probe_lock = asyncio.Lock()
 
 
+def _coordinator_health_keys(coordinator) -> dict:
+    """The consolidation-health lift for /health: everything read off the
+    coordinator's cached (DB-free) snapshot (ADR-018) — stalled=true means an
+    eligible backlog exists but nothing has folded within the stall window and
+    no fold is in-flight, an actionable alert, not a probe miss. Pure: reads
+    coordinator.consolidation_health() and derives the top-level keys from it,
+    nothing else. On ANY failure it returns the same "not yet probed" /
+    "unknown" defaults the inline except branch used to return.
+
+    Extracted (F4, fix round) so this can be unit-tested directly with a stub
+    coordinator instead of only by inspecting _build_health_checks' source —
+    a source-inspection test can prove a line exists in the function body, but
+    not that it actually executes (a `if False:` around it would still pass).
+    """
+    try:
+        consolidation = coordinator.consolidation_health()
+        return {
+            "consolidation": consolidation,
+            # Top-level inference/GPU-busy signal for the monitor's LLM tile.
+            # Tri-state ("busy"|"idle"|"unknown") from the cached snapshot the
+            # coordinator probes in the background — /health never shells out to
+            # nvtop. "unknown" (nvtop absent / SLOT_AWARE off) is reported verbatim
+            # so the monitor shows "unknown", never a false "idle". Distinct from
+            # checks["llm"], which is a reachability probe of the configured pool.
+            "inference_busy": consolidation.get("inference_busy", "unknown"),
+            # Graph integrity is NOT a dream-cycle metric — it counts nodes a
+            # write path stored under the wrong label. It rides the same cached
+            # snapshot for cheapness, but it is surfaced TOP-LEVEL so a monitor
+            # never renders it inside the consolidation tile. None = not yet
+            # probed, which must never be read as "verified clean" (decision 928).
+            "graph_invalid_nodes": consolidation.get("graph_invalid_nodes"),
+            # Project identity (migration 027) — top-level for the same reason:
+            # it is an UPGRADE-completeness signal, not a dream-cycle metric. It
+            # answers "may this deployment be trusted to fold across projects
+            # yet", because the insight gate declines to count a project node
+            # that has no registry identity. None = not yet probed, never
+            # "complete". An ADDITIVE field: a monitor that does not know it
+            # renders exactly as before.
+            "project_identity": consolidation.get("project_identity"),
+            # Domain identity (migration 028) — the same kind of signal for the
+            # sibling axis: registry vs graph, plus whether every section is
+            # attached to its project, which is what the cross-domain walk will
+            # depend on. Additive; None = not yet probed, never "complete".
+            "domain_identity": consolidation.get("domain_identity"),
+            # nvtop probe self-health (fact:1645) — top-level for the same
+            # reason as its siblings above: a monitor watching for the probe
+            # disabling itself after repeated hangs should not have to reach
+            # inside the consolidation tile. None = not yet probed, never "ok".
+            "gpu_probe": consolidation.get("gpu_probe"),
+        }
+    except Exception:
+        return {
+            "consolidation": {"fresh": False},
+            "inference_busy": "unknown",
+            "graph_invalid_nodes": None,
+            "project_identity": None,
+            "domain_identity": None,
+            "gpu_probe": None,
+        }
+
+
 async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict:
     """The full probe: every upstream backend, daemon liveness, config, and
     the dream-cycle snapshot. Returns the SAME shape regardless of caller —
@@ -4036,46 +4103,12 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
     # "backup ongoing", and a client seeing it knows write 503s are expected.
     checks["backup_in_progress"] = backup_quiesce_active()
 
-    # Dream-cycle liveness (ADR-018) — cached snapshot from the coordinator
-    # (refreshed ~60 s in the background) so /health stays DB-free. stalled=true
-    # means an eligible backlog exists but nothing has folded within the stall
-    # window and no fold is in-flight — an actionable alert, not a probe miss.
+    # Dream-cycle liveness (ADR-018) + the coordinator's other cached top-level
+    # signals — extracted into _coordinator_health_keys() (F4, fix round) so
+    # the lift itself is a pure, directly-unit-testable function; see its
+    # docstring for what each key means and why it's surfaced top-level.
     if coordinator is not None:
-        try:
-            consolidation = coordinator.consolidation_health()
-            checks["consolidation"] = consolidation
-            # Top-level inference/GPU-busy signal for the monitor's LLM tile.
-            # Tri-state ("busy"|"idle"|"unknown") from the cached snapshot the
-            # coordinator probes in the background — /health never shells out to
-            # nvtop. "unknown" (nvtop absent / SLOT_AWARE off) is reported verbatim
-            # so the monitor shows "unknown", never a false "idle". Distinct from
-            # checks["llm"], which is a reachability probe of the configured pool.
-            checks["inference_busy"] = consolidation.get("inference_busy", "unknown")
-            # Graph integrity is NOT a dream-cycle metric — it counts nodes a
-            # write path stored under the wrong label. It rides the same cached
-            # snapshot for cheapness, but it is surfaced TOP-LEVEL so a monitor
-            # never renders it inside the consolidation tile. None = not yet
-            # probed, which must never be read as "verified clean" (decision 928).
-            checks["graph_invalid_nodes"] = consolidation.get("graph_invalid_nodes")
-            # Project identity (migration 027) — top-level for the same reason:
-            # it is an UPGRADE-completeness signal, not a dream-cycle metric. It
-            # answers "may this deployment be trusted to fold across projects
-            # yet", because the insight gate declines to count a project node
-            # that has no registry identity. None = not yet probed, never
-            # "complete". An ADDITIVE field: a monitor that does not know it
-            # renders exactly as before.
-            checks["project_identity"] = consolidation.get("project_identity")
-            # Domain identity (migration 028) — the same kind of signal for the
-            # sibling axis: registry vs graph, plus whether every section is
-            # attached to its project, which is what the cross-domain walk will
-            # depend on. Additive; None = not yet probed, never "complete".
-            checks["domain_identity"] = consolidation.get("domain_identity")
-        except Exception:
-            checks["consolidation"] = {"fresh": False}
-            checks["inference_busy"] = "unknown"
-            checks["graph_invalid_nodes"] = None
-            checks["project_identity"] = None
-            checks["domain_identity"] = None
+        checks.update(_coordinator_health_keys(coordinator))
 
         # pgvector version + hnsw.iterative_scan (decision:1584/fact:1583) —
         # flat additive key, read straight off the coordinator's own startup

@@ -5,6 +5,36 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.64] — 2026-08-27
+
+### Fixed — the GPU probe reaps the `nvtop` it spawns, and stops spawning after repeated hangs
+
+The coordinator's health refresher runs `nvtop -s` about once a minute to populate the `inference_busy`
+signal. On a host where `nvtop` blocks in a GPU-fence wait, the five-second timeout fired, the probe
+logged `nvtop snapshot failed ()` — the empty parentheses were `str(TimeoutError())` — returned "not
+busy", and left the child running. The next refresh spawned another. On one test host that was 926
+D-state processes and 2.98 GB of resident memory after seventeen hours, which is the likeliest
+explanation for the out-of-memory hangs previously attributed to the encoders there. A timed-out
+child is now SIGKILLed and waited under a short bound (`NVTOP_KILL_WAIT_SEC`, default 1 s); a child that
+still does not exit is counted as leaked rather than awaited again. After `NVTOP_MAX_CONSECUTIVE_HANGS`
+snapshot timeouts with no successful snapshot in between (default 3 — an unmeasured default, chosen so
+a single transient stall does not disable the probe) the probe disables itself for the rest of the
+process lifetime, with one warning that says so; a gateway restart re-arms it. The timeout path logs
+the exception class, never an empty string, and a malformed knob value falls back to its default
+instead of silently defeating the cap.
+
+`/health` gains an additive `gpu_probe` key — `{"state": "ok"|"unavailable"|"disabled_after_hangs",
+"consecutive_hangs", "leaked_children"}` — carried on the coordinator's cached snapshot, so `/health`
+still never shells out per request. `inference_busy` reads `"unknown"` while the probe is disabled, as
+it already did when `nvtop` was absent; the three shipped definitions of `"unknown"` say so. The
+persisted hardware fingerprint now reads whether the probe is *installed*, not whether it can answer
+right now, so a runtime self-disable can no longer flip it and raise a false fingerprint mismatch at
+the next start. The `/health` lift of the coordinator's cached keys is a pure function with a direct
+unit test. `.env.example` now documents every probe knob (`SLOT_AWARE`, `NVTOP_BIN`,
+`NVTOP_TIMEOUT_SEC`, `GPU_BUSY_PERCENT`, `GPU_INDICES` and the two new ones), and the module and
+server-setup docs no longer claim the dreaming daemons gate on this probe — they stopped doing so some
+releases ago; it feeds telemetry only.
+
 ## [0.9.63] — 2026-08-26
 
 ### Fixed — a provider key file with a stray CR/LF is refused at load with a message that names the file

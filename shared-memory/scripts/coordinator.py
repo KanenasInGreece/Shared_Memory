@@ -88,7 +88,7 @@ from secure_env import get_secret
 log = logging.getLogger("coordinator")
 
 try:
-    from gpu_load import inference_busy_state
+    from gpu_load import inference_busy_state, probe_status
 except Exception as _gpu_exc:  # pragma: no cover - import-time safety only
     # The busy signal is observability, never load-bearing: if gpu_load can't be
     # imported the gateway must still serve. Fall back to "unknown" so the monitor
@@ -98,6 +98,9 @@ except Exception as _gpu_exc:  # pragma: no cover - import-time safety only
 
     async def inference_busy_state() -> str:  # type: ignore[misc]
         return "unknown"
+
+    def probe_status() -> dict:  # type: ignore[misc]
+        return {"state": "unavailable", "consecutive_hangs": 0, "leaked_children": 0}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -147,7 +150,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.63"
+FRAMEWORK_VERSION = "0.9.64"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -2593,7 +2596,11 @@ class MemoryCoordinator:
                                              # as "upgrade complete".
                                              "project_identity": None,
                                              "domain_identity": None,
-                                             "inference_busy": "unknown", "fresh": False}
+                                             "inference_busy": "unknown",
+                                             # Same "not yet probed" rule as the
+                                             # gauges above: None until the first
+                                             # refresh, never a fabricated "ok".
+                                             "gpu_probe": None, "fresh": False}
         self._consolidation_health_task: asyncio.Task | None = None
         self._alt_vector_task: asyncio.Task | None = None
 
@@ -8811,7 +8818,8 @@ class MemoryCoordinator:
     def consolidation_health(self) -> dict:
         """Cached compact snapshot for /health (DB-free, refreshed in background).
         Returns {stalled, last_outcome, last_success_age_seconds, inference_busy,
-        fresh}. inference_busy is tri-state ("busy"|"idle"|"unknown")."""
+        gpu_probe, fresh}. inference_busy is tri-state ("busy"|"idle"|"unknown").
+        gpu_probe is gpu_load.probe_status() or None if not yet probed."""
         return dict(self._consolidation_health)
 
     async def _consolidation_health_refresher(self) -> None:
@@ -8853,6 +8861,14 @@ class MemoryCoordinator:
                     # the whole cached snapshot down with it, so a metric about
                     # an incomplete upgrade would present as a stalled system.
                     project_identity = None
+                try:
+                    # probe_status() is pure module state (fact:1645) -- this
+                    # can't actually raise today, but it shares the module with
+                    # inference_busy_state() above, so it gets the same
+                    # tolerance as its three siblings rather than a bare call.
+                    gpu_probe = probe_status()
+                except Exception:
+                    gpu_probe = None
                 self._consolidation_health = {
                     "stalled": full["stalled"],
                     "graph_invalid_nodes": invalid_nodes,
@@ -8869,6 +8885,7 @@ class MemoryCoordinator:
                     "last_success_cycle_type": full.get("last_success_cycle_type"),
                     "stalled_types": full.get("stalled_types", []),
                     "inference_busy": inference_busy,
+                    "gpu_probe": gpu_probe,
                     "fresh": True,
                 }
             except asyncio.CancelledError:

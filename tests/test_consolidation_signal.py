@@ -633,6 +633,14 @@ def test_cached_snapshot_defaults_inference_busy_unknown():
     assert c.consolidation_health()["inference_busy"] == "unknown"
 
 
+def test_cached_snapshot_defaults_gpu_probe_none():
+    """Mirrors test_cached_snapshot_defaults_inference_busy_unknown (fact:1645):
+    None until the first refresh — "not yet probed" must never read as "ok",
+    same discipline as graph_invalid_nodes/project_identity/domain_identity."""
+    c = co.MemoryCoordinator()
+    assert c.consolidation_health()["gpu_probe"] is None
+
+
 @pytest.mark.asyncio
 async def test_refresher_stores_inference_busy(monkeypatch):
     c = co.MemoryCoordinator()
@@ -644,8 +652,12 @@ async def test_refresher_stores_inference_busy(monkeypatch):
     async def _state():
         return "busy"
 
+    def _probe_status():
+        return {"state": "ok", "consecutive_hangs": 0, "leaked_children": 0}
+
     monkeypatch.setattr(c, "_compute_consolidation_health", _compute)
     monkeypatch.setattr(co, "inference_busy_state", _state)
+    monkeypatch.setattr(co, "probe_status", _probe_status)
     _stop_after_one_iteration(monkeypatch)
 
     with pytest.raises(asyncio.CancelledError):
@@ -653,7 +665,93 @@ async def test_refresher_stores_inference_busy(monkeypatch):
 
     snap = c.consolidation_health()
     assert snap["inference_busy"] == "busy"
+    # ADDITIVE (fact:1645): the same cached snapshot now also carries the
+    # nvtop probe's own self-health, refreshed alongside inference_busy.
+    assert snap["gpu_probe"] == {"state": "ok", "consecutive_hangs": 0, "leaked_children": 0}
     assert snap["fresh"] is True
+
+
+@pytest.mark.asyncio
+async def test_refresher_gpu_probe_failure_defaults_to_none(monkeypatch):
+    """gpu_probe gets the SAME tolerance as its three siblings (_graph_
+    integrity, _domain_identity_health, _project_identity_health): a raise
+    inside probe_status() must degrade this one field, never abort the
+    refresh or blank the whole snapshot."""
+    c = co.MemoryCoordinator()
+
+    async def _compute():
+        return {"stalled": False, "last_outcome": "completed",
+                "last_success_age_seconds": 5}
+
+    async def _state():
+        return "busy"
+
+    def _boom():
+        raise RuntimeError("probe_status exploded")
+
+    monkeypatch.setattr(c, "_compute_consolidation_health", _compute)
+    monkeypatch.setattr(co, "inference_busy_state", _state)
+    monkeypatch.setattr(co, "probe_status", _boom)
+    _stop_after_one_iteration(monkeypatch)
+
+    with pytest.raises(asyncio.CancelledError):
+        await c._consolidation_health_refresher()
+
+    snap = c.consolidation_health()
+    assert snap["gpu_probe"] is None
+    assert snap["inference_busy"] == "busy"  # unaffected by the gpu_probe failure
+    assert snap["fresh"] is True
+
+
+def test_coordinator_health_keys_lifts_gpu_probe():
+    """(e), F4 (fix round, MEDIUM): replaces the prior source-inspection test
+    (test_health_lifts_gpu_probe_top_level) -- inspect.getsource() only proves
+    a line exists in the function body, never that it actually executes (an
+    `if False:` wrapped around the real assignment would still have passed
+    that test; that was the review finding). _build_health_checks' coordinator
+    lift is now the pure, directly callable hive_mind_proxy._coordinator_
+    health_keys(coordinator), exercised here with a stub -- no aiohttp session
+    or live gateway required.
+
+    Mutation check: wrap the gpu_probe assignment in `if False:` inside
+    _coordinator_health_keys -- this test dies (KeyError / None mismatch).
+    Verified on a scratch copy -- see HANDOFF.md."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
+    import hive_mind_proxy as hmp
+
+    class _StubCoordinator:
+        def consolidation_health(self):
+            return {
+                "inference_busy": "busy",
+                "graph_invalid_nodes": 0,
+                "project_identity": {"ok": True},
+                "domain_identity": {"ok": True},
+                "gpu_probe": {"state": "ok", "consecutive_hangs": 0, "leaked_children": 0},
+            }
+
+    keys = hmp._coordinator_health_keys(_StubCoordinator())
+    assert keys["gpu_probe"] == {"state": "ok", "consecutive_hangs": 0, "leaked_children": 0}
+    assert keys["inference_busy"] == "busy"
+
+
+def test_coordinator_health_keys_defaults_on_failure():
+    """(e), F4: a coordinator.consolidation_health() raise must degrade to the
+    same "unknown"/None defaults the inline except branch used to return —
+    gpu_probe included, same discipline as its siblings."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
+    import hive_mind_proxy as hmp
+
+    class _BoomCoordinator:
+        def consolidation_health(self):
+            raise RuntimeError("db down")
+
+    keys = hmp._coordinator_health_keys(_BoomCoordinator())
+    assert keys["gpu_probe"] is None
+    assert keys["inference_busy"] == "unknown"
+    assert keys["graph_invalid_nodes"] is None
+    assert keys["project_identity"] is None
+    assert keys["domain_identity"] is None
+    assert keys["consolidation"] == {"fresh": False}
 
 
 @pytest.mark.asyncio

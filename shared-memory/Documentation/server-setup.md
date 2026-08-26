@@ -99,7 +99,7 @@ All live in `shared-memory/scripts/` and run on the gateway host only.
 | `coordinator.py` | Owns all Postgres + Neo4j I/O — per-entity locks, outbox worker, auth middleware. Embedded in the gateway. |
 | `rem_loop.py` | REM daemon — idle enrichment: full LLM summary + typed relationships per Fact. |
 | `consolidation_loop.py` | NREM daemon — synthesises Tier‑3 community summaries once 5+ enriched facts share an entity hub. |
-| `gpu_load.py` | GPU‑busy probe (`nvtop --snapshot`) so dreaming yields to active inference. |
+| `gpu_load.py` | GPU‑busy probe (`nvtop --snapshot`), polled by the coordinator's health refresher to feed the `inference_busy` signal on `GET /health`; the dream-cycle daemons no longer gate on it directly. |
 | `ontology.py` | Loads `shared-memory/ontology.yaml` (repo-root fallback for older checkouts; `SMEM_ONTOLOGY_PATH` overrides); supplies Neo4j labels/relationship types. |
 | `generate_tokens.py` | Token minting helper (write-through mint flow, `--reveal`, `--convert-digests` — see below). |
 
