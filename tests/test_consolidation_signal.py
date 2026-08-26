@@ -82,7 +82,12 @@ def _no_census_row(cycle_type):
         "runs_24h": 0, "deferred_24h": 0, "idle_24h": 0,
         "folds_succeeded_24h": 0, "folds_attempted_24h": 0,
         "inflight": 0, "consec_fail": 0, "last_error_class": None,
-        "last_error_msg": None, "eligible_clusters": None,
+        "last_error_msg": None, "last_error_at": None, "last_error_age": None,
+        # C1 (merger fix round) — the apples-to-apples comparator for
+        # `superseded`, distinct from `last_success` above (which a crashed-
+        # but-partially-folded run can also satisfy).
+        "last_completed_at": None,
+        "eligible_clusters": None,
         "eligible_oldest_age": None, "last_deferred_reason": None,
         # D1 (fact:1189) — dead_lettered_clusters, like eligible_clusters,
         # is NULL when no census has ever recorded it.
@@ -271,6 +276,164 @@ async def test_singleton_clusters_surfaced_per_cycle_type():
     assert out["insight"]["singleton_clusters"] == 2
     # fact_consolidation got no row at all this pass — None, not 0.
     assert out["fact_consolidation"]["singleton_clusters"] is None
+
+
+# ── last_error: age + superseded (fact:1609 companion, live 2026-08-26) ──────
+#
+# GET /memory/telemetry's consolidation.<cycle_type>.last_error used to be the
+# most recent outcome='crashed' row in the WHOLE retention window, never
+# bounded by later successes — live it showed a v0.8-era OrphanedRun that had
+# been superseded by hundreds of completed runs since, and memory_bridge.py's
+# `status` rendered it as a bare "err OrphanedRun", indistinguishable from a
+# CURRENT failure. consec_fail (crashes since last success) already existed
+# on the same query and was correctly 0 in this exact scenario — last_error
+# just never checked it.
+
+async def _run_health_with_row(row):
+    coord = co.MemoryCoordinator()
+    conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[row])
+    acq = MagicMock()
+    acq.__aenter__ = AsyncMock(return_value=conn)
+    acq.__aexit__ = AsyncMock(return_value=False)
+    coord._acquire = MagicMock(return_value=acq)
+    return await coord._compute_consolidation_health()
+
+
+@pytest.mark.asyncio
+async def test_last_error_superseded_false_when_crash_is_the_latest_event():
+    """No success has landed since the crash (or none ever has) — the crash
+    is current, `superseded` must read False. age_seconds is SQL-computed
+    (O9, merger fix round) — the row supplies `last_error_age` directly,
+    exactly as the live query would."""
+    now = datetime.now(timezone.utc)
+    crash_at = now - timedelta(seconds=45)
+    row = dict(_no_census_row("insight"), last_error_class="OrphanedRun",
+               last_error_msg="reaped on restart", last_error_at=crash_at,
+               last_error_age=45, last_completed_at=None)
+    out = await _run_health_with_row(row)
+    err = out["insight"]["last_error"]
+    assert err["class"] == "OrphanedRun"
+    assert err["superseded"] is False
+    assert err["age_seconds"] == 45
+
+
+@pytest.mark.asyncio
+async def test_last_error_superseded_true_when_a_success_landed_after_it():
+    """A run with outcome='completed' landed AFTER the crash — the crash is
+    history. `superseded` must read True; age_seconds reports the crash's
+    own SQL-computed age (last_error_age), untouched by success_at."""
+    now = datetime.now(timezone.utc)
+    crash_at = now - timedelta(days=23)
+    completed_at = now - timedelta(days=1)
+    row = dict(_no_census_row("insight"), last_error_class="OrphanedRun",
+               last_error_msg="reaped on restart", last_error_at=crash_at,
+               last_error_age=23 * 86400, last_completed_at=completed_at)
+    out = await _run_health_with_row(row)
+    err = out["insight"]["last_error"]
+    assert err["superseded"] is True
+    assert err["age_seconds"] == 23 * 86400
+
+
+@pytest.mark.asyncio
+async def test_last_error_not_superseded_by_a_crash_that_itself_folded():
+    """C1 (Critical, merger fix round) — the defect this guards: `last_success`
+    is FILTERed on `folds_succeeded > 0`, which a run that CRASHED after
+    folding at least one cluster ALSO satisfies (consolidation_loop writes a
+    crashed row with rec.succeeded already > 0). So a crash seconds old can
+    itself be the very row `last_success` reads as newest -- comparing
+    `last_error_at` against `last_success` would then call that crash
+    "superseded" by ITSELF, seconds after it happened.
+
+    Scenario: `last_success` is NEWER than `last_error_at` (the broken
+    comparator's condition for `superseded=True`), but `last_completed_at`
+    (an actual outcome='completed' row) is OLDER than the crash. The FIXED
+    comparator must read `superseded=False` here -- only `last_completed_at`
+    may ever answer "did a real success land after this crash".
+
+    Mutation check: reverting `last_completed_at` back to `last_success` in
+    the `superseded` comparison makes this test fail (it would then read
+    True, since last_success > last_error_at in this row)."""
+    now = datetime.now(timezone.utc)
+    crash_at = now - timedelta(seconds=10)
+    # The crash's OWN finished_at -- inflates last_success (folds_succeeded>0
+    # on the crashed row itself), landing a few seconds AFTER the crash's
+    # started_at used for last_error_at above.
+    row = dict(_no_census_row("insight"), last_error_class="OrphanedRun",
+               last_error_msg="died after one fold", last_error_at=crash_at,
+               last_error_age=10,
+               last_success=crash_at + timedelta(seconds=5),
+               # The last run that genuinely finished clean was an HOUR ago --
+               # strictly BEFORE the crash, not after it.
+               last_completed_at=now - timedelta(hours=1))
+    out = await _run_health_with_row(row)
+    err = out["insight"]["last_error"]
+    assert err["superseded"] is False
+
+
+@pytest.mark.asyncio
+async def test_last_error_is_none_when_no_crash_ever_recorded():
+    row = dict(_no_census_row("insight"), last_error_class=None,
+               last_error_msg=None, last_error_at=None, last_error_age=None,
+               last_success=None, last_completed_at=None)
+    out = await _run_health_with_row(row)
+    assert out["insight"]["last_error"] is None
+
+
+def _strip_sql_line_comments(sql: str) -> str:
+    """Drop everything from the first `--` to end-of-line, per line -- a SQL
+    line comment, not a Python one (this text is the SQL string's own
+    content, embedded verbatim in the Python source `inspect.getsource`
+    returns). Needed before scanning for `AS <alias>` output columns: a
+    comment discussing the query in prose can legitimately contain the
+    substring "AS" as part of unrelated SQL syntax (e.g. explaining a
+    `CAST(x AS int)` elsewhere) or plain English, and that must never be
+    read as a real output alias."""
+    return "\n".join(line.split("--", 1)[0] for line in sql.splitlines())
+
+
+def _query_outer_select_aliases(method_src: str) -> set:
+    """Every `AS <alias>` the query's OUTER SELECT actually produces (plus
+    the leading bare `cycle_type` column, never `AS`-aliased), with SQL line
+    comments stripped first (NEW-3, merger final round)."""
+    outer_start = method_src.index('SELECT cycle_type,')
+    outer = method_src[outer_start:method_src.index("FROM ranked GROUP BY cycle_type", outer_start)]
+    aliases = set(re.findall(r"\bAS\s+(\w+)", _strip_sql_line_comments(outer)))
+    aliases.add("cycle_type")
+    return aliases
+
+
+def test_alias_scan_ignores_as_inside_a_sql_comment():
+    """NEW-3 (merger final round) -- proof that stripping `--` comments
+    actually matters: a comment mentioning `CAST(x AS int)` (real SQL syntax
+    that is NOT a query output column) must not leak `int` into the alias
+    set, and a comment that merely SAYS a real alias name in prose (without
+    it being genuinely `AS`-produced there) must not manufacture a phantom
+    entry either -- only the live `AS quantity` actually in code counts."""
+    synthetic = """
+              SELECT cycle_type,
+              -- some rows CAST(x AS int) before comparing -- prose noise
+              count(*) AS quantity
+              -- also mentions AS eligible_clusters in passing, not real code
+              FROM ranked GROUP BY cycle_type
+    """
+    aliases = _query_outer_select_aliases(synthetic)
+    assert aliases == {"cycle_type", "quantity"}
+
+
+def test_query_outer_select_aliases_match_the_fixture_exactly():
+    """T6 (merger fix round) -- the whole suite stubs Postgres I/O with a
+    fixed-shape fixture row (_no_census_row), so a genuine SQL alias typo or
+    a dropped column currently stays green here and would only surface as a
+    live KeyError in production. Parse every `AS <alias>` the query's OUTER
+    SELECT actually produces (plus the leading bare `cycle_type` column,
+    never `AS`-aliased) and assert it matches the fixture's key set exactly.
+
+    Mutation-checked: deleting the `last_error_at` alias from the query on a
+    scratch copy makes this fail (fixture keeps it, query no longer does)."""
+    src = inspect.getsource(co.MemoryCoordinator._compute_consolidation_health)
+    aliases = _query_outer_select_aliases(src)
+    assert aliases == set(_no_census_row("insight").keys())
 
 
 @pytest.mark.asyncio

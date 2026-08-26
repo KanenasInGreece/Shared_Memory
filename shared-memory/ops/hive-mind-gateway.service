@@ -1,7 +1,11 @@
 [Unit]
 Description=Shared Memory Hive-Mind Gateway (coordinator + consolidation + REM daemons)
 Documentation=https://github.com/YOUR_GITHUB_USER/shared-memory
-# Best-effort ordering; the daemons retry their own upstreams, so these are not hard deps.
+# Best-effort ordering: the coordinator itself waits up to PG_STARTUP_WAIT_S
+# (default 60s, .env-overridable) for Postgres to start accepting connections
+# before giving up and exiting, so a boot-order race becomes a bounded retry
+# instead of an immediate crash — Restart= below is still the real backstop
+# once that window is exhausted.
 After=network-online.target docker.service
 Wants=network-online.target
 

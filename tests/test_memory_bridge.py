@@ -564,6 +564,38 @@ def test_format_status_names_the_stalled_type_and_the_successful_one():
     assert "39 runs/24h avg 192.4s, folds 17/69" in out
 
 
+def test_format_status_shows_a_current_error_as_err():
+    """last_error with superseded False (or the key simply absent, as an
+    older gateway sends it) renders as today's bare "err <class>" — a crash
+    with nothing since it is a CURRENT condition."""
+    payload = {"status": "success", "telemetry": {"consolidation": {
+        "stalled": False, "last_outcome": "crashed",
+        "last_success_age_seconds": None,
+        "insight": {"last_outcome": "crashed", "stalled": False,
+                    "last_error": {"class": "OrphanedRun", "msg": "reaped",
+                                   "age_seconds": 45, "superseded": False}},
+    }}}
+    out = memory_bridge.format_status(payload)
+    assert "err OrphanedRun" in out
+    assert "last err" not in out
+
+
+def test_format_status_shows_a_superseded_error_as_history_with_its_age():
+    """fact:1609 companion, live 2026-08-26 — a crash from weeks ago,
+    superseded by hundreds of later successes, must read as history, not as
+    a current failure: "last err <class> <age>", never a bare "err <class>"."""
+    payload = {"status": "success", "telemetry": {"consolidation": {
+        "stalled": False, "last_outcome": "completed",
+        "last_success_age_seconds": 300,
+        "insight": {"last_outcome": "completed", "stalled": False,
+                    "last_error": {"class": "OrphanedRun", "msg": "reaped",
+                                   "age_seconds": 1987200, "superseded": True}},
+    }}}
+    out = memory_bridge.format_status(payload)
+    assert "last err OrphanedRun 1987200s ago" in out
+    assert "err OrphanedRun" not in out.replace("last err OrphanedRun", "")
+
+
 def test_format_status_falls_back_when_gateway_predates_stalled_types():
     """An older gateway sends `stalled` with no `stalled_types`. The client must
     still report the stall rather than silently rendering it as ok."""
