@@ -265,7 +265,10 @@ def call_timing_summary(
     completion_tokens/tok_s_wall (fact:1621) are the OpenAI-compatible fallback for backends that
     return no ``timings`` block at all (external, non-llama.cpp providers): tok_s_wall is an
     EFFECTIVE rate — completion_tokens / wall_s — so it includes TTFT and network time, unlike
-    service_ms's pure-inference rate. It is present precisely where the server gives no timings."""
+    service_ms's pure-inference rate. It is present precisely where the server gives no timings.
+    completion_tokens accepts int or float usage.completion_tokens (some providers send a float);
+    bool is explicitly rejected (bool is a subclass of int in Python — True/False are not token
+    counts)."""
     t = (resp_json or {}).get("timings") or {}
     pm, dm = t.get("prompt_ms"), t.get("predicted_ms")
     service_ms = (round(pm + dm, 1)
@@ -275,10 +278,12 @@ def call_timing_summary(
                      if wall_ms is not None and service_ms is not None else None)
     usage = (resp_json or {}).get("usage") or {}
     ct = usage.get("completion_tokens")
-    completion_tokens = ct if isinstance(ct, int) else None
+    completion_tokens = (int(ct) if isinstance(ct, (int, float)) and not isinstance(ct, bool)
+                          else None)
     tok_s_wall = (round(completion_tokens / wall_s, 2)
                   if isinstance(completion_tokens, int) and completion_tokens > 0
-                  and isinstance(wall_s, (int, float)) and wall_s > 0 else None)
+                  and isinstance(wall_s, (int, float)) and not isinstance(wall_s, bool)
+                  and wall_s > 0 else None)
     return {
         "service_ms": service_ms,
         "wall_ms": wall_ms,

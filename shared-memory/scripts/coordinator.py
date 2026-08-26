@@ -2401,9 +2401,14 @@ def render_rem_by_model(rows) -> list[dict]:
     so a wall-only row (no llama.cpp ``timings`` block, e.g. an OpenAI-compatible
     external backend) still renders instead of vanishing from ``by_model``:
       wall_ms       = caller-observed p50/p95, present for every backend.
-      n_service     = how many of this model's rows carried server timings.
+      n_service     = how many of this model's rows carried server timings
+                      (out of the legacy ``n`` = count(*), unchanged for the
+                      monitor contract — n now counts wall rows, not service
+                      samples, so it can exceed n_service).
       backend       = the modal backend string for this model, or None.
-      timing_source = "server" when n_service > 0, else "wall".
+      timing_source = "server" when n_service == n (every row server-timed),
+                      "mixed" when 0 < n_service < n (some rows external),
+                      "wall" when n_service == 0 (no row server-timed).
     Never invents a number: a None percentile stays None.
     """
     def _r(v):
@@ -2411,17 +2416,24 @@ def render_rem_by_model(rows) -> list[dict]:
 
     out = []
     for r in rows:
+        n = r["n"]
         n_service = int(r["n_service"] or 0)
+        if n_service == 0:
+            timing_source = "wall"
+        elif n_service == n:
+            timing_source = "server"
+        else:
+            timing_source = "mixed"
         out.append({
             "model": r["model"],
-            "n": r["n"],
+            "n": n,
             "max_batch_size": r["max_batch"],
             "service_ms":    {"p50": _r(r["svc_p50"]), "p95": _r(r["svc_p95"])},
             "contention_ms": {"p50": _r(r["con_p50"]), "p95": _r(r["con_p95"])},
             "wall_ms":       {"p50": _r(r["wall_p50"]), "p95": _r(r["wall_p95"])},
             "n_service": n_service,
             "backend": r["backend"],
-            "timing_source": "server" if n_service > 0 else "wall",
+            "timing_source": timing_source,
         })
     return out
 
@@ -8127,8 +8139,8 @@ class MemoryCoordinator:
         (fact:1621) returns no such block, so service_ms/contention_ms are null for it
         while wall_ms/backend are populated — filtering on service_ms silently dropped
         every external model from by_model. Rendering is done by the pure
-        ``render_rem_by_model`` so external backends now surface with wall-only timing
-        (timing_source="wall") instead of vanishing.
+        ``render_rem_by_model`` so external backends now surface with wall-only or
+        mixed timing (timing_source="wall"/"mixed"/"server") instead of vanishing.
         The NREM whole-cycle COMPUTE window (consolidation_runs started_at→finished_at)
         is kept ALONGSIDE (decision 568), never fact→summary — that end-to-end is
         density-gate-dominated and survivorship-biased, an erroneous latency (fact 567).
@@ -8169,9 +8181,10 @@ class MemoryCoordinator:
                 "   AND finished_at >= now() - interval '7 days'"
             )
         out["rem_ms"] = {
-            "note": "service_ms = model/hardware (anchor, server timings only); "
-                    "contention_ms = capacity; wall_ms = caller-observed, present "
-                    "for every backend incl. external",
+            "note": "service_ms/contention_ms percentiles are over n_service rows "
+                    "(server timings only, model/hardware anchor + capacity); "
+                    "wall_ms is over n rows, caller-observed, present for every "
+                    "backend incl. external",
             "by_model": render_rem_by_model(rem_rows),
         }
         out["nrem_cycle_seconds"] = (

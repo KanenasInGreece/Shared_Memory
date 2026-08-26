@@ -190,6 +190,26 @@ def test_call_timing_summary_no_usage_yields_none_new_keys(monkeypatch):
     assert t3["tok_s_wall"] is None
 
 
+def test_call_timing_summary_accepts_float_completion_tokens(monkeypatch):
+    # Some OpenAI-compatible providers send usage.completion_tokens as a float.
+    dt = _fresh(monkeypatch)
+    resp = {"model": "ext-model", "usage": {"completion_tokens": 266.0}}
+    t = dt.call_timing_summary(resp, 2.1)
+    assert t["completion_tokens"] == 266
+    assert isinstance(t["completion_tokens"], int)
+    assert t["tok_s_wall"] == 126.67
+
+
+def test_call_timing_summary_rejects_bool_completion_tokens(monkeypatch):
+    # bool is a subclass of int in Python — True/False are not token counts
+    # and must not be laundered into completion_tokens=1/0.
+    dt = _fresh(monkeypatch)
+    resp = {"model": "ext-model", "usage": {"completion_tokens": True}}
+    t = dt.call_timing_summary(resp, 2.1)
+    assert t["completion_tokens"] is None
+    assert t["tok_s_wall"] is None
+
+
 def test_writes_jsonl_when_path_set(monkeypatch, tmp_path):
     metrics = tmp_path / "dream-metrics.jsonl"
     dt = _fresh(monkeypatch, str(metrics))
