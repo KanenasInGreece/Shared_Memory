@@ -1458,7 +1458,17 @@ def format_status(payload: dict) -> str:
             if c.get("consecutive_failures"):
                 parts.append(f"{c['consecutive_failures']} fails")
             if c.get("last_error"):
-                parts.append(f"err {c['last_error'].get('class','?')}")
+                _err = c["last_error"]
+                # fact:1609 companion — a crash superseded by a later success
+                # is history, not a current condition (older gateways never
+                # send "superseded", so absence reads as "not superseded" —
+                # today's bare "err <class>" behaviour, unchanged).
+                if _err.get("superseded"):
+                    _err_age = _err.get("age_seconds")
+                    _err_age_s = f"{_err_age}s ago" if _err_age is not None else "—"
+                    parts.append(f"last err {_err.get('class','?')} {_err_age_s}")
+                else:
+                    parts.append(f"err {_err.get('class','?')}")
             if c.get("eligible_clusters") is not None:
                 cov = f"eligible {c['eligible_clusters']}"
                 if c.get("eligible_oldest_age_seconds") is not None:

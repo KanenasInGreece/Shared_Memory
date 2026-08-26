@@ -82,7 +82,7 @@ def _no_census_row(cycle_type):
         "runs_24h": 0, "deferred_24h": 0, "idle_24h": 0,
         "folds_succeeded_24h": 0, "folds_attempted_24h": 0,
         "inflight": 0, "consec_fail": 0, "last_error_class": None,
-        "last_error_msg": None, "eligible_clusters": None,
+        "last_error_msg": None, "last_error_at": None, "eligible_clusters": None,
         "eligible_oldest_age": None, "last_deferred_reason": None,
         # D1 (fact:1189) — dead_lettered_clusters, like eligible_clusters,
         # is NULL when no census has ever recorded it.
@@ -271,6 +271,71 @@ async def test_singleton_clusters_surfaced_per_cycle_type():
     assert out["insight"]["singleton_clusters"] == 2
     # fact_consolidation got no row at all this pass — None, not 0.
     assert out["fact_consolidation"]["singleton_clusters"] is None
+
+
+# ── last_error: age + superseded (fact:1609 companion, live 2026-08-26) ──────
+#
+# GET /memory/telemetry's consolidation.<cycle_type>.last_error used to be the
+# most recent outcome='crashed' row in the WHOLE retention window, never
+# bounded by later successes — live it showed a v0.8-era OrphanedRun that had
+# been superseded by hundreds of completed runs since, and memory_bridge.py's
+# `status` rendered it as a bare "err OrphanedRun", indistinguishable from a
+# CURRENT failure. consec_fail (crashes since last success) already existed
+# on the same query and was correctly 0 in this exact scenario — last_error
+# just never checked it.
+
+async def _run_health_with_row(row):
+    coord = co.MemoryCoordinator()
+    conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[row])
+    acq = MagicMock()
+    acq.__aenter__ = AsyncMock(return_value=conn)
+    acq.__aexit__ = AsyncMock(return_value=False)
+    coord._acquire = MagicMock(return_value=acq)
+    return await coord._compute_consolidation_health()
+
+
+@pytest.mark.asyncio
+async def test_last_error_superseded_false_when_crash_is_the_latest_event():
+    """No success has landed since the crash (or none ever has) — the crash
+    is current, `superseded` must read False, and age_seconds must be
+    computed from `last_error_at`."""
+    now = datetime.now(timezone.utc)
+    crash_at = now - timedelta(seconds=45)
+    row = dict(_no_census_row("insight"), last_error_class="OrphanedRun",
+               last_error_msg="reaped on restart", last_error_at=crash_at,
+               last_success=None)
+    out = await _run_health_with_row(row)
+    err = out["insight"]["last_error"]
+    assert err["class"] == "OrphanedRun"
+    assert err["superseded"] is False
+    assert 44 <= err["age_seconds"] <= 46
+
+
+@pytest.mark.asyncio
+async def test_last_error_superseded_true_when_a_success_landed_after_it():
+    """A completed run landed AFTER the crash — the crash is history.
+    `superseded` must read True; age_seconds still reports how old the crash
+    itself is (not how old the success is)."""
+    now = datetime.now(timezone.utc)
+    crash_at = now - timedelta(days=23)
+    success_at = now - timedelta(days=1)
+    row = dict(_no_census_row("insight"), last_error_class="OrphanedRun",
+               last_error_msg="reaped on restart", last_error_at=crash_at,
+               last_success=success_at)
+    out = await _run_health_with_row(row)
+    err = out["insight"]["last_error"]
+    assert err["superseded"] is True
+    expected_age = int((now - crash_at).total_seconds())
+    assert abs(err["age_seconds"] - expected_age) <= 1
+
+
+@pytest.mark.asyncio
+async def test_last_error_is_none_when_no_crash_ever_recorded():
+    row = dict(_no_census_row("insight"), last_error_class=None,
+               last_error_msg=None, last_error_at=None, last_success=None)
+    out = await _run_health_with_row(row)
+    assert out["insight"]["last_error"] is None
 
 
 @pytest.mark.asyncio

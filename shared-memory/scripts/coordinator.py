@@ -1824,6 +1824,16 @@ POOL_MIN = _env_int("POOL_MIN", 2)
 POOL_MAX = _env_int("POOL_MAX", 20)
 POOL_ACQUIRE_TIMEOUT = _env_float("POOL_ACQUIRE_TIMEOUT", 5.0)
 
+# Bounded startup wait for Postgres (fact:1609): at boot the gateway can start
+# before Postgres is accepting connections yet, and the unguarded pool create
+# used to crash on the FIRST attempt -- Restart=on-failure then just replays
+# the same race every time. PG_STARTUP_WAIT_S bounds how long start() retries
+# a "not ready yet" connection failure before giving up and re-raising, so
+# systemd's Restart= stays the real backstop instead of masking a boot-order
+# problem as a crash loop.
+PG_STARTUP_WAIT_S  = _env_float("PG_STARTUP_WAIT_S", 60.0)
+PG_STARTUP_RETRY_S = _env_float("PG_STARTUP_RETRY_S", 2.0)
+
 # The pgvector floor for `hnsw.iterative_scan` (decision:1584, fact:1583).
 # Below it a selective axis filter (--project/--domain) can return ZERO rows
 # past ~75k-300k records: HNSW returns its ef_search candidates and the SQL
@@ -2438,6 +2448,42 @@ def render_rem_by_model(rows) -> list[dict]:
     return out
 
 
+async def _connect_with_startup_wait(factory):
+    """Call `factory()` (a zero-arg async callable), retrying while Postgres
+    is still starting up (fact:1609).
+
+    Retries ONLY on `OSError` (covers `ConnectionRefusedError` etc — the TCP
+    connect itself failed) or `asyncpg.exceptions.CannotConnectNowError`
+    ("the database system is starting up"). Any other exception — including
+    `asyncpg.exceptions.TooManyConnectionsError`, which means the server IS
+    up but has no room right now, not a startup race — is not retried and
+    propagates on the first attempt.
+
+    Elapsed time is tracked as accumulated retry sleeps rather than a wall
+    clock read, so the bound is exact whether `asyncio.sleep` is the real
+    one or a test double that returns instantly.
+    """
+    attempt = 0
+    elapsed = 0.0
+    while True:
+        attempt += 1
+        try:
+            return await factory()
+        except (OSError, asyncpg.exceptions.CannotConnectNowError) as exc:
+            if elapsed >= PG_STARTUP_WAIT_S:
+                log.warning(
+                    "Postgres still not accepting connections after %.1fs "
+                    "elapsed (%d attempts) — giving up: %s",
+                    elapsed, attempt, exc)
+                raise
+            log.warning(
+                "Postgres not ready yet (attempt %d, %.1fs elapsed) — "
+                "retrying in %.1fs: %s",
+                attempt, elapsed, PG_STARTUP_RETRY_S, exc)
+            await asyncio.sleep(PG_STARTUP_RETRY_S)
+            elapsed += PG_STARTUP_RETRY_S
+
+
 # ── Coordinator ───────────────────────────────────────────────────────────────
 
 class MemoryCoordinator:
@@ -2541,7 +2587,7 @@ class MemoryCoordinator:
         # created and initialised during create_pool() itself, before any
         # query against them could have told us whether to apply it.
         try:
-            _probe = await asyncpg.connect(PG_DSN)
+            _probe = await _connect_with_startup_wait(lambda: asyncpg.connect(PG_DSN))
             try:
                 _raw_version = await _probe.fetchval(
                     "SELECT extversion FROM pg_extension WHERE extname='vector'"
@@ -2567,10 +2613,10 @@ class MemoryCoordinator:
                 "the post-filter narrows it (decision:1584); upgrade to "
                 "pgvector >= 0.8 to fix", _raw_version or "unknown")
 
-        self._pool = await asyncpg.create_pool(
+        self._pool = await _connect_with_startup_wait(lambda: asyncpg.create_pool(
             PG_DSN, min_size=POOL_MIN, max_size=POOL_MAX,
             init=self._init_connection,
-        )
+        ))
         async with self._acquire() as conn:
             result = await conn.execute(
                 "UPDATE neo4j_outbox SET status='pending' WHERE status='in_progress'"
@@ -8272,6 +8318,14 @@ class MemoryCoordinator:
                   FILTER (WHERE outcome = 'crashed'))[1] AS last_error_class,
               (array_agg(error_msg ORDER BY started_at DESC)
                   FILTER (WHERE outcome = 'crashed'))[1] AS last_error_msg,
+              -- fact:1609/1621 companion — a crash from WEEKS ago, superseded
+              -- by hundreds of later successes, used to read identically to a
+              -- CURRENT one (both surfaced as bare "err <class>"). Paired to
+              -- the SAME row as last_error_class/last_error_msg above (same
+              -- FILTER predicate), so `superseded` below compares apples to
+              -- apples against `last_success`.
+              (array_agg(started_at ORDER BY started_at DESC)
+                  FILTER (WHERE outcome = 'crashed'))[1] AS last_error_at,
               (array_agg(eligible_clusters ORDER BY started_at DESC)
                   FILTER (WHERE eligible_clusters IS NOT NULL))[1] AS eligible_clusters,
               -- R1 fix: paired to the SAME row as eligible_clusters above —
@@ -8351,7 +8405,23 @@ class MemoryCoordinator:
             any_stalled = any_stalled or stalled
             err = None
             if r and r["last_error_class"]:
-                err = {"class": r["last_error_class"], "msg": r["last_error_msg"]}
+                last_error_at = r["last_error_at"]
+                last_success = r["last_success"]
+                # superseded: a real success has landed AFTER this crash — the
+                # crash is history, not a current condition. NOT the same test
+                # as `stalled` above (that gates on age vs threshold + backlog;
+                # this gates on ORDER relative to the crash alone), and not the
+                # same population as consec_fail (crashes SINCE last success,
+                # already 0 in exactly this case) — this is about how the ONE
+                # most-recent crash, however old, should ever be *displayed*.
+                superseded = bool(
+                    last_success is not None and last_error_at is not None
+                    and last_success > last_error_at)
+                age_seconds = (
+                    int((datetime.now(timezone.utc) - last_error_at).total_seconds())
+                    if last_error_at is not None else None)
+                err = {"class": r["last_error_class"], "msg": r["last_error_msg"],
+                       "age_seconds": age_seconds, "superseded": superseded}
             out[ct] = {
                 "last_outcome": r["last_outcome"] if r else None,
                 "last_success_age_seconds": age,
