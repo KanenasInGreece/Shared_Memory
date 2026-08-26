@@ -633,6 +633,14 @@ def test_cached_snapshot_defaults_inference_busy_unknown():
     assert c.consolidation_health()["inference_busy"] == "unknown"
 
 
+def test_cached_snapshot_defaults_gpu_probe_none():
+    """Mirrors test_cached_snapshot_defaults_inference_busy_unknown (fact:1645):
+    None until the first refresh — "not yet probed" must never read as "ok",
+    same discipline as graph_invalid_nodes/project_identity/domain_identity."""
+    c = co.MemoryCoordinator()
+    assert c.consolidation_health()["gpu_probe"] is None
+
+
 @pytest.mark.asyncio
 async def test_refresher_stores_inference_busy(monkeypatch):
     c = co.MemoryCoordinator()
@@ -644,8 +652,12 @@ async def test_refresher_stores_inference_busy(monkeypatch):
     async def _state():
         return "busy"
 
+    def _probe_status():
+        return {"state": "ok", "consecutive_hangs": 0, "leaked_children": 0}
+
     monkeypatch.setattr(c, "_compute_consolidation_health", _compute)
     monkeypatch.setattr(co, "inference_busy_state", _state)
+    monkeypatch.setattr(co, "probe_status", _probe_status)
     _stop_after_one_iteration(monkeypatch)
 
     with pytest.raises(asyncio.CancelledError):
@@ -653,7 +665,67 @@ async def test_refresher_stores_inference_busy(monkeypatch):
 
     snap = c.consolidation_health()
     assert snap["inference_busy"] == "busy"
+    # ADDITIVE (fact:1645): the same cached snapshot now also carries the
+    # nvtop probe's own self-health, refreshed alongside inference_busy.
+    assert snap["gpu_probe"] == {"state": "ok", "consecutive_hangs": 0, "leaked_children": 0}
     assert snap["fresh"] is True
+
+
+@pytest.mark.asyncio
+async def test_refresher_gpu_probe_failure_defaults_to_none(monkeypatch):
+    """gpu_probe gets the SAME tolerance as its three siblings (_graph_
+    integrity, _domain_identity_health, _project_identity_health): a raise
+    inside probe_status() must degrade this one field, never abort the
+    refresh or blank the whole snapshot."""
+    c = co.MemoryCoordinator()
+
+    async def _compute():
+        return {"stalled": False, "last_outcome": "completed",
+                "last_success_age_seconds": 5}
+
+    async def _state():
+        return "busy"
+
+    def _boom():
+        raise RuntimeError("probe_status exploded")
+
+    monkeypatch.setattr(c, "_compute_consolidation_health", _compute)
+    monkeypatch.setattr(co, "inference_busy_state", _state)
+    monkeypatch.setattr(co, "probe_status", _boom)
+    _stop_after_one_iteration(monkeypatch)
+
+    with pytest.raises(asyncio.CancelledError):
+        await c._consolidation_health_refresher()
+
+    snap = c.consolidation_health()
+    assert snap["gpu_probe"] is None
+    assert snap["inference_busy"] == "busy"  # unaffected by the gpu_probe failure
+    assert snap["fresh"] is True
+
+
+def test_health_lifts_gpu_probe_top_level():
+    """(e) "/health lifts it" — composition check on hive_mind_proxy's
+    _build_health_checks (same style as the _compute_consolidation_health
+    alias check above): the gpu_probe key must be read off the cached
+    consolidation snapshot in BOTH the success and except branches, exactly
+    like its siblings graph_invalid_nodes/project_identity/domain_identity.
+    A full end-to-end run of _build_health_checks needs a live-shaped aiohttp
+    session for the embedder/reranker/LLM fan-out well above this; the
+    contract this fix owes -- gpu_probe reaches checks[] -- is what this pins.
+
+    Mutation check: delete either `checks["gpu_probe"] = ...` line and this
+    test dies. Verified on a scratch copy -- see HANDOFF.md."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
+    import hive_mind_proxy as hmp
+    src = inspect.getsource(hmp._build_health_checks)
+    assert 'checks["gpu_probe"] = consolidation.get("gpu_probe")' in src
+    # The except branch (coordinator.consolidation_health() itself raising)
+    # must default gpu_probe the same way its siblings (graph_invalid_nodes,
+    # project_identity, domain_identity) already do, never omit it. Anchor on
+    # the sibling line rather than "except Exception:" -- that phrase also
+    # appears in this function's earlier embedder/reranker probe loop.
+    except_block = src[src.index('checks["domain_identity"] = None'):]
+    assert 'checks["gpu_probe"] = None' in except_block
 
 
 @pytest.mark.asyncio

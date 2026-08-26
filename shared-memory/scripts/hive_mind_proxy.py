@@ -2946,8 +2946,14 @@ def _hardware_fingerprint() -> dict:
     except (OSError, ValueError, IndexError):
         pass   # non-Linux, unreadable, or unexpected format — stays None
     try:
-        from gpu_load import gpu_probe_available
-        out["gpu_present"] = bool(gpu_probe_available())
+        # Installation only (SLOT_AWARE on AND nvtop on PATH) -- NEVER
+        # gpu_probe_available(), which also reflects a runtime self-disable
+        # after repeated nvtop hangs. This fingerprint is PERSISTED; a
+        # process-lifetime self-disable is not a hardware fact and must not
+        # flip it (that would fire gateway_start_fingerprint_mismatch on the
+        # next restart even though nothing about the hardware changed).
+        from gpu_load import gpu_probe_installed
+        out["gpu_present"] = bool(gpu_probe_installed())
     except Exception:
         pass   # never let GPU detection block a fingerprint
     return out
@@ -4070,12 +4076,18 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
             # attached to its project, which is what the cross-domain walk will
             # depend on. Additive; None = not yet probed, never "complete".
             checks["domain_identity"] = consolidation.get("domain_identity")
+            # nvtop probe self-health (fact:1645) — top-level for the same
+            # reason as its siblings above: a monitor watching for the probe
+            # disabling itself after repeated hangs should not have to reach
+            # inside the consolidation tile. None = not yet probed, never "ok".
+            checks["gpu_probe"] = consolidation.get("gpu_probe")
         except Exception:
             checks["consolidation"] = {"fresh": False}
             checks["inference_busy"] = "unknown"
             checks["graph_invalid_nodes"] = None
             checks["project_identity"] = None
             checks["domain_identity"] = None
+            checks["gpu_probe"] = None
 
         # pgvector version + hnsw.iterative_scan (decision:1584/fact:1583) —
         # flat additive key, read straight off the coordinator's own startup

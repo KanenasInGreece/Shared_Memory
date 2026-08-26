@@ -693,9 +693,36 @@ def test_gpu_probe_exception_never_propagates(monkeypatch, tmp_path):
     def _boom():
         raise RuntimeError("nvtop exploded")
 
-    monkeypatch.setattr(gpu_load, "gpu_probe_available", _boom)
+    # _hardware_fingerprint reads gpu_probe_installed() (fact:1645, rule 3),
+    # never gpu_probe_available() -- see the "unchanged while disabled" test
+    # below for why.
+    monkeypatch.setattr(gpu_load, "gpu_probe_installed", _boom)
     hw = g._hardware_fingerprint()
     assert hw["gpu_present"] is False
+
+
+def test_gpu_present_unchanged_while_probe_disabled(monkeypatch, tmp_path):
+    """fact:1645, rule 3: a RUNTIME self-disable (repeated nvtop snapshot
+    timeouts) must never flip the PERSISTED hardware fingerprint -- that
+    would fire gateway_start_fingerprint_mismatch at the next restart even
+    though nothing about the hardware changed. _hardware_fingerprint must
+    read gpu_probe_installed() (installation only), never
+    gpu_probe_available() (which also reflects the disable).
+
+    Mutation check: swap the import back to gpu_probe_available -- this test
+    dies (gpu_present flips to False while disabled). Verified on a scratch
+    copy -- see HANDOFF.md."""
+    g = _load_gateway(monkeypatch, tmp_path / "cap.jsonl")
+    import gpu_load
+
+    monkeypatch.setattr(gpu_load, "_probe_installed", lambda: True)
+    monkeypatch.setattr(gpu_load, "_disabled_reason", "disabled_after_hangs")
+
+    # Sanity: the RIGHT-NOW-answerable surface DOES reflect the disable...
+    assert gpu_load.gpu_probe_available() is False
+    # ...but the persisted hardware fact must not move with it.
+    hw = g._hardware_fingerprint()
+    assert hw["gpu_present"] is True
 
 
 def test_corrupt_log_line_is_skipped_not_fatal(monkeypatch, tmp_path):

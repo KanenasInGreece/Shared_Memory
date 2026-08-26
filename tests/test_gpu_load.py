@@ -1,14 +1,19 @@
 """Unit tests for the cross-architecture GPU-load probe (gpu_load.py).
 
-Covers the pure decision function over an `nvtop -s` snapshot plus the fail-open
-branches of the async probe — no GPU, no nvtop, and no subprocess required.
+Covers the pure decision function over an `nvtop -s` snapshot, the fail-open
+branches of the async probe, AND the timeout-reap / self-disable path
+(fact:1645) — the latter DOES spawn a real subprocess (a small fake-nvtop
+script written to tmp_path), because the thing under test is whether that
+subprocess gets reaped, not just whether the probe fails open.
 
 The probe is platform-agnostic: it gates on raw GPU utilisation, with no
 assumption about which process drives the GPU. Any consumer — the local LLM, a
 direct chat, an unrelated app — counts as busy, because dreaming should yield to
 all of them.
 """
+import asyncio
 import os
+import stat
 import sys
 
 import pytest
@@ -16,6 +21,33 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 import gpu_load
 from gpu_load import parse_busy, inference_gpu_busy
+
+
+@pytest.fixture(autouse=True)
+def _reset_probe_state():
+    """Every timeout/disable test mutates module-level state; reset it before
+    AND after each test so tests never leak into each other regardless of
+    order or a failure mid-test."""
+    def _reset():
+        gpu_load._warned = False
+        gpu_load._consecutive_hangs = 0
+        gpu_load._leaked_children = 0
+        gpu_load._disabled_reason = None
+    _reset()
+    yield
+    _reset()
+
+
+def _write_fake_nvtop(tmp_path, body: str, name: str = "fake_nvtop"):
+    """A minimal executable script standing in for nvtop. `exec`-ing the sleep
+    (rather than a plain `sleep 5`) matters: without exec, killing the shell
+    leaves the sleep behind as a stray orphan child when the shell dies, which
+    is exactly the kind of leak this module exists to prevent in nvtop itself
+    — so the test fixture must not introduce its own version of the bug."""
+    script = tmp_path / name
+    script.write_text(f"#!/bin/sh\n{body}\n")
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return script
 
 
 def _gpu(util, cmdlines=()):
@@ -107,7 +139,7 @@ async def test_slot_aware_disabled_returns_not_busy(monkeypatch):
 async def test_missing_nvtop_fails_open(monkeypatch):
     monkeypatch.setenv("SLOT_AWARE", "1")
     monkeypatch.setenv("NVTOP_BIN", "definitely-not-a-real-binary-xyz")
-    gpu_load._warned = False  # reset rate-limit so the branch is exercised
+    # _reset_probe_state (autouse) already zeroed _warned so the branch fires.
     assert await inference_gpu_busy() is False
 
 
@@ -159,3 +191,146 @@ async def test_state_busy_and_idle_when_probe_available(monkeypatch):
     assert await inference_busy_state() == "busy"
     monkeypatch.setattr(gpu_load, "inference_gpu_busy", _idle)
     assert await inference_busy_state() == "idle"
+
+
+# ── inference_gpu_busy: timeout reaps the child (fact:1645) ──────────────────
+# On a host where nvtop blocks past NVTOP_TIMEOUT_SEC (observed cause: a
+# GPU-fence D-state wait) the OLD code returned False without touching the
+# child -- 926 leaked D-state processes, 2.98GB RSS, over 17h. These tests
+# exercise the reap path against a REAL subprocess (a fake-nvtop script),
+# because "was it actually killed and awaited" cannot be answered by mocking
+# asyncio away.
+
+def _capture_create_subprocess_exec(monkeypatch):
+    """Wrap asyncio.create_subprocess_exec so a test can inspect/count the
+    real Process objects gpu_load spawns, without changing its behaviour."""
+    real_exec = asyncio.create_subprocess_exec
+    calls = []
+
+    async def _wrapped(*args, **kwargs):
+        proc = await real_exec(*args, **kwargs)
+        calls.append(proc)
+        return proc
+
+    monkeypatch.setattr(gpu_load.asyncio, "create_subprocess_exec", _wrapped)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_timeout_kills_and_reaps_child(monkeypatch, tmp_path):
+    """(a) MUTATION: remove `proc.kill()` from _reap_after_timeout -> this
+    test dies (the child is never signalled, so os.kill(pid, 0) keeps
+    succeeding instead of raising ProcessLookupError). Verified on a scratch
+    copy -- see HANDOFF.md."""
+    fake_nvtop = _write_fake_nvtop(tmp_path, "exec sleep 5")
+    monkeypatch.setenv("SLOT_AWARE", "1")
+    monkeypatch.setenv("NVTOP_BIN", str(fake_nvtop))
+    monkeypatch.setenv("NVTOP_TIMEOUT_SEC", "0.2")
+    monkeypatch.setenv("NVTOP_KILL_WAIT_SEC", "3.0")
+    calls = _capture_create_subprocess_exec(monkeypatch)
+
+    result = await inference_gpu_busy()
+
+    assert result is False
+    assert len(calls) == 1
+    proc = calls[0]
+    # A killed-but-unreaped zombie still answers os.kill(pid, 0) (so can pid
+    # reuse) -- returncode is the assertion that actually distinguishes
+    # "reaped" from "leaked".
+    with pytest.raises(ProcessLookupError):
+        os.kill(proc.pid, 0)
+    assert proc.returncode == -9  # SIGKILL
+    assert gpu_load._consecutive_hangs == 1
+    assert gpu_load._leaked_children == 0
+
+
+@pytest.mark.asyncio
+async def test_disables_after_max_consecutive_hangs(monkeypatch, tmp_path):
+    """(b) MUTATION: remove the `if _disabled_reason is not None: return
+    False` early exit in inference_gpu_busy -> this test dies (the 3rd call
+    spawns a 3rd child instead of being refused). Verified on a scratch
+    copy -- see HANDOFF.md."""
+    fake_nvtop = _write_fake_nvtop(tmp_path, "exec sleep 5")
+    monkeypatch.setenv("SLOT_AWARE", "1")
+    monkeypatch.setenv("NVTOP_BIN", str(fake_nvtop))
+    monkeypatch.setenv("NVTOP_TIMEOUT_SEC", "0.1")
+    monkeypatch.setenv("NVTOP_KILL_WAIT_SEC", "3.0")
+    monkeypatch.setenv("NVTOP_MAX_CONSECUTIVE_HANGS", "2")
+    calls = _capture_create_subprocess_exec(monkeypatch)
+
+    for _ in range(2):
+        assert await inference_gpu_busy() is False
+    assert len(calls) == 2
+
+    status = gpu_load.probe_status()
+    assert status["state"] == "disabled_after_hangs"
+    assert status["consecutive_hangs"] == 2
+    assert gpu_load.gpu_probe_available() is False
+    assert await gpu_load.inference_busy_state() == "unknown"
+
+    # The (N+1)th call must NOT spawn another child.
+    assert await inference_gpu_busy() is False
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_success_between_timeouts_resets_consecutive_hangs(monkeypatch, tmp_path):
+    """(c) A clean snapshot clears the hang streak -- only CONSECUTIVE
+    timeouts count toward the disable cap."""
+    hanging = _write_fake_nvtop(tmp_path, "exec sleep 5", name="hanging_nvtop")
+    healthy = _write_fake_nvtop(tmp_path, "echo '[]'", name="healthy_nvtop")
+    monkeypatch.setenv("SLOT_AWARE", "1")
+    monkeypatch.setenv("NVTOP_TIMEOUT_SEC", "0.1")
+    monkeypatch.setenv("NVTOP_KILL_WAIT_SEC", "3.0")
+
+    monkeypatch.setenv("NVTOP_BIN", str(hanging))
+    assert await inference_gpu_busy() is False
+    assert gpu_load._consecutive_hangs == 1
+
+    monkeypatch.setenv("NVTOP_BIN", str(healthy))
+    assert await inference_gpu_busy() is False  # empty snapshot -> not busy
+    assert gpu_load._consecutive_hangs == 0
+
+
+# ── probe_status(): (d) additive telemetry, pure module state ────────────────
+
+def test_probe_status_unavailable_under_slot_aware_off(monkeypatch):
+    monkeypatch.setenv("SLOT_AWARE", "0")
+    assert gpu_load.probe_status()["state"] == "unavailable"
+
+
+def test_probe_status_unavailable_when_nvtop_missing(monkeypatch):
+    monkeypatch.setenv("SLOT_AWARE", "1")
+    monkeypatch.setenv("NVTOP_BIN", "definitely-not-a-real-binary-xyz")
+    assert gpu_load.probe_status()["state"] == "unavailable"
+
+
+def test_probe_status_ok_when_installed_and_armed(monkeypatch, tmp_path):
+    fake_nvtop = _write_fake_nvtop(tmp_path, "echo '[]'")
+    monkeypatch.setenv("SLOT_AWARE", "1")
+    monkeypatch.setenv("NVTOP_BIN", str(fake_nvtop))
+    assert gpu_load.probe_status()["state"] == "ok"
+
+
+# ── (f) the timeout log line names the exception class, never an empty () ────
+
+@pytest.mark.asyncio
+async def test_timeout_log_names_the_exception_class(monkeypatch, tmp_path, caplog):
+    """Regression for the bug this release fixes: the OLD handler logged
+    `"nvtop snapshot failed ()"` on a timeout -- str(TimeoutError()) is empty,
+    so the line named nothing. The new timeout-specific line must carry the
+    exception class name."""
+    import logging
+
+    fake_nvtop = _write_fake_nvtop(tmp_path, "exec sleep 5")
+    monkeypatch.setenv("SLOT_AWARE", "1")
+    monkeypatch.setenv("NVTOP_BIN", str(fake_nvtop))
+    monkeypatch.setenv("NVTOP_TIMEOUT_SEC", "0.1")
+    monkeypatch.setenv("NVTOP_KILL_WAIT_SEC", "3.0")
+
+    with caplog.at_level(logging.WARNING, logger="gpu_load"):
+        await inference_gpu_busy()
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("TimeoutError" in m for m in messages)
+    assert not any(m.strip().endswith("()") for m in messages)
