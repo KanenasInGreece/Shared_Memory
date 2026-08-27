@@ -182,7 +182,14 @@ async def test_search_expansion_is_batched_not_one_call_per_hit():
     round-trip PER Tier-1 hit (an N+1 pattern, up to ~102 sequential queries
     at limit=100). With 3 ranked hits, Neo4j must be called exactly ONCE for
     the fact/decision/retrospective expansion — via UNWIND, not a loop — and
-    each hit's graph_context must still be attributed to the right anchor."""
+    each hit's graph_context must still be attributed to the right anchor.
+
+    ⛔ RE-RULED (`decision:1736`): this counted TOTAL session.run calls, which
+    made "the expansion is batched" and "the search issues exactly one Cypher"
+    the same assertion. They are not the same, and conflating them means the
+    next query added for any reason reads as a broken batch. The property is
+    PER PURPOSE and PER HIT COUNT: the expansion is one round trip for three
+    anchors. Counted by which query, not how many."""
     c, mock_conn, mock_session = _coordinator_with_mocks()
 
     mock_conn.fetch = AsyncMock(return_value=[
@@ -210,10 +217,15 @@ async def test_search_expansion_is_batched_not_one_call_per_hit():
 
     results = await _run_search(c, mock_reranker, "three facts")
 
-    # Exactly one Neo4j round-trip for the whole batch of 3 hits — not 3.
-    assert mock_session.run.await_count == 1
-    called_pg_ids = mock_session.run.await_args.kwargs["pg_ids"]
-    assert sorted(called_pg_ids) == [1, 2, 3]
+    # Exactly one EXPANSION round-trip for the whole batch of 3 hits — not 3.
+    expansion = [call for call in mock_session.run.await_args_list
+                 if "OPTIONAL MATCH (n)-[r]-(related)" in call.args[0]]
+    assert len(expansion) == 1
+    assert sorted(expansion[0].kwargs["pg_ids"]) == [1, 2, 3]
+    # Whatever else the search asks the graph, it asks per SEARCH, never per
+    # hit: no query may carry a single anchor when three were ranked.
+    for call in mock_session.run.await_args_list:
+        assert sorted(call.kwargs["pg_ids"]) == [1, 2, 3]
 
     by_pg_id = {r["pg_id"]: r for r in results if r["tier"] == "fact"}
     assert {e["name"] for e in by_pg_id[1]["graph_context"]} == {"A", "A2"}
@@ -749,3 +761,179 @@ async def test_search_survives_neo4j_failure_on_both_walks():
     assert results[0]["graph_context"] == []
     assert results[1]["tier"] == "fact"
     assert results[1]["graph_context"] == []
+
+
+# ── (e) DERIVED BELONGING on a judgement hit (decision:1736) ──────────────────
+#
+# C1 removed every writer of a judgement's inherited sections, so "where does
+# this decision belong" stopped being answerable from its own edges. It is now
+# answered on READ, and graph expansion is where a search hit picks it up. The
+# entry is ADDITIVE and is not an edge: no rel_type, no neighbour.
+#
+# ⚠ These tests stub Cypher like every other test in this file — they prove the
+# WIRING (which query is issued, for which anchors, and what the caller does
+# with the answer). What the traversal actually returns on the live graph is a
+# separate, owed verification (`fact:1194`).
+
+def _belonging_row(pg_id, project, domains):
+    return {"anchor_pg_id": pg_id, "project": project, "domains": domains}
+
+
+def _dispatching_session(edge_rows, belonging_rows, fail_belonging=False):
+    """A session that answers each query by WHICH query it is, never by call
+    order — an ordered side_effect would make ADDING a query look like a broken
+    expansion, and this change adds one."""
+    from ontology import derived_belonging_cypher
+    calls = []
+    belonging_q = derived_belonging_cypher()
+
+    async def run(q, **kw):
+        calls.append((q, kw))
+        if q == belonging_q:
+            if fail_belonging:
+                raise RuntimeError("neo4j is having a moment")
+            return _AsyncRows(list(belonging_rows))
+        return _AsyncRows(list(edge_rows))
+
+    session = MagicMock()
+    session.run = run
+    return session, calls
+
+
+@pytest.mark.asyncio
+async def test_a_judgement_hit_carries_its_derived_belonging():
+    """The worked example's read-out (`fact:1735`): a retrospective resolves to
+    its decision's project and to the union of its decision's own section and
+    the section of the fact it grounds in. The entry sits AFTER the edges — the
+    expansion cap governs edges, and this is not one."""
+    c, _, _ = _coordinator_with_mocks()
+    session, calls = _dispatching_session(
+        edge_rows=[_row(labels=["Decision"], name=None, pg_id=42,
+                        rel_type="HAD_OUTCOME", direction="in", rel_props={},
+                        snippet="the decision this verdict judges")],
+        belonging_rows=[_belonging_row(913, "B", ["literature", "tests"])],
+    )
+    ctx = await c._expand_graph_context(
+        session, 913,
+        (coordinator_mod.ONT.fact, coordinator_mod.ONT.decision,
+         coordinator_mod.ONT.retrospective))
+
+    assert ctx[0]["rel_type"] == "HAD_OUTCOME", "the edges come first, unchanged"
+    assert ctx[-1] == {"belonging": {"project": "B",
+                                     "domains": ["literature", "tests"]}}
+    # Not an edge, and never mistakable for one.
+    assert "rel_type" not in ctx[-1] and "direction" not in ctx[-1]
+
+
+@pytest.mark.asyncio
+async def test_the_belonging_query_is_the_ontology_helper_verbatim():
+    """One expression of the rule. A query built here — even an identical one —
+    is a second copy free to drift from the one the tests in
+    `test_derived_belonging.py` pin."""
+    from ontology import derived_belonging_cypher
+    c, _, _ = _coordinator_with_mocks()
+    session, calls = _dispatching_session(
+        edge_rows=[], belonging_rows=[_belonging_row(913, "B", [])])
+    await c._expand_graph_context(
+        session, 913, (coordinator_mod.ONT.retrospective,))
+    issued = [q for q, _ in calls if q == derived_belonging_cypher()]
+    assert issued == [derived_belonging_cypher()]
+    assert calls[-1][1]["pg_ids"] == [913]
+
+
+@pytest.mark.asyncio
+async def test_a_fact_hit_gets_no_belonging_and_pays_for_no_query():
+    """A fact's belonging IS its own bare edges — already in the list. Deriving
+    one would be inventing an answer it already has, and paying for it."""
+    c, _, _ = _coordinator_with_mocks()
+    session, calls = _dispatching_session(
+        edge_rows=[_row(labels=["Entity"], name="Neo4j", rel_type="MENTIONS")],
+        belonging_rows=[_belonging_row(42, "B", ["architecture"])],
+    )
+    ctx = await c._expand_graph_context(
+        session, 42, (coordinator_mod.ONT.fact,))
+    assert all("belonging" not in e for e in ctx)
+    assert len(calls) == 1, "a fact-only expansion must issue no second query"
+
+
+@pytest.mark.asyncio
+async def test_a_summary_expansion_pays_for_no_belonging_query_either():
+    """A CommunitySummary carries no belonging edges at all (`decision:1736`
+    answers it the same way: none, traverse), so it is not an anchor here."""
+    c, _, _ = _coordinator_with_mocks()
+    session, calls = _dispatching_session(
+        edge_rows=[], belonging_rows=[_belonging_row(88, "B", ["ops"])])
+    await c._expand_graph_context(
+        session, 88, (coordinator_mod.ONT.community_summary,))
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_batch_form_derives_belonging_in_one_round_trip():
+    """The batch form exists to kill an N+1; a bounded query PER judgement hit
+    would have reinstated one for exactly the hits a lifecycle-aware search
+    returns most of. One query, every anchor, each answer filed against the
+    anchor its row names — never by position, because an anchor that resolves
+    to nothing returns no row at all."""
+    c, _, _ = _coordinator_with_mocks()
+    session, calls = _dispatching_session(
+        edge_rows=[
+            _row(labels=["Fact"], name=None, anchor_pg_id=91, rel_pg_id=601,
+                 rel_type="GROUNDED_IN", direction="out", rel_props={},
+                 snippet="tests@B"),
+            _row(labels=["Fact"], name=None, anchor_pg_id=92, rel_pg_id=602,
+                 rel_type="GROUNDED_IN", direction="out", rel_props={},
+                 snippet="architecture@A"),
+        ],
+        # 93 is a FACT anchor: the query returns no row for it. And the two
+        # rows arrive OUT OF ANCHOR ORDER (92 before 91) on purpose — filing an
+        # answer by its position in `pg_ids` rather than by the anchor its row
+        # NAMES would swap them and stay green on an in-order fixture.
+        belonging_rows=[_belonging_row(92, "B", ["literature", "tests"]),
+                        _belonging_row(91, "B", ["literature"])],
+    )
+    out = await c._expand_graph_context_batch(
+        session, [91, 92, 93],
+        (coordinator_mod.ONT.fact, coordinator_mod.ONT.decision,
+         coordinator_mod.ONT.retrospective))
+
+    assert out[91][-1] == {"belonging": {"project": "B",
+                                         "domains": ["literature"]}}
+    assert out[92][-1] == {"belonging": {"project": "B",
+                                         "domains": ["literature", "tests"]}}
+    assert all("belonging" not in e for e in out[93])
+    from ontology import derived_belonging_cypher
+    assert [q for q, _ in calls if q == derived_belonging_cypher()] == [
+        derived_belonging_cypher()]
+
+
+@pytest.mark.asyncio
+async def test_a_belonging_failure_leaves_the_expansion_intact():
+    """Same contract as the expansion it enriches: graph context enriches a
+    search, it never fails one. A derivation that throws costs the reader the
+    belonging entry and nothing else."""
+    c, _, _ = _coordinator_with_mocks()
+    session, _calls = _dispatching_session(
+        edge_rows=[_row(labels=["Decision"], name=None, pg_id=42,
+                        rel_type="HAD_OUTCOME", direction="in", rel_props={},
+                        snippet="the decision")],
+        belonging_rows=[], fail_belonging=True,
+    )
+    ctx = await c._expand_graph_context(
+        session, 913, (coordinator_mod.ONT.retrospective,))
+    assert len(ctx) == 1 and ctx[0]["rel_type"] == "HAD_OUTCOME"
+    assert all("belonging" not in e for e in ctx)
+
+
+@pytest.mark.asyncio
+async def test_a_judgement_that_resolves_to_no_section_still_says_so():
+    """"None" is a valid answer for a decision that asserted nothing and rests
+    on facts filed under another project. An EMPTY list is the honest result and
+    must reach the reader — dropping the entry would make "no sections" and "not
+    computed" indistinguishable."""
+    c, _, _ = _coordinator_with_mocks()
+    session, _calls = _dispatching_session(
+        edge_rows=[], belonging_rows=[_belonging_row(700, "B", [])])
+    ctx = await c._expand_graph_context(
+        session, 700, (coordinator_mod.ONT.decision,))
+    assert ctx == [{"belonging": {"project": "B", "domains": []}}]

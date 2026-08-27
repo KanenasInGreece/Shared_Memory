@@ -60,7 +60,7 @@ from ontology import (
     reserved_entity_name_reason,
     KNOWN_LABELS, KNOWN_RELATIONSHIPS, fact_kind_from_source_ref,
     GROUNDING_ROLES, GROUNDING_RELATIONS, default_grounding_role, RETRO_RATINGS,
-    record_label_for_type,
+    record_label_for_type, derived_belonging_cypher,
 )
 from project_axis import (
     PROJECT_SQL, PROJECT_EXISTS_SQL, PROJECT_ID_SQL, PROJECT_PROPOSALS_SQL,
@@ -6864,6 +6864,66 @@ class MemoryCoordinator:
                 len(wanted), exc,
             )
 
+    # Anchors whose belonging has to be DERIVED rather than read off their own
+    # edges. A fact's sections are its own bare edges and need nothing;
+    # a CommunitySummary has no belonging edges at all.
+    _DERIVED_BELONGING_LABELS = (ONT.decision, ONT.retrospective)
+
+    async def _derived_belonging(self, session, pg_ids: list) -> dict:
+        """`{pg_id: {"project": name, "domains": [...]}}` for the JUDGEMENTS in
+        `pg_ids` — computed on read, never stored.
+
+        `decision:1736` stopped materialising a judgement's belonging: a
+        decision and a retrospective carry only the sections their operator
+        asserted on them, and nothing writes an inherited edge any more. That
+        answer did not stop existing — it moved to the read side, and this is
+        where a search hit picks it up. The Cypher and every rule it enforces
+        live in `derived_belonging_cypher`.
+
+        ⚠ ONE ROUND TRIP FOR THE WHOLE BATCH, not one per hit. The obvious
+        shape — a bounded query per judgement — is the N+1 that
+        `_expand_graph_context_batch` was written to remove; re-introducing it
+        beside the fix would have undone it for exactly the hits (decisions and
+        their verdicts) a lifecycle-aware search returns most of.
+
+        Rows come back only for anchors that ARE judgements and DO resolve to a
+        project, so a fact's pg_id in the list simply produces nothing. Degrades
+        to `{}` on any failure, exactly like the expansion it enriches: graph
+        context enriches a search, it never fails one.
+        """
+        if not pg_ids:
+            return {}
+        out: dict = {}
+        try:
+            result = await session.run(
+                derived_belonging_cypher(), pg_ids=list(pg_ids),
+            )
+            async for rec in result:
+                out[rec["anchor_pg_id"]] = {
+                    "project": rec["project"],
+                    "domains": list(rec["domains"] or []),
+                }
+        except Exception as exc:
+            log.warning(
+                "graph context: derived belonging failed for %d anchor(s) — "
+                "hits keep their graph context without it: %s", len(pg_ids), exc,
+            )
+            return {}
+        return out
+
+    @staticmethod
+    def _belonging_entry(belonging: dict) -> dict:
+        """The additive expansion entry a judgement hit carries.
+
+        ⚠ IT IS NOT AN EDGE, and it deliberately does not pretend to be one: no
+        `rel_type`, no `direction`, no neighbour. A consumer that walks the
+        expansion looking for relations skips it; one that wants to know where
+        the record belongs reads it by name. Appended AFTER the capped edge
+        list, so no edge is displaced by it — the cap governs edges, and this is
+        not one.
+        """
+        return {"belonging": belonging}
+
     async def _expand_graph_context(self, session, pg_id: int,
                                     anchor_labels: tuple[str, ...]) -> list[dict]:
         """Read-contract graph expansion for one anchored record.
@@ -6884,6 +6944,13 @@ class MemoryCoordinator:
         notes / rem_summary — null when the node carries none). Entity ALIASES
         siblings are still folded in (ADR-017). Failures degrade to [] — graph
         context enriches a search, it never fails one.
+
+        ⭐ ONE ENTRY IS NOT AN EDGE. When the anchor is a Decision or a
+        Retrospective the list ends with ``{belonging: {project, domains}}`` —
+        where that record belongs, DERIVED on read rather than read off its own
+        edges, because nothing writes a judgement's inherited sections any more
+        (`decision:1736`). A fact never carries it: its belonging IS its own
+        bare edges, and they are already in the list above.
         """
         ctx: list[dict] = []
         anchor_where = " OR ".join(f"n:{lbl}" for lbl in anchor_labels)
@@ -6972,6 +7039,14 @@ class MemoryCoordinator:
         except Exception:
             return []
         await self._attach_decision_payload(ctx)
+        # A judgement hit also carries WHERE IT BELONGS, derived (`decision:1736`).
+        # Facts are untouched: their belonging is their own bare edges, already
+        # above. Skipped entirely when no judgement label is anchored on, so a
+        # summary expansion pays for nothing.
+        if any(lbl in self._DERIVED_BELONGING_LABELS for lbl in anchor_labels):
+            belonging = await self._derived_belonging(session, [pg_id])
+            if pg_id in belonging:
+                ctx.append(self._belonging_entry(belonging[pg_id]))
         return ctx
 
     # Ratings that QUALIFY a decision — the reader needs the verdict's reasoning,
@@ -7038,6 +7113,10 @@ class MemoryCoordinator:
         single-anchor return. Same degrade-to-empty contract on failure —
         graph context enriches a search, it never fails one, so a query error
         here returns `{}` (every caller treats a missing key as `[]` via `.get`).
+
+        Carries the same `{belonging: ...}` entry as the single-anchor form for
+        every judgement anchor — see there — in one further round trip for the
+        whole batch, never one per hit.
         """
         if not pg_ids:
             return {}
@@ -7112,6 +7191,14 @@ class MemoryCoordinator:
         # this function exists for would be undone by a query per anchor.
         await self._attach_decision_payload(
             [entry for entries in out.values() for entry in entries])
+        # Derived belonging for the judgement anchors, in ONE more round trip
+        # for the whole batch — see `_derived_belonging` on why it is not per
+        # hit. Anchors that are facts simply come back with no row.
+        if any(lbl in self._DERIVED_BELONGING_LABELS for lbl in anchor_labels):
+            for pid, belonging in (
+                    await self._derived_belonging(session, list(pg_ids))).items():
+                if pid in out:
+                    out[pid].append(self._belonging_entry(belonging))
         return out
 
     async def _resolve_search_filters(
