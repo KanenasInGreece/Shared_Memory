@@ -35,17 +35,17 @@ def _read(path):
         return fh.read()
 
 
-def test_the_cli_snippet_carries_v4():
+def test_the_cli_snippet_carries_v5():
     text = _read(_CLI_SNIPPET)
-    assert "<!-- shared-memory:constitution-snippet v4 -->" in text, (
-        "the CLI snippet's marker did not advance to v4 — an installed block "
+    assert "<!-- shared-memory:constitution-snippet v5 -->" in text, (
+        "the CLI snippet's marker did not advance to v5 — an installed block "
         "will not read as drifted and Phase 8c will not re-propose it")
 
 
-def test_the_mcp_snippet_carries_v3():
+def test_the_mcp_snippet_carries_v4():
     text = _read(_MCP_SNIPPET)
-    assert "<!-- shared-memory:mcp-constitution-snippet v3 -->" in text, (
-        "the MCP snippet's marker did not advance to v3 — an installed block "
+    assert "<!-- shared-memory:mcp-constitution-snippet v4 -->" in text, (
+        "the MCP snippet's marker did not advance to v4 — an installed block "
         "will not read as drifted and Phase 8c will not re-propose it")
 
 
@@ -77,6 +77,7 @@ def test_the_two_tracked_cli_snippet_copies_stay_byte_identical():
 
 
 _POINTER_PHRASE = "is a pointer, not the record"
+_REPAIR_PHRASE = "rewrite the index line to the current id"
 
 
 def test_all_three_surfaces_name_the_index_pointer_rule():
@@ -91,4 +92,18 @@ def test_all_three_surfaces_name_the_index_pointer_rule():
                if _POINTER_PHRASE not in _flat(path)]
     assert not missing, (
         f"{_POINTER_PHRASE!r} missing from: {missing} — the index-pointer rule "
+        "must appear on every surface, in the same words")
+
+
+def test_all_three_surfaces_prescribe_the_index_repair():
+    """v5 (2026-08-27): checking a stale pointer is not enough — the surfaces
+    must prescribe following superseded_by to the current record and rewriting
+    the index line, or the next invocation repeats the same wrong answer."""
+    def _flat(path):
+        return re.sub(r"\s+", " ", _read(path))
+
+    missing = [path for path in (_CLI_SNIPPET, _MCP_SNIPPET, _SYSTEM_PROMPT)
+               if _REPAIR_PHRASE not in _flat(path)]
+    assert not missing, (
+        f"{_REPAIR_PHRASE!r} missing from: {missing} — the index-repair rule "
         "must appear on every surface, in the same words")

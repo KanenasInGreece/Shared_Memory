@@ -38,7 +38,7 @@ it into their agent's constitution file. Never write it silently, and never
 paraphrase it: copying it verbatim is what keeps the marker intact.
 -->
 
-<!-- shared-memory:mcp-constitution-snippet v3 -->
+<!-- shared-memory:mcp-constitution-snippet v4 -->
 ## Shared Memory — through your MCP tools
 The shared memory is a three-tier store other agents write to as well, reached
 through the `shared-memory` MCP server. It is the source of truth for project
@@ -75,10 +75,13 @@ space, not authoritative.
   else can see. The tools here already cover retrieval and graph expansion, so
   such a server adds no capability, only an unguarded path to the same data. If
   one is already registered, say so rather than using it.
-An id or claim found in a local index — a CLAUDE.md rule table, a MEMORY.md
-line, a resume or handoff that cites `fact:N` — is a pointer, not the record.
-Resolve it by searching (search_memory) before you cite or act on it: the store retires
-superseded records from search, so a search returns the current version while
-an index line goes stale silently. Answering from an index line without the
-search is the failure this rule names.
+An id or claim hard-coded in a constitution file, a memory index, a resume or
+a handoff (`fact:N`) is a pointer, not the record. Before citing or acting on
+it, resolve it: the `record_lineage` tool says whether it is superseded and by what —
+follow `superseded_by` until a current record, or search the subject. If the
+pointer was stale, do not delete it and do not stop at checking: rewrite the
+index line to the current id and its corrected hook, so the next invocation
+starts from the right record — an unrepaired index reproduces the same wrong
+answer every session. The store retires superseded records from search; only
+the index decays.
 <!-- /shared-memory:mcp-constitution-snippet -->

@@ -5,6 +5,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.71] — 2026-08-27
+
+### Changed — constitution snippet v5 (MCP v4): a stale index pointer is repaired, not merely checked
+
+v0.9.70 told an agent to search before citing an id found in a constitution file or memory index. Checking is not enough: an index that is found stale and left as it is reproduces the same wrong answer at the next invocation. The snippet now prescribes the repair on all three surfaces — resolve the pointer with `lineage <id>` (the lineage tool over MCP), follow `superseded_by` until a current record or search the subject, and if the pointer was stale, rewrite the index line to the current id and its corrected hook rather than deleting it. Version markers advance so installed blocks read as drifted and are re-proposed, never written silently. The guard test now also asserts the repair phrase verbatim on every surface. The MCP snippet names the existing `record_lineage` tool (the twin of the CLI `lineage` action over the same `/memory/status/{ref}` route); Postgres supersession is the source of truth and the graph's `SUPERSEDES` edge its expansion.
+
+---
+
 ## [0.9.70] — 2026-08-27
 
 ### Changed — constitution snippet v4 (MCP snippet v3, system prompt in parity): an indexed id is a pointer, not the record
