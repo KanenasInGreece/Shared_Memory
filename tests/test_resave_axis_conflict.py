@@ -256,3 +256,58 @@ async def test_a_row_that_appears_between_the_precheck_and_the_insert_is_refused
     embed.assert_awaited_once()
     # …and nothing was written.
     conn.fetchrow.assert_not_awaited()
+
+
+# ── R-3 — a record whose entities are ALL shape-noise stays re-savable ────────
+
+@pytest.mark.asyncio
+async def test_a_noise_only_entity_list_does_not_false_conflict_on_resave():
+    """Review finding (Opus, Required). `sanitize_entity_names(["254"])` is
+    empty — a leaked pg_id is I3's gate-exempt SHAPE noise, stored verbatim in
+    Tier 1 and dropped at the graph. The gate's no-candidates early return
+    handed back a plan whose `canonical` was hard-coded `[]`, so the re-save
+    check compared a stored `["254"]` against an incoming `[]` and refused the
+    record forever, over an axis that never moved.
+
+    MUTATION CHECK: restore `return None, empty_plan` at the no-candidates
+    branch of `_entity_ingress_validate` and this test fails with a 409."""
+    c, _ = _coord(stored_metadata={"project": "alpha", "entities": ["254"]})
+    resp, _ = await _save(c, {"source": "claude-code", "project": "alpha",
+                              "entities": ["254"]})
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_noise_mixed_with_a_real_entity_is_also_stable():
+    """The mixed case takes the ORDINARY path (there IS a candidate), so it
+    exercises the main `canonical` build rather than the early return — both
+    must agree with what `_rewrite_entities` actually stores."""
+    c, _ = _coord(stored_metadata={"project": "alpha",
+                                   "entities": ["254", "Kubernetes"]})
+    resp, _ = await _save(c, {"source": "claude-code", "project": "alpha",
+                              "entities": ["254", "Kubernetes"]})
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_a_noise_only_record_still_conflicts_on_a_real_axis_change():
+    """The fix must not have turned the check off for these records: the
+    PROJECT still cannot move."""
+    c, _ = _coord(stored_metadata={"project": "alpha", "entities": ["254"]})
+    resp, _ = await _save(c, {"source": "claude-code", "project": "beta",
+                              "entities": ["254"]})
+    assert resp.status == 409
+    assert json.loads(resp.text)["axis"] == "project"
+
+
+@pytest.mark.asyncio
+async def test_the_plan_s_canonical_matches_what_is_actually_stored_for_noise():
+    """The property underneath both: the plan's PREVIEW of the entity list and
+    the list the gate really writes are the same value. They are computed by
+    one function precisely so they cannot drift."""
+    c, _ = _coord(stored_metadata=None)
+    metadata = {"source": "claude-code", "project": "alpha",
+                "entities": ["254", "0", "  "]}
+    _refusal, plan = await c._entity_ingress_validate(metadata)
+    assert await c._entity_commit_mints(metadata, "claude-code", plan) is None
+    assert plan["canonical"] == metadata["entities"] == ["254", "0", "  "]

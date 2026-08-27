@@ -5322,6 +5322,9 @@ class MemoryCoordinator:
         its counterpart in `entities` correctly rather than silently failing
         to match.
         """
+        # ⚠ RETURNED ONLY BESIDE A REFUSAL, where the caller never reads it. A
+        # SUCCESS path must build its own `canonical` — see the no-candidates
+        # return below for what happens when it does not.
         empty_plan: dict = {"resolved": {}, "to_mint": [], "canonical": []}
 
         raw_entities = metadata.get("entities") or []
@@ -5352,7 +5355,18 @@ class MemoryCoordinator:
 
         candidates = sanitize_entity_names(raw_entities)
         if not candidates:
-            return None, empty_plan
+            # ⛔ THE PLAN STILL HAS TO SAY WHAT WILL BE STORED. This returned
+            # `empty_plan`, whose `canonical` is hard-coded `[]` — but a record
+            # whose entities are ALL shape-noise (`["254"]`, I3's gate-exempt
+            # class) stores those names VERBATIM. The re-save axis check then
+            # compared a stored `["254"]` against an incoming `[]` and refused
+            # every re-save of that record with a 409, permanently, over an
+            # axis that never moved. `_canonical_entity_list(metadata, {})` is
+            # the same answer `_rewrite_entities` produces for an empty
+            # `resolved` — it leaves the list exactly as it is — so the two
+            # cannot disagree.
+            return None, {"resolved": {}, "to_mint": [],
+                          "canonical": self._canonical_entity_list(metadata, {})}
         candidates_set = set(candidates)
 
         new_entities_raw = metadata.get("new_entities")
