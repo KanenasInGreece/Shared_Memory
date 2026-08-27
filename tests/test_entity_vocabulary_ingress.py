@@ -322,28 +322,192 @@ async def test_entities_provenance_absent_is_a_harmless_no_op():
     assert "entities_provenance" not in metadata
 
 
-# ── Decision/retrospective scope — same generic gate, same rules ────────────
+# ── E3 (item 3, v0.9.69) — ONLY FACTS CARRY ENTITIES ─────────────────────────
+#
+# ⛔ REPLACES the two tests that used to live here
+# (`test_a_decision_s_entities_are_gated_identically` /
+# `test_a_retrospective_shaped_metadata_is_gated_identically`). They drove
+# `_entity_ingress_error` DIRECTLY with judgement-shaped metadata and asserted
+# that a judgement's entities are canonicalized and minted just like a fact's —
+# the exact opposite of E3. Re-ruled in the v0.9.69 plan rather than deleted
+# silently: the gate is no longer called for a judgement at all, so a test
+# calling it by hand would have stayed green while asserting behaviour the
+# endpoint can no longer produce.
+#
+# Ruling R1 (decision:1664): non-empty `entities` or any `new_entities` on a
+# decision or a retrospective is a 400 BEFORE any write. An empty list is
+# accepted PERMANENTLY — the shipped client always sends one.
 
-@pytest.mark.asyncio
-async def test_a_decision_s_entities_are_gated_identically():
-    """A decision's `entities` never reaches the graph (it inherits from its
-    grounding facts there), but it DOES reach Postgres metadata — so it is in
-    scope for canonicalization exactly like a fact's, per
-    `_entity_ingress_error`'s docstring."""
-    c = _coord()
-    metadata = {"type": "decision", "entities": ["Kubernetes"]}
-    err = await c._entity_ingress_error(metadata, "claude")
+@pytest.mark.parametrize("kind", ["decision", "retrospective"])
+def test_judgement_entities_refusal_shape(kind):
+    """The refusal names the record type, the offending field and the ruling.
+
+    MUTATION CHECK: make `_judgement_entities_error` return None
+    unconditionally and `test_decision_refuses_entities` /
+    `test_retrospective_refuses_entities` below both fail."""
+    err = MemoryCoordinator._judgement_entities_error(
+        {"type": kind, "entities": ["Kubernetes"]})
     assert err is not None
-    assert err["error"] == "entity_unknown"
+    assert err["error"] == "entities_not_allowed_on_judgement"
+    assert "decision:1664" in err["message"]
+    assert kind in err["message"]
+
+
+@pytest.mark.parametrize("kind", ["decision", "retrospective"])
+def test_an_empty_entities_list_is_accepted_on_a_judgement(kind):
+    """Accepted PERMANENTLY, not for one release: `build_decision_metadata`
+    always emits `entities: []`, and present-and-empty asserts nothing."""
+    assert MemoryCoordinator._judgement_entities_error(
+        {"type": kind, "entities": []}) is None
+    assert MemoryCoordinator._judgement_entities_error({"type": kind}) is None
+
+
+@pytest.mark.parametrize("kind", ["decision", "retrospective"])
+def test_new_entities_alone_is_refused_on_a_judgement(kind):
+    """`new_entities` is the MINT request — the faucet this rule closes — so
+    it is refused even when `entities` itself is empty."""
+    err = MemoryCoordinator._judgement_entities_error(
+        {"type": kind, "entities": [], "new_entities": ["BrandNewThing"]})
+    assert err is not None
+    assert err["error"] == "entities_not_allowed_on_judgement"
 
 
 @pytest.mark.asyncio
-async def test_a_retrospective_shaped_metadata_is_gated_identically():
-    c = _coord(vocabulary={"k8s": "Kubernetes"})
-    metadata = {"type": "retrospective", "entities": ["k8s"]}
-    err = await c._entity_ingress_error(metadata, "claude")
-    assert err is None
-    assert metadata["entities"] == ["Kubernetes"]
+async def test_decision_refuses_entities():
+    """End-to-end: nothing reaches Postgres, nothing mints, no embedding."""
+    c, conn = _full_coord()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)) as embed:
+        req = _make_request({
+            "content": "We decided to add a consolidation daemon.",
+            "metadata": {
+                "source": "claude-code",
+                "type": "decision",
+                "entities": ["Kubernetes"],
+                "decision": {
+                    "decided_by": "Xenofon",
+                    "project": "shared_memory",
+                    "rationale": "because",
+                },
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 400
+    assert json.loads(resp.text)["error"] == "entities_not_allowed_on_judgement"
+    c._entity_vocab_mint.assert_not_called()
+    c._entity_vocab_resolve_many.assert_not_called()
+    embed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_decision_with_an_empty_entities_list_still_saves():
+    """The shipped client's shape must keep working, unchanged."""
+    c, conn = _full_coord()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "We decided to add a consolidation daemon.",
+            "metadata": {
+                "source": "claude-code",
+                "type": "decision",
+                "entities": [],
+                "decision": {
+                    "decided_by": "Xenofon",
+                    "project": "shared_memory",
+                    "rationale": "because",
+                },
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_a_judgement_outbox_row_carries_no_entities_key():
+    """E3: no store carries a judgement's entities — including the outbox row,
+    which used to send an always-empty list."""
+    c, conn = _full_coord()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "We decided to add a consolidation daemon.",
+            "metadata": {
+                "source": "claude-code",
+                "type": "decision",
+                "entities": [],
+                "decision": {
+                    "decided_by": "Xenofon",
+                    "project": "shared_memory",
+                    "rationale": "because",
+                },
+            },
+        })
+        assert (await c.handle_save(req)).status == 200
+    call = next(k for k in conn.execute.call_args_list
+                if "neo4j_outbox" in k.args[0])
+    assert "entities" not in call.args[2]
+
+
+@pytest.mark.asyncio
+async def test_retrospective_refuses_entities():
+    """The other judgement endpoint, which had the gate wired in directly.
+
+    MUTATION CHECK: put the `_entity_ingress_error` call back in
+    handle_retrospective in place of `_judgement_entities_error` and this
+    fails — the name is resolved, minted on request, and stored."""
+    c, conn = _full_coord()
+    conn.fetchval = AsyncMock(return_value=1)   # the target decision exists
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)) as embed:
+        req = _make_request({
+            "pg_id": 42,
+            "rating": "validated",
+            "notes": "measured the outcome",
+            "grounded_in": [7],
+            "entities": ["Kubernetes"],
+        })
+        resp = await c.handle_retrospective(req)
+    assert resp.status == 400
+    assert json.loads(resp.text)["error"] == "entities_not_allowed_on_judgement"
+    c._entity_vocab_mint.assert_not_called()
+    c._entity_vocab_resolve_many.assert_not_called()
+    embed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_retrospective_with_no_entities_still_saves():
+    """An unchanged client — which sends no `entities` at all — keeps working."""
+    c, conn = _full_coord()
+    conn.fetchval = AsyncMock(return_value=1)
+    conn.fetchrow = AsyncMock(
+        return_value={"id": 99, "type": "decision", "project": "shared_memory"})
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "pg_id": 42,
+            "rating": "validated",
+            "notes": "measured the outcome",
+            "grounded_in": [7],
+        })
+        resp = await c.handle_retrospective(req)
+    assert resp.status == 200
+    call = next(k for k in conn.execute.call_args_list
+                if "neo4j_outbox" in k.args[0])
+    assert "entities" not in call.args[2]
+
+
+@pytest.mark.asyncio
+async def test_a_fact_outbox_row_still_carries_its_entities():
+    """The counterpart: a FACT is exactly where entities still belong."""
+    c, conn = _full_coord(vocabulary={"Kubernetes": "Kubernetes"})
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "a fact about a known concept",
+            "metadata": {
+                "source": "claude-code",
+                "project": "shared_memory",
+                "entities": ["Kubernetes"],
+            },
+        })
+        assert (await c.handle_save(req)).status == 200
+    call = next(k for k in conn.execute.call_args_list
+                if "neo4j_outbox" in k.args[0])
+    assert call.args[2]["entities"] == ["Kubernetes"]
 
 
 # ── The refusal shape itself ──────────────────────────────────────────────────

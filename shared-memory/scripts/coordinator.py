@@ -714,6 +714,12 @@ def _supersession_target_error(pg_id: int, record_type: object) -> str | None:
 # spelling to accommodate.
 ENTITIES_PROVENANCE_VALUES = ("operator", "agent")
 
+# The two JUDGEMENT record types. Only FACTS carry entities (decision:1664,
+# ruled R1 at v0.9.69): a judgement reaches its topics by walking to the facts
+# it rests on, so an entity named on one is never written to the graph and only
+# adds an unvetted name to the vocabulary (`fact:970`).
+JUDGEMENT_TYPES = ("decision", "retrospective")
+
 
 # ── Entity vocabulary ingress (fact:1375, migration 033) ──────────────────────
 #
@@ -4952,6 +4958,47 @@ class MemoryCoordinator:
             return refusal
         return await self._entity_commit_mints(metadata, agent_id, plan)
 
+    @staticmethod
+    def _judgement_entities_error(metadata: dict) -> dict | None:
+        """400 when a DECISION or RETROSPECTIVE carries entities — or None
+        (item 3, v0.9.69; ruled R1, grounded on `decision:1664`).
+
+        ONLY FACTS CARRY ENTITIES. A judgement reaches its topics by walking to
+        the facts it rests on, which is why its `entities` never became a
+        MENTIONS edge in the first place — but the value was still validated,
+        still MINTABLE through `new_entities`, and still returned by search,
+        which made the judgement path a second, unvetted faucet into the
+        vocabulary (`fact:970`, `fact:1734` A(3)).
+
+        An EMPTY list is accepted PERMANENTLY, not for one release: the shipped
+        client's `build_decision_metadata` always emits `entities: []`, and a
+        field that is present-and-empty asserts nothing.
+
+        Refuses BEFORE any write — nothing reaches Postgres, nothing mints.
+        """
+        entities = metadata.get("entities")
+        new_entities = metadata.get("new_entities")
+        offending = "entities" if entities else None
+        if offending is None and new_entities:
+            offending = "new_entities"
+        if offending is None:
+            return None
+        kind = metadata.get("type")
+        return {
+            "status": "error",
+            "error": "entities_not_allowed_on_judgement",
+            "message": (
+                f"a {kind} may not carry {offending} (decision:1664). Only "
+                "FACTS name entities: a judgement reaches its topics by "
+                "walking to the facts it is grounded in, so an entity named "
+                "here is never written to the graph and only adds an unvetted "
+                "name to the vocabulary. Save the concept on the FACT that "
+                "evidences it, and cite that fact in grounded_in. An empty "
+                "entities list is accepted and means the same thing as "
+                "omitting it."
+            ),
+        }
+
     async def _entity_confusable_error(
         self, to_mint: list[str], metadata: dict,
     ) -> dict | None:
@@ -5649,9 +5696,20 @@ class MemoryCoordinator:
                 {"status": "error", "message": "metadata.entities must be a list"},
                 status=400,
             )
-        entity_refusal, entity_plan = await self._entity_ingress_validate(metadata)
-        if entity_refusal is not None:
-            return web.json_response(entity_refusal, status=400)
+        # ⛔ ONLY FACTS CARRY ENTITIES (item 3, v0.9.69; ruled R1 on
+        # decision:1664). A judgement naming any is refused here — before the
+        # gate, before the axes, before any write — and never reaches the
+        # vocabulary at all. An empty list is accepted permanently.
+        if metadata.get("type") in JUDGEMENT_TYPES:
+            judgement_error = self._judgement_entities_error(metadata)
+            if judgement_error is not None:
+                return web.json_response(judgement_error, status=400)
+            metadata.setdefault("entities", [])
+            entity_plan: dict = {"resolved": {}, "to_mint": [], "canonical": []}
+        else:
+            entity_refusal, entity_plan = await self._entity_ingress_validate(metadata)
+            if entity_refusal is not None:
+                return web.json_response(entity_refusal, status=400)
 
         project_error = await self._project_ingress_error(
             metadata, agent_id, axis_report)
@@ -5897,7 +5955,13 @@ class MemoryCoordinator:
                         {
                             "content_snippet": content[:200],
                             "source": metadata.get("source", "coordinator"),
-                            "entities": entities,
+                            # ⛔ FACTS ONLY (item 3, v0.9.69). A judgement
+                            # carries no entities at all now, so the key is
+                            # OMITTED rather than sent empty — the projection
+                            # already defaults it, and a key that is always
+                            # empty is a promise the row should stop making.
+                            **({} if metadata.get("type") in JUDGEMENT_TYPES
+                               else {"entities": entities}),
                             "agent_id": agent_id,
                             # Fact-provenance axes (decision 912) — materialised as
                             # traversable edges on the :Fact node so provenance is a
@@ -6346,25 +6410,22 @@ class MemoryCoordinator:
                 status=404,
             )
 
-        # Entity vocabulary ingress gate (fact:1375) — the second of the two
-        # writers `_entity_ingress_error` covers; see its docstring.
+        # ⛔ THE ENTITY GATE NO LONGER RUNS HERE (item 3, v0.9.69; ruled R1 on
+        # decision:1664). A retrospective is a JUDGEMENT: it reaches its topics
+        # by walking to the facts it is grounded in, so an entity named on one
+        # was never written to the graph — it was merely validated, mintable
+        # through `new_entities`, and returned by search, which made this
+        # endpoint a second unvetted faucet into the vocabulary (`fact:970`).
+        # Naming any is now a refusal, checked BEFORE any write; an empty list
+        # is accepted permanently, so an unchanged client still saves.
         #
-        # ⛔ S-4 (security review fact:1412, ruled decision:1413): called LAST
-        # among this endpoint's 400/404-capable checks — AFTER grounded_in and
-        # the pg_id existence pre-check above, not right after `metadata` was
-        # built as originally placed. A mint is a real write with no shared
-        # transaction; anything that can still refuse the save must run
-        # before this call. Only the hard-mandate embedding 503 just below is
-        # unavoidably later — that residual is accepted by ruling, see the
-        # method's own docstring. Rewrites `metadata['entities']` to the
-        # canonical spelling in place before the locks loop below reads it.
-        entities_before = list(metadata["entities"])
-        entity_error = await self._entity_ingress_error(metadata, agent_id)
-        if entity_error is not None:
-            return web.json_response(entity_error, status=400)
-        entities_rewritten = (
-            metadata["entities"] if metadata["entities"] != entities_before else None
-        )
+        # `metadata['entities']` stays initialised (to the empty list it now
+        # always is) because the locks loop and the response below index it.
+        judgement_error = self._judgement_entities_error(metadata)
+        if judgement_error is not None:
+            return web.json_response(judgement_error, status=400)
+        metadata.pop("new_entities", None)
+        entities_rewritten = None
 
         # Embedding — hard mandate, same as every record; no save without a vector.
         # Identity: a retrospective is (target decision, notes) — the target is part
@@ -6477,7 +6538,10 @@ class MemoryCoordinator:
                             "content_snippet": notes[:200],
                             "source": agent_id,
                             "agent_id": agent_id,
-                            "entities": metadata["entities"],
+                            # ⛔ No `entities` key: a retrospective carries none
+                            # (item 3, v0.9.69). It never produced a MENTIONS
+                            # edge; the empty list was a promise this row should
+                            # stop making.
                             "source_ref": source_ref,
                             "fact_kind": fact_kind_from_source_ref(source_ref),
                             "grounded_in": grounded_ids,

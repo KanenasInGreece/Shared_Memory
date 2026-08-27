@@ -189,6 +189,12 @@ async def test_handle_save_rejects_non_list_entities():
 
 @pytest.mark.asyncio
 async def test_valid_decision_save_passes_validation():
+    """RE-RULED at v0.9.69 (item 3, ruled R1 on decision:1664): the fixture no
+    longer names entities. This test's subject is the DECISION SHAPE — title,
+    decided_by, project, rationale — and a decision may not carry entities at
+    all now; the empty list the shipped client always sends is what a valid
+    decision looks like. The refusal itself is pinned by
+    `test_decision_refuses_entities` in test_entity_vocabulary_ingress.py."""
     c, mock_conn, _ = _coordinator_with_mocks()
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         req = _make_request({
@@ -196,7 +202,7 @@ async def test_valid_decision_save_passes_validation():
             "metadata": {
                 "source": "claude-code",
                 "type": "decision",
-                "entities": ["Consolidator", "SharedMemory"],
+                "entities": [],
                 "decision": {
                     "title": "Add consolidation daemon",
                     "decided_by": "Xenofon",
