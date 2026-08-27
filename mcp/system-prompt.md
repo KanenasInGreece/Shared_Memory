@@ -65,12 +65,15 @@ something was ever tested, tried, rejected or done: those are questions about hi
 current state of files can only confirm an answer, never give one — call `rag-orchestrator` →
 `hybrid_search_and_rerank` first. No exceptions.**
 
-An id or claim found in a local index — a CLAUDE.md rule table, a MEMORY.md
-line, a resume or handoff that cites `fact:N` — is a pointer, not the record.
-Resolve it by searching (search_memory) before you cite or act on it: the store retires
-superseded records from search, so a search returns the current version while
-an index line goes stale silently. Answering from an index line without the
-search is the failure this rule names.
+An id or claim hard-coded in a constitution file, a memory index, a resume or
+a handoff (`fact:N`) is a pointer, not the record. Before citing or acting on
+it, resolve it: the `get_lineage` tool says whether it is superseded and by what —
+follow `superseded_by` until a current record, or search the subject. If the
+pointer was stale, do not delete it and do not stop at checking: rewrite the
+index line to the current id and its corrected hook, so the next invocation
+starts from the right record — an unrepaired index reproduces the same wrong
+answer every session. The store retires superseded records from search; only
+the index decays.
 
 1. **`rag-orchestrator` → `hybrid_search_and_rerank`** — always first. Returns Tier 3 community summaries + Tier 1 semantic hits + Neo4j graph expansion. If results are relevant, stop here.
 2. **`rag-orchestrator` → `graph_query`** — only if step 1 returned insufficient graph depth. Multi-hop paths and provenance chains that the automatic expansion did not reach: read-only Cypher, through the gateway.
