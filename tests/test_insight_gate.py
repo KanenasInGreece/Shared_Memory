@@ -173,8 +173,8 @@ async def test_walk_never_returns_a_fact_as_a_reached_judgement():
 @pytest.mark.asyncio
 async def test_i3_walk_is_unbounded_no_hop_cap():
     """MUTATION-CHECKED (HANDOFF.md): a chain 12 hops deep from the seed
-    fact — well past any hop bound the old design ever used (the pre-v2
-    canonical_fixpoint_entity_cypher caps at 4) — is reached in full. Verified
+    fact — well past any hop bound the old design ever used (the judgement
+    walks in ontology.py cap at 4) — is reached in full. Verified
     live by temporarily adding an artificial layer cap to
     insight_gate.walk_reached_graph, observing this exact test fail, and
     reverting (see HANDOFF.md for the exact numbers)."""
