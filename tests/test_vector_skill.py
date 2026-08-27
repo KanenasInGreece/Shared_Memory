@@ -795,3 +795,28 @@ def test_audit_log_write_is_offloaded_and_ordered(tmp_path, monkeypatch):
     logfile = tmp_path / "probe_tool.log"
     if logfile.exists():
         assert "probe_event" in logfile.read_text()
+
+
+# ── get_lineage — the MCP twin of the CLI `lineage` action (v0.9.71) ─────────
+# Parity: the constitution snippet tells an MCP agent to resolve a stale index
+# pointer with this tool; a tool the snippet names must exist and must read the
+# same gateway route the CLI reads (Postgres supersession, fact:1737 store roles).
+
+@pytest.mark.asyncio
+async def test_get_lineage_reads_the_status_route_and_returns_superseded_by():
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"pg_id": 1607, "superseded": True, "superseded_by": 1608}
+    with patch("httpx.AsyncClient.get", return_value=mock_response) as mock_get:
+        out = await vector_skill.get_lineage("fact:1607")
+    called_url = mock_get.call_args.args[0] if mock_get.call_args.args else mock_get.call_args.kwargs.get("url")
+    assert called_url.endswith("/memory/status/fact:1607"), called_url
+    assert '"superseded_by": 1608' in out and '"superseded": true' in out
+
+
+@pytest.mark.asyncio
+async def test_get_lineage_refuses_a_malformed_ref_without_calling_the_gateway():
+    with patch("httpx.AsyncClient.get") as mock_get:
+        out = await vector_skill.get_lineage("fact:abc")
+    assert out.startswith("Error: ref must be")
+    mock_get.assert_not_called()

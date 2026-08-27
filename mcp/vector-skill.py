@@ -140,7 +140,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.9.70"
+VERSION = "0.9.71"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server
@@ -1295,6 +1295,47 @@ async def supersede(pg_id: int, by: int = 0) -> str:
     if result.get("status") == "success":
         return result.get("message", f"Fact {pg_id} superseded.")
     return f"Error: {result.get('message', result)}"
+
+
+@mcp.tool()
+async def get_lineage(ref: str) -> str:
+    """
+    "What happened to record N?" — the record's Postgres lifecycle state:
+    whether it is superseded and by which id (`superseded_by`), what it is
+    grounded in, its dream-cycle stamps and what it consolidated into. This
+    is the MCP twin of the CLI's `lineage` action and reads the same gateway
+    route; Postgres is the source of truth for supersession (the graph's
+    SUPERSEDES edge is the expansion of it).
+
+    Use it to RESOLVE A POINTER before citing it: an id found in a
+    constitution file, a memory index, a resume or a handoff may be stale.
+    If `superseded` is true, call again with `superseded_by` until a current
+    record, then rewrite the index line to that id — do not stop at checking.
+
+    Required: ref — a bare pg_id, or a QUALIFIED reference (`fact:816`,
+    `summary:87`); qualify it when the id came off a summary result, since
+    technical_docs and community_summaries run independent id sequences.
+    """
+    ref = (ref or "").strip()
+    if not _valid_ref(ref):
+        return ("Error: ref must be a bare pg_id or one of fact:N, decision:N, "
+                "retrospective:N, summary:N, insight:N.")
+    coordinator_url = COORDINATOR_BASE
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(
+                f"{coordinator_url}/memory/status/{ref}",
+                headers=_auth_headers(),
+            )
+            result = _reply_json(r, "get_lineage")
+    except GatewayReplyError as exc:
+        return exc.message
+    except Exception as exc:
+        return (
+            f"Error: Memory coordinator unreachable at {coordinator_url} — "
+            f"is hive_mind_proxy.py running? ({exc})"
+        )
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
