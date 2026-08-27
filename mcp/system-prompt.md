@@ -65,6 +65,13 @@ something was ever tested, tried, rejected or done: those are questions about hi
 current state of files can only confirm an answer, never give one — call `rag-orchestrator` →
 `hybrid_search_and_rerank` first. No exceptions.**
 
+An id or claim found in a local index — a CLAUDE.md rule table, a MEMORY.md
+line, a resume or handoff that cites `fact:N` — is a pointer, not the record.
+Resolve it by searching (search_memory) before you cite or act on it: the store retires
+superseded records from search, so a search returns the current version while
+an index line goes stale silently. Answering from an index line without the
+search is the failure this rule names.
+
 1. **`rag-orchestrator` → `hybrid_search_and_rerank`** — always first. Returns Tier 3 community summaries + Tier 1 semantic hits + Neo4j graph expansion. If results are relevant, stop here.
 2. **`rag-orchestrator` → `graph_query`** — only if step 1 returned insufficient graph depth. Multi-hop paths and provenance chains that the automatic expansion did not reach: read-only Cypher, through the gateway.
 3. **Web search** — only if local memory is genuinely exhausted or the question requires information newer than any saved artifact.
