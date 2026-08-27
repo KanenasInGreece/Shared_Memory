@@ -721,6 +721,18 @@ ENTITIES_PROVENANCE_VALUES = ("operator", "agent")
 JUDGEMENT_TYPES = ("decision", "retrospective")
 
 
+class ProjectIdentityUnavailable(RuntimeError):
+    """The project registry could not produce an identity for a name that has
+    one (item 6, v0.9.69; ruled R3).
+
+    Its own class rather than a bare RuntimeError because three surfaces answer
+    it differently and each must be able to say which one it is handling: an
+    outbox row RETRIES (then goes `failed`, visibly); an ingress turns it into
+    a 503 `registry_unavailable`; a READER degrades to "no identity" and
+    reports the degrade, never a 500.
+    """
+
+
 # ── Entity vocabulary ingress (fact:1375, migration 033) ──────────────────────
 #
 # The two SQL primitives the save-time entity gate needs (Coordinator methods
@@ -4337,15 +4349,15 @@ class MemoryCoordinator:
                 ),
             }
 
+        # ⛔ STRICT SINCE v0.9.69 (item 6, ruled R3). This used to treat a None
+        # identity as "accept the record with its domain unvalidated and
+        # unlinked" — which turned an unreadable registry into a SILENTLY
+        # half-filed record: stored, searchable by text, and reachable from no
+        # axis. `_project_identity` now RAISES instead, and handle_save turns
+        # that into a 503 `registry_unavailable` — the same answer the hard
+        # embedding mandate gives when the other half of a save cannot be
+        # completed. A save that cannot be filed correctly is not saved.
         project_id = await self._project_identity(project)
-        if project_id is None:
-            # The project passed its own check, so this is not an unregistered
-            # name — it is a lookup that failed. Refusing the save would turn a
-            # transient database problem into a rejected record; accepting it
-            # keeps the value in Postgres, where the backfill can reach it.
-            log.warning("domain ingress: no identity for project %r — accepting the "
-                        "record with its domain unvalidated and unlinked", project)
-            return None
 
         for name in supplied:
             error = await self._domain_value_error(
@@ -5419,28 +5431,61 @@ class MemoryCoordinator:
             return await conn.fetchval(PROJECT_EXISTS_SQL, name) is not None
 
     async def _project_identity(self, project) -> int | None:
-        """The registry id behind a project name, or None (migration 027).
+        """The registry id behind a project name (migration 027). RAISES when
+        it cannot produce one for a name that HAS one to produce.
 
         Deliberately UNCACHED. The registry is tens of rows and this is one
         indexed lookup on a path that is already writing to two stores; a cache
         would buy nothing measurable and would hold a stale answer across
         exactly the operation the identity exists to survive — a rename.
 
-        None means "no identity to key on", from any cause: an unregistered
-        name, or a lookup that failed. Both take the write down the same
-        name-keyed fallback rather than losing the edge — see
-        ``project_merge_cypher``. A failure here must never turn a save into a
-        500, because the record and its project are both already valid.
+        ⛔ STRICT SINCE v0.9.69 (item 6, ruled R3). It used to return None from
+        ANY cause — an unregistered name or a failed lookup alike — and every
+        caller then wrote a node keyed on the NAME instead
+        (``project_merge_cypher(None)``). That rule made sense while an
+        unregistered project name could still reach a save. It cannot any more:
+        the ingress gate registers every project it accepts, so a missing row
+        is no longer "a name nobody registered" — it is a DATA-INTEGRITY DEFECT,
+        and the name-keyed fallback silently mints a SECOND node for a project
+        that already has one, which is precisely the divergence migration 027
+        exists to remove.
+
+        So both failures now raise :class:`ProjectIdentityUnavailable`:
+
+          * the lookup itself failed (the registry is unreadable)
+          * the lookup succeeded and there is NO ROW for a non-blank name
+
+        and each caller answers for its own surface: an outbox row RETRIES and
+        then goes `failed`, where it is visible; ingress turns it into a 503
+        `registry_unavailable`, consistent with the hard embedding mandate; a
+        READER degrades to "no identity" and says so, never a 500.
+
+        ``None`` survives for exactly one input — a blank or absent name. That
+        is the parked-record sentinel path (``project_for_graph`` returns None
+        for the sentinel), and it is the only remaining caller of
+        ``project_merge_cypher``'s name-keyed branch.
+
+        ⛔ This SUPERSEDES the rule stated in ``project_merge_cypher``'s own
+        docstring ("the WRITE must never be lost"); that docstring has been
+        rewritten rather than edited around.
         """
         if not isinstance(project, str) or not project.strip():
             return None
+        name = project.strip()
         try:
             async with self._acquire() as conn:
-                return await conn.fetchval(PROJECT_ID_SQL, project.strip())
+                project_id = await conn.fetchval(PROJECT_ID_SQL, name)
         except Exception as exc:
-            log.warning("project identity lookup failed for %r, writing the "
-                        "project node keyed on its name: %s", project, exc)
-            return None
+            log.error("project identity lookup FAILED for %r: %s", name, exc)
+            raise ProjectIdentityUnavailable(
+                f"the project registry could not be read for {name!r}") from exc
+        if project_id is None:
+            log.error("project identity: no registry row for %r — every project "
+                      "a save accepts is registered, so this is a data-integrity "
+                      "defect, not an unknown name", name)
+            raise ProjectIdentityUnavailable(
+                f"no registry identity for project {name!r}")
+        return project_id
 
     async def _resolve_project_alias(self, name: str) -> str | None:
         """The canonical project a retired spelling resolves to, or None.
@@ -5796,8 +5841,32 @@ class MemoryCoordinator:
         # canonical, so an aliased project reaches the right registry. A record
         # naming no domain passes straight through: most do, and that is correct
         # rather than untagged.
-        domain_error = await self._domain_ingress_error(
-            metadata, agent_id, axis_report)
+        #
+        # ⛔ 503, NOT 500 AND NOT A SILENT ACCEPT (item 6, ruled R3). The domain
+        # axis resolves through the project's registry IDENTITY, so an
+        # unreadable registry means this record cannot be FILED — and a record
+        # that saves without its axes is invisible to every reader who navigates
+        # by them. Same answer as the hard embedding mandate, and the same
+        # reason: half a save is not a save.
+        try:
+            domain_error = await self._domain_ingress_error(
+                metadata, agent_id, axis_report)
+        except ProjectIdentityUnavailable as exc:
+            log.error("save refused: %s", exc)
+            return web.json_response(
+                {
+                    "status": "error",
+                    "error": "registry_unavailable",
+                    "message": (
+                        "the project registry could not be read, so this "
+                        "record's axes cannot be resolved and it would be "
+                        "saved unfiled. Nothing was written. Retry; if it "
+                        "persists, the gateway's database is the thing to "
+                        "look at, not this save."
+                    ),
+                },
+                status=503,
+            )
         if domain_error is not None:
             return web.json_response(domain_error, status=400)
 
@@ -7084,8 +7153,17 @@ class MemoryCoordinator:
 
         domain_values = None
         if domains:
-            project_id = (await self._project_identity(canonical)
-                          if canonical is not None else None)
+            # A READER DEGRADES, never 500s (item 6, ruled R3). Without an
+            # identity the domain half of the filter resolves to nothing —
+            # which looks exactly like "nobody registered that section", so
+            # the degrade is REPORTED (counter + `filters_resolved.error`)
+            # rather than left to be read as an empty answer.
+            try:
+                project_id = (await self._project_identity(canonical)
+                              if canonical is not None else None)
+            except ProjectIdentityUnavailable as exc:
+                errors.append(self._note_registry_read_failure("project", exc))
+                project_id = None
             d_registered, d_aliases, d_err = await self._domain_spellings(
                 project_id, domains)
             if d_err:
