@@ -5,6 +5,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.70] — 2026-08-27
+
+### Changed — constitution snippet v4 (MCP snippet v3, system prompt in parity): an indexed id is a pointer, not the record
+
+An agent answered a question by citing a fact id it found in a preloaded local index, although the store held a newer record that superseded it — and search would have returned the current one, because the store filters superseded records out of results. Index files (a rule table in CLAUDE.md, a memory index, a resume) go stale silently; the store does not. The snippet now says so on all three surfaces: an id or claim found in a local index is resolved by searching before it is cited or acted on. The version markers advance so an installed block reads as drifted and the install/upgrade pass re-proposes it (never writes it silently). Guarded by `tests/test_constitution_snippet_history_trigger.py`, which now also asserts the pointer rule appears verbatim on every surface.
+
+---
+
 ## [0.9.69] — 2026-08-27
 
 ### Changed — entities get the axis protections; nothing moves after first write; belonging is read, never written
