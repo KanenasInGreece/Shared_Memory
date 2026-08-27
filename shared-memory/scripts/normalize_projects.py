@@ -340,7 +340,13 @@ def preview_neo4j(driver, old: str, new: str) -> None:
         print(f"  neo4j: Project {old!r} → {new!r}: {count} inbound edge(s)")
 
 
-def main() -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
+    """The CLI's argument surface, as a standalone function so a test can
+    assert on `parse_args(...)` directly (O1, v0.9.69) instead of grepping
+    the source text for `action="store_true"` — a check that would pass
+    against an `--apply` that was declared but never actually wired to
+    anything.
+    """
     ap = argparse.ArgumentParser(description=__doc__)
     # default=None (not the env value) so the map's SOURCE can be reported
     # accurately below — resolving the env var here would make an explicit
@@ -351,7 +357,11 @@ def main() -> int:
                     help="OPERATOR HAS CONFIRMED this rename — write it. Default "
                          "(the flag absent) previews every row it would touch and "
                          "writes nothing (O1, v0.9.69).")
-    args = ap.parse_args()
+    return ap
+
+
+def main() -> int:
+    args = build_arg_parser().parse_args()
 
     if args.map is not None:
         raw_map, map_source = args.map, "--map"
