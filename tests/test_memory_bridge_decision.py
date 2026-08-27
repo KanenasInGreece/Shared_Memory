@@ -158,7 +158,6 @@ async def test_save_decision_cli_forwards_correct_metadata(capsys):
             "--rationale", "asyncpg does not block",
             "--assisted-by", "claude-sonnet-4-6",
             "--confidence", "high",
-            "--entities", "asyncpg,PostgreSQL",
         ]
         with patch.object(mb, "save_artifact", side_effect=mock_save):
             await mb.main()
@@ -169,8 +168,29 @@ async def test_save_decision_cli_forwards_correct_metadata(capsys):
     assert captured["metadata"]["decision"]["title"] == "Use asyncpg over psycopg2"
     assert captured["metadata"]["decision"]["decided_by"] == "Xenofon"
     assert captured["metadata"]["decision"]["confidence"] == "high"
-    assert "asyncpg" in captured["metadata"]["entities"]
+    # A decision names no entities of its own (decision:1664) — the CLI no
+    # longer offers --entities, and the metadata always carries an empty list.
+    assert captured["metadata"]["entities"] == []
     assert "Use asyncpg over psycopg2" in captured["content"]
+
+
+def test_save_decision_cli_rejects_removed_entities_flag():
+    """--entities was removed from the argparse surface (v0.9.69) — a caller
+    still passing it must get argparse's own unknown-argument refusal, never
+    a silent no-op."""
+    argv_backup = sys.argv
+    try:
+        sys.argv = [
+            "memory_bridge.py", "save_decision",
+            "--title", "T", "--decided-by", "X", "--project", "P",
+            "--rationale", "R", "--entities", "asyncpg",
+        ]
+        with pytest.raises(SystemExit) as exc_info:
+            import asyncio
+            asyncio.run(mb.main())
+    finally:
+        sys.argv = argv_backup
+    assert exc_info.value.code != 0
 
 
 def test_save_decision_cli_missing_required_flag_exits():

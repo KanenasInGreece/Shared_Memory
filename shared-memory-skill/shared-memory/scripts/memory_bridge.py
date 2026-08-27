@@ -1609,7 +1609,6 @@ def build_retrospective_payload(
     date: str = "",
     source: str = None,
     grounded_in: str = "",
-    entities: str = "",
     source_ref: str = "",
     elicited: bool = False,
 ) -> dict:
@@ -1619,7 +1618,10 @@ def build_retrospective_payload(
 
     grounded_in uses the same "pgid[:role],pgid" grammar as save_decision —
     the facts that MEASURED this outcome (test-grounded retrospectives,
-    decision 542). Pure function — no I/O, no side effects.
+    decision 542). A retrospective carries no entities — only facts do
+    (decision:1664) — so this never sends the field; the gateway inherits
+    its topics from the grounding facts. Pure function — no I/O, no side
+    effects.
     """
     payload = {
         "pg_id": pg_id,
@@ -1646,8 +1648,6 @@ def build_retrospective_payload(
         payload["grounded_in"] = gi
     if grounded_roles:
         payload["grounded_roles"] = grounded_roles
-    if entities:
-        payload["entities"] = [e.strip() for e in entities.split(",") if e.strip()]
     if source_ref:
         payload["source_ref"] = source_ref
     if elicited:
@@ -1662,7 +1662,6 @@ async def save_retrospective_artifact(
     date: str = "",
     source: str = None,
     grounded_in: str = "",
-    entities: str = "",
     source_ref: str = "",
     elicited: bool = False,
 ) -> dict:
@@ -1673,7 +1672,7 @@ async def save_retrospective_artifact(
                 "message": (f"rating must be one of {list(RETRO_RATINGS)} — outcome "
                             "states, not valence; put the nuance in --notes")}
     payload = build_retrospective_payload(pg_id, rating, notes, date, source,
-                                          grounded_in, entities, source_ref, elicited)
+                                          grounded_in, source_ref, elicited)
     try:
         async with _async_client(60.0) as client:
             r = await client.post(
@@ -1991,10 +1990,6 @@ async def main() -> None:
                             "brackets and any other punctuation.")
         p.add_argument("--confidence",  default="",
                        help="Confidence level (e.g. high, medium, low)")
-        p.add_argument("--entities",    default="",
-                       help="DEPRECATED — kept for older callers and IGNORED by the "
-                            "graph. A decision mints no entity; it inherits the topics "
-                            "of the facts in --grounded-in. Use that instead.")
         p.add_argument("--grounded-in", default="",
                        help="pg_ids of the records this decision rests on, comma "
                             "separated, each optionally carrying the ROLE it plays: "
@@ -2033,7 +2028,6 @@ async def main() -> None:
             assisted_by=args.assisted_by,
             alternatives=args.alternatives,
             confidence=args.confidence,
-            entities=args.entities,
             grounded_in=args.grounded_in,
             elicited=args.elicited,
             new_project=args.new_project,
@@ -2075,10 +2069,6 @@ async def main() -> None:
                             "and it also strands the decision it judges, which reaches "
                             "its own topics through this record. Refused with 400 "
                             "when absent.")
-        p.add_argument("--entities",    default="",
-                       help="DEPRECATED — kept for older callers and IGNORED by the "
-                            "graph. A retrospective inherits the topics of the facts "
-                            "in --grounded-in, which is required.")
         p.add_argument("--source-ref",  default="",
                        help="THE INSTRUMENT THAT MEASURED THIS OUTCOME — the test "
                             "re-run, the live reading, the URL. A different question "
@@ -2098,7 +2088,6 @@ async def main() -> None:
                 date=args.date,
                 source=args.source,
                 grounded_in=args.grounded_in,
-                entities=args.entities,
                 source_ref=args.source_ref,
                 elicited=args.elicited,
             ),
