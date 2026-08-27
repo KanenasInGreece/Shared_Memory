@@ -7,11 +7,20 @@ A domain is a SECTION OF ONE PROJECT (migration 028). The invariants under test:
   D2  domain is MULTI-valued; project is single
   D3  WHO CONTROLS WHICH AXIS:
         fact           project OWN · domain OWN · mints its own entities
-        decision       project OWN · domain OWN · entities INHERITED
-        retrospective  project and domain BOTH from the decision it judges
-  D4  a decision that names NO section inherits its grounding facts' sections —
-      a DEFAULT, never a ceiling: one that names its own keeps exactly those,
-      because a decision routinely reaches further than its evidence
+        decision       project OWN · domain OWN · carries no entities
+        retrospective  asserts neither — its belonging is DERIVED ON READ from
+                       the decision it judges
+  D4  ⛔ RE-RULED by `decision:1736` (was: "a decision that names no section
+      INHERITS its grounding facts' sections"). NOTHING WRITES AN INHERITED
+      SECTION any more — not a decision's first write, not a retrospective's,
+      and not a retrospective re-running the rule onto the decision it judges.
+      A record's DOMAIN_OF edges are exactly what its operator asserted on it;
+      "what else does this judgement belong to" is a question the READ side
+      answers by traversal (`derived_belonging_cypher`), because a value a
+      reader can reach by walking is a value nothing should write twice
+      (`decision:1032`). The old rule was not wrong about the ANSWER — it was
+      wrong about materialising it, after the record's first write, from an
+      inference the operator never made.
   D5  an unregistered section is LOUD (400 + proposals), never a new spelling
   D6  no name-keyed :Domain node — no registry identity means NO edge
   D7  :Domain is never a topic: not an :Entity, not in REM's label table, and
@@ -301,20 +310,27 @@ def test_the_bare_schema_word_is_refused_as_an_entity_name():
     assert sanitize_entity_name("DOMAIN_OF") is None
 
 
-# ── D4 — inheritance is a DEFAULT, and a repair must not overrule an assertion ──
+# ── D4 — the repair tool asserts, and never derives ──────────────────────────
+
+# ⛔ RE-RULED (`decision:1736`). What stood here was
+# `test_inherit_mode_clears_only_inherited_edges_never_an_assertion`: it
+# asserted that a `domain_of` outbox row carrying `inherit: true` deletes the
+# edges stamped `inherited`, leaves bare ones alone, and then RE-DERIVES the
+# judgement's sections from what it grounds in. Every clause of that is a
+# statement about a write path that no longer exists, so the test could only be
+# kept by keeping the defect. Replaced, not deleted: the guarantee that matters
+# now is that a row asking for the retired mode writes NOTHING — and that is a
+# stronger property than the one it replaces, because live rows enqueued before
+# this shipped can still arrive.
+
 
 @pytest.mark.asyncio
-async def test_inherit_mode_clears_only_inherited_edges_never_an_assertion():
-    """D4. Inherit mode re-derives a default, so it may only clear what a
-    previous default wrote. Clearing a BARE edge would delete a decision's own
-    sections and replace them with its evidence's — silently converting a
-    deliberate choice into the default it was chosen to override.
-
-    Found live: one record was enqueued in both modes, and the inherit row
-    applied second replaced its edge. It came out right only because that record
-    was a retrospective, which has nothing to assert. On a decision the same
-    sequence loses data."""
-    from coordinator import RELATION_ASSERTED_INHERITED
+async def test_a_retired_inherit_row_writes_nothing_and_is_dropped():
+    """D4. A pending `inherit: true` row carries NO `domains` key, so falling
+    through to the explicit branch would run its unconditional `DELETE stale`
+    and write nothing back — stripping the record's real, asserted sections.
+    Recognising the retired mode and dropping the row is the difference between
+    a no-op and silent data loss."""
     c = _coord()
     queries = []
 
@@ -335,13 +351,44 @@ async def test_inherit_mode_clears_only_inherited_edges_never_an_assertion():
     await c._apply_domain_of_outbox_row(
         1, 42, {"type": "domain_of", "inherit": True, "anchor": ONT.retrospective})
 
+    assert queries == [], "the retired mode must touch the graph not at all"
+    deleted = c._acquire.return_value.__aenter__.return_value.execute
+    deleted.assert_awaited()
+    assert "DELETE FROM neo4j_outbox" in deleted.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_row_still_replaces_the_asserted_set():
+    """The half that STAYS. `explicit` is now the only mode: it clears every
+    DOMAIN_OF edge and writes what Postgres says, because the record's own
+    assertion is the whole answer."""
+    c = _coord()
+    c._domain_identity = AsyncMock(return_value=41)
+    queries = []
+
+    async def run(q, **kw):
+        queries.append((q, kw))
+        res = MagicMock()
+        res.single = AsyncMock(return_value={"n": 1})
+        return res
+
+    session = MagicMock()
+    session.run = run
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=session)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    c._neo4j = MagicMock()
+    c._neo4j.session = MagicMock(return_value=ctx)
+
+    await c._apply_domain_of_outbox_row(
+        1, 42, {"type": "domain_of", "project": "p", "domains": ["architecture"]})
+
     deletes = [q for q, _ in queries if "DELETE stale" in q]
-    assert deletes, "inherit mode must clear the defaults it previously wrote"
+    assert deletes, "explicit mode replaces the set it manages"
     for q in deletes:
-        assert "asserted_by" in q, (
-            "an unqualified DELETE removes self-asserted sections too")
-    assert any(kw.get("stamp") == RELATION_ASSERTED_INHERITED
-               for _q, kw in queries)
+        assert "asserted_by" not in q, (
+            "the stamp is gone — nothing may filter a delete on it any more")
+    assert any(f"-[:{ONT.domain_of}]->(d)" in q for q, _ in queries)
 
 
 def test_the_backfill_never_gives_a_retrospective_an_asserted_row():
@@ -355,9 +402,11 @@ def test_the_backfill_never_gives_a_retrospective_an_asserted_row():
         (2, "retrospective", {"project": "p", "domain": "ops"}),
         (3, "decision", {"decision": {"project": "p", "domain": "ops"}}),
     ]
-    explicit, _inherit, _unreg, _parked = b.plan(
-        rows, [], {("p", "ops")}, set())
+    explicit, _unreg, _parked = b.plan(rows, {("p", "ops")}, set())
     assert sorted(pg for pg, _p, _d in explicit) == [1, 3]
+    # `plan` lost its `retro_rows` argument with the inherit population it fed
+    # (`decision:1736`); a retrospective now gets no row of any kind.
+    assert not hasattr(b, "RETRO_SQL")
 
 
 def test_rem_can_never_mint_a_domain_node():
@@ -390,7 +439,10 @@ def test_save_decision_domain_flag_reaches_the_record():
     assert resolve_domains(metadata) == ["architecture", "schema"]
 
 
-def test_no_domain_flag_leaves_the_decision_free_to_inherit():
+def test_no_domain_flag_leaves_the_decision_with_no_section_at_all():
+    """RENAMED from `..._free_to_inherit` (`decision:1736`): there is no
+    inheritance left for it to be free for. A decision that names no section
+    HAS none — the record is honest, and where it belongs is answered on read."""
     import memory_bridge as mb
     _content, metadata = mb.build_decision_metadata(
         title="t", decided_by="X", project="p", rationale="r")
@@ -464,27 +516,96 @@ async def test_a_decision_with_an_explicit_domain_writes_its_OWN_edge():
     assert captured[0][1]["domains"] == [{"id": 41, "name": "architecture"}]
 
 
+# ⛔ RE-RULED (`decision:1736`). Two tests stood here:
+#
+#   `test_a_decision_with_no_domain_writes_no_edge_and_leaves_inheritance_to_run`
+#       asserted the projection carries no section AND that "inheritance must
+#       still run" — the second half is now the defect, so the test is replaced
+#       by its inverse below rather than weakened.
+#   `test_inheritance_declines_when_the_record_asserted_its_own_sections`
+#       pinned the `NOT EXISTS { ... asserted_by IS NULL }` guard that let the
+#       inheritance query be re-run from anywhere. With no inheritance query
+#       there is nothing to decline, and the property it protected — an
+#       asserted section survives — is now protected by construction: nothing
+#       else writes this axis. `test_a_decision_with_an_explicit_domain_writes
+#       _its_OWN_edge` above is the anchor for that half.
+
+
 @pytest.mark.asyncio
-async def test_a_decision_with_no_domain_writes_no_edge_and_leaves_inheritance_to_run():
-    """The default path: nothing asserted, so the projection carries no section
-    and the inheritance pass is what may supply one."""
+async def test_decision_apply_writes_no_inherited_domain_edge():
+    """D4 (re-ruled). A decision that names no section gets NO DOMAIN_OF edge —
+    not from its own projection, and not from a second statement deriving one
+    from the facts it grounds in. The old behaviour is visible in what this
+    asserts is absent: a `MERGE (a)-[m:DOMAIN_OF]->` carrying an `asserted_by`
+    stamp, issued after the grounding."""
     captured = await _decision_cypher([])
     projection = captured[0][0]
     assert "FOREACH (row IN $domains" not in projection
-    inherit = [q for q, _ in captured if ONT.had_outcome in q or "$pg_id" in q]
-    assert any(ONT.domain_of in q for q in inherit), "inheritance must still run"
+    for q, _kw in captured:
+        assert "MERGE (a)-[m:" not in q, (
+            "the inheritance MERGE is back — a decision's sections are its own")
+        assert "inherited" not in q, "nothing stamps an edge as inherited any more"
+    assert not any(ONT.domain_of in q for q, _ in captured), (
+        "a decision that asserted no section must write no DOMAIN_OF at all")
+
+
+async def _retro_cypher(*, target_pg_id=42, grounded=None):
+    """Capture the Cypher a v2 retrospective projection emits."""
+    c = _coord()
+    captured = []
+
+    async def run(q, **kw):
+        captured.append((q, kw))
+        res = MagicMock()
+        res.single = AsyncMock(return_value={"n": 0})
+        return res
+
+    session = MagicMock()
+    session.run = run
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=session)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    c._neo4j = MagicMock()
+    c._neo4j.session = MagicMock(return_value=ctx)
+    await c._apply_retrospective_outbox_row(11, 913, {
+        "v": 2, "type": "retrospective", "target_pg_id": target_pg_id,
+        "retrospective": {"rating": "validated", "date": "2026-08-27"},
+        "content_snippet": "held up", "source": "claude",
+        "fact_kind": "tested",
+        "grounded": grounded if grounded is not None else [
+            {"pg_id": 601, "rel": "GROUNDED_IN",
+             "asserted_by": "operator", "label": "Fact"}],
+    })
+    return captured
 
 
 @pytest.mark.asyncio
-async def test_inheritance_declines_when_the_record_asserted_its_own_sections():
-    """The guard that makes an explicit section survive every later re-run — of
-    the write path, of a landing retrospective, and of the repair tool. Without
-    it, re-running would ADD the evidence's sections to a decision that
-    deliberately chose different ones."""
-    captured = await _decision_cypher(["architecture"])
-    inherit = [q for q, _ in captured
-               if ONT.domain_of in q and "MERGE (a)-[m:" in q]
-    assert inherit, "the inheritance statement must still be issued"
-    for q in inherit:
-        assert "NOT EXISTS" in q and "asserted_by IS NULL" in q, (
-            "inheritance must decline wherever a self-asserted edge exists")
+async def test_retrospective_apply_does_not_touch_target_decision_domains():
+    """P2. A retrospective's save is a write about the RETROSPECTIVE. It used to
+    re-run the decision's inheritance on the way past, on the reasoning that an
+    ungrounded decision first reaches facts through its verdict — a
+    post-first-write mutation of another record's belonging axis, inferred and
+    never asserted (`fact:1671`). No statement this apply issues may name the
+    target's pg_id and the domain axis together."""
+    captured = await _retro_cypher(target_pg_id=42)
+    for q, kw in captured:
+        if ONT.domain_of in q:
+            assert 42 not in kw.values(), (
+                "the retrospective is writing sections onto its decision again")
+    assert not any(ONT.domain_of in q for q, _ in captured)
+
+
+@pytest.mark.asyncio
+async def test_retrospective_apply_writes_no_domain_edge_of_its_own():
+    """P2, the other half. The verdict took its decision's sections for itself,
+    stamped `inherited`. It now carries none: a retrospective asserts no domain
+    at ingress, so it has nothing to write, and its belonging is derived on read
+    from the decision it judges plus the facts it grounds in."""
+    captured = await _retro_cypher()
+    for q, _kw in captured:
+        assert ONT.domain_of not in q
+        assert "inherited" not in q
+    # The projection it DOES owe is untouched — this is a removal, not a
+    # regression in what a retrospective materialises.
+    assert any(f"MERGE (r:{ONT.retrospective}" in q for q, _ in captured)
+    assert any(ONT.had_outcome in q for q, _ in captured)

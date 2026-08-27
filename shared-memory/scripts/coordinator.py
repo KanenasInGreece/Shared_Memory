@@ -1952,11 +1952,13 @@ SEARCH_CANDIDATE_FLOOR = _env_int("SEARCH_CANDIDATE_FLOOR", 20)
 # empty result would then read as authoritative when it was really partial.
 SEARCH_DOMAINS_FILTER_CAP = _env_int("SEARCH_DOMAINS_FILTER_CAP", 16)
 
-# Stamp the domain-inheritance writer puts on a COPY of an edge some other
-# record already had, so an inherited naming is never mistaken for a first-write
-# one. Written by _inherit_domains (ON CREATE) and read back by the stale-edge
-# sweep that retires copies whose source moved.
-RELATION_ASSERTED_INHERITED = "inherited"
+# ⛔ RELATION_ASSERTED_INHERITED IS GONE (`decision:1736`). It stamped a COPY of
+# an edge some other record already had, so an inherited naming could be told
+# apart from a first-write one. Nothing writes such a copy any more — belonging
+# is derived on READ (`derived_belonging_cypher`) — so the stamp has no writer
+# and, with the inherit-mode outbox branch retired, no reader either. The
+# `'inherited'` edges already in the live graph are LEGACY DATA, retired by a
+# one-time ledgered operation, not by framework code.
 
 # Pool sizing is a SYSTEM budget, not just a coordinator knob: Postgres
 # max_connections must cover this pool + REM (1 conn) + NREM (per-op) + the
@@ -3537,100 +3539,6 @@ class MemoryCoordinator:
             pg_id=pg_id, grounded=grounded,
         )
 
-    async def _inherit_domains(self, session, pg_id: int,
-                               anchor_label: str = None) -> int:
-        """A judgement's DEFAULT sections, when it asserted none of its own.
-        Returns the number of `DOMAIN_OF` edges written.
-
-        Where they come from differs by record, and each route mirrors how that
-        record already gets its PROJECT:
-
-          decision       the union of the sections of the FACTS it grounds in.
-          retrospective  the sections of the DECISION it judges — the same source
-                         its project comes from, so a verdict is always filed
-                         with what it judges.
-
-        ⛔ A GOOD DEFAULT IS NOT AN ENFORCED ONE, and for a decision that
-        distinction is the whole rule. A decision REACHES FURTHER THAN ITS
-        EVIDENCE: a fact observes that agents write to the graph directly — an
-        infrastructure observation — while the decision it provokes may govern
-        which agents are AUTHORISED to write, which is about tokens and access
-        and sits above the infrastructure that prompted it. Inheriting would cap
-        the decision at its evidence's sections, so the section that most needs
-        to surface it never would. So a decision that names its own sections
-        keeps them, and one that names none takes its evidence's — which is right
-        far more often than it is wrong, and is never a ceiling.
-
-        ⚠ THE GUARD IS THE `asserted_by` STAMP, which is why this is safe to
-        re-run from anywhere. A self-asserted edge is written bare at first
-        write; an inherited one is stamped. So "did this record name its own?"
-        is answerable from the graph, and inheritance simply declines when the
-        answer is yes. Without that test, re-running after a retrospective landed
-        would ADD the evidence's sections to a decision that deliberately chose
-        different ones — silently converting an assertion into a superset.
-
-        ⚠ A RETROSPECTIVE DELIBERATELY DOES NOT READ ITS OWN GROUNDING FACTS,
-        which would have been the obvious symmetry with the entity inheritance
-        beside it. Those facts are the LATER measurement and routinely sit in a
-        different section from the decision. Entities are ABOUTNESS and
-        legitimately come from the measurement; domain is BELONGING and comes
-        from what is being judged.
-
-        No timing defect at first write — a decision's grounding and a
-        retrospective's target both exist before the row that reads them. A
-        section added LATER does not propagate on its own;
-        `backfill_domain_of.py`'s inherit mode re-runs exactly this query, which
-        is why the rule lives here rather than in that tool.
-        """
-        anchor = anchor_label or ONT.retrospective
-        # "Names no section of its own" — a bare DOMAIN_OF is an assertion, a
-        # stamped one is a copy. Same convention the entity inheritance uses.
-        self_asserted = (
-            f" WHERE NOT EXISTS {{ MATCH (a)-[sm:{ONT.domain_of}]->()"
-            f" WHERE sm.asserted_by IS NULL }}"
-        )
-        if anchor == ONT.decision:
-            rels = "|".join(GROUNDING_RELATIONS)
-            cypher = (
-                f"MATCH (a:{ONT.decision} {{pg_id: $pg_id}})"
-                + self_asserted +
-                f" MATCH (a)-[:{rels}]->(t)"
-                f" MATCH (t)-[:{rels}*0..1]->(f:{ONT.fact})"
-                f" WHERE coalesce(f.superseded, false) = false"
-                f" MATCH (f)-[:{ONT.domain_of}]->(d:{ONT.domain})"
-                f" WITH a, collect(DISTINCT d) AS ds"
-                f" UNWIND ds AS d"
-                f" MERGE (a)-[m:{ONT.domain_of}]->(d)"
-                f"   ON CREATE SET m.asserted_by = '{RELATION_ASSERTED_INHERITED}'"
-                f" WITH count(d) AS n RETURN n"
-            )
-        else:
-            cypher = (
-                f"MATCH (a:{anchor} {{pg_id: $pg_id}})"
-                + self_asserted +
-                f" MATCH (a)<-[:{ONT.had_outcome}]-(o:{ONT.decision})"
-                f" MATCH (o)-[:{ONT.domain_of}]->(d:{ONT.domain})"
-                f" WITH a, collect(DISTINCT d) AS ds"
-                f" UNWIND ds AS d"
-                f" MERGE (a)-[m:{ONT.domain_of}]->(d)"
-                f"   ON CREATE SET m.asserted_by = '{RELATION_ASSERTED_INHERITED}'"
-                f" WITH count(d) AS n RETURN n"
-            )
-        try:
-            rec = await (await session.run(cypher, pg_id=pg_id)).single()
-        except Exception as exc:
-            # Never let the belonging axis take down the record write. The
-            # judgement, its project and its grounding are all already correct;
-            # a missing inherited section is repairable by the backfill tool,
-            # while a failed outbox row would retry the whole projection.
-            log.warning("%s pg_id=%d: domain inheritance failed, record is intact "
-                        "and the edge is repairable: %s", anchor, pg_id, exc)
-            return 0
-        n = (rec["n"] if rec else 0) or 0
-        if n:
-            log.debug("%s pg_id=%d inherited %d domain(s)", anchor, pg_id, n)
-        return n
-
     async def _apply_decision_outbox_row(
         self, outbox_id: int, pg_id: int, params: dict
     ) -> None:
@@ -3737,11 +3645,13 @@ class MemoryCoordinator:
                     f"   MERGE (d)-[:{ONT.grounded_in}]->(existing) )",
                     pg_id=pg_id, grounded_in=grounded_in_flat,
                 )
-            # Sections, AFTER grounding exists — and unconditionally, because the
-            # call guards itself: a decision that asserted its own sections above
-            # already carries a bare DOMAIN_OF edge and this declines. One that
-            # named none takes its evidence's sections as the default.
-            await self._inherit_domains(session, pg_id, ONT.decision)
+            # ⛔ NO INHERITED SECTIONS. A decision's DOMAIN_OF edges are exactly
+            # the ones the operator asserted on THIS record, written by the
+            # projection above; a decision that named none carries none
+            # (`decision:1736`). Its belonging is still ANSWERABLE — read side,
+            # by traversal (`derived_belonging_cypher`) — it is simply not
+            # materialised, because a value a reader can reach by walking is a
+            # value nothing should write twice (`decision:1032`).
         async with self._acquire() as conn:
             await conn.execute(
                 "UPDATE neo4j_outbox SET status='applied', applied_at=now() WHERE id=$1",
@@ -3809,21 +3719,16 @@ class MemoryCoordinator:
                 await self._write_typed_grounding(
                     session, ONT.retrospective, pg_id, params.get("grounded") or []
                 )
-                if target_pg_id is not None:
-                    # The decision's own default may also have become reachable:
-                    # a decision that asserted no section takes its evidence's,
-                    # and this is the moment that evidence can first exist (an
-                    # ungrounded decision reaches facts through its retrospective).
-                    # Declines on a decision that named its own.
-                    await self._inherit_domains(
-                        session, target_pg_id, ONT.decision
-                    )
-                # ⚠ THE RETROSPECTIVE'S SECTIONS COME LAST, and the order is the
-                # rule rather than tidiness: it reads the DECISION's edges, so
-                # running it before the line above would read them as they were
-                # before this same transaction completed them — and a verdict
-                # would inherit nothing while the decision it judges ends up filed.
-                await self._inherit_domains(session, pg_id, ONT.retrospective)
+                # ⛔ A RETROSPECTIVE'S SAVE WRITES NO DOMAIN_OF EDGE — neither
+                # onto the decision it judges nor onto itself (`decision:1736`).
+                # It used to do both: it re-ran the decision's inheritance
+                # (because a retrospective is the moment an ungrounded decision
+                # first reaches facts) and then took the decision's sections for
+                # itself. Both were POST-FIRST-WRITE MUTATIONS of somebody's
+                # belonging axis, inferred rather than asserted — the class
+                # `fact:1671` forbids. The verdict is reached from its decision
+                # and its facts on READ, and `derived_belonging_cypher` is where
+                # that answer now lives.
             else:
                 superseded_clause = " SET d.superseded = true" if reversal else ""
                 await session.run(
@@ -3964,51 +3869,50 @@ class MemoryCoordinator:
         self, outbox_id: int, pg_id: int, params: dict
     ) -> None:
         """Point an EXISTING record at its :Domain(s) — the narrow repair row
-        `backfill_domain_of.py` enqueues, in two modes.
+        `backfill_domain_of.py` enqueues.
 
-        `domains: [names]`  a FACT's sections, resolved through the registry the
-                            same way first write resolves them.
-        `inherit: true`     a JUDGEMENT's sections, re-derived by running the
-                            SAME `_inherit_domains` rule the write path runs.
+        `domains: [names]`  the record's OWN, ASSERTED sections, resolved through
+                            the registry the same way first write resolves them.
+                            The only mode there is.
 
-        ⚠ THE INHERIT MODE EXISTS SO THE RULE HAS ONE IMPLEMENTATION. The obvious
-        alternative was to let the backfill tool compute a judgement's domains
-        from Postgres — decision → grounding facts → sections — which is a second
-        expression of P17 that can drift from this one. A repair that re-derives
-        a rule is a repair that can disagree with the thing it repairs.
+        ⛔ THE `inherit: true` MODE IS GONE (`decision:1736`). It re-derived a
+        judgement's sections from what it grounds in and wrote them as edges
+        stamped `inherited` — a materialised copy of a value the reader can
+        reach by walking, and a mutation of a record's belonging axis after its
+        first write. Nothing derives belonging into an edge any more; the read
+        side answers it (`derived_belonging_cypher`).
+
+        ⚠ A LEGACY `inherit` ROW IS DROPPED, NOT FALLEN THROUGH. Rows enqueued
+        before this shipped may still be pending, and they carry no `domains`
+        key — so letting one reach the explicit branch below would DELETE every
+        DOMAIN_OF edge the record has and write nothing back. Recognising the
+        retired mode and dropping the row is the difference between a no-op and
+        silent data loss.
 
         Narrow, like `project_of` and for the same reason: replaying an ordinary
         fact row would re-run its `MENTIONS` merges and resurrect enrichment
         edges a later sweep deliberately deleted.
 
-        ⚠ IT REPLACES THE SET IT MANAGES, AND ONLY THAT SET — which is why the
-        two modes delete different things, and getting that wrong is not
-        cosmetic:
-
-          explicit  deletes EVERY DOMAIN_OF edge, then writes what Postgres
-                    says. The record's own assertion is the whole answer.
-          inherit   deletes only edges STAMPED `inherited` — never a bare one.
-
-        A bare edge is a SELF-ASSERTION. If inherit mode cleared those too it
-        would delete a decision's own sections and then re-derive its evidence's,
-        silently converting a deliberate choice into the default the operator
-        chose to override — and a decision reaches further than its evidence
-        precisely so that it CAN differ. Measured: one retrospective in this
-        corpus was enqueued in both modes, and the inherit row applied second
-        replaced its edge; that came out right only because a retrospective has
-        nothing to assert. On a decision the same sequence loses data.
-
-        That is the P19 lesson applied to a MULTI-valued axis: the rule is not
-        "exactly one edge", it is "the graph mirrors the current answer rather
-        than keeping every answer" — where the current answer is the assertion
-        when there is one, and the inheritance when there is not.
+        ⚠ IT REPLACES THE SET IT MANAGES: it deletes EVERY DOMAIN_OF edge, then
+        writes what Postgres says. The record's own assertion is the whole
+        answer — that is the P19 lesson on a MULTI-valued axis, "the graph
+        mirrors the current answer rather than keeping every answer".
 
         One-shot, DELETED on success: it carries no dream lifecycle and must
         never be counted as working-set backlog.
         """
-        inherit = bool(params.get("inherit"))
-        anchor = params.get("anchor") or ONT.decision
+        retired_inherit = bool(params.get("inherit"))
         written = 0
+        if retired_inherit:
+            # Retired mode — see the docstring. Drop the row without touching
+            # the graph; it asks for a write this system no longer performs.
+            async with self._acquire() as conn:
+                await conn.execute("DELETE FROM neo4j_outbox WHERE id=$1", outbox_id)
+            log.info(
+                "outbox: domain_of pg_id=%s carries the retired 'inherit' mode — "
+                "no graph write, row dropped (outbox_id=%d)", pg_id, outbox_id,
+            )
+            return
         async with self._neo4j.session() as session:
             # MATCH, never MERGE — a repair mints no records. A record whose node
             # is gone leaves the row dropped rather than conjuring a phantom.
@@ -4019,17 +3923,6 @@ class MemoryCoordinator:
             if not exists or not exists["n"]:
                 log.info("outbox: domain_of pg_id=%s has no spine node — row dropped",
                          pg_id)
-            elif inherit:
-                # Only what inheritance owns. A bare edge is the record's own
-                # assertion and outranks any default — see the docstring.
-                await session.run(
-                    f"MATCH (n:{self._SPINE}) WHERE n.pg_id = $pg_id"
-                    f" MATCH (n)-[stale:{ONT.domain_of}]->()"
-                    f" WHERE stale.asserted_by = $stamp"
-                    f" DELETE stale",
-                    pg_id=pg_id, stamp=RELATION_ASSERTED_INHERITED,
-                )
-                written = await self._inherit_domains(session, pg_id, anchor)
             else:
                 project_id = await self._project_identity(params.get("project"))
                 domain_ids = await self._domain_identities(
@@ -4055,9 +3948,8 @@ class MemoryCoordinator:
         async with self._acquire() as conn:
             await conn.execute("DELETE FROM neo4j_outbox WHERE id=$1", outbox_id)
         log.info(
-            "outbox: backfilled %s pg_id=%s edges=%d mode=%s (outbox_id=%d, row deleted)",
-            ONT.domain_of, pg_id, written, "inherit" if inherit else "explicit",
-            outbox_id,
+            "outbox: backfilled %s pg_id=%s edges=%d (outbox_id=%d, row deleted)",
+            ONT.domain_of, pg_id, written, outbox_id,
         )
 
     async def _wait_for_outbox(self, pg_id: int) -> bool:
@@ -5328,8 +5220,8 @@ class MemoryCoordinator:
         stays Tier-1-only and is never minted into the graph, but it DOES
         reach Postgres metadata, so it is in scope for canonicalization) and
         handle_retrospective (its own endpoint, its own `entities` field).
-        Retrospectives also never mint into the graph (`_inherit_domains`/the
-        v2 outbox row writes no MENTIONS edge for them either), but the same
+        Retrospectives also never mint into the graph (their v2 outbox row
+        writes no MENTIONS edge and no DOMAIN_OF edge), but the same
         Tier-1-reaches-metadata reasoning applies.
 
         ⛔ ENTITIES STAY OPTIONAL (fact:1215) — an empty/absent list returns
@@ -7018,9 +6910,12 @@ class MemoryCoordinator:
                 # first, then any typed relation, bare MENTIONS last.
                 # LIFECYCLE EDGES RANK BY TYPE, NOT BY THE PROVENANCE STAMP.
                 # The stamp was never a proxy for "structurally important" — it
-                # means "something asserted this", and INHERITANCE is a something:
-                # it writes MENTIONS with asserted_by='inherited'. A decision with
-                # 31 such edges therefore buried its own HAD_OUTCOME (stamp null)
+                # means "something asserted this", and INHERITANCE was a
+                # something: it wrote MENTIONS with asserted_by='inherited'. Those
+                # edges are LEGACY now (no writer since `decision:1736`) but they
+                # are still in the graph, so the ordering rule stands on the data
+                # that provoked it. A decision with 31 such edges buried its own
+                # HAD_OUTCOME (stamp null)
                 # below the cap, so a reader could not see the decision had been
                 # judged at all, and a retrospective did not surface the decision
                 # it judges. Measured: 131 decisions carry a verdict, 6 had it
@@ -7162,8 +7057,9 @@ class MemoryCoordinator:
                 "   WITH n, r, related, labels(related) AS labels,"
                 "        collect(DISTINCT al.name) AS aliases"
                 # Lifecycle edges rank by TYPE — see the note on the
-                # single-anchor query above; inheritance stamps MENTIONS, so
-                # keying the first sort on asserted_by buried HAD_OUTCOME.
+                # single-anchor query above; inheritance stamped MENTIONS and
+                # those legacy edges remain, so keying the first sort on
+                # asserted_by buried HAD_OUTCOME.
                 f"   ORDER BY CASE WHEN type(r) IN ['{ONT.had_outcome}','{ONT.supersedes}',"
                 f"                                  '{ONT.grounded_in}','{ONT.informed_by}'] THEN 0"
                 "                 WHEN r.asserted_by IS NOT NULL THEN 1 ELSE 2 END,"

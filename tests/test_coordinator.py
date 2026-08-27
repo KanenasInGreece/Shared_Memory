@@ -364,9 +364,11 @@ async def test_apply_decision_outbox_row_writes_correct_nodes():
 
     await c._apply_decision_outbox_row(outbox_id=1, pg_id=42, params=params)
 
-    # Two statements now: the Decision projection, then the DEFAULT-SECTION pass (028).
-    # (Entity inheritance is retired under Human-Only Fact Entities architecture).
-    assert mock_session.run.await_count == 2
+    # ONE statement: the Decision projection. Was two — the second was the
+    # default-section pass (028), retired by `decision:1736`: a decision that
+    # asserted no section now gets none, and where it belongs is derived on
+    # read. (Entity inheritance was retired earlier, for the same reason.)
+    assert mock_session.run.await_count == 1
     cypher_call = mock_session.run.call_args_list[0]
     cypher = cypher_call.args[0]
     assert "Decision" in cypher
@@ -450,8 +452,8 @@ async def test_apply_decision_outbox_row_handles_empty_assisted_by():
     }
 
     await c._apply_decision_outbox_row(outbox_id=2, pg_id=50, params=params)
-    # projection + default-section pass (028)
-    assert mock_session.run.await_count == 2
+    # Projection only — the default-section pass is gone (`decision:1736`).
+    assert mock_session.run.await_count == 1
     mock_conn.execute.assert_awaited()
 
 
