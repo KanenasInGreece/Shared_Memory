@@ -189,7 +189,19 @@ async def test_a_decision_with_no_asserted_domain_gets_no_top_level_key():
 async def test_a_plain_fact_is_unaffected_by_decision_materialisation():
     """The materialisation branch is gated on type == 'decision' — a plain
     fact's own top-level `domain`/`domains` (already canonical) must pass
-    through completely untouched."""
+    through completely untouched.
+
+    ⚠ RE-RULED at v0.9.69 (O-3): the entity was `SharedMemory`, whose
+    `axis_key` is `sharedmemory` — IDENTICAL to this fixture's own project
+    `shared_memory`. The reserved-name check now refuses a save that names its
+    own project as an entity, so the fixture was asserting 200 on a record that
+    is a `fact:1215` violation. Renamed to a name that is a CONCEPT rather than
+    this record's axis; the domain-passthrough property under test is untouched.
+
+    ⚠ This is exactly the collision the plan's v2 findings predicted for
+    `SKILL.md:357`/`:484`, which ship `"SharedMemory"` as an example entity —
+    surfaced here by the suite rather than by a reader. Builder B owns those
+    lines."""
     c, mock_conn, _ = _coordinator_with_mocks()
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         req = _make_request({
@@ -198,7 +210,7 @@ async def test_a_plain_fact_is_unaffected_by_decision_materialisation():
                 "source": "claude-code",
                 "project": "shared_memory",
                 "domain": "architecture",
-                "entities": ["SharedMemory"],
+                "entities": ["OutboxPattern"],
             },
         })
         resp = await c.handle_save(req)
