@@ -121,10 +121,11 @@ gap in this store.
     "rationale": "Atomic commit guarantees: Postgres and outbox row in one transaction.",
     "source": "lm_studio",
     "assisted_by": "qwen3-27b",
-    "alternatives": ["synchronous writes (LLM latency on the save path)", "no Neo4j"],
-    "entities": "OutboxPattern,Neo4j,SharedMemory"
+    "alternatives": ["synchronous writes (LLM latency on the save path)", "no Neo4j"]
   }
   ```
+
+  A decision names no entities of its own (`decision:1664`) — it inherits its topics from the facts named in `grounded_in`. The tool no longer accepts an `entities` parameter; a non-empty one is refused (400 `entities_not_allowed_on_judgement`).
 
 - **Retrospectives:** Use `save_retrospective` to record whether a decision held up. Close the Why-To loop: decision → outcome → inform the next agent. Call after a decision has been in production for long enough to evaluate.
 

@@ -993,7 +993,6 @@ async def save_decision(
     assisted_by: str = "",
     alternatives: list[str] | str = "",
     confidence: str = "",
-    entities: str = "",
     grounded_in: str = "",
     elicited: bool = False,
     new_project: bool = False,
@@ -1031,7 +1030,8 @@ async def save_decision(
     reaches no cluster and never enters cross-project synthesis. Format
     "pgid[:role],pgid" — role one of based_on/considered/rejected/
     under_conditions/informed_by (bare id picks the fact's kind-derived default).
-    `entities` is accepted for older callers and IGNORED by the graph.
+    A decision or retrospective that named entities of its own is refused by
+    the gateway (decision:1664) — this tool accepts none.
 
     The rationale carries the two things no other field holds: the CONDITIONS
     the decision is expected to hold under, and WHY each alternative was
@@ -1081,7 +1081,9 @@ async def save_decision(
     metadata = {
         "type": "decision",
         "source": source,
-        "entities": [e.strip() for e in entities.split(",") if e.strip()],
+        # A decision mints no entity of its own (decision:1664) — the gateway
+        # accepts an empty list permanently; a non-empty one is refused.
+        "entities": [],
         "decision": decision_data,
     }
     # The operator has confirmed this project is new, so the save registers it
@@ -1153,9 +1155,7 @@ async def save_decision(
 
     if result.get("status") == "success":
         pg_id = result.get("pg_id")
-        ent_count = len(metadata["entities"])
-        ent_note = f" with {ent_count} entities" if ent_count else ""
-        return f"Decision saved (pg_id={pg_id}){ent_note}: {title}"
+        return f"Decision saved (pg_id={pg_id}): {title}"
 
     return f"Error: {result.get('message', result)}"
 
