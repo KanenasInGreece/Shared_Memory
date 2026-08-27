@@ -885,9 +885,32 @@ ENTITY_PROPOSAL_LIMIT = _env_int("ENTITY_PROPOSAL_LIMIT", 5)
 #
 # ANY() rather than one query per name: one round trip for the whole candidate
 # list, the same choice `ENTITY_VOCAB_RESOLVE_MANY_SQL` makes.
+# ⚠ TWO POPULATIONS, AND THE SECOND ONE IS THE LIKELIER MISTAKE. A live project
+# keeps a `projects` row with a trigger-maintained `normalized_key`. A RETIRED
+# spelling does not: `normalize_projects.py` deletes the `projects` row and
+# leaves the old string in `aliases`, joined through `project_aliases`. So a
+# registry-only check answers "not a project" for exactly the spelling a machine
+# still carrying the old folder name will send — which is the same reasoning
+# `_new_project_refusal` records for its own alias sweep.
+#
+# ⚠ THE ALIAS HALF COMPUTES ITS KEY, because `aliases` has no `normalized_key`
+# column (035 added one to `projects` and `project_domains` only). It calls the
+# database's own `axis_normalize()` — the SQL twin of `axis_key`, and the same
+# function 035's trigger uses — never a second normalisation expression.
+#
+# ⚠ BOTH HALVES RETURN THE CANONICAL PROJECT NAME, never the alias: an alias is
+# not somewhere a record may be saved, so pointing a refusal at one would name a
+# spelling the caller must not use either.
 ENTITY_RESERVED_PROJECT_SQL = (
-    "SELECT name, normalized_key FROM projects"
-    " WHERE normalized_key = ANY($1::text[])"
+    "SELECT p.name AS name, p.normalized_key AS matched_key"
+    "  FROM projects p"
+    " WHERE p.normalized_key = ANY($1::text[])"
+    " UNION ALL"
+    " SELECT p.name AS name, axis_normalize(a.name) AS matched_key"
+    "  FROM project_aliases pa"
+    "  JOIN aliases a ON a.id = pa.alias_id"
+    "  JOIN projects p ON p.id = pa.project_id"
+    " WHERE pa.active AND axis_normalize(a.name) = ANY($1::text[])"
 )
 
 # Axis keys reserved against entity names that no `projects` row can carry.
@@ -5154,13 +5177,26 @@ class MemoryCoordinator:
         return None
 
     async def _entity_reserved_project_error(
-        self, candidates: list[str],
+        self, candidates: list[str], metadata: dict | None = None,
     ) -> dict | None:
         """400 when one of these entity names IS a project — or None.
 
-        ONE indexed round trip for the whole list (`normalized_key = ANY(...)`,
-        migration 035's unique column). The sentinel is answered without a
-        query because no `projects` row can hold it.
+        ONE round trip for the whole list. Three populations, in ascending cost:
+
+          1. the parked-project SENTINEL — no query at all, because a CHECK
+             constraint keeps it out of `projects` so no query could answer
+          2. THIS SAVE'S OWN project — also no query, and it is the one case a
+             registry lookup CANNOT answer. This check runs before
+             `_project_ingress_error`, which is what REGISTERS a declared-new
+             project; so `--project Foo --new-project` with `entities: ["Foo"]`
+             asks the registry about a name that is not in it yet, gets "not a
+             project", and files the record's own axis as its own topic — the
+             exact `fact:1215` violation, on the one save where it is most
+             likely, because the operator has that name in mind twice.
+             Resolved through `resolve_project` + `axis_key`, so it costs
+             nothing and needs no ordering change.
+          3. every registered project and every RETIRED spelling of one — the
+             one query (see `ENTITY_RESERVED_PROJECT_SQL`)
         """
         keys = {axis_key(n): n for n in candidates if axis_key(n)}
         if not keys:
@@ -5175,10 +5211,21 @@ class MemoryCoordinator:
                     "It is a value on the PROJECT axis, carried by the "
                     "record's own project field. ",
                 )
+        own = resolve_project(metadata) if metadata is not None else None
+        own_key = axis_key(own)
+        if own_key and own_key in keys:
+            log.info("entity ingress: refused %r — it is THIS record's own "
+                     "project %r", keys[own_key], own)
+            return self._entity_reserved_rejection(
+                keys[own_key],
+                f"this record's own project {_short(own)}",
+                "The record is already filed under it; naming it as an entity "
+                "too files the axis as its own topic. ",
+            )
         async with self._acquire() as conn:
             rows = await conn.fetch(ENTITY_RESERVED_PROJECT_SQL, sorted(keys))
         for row in rows:
-            name = keys.get(row["normalized_key"])
+            name = keys.get(row["matched_key"])
             if name is None:
                 continue
             log.info("entity ingress: refused %r — a spelling of the "
@@ -5350,7 +5397,7 @@ class MemoryCoordinator:
         # a name that is a project must be refused whether or not the
         # vocabulary already knows it, because the legacy vocabulary DOES carry
         # such names and resolving one would launder it back in.
-        reserved = await self._entity_reserved_project_error(candidates)
+        reserved = await self._entity_reserved_project_error(candidates, metadata)
         if reserved is not None:
             return reserved, empty_plan
 

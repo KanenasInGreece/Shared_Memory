@@ -60,7 +60,7 @@ sys.path.insert(0, _SCRIPTS)
 from coordinator import (  # noqa: E402
     ENTITY_LIST_MAX_LEN, ENTITY_NAME_MAX_LEN, ENTITY_VOCAB_MINT_SQL,
     ENTITY_VOCAB_RESOLVE_MANY_SQL, ENTITY_VOCAB_RESOLVE_SQL, MemoryCoordinator,
-    axis_key, is_judgement_type,
+    ENTITY_RESERVED_PROJECT_SQL, axis_key, is_judgement_type,
 )
 
 
@@ -1272,25 +1272,49 @@ async def test_a_new_project_save_with_known_entities_still_registers():
 # rejects": the SHAPE rejections (a leaked pg_id, a single character) stay
 # gate-exempt, which is invariant I3 above and its own documented rationale.
 
-def _coord_with_projects(names=(), vocabulary=None, neighbours=()):
+def _coord_with_projects(names=(), vocabulary=None, neighbours=(), retired=None):
     """`_coord()` plus the two registry-facing reads the gate now issues:
 
-      * the `projects` reserved-name query (item 2) — `names` are the
-        registered projects
+      * the reserved-name query (item 2) — `names` are the LIVE registered
+        projects; `retired` maps a RETIRED spelling to the project it now
+        resolves to, modelling the alias half of the UNION
       * the entity CONFUSABLE proposal query (item 1) — `neighbours` are the
         vocabulary/alias spellings the trigram scan returns for any probe
 
+    ⚠ THE TWO HALVES ARE MODELLED SEPARATELY BECAUSE THE DATABASE HOLDS THEM
+    SEPARATELY. After `normalize_projects.py` a retired spelling has NO
+    `projects` row at all — it survives only in `aliases` — so a fixture that
+    put every spelling in one list would have made the review's R-2 defect
+    untestable by construction. Both rows come back keyed on `matched_key`
+    (the key that MATCHED) and `name` (the CANONICAL project), which is what
+    the UNION returns for either half.
+
     The SQL itself is stubbed, as everything in this file is; the trigram
-    scoring is Postgres's job and is verified against the live database
-    separately (CLAUDE.md's "a green suite is not an all-clear").
+    scoring and `axis_normalize()` are Postgres's job and are verified against
+    the live database separately (CLAUDE.md's "a green suite is not an
+    all-clear").
     """
     c = _coord(vocabulary=vocabulary)
-    rows = [{"name": n, "normalized_key": axis_key(n)} for n in names]
+    live = [{"name": n, "matched_key": axis_key(n)} for n in names]
+    aliased = [{"name": canonical, "matched_key": axis_key(alias)}
+               for alias, canonical in (retired or {}).items()]
 
     async def _fetch(sql, *args):
-        if "normalized_key = ANY" in sql:
+        if "= ANY($1::text[])" in sql:
             wanted = set(args[0])
-            return [r for r in rows if r["normalized_key"] in wanted]
+            # ⛔ EACH HALF ANSWERS ONLY IF THE QUERY ACTUALLY REACHES IT. The
+            # first spelling of this fixture matched on the PARAMETER alone and
+            # returned both populations for any query containing `= ANY(...)` —
+            # so deleting the entire alias half of the UNION left every retired
+            # -spelling test GREEN. A stub that answers a question the SQL did
+            # not ask is not a test of the SQL, it is a test of the stub
+            # (`fact:1321`: check the instrument before reporting the result).
+            out = []
+            if "p.normalized_key = ANY" in sql:
+                out += [r for r in live if r["matched_key"] in wanted]
+            if "project_aliases" in sql:
+                out += [r for r in aliased if r["matched_key"] in wanted]
+            return out
         if "similarity(name, $1)" in sql:
             probe = args[0]
             return [{"name": n, "score": 0.9}
@@ -1591,3 +1615,114 @@ async def test_a_judgement_save_never_persists_an_entities_key_it_was_not_sent()
         assert (await c.handle_save(req)).status == 200
     stored_metadata = conn.fetchrow.await_args.args[2]
     assert "entities" not in stored_metadata
+
+
+# ── R-2 — a RETIRED project spelling is reserved too ─────────────────────────
+#
+# Review finding (Opus, Required), correcting the plan's own v2 finding. The v2
+# finding said the comparison set is `projects.normalized_key` only, because
+# "retired spellings are rows in `projects` via `project_aliases`". They are
+# NOT: `normalize_projects.py` DELETES the `projects` row and leaves the old
+# string in `aliases`. So a registry-only check answered "not a project" for
+# precisely the spelling a machine still carrying the old folder name sends —
+# the likelier of the two mistakes, and the one `_new_project_refusal` already
+# sweeps the alias table for on its own path.
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spelling", ["Old-Name", "old_name", "OLD NAME"])
+async def test_a_retired_project_spelling_is_refused_as_an_entity(spelling):
+    """MUTATION CHECK: drop the `UNION ALL` alias half from
+    `ENTITY_RESERVED_PROJECT_SQL` (leaving the `projects` half) and every case
+    here fails — the name resolves to nothing in the vocabulary and the save is
+    refused as `entity_unknown`, or MINTS it when `new_entities` asks."""
+    c = _coord_with_projects(names=["new-name"], retired={"Old-Name": "new-name"})
+    err, _ = await c._entity_ingress_validate(
+        {"project": "somewhere-else", "entities": [spelling]})
+    assert err is not None
+    assert err["error"] == "entity_reserved"
+    assert err["reserved_entities"] == [spelling]
+    # It names the CANONICAL project, never the alias — an alias is not
+    # somewhere a record may be saved either.
+    assert "new-name" in err["message"]
+
+
+@pytest.mark.asyncio
+async def test_a_retired_spelling_cannot_be_minted_either():
+    c = _coord_with_projects(names=["new-name"], retired={"Old-Name": "new-name"})
+    err, _ = await c._entity_ingress_validate({
+        "project": "somewhere-else",
+        "entities": ["Old-Name"],
+        "new_entities": ["Old-Name"],
+    })
+    assert err is not None and err["error"] == "entity_reserved"
+    c._entity_vocab_mint.assert_not_called()
+
+
+# ── O-3 — the save's OWN project is reserved, before it is registered ────────
+
+@pytest.mark.asyncio
+async def test_a_new_project_cannot_also_be_this_save_s_entity():
+    """The ordering hole the review found. The reserved check runs BEFORE
+    `_project_ingress_error` — which is what REGISTERS a declared-new project —
+    so a registry lookup cannot answer for `--project Foo --new-project`. The
+    save's own resolved project is therefore checked directly.
+
+    It is the likeliest instance of the whole `fact:1215` violation, because
+    the operator has that name in mind twice on exactly this save.
+
+    MUTATION CHECK: remove the `own_key` block from
+    `_entity_reserved_project_error` and this test fails — `Foo` is not in the
+    registry yet, so nothing refuses it."""
+    c = _coord_with_projects(names=[])          # registry does not know it YET
+    err, _ = await c._entity_ingress_validate({
+        "project": "BrandNewProject",
+        "new_project": True,
+        "entities": ["brand_new_project"],     # same key, different spelling
+    })
+    assert err is not None
+    assert err["error"] == "entity_reserved"
+    assert "BrandNewProject" in err["message"]
+
+
+@pytest.mark.asyncio
+async def test_a_decision_s_own_project_is_read_from_the_decision_blob():
+    """`resolve_project` precedence, on this path too: a judgement carries its
+    project inside the blob. (A judgement cannot carry entities at all now —
+    this pins the resolution, which is shared with the fact path.)"""
+    c = _coord_with_projects(names=[])
+    err, _ = await c._entity_ingress_validate({
+        "decision": {"project": "BrandNewProject"},
+        "entities": ["Brand New Project"],
+    })
+    assert err is not None and err["error"] == "entity_reserved"
+
+
+@pytest.mark.asyncio
+async def test_an_entity_unrelated_to_this_save_s_project_still_passes():
+    """The check must not have made every save with a project fail."""
+    c = _coord_with_projects(names=[], vocabulary={"Kubernetes": "Kubernetes"})
+    err, plan = await c._entity_ingress_validate({
+        "project": "BrandNewProject",
+        "new_project": True,
+        "entities": ["Kubernetes"],
+    })
+    assert err is None
+    assert plan["canonical"] == ["Kubernetes"]
+
+
+def test_the_reserved_project_query_reaches_both_populations():
+    """A text-level guard beside the behavioural ones, because ALL SQL in this
+    file is stubbed: the live registry and the retired-spelling tables are two
+    different reads, and a stub can only prove the code CALLS them. That the
+    query is CORRECT is owed against the live database (CLAUDE.md)."""
+    sql = ENTITY_RESERVED_PROJECT_SQL
+    assert "FROM projects p" in sql
+    assert "p.normalized_key = ANY" in sql, "the live registry, by stored key"
+    assert "project_aliases" in sql and "JOIN aliases a" in sql, \
+        "a retired spelling has no projects row — it lives only in aliases"
+    # The key is computed by the DATABASE's own twin of axis_key, never by a
+    # second normalisation expression written here (`aliases` has no
+    # normalized_key column; migration 035 added one to projects only).
+    assert "axis_normalize(a.name)" in sql
+    # Both halves return the CANONICAL project name, never the alias string.
+    assert sql.count("p.name AS name") == 2
