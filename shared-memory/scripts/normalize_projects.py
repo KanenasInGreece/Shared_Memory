@@ -48,11 +48,15 @@ Usage:
     uv run --with psycopg2-binary --with neo4j python \\
         shared-memory/scripts/normalize_projects.py \\
         --map "shared_memory=shared-memory-GitHub,shared-memory=shared-memory-GitHub" \\
-        [--dry-run]
+        --apply
 
-With no --map, the PROJECT_ALIASES environment variable is used. ``--dry-run``
-reports every row the rename WOULD touch — records, ledger rows and alias rows —
-and writes nothing.
+With no --map, the PROJECT_ALIASES environment variable is used (the map's
+source — ``--map`` or the env var — is printed either way). ``--apply`` is
+required to write anything: the default previews every row the rename WOULD
+touch — records, ledger rows and alias rows — without writing. This is O1
+(v0.9.69, fact:1734 C(e)) — no orchestration script rewrites an axis unless the
+operator asked for that on this invocation, so a bare invocation of this
+script can never rename a project by accident.
 """
 
 import argparse
@@ -198,10 +202,10 @@ def rename_statements(old: str, new: str) -> list:
 
 # ── What a rename WOULD touch ────────────────────────────────────────────────
 
-# The preflight is code, not a note in a runbook: --dry-run reports the ledger
-# and alias rows a rename will re-point, because those are the rows whose
-# foreign keys can veto it, and finding that out from a failed run is finding it
-# out too late.
+# The preflight is code, not a note in a runbook: the default (--apply absent)
+# reports the ledger and alias rows a rename will re-point, because those are
+# the rows whose foreign keys can veto it, and finding that out from a failed
+# run is finding it out too late.
 _PREFLIGHT = [
     ("records",
      "SELECT count(*) FROM technical_docs WHERE " + PROJECT_MATCH_SQL.format(p="%s"),
@@ -338,18 +342,30 @@ def preview_neo4j(driver, old: str, new: str) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--map", default=os.environ.get("PROJECT_ALIASES", ""),
+    # default=None (not the env value) so the map's SOURCE can be reported
+    # accurately below — resolving the env var here would make an explicit
+    # empty --map indistinguishable from "flag omitted, fall back to the env".
+    ap.add_argument("--map", default=None,
                     help="comma-separated old=new pairs (default: $PROJECT_ALIASES)")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="report affected rows/edges without writing")
+    ap.add_argument("--apply", action="store_true",
+                    help="OPERATOR HAS CONFIRMED this rename — write it. Default "
+                         "(the flag absent) previews every row it would touch and "
+                         "writes nothing (O1, v0.9.69).")
     args = ap.parse_args()
 
-    aliases = parse_alias_map(args.map)
+    if args.map is not None:
+        raw_map, map_source = args.map, "--map"
+    else:
+        raw_map, map_source = os.environ.get("PROJECT_ALIASES", ""), "$PROJECT_ALIASES"
+    print(f"Map source: {map_source}")
+
+    aliases = parse_alias_map(raw_map)
     if not aliases:
         sys.exit("No alias map — pass --map or set PROJECT_ALIASES.")
 
+    dry_run = not args.apply
     print(f"Normalising {len(aliases)} project alias(es)"
-          + (" [DRY RUN]" if args.dry_run else "") + ":")
+          + (" [PREVIEW — pass --apply to write]" if dry_run else "") + ":")
 
     # Connect to BOTH stores before writing to either. A rename whose graph half
     # cannot be reached should fail before the first commit, not after the last.
@@ -358,7 +374,7 @@ def main() -> int:
     committed, failed = [], []
     try:
         for old, new in aliases.items():
-            if rename_pair(conn, old, new, args.dry_run):
+            if rename_pair(conn, old, new, dry_run):
                 committed.append((old, new))
                 with conn.cursor() as cur:
                     cur.execute("SELECT id FROM projects WHERE name = %s", (new,))
@@ -366,7 +382,7 @@ def main() -> int:
                 rewire_neo4j(driver, old, new, row[0] if row else None)
             elif old == new:
                 continue          # a no-op, not a failure
-            elif args.dry_run:
+            elif dry_run:
                 preview_neo4j(driver, old, new)
             else:
                 failed.append((old, new))
@@ -374,8 +390,8 @@ def main() -> int:
         conn.close()
         driver.close()
 
-    if args.dry_run:
-        print("Dry run complete — nothing written.")
+    if dry_run:
+        print("Preview complete — nothing written. Pass --apply to write it.")
         return 0
     print(f"Done: {len(committed)} renamed, {len(failed)} failed.")
     if failed:

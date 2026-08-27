@@ -949,7 +949,7 @@ Check that tag out instead, or use the tarball route above.
 export AGENT_TOKEN=<an agent token>      # postflight needs it, or A1/A5/A8 skip and it exits 1
 bash shared-memory/scripts/update_framework.sh --dry-run   # see every step, run nothing
 bash shared-memory/scripts/update_framework.sh             # do it, and prove it
-bash shared-memory/scripts/update_framework.sh --no-domain-backfill  # decline step 6 for THIS run only
+bash shared-memory/scripts/update_framework.sh --domain-backfill  # also run step 6 (opt-in; skipped by default)
 ```
 
 **After the script finishes, treat a stack-drift verdict as a step, not an aside.**
@@ -1004,7 +1004,7 @@ always to update the CHECKOUT; the schema cannot be moved backwards.**
 | 3 | `verify_neo4j_init.py --apply` | **Neo4j has no ledger** — this is the graph's entire forward-migration |
 | 4 | `reconcile_project_identity.py --apply` | graph half of migration 027; no migration can run it |
 | 5 | restart + wait for `/health` | the running gateway must BE the migrated code |
-| 6 | `backfill_domain_of.py --apply` | **after** the restart — see the guard below; declinable with `--no-domain-backfill` (default still applies it) |
+| 6 | `backfill_domain_of.py --apply` | **after** the restart — see the guard below; **opt-in** via `--domain-backfill` (skipped by default; `--no-domain-backfill` is a one-release no-op) |
 | 7 | `sync_skills.sh` | after the restart, so it cannot print a false incompatibility warning |
 | 8 | `postflight.sh` | an update is not complete until this passes |
 

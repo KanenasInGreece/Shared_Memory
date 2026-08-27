@@ -1,14 +1,15 @@
-"""update_framework.sh — --no-domain-backfill (branch fix/domain-backfill-opt-out).
+"""update_framework.sh — the domain-backfill step is OPT-IN (v0.9.69,
+fact:1734 C(d) / decision:1736 / O1 — "no orchestration script applies an
+axis rewrite unless the operator asked for that run").
 
-WHY THIS EXISTS. Step 6 of update_framework.sh enqueues the domain-backfill
-migration (backfill_domain_of.py) unconditionally on every upgrade run. An
-operator who wants everything else this run does -- fetch, schema
-migrations, gateway restart, skill sync, postflight -- WITHOUT also
-triggering that one migration on this pass had no lever for it: the only
-existing knob was --dry-run, which declines EVERYTHING, not just step 6.
---no-domain-backfill adds a narrow, single-run opt-out for that one step;
-default behaviour (the flag absent) must be provably unchanged, and step
-numbers after step 6 must not drift either way.
+RE-RULED (v0.9.69) — this file used to pin the OPPOSITE default: step 6 ran
+UNCONDITIONALLY unless `--no-domain-backfill` was given. That is precisely
+the accident O1 exists to prevent — a script that rewrites an axis on every
+deployment without the operator asking for it on THAT invocation. The
+default is now SKIP; `--domain-backfill` opts in for one run;
+`--no-domain-backfill` is kept for one release as a documented no-op (the
+skip it used to request is now the default) so an existing invocation does
+not start failing on an unrecognised flag.
 
 ⚠ EXECUTABLE, not source-reading: every test drives the REAL shipped script
 via subprocess -- see tests/test_preflight_uv_path_check.py and
@@ -34,7 +35,7 @@ check) the domain-backfill invocation itself. So no real infrastructure
 presence or absence of the printed "... backfill_domain_of.py ..." command
 line in stdout is a faithful proxy for whether that step would have
 executed for real -- it is produced by the exact same
-`if NO_DOMAIN_BACKFILL ... elif DRY_RUN ... else` selection a live run uses.
+`if DOMAIN_BACKFILL != 1 ... elif DRY_RUN ... else` selection a live run uses.
 --skip-backup sidesteps an unrelated shared-memory/ops/backup.sh existence
 requirement that has nothing to do with this flag.
 """
@@ -119,9 +120,17 @@ def _after_backfill(steps):
     raise AssertionError(f"no 'domain backfill' step found in {steps}")
 
 
-# ── 1. the flag parses and is accepted ───────────────────────────────────
+# ── 1. both flags parse and are accepted ─────────────────────────────────
 
-def test_flag_parses_and_is_accepted(tmp_path):
+def test_domain_backfill_flag_parses_and_is_accepted(tmp_path):
+    repo = _make_sandbox(tmp_path)
+    proc = _run(repo, "--dry-run", "--skip-backup", "--domain-backfill")
+    out = _strip_ansi(proc.stdout + proc.stderr)
+    assert proc.returncode == 0, out
+    assert "unknown argument" not in out
+
+
+def test_no_domain_backfill_flag_still_parses_as_a_noop(tmp_path):
     repo = _make_sandbox(tmp_path)
     proc = _run(repo, "--dry-run", "--skip-backup", "--no-domain-backfill")
     out = _strip_ansi(proc.stdout + proc.stderr)
@@ -129,46 +138,69 @@ def test_flag_parses_and_is_accepted(tmp_path):
     assert "unknown argument" not in out
 
 
-# ── 2. with the flag, the backfill is NOT run ────────────────────────────
+# ── 2. by DEFAULT (neither flag), the backfill is NOT run ────────────────
 
-def test_with_flag_backfill_is_skipped(tmp_path):
+def test_default_skips_the_backfill(tmp_path):
+    repo = _make_sandbox(tmp_path)
+    proc = _run(repo, "--dry-run", "--skip-backup")
+    out = _strip_ansi(proc.stdout)
+    assert proc.returncode == 0, out
+    assert "SKIPPED — opt-in as of this release" in out
+    assert "backfill_domain_of.py" not in out, (
+        "the default run (no flag) queued the domain backfill -- it is "
+        "opt-in as of this release, not opt-out"
+    )
+
+
+# ── 3. WITH --domain-backfill, the backfill IS run ───────────────────────
+
+def test_domain_backfill_flag_runs_it(tmp_path):
+    repo = _make_sandbox(tmp_path)
+    proc = _run(repo, "--dry-run", "--skip-backup", "--domain-backfill")
+    out = _strip_ansi(proc.stdout)
+    assert proc.returncode == 0, out
+    assert "backfill_domain_of.py" in out, (
+        "--domain-backfill did not queue the domain backfill step"
+    )
+    assert "SKIPPED — opt-in as of this release" not in out
+
+
+# ── 4. --no-domain-backfill alone stays a no-op: still skipped, plus notice ─
+
+def test_no_domain_backfill_alone_is_still_skipped_and_prints_the_notice(tmp_path):
     repo = _make_sandbox(tmp_path)
     proc = _run(repo, "--dry-run", "--skip-backup", "--no-domain-backfill")
     out = _strip_ansi(proc.stdout)
     assert proc.returncode == 0, out
-    assert "SKIPPED — --no-domain-backfill given" in out
     assert "backfill_domain_of.py" not in out, (
-        "the backfill command line was printed even with --no-domain-backfill "
-        "given -- the skip branch must never reach run()"
+        "--no-domain-backfill (alone) unexpectedly queued the backfill -- "
+        "it must remain a no-op"
     )
+    assert "Notice: --no-domain-backfill" in out, (
+        "the one-release deprecation notice for --no-domain-backfill did "
+        "not print"
+    )
+    assert "no-op" in out
 
 
-# ── 3. WITHOUT the flag, the backfill IS still run (default unchanged) ──
-
-def test_without_flag_backfill_still_runs_by_default(tmp_path):
+def test_domain_backfill_wins_when_both_flags_are_given(tmp_path):
+    """--domain-backfill is the explicit ask this run; --no-domain-backfill
+    is a legacy no-op, not a veto -- an operator who passes both (e.g. a
+    half-updated script wrapper) gets the explicit opt-in honoured, plus the
+    deprecation notice naming the no-op flag."""
     repo = _make_sandbox(tmp_path)
-    proc = _run(repo, "--dry-run", "--skip-backup")
+    proc = _run(repo, "--dry-run", "--skip-backup", "--domain-backfill", "--no-domain-backfill")
     out = _strip_ansi(proc.stdout)
     assert proc.returncode == 0, out
-    assert "backfill_domain_of.py" in out, (
-        "the default run (flag absent) no longer queues the domain backfill "
-        "-- the opt-out flag must not have changed default behaviour"
-    )
-    assert "SKIPPED — --no-domain-backfill given" not in out
+    assert "backfill_domain_of.py" in out
+    assert "Notice: --no-domain-backfill" in out
 
 
-# ── 3b. the dry-run preview states what a REAL run actually does ────────
-# Scope addendum (measured live, on the Debian test host): a REAL run always passes --apply to
-# backfill_domain_of.py by default (unless --no-domain-backfill is given) and
-# enqueues outbox rows. The OLD dry-run preview showed the bare, --apply-less
-# invocation under a "preview (enqueues nothing)" label -- true of THAT
-# invocation in isolation, false about what the real run does. Both mode
-# selections must now print the SAME command line (both carry --apply), so
-# a dry run never shows a milder invocation than the one a real run reaches.
+# ── 5. the dry-run preview states what a REAL (opted-in) run actually does ──
 
 def test_dry_run_preview_shows_the_apply_flag_a_real_run_would_use(tmp_path):
     repo = _make_sandbox(tmp_path)
-    proc = _run(repo, "--dry-run", "--skip-backup")
+    proc = _run(repo, "--dry-run", "--skip-backup", "--domain-backfill")
     out = _strip_ansi(proc.stdout)
     assert proc.returncode == 0, out
     assert "backfill_domain_of.py --apply" in out, (
@@ -178,35 +210,22 @@ def test_dry_run_preview_shows_the_apply_flag_a_real_run_would_use(tmp_path):
     )
 
 
-def test_dry_run_preview_states_it_applies_by_default_and_names_the_opt_out(tmp_path):
-    repo = _make_sandbox(tmp_path)
-    proc = _run(repo, "--dry-run", "--skip-backup")
-    out = _strip_ansi(proc.stdout)
-    assert proc.returncode == 0, out
-    assert "APPLIES" in out, (
-        f"the dry-run label does not state that a real run applies the "
-        f"backfill by default:\n{out}"
-    )
-    assert "--no-domain-backfill" in out, (
-        f"the dry-run label does not name the documented opt-out flag:\n{out}"
-    )
-
-
 # NOTE: test_update_framework_live_execution.py's
-# test_live_run_without_flag_invokes_backfill_with_apply independently pins
-# the REAL (non-dry-run) invocation as `backfill_domain_of.py ... --apply` --
-# the same substring test_dry_run_preview_shows_the_apply_flag_a_real_run_would_use
-# above asserts for the DRY-RUN preview, so the two together prove the
-# preview matches what a real run actually executes rather than merely
-# containing some --apply invocation.
+# test_live_run_with_domain_backfill_flag_invokes_backfill_with_apply
+# independently pins the REAL (non-dry-run) invocation as
+# `backfill_domain_of.py ... --apply` -- the same substring
+# test_dry_run_preview_shows_the_apply_flag_a_real_run_would_use above
+# asserts for the DRY-RUN preview, so the two together prove the preview
+# matches what a real run actually executes rather than merely containing
+# some --apply invocation.
 
 
-# ── 4. step numbers for steps AFTER step 6 are identical either way ─────
+# ── 6. step numbers for steps AFTER step 6 are identical either way ──────
 
 def test_step_numbering_after_backfill_is_unchanged_either_way(tmp_path):
     repo_a = _make_sandbox(tmp_path / "a")
     repo_b = _make_sandbox(tmp_path / "b")
-    with_flag = _run(repo_a, "--dry-run", "--skip-backup", "--no-domain-backfill")
+    with_flag = _run(repo_a, "--dry-run", "--skip-backup", "--domain-backfill")
     without_flag = _run(repo_b, "--dry-run", "--skip-backup")
     assert with_flag.returncode == 0, with_flag.stdout
     assert without_flag.returncode == 0, without_flag.stdout
@@ -222,8 +241,8 @@ def test_step_numbering_after_backfill_is_unchanged_either_way(tmp_path):
     tail_without = _after_backfill(steps_without)
     assert tail_with == tail_without, (
         "steps after the domain backfill diverge between the two modes:\n"
-        f"  with --no-domain-backfill:    {tail_with}\n"
-        f"  without --no-domain-backfill: {tail_without}"
+        f"  with --domain-backfill:    {tail_with}\n"
+        f"  without any flag:          {tail_without}"
     )
     # And there IS a tail to compare -- an empty tail would make the equality
     # above vacuously true and prove nothing.
@@ -233,34 +252,33 @@ def test_step_numbering_after_backfill_is_unchanged_either_way(tmp_path):
 # ── TV-4: interaction with --from-restore ────────────────────────────────
 # --from-restore skips step 0 (fetching code) but otherwise runs the same
 # procedure -- the domain-backfill selection logic in step 6 does not read
-# FROM_RESTORE at all, so the flag must behave identically whether or not
-# --from-restore is also given. Untested before this review.
+# FROM_RESTORE at all, so the flags must behave identically whether or not
+# --from-restore is also given.
 
-def test_no_domain_backfill_skips_with_from_restore_too(tmp_path):
+def test_domain_backfill_flag_runs_with_from_restore_too(tmp_path):
     repo = _make_sandbox(tmp_path)
-    proc = _run(repo, "--dry-run", "--skip-backup", "--from-restore", "--no-domain-backfill")
+    proc = _run(repo, "--dry-run", "--skip-backup", "--from-restore", "--domain-backfill")
     out = _strip_ansi(proc.stdout)
     assert proc.returncode == 0, out
-    assert "SKIPPED — --no-domain-backfill given" in out
-    assert "backfill_domain_of.py" not in out, (
-        "--no-domain-backfill did not skip the backfill when combined with "
+    assert "backfill_domain_of.py" in out, (
+        "--domain-backfill did not queue the backfill when combined with "
         "--from-restore"
     )
 
 
-def test_domain_backfill_still_runs_with_from_restore_and_no_flag(tmp_path):
+def test_default_still_skips_with_from_restore_and_no_flag(tmp_path):
     repo = _make_sandbox(tmp_path)
     proc = _run(repo, "--dry-run", "--skip-backup", "--from-restore")
     out = _strip_ansi(proc.stdout)
     assert proc.returncode == 0, out
-    assert "backfill_domain_of.py" in out, (
-        "--from-restore alone (no --no-domain-backfill) unexpectedly "
-        "suppressed the default backfill"
+    assert "backfill_domain_of.py" not in out, (
+        "--from-restore alone (no --domain-backfill) unexpectedly ran the "
+        "opt-in backfill"
     )
-    assert "SKIPPED — --no-domain-backfill given" not in out
+    assert "SKIPPED — opt-in as of this release" in out
 
 
-# ── 5. an unknown argument is still rejected ─────────────────────────────
+# ── 7. an unknown argument is still rejected ─────────────────────────────
 
 def test_unknown_argument_still_rejected(tmp_path):
     repo = _make_sandbox(tmp_path)
@@ -270,9 +288,9 @@ def test_unknown_argument_still_rejected(tmp_path):
     assert "unknown argument: --not-a-real-flag" in out
 
 
-# ── --help lists the new flag and keeps the exit-contract sentence ──────
+# ── --help lists both flags and keeps the exit-contract sentence ────────
 
-def test_help_documents_the_flag_and_keeps_exit_contract():
+def test_help_documents_the_flags_and_keeps_exit_contract():
     """Not sandboxed -- --help exits inside the argument-parsing loop, before
     any REPO_ROOT/.env work happens, so it is safe to run directly against
     the real script without a sandbox.
@@ -295,6 +313,7 @@ def test_help_documents_the_flag_and_keeps_exit_contract():
     )
     out = _strip_ansi(proc.stdout)
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "--domain-backfill" in out
     assert "--no-domain-backfill" in out
     assert "Exit 0 only when postflight passes." in out, (
         "the --help output no longer reaches the exit-contract sentence"

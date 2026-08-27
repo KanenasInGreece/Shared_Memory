@@ -276,7 +276,7 @@ def test_a_vetoed_pair_leaves_the_graph_untouched(monkeypatch):
     the graph moved to a name the registry had refused to retire."""
     conn = _Conn(fail_on="DELETE FROM projects")
     driver = _Driver()
-    rc = _run_main(monkeypatch, conn, driver, ["--map", f"{OLD}={NEW}"])
+    rc = _run_main(monkeypatch, conn, driver, ["--map", f"{OLD}={NEW}", "--apply"])
     assert rc == 1, "a failed pair must not exit zero"
     assert driver.ran == [], "the graph was rewired for a pair that rolled back"
 
@@ -285,7 +285,7 @@ def test_a_committed_pair_does_reach_the_graph(monkeypatch):
     """The mirror: N3 must not be satisfied by never rewiring anything."""
     conn = _Conn()
     driver = _Driver()
-    rc = _run_main(monkeypatch, conn, driver, ["--map", f"{OLD}={NEW}"])
+    rc = _run_main(monkeypatch, conn, driver, ["--map", f"{OLD}={NEW}", "--apply"])
     assert rc == 0
     assert any("PROJECT_OF" in c or "MERGE" in c for c, _ in driver.ran)
 
@@ -297,9 +297,34 @@ def test_one_failing_pair_does_not_stop_the_others(monkeypatch):
     conn = _Conn(fail_on="DELETE FROM projects", fail_times=1)
     driver = _Driver()
     rc = _run_main(monkeypatch, conn, driver,
-                   ["--map", f"{OLD}={NEW},cadence={NEW}"])
+                   ["--map", f"{OLD}={NEW},cadence={NEW}", "--apply"])
     assert rc == 1, "a run with any failed pair exits non-zero"
     assert conn.commits == 1, "the second pair must still have been applied"
+
+
+# ── O1 (v0.9.69): --apply is required to write anything ──────────────────────
+
+def test_default_invocation_previews_and_writes_nothing(monkeypatch):
+    """The flip this release makes: a bare invocation (no --apply, no
+    --dry-run — the old flag is gone) must behave exactly like the old
+    --dry-run did, not like the old default."""
+    conn = _Conn()
+    driver = _Driver()
+    rc = _run_main(monkeypatch, conn, driver, ["--map", f"{OLD}={NEW}"])
+    assert rc == 0
+    assert conn.commits == 0, "the default invocation wrote to Postgres"
+    assert not any("MERGE" in c for c, _ in driver.ran), (
+        "the default invocation rewired the graph"
+    )
+
+
+def test_apply_flag_is_required_to_write(monkeypatch):
+    conn = _Conn()
+    driver = _Driver()
+    _run_main(monkeypatch, conn, driver, ["--map", f"{OLD}={NEW}"])
+    assert conn.commits == 0
+    _run_main(monkeypatch, conn, driver, ["--map", f"{OLD}={NEW}", "--apply"])
+    assert conn.commits == 1
 
 
 def test_the_map_parser_ignores_malformed_pairs():

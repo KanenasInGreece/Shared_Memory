@@ -1,15 +1,23 @@
-"""update_framework.sh — the LIVE (non-`--dry-run`) execution path of
-`--no-domain-backfill` (branch fix/domain-backfill-opt-out, review finding
-TV-1/TV-2 in Local_Documentation/Reviews/Test_Verification_Review.md).
+"""update_framework.sh — the LIVE (non-`--dry-run`) execution path of the
+domain-backfill opt-in (v0.9.69, fact:1734 C(d) / decision:1736 / O1),
+carrying forward the review finding TV-1/TV-2 in
+Local_Documentation/Reviews/Test_Verification_Review.md.
+
+RE-RULED (v0.9.69): the backfill used to run by default and
+`--no-domain-backfill` opted OUT; it now runs only when `--domain-backfill`
+opts IN, and `--no-domain-backfill` is a one-release no-op. The gap TV-1/TV-2
+found is unchanged in shape, just flipped in polarity: it is still the LIVE
+`else` branch, not the dry-run preview, that actually decides whether
+backfill_domain_of.py --apply is invoked for real.
 
 WHY THIS EXISTS. Every test in test_update_framework_no_domain_backfill.py
 passes `--dry-run`. Under `--dry-run`, run()/run_soft() print a step's
 command line and return WITHOUT ever calling it -- so those tests only ever
 exercise the SKIP branch and the DRY-RUN PREVIEW branch of the
-`if NO_DOMAIN_BACKFILL ... elif DRY_RUN ... else` selection in
+`if DOMAIN_BACKFILL != 1 ... elif DRY_RUN ... else` selection in
 update_framework.sh. The `else` branch -- the one that actually calls
 backfill_domain_of.py --apply for real -- is never taken by any test in this
-suite. A mutation that re-scopes the NO_DOMAIN_BACKFILL check so it is only
+suite. A mutation that re-scopes the DOMAIN_BACKFILL check so it is only
 ever consulted inside the DRY_RUN branch (i.e. the flag becomes a no-op for
 every real, non-dry-run invocation) would leave that whole suite green.
 
@@ -268,18 +276,18 @@ def _backfill_invocations(log_text: str):
 # ── TV-1 / TV-2: the live `else` branch IS exercised, and it is the ONLY
 #    thing that decides whether backfill_domain_of.py --apply is invoked ──
 
-def test_live_run_without_flag_invokes_backfill_with_apply(tmp_path):
+def test_live_run_with_domain_backfill_flag_invokes_backfill_with_apply(tmp_path):
     repo, log_path = _make_live_sandbox(tmp_path)
     env = _stub_path_env(tmp_path, log_path)
 
-    proc = _run_live(repo, env, "--skip-backup")
+    proc = _run_live(repo, env, "--skip-backup", "--domain-backfill")
     out = _strip_ansi(proc.stdout + proc.stderr)
     log_text = log_path.read_text()
 
     assert proc.returncode == 0, out
     invocations = _backfill_invocations(log_text)
     assert invocations, (
-        f"the default (flag absent) LIVE run never invoked backfill_domain_of.py "
+        f"--domain-backfill on a LIVE run never invoked backfill_domain_of.py "
         f"via uv:\nlog:\n{log_text}\nstdout:\n{out}"
     )
     assert any("--apply" in line for line in invocations), (
@@ -291,7 +299,33 @@ def test_live_run_without_flag_invokes_backfill_with_apply(tmp_path):
     assert "Update complete and VERIFIED" in out, out
 
 
-def test_live_run_with_flag_never_invokes_backfill(tmp_path):
+def test_live_run_by_default_never_invokes_backfill(tmp_path):
+    repo, log_path = _make_live_sandbox(tmp_path)
+    env = _stub_path_env(tmp_path, log_path)
+
+    proc = _run_live(repo, env, "--skip-backup")
+    out = _strip_ansi(proc.stdout + proc.stderr)
+    log_text = log_path.read_text()
+
+    assert proc.returncode == 0, out
+    invocations = _backfill_invocations(log_text)
+    assert not invocations, (
+        f"the default (no --domain-backfill) LIVE run invoked "
+        f"backfill_domain_of.py anyway via uv:\n{invocations}\n"
+        f"full log:\n{log_text}"
+    )
+    assert "SKIPPED — opt-in as of this release" in out, out
+    # Later steps still fire even when this one is skipped.
+    assert "sync_skills.sh" in log_text, "step 7 (sync_skills.sh) never ran"
+    assert "postflight.sh" in log_text, "step 8 (postflight.sh) never ran"
+    assert "Update complete and VERIFIED" in out, out
+
+
+def test_live_run_with_no_domain_backfill_flag_alone_still_never_invokes_backfill(tmp_path):
+    """--no-domain-backfill is a one-release no-op now that the default is
+    already skip -- a caller still passing it (an un-updated wrapper script)
+    must not have that flag start invoking the backfill by some fallthrough,
+    and the deprecation notice must print."""
     repo, log_path = _make_live_sandbox(tmp_path)
     env = _stub_path_env(tmp_path, log_path)
 
@@ -302,15 +336,11 @@ def test_live_run_with_flag_never_invokes_backfill(tmp_path):
     assert proc.returncode == 0, out
     invocations = _backfill_invocations(log_text)
     assert not invocations, (
-        f"--no-domain-backfill was given on a LIVE (non-dry-run) run, but "
-        f"backfill_domain_of.py was invoked anyway via uv:\n{invocations}\n"
-        f"full log:\n{log_text}"
+        f"--no-domain-backfill on a LIVE run invoked backfill_domain_of.py "
+        f"anyway via uv:\n{invocations}\nfull log:\n{log_text}"
     )
-    assert "SKIPPED — --no-domain-backfill given" in out, out
-    # Later steps still fire even when this one is skipped.
-    assert "sync_skills.sh" in log_text, "step 7 (sync_skills.sh) never ran"
-    assert "postflight.sh" in log_text, "step 8 (postflight.sh) never ran"
-    assert "Update complete and VERIFIED" in out, out
+    assert "Notice: --no-domain-backfill" in out, out
+    assert "SKIPPED — opt-in as of this release" in out, out
 
 
 # ── Ruling 3: a real GATEWAY_URL/GATEWAY_UNIT/GATEWAY_RESTART_CMD exported in

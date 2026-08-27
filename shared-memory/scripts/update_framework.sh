@@ -6,7 +6,12 @@
 #   bash shared-memory/scripts/update_framework.sh              # upgrade in place
 #   bash shared-memory/scripts/update_framework.sh --from-restore
 #   bash shared-memory/scripts/update_framework.sh --dry-run    # print, run nothing
-#   bash shared-memory/scripts/update_framework.sh --no-domain-backfill  # everything except step 6
+#   bash shared-memory/scripts/update_framework.sh --domain-backfill  # also run step 6 (opt-in)
+#
+# ⛔ --no-domain-backfill is a ONE-RELEASE no-op, kept only so an existing
+# invocation does not break: the domain backfill is opt-in now (fact:1734 C(d))
+# — omit both flags and step 6 is skipped by default. Pass --domain-backfill to
+# run it. The no-op flag and this notice are removed next release.
 #
 # Env overrides: GATEWAY_URL, GATEWAY_UNIT, GATEWAY_RESTART_CMD.
 #
@@ -109,13 +114,15 @@ _linger_brief() {
 FROM_RESTORE=0
 DRY_RUN=0
 SKIP_BACKUP=0
-NO_DOMAIN_BACKFILL=0
+DOMAIN_BACKFILL=0
+NO_DOMAIN_BACKFILL_NOTICE=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --from-restore)       FROM_RESTORE=1; shift ;;
         --dry-run)            DRY_RUN=1; shift ;;
         --skip-backup)        SKIP_BACKUP=1; shift ;;
-        --no-domain-backfill) NO_DOMAIN_BACKFILL=1; shift ;;
+        --domain-backfill)    DOMAIN_BACKFILL=1; shift ;;
+        --no-domain-backfill) NO_DOMAIN_BACKFILL_NOTICE=1; shift ;;
         -h|--help)      awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; exit 0 ;;
         *)              die "unknown argument: $1" ;;
     esac
@@ -608,16 +615,28 @@ fi
 # match the `else` branch exactly except for the label text, so what prints
 # under --dry-run is the command a real run would execute, not a milder one.
 #
-# ⛔ --no-domain-backfill declines the migration for THIS run only — default
-# behaviour is unchanged, and every step after this one keeps its number
-# (the skip idiom below still increments `step`; it just never calls run()).
-if [[ "$NO_DOMAIN_BACKFILL" == "1" ]]; then
+# ⛔ OPT-IN, NOT DEFAULT (fact:1734 C(d)). This step used to run unless declined;
+# an orchestration script that rewrites axes on every deployment without the
+# operator asking for that run is exactly the accident O1 exists to prevent.
+# Pass --domain-backfill to run it. --no-domain-backfill is now a ONE-RELEASE
+# no-op — the skip it used to request is already the default — kept only so an
+# existing invocation does not break; every step after this one keeps its
+# number either way (the skip idiom below still increments `step`; it just
+# never calls run()).
+if [[ "$NO_DOMAIN_BACKFILL_NOTICE" == "1" ]]; then
+    echo
+    ylw "── Notice: --no-domain-backfill"
+    echo "   This flag is a no-op as of this release — the domain backfill is now"
+    echo "   opt-in, so omitting every domain-backfill flag already skips it. Pass"
+    echo "   --domain-backfill instead to run it. This flag and notice go away next"
+    echo "   release."
+fi
+if [[ "$DOMAIN_BACKFILL" != "1" ]]; then
     step=$((step + 1))
     echo; ylw "── Step $step: domain backfill"
-    echo "   SKIPPED — --no-domain-backfill given. No repair rows were enqueued;"
-    echo "   re-run without the flag when you are ready to apply it."
+    echo "   SKIPPED — opt-in as of this release. Pass --domain-backfill to run it."
 elif [[ "$DRY_RUN" == "1" ]]; then
-    run "domain backfill — a REAL run APPLIES this by default (writes domain rows via the outbox; pass --no-domain-backfill to skip it for one run)" \
+    run "domain backfill — opt-in via --domain-backfill (writes domain rows via the outbox)" \
         uv run --with psycopg2-binary python \
         "$REPO_ROOT/shared-memory/scripts/backfill_domain_of.py" --apply
 else
