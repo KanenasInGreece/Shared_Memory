@@ -5013,9 +5013,8 @@ class MemoryCoordinator:
             return refusal
         return await self._entity_commit_mints(metadata, agent_id, plan)
 
-    @staticmethod
-    def _axis_conflict_error(
-        stored: object, project, domains, entities, is_judgement: bool,
+    async def _axis_conflict_error(
+        self, stored: object, project, domains, entities, is_judgement: bool,
     ) -> dict | None:
         """409 when re-saving identical CONTENT under DIFFERENT axes — or None
         (P1, item 4 of the v0.9.69 plan). Pure.
@@ -5040,6 +5039,21 @@ class MemoryCoordinator:
         carry entities in Postgres; item 3 refuses new ones, so an unchanged
         re-save of one of those must stay idempotent rather than becoming
         permanently unsaveable over a field the record may no longer even send.
+
+        ⚠ COMPARED ON `axis_key`, NEVER ON THE LITERAL SPELLING. The stored
+        blob was written when the record was first saved and keeps whatever
+        spelling was canonical THEN; the incoming value has just been rewritten
+        to whatever is canonical NOW. Comparing the strings made every identical
+        re-save of every pre-rename record a 409 — a rename would have
+        retrospectively frozen the whole corpus that predates it. `Old_Name`
+        and `old-name` are one axis value here for the same reason they are one
+        project in the registry.
+
+        ⚠ AND A KEY DIFFERENCE IS NOT YET A CONFLICT. A rename to a genuinely
+        DIFFERENT name (`Old-Name` → `new-name`) changes the key, so the stored
+        spelling is resolved through the project alias table once — the same
+        one-hop resolution ingress does — before anything is refused. The lookup
+        is on the rare path only: identical keys never reach it.
 
         Identity — same content AND same axes — is untouched: it still takes
         the `DO UPDATE` path, which is what repairs a missing embedding.
@@ -5070,11 +5084,26 @@ class MemoryCoordinator:
             }
 
         existing_project = resolve_project(stored)
-        if existing_project != project:
-            return _refusal("project", existing_project, project)
+        if axis_key(existing_project) != axis_key(project):
+            # The keys differ — which is what a RENAME looks like from here.
+            # Resolve the stored spelling once (one hop, never a walk, A3)
+            # before calling it a conflict.
+            resolved_stored = (await self._resolve_project_alias(existing_project)
+                               if existing_project else None)
+            if resolved_stored is None or \
+                    axis_key(resolved_stored) != axis_key(project):
+                return _refusal("project", existing_project, project)
 
         existing_domains = resolve_domains(stored)
-        if set(existing_domains) != set(domains or []):
+        # ⚠ DOMAINS ARE COMPARED BY KEY BUT NOT ALIAS-RESOLVED. A domain alias
+        # resolves only INSIDE a project identity, and looking one up here would
+        # put `_project_identity` — which now RAISES on a registry blip — on the
+        # re-save path, turning a transient database problem into a refused
+        # save. So a section RENAME (a genuinely different name, not a
+        # respelling) still conflicts on re-save until that is designed; it is
+        # recorded as a known gap rather than closed with a call that can fail.
+        if {axis_key(d) for d in existing_domains} != \
+                {axis_key(d) for d in (domains or [])}:
             return _refusal("domains", existing_domains, list(domains or []))
 
         if is_judgement:
@@ -6105,7 +6134,7 @@ class MemoryCoordinator:
                 content_hash,
             )
         if prior is not None:
-            conflict = self._axis_conflict_error(
+            conflict = await self._axis_conflict_error(
                 prior, incoming_project, incoming_domains,
                 entity_plan.get("canonical") or [], is_judgement)
             if conflict is not None:
@@ -6176,7 +6205,7 @@ class MemoryCoordinator:
                         content_hash,
                     )
                     if prior is not None:
-                        conflict = self._axis_conflict_error(
+                        conflict = await self._axis_conflict_error(
                             prior, incoming_project, incoming_domains,
                             entities, is_judgement)
                         if conflict is not None:

@@ -214,14 +214,17 @@ async def test_a_stored_blob_that_is_not_an_object_is_not_a_conflict():
 
 # ── The pure comparison, directly ─────────────────────────────────────────────
 
-def test_the_comparison_reads_a_judgement_project_from_the_decision_blob():
+@pytest.mark.asyncio
+async def test_the_comparison_reads_a_judgement_project_from_the_decision_blob():
     """Same precedence as PROJECT_SQL: the blob wins over the top level, on
     both sides, or a decision's stored and incoming projects are read out of
     different halves of one record."""
-    assert MemoryCoordinator._axis_conflict_error(
+    c, _ = _coord(stored_metadata=None)
+    c._resolve_project_alias = AsyncMock(return_value=None)
+    assert await c._axis_conflict_error(
         {"decision": {"project": "alpha"}, "project": "beta"},
         "alpha", [], [], True) is None
-    conflict = MemoryCoordinator._axis_conflict_error(
+    conflict = await c._axis_conflict_error(
         {"decision": {"project": "alpha"}, "project": "beta"},
         "beta", [], [], True)
     assert conflict is not None and conflict["axis"] == "project"
@@ -311,3 +314,102 @@ async def test_the_plan_s_canonical_matches_what_is_actually_stored_for_noise():
     _refusal, plan = await c._entity_ingress_validate(metadata)
     assert await c._entity_commit_mints(metadata, "claude-code", plan) is None
     assert plan["canonical"] == metadata["entities"] == ["254", "0", "  "]
+
+
+# ── R-4 — a RENAME must not freeze every record that predates it ─────────────
+#
+# Review finding (Opus, Required). The comparison was on the literal spelling.
+# A stored blob keeps whatever spelling was canonical when the record was FIRST
+# written; the incoming value has just been rewritten to whatever is canonical
+# NOW. So the day a project is renamed — or merely respelled — every identical
+# re-save of every record that predates it becomes a 409, retrospectively.
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored,incoming", [
+    ("Shared_Memory", "shared-memory"),
+    ("shared memory", "shared-memory"),
+    ("SHARED-MEMORY", "shared-memory"),
+])
+async def test_a_respelling_of_the_same_project_is_not_a_conflict(stored, incoming):
+    """Separator/case variants are ONE project in the registry (`axis_key`), so
+    they must be one axis value here.
+
+    MUTATION CHECK: restore `existing_project != project` and every case here
+    fails with a 409."""
+    c, _ = _coord(stored_metadata={"project": stored, "entities": []})
+    resp, _ = await _save(c, {"source": "claude-code", "project": incoming})
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_a_renamed_project_resolves_through_its_alias_before_refusing():
+    """The case the ruling names: stored `Old-Name`, retired and aliased to
+    `new-name`; the incoming save carries the canonical. The KEYS differ, so
+    the stored spelling is resolved once before anything is refused.
+
+    MUTATION CHECK: delete the `_resolve_project_alias` hop (refuse as soon as
+    the keys differ) and this test fails with a 409 — which is the state every
+    record predating a real rename would be left in."""
+    c, _ = _coord(stored_metadata={"project": "Old-Name", "entities": []})
+    c._resolve_project_alias = AsyncMock(return_value="new-name")
+    resp, _ = await _save(c, {"source": "claude-code", "project": "new-name"})
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_a_genuinely_different_project_is_still_refused():
+    """The fix must not have turned the project check into a no-op: a stored
+    spelling that resolves to NOTHING, or to something else, still conflicts."""
+    c, _ = _coord(stored_metadata={"project": "alpha", "entities": []})
+    c._resolve_project_alias = AsyncMock(return_value=None)
+    resp, _ = await _save(c, {"source": "claude-code", "project": "beta"})
+    assert resp.status == 409
+    assert json.loads(resp.text)["axis"] == "project"
+
+
+@pytest.mark.asyncio
+async def test_an_alias_pointing_somewhere_else_is_still_a_conflict():
+    """A retired spelling that resolves to a DIFFERENT project than the one
+    this save names is the strongest form of the conflict, not a pass."""
+    c, _ = _coord(stored_metadata={"project": "Old-Name", "entities": []})
+    c._resolve_project_alias = AsyncMock(return_value="some-other-project")
+    resp, _ = await _save(c, {"source": "claude-code", "project": "new-name"})
+    assert resp.status == 409
+
+
+@pytest.mark.asyncio
+async def test_the_alias_lookup_is_not_paid_for_when_the_keys_agree():
+    """The rare path stays rare: an ordinary identical re-save must not add a
+    query to the save path."""
+    c, _ = _coord(stored_metadata={"project": "alpha", "entities": []})
+    c._resolve_project_alias = AsyncMock(return_value=None)
+    resp, _ = await _save(c, {"source": "claude-code", "project": "Alpha"})
+    assert resp.status == 200
+    c._resolve_project_alias.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored,incoming", [
+    ("Architecture", "architecture"),
+    ("data_capture", "data-capture"),
+])
+async def test_a_respelling_of_the_same_domain_is_not_a_conflict(stored, incoming):
+    """Same rule on the section axis.
+
+    MUTATION CHECK: restore `set(existing_domains) != set(domains or [])` and
+    both cases fail."""
+    c, _ = _coord(stored_metadata={"project": "alpha", "domains": [stored],
+                                   "entities": []})
+    resp, _ = await _save(c, {"source": "claude-code", "project": "alpha",
+                              "domains": [incoming]})
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_a_genuinely_different_domain_is_still_refused():
+    c, _ = _coord(stored_metadata={"project": "alpha", "domains": ["architecture"],
+                                   "entities": []})
+    resp, _ = await _save(c, {"source": "claude-code", "project": "alpha",
+                              "domains": ["capture"]})
+    assert resp.status == 409
+    assert json.loads(resp.text)["axis"] == "domains"
