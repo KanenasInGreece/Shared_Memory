@@ -835,6 +835,28 @@ ENTITY_VOCAB_RESOLVE_MANY_SQL = """
 # Names and aliases both, because a caller confusing its new name with a
 # spelling the operator has already curated is the same mistake as confusing it
 # with a canonical.
+#
+# ⚠ IT IS A SEQUENTIAL SCAN, AND NO INDEX WOULD CHANGE THAT. A trigram GIN
+# index answers `name % $1` and `name ILIKE '%…%'`; it cannot answer
+# `similarity(name, $1) >= $2`, which is an ordinary function call in the WHERE
+# clause, so the planner reads every row whatever indexes exist. A migration
+# adding `gin (name gin_trgm_ops)` for this query was written, reviewed and
+# DROPPED for exactly that reason — an index that is never used is not free:
+# it costs every INSERT, and its presence argues that the cost was measured.
+#
+# ⚠ THE COST IS UNMEASURED (`fact:1338`). What is known is the SIZE: 157 rows
+# in `entity_vocabulary` on this deployment today, plus the alias table, on a
+# path that only runs when a save actually MINTS. No timing has been taken. If
+# this ever needs to be fast, the change is to the PREDICATE — `name % $1`,
+# which a trigram index does serve, with `similarity()` kept only for ordering
+# — and it should be driven by a measurement, not by adding an index to the
+# query as it stands.
+#
+# ⚠ SAME SHAPE, SAME NON-USE, in `CONFUSABLE_SQL` (projects, migration 022) and
+# `DOMAIN_CONFUSABLE_SQL` (domains, 028), both of which ship a trigram index
+# their own predicate cannot use. Recorded for the operator; not changed here,
+# because dropping a shipped index is a migration on every install and this
+# build is not the place to decide it.
 ENTITY_CONFUSABLE_SQL = """
     SELECT name, similarity(name, $1) AS score
       FROM (

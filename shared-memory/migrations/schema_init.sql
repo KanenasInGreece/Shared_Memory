@@ -501,7 +501,6 @@ CREATE TABLE IF NOT EXISTS entity_vocabulary (
 
 CREATE UNIQUE INDEX IF NOT EXISTS entity_vocabulary_normalized_key_unique ON public.entity_vocabulary USING btree (normalized_key);
 CREATE INDEX IF NOT EXISTS idx_entity_vocabulary_created_at ON public.entity_vocabulary USING btree (created_at);
-CREATE INDEX IF NOT EXISTS idx_entity_vocabulary_name_trgm ON public.entity_vocabulary USING gin (name gin_trgm_ops);
 
 -- ─── neo4j_outbox ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS neo4j_outbox (
