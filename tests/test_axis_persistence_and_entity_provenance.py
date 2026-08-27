@@ -315,6 +315,17 @@ async def test_entities_provenance_overlong_key_yields_a_bounded_400_message():
     validation error into an amplification vector. `_short()` caps the repr
     of any interpolated value at 200 chars (plus an ellipsis marker).
 
+    RE-RULED at v0.9.69 (item 8): the overlong value is now carried by the
+    provenance KEY alone, not by `entities` as well. The entity gate's
+    validation half — including its S-5 `ENTITY_NAME_MAX_LEN` cap — moved in
+    front of the project axis and therefore in front of this check, so a
+    5000-char string sitting in `entities` is now refused as
+    `entity_name_too_long` before provenance is ever examined. The MEMBERSHIP
+    branch exercised here is the interpolation site that can still be handed
+    an unbounded caller value — a key naming something that is NOT in
+    `entities` is under no length cap at all — so it is the site SEC-03's
+    property actually needs pinned.
+
     MUTATION CHECK: replace `_short(name)` back with `name!r` at the
     entities_provenance[...] interpolation site and this test's length
     assertion fails — the message balloons to the full 5000-char key."""
@@ -326,8 +337,8 @@ async def test_entities_provenance_overlong_key_yields_a_bounded_400_message():
             "metadata": {
                 "source": "claude-code",
                 "project": "shared_memory",
-                "entities": [overlong],
-                "entities_provenance": {overlong: "guessed"},
+                "entities": ["OutboxPattern"],
+                "entities_provenance": {overlong: "operator"},
             },
         })
         resp = await c.handle_save(req)

@@ -4782,55 +4782,92 @@ class MemoryCoordinator:
         if not resolved:
             return
 
-        def _canonical_of(raw: object) -> object:
-            if not isinstance(raw, str):
-                return raw
-            sanitized = sanitize_entity_name(raw)
-            if sanitized is None:
-                return raw
-            return resolved.get(sanitized, sanitized)
+        _canonical_of = MemoryCoordinator._canonical_entity_name
 
         entities = metadata.get("entities")
         if isinstance(entities, list):
-            metadata["entities"] = [_canonical_of(e) for e in entities]
+            metadata["entities"] = [_canonical_of(e, resolved) for e in entities]
         provenance = metadata.get("entities_provenance")
         if isinstance(provenance, dict):
             metadata["entities_provenance"] = {
-                _canonical_of(k): v for k, v in provenance.items()
+                _canonical_of(k, resolved): v for k, v in provenance.items()
             }
 
+    @staticmethod
+    def _canonical_entity_name(raw: object, resolved: dict[str, str]) -> object:
+        """One raw entity name → the spelling that will be STORED. Pure.
+
+        Extracted so the re-save axis-conflict check (item 4 of the v0.9.69
+        plan) can ask "what will this save's entities be?" BEFORE the mints
+        run, without a second, drifting copy of the mapping rule.
+        """
+        if not isinstance(raw, str):
+            return raw
+        sanitized = sanitize_entity_name(raw)
+        if sanitized is None:
+            return raw
+        return resolved.get(sanitized, sanitized)
+
+    @staticmethod
+    def _canonical_entity_list(metadata: dict, resolved: dict[str, str]) -> list:
+        """`metadata['entities']` as it will be stored, without storing it. Pure."""
+        entities = metadata.get("entities")
+        if not isinstance(entities, list):
+            return []
+        if not resolved:
+            return list(entities)
+        return [MemoryCoordinator._canonical_entity_name(e, resolved)
+                for e in entities]
+
     async def _entity_ingress_error(self, metadata: dict, agent_id: str) -> dict | None:
-        """The whole save-time entity ingress gate (fact:1375). Returns the
-        400 body, or None when the save may proceed — having already
-        rewritten `metadata['entities']` (+ `entities_provenance` keys) to the
-        CANONICAL spelling in place, the same "resolve once at ingress, store
-        the canonical" choice `_project_ingress_error`/`_domain_value_error`
-        make for their own axes (rule 3), and popped `metadata['new_entities']`
-        (S-8, security review fact:1412 — a transient mint REQUEST must not
-        persist as durable record content, visible to every future reader and
-        to REM's prompts).
+        """The two halves of the gate, composed — the shape every caller used
+        before v0.9.69 and the shape the gate's own unit tests still drive.
 
-        ⛔ S-4 CALL-SITE CONTRACT (security review fact:1412, ruled by
-        decision:1413): the caller MUST invoke this method LAST — after every
-        other 400-capable metadata validation on that endpoint
-        (entities_provenance shape/membership, supersedes/grounded_in/
-        existence checks, ...) — immediately before the hard-mandate
-        embedding call. A mint is a real write to `entity_vocabulary`, on its
-        own connection, sharing no transaction with the record insert; any
-        refusal that can still fire AFTER this method runs would leave a
-        minted canonical permanently attached to a record that never existed.
-        Calling it last eliminates every SUCH refusal from racing a mint.
+        ⚠ handle_save no longer calls THIS. It calls
+        `_entity_ingress_validate` early (before the project axis, so no
+        registry row is written by a save the entity rules will refuse) and
+        `_entity_commit_mints` late (where the gate has always been, so S-4's
+        "a mint is the last write before the embed" still holds). This wrapper
+        keeps the two halves' composition in ONE place, so a test that drives
+        the whole gate is testing what the endpoint does, not a second
+        arrangement of it.
+        """
+        refusal, plan = await self._entity_ingress_validate(metadata)
+        if refusal is not None:
+            return refusal
+        return await self._entity_commit_mints(metadata, agent_id, plan)
 
-        The ONE residual this does not close — a mint surviving the
-        hard-mandate embedding call's own 503, which necessarily runs AFTER
-        this method returns None — is ACCEPTED BY RULING (decision:1413),
-        not fixed transactionally: it mirrors the exposure
-        `_project_ingress_error`'s own `_register_project` call already
-        carries today (a project can likewise be registered by a save that
-        goes on to fail on embedding), so it is not a new class of risk this
-        leg introduces, and closing it would need a shared transaction
-        between the vocabulary write and the record insert that neither axis
-        has today.
+    async def _entity_ingress_validate(
+        self, metadata: dict,
+    ) -> tuple[dict | None, dict]:
+        """The VALIDATION half of the save-time entity ingress gate — every
+        refusal it can produce, and NOT ONE WRITE (item 8 of the v0.9.69
+        post-first-write hardening plan; `fact:1734` A(4)).
+
+        Returns `(refusal_body_or_None, plan)`. `plan` is what
+        `_entity_commit_mints` needs to finish the job:
+
+          ``resolved``   {sanitized candidate: canonical} for every name the
+                         vocabulary already knows
+          ``to_mint``    the sanitized candidates `new_entities` asked to mint,
+                         in candidate order — nothing is minted yet
+          ``canonical``  the entity list AS IT WILL BE STORED, computed without
+                         writing anything (a to-mint name canonicalizes to
+                         itself except in the mint race `_entity_vocab_mint`
+                         arbitrates). The re-save axis-conflict check reads
+                         this, because it must run BEFORE the mints it is
+                         protecting.
+
+        ⛔ WHY IT MOVED IN FRONT OF THE PROJECT AXIS. `_project_ingress_error`
+        REGISTERS a project as its acceptance, and the entity rules could still
+        400 the save afterwards — so a refused save left a registry row behind
+        with no record that named it. Validating here means every entity
+        refusal fires before the first registry write; the mint itself stays
+        last (see `_entity_commit_mints`).
+
+        Returns `(None, plan)` with an empty plan for the ordinary case — no
+        entities at all (`fact:1215`: entities stay optional and never gate
+        anything).
 
         Runs on BOTH writers of caller-supplied entity names: handle_save
         (facts and decisions share this generic path — a decision's `entities`
@@ -4882,16 +4919,19 @@ class MemoryCoordinator:
         its counterpart in `entities` correctly rather than silently failing
         to match.
         """
+        empty_plan: dict = {"resolved": {}, "to_mint": [], "canonical": []}
+
         raw_entities = metadata.get("entities") or []
         if len(raw_entities) > ENTITY_LIST_MAX_LEN:
-            return self._entities_list_too_long_rejection("entities", len(raw_entities))
+            return (self._entities_list_too_long_rejection(
+                "entities", len(raw_entities)), empty_plan)
         for e in raw_entities:
             if isinstance(e, str) and len(e) > ENTITY_NAME_MAX_LEN:
-                return self._entity_name_too_long_rejection(e)
+                return self._entity_name_too_long_rejection(e), empty_plan
 
         candidates = sanitize_entity_names(raw_entities)
         if not candidates:
-            return None
+            return None, empty_plan
         candidates_set = set(candidates)
 
         new_entities_raw = metadata.get("new_entities")
@@ -4904,13 +4944,13 @@ class MemoryCoordinator:
                     "status": "error",
                     "error": "new_entities_invalid",
                     "message": "metadata.new_entities must be a list of strings.",
-                }
+                }, empty_plan
             if len(new_entities_raw) > ENTITY_LIST_MAX_LEN:
-                return self._entities_list_too_long_rejection(
-                    "new_entities", len(new_entities_raw))
+                return (self._entities_list_too_long_rejection(
+                    "new_entities", len(new_entities_raw)), empty_plan)
             for n in new_entities_raw:
                 if len(n) > ENTITY_NAME_MAX_LEN:
-                    return self._entity_name_too_long_rejection(n)
+                    return self._entity_name_too_long_rejection(n), empty_plan
 
             # S-10: enforce the subset claim the refusal message makes,
             # matched in sanitized-candidate space (see docstring).
@@ -4926,35 +4966,88 @@ class MemoryCoordinator:
                             "new_entities must also be named in entities — add "
                             "it there, or remove it from new_entities."
                         ),
-                    }
+                    }, empty_plan
                 mint_requested.add(sanitized)
 
         resolved = await self._entity_vocab_resolve_many(candidates)
         unknown = [n for n in candidates if n not in resolved]
+        to_mint: list[str] = []
 
         if unknown:
             to_mint = [n for n in unknown if n in mint_requested]
             still_unknown = [n for n in unknown if n not in mint_requested]
             if still_unknown:
-                return self._entity_unknown_rejection(still_unknown)
-            for name in to_mint:
-                canonical = await self._entity_vocab_mint(name, agent_id)
-                if canonical is None:
-                    return {
-                        "status": "error",
-                        "error": "new_entities_invalid",
-                        "message": (
-                            f"new_entities name {_short(name)} cannot be minted "
-                            "as a canonical entity — it normalizes to nothing "
-                            "(every character is punctuation, whitespace, or "
-                            "similar), so there is no spelling left to "
-                            "register. Name it with at least one letter or "
-                            "digit, or drop it from new_entities."
-                        ),
-                    }
-                resolved[name] = canonical
-                log.info("entity vocabulary: %r minted as canonical %r by %s "
-                         "(new_entities)", name, canonical, agent_id)
+                return self._entity_unknown_rejection(still_unknown), empty_plan
+
+        plan = {
+            "resolved": resolved,
+            "to_mint": to_mint,
+            # A name about to be minted canonicalizes to ITSELF — the one
+            # exception is the mint race `_entity_vocab_mint` arbitrates, which
+            # can only substitute an equivalent spelling of the same key.
+            "canonical": self._canonical_entity_list(
+                metadata, resolved | {n: n for n in to_mint}),
+        }
+        return None, plan
+
+    async def _entity_commit_mints(
+        self, metadata: dict, agent_id: str, plan: dict,
+    ) -> dict | None:
+        """The WRITING half of the entity gate: mint what `new_entities` asked
+        for, then rewrite `metadata['entities']` (+ `entities_provenance` keys)
+        to the CANONICAL spelling in place — the same "resolve once at ingress,
+        store the canonical" choice `_project_ingress_error`/
+        `_domain_value_error` make for their own axes (rule 3) — and pop
+        `metadata['new_entities']` (S-8, security review fact:1412: a transient
+        mint REQUEST must not persist as durable record content, visible to
+        every future reader and to REM's prompts).
+
+        Returns the 400 body, or None when the save may proceed. The only
+        refusal left on this side is the one that needs the database's own
+        answer: a name Postgres itself refuses to mint.
+
+        ⛔ S-4 CALL-SITE CONTRACT (security review fact:1412, ruled by
+        decision:1413): the caller MUST invoke this method LAST — after every
+        other 400-capable metadata validation on that endpoint
+        (entities_provenance shape/membership, supersedes/grounded_in/
+        existence checks, the re-save axis-conflict check, ...) — immediately
+        before the hard-mandate embedding call. A mint is a real write to
+        `entity_vocabulary`, on its own connection, sharing no transaction with
+        the record insert; any refusal that can still fire AFTER this method
+        runs would leave a minted canonical permanently attached to a record
+        that never existed. Calling it last eliminates every SUCH refusal from
+        racing a mint.
+
+        The ONE residual this does not close — a mint surviving the
+        hard-mandate embedding call's own 503, which necessarily runs AFTER
+        this method returns None — is ACCEPTED BY RULING (decision:1413),
+        not fixed transactionally: it mirrors the exposure
+        `_project_ingress_error`'s own `_register_project` call already
+        carries today (a project can likewise be registered by a save that
+        goes on to fail on embedding), so it is not a new class of risk this
+        leg introduces, and closing it would need a shared transaction
+        between the vocabulary write and the record insert that neither axis
+        has today.
+        """
+        resolved = dict(plan.get("resolved") or {})
+        for name in (plan.get("to_mint") or []):
+            canonical = await self._entity_vocab_mint(name, agent_id)
+            if canonical is None:
+                return {
+                    "status": "error",
+                    "error": "new_entities_invalid",
+                    "message": (
+                        f"new_entities name {_short(name)} cannot be minted "
+                        "as a canonical entity — it normalizes to nothing "
+                        "(every character is punctuation, whitespace, or "
+                        "similar), so there is no spelling left to "
+                        "register. Name it with at least one letter or "
+                        "digit, or drop it from new_entities."
+                    ),
+                }
+            resolved[name] = canonical
+            log.info("entity vocabulary: %r minted as canonical %r by %s "
+                     "(new_entities)", name, canonical, agent_id)
 
         self._rewrite_entities(metadata, resolved)
         metadata.pop("new_entities", None)
@@ -5303,6 +5396,25 @@ class MemoryCoordinator:
         # actually landed — the same reasoning that put `entities_rewritten` on
         # this response.
         axis_report: dict = {}
+
+        # ⛔ ENTITY VALIDATION RUNS FIRST — BEFORE THE PROJECT AXIS, and the
+        # position is the rule (item 8, v0.9.69; `fact:1734` A(4)).
+        # `_project_ingress_error` REGISTERS a declared-new project as its
+        # acceptance, and every entity refusal below could still 400 the save
+        # afterwards — so a save refused for an unknown entity used to leave a
+        # project registered that no record ever named. Validation writes
+        # NOTHING; the mint it plans is committed further down, still last
+        # (S-4, decision:1413).
+        entities_field = metadata.get("entities", [])
+        if not isinstance(entities_field, list):
+            return web.json_response(
+                {"status": "error", "message": "metadata.entities must be a list"},
+                status=400,
+            )
+        entity_refusal, entity_plan = await self._entity_ingress_validate(metadata)
+        if entity_refusal is not None:
+            return web.json_response(entity_refusal, status=400)
+
         project_error = await self._project_ingress_error(
             metadata, agent_id, axis_report)
         if project_error is not None:
@@ -5385,12 +5497,9 @@ class MemoryCoordinator:
             if bad:
                 return web.json_response({"status": "error", "message": bad}, status=400)
 
+        # Shape already validated (and the ENTITY GATE'S VALIDATION HALF
+        # already run) above, before the project axis.
         entities = metadata.get("entities", [])
-        if not isinstance(entities, list):
-            return web.json_response(
-                {"status": "error", "message": "metadata.entities must be a list"},
-                status=400,
-            )
 
         # Per-entity provenance stamping (fact:1215) — additive, no api_version
         # bump. `entities_provenance` is an optional {name: "operator"|"agent"}
@@ -5445,26 +5554,27 @@ class MemoryCoordinator:
         # below) so it is seen at capture time rather than only on inspection.
         entities_provenance_missing = bool(entities) and entities_provenance is None
 
-        # Entity vocabulary ingress gate (fact:1375, migration 033) — additive
-        # AFTER sanitize_entity_name (rule 7), lookup-never-create (rule 2),
-        # refuses an unknown name unless metadata.new_entities explicitly
-        # mints it (rules 4/5). Rewrites `metadata['entities']` to the
-        # CANONICAL spelling in place before anything downstream — locks, PG
+        # Entity vocabulary ingress gate (fact:1375, migration 033) — the
+        # COMMIT half. Every refusal the gate can produce already fired above,
+        # before the project axis (item 8, v0.9.69); what is left here is the
+        # mint itself plus the in-place rewrite of `metadata['entities']` to
+        # the CANONICAL spelling, before anything downstream — locks, PG
         # metadata, the outbox row, entity_registry, the graph — sees this
         # list, so `entities` is re-read below.
         #
-        # ⛔ S-4 (security review fact:1412, ruled decision:1413): called LAST
-        # among the 400-capable metadata checks — AFTER entities_provenance
-        # above, not before it as originally built. A mint is a real write
-        # (to entity_vocabulary, no shared transaction with the record
-        # insert), so anything that can still 400 the save must run BEFORE
-        # this call, or a mint survives the very refusal that requested it.
-        # Only the hard-mandate embedding 503 (unavoidably later — it needs
-        # the final content) can still race a mint; that residual is
-        # accepted by ruling, not fixed here — see the method's own
-        # docstring.
+        # ⛔ S-4 (security review fact:1412, ruled decision:1413): the MINT is
+        # still LAST among the writes — after entities_provenance above, after
+        # the axis gates, and immediately before the hard-mandate embedding
+        # call. A mint is a real write (to entity_vocabulary, no shared
+        # transaction with the record insert), so anything that can still 400
+        # the save must run BEFORE this call, or a mint survives the very
+        # refusal that requested it. Only the hard-mandate embedding 503
+        # (unavoidably later — it needs the final content) can still race a
+        # mint; that residual is accepted by ruling, not fixed here — see the
+        # method's own docstring.
         entities_before = list(entities)
-        entity_error = await self._entity_ingress_error(metadata, agent_id)
+        entity_error = await self._entity_commit_mints(
+            metadata, agent_id, entity_plan)
         if entity_error is not None:
             return web.json_response(entity_error, status=400)
         entities = metadata.get("entities", [])

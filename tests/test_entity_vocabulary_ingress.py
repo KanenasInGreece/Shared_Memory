@@ -46,6 +46,7 @@ are monkeypatched directly) — see CLAUDE.md's "green suite is not an
 all-clear" rule. The raw SQL is verified against the live database
 separately; see EG_LEG1_HANDOFF.md's FIX ROUND section for the numbers.
 """
+import json
 import os
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -884,14 +885,20 @@ def _full_coord(vocabulary=None):
 @pytest.mark.asyncio
 async def test_invalid_entities_provenance_refuses_before_the_gate_ever_runs():
     """MUTATION CHECK: move the `entity_error = await
-    self._entity_ingress_error(...)` call in handle_save back to its
+    self._entity_commit_mints(...)` call in handle_save back to its
     pre-fix-round position (immediately after the `entities` list-type
     check, BEFORE the entities_provenance validation block) and this test
-    fails — `_entity_vocab_resolve_many`/`_entity_vocab_mint` get called
-    (and in this fixture, `_entity_vocab_mint` would succeed) before the
-    entities_provenance shape check ever has a chance to 400 the save,
-    reproducing S-4's exact defect: a mint surviving the refusal of the
-    save that requested it."""
+    fails — `_entity_vocab_mint` gets called (and in this fixture it would
+    succeed) before the entities_provenance shape check ever has a chance to
+    400 the save, reproducing S-4's exact defect: a mint surviving the
+    refusal of the save that requested it.
+
+    ⚠ NARROWED at v0.9.69 (item 8, re-ruled in the plan): the assertion is on
+    `_entity_vocab_mint`, not on `_entity_vocab_resolve_many`. S-4's defect is
+    the MINT — the write — surviving a refusal; this test's own docstring has
+    always named it as such. Resolution is a read, and it now deliberately
+    runs FIRST, before the project axis, so that an entity refusal fires
+    before `_register_project` writes a registry row (P4)."""
     c, conn = _full_coord()
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         req = _make_request({
@@ -908,7 +915,6 @@ async def test_invalid_entities_provenance_refuses_before_the_gate_ever_runs():
         resp = await c.handle_save(req)
     assert resp.status == 400
     body = await resp.json() if hasattr(resp, "json") else None
-    c._entity_vocab_resolve_many.assert_not_called()
     c._entity_vocab_mint.assert_not_called()
 
 
@@ -1013,3 +1019,67 @@ async def test_new_entities_is_absent_from_the_metadata_actually_written():
     stored_metadata = conn.fetchrow.await_args.args[2]
     assert "new_entities" not in stored_metadata
     assert stored_metadata["entities"] == ["BrandNewThing"]
+
+
+# ── P4 (item 8, v0.9.69) — a REFUSED save writes no registry row ───────────
+
+@pytest.mark.asyncio
+async def test_refused_save_leaves_no_registry_rows():
+    """P4: no registry row and no mint is written by a save refused with 400.
+
+    The shape that used to break it: `new_project` declares a project (which
+    `_project_ingress_error` REGISTERS — that IS the acceptance) and the same
+    save names an entity the vocabulary does not know. The entity refusal
+    fired AFTER the project registration, so the save 400'd having already
+    created a project row no record ever named.
+
+    MUTATION CHECK: move the `_entity_ingress_validate` call in handle_save
+    back below `_project_ingress_error` and this test fails —
+    `_register_project` is awaited before the entity gate ever refuses.
+    """
+    c, conn = _full_coord()
+    c._project_registered = AsyncMock(return_value=False)
+    c._register_project = AsyncMock()
+    c._new_project_refusal = AsyncMock(return_value=None)
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)) as embed:
+        req = _make_request({
+            "content": "a fact declaring a new project and an unknown entity",
+            "metadata": {
+                "source": "claude-code",
+                "project": "BrandNewProject",
+                "new_project": True,
+                # NOT in new_entities — the vocabulary does not know it, so
+                # the gate must refuse rather than mint.
+                "entities": ["SomeUnknownConcept"],
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 400
+    body = json.loads(resp.text)
+    assert body["error"] == "entity_unknown"
+    c._register_project.assert_not_called()
+    c._entity_vocab_mint.assert_not_called()
+    embed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_new_project_save_with_known_entities_still_registers():
+    """The reorder must not have made registration unreachable: the same save
+    with an entity the vocabulary knows registers the project and succeeds."""
+    c, conn = _full_coord(vocabulary={"KnownConcept": "KnownConcept"})
+    c._project_registered = AsyncMock(return_value=False)
+    c._register_project = AsyncMock()
+    c._new_project_refusal = AsyncMock(return_value=None)
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "a fact declaring a new project with a known entity",
+            "metadata": {
+                "source": "claude-code",
+                "project": "BrandNewProject",
+                "new_project": True,
+                "entities": ["KnownConcept"],
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 200
+    c._register_project.assert_awaited_once()
