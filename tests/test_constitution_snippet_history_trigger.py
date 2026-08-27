@@ -35,17 +35,17 @@ def _read(path):
         return fh.read()
 
 
-def test_the_cli_snippet_carries_v3():
+def test_the_cli_snippet_carries_v4():
     text = _read(_CLI_SNIPPET)
-    assert "<!-- shared-memory:constitution-snippet v3 -->" in text, (
-        "the CLI snippet's marker did not advance to v3 — an installed block "
+    assert "<!-- shared-memory:constitution-snippet v4 -->" in text, (
+        "the CLI snippet's marker did not advance to v4 — an installed block "
         "will not read as drifted and Phase 8c will not re-propose it")
 
 
-def test_the_mcp_snippet_carries_v2():
+def test_the_mcp_snippet_carries_v3():
     text = _read(_MCP_SNIPPET)
-    assert "<!-- shared-memory:mcp-constitution-snippet v2 -->" in text, (
-        "the MCP snippet's marker did not advance to v2 — an installed block "
+    assert "<!-- shared-memory:mcp-constitution-snippet v3 -->" in text, (
+        "the MCP snippet's marker did not advance to v3 — an installed block "
         "will not read as drifted and Phase 8c will not re-propose it")
 
 
@@ -74,3 +74,21 @@ def test_the_two_tracked_cli_snippet_copies_stay_byte_identical():
     assert _read(_CLI_SNIPPET) == _read(_CLI_SNIPPET_SHIPPED), (
         "the source CLI snippet and its tracked shipped copy have diverged — "
         "make the shipped copy byte-identical to the source")
+
+
+_POINTER_PHRASE = "is a pointer, not the record"
+
+
+def test_all_three_surfaces_name_the_index_pointer_rule():
+    """v4 (2026-08-27): an agent cited a superseded fact id from a preloaded
+    local index without searching, although the store held the current record
+    and filters superseded ones from search. The rule must read the same on
+    every surface; whitespace-normalised for the same reason as above."""
+    def _flat(path):
+        return re.sub(r"\s+", " ", _read(path))
+
+    missing = [path for path in (_CLI_SNIPPET, _MCP_SNIPPET, _SYSTEM_PROMPT)
+               if _POINTER_PHRASE not in _flat(path)]
+    assert not missing, (
+        f"{_POINTER_PHRASE!r} missing from: {missing} — the index-pointer rule "
+        "must appear on every surface, in the same words")
