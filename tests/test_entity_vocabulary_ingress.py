@@ -60,7 +60,7 @@ sys.path.insert(0, _SCRIPTS)
 from coordinator import (  # noqa: E402
     ENTITY_LIST_MAX_LEN, ENTITY_NAME_MAX_LEN, ENTITY_VOCAB_MINT_SQL,
     ENTITY_VOCAB_RESOLVE_MANY_SQL, ENTITY_VOCAB_RESOLVE_SQL, MemoryCoordinator,
-    axis_key,
+    axis_key, is_judgement_type,
 )
 
 
@@ -1496,3 +1496,98 @@ async def test_the_confusable_check_never_runs_for_a_save_that_mints_nothing():
         {"project": "p", "entities": ["Kubernetes"]})
     assert err is None
     assert plan["to_mint"] == []
+
+
+# ── R-1 — the E3 gate normalises `type` the way the GRAPH does ────────────────
+#
+# Review finding (Opus, Required). The gate matched `metadata["type"]` EXACTLY
+# while `record_label_for_type` — which decides the record's graph label, and
+# therefore what the record IS everywhere downstream — lowercases and strips
+# first. `{"type": "Decision"}` was a :Decision to the graph and a plain fact to
+# the gate, so it carried entities past the refusal and MINTED them: the one
+# outcome item 3 exists to prevent, reachable by capitalising a letter.
+
+@pytest.mark.parametrize("kind", ["Decision", "decision ", " DECISION",
+                                  "Retrospective", "retrospective\t",
+                                  "RETROSPECTIVE"])
+def test_a_case_or_space_variant_type_is_still_a_judgement(kind):
+    """MUTATION CHECK: restore the exact match (`record_type in ("decision",
+    "retrospective")` in `is_judgement_type`) and every case here fails."""
+    assert is_judgement_type(kind) is True
+
+
+@pytest.mark.parametrize("kind", ["fact", None, "", "  ", 42, "summary",
+                                  "decisions", "predecision"])
+def test_a_non_judgement_type_is_not_dragged_in_by_the_normalisation(kind):
+    """The normalisation must not become a substring match: `decisions` and
+    `predecision` are not decisions, and an absent type is a fact."""
+    assert is_judgement_type(kind) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["Decision", "decision "])
+async def test_a_case_variant_decision_still_cannot_carry_entities(kind):
+    """End-to-end, through handle_save: the bypass is closed and nothing mints."""
+    c, conn = _full_coord()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)) as embed:
+        req = _make_request({
+            "content": "We decided to add a consolidation daemon.",
+            "metadata": {
+                "source": "claude-code",
+                "type": kind,
+                "entities": ["Kubernetes"],
+                "new_entities": ["Kubernetes"],
+                "decision": {"decided_by": "Xenofon", "project": "shared_memory",
+                             "rationale": "because"},
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 400
+    body = json.loads(resp.text)
+    assert body["error"] == "entities_not_allowed_on_judgement"
+    # The message names the NORMALISED kind, never the raw caller string.
+    assert "decision" in body["message"]
+    c._entity_vocab_mint.assert_not_called()
+    embed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_case_variant_judgement_outbox_row_still_carries_no_entities():
+    """The other two call sites the exact match reached — the outbox row and
+    the re-save conflict's judgement branch — normalise too."""
+    c, conn = _full_coord()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "We decided to add a consolidation daemon.",
+            "metadata": {
+                "source": "claude-code",
+                "type": "Decision",
+                "decision": {"decided_by": "Xenofon", "project": "shared_memory",
+                             "rationale": "because"},
+            },
+        })
+        assert (await c.handle_save(req)).status == 200
+    call = next(k for k in conn.execute.call_args_list
+                if "neo4j_outbox" in k.args[0])
+    assert "entities" not in call.args[2]
+
+
+@pytest.mark.asyncio
+async def test_a_judgement_save_never_persists_an_entities_key_it_was_not_sent():
+    """The nit, made an assertion: `setdefault` used to write `entities: []`
+    into the stored metadata of a judgement that never sent the field — the
+    STORAGE half of the rule item 3 enforces ("no entities in any store")."""
+    c, conn = _full_coord()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "We decided to add a consolidation daemon.",
+            "metadata": {
+                "source": "claude-code",
+                "type": "decision",
+                "decision": {"decided_by": "Xenofon", "project": "shared_memory",
+                             "rationale": "because"},
+            },
+        })
+        assert (await c.handle_save(req)).status == 200
+    stored_metadata = conn.fetchrow.await_args.args[2]
+    assert "entities" not in stored_metadata

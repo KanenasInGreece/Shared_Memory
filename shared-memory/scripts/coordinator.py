@@ -718,7 +718,27 @@ ENTITIES_PROVENANCE_VALUES = ("operator", "agent")
 # ruled R1 at v0.9.69): a judgement reaches its topics by walking to the facts
 # it rests on, so an entity named on one is never written to the graph and only
 # adds an unvetted name to the vocabulary (`fact:970`).
-JUDGEMENT_TYPES = ("decision", "retrospective")
+# ⛔ THERE IS NO `JUDGEMENT_TYPES` TUPLE OF RAW STRINGS, deliberately. One
+# existed for exactly one release and every use of it was a bug waiting to be
+# written: an exact `metadata["type"] in (...)` match against a CLIENT-SUPPLIED
+# string, beside a `record_label_for_type` that normalises. Removed so the only
+# way to ask the question is the predicate below.
+JUDGEMENT_LABELS = (ONT.decision, ONT.retrospective)
+
+
+def is_judgement_type(record_type: object) -> bool:
+    """Is this record type a JUDGEMENT? Pure.
+
+    ⛔ IT DELEGATES TO `record_label_for_type` AND HOLDS NO COPY OF THE RULE.
+    The E3 gate first spelled this as an EXACT `in ("decision", "retrospective")`
+    match — while `record_label_for_type` (which decides the record's
+    graph LABEL, and therefore what it actually IS everywhere downstream)
+    lowercases and strips first. So `{"type": "Decision"}` was a Decision to the
+    graph and a fact to the gate: it carried entities straight past the refusal
+    and minted them. A second normalisation is a second rule; there is now one,
+    in one place, and this asks it the question rather than re-deciding it.
+    """
+    return record_label_for_type(record_type) in JUDGEMENT_LABELS
 
 
 class ProjectIdentityUnavailable(RuntimeError):
@@ -5070,7 +5090,7 @@ class MemoryCoordinator:
             offending = "new_entities"
         if offending is None:
             return None
-        kind = metadata.get("type")
+        kind = record_label_for_type(metadata.get("type")).lower()
         return {
             "status": "error",
             "error": "entities_not_allowed_on_judgement",
@@ -5820,11 +5840,16 @@ class MemoryCoordinator:
         # decision:1664). A judgement naming any is refused here — before the
         # gate, before the axes, before any write — and never reaches the
         # vocabulary at all. An empty list is accepted permanently.
-        if metadata.get("type") in JUDGEMENT_TYPES:
+        if is_judgement_type(metadata.get("type")):
             judgement_error = self._judgement_entities_error(metadata)
             if judgement_error is not None:
                 return web.json_response(judgement_error, status=400)
-            metadata.setdefault("entities", [])
+            # ⛔ NOTHING IS ADDED TO `metadata` HERE. An earlier spelling called
+            # `setdefault("entities", [])`, which PERSISTED a key the caller
+            # never sent — the storage half of the very rule this gate enforces
+            # ("a judgement carries no entities in any store"). Every reader
+            # below already defaults it: `metadata.get("entities", [])` feeds
+            # the locks loop, and the outbox row omits the key outright.
             entity_plan: dict = {"resolved": {}, "to_mint": [], "canonical": []}
         else:
             entity_refusal, entity_plan = await self._entity_ingress_validate(metadata)
@@ -6009,7 +6034,7 @@ class MemoryCoordinator:
         # between the read and the INSERT. This one exists for the cost, not
         # for the correctness — the same "cheap indexed pre-check before the
         # GPU" shape `handle_retrospective` uses for its target pg_id.
-        is_judgement = metadata.get("type") in JUDGEMENT_TYPES
+        is_judgement = is_judgement_type(metadata.get("type"))
         content_hash = hashlib.sha256(content.encode()).hexdigest()
         incoming_project = resolve_project(metadata)
         incoming_domains = resolve_domains(metadata)
@@ -6151,7 +6176,7 @@ class MemoryCoordinator:
                             # OMITTED rather than sent empty — the projection
                             # already defaults it, and a key that is always
                             # empty is a promise the row should stop making.
-                            **({} if metadata.get("type") in JUDGEMENT_TYPES
+                            **({} if is_judgement_type(metadata.get("type"))
                                else {"entities": entities}),
                             "agent_id": agent_id,
                             # Fact-provenance axes (decision 912) — materialised as
