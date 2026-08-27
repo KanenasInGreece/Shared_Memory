@@ -2024,11 +2024,21 @@ def _consolidation_rollup(by_type: dict, any_stalled: bool, started_at: dict,
 
 
 # Cypher write-operation guard — reject queries containing mutating keywords.
-# Defence-in-depth: blocks obvious destructive ops while a deeper Neo4j RBAC
-# solution is built. Regex is intentionally strict (SET followed by a space
-# avoids matching property names that contain "set" as a substring).
+# Defence-in-depth (second layer: the session opens with default_access_mode
+# ="READ"). Every keyword is matched on WORD BOUNDARIES, never on a following
+# whitespace character: `SET\s` let `SET  n:Label` (two spaces) through the
+# guard entirely, because the `\b` closing the alternation then had to hold
+# between two spaces. Live-reproduced bypass, fact:1734 (item 7 of the
+# v0.9.69 post-first-write hardening plan).
+#
+# `\bSET\b` does NOT match a property name that merely CONTAINS "set"
+# (`n.settings`, `n.asset`) — those are the cases the old comment feared and
+# they still pass. It DOES over-block a bare `n.set`, an `AS set` alias, and
+# any write keyword appearing inside a string literal; those are known,
+# accepted over-blocks (a read-only guard erring towards refusal), pinned as
+# such in tests/test_graph_route_guard.py.
 _WRITE_CYPHER = re.compile(
-    r"\b(CREATE|DELETE|DETACH\s+DELETE|SET\s|REMOVE|MERGE|CALL|LOAD\s+CSV|DROP)\b",
+    r"\b(CREATE|DELETE|DETACH\s+DELETE|SET|REMOVE|MERGE|CALL|LOAD\s+CSV|DROP)\b",
     re.IGNORECASE,
 )
 
