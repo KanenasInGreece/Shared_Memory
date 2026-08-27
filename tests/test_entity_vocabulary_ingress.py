@@ -46,6 +46,7 @@ are monkeypatched directly) — see CLAUDE.md's "green suite is not an
 all-clear" rule. The raw SQL is verified against the live database
 separately; see EG_LEG1_HANDOFF.md's FIX ROUND section for the numbers.
 """
+import json
 import os
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -59,6 +60,7 @@ sys.path.insert(0, _SCRIPTS)
 from coordinator import (  # noqa: E402
     ENTITY_LIST_MAX_LEN, ENTITY_NAME_MAX_LEN, ENTITY_VOCAB_MINT_SQL,
     ENTITY_VOCAB_RESOLVE_MANY_SQL, ENTITY_VOCAB_RESOLVE_SQL, MemoryCoordinator,
+    ENTITY_RESERVED_PROJECT_SQL, axis_key, is_judgement_type,
 )
 
 
@@ -80,6 +82,16 @@ def _coord(vocabulary=None):
     # ordinary, non-racing, non-empty-normalization case. Tests that care
     # about a different outcome stub this differently.
     c._entity_vocab_mint = AsyncMock(side_effect=lambda n, agent: n)
+    # v0.9.69 item 2: the gate now asks the `projects` registry whether a
+    # candidate name IS a project. An EMPTY registry is this fixture's default
+    # — "no project by that name" — so every pre-existing case here answers
+    # exactly as it did before the check existed. `_coord_with_projects()`
+    # below is the variant with rows in it.
+    conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[])
+    pool = MagicMock()
+    pool.acquire = MagicMock(return_value=_AsyncCtx(conn))
+    c._pool = pool
     return c
 
 
@@ -310,28 +322,192 @@ async def test_entities_provenance_absent_is_a_harmless_no_op():
     assert "entities_provenance" not in metadata
 
 
-# ── Decision/retrospective scope — same generic gate, same rules ────────────
+# ── E3 (item 3, v0.9.69) — ONLY FACTS CARRY ENTITIES ─────────────────────────
+#
+# ⛔ REPLACES the two tests that used to live here
+# (`test_a_decision_s_entities_are_gated_identically` /
+# `test_a_retrospective_shaped_metadata_is_gated_identically`). They drove
+# `_entity_ingress_error` DIRECTLY with judgement-shaped metadata and asserted
+# that a judgement's entities are canonicalized and minted just like a fact's —
+# the exact opposite of E3. Re-ruled in the v0.9.69 plan rather than deleted
+# silently: the gate is no longer called for a judgement at all, so a test
+# calling it by hand would have stayed green while asserting behaviour the
+# endpoint can no longer produce.
+#
+# Ruling R1 (decision:1664): non-empty `entities` or any `new_entities` on a
+# decision or a retrospective is a 400 BEFORE any write. An empty list is
+# accepted PERMANENTLY — the shipped client always sends one.
 
-@pytest.mark.asyncio
-async def test_a_decision_s_entities_are_gated_identically():
-    """A decision's `entities` never reaches the graph (it inherits from its
-    grounding facts there), but it DOES reach Postgres metadata — so it is in
-    scope for canonicalization exactly like a fact's, per
-    `_entity_ingress_error`'s docstring."""
-    c = _coord()
-    metadata = {"type": "decision", "entities": ["Kubernetes"]}
-    err = await c._entity_ingress_error(metadata, "claude")
+@pytest.mark.parametrize("kind", ["decision", "retrospective"])
+def test_judgement_entities_refusal_shape(kind):
+    """The refusal names the record type, the offending field and the ruling.
+
+    MUTATION CHECK: make `_judgement_entities_error` return None
+    unconditionally and `test_decision_refuses_entities` /
+    `test_retrospective_refuses_entities` below both fail."""
+    err = MemoryCoordinator._judgement_entities_error(
+        {"type": kind, "entities": ["Kubernetes"]})
     assert err is not None
-    assert err["error"] == "entity_unknown"
+    assert err["error"] == "entities_not_allowed_on_judgement"
+    assert "decision:1664" in err["message"]
+    assert kind in err["message"]
+
+
+@pytest.mark.parametrize("kind", ["decision", "retrospective"])
+def test_an_empty_entities_list_is_accepted_on_a_judgement(kind):
+    """Accepted PERMANENTLY, not for one release: `build_decision_metadata`
+    always emits `entities: []`, and present-and-empty asserts nothing."""
+    assert MemoryCoordinator._judgement_entities_error(
+        {"type": kind, "entities": []}) is None
+    assert MemoryCoordinator._judgement_entities_error({"type": kind}) is None
+
+
+@pytest.mark.parametrize("kind", ["decision", "retrospective"])
+def test_new_entities_alone_is_refused_on_a_judgement(kind):
+    """`new_entities` is the MINT request — the faucet this rule closes — so
+    it is refused even when `entities` itself is empty."""
+    err = MemoryCoordinator._judgement_entities_error(
+        {"type": kind, "entities": [], "new_entities": ["BrandNewThing"]})
+    assert err is not None
+    assert err["error"] == "entities_not_allowed_on_judgement"
 
 
 @pytest.mark.asyncio
-async def test_a_retrospective_shaped_metadata_is_gated_identically():
-    c = _coord(vocabulary={"k8s": "Kubernetes"})
-    metadata = {"type": "retrospective", "entities": ["k8s"]}
-    err = await c._entity_ingress_error(metadata, "claude")
-    assert err is None
-    assert metadata["entities"] == ["Kubernetes"]
+async def test_decision_refuses_entities():
+    """End-to-end: nothing reaches Postgres, nothing mints, no embedding."""
+    c, conn = _full_coord()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)) as embed:
+        req = _make_request({
+            "content": "We decided to add a consolidation daemon.",
+            "metadata": {
+                "source": "claude-code",
+                "type": "decision",
+                "entities": ["Kubernetes"],
+                "decision": {
+                    "decided_by": "Xenofon",
+                    "project": "shared_memory",
+                    "rationale": "because",
+                },
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 400
+    assert json.loads(resp.text)["error"] == "entities_not_allowed_on_judgement"
+    c._entity_vocab_mint.assert_not_called()
+    c._entity_vocab_resolve_many.assert_not_called()
+    embed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_decision_with_an_empty_entities_list_still_saves():
+    """The shipped client's shape must keep working, unchanged."""
+    c, conn = _full_coord()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "We decided to add a consolidation daemon.",
+            "metadata": {
+                "source": "claude-code",
+                "type": "decision",
+                "entities": [],
+                "decision": {
+                    "decided_by": "Xenofon",
+                    "project": "shared_memory",
+                    "rationale": "because",
+                },
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_a_judgement_outbox_row_carries_no_entities_key():
+    """E3: no store carries a judgement's entities — including the outbox row,
+    which used to send an always-empty list."""
+    c, conn = _full_coord()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "We decided to add a consolidation daemon.",
+            "metadata": {
+                "source": "claude-code",
+                "type": "decision",
+                "entities": [],
+                "decision": {
+                    "decided_by": "Xenofon",
+                    "project": "shared_memory",
+                    "rationale": "because",
+                },
+            },
+        })
+        assert (await c.handle_save(req)).status == 200
+    call = next(k for k in conn.execute.call_args_list
+                if "neo4j_outbox" in k.args[0])
+    assert "entities" not in call.args[2]
+
+
+@pytest.mark.asyncio
+async def test_retrospective_refuses_entities():
+    """The other judgement endpoint, which had the gate wired in directly.
+
+    MUTATION CHECK: put the `_entity_ingress_error` call back in
+    handle_retrospective in place of `_judgement_entities_error` and this
+    fails — the name is resolved, minted on request, and stored."""
+    c, conn = _full_coord()
+    conn.fetchval = AsyncMock(return_value=1)   # the target decision exists
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)) as embed:
+        req = _make_request({
+            "pg_id": 42,
+            "rating": "validated",
+            "notes": "measured the outcome",
+            "grounded_in": [7],
+            "entities": ["Kubernetes"],
+        })
+        resp = await c.handle_retrospective(req)
+    assert resp.status == 400
+    assert json.loads(resp.text)["error"] == "entities_not_allowed_on_judgement"
+    c._entity_vocab_mint.assert_not_called()
+    c._entity_vocab_resolve_many.assert_not_called()
+    embed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_retrospective_with_no_entities_still_saves():
+    """An unchanged client — which sends no `entities` at all — keeps working."""
+    c, conn = _full_coord()
+    conn.fetchval = AsyncMock(return_value=1)
+    conn.fetchrow = AsyncMock(
+        return_value={"id": 99, "type": "decision", "project": "shared_memory"})
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "pg_id": 42,
+            "rating": "validated",
+            "notes": "measured the outcome",
+            "grounded_in": [7],
+        })
+        resp = await c.handle_retrospective(req)
+    assert resp.status == 200
+    call = next(k for k in conn.execute.call_args_list
+                if "neo4j_outbox" in k.args[0])
+    assert "entities" not in call.args[2]
+
+
+@pytest.mark.asyncio
+async def test_a_fact_outbox_row_still_carries_its_entities():
+    """The counterpart: a FACT is exactly where entities still belong."""
+    c, conn = _full_coord(vocabulary={"Kubernetes": "Kubernetes"})
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "a fact about a known concept",
+            "metadata": {
+                "source": "claude-code",
+                "project": "shared_memory",
+                "entities": ["Kubernetes"],
+            },
+        })
+        assert (await c.handle_save(req)).status == 200
+    call = next(k for k in conn.execute.call_args_list
+                if "neo4j_outbox" in k.args[0])
+    assert call.args[2]["entities"] == ["Kubernetes"]
 
 
 # ── The refusal shape itself ──────────────────────────────────────────────────
@@ -884,14 +1060,20 @@ def _full_coord(vocabulary=None):
 @pytest.mark.asyncio
 async def test_invalid_entities_provenance_refuses_before_the_gate_ever_runs():
     """MUTATION CHECK: move the `entity_error = await
-    self._entity_ingress_error(...)` call in handle_save back to its
+    self._entity_commit_mints(...)` call in handle_save back to its
     pre-fix-round position (immediately after the `entities` list-type
     check, BEFORE the entities_provenance validation block) and this test
-    fails — `_entity_vocab_resolve_many`/`_entity_vocab_mint` get called
-    (and in this fixture, `_entity_vocab_mint` would succeed) before the
-    entities_provenance shape check ever has a chance to 400 the save,
-    reproducing S-4's exact defect: a mint surviving the refusal of the
-    save that requested it."""
+    fails — `_entity_vocab_mint` gets called (and in this fixture it would
+    succeed) before the entities_provenance shape check ever has a chance to
+    400 the save, reproducing S-4's exact defect: a mint surviving the
+    refusal of the save that requested it.
+
+    ⚠ NARROWED at v0.9.69 (item 8, re-ruled in the plan): the assertion is on
+    `_entity_vocab_mint`, not on `_entity_vocab_resolve_many`. S-4's defect is
+    the MINT — the write — surviving a refusal; this test's own docstring has
+    always named it as such. Resolution is a read, and it now deliberately
+    runs FIRST, before the project axis, so that an entity refusal fires
+    before `_register_project` writes a registry row (P4)."""
     c, conn = _full_coord()
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         req = _make_request({
@@ -908,7 +1090,6 @@ async def test_invalid_entities_provenance_refuses_before_the_gate_ever_runs():
         resp = await c.handle_save(req)
     assert resp.status == 400
     body = await resp.json() if hasattr(resp, "json") else None
-    c._entity_vocab_resolve_many.assert_not_called()
     c._entity_vocab_mint.assert_not_called()
 
 
@@ -1013,3 +1194,535 @@ async def test_new_entities_is_absent_from_the_metadata_actually_written():
     stored_metadata = conn.fetchrow.await_args.args[2]
     assert "new_entities" not in stored_metadata
     assert stored_metadata["entities"] == ["BrandNewThing"]
+
+
+# ── P4 (item 8, v0.9.69) — a REFUSED save writes no registry row ───────────
+
+@pytest.mark.asyncio
+async def test_refused_save_leaves_no_registry_rows():
+    """P4: no registry row and no mint is written by a save refused with 400.
+
+    The shape that used to break it: `new_project` declares a project (which
+    `_project_ingress_error` REGISTERS — that IS the acceptance) and the same
+    save names an entity the vocabulary does not know. The entity refusal
+    fired AFTER the project registration, so the save 400'd having already
+    created a project row no record ever named.
+
+    MUTATION CHECK: move the `_entity_ingress_validate` call in handle_save
+    back below `_project_ingress_error` and this test fails —
+    `_register_project` is awaited before the entity gate ever refuses.
+    """
+    c, conn = _full_coord()
+    c._project_registered = AsyncMock(return_value=False)
+    c._register_project = AsyncMock()
+    c._new_project_refusal = AsyncMock(return_value=None)
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)) as embed:
+        req = _make_request({
+            "content": "a fact declaring a new project and an unknown entity",
+            "metadata": {
+                "source": "claude-code",
+                "project": "BrandNewProject",
+                "new_project": True,
+                # NOT in new_entities — the vocabulary does not know it, so
+                # the gate must refuse rather than mint.
+                "entities": ["SomeUnknownConcept"],
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 400
+    body = json.loads(resp.text)
+    assert body["error"] == "entity_unknown"
+    c._register_project.assert_not_called()
+    c._entity_vocab_mint.assert_not_called()
+    embed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_new_project_save_with_known_entities_still_registers():
+    """The reorder must not have made registration unreachable: the same save
+    with an entity the vocabulary knows registers the project and succeeds."""
+    c, conn = _full_coord(vocabulary={"KnownConcept": "KnownConcept"})
+    c._project_registered = AsyncMock(return_value=False)
+    c._register_project = AsyncMock()
+    c._new_project_refusal = AsyncMock(return_value=None)
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "a fact declaring a new project with a known entity",
+            "metadata": {
+                "source": "claude-code",
+                "project": "BrandNewProject",
+                "new_project": True,
+                "entities": ["KnownConcept"],
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 200
+    c._register_project.assert_awaited_once()
+
+
+# ── E2 (item 2, v0.9.69) — RESERVED names are refused, never silently dropped ──
+#
+# Two halves, and they are refused for different reasons in different places:
+#
+#   (a) a SCHEMA WORD or an axis declaration — a pure form test
+#       (`ontology.reserved_entity_name_reason`), no registry needed
+#   (b) a REGISTERED PROJECT NAME — a registry question, compared on `axis_key`
+#
+# ⚠ (a) is deliberately NARROWER than "everything `sanitize_entity_name`
+# rejects": the SHAPE rejections (a leaked pg_id, a single character) stay
+# gate-exempt, which is invariant I3 above and its own documented rationale.
+
+def _coord_with_projects(names=(), vocabulary=None, neighbours=(), retired=None):
+    """`_coord()` plus the two registry-facing reads the gate now issues:
+
+      * the reserved-name query (item 2) — `names` are the LIVE registered
+        projects; `retired` maps a RETIRED spelling to the project it now
+        resolves to, modelling the alias half of the UNION
+      * the entity CONFUSABLE proposal query (item 1) — `neighbours` are the
+        vocabulary/alias spellings the trigram scan returns for any probe
+
+    ⚠ THE TWO HALVES ARE MODELLED SEPARATELY BECAUSE THE DATABASE HOLDS THEM
+    SEPARATELY. After `normalize_projects.py` a retired spelling has NO
+    `projects` row at all — it survives only in `aliases` — so a fixture that
+    put every spelling in one list would have made the review's R-2 defect
+    untestable by construction. Both rows come back keyed on `matched_key`
+    (the key that MATCHED) and `name` (the CANONICAL project), which is what
+    the UNION returns for either half.
+
+    The SQL itself is stubbed, as everything in this file is; the trigram
+    scoring and `axis_normalize()` are Postgres's job and are verified against
+    the live database separately (CLAUDE.md's "a green suite is not an
+    all-clear").
+    """
+    c = _coord(vocabulary=vocabulary)
+    live = [{"name": n, "matched_key": axis_key(n)} for n in names]
+    aliased = [{"name": canonical, "matched_key": axis_key(alias)}
+               for alias, canonical in (retired or {}).items()]
+
+    async def _fetch(sql, *args):
+        if "= ANY($1::text[])" in sql:
+            wanted = set(args[0])
+            # ⛔ EACH HALF ANSWERS ONLY IF THE QUERY ACTUALLY REACHES IT. The
+            # first spelling of this fixture matched on the PARAMETER alone and
+            # returned both populations for any query containing `= ANY(...)` —
+            # so deleting the entire alias half of the UNION left every retired
+            # -spelling test GREEN. A stub that answers a question the SQL did
+            # not ask is not a test of the SQL, it is a test of the stub
+            # (`fact:1321`: check the instrument before reporting the result).
+            out = []
+            if "p.normalized_key = ANY" in sql:
+                out += [r for r in live if r["matched_key"] in wanted]
+            if "project_aliases" in sql:
+                out += [r for r in aliased if r["matched_key"] in wanted]
+            return out
+        if "similarity(name, $1)" in sql:
+            probe = args[0]
+            return [{"name": n, "score": 0.9}
+                    for n in neighbours if n != probe]
+        return []
+
+    conn = MagicMock()
+    conn.fetch = AsyncMock(side_effect=_fetch)
+    pool = MagicMock()
+    pool.acquire = MagicMock(return_value=_AsyncCtx(conn))
+    c._pool = pool
+    return c
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["Decision", "decision", "Project", "Domain",
+                                  "MENTIONS", "grounded_in", "Component",
+                                  "TBD", "null"])
+async def test_save_refuses_schema_vocabulary_entity(name):
+    """E2(a): a schema word never becomes an :Entity — and the caller is TOLD,
+    rather than having the name accepted into Postgres and dropped on the way
+    to the graph.
+
+    MUTATION CHECK: remove the `reserved_entity_name_reason` sweep from
+    `_entity_ingress_validate` and every case here fails — the name sanitizes
+    to nothing, is therefore not a candidate, and the gate returns None."""
+    c = _coord_with_projects()
+    metadata = {"project": "p", "entities": [name]}
+    err, plan = await c._entity_ingress_validate(metadata)
+    assert err is not None
+    assert err["error"] == "entity_reserved"
+    assert err["reserved_entities"] == [name]
+    c._entity_vocab_mint.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_reserved_name_in_new_entities_is_refused_too():
+    """The mint request is swept as well — a schema word must not be mintable
+    by naming it in `new_entities`, and `entities` alone is not the whole
+    surface a caller can put a name on."""
+    c = _coord_with_projects()
+    err, _ = await c._entity_ingress_validate(
+        {"project": "p", "entities": ["Kubernetes"], "new_entities": ["Decision"]})
+    assert err is not None
+    assert err["error"] == "entity_reserved"
+    c._entity_vocab_mint.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["shared-memory-GitHub", "shared_memory_github",
+                                  "SHARED MEMORY GITHUB"])
+async def test_save_refuses_project_name_as_entity(name):
+    """E2(b): a registered project name is an AXIS, never an entity
+    (`fact:1215`) — and it passes `sanitize_entity_name` cleanly, which is
+    exactly why the rule kept being broken. Compared on `axis_key`, so every
+    spelling of the project is refused, not only the registered one.
+
+    MUTATION CHECK: remove the `_entity_reserved_project_error` call from
+    `_entity_ingress_validate` and all three cases fail — the name is
+    unregistered in the vocabulary, so the save is refused as `entity_unknown`
+    (and, with `new_entities`, would MINT the project name)."""
+    c = _coord_with_projects(names=["shared-memory-GitHub"])
+    err, _ = await c._entity_ingress_validate(
+        {"project": "p", "entities": [name]})
+    assert err is not None
+    assert err["error"] == "entity_reserved"
+    assert err["reserved_entities"] == [name]
+
+
+@pytest.mark.asyncio
+async def test_a_project_name_already_in_the_vocabulary_is_still_refused():
+    """The check runs BEFORE resolution on purpose: the legacy vocabulary DOES
+    carry project names, and resolving one would launder it straight back in."""
+    c = _coord_with_projects(names=["shared-memory-GitHub"],
+                             vocabulary={"shared-memory-GitHub": "shared-memory-GitHub"})
+    err, _ = await c._entity_ingress_validate(
+        {"project": "p", "entities": ["shared-memory-GitHub"]})
+    assert err is not None
+    assert err["error"] == "entity_reserved"
+
+
+@pytest.mark.asyncio
+async def test_the_parked_project_sentinel_is_reserved_without_a_registry_row():
+    """`general_discussion` is excluded from `projects` by a CHECK constraint,
+    so no registry query can ever answer for it — it is named explicitly."""
+    c = _coord_with_projects()
+    err, _ = await c._entity_ingress_validate(
+        {"project": "p", "entities": ["general_discussion"]})
+    assert err is not None
+    assert err["error"] == "entity_reserved"
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_entity_that_is_not_a_project_still_resolves():
+    """The reserved checks must not have made every save fail: a name that is
+    neither schema vocabulary nor a registered project passes untouched."""
+    c = _coord_with_projects(names=["shared-memory-GitHub"],
+                             vocabulary={"Kubernetes": "Kubernetes"})
+    metadata = {"project": "p", "entities": ["Kubernetes"]}
+    err, plan = await c._entity_ingress_validate(metadata)
+    assert err is None
+    assert plan["canonical"] == ["Kubernetes"]
+
+
+@pytest.mark.asyncio
+async def test_shape_noise_stays_gate_exempt_next_to_the_reserved_check():
+    """I3 is UNCHANGED by item 2 — a leaked pg_id is a SHAPE rejection, not a
+    reserved name, and refusing a whole save over one is the regression that
+    invariant exists to prevent."""
+    c = _coord_with_projects()
+    metadata = {"project": "p", "entities": ["254"]}
+    err, _ = await c._entity_ingress_validate(metadata)
+    assert err is None
+    assert metadata["entities"] == ["254"]
+
+
+# ── E1 (item 1, v0.9.69) — a MINT must not be a typo of a name already held ────
+#
+# `Games Workshops` minted straight beside `Games Workshop` with no warning
+# (`fact:1734` A(2)). The mint path had no equivalent of the project registry's
+# `_new_project_refusal`; this is that rule, on the same override.
+#
+# ⚠ THERE IS NO SPELLING-VARIANT TEST HERE, deliberately. A separator/case
+# variant cannot reach the mint at all: `ENTITY_VOCAB_RESOLVE_MANY_SQL` joins on
+# `entity_normalize()` (the SQL twin of `axis_key`), so a key-identical name is
+# already RESOLVED and never appears in `unknown`. A test for that branch would
+# be unkillable — no mutation of the confusable check could make it fail.
+
+@pytest.mark.asyncio
+async def test_entity_mint_confusable_needs_confirm():
+    """E1: a near-match to an existing canonical is held for confirmation.
+
+    MUTATION CHECK: remove the `_entity_confusable_error` call from
+    `_entity_ingress_validate` and this test fails — the mint goes through and
+    `Games Workshops` lands in the vocabulary beside `Games Workshop`."""
+    c = _coord_with_projects(neighbours=["Games Workshop"])
+    err, _ = await c._entity_ingress_validate({
+        "project": "p",
+        "entities": ["Games Workshops"],
+        "new_entities": ["Games Workshops"],
+    })
+    assert err is not None
+    assert err["error"] == "entity_confusable"
+    assert err["proposals"] == ["Games Workshop"]
+    assert "Games Workshop" in err["message"]
+    c._entity_vocab_mint.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_confirm_distinct_from_lets_the_mint_through():
+    """The override is a NAME, not a boolean: naming the neighbour cannot be
+    produced without having read it."""
+    c = _coord_with_projects(neighbours=["Games Workshop"])
+    metadata = {
+        "project": "p",
+        "entities": ["Games Workshops"],
+        "new_entities": ["Games Workshops"],
+        "confirm_distinct_from": ["Games Workshop"],
+    }
+    err, plan = await c._entity_ingress_validate(metadata)
+    assert err is None
+    assert plan["to_mint"] == ["Games Workshops"]
+    assert await c._entity_commit_mints(metadata, "claude", plan) is None
+    c._entity_vocab_mint.assert_awaited_once_with("Games Workshops", "claude")
+
+
+@pytest.mark.asyncio
+async def test_confirmation_is_compared_on_the_spelling_key():
+    """Confirming `Games Workshop` confirms `games-workshop` — the same
+    `unconfirmed_confusables` comparison the project axis uses."""
+    c = _coord_with_projects(neighbours=["games-workshop"])
+    err, _ = await c._entity_ingress_validate({
+        "project": "p",
+        "entities": ["Games Workshops"],
+        "new_entities": ["Games Workshops"],
+        "confirm_distinct_from": "Games Workshop",
+    })
+    assert err is None
+
+
+@pytest.mark.asyncio
+async def test_a_mint_with_no_near_neighbour_is_untouched():
+    """The check must not have made every mint fail: a name nothing is close
+    to mints exactly as before."""
+    c = _coord_with_projects(neighbours=[])
+    metadata = {
+        "project": "p",
+        "entities": ["BrandNewThing"],
+        "new_entities": ["BrandNewThing"],
+    }
+    err, plan = await c._entity_ingress_validate(metadata)
+    assert err is None
+    assert plan["to_mint"] == ["BrandNewThing"]
+
+
+@pytest.mark.asyncio
+async def test_the_confusable_check_never_runs_for_a_save_that_mints_nothing():
+    """A save naming only KNOWN entities mints nothing, so it must not pay for
+    a proposal query — and must never be refused by one."""
+    c = _coord_with_projects(neighbours=["Kubernetes Operator"],
+                             vocabulary={"Kubernetes": "Kubernetes"})
+    err, plan = await c._entity_ingress_validate(
+        {"project": "p", "entities": ["Kubernetes"]})
+    assert err is None
+    assert plan["to_mint"] == []
+
+
+# ── R-1 — the E3 gate normalises `type` the way the GRAPH does ────────────────
+#
+# Review finding (Opus, Required). The gate matched `metadata["type"]` EXACTLY
+# while `record_label_for_type` — which decides the record's graph label, and
+# therefore what the record IS everywhere downstream — lowercases and strips
+# first. `{"type": "Decision"}` was a :Decision to the graph and a plain fact to
+# the gate, so it carried entities past the refusal and MINTED them: the one
+# outcome item 3 exists to prevent, reachable by capitalising a letter.
+
+@pytest.mark.parametrize("kind", ["Decision", "decision ", " DECISION",
+                                  "Retrospective", "retrospective\t",
+                                  "RETROSPECTIVE"])
+def test_a_case_or_space_variant_type_is_still_a_judgement(kind):
+    """MUTATION CHECK: restore the exact match (`record_type in ("decision",
+    "retrospective")` in `is_judgement_type`) and every case here fails."""
+    assert is_judgement_type(kind) is True
+
+
+@pytest.mark.parametrize("kind", ["fact", None, "", "  ", 42, "summary",
+                                  "decisions", "predecision"])
+def test_a_non_judgement_type_is_not_dragged_in_by_the_normalisation(kind):
+    """The normalisation must not become a substring match: `decisions` and
+    `predecision` are not decisions, and an absent type is a fact."""
+    assert is_judgement_type(kind) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["Decision", "decision "])
+async def test_a_case_variant_decision_still_cannot_carry_entities(kind):
+    """End-to-end, through handle_save: the bypass is closed and nothing mints."""
+    c, conn = _full_coord()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)) as embed:
+        req = _make_request({
+            "content": "We decided to add a consolidation daemon.",
+            "metadata": {
+                "source": "claude-code",
+                "type": kind,
+                "entities": ["Kubernetes"],
+                "new_entities": ["Kubernetes"],
+                "decision": {"decided_by": "Xenofon", "project": "shared_memory",
+                             "rationale": "because"},
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 400
+    body = json.loads(resp.text)
+    assert body["error"] == "entities_not_allowed_on_judgement"
+    # The message names the NORMALISED kind, never the raw caller string.
+    assert "decision" in body["message"]
+    c._entity_vocab_mint.assert_not_called()
+    embed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_case_variant_judgement_outbox_row_still_carries_no_entities():
+    """The other two call sites the exact match reached — the outbox row and
+    the re-save conflict's judgement branch — normalise too."""
+    c, conn = _full_coord()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "We decided to add a consolidation daemon.",
+            "metadata": {
+                "source": "claude-code",
+                "type": "Decision",
+                "decision": {"decided_by": "Xenofon", "project": "shared_memory",
+                             "rationale": "because"},
+            },
+        })
+        assert (await c.handle_save(req)).status == 200
+    call = next(k for k in conn.execute.call_args_list
+                if "neo4j_outbox" in k.args[0])
+    assert "entities" not in call.args[2]
+
+
+@pytest.mark.asyncio
+async def test_a_judgement_save_never_persists_an_entities_key_it_was_not_sent():
+    """The nit, made an assertion: `setdefault` used to write `entities: []`
+    into the stored metadata of a judgement that never sent the field — the
+    STORAGE half of the rule item 3 enforces ("no entities in any store")."""
+    c, conn = _full_coord()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "We decided to add a consolidation daemon.",
+            "metadata": {
+                "source": "claude-code",
+                "type": "decision",
+                "decision": {"decided_by": "Xenofon", "project": "shared_memory",
+                             "rationale": "because"},
+            },
+        })
+        assert (await c.handle_save(req)).status == 200
+    stored_metadata = conn.fetchrow.await_args.args[2]
+    assert "entities" not in stored_metadata
+
+
+# ── R-2 — a RETIRED project spelling is reserved too ─────────────────────────
+#
+# Review finding (Opus, Required), correcting the plan's own v2 finding. The v2
+# finding said the comparison set is `projects.normalized_key` only, because
+# "retired spellings are rows in `projects` via `project_aliases`". They are
+# NOT: `normalize_projects.py` DELETES the `projects` row and leaves the old
+# string in `aliases`. So a registry-only check answered "not a project" for
+# precisely the spelling a machine still carrying the old folder name sends —
+# the likelier of the two mistakes, and the one `_new_project_refusal` already
+# sweeps the alias table for on its own path.
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spelling", ["Old-Name", "old_name", "OLD NAME"])
+async def test_a_retired_project_spelling_is_refused_as_an_entity(spelling):
+    """MUTATION CHECK: drop the `UNION ALL` alias half from
+    `ENTITY_RESERVED_PROJECT_SQL` (leaving the `projects` half) and every case
+    here fails — the name resolves to nothing in the vocabulary and the save is
+    refused as `entity_unknown`, or MINTS it when `new_entities` asks."""
+    c = _coord_with_projects(names=["new-name"], retired={"Old-Name": "new-name"})
+    err, _ = await c._entity_ingress_validate(
+        {"project": "somewhere-else", "entities": [spelling]})
+    assert err is not None
+    assert err["error"] == "entity_reserved"
+    assert err["reserved_entities"] == [spelling]
+    # It names the CANONICAL project, never the alias — an alias is not
+    # somewhere a record may be saved either.
+    assert "new-name" in err["message"]
+
+
+@pytest.mark.asyncio
+async def test_a_retired_spelling_cannot_be_minted_either():
+    c = _coord_with_projects(names=["new-name"], retired={"Old-Name": "new-name"})
+    err, _ = await c._entity_ingress_validate({
+        "project": "somewhere-else",
+        "entities": ["Old-Name"],
+        "new_entities": ["Old-Name"],
+    })
+    assert err is not None and err["error"] == "entity_reserved"
+    c._entity_vocab_mint.assert_not_called()
+
+
+# ── O-3 — the save's OWN project is reserved, before it is registered ────────
+
+@pytest.mark.asyncio
+async def test_a_new_project_cannot_also_be_this_save_s_entity():
+    """The ordering hole the review found. The reserved check runs BEFORE
+    `_project_ingress_error` — which is what REGISTERS a declared-new project —
+    so a registry lookup cannot answer for `--project Foo --new-project`. The
+    save's own resolved project is therefore checked directly.
+
+    It is the likeliest instance of the whole `fact:1215` violation, because
+    the operator has that name in mind twice on exactly this save.
+
+    MUTATION CHECK: remove the `own_key` block from
+    `_entity_reserved_project_error` and this test fails — `Foo` is not in the
+    registry yet, so nothing refuses it."""
+    c = _coord_with_projects(names=[])          # registry does not know it YET
+    err, _ = await c._entity_ingress_validate({
+        "project": "BrandNewProject",
+        "new_project": True,
+        "entities": ["brand_new_project"],     # same key, different spelling
+    })
+    assert err is not None
+    assert err["error"] == "entity_reserved"
+    assert "BrandNewProject" in err["message"]
+
+
+@pytest.mark.asyncio
+async def test_a_decision_s_own_project_is_read_from_the_decision_blob():
+    """`resolve_project` precedence, on this path too: a judgement carries its
+    project inside the blob. (A judgement cannot carry entities at all now —
+    this pins the resolution, which is shared with the fact path.)"""
+    c = _coord_with_projects(names=[])
+    err, _ = await c._entity_ingress_validate({
+        "decision": {"project": "BrandNewProject"},
+        "entities": ["Brand New Project"],
+    })
+    assert err is not None and err["error"] == "entity_reserved"
+
+
+@pytest.mark.asyncio
+async def test_an_entity_unrelated_to_this_save_s_project_still_passes():
+    """The check must not have made every save with a project fail."""
+    c = _coord_with_projects(names=[], vocabulary={"Kubernetes": "Kubernetes"})
+    err, plan = await c._entity_ingress_validate({
+        "project": "BrandNewProject",
+        "new_project": True,
+        "entities": ["Kubernetes"],
+    })
+    assert err is None
+    assert plan["canonical"] == ["Kubernetes"]
+
+
+def test_the_reserved_project_query_reaches_both_populations():
+    """A text-level guard beside the behavioural ones, because ALL SQL in this
+    file is stubbed: the live registry and the retired-spelling tables are two
+    different reads, and a stub can only prove the code CALLS them. That the
+    query is CORRECT is owed against the live database (CLAUDE.md)."""
+    sql = ENTITY_RESERVED_PROJECT_SQL
+    assert "FROM projects p" in sql
+    assert "p.normalized_key = ANY" in sql, "the live registry, by stored key"
+    assert "project_aliases" in sql and "JOIN aliases a" in sql, \
+        "a retired spelling has no projects row — it lives only in aliases"
+    # The key is computed by the DATABASE's own twin of axis_key, never by a
+    # second normalisation expression written here (`aliases` has no
+    # normalized_key column; migration 035 added one to projects only).
+    assert "axis_normalize(a.name)" in sql
+    # Both halves return the CANONICAL project name, never the alias string.
+    assert sql.count("p.name AS name") == 2

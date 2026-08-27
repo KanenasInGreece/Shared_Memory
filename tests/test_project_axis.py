@@ -343,12 +343,18 @@ class _Recorder:
         self.cypher = []
         self.sql = []
 
-    def coordinator(self, project_id=None):
+    def coordinator(self, project_id=11):
         """``project_id`` is what the registry lookup returns (migration 027).
 
-        Default None — the pre-027 shape, and also what a deployment whose
-        registry does not hold the name gets. Pass an int to exercise the
-        identified path.
+        ⚠ RE-RULED at v0.9.69 (item 6, ruled R3). The default used to be None —
+        "the pre-027 shape, and also what a deployment whose registry does not
+        hold the name gets" — and every case below inherited it. That answer no
+        longer exists on this path: `_project_identity` RAISES when the registry
+        has no row for a non-blank name, precisely so the outbox row retries and
+        then fails VISIBLY instead of minting a second, name-keyed :Project node
+        beside the identified one. The default is now an identity, which is what
+        every row this handler applies actually has; the cases here are about the
+        row's CYPHER SHAPE and never were about the fallback.
         """
         from coordinator import MemoryCoordinator
         c = MemoryCoordinator()
@@ -391,7 +397,7 @@ async def test_backfill_row_writes_only_the_project_edge():
     assert "MENTIONS" not in query
     assert "$entities" not in query
     assert "f.content" not in query
-    assert params == {"pg_id": 42, "project": "smg", "project_id": None}
+    assert params == {"pg_id": 42, "project": "smg", "project_id": 11}
 
 
 @pytest.mark.asyncio
