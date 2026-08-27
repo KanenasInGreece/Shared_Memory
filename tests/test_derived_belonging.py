@@ -161,3 +161,28 @@ def test_the_retired_entity_fixpoint_walk_is_gone():
     (`decision:1664`). It is replaced, not kept beside its successor."""
     import ontology
     assert not hasattr(ontology, "canonical_fixpoint_entity_cypher")
+
+
+# ── The payload key is a CLIENT-FACING contract, so the doc must name it ─────
+
+def test_both_skill_copies_name_the_belonging_key_the_coordinator_emits():
+    """A doc describing a contract IS the contract. The expansion payload gained
+    a key; a reader who is told "expansion returns its derived belonging" but
+    never told what the key is CALLED cannot find it. Pinned against the code's
+    own key rather than a literal, so a rename cannot pass by renaming the
+    string in one place."""
+    import coordinator
+    key, = coordinator.MemoryCoordinator._belonging_entry({"project": "p",
+                                                           "domains": []})
+    assert key == "belonging"
+    root = os.path.join(os.path.dirname(__file__), "..")
+    copies = [
+        os.path.join(root, "shared-memory", "SKILL.md"),
+        os.path.join(root, "shared-memory-skill", "shared-memory", "SKILL.md"),
+    ]
+    for path in copies:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        assert f"`{key}`" in text, f"{path} never names the {key!r} key"
+    assert open(copies[0], encoding="utf-8").read() == \
+        open(copies[1], encoding="utf-8").read(), "the two SKILL.md copies diverged"

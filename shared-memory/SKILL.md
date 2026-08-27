@@ -219,13 +219,15 @@ A **fact** asserts its own project and domain and mints its own entities.
 
 A **decision** asserts its own project and domain, and carries no entities of its own — a non-empty `entities` or any `new_entities` on a decision is refused (400 `entities_not_allowed_on_judgement`).
 
-**Naming no domain leaves a decision to inherit its grounding facts' sections as a DEFAULT, never a ceiling** — a decision routinely reaches further than the fact that prompted it (a fact observing how agents write to the graph is infrastructure; the decision on who may write is about access, and sits above it).
+**Naming no domain leaves a decision with NO section stored — nothing infers one for it** (`decision:1736`); a decision routinely reaches further than the fact that prompted it, so its evidence's sections were never safe to write as a default (a fact observing how agents write to the graph is infrastructure; the decision on who may write is about access, and sits above it).
 
 A **retrospective** asserts neither axis, and its own `entities`/`new_entities` are refused the same way as a decision's (400 `entities_not_allowed_on_judgement`).
 
 **In Postgres a retrospective's record carries no domain and no entities at all** (fact:1737) — nothing is stored on it for either axis to match, so it does not satisfy a `--domain` search filter on its own.
 
 **Its belonging is DERIVED, not stored, and Postgres is consulted first — the graph then enriches the answer.** Graph expansion returns the retrospective's project (the decision it judges) and its domains (the SET of that decision's own asserted sections and the sections of the facts reached through grounding relations that lie in the *same* project — a retrospective grounded on evidence from a different project inherits none of that project's sections).
+
+**Graph expansion carries that answer on ANY judgement hit, under the key `belonging` (`{project, domains}`)** — a decision that asserted no section gets one too; a fact never does, because its belonging is the axis values it stored.
 
 **A retrospective supplying a domain at save time is refused (400 `domain_not_allowed_on_judgement`)** — fix the section on the decision, and the graph-expanded answer follows.
 
