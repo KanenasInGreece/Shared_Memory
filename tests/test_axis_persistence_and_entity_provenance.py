@@ -189,7 +189,19 @@ async def test_a_decision_with_no_asserted_domain_gets_no_top_level_key():
 async def test_a_plain_fact_is_unaffected_by_decision_materialisation():
     """The materialisation branch is gated on type == 'decision' — a plain
     fact's own top-level `domain`/`domains` (already canonical) must pass
-    through completely untouched."""
+    through completely untouched.
+
+    ⚠ RE-RULED at v0.9.69 (O-3): the entity was `SharedMemory`, whose
+    `axis_key` is `sharedmemory` — IDENTICAL to this fixture's own project
+    `shared_memory`. The reserved-name check now refuses a save that names its
+    own project as an entity, so the fixture was asserting 200 on a record that
+    is a `fact:1215` violation. Renamed to a name that is a CONCEPT rather than
+    this record's axis; the domain-passthrough property under test is untouched.
+
+    ⚠ This is exactly the collision the plan's v2 findings predicted for
+    `SKILL.md:357`/`:484`, which ship `"SharedMemory"` as an example entity —
+    surfaced here by the suite rather than by a reader. Builder B owns those
+    lines."""
     c, mock_conn, _ = _coordinator_with_mocks()
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         req = _make_request({
@@ -198,7 +210,7 @@ async def test_a_plain_fact_is_unaffected_by_decision_materialisation():
                 "source": "claude-code",
                 "project": "shared_memory",
                 "domain": "architecture",
-                "entities": ["SharedMemory"],
+                "entities": ["OutboxPattern"],
             },
         })
         resp = await c.handle_save(req)
@@ -315,9 +327,27 @@ async def test_entities_provenance_overlong_key_yields_a_bounded_400_message():
     validation error into an amplification vector. `_short()` caps the repr
     of any interpolated value at 200 chars (plus an ellipsis marker).
 
+    RE-RULED at v0.9.69 (item 8, corrected by review finding R-5): the overlong
+    value is now carried by the provenance KEY alone, not by `entities` as
+    well. The entity gate's validation half — including its S-5
+    `ENTITY_NAME_MAX_LEN` cap — moved in front of the project axis and
+    therefore in front of this check, so a 5000-char string sitting in
+    `entities` is now refused as `entity_name_too_long` before provenance is
+    ever examined. The MEMBERSHIP branch exercised here is the interpolation
+    site that can still be handed an unbounded caller value — a key naming
+    something that is NOT in `entities` is under no length cap at all.
+
+    ⚠ THERE ARE TWO INTERPOLATION SITES AND THIS COVERS ONE. The first version
+    of this re-rule silently dropped coverage of the other (the VALUE branch),
+    because the single fixture it replaced happened to reach it. The companion
+    test below restores it. A refusal-message property is per SITE, not per
+    validator: `_short()` is applied by hand at each one, so each one has to be
+    pinned by hand too.
+
     MUTATION CHECK: replace `_short(name)` back with `name!r` at the
-    entities_provenance[...] interpolation site and this test's length
-    assertion fails — the message balloons to the full 5000-char key."""
+    `entities_provenance names ...` (MEMBERSHIP) interpolation site and this
+    test's length assertion fails — the message balloons to the full 5000-char
+    key."""
     c, mock_conn, _ = _coordinator_with_mocks()
     overlong = "X" * 5000
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)) as mock_embed:
@@ -326,8 +356,8 @@ async def test_entities_provenance_overlong_key_yields_a_bounded_400_message():
             "metadata": {
                 "source": "claude-code",
                 "project": "shared_memory",
-                "entities": [overlong],
-                "entities_provenance": {overlong: "guessed"},
+                "entities": ["OutboxPattern"],
+                "entities_provenance": {overlong: "operator"},
             },
         })
         resp = await c.handle_save(req)
@@ -337,6 +367,41 @@ async def test_entities_provenance_overlong_key_yields_a_bounded_400_message():
     # machine-readable classification.
     assert body["error"] == "entities_provenance_invalid"
     assert len(body["message"]) < 300
+    mock_embed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_entities_provenance_overlong_value_yields_a_bounded_400_message():
+    """SEC-03, the VALUE branch — restored by review finding R-5.
+
+    The other interpolation site: a well-formed key that IS in `entities`, with
+    a caller-supplied VALUE outside the closed enum. The value is echoed to say
+    what was rejected, and it is under no length cap of its own — `entities`
+    bounds the NAMES, nothing bounds the provenance values.
+
+    MUTATION CHECK: replace `_short(value)` back with `value!r` at the
+    `entities_provenance[...] = ...` interpolation site and this test's length
+    assertion fails, while the membership test above stays green — which is
+    exactly why both have to exist."""
+    c, mock_conn, _ = _coordinator_with_mocks()
+    overlong = "X" * 5000
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)) as mock_embed:
+        req = _make_request({
+            "content": "a fact",
+            "metadata": {
+                "source": "claude-code",
+                "project": "shared_memory",
+                "entities": ["OutboxPattern"],
+                # The key is valid and IS in entities — so the membership check
+                # passes and the ENUM check is what refuses.
+                "entities_provenance": {"OutboxPattern": overlong},
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 400
+    body = json.loads(resp.text)
+    assert body["error"] == "entities_provenance_invalid"
+    assert len(body["message"]) < 400
     mock_embed.assert_not_called()
 
 

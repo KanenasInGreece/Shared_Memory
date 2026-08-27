@@ -6,7 +6,7 @@ Coverage:
   - build_retrospective_payload: date defaults to ISO today when omitted
   - build_retrospective_payload: source defaults to AGENT_ID
   - build_retrospective_payload: grounded_in "pgid[:role]" grammar (same as save_decision)
-  - build_retrospective_payload: entities / source_ref / elicited passthrough
+  - build_retrospective_payload: source_ref / elicited passthrough; never sends entities
   - save_retrospective_artifact: client-side outcome-state enum rejection
   - save_retrospective CLI action: correct payload forwarded to /memory/retrospective
   - save_retrospective CLI action: missing required flag exits with non-zero status
@@ -99,16 +99,29 @@ def test_grounded_in_empty_omits_keys():
     assert "grounded_roles" not in payload
 
 
-def test_entities_source_ref_elicited_passthrough():
+def test_source_ref_elicited_passthrough():
     payload = mb.build_retrospective_payload(
         pg_id=1, rating="validated", notes="ok",
-        entities="OutboxPattern, coordinator",
         source_ref="tests/test_outbox_ledger.py",
         elicited=True,
     )
-    assert payload["entities"] == ["OutboxPattern", "coordinator"]
     assert payload["source_ref"] == "tests/test_outbox_ledger.py"
     assert payload["elicited"] is True
+
+
+def test_retrospective_never_sends_entities_or_new_entities():
+    """A retrospective names no entities of its own (decision:1664) — the
+    payload never carries the key at all, not even empty, and the function no
+    longer accepts one to send (v0.9.69)."""
+    payload = mb.build_retrospective_payload(
+        pg_id=1, rating="validated", notes="ok",
+    )
+    assert "entities" not in payload
+    assert "new_entities" not in payload
+    with pytest.raises(TypeError):
+        mb.build_retrospective_payload(
+            pg_id=1, rating="validated", notes="ok", entities="X",
+        )
 
 
 # ── client-side enum gate ─────────────────────────────────────────────────────
@@ -129,7 +142,7 @@ async def test_save_retrospective_cli_forwards_correct_payload(capsys):
     captured = {}
 
     async def mock_save(pg_id, rating, notes, date, source,
-                        grounded_in, entities, source_ref, elicited):
+                        grounded_in, source_ref, elicited):
         captured.update(pg_id=pg_id, rating=rating, notes=notes, date=date,
                         source=source, grounded_in=grounded_in,
                         source_ref=source_ref, elicited=elicited)
@@ -168,6 +181,24 @@ def test_save_retrospective_cli_missing_required_flag_exits():
             "memory_bridge.py", "save_retrospective",
             "--pg-id", "42",
             # missing --rating and --notes
+        ]
+        with pytest.raises(SystemExit) as exc_info:
+            import asyncio
+            asyncio.run(mb.main())
+    finally:
+        sys.argv = argv_backup
+    assert exc_info.value.code != 0
+
+
+def test_save_retrospective_cli_rejects_removed_entities_flag():
+    """--entities was removed from the argparse surface (v0.9.69) — a caller
+    still passing it must get argparse's own unknown-argument refusal."""
+    argv_backup = sys.argv
+    try:
+        sys.argv = [
+            "memory_bridge.py", "save_retrospective",
+            "--pg-id", "42", "--rating", "validated", "--notes", "ok",
+            "--grounded-in", "601", "--entities", "OutboxPattern",
         ]
         with pytest.raises(SystemExit) as exc_info:
             import asyncio

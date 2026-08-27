@@ -121,10 +121,19 @@ def test_two_real_projects_leave_the_record_parked():
 class FakeConn:
     """Minimal asyncpg-shaped connection. Records what was written."""
 
-    def __init__(self, current):
+    def __init__(self, current, project_id=11):
         self.current = current
         self.executed = []
         self.locked = False
+        # The registry identity behind a project name (migration 027). Added at
+        # v0.9.69 (item 6, ruled R3): this fixture never modelled the lookup at
+        # all, and `_project_identity` now RAISES rather than silently falling
+        # back to a name-keyed node when it cannot answer — so "no fetchval on
+        # the fake connection" became a failure instead of a shrug.
+        self.project_id = project_id
+
+    async def fetchval(self, sql, *args):
+        return self.project_id
 
     async def fetchrow(self, sql, *args):
         if "FOR UPDATE" in sql:

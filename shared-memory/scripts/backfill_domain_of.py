@@ -15,17 +15,15 @@ fact row would also re-run that row's ``MENTIONS`` merges and resurrect every
 enrichment edge a later sweep deliberately deleted. A repair must touch only what
 it repairs.
 
-TWO POPULATIONS, because two rules produce a record's sections:
+ONE POPULATION: records that ASSERT their own sections — resolved here with
+``domain_axis.resolve_domains``, the same function ingress uses, so the tool and
+the gateway can never disagree about what a record claims.
 
-* **Facts and decisions ASSERT their own** — resolved here with
-  ``domain_axis.resolve_domains``, the same function ingress uses, so the tool
-  and the gateway can never disagree about what a record claims.
-* **Judgements that assert none INHERIT** — a decision takes the sections of the
-  facts it grounds in, a retrospective takes its target decision's. Those rows
-  carry ``inherit: true`` and the worker re-runs the gateway's own inheritance
-  query, which declines on any record that named its own. The alternative —
-  computing the inherited set here — would be a second expression of the rule,
-  free to drift from the one the write path uses.
+⛔ THE INHERIT MODE IS GONE (``decision:1736``). It enqueued a second population
+— judgements that assert no section — for the worker to fill in from what they
+ground in. That wrote a record's belonging axis from an inference made after its
+first write, which is the class ``fact:1671`` forbids; a judgement's belonging is
+now DERIVED ON READ and never materialised. This tool repairs assertions only.
 
 ⚠⚠ **The gateway must already be running the code that HANDLES this row type.**
 An older worker does not recognise ``domain_of`` and falls through to its
@@ -73,16 +71,6 @@ CANDIDATE_SQL = """
       FROM technical_docs
      WHERE metadata ? 'domain' OR metadata ? 'domains'
         OR metadata->'decision' ? 'domain' OR metadata->'decision' ? 'domains'
-     ORDER BY id
-"""
-
-# A retrospective inherits from its target decision, so it needs a row exactly
-# when that decision ends up with one.
-RETRO_SQL = """
-    SELECT id, (metadata->>'target_pg_id')::bigint AS target
-      FROM technical_docs
-     WHERE metadata->>'type' = 'retrospective'
-       AND metadata->>'target_pg_id' IS NOT NULL
      ORDER BY id
 """
 
@@ -153,28 +141,26 @@ def already_queued(conn) -> set:
         return {r[0] for r in cur.fetchall()}
 
 
-def plan(rows, retro_rows, known, pending):
+def plan(rows, known, pending):
     """Split the corpus into what this tool will enqueue and what it will not.
 
     Pure — every judgement the tool makes is visible here and testable without a
     database.
 
-    Returns (explicit, inherit, unregistered, parked), where `explicit` is
-    [(pg_id, project, [domain, …])] and `inherit` is [(pg_id, anchor), …].
+    Returns (explicit, unregistered, parked), where `explicit` is
+    [(pg_id, project, [domain, …])].
 
-    ⛔ A RETROSPECTIVE IS NEVER GIVEN AN EXPLICIT ROW, however its metadata
-    reads. It does not control this axis — it inherits from the decision it
-    judges — and the gateway refuses one that tries at ingress. A record can
-    still CARRY the field: an older corpus predates the rule, and a bulk data
-    operation can set it without meaning to. Reading the value here anyway
-    would let this tool write, through the back door, exactly the edge the
-    front door refuses. Measured the hard way: one retrospective in this corpus
-    acquired a domain from a project-wide backfill and was enqueued as
-    self-asserting; it came out correct only because an inherit row happened to
-    be applied after it, which is ordering, not design.
+    ⛔ A RETROSPECTIVE IS NEVER GIVEN A ROW, however its metadata reads. It does
+    not control this axis — its belonging is derived on read from the decision
+    it judges — and the gateway refuses one that names a domain at ingress. A
+    record can still CARRY the field: an older corpus predates the rule, and a
+    bulk data operation can set it without meaning to. Reading the value here
+    anyway would let this tool write, through the back door, exactly the edge
+    the front door refuses. Measured the hard way: one retrospective in this
+    corpus acquired a domain from a project-wide backfill and was enqueued as
+    self-asserting.
     """
     explicit, unregistered, parked = [], [], []
-    have_domains = set()
     for pg_id, rtype, metadata in rows:
         if pg_id in pending or rtype == "retrospective":
             continue
@@ -193,13 +179,8 @@ def plan(rows, retro_rows, known, pending):
             unregistered.append((pg_id, project, missing))
         if good:
             explicit.append((pg_id, project, good))
-            have_domains.add(pg_id)
 
-    inherit = [
-        pg_id for pg_id, target in retro_rows
-        if target in have_domains and pg_id not in pending
-    ]
-    return explicit, inherit, unregistered, parked
+    return explicit, unregistered, parked
 
 
 def main() -> int:
@@ -215,13 +196,10 @@ def main() -> int:
         with conn.cursor() as cur:
             cur.execute(CANDIDATE_SQL)
             rows = cur.fetchall()
-            cur.execute(RETRO_SQL)
-            retro_rows = cur.fetchall()
         known = registry(conn)
         pending = already_queued(conn)
 
-        explicit, inherit, unregistered, parked = plan(
-            rows, retro_rows, known, pending)
+        explicit, unregistered, parked = plan(rows, known, pending)
 
         print(f"records naming a domain            : {len(rows)}")
         print(f"  already queued for repair        : {len(pending)}")
@@ -230,7 +208,6 @@ def main() -> int:
         for pg_id, project, missing in unregistered:
             print(f"      pg_id {pg_id}: {missing} not registered under {project!r}")
         print(f"  TO BACKFILL (asserted)           : {len(explicit)}")
-        print(f"  TO BACKFILL (retro, inherited)   : {len(inherit)}")
         by_domain: dict = {}
         for _pg, project, domains in explicit:
             for d in domains:
@@ -241,7 +218,7 @@ def main() -> int:
         if not args.apply:
             print("\nDry run — nothing enqueued. Re-run with --apply.")
             return 0
-        if not explicit and not inherit:
+        if not explicit:
             print("\nNothing to do.")
             return 0
 
@@ -266,17 +243,10 @@ def main() -> int:
                     (pg_id, json.dumps({"type": "domain_of", "project": project,
                                         "domains": domains})),
                 )
-            for pg_id in inherit:
-                cur.execute(
-                    "INSERT INTO neo4j_outbox (pg_id, cypher_params, status)"
-                    " VALUES (%s, %s, 'pending')",
-                    (pg_id, json.dumps({"type": "domain_of", "inherit": True,
-                                        "anchor": "Retrospective"})),
-                )
         conn.commit()
-        print(f"\nEnqueued {len(explicit)} asserted + {len(inherit)} inherited "
-              f"domain_of row(s). The gateway's outbox worker applies them; each "
-              f"row is deleted on success.")
+        print(f"\nEnqueued {len(explicit)} asserted domain_of row(s). The "
+              f"gateway's outbox worker applies them; each row is deleted on "
+              f"success.")
         return 0
     finally:
         conn.close()

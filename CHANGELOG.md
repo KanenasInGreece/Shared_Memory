@@ -5,6 +5,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.69] — 2026-08-27
+
+### Changed — entities get the axis protections; nothing moves after first write; belonging is read, never written
+
+The sweep after the 0.9.66–0.9.68 retirements (fact:1733, fact:1734) found the daemons clean and every retirement justified against its founding decision — and exposed seams the retired machinery used to paper over. This release closes them under three rulings: only facts carry entities (decision:1664); a record's project, domains and entities are fixed at its first write; and a judgement's belonging is derived by traversal on read, never materialised (decision:1736, retro:1738, fact:1737 — Postgres first, the graph is expansion).
+
+**Ingress (`/memory/save`, `/memory/retrospective`)**
+- A decision or retrospective that names any entity, or any `new_entities`, is refused (`400 entities_not_allowed_on_judgement`) before anything is written. An empty list is accepted. Both clients stop offering `--entities` on judgement saves; the MCP tools match.
+- An entity name that is schema vocabulary, an axis declaration, a registered project name or a retired spelling of one (by normalised key, including the alias tables), or the save's own newly declared project, is refused (`400 entity_reserved`) — a project is an axis a record is filed on, never a topic it mentions (fact:1215).
+- Minting a new entity that is trigram-near an existing canonical or alias needs `confirm_distinct_from` (`400 entity_confusable`, with proposals) — the same guard projects and domains already had. The similarity floor is inherited from the project guard and is unmeasured for the vocabulary; it is env-overridable.
+- Entity validation now runs to completion before any registry row or vocabulary mint is written, so a save refused with 400 by the entity gate leaves nothing behind. (A project registered by `new_project` can still precede a later domain refusal — pre-existing, recorded.)
+- Re-saving identical content (same hash) under a different project, domains or entities is refused (`409 axis_conflict`). Comparison is by normalised key on both sides and resolves a renamed project through its alias, so an identical re-save after a rename is still identical. A verbatim re-save keeps today's embedding/attribution refresh. Judgements compare project and domains only.
+- A project node is never minted from an error: the identity lookup raises on a failed lookup or a missing registry row; the outbox row retries and then shows `failed`; at ingress the save answers `503 registry_unavailable`; the search filter degrades and reports it. The former name-keyed fallback ("the write must never be lost") is withdrawn — under the ingress gate a missing identity is a defect to see, not to paper over.
+
+**Graph**
+- Nothing writes an inherited domain any more: the decision default-section pass, the retrospective copy of its decision's sections, and the retrospective-time re-run onto its decision are all gone, together with `backfill_domain_of.py`'s inherit mode. A record carries exactly the `DOMAIN_OF` edges the operator asserted on it. A pending legacy `inherit` outbox row is dropped with a log line rather than falling into the explicit branch (which would have deleted the record's asserted edges).
+- `derived_belonging_cypher` replaces the dead `canonical_fixpoint_entity_cypher`: a judgement's project is its decision's, its domains the set of sections asserted on it or its decision plus the sections of the non-superseded facts reached through every grounding relation, bounded to the same project node. Search's graph expansion now appends one non-edge `{"belonging": {"project", "domains"}}` entry to every decision and retrospective hit (one bounded query per search); judgement hits no longer carry `{rel_type: DOMAIN_OF}` context entries. Both halves are an expansion payload-shape change for the monitor. The axis filter itself is unchanged and Postgres-side: a retrospective carries no domain or entities in Postgres and does not match `--domain` on its own.
+- `/memory/graph`'s read-only guard matches write keywords on word boundaries. A doubled space after `SET` passed the old regex and was stopped only by Neo4j's read access mode (reproduced live; SECURITY.md corrected). The guard now has a table-driven test.
+
+**Operate**
+- `update_framework.sh` no longer applies the domain backfill by default; `--domain-backfill` opts in (`--no-domain-backfill` is accepted as a no-op for one release). `normalize_projects.py` previews by default and requires `--apply`.
+
+**Not in this release, recorded:** migration 039 (a trigram index for the confusable query) was dropped because a `similarity()` predicate with a floor cannot use it — the same holds for the indexes 022 and 028 ship; the retrospective's Postgres `project` copy stays (ruling owed); a domain *rename* still conflicts on re-save (a section alias resolves only inside a project identity, which now raises on a registry blip); SKILL.md's older `MENTIONS`-inheritance prose is residue for the docs sweep.
+
+---
+
 ## [0.9.68] — 2026-08-27
 
 ### Removed — the calibration layer for machine-proposed edges

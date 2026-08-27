@@ -255,7 +255,9 @@ def test_dry_run_no_upstream_predicts_refusal_and_stops_enumerating(tmp_path):
     # same real-refusal state test_no_upstream_configured_refuses_before_pull
     # covers for a REAL run.
 
-    proc = _run_live(repo, env, "--dry-run", "--skip-backup")
+    # --domain-backfill: opt the step IN so its absence below is proof of
+    # truncation, not just the v0.9.69 opt-in default masking it either way.
+    proc = _run_live(repo, env, "--dry-run", "--skip-backup", "--domain-backfill")
     out = _strip_ansi(proc.stdout + proc.stderr)
     log_text = log_path.read_text()
 
@@ -290,7 +292,9 @@ def test_dry_run_detached_head_predicts_refusal_and_stops_enumerating(tmp_path):
 
     subprocess.run(["git", "checkout", "-q", "--detach", "HEAD"], cwd=repo, check=True)
 
-    proc = _run_live(repo, env, "--dry-run", "--skip-backup")
+    # --domain-backfill: opt the step IN so its absence below is proof of
+    # truncation, not just the v0.9.69 opt-in default masking it either way.
+    proc = _run_live(repo, env, "--dry-run", "--skip-backup", "--domain-backfill")
     out = _strip_ansi(proc.stdout + proc.stderr)
 
     assert proc.returncode != 0, out
@@ -315,7 +319,9 @@ def test_dry_run_remote_branch_deleted_predicts_refusal_and_stops_enumerating(tm
     _push_upstream(repo, "fix/some-merged-feature-dry-run")
     _delete_branch_on_remote(remote, "fix/some-merged-feature-dry-run")
 
-    proc = _run_live(repo, env, "--dry-run", "--skip-backup")
+    # --domain-backfill: opt the step IN so its absence below is proof of
+    # truncation, not just the v0.9.69 opt-in default masking it either way.
+    proc = _run_live(repo, env, "--dry-run", "--skip-backup", "--domain-backfill")
     out = _strip_ansi(proc.stdout + proc.stderr)
 
     assert proc.returncode != 0, out
@@ -334,7 +340,10 @@ def test_dry_run_with_a_healthy_branch_still_enumerates_every_step(tmp_path):
     repo, log_path = _make_live_sandbox(tmp_path)
     env = _stub_path_env(tmp_path, log_path)
 
-    proc = _run_live(repo, env, "--dry-run", "--skip-backup")
+    # --domain-backfill: the step is opt-in as of v0.9.69 (O1) — without it,
+    # step 6 is legitimately SKIPPED and this test would prove nothing about
+    # enumeration reaching it.
+    proc = _run_live(repo, env, "--dry-run", "--skip-backup", "--domain-backfill")
     out = _strip_ansi(proc.stdout + proc.stderr)
 
     assert proc.returncode == 0, out

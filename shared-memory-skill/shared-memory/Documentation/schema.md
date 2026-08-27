@@ -401,10 +401,14 @@ legitimately be canonical in one project and an alias in another.
 **Who controls the axis.** A **fact** and a **decision** each assert their own
 project and domain. A **retrospective** asserts neither: both come from the
 decision it judges, and one that names a domain is refused (`400
-domain_not_allowed_on_judgement`). A decision that names no domain inherits its
-grounding facts' sections as a **default, never a ceiling** — a decision
-routinely reaches further than the fact that prompted it, so the operator can
-always name more.
+domain_not_allowed_on_judgement`). A decision that names no domain has **none
+stored** — nothing infers one (v0.9.69, decision:1736). On read, a judgement's
+belonging is DERIVED by traversal: its project from the decision it is or judges,
+its domains as the set of sections asserted on it or its decision plus the
+sections of the facts reached through its grounding relations, within the same
+project. Search's graph expansion returns that as a `belonging` entry. A decision
+routinely reaches further than the fact that prompted it, which is exactly why
+its own asserted sections are stored and its facts' are only ever derived.
 
 **The graph half is not automatic here either.** `:Domain` nodes and their edges
 are written by the outbox worker at first write; the historical population is
@@ -619,7 +623,7 @@ Written by the outbox worker for `type:decision` saves.
 | `WAS_ATTRIBUTED_TO` | `(:Decision)-[:WAS_ATTRIBUTED_TO]->(:Human)` | Who owns the decision |
 | `WAS_ASSISTED_BY` | `(:Decision)-[:WAS_ASSISTED_BY]->(:AIAgent)` | Which AI tool(s) assisted |
 | `PROJECT_OF` | `(:Fact\|:Decision)-[:PROJECT_OF]->(:Project)` | Which project the record belongs to. Written at first write from the record's resolved project — a `:Project` node is only ever minted from a **project**, never from a section of one. A record whose project does not resolve gets no edge and no node; it is left for the repair path rather than attached to an invented default. |
-| `DOMAIN_OF` | `(:Fact\|:Decision\|:Retrospective)-[:DOMAIN_OF]->(:Domain)-[:PROJECT_OF]->(:Project)` | Which SECTION(s) of its project the record sits in — multi-valued, unlike `PROJECT_OF`. Written at first write from a registry identity, never from a name. A **bare** edge is the record's own assertion; one stamped `asserted_by='inherited'` is a default derived from what the record judges, so a repair may replace an inherited edge and must never touch an asserted one. |
+| `DOMAIN_OF` | `(:Fact\|:Decision\|:Retrospective)-[:DOMAIN_OF]->(:Domain)-[:PROJECT_OF]->(:Project)` | Which SECTION(s) of its project the record sits in — multi-valued, unlike `PROJECT_OF`. Written at first write from a registry identity, never from a name. Every edge is the record's own assertion; nothing writes a derived (`inherited`) edge since v0.9.69 (decision:1736) — legacy stamped edges may remain until the ledgered one-time removal. The `explicit` repair row replaces the record's whole `DOMAIN_OF` set from its Postgres `domains`. |
 | `WAS_GENERATED_BY` | `(:Decision)-[:WAS_GENERATED_BY]->(:Activity)` | Which session produced it (reserved) |
 | `ACTED_ON_BEHALF_OF` | `(:AIAgent)-[:ACTED_ON_BEHALF_OF]->(:Human)` | Delegation chain (reserved) |
 | `SUPERSEDES` | `(:Decision)-[:SUPERSEDES]->(:Decision)` | Replaces a prior decision |

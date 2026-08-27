@@ -401,15 +401,31 @@ def project_merge_cypher(project_id, var: str = "p", name_param: str = "$project
     a display label. That is what makes a rename cost one property write on one
     node instead of a rewiring: the identity the edges hang off never moves.
 
-    WITHOUT one — the name is not in the registry, or this deployment has not
-    run the reconcile step yet — it falls back to keying on the name, exactly as
-    before this migration. That fallback is deliberate and it is NOT the gate's
-    fallback: the WRITE must never be lost, because a record with no project
-    edge violates the axis outright, while the READ side (the insight gate) must
-    fail closed. So an unidentified project still gets its edge, still searches,
-    still enriches — and simply does not count toward the two-project rule until
-    it has an identity. Losing the write instead would trade a synthesis risk
-    for data loss.
+    WITHOUT one, the node is keyed on the NAME. ⛔ THAT BRANCH IS NOW REACHED
+    BY EXACTLY ONE INPUT: a caller that has no project name to give at all
+    (``project_for_graph`` returns None for the parked-record SENTINEL, and the
+    outbox FOREACH is guarded). Nothing else may pass None here.
+
+    ⛔ SUPERSEDED RULE (v0.9.69, item 6, ruled R3). This docstring used to state
+    the fallback as a DESIGN RULE — *"the WRITE must never be lost"*: an
+    unidentified project still got its edge, keyed on its name, on the reasoning
+    that a record with no project edge violates the axis outright while the READ
+    side (the insight gate) fails closed, so losing the write would trade a
+    synthesis risk for data loss.
+
+    That rule is withdrawn, because its premise no longer holds. It was written
+    when an UNREGISTERED project name could still reach a save. Under the
+    ingress gate every project a save accepts is registered, so a missing
+    identity is no longer "a name nobody registered" — it is a data-integrity
+    defect or an unreadable registry, and in both cases keying on the name mints
+    a SECOND node for a project that already has one, which is the divergence
+    migration 027 exists to remove. ``coordinator._project_identity`` therefore
+    RAISES rather than returning None: the outbox row retries and then goes
+    `failed`, where the failure is VISIBLE, instead of being papered over with a
+    duplicate node nobody will notice.
+
+    See ``coordinator.ProjectIdentityUnavailable`` and the v0.9.69
+    post-first-write hardening plan (item 6) for the ruling and its callers.
     """
     if project_id is None:
         return f"MERGE ({var}:{ONT.project} {{name: {name_param}}})"

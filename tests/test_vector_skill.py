@@ -215,7 +215,6 @@ async def test_mcp_save_decision_success():
             source="qwen3-30b",
             assisted_by="claude-sonnet-4-6",
             confidence="high",
-            entities="asyncpg,PostgreSQL",
         )
 
     assert "pg_id=77" in result
@@ -225,7 +224,20 @@ async def test_mcp_save_decision_success():
     assert payload["metadata"]["type"] == "decision"
     assert payload["metadata"]["decision"]["decided_by"] == "Xenofon"
     assert payload["metadata"]["decision"]["confidence"] == "high"
-    assert "asyncpg" in payload["metadata"]["entities"]
+    # A decision names no entities of its own (decision:1664) — the MCP tool
+    # no longer accepts the parameter, and the metadata always carries [].
+    assert payload["metadata"]["entities"] == []
+
+
+@pytest.mark.asyncio
+async def test_mcp_save_decision_rejects_removed_entities_kwarg():
+    """`entities` was removed from the tool's parameter surface (v0.9.69) —
+    a caller still passing it must get a TypeError, never a silent no-op."""
+    with pytest.raises(TypeError):
+        await vector_skill.save_decision(
+            title="T", decided_by="X", project="P", rationale="R",
+            source="s", entities="asyncpg",
+        )
 
 
 @pytest.mark.asyncio

@@ -57,9 +57,10 @@ from log_hygiene import AsyncLineWriter, scrub_url_credentials
 from agent_roles import effective_role, read_only_agents
 from ontology import (
     ONT, sanitize_entity_names, sanitize_entity_name,
+    reserved_entity_name_reason,
     KNOWN_LABELS, KNOWN_RELATIONSHIPS, fact_kind_from_source_ref,
     GROUNDING_ROLES, GROUNDING_RELATIONS, default_grounding_role, RETRO_RATINGS,
-    record_label_for_type,
+    record_label_for_type, derived_belonging_cypher,
 )
 from project_axis import (
     PROJECT_SQL, PROJECT_EXISTS_SQL, PROJECT_ID_SQL, PROJECT_PROPOSALS_SQL,
@@ -150,7 +151,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.68"
+FRAMEWORK_VERSION = "0.9.69"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -713,6 +714,44 @@ def _supersession_target_error(pg_id: int, record_type: object) -> str | None:
 # spelling to accommodate.
 ENTITIES_PROVENANCE_VALUES = ("operator", "agent")
 
+# The two JUDGEMENT record types. Only FACTS carry entities (decision:1664,
+# ruled R1 at v0.9.69): a judgement reaches its topics by walking to the facts
+# it rests on, so an entity named on one is never written to the graph and only
+# adds an unvetted name to the vocabulary (`fact:970`).
+# ⛔ THERE IS NO `JUDGEMENT_TYPES` TUPLE OF RAW STRINGS, deliberately. One
+# existed for exactly one release and every use of it was a bug waiting to be
+# written: an exact `metadata["type"] in (...)` match against a CLIENT-SUPPLIED
+# string, beside a `record_label_for_type` that normalises. Removed so the only
+# way to ask the question is the predicate below.
+JUDGEMENT_LABELS = (ONT.decision, ONT.retrospective)
+
+
+def is_judgement_type(record_type: object) -> bool:
+    """Is this record type a JUDGEMENT? Pure.
+
+    ⛔ IT DELEGATES TO `record_label_for_type` AND HOLDS NO COPY OF THE RULE.
+    The E3 gate first spelled this as an EXACT `in ("decision", "retrospective")`
+    match — while `record_label_for_type` (which decides the record's
+    graph LABEL, and therefore what it actually IS everywhere downstream)
+    lowercases and strips first. So `{"type": "Decision"}` was a Decision to the
+    graph and a fact to the gate: it carried entities straight past the refusal
+    and minted them. A second normalisation is a second rule; there is now one,
+    in one place, and this asks it the question rather than re-deciding it.
+    """
+    return record_label_for_type(record_type) in JUDGEMENT_LABELS
+
+
+class ProjectIdentityUnavailable(RuntimeError):
+    """The project registry could not produce an identity for a name that has
+    one (item 6, v0.9.69; ruled R3).
+
+    Its own class rather than a bare RuntimeError because three surfaces answer
+    it differently and each must be able to say which one it is handling: an
+    outbox row RETRIES (then goes `failed`, visibly); an ingress turns it into
+    a 503 `registry_unavailable`; a READER degrades to "no identity" and
+    reports the degrade, never a 500.
+    """
+
 
 # ── Entity vocabulary ingress (fact:1375, migration 033) ──────────────────────
 #
@@ -774,6 +813,135 @@ ENTITY_VOCAB_RESOLVE_MANY_SQL = """
         ON alias_canon.id = a.entity_id
      GROUP BY i.raw_name, COALESCE(canon.name, alias_canon.name)
 """
+
+# ── Minting a NEW entity: the CONFUSABLE check (item 1, v0.9.69) ──────────────
+#
+# The mint path had no equivalent of `_new_project_refusal` / `_new_domain_refusal`:
+# `Games Workshops` minted straight beside `Games Workshop` with no warning
+# (`fact:1734` A(2)). This is the same rule those two enforce, on the same
+# override — the caller names the neighbour it means to differ from, because a
+# name cannot be produced without having read it, while a boolean can be flipped
+# without reading anything.
+#
+# ⚠ THERE IS NO SPELLING-VARIANT HALF HERE, and its absence is deliberate rather
+# than an omission. On the project axis a separator/case variant is refused
+# outright, uncconfirmable — but for entities that case cannot reach the mint at
+# all: `_entity_ingress_validate` resolves every candidate through
+# `ENTITY_VOCAB_RESOLVE_MANY_SQL`, which joins on `entity_normalize()` (the SQL
+# twin of `axis_key`), so a key-identical name is already RESOLVED to its
+# canonical and never appears in `unknown`. A spelling-variant guard here would
+# be code no input can reach — and a test for it would be unkillable.
+#
+# Names and aliases both, because a caller confusing its new name with a
+# spelling the operator has already curated is the same mistake as confusing it
+# with a canonical.
+#
+# ⚠ IT IS A SEQUENTIAL SCAN, AND NO INDEX WOULD CHANGE THAT. A trigram GIN
+# index answers `name % $1` and `name ILIKE '%…%'`; it cannot answer
+# `similarity(name, $1) >= $2`, which is an ordinary function call in the WHERE
+# clause, so the planner reads every row whatever indexes exist. A migration
+# adding `gin (name gin_trgm_ops)` for this query was written, reviewed and
+# DROPPED for exactly that reason — an index that is never used is not free:
+# it costs every INSERT, and its presence argues that the cost was measured.
+#
+# ⚠ THE COST IS UNMEASURED (`fact:1338`). What is known is the SIZE: 157 rows
+# in `entity_vocabulary` on this deployment today, plus the alias table, on a
+# path that only runs when a save actually MINTS. No timing has been taken. If
+# this ever needs to be fast, the change is to the PREDICATE — `name % $1`,
+# which a trigram index does serve, with `similarity()` kept only for ordering
+# — and it should be driven by a measurement, not by adding an index to the
+# query as it stands.
+#
+# ⚠ SAME SHAPE, SAME NON-USE, in `CONFUSABLE_SQL` (projects, migration 022) and
+# `DOMAIN_CONFUSABLE_SQL` (domains, 028), both of which ship a trigram index
+# their own predicate cannot use. Recorded for the operator; not changed here,
+# because dropping a shipped index is a migration on every install and this
+# build is not the place to decide it.
+ENTITY_CONFUSABLE_SQL = """
+    SELECT name, similarity(name, $1) AS score
+      FROM (
+            SELECT name FROM entity_vocabulary
+            UNION ALL
+            SELECT alias AS name FROM entity_vocab_aliases
+           ) v
+     WHERE similarity(name, $1) >= $2 AND name <> $1
+     ORDER BY similarity(name, $1) DESC, name
+     LIMIT $3
+"""
+
+# ⚠ UNMEASURED ON THIS VOCABULARY, and said plainly (`fact:1338`). The default
+# is CARRIED OVER from `PROJECT_CONFUSABLE_SIMILARITY`, whose 0.6 was derived
+# from a live registry — every pair of 37 registered projects, closest
+# legitimately distinct pair 0.500, realistic typos 0.78-1.00. No equivalent
+# pairwise sweep has been run over `entity_vocabulary`, whose names are longer
+# and more varied than project names, so this floor is a starting point that
+# INHERITS a measurement rather than one that has its own.
+#
+# The measurement that would settle it: score every pair of registered canonical
+# + alias spellings, and score a set of realistic typos of them, then place the
+# floor in the gap between the two populations — the same procedure the project
+# floor came from. Until that runs, the env override is the answer for an
+# install whose vocabulary this floor fits badly.
+ENTITY_CONFUSABLE_SIMILARITY = float(
+    os.environ.get("ENTITY_CONFUSABLE_SIMILARITY", "0.6")
+)
+ENTITY_PROPOSAL_LIMIT = _env_int("ENTITY_PROPOSAL_LIMIT", 5)
+
+
+# A project name is an AXIS, never an entity (`fact:1215`) — and the graph's own
+# gate does not catch it: `sanitize_entity_name` rejects `Project` (the schema
+# label) but passes `shared-memory-GitHub` cleanly, which is exactly why the rule
+# kept being broken and why the live graph carries `:Entity` nodes named after
+# registered projects (`fact:1734` A/C).
+#
+# ⚠ IT READS THE STORED KEY, for the reason `PROJECT_NAME_OR_KEY_SQL` documents:
+# migration 035 maintains `projects.normalized_key` with a trigger and a UNIQUE
+# constraint, so the key is the database's own materialised value on an indexed
+# column, and the Python side stays the single definition (`axis_key`).
+#
+# ⚠ THE COMPARISON SET IS `projects` ALONE. A retired spelling is not a separate
+# population to check — a rename writes the old spelling into `project_aliases`
+# AND keeps its row in `projects`, so the alias table adds nothing here. The one
+# name that is NOT in `projects` is the sentinel (a CHECK constraint keeps it
+# out), so it is named explicitly in `RESERVED_ENTITY_AXIS_KEYS` below.
+#
+# ANY() rather than one query per name: one round trip for the whole candidate
+# list, the same choice `ENTITY_VOCAB_RESOLVE_MANY_SQL` makes.
+# ⚠ TWO POPULATIONS, AND THE SECOND ONE IS THE LIKELIER MISTAKE. A live project
+# keeps a `projects` row with a trigger-maintained `normalized_key`. A RETIRED
+# spelling does not: `normalize_projects.py` deletes the `projects` row and
+# leaves the old string in `aliases`, joined through `project_aliases`. So a
+# registry-only check answers "not a project" for exactly the spelling a machine
+# still carrying the old folder name will send — which is the same reasoning
+# `_new_project_refusal` records for its own alias sweep.
+#
+# ⚠ THE ALIAS HALF COMPUTES ITS KEY, because `aliases` has no `normalized_key`
+# column (035 added one to `projects` and `project_domains` only). It calls the
+# database's own `axis_normalize()` — the SQL twin of `axis_key`, and the same
+# function 035's trigger uses — never a second normalisation expression.
+#
+# ⚠ BOTH HALVES RETURN THE CANONICAL PROJECT NAME, never the alias: an alias is
+# not somewhere a record may be saved, so pointing a refusal at one would name a
+# spelling the caller must not use either.
+ENTITY_RESERVED_PROJECT_SQL = (
+    "SELECT p.name AS name, p.normalized_key AS matched_key"
+    "  FROM projects p"
+    " WHERE p.normalized_key = ANY($1::text[])"
+    " UNION ALL"
+    " SELECT p.name AS name, axis_normalize(a.name) AS matched_key"
+    "  FROM project_aliases pa"
+    "  JOIN aliases a ON a.id = pa.alias_id"
+    "  JOIN projects p ON p.id = pa.project_id"
+    " WHERE pa.active AND axis_normalize(a.name) = ANY($1::text[])"
+)
+
+# Axis keys reserved against entity names that no `projects` row can carry.
+# `general_discussion` is the parked-record sentinel: it is a legitimate value on
+# the PROJECT axis and is excluded from the registry by a CHECK constraint, so a
+# registry query can never answer for it.
+RESERVED_ENTITY_AXIS_KEYS: dict[str, str] = {
+    axis_key(SENTINEL): SENTINEL,
+}
 
 # Env-overridable caps (S-5): a name/list-length bound is a correctness/DoS
 # property, not a performance tuning parameter (fact:1338 governs the
@@ -1784,11 +1952,13 @@ SEARCH_CANDIDATE_FLOOR = _env_int("SEARCH_CANDIDATE_FLOOR", 20)
 # empty result would then read as authoritative when it was really partial.
 SEARCH_DOMAINS_FILTER_CAP = _env_int("SEARCH_DOMAINS_FILTER_CAP", 16)
 
-# Stamp the domain-inheritance writer puts on a COPY of an edge some other
-# record already had, so an inherited naming is never mistaken for a first-write
-# one. Written by _inherit_domains (ON CREATE) and read back by the stale-edge
-# sweep that retires copies whose source moved.
-RELATION_ASSERTED_INHERITED = "inherited"
+# ⛔ RELATION_ASSERTED_INHERITED IS GONE (`decision:1736`). It stamped a COPY of
+# an edge some other record already had, so an inherited naming could be told
+# apart from a first-write one. Nothing writes such a copy any more — belonging
+# is derived on READ (`derived_belonging_cypher`) — so the stamp has no writer
+# and, with the inherit-mode outbox branch retired, no reader either. The
+# `'inherited'` edges already in the live graph are LEGACY DATA, retired by a
+# one-time ledgered operation, not by framework code.
 
 # Pool sizing is a SYSTEM budget, not just a coordinator knob: Postgres
 # max_connections must cover this pool + REM (1 conn) + NREM (per-op) + the
@@ -2024,11 +2194,21 @@ def _consolidation_rollup(by_type: dict, any_stalled: bool, started_at: dict,
 
 
 # Cypher write-operation guard — reject queries containing mutating keywords.
-# Defence-in-depth: blocks obvious destructive ops while a deeper Neo4j RBAC
-# solution is built. Regex is intentionally strict (SET followed by a space
-# avoids matching property names that contain "set" as a substring).
+# Defence-in-depth (second layer: the session opens with default_access_mode
+# ="READ"). Every keyword is matched on WORD BOUNDARIES, never on a following
+# whitespace character: `SET\s` let `SET  n:Label` (two spaces) through the
+# guard entirely, because the `\b` closing the alternation then had to hold
+# between two spaces. Live-reproduced bypass, fact:1734 (item 7 of the
+# v0.9.69 post-first-write hardening plan).
+#
+# `\bSET\b` does NOT match a property name that merely CONTAINS "set"
+# (`n.settings`, `n.asset`) — those are the cases the old comment feared and
+# they still pass. It DOES over-block a bare `n.set`, an `AS set` alias, and
+# any write keyword appearing inside a string literal; those are known,
+# accepted over-blocks (a read-only guard erring towards refusal), pinned as
+# such in tests/test_graph_route_guard.py.
 _WRITE_CYPHER = re.compile(
-    r"\b(CREATE|DELETE|DETACH\s+DELETE|SET\s|REMOVE|MERGE|CALL|LOAD\s+CSV|DROP)\b",
+    r"\b(CREATE|DELETE|DETACH\s+DELETE|SET|REMOVE|MERGE|CALL|LOAD\s+CSV|DROP)\b",
     re.IGNORECASE,
 )
 
@@ -3359,100 +3539,6 @@ class MemoryCoordinator:
             pg_id=pg_id, grounded=grounded,
         )
 
-    async def _inherit_domains(self, session, pg_id: int,
-                               anchor_label: str = None) -> int:
-        """A judgement's DEFAULT sections, when it asserted none of its own.
-        Returns the number of `DOMAIN_OF` edges written.
-
-        Where they come from differs by record, and each route mirrors how that
-        record already gets its PROJECT:
-
-          decision       the union of the sections of the FACTS it grounds in.
-          retrospective  the sections of the DECISION it judges — the same source
-                         its project comes from, so a verdict is always filed
-                         with what it judges.
-
-        ⛔ A GOOD DEFAULT IS NOT AN ENFORCED ONE, and for a decision that
-        distinction is the whole rule. A decision REACHES FURTHER THAN ITS
-        EVIDENCE: a fact observes that agents write to the graph directly — an
-        infrastructure observation — while the decision it provokes may govern
-        which agents are AUTHORISED to write, which is about tokens and access
-        and sits above the infrastructure that prompted it. Inheriting would cap
-        the decision at its evidence's sections, so the section that most needs
-        to surface it never would. So a decision that names its own sections
-        keeps them, and one that names none takes its evidence's — which is right
-        far more often than it is wrong, and is never a ceiling.
-
-        ⚠ THE GUARD IS THE `asserted_by` STAMP, which is why this is safe to
-        re-run from anywhere. A self-asserted edge is written bare at first
-        write; an inherited one is stamped. So "did this record name its own?"
-        is answerable from the graph, and inheritance simply declines when the
-        answer is yes. Without that test, re-running after a retrospective landed
-        would ADD the evidence's sections to a decision that deliberately chose
-        different ones — silently converting an assertion into a superset.
-
-        ⚠ A RETROSPECTIVE DELIBERATELY DOES NOT READ ITS OWN GROUNDING FACTS,
-        which would have been the obvious symmetry with the entity inheritance
-        beside it. Those facts are the LATER measurement and routinely sit in a
-        different section from the decision. Entities are ABOUTNESS and
-        legitimately come from the measurement; domain is BELONGING and comes
-        from what is being judged.
-
-        No timing defect at first write — a decision's grounding and a
-        retrospective's target both exist before the row that reads them. A
-        section added LATER does not propagate on its own;
-        `backfill_domain_of.py`'s inherit mode re-runs exactly this query, which
-        is why the rule lives here rather than in that tool.
-        """
-        anchor = anchor_label or ONT.retrospective
-        # "Names no section of its own" — a bare DOMAIN_OF is an assertion, a
-        # stamped one is a copy. Same convention the entity inheritance uses.
-        self_asserted = (
-            f" WHERE NOT EXISTS {{ MATCH (a)-[sm:{ONT.domain_of}]->()"
-            f" WHERE sm.asserted_by IS NULL }}"
-        )
-        if anchor == ONT.decision:
-            rels = "|".join(GROUNDING_RELATIONS)
-            cypher = (
-                f"MATCH (a:{ONT.decision} {{pg_id: $pg_id}})"
-                + self_asserted +
-                f" MATCH (a)-[:{rels}]->(t)"
-                f" MATCH (t)-[:{rels}*0..1]->(f:{ONT.fact})"
-                f" WHERE coalesce(f.superseded, false) = false"
-                f" MATCH (f)-[:{ONT.domain_of}]->(d:{ONT.domain})"
-                f" WITH a, collect(DISTINCT d) AS ds"
-                f" UNWIND ds AS d"
-                f" MERGE (a)-[m:{ONT.domain_of}]->(d)"
-                f"   ON CREATE SET m.asserted_by = '{RELATION_ASSERTED_INHERITED}'"
-                f" WITH count(d) AS n RETURN n"
-            )
-        else:
-            cypher = (
-                f"MATCH (a:{anchor} {{pg_id: $pg_id}})"
-                + self_asserted +
-                f" MATCH (a)<-[:{ONT.had_outcome}]-(o:{ONT.decision})"
-                f" MATCH (o)-[:{ONT.domain_of}]->(d:{ONT.domain})"
-                f" WITH a, collect(DISTINCT d) AS ds"
-                f" UNWIND ds AS d"
-                f" MERGE (a)-[m:{ONT.domain_of}]->(d)"
-                f"   ON CREATE SET m.asserted_by = '{RELATION_ASSERTED_INHERITED}'"
-                f" WITH count(d) AS n RETURN n"
-            )
-        try:
-            rec = await (await session.run(cypher, pg_id=pg_id)).single()
-        except Exception as exc:
-            # Never let the belonging axis take down the record write. The
-            # judgement, its project and its grounding are all already correct;
-            # a missing inherited section is repairable by the backfill tool,
-            # while a failed outbox row would retry the whole projection.
-            log.warning("%s pg_id=%d: domain inheritance failed, record is intact "
-                        "and the edge is repairable: %s", anchor, pg_id, exc)
-            return 0
-        n = (rec["n"] if rec else 0) or 0
-        if n:
-            log.debug("%s pg_id=%d inherited %d domain(s)", anchor, pg_id, n)
-        return n
-
     async def _apply_decision_outbox_row(
         self, outbox_id: int, pg_id: int, params: dict
     ) -> None:
@@ -3559,11 +3645,13 @@ class MemoryCoordinator:
                     f"   MERGE (d)-[:{ONT.grounded_in}]->(existing) )",
                     pg_id=pg_id, grounded_in=grounded_in_flat,
                 )
-            # Sections, AFTER grounding exists — and unconditionally, because the
-            # call guards itself: a decision that asserted its own sections above
-            # already carries a bare DOMAIN_OF edge and this declines. One that
-            # named none takes its evidence's sections as the default.
-            await self._inherit_domains(session, pg_id, ONT.decision)
+            # ⛔ NO INHERITED SECTIONS. A decision's DOMAIN_OF edges are exactly
+            # the ones the operator asserted on THIS record, written by the
+            # projection above; a decision that named none carries none
+            # (`decision:1736`). Its belonging is still ANSWERABLE — read side,
+            # by traversal (`derived_belonging_cypher`) — it is simply not
+            # materialised, because a value a reader can reach by walking is a
+            # value nothing should write twice (`decision:1032`).
         async with self._acquire() as conn:
             await conn.execute(
                 "UPDATE neo4j_outbox SET status='applied', applied_at=now() WHERE id=$1",
@@ -3631,21 +3719,16 @@ class MemoryCoordinator:
                 await self._write_typed_grounding(
                     session, ONT.retrospective, pg_id, params.get("grounded") or []
                 )
-                if target_pg_id is not None:
-                    # The decision's own default may also have become reachable:
-                    # a decision that asserted no section takes its evidence's,
-                    # and this is the moment that evidence can first exist (an
-                    # ungrounded decision reaches facts through its retrospective).
-                    # Declines on a decision that named its own.
-                    await self._inherit_domains(
-                        session, target_pg_id, ONT.decision
-                    )
-                # ⚠ THE RETROSPECTIVE'S SECTIONS COME LAST, and the order is the
-                # rule rather than tidiness: it reads the DECISION's edges, so
-                # running it before the line above would read them as they were
-                # before this same transaction completed them — and a verdict
-                # would inherit nothing while the decision it judges ends up filed.
-                await self._inherit_domains(session, pg_id, ONT.retrospective)
+                # ⛔ A RETROSPECTIVE'S SAVE WRITES NO DOMAIN_OF EDGE — neither
+                # onto the decision it judges nor onto itself (`decision:1736`).
+                # It used to do both: it re-ran the decision's inheritance
+                # (because a retrospective is the moment an ungrounded decision
+                # first reaches facts) and then took the decision's sections for
+                # itself. Both were POST-FIRST-WRITE MUTATIONS of somebody's
+                # belonging axis, inferred rather than asserted — the class
+                # `fact:1671` forbids. The verdict is reached from its decision
+                # and its facts on READ, and `derived_belonging_cypher` is where
+                # that answer now lives.
             else:
                 superseded_clause = " SET d.superseded = true" if reversal else ""
                 await session.run(
@@ -3786,51 +3869,50 @@ class MemoryCoordinator:
         self, outbox_id: int, pg_id: int, params: dict
     ) -> None:
         """Point an EXISTING record at its :Domain(s) — the narrow repair row
-        `backfill_domain_of.py` enqueues, in two modes.
+        `backfill_domain_of.py` enqueues.
 
-        `domains: [names]`  a FACT's sections, resolved through the registry the
-                            same way first write resolves them.
-        `inherit: true`     a JUDGEMENT's sections, re-derived by running the
-                            SAME `_inherit_domains` rule the write path runs.
+        `domains: [names]`  the record's OWN, ASSERTED sections, resolved through
+                            the registry the same way first write resolves them.
+                            The only mode there is.
 
-        ⚠ THE INHERIT MODE EXISTS SO THE RULE HAS ONE IMPLEMENTATION. The obvious
-        alternative was to let the backfill tool compute a judgement's domains
-        from Postgres — decision → grounding facts → sections — which is a second
-        expression of P17 that can drift from this one. A repair that re-derives
-        a rule is a repair that can disagree with the thing it repairs.
+        ⛔ THE `inherit: true` MODE IS GONE (`decision:1736`). It re-derived a
+        judgement's sections from what it grounds in and wrote them as edges
+        stamped `inherited` — a materialised copy of a value the reader can
+        reach by walking, and a mutation of a record's belonging axis after its
+        first write. Nothing derives belonging into an edge any more; the read
+        side answers it (`derived_belonging_cypher`).
+
+        ⚠ A LEGACY `inherit` ROW IS DROPPED, NOT FALLEN THROUGH. Rows enqueued
+        before this shipped may still be pending, and they carry no `domains`
+        key — so letting one reach the explicit branch below would DELETE every
+        DOMAIN_OF edge the record has and write nothing back. Recognising the
+        retired mode and dropping the row is the difference between a no-op and
+        silent data loss.
 
         Narrow, like `project_of` and for the same reason: replaying an ordinary
         fact row would re-run its `MENTIONS` merges and resurrect enrichment
         edges a later sweep deliberately deleted.
 
-        ⚠ IT REPLACES THE SET IT MANAGES, AND ONLY THAT SET — which is why the
-        two modes delete different things, and getting that wrong is not
-        cosmetic:
-
-          explicit  deletes EVERY DOMAIN_OF edge, then writes what Postgres
-                    says. The record's own assertion is the whole answer.
-          inherit   deletes only edges STAMPED `inherited` — never a bare one.
-
-        A bare edge is a SELF-ASSERTION. If inherit mode cleared those too it
-        would delete a decision's own sections and then re-derive its evidence's,
-        silently converting a deliberate choice into the default the operator
-        chose to override — and a decision reaches further than its evidence
-        precisely so that it CAN differ. Measured: one retrospective in this
-        corpus was enqueued in both modes, and the inherit row applied second
-        replaced its edge; that came out right only because a retrospective has
-        nothing to assert. On a decision the same sequence loses data.
-
-        That is the P19 lesson applied to a MULTI-valued axis: the rule is not
-        "exactly one edge", it is "the graph mirrors the current answer rather
-        than keeping every answer" — where the current answer is the assertion
-        when there is one, and the inheritance when there is not.
+        ⚠ IT REPLACES THE SET IT MANAGES: it deletes EVERY DOMAIN_OF edge, then
+        writes what Postgres says. The record's own assertion is the whole
+        answer — that is the P19 lesson on a MULTI-valued axis, "the graph
+        mirrors the current answer rather than keeping every answer".
 
         One-shot, DELETED on success: it carries no dream lifecycle and must
         never be counted as working-set backlog.
         """
-        inherit = bool(params.get("inherit"))
-        anchor = params.get("anchor") or ONT.decision
+        retired_inherit = bool(params.get("inherit"))
         written = 0
+        if retired_inherit:
+            # Retired mode — see the docstring. Drop the row without touching
+            # the graph; it asks for a write this system no longer performs.
+            async with self._acquire() as conn:
+                await conn.execute("DELETE FROM neo4j_outbox WHERE id=$1", outbox_id)
+            log.info(
+                "outbox: domain_of pg_id=%s carries the retired 'inherit' mode — "
+                "no graph write, row dropped (outbox_id=%d)", pg_id, outbox_id,
+            )
+            return
         async with self._neo4j.session() as session:
             # MATCH, never MERGE — a repair mints no records. A record whose node
             # is gone leaves the row dropped rather than conjuring a phantom.
@@ -3841,17 +3923,6 @@ class MemoryCoordinator:
             if not exists or not exists["n"]:
                 log.info("outbox: domain_of pg_id=%s has no spine node — row dropped",
                          pg_id)
-            elif inherit:
-                # Only what inheritance owns. A bare edge is the record's own
-                # assertion and outranks any default — see the docstring.
-                await session.run(
-                    f"MATCH (n:{self._SPINE}) WHERE n.pg_id = $pg_id"
-                    f" MATCH (n)-[stale:{ONT.domain_of}]->()"
-                    f" WHERE stale.asserted_by = $stamp"
-                    f" DELETE stale",
-                    pg_id=pg_id, stamp=RELATION_ASSERTED_INHERITED,
-                )
-                written = await self._inherit_domains(session, pg_id, anchor)
             else:
                 project_id = await self._project_identity(params.get("project"))
                 domain_ids = await self._domain_identities(
@@ -3877,9 +3948,8 @@ class MemoryCoordinator:
         async with self._acquire() as conn:
             await conn.execute("DELETE FROM neo4j_outbox WHERE id=$1", outbox_id)
         log.info(
-            "outbox: backfilled %s pg_id=%s edges=%d mode=%s (outbox_id=%d, row deleted)",
-            ONT.domain_of, pg_id, written, "inherit" if inherit else "explicit",
-            outbox_id,
+            "outbox: backfilled %s pg_id=%s edges=%d (outbox_id=%d, row deleted)",
+            ONT.domain_of, pg_id, written, outbox_id,
         )
 
     async def _wait_for_outbox(self, pg_id: int) -> bool:
@@ -4236,15 +4306,15 @@ class MemoryCoordinator:
                 ),
             }
 
+        # ⛔ STRICT SINCE v0.9.69 (item 6, ruled R3). This used to treat a None
+        # identity as "accept the record with its domain unvalidated and
+        # unlinked" — which turned an unreadable registry into a SILENTLY
+        # half-filed record: stored, searchable by text, and reachable from no
+        # axis. `_project_identity` now RAISES instead, and handle_save turns
+        # that into a 503 `registry_unavailable` — the same answer the hard
+        # embedding mandate gives when the other half of a save cannot be
+        # completed. A save that cannot be filed correctly is not saved.
         project_id = await self._project_identity(project)
-        if project_id is None:
-            # The project passed its own check, so this is not an unregistered
-            # name — it is a lookup that failed. Refusing the save would turn a
-            # transient database problem into a rejected record; accepting it
-            # keeps the value in Postgres, where the backfill can reach it.
-            log.warning("domain ingress: no identity for project %r — accepting the "
-                        "record with its domain unvalidated and unlinked", project)
-            return None
 
         for name in supplied:
             error = await self._domain_value_error(
@@ -4701,6 +4771,36 @@ class MemoryCoordinator:
         }
 
     @staticmethod
+    def _entity_reserved_rejection(name: str, reason: str, use: str = "") -> dict:
+        """The 400 body for a name that is RESERVED — a schema word, an axis
+        declaration, or a registered project name (item 2, v0.9.69;
+        `fact:1215`, `decision:1678` (4)).
+
+        ⛔ IT IS A REFUSAL, NOT A DROP, and the difference is the whole point.
+        Both halves of this rule were already enforced somewhere DOWNSTREAM —
+        the outbox→graph gate filters a schema word out, and a project name
+        simply never becomes a useful entity — so the name reached Postgres
+        verbatim and vanished on the way to the graph, silently, leaving a
+        record whose stored entities do not match its graph edges and an agent
+        that goes on sending the same name forever. The gate stays where it is
+        (belt); this is the brace, at the point where the caller can still be
+        told.
+        """
+        return {
+            "status": "error",
+            "error": "entity_reserved",
+            "message": (
+                f"entity {_short(name)} is {reason} and cannot be an entity. "
+                f"{use}"
+                "ASK THE OPERATOR which CONCEPT the record is actually about "
+                "and name that instead, or drop the name — an entity is a "
+                "topic the content is about, never a label from the schema and "
+                "never the axis the record is filed on."
+            ),
+            "reserved_entities": [name],
+        }
+
+    @staticmethod
     def _entities_list_too_long_rejection(field: str, length: int) -> dict:
         """The 400 body for an oversized `entities`/`new_entities` list
         (S-5, security review fact:1412) — a correctness/DoS bound on the
@@ -4772,63 +4872,356 @@ class MemoryCoordinator:
         if not resolved:
             return
 
-        def _canonical_of(raw: object) -> object:
-            if not isinstance(raw, str):
-                return raw
-            sanitized = sanitize_entity_name(raw)
-            if sanitized is None:
-                return raw
-            return resolved.get(sanitized, sanitized)
+        _canonical_of = MemoryCoordinator._canonical_entity_name
 
         entities = metadata.get("entities")
         if isinstance(entities, list):
-            metadata["entities"] = [_canonical_of(e) for e in entities]
+            metadata["entities"] = [_canonical_of(e, resolved) for e in entities]
         provenance = metadata.get("entities_provenance")
         if isinstance(provenance, dict):
             metadata["entities_provenance"] = {
-                _canonical_of(k): v for k, v in provenance.items()
+                _canonical_of(k, resolved): v for k, v in provenance.items()
             }
 
+    @staticmethod
+    def _canonical_entity_name(raw: object, resolved: dict[str, str]) -> object:
+        """One raw entity name → the spelling that will be STORED. Pure.
+
+        Extracted so the re-save axis-conflict check (item 4 of the v0.9.69
+        plan) can ask "what will this save's entities be?" BEFORE the mints
+        run, without a second, drifting copy of the mapping rule.
+        """
+        if not isinstance(raw, str):
+            return raw
+        sanitized = sanitize_entity_name(raw)
+        if sanitized is None:
+            return raw
+        return resolved.get(sanitized, sanitized)
+
+    @staticmethod
+    def _canonical_entity_list(metadata: dict, resolved: dict[str, str]) -> list:
+        """`metadata['entities']` as it will be stored, without storing it. Pure."""
+        entities = metadata.get("entities")
+        if not isinstance(entities, list):
+            return []
+        if not resolved:
+            return list(entities)
+        return [MemoryCoordinator._canonical_entity_name(e, resolved)
+                for e in entities]
+
     async def _entity_ingress_error(self, metadata: dict, agent_id: str) -> dict | None:
-        """The whole save-time entity ingress gate (fact:1375). Returns the
-        400 body, or None when the save may proceed — having already
-        rewritten `metadata['entities']` (+ `entities_provenance` keys) to the
-        CANONICAL spelling in place, the same "resolve once at ingress, store
-        the canonical" choice `_project_ingress_error`/`_domain_value_error`
-        make for their own axes (rule 3), and popped `metadata['new_entities']`
-        (S-8, security review fact:1412 — a transient mint REQUEST must not
-        persist as durable record content, visible to every future reader and
-        to REM's prompts).
+        """The two halves of the gate, composed — the shape every caller used
+        before v0.9.69 and the shape the gate's own unit tests still drive.
 
-        ⛔ S-4 CALL-SITE CONTRACT (security review fact:1412, ruled by
-        decision:1413): the caller MUST invoke this method LAST — after every
-        other 400-capable metadata validation on that endpoint
-        (entities_provenance shape/membership, supersedes/grounded_in/
-        existence checks, ...) — immediately before the hard-mandate
-        embedding call. A mint is a real write to `entity_vocabulary`, on its
-        own connection, sharing no transaction with the record insert; any
-        refusal that can still fire AFTER this method runs would leave a
-        minted canonical permanently attached to a record that never existed.
-        Calling it last eliminates every SUCH refusal from racing a mint.
+        ⚠ handle_save no longer calls THIS. It calls
+        `_entity_ingress_validate` early (before the project axis, so no
+        registry row is written by a save the entity rules will refuse) and
+        `_entity_commit_mints` late (where the gate has always been, so S-4's
+        "a mint is the last write before the embed" still holds). This wrapper
+        keeps the two halves' composition in ONE place, so a test that drives
+        the whole gate is testing what the endpoint does, not a second
+        arrangement of it.
+        """
+        refusal, plan = await self._entity_ingress_validate(metadata)
+        if refusal is not None:
+            return refusal
+        return await self._entity_commit_mints(metadata, agent_id, plan)
 
-        The ONE residual this does not close — a mint surviving the
-        hard-mandate embedding call's own 503, which necessarily runs AFTER
-        this method returns None — is ACCEPTED BY RULING (decision:1413),
-        not fixed transactionally: it mirrors the exposure
-        `_project_ingress_error`'s own `_register_project` call already
-        carries today (a project can likewise be registered by a save that
-        goes on to fail on embedding), so it is not a new class of risk this
-        leg introduces, and closing it would need a shared transaction
-        between the vocabulary write and the record insert that neither axis
-        has today.
+    async def _axis_conflict_error(
+        self, stored: object, project, domains, entities, is_judgement: bool,
+    ) -> dict | None:
+        """409 when re-saving identical CONTENT under DIFFERENT axes — or None
+        (P1, item 4 of the v0.9.69 plan). Pure.
+
+        ⛔ AFTER A RECORD'S FIRST WRITE, NOTHING IN THE SAVE PATH MOVES ITS
+        AXES. `ON CONFLICT (content_hash) DO UPDATE` replaces the metadata blob
+        WHOLESALE, so re-saving the same words under a different project or
+        domain silently relabelled the record — while the graph kept the edges
+        from the first write and gained the new ones, so the two stores stopped
+        agreeing (`fact:1734` C(a)). The explicit paths — supersede, and a
+        ledgered operator backfill (`fact:1255`) — remain the only ways an axis
+        moves.
+
+        ⚠ COMPARED THROUGH THE RESOLVERS, NEVER ON THE LITERAL KEYS.
+        `resolve_project`/`resolve_domains` read the `decision` blob first and
+        the top level second, and they accept a bare string where a list is
+        expected — so 152 legacy facts carrying a singular `domain` resolve to
+        exactly what a modern `domains` list resolves to, instead of
+        false-conflicting on the key name.
+
+        ⚠ A JUDGEMENT COMPARES PROJECT + DOMAINS ONLY. 194 legacy decisions
+        carry entities in Postgres; item 3 refuses new ones, so an unchanged
+        re-save of one of those must stay idempotent rather than becoming
+        permanently unsaveable over a field the record may no longer even send.
+
+        ⚠ COMPARED ON `axis_key`, NEVER ON THE LITERAL SPELLING. The stored
+        blob was written when the record was first saved and keeps whatever
+        spelling was canonical THEN; the incoming value has just been rewritten
+        to whatever is canonical NOW. Comparing the strings made every identical
+        re-save of every pre-rename record a 409 — a rename would have
+        retrospectively frozen the whole corpus that predates it. `Old_Name`
+        and `old-name` are one axis value here for the same reason they are one
+        project in the registry.
+
+        ⚠ AND A KEY DIFFERENCE IS NOT YET A CONFLICT. A rename to a genuinely
+        DIFFERENT name (`Old-Name` → `new-name`) changes the key, so the stored
+        spelling is resolved through the project alias table once — the same
+        one-hop resolution ingress does — before anything is refused. The lookup
+        is on the rare path only: identical keys never reach it.
+
+        Identity — same content AND same axes — is untouched: it still takes
+        the `DO UPDATE` path, which is what repairs a missing embedding.
+        """
+        stored = _coerce_jsonb_obj(stored)
+        if not isinstance(stored, dict):
+            return None
+
+        def _refusal(axis: str, existing, incoming) -> dict:
+            return {
+                "status": "error",
+                "error": "axis_conflict",
+                "message": (
+                    f"this content is already saved under {axis} "
+                    f"{_short(existing)}; this save names {_short(incoming)}. "
+                    "A record's axes are fixed at its FIRST write — a re-save "
+                    "never moves them, because the graph edges written the "
+                    "first time do not move with it. If the record genuinely "
+                    "belongs elsewhere, SUPERSEDE it with a new record that "
+                    "says so; if the axes were wrong, that is a deliberate "
+                    "operator backfill with its own ledger, never a side "
+                    "effect of a save. If you meant to save something new, "
+                    "the content has to differ."
+                ),
+                "axis": axis,
+                "existing": existing,
+                "incoming": incoming,
+            }
+
+        existing_project = resolve_project(stored)
+        if axis_key(existing_project) != axis_key(project):
+            # The keys differ — which is what a RENAME looks like from here.
+            # Resolve the stored spelling once (one hop, never a walk, A3)
+            # before calling it a conflict.
+            resolved_stored = (await self._resolve_project_alias(existing_project)
+                               if existing_project else None)
+            if resolved_stored is None or \
+                    axis_key(resolved_stored) != axis_key(project):
+                return _refusal("project", existing_project, project)
+
+        existing_domains = resolve_domains(stored)
+        # ⚠ DOMAINS ARE COMPARED BY KEY BUT NOT ALIAS-RESOLVED. A domain alias
+        # resolves only INSIDE a project identity, and looking one up here would
+        # put `_project_identity` — which now RAISES on a registry blip — on the
+        # re-save path, turning a transient database problem into a refused
+        # save. So a section RENAME (a genuinely different name, not a
+        # respelling) still conflicts on re-save until that is designed; it is
+        # recorded as a known gap rather than closed with a call that can fail.
+        if {axis_key(d) for d in existing_domains} != \
+                {axis_key(d) for d in (domains or [])}:
+            return _refusal("domains", existing_domains, list(domains or []))
+
+        if is_judgement:
+            return None
+
+        existing_entities = stored.get("entities")
+        existing_entities = (existing_entities
+                             if isinstance(existing_entities, list) else [])
+        incoming = [e for e in (entities or []) if isinstance(e, str)]
+        if {e for e in existing_entities if isinstance(e, str)} != set(incoming):
+            return _refusal("entities", existing_entities, incoming)
+        return None
+
+    @staticmethod
+    def _judgement_entities_error(metadata: dict) -> dict | None:
+        """400 when a DECISION or RETROSPECTIVE carries entities — or None
+        (item 3, v0.9.69; ruled R1, grounded on `decision:1664`).
+
+        ONLY FACTS CARRY ENTITIES. A judgement reaches its topics by walking to
+        the facts it rests on, which is why its `entities` never became a
+        MENTIONS edge in the first place — but the value was still validated,
+        still MINTABLE through `new_entities`, and still returned by search,
+        which made the judgement path a second, unvetted faucet into the
+        vocabulary (`fact:970`, `fact:1734` A(3)).
+
+        An EMPTY list is accepted PERMANENTLY, not for one release: the shipped
+        client's `build_decision_metadata` always emits `entities: []`, and a
+        field that is present-and-empty asserts nothing.
+
+        Refuses BEFORE any write — nothing reaches Postgres, nothing mints.
+        """
+        entities = metadata.get("entities")
+        new_entities = metadata.get("new_entities")
+        offending = "entities" if entities else None
+        if offending is None and new_entities:
+            offending = "new_entities"
+        if offending is None:
+            return None
+        kind = record_label_for_type(metadata.get("type")).lower()
+        return {
+            "status": "error",
+            "error": "entities_not_allowed_on_judgement",
+            "message": (
+                f"a {kind} may not carry {offending} (decision:1664). Only "
+                "FACTS name entities: a judgement reaches its topics by "
+                "walking to the facts it is grounded in, so an entity named "
+                "here is never written to the graph and only adds an unvetted "
+                "name to the vocabulary. Save the concept on the FACT that "
+                "evidences it, and cite that fact in grounded_in. An empty "
+                "entities list is accepted and means the same thing as "
+                "omitting it."
+            ),
+        }
+
+    async def _entity_confusable_error(
+        self, to_mint: list[str], metadata: dict,
+    ) -> dict | None:
+        """400 when a name about to be MINTED is confusable with one the
+        vocabulary already holds and the caller has not confirmed it is
+        distinct — or None (E1, item 1 of the v0.9.69 plan).
+
+        Mirrors `_new_project_refusal`'s confusable half exactly, including the
+        override: `metadata.confirm_distinct_from` names the existing spellings
+        this new name is deliberately different from, compared on the spelling
+        key so confirming `Games Workshop` confirms `games-workshop`.
+
+        ONE query per name to mint. That is the same shape
+        `_new_project_refusal` uses, and `new_entities` is a short list by
+        construction (every name in it must also appear in `entities`, which is
+        capped at `ENTITY_LIST_MAX_LEN`) — a mint is already the rare path.
+        """
+        for name in to_mint:
+            async with self._acquire() as conn:
+                rows = await conn.fetch(
+                    ENTITY_CONFUSABLE_SQL, name,
+                    ENTITY_CONFUSABLE_SIMILARITY, ENTITY_PROPOSAL_LIMIT)
+            near = [r["name"] for r in rows]
+            if not near:
+                continue
+            unconfirmed = unconfirmed_confusables(
+                near, metadata.get("confirm_distinct_from"))
+            if not unconfirmed:
+                continue
+            log.info("entity vocabulary: %r held for confirmation against %s",
+                     name, unconfirmed)
+            return {
+                "status": "error",
+                "error": "entity_confusable",
+                "message": (
+                    f"entity {_short(name)} is close enough to a name the "
+                    f"vocabulary already holds to be a typo for it: "
+                    f"{unconfirmed}. ASK THE OPERATOR whether this is genuinely "
+                    "a separate concept. If it is, re-send with "
+                    "metadata.confirm_distinct_from listing the names above; if "
+                    "it is not, save under the existing name. Minting a variant "
+                    "is how one concept quietly becomes two."
+                ),
+                "proposals": near,
+            }
+        return None
+
+    async def _entity_reserved_project_error(
+        self, candidates: list[str], metadata: dict | None = None,
+    ) -> dict | None:
+        """400 when one of these entity names IS a project — or None.
+
+        ONE round trip for the whole list. Three populations, in ascending cost:
+
+          1. the parked-project SENTINEL — no query at all, because a CHECK
+             constraint keeps it out of `projects` so no query could answer
+          2. THIS SAVE'S OWN project — also no query, and it is the one case a
+             registry lookup CANNOT answer. This check runs before
+             `_project_ingress_error`, which is what REGISTERS a declared-new
+             project; so `--project Foo --new-project` with `entities: ["Foo"]`
+             asks the registry about a name that is not in it yet, gets "not a
+             project", and files the record's own axis as its own topic — the
+             exact `fact:1215` violation, on the one save where it is most
+             likely, because the operator has that name in mind twice.
+             Resolved through `resolve_project` + `axis_key`, so it costs
+             nothing and needs no ordering change.
+          3. every registered project and every RETIRED spelling of one — the
+             one query (see `ENTITY_RESERVED_PROJECT_SQL`)
+        """
+        keys = {axis_key(n): n for n in candidates if axis_key(n)}
+        if not keys:
+            return None
+        for key, registered_as in RESERVED_ENTITY_AXIS_KEYS.items():
+            if key in keys:
+                log.info("entity ingress: refused %r — the parked-project "
+                         "sentinel %r", keys[key], registered_as)
+                return self._entity_reserved_rejection(
+                    keys[key],
+                    f"the parked-project sentinel {_short(registered_as)}",
+                    "It is a value on the PROJECT axis, carried by the "
+                    "record's own project field. ",
+                )
+        own = resolve_project(metadata) if metadata is not None else None
+        own_key = axis_key(own)
+        if own_key and own_key in keys:
+            log.info("entity ingress: refused %r — it is THIS record's own "
+                     "project %r", keys[own_key], own)
+            return self._entity_reserved_rejection(
+                keys[own_key],
+                f"this record's own project {_short(own)}",
+                "The record is already filed under it; naming it as an entity "
+                "too files the axis as its own topic. ",
+            )
+        async with self._acquire() as conn:
+            rows = await conn.fetch(ENTITY_RESERVED_PROJECT_SQL, sorted(keys))
+        for row in rows:
+            name = keys.get(row["matched_key"])
+            if name is None:
+                continue
+            log.info("entity ingress: refused %r — a spelling of the "
+                     "registered project %r", name, row["name"])
+            return self._entity_reserved_rejection(
+                name,
+                f"the registered project {_short(row['name'])}",
+                "A project is an AXIS a record is filed on, carried by its "
+                "own project field and by the PROJECT_OF edge; naming it as "
+                "an entity as well makes the axis a hub that records cluster "
+                "on. ",
+            )
+        return None
+
+    async def _entity_ingress_validate(
+        self, metadata: dict,
+    ) -> tuple[dict | None, dict]:
+        """The VALIDATION half of the save-time entity ingress gate — every
+        refusal it can produce, and NOT ONE WRITE (item 8 of the v0.9.69
+        post-first-write hardening plan; `fact:1734` A(4)).
+
+        Returns `(refusal_body_or_None, plan)`. `plan` is what
+        `_entity_commit_mints` needs to finish the job:
+
+          ``resolved``   {sanitized candidate: canonical} for every name the
+                         vocabulary already knows
+          ``to_mint``    the sanitized candidates `new_entities` asked to mint,
+                         in candidate order — nothing is minted yet
+          ``canonical``  the entity list AS IT WILL BE STORED, computed without
+                         writing anything (a to-mint name canonicalizes to
+                         itself except in the mint race `_entity_vocab_mint`
+                         arbitrates). The re-save axis-conflict check reads
+                         this, because it must run BEFORE the mints it is
+                         protecting.
+
+        ⛔ WHY IT MOVED IN FRONT OF THE PROJECT AXIS. `_project_ingress_error`
+        REGISTERS a project as its acceptance, and the entity rules could still
+        400 the save afterwards — so a refused save left a registry row behind
+        with no record that named it. Validating here means every entity
+        refusal fires before the first registry write; the mint itself stays
+        last (see `_entity_commit_mints`).
+
+        Returns `(None, plan)` with an empty plan for the ordinary case — no
+        entities at all (`fact:1215`: entities stay optional and never gate
+        anything).
 
         Runs on BOTH writers of caller-supplied entity names: handle_save
         (facts and decisions share this generic path — a decision's `entities`
         stays Tier-1-only and is never minted into the graph, but it DOES
         reach Postgres metadata, so it is in scope for canonicalization) and
         handle_retrospective (its own endpoint, its own `entities` field).
-        Retrospectives also never mint into the graph (`_inherit_domains`/the
-        v2 outbox row writes no MENTIONS edge for them either), but the same
+        Retrospectives also never mint into the graph (their v2 outbox row
+        writes no MENTIONS edge and no DOMAIN_OF edge), but the same
         Tier-1-reaches-metadata reasoning applies.
 
         ⛔ ENTITIES STAY OPTIONAL (fact:1215) — an empty/absent list returns
@@ -4872,16 +5265,51 @@ class MemoryCoordinator:
         its counterpart in `entities` correctly rather than silently failing
         to match.
         """
+        # ⚠ RETURNED ONLY BESIDE A REFUSAL, where the caller never reads it. A
+        # SUCCESS path must build its own `canonical` — see the no-candidates
+        # return below for what happens when it does not.
+        empty_plan: dict = {"resolved": {}, "to_mint": [], "canonical": []}
+
         raw_entities = metadata.get("entities") or []
         if len(raw_entities) > ENTITY_LIST_MAX_LEN:
-            return self._entities_list_too_long_rejection("entities", len(raw_entities))
+            return (self._entities_list_too_long_rejection(
+                "entities", len(raw_entities)), empty_plan)
         for e in raw_entities:
             if isinstance(e, str) and len(e) > ENTITY_NAME_MAX_LEN:
-                return self._entity_name_too_long_rejection(e)
+                return self._entity_name_too_long_rejection(e), empty_plan
+
+        # RESERVED VOCABULARY (item 2a, v0.9.69) — a schema word or an axis
+        # declaration, on the RAW names, because `sanitize_entity_name` rejects
+        # exactly these and they would otherwise never become candidates: the
+        # name would reach Postgres verbatim and be dropped at the graph, which
+        # is the silence this refusal replaces. `new_entities` is swept too, so
+        # a reserved name is refused whether or not it is also a mint request.
+        # ⚠ `new_entities` has not had its SHAPE validated yet (that check needs
+        # `candidates`, below) — so only sweep it when it is already a list.
+        # A malformed one still gets its own `new_entities_invalid` refusal.
+        declared_new = metadata.get("new_entities")
+        swept = list(raw_entities) + (
+            list(declared_new) if isinstance(declared_new, list) else [])
+        for e in swept:
+            reason = reserved_entity_name_reason(e)
+            if reason is not None:
+                log.info("entity ingress: refused %r — %s", e, reason)
+                return self._entity_reserved_rejection(e, reason), empty_plan
 
         candidates = sanitize_entity_names(raw_entities)
         if not candidates:
-            return None
+            # ⛔ THE PLAN STILL HAS TO SAY WHAT WILL BE STORED. This returned
+            # `empty_plan`, whose `canonical` is hard-coded `[]` — but a record
+            # whose entities are ALL shape-noise (`["254"]`, I3's gate-exempt
+            # class) stores those names VERBATIM. The re-save axis check then
+            # compared a stored `["254"]` against an incoming `[]` and refused
+            # every re-save of that record with a 409, permanently, over an
+            # axis that never moved. `_canonical_entity_list(metadata, {})` is
+            # the same answer `_rewrite_entities` produces for an empty
+            # `resolved` — it leaves the list exactly as it is — so the two
+            # cannot disagree.
+            return None, {"resolved": {}, "to_mint": [],
+                          "canonical": self._canonical_entity_list(metadata, {})}
         candidates_set = set(candidates)
 
         new_entities_raw = metadata.get("new_entities")
@@ -4894,13 +5322,13 @@ class MemoryCoordinator:
                     "status": "error",
                     "error": "new_entities_invalid",
                     "message": "metadata.new_entities must be a list of strings.",
-                }
+                }, empty_plan
             if len(new_entities_raw) > ENTITY_LIST_MAX_LEN:
-                return self._entities_list_too_long_rejection(
-                    "new_entities", len(new_entities_raw))
+                return (self._entities_list_too_long_rejection(
+                    "new_entities", len(new_entities_raw)), empty_plan)
             for n in new_entities_raw:
                 if len(n) > ENTITY_NAME_MAX_LEN:
-                    return self._entity_name_too_long_rejection(n)
+                    return self._entity_name_too_long_rejection(n), empty_plan
 
             # S-10: enforce the subset claim the refusal message makes,
             # matched in sanitized-candidate space (see docstring).
@@ -4916,35 +5344,106 @@ class MemoryCoordinator:
                             "new_entities must also be named in entities — add "
                             "it there, or remove it from new_entities."
                         ),
-                    }
+                    }, empty_plan
                 mint_requested.add(sanitized)
+
+        # A PROJECT NAME IS AN AXIS, NEVER AN ENTITY (item 2b, v0.9.69;
+        # `fact:1215`). Compared on `axis_key`, so `Shared_Memory`,
+        # `shared-memory` and `SHARED MEMORY` are one answer — the same key the
+        # registry itself is unique on. It runs BEFORE resolution deliberately:
+        # a name that is a project must be refused whether or not the
+        # vocabulary already knows it, because the legacy vocabulary DOES carry
+        # such names and resolving one would launder it back in.
+        reserved = await self._entity_reserved_project_error(candidates, metadata)
+        if reserved is not None:
+            return reserved, empty_plan
 
         resolved = await self._entity_vocab_resolve_many(candidates)
         unknown = [n for n in candidates if n not in resolved]
+        to_mint: list[str] = []
 
         if unknown:
             to_mint = [n for n in unknown if n in mint_requested]
             still_unknown = [n for n in unknown if n not in mint_requested]
             if still_unknown:
-                return self._entity_unknown_rejection(still_unknown)
-            for name in to_mint:
-                canonical = await self._entity_vocab_mint(name, agent_id)
-                if canonical is None:
-                    return {
-                        "status": "error",
-                        "error": "new_entities_invalid",
-                        "message": (
-                            f"new_entities name {_short(name)} cannot be minted "
-                            "as a canonical entity — it normalizes to nothing "
-                            "(every character is punctuation, whitespace, or "
-                            "similar), so there is no spelling left to "
-                            "register. Name it with at least one letter or "
-                            "digit, or drop it from new_entities."
-                        ),
-                    }
-                resolved[name] = canonical
-                log.info("entity vocabulary: %r minted as canonical %r by %s "
-                         "(new_entities)", name, canonical, agent_id)
+                return self._entity_unknown_rejection(still_unknown), empty_plan
+
+            # E1 — a name about to be minted must not be a typo of one the
+            # vocabulary already holds. Last of the validations, because it is
+            # the only one that needs to know WHICH names will be minted.
+            confusable = await self._entity_confusable_error(to_mint, metadata)
+            if confusable is not None:
+                return confusable, empty_plan
+
+        plan = {
+            "resolved": resolved,
+            "to_mint": to_mint,
+            # A name about to be minted canonicalizes to ITSELF — the one
+            # exception is the mint race `_entity_vocab_mint` arbitrates, which
+            # can only substitute an equivalent spelling of the same key.
+            "canonical": self._canonical_entity_list(
+                metadata, resolved | {n: n for n in to_mint}),
+        }
+        return None, plan
+
+    async def _entity_commit_mints(
+        self, metadata: dict, agent_id: str, plan: dict,
+    ) -> dict | None:
+        """The WRITING half of the entity gate: mint what `new_entities` asked
+        for, then rewrite `metadata['entities']` (+ `entities_provenance` keys)
+        to the CANONICAL spelling in place — the same "resolve once at ingress,
+        store the canonical" choice `_project_ingress_error`/
+        `_domain_value_error` make for their own axes (rule 3) — and pop
+        `metadata['new_entities']` (S-8, security review fact:1412: a transient
+        mint REQUEST must not persist as durable record content, visible to
+        every future reader and to REM's prompts).
+
+        Returns the 400 body, or None when the save may proceed. The only
+        refusal left on this side is the one that needs the database's own
+        answer: a name Postgres itself refuses to mint.
+
+        ⛔ S-4 CALL-SITE CONTRACT (security review fact:1412, ruled by
+        decision:1413): the caller MUST invoke this method LAST — after every
+        other 400-capable metadata validation on that endpoint
+        (entities_provenance shape/membership, supersedes/grounded_in/
+        existence checks, the re-save axis-conflict check, ...) — immediately
+        before the hard-mandate embedding call. A mint is a real write to
+        `entity_vocabulary`, on its own connection, sharing no transaction with
+        the record insert; any refusal that can still fire AFTER this method
+        runs would leave a minted canonical permanently attached to a record
+        that never existed. Calling it last eliminates every SUCH refusal from
+        racing a mint.
+
+        The ONE residual this does not close — a mint surviving the
+        hard-mandate embedding call's own 503, which necessarily runs AFTER
+        this method returns None — is ACCEPTED BY RULING (decision:1413),
+        not fixed transactionally: it mirrors the exposure
+        `_project_ingress_error`'s own `_register_project` call already
+        carries today (a project can likewise be registered by a save that
+        goes on to fail on embedding), so it is not a new class of risk this
+        leg introduces, and closing it would need a shared transaction
+        between the vocabulary write and the record insert that neither axis
+        has today.
+        """
+        resolved = dict(plan.get("resolved") or {})
+        for name in (plan.get("to_mint") or []):
+            canonical = await self._entity_vocab_mint(name, agent_id)
+            if canonical is None:
+                return {
+                    "status": "error",
+                    "error": "new_entities_invalid",
+                    "message": (
+                        f"new_entities name {_short(name)} cannot be minted "
+                        "as a canonical entity — it normalizes to nothing "
+                        "(every character is punctuation, whitespace, or "
+                        "similar), so there is no spelling left to "
+                        "register. Name it with at least one letter or "
+                        "digit, or drop it from new_entities."
+                    ),
+                }
+            resolved[name] = canonical
+            log.info("entity vocabulary: %r minted as canonical %r by %s "
+                     "(new_entities)", name, canonical, agent_id)
 
         self._rewrite_entities(metadata, resolved)
         metadata.pop("new_entities", None)
@@ -4956,28 +5455,61 @@ class MemoryCoordinator:
             return await conn.fetchval(PROJECT_EXISTS_SQL, name) is not None
 
     async def _project_identity(self, project) -> int | None:
-        """The registry id behind a project name, or None (migration 027).
+        """The registry id behind a project name (migration 027). RAISES when
+        it cannot produce one for a name that HAS one to produce.
 
         Deliberately UNCACHED. The registry is tens of rows and this is one
         indexed lookup on a path that is already writing to two stores; a cache
         would buy nothing measurable and would hold a stale answer across
         exactly the operation the identity exists to survive — a rename.
 
-        None means "no identity to key on", from any cause: an unregistered
-        name, or a lookup that failed. Both take the write down the same
-        name-keyed fallback rather than losing the edge — see
-        ``project_merge_cypher``. A failure here must never turn a save into a
-        500, because the record and its project are both already valid.
+        ⛔ STRICT SINCE v0.9.69 (item 6, ruled R3). It used to return None from
+        ANY cause — an unregistered name or a failed lookup alike — and every
+        caller then wrote a node keyed on the NAME instead
+        (``project_merge_cypher(None)``). That rule made sense while an
+        unregistered project name could still reach a save. It cannot any more:
+        the ingress gate registers every project it accepts, so a missing row
+        is no longer "a name nobody registered" — it is a DATA-INTEGRITY DEFECT,
+        and the name-keyed fallback silently mints a SECOND node for a project
+        that already has one, which is precisely the divergence migration 027
+        exists to remove.
+
+        So both failures now raise :class:`ProjectIdentityUnavailable`:
+
+          * the lookup itself failed (the registry is unreadable)
+          * the lookup succeeded and there is NO ROW for a non-blank name
+
+        and each caller answers for its own surface: an outbox row RETRIES and
+        then goes `failed`, where it is visible; ingress turns it into a 503
+        `registry_unavailable`, consistent with the hard embedding mandate; a
+        READER degrades to "no identity" and says so, never a 500.
+
+        ``None`` survives for exactly one input — a blank or absent name. That
+        is the parked-record sentinel path (``project_for_graph`` returns None
+        for the sentinel), and it is the only remaining caller of
+        ``project_merge_cypher``'s name-keyed branch.
+
+        ⛔ This SUPERSEDES the rule stated in ``project_merge_cypher``'s own
+        docstring ("the WRITE must never be lost"); that docstring has been
+        rewritten rather than edited around.
         """
         if not isinstance(project, str) or not project.strip():
             return None
+        name = project.strip()
         try:
             async with self._acquire() as conn:
-                return await conn.fetchval(PROJECT_ID_SQL, project.strip())
+                project_id = await conn.fetchval(PROJECT_ID_SQL, name)
         except Exception as exc:
-            log.warning("project identity lookup failed for %r, writing the "
-                        "project node keyed on its name: %s", project, exc)
-            return None
+            log.error("project identity lookup FAILED for %r: %s", name, exc)
+            raise ProjectIdentityUnavailable(
+                f"the project registry could not be read for {name!r}") from exc
+        if project_id is None:
+            log.error("project identity: no registry row for %r — every project "
+                      "a save accepts is registered, so this is a data-integrity "
+                      "defect, not an unknown name", name)
+            raise ProjectIdentityUnavailable(
+                f"no registry identity for project {name!r}")
+        return project_id
 
     async def _resolve_project_alias(self, name: str) -> str | None:
         """The canonical project a retired spelling resolves to, or None.
@@ -5293,6 +5825,41 @@ class MemoryCoordinator:
         # actually landed — the same reasoning that put `entities_rewritten` on
         # this response.
         axis_report: dict = {}
+
+        # ⛔ ENTITY VALIDATION RUNS FIRST — BEFORE THE PROJECT AXIS, and the
+        # position is the rule (item 8, v0.9.69; `fact:1734` A(4)).
+        # `_project_ingress_error` REGISTERS a declared-new project as its
+        # acceptance, and every entity refusal below could still 400 the save
+        # afterwards — so a save refused for an unknown entity used to leave a
+        # project registered that no record ever named. Validation writes
+        # NOTHING; the mint it plans is committed further down, still last
+        # (S-4, decision:1413).
+        entities_field = metadata.get("entities", [])
+        if not isinstance(entities_field, list):
+            return web.json_response(
+                {"status": "error", "message": "metadata.entities must be a list"},
+                status=400,
+            )
+        # ⛔ ONLY FACTS CARRY ENTITIES (item 3, v0.9.69; ruled R1 on
+        # decision:1664). A judgement naming any is refused here — before the
+        # gate, before the axes, before any write — and never reaches the
+        # vocabulary at all. An empty list is accepted permanently.
+        if is_judgement_type(metadata.get("type")):
+            judgement_error = self._judgement_entities_error(metadata)
+            if judgement_error is not None:
+                return web.json_response(judgement_error, status=400)
+            # ⛔ NOTHING IS ADDED TO `metadata` HERE. An earlier spelling called
+            # `setdefault("entities", [])`, which PERSISTED a key the caller
+            # never sent — the storage half of the very rule this gate enforces
+            # ("a judgement carries no entities in any store"). Every reader
+            # below already defaults it: `metadata.get("entities", [])` feeds
+            # the locks loop, and the outbox row omits the key outright.
+            entity_plan: dict = {"resolved": {}, "to_mint": [], "canonical": []}
+        else:
+            entity_refusal, entity_plan = await self._entity_ingress_validate(metadata)
+            if entity_refusal is not None:
+                return web.json_response(entity_refusal, status=400)
+
         project_error = await self._project_ingress_error(
             metadata, agent_id, axis_report)
         if project_error is not None:
@@ -5303,8 +5870,32 @@ class MemoryCoordinator:
         # canonical, so an aliased project reaches the right registry. A record
         # naming no domain passes straight through: most do, and that is correct
         # rather than untagged.
-        domain_error = await self._domain_ingress_error(
-            metadata, agent_id, axis_report)
+        #
+        # ⛔ 503, NOT 500 AND NOT A SILENT ACCEPT (item 6, ruled R3). The domain
+        # axis resolves through the project's registry IDENTITY, so an
+        # unreadable registry means this record cannot be FILED — and a record
+        # that saves without its axes is invisible to every reader who navigates
+        # by them. Same answer as the hard embedding mandate, and the same
+        # reason: half a save is not a save.
+        try:
+            domain_error = await self._domain_ingress_error(
+                metadata, agent_id, axis_report)
+        except ProjectIdentityUnavailable as exc:
+            log.error("save refused: %s", exc)
+            return web.json_response(
+                {
+                    "status": "error",
+                    "error": "registry_unavailable",
+                    "message": (
+                        "the project registry could not be read, so this "
+                        "record's axes cannot be resolved and it would be "
+                        "saved unfiled. Nothing was written. Retry; if it "
+                        "persists, the gateway's database is the thing to "
+                        "look at, not this save."
+                    ),
+                },
+                status=503,
+            )
         if domain_error is not None:
             return web.json_response(domain_error, status=400)
 
@@ -5375,12 +5966,9 @@ class MemoryCoordinator:
             if bad:
                 return web.json_response({"status": "error", "message": bad}, status=400)
 
+        # Shape already validated (and the ENTITY GATE'S VALIDATION HALF
+        # already run) above, before the project axis.
         entities = metadata.get("entities", [])
-        if not isinstance(entities, list):
-            return web.json_response(
-                {"status": "error", "message": "metadata.entities must be a list"},
-                status=400,
-            )
 
         # Per-entity provenance stamping (fact:1215) — additive, no api_version
         # bump. `entities_provenance` is an optional {name: "operator"|"agent"}
@@ -5435,26 +6023,58 @@ class MemoryCoordinator:
         # below) so it is seen at capture time rather than only on inspection.
         entities_provenance_missing = bool(entities) and entities_provenance is None
 
-        # Entity vocabulary ingress gate (fact:1375, migration 033) — additive
-        # AFTER sanitize_entity_name (rule 7), lookup-never-create (rule 2),
-        # refuses an unknown name unless metadata.new_entities explicitly
-        # mints it (rules 4/5). Rewrites `metadata['entities']` to the
-        # CANONICAL spelling in place before anything downstream — locks, PG
+        # ── P1: a re-save never moves a record's axes (item 4, v0.9.69) ──────
+        #
+        # The hash moved UP to here, ahead of the mint and the embed. `content`
+        # is fixed by this point (nothing below rewrites it), so computing it
+        # earlier changes no value — it just lets the conflict be found before
+        # anything is written. What it PROTECTS is exactly what used to be
+        # spent on a save that was going to be refused anyway: a vocabulary
+        # mint, and a GPU embedding.
+        #
+        # ⚠ THIS CHECK IS ADVISORY, and deliberately so: the AUTHORITATIVE one
+        # is the `FOR UPDATE` re-read inside the transaction below, which is
+        # the only place a concurrent save of the same content cannot slip
+        # between the read and the INSERT. This one exists for the cost, not
+        # for the correctness — the same "cheap indexed pre-check before the
+        # GPU" shape `handle_retrospective` uses for its target pg_id.
+        is_judgement = is_judgement_type(metadata.get("type"))
+        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        incoming_project = resolve_project(metadata)
+        incoming_domains = resolve_domains(metadata)
+        async with self._acquire() as conn:
+            prior = await conn.fetchval(
+                "SELECT metadata FROM technical_docs WHERE content_hash = $1",
+                content_hash,
+            )
+        if prior is not None:
+            conflict = await self._axis_conflict_error(
+                prior, incoming_project, incoming_domains,
+                entity_plan.get("canonical") or [], is_judgement)
+            if conflict is not None:
+                return web.json_response(conflict, status=409)
+
+        # Entity vocabulary ingress gate (fact:1375, migration 033) — the
+        # COMMIT half. Every refusal the gate can produce already fired above,
+        # before the project axis (item 8, v0.9.69); what is left here is the
+        # mint itself plus the in-place rewrite of `metadata['entities']` to
+        # the CANONICAL spelling, before anything downstream — locks, PG
         # metadata, the outbox row, entity_registry, the graph — sees this
         # list, so `entities` is re-read below.
         #
-        # ⛔ S-4 (security review fact:1412, ruled decision:1413): called LAST
-        # among the 400-capable metadata checks — AFTER entities_provenance
-        # above, not before it as originally built. A mint is a real write
-        # (to entity_vocabulary, no shared transaction with the record
-        # insert), so anything that can still 400 the save must run BEFORE
-        # this call, or a mint survives the very refusal that requested it.
-        # Only the hard-mandate embedding 503 (unavoidably later — it needs
-        # the final content) can still race a mint; that residual is
-        # accepted by ruling, not fixed here — see the method's own
-        # docstring.
+        # ⛔ S-4 (security review fact:1412, ruled decision:1413): the MINT is
+        # still LAST among the writes — after entities_provenance above, after
+        # the axis gates, and immediately before the hard-mandate embedding
+        # call. A mint is a real write (to entity_vocabulary, no shared
+        # transaction with the record insert), so anything that can still 400
+        # the save must run BEFORE this call, or a mint survives the very
+        # refusal that requested it. Only the hard-mandate embedding 503
+        # (unavoidably later — it needs the final content) can still race a
+        # mint; that residual is accepted by ruling, not fixed here — see the
+        # method's own docstring.
         entities_before = list(entities)
-        entity_error = await self._entity_ingress_error(metadata, agent_id)
+        entity_error = await self._entity_commit_mints(
+            metadata, agent_id, entity_plan)
         if entity_error is not None:
             return web.json_response(entity_error, status=400)
         entities = metadata.get("entities", [])
@@ -5465,8 +6085,6 @@ class MemoryCoordinator:
         # so the ordinary case (no entities, or every name already
         # canonical) adds no noise to the response.
         entities_rewritten = entities if entities != entities_before else None
-
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
 
         # Embedding — hard mandate; no save without a vector
         try:
@@ -5489,6 +6107,24 @@ class MemoryCoordinator:
                 acquired.append(lk)
             async with self._acquire() as conn:
                 async with conn.transaction():
+                    # P1, AUTHORITATIVELY (item 4, v0.9.69). The pre-check
+                    # above saved the mint and the embed; THIS one is the
+                    # guard, because only a row lock stops a concurrent save
+                    # of the same content from landing between a read and the
+                    # INSERT. `FOR UPDATE` on a hash that matches nothing
+                    # locks nothing and costs an index probe.
+                    prior = await conn.fetchval(
+                        "SELECT metadata FROM technical_docs"
+                        " WHERE content_hash = $1 FOR UPDATE",
+                        content_hash,
+                    )
+                    if prior is not None:
+                        conflict = await self._axis_conflict_error(
+                            prior, incoming_project, incoming_domains,
+                            entities, is_judgement)
+                        if conflict is not None:
+                            return web.json_response(conflict, status=409)
+
                     row = await conn.fetchrow(
                         """
                         INSERT INTO technical_docs
@@ -5539,7 +6175,13 @@ class MemoryCoordinator:
                         {
                             "content_snippet": content[:200],
                             "source": metadata.get("source", "coordinator"),
-                            "entities": entities,
+                            # ⛔ FACTS ONLY (item 3, v0.9.69). A judgement
+                            # carries no entities at all now, so the key is
+                            # OMITTED rather than sent empty — the projection
+                            # already defaults it, and a key that is always
+                            # empty is a promise the row should stop making.
+                            **({} if is_judgement_type(metadata.get("type"))
+                               else {"entities": entities}),
                             "agent_id": agent_id,
                             # Fact-provenance axes (decision 912) — materialised as
                             # traversable edges on the :Fact node so provenance is a
@@ -5988,25 +6630,22 @@ class MemoryCoordinator:
                 status=404,
             )
 
-        # Entity vocabulary ingress gate (fact:1375) — the second of the two
-        # writers `_entity_ingress_error` covers; see its docstring.
+        # ⛔ THE ENTITY GATE NO LONGER RUNS HERE (item 3, v0.9.69; ruled R1 on
+        # decision:1664). A retrospective is a JUDGEMENT: it reaches its topics
+        # by walking to the facts it is grounded in, so an entity named on one
+        # was never written to the graph — it was merely validated, mintable
+        # through `new_entities`, and returned by search, which made this
+        # endpoint a second unvetted faucet into the vocabulary (`fact:970`).
+        # Naming any is now a refusal, checked BEFORE any write; an empty list
+        # is accepted permanently, so an unchanged client still saves.
         #
-        # ⛔ S-4 (security review fact:1412, ruled decision:1413): called LAST
-        # among this endpoint's 400/404-capable checks — AFTER grounded_in and
-        # the pg_id existence pre-check above, not right after `metadata` was
-        # built as originally placed. A mint is a real write with no shared
-        # transaction; anything that can still refuse the save must run
-        # before this call. Only the hard-mandate embedding 503 just below is
-        # unavoidably later — that residual is accepted by ruling, see the
-        # method's own docstring. Rewrites `metadata['entities']` to the
-        # canonical spelling in place before the locks loop below reads it.
-        entities_before = list(metadata["entities"])
-        entity_error = await self._entity_ingress_error(metadata, agent_id)
-        if entity_error is not None:
-            return web.json_response(entity_error, status=400)
-        entities_rewritten = (
-            metadata["entities"] if metadata["entities"] != entities_before else None
-        )
+        # `metadata['entities']` stays initialised (to the empty list it now
+        # always is) because the locks loop and the response below index it.
+        judgement_error = self._judgement_entities_error(metadata)
+        if judgement_error is not None:
+            return web.json_response(judgement_error, status=400)
+        metadata.pop("new_entities", None)
+        entities_rewritten = None
 
         # Embedding — hard mandate, same as every record; no save without a vector.
         # Identity: a retrospective is (target decision, notes) — the target is part
@@ -6119,7 +6758,10 @@ class MemoryCoordinator:
                             "content_snippet": notes[:200],
                             "source": agent_id,
                             "agent_id": agent_id,
-                            "entities": metadata["entities"],
+                            # ⛔ No `entities` key: a retrospective carries none
+                            # (item 3, v0.9.69). It never produced a MENTIONS
+                            # edge; the empty list was a promise this row should
+                            # stop making.
                             "source_ref": source_ref,
                             "fact_kind": fact_kind_from_source_ref(source_ref),
                             "grounded_in": grounded_ids,
@@ -6222,6 +6864,66 @@ class MemoryCoordinator:
                 len(wanted), exc,
             )
 
+    # Anchors whose belonging has to be DERIVED rather than read off their own
+    # edges. A fact's sections are its own bare edges and need nothing;
+    # a CommunitySummary has no belonging edges at all.
+    _DERIVED_BELONGING_LABELS = (ONT.decision, ONT.retrospective)
+
+    async def _derived_belonging(self, session, pg_ids: list) -> dict:
+        """`{pg_id: {"project": name, "domains": [...]}}` for the JUDGEMENTS in
+        `pg_ids` — computed on read, never stored.
+
+        `decision:1736` stopped materialising a judgement's belonging: a
+        decision and a retrospective carry only the sections their operator
+        asserted on them, and nothing writes an inherited edge any more. That
+        answer did not stop existing — it moved to the read side, and this is
+        where a search hit picks it up. The Cypher and every rule it enforces
+        live in `derived_belonging_cypher`.
+
+        ⚠ ONE ROUND TRIP FOR THE WHOLE BATCH, not one per hit. The obvious
+        shape — a bounded query per judgement — is the N+1 that
+        `_expand_graph_context_batch` was written to remove; re-introducing it
+        beside the fix would have undone it for exactly the hits (decisions and
+        their verdicts) a lifecycle-aware search returns most of.
+
+        Rows come back only for anchors that ARE judgements and DO resolve to a
+        project, so a fact's pg_id in the list simply produces nothing. Degrades
+        to `{}` on any failure, exactly like the expansion it enriches: graph
+        context enriches a search, it never fails one.
+        """
+        if not pg_ids:
+            return {}
+        out: dict = {}
+        try:
+            result = await session.run(
+                derived_belonging_cypher(), pg_ids=list(pg_ids),
+            )
+            async for rec in result:
+                out[rec["anchor_pg_id"]] = {
+                    "project": rec["project"],
+                    "domains": list(rec["domains"] or []),
+                }
+        except Exception as exc:
+            log.warning(
+                "graph context: derived belonging failed for %d anchor(s) — "
+                "hits keep their graph context without it: %s", len(pg_ids), exc,
+            )
+            return {}
+        return out
+
+    @staticmethod
+    def _belonging_entry(belonging: dict) -> dict:
+        """The additive expansion entry a judgement hit carries.
+
+        ⚠ IT IS NOT AN EDGE, and it deliberately does not pretend to be one: no
+        `rel_type`, no `direction`, no neighbour. A consumer that walks the
+        expansion looking for relations skips it; one that wants to know where
+        the record belongs reads it by name. Appended AFTER the capped edge
+        list, so no edge is displaced by it — the cap governs edges, and this is
+        not one.
+        """
+        return {"belonging": belonging}
+
     async def _expand_graph_context(self, session, pg_id: int,
                                     anchor_labels: tuple[str, ...]) -> list[dict]:
         """Read-contract graph expansion for one anchored record.
@@ -6242,6 +6944,13 @@ class MemoryCoordinator:
         notes / rem_summary — null when the node carries none). Entity ALIASES
         siblings are still folded in (ADR-017). Failures degrade to [] — graph
         context enriches a search, it never fails one.
+
+        ⭐ ONE ENTRY IS NOT AN EDGE. When the anchor is a Decision or a
+        Retrospective the list ends with ``{belonging: {project, domains}}`` —
+        where that record belongs, DERIVED on read rather than read off its own
+        edges, because nothing writes a judgement's inherited sections any more
+        (`decision:1736`). A fact never carries it: its belonging IS its own
+        bare edges, and they are already in the list above.
         """
         ctx: list[dict] = []
         anchor_where = " OR ".join(f"n:{lbl}" for lbl in anchor_labels)
@@ -6268,9 +6977,12 @@ class MemoryCoordinator:
                 # first, then any typed relation, bare MENTIONS last.
                 # LIFECYCLE EDGES RANK BY TYPE, NOT BY THE PROVENANCE STAMP.
                 # The stamp was never a proxy for "structurally important" — it
-                # means "something asserted this", and INHERITANCE is a something:
-                # it writes MENTIONS with asserted_by='inherited'. A decision with
-                # 31 such edges therefore buried its own HAD_OUTCOME (stamp null)
+                # means "something asserted this", and INHERITANCE was a
+                # something: it wrote MENTIONS with asserted_by='inherited'. Those
+                # edges are LEGACY now (no writer since `decision:1736`) but they
+                # are still in the graph, so the ordering rule stands on the data
+                # that provoked it. A decision with 31 such edges buried its own
+                # HAD_OUTCOME (stamp null)
                 # below the cap, so a reader could not see the decision had been
                 # judged at all, and a retrospective did not surface the decision
                 # it judges. Measured: 131 decisions carry a verdict, 6 had it
@@ -6327,6 +7039,14 @@ class MemoryCoordinator:
         except Exception:
             return []
         await self._attach_decision_payload(ctx)
+        # A judgement hit also carries WHERE IT BELONGS, derived (`decision:1736`).
+        # Facts are untouched: their belonging is their own bare edges, already
+        # above. Skipped entirely when no judgement label is anchored on, so a
+        # summary expansion pays for nothing.
+        if any(lbl in self._DERIVED_BELONGING_LABELS for lbl in anchor_labels):
+            belonging = await self._derived_belonging(session, [pg_id])
+            if pg_id in belonging:
+                ctx.append(self._belonging_entry(belonging[pg_id]))
         return ctx
 
     # Ratings that QUALIFY a decision — the reader needs the verdict's reasoning,
@@ -6393,6 +7113,10 @@ class MemoryCoordinator:
         single-anchor return. Same degrade-to-empty contract on failure —
         graph context enriches a search, it never fails one, so a query error
         here returns `{}` (every caller treats a missing key as `[]` via `.get`).
+
+        Carries the same `{belonging: ...}` entry as the single-anchor form for
+        every judgement anchor — see there — in one further round trip for the
+        whole batch, never one per hit.
         """
         if not pg_ids:
             return {}
@@ -6412,8 +7136,9 @@ class MemoryCoordinator:
                 "   WITH n, r, related, labels(related) AS labels,"
                 "        collect(DISTINCT al.name) AS aliases"
                 # Lifecycle edges rank by TYPE — see the note on the
-                # single-anchor query above; inheritance stamps MENTIONS, so
-                # keying the first sort on asserted_by buried HAD_OUTCOME.
+                # single-anchor query above; inheritance stamped MENTIONS and
+                # those legacy edges remain, so keying the first sort on
+                # asserted_by buried HAD_OUTCOME.
                 f"   ORDER BY CASE WHEN type(r) IN ['{ONT.had_outcome}','{ONT.supersedes}',"
                 f"                                  '{ONT.grounded_in}','{ONT.informed_by}'] THEN 0"
                 "                 WHEN r.asserted_by IS NOT NULL THEN 1 ELSE 2 END,"
@@ -6466,6 +7191,14 @@ class MemoryCoordinator:
         # this function exists for would be undone by a query per anchor.
         await self._attach_decision_payload(
             [entry for entries in out.values() for entry in entries])
+        # Derived belonging for the judgement anchors, in ONE more round trip
+        # for the whole batch — see `_derived_belonging` on why it is not per
+        # hit. Anchors that are facts simply come back with no row.
+        if any(lbl in self._DERIVED_BELONGING_LABELS for lbl in anchor_labels):
+            for pid, belonging in (
+                    await self._derived_belonging(session, list(pg_ids))).items():
+                if pid in out:
+                    out[pid].append(self._belonging_entry(belonging))
         return out
 
     async def _resolve_search_filters(
@@ -6540,8 +7273,17 @@ class MemoryCoordinator:
 
         domain_values = None
         if domains:
-            project_id = (await self._project_identity(canonical)
-                          if canonical is not None else None)
+            # A READER DEGRADES, never 500s (item 6, ruled R3). Without an
+            # identity the domain half of the filter resolves to nothing —
+            # which looks exactly like "nobody registered that section", so
+            # the degrade is REPORTED (counter + `filters_resolved.error`)
+            # rather than left to be read as an empty answer.
+            try:
+                project_id = (await self._project_identity(canonical)
+                              if canonical is not None else None)
+            except ProjectIdentityUnavailable as exc:
+                errors.append(self._note_registry_read_failure("project", exc))
+                project_id = None
             d_registered, d_aliases, d_err = await self._domain_spellings(
                 project_id, domains)
             if d_err:

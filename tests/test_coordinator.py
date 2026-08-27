@@ -189,6 +189,12 @@ async def test_handle_save_rejects_non_list_entities():
 
 @pytest.mark.asyncio
 async def test_valid_decision_save_passes_validation():
+    """RE-RULED at v0.9.69 (item 3, ruled R1 on decision:1664): the fixture no
+    longer names entities. This test's subject is the DECISION SHAPE — title,
+    decided_by, project, rationale — and a decision may not carry entities at
+    all now; the empty list the shipped client always sends is what a valid
+    decision looks like. The refusal itself is pinned by
+    `test_decision_refuses_entities` in test_entity_vocabulary_ingress.py."""
     c, mock_conn, _ = _coordinator_with_mocks()
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         req = _make_request({
@@ -196,7 +202,7 @@ async def test_valid_decision_save_passes_validation():
             "metadata": {
                 "source": "claude-code",
                 "type": "decision",
-                "entities": ["Consolidator", "SharedMemory"],
+                "entities": [],
                 "decision": {
                     "title": "Add consolidation daemon",
                     "decided_by": "Xenofon",
@@ -358,9 +364,11 @@ async def test_apply_decision_outbox_row_writes_correct_nodes():
 
     await c._apply_decision_outbox_row(outbox_id=1, pg_id=42, params=params)
 
-    # Two statements now: the Decision projection, then the DEFAULT-SECTION pass (028).
-    # (Entity inheritance is retired under Human-Only Fact Entities architecture).
-    assert mock_session.run.await_count == 2
+    # ONE statement: the Decision projection. Was two — the second was the
+    # default-section pass (028), retired by `decision:1736`: a decision that
+    # asserted no section now gets none, and where it belongs is derived on
+    # read. (Entity inheritance was retired earlier, for the same reason.)
+    assert mock_session.run.await_count == 1
     cypher_call = mock_session.run.call_args_list[0]
     cypher = cypher_call.args[0]
     assert "Decision" in cypher
@@ -444,8 +452,8 @@ async def test_apply_decision_outbox_row_handles_empty_assisted_by():
     }
 
     await c._apply_decision_outbox_row(outbox_id=2, pg_id=50, params=params)
-    # projection + default-section pass (028)
-    assert mock_session.run.await_count == 2
+    # Projection only — the default-section pass is gone (`decision:1736`).
+    assert mock_session.run.await_count == 1
     mock_conn.execute.assert_awaited()
 
 
