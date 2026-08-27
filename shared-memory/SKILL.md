@@ -60,11 +60,11 @@ whether it is worth interrupting the operator for.
 |---|---|---|---|---|---|
 | **fact** | asserts its own | asserts its own | **mints** them | origin of the knowledge | optional |
 | **decision** | asserts its own | asserts its own | **none — refused if sent** | rarely used | optional, flagged if absent |
-| **retrospective** | derived by traversal from the decision it judges | derived by traversal: the grounding facts' sections, same project | **none — refused if sent** | the instrument that measured the outcome | **required (400 without it)** |
+| **retrospective** | **derived** — not stored; graph expansion returns its decision's project | **derived** — not stored; graph expansion returns same-project sections reached through grounding | **none — refused if sent** | the instrument that measured the outcome | **required (400 without it)** |
 
-A record type that is "derived by traversal" must not send that field — the gateway refuses a
-retrospective that names a domain, and refuses (400 `entities_not_allowed_on_judgement`) a non-empty
-`entities` or any `new_entities` on either judgement type; an empty `entities` list is accepted
+A record type whose project or domain is DERIVED, not stored, must not send that field — the gateway
+refuses a retrospective that names a domain, and refuses (400 `entities_not_allowed_on_judgement`) a
+non-empty `entities` or any `new_entities` on either judgement type; an empty `entities` list is accepted
 permanently, for older callers.
 
 ### The fields
@@ -213,7 +213,21 @@ The enrichment pass links only to concepts a fact's `entities` list already name
 
 **`domain` is a registered SECTION of one project — optional, may be several, and refused (400) when unregistered.** `operations` under one project and `operations` under another are different sections; the same protocol as `project` applies (`domain_unknown` + `proposals`, then `new_domain` to register, plus `domain_spelling_variant` / `domain_confusable` naming guards). Pass it as `--domain <name>`, **repeating the flag** for several — the value is stored verbatim and never split. **ELICIT IT ONLY WHEN THE PROJECT ALREADY HAS REGISTERED SECTIONS**, and never prompt on a project whose registry is empty: the first section in any project is a deliberate act, and a record with no domain is filed under its project, which is always correct. Proposals match a section's DESCRIPTION as well as its name, so a near miss can reach a section named nothing like what was typed.
 
-**Who controls which axis — the whole rule in one place.** A **fact** asserts its own project and domain and mints its own entities. A **decision** asserts its own project and domain, and carries no entities of its own — a non-empty `entities` or any `new_entities` on a decision is refused (400 `entities_not_allowed_on_judgement`); naming no domain leaves it to inherit its grounding facts' sections as a DEFAULT, never a ceiling, because a decision routinely reaches further than the fact that prompted it (a fact observing how agents write to the graph is infrastructure; the decision on who may write is about access, and sits above it). A **retrospective** asserts neither axis, and its own `entities`/`new_entities` are refused the same way as a decision's — both project and domain are **derived by traversal on read**, never written: project from the decision it judges, domains from the union of that decision's own asserted sections and the sections of the facts reached through grounding relations that lie in the *same* project (a retrospective grounded on evidence from a different project inherits none of that project's sections). **A retrospective supplying a domain is refused (400 `domain_not_allowed_on_judgement`)** — fix the section on the decision and the verdict follows on the next read.
+**Who controls which axis — the whole rule in one place.**
+
+A **fact** asserts its own project and domain and mints its own entities.
+
+A **decision** asserts its own project and domain, and carries no entities of its own — a non-empty `entities` or any `new_entities` on a decision is refused (400 `entities_not_allowed_on_judgement`).
+
+**Naming no domain leaves a decision to inherit its grounding facts' sections as a DEFAULT, never a ceiling** — a decision routinely reaches further than the fact that prompted it (a fact observing how agents write to the graph is infrastructure; the decision on who may write is about access, and sits above it).
+
+A **retrospective** asserts neither axis, and its own `entities`/`new_entities` are refused the same way as a decision's (400 `entities_not_allowed_on_judgement`).
+
+**In Postgres a retrospective's record carries no domain and no entities at all** (fact:1737) — nothing is stored on it for either axis to match, so it does not satisfy a `--domain` search filter on its own.
+
+**Its belonging is DERIVED, not stored, and Postgres is consulted first — the graph then enriches the answer.** Graph expansion returns the retrospective's project (the decision it judges) and its domains (the SET of that decision's own asserted sections and the sections of the facts reached through grounding relations that lie in the *same* project — a retrospective grounded on evidence from a different project inherits none of that project's sections).
+
+**A retrospective supplying a domain at save time is refused (400 `domain_not_allowed_on_judgement`)** — fix the section on the decision, and the graph-expanded answer follows.
 
 **⛔ A NEW PROJECT IS THE OPERATOR'S TO DECLARE — `new_project` is a confirmation, never a way past a rejection.** Work legitimately starts this way: a discussion produces an idea, the idea is saved as a fact, and a decision grounded on that fact commits to acting on it — and until that moment the project does not exist. So both record types may introduce one (`--new-project` on `save_decision`, `"new_project": true` in a fact's metadata). **Ask first, and confirm the exact spelling**, because that string becomes a permanent registry row and the whole value of the registry is that a misspelling and a new project stop being the same event. **It is declared ONCE, on the first record that names it** — everything saved afterwards in the same flow simply uses the now-registered name and needs no flag. If the name is not settled yet, park on the sentinel and promote later; never invent a placeholder spelling to get a save through.
 
