@@ -4959,6 +4959,81 @@ class MemoryCoordinator:
         return await self._entity_commit_mints(metadata, agent_id, plan)
 
     @staticmethod
+    def _axis_conflict_error(
+        stored: object, project, domains, entities, is_judgement: bool,
+    ) -> dict | None:
+        """409 when re-saving identical CONTENT under DIFFERENT axes — or None
+        (P1, item 4 of the v0.9.69 plan). Pure.
+
+        ⛔ AFTER A RECORD'S FIRST WRITE, NOTHING IN THE SAVE PATH MOVES ITS
+        AXES. `ON CONFLICT (content_hash) DO UPDATE` replaces the metadata blob
+        WHOLESALE, so re-saving the same words under a different project or
+        domain silently relabelled the record — while the graph kept the edges
+        from the first write and gained the new ones, so the two stores stopped
+        agreeing (`fact:1734` C(a)). The explicit paths — supersede, and a
+        ledgered operator backfill (`fact:1255`) — remain the only ways an axis
+        moves.
+
+        ⚠ COMPARED THROUGH THE RESOLVERS, NEVER ON THE LITERAL KEYS.
+        `resolve_project`/`resolve_domains` read the `decision` blob first and
+        the top level second, and they accept a bare string where a list is
+        expected — so 152 legacy facts carrying a singular `domain` resolve to
+        exactly what a modern `domains` list resolves to, instead of
+        false-conflicting on the key name.
+
+        ⚠ A JUDGEMENT COMPARES PROJECT + DOMAINS ONLY. 194 legacy decisions
+        carry entities in Postgres; item 3 refuses new ones, so an unchanged
+        re-save of one of those must stay idempotent rather than becoming
+        permanently unsaveable over a field the record may no longer even send.
+
+        Identity — same content AND same axes — is untouched: it still takes
+        the `DO UPDATE` path, which is what repairs a missing embedding.
+        """
+        stored = _coerce_jsonb_obj(stored)
+        if not isinstance(stored, dict):
+            return None
+
+        def _refusal(axis: str, existing, incoming) -> dict:
+            return {
+                "status": "error",
+                "error": "axis_conflict",
+                "message": (
+                    f"this content is already saved under {axis} "
+                    f"{_short(existing)}; this save names {_short(incoming)}. "
+                    "A record's axes are fixed at its FIRST write — a re-save "
+                    "never moves them, because the graph edges written the "
+                    "first time do not move with it. If the record genuinely "
+                    "belongs elsewhere, SUPERSEDE it with a new record that "
+                    "says so; if the axes were wrong, that is a deliberate "
+                    "operator backfill with its own ledger, never a side "
+                    "effect of a save. If you meant to save something new, "
+                    "the content has to differ."
+                ),
+                "axis": axis,
+                "existing": existing,
+                "incoming": incoming,
+            }
+
+        existing_project = resolve_project(stored)
+        if existing_project != project:
+            return _refusal("project", existing_project, project)
+
+        existing_domains = resolve_domains(stored)
+        if set(existing_domains) != set(domains or []):
+            return _refusal("domains", existing_domains, list(domains or []))
+
+        if is_judgement:
+            return None
+
+        existing_entities = stored.get("entities")
+        existing_entities = (existing_entities
+                             if isinstance(existing_entities, list) else [])
+        incoming = [e for e in (entities or []) if isinstance(e, str)]
+        if {e for e in existing_entities if isinstance(e, str)} != set(incoming):
+            return _refusal("entities", existing_entities, incoming)
+        return None
+
+    @staticmethod
     def _judgement_entities_error(metadata: dict) -> dict | None:
         """400 when a DECISION or RETROSPECTIVE carries entities — or None
         (item 3, v0.9.69; ruled R1, grounded on `decision:1664`).
@@ -5850,6 +5925,37 @@ class MemoryCoordinator:
         # below) so it is seen at capture time rather than only on inspection.
         entities_provenance_missing = bool(entities) and entities_provenance is None
 
+        # ── P1: a re-save never moves a record's axes (item 4, v0.9.69) ──────
+        #
+        # The hash moved UP to here, ahead of the mint and the embed. `content`
+        # is fixed by this point (nothing below rewrites it), so computing it
+        # earlier changes no value — it just lets the conflict be found before
+        # anything is written. What it PROTECTS is exactly what used to be
+        # spent on a save that was going to be refused anyway: a vocabulary
+        # mint, and a GPU embedding.
+        #
+        # ⚠ THIS CHECK IS ADVISORY, and deliberately so: the AUTHORITATIVE one
+        # is the `FOR UPDATE` re-read inside the transaction below, which is
+        # the only place a concurrent save of the same content cannot slip
+        # between the read and the INSERT. This one exists for the cost, not
+        # for the correctness — the same "cheap indexed pre-check before the
+        # GPU" shape `handle_retrospective` uses for its target pg_id.
+        is_judgement = metadata.get("type") in JUDGEMENT_TYPES
+        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        incoming_project = resolve_project(metadata)
+        incoming_domains = resolve_domains(metadata)
+        async with self._acquire() as conn:
+            prior = await conn.fetchval(
+                "SELECT metadata FROM technical_docs WHERE content_hash = $1",
+                content_hash,
+            )
+        if prior is not None:
+            conflict = self._axis_conflict_error(
+                prior, incoming_project, incoming_domains,
+                entity_plan.get("canonical") or [], is_judgement)
+            if conflict is not None:
+                return web.json_response(conflict, status=409)
+
         # Entity vocabulary ingress gate (fact:1375, migration 033) — the
         # COMMIT half. Every refusal the gate can produce already fired above,
         # before the project axis (item 8, v0.9.69); what is left here is the
@@ -5882,8 +5988,6 @@ class MemoryCoordinator:
         # canonical) adds no noise to the response.
         entities_rewritten = entities if entities != entities_before else None
 
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
-
         # Embedding — hard mandate; no save without a vector
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -5905,6 +6009,24 @@ class MemoryCoordinator:
                 acquired.append(lk)
             async with self._acquire() as conn:
                 async with conn.transaction():
+                    # P1, AUTHORITATIVELY (item 4, v0.9.69). The pre-check
+                    # above saved the mint and the embed; THIS one is the
+                    # guard, because only a row lock stops a concurrent save
+                    # of the same content from landing between a read and the
+                    # INSERT. `FOR UPDATE` on a hash that matches nothing
+                    # locks nothing and costs an index probe.
+                    prior = await conn.fetchval(
+                        "SELECT metadata FROM technical_docs"
+                        " WHERE content_hash = $1 FOR UPDATE",
+                        content_hash,
+                    )
+                    if prior is not None:
+                        conflict = self._axis_conflict_error(
+                            prior, incoming_project, incoming_domains,
+                            entities, is_judgement)
+                        if conflict is not None:
+                            return web.json_response(conflict, status=409)
+
                     row = await conn.fetchrow(
                         """
                         INSERT INTO technical_docs
