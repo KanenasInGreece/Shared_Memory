@@ -67,7 +67,7 @@ current state of files can only confirm an answer, never give one — call `rag-
 
 An id or claim hard-coded in a constitution file, a memory index, a resume or
 a handoff (`fact:N`) is a pointer, not the record. Before citing or acting on
-it, resolve it: the `get_lineage` tool says whether it is superseded and by what —
+it, resolve it: the `record_lineage` tool says whether it is superseded and by what —
 follow `superseded_by` until a current record, or search the subject. If the
 pointer was stale, do not delete it and do not stop at checking: rewrite the
 index line to the current id and its corrected hook, so the next invocation
