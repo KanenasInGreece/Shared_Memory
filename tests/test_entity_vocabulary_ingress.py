@@ -60,6 +60,7 @@ sys.path.insert(0, _SCRIPTS)
 from coordinator import (  # noqa: E402
     ENTITY_LIST_MAX_LEN, ENTITY_NAME_MAX_LEN, ENTITY_VOCAB_MINT_SQL,
     ENTITY_VOCAB_RESOLVE_MANY_SQL, ENTITY_VOCAB_RESOLVE_SQL, MemoryCoordinator,
+    axis_key,
 )
 
 
@@ -81,6 +82,16 @@ def _coord(vocabulary=None):
     # ordinary, non-racing, non-empty-normalization case. Tests that care
     # about a different outcome stub this differently.
     c._entity_vocab_mint = AsyncMock(side_effect=lambda n, agent: n)
+    # v0.9.69 item 2: the gate now asks the `projects` registry whether a
+    # candidate name IS a project. An EMPTY registry is this fixture's default
+    # — "no project by that name" — so every pre-existing case here answers
+    # exactly as it did before the check existed. `_coord_with_projects()`
+    # below is the variant with rows in it.
+    conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[])
+    pool = MagicMock()
+    pool.acquire = MagicMock(return_value=_AsyncCtx(conn))
+    c._pool = pool
     return c
 
 
@@ -1083,3 +1094,136 @@ async def test_a_new_project_save_with_known_entities_still_registers():
         resp = await c.handle_save(req)
     assert resp.status == 200
     c._register_project.assert_awaited_once()
+
+
+# ── E2 (item 2, v0.9.69) — RESERVED names are refused, never silently dropped ──
+#
+# Two halves, and they are refused for different reasons in different places:
+#
+#   (a) a SCHEMA WORD or an axis declaration — a pure form test
+#       (`ontology.reserved_entity_name_reason`), no registry needed
+#   (b) a REGISTERED PROJECT NAME — a registry question, compared on `axis_key`
+#
+# ⚠ (a) is deliberately NARROWER than "everything `sanitize_entity_name`
+# rejects": the SHAPE rejections (a leaked pg_id, a single character) stay
+# gate-exempt, which is invariant I3 above and its own documented rationale.
+
+def _coord_with_projects(names=(), vocabulary=None):
+    """`_coord()` plus a `projects` table answering the reserved-name query."""
+    c = _coord(vocabulary=vocabulary)
+    rows = [{"name": n, "normalized_key": axis_key(n)} for n in names]
+
+    async def _fetch(sql, *args):
+        if "normalized_key = ANY" in sql:
+            wanted = set(args[0])
+            return [r for r in rows if r["normalized_key"] in wanted]
+        return []
+
+    conn = MagicMock()
+    conn.fetch = AsyncMock(side_effect=_fetch)
+    pool = MagicMock()
+    pool.acquire = MagicMock(return_value=_AsyncCtx(conn))
+    c._pool = pool
+    return c
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["Decision", "decision", "Project", "Domain",
+                                  "MENTIONS", "grounded_in", "Component",
+                                  "TBD", "null"])
+async def test_save_refuses_schema_vocabulary_entity(name):
+    """E2(a): a schema word never becomes an :Entity — and the caller is TOLD,
+    rather than having the name accepted into Postgres and dropped on the way
+    to the graph.
+
+    MUTATION CHECK: remove the `reserved_entity_name_reason` sweep from
+    `_entity_ingress_validate` and every case here fails — the name sanitizes
+    to nothing, is therefore not a candidate, and the gate returns None."""
+    c = _coord_with_projects()
+    metadata = {"project": "p", "entities": [name]}
+    err, plan = await c._entity_ingress_validate(metadata)
+    assert err is not None
+    assert err["error"] == "entity_reserved"
+    assert err["reserved_entities"] == [name]
+    c._entity_vocab_mint.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_reserved_name_in_new_entities_is_refused_too():
+    """The mint request is swept as well — a schema word must not be mintable
+    by naming it in `new_entities`, and `entities` alone is not the whole
+    surface a caller can put a name on."""
+    c = _coord_with_projects()
+    err, _ = await c._entity_ingress_validate(
+        {"project": "p", "entities": ["Kubernetes"], "new_entities": ["Decision"]})
+    assert err is not None
+    assert err["error"] == "entity_reserved"
+    c._entity_vocab_mint.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["shared-memory-GitHub", "shared_memory_github",
+                                  "SHARED MEMORY GITHUB"])
+async def test_save_refuses_project_name_as_entity(name):
+    """E2(b): a registered project name is an AXIS, never an entity
+    (`fact:1215`) — and it passes `sanitize_entity_name` cleanly, which is
+    exactly why the rule kept being broken. Compared on `axis_key`, so every
+    spelling of the project is refused, not only the registered one.
+
+    MUTATION CHECK: remove the `_entity_reserved_project_error` call from
+    `_entity_ingress_validate` and all three cases fail — the name is
+    unregistered in the vocabulary, so the save is refused as `entity_unknown`
+    (and, with `new_entities`, would MINT the project name)."""
+    c = _coord_with_projects(names=["shared-memory-GitHub"])
+    err, _ = await c._entity_ingress_validate(
+        {"project": "p", "entities": [name]})
+    assert err is not None
+    assert err["error"] == "entity_reserved"
+    assert err["reserved_entities"] == [name]
+
+
+@pytest.mark.asyncio
+async def test_a_project_name_already_in_the_vocabulary_is_still_refused():
+    """The check runs BEFORE resolution on purpose: the legacy vocabulary DOES
+    carry project names, and resolving one would launder it straight back in."""
+    c = _coord_with_projects(names=["shared-memory-GitHub"],
+                             vocabulary={"shared-memory-GitHub": "shared-memory-GitHub"})
+    err, _ = await c._entity_ingress_validate(
+        {"project": "p", "entities": ["shared-memory-GitHub"]})
+    assert err is not None
+    assert err["error"] == "entity_reserved"
+
+
+@pytest.mark.asyncio
+async def test_the_parked_project_sentinel_is_reserved_without_a_registry_row():
+    """`general_discussion` is excluded from `projects` by a CHECK constraint,
+    so no registry query can ever answer for it — it is named explicitly."""
+    c = _coord_with_projects()
+    err, _ = await c._entity_ingress_validate(
+        {"project": "p", "entities": ["general_discussion"]})
+    assert err is not None
+    assert err["error"] == "entity_reserved"
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_entity_that_is_not_a_project_still_resolves():
+    """The reserved checks must not have made every save fail: a name that is
+    neither schema vocabulary nor a registered project passes untouched."""
+    c = _coord_with_projects(names=["shared-memory-GitHub"],
+                             vocabulary={"Kubernetes": "Kubernetes"})
+    metadata = {"project": "p", "entities": ["Kubernetes"]}
+    err, plan = await c._entity_ingress_validate(metadata)
+    assert err is None
+    assert plan["canonical"] == ["Kubernetes"]
+
+
+@pytest.mark.asyncio
+async def test_shape_noise_stays_gate_exempt_next_to_the_reserved_check():
+    """I3 is UNCHANGED by item 2 — a leaked pg_id is a SHAPE rejection, not a
+    reserved name, and refusing a whole save over one is the regression that
+    invariant exists to prevent."""
+    c = _coord_with_projects()
+    metadata = {"project": "p", "entities": ["254"]}
+    err, _ = await c._entity_ingress_validate(metadata)
+    assert err is None
+    assert metadata["entities"] == ["254"]

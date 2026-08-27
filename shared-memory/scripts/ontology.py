@@ -250,6 +250,47 @@ def sanitize_entity_name(raw: object) -> str | None:
     return name
 
 
+def reserved_entity_name_reason(raw: object) -> str | None:
+    """Why this name is RESERVED and can never be an entity — or None. Pure.
+
+    The subset of `sanitize_entity_name`'s rejections that are about what the
+    name MEANS rather than about its shape:
+
+      * a schema word — a relationship or label name, or a content-free
+        placeholder (`_ENTITY_NOISE_NAMES`)
+      * an axis DECLARATION (`Project: …`, `Domain: …`, `_AXIS_DECLARATION_RE`)
+
+    ⚠ IT IS DELIBERATELY NOT "everything sanitize rejects". The SHAPE
+    rejections — a leaked pg_id (`254`), a single character, an empty string —
+    stay exempt from refusal at ingress: they are noise the record may honestly
+    carry, Tier 1 stores them verbatim, and the graph gate drops them. Refusing
+    a whole save over one is the regression `_entity_ingress_validate`'s I3
+    invariant exists to prevent (`tests/test_entity_vocabulary_ingress.py`,
+    "noise sanitize_entity_name rejects is gate-exempt").
+
+    A reserved name is different in kind: an `:Entity` called `Decision` or
+    `Project: X` would be a HUB colliding with the ontology's own vocabulary,
+    so there is no honest reading under which the caller meant it — which is
+    what makes it a question to put back to the operator (400) rather than
+    something to drop quietly at the graph boundary.
+
+    ⛔ It says NOTHING about project NAMES. `shared-memory-GitHub` passes every
+    rule here, and refusing it is a REGISTRY question (`fact:1215`: a project
+    name is an axis, never an entity), answered by the coordinator against the
+    live `projects` table — never by a form test in a pure module.
+    """
+    if not isinstance(raw, str):
+        return None
+    name = _WHITESPACE_RE.sub(" ", raw.strip())
+    if not name:
+        return None
+    if name.lower() in _ENTITY_NOISE_NAMES:
+        return "a schema word (an ontology label, relationship or placeholder)"
+    if _AXIS_DECLARATION_RE.match(name):
+        return "an axis declaration"
+    return None
+
+
 def sanitize_entity_names(raw_names: object) -> list[str]:
     """Sanitise a list of names: drop rejects, de-duplicate, preserve order."""
     seen: set[str] = set()

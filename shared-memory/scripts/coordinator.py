@@ -57,6 +57,7 @@ from log_hygiene import AsyncLineWriter, scrub_url_credentials
 from agent_roles import effective_role, read_only_agents
 from ontology import (
     ONT, sanitize_entity_names, sanitize_entity_name,
+    reserved_entity_name_reason,
     KNOWN_LABELS, KNOWN_RELATIONSHIPS, fact_kind_from_source_ref,
     GROUNDING_ROLES, GROUNDING_RELATIONS, default_grounding_role, RETRO_RATINGS,
     record_label_for_type,
@@ -774,6 +775,38 @@ ENTITY_VOCAB_RESOLVE_MANY_SQL = """
         ON alias_canon.id = a.entity_id
      GROUP BY i.raw_name, COALESCE(canon.name, alias_canon.name)
 """
+
+# A project name is an AXIS, never an entity (`fact:1215`) — and the graph's own
+# gate does not catch it: `sanitize_entity_name` rejects `Project` (the schema
+# label) but passes `shared-memory-GitHub` cleanly, which is exactly why the rule
+# kept being broken and why the live graph carries `:Entity` nodes named after
+# registered projects (`fact:1734` A/C).
+#
+# ⚠ IT READS THE STORED KEY, for the reason `PROJECT_NAME_OR_KEY_SQL` documents:
+# migration 035 maintains `projects.normalized_key` with a trigger and a UNIQUE
+# constraint, so the key is the database's own materialised value on an indexed
+# column, and the Python side stays the single definition (`axis_key`).
+#
+# ⚠ THE COMPARISON SET IS `projects` ALONE. A retired spelling is not a separate
+# population to check — a rename writes the old spelling into `project_aliases`
+# AND keeps its row in `projects`, so the alias table adds nothing here. The one
+# name that is NOT in `projects` is the sentinel (a CHECK constraint keeps it
+# out), so it is named explicitly in `RESERVED_ENTITY_AXIS_KEYS` below.
+#
+# ANY() rather than one query per name: one round trip for the whole candidate
+# list, the same choice `ENTITY_VOCAB_RESOLVE_MANY_SQL` makes.
+ENTITY_RESERVED_PROJECT_SQL = (
+    "SELECT name, normalized_key FROM projects"
+    " WHERE normalized_key = ANY($1::text[])"
+)
+
+# Axis keys reserved against entity names that no `projects` row can carry.
+# `general_discussion` is the parked-record sentinel: it is a legitimate value on
+# the PROJECT axis and is excluded from the registry by a CHECK constraint, so a
+# registry query can never answer for it.
+RESERVED_ENTITY_AXIS_KEYS: dict[str, str] = {
+    axis_key(SENTINEL): SENTINEL,
+}
 
 # Env-overridable caps (S-5): a name/list-length bound is a correctness/DoS
 # property, not a performance tuning parameter (fact:1338 governs the
@@ -4711,6 +4744,36 @@ class MemoryCoordinator:
         }
 
     @staticmethod
+    def _entity_reserved_rejection(name: str, reason: str, use: str = "") -> dict:
+        """The 400 body for a name that is RESERVED — a schema word, an axis
+        declaration, or a registered project name (item 2, v0.9.69;
+        `fact:1215`, `decision:1678` (4)).
+
+        ⛔ IT IS A REFUSAL, NOT A DROP, and the difference is the whole point.
+        Both halves of this rule were already enforced somewhere DOWNSTREAM —
+        the outbox→graph gate filters a schema word out, and a project name
+        simply never becomes a useful entity — so the name reached Postgres
+        verbatim and vanished on the way to the graph, silently, leaving a
+        record whose stored entities do not match its graph edges and an agent
+        that goes on sending the same name forever. The gate stays where it is
+        (belt); this is the brace, at the point where the caller can still be
+        told.
+        """
+        return {
+            "status": "error",
+            "error": "entity_reserved",
+            "message": (
+                f"entity {_short(name)} is {reason} and cannot be an entity. "
+                f"{use}"
+                "ASK THE OPERATOR which CONCEPT the record is actually about "
+                "and name that instead, or drop the name — an entity is a "
+                "topic the content is about, never a label from the schema and "
+                "never the axis the record is filed on."
+            ),
+            "reserved_entities": [name],
+        }
+
+    @staticmethod
     def _entities_list_too_long_rejection(field: str, length: int) -> dict:
         """The 400 body for an oversized `entities`/`new_entities` list
         (S-5, security review fact:1412) — a correctness/DoS bound on the
@@ -4837,6 +4900,46 @@ class MemoryCoordinator:
             return refusal
         return await self._entity_commit_mints(metadata, agent_id, plan)
 
+    async def _entity_reserved_project_error(
+        self, candidates: list[str],
+    ) -> dict | None:
+        """400 when one of these entity names IS a project — or None.
+
+        ONE indexed round trip for the whole list (`normalized_key = ANY(...)`,
+        migration 035's unique column). The sentinel is answered without a
+        query because no `projects` row can hold it.
+        """
+        keys = {axis_key(n): n for n in candidates if axis_key(n)}
+        if not keys:
+            return None
+        for key, registered_as in RESERVED_ENTITY_AXIS_KEYS.items():
+            if key in keys:
+                log.info("entity ingress: refused %r — the parked-project "
+                         "sentinel %r", keys[key], registered_as)
+                return self._entity_reserved_rejection(
+                    keys[key],
+                    f"the parked-project sentinel {_short(registered_as)}",
+                    "It is a value on the PROJECT axis, carried by the "
+                    "record's own project field. ",
+                )
+        async with self._acquire() as conn:
+            rows = await conn.fetch(ENTITY_RESERVED_PROJECT_SQL, sorted(keys))
+        for row in rows:
+            name = keys.get(row["normalized_key"])
+            if name is None:
+                continue
+            log.info("entity ingress: refused %r — a spelling of the "
+                     "registered project %r", name, row["name"])
+            return self._entity_reserved_rejection(
+                name,
+                f"the registered project {_short(row['name'])}",
+                "A project is an AXIS a record is filed on, carried by its "
+                "own project field and by the PROJECT_OF edge; naming it as "
+                "an entity as well makes the axis a hub that records cluster "
+                "on. ",
+            )
+        return None
+
     async def _entity_ingress_validate(
         self, metadata: dict,
     ) -> tuple[dict | None, dict]:
@@ -4929,6 +5032,24 @@ class MemoryCoordinator:
             if isinstance(e, str) and len(e) > ENTITY_NAME_MAX_LEN:
                 return self._entity_name_too_long_rejection(e), empty_plan
 
+        # RESERVED VOCABULARY (item 2a, v0.9.69) — a schema word or an axis
+        # declaration, on the RAW names, because `sanitize_entity_name` rejects
+        # exactly these and they would otherwise never become candidates: the
+        # name would reach Postgres verbatim and be dropped at the graph, which
+        # is the silence this refusal replaces. `new_entities` is swept too, so
+        # a reserved name is refused whether or not it is also a mint request.
+        # ⚠ `new_entities` has not had its SHAPE validated yet (that check needs
+        # `candidates`, below) — so only sweep it when it is already a list.
+        # A malformed one still gets its own `new_entities_invalid` refusal.
+        declared_new = metadata.get("new_entities")
+        swept = list(raw_entities) + (
+            list(declared_new) if isinstance(declared_new, list) else [])
+        for e in swept:
+            reason = reserved_entity_name_reason(e)
+            if reason is not None:
+                log.info("entity ingress: refused %r — %s", e, reason)
+                return self._entity_reserved_rejection(e, reason), empty_plan
+
         candidates = sanitize_entity_names(raw_entities)
         if not candidates:
             return None, empty_plan
@@ -4968,6 +5089,17 @@ class MemoryCoordinator:
                         ),
                     }, empty_plan
                 mint_requested.add(sanitized)
+
+        # A PROJECT NAME IS AN AXIS, NEVER AN ENTITY (item 2b, v0.9.69;
+        # `fact:1215`). Compared on `axis_key`, so `Shared_Memory`,
+        # `shared-memory` and `SHARED MEMORY` are one answer — the same key the
+        # registry itself is unique on. It runs BEFORE resolution deliberately:
+        # a name that is a project must be refused whether or not the
+        # vocabulary already knows it, because the legacy vocabulary DOES carry
+        # such names and resolving one would launder it back in.
+        reserved = await self._entity_reserved_project_error(candidates)
+        if reserved is not None:
+            return reserved, empty_plan
 
         resolved = await self._entity_vocab_resolve_many(candidates)
         unknown = [n for n in candidates if n not in resolved]
