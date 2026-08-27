@@ -571,15 +571,76 @@ KNOWN_LABELS: frozenset[str] = SPINE_LABELS | DOMAIN_LABELS
 KNOWN_RELATIONSHIPS: frozenset[str] = SPINE_RELATIONSHIPS | DOMAIN_RELATIONSHIPS
 
 
-def canonical_fixpoint_entity_cypher() -> str:
-    """Canonical Fixpoint Entity Traversal Cypher for non-Fact nodes.
-    Walks HAD_OUTCOME to Decision, then outgoing GROUNDED_IN | INFORMED_BY path to live Facts to read human-asserted entities.
+def derived_belonging_cypher(hops: int = 4) -> str:
+    """Where a JUDGEMENT belongs, READ from the graph instead of written into it.
+
+    Successor to `canonical_fixpoint_entity_cypher`, which walked the same
+    shape to read a judgement's *entities* and had no caller left. This walks it
+    to answer the question `decision:1736` moved to the read side: a decision
+    and a retrospective carry only the sections their operator asserted on them,
+    so anything they belong to BY VIRTUE OF WHAT THEY REST ON has to be derived
+    at the moment it is asked for. Nothing here writes; nothing here is stored.
+
+    Binds `$pg_ids` (a list — one query serves a whole search's judgement hits)
+    and returns one row per resolvable judgement:
+
+        anchor_pg_id   the id that was asked about
+        project        the project NAME
+        domains        the section names, a SET — never a ranking
+
+    THE RULES IT IMPLEMENTS, each of which is a choice that could have gone the
+    other way (`decision:1736` (ii)/(iii)):
+
+    * **The anchor is the DECISION.** A retrospective follows `HAD_OUTCOME`
+      backwards to the decision it judges; a decision is its own anchor. A
+      verdict has no belonging of its own — it belongs where what it judges
+      belongs, plus wherever its own measurements were taken.
+    * **The project is the anchor's `PROJECT_OF`**, and a decision always
+      asserts one at ingress, so this resolves whenever the graph is complete.
+      No project, no rows: the answer is "not knowable from the graph", never a
+      name-keyed guess.
+    * **Domains = own ∪ grounded.** The sections asserted on the record OR on
+      its anchor, union the sections of the non-superseded FACTS reachable from
+      either through `GROUNDING_RELATIONS` up to `hops` deep. Multi-hop because
+      a decision can ground on another judgement, and the facts are what carry
+      the axis.
+    * ⛔ **DERIVATION NEVER CROSSES A PROJECT BOUNDARY.** A domain is a SECTION
+      OF A PROJECT, so a B-project decision grounded on A-project facts inherits
+      none of A's sections. Both halves are bound to the SAME `:Project` NODE
+      `p` — node identity, never a name comparison, because two projects can
+      carry the same section name and a string match would silently merge them.
+    * **"None" is a valid answer** for a decision that asserted nothing and
+      rests on facts filed elsewhere. An empty list is the honest result, not a
+      failure.
+
+    Bounded by construction: `hops` caps the walk, the pattern is anchored on
+    indexed `pg_id`, and the whole thing is one round trip for the batch.
     """
+    rels = "|".join(GROUNDING_RELATIONS)
     return (
-        f"MATCH (start {{pg_id: $pg_id}})"
-        f" WHERE start:{ONT.decision} OR start:{ONT.retrospective} OR start:{ONT.community_summary}"
-        f" MATCH (start)-[:{ONT.had_outcome}*0..1]-(d)-[:{ONT.grounded_in}|{ONT.informed_by}*0..4]->(f:{ONT.fact})"
-        f" WHERE coalesce(f.superseded, false) = false"
-        f" MATCH (f)-[:{ONT.entity_link}]->(e:{ONT.entity})"
-        f" RETURN DISTINCT e.name AS name, elementId(e) AS element_id"
+        f"UNWIND $pg_ids AS wanted"
+        f" MATCH (j {{pg_id: wanted}})"
+        f" WHERE j:{ONT.decision} OR j:{ONT.retrospective}"
+        # A retrospective reaches its decision; a decision is its own anchor.
+        f" OPTIONAL MATCH (j)<-[:{ONT.had_outcome}]-(dec:{ONT.decision})"
+        f" WITH wanted, j, CASE WHEN j:{ONT.decision} THEN j ELSE dec END AS a"
+        f" WHERE a IS NOT NULL"
+        # THE project node. Every section below is checked against this node.
+        f" MATCH (a)-[:{ONT.project_of}]->(p:{ONT.project})"
+        f" WITH wanted, p,"
+        f"      CASE WHEN j = a THEN [a] ELSE [j, a] END AS anchors"
+        # Own sections: asserted on the record or on its anchor.
+        f" UNWIND anchors AS n"
+        f" OPTIONAL MATCH (n)-[:{ONT.domain_of}]->(od:{ONT.domain})"
+        f"                  -[:{ONT.project_of}]->(p)"
+        f" WITH wanted, p, anchors, collect(DISTINCT od.name) AS own"
+        # Grounded sections: the live facts either anchor rests on.
+        f" UNWIND anchors AS n2"
+        f" OPTIONAL MATCH (n2)-[:{rels}*1..{hops}]->(f:{ONT.fact})"
+        f"                   -[:{ONT.domain_of}]->(gd:{ONT.domain})"
+        f"                   -[:{ONT.project_of}]->(p)"
+        f"   WHERE coalesce(f.superseded, false) = false"
+        f" WITH wanted, p, own, collect(DISTINCT gd.name) AS grounded"
+        f" RETURN wanted AS anchor_pg_id, p.name AS project,"
+        f"        own + [x IN grounded WHERE NOT x IN own] AS domains"
     )
