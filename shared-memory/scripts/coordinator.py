@@ -776,6 +776,58 @@ ENTITY_VOCAB_RESOLVE_MANY_SQL = """
      GROUP BY i.raw_name, COALESCE(canon.name, alias_canon.name)
 """
 
+# ── Minting a NEW entity: the CONFUSABLE check (item 1, v0.9.69) ──────────────
+#
+# The mint path had no equivalent of `_new_project_refusal` / `_new_domain_refusal`:
+# `Games Workshops` minted straight beside `Games Workshop` with no warning
+# (`fact:1734` A(2)). This is the same rule those two enforce, on the same
+# override — the caller names the neighbour it means to differ from, because a
+# name cannot be produced without having read it, while a boolean can be flipped
+# without reading anything.
+#
+# ⚠ THERE IS NO SPELLING-VARIANT HALF HERE, and its absence is deliberate rather
+# than an omission. On the project axis a separator/case variant is refused
+# outright, uncconfirmable — but for entities that case cannot reach the mint at
+# all: `_entity_ingress_validate` resolves every candidate through
+# `ENTITY_VOCAB_RESOLVE_MANY_SQL`, which joins on `entity_normalize()` (the SQL
+# twin of `axis_key`), so a key-identical name is already RESOLVED to its
+# canonical and never appears in `unknown`. A spelling-variant guard here would
+# be code no input can reach — and a test for it would be unkillable.
+#
+# Names and aliases both, because a caller confusing its new name with a
+# spelling the operator has already curated is the same mistake as confusing it
+# with a canonical.
+ENTITY_CONFUSABLE_SQL = """
+    SELECT name, similarity(name, $1) AS score
+      FROM (
+            SELECT name FROM entity_vocabulary
+            UNION ALL
+            SELECT alias AS name FROM entity_vocab_aliases
+           ) v
+     WHERE similarity(name, $1) >= $2 AND name <> $1
+     ORDER BY similarity(name, $1) DESC, name
+     LIMIT $3
+"""
+
+# ⚠ UNMEASURED ON THIS VOCABULARY, and said plainly (`fact:1338`). The default
+# is CARRIED OVER from `PROJECT_CONFUSABLE_SIMILARITY`, whose 0.6 was derived
+# from a live registry — every pair of 37 registered projects, closest
+# legitimately distinct pair 0.500, realistic typos 0.78-1.00. No equivalent
+# pairwise sweep has been run over `entity_vocabulary`, whose names are longer
+# and more varied than project names, so this floor is a starting point that
+# INHERITS a measurement rather than one that has its own.
+#
+# The measurement that would settle it: score every pair of registered canonical
+# + alias spellings, and score a set of realistic typos of them, then place the
+# floor in the gap between the two populations — the same procedure the project
+# floor came from. Until that runs, the env override is the answer for an
+# install whose vocabulary this floor fits badly.
+ENTITY_CONFUSABLE_SIMILARITY = float(
+    os.environ.get("ENTITY_CONFUSABLE_SIMILARITY", "0.6")
+)
+ENTITY_PROPOSAL_LIMIT = _env_int("ENTITY_PROPOSAL_LIMIT", 5)
+
+
 # A project name is an AXIS, never an entity (`fact:1215`) — and the graph's own
 # gate does not catch it: `sanitize_entity_name` rejects `Project` (the schema
 # label) but passes `shared-memory-GitHub` cleanly, which is exactly why the rule
@@ -4900,6 +4952,53 @@ class MemoryCoordinator:
             return refusal
         return await self._entity_commit_mints(metadata, agent_id, plan)
 
+    async def _entity_confusable_error(
+        self, to_mint: list[str], metadata: dict,
+    ) -> dict | None:
+        """400 when a name about to be MINTED is confusable with one the
+        vocabulary already holds and the caller has not confirmed it is
+        distinct — or None (E1, item 1 of the v0.9.69 plan).
+
+        Mirrors `_new_project_refusal`'s confusable half exactly, including the
+        override: `metadata.confirm_distinct_from` names the existing spellings
+        this new name is deliberately different from, compared on the spelling
+        key so confirming `Games Workshop` confirms `games-workshop`.
+
+        ONE query per name to mint. That is the same shape
+        `_new_project_refusal` uses, and `new_entities` is a short list by
+        construction (every name in it must also appear in `entities`, which is
+        capped at `ENTITY_LIST_MAX_LEN`) — a mint is already the rare path.
+        """
+        for name in to_mint:
+            async with self._acquire() as conn:
+                rows = await conn.fetch(
+                    ENTITY_CONFUSABLE_SQL, name,
+                    ENTITY_CONFUSABLE_SIMILARITY, ENTITY_PROPOSAL_LIMIT)
+            near = [r["name"] for r in rows]
+            if not near:
+                continue
+            unconfirmed = unconfirmed_confusables(
+                near, metadata.get("confirm_distinct_from"))
+            if not unconfirmed:
+                continue
+            log.info("entity vocabulary: %r held for confirmation against %s",
+                     name, unconfirmed)
+            return {
+                "status": "error",
+                "error": "entity_confusable",
+                "message": (
+                    f"entity {_short(name)} is close enough to a name the "
+                    f"vocabulary already holds to be a typo for it: "
+                    f"{unconfirmed}. ASK THE OPERATOR whether this is genuinely "
+                    "a separate concept. If it is, re-send with "
+                    "metadata.confirm_distinct_from listing the names above; if "
+                    "it is not, save under the existing name. Minting a variant "
+                    "is how one concept quietly becomes two."
+                ),
+                "proposals": near,
+            }
+        return None
+
     async def _entity_reserved_project_error(
         self, candidates: list[str],
     ) -> dict | None:
@@ -5110,6 +5209,13 @@ class MemoryCoordinator:
             still_unknown = [n for n in unknown if n not in mint_requested]
             if still_unknown:
                 return self._entity_unknown_rejection(still_unknown), empty_plan
+
+            # E1 — a name about to be minted must not be a typo of one the
+            # vocabulary already holds. Last of the validations, because it is
+            # the only one that needs to know WHICH names will be minted.
+            confusable = await self._entity_confusable_error(to_mint, metadata)
+            if confusable is not None:
+                return confusable, empty_plan
 
         plan = {
             "resolved": resolved,

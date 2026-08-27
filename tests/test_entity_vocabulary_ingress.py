@@ -1108,8 +1108,18 @@ async def test_a_new_project_save_with_known_entities_still_registers():
 # rejects": the SHAPE rejections (a leaked pg_id, a single character) stay
 # gate-exempt, which is invariant I3 above and its own documented rationale.
 
-def _coord_with_projects(names=(), vocabulary=None):
-    """`_coord()` plus a `projects` table answering the reserved-name query."""
+def _coord_with_projects(names=(), vocabulary=None, neighbours=()):
+    """`_coord()` plus the two registry-facing reads the gate now issues:
+
+      * the `projects` reserved-name query (item 2) — `names` are the
+        registered projects
+      * the entity CONFUSABLE proposal query (item 1) — `neighbours` are the
+        vocabulary/alias spellings the trigram scan returns for any probe
+
+    The SQL itself is stubbed, as everything in this file is; the trigram
+    scoring is Postgres's job and is verified against the live database
+    separately (CLAUDE.md's "a green suite is not an all-clear").
+    """
     c = _coord(vocabulary=vocabulary)
     rows = [{"name": n, "normalized_key": axis_key(n)} for n in names]
 
@@ -1117,6 +1127,10 @@ def _coord_with_projects(names=(), vocabulary=None):
         if "normalized_key = ANY" in sql:
             wanted = set(args[0])
             return [r for r in rows if r["normalized_key"] in wanted]
+        if "similarity(name, $1)" in sql:
+            probe = args[0]
+            return [{"name": n, "score": 0.9}
+                    for n in neighbours if n != probe]
         return []
 
     conn = MagicMock()
@@ -1227,3 +1241,94 @@ async def test_shape_noise_stays_gate_exempt_next_to_the_reserved_check():
     err, _ = await c._entity_ingress_validate(metadata)
     assert err is None
     assert metadata["entities"] == ["254"]
+
+
+# ── E1 (item 1, v0.9.69) — a MINT must not be a typo of a name already held ────
+#
+# `Games Workshops` minted straight beside `Games Workshop` with no warning
+# (`fact:1734` A(2)). The mint path had no equivalent of the project registry's
+# `_new_project_refusal`; this is that rule, on the same override.
+#
+# ⚠ THERE IS NO SPELLING-VARIANT TEST HERE, deliberately. A separator/case
+# variant cannot reach the mint at all: `ENTITY_VOCAB_RESOLVE_MANY_SQL` joins on
+# `entity_normalize()` (the SQL twin of `axis_key`), so a key-identical name is
+# already RESOLVED and never appears in `unknown`. A test for that branch would
+# be unkillable — no mutation of the confusable check could make it fail.
+
+@pytest.mark.asyncio
+async def test_entity_mint_confusable_needs_confirm():
+    """E1: a near-match to an existing canonical is held for confirmation.
+
+    MUTATION CHECK: remove the `_entity_confusable_error` call from
+    `_entity_ingress_validate` and this test fails — the mint goes through and
+    `Games Workshops` lands in the vocabulary beside `Games Workshop`."""
+    c = _coord_with_projects(neighbours=["Games Workshop"])
+    err, _ = await c._entity_ingress_validate({
+        "project": "p",
+        "entities": ["Games Workshops"],
+        "new_entities": ["Games Workshops"],
+    })
+    assert err is not None
+    assert err["error"] == "entity_confusable"
+    assert err["proposals"] == ["Games Workshop"]
+    assert "Games Workshop" in err["message"]
+    c._entity_vocab_mint.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_confirm_distinct_from_lets_the_mint_through():
+    """The override is a NAME, not a boolean: naming the neighbour cannot be
+    produced without having read it."""
+    c = _coord_with_projects(neighbours=["Games Workshop"])
+    metadata = {
+        "project": "p",
+        "entities": ["Games Workshops"],
+        "new_entities": ["Games Workshops"],
+        "confirm_distinct_from": ["Games Workshop"],
+    }
+    err, plan = await c._entity_ingress_validate(metadata)
+    assert err is None
+    assert plan["to_mint"] == ["Games Workshops"]
+    assert await c._entity_commit_mints(metadata, "claude", plan) is None
+    c._entity_vocab_mint.assert_awaited_once_with("Games Workshops", "claude")
+
+
+@pytest.mark.asyncio
+async def test_confirmation_is_compared_on_the_spelling_key():
+    """Confirming `Games Workshop` confirms `games-workshop` — the same
+    `unconfirmed_confusables` comparison the project axis uses."""
+    c = _coord_with_projects(neighbours=["games-workshop"])
+    err, _ = await c._entity_ingress_validate({
+        "project": "p",
+        "entities": ["Games Workshops"],
+        "new_entities": ["Games Workshops"],
+        "confirm_distinct_from": "Games Workshop",
+    })
+    assert err is None
+
+
+@pytest.mark.asyncio
+async def test_a_mint_with_no_near_neighbour_is_untouched():
+    """The check must not have made every mint fail: a name nothing is close
+    to mints exactly as before."""
+    c = _coord_with_projects(neighbours=[])
+    metadata = {
+        "project": "p",
+        "entities": ["BrandNewThing"],
+        "new_entities": ["BrandNewThing"],
+    }
+    err, plan = await c._entity_ingress_validate(metadata)
+    assert err is None
+    assert plan["to_mint"] == ["BrandNewThing"]
+
+
+@pytest.mark.asyncio
+async def test_the_confusable_check_never_runs_for_a_save_that_mints_nothing():
+    """A save naming only KNOWN entities mints nothing, so it must not pay for
+    a proposal query — and must never be refused by one."""
+    c = _coord_with_projects(neighbours=["Kubernetes Operator"],
+                             vocabulary={"Kubernetes": "Kubernetes"})
+    err, plan = await c._entity_ingress_validate(
+        {"project": "p", "entities": ["Kubernetes"]})
+    assert err is None
+    assert plan["to_mint"] == []
