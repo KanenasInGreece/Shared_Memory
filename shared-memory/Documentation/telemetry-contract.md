@@ -425,14 +425,14 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 
 | key | type | unit | since | moved to | removed in | log twin | notes |
 |---|---|---|---|---|---|---|---|
-| `neo4j.cypher_rejected_total` | int | _total | 0.9.74 | — | — | — | the /memory/graph route's guard refusals |
+| `neo4j.cypher_rejected_total` | int | _total | 0.9.74 | — | — | — | queries the DATABASE refused because the CALLER wrote them wrong (/memory/graph only — the outbox apply has no caller to blame). Counted apart from tx_failures_total so a user's typo cannot read as an outage |
 | `neo4j.decisions_total` | int | — | <=0.9.73 | — | — | — | — |
 | `neo4j.error` | str | — | <=0.9.73 | — | — | — | present only when this section's own query failed |
 | `neo4j.facts_total` | int | — | <=0.9.73 | — | — | — | — |
-| `neo4j.query_p50_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
+| `neo4j.query_p50_ms` | float/null | _ms | 0.9.74 | — | — | — | over BOTH Neo4j callers — the /memory/graph route and the outbox apply — so the write path that actually blocks the pipeline is in scope, not only ad-hoc read Cypher |
 | `neo4j.query_p95_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
 | `neo4j.query_window` | int | — | 0.9.74 | — | — | — | — |
-| `neo4j.tx_failures_total` | int | _total | 0.9.74 | — | — | — | failed graph-route queries + failed outbox applies |
+| `neo4j.tx_failures_total` | int | _total | 0.9.74 | — | — | — | OUR failures, from both callers: a failed /memory/graph query and a failed outbox apply. Non-zero with cypher_rejected_total flat means Neo4j, not the caller |
 
 ### llm
 
@@ -643,11 +643,15 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `breakdown.projects[]` | list | — | 0.9.74 | — | — | — | the PROJECT distribution, under its true name |
 | `breakdown.projects[].count` | int | — | 0.9.74 | — | — | — | — |
 | `breakdown.projects[].key` | str | — | 0.9.74 | — | — | — | — |
-| `registry.aliases` | int | — | 0.9.74 | — | — | — | — |
-| `registry.domains` | int | — | 0.9.74 | — | — | — | — |
+| `breakdown.records_total` | int | — | 0.9.74 | — | — | — | records in technical_docs, so the coverage above can be read as a fraction without a second query |
+| `breakdown.records_with_domains` | int | — | 0.9.74 | — | — | — | how many records carry a non-empty `domains` array — the DENOMINATOR for breakdown.domains. Live 2026-08-28: 629 of 1691, so 62.8% of the corpus carries none and the distribution describes a 37% subset |
+| `registry.aliases` | int | — | 0.9.74 | — | — | — | ACTIVE alias BINDINGS — `project_aliases` + `domain_aliases` — not rows in `aliases`, which is the shared NAME POOL. A pooled name no active binding points at resolves nothing |
+| `registry.as_of` | str/null | — | 0.9.74 | — | — | — | when the census last SUCCEEDED. null before the first success |
+| `registry.census_failures_total` | int | _total | 0.9.74 | — | — | `health.registry` | failures of the row-count query behind registry.*. Deliberately SEPARATE from read_failures_total: a failed census means these numbers are stale, a failed axis read means a SEARCH silently answered from the literal string — same subsystem, different incidents |
+| `registry.domains` | int | — | 0.9.74 | — | — | — | rows in `project_domains`. A domain is (project_id, name), so the same NAME under two projects is two rows — they are different sections |
 | `registry.error` | str | — | 0.9.74 | — | — | — | present only when this section's own query failed |
-| `registry.projects` | int | — | 0.9.74 | — | — | — | — |
-| `registry.read_failures_total` | int | _total | 0.9.74 | — | — | `health.registry` | — |
+| `registry.projects` | int | — | 0.9.74 | — | — | — | rows in `projects`. ⛔ NEVER NULL: on a failed census the LAST GOOD value is served with `as_of` and `error` beside it, because a null would make a failed query look like a deployment with no projects |
+| `registry.read_failures_total` | int | _total | 0.9.74 | — | — | `health.registry` | the SEARCH path: a filter that could not be resolved |
 | `registry.refusals.axis_conflict` | int | — | 0.9.74 | — | — | — | — |
 | `registry.refusals.entities_not_allowed_on_judgement` | int | — | 0.9.74 | — | — | — | — |
 | `registry.refusals.entity_confusable` | int | — | 0.9.74 | — | — | — | — |

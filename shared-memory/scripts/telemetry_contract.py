@@ -693,13 +693,23 @@ TELEMETRY: dict[str, dict] = {
     "neo4j.rem_starved_pending": _k("int", "rem",
                                     moved_to="telemetry:rem.starved_pending",
                                     removed_in=NEXT),
-    "neo4j.query_p50_ms": _k("float|null", "neo4j", unit="_ms", since=NOW),
+    "neo4j.query_p50_ms": _k("float|null", "neo4j", unit="_ms", since=NOW, note=(
+        "over BOTH Neo4j callers — the /memory/graph route and the outbox "
+        "apply — so the write path that actually blocks the pipeline is in "
+        "scope, not only ad-hoc read Cypher")),
     "neo4j.query_p95_ms": _k("float|null", "neo4j", unit="_ms", since=NOW),
     "neo4j.query_window": _k("int", "neo4j", since=NOW),
     "neo4j.cypher_rejected_total": _k("int", "neo4j", unit="_total", since=NOW,
-                                      note="the /memory/graph route's guard refusals"),
+                                      note=(
+        "queries the DATABASE refused because the CALLER wrote them wrong "
+        "(/memory/graph only — the outbox apply has no caller to blame). "
+        "Counted apart from tx_failures_total so a user's typo cannot read as "
+        "an outage")),
     "neo4j.tx_failures_total": _k("int", "neo4j", unit="_total", since=NOW,
-                                  note="failed graph-route queries + failed outbox applies"),
+                                  note=(
+        "OUR failures, from both callers: a failed /memory/graph query and a "
+        "failed outbox apply. Non-zero with cypher_rejected_total flat means "
+        "Neo4j, not the caller")),
     "neo4j.error": _k("str", "neo4j",
                       note="present only when this section's own query failed"),
 
@@ -722,11 +732,33 @@ TELEMETRY: dict[str, dict] = {
                     note="present only when this section's own query failed"),
 
     # ── registry (NEW section, 0.9.74) ──────────────────────────────────────
-    "registry.projects": _k("int", "axes/registry", since=NOW),
-    "registry.domains": _k("int", "axes/registry", since=NOW),
-    "registry.aliases": _k("int", "axes/registry", since=NOW),
+    "registry.projects": _k("int", "axes/registry", since=NOW, note=(
+        "rows in `projects`. ⛔ NEVER NULL: on a failed census the LAST GOOD "
+        "value is served with `as_of` and `error` beside it, because a null "
+        "would make a failed query look like a deployment with no projects")),
+    "registry.domains": _k("int", "axes/registry", since=NOW, note=(
+        "rows in `project_domains`. A domain is (project_id, name), so the "
+        "same NAME under two projects is two rows — they are different "
+        "sections")),
+    "registry.aliases": _k("int", "axes/registry", since=NOW, note=(
+        "ACTIVE alias BINDINGS — `project_aliases` + `domain_aliases` — not "
+        "rows in `aliases`, which is the shared NAME POOL. A pooled name no "
+        "active binding points at resolves nothing")),
+    "registry.as_of": _k("str|null", "axes/registry", since=NOW, note=(
+        "when the census last SUCCEEDED. null before the first success")),
+    "registry.error": _k("str", "axes/registry", since=NOW, note=(
+        "present only while the last census attempt failed; the counts beside "
+        "it are the last good ones")),
+    "registry.census_failures_total": _k(
+        "int", "axes/registry", unit="_total", since=NOW, log="health.registry",
+        note=("failures of the row-count query behind registry.*. Deliberately "
+              "SEPARATE from read_failures_total: a failed census means these "
+              "numbers are stale, a failed axis read means a SEARCH silently "
+              "answered from the literal string — same subsystem, different "
+              "incidents")),
     "registry.read_failures_total": _k("int", "axes/registry", unit="_total",
-                                       since=NOW, log="health.registry"),
+                                       since=NOW, log="health.registry",
+                                       note="the SEARCH path: a filter that could not be resolved"),
     "registry.refusals.entity_reserved": _k("int", "axes/registry", since=NOW),
     "registry.refusals.entity_confusable": _k("int", "axes/registry", since=NOW),
     "registry.refusals.entity_unknown": _k("int", "axes/registry", since=NOW),
@@ -941,6 +973,13 @@ TELEMETRY: dict[str, dict] = {
         "breakdown.projects.")),
     "breakdown.domains[].key": _k("str", "axes/registry"),
     "breakdown.domains[].count": _k("int", "axes/registry"),
+    "breakdown.records_with_domains": _k("int", "axes/registry", since=NOW, note=(
+        "how many records carry a non-empty `domains` array — the DENOMINATOR "
+        "for breakdown.domains. Live 2026-08-28: 629 of 1691, so 62.8% of the "
+        "corpus carries none and the distribution describes a 37% subset")),
+    "breakdown.records_total": _k("int", "axes/registry", since=NOW, note=(
+        "records in technical_docs, so the coverage above can be read as a "
+        "fraction without a second query")),
     "breakdown.summaries[]": _k("list", "nrem/consolidation"),
     "breakdown.summaries[].kind": _k("str", "nrem/consolidation"),
     "breakdown.summaries[].superseded": _k("int", "nrem/consolidation"),
@@ -1235,8 +1274,8 @@ CONDITIONAL: frozenset = frozenset({
     "telemetry:neo4j.error",
     "telemetry:outbox.error",
     "telemetry:rem.error",
-    "telemetry:registry.error",
     "telemetry:nrem.error",
+    "telemetry:registry.error",
     "telemetry:breakdown.error",
     "telemetry:entity_graph.error",
     "telemetry:compliance.error",

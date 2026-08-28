@@ -1140,6 +1140,14 @@ class _TimedAcquire:
         self._t0 = time.monotonic()
         try:
             conn = await self._ctx.__aenter__()
+        except asyncio.CancelledError:
+            # ⛔ CANCELLATION IS NOT A POOL FAILURE. A task cancelled while
+            # waiting — shutdown, a client disconnect, an outer timeout — says
+            # nothing about whether the pool could have served it. Counting it
+            # would make an orderly gateway restart look like a burst of
+            # database errors, which is exactly the false alarm this counter
+            # exists to avoid raising.
+            raise
         except BaseException:
             self._ring.record_error()
             raise
@@ -2254,6 +2262,14 @@ CONSOLIDATION_ORPHAN_TIMEOUT_SEC = int(os.environ.get("CONSOLIDATION_ORPHAN_TIME
 TELEMETRY_CACHE_S = float(os.environ.get("TELEMETRY_CACHE_S", "15"))
 #: Observation window for the encoder latency rings. UNMEASURED.
 ENCODER_LATENCY_WINDOW = int(os.environ.get("ENCODER_LATENCY_WINDOW", "200"))
+#: F9 — the Postgres-pool-wait and Neo4j rings get their OWN windows, defaulting
+#: to the encoder one. They were sharing ENCODER_LATENCY_WINDOW, which meant a
+#: name that said "encoder" silently sized three unrelated instruments: an
+#: operator widening the encoder window to chase a slow reranker would have
+#: moved the Neo4j percentiles underneath themselves at the same time, and
+#: nothing in the name would have warned them. ⚠ Both UNMEASURED.
+POOL_WAIT_WINDOW = int(os.environ.get("POOL_WAIT_WINDOW", str(ENCODER_LATENCY_WINDOW)))
+NEO4J_LATENCY_WINDOW = int(os.environ.get("NEO4J_LATENCY_WINDOW", str(ENCODER_LATENCY_WINDOW)))
 #: Encoder p95 above this raises a /health warning. Default None → DERIVED
 #: per-encoder from backend_capability.<encoder>.ceiling_s, which IS measured
 #: (the capability probe times a fixed representative payload). Set the env only
@@ -2272,6 +2288,22 @@ TOKEN_VERIFY_WARN_PER_MIN = float(os.environ.get("TOKEN_VERIFY_WARN_PER_MIN", "1
 #: succeeded) is the ruling; the number is a floor to keep one unlucky fold from
 #: raising an alarm.
 NREM_FOLD_ATTEMPT_WARN = int(os.environ.get("NREM_FOLD_ATTEMPT_WARN", "5"))
+#: Guards the `(rem_timing->>'ts')::double precision` cast in `_rem_telemetry`.
+#: ⛔ NOT DECORATION. `rem_timing` is JSONB on a table with rows older than the
+#: writer that fills `ts`, and ONE unparseable value aborts the whole query —
+#: taking the REM section down with it, not just that row. Named rather than
+#: inlined so the pattern is unit-testable: every row on the development corpus
+#: is a clean number today (measured 2026-08-28, 188/188), so the guard is a
+#: no-op HERE and would go untested exactly where it matters — a corpus that
+#: has one bad row.
+REM_TS_NUMERIC_RE = r"^[0-9]+(\.[0-9]+)?$"
+#: Top-N for the two REGISTRY-BACKED breakdowns (projects, domains). ⚠
+#: UNMEASURED as a value; what IS measured is that the previous hard-coded 12
+#: truncated both on this corpus (38 projects, 15 domain names in use,
+#: 2026-08-28). 50 is headroom above the registry, not a tuned number.
+#: `agents`/`sources` keep their own top-12 — those are unbounded populations
+#: where a top-N is the answer rather than a truncation.
+BREAKDOWN_AXIS_TOP_N = int(os.environ.get("BREAKDOWN_AXIS_TOP_N", "50"))
 
 
 def _consolidation_backlog(eligible_clusters) -> int:
@@ -2875,11 +2907,11 @@ class MemoryCoordinator:
         # Postgres pool wait — how long `_acquire` blocked before handing over a
         # connection. Saturation was only ever visible as the 503 it eventually
         # produced; this is the number that climbs BEFORE that.
-        self._pool_wait_ring = LatencyRing(ENCODER_LATENCY_WINDOW)
+        self._pool_wait_ring = LatencyRing(POOL_WAIT_WINDOW)
         # Neo4j query latency + failure counters. `cypher_rejected` is the
         # CALLER's fault (a query the database refused) and `tx_failures` is
         # ours; counting them together would make a user typo read as an outage.
-        self._neo4j_ring = LatencyRing(ENCODER_LATENCY_WINDOW)
+        self._neo4j_ring = LatencyRing(NEO4J_LATENCY_WINDOW)
         self._cypher_rejected_total = 0
         self._neo4j_tx_failures_total = 0
         # ⛔ NO OUTBOX RING HERE, DELIBERATELY. Apply latency and drain rate are
@@ -2890,6 +2922,20 @@ class MemoryCoordinator:
         # restart, where the columns do not. Both numbers are SQL percentiles
         # over those two columns — see `_outbox_telemetry`.
         #
+        # Registry census health (F1). ⛔ THE CENSUS QUERY WAS DEAD FROM THE DAY
+        # IT SHIPPED — it selected FROM a `domains` table that does not exist —
+        # and the refresher's bare `except Exception: registry = None` made that
+        # indistinguishable from "not probed yet". Three pieces of state fix the
+        # class, not just the query: a COUNTER the registry dependency reads, so
+        # /health degrades when its own census cannot be read; the LAST GOOD
+        # value plus when it was taken, so a transient failure does not blank a
+        # number an operator was watching; and an ok/failed flag so the log line
+        # fires ONCE PER TRANSITION rather than once per 60-second tick.
+        self._registry_census_failures = 0
+        self._registry_census_last_error: str | None = None
+        self._registry_census_last_good: dict | None = None
+        self._registry_census_as_of: str | None = None
+        self._registry_census_ok: bool | None = None
         # Ingress refusal counters (0.9.69 shipped every one of these gates
         # UNINSTRUMENTED — a refusal was visible to the one caller who got it
         # and to nobody else). The seven keys are the contract's; several
@@ -2968,7 +3014,6 @@ class MemoryCoordinator:
             "postgres": {"state": "unknown", "reason": "not yet probed"},
             "neo4j": {"state": "unknown", "reason": "not yet probed"},
             "outbox": None,
-            "registry": None,
             "rem": None,
             "nrem": None,
             "as_of": None,
@@ -3370,6 +3415,14 @@ class MemoryCoordinator:
     async def _apply_outbox_row(
         self, outbox_id: int, pg_id: int, params: dict, retries: int
     ) -> None:
+        # F6/F7: the outbox apply is the OTHER Neo4j caller, and B2 asked for
+        # both. Timing only the graph route would have made `neo4j.query_p95_ms`
+        # describe read-only ad-hoc Cypher while the write path — the one that
+        # actually blocks the pipeline — stayed invisible; counting only the
+        # graph route's failures would have made `tx_failures_total` read as
+        # "Neo4j is fine" through a Neo4j outage that was failing every apply.
+        # One clock read on either side, and the recorders cannot raise.
+        _t0 = time.monotonic()
         try:
             if params.get("type") == "decision":
                 await self._apply_decision_outbox_row(outbox_id, pg_id, params)
@@ -3495,8 +3548,15 @@ class MemoryCoordinator:
                     "UPDATE neo4j_outbox SET status='applied', applied_at=now() WHERE id=$1",
                     outbox_id,
                 )
+            safe(lambda: self._neo4j_ring.record(
+                (time.monotonic() - _t0) * 1000.0))
             log.debug("outbox: applied pg_id=%d (outbox_id=%d)", pg_id, outbox_id)
         except Exception as exc:
+            # OURS, not the caller's — the same discriminator the graph route
+            # uses: `cypher_rejected_total` is a query the DATABASE refused
+            # because the CALLER wrote it wrong, and there is no caller here.
+            safe(lambda: setattr(self, "_neo4j_tx_failures_total",
+                                 self._neo4j_tx_failures_total + 1))
             log.warning(
                 "outbox: neo4j write failed pg_id=%d attempt %d/%d: %s",
                 pg_id, retries + 1, OUTBOX_MAX_RETRIES, exc,
@@ -9076,6 +9136,7 @@ class MemoryCoordinator:
             snap["outbox"] = {"error": str(exc)}
 
         # Neo4j — REM/NREM backlog for facts and decisions
+        _nj = self._neo4j_ring.snapshot()
         try:
             async with self._neo4j.session() as session:
                 fres = await session.run(
@@ -9135,9 +9196,13 @@ class MemoryCoordinator:
                 # nothing about the DATABASE. `cypher_rejected_total` is the
                 # CALLER's fault and `tx_failures_total` is ours; see the
                 # increment sites for why they are never summed.
-                "query_p50_ms": self._neo4j_ring.snapshot()["p50_ms"],
-                "query_p95_ms": self._neo4j_ring.snapshot()["p95_ms"],
-                "query_window": self._neo4j_ring.snapshot()["window"],
+                # ONE snapshot, three reads (F12). Three separate snapshot()
+                # calls sorted the ring three times and — worse — could observe
+                # three different windows, since a concurrent request can record
+                # between them: p50 and p95 would then describe populations that
+                # never coexisted, and `window` would name neither.
+                **{f"query_{k}": v for k, v in _nj.items()
+                   if k in ("p50_ms", "p95_ms", "window")},
                 "cypher_rejected_total": self._cypher_rejected_total,
                 "tx_failures_total": self._neo4j_tx_failures_total,
             }
@@ -10175,14 +10240,78 @@ class MemoryCoordinator:
     async def _registry_census(self) -> dict:
         """Row counts for the three registries the axes resolve against. Nothing
         reported these: `complete: true` on the identity probes says the graph
-        and the registry AGREE, which is equally true of two empty stores."""
+        and the registry AGREE, which is equally true of two empty stores.
+
+        ⛔ THE FIRST VERSION OF THIS QUERY SELECTED FROM A TABLE THAT DOES NOT
+        EXIST. `SELECT count(*) FROM domains` raises UndefinedTableError on
+        every install — there is no `domains` table and there never was. The
+        refresher's `except Exception: registry = None` then swallowed it, so
+        `registry.projects/domains/aliases` were null FOREVER and nothing said
+        why. That is the whole reason the swallow now logs and counts: a probe
+        that cannot run must not be indistinguishable from a probe that has not
+        run yet.
+
+        WHAT THE THREE NUMBERS ACTUALLY COUNT, because two of them are not
+        obvious from their names:
+
+        * ``projects``  — rows in `projects`, one per registered project.
+        * ``domains``   — rows in `project_domains`. A domain is identified by
+          (project_id, name), so the same NAME registered under two projects is
+          two rows and must be: they are different sections.
+        * ``aliases``   — ACTIVE alias BINDINGS, `project_aliases` +
+          `domain_aliases`, not rows in `aliases`. `aliases` is the shared
+          NAME POOL; a name in it that no active binding points at resolves
+          nothing, so counting the pool would report alias coverage this
+          deployment does not have. Inactive (superseded) bindings are excluded
+          for the same reason.
+
+        Measured live 2026-08-28: projects 38, domains 20, aliases 18 in 1.9 ms.
+        """
         async with self._acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT (SELECT count(*) FROM projects)::int AS projects,"
-                "       (SELECT count(*) FROM domains)::int  AS domains,"
-                "       (SELECT count(*) FROM aliases)::int  AS aliases"
+                "SELECT (SELECT count(*) FROM projects)::int        AS projects,"
+                "       (SELECT count(*) FROM project_domains)::int AS domains,"
+                "       (SELECT (SELECT count(*) FROM project_aliases WHERE active)"
+                "             + (SELECT count(*) FROM domain_aliases  WHERE active))::int"
+                "                                                    AS aliases"
             )
         return dict(row)
+
+    async def _refresh_registry_census(self) -> None:
+        """Take one registry census and fold the OUTCOME into health state.
+
+        Extracted from the refresher (F1) so the refresher and the tests run the
+        SAME code — the defect this fixes was a census nothing ever executed in
+        a test, and re-testing it through a different path would have reproduced
+        exactly that.
+
+        ⛔ A FAILURE IS COUNTED, LOGGED ONCE PER TRANSITION, AND SERVES THE LAST
+        GOOD VALUE. The bare `except Exception: registry = None` this replaces
+        is why `SELECT count(*) FROM domains` — a table that does not exist —
+        ran unnoticed on every install: /health showed nulls, nothing said why,
+        and the `registry` dependency stayed `ok` because it was reading a
+        different counter entirely.
+        """
+        try:
+            census = await self._registry_census()
+        except Exception as exc:
+            self._registry_census_failures += 1
+            self._registry_census_last_error = f"{type(exc).__name__}: {exc}"
+            # Once per TRANSITION: this runs every CONSOLIDATION_HEALTH_REFRESH_
+            # SEC, and a line per tick is a log nobody reads.
+            if self._registry_census_ok is not False:
+                log.warning(
+                    "health.registry: census FAILED (%s: %s) — registry.* is "
+                    "serving its last good value; the registry dependency is "
+                    "degraded", type(exc).__name__, exc)
+            self._registry_census_ok = False
+            return
+        self._registry_census_last_good = census
+        self._registry_census_as_of = datetime.now(timezone.utc).isoformat()
+        self._registry_census_last_error = None
+        if self._registry_census_ok is False:
+            log.info("health.registry: census recovered")
+        self._registry_census_ok = True
 
     async def _rem_dead_letter_count(self) -> dict:
         """How many records REM has GIVEN UP on. One cheap Neo4j aggregate.
@@ -10310,10 +10439,7 @@ class MemoryCoordinator:
                     outbox = await self._outbox_census()
                 except Exception:
                     outbox = None
-                try:
-                    registry = await self._registry_census()
-                except Exception:
-                    registry = None
+                await self._refresh_registry_census()
                 try:
                     rem = await self._rem_dead_letter_count()
                 except Exception:
@@ -10333,7 +10459,6 @@ class MemoryCoordinator:
                     "postgres": postgres,
                     "neo4j": neo4j,
                     "outbox": outbox,
-                    "registry": registry,
                     "rem": rem,
                     "nrem": nrem,
                     "as_of": datetime.now(timezone.utc).isoformat(),
@@ -10503,8 +10628,12 @@ class MemoryCoordinator:
             "apply_latency_p50_s": _r(lat["p50"]),
             "apply_latency_p95_s": _r(lat["p95"]),
             "apply_latency_window": lat["n"],
-            # None, not 0.0, when no row has been applied in 24 h: a rate over
-            # an empty window is not a measured zero.
+            # ⛔ NULL WHEN THERE IS NO BASIS, 0.0 WHEN THERE IS. `n` is how many
+            # rows were applied in the 24 h window; if none were, this process
+            # has measured nothing and a rate of 0.0 would assert an
+            # observation nobody made. With a non-empty window a 0.0 IS a real
+            # measurement — nothing drained this minute — and nulling THAT
+            # would be the same absence-is-not-zero rule pointed backwards.
             "drain_rate_per_min": (float(lat["applied_last_min"])
                                    if lat["n"] else None),
             "age_limit_s": OUTBOX_AGE_WARN_S,
@@ -10534,7 +10663,7 @@ class MemoryCoordinator:
                 # abort the whole query rather than skip a row.
                 "SELECT count(*)::int AS n FROM technical_docs"
                 " WHERE rem_timing IS NOT NULL"
-                "   AND rem_timing->>'ts' ~ '^[0-9]+(\\.[0-9]+)?$'"
+                f"   AND rem_timing->>'ts' ~ '{REM_TS_NUMERIC_RE}'"
                 "   AND (rem_timing->>'ts')::double precision"
                 "       >= EXTRACT(EPOCH FROM now()) - 3600"
             )
@@ -10569,14 +10698,32 @@ class MemoryCoordinator:
         request. The refusal counters are in-process and reset on restart, the
         same contract every other counter in this payload carries.
         """
-        census = self._dependency_health.get("registry") or {}
-        return {
-            "projects": census.get("projects"),
-            "domains": census.get("domains"),
-            "aliases": census.get("aliases"),
+        census = self._registry_census_last_good
+        out = {
+            # ⛔ NEVER NULL ONCE A CENSUS HAS SUCCEEDED. On a failed poll the
+            # LAST GOOD value is served and `error`/`as_of` say what happened
+            # and how old it is — a null would make "the query failed" look
+            # exactly like "this deployment has no projects", which is the same
+            # absence-is-not-zero confusion the outbox census had. Before the
+            # first successful poll they are 0 with `as_of: null`, which reads
+            # as "nothing counted yet" rather than "nothing exists".
+            "projects": (census or {}).get("projects", 0),
+            "domains": (census or {}).get("domains", 0),
+            "aliases": (census or {}).get("aliases", 0),
+            "as_of": self._registry_census_as_of,
+            # The SEARCH-path counter: a filter that could not be resolved.
             "read_failures_total": self._axis_registry_read_failures,
+            # The CENSUS counter, deliberately separate. A failed census means
+            # this telemetry is stale; a failed axis read means a SEARCH
+            # silently answered from the literal string. Same subsystem, two
+            # different consequences, and summing them would let an operator
+            # read a stale gauge as a broken retrieval path.
+            "census_failures_total": self._registry_census_failures,
             "refusals": self._registry_refusals.snapshot(),
         }
+        if self._registry_census_last_error is not None:
+            out["error"] = self._registry_census_last_error
+        return out
 
     def _pool_gauges(self) -> dict:
         """asyncpg pool size / free / in-use, or None for each.
@@ -10656,9 +10803,17 @@ class MemoryCoordinator:
                 "SELECT COALESCE(metadata->>'source','(none)') AS key,"
                 " count(*)::int AS count FROM technical_docs GROUP BY 1 ORDER BY count DESC LIMIT 12"
             )
+            # ⚠ THE AXIS BREAKDOWNS GET THEIR OWN, LARGER LIMIT. `agents` and
+            # `sources` are unbounded populations where a top-12 IS the answer.
+            # Projects and domains are REGISTRY-BACKED: truncating them below
+            # the number of registered entries silently hides whole sections,
+            # and a reader has no way to tell a section with no records from a
+            # section that fell off the end of a LIMIT. Live 2026-08-28: 38
+            # projects and 15 distinct domain names in use against a top-12.
             projects = await conn.fetch(
                 f"SELECT COALESCE({PROJECT_SQL}, '(none)') AS key,"
-                " count(*)::int AS count FROM technical_docs GROUP BY 1 ORDER BY count DESC LIMIT 12"
+                " count(*)::int AS count FROM technical_docs"
+                " GROUP BY 1 ORDER BY count DESC LIMIT $1", BREAKDOWN_AXIS_TOP_N
             )
             # ⚠ THE REAL DOMAIN DISTRIBUTION (0.9.74). `domains` is a JSON ARRAY
             # on the record — one record belongs to several sections — so the
@@ -10670,7 +10825,23 @@ class MemoryCoordinator:
                 "       LATERAL jsonb_array_elements_text("
                 "         CASE WHEN jsonb_typeof(metadata->'domains') = 'array'"
                 "              THEN metadata->'domains' ELSE '[]'::jsonb END) AS d"
-                " GROUP BY 1 ORDER BY count DESC LIMIT 12"
+                " GROUP BY 1 ORDER BY count DESC LIMIT $1", BREAKDOWN_AXIS_TOP_N
+            )
+            # ⛔ THE DENOMINATOR SHIPS WITH THE DISTRIBUTION. Domain counts are
+            # over an ARRAY column, so they are not comparable with any other
+            # breakdown in this payload and cannot be read against a record
+            # total the reader has to guess at. Live 2026-08-28: 629 of 1691
+            # records carry a non-empty `domains` — 62.8% carry NONE — so the
+            # counts describe a 37% subset. Without these two numbers a reader
+            # sums the distribution, gets less than the corpus, and concludes
+            # records are missing rather than unlabelled.
+            coverage = await conn.fetchrow(
+                "SELECT count(*)::int AS records_total,"
+                "       count(*) FILTER ("
+                "         WHERE jsonb_typeof(metadata->'domains') = 'array'"
+                "           AND jsonb_array_length(metadata->'domains') > 0"
+                "       )::int AS records_with_domains"
+                "  FROM technical_docs"
             )
             summaries = await conn.fetch(
                 "SELECT COALESCE(metadata->>'kind','community_summary') AS kind,"
@@ -10690,6 +10861,8 @@ class MemoryCoordinator:
             # its own correct name; `domains` finally means domains.
             "projects": kv(projects),
             "domains": kv(domains),
+            "records_with_domains": coverage["records_with_domains"],
+            "records_total": coverage["records_total"],
             "summaries": [
                 {"kind": r["kind"], "superseded": r["superseded"], "active": r["active"]}
                 for r in summaries

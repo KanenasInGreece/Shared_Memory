@@ -3907,15 +3907,33 @@ def _nrem_dependency(process_running: bool, consolidation: object,
     return _dep(_STATE_OK)
 
 
-def _registry_dependency(read_failures: object) -> dict:
+def _registry_dependency(read_failures: object,
+                         census_failures: object = 0) -> dict:
     """A registry that could not be READ answers 200 with a silently different
     answer: by-key resolution becomes a no-op and a filtered search matches only
     the literal string it was given, which is indistinguishable from a name
-    nobody registered."""
+    nobody registered.
+
+    ⛔ TWO INPUTS, BOTH OF WHICH MUST REACH THE VERDICT (F1). `read_failures` is
+    the SEARCH path: a filter that could not be resolved. `census_failures` is
+    this health layer's OWN probe: the row-count query behind `registry.*`. The
+    first version of that query named a table that does not exist, so it failed
+    on every install — and because nothing counted it, the dependency read `ok`
+    while the numbers it is supposed to describe were null. A health check that
+    cannot see its own instrument failing is not a health check.
+
+    The reason NAMES which one, because the two have different fixes: a stale
+    gauge and a silently-degraded search are not the same incident.
+    """
     if not isinstance(read_failures, int):
         return _dep(_STATE_UNKNOWN, "not yet probed")
+    reasons = []
     if read_failures > 0:
-        return _dep(_STATE_DEGRADED, f"read_failures:{read_failures}")
+        reasons.append(f"read_failures:{read_failures}")
+    if isinstance(census_failures, int) and census_failures > 0:
+        reasons.append(f"census_failures:{census_failures}")
+    if reasons:
+        return _dep(_STATE_DEGRADED, " ".join(reasons))
     return _dep(_STATE_OK)
 
 
@@ -4484,7 +4502,9 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
         "outbox": _outbox_dependency(outbox_census, OUTBOX_AGE_WARN_S),
         "registry": _registry_dependency(
             getattr(coordinator, "_axis_registry_read_failures", None)
-            if coordinator is not None else None),
+            if coordinator is not None else None,
+            getattr(coordinator, "_registry_census_failures", 0)
+            if coordinator is not None else 0),
     }
 
     warnings: list = []
@@ -4514,9 +4534,16 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
     if isinstance(rem_block, dict) and (rem_block.get("dead_lettered") or 0) > 0:
         warnings.append(_warning("rem_dead_lettered", 0,
                                  rem_block["dead_lettered"], "records"))
-    if _gateway_shed_rate() > 0:
-        warnings.append(_warning("gateway_shed_503_total", 0,
-                                 _gateway_shed_rate(), "requests"))
+    # ⛔ CALLED ONCE. `_gateway_shed_rate` MOVES ITS OWN WATERMARK, so the second
+    # call in the old `if rate > 0: ... rate ...` pair measured the interval
+    # between the two calls — microseconds — and always reported `observed: 0`.
+    # A warning whose observed value is the value that could not have raised it
+    # is worse than no warning: it fires and then denies itself. (fact:1309 —
+    # an equality between two expressions is half a guard; the VALUE is asserted
+    # in the test.)
+    shed = _gateway_shed_rate()
+    if shed > 0:
+        warnings.append(_warning("gateway_shed_503_total", 0, shed, "requests"))
     tv_rate = _token_verify_failure_rate()
     if tv_rate is not None and tv_rate > TOKEN_VERIFY_WARN_PER_MIN:
         warnings.append(_warning("token_verify_failed_per_min",
@@ -4639,16 +4666,27 @@ async def handle_health(request: web.Request) -> web.Response:
     / `role: "write"` would dress an absence up as an answer. Absent means
     "this install has no identities", which is true and useful.
 
-    ⚠ `role` is two-valued by ruling — `read` for an identity confined to
-    the read allowlist, `write` for everyone else. An `admin` token reaches
-    here (`/health` is in `_UNPROTECTED_PATHS`, so the role gate never runs
-    on it) and reports `write`, which OVERSTATES it: an admin token is
-    confined to `/admin/*` and cannot save either. Raised as a finding
-    rather than answered here — the vocabulary is the operator's.
+    ⚠ `role` is THREE-valued since v0.9.74 — `read` for an identity confined
+    to the read allowlist, `admin` for an admin credential, `write` for
+    everyone else. It used to collapse to two, and an `admin` token (which
+    reaches here because `/health` is in `_UNPROTECTED_PATHS`, so the role
+    gate never runs on it) was reported `write`. That OVERSTATED it: an admin
+    token is confined to `/admin/*` and cannot save either, so the caller was
+    told it may write and then 403'd on every write route. The finding was
+    raised at the time and left for the operator, whose vocabulary this is;
+    `admin` is the roster's own word for the role, and it is what ships.
 
     HTTP 200: embedder + reranker both reachable (save/search path healthy).
     HTTP 503: at least one critical backend is down — computed identically
     for every caller; an anonymous caller learns the VERDICT, not why.
+
+    ⛔ THE STATUS CODE IS NOT THE `status` ENUM, and v0.9.74 is where the two
+    part company. The enum is now derived from `dependencies` + `warnings` and
+    can read `degraded` or `down` for a failing outbox, a dead-lettering REM
+    daemon, an unreadable registry or a crossed limit — none of which stop a
+    save from producing a vector. The CODE still answers exactly one question:
+    can this gateway embed? 503 iff the embedder or the reranker is down. It is
+    read off `dependencies` below rather than off the enum, and a test pins it.
     """
     proxy: AsyncHiveMindProxy = request.app["proxy"]
     checks = await _health_probe_cached(proxy, request.app.get("coordinator"))

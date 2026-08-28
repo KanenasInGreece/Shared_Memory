@@ -15,8 +15,10 @@ dropped while its row stays in the table. So:
 And the DOCUMENT is generated from the same dict, so it cannot drift either.
 """
 
+import ast
 import asyncio
 import importlib
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -283,7 +285,6 @@ class _StubCoordinator:
             "outbox": {"pending": 0, "in_progress": 0, "applied": 1, "failed": 0,
                        "rem_reviewed": 0, "oldest_failed_age_s": None,
                        "oldest_pending_age_s": None},
-            "registry": {"projects": 1, "domains": 1, "aliases": 0},
             "rem": {"dead_lettered": 0},
             "nrem": {"fact_cycles": 1, "decision_cycles": 1, "total_cycles": 2,
                      "fact_threshold": 3},
@@ -548,9 +549,192 @@ def test_an_admin_token_is_reported_as_admin_not_write(gateway):
 # TWO-WAY: /memory/telemetry
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _stub_telemetry_coordinator(g):
-    """A coordinator whose every DB-facing section is stubbed with a fully
-    populated result, so the completeness direction sees every documented key."""
+class _FakeRow(dict):
+    """A dict that behaves like an asyncpg Record — and RAISES on a key nobody
+    planned for, rather than returning None.
+
+    ⛔ THE RAISE IS THE POINT. A fake that answers every column with None lets a
+    builder read a column that does not exist and quietly emit a null, which is
+    the exact class of defect this fix round exists for: `_registry_census`
+    selected FROM a table that does not exist and nothing noticed, because every
+    layer above it tolerated an absence.
+    """
+
+    def __missing__(self, key):
+        raise KeyError(
+            f"the fake connection was asked for column {key!r}, which no "
+            f"planned row provides — add it to _PG_PLAN, do not let the "
+            f"builder read a hole")
+
+
+class _FakeConn:
+    """A Postgres stand-in that DISPATCHES ON THE QUERY and returns rows of the
+    documented shape, so every telemetry section runs its REAL builder.
+
+    Replaces the AsyncMock-per-builder the first draft used. A mocked builder
+    makes the two-way pin vacuous for that section: the payload comes from the
+    mock, so the contract is only ever compared against the test's own
+    imagination of the code. Two mutation checks proved it — deleting a key from
+    a real builder changed nothing, because no real builder ran.
+
+    An unrecognised query RAISES. A fake that silently returned [] for anything
+    it did not know would let a whole section degrade to `{"error": ...}`, and
+    the completeness direction would then simply skip it.
+    """
+
+    def __init__(self, plan: dict):
+        self._plan = plan
+
+    def _match(self, sql: str, kind: str):
+        flat = " ".join(sql.split())
+        for needle, value in self._plan.get(kind, []):
+            if needle in flat:
+                return value
+        raise AssertionError(
+            f"the fake connection has no planned {kind} for this SQL — add one "
+            f"rather than letting the section fail into an error branch:\n{flat[:300]}")
+
+    async def fetchrow(self, sql, *args):
+        return self._match(sql, "fetchrow")
+
+    async def fetchval(self, sql, *args):
+        return self._match(sql, "fetchval")
+
+    async def fetch(self, sql, *args):
+        return self._match(sql, "fetch")
+
+    async def execute(self, sql, *args):
+        return "SELECT 0"
+
+    async def executemany(self, sql, *args):
+        return None
+
+
+class _FakeResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    async def data(self):
+        return list(self._rows)
+
+    async def single(self):
+        return self._rows[0] if self._rows else None
+
+
+class _FakeSession:
+    """Neo4j stand-in, same dispatch-or-raise contract as _FakeConn."""
+
+    def __init__(self, plan):
+        self._plan = plan
+
+    async def run(self, cypher, **params):
+        flat = " ".join(cypher.split())
+        for needle, rows in self._plan:
+            if needle in flat:
+                return _FakeResult(rows)
+        raise AssertionError(
+            f"the fake session has no planned result for this Cypher — add one "
+            f"rather than letting the section fail into an error branch:\n{flat[:300]}")
+
+
+_PER_TYPE_ROLLUP = {
+    "last_outcome": "success", "last_success_age_seconds": 1,
+    "in_flight": False, "consecutive_failures": 0, "backlog": 0,
+    "stalled": False,
+    "last_error": {"class": "X", "msg": "m", "age_seconds": 1,
+                   "superseded": False},
+    "eligible_clusters": 0, "eligible_oldest_age_seconds": None,
+    "dead_lettered_clusters": 0, "unchanged_clusters": 0,
+    "singleton_clusters": 0, "truncation_failures": 0, "slot_failures": 0,
+    "last_deferred_reason": None, "cycle_seconds_avg": 1.0, "runs_24h": 1,
+    "deferred_24h": 0, "idle_24h": 0, "folds_succeeded_24h": 1,
+    "folds_attempted_24h": 1, "truncation_failures_24h": 0,
+    "slot_failures_24h": 0, "last_started": "2026-08-28T00:00:00+00:00",
+}
+
+#: Every Postgres query the telemetry payload makes, keyed by a distinctive
+#: fragment, with a row of the DOCUMENTED shape. Ordered — first match wins.
+_PG_PLAN = {
+    "fetchrow": [
+        ("FILTER (WHERE status='pending')", _FakeRow(
+            pending=1, in_progress=0, applied=4, failed=0, rem_reviewed=2,
+            oldest_failed_age_s=None, oldest_pending_age_s=12)),
+        ("applied_at - created_at", _FakeRow(
+            n=4, p50=1.5, p95=2.5, applied_last_min=2)),
+        ("FROM project_domains)::int AS domains", _FakeRow(
+            projects=38, domains=20, aliases=18)),
+        ("rem_timing->>'ts'", _FakeRow(n=7)),
+        ("records_with_domains", _FakeRow(
+            records_total=1691, records_with_domains=629)),
+        ("count(*) FILTER (WHERE metadata->>'kind'='insight')", _FakeRow(
+            total=3, superseded=1, insight=1)),
+        ("count(*) AS total, count(*) FILTER (WHERE superseded) AS superseded FROM technical_docs",
+         _FakeRow(total=1691, superseded=40)),
+        ("metadata->'decision' ? 'alternatives'", _FakeRow(
+            n=10, grounded=9, alts=8, conf=7, elicited=6)),
+        ("NOT IN ('decision', 'retrospective')", _FakeRow(
+            n=100, sref=90, elicited=80)),
+        ("metadata ? 'target_pg_id'", _FakeRow(
+            n=5, rating=5, target=5, grounded=4, elicited=3)),
+        ("decision_alternatives", _FakeRow(
+            entries=12, decisions=6, embedded=12, pending=0, failing=0,
+            oldest_pending_age_s=None)),
+        ("FROM consolidation_runs", _FakeRow(n=3, p50=12.0, p95=30.0)),
+        ("count(*) FROM refold_ledger", _FakeRow(n=0)),
+    ],
+    "fetchval": [
+        ("FROM neo4j_outbox WHERE status='failed'", None),
+        ("count(*) FROM refold_ledger", 0),
+    ],
+    "fetch": [
+        ("FROM neo4j_outbox GROUP BY status", [
+            _FakeRow(status="applied", n=4), _FakeRow(status="pending", n=1)]),
+        ("metadata->>'type','(untagged)'", [
+            _FakeRow(key="fact", count=900), _FakeRow(key="decision", count=200)]),
+        ("agent_id AS key", [_FakeRow(key="claude", count=500)]),
+        ("metadata->>'source','(none)'", [_FakeRow(key="claude", count=500)]),
+        ("jsonb_array_elements_text", [
+            _FakeRow(key="architecture", count=301),
+            _FakeRow(key="operations", count=184)]),
+        ("FROM community_summaries GROUP BY 1", [
+            _FakeRow(kind="insight", superseded=0, active=2)]),
+        ("AS key, count(*)::int AS count FROM technical_docs GROUP BY 1", [
+            _FakeRow(key="shared-memory-GitHub", count=800)]),
+        ("jsonb_object_keys(metadata) k", [_FakeRow(k="elicited", n=50)]),
+        ("rem_timing->>'model' AS model", [_FakeRow(
+            model="qwen3-14b", n=12, n_service=10, svc_p50=100.0, svc_p95=200.0,
+            con_p50=1.0, con_p95=2.0, wall_p50=110.0, wall_p95=220.0,
+            max_batch=4, backend="http://localhost:5000")]),
+        ("GROUP BY status, closed_reason", [
+            _FakeRow(status="dropped", closed_reason="out_of_scan", n=37)]),
+        ("GROUP BY trigger_kind", [_FakeRow(trigger_kind="technical_docs", n=43)]),
+        ("status = 'open' AND summary_kind = 'insight'", []),
+    ],
+}
+
+_NEO4J_PLAN = [
+    ("AND coalesce(n.rem_attempts,0) >= $cap", [{"n": 0}]),
+    ("RETURN coalesce(n.rem_attempts,0) AS a", [
+        {"a": 0, "p": 0, "n": 40}, {"a": 5, "p": 0, "n": 0}]),
+    ("MATCH (f:Fact) WHERE f.pg_id IS NOT NULL", [
+        {"rem": True, "con": True, "superseded": False, "n": 900}]),
+    ("MATCH (d:Decision) RETURN coalesce(d.rem_processed,false)", [
+        {"rem": True, "superseded": False, "n": 200}]),
+    ("RETURN count(e) AS total", [{
+        "total": 300, "orphans": 2, "unmentioned": 5, "singletons": 40,
+        "genuinely_referenced": 250}]),
+    ("ORDER BY degree DESC LIMIT 8", [{"name": "outbox", "degree": 30}]),
+    ("MATCH ()-[r]->() RETURN type(r) AS name", [
+        {"name": "MENTIONS", "c": 6000}, {"name": "ALIASES", "c": 3}]),
+    ("UNWIND labels(n) AS l", [
+        {"name": "Fact", "c": 900}, {"name": "Decision", "c": 200}]),
+    ("coalesce(n.rem_invalid, false) = true", [
+        {"label": "Fact", "reason": "label_mismatch", "c": 1}]),
+]
+
+
+def _stub_telemetry_coordinator(g, pg_plan=None, neo4j_plan=None):
+    """A coordinator wired to the fakes above, running EVERY real builder."""
     import coordinator as co
     c = co.MemoryCoordinator()
     c._pool = MagicMock()
@@ -560,108 +744,25 @@ def _stub_telemetry_coordinator(g):
     c.hnsw_iterative_scan = True
     c.telemetry_extras_provider = g.telemetry_extras
 
-    conn = AsyncMock()
-    conn.fetchrow = AsyncMock(return_value={
-        "total": 1, "superseded": 0, "insight": 0,
-    })
-    conn.fetch = AsyncMock(return_value=[])
-    conn.fetchval = AsyncMock(return_value=None)
+    conn = _FakeConn(pg_plan or _PG_PLAN)
     c._acquire = MagicMock(return_value=_async_ctx(conn))
-
-    session = AsyncMock()
-    result = AsyncMock()
-    result.data = AsyncMock(return_value=[])
-    result.single = AsyncMock(return_value=None)
-    session.run = AsyncMock(return_value=result)
+    session = _FakeSession(neo4j_plan or _NEO4J_PLAN)
     c._neo4j = MagicMock()
     c._neo4j.session = MagicMock(return_value=_async_ctx(session))
 
     c._consolidation_health = dict(_FULL_CONSOLIDATION)
     c._dependency_health = _StubCoordinator().dependency_snapshot()
 
-    # Every DB-backed section stubbed with a full result — this test is about
-    # the CONTRACT, not about re-testing each section's SQL.
-    c._metadata_breakdown = AsyncMock(return_value={
-        "record_types": [{"key": "fact", "count": 1}],
-        "agents": [{"key": "claude", "count": 1}],
-        "sources": [{"key": "claude", "count": 1}],
-        "projects": [{"key": "shared-memory-GitHub", "count": 1}],
-        "domains": [{"key": "delivery", "count": 1}],
-        "summaries": [{"kind": "insight", "superseded": 0, "active": 1}],
-    })
-    c._entity_graph = AsyncMock(return_value={
-        "entities_total": 1, "orphan_entities": 0, "unmentioned_entities": 0,
-        "singleton_entities": 0, "genuinely_referenced_entities": 1,
-        "top_hubs": [{"name": "x", "degree": 1}],
-    })
-    c._graph_compliance = AsyncMock(return_value={
-        "predicate_distribution": {"MENTIONS": 1},
-        "label_compliance": "ok", "invalid_labels": [{"name": "X", "count": 1}],
-        "relationship_compliance": "ok",
-        "invalid_relationships": [{"name": "Y", "count": 1}],
-    })
-    c._graph_integrity = AsyncMock(return_value={
-        "invalid_nodes": 0, "by_reason": {"label_mismatch": 1},
-        "by_label": {"Fact": 1}, "clean": True,
-    })
-    per_type = {
-        "last_outcome": "success", "last_success_age_seconds": 1,
-        "in_flight": False, "consecutive_failures": 0, "backlog": 0,
-        "stalled": False,
-        "last_error": {"class": "X", "msg": "m", "age_seconds": 1,
-                       "superseded": False},
-        "eligible_clusters": 0, "eligible_oldest_age_seconds": None,
-        "dead_lettered_clusters": 0, "unchanged_clusters": 0,
-        "singleton_clusters": 0, "truncation_failures": 0, "slot_failures": 0,
-        "last_deferred_reason": None, "cycle_seconds_avg": 1.0, "runs_24h": 1,
-        "deferred_24h": 0, "idle_24h": 0, "folds_succeeded_24h": 1,
-        "folds_attempted_24h": 1, "truncation_failures_24h": 0,
-        "slot_failures_24h": 0, "last_started": "2026-08-28T00:00:00+00:00",
-    }
+    # The per-cycle-type rollup is left stubbed: modelling
+    # _compute_consolidation_health's windowed SQL here would reimplement that
+    # function's own test rather than pin this contract.
     c._consolidation_telemetry = AsyncMock(return_value={
         "stall_threshold_seconds": 900,
-        "insight": dict(per_type), "fact_consolidation": dict(per_type),
+        "insight": dict(_PER_TYPE_ROLLUP),
+        "fact_consolidation": dict(_PER_TYPE_ROLLUP),
         "stalled": False, "stalled_types": [], "last_success_age_seconds": 1,
         "last_success_cycle_type": "insight", "last_outcome": "success",
         "last_deferred_reason": None, "last_active_cycle_type": "insight",
-    })
-    c._refold_ledger_telemetry = AsyncMock(return_value={
-        "by_status_reason": [{"status": "open", "closed_reason": None, "count": 1}],
-        "by_trigger_kind": {"technical_docs": 1},
-        "insight_reconciliation_stuck": 0,
-    })
-    c._spine_telemetry = AsyncMock(return_value={
-        "decisions": {"total": 1, "grounded_in_pct": 1.0, "alternatives_pct": 1.0,
-                      "confidence_pct": 1.0, "elicited_pct": 1.0},
-        "alternative_vectors": {"entries": 1, "decisions": 1, "embedded": 1,
-                                "pending": 0, "failing": 0, "embedded_pct": 1.0,
-                                "oldest_pending_age_s": None},
-        "facts": {"total": 1, "source_ref_pct": 1.0, "elicited_pct": 1.0},
-        "retrospectives": {"total": 1, "rating_pct": 1.0, "target_pg_id_pct": 1.0,
-                           "grounded_in_pct": 1.0, "elicited_pct": 1.0},
-        "emergent_unprojected_fields": [{"key": "k", "n": 1}],
-    })
-    c._latency_telemetry = AsyncMock(return_value={
-        "rem_ms": {"note": "n", "by_model": [{
-            "model": "m", "n": 1, "n_service": 1, "max_batch_size": 1,
-            "backend": "b", "timing_source": "server",
-            "service_ms": {"p50": 1.0, "p95": 1.0},
-            "contention_ms": {"p50": 1.0, "p95": 1.0},
-            "wall_ms": {"p50": 1.0, "p95": 1.0}}]},
-        "nrem_cycle_seconds": {"window_days": 7, "n": 1, "p50": 1.0, "p95": 1.0,
-                               "note": "n"},
-    })
-    c._outbox_telemetry = AsyncMock(return_value={
-        "pending": 0, "applied": 1, "failed": 0, "rem_reviewed": 0,
-        "oldest_failed_age_s": None, "oldest_pending_age_s": None,
-        "apply_latency_p50_s": 1.0, "apply_latency_p95_s": 1.0,
-        "apply_latency_window": 1, "drain_rate_per_min": 1.0,
-        "age_limit_s": 3600,
-    })
-    c._rem_telemetry = AsyncMock(return_value={
-        "dead_lettered": 0, "failing": 0, "passed_over": 0, "starved_pending": 0,
-        "max_attempts": 5, "throughput_per_hour": 1.0,
-        "degeneration_firings": None,
     })
     return c
 
@@ -678,7 +779,16 @@ def _telemetry_payload(g):
     # at SERVE time, so a test that bypassed the cache would be checking a
     # payload no client can ever receive.
     c = _stub_telemetry_coordinator(g)
-    return asyncio.run(c._telemetry_cached())
+
+    async def _run():
+        # ⛔ THE REGISTRY NUMBERS COME THROUGH THE REAL CENSUS (F3), via the real
+        # refresher step, not hand-crafted ints. Hand-crafting them is how a
+        # census query naming a table that does not exist stayed green in every
+        # test while failing on every install.
+        await c._refresh_registry_census()
+        return await c._telemetry_cached()
+
+    return asyncio.run(_run())
 
 
 def test_every_key_telemetry_emits_is_documented(gateway):
@@ -783,8 +893,14 @@ def test_breakdown_projects_and_domains_are_now_different_questions(gateway):
     carry the PROJECT distribution."""
     payload = _telemetry_payload(gateway)
     assert payload["breakdown"]["projects"] == [
-        {"key": "shared-memory-GitHub", "count": 1}]
-    assert payload["breakdown"]["domains"] == [{"key": "delivery", "count": 1}]
+        {"key": "shared-memory-GitHub", "count": 800}]
+    assert payload["breakdown"]["domains"] == [
+        {"key": "architecture", "count": 301}, {"key": "operations", "count": 184}]
+    # F8: the denominator ships WITH the distribution. 301+184 against 1691
+    # records is not "records are missing" — it is 1062 records carrying no
+    # `domains` key at all, which only these two numbers can say.
+    assert payload["breakdown"]["records_with_domains"] == 629
+    assert payload["breakdown"]["records_total"] == 1691
 
 
 def test_the_meaning_change_list_covers_every_re_pointed_key():
@@ -900,3 +1016,304 @@ def test_the_two_bridge_copies_stay_byte_identical():
     a = root / "shared-memory" / "scripts" / "memory_bridge.py"
     b = root / "shared-memory-skill" / "shared-memory" / "scripts" / "memory_bridge.py"
     assert a.read_text() == b.read_text()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIX ROUND — F1: the registry census
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_the_registry_census_names_tables_that_exist():
+    """⛔ THE DEFECT THIS FILE MISSED FIRST TIME ROUND. The census selected
+    `FROM domains` — a table that does not exist and never did — so it raised
+    UndefinedTableError on every install, the refresher swallowed it, and
+    `registry.*` was null forever with nothing saying why.
+
+    Pinned against the SHIPPED schema rather than a list retyped here, so a
+    table renamed in a migration breaks this test instead of the endpoint.
+    """
+    import re
+    import coordinator as co
+    schema = (Path(__file__).resolve().parents[1] / "shared-memory" /
+              "migrations" / "schema_init.sql").read_text()
+    real = set(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", schema))
+    # ⚠ THE DOCSTRING IS STRIPPED FIRST. It NAMES the dead `domains` table in
+    # order to explain the defect, so a naive scan of the source would flag the
+    # explanation and pass a query that still had the bug.
+    fn = ast.parse(inspect.getsource(co.MemoryCoordinator._registry_census).lstrip())
+    body = fn.body[0]
+    stmts = body.body[1:] if ast.get_docstring(body) else body.body
+    sql = " ".join(
+        node.value for stmt in stmts for node in ast.walk(stmt)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    )
+    named = set(re.findall(r"FROM (\w+)", sql))
+    unknown = named - real
+    assert not unknown, f"the census selects from tables that do not exist: {unknown}"
+    assert {"projects", "project_domains", "project_aliases", "domain_aliases"} <= named
+
+
+@pytest.mark.asyncio
+async def test_a_failed_census_is_counted_logged_once_and_serves_the_last_good(caplog):
+    """A probe that CANNOT RUN must never look like a probe that has not run yet
+    — and it must reach /health, not only the log."""
+    import logging
+    import coordinator as co
+    c = co.MemoryCoordinator()
+
+    c._acquire = MagicMock(return_value=_async_ctx(_FakeConn(_PG_PLAN)))
+    await c._refresh_registry_census()
+    assert c._registry_census_last_good == {"projects": 38, "domains": 20, "aliases": 18}
+    assert c._registry_census_failures == 0
+    good_as_of = c._registry_census_as_of
+    assert good_as_of is not None
+
+    class _Broken:
+        async def fetchrow(self, sql, *a):
+            raise RuntimeError('relation "domains" does not exist')
+
+    c._acquire = MagicMock(return_value=_async_ctx(_Broken()))
+    with caplog.at_level(logging.WARNING, logger="coordinator"):
+        await c._refresh_registry_census()
+        await c._refresh_registry_census()
+        await c._refresh_registry_census()
+
+    # Counted every time…
+    assert c._registry_census_failures == 3
+    # …logged ONCE, at the transition. /health refreshes every 60 s; a line per
+    # tick is a log nobody reads.
+    lines = [r for r in caplog.records if "health.registry" in r.getMessage()]
+    assert len(lines) == 1, f"expected one transition line, got {len(lines)}"
+    assert "RuntimeError" in lines[0].getMessage()
+    assert "domains" in lines[0].getMessage()
+    # …and the numbers an operator was watching survive.
+    assert c._registry_census_last_good == {"projects": 38, "domains": 20, "aliases": 18}
+    assert c._registry_census_as_of == good_as_of
+
+    section = c._registry_telemetry()
+    assert section["projects"] == 38
+    assert section["as_of"] == good_as_of
+    assert "relation" in section["error"]
+    assert section["census_failures_total"] == 3
+
+
+def test_a_failed_census_degrades_the_registry_dependency():
+    """F1's actual requirement: the failure must reach /health. It previously
+    could not — the enum read a different counter entirely (the SEARCH path's),
+    so a dead census left the dependency reading `ok`."""
+    import hive_mind_proxy as g
+    assert g._registry_dependency(0, 0)["state"] == "ok"
+    degraded = g._registry_dependency(0, 4)
+    assert degraded["state"] == "degraded"
+    assert "census_failures:4" in degraded["reason"]
+    # The two counters name themselves, because they have different fixes.
+    both = g._registry_dependency(2, 4)
+    assert "read_failures:2" in both["reason"] and "census_failures:4" in both["reason"]
+
+
+def test_registry_counts_are_never_null(gateway):
+    """F3: no null path. Before the first census they are 0 with `as_of: null`
+    — "nothing counted yet", not "nothing exists"."""
+    payload = _telemetry_payload(gateway)
+    for key in ("projects", "domains", "aliases"):
+        assert isinstance(payload["registry"][key], int)
+    spec = tc.TELEMETRY["registry.projects"]
+    assert "null" not in spec["types"], (
+        "registry.projects is documented as nullable — either the null path "
+        "came back, or the contract is describing one that no longer exists")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIX ROUND — F4: the shed warning reported a value that could not have raised it
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_the_shed_warning_carries_the_value_that_raised_it(gateway, monkeypatch):
+    """⛔ ASSERT THE VALUE, NOT JUST THE PRESENCE (fact:1309). `_gateway_shed_rate`
+    MOVES ITS OWN WATERMARK, so calling it twice — once to test and once to
+    report — measured the microseconds between the two calls and always reported
+    `observed: 0`: a warning that fires and then denies itself."""
+    g = gateway
+    g._rate_marks.clear()
+    seq = iter([{"shed_503_total": 0}, {"shed_503_total": 7}])
+    monkeypatch.setattr(g, "telemetry_gateway_counters", lambda: next(seq))
+    g._gateway_shed_rate()          # establish the watermark at 0
+
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _OkSession()
+
+    async def _run():
+        return await g._build_health_checks(proxy, _StubCoordinator())
+
+    checks = asyncio.run(_run())
+    shed = [w for w in checks["warnings"] if w["key"] == "gateway_shed_503_total"]
+    assert shed, "the warning did not fire at all"
+    assert shed[0]["observed"] == 7, (
+        "the warning reported a value that could not have raised it — "
+        "_gateway_shed_rate was called more than once")
+    assert shed[0]["limit"] == 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIX ROUND — F6/F7: the outbox apply is the OTHER Neo4j caller
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_a_failed_outbox_apply_counts_as_a_neo4j_failure():
+    """F6. Counting only the graph route made `tx_failures_total` read "Neo4j is
+    fine" through an outage that was failing every apply — and the write path is
+    the one that actually blocks the pipeline."""
+    import coordinator as co
+    c = co.MemoryCoordinator()
+    conn = AsyncMock()
+    conn.execute = AsyncMock(return_value="UPDATE 1")
+    c._acquire = MagicMock(return_value=_async_ctx(conn))
+
+    class _DeadNeo4j:
+        def session(self, **kw):
+            raise RuntimeError("Neo4j unavailable")
+
+    c._neo4j = _DeadNeo4j()
+    c._project_identity = AsyncMock(return_value=None)
+    c._domain_identities = AsyncMock(return_value=[])
+    assert c._neo4j_tx_failures_total == 0
+    await c._apply_outbox_row(1, 42, {"content_snippet": "x"}, 0)
+    assert c._neo4j_tx_failures_total == 1
+    # A rejection is the CALLER's fault, and there is no caller here.
+    assert c._cypher_rejected_total == 0
+
+
+@pytest.mark.asyncio
+async def test_a_successful_outbox_apply_is_timed_into_the_neo4j_ring():
+    """F7. B2 asked for both callers; timing only the graph route would make
+    `neo4j.query_p95_ms` describe ad-hoc read Cypher while the write path stayed
+    invisible."""
+    import coordinator as co
+    c = co.MemoryCoordinator()
+    conn = AsyncMock()
+    conn.execute = AsyncMock(return_value="UPDATE 1")
+    conn.executemany = AsyncMock()
+    c._acquire = MagicMock(return_value=_async_ctx(conn))
+    session = AsyncMock()
+    session.run = AsyncMock(return_value=AsyncMock())
+    c._neo4j = MagicMock()
+    c._neo4j.session = MagicMock(return_value=_async_ctx(session))
+    c._project_identity = AsyncMock(return_value=None)
+    c._domain_identities = AsyncMock(return_value=[])
+
+    assert c._neo4j_ring.snapshot()["window"] == 0
+    await c._apply_outbox_row(1, 42, {"content_snippet": "x", "entities": []}, 0)
+    assert c._neo4j_ring.snapshot()["window"] == 1
+    assert c._neo4j_tx_failures_total == 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIX ROUND — F9 / F10 / F12 / the rem-timing guard / the drain rate
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_a_cancelled_acquire_is_not_a_pool_error():
+    """F10. Cancellation — shutdown, a client disconnect, an outer timeout —
+    says nothing about whether the pool could have served the request. Counting
+    it would make an orderly restart look like a burst of database errors."""
+    import coordinator as co
+    ring = LatencyRing()
+
+    class _Cancelling:
+        async def __aenter__(self):
+            raise asyncio.CancelledError()
+
+        async def __aexit__(self, *a):
+            return False
+
+    with pytest.raises(asyncio.CancelledError):
+        async with co._TimedAcquire(_Cancelling(), ring):
+            pass
+    assert ring.snapshot()["errors"] == 0
+
+    class _Failing:
+        async def __aenter__(self):
+            raise RuntimeError("pool exhausted")
+
+        async def __aexit__(self, *a):
+            return False
+
+    with pytest.raises(RuntimeError):
+        async with co._TimedAcquire(_Failing(), ring):
+            pass
+    assert ring.snapshot()["errors"] == 1
+
+
+def test_the_rem_timing_guard_rejects_a_non_numeric_ts():
+    """⚠ THE GUARD IS A NO-OP ON THE DEVELOPMENT CORPUS — measured live
+    2026-08-28: 188 of 188 rows carry a clean number — which is exactly why it
+    needs a test. `rem_timing` is JSONB on a table with rows older than the
+    writer that fills `ts`, and ONE unparseable value aborts the whole query,
+    taking the REM section down rather than skipping a row.
+
+    The pattern is tested here; it was ALSO run through Postgres' own regex
+    against these strings on the live database, and the unguarded cast confirmed
+    to raise InvalidTextRepresentationError.
+    """
+    import re
+    import coordinator as co
+    ok = re.compile(co.REM_TS_NUMERIC_RE)
+    assert ok.match("1756377600")
+    assert ok.match("1756377600.123")
+    for bad in ("2026-08-28T00:00:00+00:00", "", "NaN", "null", "1e9", " 17"):
+        assert not ok.match(bad), f"{bad!r} would reach the cast and abort the query"
+
+
+@pytest.mark.asyncio
+async def test_the_drain_rate_is_null_with_no_basis_and_zero_when_measured():
+    """Both directions. A rate over an empty window is not a measured zero — but
+    a zero over a real window IS a measurement, and nulling THAT would be the
+    same absence-is-not-zero rule pointed backwards."""
+    import coordinator as co
+    c = co.MemoryCoordinator()
+    c._outbox_census = AsyncMock(return_value={
+        "pending": 0, "in_progress": 0, "applied": 0, "failed": 0,
+        "rem_reviewed": 0, "oldest_failed_age_s": None,
+        "oldest_pending_age_s": None})
+
+    conn = AsyncMock()
+    conn.fetchrow = AsyncMock(return_value={"n": 0, "p50": None, "p95": None,
+                                            "applied_last_min": 0})
+    c._acquire = MagicMock(return_value=_async_ctx(conn))
+    assert (await c._outbox_telemetry())["drain_rate_per_min"] is None
+
+    conn.fetchrow = AsyncMock(return_value={"n": 9, "p50": 1.0, "p95": 2.0,
+                                            "applied_last_min": 0})
+    assert (await c._outbox_telemetry())["drain_rate_per_min"] == 0.0
+
+
+def test_the_neo4j_ring_is_snapshotted_once_per_payload():
+    """F12. Three separate snapshot() calls sorted the ring three times and could
+    observe three different windows — p50 and p95 would then describe
+    populations that never coexisted, and `window` would name neither."""
+    import coordinator as co
+    src = inspect.getsource(co.MemoryCoordinator._build_telemetry)
+    assert src.count("_neo4j_ring.snapshot()") == 1
+
+
+def test_each_latency_ring_can_be_sized_on_its_own(monkeypatch):
+    """F9. They shared ENCODER_LATENCY_WINDOW, so a name that said "encoder"
+    silently sized three unrelated instruments: widening it to chase a slow
+    reranker moved the Neo4j percentiles underneath themselves."""
+    import importlib
+    import coordinator as co
+    monkeypatch.setenv("ENCODER_LATENCY_WINDOW", "11")
+    monkeypatch.setenv("POOL_WAIT_WINDOW", "22")
+    monkeypatch.setenv("NEO4J_LATENCY_WINDOW", "33")
+    importlib.reload(co)
+    try:
+        assert (co.ENCODER_LATENCY_WINDOW, co.POOL_WAIT_WINDOW,
+                co.NEO4J_LATENCY_WINDOW) == (11, 22, 33)
+        # …and each defaults to the encoder window when unset, so an operator
+        # who never heard of them keeps today's behaviour.
+        monkeypatch.delenv("POOL_WAIT_WINDOW")
+        monkeypatch.delenv("NEO4J_LATENCY_WINDOW")
+        importlib.reload(co)
+        assert co.POOL_WAIT_WINDOW == co.ENCODER_LATENCY_WINDOW == 11
+    finally:
+        for k in ("ENCODER_LATENCY_WINDOW", "POOL_WAIT_WINDOW", "NEO4J_LATENCY_WINDOW"):
+            monkeypatch.delenv(k, raising=False)
+        importlib.reload(co)
