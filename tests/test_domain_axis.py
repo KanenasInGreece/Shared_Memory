@@ -183,10 +183,18 @@ async def test_a_registered_domain_passes():
 
 @pytest.mark.asyncio
 async def test_the_second_submission_registers_it():
+    """⚠ RE-RULED at v0.9.72 (P4′): the section is ACCEPTED here and the row is
+    written by `_commit_axis_registrations`, after every gate — so a save
+    refused later leaves `project_domains` untouched."""
     c = _coord(registered=set())
+    report = {}
     err = await c._domain_ingress_error(
-        dict(_fact("telemetry"), new_domain=True), "claude")
+        dict(_fact("telemetry"), new_domain=True), "claude", report)
     assert err is None
+    c._register_domain.assert_not_awaited()
+    assert [d["name"] for d in report["pending_registrations"]["domains"]] \
+        == ["telemetry"]
+    await c._commit_axis_registrations(report, "claude")
     c._register_domain.assert_awaited_once()
 
 
