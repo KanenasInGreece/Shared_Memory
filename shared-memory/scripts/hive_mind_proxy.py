@@ -355,6 +355,19 @@ def _load_llm_backends() -> tuple[
                         "above) — excluding this backend from the pool.",
                         url, token_env)
                     continue
+            if token and not _bearer_transport_ok(url):
+                # ⛔ The real call would put this key on the wire in the clear
+                # (handle_proxy attaches `Authorization: Bearer` to every
+                # credentialed request). Refuse at configuration, where the
+                # operator can see it, rather than at the first request.
+                log.error(
+                    "LLM backend %s is credentialed (token_env=%s) but its URL "
+                    "is plaintext http to a non-loopback host — this gateway "
+                    "never sends a provider key in the clear. Use https, or a "
+                    "loopback address for a local server. Excluding this "
+                    "backend from the pool.",
+                    scrub_url_credentials(url), token_env)
+                continue
             # Per-backend request-body overrides ("extra_body", the OpenAI-SDK
             # name for the same thing): keys merged into every chat payload
             # routed to this backend. This is what carries provider-specific
@@ -630,6 +643,27 @@ def _upstream_url(target_base: str, rel_url) -> str:
     return f"{base}{rel}"
 
 
+def _bearer_transport_ok(backend_url: str) -> bool:
+    """May this gateway put a bearer on the wire to `backend_url`?
+
+    ⛔ A KEY OVER PLAINTEXT TO A REMOTE HOST IS A KEY PUBLISHED TO THE PATH
+    (operator security ruling, 2026-08-28). True only for https, or http to a
+    loopback host (a local llama-server behind a token). Parsed strictly:
+    lowercase scheme, `hostname` (never the netloc — userinfo and ports do
+    not count), exact loopback names; a URL that fails to parse is refused.
+    One rule, two callers: the pool loader (a credentialed backend that fails
+    it is EXCLUDED, never called) and the /health probe (bare when it fails)."""
+    try:
+        parts = urllib.parse.urlsplit(backend_url)
+    except Exception:
+        return False
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower()
+    if scheme == "https":
+        return True
+    return scheme == "http" and host in ("localhost", "127.0.0.1", "::1")
+
+
 def _probe_headers(backend: str) -> dict:
     """Headers for a liveness/health probe of `backend` — the SAME credential a
     real call carries (handle_proxy's `backend_token` branch), or nothing.
@@ -651,12 +685,7 @@ def _probe_headers(backend: str) -> dict:
     # only to a loopback host (a local llama-server behind a token). Anything
     # else probes BARE — its 401 then honestly means "not authenticated",
     # which the operator can read beside the scheme in llm_backends.
-    try:
-        parts = urllib.parse.urlsplit(backend)
-        host = (parts.hostname or "").lower()
-    except Exception:
-        return {}
-    if parts.scheme == "https" or host in ("localhost", "127.0.0.1", "::1"):
+    if _bearer_transport_ok(backend):
         return {"Authorization": f"Bearer {token}"}
     return {}
 

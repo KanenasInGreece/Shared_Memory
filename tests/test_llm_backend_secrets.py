@@ -378,3 +378,49 @@ def test_embedder_target_never_gets_authorization_either(monkeypatch):
     asyncio.run(proxy.handle_proxy(_EmbedReq()))
 
     assert "Authorization" not in (session.captured_headers or {})
+
+
+def test_a_credentialed_backend_over_plaintext_to_a_remote_host_is_excluded(monkeypatch, caplog):
+    """Operator security ruling 2026-08-28: the gateway never sends a provider
+    key in the clear — not from the /health probe, not from a real call. A
+    credentialed backend whose URL is http to a non-loopback host is excluded
+    at load, with one ERROR line naming the URL (scrubbed) and the token_env;
+    a loopback http backend and an https backend are accepted."""
+    import logging
+    monkeypatch.setenv("REMOTE_KEY", "sk-remote")
+    monkeypatch.setenv("LOCAL_KEY", "sk-local")
+    monkeypatch.setenv("CLOUD_KEY", "sk-cloud")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://10.0.0.7:8000/v1", "token_env": "REMOTE_KEY", "private_ok": True},
+        {"url": "http://127.0.0.1:5001/v1", "token_env": "LOCAL_KEY", "private_ok": True},
+        {"url": "https://api.example.com/v1", "token_env": "CLOUD_KEY", "private_ok": True},
+        {"url": "http://192.168.1.9:5000"},   # uncredentialed plaintext is fine
+    ]))
+    import hive_mind_proxy as g
+    with caplog.at_level(logging.ERROR, logger="hive-proxy"):
+        importlib.reload(g)
+    assert "http://10.0.0.7:8000/v1" not in g.LLM_BACKENDS
+    assert "http://127.0.0.1:5001/v1" in g.LLM_BACKENDS
+    assert "https://api.example.com/v1" in g.LLM_BACKENDS
+    assert "http://192.168.1.9:5000" in g.LLM_BACKENDS
+    line = [r.getMessage() for r in caplog.records if "plaintext" in r.getMessage()]
+    assert line and "REMOTE_KEY" in line[0] and "sk-remote" not in line[0]
+
+
+def test_bearer_transport_rule_is_strict_about_odd_urls(monkeypatch):
+    """The rule reads the parsed hostname, never the netloc: userinfo, ports,
+    uppercase schemes and look-alike hosts cannot smuggle a bearer onto
+    plaintext; an unparsable URL is refused."""
+    import hive_mind_proxy as g
+    ok = g._bearer_transport_ok
+    assert ok("https://api.deepseek.com/v1")
+    assert ok("HTTPS://API.DEEPSEEK.COM")
+    assert ok("http://localhost:5000")
+    assert ok("http://127.0.0.1:5000/v1")
+    assert ok("http://[::1]:5000")
+    assert not ok("http://10.0.0.7:8000")
+    assert not ok("http://localhost.evil.com:80")
+    assert not ok("http://localhost@10.0.0.7:8000")     # userinfo is not the host
+    assert not ok("ftp://localhost")
+    assert not ok("http://")
+    assert not ok("")
