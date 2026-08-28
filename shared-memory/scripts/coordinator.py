@@ -4830,7 +4830,7 @@ class MemoryCoordinator:
         }
 
     async def _domain_rejection(
-        self, name: str, project: str, project_id: int
+        self, name: str, project: str, project_id: int | None
     ) -> dict:
         """The 400 body for an unregistered section. One status code, so a client
         branches on `error`; the message tells the model to ASK rather than
