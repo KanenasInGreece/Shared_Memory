@@ -5,6 +5,52 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.73] — 2026-08-28
+
+### Docs residue after the culling — the documentation says what the code does
+
+Ten items of documentation/comment/fixture residue left behind by the 0.9.66–0.9.72
+retirements (fact:1743), no behaviour change:
+
+- SKILL.md (both copies): the decision-save pipeline's step 4 no longer claims a MENTIONS
+  edge is written for a decision's grounding entities — a decision carries no entities
+  anywhere (decision:1664); its topics are answered on read by walking the grounding chain
+  (decision:1736). The "labels and relationship types configurable in ontology.yaml" line
+  corrected: only entity sub-labels are configurable, relationship types are spine.
+- README.md: REM described as summarising only (fact:1674), not "connecting" records; the
+  ontology.yaml labels claim corrected to "widens the compliance allowlist, nothing writes
+  a sub-label".
+- ontology.yaml/.py: dropped the dead `alias_max_hops` key (unread anywhere); corrected
+  stale comments claiming REM still populates entity sub-labels or typed Entity->Entity
+  relations (both retired, decision:1664 / v0.9.67-68); removed dangling citations of the
+  deleted entity_resolution_eval.py module.
+- Documentation/schema.md (both copies) + server-setup.md: fixed the ontology.yaml location
+  (shared-memory/, not the repo root); removed the false claim of a `relationships:` yaml
+  section (none exists — relationship types are code-pinned); the ALIASES row no longer
+  credits retired writers.
+- .env.example: removed RELCONF_*, ALIAS_SWEEP_*/ALIAS_LLM_*, NREM_PRESERVATION_*, and the
+  orphaned Reference-resolution paragraph — all dead, grep-verified no reader. Documented
+  the previously-undocumented REM_SUMMARY_THRESHOLD (default 2000) and REM_STARVED_THRESHOLD
+  (default 3).
+- consolidation_loop.py: corrected a stale docstring claiming facts without entities wait on
+  REM's (retired) MENTIONS-writing to reach Tier 3; deleted one unreachable dead-code line.
+- entity_vote.py + its test removed: a test-only orphan, no runtime importer anywhere.
+- coordinator.py: the save-response note describing what entities feed now says "graph
+  navigation and search matching" rather than the retired "REM/entity-relation linking".
+- tests/: the operator's real first name replaced with the generic role word "Operator" in
+  14 test files (decision:1756(6), same principle as fact:1195 for project names).
+
+Round 2 (Gemini + Opus review of PR #341, merger-ruled): mcp/system-prompt.md brought to
+Group 1 parity with the SKILL.md fixes above (REM summary-only, no ALIASES writer climbing);
+schema.md's MENTIONS row and ontology.py's _load() docstring corrected the same way as the
+ALIASES row / yaml-configurability fixes; SKILL.md's NREM key axis corrected to
+project+domain; README's REM paragraph scoped to entity relationships specifically (NREM
+still writes SUMMARIZED_BY after the save); consolidation_loop.py's eligibility docstring
+corrected to status='rem_reviewed'; coordinator.py's retrospective-refusal rationale no
+longer cites the retired entity-inheritance mode; sync_project_registry.py's only test
+coverage (deleted along with the entity_vote.py orphan) restored into its own file; a second
+private project name genericised in test_coordinator.py and test_project_promotion.py.
+
 ## [0.9.72] — 2026-08-28
 
 ### Culling closeout — registry rows only on success, one project value per decision, belonging counts the judgements on the walk, two dead indexes and a dead ledger gone, graph queries fail honestly
