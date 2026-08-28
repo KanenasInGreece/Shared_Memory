@@ -9,6 +9,7 @@ import secrets
 import shutil
 import signal
 import sys
+import ipaddress
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -236,6 +237,58 @@ ROUTING_ROLE_NAMES = frozenset({"extract", "judge"})
 RESERVED_ROLE_NAMES = frozenset({"summarize"})
 
 
+_PRIVATE_NAME_SUFFIXES = (".local", ".lan", ".internal", ".home", ".home.arpa", ".ts.net")
+
+
+def _bearer_transport_ok(backend_url: str, plaintext_ok: bool = False) -> bool:
+    """May this gateway put a bearer on the wire to `backend_url`?
+
+    ⛔ A KEY OVER PLAINTEXT TO A PUBLIC HOST IS A KEY PUBLISHED TO THE PATH
+    (operator security ruling, 2026-08-28). https is always fine. Plaintext
+    http carries a bearer only where the path is private by construction —
+    and the operator's own local fleet (a llama-server on the LAN, a node on
+    the tailnet) MUST keep working, so "private" is: any IP that is NOT
+    GLOBAL per `ipaddress` (loopback, RFC1918, Tailscale CGNAT 100.64/10,
+    link-local, ULA, and the documentation ranges — the predicate is
+    `not is_global`, never `is_private`, which misses CGNAT) · an unqualified
+    host name (`llama-box`) · a name under .local/.lan/.internal/.home/
+    .home.arpa/.ts.net. Anything else — a public IP or a public FQDN — is
+    refused unless the backend entry says `"plaintext_ok": true`, the operator
+    asserting the path is private (a VPN, a reverse tunnel). Parsed strictly: lowercase scheme, `hostname`
+    (never the netloc — userinfo and ports do not count); an unparsable URL
+    is refused. One rule, two callers: the pool loader (a credentialed backend
+    that fails it is EXCLUDED, never called) and the /health probe (bare)."""
+    try:
+        parts = urllib.parse.urlsplit(backend_url)
+    except Exception:
+        return False
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower()
+    if scheme == "https":
+        return True
+    if scheme != "http" or not host:
+        return False
+    if plaintext_ok:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return bool(ip.is_loopback or not ip.is_global)
+    except ValueError:
+        pass
+    if host in ("localhost",) or "." not in host:
+        return True
+    return host.endswith(_PRIVATE_NAME_SUFFIXES)
+
+
+# url -> the operator's "plaintext_ok": true assertion (a private path for a
+# plaintext credentialed backend — VPN, tunnel). Written by the loader, read by
+# the /health probe; the loader itself refuses a public plaintext backend.
+LLM_BACKEND_PLAINTEXT_OK: dict[str, bool] = {}
+# Set by the loader when LLM_BACKENDS_JSON was present but produced NO usable
+# backend and the legacy fallback took over — surfaced as a degraded llm_pool.
+LLM_POOL_FALLBACK_REASON: "str | None" = None
+
+
 def _load_llm_backends() -> tuple[
         list[str], dict[str, float], dict[str, "str | None"], dict[str, "str | None"],
         dict[str, "dict | None"], dict[str, "frozenset[str] | None"], dict[str, "int | None"],
@@ -353,8 +406,23 @@ def _load_llm_backends() -> tuple[
                         "variable did not resolve to a usable secret (unset, or "
                         "refused by secure_env — see the [secure_env] WARNING "
                         "above) — excluding this backend from the pool.",
-                        url, token_env)
+                        scrub_url_credentials(url), token_env)
                     continue
+            if token and not _bearer_transport_ok(url, bool(entry.get("plaintext_ok"))):
+                # ⛔ The real call would put this key on the wire in the clear
+                # (handle_proxy attaches `Authorization: Bearer` to every
+                # credentialed request). Refuse at configuration, where the
+                # operator can see it, rather than at the first request.
+                log.error(
+                    "LLM backend %s is credentialed (token_env=%s) but its URL "
+                    "is plaintext http to a PUBLIC host — this gateway never "
+                    "sends a provider key in the clear across the internet. "
+                    "Use https; a LAN, loopback or tailnet address is accepted "
+                    "as-is; if the path really is private (VPN, tunnel) set "
+                    "\"plaintext_ok\": true on the entry. Excluding this "
+                    "backend from the pool.",
+                    scrub_url_credentials(url), token_env)
+                continue
             # Per-backend request-body overrides ("extra_body", the OpenAI-SDK
             # name for the same thing): keys merged into every chat payload
             # routed to this backend. This is what carries provider-specific
@@ -407,6 +475,7 @@ def _load_llm_backends() -> tuple[
             urls.append(url)
             weights[url] = max(float(entry.get("weight", 1.0) or 1.0), 0.1)
             tokens[url] = token
+            LLM_BACKEND_PLAINTEXT_OK[url] = bool(entry.get("plaintext_ok"))
             models[url] = entry.get("model") or None
             extras[url] = extra_body or None
             roles[url] = _parse_roles(url, entry.get("roles"))
@@ -423,6 +492,11 @@ def _load_llm_backends() -> tuple[
             return (urls, weights, tokens, models, extras, roles, n_ctxs, private_oks,
                     private_ok_explicit, max_inflights, price_ins, price_outs, role_config_errors)
         log.error("LLM_BACKENDS_JSON produced no usable backend — falling back to LLM_BACKENDS/LLM_DEFAULT_TARGET")
+        # Group 3: a fleet that silently became localhost:5000 read as a healthy
+        # pool pointing at the wrong place (v0.9.75 review F6). Remember WHY,
+        # so the llm_pool dependency can say so on /health.
+        global LLM_POOL_FALLBACK_REASON
+        LLM_POOL_FALLBACK_REASON = "LLM_BACKENDS_JSON produced no usable backend (every entry excluded) — serving the LLM_BACKENDS/LLM_DEFAULT_TARGET fallback"
 
     _raw_backends = [_parse_backend(e) for e in os.environ.get("LLM_BACKENDS", "").split(",") if e.strip()]
     if not _raw_backends:
@@ -630,13 +704,43 @@ def _upstream_url(target_base: str, rel_url) -> str:
     return f"{base}{rel}"
 
 
+def _probe_headers(backend: str) -> dict:
+    """Headers for a liveness/health probe of `backend` — the SAME credential a
+    real call carries (handle_proxy's `backend_token` branch), or nothing.
+
+    A probe that does not authenticate cannot tell "the key is rejected" from
+    "no key was sent": DeepSeek's edge answers 401 to ANY unauthenticated
+    request on any path, so a bare probe of a credentialed backend always
+    401s. v0.9.74 started counting a credentialed 401 as down (correct about
+    the DEPENDENCY) while the probe was still bare — a false `degraded` the
+    operator caught on the first live reading (fact:1794). With the bearer
+    attached, `http_401` means exactly what /health says it means: this
+    gateway's key for that backend is not accepted."""
+    token = LLM_BACKEND_TOKENS.get(backend)
+    if not token:
+        return {}
+    # Same transport rule as the loader (_bearer_transport_ok). For a pool
+    # backend this branch is defence in depth: a credentialed backend that
+    # fails the rule was already EXCLUDED at load and never reaches here. It
+    # matters for any future caller that probes a URL the loader did not vet.
+    # S-04 note: handle_proxy attaches a provider key only on the allowed POST
+    # routes; the probe is the one deliberate GET carve-out — its URL comes
+    # from operator configuration (_v1_models_probe_url / the backend's own
+    # /health), never from a request.
+    if _bearer_transport_ok(backend, LLM_BACKEND_PLAINTEXT_OK.get(backend, False)):
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
 async def _probe_backend_alive(session, backend: str) -> bool:
     """2s liveness probe of the backend's own health surface. llama.cpp serves
     /health; OpenAI-compatible fallback is /v1/models. True = answered."""
     for path in ("/health", None):
         try:
             url = f"{backend}{path}" if path else _v1_models_probe_url(backend)
-            async with session.get(url, timeout=ClientTimeout(total=2.0)) as r:
+            async with session.get(url, timeout=ClientTimeout(total=2.0),
+                                   headers=_probe_headers(backend),
+                                   allow_redirects=False) as r:
                 # 404 means "not served HERE", never "this backend is down" --
                 # so fall through to the next candidate rather than accepting
                 # it. Accepting 404 is what let a backend whose every real
@@ -3847,6 +3951,10 @@ def _llm_pool_dependency(backend_status: dict) -> dict:
     """
     if not backend_status:
         return _dep(_STATE_UNKNOWN, "no backend configured")
+    if LLM_POOL_FALLBACK_REASON:
+        # F6 (v0.9.75): the configured fleet was entirely excluded and the
+        # legacy fallback is serving — a "healthy" pool at the wrong place.
+        return _dep(_STATE_DEGRADED, LLM_POOL_FALLBACK_REASON)
     bad = sorted(b for b, s in backend_status.items() if s != "ok")
     if len(bad) == len(backend_status):
         return _dep(_STATE_DOWN, f"all {len(bad)} backend(s) down")
@@ -4332,7 +4440,8 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
     backend_status: dict[str, str] = {}
     for b in LLM_BACKENDS:
         try:
-            async with proxy.session.get(_v1_models_probe_url(b), timeout=ClientTimeout(total=2.0)) as r:
+            async with proxy.session.get(_v1_models_probe_url(b), timeout=ClientTimeout(total=2.0),
+                                         headers=_probe_headers(b), allow_redirects=False) as r:
                 if r.status < 400:
                     backend_status[b] = "ok"
                 else:
@@ -4341,6 +4450,11 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
                     # CREDENTIALED backend used to be reported `ok`, on the
                     # argument that the server ANSWERED and its rejection of a
                     # bare probe is correct auth behaviour rather than downness.
+                    # ⚠ AND FIXED AGAIN IN 0.9.75: that 0.9.74 change kept the
+                    # probe BARE, so a credentialed backend's expected 401 to
+                    # an unauthenticated GET read as down (fact:1794). The probe
+                    # now carries the backend's own bearer (_probe_headers), so
+                    # a 401 here is a rejected key, never a missing one.
                     # That argument is about the SERVER; the question /health
                     # answers is about the DEPENDENCY, and a backend this
                     # gateway cannot get a completion out of is not usable

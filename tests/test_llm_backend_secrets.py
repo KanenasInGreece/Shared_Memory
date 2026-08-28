@@ -196,7 +196,7 @@ def test_backend_whose_keyfile_holds_a_control_character_is_excluded(
     assert not any("sk-test" in r.getMessage() for r in caplog.records)
 
 
-def test_all_json_backends_excluded_falls_back_not_crashes(monkeypatch):
+def test_all_json_backends_excluded_falls_back_LOUDLY_and_health_says_so(monkeypatch):
     """Every entry needs a token_env that isn't set -> the pool must still be
     non-empty (falls back to LLM_BACKENDS/DEFAULT_TARGET) so _select_llm_backend
     never raises. Reasoning-LLM outages must degrade per-request (503/504), never
@@ -213,6 +213,13 @@ def test_all_json_backends_excluded_falls_back_not_crashes(monkeypatch):
 
     assert len(g.LLM_BACKENDS) > 0                  # fell back, never empty
     assert g._select_llm_backend("", None)           # does not raise
+    # RE-RULED v0.9.75 (review F6): the fallback still happens — an empty pool
+    # would crash the selector — but it is no longer silent: the reason is
+    # remembered and the llm_pool dependency reports DEGRADED with it.
+    assert g.LLM_POOL_FALLBACK_REASON and "no usable backend" in g.LLM_POOL_FALLBACK_REASON
+    dep = g._llm_pool_dependency({g.LLM_BACKENDS[0]: "ok"})
+    assert dep["state"] == "degraded" and "fallback" in dep["reason"]
+
 
 
 class _HealthProbeResp:
@@ -229,7 +236,7 @@ class _HealthProbeCm:
 
 class _HealthProbeSession:
     """No real network — every probe (/health, /v1/models) just reports 200."""
-    def get(self, url, timeout=None):
+    def get(self, url, timeout=None, headers=None, **_kw):
         return _HealthProbeCm()
 
 
@@ -378,3 +385,87 @@ def test_embedder_target_never_gets_authorization_either(monkeypatch):
     asyncio.run(proxy.handle_proxy(_EmbedReq()))
 
     assert "Authorization" not in (session.captured_headers or {})
+
+
+def test_a_credentialed_backend_over_plaintext_to_a_remote_host_is_excluded(monkeypatch, caplog):
+    """Operator security ruling 2026-08-28: the gateway never sends a provider
+    key in the clear — not from the /health probe, not from a real call. A
+    credentialed backend whose URL is http to a non-loopback host is excluded
+    at load, with one ERROR line naming the URL (scrubbed) and the token_env;
+    a loopback http backend and an https backend are accepted."""
+    import logging
+    monkeypatch.setenv("REMOTE_KEY", "sk-remote")
+    monkeypatch.setenv("LOCAL_KEY", "sk-local")
+    monkeypatch.setenv("CLOUD_KEY", "sk-cloud")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://8.8.8.8:8000/v1", "token_env": "REMOTE_KEY", "private_ok": True},   # PUBLIC, plaintext
+        {"url": "http://127.0.0.1:5001/v1", "token_env": "LOCAL_KEY", "private_ok": True},
+        {"url": "https://api.example.com/v1", "token_env": "CLOUD_KEY", "private_ok": True},
+        {"url": "http://192.168.1.9:5000"},   # uncredentialed plaintext is fine
+        {"url": "http://llama-box:8000/v1", "token_env": "LOCAL_KEY", "private_ok": True},        # LAN name
+        {"url": "http://100.101.102.103:8000/v1", "token_env": "LOCAL_KEY", "private_ok": True},  # tailnet
+        {"url": "http://1.1.1.1:8000/v1", "token_env": "LOCAL_KEY", "private_ok": True, "plaintext_ok": True},  # operator-asserted
+    ]))
+    import hive_mind_proxy as g
+    with caplog.at_level(logging.ERROR, logger="hive-proxy"):
+        importlib.reload(g)
+    assert "http://8.8.8.8:8000/v1" not in g.LLM_BACKENDS
+    assert "http://llama-box:8000/v1" in g.LLM_BACKENDS
+    assert "http://100.101.102.103:8000/v1" in g.LLM_BACKENDS
+    assert "http://1.1.1.1:8000/v1" in g.LLM_BACKENDS
+    assert "http://127.0.0.1:5001/v1" in g.LLM_BACKENDS
+    assert "https://api.example.com/v1" in g.LLM_BACKENDS
+    assert "http://192.168.1.9:5000" in g.LLM_BACKENDS
+    line = [r.getMessage() for r in caplog.records if "plaintext" in r.getMessage()]
+    assert line and "REMOTE_KEY" in line[0] and "sk-remote" not in line[0]
+
+
+def test_bearer_transport_rule_is_strict_about_odd_urls(monkeypatch):
+    """The rule reads the parsed hostname, never the netloc: userinfo, ports,
+    uppercase schemes and look-alike hosts cannot smuggle a bearer onto
+    plaintext; an unparsable URL is refused."""
+    import hive_mind_proxy as g
+    ok = g._bearer_transport_ok
+    assert ok("https://api.deepseek.com/v1")
+    assert ok("HTTPS://API.DEEPSEEK.COM")
+    assert ok("http://localhost:5000")
+    assert ok("http://127.0.0.1:5000/v1")
+    assert ok("http://[::1]:5000")
+    assert ok("http://10.0.0.7:8000")                    # RFC1918 — the LAN
+    assert ok("http://100.101.102.103:8000")            # Tailscale CGNAT
+    assert ok("http://llama-box:8000")                      # unqualified LAN name
+    assert ok("http://llama-box.lan:8000") and ok("http://box.tailnet.ts.net:8000")
+    assert not ok("http://8.8.8.8:8000")             # public IP
+    assert ok("http://8.8.8.8:8000", plaintext_ok=True)
+    assert not ok("http://localhost.evil.com:80")
+    assert not ok("http://localhost@8.8.8.8:8000")       # userinfo is not the host
+    assert not ok("ftp://localhost")
+    assert not ok("http://")
+    assert not ok("")
+
+
+def test_the_gateway_cold_imports_with_a_credentialed_backend(tmp_path):
+    """v0.9.75 review (Opus): every test here imports hive_mind_proxy through
+    importlib.reload, which re-executes in a namespace where every name is
+    ALREADY bound — so a helper defined below the module-level loader that
+    calls it raised NameError on a real cold start and never in the suite.
+    This is the only test that starts the interpreter the way systemd does.
+    Fake key value only; nothing is contacted (import only)."""
+    import subprocess, sys, os
+    env = dict(os.environ)
+    env.update({
+        "DS_TEST_KEY": "sk-test-cold-import",
+        "LLM_BACKENDS_JSON": json.dumps([
+            {"url": "https://api.example.com/v1", "token_env": "DS_TEST_KEY",
+             "model": "m", "private_ok": True},
+            {"url": "http://llama-box:8000/v1", "token_env": "DS_TEST_KEY", "private_ok": True},
+        ]),
+        "PYTHONPATH": os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts")),
+    })
+    r = subprocess.run(
+        [sys.executable, "-c",
+         "import hive_mind_proxy as g; print(sorted(g.LLM_BACKENDS))"],
+        env=env, capture_output=True, text=True, timeout=60, cwd=str(tmp_path))
+    assert r.returncode == 0, r.stderr[-1500:]
+    assert "https://api.example.com/v1" in r.stdout and "http://llama-box:8000/v1" in r.stdout
+    assert "sk-test-cold-import" not in r.stdout + r.stderr

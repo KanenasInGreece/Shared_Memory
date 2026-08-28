@@ -45,7 +45,7 @@ class _HealthProbeSession:
     def __init__(self):
         self.get_calls = 0
 
-    def get(self, url, timeout=None):
+    def get(self, url, timeout=None, headers=None, **_kw):
         self.get_calls += 1
         return _HealthProbeCm()
 
@@ -180,7 +180,7 @@ def test_degraded_status_code_preserved_for_anonymous_caller(monkeypatch):
             return False
 
     class _DownSession:
-        def get(self, url, timeout=None):
+        def get(self, url, timeout=None, headers=None, **_kw):
             return _DownCm()
 
     proxy = g.AsyncHiveMindProxy()
@@ -330,7 +330,7 @@ class _SlowHealthProbeSession:
         self.get_calls = 0
         self.gate = asyncio.Event()
 
-    def get(self, url, timeout=None):
+    def get(self, url, timeout=None, headers=None, **_kw):
         self.get_calls += 1
         return _SlowHealthProbeCm(self.gate)
 
