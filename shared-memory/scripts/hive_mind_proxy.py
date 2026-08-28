@@ -630,13 +630,30 @@ def _upstream_url(target_base: str, rel_url) -> str:
     return f"{base}{rel}"
 
 
+def _probe_headers(backend: str) -> dict:
+    """Headers for a liveness/health probe of `backend` — the SAME credential a
+    real call carries (handle_proxy's `backend_token` branch), or nothing.
+
+    A probe that does not authenticate cannot tell "the key is rejected" from
+    "no key was sent": DeepSeek's edge answers 401 to ANY unauthenticated
+    request on any path, so a bare probe of a credentialed backend always
+    401s. v0.9.74 started counting a credentialed 401 as down (correct about
+    the DEPENDENCY) while the probe was still bare — a false `degraded` the
+    operator caught on the first live reading (fact:1794). With the bearer
+    attached, `http_401` means exactly what /health says it means: this
+    gateway's key for that backend is not accepted."""
+    token = LLM_BACKEND_TOKENS.get(backend)
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 async def _probe_backend_alive(session, backend: str) -> bool:
     """2s liveness probe of the backend's own health surface. llama.cpp serves
     /health; OpenAI-compatible fallback is /v1/models. True = answered."""
     for path in ("/health", None):
         try:
             url = f"{backend}{path}" if path else _v1_models_probe_url(backend)
-            async with session.get(url, timeout=ClientTimeout(total=2.0)) as r:
+            async with session.get(url, timeout=ClientTimeout(total=2.0),
+                                   headers=_probe_headers(backend)) as r:
                 # 404 means "not served HERE", never "this backend is down" --
                 # so fall through to the next candidate rather than accepting
                 # it. Accepting 404 is what let a backend whose every real
@@ -4332,7 +4349,8 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
     backend_status: dict[str, str] = {}
     for b in LLM_BACKENDS:
         try:
-            async with proxy.session.get(_v1_models_probe_url(b), timeout=ClientTimeout(total=2.0)) as r:
+            async with proxy.session.get(_v1_models_probe_url(b), timeout=ClientTimeout(total=2.0),
+                                         headers=_probe_headers(b)) as r:
                 if r.status < 400:
                     backend_status[b] = "ok"
                 else:
@@ -4341,6 +4359,11 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
                     # CREDENTIALED backend used to be reported `ok`, on the
                     # argument that the server ANSWERED and its rejection of a
                     # bare probe is correct auth behaviour rather than downness.
+                    # ⚠ AND FIXED AGAIN IN 0.9.75: that 0.9.74 change kept the
+                    # probe BARE, so a credentialed backend's expected 401 to
+                    # an unauthenticated GET read as down (fact:1794). The probe
+                    # now carries the backend's own bearer (_probe_headers), so
+                    # a 401 here is a rejected key, never a missing one.
                     # That argument is about the SERVER; the question /health
                     # answers is about the DEPENDENCY, and a backend this
                     # gateway cannot get a completion out of is not usable

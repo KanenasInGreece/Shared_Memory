@@ -566,8 +566,10 @@ class _StatusCm:
 class _FixedStatusSession:
     def __init__(self, status):
         self._status = status
+        self.probe_headers: dict = {}   # url -> headers the probe SENT (v0.9.75)
 
-    def get(self, url, timeout=None):
+    def get(self, url, timeout=None, headers=None):
+        self.probe_headers[url] = dict(headers or {})
         return _StatusCm(self._status)
 
 
@@ -872,3 +874,49 @@ def test_n4_record_llm_call_prompt_chars_additive(monkeypatch):
     assert rec["prompt_chars"] == 1234
     rec2 = dt.record_llm_call("REM", {"model": "m"})
     assert rec2["prompt_chars"] is None
+
+
+def test_the_backend_probe_carries_the_backends_own_bearer(monkeypatch):
+    """v0.9.75 (fact:1794). v0.9.74 started counting a credentialed 401 as down
+    while the probe was still a BARE GET — and DeepSeek 401s every
+    unauthenticated request on every path, so a correct key read `http_401`
+    and the pool `degraded` on the first live reading. The probe must send
+    exactly what a real call sends: the backend's bearer, from the token map
+    (never os.environ, never logged). Then a 401 means a rejected key."""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True},
+        {"url": "http://localhost:5000"},
+    ]))
+    g = _fresh(monkeypatch)
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _FixedStatusSession(200)
+
+    async def _run():
+        return await g._build_health_checks(proxy, None)
+    checks = asyncio.run(_run())
+    sent = proxy.session.probe_headers
+    assert sent["https://api.deepseek.com/v1/models"] == {"Authorization": "Bearer sk-test"}
+    assert sent["http://localhost:5000/v1/models"] == {}          # uncredentialed: nothing
+    assert checks["llm_backends"]["https://api.deepseek.com/v1"] == "ok"
+
+
+def test_a_401_with_the_bearer_attached_is_a_rejected_key(monkeypatch):
+    """The 0.9.74 reading is only TRUE once the probe authenticates: a 401 to a
+    request that carried the bearer is the key being refused, and that IS
+    down. (Mutation: drop headers= from the probe → the first test dies; map a
+    401 back to ok → this one dies.)"""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True},
+    ]))
+    g = _fresh(monkeypatch)
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _FixedStatusSession(401)
+
+    async def _run():
+        return await g._build_health_checks(proxy, None)
+    checks = asyncio.run(_run())
+    assert proxy.session.probe_headers["https://api.deepseek.com/v1/models"]["Authorization"] == "Bearer sk-test"
+    assert checks["llm_backends"]["https://api.deepseek.com/v1"] == "http_401"
+    assert checks["dependencies"]["llm_pool"]["state"] == "down"

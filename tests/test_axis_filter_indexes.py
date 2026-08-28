@@ -231,7 +231,7 @@ class _HealthProbeCm:
 class _HealthProbeSession:
     """No real network — every upstream probe /health hits just reports 200,
     the same stub test_health_anonymous_slimming.py uses."""
-    def get(self, url, timeout=None):
+    def get(self, url, timeout=None, headers=None):
         return _HealthProbeCm()
 
 

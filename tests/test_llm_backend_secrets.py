@@ -229,7 +229,7 @@ class _HealthProbeCm:
 
 class _HealthProbeSession:
     """No real network — every probe (/health, /v1/models) just reports 200."""
-    def get(self, url, timeout=None):
+    def get(self, url, timeout=None, headers=None):
         return _HealthProbeCm()
 
 
