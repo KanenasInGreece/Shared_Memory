@@ -140,7 +140,10 @@ than rewritten.
 ledgered operator operation may change its project, domain or entities — a plain re-save that matches
 an existing record's content but names a different project, domain or entity set is refused (409
 `axis_conflict`, naming both the stored and the incoming values); a re-save that matches on every axis
-too is the ordinary idempotent path and succeeds unchanged.
+too is the ordinary idempotent path and succeeds unchanged. ⚠ **A renamed DOMAIN makes that re-save
+refuse:** domain aliases are not resolved on the re-save path, so identical content saved again after
+its section was renamed reads as a different domain and is refused with `axis_conflict` — supersede
+the record instead of re-saving it.
 
 ### What to ask the operator, and what to decide yourself
 
@@ -285,6 +288,7 @@ Query the knowledge graph for structural and provenance context.
   uv run --with httpx --with python-dotenv python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py graph "<cypher_query>"
   ```
   Read-only enforced: `CREATE`, `DELETE`, `DETACH DELETE`, `SET`, `MERGE`, `CALL`, `LOAD CSV`, `DROP` are blocked.
+  **A Cypher the database itself refuses — a syntax error, an unknown function, a type error — comes back as 400 `cypher_rejected` carrying Neo4j's own message, not as a 500.** It is your query to fix; re-sending it unchanged will never succeed. A 500 `query failed` means the gateway or Neo4j is the problem, and retrying is reasonable.
 
 **Record lineage** — *"what happened to this record?"*:
 ```
@@ -607,7 +611,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness (anonymous — status/version/api_version only, v0.9.9 S-10):
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":4,"version":"0.9.71"}
+# → {"status":"ok","api_version":4,"version":"0.9.72"}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -679,7 +683,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.71", "api_version": 4, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.72", "api_version": 4, "tool": "shared-memory-framework"}`
 
 ### Updating This Skill
 

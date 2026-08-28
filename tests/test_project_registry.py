@@ -123,28 +123,45 @@ async def test_a_decision_may_declare_a_new_project_with_the_operator_s_confirma
     it — and until that moment the project does not exist. So a decision must be
     able to introduce one. What it must NOT be able to do is introduce one
     silently, which is why the declaration is an explicit flag and not a
-    fallback."""
+    fallback.
+
+    ⚠ RE-RULED at v0.9.72 (P4′). The acceptance is unchanged and still happens
+    exactly here; what moved is the WRITE. This gate now records the intent in
+    the axis report and `_commit_axis_registrations` performs the insert once
+    every gate has passed, so the assertion is on the intent — `handle_save`'s
+    end-to-end tests are what prove the row is still written."""
     coord = _coord(registered=())
+    report = {}
     assert await coord._project_ingress_error(
         {"type": "decision", "new_project": True,
-         "decision": {"project": "brand-new"}}, "c") is None
-    coord._register_project.assert_awaited_once()
+         "decision": {"project": "brand-new"}}, "c", report) is None
+    coord._register_project.assert_not_awaited()
+    assert report["pending_registrations"]["project"] == "brand-new"
+    await coord._commit_axis_registrations(report, "c")
+    coord._register_project.assert_awaited_once_with("brand-new", "c")
 
 
 @pytest.mark.asyncio
 async def test_a_decision_declared_once_needs_no_flag_on_the_records_that_follow():
     """It is declared ONCE, on the first record that names it. Everything saved
     afterwards in the same flow finds it registered — which is what makes the
-    confirmation a single deliberate act rather than a prompt on every save."""
+    confirmation a single deliberate act rather than a prompt on every save.
+
+    ⚠ v0.9.72 (P4′): the first save's registration is committed at the end of
+    THAT save, so the second one — a separate request — still finds the project
+    on file. The commit is what makes the sequence work; deferring it does not
+    change the story, it only moves where in the first save the row appears."""
     registry = set()
     coord = _coord(registered=registry)
     coord._project_registered = AsyncMock(side_effect=lambda n: n in registry)
     coord._register_project = AsyncMock(side_effect=lambda n, a: registry.add(n))
 
+    report = {}
     first = await coord._project_ingress_error(
-        {"source": "c", "project": "brand-new", "new_project": True}, "c")
+        {"source": "c", "project": "brand-new", "new_project": True}, "c", report)
+    await coord._commit_axis_registrations(report, "c")
     second = await coord._project_ingress_error(
-        {"type": "decision", "decision": {"project": "brand-new"}}, "c")
+        {"type": "decision", "decision": {"project": "brand-new"}}, "c", {})
     assert first is None and second is None
     coord._register_project.assert_awaited_once()
 
@@ -199,9 +216,15 @@ async def test_second_submission_form_1_a_proposal():
 
 @pytest.mark.asyncio
 async def test_second_submission_form_2_declares_a_new_project():
+    # A report, because the ACCEPTING branch defers its registration into one
+    # and refuses to run without it (v0.9.72, R4 — a missing report is a coding
+    # error, never a quietly dropped registration).
     coord = _coord(registered=())
+    report = {}
     assert await coord._project_ingress_error(
-        {"source": "c", "project": "brand-new", "new_project": True}, "c") is None
+        {"source": "c", "project": "brand-new", "new_project": True},
+        "c", report) is None
+    assert report["pending_registrations"]["project"] == "brand-new"
 
 
 # ── P23 — a declaration is not a defence ────────────────────────────────────
@@ -279,10 +302,14 @@ async def test_naming_the_neighbour_lets_a_genuinely_separate_project_through():
     """The check must not block real work: a spin-off with a similar name is a
     real project, and the operator is the one who knows."""
     coord = _coord_near(["alpha-service"])
+    report = {}
     err = await coord._project_ingress_error(
         {"source": "c", "project": "alpha-servize", "new_project": True,
-         "confirm_distinct_from": ["Alpha-Service"]}, "c")   # key-compared
+         "confirm_distinct_from": ["Alpha-Service"]}, "c", report)   # key-compared
     assert err is None
+    # v0.9.72 (P4′): accepted here, written by the commit step.
+    assert report["pending_registrations"]["project"] == "alpha-servize"
+    await coord._commit_axis_registrations(report, "c")
     coord._register_project.assert_awaited_once()
 
 
@@ -304,8 +331,11 @@ async def test_an_unmistakable_new_project_registers_with_no_extra_step():
     """The guard must stay quiet for the ordinary case, or it trains the reflex
     to override it."""
     coord = _coord_near([])
+    report = {}
     assert await coord._project_ingress_error(
-        {"source": "c", "project": "unrelated-thing", "new_project": True}, "c") is None
+        {"source": "c", "project": "unrelated-thing", "new_project": True},
+        "c", report) is None
+    await coord._commit_axis_registrations(report, "c")
     coord._register_project.assert_awaited_once()
 
 

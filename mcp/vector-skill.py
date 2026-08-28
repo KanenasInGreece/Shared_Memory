@@ -140,7 +140,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.9.71"
+VERSION = "0.9.72"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server
@@ -1081,6 +1081,12 @@ async def save_decision(
     metadata = {
         "type": "decision",
         "source": source,
+        # ⛔ THE SAME VALUE, IN BOTH PLACES, AND ONLY EVER THIS ONE. A decision
+        # has ONE project — the one the operator asserted — and it belongs at
+        # the top level as well as in the blob, because that is the key every
+        # reader inspecting Postgres directly trusts. Parity with
+        # memory_bridge.py's `build_decision_metadata` (`fact:1757`).
+        "project": project,
         # A decision mints no entity of its own (decision:1664) — the gateway
         # accepts an empty list permanently; a non-empty one is refused.
         "entities": [],

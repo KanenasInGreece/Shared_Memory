@@ -338,25 +338,6 @@ END;
 $function$
 ;
 
--- ─── alias_adjudications ────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS alias_adjudications (
-    id               BIGSERIAL PRIMARY KEY,
-    name_a           TEXT NOT NULL,
-    name_b           TEXT NOT NULL,
-    verdict          TEXT NOT NULL,
-    method           TEXT NOT NULL,
-    confidence       REAL,
-    cosine           REAL,
-    lexical_jaccard  REAL,
-    shared_facts     INTEGER,
-    domain_disjoint  BOOLEAN,
-    rationale        TEXT,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS alias_adjudications_name_a_name_b_key ON public.alias_adjudications USING btree (name_a, name_b);
-CREATE INDEX IF NOT EXISTS alias_adjudications_verdict_idx ON public.alias_adjudications USING btree (verdict);
-
 -- ─── aliases ────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS aliases (
     id               BIGSERIAL PRIMARY KEY,
@@ -548,7 +529,6 @@ CREATE TABLE IF NOT EXISTS project_domains (
     CONSTRAINT project_domains_sentinel_reserved CHECK ((name <> 'general_discussion'::text))
 );
 
-CREATE INDEX IF NOT EXISTS idx_project_domains_name_trgm ON public.project_domains USING gin (name gin_trgm_ops);
 CREATE UNIQUE INDEX IF NOT EXISTS project_domains_id_project ON public.project_domains USING btree (id, project_id);
 CREATE UNIQUE INDEX IF NOT EXISTS project_domains_name_unique ON public.project_domains USING btree (project_id, name);
 CREATE UNIQUE INDEX IF NOT EXISTS project_domains_normalized_key_unique ON public.project_domains USING btree (project_id, normalized_key);
@@ -582,7 +562,6 @@ CREATE TABLE IF NOT EXISTS projects (
     CONSTRAINT projects_sentinel_reserved CHECK ((name <> 'general_discussion'::text))
 );
 
-CREATE INDEX IF NOT EXISTS idx_projects_name_trgm ON public.projects USING gin (name gin_trgm_ops);
 CREATE UNIQUE INDEX IF NOT EXISTS projects_name_key ON public.projects USING btree (name);
 CREATE UNIQUE INDEX IF NOT EXISTS projects_normalized_key_unique ON public.projects USING btree (normalized_key);
 

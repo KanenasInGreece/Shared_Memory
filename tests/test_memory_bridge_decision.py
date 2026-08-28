@@ -55,6 +55,45 @@ def test_required_fields_only():
     assert "confidence" not in meta["decision"]
 
 
+def test_build_decision_metadata_sets_top_level_project():
+    """⛔ A DECISION'S PROJECT IS ONE VALUE, AND IT IS IN BOTH PLACES.
+
+    This function set `decision.project` and left the TOP-LEVEL key unset, so
+    `save_artifact` filled it from the cwd walk instead — which yields
+    `.claude` when the save runs from under `~/.claude/...` and nothing at all
+    from `~`. The two fields then disagreed in Postgres, and 12 live decisions
+    were repaired for exactly that (`fact:1757`). The operator's `--project` is
+    the only project a decision has; a walk must never get a vote on it.
+
+    MUTATION CHECK: drop the `"project": project` assignment from
+    `build_decision_metadata` and this test dies.
+
+    ⚠ Asserted on the FRAMEWORK copy only, deliberately — the shipped copy is
+    covered by `test_client_secret_mirror_parity.py::
+    test_both_tracked_memory_bridge_copies_stay_byte_identical`, which proves
+    the two files are byte-identical. Re-asserting the same string against the
+    second file would test the copy, not the rule.
+    """
+    _, meta = mb.build_decision_metadata(
+        title="Use asyncpg",
+        decided_by="Xenofon",
+        project="shared-memory-GitHub",
+        rationale="because",
+    )
+    assert meta["project"] == "shared-memory-GitHub"
+    assert meta["project"] == meta["decision"]["project"]
+
+
+def test_the_top_level_project_is_never_a_second_answer():
+    """The two fields are ONE value from one argument, so no input can make
+    them differ — which is the property that makes the top-level key safe for a
+    reader inspecting Postgres directly."""
+    for project in ("shared-memory", "shared-memory-monitor", "a-new-thing"):
+        _, meta = mb.build_decision_metadata(
+            title="t", decided_by="X", project=project, rationale="r")
+        assert meta["project"] == meta["decision"]["project"] == project
+
+
 def test_all_optional_fields():
     _, meta = mb.build_decision_metadata(
         title="Use asyncpg",

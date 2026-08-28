@@ -116,15 +116,101 @@ def test_a_superseded_fact_carries_nothing_forward():
     assert "coalesce(f.superseded, false) = false" in _q()
 
 
+# ── The judged collection: D2's own sections reach R (v0.9.72) ──────────────
+
+def test_a_judgement_on_the_grounding_walk_contributes_its_own_sections():
+    """⛔ THE CLAUSE THE WORKED EXAMPLE GAINED. Extend `fact:1735`'s example
+    with a second decision on the walk:
+
+        R —INFORMED_BY→ D2, and D2 asserts `architecture@B`
+        ⇒ R = {literature@B, tests@B, architecture@B}
+
+    The walk always went THROUGH D2 to reach the facts beyond it and collected
+    NOTHING from D2 itself — yet D2's sections are OPERATOR-ASSERTED, the
+    strongest signal on the path. Live case: retro 1694 derived `[]` while
+    decision 1678, on its own grounding walk, asserts `architecture`.
+
+    MUTATION CHECK: delete the `judged` collection from
+    `derived_belonging_cypher` and this test dies.
+    """
+    q = _q()
+    rels = "|".join(GROUNDING_RELATIONS)
+    # Reached from an anchor, over the SAME relations and the same cap as the
+    # fact walk — a judgement is reached the same way its evidence is.
+    assert (f" OPTIONAL MATCH (n1)-[:{rels}*1..4]->(m)"
+            f"                   -[:{ONT.domain_of}]->(jd:{ONT.domain})"
+            f"                   -[:{ONT.project_of}]->(p)") in q
+    # ONLY a judgement. A fact reached on the walk is the `grounded` collection's
+    # business, and it filters supersession; collecting facts twice here would
+    # smuggle a superseded fact's section past that filter.
+    assert f"WHERE (m:{ONT.decision} OR m:{ONT.retrospective})" in q
+
+
+def test_the_judged_collection_is_bound_to_the_anchor_s_project_node():
+    """⛔ D2′ asserting `ops@A` CONTRIBUTES NOTHING to a B-project retrospective.
+    The project boundary is not relaxed for judgements — a decision reached on
+    the walk is exactly as capable of belonging to another project as a fact is,
+    and that is the case `fact:1735`'s example was built around."""
+    q = _q()
+    after = q.split(f"(jd:{ONT.domain})", 1)[1]
+    assert after.lstrip().startswith(f"-[:{ONT.project_of}]->(p)"), (
+        "the judged collection is not bound to the anchor's project node")
+
+
+def test_a_superseded_judgement_carries_nothing_forward():
+    """⛔ A REVERSED DECISION IS NOT WHERE ANYTHING BELONGS (review R2). The
+    grounded collection has always skipped a superseded FACT; the judged
+    collection must skip a superseded JUDGEMENT for the identical reason, and
+    with the identical predicate. `reversed` is the one rating that performs
+    the supersession cascade, so this is precisely the decision an operator has
+    said was overturned — letting it keep filing later work under its sections
+    would make a retraction propagate as an endorsement.
+
+    MUTATION CHECK: drop `coalesce(m.superseded, false) = false` from the
+    judged collection and this test dies.
+    """
+    q = _q()
+    assert "coalesce(m.superseded, false) = false" in q
+    # Both walks filter, and they filter the same way — a divergence here would
+    # mean one kind of retired node still counted.
+    assert q.count("superseded, false) = false") == 2
+    # The label test is a GROUP with the filter ANDed onto it: dropping the
+    # parentheses would make `OR m:Retrospective` swallow the predicate and a
+    # reversed retrospective would slip through.
+    assert f"WHERE (m:{ONT.decision} OR m:{ONT.retrospective})" in q
+
+
+def test_a_section_asserted_twice_is_listed_once():
+    """D2 asserts `architecture` and a fact on the same walk carries it too —
+    ONE entry, not two. Cypher's list `+` concatenates, it does not dedupe, so
+    the union has to anti-join every list against the ones before it.
+
+    MUTATION CHECK: replace the two comprehensions with a bare
+    `own + judged + grounded` and this dies."""
+    q = _q()
+    assert "own + judged + grounded" not in q
+    assert "[x IN judged WHERE NOT x IN own]" in q
+    assert "[x IN grounded WHERE NOT x IN own AND NOT x IN judged]" in q
+
+
 # ── The answer's shape ──────────────────────────────────────────────────────
 
 def test_domains_are_a_set_and_never_a_ranking():
     """`decision:1736` (ii) says SET, explicitly. D's own `literature` and a
     grounding fact's `literature` are one section, listed once — and the answer
-    carries no order the caller could mistake for importance."""
+    carries no order the caller could mistake for importance.
+
+    ⚠ RE-RULED at v0.9.72: three collections now, not two, so the union has one
+    more anti-join. Cypher's list `+` does NOT dedupe, so every list has to be
+    anti-joined against ALL the ones before it — `grounded` against both `own`
+    and `judged`, not just `own`. Each `collect` is DISTINCT, which handles the
+    duplicates WITHIN a list; these comprehensions handle the ones ACROSS."""
     q = _q()
-    assert "own + [x IN grounded WHERE NOT x IN own] AS domains" in q
+    assert "own + [x IN judged WHERE NOT x IN own]" in q
+    assert "[x IN grounded WHERE NOT x IN own AND NOT x IN judged]" in q
+    assert "AS domains" in q
     assert "collect(DISTINCT od.name) AS own" in q
+    assert "collect(DISTINCT jd.name) AS judged" in q
     assert "collect(DISTINCT gd.name) AS grounded" in q
 
 

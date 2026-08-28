@@ -486,11 +486,19 @@ async def test_declaring_an_ALL_PUNCTUATION_section_is_refused_at_INGRESS():
 @pytest.mark.asyncio
 async def test_a_genuinely_new_project_still_registers_with_no_extra_step():
     """The guard must stay quiet for the ordinary case, or it trains the reflex
-    to override it."""
+    to override it.
+
+    ⚠ RE-RULED at v0.9.72 (P4′): the gate ACCEPTS here and records the intent;
+    `_commit_axis_registrations` writes the row once every gate has passed, so
+    a save refused later leaves no project behind."""
     c = _project_coord(registered=("orbit-relay",))
+    report = {}
     assert await c._project_ingress_error(
         {"source": "c", "project": "unrelated-thing", "new_project": True},
-        "c", {}) is None
+        "c", report) is None
+    c._register_project.assert_not_awaited()
+    assert report["pending_registrations"]["project"] == "unrelated-thing"
+    await c._commit_axis_registrations(report, "c")
     c._register_project.assert_awaited_once()
 
 

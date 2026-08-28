@@ -183,10 +183,18 @@ async def test_a_registered_domain_passes():
 
 @pytest.mark.asyncio
 async def test_the_second_submission_registers_it():
+    """⚠ RE-RULED at v0.9.72 (P4′): the section is ACCEPTED here and the row is
+    written by `_commit_axis_registrations`, after every gate — so a save
+    refused later leaves `project_domains` untouched."""
     c = _coord(registered=set())
+    report = {}
     err = await c._domain_ingress_error(
-        dict(_fact("telemetry"), new_domain=True), "claude")
+        dict(_fact("telemetry"), new_domain=True), "claude", report)
     assert err is None
+    c._register_domain.assert_not_awaited()
+    assert [d["name"] for d in report["pending_registrations"]["domains"]] \
+        == ["telemetry"]
+    await c._commit_axis_registrations(report, "claude")
     c._register_domain.assert_awaited_once()
 
 
@@ -208,10 +216,16 @@ async def test_a_confusable_new_domain_is_held_until_confirmed():
         dict(_fact("operatons"), new_domain=True), "claude")
     assert err["error"] == "domain_confusable"
 
+    # A report, because the ACCEPTING branch defers its registration into one
+    # and refuses to run without it (v0.9.72, R4 — a missing report is a
+    # coding error, never a quietly dropped registration).
+    report = {}
     ok = await c._domain_ingress_error(
         dict(_fact("operatons"), new_domain=True,
-             confirm_distinct_from=["operations"]), "claude")
+             confirm_distinct_from=["operations"]), "claude", report)
     assert ok is None
+    assert [d["name"] for d in report["pending_registrations"]["domains"]] \
+        == ["operatons"]
 
 
 @pytest.mark.asyncio

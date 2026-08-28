@@ -5,6 +5,50 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.72] — 2026-08-28
+
+### Culling closeout — registry rows only on success, one project value per decision, belonging counts the judgements on the walk, two dead indexes and a dead ledger gone, graph queries fail honestly
+
+### Changed
+- A registry row is no longer written by a refusal that could have fired earlier. The project
+  and domain ingress gates recorded their `projects` / `project_domains` row at the moment they
+  accepted a declared-new name, so a save refused afterwards — a malformed
+  `entities_provenance`, a bad `supersedes` pointer, an unmintable entity name — left a project
+  or a section behind for a record that was never stored, under a reply whose own text says
+  "Nothing was written". The gates now record an intent; the inserts happen once every
+  validation has passed, immediately before the entity mint, project first and then its
+  sections. A project being registered by the save in hand has no sections yet, so a section
+  named alongside it is accepted only when declared new. Three refusals still come after that
+  point and cannot be moved before it: the embedding mandate's 503, which needs the record's
+  final content; the authoritative re-save `axis_conflict`, which only a row lock can decide;
+  and the registration step's own 503. Each is named in the code beside the commit, so a fourth
+  one appearing is a defect rather than a surprise.
+- A decision's project is one value. `save_decision` set it inside the decision blob and left
+  the top-level key to be filled by the client's folder walk, which disagreed with it whenever
+  the save was run from outside a project root. The client now sets both from the operator's
+  `--project` (CLI and MCP alike), and the gateway treats `decision.project` as authoritative
+  for a decision or a retrospective, reporting the correction in `project_resolved`.
+- Where a judgement belongs now includes the sections asserted on the judgements it rests on,
+  not only on the facts beyond them. A retrospective grounded on a decision that asserts a
+  section used to derive nothing while that section sat one hop away. A judgement that has been
+  superseded contributes nothing, exactly as a superseded fact never has: a decision an operator
+  reversed is not where later work belongs.
+- `POST /memory/graph` answers 400 `cypher_rejected`, carrying Neo4j's own message, to a query
+  the database itself refuses — a syntax error, an unknown function, a type error. Only a real
+  fault is a 500 now, so "retry" and "fix your query" are no longer the same reply.
+
+### Removed
+- The two axis trigram indexes (`idx_projects_name_trgm`, `idx_project_domains_name_trgm`,
+  migration 039). A `gin_trgm_ops` index cannot serve `similarity(name, $1) >= <floor>`, which
+  is what every proposal and confusable lookup filters on; measured before removal, neither
+  index had ever been used. The `pg_trgm` extension stays — `similarity()` comes from it.
+- `alias_adjudications` (migration 040), the ADR-017 per-pair verdict ledger, with no writer
+  since v0.8.60 and a single reader. ⚠ The `aliases` table is a different table and STAYS: it is
+  the live axis-alias identity `project_aliases.alias_id` and `domain_aliases.alias_id` point at.
+- **MONITOR CONTRACT:** `GET /memory/telemetry` no longer carries the `alias` key. It counted
+  `alias_adjudications` and reported a frozen census of a retired layer as current state. The
+  monitor must stop rendering it; the absence is now pinned by a test.
+
 ## [0.9.71] — 2026-08-27
 
 ### Changed — constitution snippet v5 (MCP v4): a stale index pointer is repaired, not merely checked

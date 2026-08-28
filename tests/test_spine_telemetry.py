@@ -159,4 +159,12 @@ def test_existing_blocks_keep_their_shape():
         "total", "grounded_in_pct", "alternatives_pct", "confidence_pct",
         "elicited_pct"}
     assert set(out["facts"]) == {"total", "source_ref_pct", "elicited_pct"}
-    assert "emergent_unprojected_fields" in out and "alias" in out
+    assert "emergent_unprojected_fields" in out
+    # ⛔ RE-RULED at v0.9.72: the `alias` key is GONE, and its ABSENCE is now
+    # the contract. It counted `alias_adjudications`, the ADR-017 verdict
+    # ledger dropped by migration 040 — nothing had written to it since
+    # v0.8.60, so the block reported a frozen census of a retired layer as
+    # current state. This assertion is the monitor's notice: a key it used to
+    # render is not coming back, and re-adding it is a deliberate change, not
+    # a restoration.
+    assert "alias" not in out

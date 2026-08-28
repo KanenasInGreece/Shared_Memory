@@ -35,7 +35,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.9.71"
+VERSION = "0.9.72"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v4 (project registry): a fact save without a REGISTERED metadata.project is
@@ -1532,6 +1532,15 @@ def build_decision_metadata(
     metadata = {
         "type": "decision",
         "source": source or AGENT_ID,
+        # ⛔ THE SAME VALUE, IN BOTH PLACES, AND ONLY EVER THIS ONE. A decision
+        # has ONE project — the one the operator asserted — and it has to be at
+        # the top level as well as in the blob, because that is the key every
+        # reader inspecting Postgres directly trusts. Leaving it unset let
+        # `save_artifact` fill it from the cwd walk instead, which yields
+        # `.claude` when the save is run from under `~/.claude/...` and nothing
+        # at all from `~` — so a decision's two project fields disagreed, and
+        # 12 live records were repaired for exactly this (`fact:1757`).
+        "project": project,
         "entities": [e.strip() for e in entities.split(",") if e.strip()],
         "decision": decision,
     }

@@ -60,7 +60,8 @@ sys.path.insert(0, _SCRIPTS)
 from coordinator import (  # noqa: E402
     ENTITY_LIST_MAX_LEN, ENTITY_NAME_MAX_LEN, ENTITY_VOCAB_MINT_SQL,
     ENTITY_VOCAB_RESOLVE_MANY_SQL, ENTITY_VOCAB_RESOLVE_SQL, MemoryCoordinator,
-    ENTITY_RESERVED_PROJECT_SQL, axis_key, is_judgement_type,
+    ENTITY_RESERVED_PROJECT_SQL, ProjectIdentityUnavailable, axis_key,
+    is_judgement_type,
 )
 
 
@@ -1203,18 +1204,28 @@ async def test_refused_save_leaves_no_registry_rows():
     """P4: no registry row and no mint is written by a save refused with 400.
 
     The shape that used to break it: `new_project` declares a project (which
-    `_project_ingress_error` REGISTERS — that IS the acceptance) and the same
-    save names an entity the vocabulary does not know. The entity refusal
-    fired AFTER the project registration, so the save 400'd having already
-    created a project row no record ever named.
+    `_project_ingress_error` REGISTERED on the spot — that WAS the acceptance)
+    and the same save names an entity the vocabulary does not know. The entity
+    refusal fired AFTER the project registration, so the save 400'd having
+    already created a project row no record ever named.
+
+    ⚠ EXTENDED at v0.9.72 (P4′). Two things now stand between this save and a
+    stray registry row, and they are independent: the entity gate runs BEFORE
+    the project axis (v0.9.69, the mutation named below), and the project axis
+    no longer writes when it accepts (v0.9.72 — the row is written by
+    `_commit_axis_registrations`, past every gate). The DOMAIN registry is
+    asserted too: it is the other half of the same rule, and it had no test.
 
     MUTATION CHECK: move the `_entity_ingress_validate` call in handle_save
-    back below `_project_ingress_error` and this test fails —
-    `_register_project` is awaited before the entity gate ever refuses.
+    back below `_project_ingress_error` and this test STILL PASSES under
+    v0.9.72 — which is the point of the second guard. `test_a_400_after_the_
+    axis_gates_leaves_no_registry_rows` below is the one that dies when the
+    registrations are moved back into the gates.
     """
     c, conn = _full_coord()
     c._project_registered = AsyncMock(return_value=False)
     c._register_project = AsyncMock()
+    c._register_domain = AsyncMock()
     c._new_project_refusal = AsyncMock(return_value=None)
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)) as embed:
         req = _make_request({
@@ -1233,6 +1244,7 @@ async def test_refused_save_leaves_no_registry_rows():
     body = json.loads(resp.text)
     assert body["error"] == "entity_unknown"
     c._register_project.assert_not_called()
+    c._register_domain.assert_not_called()
     c._entity_vocab_mint.assert_not_called()
     embed.assert_not_called()
 
@@ -1258,6 +1270,533 @@ async def test_a_new_project_save_with_known_entities_still_registers():
         resp = await c.handle_save(req)
     assert resp.status == 200
     c._register_project.assert_awaited_once()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# P4′ (item 1, v0.9.72) — a registry row is written ONLY by a save that gets
+# past every gate.
+#
+# `_project_ingress_error` and `_domain_ingress_error` INSERTED at the moment
+# they accepted a declared-new name. Every refusal still ahead of them —
+# entities_provenance, supersedes, the 409 axis_conflict, a mint Postgres
+# rejects — and the 503 `registry_unavailable` therefore left a project or a
+# section behind for a record that was never stored, under a refusal whose own
+# text says "Nothing was written". They now record an INTENT; the inserts
+# happen in `_commit_axis_registrations`, immediately before the entity mint.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _new_project_coord(**kw):
+    """`_full_coord` with the project registry answering "no such project", so
+    a `new_project` declaration is a genuine new registration."""
+    c, conn = _full_coord(**kw)
+    c._project_registered = AsyncMock(return_value=False)
+    c._new_project_refusal = AsyncMock(return_value=None)
+    c._register_project = AsyncMock()
+    c._register_domain = AsyncMock()
+    c._project_identity = AsyncMock(return_value=77)
+    return c, conn
+
+
+@pytest.mark.asyncio
+async def test_a_400_after_the_axis_gates_leaves_no_registry_rows():
+    """⛔ THE TEST THE OLD ORDERING CANNOT PASS. The save declares a new project
+    AND a new section — both accepted — and is then refused by a check that
+    runs AFTER both gates: a malformed `entities_provenance`. Under the old
+    code the 400 came back with a `projects` row and a `project_domains` row
+    already committed for a record that does not exist.
+
+    MUTATION CHECK: put the `await self._register_project(...)` call back
+    inside `_project_ingress_error` (in place of the deferral) and this test
+    dies.
+    """
+    c, conn = _new_project_coord()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)) as embed:
+        req = _make_request({
+            "content": "a fact declaring a new project, a new section, and a "
+                       "malformed provenance map",
+            "metadata": {
+                "source": "claude-code",
+                "project": "BrandNewProject",
+                "new_project": True,
+                "domain": "telemetry",
+                "new_domain": True,
+                # Not a dict — refused well after both axis gates have run.
+                "entities_provenance": "operator",
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 400
+    assert json.loads(resp.text)["error"] == "entities_provenance_invalid"
+    c._register_project.assert_not_called()
+    c._register_domain.assert_not_called()
+    embed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_new_project_then_unknown_domain_refusal_leaves_no_project_row():
+    """A new project plus a section the caller did NOT declare new: the domain
+    gate refuses, and the project the same save declared must not survive it.
+
+    This is the ordering that made the defect visible — the project axis runs
+    first and used to write first, so a refusal on the SECOND axis always left
+    the first one's row behind."""
+    c, conn = _new_project_coord()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)) as embed:
+        req = _make_request({
+            "content": "a fact declaring a new project and an undeclared section",
+            "metadata": {
+                "source": "claude-code",
+                "project": "BrandNewProject",
+                "new_project": True,
+                "domain": "telemetry",
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 400
+    c._register_project.assert_not_called()
+    c._register_domain.assert_not_called()
+    embed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_new_project_with_unknown_domain_and_no_new_domain_flag_is_400_and_leaves_no_rows():
+    """⛔ NEW-PROJECT MODE, AND WHAT IT REFUSES. A project this save is
+    registering has NO SECTIONS — not "none we could read", none at all — so a
+    named section is accepted only when the caller declares it new. Anything
+    else is the ordinary unknown-domain refusal, and it carries an EMPTY
+    proposal list because there is genuinely nothing to propose.
+
+    ⚠ `new_domain` is still required here, and that is the whole point: a
+    brand-new project is exactly where an agent is most likely to invent a
+    section name in passing, so the rule must not stop applying precisely
+    when the project is new.
+    """
+    c, conn = _new_project_coord()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "a fact naming a section of a project being registered",
+            "metadata": {
+                "source": "claude-code",
+                "project": "BrandNewProject",
+                "new_project": True,
+                "domain": "telemetry",
+            },
+        })
+        resp = await c.handle_save(req)
+    body = json.loads(resp.text)
+    assert resp.status == 400
+    assert body["error"] == "domain_unknown"
+    assert not body.get("proposals")
+    c._register_project.assert_not_called()
+    c._register_domain.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_the_domain_gate_never_asks_for_the_identity_of_a_pending_project():
+    """⛔ THE FALSE 503 THIS RELEASE HAD TO AVOID. `_project_identity` RAISES
+    when a name has no registry row (v0.9.69, item 6) — and with the project
+    insert deferred, a pending project HAS no row. Asking it for one during the
+    domain gate would turn the ordinary "new project plus its first section"
+    save into a 503 `registry_unavailable`: a healthy registry reported as an
+    outage, on the one save shape that introduces a project.
+
+    ⚠ ASSERTED ON THE CALL ORDER, NOT ON A 503, and the difference matters. A
+    version of this test that made `_project_identity` RAISE would pass under
+    the mutation too: the real code raises at COMMIT time and the mutant raises
+    at GATE time, and both answer 503 `registry_unavailable`, so the assertion
+    would hold for the wrong reason. What actually separates them is WHEN the
+    identity is first asked for — never before the project row exists.
+
+    MUTATION CHECK: delete the `new_project` branch in `_domain_ingress_error`
+    so it always calls `_project_identity`, and this test dies — the first
+    recorded event becomes the gate's lookup instead of the project insert.
+    """
+    order = []
+    c, conn = _new_project_coord()
+    c._project_identity = AsyncMock(side_effect=lambda p: order.append("identity") or 77)
+    c._register_project = AsyncMock(
+        side_effect=lambda n, a: order.append("register_project"))
+    c._register_domain = AsyncMock(
+        side_effect=lambda pid, n, a: order.append("register_domain"))
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "a fact declaring a new project and its first section",
+            "metadata": {
+                "source": "claude-code",
+                "project": "BrandNewProject",
+                "new_project": True,
+                "domain": "telemetry",
+                "new_domain": True,
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 200
+    # The project row is written FIRST; only then is its id asked for, and only
+    # then is the section written against it.
+    assert order == ["register_project", "identity", "register_domain"]
+
+
+@pytest.mark.asyncio
+async def test_registry_unavailable_503_leaves_no_project_row():
+    """The 503 path writes nothing either. An unreadable registry during the
+    domain gate is answered exactly as the hard embedding mandate answers a
+    missing vector — "half a save is not a save" — and the reply says "Nothing
+    was written", which has to be true of the REGISTRY as well as of
+    `technical_docs`."""
+    c, conn = _full_coord()
+    c._register_project = AsyncMock()
+    c._register_domain = AsyncMock()
+    c._project_identity = AsyncMock(side_effect=ProjectIdentityUnavailable("boom"))
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)) as embed:
+        req = _make_request({
+            "content": "a fact on a registered project naming a new section",
+            "metadata": {
+                "source": "claude-code",
+                "project": "shared-memory-GitHub",
+                "domain": "telemetry",
+                "new_domain": True,
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 503
+    assert json.loads(resp.text)["error"] == "registry_unavailable"
+    c._register_project.assert_not_called()
+    c._register_domain.assert_not_called()
+    embed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_new_project_with_new_domain_registers_both_after_gates():
+    """The positive case, with the ORDER asserted — because the order is a
+    dependency, not a preference:
+
+        project → its sections → the entity mint → the embed
+
+    `project_domains` is keyed on the project's registry id, so a section of a
+    brand-new project can only be written once the project row exists; the
+    intent therefore carries no id and resolves one at COMMIT time.
+
+    MUTATION CHECK: commit the domain intents before the project (swap the two
+    halves of `_commit_axis_registrations`) and this test dies on the order
+    assertion.
+    """
+    order = []
+    c, conn = _new_project_coord()
+    c._register_project = AsyncMock(
+        side_effect=lambda n, a: order.append(("project", n)))
+    c._register_domain = AsyncMock(
+        side_effect=lambda pid, n, a: order.append(("domain", n, pid)))
+
+    async def _embed(*_a, **_kw):
+        order.append(("embed",))
+        return [0.1] * 1024
+
+    with patch.object(c, "_embed", new=AsyncMock(side_effect=_embed)):
+        req = _make_request({
+            "content": "a fact declaring a new project and its first section",
+            "metadata": {
+                "source": "claude-code",
+                "project": "BrandNewProject",
+                "new_project": True,
+                "domain": "telemetry",
+                "new_domain": True,
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 200
+    assert order == [
+        ("project", "BrandNewProject"),
+        ("domain", "telemetry", 77),
+        ("embed",),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_declared_new_section_on_an_existing_project_still_registers():
+    """The reorder must not have made the ordinary case unreachable: a section
+    declared new on a project that already exists is registered exactly as
+    before, with the id the gate resolved rather than one looked up again."""
+    c, conn = _full_coord()
+    c._register_domain = AsyncMock()
+    c._domain_registered = AsyncMock(return_value=False)
+    c._new_domain_refusal = AsyncMock(return_value=None)
+    c._project_identity = AsyncMock(return_value=42)
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "a fact naming a new section of a registered project",
+            "metadata": {
+                "source": "claude-code",
+                "project": "shared-memory-GitHub",
+                "domain": "telemetry",
+                "new_domain": True,
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 200
+    c._register_domain.assert_awaited_once_with(42, "telemetry", "claude-code")
+
+
+@pytest.mark.asyncio
+async def test_the_pending_intent_never_reaches_the_save_response():
+    """The intents live in the axis report, which is also what the response's
+    `project_resolved` / `domains_resolved` are read from. `_commit_axis_
+    registrations` POPS the key, so an internal bookkeeping structure can never
+    be rendered to a caller as though it were part of the contract."""
+    c, conn = _new_project_coord()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "a fact declaring a new project and its first section",
+            "metadata": {
+                "source": "claude-code",
+                "project": "BrandNewProject",
+                "new_project": True,
+                "domain": "telemetry",
+                "new_domain": True,
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 200
+    assert "pending_registrations" not in json.loads(resp.text)
+
+
+@pytest.mark.asyncio
+async def test_an_unmintable_entity_name_leaves_no_registry_row():
+    """⛔ THE LEAK P4' MISSED ON ITS FIRST PASS (review R1). A name that
+    NORMALIZES TO NOTHING survives `sanitize_entity_name` — MIN_ENTITY_NAME_LEN
+    is 2, so `'!!'` passes intact — and was refused only by
+    `_entity_commit_mints`, which runs AFTER `_commit_axis_registrations`. So
+    `--new-project --new-domain` with `new_entities: ["!!"]` committed BOTH
+    registry rows and then 400'd `new_entities_invalid`: deterministic, not a
+    race, and exactly the shape the whole item exists to close.
+
+    The check is hoisted into `_entity_ingress_validate`, which runs before the
+    axis gates — the same extraction the domain axis got
+    (`_domain_unnameable_refusal`), for the same reason: a gate the database
+    enforces and the ingress does not is a refusal that arrives too late.
+
+    MUTATION CHECK: move the unnameable check back out of
+    `_entity_ingress_validate` (so only `_entity_commit_mints` catches it) and
+    this test dies — both registry rows are written before the 400.
+    """
+    c, conn = _new_project_coord()
+    c._entity_vocab_mint = AsyncMock(return_value=None)
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)) as embed:
+        req = _make_request({
+            "content": "a fact declaring a new project, a new section, and an "
+                       "entity name that normalizes to nothing",
+            "metadata": {
+                "source": "claude-code",
+                "project": "BrandNewProject",
+                "new_project": True,
+                "domain": "telemetry",
+                "new_domain": True,
+                "entities": ["!!"],
+                "new_entities": ["!!"],
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 400
+    assert json.loads(resp.text)["error"] == "new_entities_invalid"
+    c._register_project.assert_not_called()
+    c._register_domain.assert_not_called()
+    c._entity_vocab_mint.assert_not_called()
+    embed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_the_database_still_gets_the_last_word_on_a_mint():
+    """The gateway-side twin does not REPLACE the database's own refusal. If
+    Postgres rejects a mint the twin accepted — a `[:alnum:]` locale
+    difference, a future trigger rule — the save is still a structured 400 and
+    never a 500 with an unparseable body (S-2)."""
+    c, conn = _full_coord()
+    c._entity_vocab_mint = AsyncMock(return_value=None)
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "a fact whose mint the database refuses",
+            "metadata": {
+                "source": "claude-code",
+                "project": "shared-memory-GitHub",
+                "entities": ["PerfectlyNameable"],
+                "new_entities": ["PerfectlyNameable"],
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 400
+    assert json.loads(resp.text)["error"] == "new_entities_invalid"
+    c._entity_vocab_mint.assert_awaited_once()
+
+
+def test_deferring_a_registration_with_no_report_is_a_coding_error():
+    """⛔ RAISES, NEVER WARNS (review R4). The first version logged and
+    returned, which answered 200 to a save whose project was never registered —
+    and the outbox would then mint a `:Project` node the registry does not
+    have, the exact divergence migration 027 removed. One production caller
+    passes a report always, so this can only fire in new code."""
+    c = MemoryCoordinator()
+    with pytest.raises(RuntimeError, match="axis report"):
+        c._defer_project_registration(None, "BrandNewProject", "c", {})
+    with pytest.raises(RuntimeError, match="axis report"):
+        c._defer_domain_registration(None, "BrandNewProject", "telemetry", 77, "c")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Item 2 (v0.9.72) — a decision's project is ONE value: `decision.project`
+# ══════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_decision_top_level_project_follows_decision_project():
+    """⛔ THE BLOB IS AUTHORITATIVE, AND THE REWRITE IS DISCLOSED.
+
+    The client used to send `decision.project` (the operator's `--project`) and
+    a top-level `project` derived from the cwd walk — which under
+    `~/.claude/...` is the literal string `.claude`. The gateway stored both,
+    and the two disagreed on 12 live decisions (`fact:1757`). The client is
+    fixed; this makes the SERVER independent of it, for every client that has
+    not been updated and every one that never will be.
+
+    The rewrite is reported rather than silent: a caller whose value was
+    replaced learns where its record actually landed, exactly as the axis
+    gates report an alias rewrite.
+
+    MUTATION CHECK: drop the `metadata["project"] = _asserted` assignment and
+    this test dies — the stored top-level project stays `.claude`.
+    """
+    c, conn = _full_coord()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "We decided to defer the axis registry writes.",
+            "metadata": {
+                "source": "claude-code",
+                "type": "decision",
+                "project": ".claude",
+                "entities": [],
+                "decision": {
+                    "decided_by": "Xenofon",
+                    "project": "shared-memory-GitHub",
+                    "rationale": "because a refused save must write nothing",
+                },
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 200
+    stored = conn.fetchrow.await_args.args[2]
+    assert stored["project"] == "shared-memory-GitHub"
+    assert stored["decision"]["project"] == "shared-memory-GitHub"
+    resolved = json.loads(resp.text)["project_resolved"]
+    assert resolved["from"] == ".claude"
+    assert resolved["to"] == "shared-memory-GitHub"
+    assert "authoritative" in resolved["reason"]
+
+
+@pytest.mark.asyncio
+async def test_a_decision_whose_two_project_fields_agree_reports_nothing():
+    """No rewrite, no report. A client sending the same value in both places —
+    which is what the fixed client does — must not be told about a change that
+    did not happen, or the field stops meaning anything."""
+    c, conn = _full_coord()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "We decided to keep the two fields in step.",
+            "metadata": {
+                "source": "claude-code",
+                "type": "decision",
+                "project": "shared-memory-GitHub",
+                "entities": [],
+                "decision": {
+                    "decided_by": "Xenofon",
+                    "project": "shared-memory-GitHub",
+                    "rationale": "one value, two places",
+                },
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 200
+    assert json.loads(resp.text)["project_resolved"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_decision_with_no_top_level_project_gains_one():
+    """The commonest shape in the corpus: the client never set the key at all,
+    so `save_artifact` filled it from the walk — or, from `~`, left it empty.
+    `from` is null, because nothing was replaced; a value was supplied."""
+    c, conn = _full_coord()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "We decided the top-level key must always be present.",
+            "metadata": {
+                "source": "claude-code",
+                "type": "decision",
+                "entities": [],
+                "decision": {
+                    "decided_by": "Xenofon",
+                    "project": "shared-memory-GitHub",
+                    "rationale": "a reader of Postgres must be able to trust it",
+                },
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 200
+    assert conn.fetchrow.await_args.args[2]["project"] == "shared-memory-GitHub"
+    assert json.loads(resp.text)["project_resolved"] == {
+        "from": None, "to": "shared-memory-GitHub",
+        "reason": "decision.project is authoritative",
+    }
+
+
+@pytest.mark.asyncio
+async def test_the_ingress_canonical_wins_for_the_destination():
+    """When the axis gate ALSO moves the name — a retired spelling resolved
+    through an alias — the caller must be told ONE destination, and it must be
+    the one actually stored. The ingress report wins for `to`; the
+    decision-blob rewrite still supplies `from`, which the ingress cannot know
+    because it never saw the pre-overwrite value."""
+    c, conn = _full_coord()
+    c._project_registered = AsyncMock(return_value=False)
+    c._resolve_project_alias = AsyncMock(return_value="shared-memory-GitHub")
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "We decided a retired spelling still resolves.",
+            "metadata": {
+                "source": "claude-code",
+                "type": "decision",
+                "project": ".claude",
+                "entities": [],
+                "decision": {
+                    "decided_by": "Xenofon",
+                    "project": "Shared_Memory_GitHub",
+                    "rationale": "one resolution, at ingress",
+                },
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 200
+    resolved = json.loads(resp.text)["project_resolved"]
+    assert resolved["from"] == ".claude"
+    assert resolved["to"] == "shared-memory-GitHub"
+    # The ingress' own keys survive alongside — the caller sees both halves of
+    # what happened to its value.
+    assert resolved["supplied"] == "Shared_Memory_GitHub"
+    assert resolved["canonical"] == "shared-memory-GitHub"
+
+
+@pytest.mark.asyncio
+async def test_a_fact_is_untouched_by_the_decision_project_rule():
+    """A fact has no `decision` blob and its top-level project is the only one
+    it has. The rule must not reach it — it is about reconciling TWO fields,
+    and a fact has one."""
+    c, conn = _full_coord()
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "a plain fact",
+            "metadata": {"source": "claude-code",
+                         "project": "shared-memory-GitHub"},
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 200
+    assert conn.fetchrow.await_args.args[2]["project"] == "shared-memory-GitHub"
+    assert json.loads(resp.text)["project_resolved"] is None
 
 
 # ── E2 (item 2, v0.9.69) — RESERVED names are refused, never silently dropped ──
