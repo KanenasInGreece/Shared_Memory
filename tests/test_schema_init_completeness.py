@@ -111,8 +111,20 @@ def test_a_dropped_object_is_absent_from_the_fresh_install():
     must be gone from `schema_init.sql`.
 
     Derived from the migration chain rather than restated beside it: the names
-    come out of the `DROP INDEX` / `DROP TABLE` statements themselves, so a
-    future drop is covered the day it lands and cannot be forgotten here.
+    come out of the `DROP INDEX` / `DROP TABLE` / `DROP SEQUENCE` statements
+    themselves, so a future drop is covered the day it lands and cannot be
+    forgotten here. (`DROP SEQUENCE` added at v0.9.72 — migration 040 uses it,
+    and the first version of this parser silently skipped that whole form.)
+
+    ⚠ KNOWN GAPS, LEFT DELIBERATELY AND WRITTEN DOWN RATHER THAN IMPLIED: the
+    parser reads ONE object per statement, so a comma-separated
+    `DROP INDEX a, b` would register only `a`; and it treats the whole chain as
+    unordered when it un-drops a name, so a migration that CREATES an object an
+    EARLIER one dropped clears the entry correctly while one that creates it in
+    an earlier file and drops it in a later one is also cleared — wrongly. Both
+    shapes are absent from this chain today. Widening the parser to cover them
+    is worth doing the first time either appears, not before: a parser with
+    cases nothing exercises is a parser nobody can prove.
     """
     chain_files = sorted(
         n for n in os.listdir(MIGRATIONS)
@@ -123,14 +135,15 @@ def test_a_dropped_object_is_absent_from_the_fresh_install():
         with open(os.path.join(MIGRATIONS, name), encoding="utf-8") as fh:
             sql = fh.read()
         for obj in re.findall(
-                r"DROP\s+(?:INDEX|TABLE)\s+(?:IF\s+EXISTS\s+)?([A-Za-z_][\w.]*)",
+                r"DROP\s+(?:INDEX|TABLE|SEQUENCE)\s+(?:IF\s+EXISTS\s+)?"
+                r"([A-Za-z_][\w.]*)",
                 sql, re.I):
             dropped[obj.split(".")[-1]] = name
         # A later migration may legitimately recreate a name an earlier one
         # dropped — the drop is then not the last word about it.
         for obj in re.findall(
-                r"CREATE\s+(?:UNIQUE\s+)?(?:INDEX|TABLE)\s+(?:IF\s+NOT\s+EXISTS\s+)?"
-                r"([A-Za-z_][\w.]*)", sql, re.I):
+                r"CREATE\s+(?:UNIQUE\s+)?(?:INDEX|TABLE|SEQUENCE)\s+"
+                r"(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][\w.]*)", sql, re.I):
             dropped.pop(obj.split(".")[-1], None)
 
     assert dropped, "no migration drops anything — this test has stopped covering it"
