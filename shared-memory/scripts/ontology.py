@@ -41,8 +41,10 @@ class OntologyConfig:
     # content/grounding. Never configurable from ontology.yaml.
     retrospective: str = "Retrospective"
     # Node labels — entity type sub-labels (Path A multi-label under :Entity; decision 472).
-    # Stage 1 defines them; REM populates them (1.3) + one-time backfill (1.4). Person/
-    # Agent/Process reuse the provenance labels above (Human/AIAgent/Activity).
+    # ⚠ No writer applies these any more — REM stopped assigning them (decision:1664,
+    # v0.9.66); every :Entity is merged plain. They survive only as the schema-compliance
+    # allowlist (KNOWN_LABELS below). Person/Agent/Process reuse the provenance labels
+    # above (Human/AIAgent/Activity).
     component: str = "Component"   # software unit we build (module/class/script/daemon)
     system: str = "System"        # service / datastore / framework / infra we run
     model: str = "Model"          # AI/ML model
@@ -74,9 +76,11 @@ class OntologyConfig:
     under_conditions: str = "UNDER_CONDITIONS"
     considered: str = "CONSIDERED"
     rejected: str = "REJECTED"
-    # Relationship types — typed Entity→Entity domain (decision 472). REM picks one
-    # (1.3) gated by the domain-range map; MENTIONS stays as fallback until per-edge
-    # confidence retires it in v0.6.1.
+    # Relationship types — typed Entity→Entity domain (decision 472). No writer mints
+    # these any more: the evidence sweep that proposed them (`relation_sweep.py`) and
+    # the confidence calibration that adjudicated them are both retired (v0.9.67/68).
+    # `MENTIONS` remains the explicit edge a save writes; these names survive only as
+    # the schema-compliance vocabulary for edges already in the graph.
     depends_on: str = "DEPENDS_ON"   # needs / requires (build/config dependency)
     part_of: str = "PART_OF"         # composition / belongs-to
     implements: str = "IMPLEMENTS"   # realises a concept / pattern
@@ -94,7 +98,6 @@ class OntologyConfig:
     # grounded facts). See consolidation_loop.py's DENSITY_THRESHOLD.
     density_threshold: int = 3
     insight_threshold: int = 2
-    alias_max_hops: int = 2
 
 
 def _load() -> OntologyConfig:
@@ -138,7 +141,6 @@ def _load() -> OntologyConfig:
     # Framework consolidation tuning (operator-tunable mechanism params, NOT domain vocab)
     cfg.density_threshold = int(cons.get("density_threshold", cfg.density_threshold))
     cfg.insight_threshold = int(cons.get("insight_threshold", cfg.insight_threshold))
-    cfg.alias_max_hops = int(cons.get("alias_max_hops", cfg.alias_max_hops))
     return cfg
 
 
@@ -328,11 +330,11 @@ def sanitize_entity_names(raw_names: object) -> list[str]:
 # whole purpose is "content genuinely referenced this as a named entity"),
 # not an enumeration of provenance relationship types to exclude — a 5th
 # provenance-style relationship type added later cannot silently bypass this
-# check the way an exclusion list could. Synchronous scripts share the actual
-# query (`entity_resolution_eval.fetch_entities`); the async gateway
-# (`coordinator.py`, a different runtime/driver) cannot import that function,
-# so it re-expresses the SAME rule in its own Cypher — any consumer doing so
-# must match this criterion exactly, not approximate it.
+# check the way an exclusion list could. `coordinator.py` re-expresses this
+# SAME rule in its own Cypher (it cannot import a shared query — different
+# runtime/driver) — any consumer doing so must match this criterion exactly,
+# not approximate it. The offline `entity_resolution_eval.py` harness that
+# once shared the query is retired; nothing else currently applies this rule.
 GENUINELY_REFERENCED_ENTITY_RULE = (
     "requires >=1 incoming, non-superseded MENTIONS edge — see ontology.py's "
     "GENUINELY_REFERENCED_ENTITY_RULE docstring (decision 890) before changing "
@@ -534,9 +536,12 @@ RETRO_RATINGS: frozenset[str] = frozenset({
 # SPINE = the framework identity / unique selling point — code-pinned, never read
 # from ontology.yaml: the high-signal ADR capture (Fact/Decision/CommunitySummary/
 # Insight + provenance), alias-not-merge, fact-grounding, and every relation the
-# summarising dream cycle (NREM) depends on. DOMAIN = the configurable vocabulary
-# (entity sub-labels + typed Entity→Entity relations) loaded from the file; it
-# describes what records are ABOUT and is applied only at first-write and REM.
+# summarising dream cycle (NREM) depends on. DOMAIN = the entity sub-labels loaded
+# from the file; it describes what records are ABOUT. ⚠ Nothing currently applies
+# a sub-label to a node — DOMAIN_LABELS below is a compliance ALLOWLIST, not a set
+# of labels any writer stamps (REM writes none, `decision:1664`). The typed
+# Entity→Entity relation NAMES are code-pinned too (no `relationships:` section
+# in the file); only their compliance membership lives here.
 # The boundary contract test asserts consolidation touches only SPINE identifiers.
 SPINE_LABELS: frozenset[str] = frozenset({
     ONT.fact, ONT.entity, ONT.community_summary, ONT.reasoning_trace,
