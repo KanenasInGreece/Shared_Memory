@@ -64,15 +64,15 @@ def test_a_non_string_project_is_parked_not_an_exception():
 def test_parked_to_real_is_allowed():
     assert promotion_refusal(None, "shared-memory-GitHub") is None
     assert promotion_refusal(SENTINEL, "shared-memory-GitHub") is None
-    assert promotion_refusal("", "tier3-cloe") is None
+    assert promotion_refusal("", "project-b") is None
 
 
 def test_real_to_real_is_refused():
     """The safety property. Promotion is one-way, so overwriting an established
     project here would be unrepairable through this path."""
-    refusal = promotion_refusal("tier3-cloe", "shared-memory-GitHub")
+    refusal = promotion_refusal("project-b", "shared-memory-GitHub")
     assert refusal is not None
-    assert "tier3-cloe" in refusal
+    assert "project-b" in refusal
 
 
 def test_real_to_the_same_value_is_still_refused():
@@ -99,7 +99,7 @@ def test_promoting_to_an_empty_target_is_refused():
 def test_sole_project_requires_unanimity_among_real_values():
     assert sole_project(["smg", "smg"]) == "smg"
     assert sole_project(["smg"]) == "smg"
-    assert sole_project(["smg", "tier3-cloe"]) is None
+    assert sole_project(["smg", "project-b"]) is None
     assert sole_project([]) is None
     assert sole_project(None) is None
 
@@ -113,7 +113,7 @@ def test_abstentions_are_not_dissent():
 
 def test_two_real_projects_leave_the_record_parked():
     """Parked is visible and repairable; wrong is neither."""
-    assert sole_project(["smg", "tier3-cloe", "smg"]) is None
+    assert sole_project(["smg", "project-b", "smg"]) is None
 
 
 # ── The writer: all three writes, or none ────────────────────────────────────
@@ -223,7 +223,7 @@ async def test_the_graph_half_goes_through_the_outbox_never_direct():
 @pytest.mark.asyncio
 async def test_a_refused_promotion_writes_nothing_at_all():
     """A refusal is a result, not a partial write."""
-    conn = FakeConn(current="tier3-cloe")
+    conn = FakeConn(current="project-b")
     result = await promote_record(conn, 1, "smg", method="test", actor="t")
     assert result["promoted"] is False
     assert conn.executed == []
@@ -359,13 +359,13 @@ def _find_drift(*a, **kw):
 
 
 def test_reconciler_repairs_a_wrong_edge():
-    drift = _find_drift({7: "tier3-cloe"}, {7: ["shared-memory-GitHub"]}, set())
-    assert drift == {7: (["shared-memory-GitHub"], "tier3-cloe")}
+    drift = _find_drift({7: "project-b"}, {7: ["shared-memory-GitHub"]}, set())
+    assert drift == {7: (["shared-memory-GitHub"], "project-b")}
 
 
 def test_reconciler_collapses_an_extra_edge():
     """A bare MERGE only ever adds, so a record can name two projects at once."""
-    drift = _find_drift({7: "tier3-cloe"}, {7: ["tier3-cloe", "smg"]}, set())
+    drift = _find_drift({7: "project-b"}, {7: ["project-b", "smg"]}, set())
     assert 7 in drift
 
 

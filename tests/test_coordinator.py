@@ -1677,7 +1677,7 @@ async def test_retrospective_v2_inherits_target_project_and_stores_record():
     domain-scoped reads see the retro beside its decision."""
     c, mock_conn, _ = _coordinator_with_mocks()
     mock_conn.fetchrow = AsyncMock(side_effect=[
-        {"id": 240, "type": "decision", "project": "tier3-cloe"},
+        {"id": 240, "type": "decision", "project": "project-b"},
         {"id": 912},
     ])
     # _resolve_typed_grounding looks the grounded fact up in technical_docs
@@ -1692,7 +1692,7 @@ async def test_retrospective_v2_inherits_target_project_and_stores_record():
     # technical_docs INSERT metadata (2nd fetchrow call): row content + metadata
     meta = mock_conn.fetchrow.await_args_list[1].args[2]
     assert meta["type"] == "retrospective"
-    assert meta["project"] == "tier3-cloe"
+    assert meta["project"] == "project-b"
     assert meta["target_pg_id"] == 240
     assert meta["rating"] == "mixed"
     assert meta["grounded_in"] == [601]
