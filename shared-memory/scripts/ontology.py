@@ -603,8 +603,8 @@ def derived_belonging_cypher(hops: int = 4) -> str:
       the same project node:
 
         `own`       the sections asserted on the record or on its anchor
-        `judged`    the sections asserted on any DECISION or RETROSPECTIVE
-                    reached on the grounding walk
+        `judged`    the sections asserted on any live DECISION or
+                    RETROSPECTIVE reached on the grounding walk
         `grounded`  the sections of the non-superseded FACTS reachable the
                     same way
 
@@ -618,6 +618,13 @@ def derived_belonging_cypher(hops: int = 4) -> str:
       the path. Measured live: retro 1694 derived `[]` while decision 1678, on
       its own grounding walk, asserts `architecture`. A judgement that rests on
       a judgement was reading only the leaves of its evidence.
+
+      ⛔ AND `judged` SKIPS A SUPERSEDED JUDGEMENT, exactly as `grounded`
+      skips a superseded fact. A decision a retrospective REVERSED is not
+      where anything belongs: the reversal is what the supersession cascade
+      stamps, and the same predicate already excludes those nodes on both
+      sides of the insight gate. Collecting from one would let an overturned
+      decision keep filing later work under its sections.
 
       ⚠ The three are UNIONED AS SETS. Each `collect` is DISTINCT, so no list
       repeats a name internally, and each list is anti-joined against the ones
@@ -661,7 +668,8 @@ def derived_belonging_cypher(hops: int = 4) -> str:
         f" OPTIONAL MATCH (n1)-[:{rels}*1..{hops}]->(m)"
         f"                   -[:{ONT.domain_of}]->(jd:{ONT.domain})"
         f"                   -[:{ONT.project_of}]->(p)"
-        f"   WHERE m:{ONT.decision} OR m:{ONT.retrospective}"
+        f"   WHERE (m:{ONT.decision} OR m:{ONT.retrospective})"
+        f"     AND coalesce(m.superseded, false) = false"
         f" WITH wanted, p, anchors, own, collect(DISTINCT jd.name) AS judged"
         # Grounded sections: the live facts either anchor rests on.
         f" UNWIND anchors AS n2"

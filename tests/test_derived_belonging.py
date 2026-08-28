@@ -143,7 +143,7 @@ def test_a_judgement_on_the_grounding_walk_contributes_its_own_sections():
     # ONLY a judgement. A fact reached on the walk is the `grounded` collection's
     # business, and it filters supersession; collecting facts twice here would
     # smuggle a superseded fact's section past that filter.
-    assert f"WHERE m:{ONT.decision} OR m:{ONT.retrospective}" in q
+    assert f"WHERE (m:{ONT.decision} OR m:{ONT.retrospective})" in q
 
 
 def test_the_judged_collection_is_bound_to_the_anchor_s_project_node():
@@ -155,6 +155,29 @@ def test_the_judged_collection_is_bound_to_the_anchor_s_project_node():
     after = q.split(f"(jd:{ONT.domain})", 1)[1]
     assert after.lstrip().startswith(f"-[:{ONT.project_of}]->(p)"), (
         "the judged collection is not bound to the anchor's project node")
+
+
+def test_a_superseded_judgement_carries_nothing_forward():
+    """⛔ A REVERSED DECISION IS NOT WHERE ANYTHING BELONGS (review R2). The
+    grounded collection has always skipped a superseded FACT; the judged
+    collection must skip a superseded JUDGEMENT for the identical reason, and
+    with the identical predicate. `reversed` is the one rating that performs
+    the supersession cascade, so this is precisely the decision an operator has
+    said was overturned — letting it keep filing later work under its sections
+    would make a retraction propagate as an endorsement.
+
+    MUTATION CHECK: drop `coalesce(m.superseded, false) = false` from the
+    judged collection and this test dies.
+    """
+    q = _q()
+    assert "coalesce(m.superseded, false) = false" in q
+    # Both walks filter, and they filter the same way — a divergence here would
+    # mean one kind of retired node still counted.
+    assert q.count("superseded, false) = false") == 2
+    # The label test is a GROUP with the filter ANDed onto it: dropping the
+    # parentheses would make `OR m:Retrospective` swallow the predicate and a
+    # reversed retrospective would slip through.
+    assert f"WHERE (m:{ONT.decision} OR m:{ONT.retrospective})" in q
 
 
 def test_a_section_asserted_twice_is_listed_once():
