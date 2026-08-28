@@ -1,6 +1,6 @@
 # Shared Memory Schema
 
-> Label and relationship names are configurable via `ontology.yaml` at the repo root (override `SMEM_ONTOLOGY_PATH` to point elsewhere). All names shown here are the defaults.
+> Entity sub-label names are configurable via `shared-memory/ontology.yaml` (repo root is a fallback for checkouts predating the move; override `SMEM_ONTOLOGY_PATH` to point elsewhere). Relationship type names are spine, pinned in code, not configurable. All names shown here are the defaults.
 
 ## PostgreSQL (Semantic Memory)
 
@@ -564,7 +564,7 @@ generator does faithfully introspect.
 
 ## Neo4j (Relational Memory)
 
-> Configurable via `ontology.yaml`. Label and relationship keys map directly to the `labels:` and `relationships:` sections.
+> Entity sub-labels are configurable via `ontology.yaml`'s `labels:` section (see "Entity type sub-labels" below — no writer currently applies one). The file has no `relationships:` section: every relationship type name below is spine, pinned in `ontology.py`.
 
 ### Core labels (Tier 1 / Tier 3 nodes)
 
@@ -613,7 +613,7 @@ Written by the outbox worker when `metadata["type"] == "decision"`.
 |---|---|---|
 | `MENTIONS` | `(:Fact)-[:MENTIONS]->(:Entity)` | Outbox worker — from `metadata["entities"]`, at first write only; drives graph navigation and the entity-relation sweep (Tier 3 consolidation itself keys on project+domain, not entities — fact 1215) |
 | `REPORTS_ON` | `(:Fact)-[:REPORTS_ON]->(:Entity)` | Legacy alias; accepted by consolidation query. Use `MENTIONS` for new saves. |
-| `ALIASES` | `(:Entity)-[:ALIASES]-(:Entity)` | Soft synonym link between entity surface forms (`coordinator` ↔ `Coordinator`), v0.6.0. **Never merges nodes** — reversible. Consolidation + search traverse alias *components*: Neo4j GDS `gds.wcc` stamps `Entity.alias_component`, and clusters group on `coalesce(alias_component, elementId(e))`. Edges carry `method`/`score`/`confidence`. Written by the REM alias-writer (v0.6.1); until then created via the offline `entity_resolution_eval.py` harness. |
+| `ALIASES` | `(:Entity)-[:ALIASES]-(:Entity)` | Soft synonym link between entity surface forms (`coordinator` ↔ `Coordinator`), v0.6.0. **Never merges nodes** — reversible. Consolidation + search traverse alias *components*: Neo4j GDS `gds.wcc` stamps `Entity.alias_component`, and clusters group on `coalesce(alias_component, elementId(e))`. Edges carry `method`/`score`/`confidence`. No current writer — the REM alias-writer and the offline `entity_resolution_eval.py` harness that preceded it are both retired; existing edges are legacy. |
 | `SUMMARIZED_BY` | `(:Fact\|:Decision)-[:SUMMARIZED_BY]->(:CommunitySummary)` | Consolidation daemon after synthesis (Decision source = insight fold) |
 | `NEXT_STEP` | `(:ReasoningStep)-[:NEXT_STEP]->(:ReasoningStep)` | Agent — links consecutive steps in a trace |
 
