@@ -643,7 +643,22 @@ def _probe_headers(backend: str) -> dict:
     attached, `http_401` means exactly what /health says it means: this
     gateway's key for that backend is not accepted."""
     token = LLM_BACKEND_TOKENS.get(backend)
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    if not token:
+        return {}
+    # ⛔ NEVER OVER PLAINTEXT TO A REMOTE HOST. A key on the wire in the clear is
+    # a key published to the path; a probe must not widen exposure beyond what
+    # the operator's own configuration already implies. https always; http
+    # only to a loopback host (a local llama-server behind a token). Anything
+    # else probes BARE — its 401 then honestly means "not authenticated",
+    # which the operator can read beside the scheme in llm_backends.
+    try:
+        parts = urllib.parse.urlsplit(backend)
+        host = (parts.hostname or "").lower()
+    except Exception:
+        return {}
+    if parts.scheme == "https" or host in ("localhost", "127.0.0.1", "::1"):
+        return {"Authorization": f"Bearer {token}"}
+    return {}
 
 
 async def _probe_backend_alive(session, backend: str) -> bool:

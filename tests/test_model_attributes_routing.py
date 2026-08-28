@@ -920,3 +920,25 @@ def test_a_401_with_the_bearer_attached_is_a_rejected_key(monkeypatch):
     assert proxy.session.probe_headers["https://api.deepseek.com/v1/models"]["Authorization"] == "Bearer sk-test"
     assert checks["llm_backends"]["https://api.deepseek.com/v1"] == "http_401"
     assert checks["dependencies"]["llm_pool"]["state"] == "down"
+
+
+def test_the_probe_never_sends_a_bearer_over_plaintext_to_a_remote_host(monkeypatch):
+    """Security (operator, 2026-08-28): a key on the wire in the clear is a key
+    published to the path. The bearer rides only https, or http to loopback;
+    a credentialed remote http backend is probed BARE and its 401 is honest."""
+    monkeypatch.setenv("REMOTE_KEY", "sk-remote")
+    monkeypatch.setenv("LOCAL_KEY", "sk-local")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://10.0.0.7:8000/v1", "token_env": "REMOTE_KEY", "private_ok": True},
+        {"url": "http://127.0.0.1:5001/v1", "token_env": "LOCAL_KEY", "private_ok": True},
+    ]))
+    g = _fresh(monkeypatch)
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _FixedStatusSession(200)
+
+    async def _run():
+        return await g._build_health_checks(proxy, None)
+    asyncio.run(_run())
+    sent = proxy.session.probe_headers
+    assert sent["http://10.0.0.7:8000/v1/models"] == {}
+    assert sent["http://127.0.0.1:5001/v1/models"] == {"Authorization": "Bearer sk-local"}
