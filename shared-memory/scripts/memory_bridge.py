@@ -50,6 +50,12 @@ API_VERSION = 4
 # not valence: 'reversed' drives the supersession cascade; nuance goes in notes.
 RETRO_RATINGS = ("validated", "mixed", "refined", "pending", "reversed")
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
+# This client's own FRAMEWORK VERSION, distinct from the wire API_VERSION: two
+# clients can speak api_version 4 while one of them is forty releases behind on
+# behaviour, and only this header tells them apart. The gateway counts it as
+# `clients.versions_seen` so a fleet-wide version skew is observable at all —
+# before 0.9.74 nothing on either side recorded the caller's build.
+CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"
 
 # Skill-directory-scoped dotenv search (S-18, Credential_Custody_Plan
 # PR A2) — exactly two candidates, in order, first definition wins:
@@ -483,7 +489,8 @@ def _request_headers() -> dict:
     this module parsed out of its own .env at import time (never itself
     exported to os.environ — see _AGENT_TOKEN_FROM_FILE above).
     """
-    headers = {CLIENT_VERSION_HEADER: str(API_VERSION)}
+    headers = {CLIENT_VERSION_HEADER: str(API_VERSION),
+               CLIENT_BUILD_HEADER: VERSION}
     token = os.environ.get("AGENT_TOKEN", "").strip() or _AGENT_TOKEN_FROM_FILE
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -660,8 +667,18 @@ def _gateway_message(r) -> str | None:
     return None
 
 
-def _reply_json(r, *, log_auth: bool = False) -> dict:
+def _reply_json(r, *, log_auth: bool = False,
+                accept_status: tuple = ()) -> dict:
     """Decode a gateway response ONLY after branching on its status class.
+
+    ``accept_status`` names non-2xx statuses whose BODY this caller wants
+    decoded rather than converted to an error — and the enumeration is the
+    point: fact:1503's defect was decoding a status nobody had thought about,
+    so a caller that wants a 503 body must SAY 503. `/health` is the route that
+    needs it: it answers 503 when an encoder is down, and that response carries
+    the very `status`/`dependencies`/`warnings` payload an operator is asking
+    for. The decode still happens HERE, inside the one helper allowed to do it,
+    so no new decode site is created.
 
     THE RULE (fact:1503). A non-2xx aiohttp page is plain text — ``"403:
     Read-only token: this route requires a write-capable agent token"`` — and
@@ -707,7 +724,7 @@ def _reply_json(r, *, log_auth: bool = False) -> dict:
                    f"and not a transport fault.")
         raise GatewayReplyError({"status": "error", "message": message})
 
-    if r.status_code >= 400:
+    if r.status_code >= 400 and r.status_code not in accept_status:
         detail = _gateway_message(r) or _body_snippet(r) or "(empty body)"
         raise GatewayReplyError({"status": "error", "message": (
             f"Gateway answered HTTP {r.status_code}: {detail} — it is UP at "
@@ -1223,6 +1240,31 @@ def get_telemetry() -> dict:
         return _coordinator_unavailable(exc)
 
 
+def get_health_payload() -> dict | None:
+    """The gateway's /health payload, or None if it could not be fetched.
+
+    Separate from ``check_gateway_compat`` (which reads only the three keys an
+    anonymous caller receives) because this one wants the AUTHENTICATED shape:
+    ``dependencies`` and ``warnings`` are operational detail about the
+    deployment and are not served anonymously.
+
+    Never raises: `status` is a diagnostic command, and a report that refuses to
+    print because one of its two sources was unreachable is worse than a report
+    that prints the half it has.
+    """
+    try:
+        with _sync_client(HEALTH_PROBE_TIMEOUT_S) as client:
+            r = client.get(f"{COORDINATOR_BASE}/health", headers=_request_headers())
+        # 503 IS ENUMERATED, not decoded blindly (fact:1503). /health answers
+        # 503 when an encoder is down, and that response carries the very
+        # verdict this function exists to render — treating it as an error
+        # would discard the payload in exactly the state an operator runs
+        # `status` to see. The decode stays inside _reply_json.
+        return _reply_json(r, accept_status=(503,))
+    except Exception:
+        return None
+
+
 def _age_phrase(ts: str | None) -> str:
     """Render an ISO-8601 telemetry timestamp as an age, or '—' when absent.
 
@@ -1250,14 +1292,59 @@ def _age_phrase(ts: str | None) -> str:
     return f"{delta}s ago"
 
 
-def format_status(payload: dict) -> str:
-    """Render the telemetry snapshot as a compact human-readable report."""
+def format_health_verdict(health: dict | None) -> list[str]:
+    """The /health verdict lines: one enum per dependency, then any warnings.
+
+    ⛔ THE VERDICT COMES FROM THE GATEWAY, NOT FROM HERE. Before v0.9.74 every
+    consumer derived its own health from telemetry numbers — the monitor had one
+    opinion about when the outbox was unwell, this client had none, and a third
+    consumer would have invented a third. The threshold now lives server-side
+    and this function only renders what it was told.
+
+    A pure function so a mutation check can bite it, and tolerant of an OLDER
+    gateway: no `dependencies` key means a pre-0.9.74 server, which is not an
+    error — it is a server that cannot answer the question yet, and saying
+    nothing is better than inventing a verdict on its behalf.
+    """
+    if not isinstance(health, dict):
+        return []
+    deps = health.get("dependencies")
+    warnings = health.get("warnings") or []
+    if not isinstance(deps, dict):
+        return []
+    lines = [f"  gateway: {health.get('status', '?')}"]
+    unwell = [(name, d) for name, d in sorted(deps.items())
+              if isinstance(d, dict) and d.get("state") not in ("ok", None)]
+    if unwell:
+        for name, d in unwell:
+            reason = d.get("reason")
+            lines.append(f"    {name}: {d['state']}"
+                         + (f" ({reason})" if reason else ""))
+    else:
+        # Named rather than silent: "9 dependencies ok" is a measurement, and an
+        # empty section would read as "nothing was checked".
+        lines.append(f"    all {len(deps)} dependencies ok")
+    for w in warnings:
+        if isinstance(w, dict):
+            lines.append(f"    ⚠ {w.get('key')}: {w.get('observed')} "
+                         f"> {w.get('limit')} {w.get('unit', '')}".rstrip())
+    return lines
+
+
+def format_status(payload: dict, health: dict | None = None) -> str:
+    """Render the telemetry snapshot as a compact human-readable report.
+
+    `health` is the /health payload, rendered FIRST when supplied: the numbers
+    below are the detail, and the question an operator opens this with is
+    whether the system is usable at all.
+    """
     if payload.get("status") != "success":
         return json.dumps(payload, indent=2)
     t  = payload["telemetry"]
     pg = t.get("postgres", {})
     nj = t.get("neo4j", {})
     lines = [f"Shared-memory status  @ {t.get('timestamp','?')}"]
+    lines.extend(format_health_verdict(health))
     if "error" in pg:
         lines.append(f"  postgres: ERROR {pg['error']}")
     else:
@@ -1300,10 +1387,16 @@ def format_status(payload: dict) -> str:
     eg = t.get("entity_graph", {})
     if eg and "error" not in eg:
         _tot = eg.get("entities_total", 0) or 0
-        _cov = eg.get("alias_covered_entities", 0) or 0
-        _pct = f" ({_cov * 100 // _tot}% covered)" if _tot and _cov else ""
+        # ⛔ THE ALIAS FIGURES ARE GONE (v0.9.74), not merely unavailable. They
+        # counted an ALIASES relationship no code path has ever written, so
+        # `aliases 0 (0% covered)` was printed on every run of this command
+        # since it shipped — a measurement of nothing, next to a registry that
+        # holds real aliases. Rendering it was the read-side half of the same
+        # defect; removing the writer without removing this line would have
+        # left `aliases 0` printing forever off a `.get` default.
         lines.append(f"  entities:  {_tot} total | singletons {eg.get('singleton_entities',0)} "
-                     f"| orphans {eg.get('orphan_entities',0)} | aliases {eg.get('alias_edges',0)}{_pct}")
+                     f"| orphans {eg.get('orphan_entities',0)} "
+                     f"| referenced {eg.get('genuinely_referenced_entities',0)}")
     elif "error" in eg:
         lines.append(f"  entities: ERROR {eg['error']}")
     # Graph integrity — nodes REM retired because their label contradicted the
@@ -1814,11 +1907,17 @@ async def main() -> None:
         return
     elif action == "status":
         payload = get_telemetry()
+        # /health as well as /memory/telemetry (v0.9.74): the dependency enums
+        # and the warnings answer "is it usable", which is the question this
+        # command is opened with, and only the telemetry payload was ever
+        # fetched. Best-effort — an unreachable or older /health simply
+        # contributes no lines rather than failing the whole report.
+        health = get_health_payload()
         # --json for machine-readable; default is the compact human report.
         if "--json" in sys.argv:
-            print(json.dumps(payload, indent=2))
+            print(json.dumps({**payload, "health": health}, indent=2))
         else:
-            print(format_status(payload))
+            print(format_status(payload, health))
         return
     elif action == "lineage":
         # "What happened to pg_id N?" — record state + in-flight dream-cycle stamps +

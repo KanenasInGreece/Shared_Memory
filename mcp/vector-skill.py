@@ -142,6 +142,11 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 API_VERSION = 4
 VERSION = "0.9.73"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
+# This client's own FRAMEWORK VERSION, distinct from the wire API_VERSION: two
+# clients can speak api_version 4 while one of them is forty releases behind on
+# behaviour. The gateway counts it as `clients.versions_seen` (0.9.74). Group 1
+# parity — memory_bridge.py sends the same header under the same name.
+CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"
 
 # Constants that MUST mirror the gateway's (a thin client never imports server
 # modules, so they are restated here and kept in step by review).
@@ -326,7 +331,8 @@ def _auth_headers() -> dict:
     Advertises this server's API_VERSION so the gateway can log version skew,
     and adds the Bearer token when AGENT_TOKEN is set.
     """
-    headers = {CLIENT_VERSION_HEADER: str(API_VERSION)}
+    headers = {CLIENT_VERSION_HEADER: str(API_VERSION),
+               CLIENT_BUILD_HEADER: VERSION}
     token = os.environ.get("AGENT_TOKEN", "").strip()
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -1378,11 +1384,21 @@ async def check_memory_health() -> str:
     """
     Full-stack diagnostic for the shared-memory infrastructure.
 
-    Reports what the gateway reports — embedder, reranker, reasoning backends,
-    both dream daemons, and consolidation liveness — rather than opening its own
-    database connection to count rows. The gateway is the component that knows
-    whether the stack is healthy; asking it is also the only check that
-    exercises the path this client actually uses.
+    Reports what the gateway reports rather than opening its own database
+    connection to count rows. The gateway is the component that knows whether
+    the stack is healthy; asking it is also the only check that exercises the
+    path this client actually uses.
+
+    Read `status` (ok | degraded | down) and `dependencies` first: one enum per
+    dependency — postgres, neo4j, embedder, reranker, llm_pool, rem_daemon,
+    nrem_daemon, outbox, registry — each with a `reason` when it is not ok.
+    `warnings` lists every limit that has been crossed, as
+    {key, limit, observed, unit}; the NUMBER behind each one is on
+    memory_telemetry.
+
+    ⛔ HTTP 503 MEANS ONE THING: the embedder or the reranker is down, so a save
+    cannot produce a vector. Every other verdict — a dead Postgres, a failing
+    outbox, a stalled daemon — is served 200 with the enum in the body.
 
     That full detail requires AGENT_TOKEN to be set (S-10, PR A5): a
     credential-less caller gets liveness only (status/version/api_version) —
@@ -1422,11 +1438,18 @@ async def check_memory_health() -> str:
 async def memory_telemetry() -> str:
     """Operational telemetry snapshot from the gateway (GET /memory/telemetry).
 
-    Pull-based rollup the coordinator computes over both backends: outbox health,
-    REM/NREM dream-cycle backlog, NREM consolidation-cycle counts (`nrem`), and
-    metadata distributions (`breakdown`). Use this to see whether the dream cycle
-    has work pending or is caught up — it is the same snapshot the CLI agents get
-    via `memory_bridge.py status`. Read-only; no direct database access needed.
+    THE NUMBERS, with the limit stated next to each one: counters, gauges,
+    percentiles and censuses over both backends. `encoders` (per-call embed and
+    rerank latency), `gateway` (request rate, status split, latency, in-flight,
+    load-shed), `outbox` (apply latency, drain rate, and `failed` ALWAYS present
+    even at zero), `postgres`/`neo4j` (pool and query latency), `rem`, `nrem`,
+    `registry` (row counts and ingress refusals), `llm`, `clients`, plus the
+    consolidation, spine, breakdown and compliance rollups.
+
+    Use this for "how bad is it" and check_memory_health for "is it usable".
+    `generated_at` is when the payload was BUILT (it is cached briefly) and
+    `timestamp` when it was served. Read-only; no direct database access needed.
+    The full key-by-key contract is Documentation/telemetry-contract.md.
     """
     coordinator_url = COORDINATOR_BASE
     try:

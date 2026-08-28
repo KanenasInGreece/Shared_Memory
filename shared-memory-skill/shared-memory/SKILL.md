@@ -653,16 +653,31 @@ itself lost lines. `llm faults` splits per backend into `credential`
 paired with the age of its **own** last event, taken where the event happened;
 the counters are in-process and reset when the gateway restarts, so "since
 gateway start" is literal and a missing age renders `—`, never `0s`.
-`status` rolls up the outbox health and the REM/NREM dream-cycle backlog
-(`GET /memory/telemetry`). Use it to see whether REM/NREM have work pending or
-the system is caught up. The coordinator owns the DB connections, so the client
-needs nothing but its token. The `--json` payload also carries `telemetry.nrem`
-(pending consolidation-cycle counts + thresholds), `telemetry.breakdown`
-(record-type / agent / source / domain / summary-kind distributions),
-`telemetry.entity_graph` — entity-graph shape for the alias layer
-(`entities_total`, `singleton_entities`, `orphan_entities`, `alias_edges`,
-`alias_covered_entities`, `top_hubs`; `alias_*` stay 0 until the REM alias-writer
-lands in v0.6.1, then climb as an alias-coverage signal),
+`status` opens with the gateway's own VERDICT and then the numbers behind it.
+The verdict comes from `GET /health` — `gateway: ok|degraded|down`, then any
+dependency that is not `ok` (postgres, neo4j, embedder, reranker, llm_pool,
+rem_daemon, nrem_daemon, outbox, registry) with its reason, then any `⚠` warning
+line as `observed > limit unit`. ⛔ **HTTP 503 from `/health` means one thing:
+the embedder or the reranker is down**, so a save cannot produce a vector; every
+other verdict is served 200 with the enum in the body. The numbers come from
+`GET /memory/telemetry`. The coordinator owns the DB connections, so the client
+needs nothing but its token. The `--json` payload carries both, and also
+`telemetry.encoders` (per-call embed/rerank p50/p95/max, calls, errors),
+`telemetry.gateway` (requests, status split, latency percentiles, in-flight,
+load-shed 503s), `telemetry.outbox` (pending/applied/`failed` — **always
+present, `0` when zero** — oldest ages, apply-latency percentiles, drain rate),
+`telemetry.rem` and `telemetry.nrem` (pending consolidation-cycle counts +
+thresholds; `nrem` carries an `as_of` stamp because it is computed by the
+gateway's 60-second refresher, not per request), `telemetry.registry`
+(project/domain/alias row counts and the ingress refusal counters),
+`telemetry.llm` (pool, affinity, routing, token usage, latency, faults),
+`telemetry.clients.versions_seen`, `telemetry.breakdown` (record-type / agent /
+source / **`projects`** / **`domains`** / summary-kind distributions — ⚠
+`breakdown.domains` carried the PROJECT distribution before v0.9.74 and now
+carries the domain one; the project distribution is `breakdown.projects`),
+`telemetry.entity_graph` — entity-graph shape
+(`entities_total`, `singleton_entities`, `orphan_entities`,
+`genuinely_referenced_entities`, `top_hubs`),
 `telemetry.inference_busy` — the inference/GPU-busy signal (tri-state
 `"busy"|"idle"|"unknown"`, also top-level on `GET /health`; `"unknown"` means
 nvtop is absent or `SLOT_AWARE=0`, or the probe disabled itself after repeated
@@ -674,7 +689,9 @@ last error, `last_deferred_reason` (`"gpu_busy"|"backup_in_progress"`), and
 coverage (`eligible_clusters`, `eligible_oldest_age_seconds`).
 A `consolidation: STALLED ⚠` line (also `consolidation.stalled` on `GET /health`)
 means an eligible backlog exists but nothing has folded — investigate. Enough to
-render a full dashboard without any direct Postgres or Neo4j access.
+render a full dashboard without any direct Postgres or Neo4j access. Every key on
+both endpoints — type, unit, the release it arrived in, and where it is moving —
+is listed in [Documentation/telemetry-contract.md](Documentation/telemetry-contract.md).
 
 ### MCP Server (LM Studio only)
 LM Studio uses the MCP interface (`vector-skill.py` via `mcp.json`), not this CLI skill.
