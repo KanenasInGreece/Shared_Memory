@@ -1401,11 +1401,24 @@ async def test_the_domain_gate_never_asks_for_the_identity_of_a_pending_project(
     save into a 503 `registry_unavailable`: a healthy registry reported as an
     outage, on the one save shape that introduces a project.
 
+    ⚠ ASSERTED ON THE CALL ORDER, NOT ON A 503, and the difference matters. A
+    version of this test that made `_project_identity` RAISE would pass under
+    the mutation too: the real code raises at COMMIT time and the mutant raises
+    at GATE time, and both answer 503 `registry_unavailable`, so the assertion
+    would hold for the wrong reason. What actually separates them is WHEN the
+    identity is first asked for — never before the project row exists.
+
     MUTATION CHECK: delete the `new_project` branch in `_domain_ingress_error`
-    so it always calls `_project_identity`, and this test dies with a 503.
+    so it always calls `_project_identity`, and this test dies — the first
+    recorded event becomes the gate's lookup instead of the project insert.
     """
+    order = []
     c, conn = _new_project_coord()
-    c._project_identity = AsyncMock(side_effect=ProjectIdentityUnavailable("boom"))
+    c._project_identity = AsyncMock(side_effect=lambda p: order.append("identity") or 77)
+    c._register_project = AsyncMock(
+        side_effect=lambda n, a: order.append("register_project"))
+    c._register_domain = AsyncMock(
+        side_effect=lambda pid, n, a: order.append("register_domain"))
     with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
         req = _make_request({
             "content": "a fact declaring a new project and its first section",
@@ -1418,11 +1431,10 @@ async def test_the_domain_gate_never_asks_for_the_identity_of_a_pending_project(
             },
         })
         resp = await c.handle_save(req)
-    # The gate itself never asks; only the COMMIT does, which is why this save
-    # reaches a 503 from the commit step rather than from the gate — and why
-    # the project row is not written before that answer.
-    assert resp.status == 503
-    assert json.loads(resp.text)["error"] == "registry_unavailable"
+    assert resp.status == 200
+    # The project row is written FIRST; only then is its id asked for, and only
+    # then is the section written against it.
+    assert order == ["register_project", "identity", "register_domain"]
 
 
 @pytest.mark.asyncio
