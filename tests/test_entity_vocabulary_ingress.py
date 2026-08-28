@@ -385,7 +385,7 @@ async def test_decision_refuses_entities():
                 "type": "decision",
                 "entities": ["Kubernetes"],
                 "decision": {
-                    "decided_by": "Xenofon",
+                    "decided_by": "Operator",
                     "project": "shared_memory",
                     "rationale": "because",
                 },
@@ -411,7 +411,7 @@ async def test_a_decision_with_an_empty_entities_list_still_saves():
                 "type": "decision",
                 "entities": [],
                 "decision": {
-                    "decided_by": "Xenofon",
+                    "decided_by": "Operator",
                     "project": "shared_memory",
                     "rationale": "because",
                 },
@@ -434,7 +434,7 @@ async def test_a_judgement_outbox_row_carries_no_entities_key():
                 "type": "decision",
                 "entities": [],
                 "decision": {
-                    "decided_by": "Xenofon",
+                    "decided_by": "Operator",
                     "project": "shared_memory",
                     "rationale": "because",
                 },
@@ -1673,7 +1673,7 @@ async def test_decision_top_level_project_follows_decision_project():
                 "project": ".claude",
                 "entities": [],
                 "decision": {
-                    "decided_by": "Xenofon",
+                    "decided_by": "Operator",
                     "project": "shared-memory-GitHub",
                     "rationale": "because a refused save must write nothing",
                 },
@@ -1705,7 +1705,7 @@ async def test_a_decision_whose_two_project_fields_agree_reports_nothing():
                 "project": "shared-memory-GitHub",
                 "entities": [],
                 "decision": {
-                    "decided_by": "Xenofon",
+                    "decided_by": "Operator",
                     "project": "shared-memory-GitHub",
                     "rationale": "one value, two places",
                 },
@@ -1730,7 +1730,7 @@ async def test_a_decision_with_no_top_level_project_gains_one():
                 "type": "decision",
                 "entities": [],
                 "decision": {
-                    "decided_by": "Xenofon",
+                    "decided_by": "Operator",
                     "project": "shared-memory-GitHub",
                     "rationale": "a reader of Postgres must be able to trust it",
                 },
@@ -1764,7 +1764,7 @@ async def test_the_ingress_canonical_wins_for_the_destination():
                 "project": ".claude",
                 "entities": [],
                 "decision": {
-                    "decided_by": "Xenofon",
+                    "decided_by": "Operator",
                     "project": "Shared_Memory_GitHub",
                     "rationale": "one resolution, at ingress",
                 },
@@ -2100,7 +2100,7 @@ async def test_a_case_variant_decision_still_cannot_carry_entities(kind):
                 "type": kind,
                 "entities": ["Kubernetes"],
                 "new_entities": ["Kubernetes"],
-                "decision": {"decided_by": "Xenofon", "project": "shared_memory",
+                "decision": {"decided_by": "Operator", "project": "shared_memory",
                              "rationale": "because"},
             },
         })
@@ -2125,7 +2125,7 @@ async def test_a_case_variant_judgement_outbox_row_still_carries_no_entities():
             "metadata": {
                 "source": "claude-code",
                 "type": "Decision",
-                "decision": {"decided_by": "Xenofon", "project": "shared_memory",
+                "decision": {"decided_by": "Operator", "project": "shared_memory",
                              "rationale": "because"},
             },
         })
@@ -2147,7 +2147,7 @@ async def test_a_judgement_save_never_persists_an_entities_key_it_was_not_sent()
             "metadata": {
                 "source": "claude-code",
                 "type": "decision",
-                "decision": {"decided_by": "Xenofon", "project": "shared_memory",
+                "decision": {"decided_by": "Operator", "project": "shared_memory",
                              "rationale": "because"},
             },
         })

@@ -702,10 +702,10 @@ def test_token_verify_failed_carries_principal_when_peer_identity_available(tmp_
     target = tmp_path / "credential-audit.jsonl"
     mod = load_coordinator(credential_audit_log_path=str(target))
     monkeypatch.setattr(mod, "_peer_identity",
-                         lambda request: {"user": "xenofon", "uid": 1000, "gid": 1000, "pid": 4242})
+                         lambda request: {"user": "operator", "uid": 1000, "gid": 1000, "pid": 4242})
     mod._record_token_verify_failed(_FakeRequest(), "tok_x")
     line = json.loads(target.read_text().strip())
-    assert line["principal"] == "xenofon"
+    assert line["principal"] == "operator"
     assert line["connected_from"]["uid"] == 1000
     assert line["connected_from"]["pid"] == 4242
 

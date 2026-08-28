@@ -48,9 +48,9 @@ def test_build_plan_recovers_provenance_from_legacy_rows():
     loops = [{"decision_id": 42, "rating": "good", "date": "2026-05-01",
               "notes": "held up well", "edge_id": "e1"}]
     legacy = {(42, "held up well"): {"source": "claude",
-                                     "principal": "xenofon",
+                                     "principal": "operator",
                                      "connected_from": {"uid": 1000}}}
     plan = mig.build_plan(loops, legacy)
     assert plan[0]["source"] == "claude"
-    assert plan[0]["principal"] == "xenofon"
+    assert plan[0]["principal"] == "operator"
     assert plan[0]["connected_from"] == {"uid": 1000}

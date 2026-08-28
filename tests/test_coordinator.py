@@ -143,7 +143,7 @@ async def test_decision_save_missing_one_field_names_it_in_error():
         "metadata": {
             "source": "claude-code",
             "type": "decision",
-            "decision": {"decided_by": "Xenofon", "project": "shared_memory"},
+            "decision": {"decided_by": "Operator", "project": "shared_memory"},
         },
     })
     resp = await c.handle_save(req)
@@ -205,7 +205,7 @@ async def test_valid_decision_save_passes_validation():
                 "entities": [],
                 "decision": {
                     "title": "Add consolidation daemon",
-                    "decided_by": "Xenofon",
+                    "decided_by": "Operator",
                     "project": "shared_memory",
                     "rationale": "simulate dreaming; reduce hot-path latency",
                     "assisted_by": ["claude-code"],
@@ -232,7 +232,7 @@ async def test_apply_outbox_row_dispatches_decision_type():
     params = {
         "type": "decision",
         "decision": {
-            "decided_by": "Xenofon",
+            "decided_by": "Operator",
             "project": "shared_memory",
             "rationale": "simulate dreaming",
             "assisted_by": ["claude-code"],
@@ -289,7 +289,7 @@ async def test_handle_save_carries_fact_custody_into_outbox_params():
                     "project": "shared-memory-GitHub",
                 },
             },
-            principal={"user": "xenofon", "uid": 1000, "pid": 42},
+            principal={"user": "operator", "uid": 1000, "pid": 42},
         )
         resp = await c.handle_save(req)
     assert resp.status == 200
@@ -301,7 +301,7 @@ async def test_handle_save_carries_fact_custody_into_outbox_params():
             outbox_params = call_obj.args[2]
             break
     assert outbox_params is not None, "no neo4j_outbox INSERT was issued"
-    assert outbox_params["person"] == "xenofon"          # kernel principal, not a client claim
+    assert outbox_params["person"] == "operator"          # kernel principal, not a client claim
     assert outbox_params["project"] == "shared-memory-GitHub"
 
 
@@ -318,7 +318,7 @@ async def test_apply_outbox_row_fact_writes_custody_delegation_pair():
         "type": "fact",
         "entities": ["SharedMemory"],
         "source": "claude",
-        "person": "xenofon",
+        "person": "operator",
         "project": "shared-memory-GitHub",
         "content_snippet": "a plain fact",
     }
@@ -337,7 +337,7 @@ async def test_apply_outbox_row_fact_writes_custody_delegation_pair():
     assert "(a)-[:ACTED_ON_BEHALF_OF]->(h)" in query
     # Never attribute a fact directly to the human (custody ≠ authorship).
     assert "-[:WAS_ATTRIBUTED_TO]->(h)" not in query
-    assert kwargs["person"] == "xenofon"
+    assert kwargs["person"] == "operator"
     assert kwargs["project"] == "shared-memory-GitHub"
     assert kwargs["source"] == "claude"
 
@@ -351,7 +351,7 @@ async def test_apply_decision_outbox_row_writes_correct_nodes():
     params = {
         "decision": {
             "title": "Add consolidation daemon",
-            "decided_by": "Xenofon",
+            "decided_by": "Operator",
             "project": "shared_memory",
             "rationale": "simulate dreaming",
             "assisted_by": ["claude-code"],
@@ -381,7 +381,7 @@ async def test_apply_decision_outbox_row_writes_correct_nodes():
 
     # Kwargs should carry all required values
     kwargs = cypher_call.kwargs
-    assert kwargs["decided_by"] == "Xenofon"
+    assert kwargs["decided_by"] == "Operator"
     assert kwargs["project"]    == "shared_memory"
     assert kwargs["rationale"]  == "simulate dreaming"
     assert kwargs["assisted_by"] == ["claude-code"]
@@ -414,7 +414,7 @@ async def test_a_decisions_payload_is_not_copied_into_the_graph():
     await c._apply_decision_outbox_row(outbox_id=3, pg_id=60, params={
         "decision": {
             "title": "Dereference the payload",
-            "decided_by": "Xenofon",
+            "decided_by": "Operator",
             "project": "shared-memory-GitHub",
             "rationale": "the copy earns nothing the pg_id does not give",
             "confidence": "high",
@@ -441,13 +441,13 @@ async def test_apply_decision_outbox_row_handles_empty_assisted_by():
 
     params = {
         "decision": {
-            "decided_by": "Xenofon",
+            "decided_by": "Operator",
             "project": "shared_memory",
             "rationale": "test",
             "assisted_by": [],
         },
         "entities": [],
-        "source": "Xenofon",
+        "source": "Operator",
         "content_snippet": "manual decision",
     }
 
@@ -462,7 +462,7 @@ async def test_apply_decision_outbox_row_handles_empty_assisted_by():
 _norm = coordinator_mod._normalise_decided_by
 
 
-def _decision_meta(decided_by, principal="xenofon"):
+def _decision_meta(decided_by, principal="operator"):
     md = {"type": "decision", "decision": {"decided_by": decided_by,
                                            "project": "p", "rationale": "r"}}
     if principal is not None:
@@ -471,45 +471,45 @@ def _decision_meta(decided_by, principal="xenofon"):
 
 
 @pytest.mark.parametrize("claimed", [
-    "Xenofon",                      # case variant
-    "Xenofon + Antigravity",        # operator compounded with the assisting agent
-    "Xenofon & Antigravity",
-    "xenofon & Cloe & Gemini",
+    "Operator",                      # case variant
+    "Operator + Antigravity",        # operator compounded with the assisting agent
+    "Operator & Antigravity",
+    "operator & Cloe & Gemini",
     "Antigravity",                  # the agent claimed the decision outright
-    "  Xenofon  ",                  # stray whitespace
+    "  Operator  ",                  # stray whitespace
 ])
 def test_decided_by_collapses_onto_the_principal(claimed):
     """Every spelling of one operator must land on the SAME person, or a single
     operator's decisions report as several distinct humans in Tier-3 provenance."""
     md = _decision_meta(claimed)
     assert _norm(md) is True
-    assert md["decision"]["decided_by"] == "xenofon"
+    assert md["decision"]["decided_by"] == "operator"
     assert md["decision"]["decided_by_claimed"] == claimed.strip()
 
 
 def test_decided_by_already_canonical_is_left_untouched():
     """No rewrite, no audit field, no log line when the claim already matches."""
-    md = _decision_meta("xenofon")
+    md = _decision_meta("operator")
     assert _norm(md) is False
-    assert md["decision"]["decided_by"] == "xenofon"
+    assert md["decision"]["decided_by"] == "operator"
     assert "decided_by_claimed" not in md["decision"]
 
 
 def test_decided_by_without_a_principal_is_never_guessed():
     """TCP transport carries no kernel credential. The claim stands as given —
     the same 'honestly unknown, never guessed' rule _apply_principal follows."""
-    md = _decision_meta("Xenofon + Antigravity", principal=None)
+    md = _decision_meta("Operator + Antigravity", principal=None)
     assert _norm(md) is False
-    assert md["decision"]["decided_by"] == "Xenofon + Antigravity"
+    assert md["decision"]["decided_by"] == "Operator + Antigravity"
     assert "decided_by_claimed" not in md["decision"]
 
 
 def test_normalisation_ignores_non_decision_records():
     """Facts and retrospectives carry no decided_by — the principal is their whole
     person axis, and this must not invent a decision object on them."""
-    md = {"type": "retrospective", "principal": "xenofon"}
+    md = {"type": "retrospective", "principal": "operator"}
     assert _norm(md) is False
-    assert md == {"type": "retrospective", "principal": "xenofon"}
+    assert md == {"type": "retrospective", "principal": "operator"}
 
 
 @pytest.mark.asyncio
@@ -523,9 +523,9 @@ async def test_non_string_decided_by_is_rejected_not_silently_destroyed():
         req = _make_request(
             {"content": "x",
              "metadata": {"source": "claude", "type": "decision",
-                          "decision": {"decided_by": ["Xenofon"],
+                          "decision": {"decided_by": ["Operator"],
                                        "project": "p", "rationale": "r"}}},
-            principal={"user": "xenofon"},
+            principal={"user": "operator"},
         )
         resp = await c.handle_save(req)
     assert resp.status == 400
@@ -581,7 +581,7 @@ async def test_missing_decided_by_still_400s_rather_than_being_filled_in():
             {"content": "x",
              "metadata": {"source": "claude", "type": "decision",
                           "decision": {"project": "p", "rationale": "r"}}},
-            principal={"user": "xenofon"},
+            principal={"user": "operator"},
         )
         resp = await c.handle_save(req)
     assert resp.status == 400

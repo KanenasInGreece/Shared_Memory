@@ -18,7 +18,7 @@ auth_middleware end to end) and test_secrets_out_of_process_env.py
      from the fd at import time (the mainline, proxy-spawned path), and
      preferring it over the get_secret() fallback when both are present.
   4. hive_mind_proxy.main() calling coordinator.require_no_plaintext_agent_
-     tokens() as its FIRST act (RULED, Xenofon 2026-08-14: a plaintext
+     tokens() as its FIRST act (RULED, Operator 2026-08-14: a plaintext
      AGENT_TOKENS entry refuses gateway startup outright as of v0.9.3 — no
      deprecation window).
 """
@@ -311,7 +311,7 @@ def test_rem_loop_falls_back_when_no_fd_and_no_file_value(monkeypatch, tmp_path)
 
 @pytest.mark.asyncio
 async def test_main_refuses_before_anything_else_when_plaintext_present(monkeypatch):
-    """RULED (Xenofon, 2026-08-14): the refusal must be the FIRST thing
+    """RULED (Operator, 2026-08-14): the refusal must be the FIRST thing
     main() does -- confirmed by making the very next call (AsyncHiveMindProxy
     construction) a hard failure if reached, so this test can only pass if
     require_no_plaintext_agent_tokens() raised before that point."""
