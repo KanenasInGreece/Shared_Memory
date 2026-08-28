@@ -335,7 +335,7 @@ async def test_health_surfaces_backup_in_progress():
             return False
 
     class _Session:
-        def get(self, url, timeout=None, headers=None):
+        def get(self, url, timeout=None, headers=None, **_kw):
             return _Cm()
 
     proxy = MagicMock()

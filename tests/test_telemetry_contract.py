@@ -266,7 +266,7 @@ class _OkCm:
 
 
 class _OkSession:
-    def get(self, url, timeout=None, headers=None):
+    def get(self, url, timeout=None, headers=None, **_kw):
         return _OkCm()
 
 
@@ -434,7 +434,7 @@ def test_a_down_encoder_still_produces_503(gateway):
             return False
 
     class _DownSession:
-        def get(self, url, timeout=None, headers=None):
+        def get(self, url, timeout=None, headers=None, **_kw):
             return _DownCm()
 
     proxy = g.AsyncHiveMindProxy()

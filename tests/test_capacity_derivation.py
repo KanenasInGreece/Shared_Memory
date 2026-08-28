@@ -508,7 +508,7 @@ class _HealthProbeCm:
 
 
 class _HealthProbeSession:
-    def get(self, url, timeout=None, headers=None):
+    def get(self, url, timeout=None, headers=None, **_kw):
         return _HealthProbeCm()
 
 

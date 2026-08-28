@@ -568,7 +568,7 @@ class _FixedStatusSession:
         self._status = status
         self.probe_headers: dict = {}   # url -> headers the probe SENT (v0.9.75)
 
-    def get(self, url, timeout=None, headers=None):
+    def get(self, url, timeout=None, headers=None, **_kw):
         self.probe_headers[url] = dict(headers or {})
         return _StatusCm(self._status)
 
@@ -924,12 +924,14 @@ def test_a_401_with_the_bearer_attached_is_a_rejected_key(monkeypatch):
 
 def test_the_probe_never_sends_a_bearer_over_plaintext_to_a_remote_host(monkeypatch):
     """Security (operator, 2026-08-28): a key on the wire in the clear is a key
-    published to the path. The bearer rides only https, or http to loopback;
-    a credentialed remote http backend is probed BARE and its 401 is honest."""
+    published to the path — but the operator's own fleet over LAN/tailnet keeps
+    working. A PUBLIC plaintext backend is excluded at load (see
+    test_llm_backend_secrets); one the operator marked plaintext_ok, and any
+    loopback/private one, gets the bearer on the probe like a real call."""
     monkeypatch.setenv("REMOTE_KEY", "sk-remote")
     monkeypatch.setenv("LOCAL_KEY", "sk-local")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://10.0.0.7:8000/v1", "token_env": "REMOTE_KEY", "private_ok": True},
+        {"url": "http://8.8.8.8:8000/v1", "token_env": "REMOTE_KEY", "private_ok": True, "plaintext_ok": True},
         {"url": "http://127.0.0.1:5001/v1", "token_env": "LOCAL_KEY", "private_ok": True},
     ]))
     g = _fresh(monkeypatch)
@@ -940,5 +942,6 @@ def test_the_probe_never_sends_a_bearer_over_plaintext_to_a_remote_host(monkeypa
         return await g._build_health_checks(proxy, None)
     asyncio.run(_run())
     sent = proxy.session.probe_headers
-    assert sent["http://10.0.0.7:8000/v1/models"] == {}
+    # plaintext_ok: the operator asserted a private path, so the bearer rides
+    assert sent["http://8.8.8.8:8000/v1/models"] == {"Authorization": "Bearer sk-remote"}
     assert sent["http://127.0.0.1:5001/v1/models"] == {"Authorization": "Bearer sk-local"}

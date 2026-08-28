@@ -149,7 +149,7 @@ class _FixedStatusSession:
     def __init__(self, status=200):
         self._status = status
 
-    def get(self, url, timeout=None, headers=None):
+    def get(self, url, timeout=None, headers=None, **_kw):
         return _HealthProbeResp(self._status)
 
 

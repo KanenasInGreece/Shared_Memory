@@ -66,6 +66,8 @@ with nothing further to configure per file.
 
 ## Reasoning-LLM backends (`LLM_BACKENDS_JSON`) — credentials, never in a file
 
+> **Local backends that need a key use the same mechanism.** A llama-server or vLLM on your LAN or tailnet that sits behind a token is configured exactly like a cloud API below — a JSON entry with `token_env`, the key delivered through `$CREDENTIALS_DIRECTORY` or a `<NAME>_FILE` pointer, default location **`~/.shared-memory/creds/<name>`** (mode 600). The only difference is transport: plaintext `http` is accepted to a private path, refused to a public one (see `plaintext_ok`).
+
 ```bash
 bash shared-memory/ops/install_llm_backends.sh
 ```
@@ -94,6 +96,7 @@ paid cloud API. Each entry is a URL plus an optional `token_env` — the
 | `weight` | float | `1.0` | ⚠ Currently affects **no** live routing decision — dispatch is cache-affinity then least-in-flight. Stored and displayed only. |
 | `roles` | list | absent = serves all | Which dream functions this backend may serve: `extract` (REM's per-record summary call) or `judge` (NREM's insight fold) (`summarize` is reserved and refused). An explicit list is itself the per-function privacy opt-in; an **empty** list refuses startup. |
 | `n_ctx` | int ≥ 1 | absent = always fits | The model's usable context. When set, a request whose estimated size cannot fit is excluded here rather than sent and truncated. |
+| `plaintext_ok` | bool | `false` | **Transport assertion.** A credentialed entry is accepted over `https`, or over plaintext `http` to a private path (loopback, RFC1918, Tailscale CGNAT, link-local, ULA, an unqualified name, `.local`/`.lan`/`.internal`/`.home`/`.ts.net`). Over plaintext to a **public** address or FQDN it is **excluded at startup** unless you set this `true` — you asserting the path is private (VPN, reverse tunnel). The gateway never sends a provider key in the clear across the internet; the `/health` probe follows the same rule. |
 | `private_ok` | bool | `true` without `token_env`, `false` with | May record content land here as unrestricted/role-less traffic? A **credentialed entry with neither `roles` nor an explicit `private_ok` refuses gateway startup** — the choice is yours to state, loudly, once. |
 | `max_inflight` | int ≥ 1 | absent = unbounded | Per-backend concurrency ceiling. At cap the backend counts busy; a sole-eligible capped backend makes requests wait (bounded), never overrides the cap. |
 | `price_per_mtok_in` / `price_per_mtok_out` | float | none | Operator-maintained prices surfaced on the authenticated `/health` for a dashboard to multiply against the per-backend token counters. Never read by routing. |
