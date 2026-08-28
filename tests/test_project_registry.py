@@ -216,9 +216,15 @@ async def test_second_submission_form_1_a_proposal():
 
 @pytest.mark.asyncio
 async def test_second_submission_form_2_declares_a_new_project():
+    # A report, because the ACCEPTING branch defers its registration into one
+    # and refuses to run without it (v0.9.72, R4 — a missing report is a coding
+    # error, never a quietly dropped registration).
     coord = _coord(registered=())
+    report = {}
     assert await coord._project_ingress_error(
-        {"source": "c", "project": "brand-new", "new_project": True}, "c") is None
+        {"source": "c", "project": "brand-new", "new_project": True},
+        "c", report) is None
+    assert report["pending_registrations"]["project"] == "brand-new"
 
 
 # ── P23 — a declaration is not a defence ────────────────────────────────────

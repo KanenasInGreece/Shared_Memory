@@ -1560,6 +1560,87 @@ async def test_the_pending_intent_never_reaches_the_save_response():
     assert "pending_registrations" not in json.loads(resp.text)
 
 
+@pytest.mark.asyncio
+async def test_an_unmintable_entity_name_leaves_no_registry_row():
+    """⛔ THE LEAK P4' MISSED ON ITS FIRST PASS (review R1). A name that
+    NORMALIZES TO NOTHING survives `sanitize_entity_name` — MIN_ENTITY_NAME_LEN
+    is 2, so `'!!'` passes intact — and was refused only by
+    `_entity_commit_mints`, which runs AFTER `_commit_axis_registrations`. So
+    `--new-project --new-domain` with `new_entities: ["!!"]` committed BOTH
+    registry rows and then 400'd `new_entities_invalid`: deterministic, not a
+    race, and exactly the shape the whole item exists to close.
+
+    The check is hoisted into `_entity_ingress_validate`, which runs before the
+    axis gates — the same extraction the domain axis got
+    (`_domain_unnameable_refusal`), for the same reason: a gate the database
+    enforces and the ingress does not is a refusal that arrives too late.
+
+    MUTATION CHECK: move the unnameable check back out of
+    `_entity_ingress_validate` (so only `_entity_commit_mints` catches it) and
+    this test dies — both registry rows are written before the 400.
+    """
+    c, conn = _new_project_coord()
+    c._entity_vocab_mint = AsyncMock(return_value=None)
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)) as embed:
+        req = _make_request({
+            "content": "a fact declaring a new project, a new section, and an "
+                       "entity name that normalizes to nothing",
+            "metadata": {
+                "source": "claude-code",
+                "project": "BrandNewProject",
+                "new_project": True,
+                "domain": "telemetry",
+                "new_domain": True,
+                "entities": ["!!"],
+                "new_entities": ["!!"],
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 400
+    assert json.loads(resp.text)["error"] == "new_entities_invalid"
+    c._register_project.assert_not_called()
+    c._register_domain.assert_not_called()
+    c._entity_vocab_mint.assert_not_called()
+    embed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_the_database_still_gets_the_last_word_on_a_mint():
+    """The gateway-side twin does not REPLACE the database's own refusal. If
+    Postgres rejects a mint the twin accepted — a `[:alnum:]` locale
+    difference, a future trigger rule — the save is still a structured 400 and
+    never a 500 with an unparseable body (S-2)."""
+    c, conn = _full_coord()
+    c._entity_vocab_mint = AsyncMock(return_value=None)
+    with patch.object(c, "_embed", new=AsyncMock(return_value=[0.1] * 1024)):
+        req = _make_request({
+            "content": "a fact whose mint the database refuses",
+            "metadata": {
+                "source": "claude-code",
+                "project": "shared-memory-GitHub",
+                "entities": ["PerfectlyNameable"],
+                "new_entities": ["PerfectlyNameable"],
+            },
+        })
+        resp = await c.handle_save(req)
+    assert resp.status == 400
+    assert json.loads(resp.text)["error"] == "new_entities_invalid"
+    c._entity_vocab_mint.assert_awaited_once()
+
+
+def test_deferring_a_registration_with_no_report_is_a_coding_error():
+    """⛔ RAISES, NEVER WARNS (review R4). The first version logged and
+    returned, which answered 200 to a save whose project was never registered —
+    and the outbox would then mint a `:Project` node the registry does not
+    have, the exact divergence migration 027 removed. One production caller
+    passes a report always, so this can only fire in new code."""
+    c = MemoryCoordinator()
+    with pytest.raises(RuntimeError, match="axis report"):
+        c._defer_project_registration(None, "BrandNewProject", "c", {})
+    with pytest.raises(RuntimeError, match="axis report"):
+        c._defer_domain_registration(None, "BrandNewProject", "telemetry", 77, "c")
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # Item 2 (v0.9.72) — a decision's project is ONE value: `decision.project`
 # ══════════════════════════════════════════════════════════════════════════

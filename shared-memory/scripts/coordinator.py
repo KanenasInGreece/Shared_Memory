@@ -3991,15 +3991,25 @@ class MemoryCoordinator:
 
     # ── Deferred axis registration (P4′, v0.9.72) ────────────────────────────
     #
-    # ⛔ NO REGISTRY ROW IS WRITTEN BY A SAVE THAT IS THEN REFUSED. The project
-    # and domain gates ACCEPT a declared-new name where they always did — the
-    # position of that acceptance is the rule (P9) and has not moved — but they
-    # now record an INTENT instead of inserting. `_commit_axis_registrations`
-    # performs the inserts in `handle_save`, immediately before
-    # `_entity_commit_mints`: after every validation that can still 400 or 503,
-    # before the embed. It is the same ordering rule S-4 gave the entity mint
-    # (`decision:1413`) and for the same reason — a write that survives the
-    # refusal of the save that requested it is a lie in the registry.
+    # ⛔ NO REGISTRY ROW IS WRITTEN BY A REFUSAL THAT COULD HAVE FIRED EARLIER.
+    # The project and domain gates ACCEPT a declared-new name where they always
+    # did — the position of that acceptance is the rule (P9) and has not moved
+    # — but they now record an INTENT instead of inserting.
+    # `_commit_axis_registrations` performs the inserts in `handle_save`,
+    # immediately before `_entity_commit_mints`: after every validation that
+    # can still 400, before the embed. It is the same ordering rule S-4 gave
+    # the entity mint (`decision:1413`) and for the same reason — a write that
+    # survives the refusal of the save that requested it is a lie in the
+    # registry.
+    #
+    # ⚠ P4′ IS "COULD HAVE FIRED EARLIER", NOT "NEVER". Stating it as an
+    # absolute was wrong (review R1) and hid a real leak for one release
+    # candidate. Three exits remain downstream of the commit BY CONSTRUCTION —
+    # the hard-mandate embed's 503, the in-transaction `axis_conflict` 409, and
+    # the commit's own 503 — each enumerated in
+    # `_commit_axis_registrations`'s docstring with why it cannot be hoisted.
+    # Anything that is NOT in that list and still fires after the commit is a
+    # defect, and the list is how you tell.
     #
     # The intents live in the axis REPORT dict, the out parameter both gates
     # already carry, keyed under `_PENDING_KEY`. `_commit_axis_registrations`
@@ -4027,10 +4037,18 @@ class MemoryCoordinator:
                                     agent_id: str, metadata: dict) -> None:
         pending = self._pending_registrations(report)
         if pending is None:
-            log.warning("project registry: %r was accepted as new but no axis "
-                        "report was supplied, so the registration is DROPPED "
-                        "rather than deferred", name)
-            return
+            # ⛔ A CODING ERROR, AND IT RAISES (v0.9.72, R4). The first version
+            # logged a warning and returned, which meant a caller that forgot
+            # the report got a 200 for a save whose project was never
+            # registered — the graph would then carry a project the registry
+            # does not have, which is the exact divergence migration 027
+            # exists to remove, reintroduced by an omission nobody would see.
+            # There is one production caller and it always passes a report, so
+            # this can only fire in new code, which is when it is cheap to fix.
+            raise RuntimeError(
+                f"_defer_project_registration({name!r}) was called with no "
+                "axis report — the caller must pass one, because that is "
+                "where the registration intent lives")
         pending["project"] = name
         log.info("project registry: %r accepted as new by %s (new_project, "
                  "record type %s) — registration deferred until every gate "
@@ -4048,10 +4066,11 @@ class MemoryCoordinator:
         """
         pending = self._pending_registrations(report)
         if pending is None:
-            log.warning("domain registry: %r in project %r was accepted as new "
-                        "but no axis report was supplied, so the registration "
-                        "is DROPPED rather than deferred", name, project)
-            return
+            # A coding error, and it raises — see `_defer_project_registration`.
+            raise RuntimeError(
+                f"_defer_domain_registration({name!r}) was called with no axis "
+                "report — the caller must pass one, because that is where the "
+                "registration intent lives")
         pending["domains"].append(
             {"project": project, "project_id": project_id, "name": name})
         log.info("domain registry: %r accepted as a new section of project %r "
@@ -4071,14 +4090,30 @@ class MemoryCoordinator:
         declared on a brand-new project can only be written once the project
         row exists. An intent that carries no `project_id` resolves one here.
 
-        ⚠ THE ONE RESIDUAL THIS DOES NOT CLOSE is the standing `decision:1413`
-        residual, unchanged and stated rather than hidden: the hard-mandate
-        embedding call runs AFTER this (it needs the final content), so a 503
-        from the embedder can still leave a project or a section registered by
-        a save that stored no record. That is the same exposure the entity mint
-        has carried since S-4, it is not a new class, and closing it would need
-        one transaction spanning the registry writes and the record insert —
-        which no axis has today.
+        ⚠ WHAT STILL EXITS AFTER THIS POINT — stated in full, because the
+        first version of this docstring claimed "no registry row is written by
+        a save refused with 4xx or 503" and that was OVERSTATED (review R1).
+        Three exits remain downstream of this commit, and they are here by
+        CONSTRUCTION rather than by oversight:
+
+          * the **hard-mandate embedding 503** — it needs the final content,
+            so it cannot run earlier. The standing `decision:1413` residual,
+            the same exposure the entity mint has carried since S-4.
+          * the **in-transaction 409 `axis_conflict`** — the authoritative one,
+            re-read under `FOR UPDATE`. Only a row lock stops a concurrent save
+            of the same content landing between the read and the INSERT, so it
+            cannot be hoisted; the cheap pre-check above it already fires
+            before this commit for every non-racing case.
+          * this method's **own 503**, when the project row is written and its
+            id cannot be read back for the sections that follow.
+
+        Closing any of them needs one transaction spanning the registry writes
+        and the record insert, which no axis has today. What WAS fixed is the
+        exit that was not by construction at all: a `new_entities` name that
+        normalizes to nothing used to be refused by `_entity_commit_mints`,
+        below this line, so `--new-project --new-domain` with
+        `new_entities: ["!!"]` committed both rows and then 400'd. That check
+        now runs in `_entity_ingress_validate`, before every write.
         """
         pending = (report or {}).pop(self._PENDING_KEY, None)
         if not pending:
@@ -4104,11 +4139,14 @@ class MemoryCoordinator:
         records the INTENT to register it; the row itself is written by
         `_commit_axis_registrations` once every gate has passed (P4′).
 
-        ⛔ `report` IS WHERE THAT INTENT LIVES, so a caller that means to reach
-        the registry must pass one. Called with `report=None` — as unit tests of
-        the refusal branches do — a declared-new project is still ACCEPTED and
-        simply never registered, and the drop is logged at WARNING rather than
-        being silent.
+        ⛔ `report` IS WHERE THAT INTENT LIVES, so a caller that ACCEPTS a
+        declared-new project must pass one — calling this with `report=None`
+        on that path RAISES. It is a coding error, not a degraded mode: a
+        silent drop would answer 200 to a save whose project was never
+        registered, and the outbox would then mint a `:Project` node the
+        registry does not have. Every OTHER path (a registered name, an alias,
+        a refusal) still takes `report=None` happily, which is why the
+        parameter stays optional.
 
         `report`, when given, is filled with `project_resolved` — `{supplied,
         canonical, via}` — whenever the value stored differs from the value
@@ -4944,6 +4982,44 @@ class MemoryCoordinator:
         return resolved if resolved is not None else name
 
     @staticmethod
+    def _new_entity_unnameable_refusal(name: str, forced: bool = False):
+        """The 400 for a `new_entities` name that normalizes to nothing — or
+        None when the name is nameable (`forced=True` returns the body
+        unconditionally, for the caller that already has the database's answer).
+
+        Extracted for the reason `_domain_unnameable_refusal` was: two callers
+        must not drift. `axis_key` is the Python twin of migration 033's
+        `entity_normalize()`, whose BEFORE-write trigger RAISEs on an empty
+        key — so a two-character punctuation name (`'!!'`, `'🔥🔥'`) survives
+        `sanitize_entity_name` (MIN_ENTITY_NAME_LEN is 2), reaches the mint,
+        and is refused by Postgres.
+
+        ⛔ IT HAD TO MOVE EARLIER (v0.9.72, R1). The refusal used to fire
+        inside `_entity_commit_mints`, which runs AFTER
+        `_commit_axis_registrations` — so `--new-project --new-domain` with
+        `new_entities: ["!!"]` committed both registry rows and THEN 400'd,
+        which is exactly the leak P4′ exists to close. A gate the database
+        enforces and the ingress does not is a refusal that arrives too late
+        to be useful.
+        """
+        if not forced and axis_key(name):
+            return None
+        log.info("entity ingress: refused mint of %r — normalizes to nothing",
+                 name)
+        return {
+            "status": "error",
+            "error": "new_entities_invalid",
+            "message": (
+                f"new_entities name {_short(name)} cannot be minted "
+                "as a canonical entity — it normalizes to nothing "
+                "(every character is punctuation, whitespace, or "
+                "similar), so there is no spelling left to "
+                "register. Name it with at least one letter or "
+                "digit, or drop it from new_entities."
+            ),
+        }
+
+    @staticmethod
     def _entity_unknown_rejection(unknown: list[str]) -> dict:
         """The 400 body for one or more entity names the vocabulary does not
         know. A refusal is a QUESTION for the operator, never a silent drop or
@@ -5547,6 +5623,20 @@ class MemoryCoordinator:
                     }, empty_plan
                 mint_requested.add(sanitized)
 
+            # ⛔ THE UNNAMEABLE CHECK, HERE AND NOT AT THE MINT (v0.9.72, R1).
+            # Cheapest of the mint validations and the only one needing no
+            # query at all — the project and domain axes put their twin in the
+            # same position, first, for the same reason. Checked over
+            # `mint_requested` rather than over `to_mint`: the two coincide
+            # (a name normalizing to nothing can never be IN the vocabulary,
+            # because the same trigger refused it there too), and this way the
+            # refusal fires before the reserved-project query and the batched
+            # resolution as well as before every write.
+            for sanitized in sorted(mint_requested):
+                unnameable = self._new_entity_unnameable_refusal(sanitized)
+                if unnameable is not None:
+                    return unnameable, empty_plan
+
         # A PROJECT NAME IS AN AXIS, NEVER AN ENTITY (item 2b, v0.9.69;
         # `fact:1215`). Compared on `axis_key`, so `Shared_Memory`,
         # `shared-memory` and `SHARED MEMORY` are one answer — the same key the
@@ -5630,18 +5720,16 @@ class MemoryCoordinator:
         for name in (plan.get("to_mint") or []):
             canonical = await self._entity_vocab_mint(name, agent_id)
             if canonical is None:
-                return {
-                    "status": "error",
-                    "error": "new_entities_invalid",
-                    "message": (
-                        f"new_entities name {_short(name)} cannot be minted "
-                        "as a canonical entity — it normalizes to nothing "
-                        "(every character is punctuation, whitespace, or "
-                        "similar), so there is no spelling left to "
-                        "register. Name it with at least one letter or "
-                        "digit, or drop it from new_entities."
-                    ),
-                }
+                # ⚠ NO LONGER THE FIRST LINE OF DEFENCE, and kept anyway. The
+                # normalizes-to-nothing case is refused by
+                # `_entity_ingress_validate` now (v0.9.72, R1) — before the
+                # axis registrations commit — so this fires only if the
+                # database refuses a mint the gateway-side twin accepted:
+                # a `[:alnum:]` locale difference, or a future trigger rule
+                # Python does not know about. The database is the authority on
+                # its own writes; this is what turns its RAISE into a 400
+                # rather than a 500.
+                return self._new_entity_unnameable_refusal(name, forced=True)
             resolved[name] = canonical
             log.info("entity vocabulary: %r minted as canonical %r by %s "
                      "(new_entities)", name, canonical, agent_id)

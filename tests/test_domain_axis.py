@@ -216,10 +216,16 @@ async def test_a_confusable_new_domain_is_held_until_confirmed():
         dict(_fact("operatons"), new_domain=True), "claude")
     assert err["error"] == "domain_confusable"
 
+    # A report, because the ACCEPTING branch defers its registration into one
+    # and refuses to run without it (v0.9.72, R4 — a missing report is a
+    # coding error, never a quietly dropped registration).
+    report = {}
     ok = await c._domain_ingress_error(
         dict(_fact("operatons"), new_domain=True,
-             confirm_distinct_from=["operations"]), "claude")
+             confirm_distinct_from=["operations"]), "claude", report)
     assert ok is None
+    assert [d["name"] for d in report["pending_registrations"]["domains"]] \
+        == ["operatons"]
 
 
 @pytest.mark.asyncio
