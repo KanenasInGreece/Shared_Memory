@@ -105,9 +105,11 @@ def _load() -> OntologyConfig:
     CommunitySummary / Insight, provenance, alias, grounding, and every relation the
     consolidation dream cycle depends on) is HARDCODED via the dataclass defaults and
     is NEVER read from the config file (decision 550). Only the DOMAIN layer — entity
-    sub-labels + typed Entity→Entity relationships — plus framework consolidation
-    tuning is read from ontology.yaml. Spine keys present in the file are ignored: the
-    file cannot rename or redefine the framework, only extend the domain vocabulary."""
+    sub-labels — plus framework consolidation tuning is read from ontology.yaml's
+    `labels:` and `consolidation:` sections; there is no `relationships:` section —
+    typed Entity→Entity relationship names are code-pinned like every other
+    relationship type. Spine keys present in the file are ignored: the file cannot
+    rename or redefine the framework, only extend the domain vocabulary."""
     cfg = OntologyConfig()  # all spine + domain defaults; spine is fixed from here on
     # Candidate list (same form as the env loaders): the file lives with the
     # framework at shared-memory/ontology.yaml; the repo root is a FALLBACK
