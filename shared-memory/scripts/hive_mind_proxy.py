@@ -78,6 +78,17 @@ from coordinator import (
     _decompress_full_for_usage,
     SUPPORTED_CONTENT_ENCODINGS,
     _short,
+    # The telemetry contract's limits (v0.9.74) — imported rather than
+    # re-declared so the number /health compares against and the number
+    # /memory/telemetry reports beside the measurement are the SAME number.
+    # Two spellings of one limit is how a payload starts contradicting itself.
+    OUTBOX_AGE_WARN_S,
+    ENCODER_LATENCY_WARN_MS,
+    TOKEN_VERIFY_WARN_PER_MIN,
+    NREM_FOLD_ATTEMPT_WARN,
+    telemetry_gateway_counters,
+    telemetry_credential_counters,
+    _llm_faults_snapshot,
 )
 
 # Unified Hive-Mind Async Proxy v7
@@ -3772,6 +3783,418 @@ _health_cache: dict = {"checks": None, "ts": 0.0}
 _health_probe_lock = asyncio.Lock()
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# THE DEPENDENCY / WARNING LAYER (v0.9.74, decision:1785)
+#
+# THE RULE OF THUMB (the operator's): up/down → health · a number → telemetry ·
+# number > limit → telemetry keeps the number, health raises the warning, the log
+# records the crossing.
+#
+# ⛔ THE THRESHOLD LIVES HERE, SERVER-SIDE. The monitor was already deriving
+# health from telemetry numbers client-side (outbox.failed > 0, backlog,
+# contention >= 30%), which meant every consumer had its own private opinion
+# about when the system was unwell, and a second consumer would have invented a
+# third. One verdict, computed once, read by everyone.
+#
+# ⛔ AND THE HTTP STATUS CODE IS NOT THIS LAYER'S OUTPUT. 503 still means exactly
+# what it meant before: the embedder or the reranker is down, so a save cannot
+# produce a vector. A degraded dependency, a failing outbox row, a dead-lettered
+# REM record — all of those are 200 with the enum in the body. Widening the 503
+# would turn every one of these new signals into an outage for every client.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_STATE_OK, _STATE_DEGRADED, _STATE_DOWN = "ok", "degraded", "down"
+_STATE_UNKNOWN = "unknown"
+
+#: Last observed state per dependency, and the set of currently-raised warning
+#: keys — so a TRANSITION can be logged and a steady state cannot. Module state,
+#: not per-caller: the probe behind it is shared by every caller (see
+#: _health_probe_cached), so the transitions are the process's, not a client's.
+_dependency_state: dict[str, str] = {}
+_warning_state: set = set()
+
+
+def _dep(state: str, reason: str | None = None) -> dict:
+    return {"state": state, "reason": reason}
+
+
+def _encoder_dependency(probe: str, capability: object) -> dict:
+    """One encoder's dependency enum.
+
+    ⛔ LIVENESS IS NOT CAPABILITY, and this is where that finally reaches
+    `status`. The reranker once answered /health throughout a period in which a
+    full candidate set cost ~64 s against a 5 s ceiling — every search silently
+    fell back to unranked vector order while the probe read green. The capability
+    verdict (`too_slow` / `failing`) now makes the encoder DEGRADED. It does NOT
+    make it down, and that distinction is load-bearing: down is the 503, and a
+    slow encoder still returns vectors.
+    """
+    if probe != "ok":
+        return _dep(_STATE_DOWN, f"probe:{probe}")
+    if isinstance(capability, dict):
+        status = capability.get("status")
+        if status in ("too_slow", "failing", "degraded"):
+            return _dep(_STATE_DEGRADED, f"capability:{status}")
+    return _dep(_STATE_OK)
+
+
+def _llm_pool_dependency(backend_status: dict) -> dict:
+    """down when EVERY backend is down, degraded when any is.
+
+    Before this, `llm` read `ok` while N-1 of N backends were down — the pool
+    tolerates a dead backend, so "any is up" was the right answer for the
+    routing question and the wrong answer for the operator's.
+    """
+    if not backend_status:
+        return _dep(_STATE_UNKNOWN, "no backend configured")
+    bad = sorted(b for b, s in backend_status.items() if s != "ok")
+    if len(bad) == len(backend_status):
+        return _dep(_STATE_DOWN, f"all {len(bad)} backend(s) down")
+    if bad:
+        return _dep(_STATE_DEGRADED, f"{len(bad)}/{len(backend_status)} backend(s) down")
+    return _dep(_STATE_OK)
+
+
+def _outbox_dependency(census: object, age_limit_s: int) -> dict:
+    """failed rows, or a pending row older than the limit, is DEGRADED.
+
+    The outbox had NO representation on /health at all: a permanently-failed row
+    means a record that is in Postgres and will never reach Neo4j, and the only
+    place that was visible was a telemetry key that VANISHED when it read zero.
+    """
+    if not isinstance(census, dict):
+        return _dep(_STATE_UNKNOWN, "not yet probed")
+    failed = census.get("failed") or 0
+    if failed:
+        return _dep(_STATE_DEGRADED, f"failed:{failed}")
+    age = census.get("oldest_pending_age_s")
+    if isinstance(age, (int, float)) and age > age_limit_s:
+        return _dep(_STATE_DEGRADED, f"oldest_pending_age_s:{int(age)}")
+    return _dep(_STATE_OK)
+
+
+def _rem_dependency(process_running: bool, dead_lettered: object) -> dict:
+    """A PID is not health. `rem_daemon` was a PID check and nothing else, so a
+    REM that was dead-lettering every record it touched read `running`."""
+    if not process_running:
+        return _dep(_STATE_DOWN, "process not running")
+    if isinstance(dead_lettered, int) and dead_lettered > 0:
+        return _dep(_STATE_DEGRADED, f"dead_letters:{dead_lettered}")
+    return _dep(_STATE_OK)
+
+
+def _nrem_dependency(process_running: bool, consolidation: object,
+                     attempt_floor: int) -> dict:
+    """Same argument as REM, plus the middle state `stalled` alone cannot say:
+    a daemon that ATTEMPTS folds and succeeds at none is not stalled — it is
+    running, busy, and producing nothing, which reads as perfectly healthy."""
+    if not process_running:
+        return _dep(_STATE_DOWN, "process not running")
+    if not isinstance(consolidation, dict):
+        return _dep(_STATE_UNKNOWN, "not yet probed")
+    if consolidation.get("stalled"):
+        types = consolidation.get("stalled_types") or []
+        return _dep(_STATE_DEGRADED,
+                    f"stalled:{','.join(types)}" if types else "stalled")
+    attempted = 0
+    succeeded = 0
+    for key, block in consolidation.items():
+        if isinstance(block, dict) and "folds_attempted_24h" in block:
+            attempted += block.get("folds_attempted_24h") or 0
+            succeeded += block.get("folds_succeeded_24h") or 0
+    if attempted >= attempt_floor and succeeded == 0:
+        return _dep(_STATE_DEGRADED, f"folds_attempted_24h:{attempted} succeeded:0")
+    return _dep(_STATE_OK)
+
+
+def _registry_dependency(read_failures: object) -> dict:
+    """A registry that could not be READ answers 200 with a silently different
+    answer: by-key resolution becomes a no-op and a filtered search matches only
+    the literal string it was given, which is indistinguishable from a name
+    nobody registered."""
+    if not isinstance(read_failures, int):
+        return _dep(_STATE_UNKNOWN, "not yet probed")
+    if read_failures > 0:
+        return _dep(_STATE_DEGRADED, f"read_failures:{read_failures}")
+    return _dep(_STATE_OK)
+
+
+def _warning(key: str, limit, observed, unit: str) -> dict:
+    return {"key": key, "limit": limit, "observed": observed, "unit": unit}
+
+
+# ⛔ A WARNING MUST BE ABLE TO CLEAR, so neither of the two below is read off a
+# cumulative counter. A `shed_503_total > 0` warning raised once would stay
+# raised until the process restarted, and an alert that never clears is an alert
+# an operator learns to close. Both take the DELTA since the previous health
+# build (the TTL bounds how often that is), which falls back to zero on its own
+# as soon as the condition stops.
+_rate_marks: dict[str, tuple[int, float]] = {}
+
+
+def _delta_per_min(key: str, total: int) -> float | None:
+    """Events per minute since the last call for ``key``.
+
+    None on the FIRST call: there is no previous mark, so there is no rate — and
+    dividing a lifetime total by the seconds since boot would report a
+    long-dead burst as a live one.
+    """
+    now = time.monotonic()
+    prev = _rate_marks.get(key)
+    _rate_marks[key] = (total, now)
+    if prev is None:
+        return None
+    prev_total, prev_at = prev
+    elapsed = now - prev_at
+    if elapsed <= 0:
+        return None
+    # A counter that went DOWN means the process restarted; there is no rate
+    # across a restart, only a new baseline.
+    if total < prev_total:
+        return None
+    return round((total - prev_total) * 60.0 / elapsed, 2)
+
+
+def _gateway_shed_rate() -> int:
+    """Load-shed 503s since the previous health build. 0 clears the warning."""
+    try:
+        total = telemetry_gateway_counters().get("shed_503_total", 0)
+        now = time.monotonic()
+        prev = _rate_marks.get("shed")
+        _rate_marks["shed"] = (total, now)
+        if prev is None or total < prev[0]:
+            return 0
+        return total - prev[0]
+    except Exception:
+        return 0
+
+
+def _token_verify_failure_rate() -> float | None:
+    """token_verify_failed per minute since the previous health build."""
+    try:
+        return _delta_per_min(
+            "token_verify_failed",
+            telemetry_credential_counters().get("token_verify_failed", 0))
+    except Exception:
+        return None
+
+
+def overall_status(dependencies: dict, warnings: list) -> str:
+    """down if any dependency is down; degraded if any is degraded or any
+    warning is raised; else ok.
+
+    ⚠ `unknown` NEVER ELEVATES. A dependency nobody has probed yet is not a
+    dependency that is failing, and a gateway that reported `degraded` for its
+    first 60 seconds every restart would train an operator to ignore the field.
+    """
+    states = [d.get("state") for d in dependencies.values()]
+    if _STATE_DOWN in states:
+        return _STATE_DOWN
+    if _STATE_DEGRADED in states or warnings:
+        return _STATE_DEGRADED
+    return _STATE_OK
+
+
+def _log_health_transitions(dependencies: dict, warnings: list) -> None:
+    """ONE LINE PER CHANGE, never one per poll.
+
+    /health is polled every 30 s by an open dashboard and on every client call;
+    logging the state would produce a log that is 100% steady-state noise and
+    would bury the one line that matters. A transition into a bad state is a
+    WARNING, a recovery is INFO — so `journalctl -p warning` is a list of things
+    that went wrong, not a list of times someone looked.
+    """
+    try:
+        for name, dep in dependencies.items():
+            new = dep.get("state")
+            old = _dependency_state.get(name)
+            if old == new:
+                continue
+            _dependency_state[name] = new
+            if new in (_STATE_DOWN, _STATE_DEGRADED):
+                log.warning("health.%s: %s -> %s (%s)", name, old or "unknown",
+                            new, dep.get("reason"))
+            else:
+                log.info("health.%s: %s -> %s", name, old or "unknown", new)
+        keys = {w["key"] for w in warnings}
+        for w in warnings:
+            if w["key"] not in _warning_state:
+                log.warning("health.warning.%s RAISED: observed=%s limit=%s %s",
+                            w["key"], w["observed"], w["limit"], w["unit"])
+        for cleared in sorted(_warning_state - keys):
+            log.info("health.warning.%s cleared", cleared)
+        _warning_state.clear()
+        _warning_state.update(keys)
+    except Exception:
+        # A logging failure must never take the health payload with it.
+        pass
+
+
+def _llm_runtime_snapshot(backend_status: dict | None = None) -> dict:
+    """The whole in-memory llm_* family, built ONCE.
+
+    Every value here is process-local and reset-on-restart; nothing in this
+    function performs I/O, so it is safe to call from the telemetry path as well
+    as the health path. `backend_status` is the liveness map the health probe
+    already computed — passed in rather than re-probed, because a telemetry
+    request must never fire N network probes of its own.
+    """
+    now = time.monotonic()
+    total_routed = sum(_llm_routed.values()) or 1
+    aff_total = _llm_affinity_hits + _llm_affinity_misses
+    return {
+        "backends": dict(backend_status or {}),
+        "reserved": sorted(_llm_reserved),
+        # Parallelisation: per-backend weight, current in-flight, cumulative
+        # routed (check the realised split against weights), fails, cooldown.
+        "pool": {
+            b: {
+                "weight": LLM_WEIGHTS.get(b, 1.0),
+                "inflight": _llm_inflight.get(b, 0),
+                "routed": _llm_routed.get(b, 0),
+                "routed_pct": round(100 * _llm_routed.get(b, 0) / total_routed, 1),
+                "fails": _llm_fail_total.get(b, 0),
+                "cooldown": round(max(0.0, _llm_unhealthy_until.get(b, 0.0) - now), 1),
+                "reserved": b in _llm_reserved,
+            }
+            for b in LLM_BACKENDS
+        },
+        # Cache affinity: hit rate + which backend holds each hot prefix, so the
+        # KV-cache win is observable.
+        "affinity": {
+            "hits": _llm_affinity_hits,
+            "misses": _llm_affinity_misses,
+            "hit_rate": round(_llm_affinity_hits / aff_total, 3) if aff_total else None,
+            "hot_prefixes": {k[:8]: {"backend": v[0], "hits": v[2]}
+                             for k, v in _llm_affinity.items()
+                             if now - v[1] <= AFFINITY_TTL},
+        },
+        # Routing (fact:1314 shape — flat, each counter paired with its own
+        # last-event ts). Present regardless of pool size: meaningful even for a
+        # single role-scoped backend.
+        "routing": {
+            "routed_role_extract": _llm_routed_by_role.get("extract", 0),
+            "routed_role_extract_last_ts": _llm_routed_by_role_last_ts.get("extract"),
+            "routed_role_judge": _llm_routed_by_role.get("judge", 0),
+            "routed_role_judge_last_ts": _llm_routed_by_role_last_ts.get("judge"),
+            "routing_no_eligible_backend": _routing_no_eligible_backend_count,
+            "routing_no_eligible_backend_last_ts": _routing_no_eligible_backend_last_ts,
+            "routing_fit_rejected": _routing_fit_rejected_count,
+            "routing_fit_rejected_last_ts": _routing_fit_rejected_last_ts,
+            "routing_backend_at_capacity": _routing_backend_at_capacity_count,
+            "routing_backend_at_capacity_last_ts": _routing_backend_at_capacity_last_ts,
+        },
+        # Per-backend cumulative token counters, IN-PROCESS ONLY (reset on
+        # restart — deliberate; the ts pairing is what makes a restart-aware
+        # delta computable).
+        "token_usage": {
+            b: {
+                "tokens_prompt_total": _llm_tokens_prompt_total.get(b, 0),
+                "tokens_completion_total": _llm_tokens_completion_total.get(b, 0),
+                "tokens_last_ts": _llm_tokens_last_ts.get(b),
+            }
+            for b in LLM_BACKENDS
+        },
+        # Per-backend request latency (local-vs-online comparison). latency_sum_s
+        # + requests_total makes the average derivable on the read side without
+        # the gateway ever deciding what "average" means; requests_failed_total
+        # is separate so a string of fast failures cannot dilute the success
+        # average.
+        "latency": {
+            b: {
+                "requests_total": _llm_requests_total.get(b, 0),
+                "requests_failed_total": _llm_requests_failed_total.get(b, 0),
+                "latency_sum_s": round(_llm_latency_sum_s.get(b, 0.0), 6),
+                "latency_max_s": round(_llm_latency_max_s.get(b, 0.0), 6),
+                "latency_last_ts": _llm_latency_last_ts.get(b),
+            }
+            for b in LLM_BACKENDS
+        },
+    }
+
+
+def _config_snapshot() -> dict:
+    """Effective NON-SECRET configuration the running gateway resolved from the
+    environment, so the live LLM/tuning setup is inspectable without reading
+    .env on the host.
+
+    ⛔ SECRETS ARE NEVER ECHOED HERE — AGENT_TOKENS and the PG/Neo4j passwords
+    do not appear, and `has_credential` is a BOOL, never the token. Tracked
+    regardless of whether any backend uses it today, so the capability is
+    monitor-visible from the moment it is configured rather than only once
+    someone goes looking (fact 898).
+    """
+    cfg = {
+        "llm_backends": [
+            {"url": b, "weight": LLM_WEIGHTS.get(b, 1.0),
+             "has_credential": LLM_BACKEND_TOKENS.get(b) is not None,
+             "model": LLM_BACKEND_MODELS.get(b),
+             # Model-attributes routing descriptor fields (additive) — never
+             # used by the monitor for routing math, only display; the gateway
+             # itself stays price-agnostic (M-4).
+             "roles": sorted(LLM_BACKEND_ROLES[b]) if LLM_BACKEND_ROLES.get(b) else None,
+             "n_ctx": LLM_BACKEND_NCTX.get(b),
+             "private_ok": LLM_BACKEND_PRIVATE_OK.get(b, True),
+             "max_inflight": LLM_BACKEND_MAX_INFLIGHT.get(b),
+             "price_per_mtok_in": LLM_BACKEND_PRICE_IN.get(b),
+             "price_per_mtok_out": LLM_BACKEND_PRICE_OUT.get(b)}
+            for b in LLM_BACKENDS
+        ],
+        "llm_pool_tuning": {
+            "fail_threshold": LLM_FAIL_THRESHOLD,
+            "fail_window_s": LLM_FAIL_WINDOW,
+            "cooldown_s": LLM_COOLDOWN,
+            "max_tries": LLM_MAX_TRIES,
+        },
+        "llm_affinity": {
+            "prefix_chars": AFFINITY_PREFIX_CHARS,
+            "ttl_s": AFFINITY_TTL,
+            "max_inflight": AFFINITY_MAX_INFLIGHT,
+        },
+        "embed_max_chars": int(os.environ.get("EMBED_MAX_CHARS", "24000")),
+    }
+    # SEC-A5-02: present ONLY while the S-05 override is actually exposing a
+    # live provider key unauthenticated — additive, so a monitor that does not
+    # know the key renders exactly as before on every other install.
+    if _unauthenticated_provider_keys_override_active():
+        cfg["allow_unauthenticated_provider_keys"] = True
+    return cfg
+
+
+def telemetry_extras() -> dict:
+    """The blocks /memory/telemetry serves out of THIS module's state.
+
+    Registered on the coordinator at startup (see the app factory) because
+    coordinator.py cannot import this module — this module imports it.
+
+    ⛔ NO NETWORK PROBE HAPPENS HERE. The liveness enums are read off the
+    /health probe CACHE, so a telemetry request never fires the 2+N backend
+    fan-out of its own; a stale-by-up-to-HEALTH_CACHE_TTL_S enum on the numbers
+    endpoint is exactly the right trade, and the fresh verdict is on /health
+    where it belongs. Cheap, synchronous, and safe to call from a request path.
+    """
+    cached = _health_cache.get("checks") or {}
+    rt = _llm_runtime_snapshot(cached.get("llm_backends") or {})
+    llm: dict = {
+        "status": cached.get("llm"),
+        "backends": rt["backends"],
+        "reserved": rt["reserved"],
+        "oldest_inflight_age_s": cached.get("llm_oldest_inflight_age_s"),
+        "suspect_wedged": cached.get("llm_suspect_wedged") or [],
+        "pool": rt["pool"],
+        "affinity": rt["affinity"],
+        "routing": rt["routing"],
+        "token_usage": rt["token_usage"],
+        "latency": rt["latency"],
+        "faults": _llm_faults_snapshot(),
+    }
+    return {
+        "llm": llm,
+        "config": _config_snapshot(),
+        "capacity": capacity_snapshot(),
+    }
+
+
 def _coordinator_health_keys(coordinator) -> dict:
     """The consolidation-health lift for /health: everything read off the
     coordinator's cached (DB-free) snapshot (ADR-018) — stalled=true means an
@@ -3894,21 +4317,20 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
             async with proxy.session.get(_v1_models_probe_url(b), timeout=ClientTimeout(total=2.0)) as r:
                 if r.status < 400:
                     backend_status[b] = "ok"
-                elif LLM_BACKEND_TOKENS.get(b) is not None and r.status in (401, 403):
-                    # H-1/H-2: this is a BARE probe — no Authorization header
-                    # is attached (has_credential is deliberately never used
-                    # to authenticate a liveness poll, see this section's own
-                    # header comment: no per-poll provider-key probing). A
-                    # 401/403 from a CREDENTIALED backend therefore means the
-                    # server ANSWERED — this file's own liveness definition
-                    # ("answered <500 = alive") — its rejection of an
-                    # unauthenticated probe is correct auth behavior, not
-                    # downness. H-1: the unauthenticated probe never carried
-                    # key-validity information anyway; llm_faults.credential
-                    # on a REAL call is that signal. Genuinely down (connect
-                    # error / 5xx) is unaffected by this branch.
-                    backend_status[b] = "ok"
                 else:
+                    # ⚠ FIXED IN 0.9.74 (enumerated in
+                    # telemetry_contract.MEANING_CHANGES). A 401/403 from a
+                    # CREDENTIALED backend used to be reported `ok`, on the
+                    # argument that the server ANSWERED and its rejection of a
+                    # bare probe is correct auth behaviour rather than downness.
+                    # That argument is about the SERVER; the question /health
+                    # answers is about the DEPENDENCY, and a backend this
+                    # gateway cannot get a completion out of is not usable
+                    # however correct its refusal is. Reporting it green meant
+                    # the one failure an operator can actually fix — a wrong or
+                    # expired provider key — was the one failure /health hid.
+                    # The status code is passed through as-is, so `http_401`
+                    # says WHICH kind of unusable it is.
                     backend_status[b] = f"http_{r.status}"
         except asyncio.TimeoutError:
             backend_status[b] = "timeout"
@@ -3940,90 +4362,35 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
     # monitor entirely. This is a PRESENCE change only — additive, no
     # existing key's meaning changes; sections below now also appear for a
     # one-backend fleet.
+    # v0.9.74: the llm_* runtime family is built ONCE, by
+    # `_llm_runtime_snapshot`, and rendered on BOTH endpoints from that single
+    # call — /health under its historical flat key names (dual-emit, removed in
+    # 0.9.75) and /memory/telemetry under `llm.*`, which is where it belongs.
+    # ⛔ Not two builders producing "the same" dict: two builders is how the two
+    # copies start disagreeing, and a monitor comparing them would have no way
+    # to tell which one was wrong.
+    _llm_rt = _llm_runtime_snapshot(backend_status)
     if LLM_BACKENDS:
         checks["llm_backends"] = backend_status
-        if _llm_reserved:
-            checks["llm_reserved"] = sorted(_llm_reserved)
-        # Parallelisation telemetry: per-backend weight, current in-flight, cumulative
-        # routed (check the realised split against weights), total fails, cooldown.
-        now = time.monotonic()
-        total_routed = sum(_llm_routed.values()) or 1
-        checks["llm_pool"] = {
-            b: {
-                "weight": LLM_WEIGHTS.get(b, 1.0),
-                "inflight": _llm_inflight.get(b, 0),
-                "routed": _llm_routed.get(b, 0),
-                "routed_pct": round(100 * _llm_routed.get(b, 0) / total_routed, 1),
-                "fails": _llm_fail_total.get(b, 0),
-                "cooldown": round(max(0.0, _llm_unhealthy_until.get(b, 0.0) - now), 1),
-                "reserved": b in _llm_reserved,
-            }
-            for b in LLM_BACKENDS
-        }
-        # Cache-affinity telemetry: hit rate + which backend holds each hot prefix
-        # (so the KV-cache win is observable). hits/(hits+misses) should climb as
-        # REM's stable grounding prefix keeps landing on its warm card.
-        _aff_total = _llm_affinity_hits + _llm_affinity_misses
-        checks["llm_affinity"] = {
-            "hits": _llm_affinity_hits,
-            "misses": _llm_affinity_misses,
-            "hit_rate": round(_llm_affinity_hits / _aff_total, 3) if _aff_total else None,
-            "hot_prefixes": {k[:8]: {"backend": v[0], "hits": v[2]}
-                             for k, v in _llm_affinity.items()
-                             if now - v[1] <= AFFINITY_TTL},
-        }
-
-    # Routing telemetry (Group 3, fact:1314 shape — flat, additive, each
-    # counter paired with its own last-event ts; no existing key changes
-    # meaning). Surfaced regardless of pool size — meaningful even for a
-    # single role-scoped backend.
-    checks["llm_routing"] = {
-        "routed_role_extract": _llm_routed_by_role.get("extract", 0),
-        "routed_role_extract_last_ts": _llm_routed_by_role_last_ts.get("extract"),
-        "routed_role_judge": _llm_routed_by_role.get("judge", 0),
-        "routed_role_judge_last_ts": _llm_routed_by_role_last_ts.get("judge"),
-        "routing_no_eligible_backend": _routing_no_eligible_backend_count,
-        "routing_no_eligible_backend_last_ts": _routing_no_eligible_backend_last_ts,
-        "routing_fit_rejected": _routing_fit_rejected_count,
-        "routing_fit_rejected_last_ts": _routing_fit_rejected_last_ts,
-        "routing_backend_at_capacity": _routing_backend_at_capacity_count,
-        "routing_backend_at_capacity_last_ts": _routing_backend_at_capacity_last_ts,
-    }
-    # Post-review addition A: per-backend cumulative token counters, IN-
-    # PROCESS ONLY (reset on restart — deliberate, the ts pairing is what
-    # makes a restart-aware delta computable; see the README proposal's B2
-    # note for the operator-facing framing of this).
+        if _llm_rt["reserved"]:
+            checks["llm_reserved"] = _llm_rt["reserved"]
+        checks["llm_pool"] = _llm_rt["pool"]
+        checks["llm_affinity"] = _llm_rt["affinity"]
+    checks["llm_routing"] = _llm_rt["routing"]
     if LLM_BACKENDS:
-        checks["llm_token_usage"] = {
-            b: {
-                "tokens_prompt_total": _llm_tokens_prompt_total.get(b, 0),
-                "tokens_completion_total": _llm_tokens_completion_total.get(b, 0),
-                "tokens_last_ts": _llm_tokens_last_ts.get(b),
-            }
-            for b in LLM_BACKENDS
-        }
-    # New instrument: per-backend LLM request latency (local-vs-online
-    # comparison). Same lifecycle as llm_token_usage above — IN-PROCESS
-    # ONLY, reset on restart, the ts pairing is what makes a restart-aware
-    # delta computable. latency_sum_s + requests_total makes the average
-    # derivable on the read side without the gateway ever caring what
-    # "average" means; requests_failed_total is counted separately so a
-    # string of failures (fast, low-latency) doesn't dilute the success
-    # average.
-    if LLM_BACKENDS:
-        checks["llm_latency"] = {
-            b: {
-                "requests_total": _llm_requests_total.get(b, 0),
-                "requests_failed_total": _llm_requests_failed_total.get(b, 0),
-                "latency_sum_s": round(_llm_latency_sum_s.get(b, 0.0), 6),
-                "latency_max_s": round(_llm_latency_max_s.get(b, 0.0), 6),
-                "latency_last_ts": _llm_latency_last_ts.get(b),
-            }
-            for b in LLM_BACKENDS
-        }
+        checks["llm_token_usage"] = _llm_rt["token_usage"]
+        checks["llm_latency"] = _llm_rt["latency"]
 
-    checks["daemon"]     = "running" if _daemon_healthy else "stopped"
-    checks["rem_daemon"] = "running" if _rem_healthy    else "stopped"
+    # ⚠ RENAMED IN 0.9.74. These are PID CHECKS and nothing more, and the old
+    # names did not say so — `rem_daemon: running` was read as "REM is healthy"
+    # when it only ever meant "a process exists". The `_process` suffix says
+    # what is actually measured; the derived HEALTH verdict is
+    # dependencies.rem_daemon / dependencies.nrem_daemon. Old keys kept this
+    # release (removed in 0.9.75).
+    checks["nrem_daemon_process"] = "running" if _daemon_healthy else "stopped"
+    checks["rem_daemon_process"]  = "running" if _rem_healthy    else "stopped"
+    checks["daemon"]     = checks["nrem_daemon_process"]
+    checks["rem_daemon"] = checks["rem_daemon_process"]
 
     # Version contract — clients compare api_version against their own to detect
     # skew. Cheap string fields; no backend probe. version is informational only.
@@ -4047,48 +4414,13 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
     # _load_llm_backends). Unconditional here (S-10): this whole function's
     # output is now only ever handed to an authenticated caller — see this
     # function's own docstring.
-    checks["config"] = {
-        "llm_backends": [
-            {"url": b, "weight": LLM_WEIGHTS.get(b, 1.0),
-             "has_credential": LLM_BACKEND_TOKENS.get(b) is not None,
-             "model": LLM_BACKEND_MODELS.get(b),
-             # Model-attributes routing descriptor fields (additive) — never
-             # used by the monitor for routing math, only display; the
-             # gateway itself stays price-agnostic (M-4).
-             "roles": sorted(LLM_BACKEND_ROLES[b]) if LLM_BACKEND_ROLES.get(b) else None,
-             "n_ctx": LLM_BACKEND_NCTX.get(b),
-             "private_ok": LLM_BACKEND_PRIVATE_OK.get(b, True),
-             "max_inflight": LLM_BACKEND_MAX_INFLIGHT.get(b),
-             "price_per_mtok_in": LLM_BACKEND_PRICE_IN.get(b),
-             "price_per_mtok_out": LLM_BACKEND_PRICE_OUT.get(b)}
-            for b in LLM_BACKENDS
-        ],
-        "llm_pool_tuning": {
-            "fail_threshold": LLM_FAIL_THRESHOLD,
-            "fail_window_s": LLM_FAIL_WINDOW,
-            "cooldown_s": LLM_COOLDOWN,
-            "max_tries": LLM_MAX_TRIES,
-        },
-        "llm_affinity": {
-            "prefix_chars": AFFINITY_PREFIX_CHARS,
-            "ttl_s": AFFINITY_TTL,
-            "max_inflight": AFFINITY_MAX_INFLIGHT,
-        },
-        "embed_max_chars": int(os.environ.get("EMBED_MAX_CHARS", "24000")),
-    }
-    # SEC-A5-02 (PR A5 fix round): present ONLY while the S-05 override is
-    # actually exposing a live provider key unauthenticated — additive, so
-    # a monitor that doesn't know the key renders exactly as before on
-    # every other install. See _unauthenticated_provider_keys_override_
-    # active's docstring for why this mirrors the startup log.warning.
-    if _unauthenticated_provider_keys_override_active():
-        checks["config"]["allow_unauthenticated_provider_keys"] = True
+    # v0.9.74: built once by `_config_snapshot`, rendered on both endpoints
+    # from that one call — same reason as the llm_* family above.
+    checks["config"] = _config_snapshot()
 
-    # Embedder and reranker are the critical path — every save and search
-    # depends on them.  LLM and daemon degradation is reported but does not
-    # fail the health check so agents can still read/write memory.
-    critical_ok = checks["embedder"] == "ok" and checks["reranker"] == "ok"
-    checks["status"] = "ok" if critical_ok else "degraded"
+    # `status` is now the DERIVED enum over `dependencies` + `warnings`, both
+    # built at the end of this function once the coordinator's cached snapshot
+    # has been folded in. Nothing is set here.
     # The STARTUP truth (finding 1), not live _AGENT_TOKENS emptiness -- a
     # daemon token minted after boot must not flip this to True for an
     # install that never configured auth. See coordinator.
@@ -4118,6 +4450,82 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
             "version": getattr(coordinator, "pgvector_version", None),
             "iterative_scan": bool(getattr(coordinator, "hnsw_iterative_scan", False)),
         }
+
+    # ── dependencies + warnings + the derived status enum (v0.9.74) ──────────
+    # Everything below reads from values ALREADY IN HAND — the probes above and
+    # the coordinator's 60 s cached snapshot. ⛔ NO DATABASE CALL IS MADE HERE,
+    # which is the whole reason the snapshot exists (ADR-018, decision:362):
+    # /health is hit on every client call and every 30 s by an open dashboard.
+    dep_snap = {}
+    if coordinator is not None:
+        try:
+            dep_snap = coordinator.dependency_snapshot()
+        except Exception:
+            dep_snap = {}
+    consolidation = checks.get("consolidation") if isinstance(
+        checks.get("consolidation"), dict) else {}
+    outbox_census = dep_snap.get("outbox")
+    capability = checks.get("backend_capability") or {}
+
+    dependencies = {
+        "postgres": dep_snap.get("postgres") or _dep(_STATE_UNKNOWN, "not yet probed"),
+        "neo4j": dep_snap.get("neo4j") or _dep(_STATE_UNKNOWN, "not yet probed"),
+        "embedder": _encoder_dependency(checks["embedder"],
+                                        capability.get("embedder")),
+        "reranker": _encoder_dependency(checks["reranker"],
+                                        capability.get("reranker")),
+        "llm_pool": _llm_pool_dependency(backend_status),
+        "rem_daemon": _rem_dependency(
+            _rem_healthy,
+            (dep_snap.get("rem") or {}).get("dead_lettered")
+            if isinstance(dep_snap.get("rem"), dict) else None),
+        "nrem_daemon": _nrem_dependency(_daemon_healthy, consolidation,
+                                        NREM_FOLD_ATTEMPT_WARN),
+        "outbox": _outbox_dependency(outbox_census, OUTBOX_AGE_WARN_S),
+        "registry": _registry_dependency(
+            getattr(coordinator, "_axis_registry_read_failures", None)
+            if coordinator is not None else None),
+    }
+
+    warnings: list = []
+    # Encoder p95 over its limit. The limit is DERIVED from the capability
+    # probe's own measured ceiling unless an operator pinned one — a flat
+    # default would be a number nobody measured (fact:1338).
+    for name in ("embedder", "reranker"):
+        block = capability.get(name)
+        if not isinstance(block, dict):
+            continue
+        limit_ms = ENCODER_LATENCY_WARN_MS
+        if limit_ms is None:
+            ceiling = block.get("ceiling_s")
+            limit_ms = ceiling * 1000.0 if isinstance(ceiling, (int, float)) else None
+        observed = block.get("projected_full_payload_s")
+        if (limit_ms is not None and isinstance(observed, (int, float))
+                and observed * 1000.0 > limit_ms):
+            warnings.append(_warning(f"encoder_{name}_projected_ms",
+                                     round(limit_ms, 1),
+                                     round(observed * 1000.0, 1), "ms"))
+    if isinstance(outbox_census, dict):
+        age = outbox_census.get("oldest_pending_age_s")
+        if isinstance(age, (int, float)) and age > OUTBOX_AGE_WARN_S:
+            warnings.append(_warning("outbox_oldest_pending_age_s",
+                                     OUTBOX_AGE_WARN_S, int(age), "s"))
+    rem_block = dep_snap.get("rem")
+    if isinstance(rem_block, dict) and (rem_block.get("dead_lettered") or 0) > 0:
+        warnings.append(_warning("rem_dead_lettered", 0,
+                                 rem_block["dead_lettered"], "records"))
+    if _gateway_shed_rate() > 0:
+        warnings.append(_warning("gateway_shed_503_total", 0,
+                                 _gateway_shed_rate(), "requests"))
+    tv_rate = _token_verify_failure_rate()
+    if tv_rate is not None and tv_rate > TOKEN_VERIFY_WARN_PER_MIN:
+        warnings.append(_warning("token_verify_failed_per_min",
+                                 TOKEN_VERIFY_WARN_PER_MIN, tv_rate, "per_min"))
+
+    checks["dependencies"] = dependencies
+    checks["warnings"] = warnings
+    checks["status"] = overall_status(dependencies, warnings)
+    _log_health_transitions(dependencies, warnings)
 
     return checks
 
@@ -4159,11 +4567,15 @@ async def _health_probe_cached(proxy: "AsyncHiveMindProxy", coordinator) -> dict
 
 
 def _health_role_for(agent_name: str) -> str:
-    """`read` or `write` for an authenticated /health caller (A-4).
+    """`read`, `write` or `admin` for an authenticated /health caller (A-4).
 
-    Two-valued by ruling, over a three-valued underlying vocabulary: it
-    answers the question a client actually has — *may I write?* — rather than
-    exposing the roster's internal spelling.
+    ⚠ THREE-VALUED SINCE 0.9.74, and the third value is a FIX. This used to
+    collapse to two — anything not `read` was reported `write` — which
+    OVERSTATED an admin token: an admin credential is confined to `/admin/*`
+    and cannot save either, so a caller holding one was told it may write and
+    then 403'd on every write route. That was raised as a finding at the time
+    and left for the operator to rule on the vocabulary; `admin` is the
+    vocabulary, and it is the roster's own word for the role.
 
     It goes through `effective_role`, never a bare `_AGENT_ROLES` lookup, and
     that is the whole reason this is a function. `read_only_agents()` confines
@@ -4171,9 +4583,12 @@ def _health_role_for(agent_name: str) -> str:
     map would report `write` for an identity the gateway 403s on every write
     route — the exact false reassurance this key exists to remove.
     """
-    return ("read"
-            if effective_role(agent_name, _AGENT_ROLES.get(agent_name)) == "read"
-            else "write")
+    role = effective_role(agent_name, _AGENT_ROLES.get(agent_name))
+    if role == "read":
+        return "read"
+    if role == "admin":
+        return "admin"
+    return "write"
 
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -4237,8 +4652,19 @@ async def handle_health(request: web.Request) -> web.Response:
     """
     proxy: AsyncHiveMindProxy = request.app["proxy"]
     checks = await _health_probe_cached(proxy, request.app.get("coordinator"))
-    critical_ok = checks["status"] == "ok"
-    status_code = 200 if critical_ok else 503
+    # ⛔ THE 503 GATE IS UNCHANGED BY v0.9.74, and it is read HERE rather than
+    # off `status`. Before this release the two were the same test, because
+    # `status` was ONLY ever "not ok" when an encoder was down. `status` now
+    # also goes degraded for a failing outbox, a dead-lettering REM, an
+    # unreadable registry and a raised warning — none of which stop a save from
+    # producing a vector, and none of which may turn every client's every call
+    # into a 503. The save mandate is the encoders and nothing else.
+    _deps = checks.get("dependencies") or {}
+    critical_down = any(
+        (_deps.get(name) or {}).get("state") == _STATE_DOWN
+        for name in ("embedder", "reranker")
+    )
+    status_code = 503 if critical_down else 200
 
     # Resolved HERE rather than read off `request["authenticated_agent"]`,
     # because /health is in `_UNPROTECTED_PATHS`: auth_middleware returns
@@ -4540,6 +4966,12 @@ async def main() -> None:
     app = web.Application(client_max_size=50 * 1024 * 1024, middlewares=[auth_middleware])
     app["proxy"] = proxy  # shared with health handler
     app["coordinator"] = coordinator  # health reads the cached consolidation snapshot
+    # v0.9.74: the llm_* family, the capability/capacity snapshots and the
+    # resolved config move to /memory/telemetry, but they live in THIS module's
+    # state. A callback, not an import: coordinator.py cannot import this module
+    # (this module imports it), and the coordinator has no other way to reach
+    # them. Set before any request can be served.
+    coordinator.telemetry_extras_provider = telemetry_extras
 
     # Coordinator routes and health endpoint before the catch-all proxy route.
     attach_coordinator(app, coordinator)

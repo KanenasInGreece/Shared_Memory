@@ -86,6 +86,7 @@ from project_promotion import (
 )
 from project_alias import ALIAS_RESOLVE_SQL, ACTIVE_ALIASES_SQL
 from secure_env import get_secret
+from telemetry_instruments import LatencyRing, Counter, safe
 
 log = logging.getLogger("coordinator")
 
@@ -163,6 +164,12 @@ FRAMEWORK_VERSION = "0.9.73"
 # reserved sentinel general_discussion.
 API_VERSION = 4
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
+#: The client's own FRAMEWORK VERSION (e.g. "0.9.74"), distinct from the wire
+#: API_VERSION above: two clients can speak api_version 4 while one of them is
+#: forty releases behind on behaviour, and only this header can tell them apart.
+#: Advertised by memory_bridge.py (both copies) and mcp/vector-skill.py from
+#: 0.9.74; a pre-0.9.74 client sends nothing and is simply not counted.
+CLIENT_BUILD_HEADER = "X-Shared-Memory-Client"
 
 # ── Record references: a record id is only unique WITHIN ITS TABLE ────────────
 # `technical_docs` and `community_summaries` run INDEPENDENT id sequences, so the
@@ -1048,6 +1055,120 @@ def _apply_principal(target: dict[str, Any], principal: dict[str, Any] | None) -
 # admitted and never reaches the increment.
 _inflight = 0
 
+# ── Gateway request instrument (the telemetry contract, v0.9.74) ───────────────
+# The per-request latency the audit line already carries (see auth_middleware's
+# `finally`) was written to the JSONL and aggregated NOWHERE, so nothing could
+# answer "what is this gateway's p95" without parsing a log. These are the same
+# numbers, aggregated in memory.
+#
+# ⛔ RECORDING MUST NOT CHANGE THIS PATH'S FAILURE MODES. Every write below goes
+# through telemetry_instruments, whose recorders swallow everything, and the one
+# assembling function is wrapped by the caller. It never awaits, never touches a
+# connection, and runs in the SAME `finally` that already writes the audit line —
+# so it cannot add a failure mode the audit line does not already have.
+GATEWAY_LATENCY_WINDOW = int(os.environ.get("GATEWAY_LATENCY_WINDOW", "500"))
+_gateway_latency = LatencyRing(GATEWAY_LATENCY_WINDOW)
+_gateway_requests_total = 0
+_gateway_shed_503_total = 0
+_gateway_by_status: dict[str, int] = {
+    "2xx": 0, "4xx": 0, "5xx": 0, "401": 0, "403": 0, "409": 0, "503": 0,
+}
+#: {client VERSION string: requests seen}. Fed by the X-Shared-Memory-Client
+#: header both front doors send from 0.9.74; a pre-0.9.74 client sends none and
+#: is simply not counted — an absent client is not a version, and inventing
+#: "unknown" as a bucket would put every old client into one made-up release.
+_client_versions_seen: dict[str, int] = {}
+#: How many DISTINCT client versions may be tracked. A header is caller-supplied
+#: text, so the map is a caller-controlled allocation without a bound.
+CLIENT_VERSIONS_MAX = int(os.environ.get("CLIENT_VERSIONS_MAX", "64"))
+
+
+def _record_gateway_request(status: int, latency_ms: float) -> None:
+    """Fold one served request into the gateway instrument. Never raises."""
+    global _gateway_requests_total
+    try:
+        _gateway_requests_total += 1
+        _gateway_latency.record(latency_ms)
+        cls = f"{status // 100}xx"
+        if cls in _gateway_by_status:
+            _gateway_by_status[cls] += 1
+        key = str(status)
+        if key in _gateway_by_status:
+            _gateway_by_status[key] += 1
+    except Exception:
+        pass
+
+
+def telemetry_gateway_counters() -> dict:
+    """The gateway counters, read across the module boundary.
+
+    An accessor rather than an import of the names themselves: these are
+    REBOUND integers, so `from coordinator import _gateway_shed_503_total` would
+    capture the value at import time and never move again — a counter frozen at
+    zero that looks exactly like a counter that never fired.
+    """
+    return {
+        "requests_total": _gateway_requests_total,
+        "shed_503_total": _gateway_shed_503_total,
+    }
+
+
+def telemetry_credential_counters() -> dict:
+    """Ditto for the credential counters (a dict, so this is only for symmetry
+    and to keep every cross-module telemetry read in one place)."""
+    return dict(_credential_counters)
+
+
+class _TimedAcquire:
+    """Times a pool acquire without changing anything about it.
+
+    A pure delegation wrapper: ``__aenter__`` and ``__aexit__`` forward to the
+    asyncpg acquire context, so the POOL_ACQUIRE_TIMEOUT, the
+    ``asyncio.TimeoutError`` that auth_middleware maps to a 503, and the
+    connection's release are all exactly as before. The clock reads and the ring
+    write are the only additions, and the ring write cannot raise.
+    """
+
+    __slots__ = ("_ctx", "_ring", "_t0")
+
+    def __init__(self, ctx, ring):
+        self._ctx = ctx
+        self._ring = ring
+        self._t0 = 0.0
+
+    async def __aenter__(self):
+        self._t0 = time.monotonic()
+        try:
+            conn = await self._ctx.__aenter__()
+        except BaseException:
+            self._ring.record_error()
+            raise
+        self._ring.record((time.monotonic() - self._t0) * 1000.0)
+        return conn
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return await self._ctx.__aexit__(exc_type, exc, tb)
+
+
+def _record_client_version(request: web.Request) -> None:
+    """Count the caller's client VERSION (not api_version). Never raises."""
+    try:
+        raw = request.headers.get(CLIENT_BUILD_HEADER)
+        if not raw:
+            return
+        # Bounded and sanitised: this is caller-supplied text on an
+        # unauthenticated-reachable path, and it ends up in a JSON payload an
+        # operator reads. A version string is short and boring; anything else is
+        # not a version.
+        v = raw.strip()[:32]
+        if not v or not all(c.isalnum() or c in "._-+" for c in v):
+            return
+        if v not in _client_versions_seen and len(_client_versions_seen) >= CLIENT_VERSIONS_MAX:
+            return
+        _client_versions_seen[v] = _client_versions_seen.get(v, 0) + 1
+    except Exception:
+        pass
+
 # ── Backup quiesce: client-write shed + daemon advisory-lock gate ───────────────
 # While a backup runs, client WRITE routes shed (503 + Retry-After) so the dump
 # sees a quiet database; reads always flow. Set/cleared via POST /admin/backup by
@@ -1668,8 +1789,9 @@ async def auth_middleware(request: web.Request, handler):
     asyncio.TimeoutError from a handler's _acquire(); it is mapped here to
     503 + Retry-After so the gateway sheds load instead of hanging a caller.
     """
-    global _inflight
+    global _inflight, _gateway_shed_503_total
     _check_client_version(request)  # logs API skew to the gateway log; never raises
+    _record_client_version(request)  # counts the caller's build; never raises
 
     # S-11 (PR A5): the load-shed valve is the FIRST gate — ahead of both the
     # auth-disabled bypass below and the per-path _UNPROTECTED_PATHS
@@ -1680,6 +1802,14 @@ async def auth_middleware(request: web.Request, handler):
     # pile-up, not to gate access, so it must apply uniformly regardless of
     # what auth decides afterward.
     if GATEWAY_INFLIGHT_MAX and _inflight >= GATEWAY_INFLIGHT_MAX:
+        # Counted HERE, not in the `finally` below: a shed request is never
+        # admitted, so it never reaches the audit line and would otherwise be
+        # the one 503 the gateway serves that nothing can see. `gateway.shed_
+        # 503_total` is the number; /health raises the warning off it.
+        try:
+            _gateway_shed_503_total += 1
+        except Exception:
+            pass
         raise web.HTTPServiceUnavailable(
             reason="gateway at capacity", headers={"Retry-After": "1"},
             **_error_body("Gateway at capacity — too many requests in flight; "
@@ -1810,6 +1940,11 @@ async def auth_middleware(request: web.Request, handler):
                    request_id, request.get("principal"),
                    backend=request.get("backend"),
                    key_attached=bool(request.get("key_attached")))
+            # The same numbers the audit line just wrote, aggregated in memory
+            # so a consumer does not have to parse the JSONL to get a p95.
+            # Deliberately AFTER _audit: the durable record is written first,
+            # and this call cannot raise (see _record_gateway_request).
+            _record_gateway_request(status, latency_ms)
     finally:
         _inflight -= 1
 
@@ -2105,6 +2240,38 @@ CONSOLIDATION_HEALTH_REFRESH_SEC = int(os.environ.get("CONSOLIDATION_HEALTH_REFR
 # a live fold — so a crashed daemon cannot peg in_flight=true forever (the daemon
 # also reaps these on restart; this is the read-side backstop).
 CONSOLIDATION_ORPHAN_TIMEOUT_SEC = int(os.environ.get("CONSOLIDATION_ORPHAN_TIMEOUT_SEC", "1800"))
+
+# ── The telemetry contract's tunables (v0.9.74, decision:1785) ─────────────────
+# ⚠ EVERY DEFAULT BELOW IS UNMEASURED unless its comment says otherwise
+# (fact:1338 — a proposed limit is a measurement claim in disguise, so it says
+# plainly which it is). The same statement is repeated in .env.example, where an
+# operator actually reads it.
+#
+#: Whole-payload cache for /memory/telemetry. UNMEASURED: chosen so the
+#: monitor's 30 s browser re-fetch cannot stack two builds, not from a measured
+#: build cost. The measured build cost on this corpus at 0.9.73 was 733 ms
+#: median (7 samples) for the WHOLE payload.
+TELEMETRY_CACHE_S = float(os.environ.get("TELEMETRY_CACHE_S", "15"))
+#: Observation window for the encoder latency rings. UNMEASURED.
+ENCODER_LATENCY_WINDOW = int(os.environ.get("ENCODER_LATENCY_WINDOW", "200"))
+#: Encoder p95 above this raises a /health warning. Default None → DERIVED
+#: per-encoder from backend_capability.<encoder>.ceiling_s, which IS measured
+#: (the capability probe times a fixed representative payload). Set the env only
+#: to pin a flat ceiling instead.
+_ENCODER_WARN_RAW = os.environ.get("ENCODER_LATENCY_WARN_MS", "").strip()
+ENCODER_LATENCY_WARN_MS = float(_ENCODER_WARN_RAW) if _ENCODER_WARN_RAW else None
+#: An outbox row pending longer than this raises a /health warning and marks the
+#: outbox dependency degraded. UNMEASURED — one hour is a round number, not an
+#: observation about this pipeline's normal drain time.
+OUTBOX_AGE_WARN_S = int(os.environ.get("OUTBOX_AGE_WARN_S", "3600"))
+#: token_verify_failed climbing faster than this raises a /health warning.
+#: UNMEASURED.
+TOKEN_VERIFY_WARN_PER_MIN = float(os.environ.get("TOKEN_VERIFY_WARN_PER_MIN", "10"))
+#: NREM is DEGRADED when it attempted at least this many folds in 24 h and
+#: succeeded at none. UNMEASURED — the shape of the condition (attempted ≫
+#: succeeded) is the ruling; the number is a floor to keep one unlucky fold from
+#: raising an alarm.
+NREM_FOLD_ATTEMPT_WARN = int(os.environ.get("NREM_FOLD_ATTEMPT_WARN", "5"))
 
 
 def _consolidation_backlog(eligible_clusters) -> int:
@@ -2694,6 +2861,45 @@ class MemoryCoordinator:
         # exists (see there for why). None/False until that probe runs.
         self.pgvector_version: str | None = None
         self.hnsw_iterative_scan: bool = False
+
+        # ── The telemetry contract's in-process instruments (v0.9.74) ────────
+        # ⛔ EVERY ONE OF THESE IS WRITTEN FROM A WORK PATH, so every write goes
+        # through telemetry_instruments (which swallows) and never awaits. See
+        # that module's docstring for the rule and why it is centralised there.
+        #
+        # The encoders had NO per-call latency at all before this: the only
+        # number was the 600 s synthetic capability probe, which is a
+        # projection, not an observation of what real callers experienced.
+        self._embed_ring = LatencyRing(ENCODER_LATENCY_WINDOW)
+        self._rerank_ring = LatencyRing(ENCODER_LATENCY_WINDOW)
+        # Postgres pool wait — how long `_acquire` blocked before handing over a
+        # connection. Saturation was only ever visible as the 503 it eventually
+        # produced; this is the number that climbs BEFORE that.
+        self._pool_wait_ring = LatencyRing(ENCODER_LATENCY_WINDOW)
+        # Neo4j query latency + failure counters. `cypher_rejected` is the
+        # CALLER's fault (a query the database refused) and `tx_failures` is
+        # ours; counting them together would make a user typo read as an outage.
+        self._neo4j_ring = LatencyRing(ENCODER_LATENCY_WINDOW)
+        self._cypher_rejected_total = 0
+        self._neo4j_tx_failures_total = 0
+        # ⛔ NO OUTBOX RING HERE, DELIBERATELY. Apply latency and drain rate are
+        # DERIVABLE — `neo4j_outbox` already stores `created_at` and
+        # `applied_at`, and `_apply_outbox_row` already stamps the second one.
+        # Adding an in-memory ring would write a value a reader can reach by
+        # query (decision:1032), and would be the WORSE copy: it resets on
+        # restart, where the columns do not. Both numbers are SQL percentiles
+        # over those two columns — see `_outbox_telemetry`.
+        #
+        # Ingress refusal counters (0.9.69 shipped every one of these gates
+        # UNINSTRUMENTED — a refusal was visible to the one caller who got it
+        # and to nobody else). The seven keys are the contract's; several
+        # aggregate a family of refusal codes, and telemetry_contract.py's own
+        # note for each says exactly which.
+        self._registry_refusals = Counter((
+            "entity_reserved", "entity_confusable", "entity_unknown",
+            "axis_conflict", "entities_not_allowed_on_judgement",
+            "new_project_refused", "new_domain_refused",
+        ))
         # Rerank outcome counters. The reranker is a separate process on the
         # search path with a FALLBACK, so its total failure is silent by
         # construction — it degrades to vector order and still answers. These
@@ -2740,6 +2946,34 @@ class MemoryCoordinator:
         # ADR-018 consolidation health: cached snapshot refreshed by a background
         # task so /health stays DB-free. Defaults read as "unknown" until the
         # first refresh lands (stalled is never asserted on no data).
+        # Whole-payload cache for /memory/telemetry (v0.9.74) + its single-flight
+        # lock. See _telemetry_cached for why the lock is not optional.
+        self._telemetry_cache: dict = {"snap": None, "ts": 0.0}
+        self._telemetry_lock = asyncio.Lock()
+        # Set by hive_mind_proxy at startup: a zero-argument callable returning
+        # the blocks that live in the PROXY's module state (the llm_* family,
+        # the capability/capacity snapshots, the resolved config). A callback
+        # rather than an import because hive_mind_proxy imports THIS module —
+        # importing back would be a cycle. None on a coordinator running without
+        # a proxy (every unit test), and the sections simply do not appear.
+        self.telemetry_extras_provider = None
+
+        # ── The DB-free dependency snapshot /health reads (v0.9.74) ──────────
+        # ⛔ EVERY STATE STARTS "unknown", NEVER "ok". A never-probed dependency
+        # that reads healthy is the exact failure decision:374/fact:375 named,
+        # and the one this block exists to avoid repeating for Postgres, Neo4j,
+        # the outbox and the registry — four dependencies that, before 0.9.74,
+        # had no representation on /health at all.
+        self._dependency_health: dict = {
+            "postgres": {"state": "unknown", "reason": "not yet probed"},
+            "neo4j": {"state": "unknown", "reason": "not yet probed"},
+            "outbox": None,
+            "registry": None,
+            "rem": None,
+            "nrem": None,
+            "as_of": None,
+            "fresh": False,
+        }
         self._consolidation_health: dict = {"stalled": False, "last_outcome": None,
                                              "last_success_age_seconds": None,
                                              "last_success_cycle_type": None,
@@ -2947,8 +3181,18 @@ class MemoryCoordinator:
         which maps it to 503 + Retry-After — the gateway sheds load instead of
         blocking a caller on the pool forever. Background tasks (outbox worker)
         catch it in their own loop and retry on the next cycle.
+
+        v0.9.74: the wait is TIMED (``postgres.pool_wait_p95_ms``). The wrapper
+        below delegates ``__aenter__``/``__aexit__`` straight through to
+        asyncpg's own acquire context, so the timeout, the exception type, and
+        the release semantics are byte-for-byte what they were — the ONLY thing
+        added is a monotonic clock read on either side of the enter, and the
+        recording itself cannot raise. A failed acquire is counted as an error,
+        never timed into the window: it lands on POOL_ACQUIRE_TIMEOUT by
+        definition and would tell you about the ceiling, not the pool.
         """
-        return self._pool.acquire(timeout=POOL_ACQUIRE_TIMEOUT)
+        return _TimedAcquire(self._pool.acquire(timeout=POOL_ACQUIRE_TIMEOUT),
+                             self._pool_wait_ring)
 
     async def _lock_for(self, entity: str) -> asyncio.Lock:
         return await self._locks.get(entity)
@@ -2966,12 +3210,24 @@ class MemoryCoordinator:
         # this function's own clamp.
         ceiling = embed_ceiling(len(text))
         for attempt in range(1, EMBED_RETRIES + 1):
+            # ⛔ ONE ATTEMPT, ONE OBSERVATION. Timing the whole retry loop would
+            # fold the backoff sleeps into "how long the embedder takes", which
+            # is a statement about our retry policy, not about the encoder.
+            _t0 = time.monotonic()
             try:
                 r = await client.post(EMBED_URL, json={"input": text, "model": "bge-m3"},
                                       timeout=ceiling)
                 r.raise_for_status()
-                return r.json()["data"][0]["embedding"]
+                vec = r.json()["data"][0]["embedding"]
+                # `safe` (not a bare call) because the recorder must tolerate a
+                # partially-constructed or stubbed owner too: an instrument that
+                # can AttributeError is an instrument that can break the embed
+                # path, which is the one thing it may never do.
+                safe(lambda: self._embed_ring.record(
+                    (time.monotonic() - _t0) * 1000.0, payload_chars=len(text)))
+                return vec
             except Exception as exc:
+                safe(lambda: self._embed_ring.record_error())
                 if attempt == EMBED_RETRIES:
                     # The encoder URL is operator-supplied and may carry
                     # userinfo; an httpx error renders the full URL, and this
@@ -3006,8 +3262,10 @@ class MemoryCoordinator:
         if not texts:
             return []
         clamped = [t[:EMBED_MAX_CHARS] for t in texts]
-        ceiling = embed_ceiling(sum(len(t) for t in clamped))
+        total_chars = sum(len(t) for t in clamped)
+        ceiling = embed_ceiling(total_chars)
         for attempt in range(1, EMBED_RETRIES + 1):
+            _t0 = time.monotonic()
             try:
                 r = await client.post(
                     EMBED_URL, json={"input": clamped, "model": "bge-m3"},
@@ -3021,8 +3279,13 @@ class MemoryCoordinator:
                         f"{len(clamped)} inputs"
                     )
                 ordered = sorted(data, key=lambda d: d.get("index", 0))
+                # A batch is ONE call and is recorded as one — its payload is
+                # the whole batch, which is what the ceiling was sized on.
+                safe(lambda: self._embed_ring.record(
+                    (time.monotonic() - _t0) * 1000.0, payload_chars=total_chars))
                 return [d["embedding"] for d in ordered]
             except Exception as exc:
+                safe(lambda: self._embed_ring.record_error())
                 if attempt == EMBED_RETRIES:
                     raise RuntimeError(
                         f"Batch embedding failed after {EMBED_RETRIES} attempts "
@@ -4901,6 +5164,48 @@ class MemoryCoordinator:
     # two methods below are its DB-facing primitives, kept separate so a test
     # can stub either one without reimplementing the gate's control flow.
 
+    #: Which refusal CODE lands in which contract counter. Several counters
+    #: aggregate a family: the contract documents one key per KIND of refusal an
+    #: operator acts on, not one per error string — "a project name was refused"
+    #: is the actionable fact, and which of the three naming rules refused it is
+    #: in the refusal the caller already received. Any code not listed here is
+    #: deliberately uncounted rather than silently folded into a neighbour.
+    _REFUSAL_COUNTER: dict[str, str] = {
+        "entity_reserved": "entity_reserved",
+        "entity_confusable": "entity_confusable",
+        "entity_unknown": "entity_unknown",
+        "axis_conflict": "axis_conflict",
+        "entities_not_allowed_on_judgement": "entities_not_allowed_on_judgement",
+        "project_unnameable": "new_project_refused",
+        "project_spelling_variant": "new_project_refused",
+        "project_confusable": "new_project_refused",
+        "domain_unnameable": "new_domain_refused",
+        "domain_spelling_variant": "new_domain_refused",
+        "domain_confusable": "new_domain_refused",
+        "domain_unknown": "new_domain_refused",
+        "domain_without_project": "new_domain_refused",
+        "domain_not_allowed_on_judgement": "new_domain_refused",
+    }
+
+    def _count_refusal(self, payload: object) -> None:
+        """Count one ingress refusal on its way out. Never raises.
+
+        Called where the refusal BECOMES A RESPONSE rather than where the dict
+        is built: a builder can be called speculatively and its result
+        discarded, and counting there would report refusals nobody ever
+        received. Reads the code off the payload the caller is about to send, so
+        the counter and the client's `error` field can never disagree.
+        """
+        try:
+            if not isinstance(payload, dict):
+                return
+            key = self._REFUSAL_COUNTER.get(payload.get("error"))
+            if key:
+                self._registry_refusals.bump(
+                    key, ts=datetime.now(timezone.utc).isoformat())
+        except Exception:
+            pass
+
     async def _entity_vocab_resolve(self, name: str) -> str | None:
         """The canonical spelling `name` resolves to via `entity_vocabulary` +
         `entity_vocab_aliases` (migration 033's `entity_normalize` match), or
@@ -6142,6 +6447,7 @@ class MemoryCoordinator:
         if is_judgement_type(metadata.get("type")):
             judgement_error = self._judgement_entities_error(metadata)
             if judgement_error is not None:
+                self._count_refusal(judgement_error)
                 return web.json_response(judgement_error, status=400)
             # ⛔ NOTHING IS ADDED TO `metadata` HERE. An earlier spelling called
             # `setdefault("entities", [])`, which PERSISTED a key the caller
@@ -6153,6 +6459,7 @@ class MemoryCoordinator:
         else:
             entity_refusal, entity_plan = await self._entity_ingress_validate(metadata)
             if entity_refusal is not None:
+                self._count_refusal(entity_refusal)
                 return web.json_response(entity_refusal, status=400)
 
         # ⛔ A JUDGEMENT'S PROJECT IS ONE VALUE, AND IT IS `decision.project`
@@ -6197,6 +6504,7 @@ class MemoryCoordinator:
         project_error = await self._project_ingress_error(
             metadata, agent_id, axis_report)
         if project_error is not None:
+            self._count_refusal(project_error)
             return web.json_response(project_error, status=400)
 
         # Disclose the rewrite the caller did not ask for. When the ingress
@@ -6242,6 +6550,7 @@ class MemoryCoordinator:
                 status=503,
             )
         if domain_error is not None:
+            self._count_refusal(domain_error)
             return web.json_response(domain_error, status=400)
 
         # Canonical top-level axis key (decision:1214): every OPERATOR-ASSERTED
@@ -6397,6 +6706,7 @@ class MemoryCoordinator:
                 prior, incoming_project, incoming_domains,
                 entity_plan.get("canonical") or [], is_judgement)
             if conflict is not None:
+                self._count_refusal(conflict)
                 return web.json_response(conflict, status=409)
 
         # ⛔ THE AXIS REGISTRY WRITES LAND HERE (P4′, v0.9.72) — after every
@@ -6450,6 +6760,7 @@ class MemoryCoordinator:
         entity_error = await self._entity_commit_mints(
             metadata, agent_id, entity_plan)
         if entity_error is not None:
+            self._count_refusal(entity_error)
             return web.json_response(entity_error, status=400)
         entities = metadata.get("entities", [])
         # S-6 (security review fact:1412): a caller must be able to see what
@@ -6497,6 +6808,7 @@ class MemoryCoordinator:
                             prior, incoming_project, incoming_domains,
                             entities, is_judgement)
                         if conflict is not None:
+                            self._count_refusal(conflict)
                             return web.json_response(conflict, status=409)
 
                     row = await conn.fetchrow(
@@ -7017,6 +7329,7 @@ class MemoryCoordinator:
         # always is) because the locks loop and the response below index it.
         judgement_error = self._judgement_entities_error(metadata)
         if judgement_error is not None:
+            self._count_refusal(judgement_error)
             return web.json_response(judgement_error, status=400)
         metadata.pop("new_entities", None)
         entities_rewritten = None
@@ -8022,6 +8335,7 @@ class MemoryCoordinator:
             if rerank_payload_chars > self._rerank_payload_chars_max:
                 self._rerank_payload_chars_max = rerank_payload_chars
             reranked = False
+            _rr_t0 = time.monotonic()
             try:
                 rr = await client.post(
                     RERANK_URL,
@@ -8040,7 +8354,11 @@ class MemoryCoordinator:
                 rr.raise_for_status()
                 ranked = rr.json()["results"]
                 reranked = True
+                safe(lambda: self._rerank_ring.record(
+                    (time.monotonic() - _rr_t0) * 1000.0,
+                    payload_chars=rerank_payload_chars))
             except Exception as exc:
+                safe(lambda: self._rerank_ring.record_error())
                 # FAILURE != IDLE. The fallback serves VECTOR order, which is a
                 # different answer from a ranked one — so it is logged, counted
                 # and declared in the response rather than dressed up as a
@@ -8410,11 +8728,18 @@ class MemoryCoordinator:
                 status=400,
             )
 
+        _t0 = time.monotonic()
         try:
             async with self._neo4j.session(default_access_mode="READ") as session:
                 result  = await session.run(cypher, **params)
                 records = await result.data()
+            safe(lambda: self._neo4j_ring.record((time.monotonic() - _t0) * 1000.0))
         except ClientError as exc:
+            # A REJECTION IS THE CALLER'S, NOT OURS — counted separately from
+            # tx_failures for exactly that reason. Rolling a syntax error into
+            # a failure count makes a user's typo read as a database outage.
+            safe(lambda: setattr(self, "_cypher_rejected_total",
+                                 self._cypher_rejected_total + 1))
             # ⛔ THE CALLER'S ERROR, NOT THE SERVER'S (v0.9.72). Every exception
             # used to become a 500 "query failed" — including a Cypher the
             # DATABASE refused: a syntax error, an unknown function, a type
@@ -8441,6 +8766,8 @@ class MemoryCoordinator:
                 status=400,
             )
         except Exception as exc:
+            safe(lambda: setattr(self, "_neo4j_tx_failures_total",
+                                 self._neo4j_tx_failures_total + 1))
             log.error("graph query error for cypher=%r: %s", cypher[:120], exc, exc_info=True)
             return web.json_response({"status": "error", "message": "query failed"}, status=500)
 
@@ -8636,19 +8963,55 @@ class MemoryCoordinator:
     # ── GET /memory/telemetry ─────────────────────────────────────────────────
 
     async def handle_telemetry(self, request: web.Request) -> web.Response:
-        """Operational telemetry snapshot — pull-based rollup of the state that
-        matters day to day: outbox health, the REM/NREM dream-cycle backlog,
-        consolidation-cycle counts, and a metadata breakdown. Each section is
-        computed independently so a partial backend failure still returns
-        whatever the others can.
+        """Operational telemetry snapshot — THE NUMBERS (the telemetry contract,
+        decision:1785): counters, gauges, percentiles and censuses, each with
+        the limit stated next to it. Every section is computed independently so
+        a partial backend failure still returns whatever the others can.
 
         This endpoint is the single read-only source of truth for the pipeline:
         a read-scoped client (e.g. the Shared Memory Monitor) can render the
         whole live dashboard from here without any direct Postgres or Neo4j
         credentials — the coordinator owns both backends and does the joins.
+
+        v0.9.74: the whole payload is CACHED for TELEMETRY_CACHE_S and served
+        stale inside that window. The monitor re-fetches live on a 30 s browser
+        timer while also polling on its own 600 s loop, so without a cache two
+        builds could overlap; `generated_at` states when the served payload was
+        actually built, and `timestamp` when it was served.
         """
-        from datetime import datetime, timezone
-        snap: dict = {"timestamp": datetime.now(timezone.utc).isoformat()}
+        snap = await self._telemetry_cached()
+        return web.json_response({"status": "success", "telemetry": snap})
+
+    async def _telemetry_cached(self) -> dict:
+        """TTL cache + single-flight around ``_build_telemetry``.
+
+        Same shape as the /health probe cache, for the same reason: the TTL
+        alone bounds SEQUENTIAL cost only, so N concurrent misses arriving
+        together would each run a full build. The second-and-later caller
+        re-checks the cache after taking the lock and finds it fresh — that
+        re-check IS the coalescing, not a redundant guard.
+        """
+        now = time.monotonic()
+        cached = self._telemetry_cache["snap"]
+        if cached is not None and now - self._telemetry_cache["ts"] < TELEMETRY_CACHE_S:
+            return {**cached, "timestamp": datetime.now(timezone.utc).isoformat()}
+        async with self._telemetry_lock:
+            now = time.monotonic()
+            cached = self._telemetry_cache["snap"]
+            if cached is not None and now - self._telemetry_cache["ts"] < TELEMETRY_CACHE_S:
+                return {**cached, "timestamp": datetime.now(timezone.utc).isoformat()}
+            snap = await self._build_telemetry()
+            self._telemetry_cache = {"snap": snap, "ts": now}
+            return {**snap, "timestamp": datetime.now(timezone.utc).isoformat()}
+
+    async def _build_telemetry(self) -> dict:
+        """Build the telemetry payload from scratch. See ``handle_telemetry``."""
+        # `generated_at` is stamped HERE and `timestamp` at SERVE time, so the
+        # two differ by exactly the cache age. The age itself is deliberately
+        # NOT a third key: a reader who wants it subtracts two timestamps it
+        # already has, and writing it would be the derived-value duplication
+        # decision:1032 forbids.
+        snap: dict = {"generated_at": datetime.now(timezone.utc).isoformat()}
 
         # Postgres — outbox status, doc + summary counts
         try:
@@ -8678,6 +9041,9 @@ class MemoryCoordinator:
             snap["postgres"] = {
                 "technical_docs": docs,
                 "technical_docs_superseded": docrow["superseded"],
+                # ⚠ MOVED (removed in 0.9.75) — see the `outbox` section below.
+                # This census OMITS a status with zero rows, so `outbox.failed`
+                # went missing exactly when it read zero.
                 "outbox": {r["status"]: r["n"] for r in outbox},
                 "outbox_failed_oldest_age_seconds": failed_age,
                 "community_summaries": {
@@ -8685,9 +9051,29 @@ class MemoryCoordinator:
                     "superseded": summ["superseded"],
                     "insight": summ["insight"],
                 },
+                # Pool gauges (0.9.74) — saturation was previously visible only
+                # as the 503 it eventually produced; these climb before that.
+                # asyncpg exposes both, so nothing here is derived twice.
+                **self._pool_gauges(),
+                # pgvector, moved off /health: it is a Postgres FACT, and it was
+                # only ever on /health because that is where the startup probe's
+                # result happened to be surfaced.
+                "pgvector": {
+                    "version": self.pgvector_version,
+                    "iterative_scan": bool(self.hnsw_iterative_scan),
+                },
             }
         except Exception as exc:
             snap["postgres"] = {"error": str(exc)}
+
+        # Outbox (0.9.74) — its own section, with EVERY status always present
+        # and the two latency numbers DERIVED from the columns the writer
+        # already stamps (created_at, applied_at) rather than duplicated into an
+        # in-memory ring that would reset on restart (decision:1032).
+        try:
+            snap["outbox"] = await self._outbox_telemetry()
+        except Exception as exc:
+            snap["outbox"] = {"error": str(exc)}
 
         # Neo4j — REM/NREM backlog for facts and decisions
         try:
@@ -8744,9 +9130,35 @@ class MemoryCoordinator:
                 "rem_passed_over_total": sum(r["n"] * r["p"] for r in attempts),
                 "rem_starved_pending":  sum(r["n"] for r in attempts
                                             if r["p"] >= REM_STARVED_THRESHOLD),
+                # Neo4j's own service numbers (0.9.74). Before this the section
+                # named after Neo4j contained only REM/NREM backlog counts —
+                # nothing about the DATABASE. `cypher_rejected_total` is the
+                # CALLER's fault and `tx_failures_total` is ours; see the
+                # increment sites for why they are never summed.
+                "query_p50_ms": self._neo4j_ring.snapshot()["p50_ms"],
+                "query_p95_ms": self._neo4j_ring.snapshot()["p95_ms"],
+                "query_window": self._neo4j_ring.snapshot()["window"],
+                "cypher_rejected_total": self._cypher_rejected_total,
+                "tx_failures_total": self._neo4j_tx_failures_total,
             }
         except Exception as exc:
             snap["neo4j"] = {"error": str(exc)}
+
+        # REM (0.9.74) — the four backlog numbers that were living under
+        # `neo4j.*` because that is where the query ran, plus the throughput the
+        # durable rem_timing clock can answer and nothing was asking.
+        try:
+            snap["rem"] = await self._rem_telemetry()
+        except Exception as exc:
+            snap["rem"] = {"error": str(exc)}
+
+        # Registry (0.9.74) — row counts and the ingress refusal counters. Every
+        # one of these gates shipped in 0.9.69 UNINSTRUMENTED: a refusal was
+        # visible to the one caller who received it and to nobody else.
+        try:
+            snap["registry"] = self._registry_telemetry()
+        except Exception as exc:
+            snap["registry"] = {"error": str(exc)}
 
         # NREM dream-cycle backlog — pending consolidation CYCLES, not raw facts.
         # One cycle per (entity, domain) cluster meeting the density threshold.
@@ -8754,10 +9166,22 @@ class MemoryCoordinator:
         # clusters; Postgres supplies the authoritative domain per pg_id (the
         # Fact node has no domain). This is the join a read-only client cannot
         # do itself — hence it lives here.
-        try:
-            snap["nrem"] = await self._nrem_cycle_counts()
-        except Exception as exc:
-            snap["nrem"] = {"error": str(exc)}
+        #
+        # ⭐ SERVED FROM THE 60 s REFRESHER, NOT COMPUTED HERE (v0.9.74, B4).
+        # MEASURED on this corpus 2026-08-28 through the gateway's own read-only
+        # graph route: the insight half is 149 SEQUENTIAL Neo4j round-trips —
+        # 8 gating (project, domain) groups at density>=3, each walked over 9-26
+        # BFS layers — and the walk is unbounded by construction (insight_gate,
+        # I3: no hop cap, no edge cap, termination by fixpoint). A per-request
+        # cap would not have been honest either: the number of layers is a
+        # property of the corpus, not a budget. `as_of` states when it was
+        # computed so a reader is never guessing how old it is.
+        dep = self._dependency_health
+        nrem = dep.get("nrem")
+        if isinstance(nrem, dict):
+            snap["nrem"] = {**nrem, "as_of": dep.get("as_of")}
+        else:
+            snap["nrem"] = {"error": "not yet computed", "as_of": dep.get("as_of")}
 
         # Metadata breakdown — drill-down distributions a dashboard renders
         # (record types, agents, sources, domains, summary kinds). Cheap GROUP
@@ -8888,10 +9312,45 @@ class MemoryCoordinator:
         # I/O, so no try/except: same reset-on-restart contract as the
         # existing _llm_routed counters. Detail lives in the separate
         # credential-events log; this is the operator-attention SIGNAL only.
+        # ⚠ MOVED to `llm.faults` (removed in 0.9.75) — dual-emitted here so the
+        # monitor migrates without a flag day.
         snap["llm_faults"] = _llm_faults_snapshot()
-        snap["credentials"] = _credentials_snapshot()
+        snap["credentials"] = {
+            **_credentials_snapshot(),
+            # The limit next to the number it bounds — the contract's own rule.
+            "token_verify_warn_per_min": TOKEN_VERIFY_WARN_PER_MIN,
+        }
 
-        return web.json_response({"status": "success", "telemetry": snap})
+        # ── In-memory sections (0.9.74) — no I/O, so no try/except needed on
+        # the calls themselves; the assembly is guarded anyway because a
+        # telemetry section must never be the reason the endpoint 500s.
+        snap["encoders"] = safe(self._encoders_telemetry, default={"error": "unavailable"})
+        snap["gateway"] = safe(self._gateway_telemetry, default={"error": "unavailable"})
+        snap["clients"] = {"versions_seen": dict(_client_versions_seen)}
+
+        # ── The blocks that live in hive_mind_proxy's module state ───────────
+        # The whole llm_* family, the capability/capacity snapshots and the
+        # resolved config were only ever on /health, which is the 30-second
+        # endpoint every client hits on every call — ~130 of its 193 keys were
+        # ANALYTICS a monitor drawer reads, not liveness. They belong here.
+        # Delivered through a provider callback (see telemetry_extras_provider)
+        # because hive_mind_proxy imports this module, so importing back would
+        # be a cycle.
+        if self.telemetry_extras_provider is not None:
+            extras = safe(self.telemetry_extras_provider, default=None)
+            if isinstance(extras, dict):
+                snap.update(extras)
+
+        # gpu_probe + the two identity probes, moved off /health. Read from the
+        # coordinator's OWN cached snapshot — the same value /health's
+        # consolidation block carries, not a second probe.
+        snap["gpu_probe"] = self._consolidation_health.get("gpu_probe")
+        snap["axes"] = {
+            "project_identity": self._consolidation_health.get("project_identity"),
+            "domain_identity": self._consolidation_health.get("domain_identity"),
+        }
+
+        return snap
 
     # ── Spine coverage (decision 559) ─────────────────────────────────────────
 
@@ -9056,10 +9515,20 @@ class MemoryCoordinator:
 
     async def _latency_telemetry(self) -> dict:
         """Latency rollup for the monitor, from the DURABLE technical_docs.rem_timing
-        (survives outbox deletion — migration 019). REM is the anchor because it is
-        UNGATED: every saved fact passes through it (fact 567), so this is unbiased and
-        reflects model + hardware. Two REM percentile pairs, grouped by model so the
-        series is a model-evolution axis (decision 571):
+        (survives outbox deletion — migration 019).
+
+        ⚠ THIS IS A GATED SUBSET SINCE v0.9.66, and this docstring claimed the
+        opposite for eight releases. REM was chosen as the anchor because it was
+        UNGATED — every saved fact passed through it (fact 567) — but 0.9.66
+        made short records SKIP THE MODEL entirely, so a row only carries
+        rem_timing if its record was long enough to be sent. The percentiles
+        below therefore describe the records REM actually ran on, which is a
+        LONGER population than the corpus average, and they are not comparable
+        with a pre-0.9.66 series. They still reflect model + hardware for that
+        population, which is what the by_model axis is for.
+
+        Two REM percentile pairs, grouped by model so the series is a
+        model-evolution axis (decision 571):
           service_ms   = pure inference = MODEL + HARDWARE, load-invariant.
           contention_ms= queue behind a busy backend = CAPACITY (→ 0 as the pool grows).
         A row is included whenever it has a wall_ms, not only when it carries the
@@ -9652,6 +10121,99 @@ class MemoryCoordinator:
             "insight_reconciliation_stuck": stuck_row_count,
         }
 
+    # ── The dependency snapshot behind /health (v0.9.74, decision:1785) ───────
+
+    async def _probe_postgres(self) -> dict:
+        """``SELECT 1``. Postgres liveness had NO representation on /health: a
+        dead database read `ok` right up until the first save 500'd, because the
+        only Postgres signal was `pgvector`, probed once at startup and never
+        again. Runs in the 60 s refresher, never at request time."""
+        try:
+            async with self._acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            return {"state": "ok", "reason": None}
+        except Exception as exc:
+            return {"state": "down", "reason": type(exc).__name__}
+
+    async def _probe_neo4j(self) -> dict:
+        """``RETURN 1``. Neo4j had no liveness key at all — not even a stale
+        one."""
+        try:
+            async with self._neo4j.session(default_access_mode="READ") as session:
+                await (await session.run("RETURN 1 AS ok")).single()
+            return {"state": "ok", "reason": None}
+        except Exception as exc:
+            return {"state": "down", "reason": type(exc).__name__}
+
+    async def _outbox_census(self) -> dict:
+        """Outbox counts + ages, in ONE query, with EVERY status present.
+
+        ⛔ ZERO IS A NUMBER; ABSENCE IS NOT. The pre-0.9.74 census was a
+        `GROUP BY status`, so a status with no rows vanished from the payload —
+        `outbox.failed` was missing exactly when it was zero, which is the one
+        state a consumer most needs to be able to READ rather than infer. The
+        counts below are `FILTER` aggregates over one scan, so every key is
+        always there.
+        """
+        async with self._acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT"
+                "  count(*) FILTER (WHERE status='pending')::int      AS pending,"
+                "  count(*) FILTER (WHERE status='in_progress')::int  AS in_progress,"
+                "  count(*) FILTER (WHERE status='applied')::int      AS applied,"
+                "  count(*) FILTER (WHERE status='failed')::int       AS failed,"
+                "  count(*) FILTER (WHERE status='rem_reviewed')::int AS rem_reviewed,"
+                "  EXTRACT(EPOCH FROM now() - min(created_at)"
+                "    FILTER (WHERE status='failed'))::int             AS oldest_failed_age_s,"
+                "  EXTRACT(EPOCH FROM now() - min(created_at)"
+                "    FILTER (WHERE status IN ('pending','in_progress')))::int"
+                "                                                     AS oldest_pending_age_s"
+                " FROM neo4j_outbox"
+            )
+        return dict(row)
+
+    async def _registry_census(self) -> dict:
+        """Row counts for the three registries the axes resolve against. Nothing
+        reported these: `complete: true` on the identity probes says the graph
+        and the registry AGREE, which is equally true of two empty stores."""
+        async with self._acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT (SELECT count(*) FROM projects)::int AS projects,"
+                "       (SELECT count(*) FROM domains)::int  AS domains,"
+                "       (SELECT count(*) FROM aliases)::int  AS aliases"
+            )
+        return dict(row)
+
+    async def _rem_dead_letter_count(self) -> dict:
+        """How many records REM has GIVEN UP on. One cheap Neo4j aggregate.
+
+        Deliberately narrower than `_rem_telemetry`: /health needs a VERDICT
+        ("is REM losing records"), and the rule of thumb puts the numbers on
+        telemetry. Computing the whole REM section here to answer one boolean
+        would drag a Postgres query into the health refresher for nothing.
+        """
+        async with self._neo4j.session(default_access_mode="READ") as session:
+            rec = await (await session.run(
+                f"MATCH (n) WHERE (n:{ONT.fact} OR n:{ONT.decision}"
+                f"                 OR n:{ONT.retrospective})"
+                f"   AND coalesce(n.rem_processed,false) = false"
+                f"   AND coalesce(n.superseded,false) = false"
+                f"   AND n.pg_id IS NOT NULL"
+                f"   AND coalesce(n.rem_attempts,0) >= $cap"
+                f" RETURN count(*) AS n", cap=REM_MAX_ATTEMPTS
+            )).single()
+        return {"dead_lettered": (rec["n"] if rec else 0) or 0}
+
+    def dependency_snapshot(self) -> dict:
+        """The cached, DB-FREE inputs /health derives its dependency enums from.
+
+        Mirrors ``consolidation_health()``'s contract exactly: refreshed in the
+        background every CONSOLIDATION_HEALTH_REFRESH_SEC, read synchronously,
+        and ``fresh: false`` when the last pass failed — which is a statement
+        about the SNAPSHOT, never a verdict about the system.
+        """
+        return dict(self._dependency_health)
+
     def consolidation_health(self) -> dict:
         """Cached compact snapshot for /health (DB-free, refreshed in background).
         Returns {stalled, last_outcome, last_success_age_seconds, inference_busy,
@@ -9733,6 +10295,56 @@ class MemoryCoordinator:
                 # prior inference_busy rather than inventing "idle" on failure.
                 log.warning("consolidation health refresh failed: %s", exc)
                 self._consolidation_health = {**self._consolidation_health, "fresh": False}
+
+            # ── The dependency snapshot (v0.9.74) ────────────────────────────
+            # Its own try/except, NOT folded into the block above: a failing
+            # Postgres probe must not blank the consolidation snapshot, and a
+            # failing consolidation rollup must not blank the liveness enums.
+            # Each sub-probe is guarded on its own for the same reason — this is
+            # the block that answers "is anything up", and it is worth nothing
+            # if one dead component can take the whole answer down with it.
+            try:
+                postgres = await self._probe_postgres()
+                neo4j = await self._probe_neo4j()
+                try:
+                    outbox = await self._outbox_census()
+                except Exception:
+                    outbox = None
+                try:
+                    registry = await self._registry_census()
+                except Exception:
+                    registry = None
+                try:
+                    rem = await self._rem_dead_letter_count()
+                except Exception:
+                    rem = None
+                try:
+                    # ⭐ MOVED OUT OF THE REQUEST PATH (B4, measured 2026-08-28
+                    # on this corpus): the insight walk is 149 SEQUENTIAL Neo4j
+                    # round-trips — 8 gating groups at density>=3, each walked
+                    # over 9-26 BFS layers — and the walk is unbounded by
+                    # construction (I3: no hop cap, no edge cap). It grows with
+                    # the corpus, so no per-request cap would be honest either.
+                    # Computed here, served from cache with `as_of`.
+                    nrem = await self._nrem_cycle_counts()
+                except Exception as exc:
+                    nrem = {"error": str(exc)}
+                self._dependency_health = {
+                    "postgres": postgres,
+                    "neo4j": neo4j,
+                    "outbox": outbox,
+                    "registry": registry,
+                    "rem": rem,
+                    "nrem": nrem,
+                    "as_of": datetime.now(timezone.utc).isoformat(),
+                    "fresh": True,
+                }
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("dependency health refresh failed: %s", exc)
+                self._dependency_health = {**self._dependency_health, "fresh": False}
+
             try:
                 await asyncio.sleep(CONSOLIDATION_HEALTH_REFRESH_SEC)
             except asyncio.CancelledError:
@@ -9849,6 +10461,184 @@ class MemoryCoordinator:
             "fact_threshold": ONT.density_threshold,
         }
 
+    async def _outbox_telemetry(self) -> dict:
+        """The outbox's own numbers (0.9.74).
+
+        ⛔ EVERY STATUS IS ALWAYS PRESENT, 0 WHEN ZERO — see `_outbox_census`,
+        which this shares its shape with, for why absence was the defect.
+
+        Apply latency and drain rate are DERIVED from `created_at`/`applied_at`,
+        which `_apply_outbox_row` already stamps: adding an in-memory ring would
+        write a value a reader can reach by query (decision:1032), and it would
+        be the worse copy — a ring resets on restart, the columns do not. The
+        percentile window is 24 h because applied rows are DELETED on NREM
+        consolidation, so an unbounded percentile silently measures only
+        whatever the last sweep happened to leave behind.
+        """
+        census = await self._outbox_census()
+        async with self._acquire() as conn:
+            lat = await conn.fetchrow(
+                "SELECT count(*)::int AS n,"
+                "  percentile_cont(0.5)  WITHIN GROUP ("
+                "    ORDER BY EXTRACT(EPOCH FROM (applied_at - created_at))) AS p50,"
+                "  percentile_cont(0.95) WITHIN GROUP ("
+                "    ORDER BY EXTRACT(EPOCH FROM (applied_at - created_at))) AS p95,"
+                "  count(*) FILTER (WHERE applied_at >= now() - interval '1 minute')::int"
+                "    AS applied_last_min"
+                " FROM neo4j_outbox"
+                " WHERE applied_at IS NOT NULL AND created_at IS NOT NULL"
+                "   AND applied_at >= now() - interval '24 hours'"
+            )
+
+        def _r(v):
+            return round(float(v), 3) if v is not None else None
+
+        return {
+            "pending": census["pending"] + census["in_progress"],
+            "applied": census["applied"],
+            "failed": census["failed"],
+            "rem_reviewed": census["rem_reviewed"],
+            "oldest_failed_age_s": census["oldest_failed_age_s"],
+            "oldest_pending_age_s": census["oldest_pending_age_s"],
+            "apply_latency_p50_s": _r(lat["p50"]),
+            "apply_latency_p95_s": _r(lat["p95"]),
+            "apply_latency_window": lat["n"],
+            # None, not 0.0, when no row has been applied in 24 h: a rate over
+            # an empty window is not a measured zero.
+            "drain_rate_per_min": (float(lat["applied_last_min"])
+                                   if lat["n"] else None),
+            "age_limit_s": OUTBOX_AGE_WARN_S,
+        }
+
+    async def _rem_telemetry(self) -> dict:
+        """REM's own section (0.9.74).
+
+        The four backlog numbers moved here from `neo4j.*`, where they lived
+        only because that is the query that produced them. `throughput_per_hour`
+        is new and needs no new writer: `technical_docs.rem_timing` already
+        carries a `ts` (unix epoch seconds, see dream_telemetry.call_timing_
+        summary), so the rate is a count over that column.
+
+        ⚠ `degeneration_firings` IS NULL AND WILL BE UNTIL SOMETHING DURABLE
+        RECORDS IT. REM runs in a SEPARATE PROCESS (rem_loop.py, spawned by the
+        gateway), and its anti-degeneration detector writes only a log line — no
+        column, no counter this process can see. Reporting 0 would say "it never
+        fired", which is a claim this gateway cannot make. Null says what is
+        true: not observable from here.
+        """
+        async with self._acquire() as conn:
+            row = await conn.fetchrow(
+                # The regex guard makes the cast SAFE: `ts` is written by one
+                # code path as a float, but this column is JSONB on a table with
+                # rows older than that writer, and one unparseable value would
+                # abort the whole query rather than skip a row.
+                "SELECT count(*)::int AS n FROM technical_docs"
+                " WHERE rem_timing IS NOT NULL"
+                "   AND rem_timing->>'ts' ~ '^[0-9]+(\\.[0-9]+)?$'"
+                "   AND (rem_timing->>'ts')::double precision"
+                "       >= EXTRACT(EPOCH FROM now()) - 3600"
+            )
+            attempts = None
+        async with self._neo4j.session(default_access_mode="READ") as session:
+            ares = await (await session.run(
+                f"MATCH (n) WHERE (n:{ONT.fact} OR n:{ONT.decision}"
+                f"                 OR n:{ONT.retrospective})"
+                f"   AND coalesce(n.rem_processed,false) = false"
+                f"   AND coalesce(n.superseded,false) = false"
+                f"   AND n.pg_id IS NOT NULL"
+                f" RETURN coalesce(n.rem_attempts,0) AS a,"
+                f"        coalesce(n.rem_passed_over,0) AS p, count(*) AS n"
+            )).data()
+            attempts = ares
+        return {
+            "dead_lettered": sum(r["n"] for r in attempts if r["a"] >= REM_MAX_ATTEMPTS),
+            "failing": sum(r["n"] for r in attempts if 0 < r["a"] < REM_MAX_ATTEMPTS),
+            "passed_over": sum(r["n"] * r["p"] for r in attempts),
+            "starved_pending": sum(r["n"] for r in attempts
+                                   if r["p"] >= REM_STARVED_THRESHOLD),
+            "max_attempts": REM_MAX_ATTEMPTS,
+            "throughput_per_hour": float(row["n"]),
+            "degeneration_firings": None,
+        }
+
+    def _registry_telemetry(self) -> dict:
+        """Registry row counts + ingress refusal counters (0.9.74).
+
+        The counts come off the SAME cached census /health's registry
+        dependency reads — one query per refresher pass, not one per telemetry
+        request. The refusal counters are in-process and reset on restart, the
+        same contract every other counter in this payload carries.
+        """
+        census = self._dependency_health.get("registry") or {}
+        return {
+            "projects": census.get("projects"),
+            "domains": census.get("domains"),
+            "aliases": census.get("aliases"),
+            "read_failures_total": self._axis_registry_read_failures,
+            "refusals": self._registry_refusals.snapshot(),
+        }
+
+    def _pool_gauges(self) -> dict:
+        """asyncpg pool size / free / in-use, or None for each.
+
+        ⛔ THE TYPE IS CHECKED, not just the call. `_pool` is a mock in every
+        unit test, and a bare `safe(self._pool.get_size)` returns the MOCK —
+        which is not an exception, so nothing catches it, and it reaches
+        `json.dumps` as a TypeError at serialise time: the section's own
+        try/except is long past by then and the WHOLE endpoint 500s. A gauge
+        that cannot be read is None; None is a documented value.
+        """
+        def _int(fn):
+            v = safe(fn, default=None)
+            return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+        size = _int(getattr(self._pool, "get_size", None))
+        free = _int(getattr(self._pool, "get_idle_size", None))
+        wait = self._pool_wait_ring.snapshot()
+        return {
+            "pool_size": size,
+            "pool_free": free,
+            # Derived from the two above ONLY when both are real numbers — a
+            # subtraction over a None is not a zero.
+            "pool_in_use": (size - free) if (size is not None and free is not None) else None,
+            "pool_wait_p50_ms": wait["p50_ms"],
+            "pool_wait_p95_ms": wait["p95_ms"],
+            "pool_wait_window": wait["window"],
+        }
+
+    def _encoders_telemetry(self) -> dict:
+        """Per-CALL embed/rerank latency (0.9.74).
+
+        Before this the only encoder timing anywhere was the 600 s capability
+        probe — a PROJECTION from one synthetic payload, not an observation of
+        what real callers experienced. These are the real calls.
+        """
+        return {
+            "embed": self._embed_ring.snapshot(),
+            "rerank": self._rerank_ring.snapshot(),
+            "limit_ms": ENCODER_LATENCY_WARN_MS,
+        }
+
+    @staticmethod
+    def _gateway_telemetry() -> dict:
+        """Request rate, status split, latency percentiles, in-flight (0.9.74).
+
+        The per-request latency this aggregates has existed since the audit line
+        did; it went to the JSONL and was aggregated nowhere, so "what is this
+        gateway's p95" could only be answered by parsing a log file.
+        """
+        ring = _gateway_latency.snapshot()
+        return {
+            "requests_total": _gateway_requests_total,
+            "by_status": dict(_gateway_by_status),
+            "latency_p50_ms": ring["p50_ms"],
+            "latency_p95_ms": ring["p95_ms"],
+            "latency_window": ring["window"],
+            "inflight": _inflight,
+            "inflight_max": GATEWAY_INFLIGHT_MAX,
+            "shed_503_total": _gateway_shed_503_total,
+        }
+
     async def _metadata_breakdown(self) -> dict:
         """Distribution counts a dashboard renders, sourced server-side so a
         read-only client needs no direct Postgres access.
@@ -9866,9 +10656,21 @@ class MemoryCoordinator:
                 "SELECT COALESCE(metadata->>'source','(none)') AS key,"
                 " count(*)::int AS count FROM technical_docs GROUP BY 1 ORDER BY count DESC LIMIT 12"
             )
-            domains = await conn.fetch(
+            projects = await conn.fetch(
                 f"SELECT COALESCE({PROJECT_SQL}, '(none)') AS key,"
                 " count(*)::int AS count FROM technical_docs GROUP BY 1 ORDER BY count DESC LIMIT 12"
+            )
+            # ⚠ THE REAL DOMAIN DISTRIBUTION (0.9.74). `domains` is a JSON ARRAY
+            # on the record — one record belongs to several sections — so the
+            # counts here SUM TO MORE than the record count, unlike every other
+            # breakdown in this payload. That is the axis, not a defect.
+            domains = await conn.fetch(
+                "SELECT d AS key, count(*)::int AS count"
+                "  FROM technical_docs,"
+                "       LATERAL jsonb_array_elements_text("
+                "         CASE WHEN jsonb_typeof(metadata->'domains') = 'array'"
+                "              THEN metadata->'domains' ELSE '[]'::jsonb END) AS d"
+                " GROUP BY 1 ORDER BY count DESC LIMIT 12"
             )
             summaries = await conn.fetch(
                 "SELECT COALESCE(metadata->>'kind','community_summary') AS kind,"
@@ -9881,6 +10683,12 @@ class MemoryCoordinator:
             "record_types": kv(record_types),
             "agents": kv(agents),
             "sources": kv(sources),
+            # ⚠ `domains` CHANGED MEANING IN 0.9.74 (enumerated in
+            # telemetry_contract.MEANING_CHANGES, per fact:1626). It used to
+            # carry the PROJECT distribution — it was built from PROJECT_SQL,
+            # under a name that said domain. The project distribution now has
+            # its own correct name; `domains` finally means domains.
+            "projects": kv(projects),
             "domains": kv(domains),
             "summaries": [
                 {"kind": r["kind"], "superseded": r["superseded"], "active": r["active"]}
@@ -9917,12 +10725,22 @@ class MemoryCoordinator:
               was previously silently diluted by (~54% of entities_total on this
               graph, live-measured 2026-07-22). Kept as a separate field rather
               than redefining entities_total, which other consumers may depend on.
-          alias_edges / alias_covered_entities — populate once ADR-017 ships alias
-              edges; 0 until then (an honest gap, the metric to watch climb)
           top_hubs         — highest-degree entities, the consolidation backbone
 
         The over-merge RISK behind these (which singletons are really the same
         concept) is the offline harness's job; this just sizes the problem live.
+
+        ⛔ REMOVED IN 0.9.74 — `alias_edges`, `alias_covered_entities`,
+        `alias_components`, `largest_alias_component`. Not moved: REMOVED. The
+        first two counted an `ALIASES` relationship NO CODE PATH HAS EVER
+        WRITTEN, and the second two read `Entity.alias_component`, whose only
+        writer (a gds.wcc caller) was retired. All four had therefore read 0
+        since they shipped, and a metric that can only ever read 0 does not
+        report an empty graph — it reports nothing, while looking like a
+        measurement. The name also collided with the LIVE alias tables
+        (`aliases`, `project_aliases`, `domain_aliases`), which is worse than
+        useless: a reader seeing `alias_edges: 0` beside a registry with real
+        aliases in it concludes the alias layer is broken.
         """
         async with self._neo4j.session() as session:
             deg = await (await session.run(
@@ -9936,19 +10754,6 @@ class MemoryCoordinator:
                 f"  sum(CASE WHEN mentions = 1 THEN 1 ELSE 0 END) AS singletons, "
                 f"  sum(CASE WHEN mentions >= 1 THEN 1 ELSE 0 END) AS genuinely_referenced"
             )).single()
-            aliases = await (await session.run(
-                f"MATCH ()-[r:{self._ALIAS_REL}]-() RETURN count(DISTINCT r) AS edges"
-            )).single()
-            covered = await (await session.run(
-                f"MATCH (e:{ONT.entity})-[:{self._ALIAS_REL}]-() RETURN count(DISTINCT e) AS c"
-            )).single()
-            # Alias-component distribution (gds.wcc stamps Entity.alias_component;
-            # singletons get their own id, so a group is a component of size > 1).
-            comp = await (await session.run(
-                f"MATCH (e:{ONT.entity}) WHERE e.alias_component IS NOT NULL "
-                f"WITH e.alias_component AS c, count(*) AS sz WHERE sz > 1 "
-                f"RETURN count(*) AS groups, coalesce(max(sz), 0) AS largest"
-            )).single()
             hubs = await (await session.run(
                 f"MATCH (e:{ONT.entity})<-[:{ONT.entity_link}]-(n) "
                 f"  WHERE n.pg_id IS NOT NULL AND coalesce(n.superseded,false) = false "
@@ -9961,10 +10766,6 @@ class MemoryCoordinator:
             "unmentioned_entities": deg["unmentioned"] or 0,
             "singleton_entities": deg["singletons"] or 0,
             "genuinely_referenced_entities": deg["genuinely_referenced"] or 0,
-            "alias_edges": aliases["edges"] or 0,
-            "alias_covered_entities": covered["c"] or 0,
-            "alias_components": comp["groups"] or 0,
-            "largest_alias_component": comp["largest"] or 0,
             "top_hubs": [{"name": h["name"], "degree": h["degree"]} for h in hubs],
         }
 
