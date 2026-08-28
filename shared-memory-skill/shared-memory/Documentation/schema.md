@@ -210,21 +210,13 @@ Postgres (Neo4j remains the structure tier); reuses the `technical_docs` HNSW pa
 
 **Indexes:** `entity_embeddings_embedding_idx` — `hnsw (embedding vector_cosine_ops)`.
 
-### `alias_adjudications` — alias verdict ledger (ADR-017, migration 014)
-
-Per-pair `alias` / `distinct` verdicts from the writer — both the audit trail (method / confidence / signals /
-rationale, revocable) and the idempotency cache: a sweep skips pairs already judged, so the LLM is never re-asked.
-
-| Column | Type | Notes |
-|---|---|---|
-| `name_a`, `name_b` | `TEXT` | Canonical order `name_a < name_b`; `UNIQUE(name_a, name_b)` |
-| `verdict` | `TEXT` | `alias` \| `distinct` |
-| `method` | `TEXT` | `normalized_exact` (auto-accept) \| `llm` |
-| `confidence` | `REAL` | 0..1 (llm) or 1.0 (normalized-exact) |
-| `cosine`, `lexical_jaccard`, `shared_facts`, `domain_disjoint` | `REAL`/`INT`/`BOOLEAN` | Signals recorded at adjudication |
-| `rationale` | `TEXT` | Short LLM justification (audit) |
-
-**Indexes:** `alias_adjudications_verdict_idx` on `(verdict)`.
+> **`alias_adjudications` is gone (migration 040).** Migration 014 built it as the
+> ADR-017 per-pair verdict ledger — the audit trail and don't-re-ask cache of the
+> entity alias writer. Nothing has written to it since v0.8.60, and its one reader
+> (the `alias` block of `/memory/telemetry`) was removed with it, so it was
+> reporting a frozen census of a retired layer as current state. ⚠ Not to be
+> confused with **`aliases`**, which stays: that is the live axis-alias identity
+> table `project_aliases.alias_id` and `domain_aliases.alias_id` point at.
 
 ---
 
@@ -397,6 +389,17 @@ function `IMMUTABLE`, which is false; an index built on a false immutability
 claim is silently wrong rather than loudly broken. A trigger keeps the two
 namespaces disjoint **within a project**, not globally — the same spelling may
 legitimately be canonical in one project and an alias in another.
+
+**No trigram index on either registry's `name` (migration 039).** `projects` and
+`project_domains` each carried a `gin_trgm_ops` index for the proposal and
+confusable lookups, and neither was ever used: those queries filter on
+`similarity(name, $1) >= <floor>`, and a GIN trigram index answers the `%`
+similarity **operator**, not a function call compared against a literal — so the
+planner has always chosen a sequential scan (measured: sub-millisecond, on
+two-digit registries). The `pg_trgm` **extension** stays; `similarity()` comes
+from it and every proposal lookup calls it. If either registry ever grows to
+where the scan matters, the fix is the `%` operator with
+`pg_trgm.similarity_threshold` — not these indexes back.
 
 **Who controls the axis.** A **fact** and a **decision** each assert their own
 project and domain. A **retrospective** asserts neither: both come from the
