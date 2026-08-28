@@ -599,11 +599,31 @@ def derived_belonging_cypher(hops: int = 4) -> str:
       asserts one at ingress, so this resolves whenever the graph is complete.
       No project, no rows: the answer is "not knowable from the graph", never a
       name-keyed guess.
-    * **Domains = own ∪ grounded.** The sections asserted on the record OR on
-      its anchor, union the sections of the non-superseded FACTS reachable from
-      either through `GROUNDING_RELATIONS` up to `hops` deep. Multi-hop because
-      a decision can ground on another judgement, and the facts are what carry
-      the axis.
+    * **Domains = own ∪ judged ∪ grounded.** Three collections, all bound to
+      the same project node:
+
+        `own`       the sections asserted on the record or on its anchor
+        `judged`    the sections asserted on any DECISION or RETROSPECTIVE
+                    reached on the grounding walk
+        `grounded`  the sections of the non-superseded FACTS reachable the
+                    same way
+
+      Multi-hop because a decision can ground on another judgement, and the
+      facts are what carry the axis.
+
+      ⛔ `judged` IS NOT AN OPTIMISATION, IT IS A MISSING HALF (v0.9.72,
+      `decision:1756` (4)). The walk always went THROUGH intermediate
+      judgements to reach facts, and collected nothing from them — yet a
+      decision's own sections are OPERATOR-ASSERTED, the strongest signal on
+      the path. Measured live: retro 1694 derived `[]` while decision 1678, on
+      its own grounding walk, asserts `architecture`. A judgement that rests on
+      a judgement was reading only the leaves of its evidence.
+
+      ⚠ The three are UNIONED AS SETS. Each `collect` is DISTINCT, so no list
+      repeats a name internally, and each list is anti-joined against the ones
+      before it, so a section asserted on D2 and also carried by a fact appears
+      exactly ONCE. A plain `+` would not: list concatenation in Cypher does
+      not dedupe.
     * ⛔ **DERIVATION NEVER CROSSES A PROJECT BOUNDARY.** A domain is a SECTION
       OF A PROJECT, so a B-project decision grounded on A-project facts inherits
       none of A's sections. Both halves are bound to the SAME `:Project` NODE
@@ -634,13 +654,24 @@ def derived_belonging_cypher(hops: int = 4) -> str:
         f" OPTIONAL MATCH (n)-[:{ONT.domain_of}]->(od:{ONT.domain})"
         f"                  -[:{ONT.project_of}]->(p)"
         f" WITH wanted, p, anchors, collect(DISTINCT od.name) AS own"
+        # Judged sections: what the JUDGEMENTS on the grounding walk assert.
+        # An intermediate decision's sections are operator-asserted, exactly
+        # like the anchor's own, so the walk stops passing through them.
+        f" UNWIND anchors AS n1"
+        f" OPTIONAL MATCH (n1)-[:{rels}*1..{hops}]->(m)"
+        f"                   -[:{ONT.domain_of}]->(jd:{ONT.domain})"
+        f"                   -[:{ONT.project_of}]->(p)"
+        f"   WHERE m:{ONT.decision} OR m:{ONT.retrospective}"
+        f" WITH wanted, p, anchors, own, collect(DISTINCT jd.name) AS judged"
         # Grounded sections: the live facts either anchor rests on.
         f" UNWIND anchors AS n2"
         f" OPTIONAL MATCH (n2)-[:{rels}*1..{hops}]->(f:{ONT.fact})"
         f"                   -[:{ONT.domain_of}]->(gd:{ONT.domain})"
         f"                   -[:{ONT.project_of}]->(p)"
         f"   WHERE coalesce(f.superseded, false) = false"
-        f" WITH wanted, p, own, collect(DISTINCT gd.name) AS grounded"
+        f" WITH wanted, p, own, judged, collect(DISTINCT gd.name) AS grounded"
         f" RETURN wanted AS anchor_pg_id, p.name AS project,"
-        f"        own + [x IN grounded WHERE NOT x IN own] AS domains"
+        f"        own + [x IN judged WHERE NOT x IN own]"
+        f"            + [x IN grounded WHERE NOT x IN own AND NOT x IN judged]"
+        f"        AS domains"
     )
