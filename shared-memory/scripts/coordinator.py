@@ -685,8 +685,9 @@ def _supersession_target_error(pg_id: int, record_type: object) -> str | None:
 
     A retrospective is refused for the mirror-image reason: it is an observation
     dated to when it was made, so a changed outcome is a NEW retrospective, not
-    an edit of the old one. Entity inheritance already prefers the latest live
-    verdict, so nothing needs retracting for the newer judgement to take effect.
+    an edit of the old one. The latest live retrospective is simply read as the
+    current verdict, so nothing needs retracting for the newer judgement to take
+    effect.
 
     Both refusals also close a real corruption: the supersede mirror MERGEs its
     target as a :Fact by pg_id, so superseding a decision or retrospective minted

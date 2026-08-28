@@ -611,9 +611,9 @@ Records accumulate during work. In idle time, two passes — named for the sleep
 imitate — turn the pile into something structured.
 
 **REM, the enrichment pass,** reads new records and summarises them, writing the compact form
-later passes build on. It writes no edges and no labels: entities, relationships and the
-project/domain a record belongs to are fixed once, at the moment the record is saved, by the
-person who saved it — never added to or re-proposed afterward.
+later passes build on. It writes no edges and no labels: entities, the entity relationships that
+name what a record is about, and the project/domain a record belongs to are fixed once, at the
+moment the record is saved, by the person who saved it — never added to or re-proposed afterward.
 
 **NREM, the consolidation pass,** builds two syntheses:
 
