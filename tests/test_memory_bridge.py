@@ -78,7 +78,14 @@ async def test_search_and_rerank_coordinator_unreachable():
 # _request_headers() always advertises the client API_VERSION; the Bearer token
 # is added only when AGENT_TOKEN is set.
 
-_VER = {memory_bridge.CLIENT_VERSION_HEADER: str(memory_bridge.API_VERSION)}
+# v0.9.74: every request now carries TWO version headers. The wire API_VERSION
+# says which protocol this client speaks; the BUILD header says which release it
+# is — two clients can speak api_version 4 while one is forty releases behind on
+# behaviour, and only the second header can tell them apart. The gateway counts
+# it as `clients.versions_seen`, which is the first observation of client skew
+# either side has ever had.
+_VER = {memory_bridge.CLIENT_VERSION_HEADER: str(memory_bridge.API_VERSION),
+        memory_bridge.CLIENT_BUILD_HEADER: memory_bridge.VERSION}
 
 
 def test_request_headers_version_only_when_no_token(monkeypatch):

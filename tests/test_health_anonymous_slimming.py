@@ -91,6 +91,14 @@ def test_anonymous_caller_gets_exactly_the_slim_shape(monkeypatch):
 
     proxy = g.AsyncHiveMindProxy()
     proxy.session = _HealthProbeSession()
+    # RE-RULED at v0.9.74: `status` is now DERIVED from `dependencies`, and the
+    # two daemons are dependencies. In this process no daemon is spawned, so
+    # both PID flags are False and the honest verdict would be `down` — which is
+    # correct behaviour and nothing to do with what this test is about (the slim
+    # SHAPE an anonymous caller receives). Declare them healthy so the assertion
+    # below still pins `ok` rather than being weakened to "some enum value".
+    g._daemon_healthy = True
+    g._rem_healthy = True
     req = _health_request()  # no Authorization header at all
     req.app = {"proxy": proxy}
 
@@ -181,9 +189,17 @@ def test_degraded_status_code_preserved_for_anonymous_caller(monkeypatch):
     req.app = {"proxy": proxy}
 
     resp = asyncio.run(g.handle_health(req))
+    # ⛔ THE 503 IS THE POINT AND IT IS UNCHANGED. v0.9.74 widened what the ENUM
+    # can say (a third value, `down`) without widening what the CODE means: 503
+    # still fires if and only if an encoder is down, which is the save mandate.
     assert resp.status == 503
     body = json.loads(resp.body.decode())
-    assert body["status"] == "degraded"
+    # RE-RULED at v0.9.74: an encoder that does not answer is `down`, not
+    # `degraded`. `degraded` now means "usable but not right" — a slow encoder,
+    # a failing outbox row, a raised warning — and reporting a dead critical
+    # backend with the same word as a slow one was the imprecision that made the
+    # enum unable to carry the new dependency states at all.
+    assert body["status"] == "down"
 
 
 # ── SEC-A5-03: auth-OFF install keeps the full payload for EVERYONE ─────────

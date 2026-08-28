@@ -5,6 +5,103 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.74] — 2026-08-28
+
+### The telemetry contract — `/health` answers "can I use it and what to expect", `/memory/telemetry` carries the numbers, logs carry the events
+
+Ruled as `decision:1785` at v0.9.73 after measuring what each surface carried (193 keys on `/health`, 203 on telemetry) against what its consumers read. `/health` now carries one enum per dependency — `dependencies.{postgres, neo4j, embedder, reranker, llm_pool, rem_daemon, nrem_daemon, outbox, registry}` each `ok|degraded|down` with a reason — and a `warnings` list carrying every limit crossed (`{key, limit, observed, unit}`); `status` derives from them. The HTTP 503 still means exactly "an encoder is down": a dead Postgres or Neo4j, a failed outbox, a dead-lettering REM now read `down`/`degraded` at 200 where before they read `ok`. `/health` makes no database call at request time (the new liveness probes run in the 60 s refresher), anonymous callers still get three keys, and every health transition logs one line named after the key. `/memory/telemetry` is cached for `TELEMETRY_CACHE_S` (15 s, `generated_at` stamped) and gains the numbers nobody recorded: per-call embed and rerank latency, gateway request/latency/shedding, outbox apply latency and drain rate (every status key always present — `failed` used to vanish at zero), Postgres pool wait, Neo4j query latency and rejected Cypher, REM throughput and dead-letters, the registry census and every refusal code from v0.9.69, client versions seen. The insight-gate walk (149 sequential Neo4j round-trips per request, measured) moved to the refresher. The contract itself ships as `Documentation/telemetry-contract.md`, generated from one source of truth (`telemetry_contract.py`) and pinned two ways by `tests/test_telemetry_contract.py` — every documented key emitted, every emitted key documented, run against the real builders over a fake connection. Moved keys are dual-emitted this release and removed in 0.9.75.
+
+Two reviews (Gemini, Opus with the five new statements run live) found the registry census querying a table that never existed, swallowed silently — fixed, and the swallow class with it: a census that cannot be read is counted, logged once per transition, and served as its last good value with `as_of` and `error`.
+
+#### Monitor contract — lifted from the build handoff
+### Removed outright in 0.9.74 — not moved
+Each had no writer and had read `0` since it shipped. The name also collided with the live
+alias TABLES, so `alias_edges: 0` beside a registry holding real aliases read as a broken
+alias layer.
+
+| endpoint | key | why |
+|---|---|---|
+| telemetry | `entity_graph.alias_edges` | no writer of `ALIASES` has ever existed |
+| telemetry | `entity_graph.alias_covered_entities` | same |
+| telemetry | `entity_graph.alias_components` | read `Entity.alias_component`; its only writer (a `gds.wcc` caller) was retired |
+| telemetry | `entity_graph.largest_alias_component` | same |
+
+##### Meaning changes — same key, different answer (`fact:1626`)
+A consumer reading only the key list would see nothing wrong. The SHAPE is unchanged in
+every case, so nothing crashes; the VALUE is a different measurement.
+
+| endpoint | key | was | now | what to do |
+|---|---|---|---|---|
+| telemetry | `breakdown.domains` | the PROJECT distribution (built from `PROJECT_SQL`) | the DOMAIN distribution, from `metadata->'domains'` | read `breakdown.projects` for the old value. ⚠ **CORRECTED:** an earlier draft of this row said the counts "sum to more than the record count". They do not. Live 2026-08-28: **629 of 1691 records carry a non-empty `domains`; 1062 (62.8%) carry none**, so the distribution describes a 37% subset and sums to FAR LESS than the corpus. It exceeds only `records_with_domains`, because a record may name several sections. Both numbers now ship in the payload as `breakdown.records_with_domains` / `records_total` |
+| health | `role` | two-valued `read`/`write`; an admin token reported `write` | three-valued `read`/`write`/`admin` | a consumer testing `role == "write"` for may-I-save now correctly excludes an admin token |
+| health | `llm_backends.*` | a 401/403 from a CREDENTIALED backend reported `ok` | `http_401`/`http_403`, and it counts as down | expect a backend with a bad key to read down rather than green |
+| health | `status` | `ok`/`degraded`, degraded iff an encoder was not ok | `ok`/`degraded`/`down`, derived from `dependencies` + `warnings` | ⛔ **the HTTP code is UNCHANGED** — 503 still means exactly "an encoder is down". A consumer that inferred the code from the enum must read the code |
+
+##### Moved — dual-emitted in 0.9.74, **removed in 0.9.75**
+Both paths carry the same value this release. Migrate to the right-hand column now.
+
+| from (`/health`) | to (`/memory/telemetry`) |
+|---|---|
+| `daemon` | `/health` `nrem_daemon_process` (stayed on health, renamed) |
+| `rem_daemon` | `/health` `rem_daemon_process` (stayed on health, renamed) |
+| `llm_pool.*` | `llm.pool.*` |
+| `llm_affinity.*` | `llm.affinity.*` |
+| `llm_routing.*` | `llm.routing.*` |
+| `llm_token_usage.*` | `llm.token_usage.*` |
+| `llm_latency.*` | `llm.latency.*` |
+| `llm_reserved` | `llm.reserved` |
+| `llm_oldest_inflight_age_s` | `llm.oldest_inflight_age_s` |
+| `llm_suspect_wedged` | `llm.suspect_wedged` |
+| `config.*` (all ~20) | `config.*` |
+| `capacity.*` — **23 of 28** | `capacity.*` |
+| `project_identity.*` | `axes.project_identity.*` |
+| `domain_identity.*` | `axes.domain_identity.*` |
+| `gpu_probe.*` | `gpu_probe.*` |
+| `pgvector.*` | `postgres.pgvector.*` |
+| `graph_invalid_nodes` | `graph_integrity.invalid_nodes` (already existed there) |
+
+**KEPT on `/health`** — `status`, `version`, `api_version`, `agent`, `role`, `auth_required`,
+`auth_scheme`, `backup_in_progress`, `inference_busy`, `embedder`, `reranker`,
+`backend_capability` (whole), `llm`, `llm_backends`, the `consolidation` subset, and the five
+capacity keys a client derives its own timeouts from: `capacity.timestamp`,
+`capacity.derived.{s_mean_s, s_max_measured_s, client_ceiling_s}`, `capacity.probe.probe_stale`.
+
+| from (`/memory/telemetry`) | to (`/memory/telemetry`) |
+|---|---|
+| `postgres.outbox.*` (status census) | `outbox.*` — ⚠ the census OMITTED a status with zero rows |
+| `postgres.outbox_failed_oldest_age_seconds` | `outbox.oldest_failed_age_s` |
+| `neo4j.rem_dead_lettered` | `rem.dead_lettered` |
+| `neo4j.rem_failing` | `rem.failing` |
+| `neo4j.rem_passed_over_total` | `rem.passed_over` |
+| `neo4j.rem_starved_pending` | `rem.starved_pending` |
+| `neo4j.rem_max_attempts` | `rem.max_attempts` |
+| `llm_faults` | `llm.faults` |
+| `axis_registry_read_failures_total` | `registry.read_failures_total` |
+
+##### New on `/health`
+`dependencies.{postgres,neo4j,embedder,reranker,llm_pool,rem_daemon,nrem_daemon,outbox,registry}.{state,reason}`
+· `warnings[].{key,limit,observed,unit}` · `rem_daemon_process` · `nrem_daemon_process`.
+
+##### New on `/memory/telemetry`
+`generated_at` · `encoders.{embed,rerank}.*` + `encoders.limit_ms` · `gateway.*` · `outbox.*` ·
+`postgres.{pool_size,pool_free,pool_in_use,pool_wait_p50_ms,pool_wait_p95_ms,pool_wait_window,pgvector.*}` ·
+`neo4j.{query_p50_ms,query_p95_ms,query_window,cypher_rejected_total,tx_failures_total}` ·
+`rem.*` · `nrem.as_of` · `registry.*` incl. `registry.refusals.*` · `clients.versions_seen.*` ·
+`llm.*` · `capacity.*` · `config.*` · `axes.*` · `gpu_probe.*` · `breakdown.projects` ·
+`credentials.token_verify_warn_per_min`.
+
+##### Behaviour the monitor should stop doing
+It derives health from telemetry numbers client-side (`outbox.failed > 0`, backlog,
+contention ≥ 30 %). Those thresholds are now server-side and in `warnings`. Two consumers
+with private thresholds is how a third gets invented.
+
+##### journald line names (the log twin)
+`health.<dependency>` on every state transition — WARNING into down/degraded, INFO on
+recovery. `health.warning.<key>` when a warning is raised or cleared. **Never a line per
+poll**: /health is hit every 30 s by an open dashboard.
+
+---
+
 ## [0.9.73] — 2026-08-28
 
 ### Docs residue after the culling — the documentation says what the code does

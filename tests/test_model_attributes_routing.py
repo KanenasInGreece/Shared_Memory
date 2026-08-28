@@ -571,10 +571,20 @@ class _FixedStatusSession:
         return _StatusCm(self._status)
 
 
-def test_h1_credentialed_backend_401_reads_ok(monkeypatch):
-    """MUTATION TARGET (H-1): a bare-probe 401/403 from a CREDENTIALED
-    backend must display 'ok' -- it answered, which is this file's own
-    liveness definition."""
+def test_a_credentialed_backend_that_401s_is_reported_unusable(monkeypatch):
+    """RE-RULED at v0.9.74 (was: test_h1_credentialed_backend_401_reads_ok).
+
+    H-1 argued that a bare-probe 401/403 from a CREDENTIALED backend should
+    display `ok`, because the server ANSWERED and refusing an unauthenticated
+    probe is correct auth behaviour. That is a true statement about the SERVER
+    and the wrong answer to the question /health asks, which is about the
+    DEPENDENCY: a backend this gateway cannot get a completion out of is not
+    usable, however correct its refusal is. The practical cost was that a wrong
+    or expired provider key — the one LLM failure an operator can immediately
+    fix — was the one failure /health reported green.
+
+    Enumerated as a meaning change in telemetry_contract.MEANING_CHANGES
+    (fact:1626), because the KEY did not change: only what it says."""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True},
@@ -586,7 +596,11 @@ def test_h1_credentialed_backend_401_reads_ok(monkeypatch):
     async def _run():
         return await g._build_health_checks(proxy, None)
     checks = asyncio.run(_run())
-    assert checks["llm"] == "ok"
+    # The status code is passed through, so the payload says WHICH kind of
+    # unusable — not merely that it is.
+    assert checks["llm_backends"]["https://api.deepseek.com/v1"] == "http_401"
+    assert checks["llm"] == "down"
+    assert checks["dependencies"]["llm_pool"]["state"] == "down"
 
 
 def test_h1_uncredentialed_backend_401_stays_down(monkeypatch):
