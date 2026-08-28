@@ -330,7 +330,7 @@ Record architectural or design decisions with full PROV-O provenance — who dec
 1. Coordinator validates required decision fields at ingress (before any DB write)
 2. Upserts into Postgres `technical_docs` (same idempotency as plain facts)
 3. Outbox worker writes Decision→Human→Project→AIAgent subgraph in Neo4j with PROV-O edges: `WAS_ATTRIBUTED_TO`, `PROJECT_OF`, `WAS_ASSISTED_BY`, plus `GROUNDED_IN` to each cited fact
-4. `MENTIONS` edges are then **inherited** — every entity on the grounding facts, operator-asserted grounding first, falling back to the decision's latest live retrospective's facts when it grounds nothing itself
+4. Nothing else is written: **a decision carries no entities of its own** (`decision:1664`). Its topics are answered later, on READ, by walking the grounding chain to the facts it rests on (`decision:1736`) — never materialised as a `MENTIONS` edge on the decision node itself
 
 **Query decisions later:**
 ```
@@ -730,5 +730,5 @@ separately, on its own host — see [server-setup.md](Documentation/server-setup
 - **Operations runbook:** gateway/daemon install + upgrade — [server-setup.md](Documentation/server-setup.md)
 - **Schema:** Neo4j labels, relationship types, Postgres tables — [schema.md](Documentation/schema.md)
 - **Embedding mandate:** All calls route through the gateway (:8888). Never call port 8070 (BGE-M3) or 8071 (BGE-Reranker) directly — the gateway enforces 1024-dim consistency across all agents.
-- **Ontology:** All Neo4j labels and relationship types are configurable in `shared-memory/ontology.yaml` at the repo root.
+- **Ontology:** Neo4j entity sub-labels (`Component`/`System`/`Model`/`Concept`/`Document`) are configurable in `shared-memory/ontology.yaml` (repo-root fallback for older checkouts) — relationship types are spine, pinned in code, not configurable.
 - **Security posture:** Read-only Cypher guard active. `Authorization: Bearer <token>` auth enforced (v0.3.5). `starlette>=1.0.1` floor enforced (BadHost CVE-2026-48710).
