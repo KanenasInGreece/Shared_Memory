@@ -1387,9 +1387,10 @@ def mark_covered_rows_consolidated(conn):
 
     'pending' and 'failed' rows are never touched — the outbox worker still
     owes them a Neo4j write or an investigation. Facts saved without entities
-    are NOT special-cased: REM extracts entities and creates MENTIONS edges,
-    so they can become Tier-3 eligible after enrichment; until then their
-    rows correctly remain backlog. Returns the number of rows advanced.
+    are NOT special-cased: Tier 3 consolidation keys on (project, domain),
+    never entities (fact:1215), so an entity-less fact is already eligible
+    once its outbox row reaches 'applied'/'rem_reviewed' — entities are never
+    what gates a row's backlog status. Returns the number of rows advanced.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -2874,7 +2875,6 @@ class ConsolidationDaemon:
                 f"        project, domain"
             )
             return await result.data()
-        return clusters, edge_stats
 
     async def run_lineage_invalidation_pass(self, context="consolidation"):
         """C3 — Mechanism B (Dreaming Cycle Plan to v2, §5 AMENDED block):
