@@ -100,7 +100,7 @@ All live in `shared-memory/scripts/` and run on the gateway host only.
 | `rem_loop.py` | REM daemon — idle summarisation: an LLM summary for a long record; writes no edges and no labels. |
 | `consolidation_loop.py` | NREM daemon — synthesises Tier‑3 community summaries: grounded facts fold on the **(project, domain)** spine at density ≥ 3 (fact 1215), never on an entity hub. |
 | `gpu_load.py` | GPU‑busy probe (`nvtop --snapshot`), polled by the coordinator's health refresher to feed the `inference_busy` signal on `GET /health`; the dream-cycle daemons no longer gate on it directly. |
-| `ontology.py` | Loads `shared-memory/ontology.yaml` (repo-root fallback for older checkouts; `SMEM_ONTOLOGY_PATH` overrides); supplies Neo4j labels/relationship types. |
+| `ontology.py` | Loads `shared-memory/ontology.yaml` (repo-root fallback for older checkouts; `SMEM_ONTOLOGY_PATH` overrides) for the configurable entity sub-labels; relationship types are spine, pinned in code, not configurable. |
 | `generate_tokens.py` | Token minting helper (write-through mint flow, `--reveal`, `--convert-digests` — see below). |
 
 None of these ship with the skill. See [`sync_skills.sh`](../scripts/sync_skills.sh).

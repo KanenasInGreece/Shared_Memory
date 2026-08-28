@@ -115,7 +115,7 @@ def test_load_agent_tokens_duplicate_token_logs_warning_first_wins(caplog):
 
 
 # ── PR A2: digest-form entries, mixed registry, plaintext HARD REFUSAL ──────
-# RULED (Xenofon, 2026-08-14): there is no accept+warn window — a plaintext
+# RULED (Operator, 2026-08-14): there is no accept+warn window — a plaintext
 # AGENT_TOKENS entry makes the gateway refuse to START (require_no_plaintext_
 # agent_tokens(), called from hive_mind_proxy.main() only). Parsing itself
 # still ACCEPTS the shape (so the refusal can name exactly which agents need

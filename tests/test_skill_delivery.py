@@ -14,7 +14,7 @@ The symlink made the SCRIPT auto-current. It said nothing about the capture
 surface, the constitution snippet, the schema doc, or anything added to the
 package next — which is exactly what a per-file fix cannot express.
 
-⛔ AND THE SYMLINKS THEMSELVES ARE NOW GONE (Xenofon, 2026-08-04): every
+⛔ AND THE SYMLINKS THEMSELVES ARE NOW GONE (Operator, 2026-08-04): every
 installed file is a REAL COPY. Repo-linking bought auto-currency by binding
 every agent on the machine to one checkout's path, so moving, renaming or
 archiving the project breaks all of them at once — silently, discovered only by
@@ -133,7 +133,7 @@ def test_a_stale_file_is_actually_refreshed_not_merely_present(tmp_path):
 
 
 def test_an_installed_file_is_a_real_copy_never_a_symlink(tmp_path):
-    """⛔ POLICY (Xenofon, 2026-08-04): installs hold REAL COPIES.
+    """⛔ POLICY (Operator, 2026-08-04): installs hold REAL COPIES.
 
     Repo-linking made a file auto-current at the cost of binding every agent on
     the machine to one checkout's PATH — move, rename or archive the project and

@@ -39,14 +39,14 @@ mb = load_memory_bridge()
 def test_required_fields_only():
     content, meta = mb.build_decision_metadata(
         title="Use asyncpg",
-        decided_by="Xenofon",
+        decided_by="Operator",
         project="shared-memory",
         rationale="asyncpg is fully async; psycopg2 blocks the event loop",
     )
     assert content == "Use asyncpg\n\nasyncpg is fully async; psycopg2 blocks the event loop"
     assert meta["type"] == "decision"
     assert meta["decision"]["title"] == "Use asyncpg"
-    assert meta["decision"]["decided_by"] == "Xenofon"
+    assert meta["decision"]["decided_by"] == "Operator"
     assert meta["decision"]["project"] == "shared-memory"
     assert meta["decision"]["rationale"] == "asyncpg is fully async; psycopg2 blocks the event loop"
     assert meta["entities"] == []
@@ -76,7 +76,7 @@ def test_build_decision_metadata_sets_top_level_project():
     """
     _, meta = mb.build_decision_metadata(
         title="Use asyncpg",
-        decided_by="Xenofon",
+        decided_by="Operator",
         project="shared-memory-GitHub",
         rationale="because",
     )
@@ -97,7 +97,7 @@ def test_the_top_level_project_is_never_a_second_answer():
 def test_all_optional_fields():
     _, meta = mb.build_decision_metadata(
         title="Use asyncpg",
-        decided_by="Xenofon",
+        decided_by="Operator",
         project="shared-memory",
         rationale="async I/O",
         source="claude-code",
@@ -192,7 +192,7 @@ async def test_save_decision_cli_forwards_correct_metadata(capsys):
         sys.argv = [
             "memory_bridge.py", "save_decision",
             "--title", "Use asyncpg over psycopg2",
-            "--decided-by", "Xenofon",
+            "--decided-by", "Operator",
             "--project", "shared-memory",
             "--rationale", "asyncpg does not block",
             "--assisted-by", "claude-sonnet-4-6",
@@ -205,7 +205,7 @@ async def test_save_decision_cli_forwards_correct_metadata(capsys):
 
     assert captured["metadata"]["type"] == "decision"
     assert captured["metadata"]["decision"]["title"] == "Use asyncpg over psycopg2"
-    assert captured["metadata"]["decision"]["decided_by"] == "Xenofon"
+    assert captured["metadata"]["decision"]["decided_by"] == "Operator"
     assert captured["metadata"]["decision"]["confidence"] == "high"
     # A decision names no entities of its own (decision:1664) — the CLI no
     # longer offers --entities, and the metadata always carries an empty list.

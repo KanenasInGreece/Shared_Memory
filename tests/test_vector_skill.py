@@ -209,7 +209,7 @@ async def test_mcp_save_decision_success():
     with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
         result = await vector_skill.save_decision(
             title="Use asyncpg over psycopg2",
-            decided_by="Xenofon",
+            decided_by="Operator",
             project="shared-memory",
             rationale="asyncpg does not block the event loop",
             source="qwen3-30b",
@@ -222,7 +222,7 @@ async def test_mcp_save_decision_success():
     call_kwargs = mock_post.call_args
     payload = call_kwargs[1]["json"] if "json" in call_kwargs[1] else call_kwargs.kwargs["json"]
     assert payload["metadata"]["type"] == "decision"
-    assert payload["metadata"]["decision"]["decided_by"] == "Xenofon"
+    assert payload["metadata"]["decision"]["decided_by"] == "Operator"
     assert payload["metadata"]["decision"]["confidence"] == "high"
     # A decision names no entities of its own (decision:1664) — the MCP tool
     # no longer accepts the parameter, and the metadata always carries [].

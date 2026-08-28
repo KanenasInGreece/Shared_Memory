@@ -126,7 +126,7 @@ def _outbox_params(mock_conn):
 
 def _decision_request(domains=None, **decision_extra):
     decision = {
-        "decided_by": "Xenofon",
+        "decided_by": "Operator",
         "project": "shared_memory",
         "rationale": "test rationale for axis materialisation",
         **decision_extra,

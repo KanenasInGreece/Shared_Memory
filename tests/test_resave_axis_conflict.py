@@ -196,7 +196,7 @@ async def test_a_legacy_decision_with_pg_entities_is_still_resavable():
         "source": "claude-code",
         "type": "decision",
         "entities": [],
-        "decision": {"decided_by": "Xenofon", "project": "alpha",
+        "decision": {"decided_by": "Operator", "project": "alpha",
                      "rationale": "because"},
     })
     assert resp.status == 200

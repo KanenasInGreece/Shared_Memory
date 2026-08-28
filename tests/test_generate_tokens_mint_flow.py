@@ -1,6 +1,6 @@
 """Credential_Custody_Plan_2026-08-14, PR A2 — generate_tokens.py's mint flow.
 
-RULED (Xenofon, 2026-08-14): no secret token value is ever printed to
+RULED (Operator, 2026-08-14): no secret token value is ever printed to
 stdout. Covers:
   - mint(): write-through to a LOCAL agent's skill .env (mode 600, no
     create-then-chmod window), nothing printed for a remote/not-installed

@@ -610,8 +610,10 @@ answered, by successors and retrospectives, and the answer is what propagates.
 Records accumulate during work. In idle time, two passes — named for the sleep phases they
 imitate — turn the pile into something structured.
 
-**REM, the enrichment pass,** reads new records and connects them: linking facts to the concepts
-they name, proposing relationships, writing the compact summaries later passes build on.
+**REM, the enrichment pass,** reads new records and summarises them, writing the compact form
+later passes build on. It writes no edges and no labels: entities, the entity relationships that
+name what a record is about, and the project/domain a record belongs to are fixed once, at the
+moment the record is saved, by the person who saved it — never added to or re-proposed afterward.
 
 **NREM, the consolidation pass,** builds two syntheses:
 
@@ -874,8 +876,10 @@ uv run --with neo4j python shared-memory/migrations/verify_neo4j_init.py        
 ```
 
 The full schema — every table, label and relationship — is documented in
-[`shared-memory/Documentation/schema.md`](shared-memory/Documentation/schema.md). Graph label
-names are configurable in `shared-memory/ontology.yaml`; the machinery does not depend on your vocabulary.
+[`shared-memory/Documentation/schema.md`](shared-memory/Documentation/schema.md). Entity sub-label
+names widen the schema-compliance allowlist checked in `shared-memory/ontology.yaml` — no writer
+applies a sub-label to a node on its own, so editing the file changes what compliance telemetry
+accepts, not what gets written.
 
 ### Filtered search at scale — measured
 

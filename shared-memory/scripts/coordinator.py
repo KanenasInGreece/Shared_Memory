@@ -152,7 +152,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.72"
+FRAMEWORK_VERSION = "0.9.73"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -685,8 +685,9 @@ def _supersession_target_error(pg_id: int, record_type: object) -> str | None:
 
     A retrospective is refused for the mirror-image reason: it is an observation
     dated to when it was made, so a changed outcome is a NEW retrospective, not
-    an edit of the old one. Entity inheritance already prefers the latest live
-    verdict, so nothing needs retracting for the newer judgement to take effect.
+    an edit of the old one. The latest live retrospective is simply read as the
+    current verdict, so nothing needs retracting for the newer judgement to take
+    effect.
 
     Both refusals also close a real corruption: the supersede mirror MERGEs its
     target as a :Fact by pg_id, so superseding a decision or retrospective minted
@@ -989,7 +990,7 @@ def save_response_warning(record_type: object, entities, grounded_in) -> str:
     DOMAIN_OF→PROJECT_OF spine (project+domain), not an entity level, so an
     entity-less fact is fully consolidatable. `entities` still matters — it is
     the only way a new concept enters the graph, and it feeds graph navigation
-    and REM/entity-relation linking — but Tier 3 eligibility is not one of the
+    and search matching — but Tier 3 eligibility is not one of the
     things it buys. Saying otherwise trains the operator to add entities for a
     reason that no longer holds, which is a worse outcome than an honest note.
 
@@ -1014,7 +1015,7 @@ def save_response_warning(record_type: object, entities, grounded_in) -> str:
     return (
         " NOTE: no entities — fine for Tier 3 consolidation (the fold keys on"
         " project+domain, not entities); entities feed graph navigation and"
-        " REM/entity-relation linking only."
+        " search matching only."
     )
 
 
@@ -8768,9 +8769,9 @@ class MemoryCoordinator:
             snap["breakdown"] = {"error": str(exc)}
 
         # Entity-graph shape (ADR-017) — the live, cheap counterpart to the
-        # offline ER calibration harness (entity_resolution_eval.py). Surfaces
-        # fragmentation and, once the alias layer ships, alias coverage. The O(n²)
-        # cosine over-merge analysis stays OUT of the hot path; only aggregates here.
+        # offline ER calibration harness this framework once shipped (retired).
+        # Surfaces fragmentation and alias coverage. The O(n²) cosine over-merge
+        # analysis stays OUT of the hot path; only aggregates here.
         try:
             snap["entity_graph"] = await self._entity_graph()
         except Exception as exc:

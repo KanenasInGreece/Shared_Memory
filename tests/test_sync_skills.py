@@ -97,7 +97,7 @@ def test_no_symlink_short_circuit_survives_anywhere_in_the_per_agent_loop():
 
 
 def test_both_delivery_paths_replace_a_symlink_rather_than_following_it():
-    """⛔ COPY-ONLY (Xenofon, 2026-08-04): an installed file is a real copy.
+    """⛔ COPY-ONLY (Operator, 2026-08-04): an installed file is a real copy.
 
     A link into a checkout binds every agent on the machine to that checkout's
     PATH — move or archive the project and all of them break at once, silently.

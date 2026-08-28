@@ -1,6 +1,6 @@
 # Shared Memory Schema
 
-> Label and relationship names are configurable via `ontology.yaml` at the repo root (override `SMEM_ONTOLOGY_PATH` to point elsewhere). All names shown here are the defaults.
+> Entity sub-label names are configurable via `shared-memory/ontology.yaml` (repo root is a fallback for checkouts predating the move; override `SMEM_ONTOLOGY_PATH` to point elsewhere). Relationship type names are spine, pinned in code, not configurable. All names shown here are the defaults.
 
 ## PostgreSQL (Semantic Memory)
 
@@ -564,7 +564,7 @@ generator does faithfully introspect.
 
 ## Neo4j (Relational Memory)
 
-> Configurable via `ontology.yaml`. Label and relationship keys map directly to the `labels:` and `relationships:` sections.
+> Entity sub-labels are configurable via `ontology.yaml`'s `labels:` section (see "Entity type sub-labels" below — no writer currently applies one). The file has no `relationships:` section: every relationship type name below is spine, pinned in `ontology.py`.
 
 ### Core labels (Tier 1 / Tier 3 nodes)
 
@@ -611,9 +611,9 @@ Written by the outbox worker when `metadata["type"] == "decision"`.
 
 | Relationship | Pattern | Written by |
 |---|---|---|
-| `MENTIONS` | `(:Fact)-[:MENTIONS]->(:Entity)` | Outbox worker — from `metadata["entities"]`, at first write only; drives graph navigation and the entity-relation sweep (Tier 3 consolidation itself keys on project+domain, not entities — fact 1215) |
+| `MENTIONS` | `(:Fact)-[:MENTIONS]->(:Entity)` | Outbox worker — from `metadata["entities"]`, at first write only; drives graph navigation and search matching (Tier 3 consolidation itself keys on project+domain, not entities — fact 1215) |
 | `REPORTS_ON` | `(:Fact)-[:REPORTS_ON]->(:Entity)` | Legacy alias; accepted by consolidation query. Use `MENTIONS` for new saves. |
-| `ALIASES` | `(:Entity)-[:ALIASES]-(:Entity)` | Soft synonym link between entity surface forms (`coordinator` ↔ `Coordinator`), v0.6.0. **Never merges nodes** — reversible. Consolidation + search traverse alias *components*: Neo4j GDS `gds.wcc` stamps `Entity.alias_component`, and clusters group on `coalesce(alias_component, elementId(e))`. Edges carry `method`/`score`/`confidence`. Written by the REM alias-writer (v0.6.1); until then created via the offline `entity_resolution_eval.py` harness. |
+| `ALIASES` | `(:Entity)-[:ALIASES]-(:Entity)` | Soft synonym link between entity surface forms (`coordinator` ↔ `Coordinator`), v0.6.0. **Never merges nodes** — reversible. Consolidation + search traverse alias *components*: Neo4j GDS `gds.wcc` stamps `Entity.alias_component`, and clusters group on `coalesce(alias_component, elementId(e))`. Edges carry `method`/`score`/`confidence`. No current writer — the REM alias-writer and the offline `entity_resolution_eval.py` harness that preceded it are both retired; existing edges are legacy. |
 | `SUMMARIZED_BY` | `(:Fact\|:Decision)-[:SUMMARIZED_BY]->(:CommunitySummary)` | Consolidation daemon after synthesis (Decision source = insight fold) |
 | `NEXT_STEP` | `(:ReasoningStep)-[:NEXT_STEP]->(:ReasoningStep)` | Agent — links consecutive steps in a trace |
 
@@ -758,7 +758,7 @@ To create a Decision node, save with `metadata["type"] == "decision"` and a nest
 Required fields: `decided_by`, `project`, `rationale`. All others optional.
 
 **Entity Ingestion Protocol:**
-Supply `"entities": ["Name1", "Name2"]` in the metadata JSON when saving. The saver creates `Entity` nodes and `MENTIONS` relationships for each name. **Tier 3 consolidation no longer keys on entities** (fact 1215) — the NREM fold walks the `DOMAIN_OF`→`PROJECT_OF` spine (project+domain), so a fact saved without entities is stored, retrievable, and fully consolidatable. Entities still matter: they are the only way a new concept enters the graph, and they drive graph navigation and the entity-relation sweep. ⛔ They are written at FIRST WRITE only — REM never adds one (`decision:1664`). Optionally, `entities_provenance` (`{"<name>": "operator"|"agent"}`) stamps who named each one.
+Supply `"entities": ["Name1", "Name2"]` in the metadata JSON when saving. The saver creates `Entity` nodes and `MENTIONS` relationships for each name. **Tier 3 consolidation no longer keys on entities** (fact 1215) — the NREM fold walks the `DOMAIN_OF`→`PROJECT_OF` spine (project+domain), so a fact saved without entities is stored, retrievable, and fully consolidatable. Entities still matter: they are the only way a new concept enters the graph, and they drive graph navigation and search matching. ⛔ They are written at FIRST WRITE only — REM never adds one (`decision:1664`). Optionally, `entities_provenance` (`{"<name>": "operator"|"agent"}`) stamps who named each one.
 
 **Vector Indexes (1024 Dimensions):**
 - `entity_embedding_idx`

@@ -2,8 +2,11 @@
 #
 # This file configures ONLY the DOMAIN vocabulary — the entity sub-types that
 # describe what your facts and decisions are ABOUT. Edit and GROW these as your
-# domain evolves; they are applied at first write. Restart the daemons after
-# editing (read at startup).
+# domain evolves. ⚠ No writer currently applies a sub-label to a node — every
+# :Entity is merged plain, and REM writes no labels (decision:1664). Renaming
+# or adding one here only widens the schema-compliance allowlist these names
+# are checked against; it changes what telemetry accepts, not what gets
+# written. Restart the daemons after editing (read at startup).
 # To use a non-default location: set SMEM_ONTOLOGY_PATH=/path/to/ontology.yaml
 #
 # ─────────────────────────────────────────────────────────────────────────────
@@ -57,4 +60,3 @@ consolidation:
   # sparser population by construction).
   density_threshold: 3
   insight_threshold: 2           # min unconsolidated Decisions per shared grounded Entity to fold an insight
-  alias_max_hops: 2              # bound on ALIASES component traversal

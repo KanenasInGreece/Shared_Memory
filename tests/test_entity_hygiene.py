@@ -17,7 +17,7 @@ from ontology import sanitize_entity_name, sanitize_entity_names  # noqa: E402
 def test_proper_nouns_pass_unchanged():
     # Proper-noun casing is canonical — the gate must NOT lowercase it.
     for name in ["Neo4j", "LanceDB", "OpenClaw", "Coordinator", "BGE-M3",
-                 "shared-memory-GitHub", "Xenofon"]:
+                 "shared-memory-GitHub", "Operator"]:
         assert sanitize_entity_name(name) == name
 
 

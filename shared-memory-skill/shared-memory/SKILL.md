@@ -208,9 +208,9 @@ Commit findings, decisions, and technical facts to long-term shared memory.
 
 **Two more refusals guard the same vocabulary, both ahead of the mint.** `entity_confusable` — a `new_entities` name is trigram-near an existing canonical or alias, so it is very likely a typo rather than a new concept; the response names the near match, and minting it anyway needs `confirm_distinct_from` naming that match, the same confirmation a project's confusable check asks for. `entity_reserved` — the name is schema vocabulary (`Decision`, `Project`, `Domain`, ...) or already a registered project's name; an entity answers *what a record is about*, never *where it belongs*, so a name that is itself an axis is refused rather than minted as a concept.
 
-The enrichment pass links only to concepts a fact's `entities` list already named — never inventing one, and never reaching a name it introduced itself — and decisions and retrospectives no longer name their own, inheriting from the facts they rest on. A phrase you type here becomes a node for good — the one way back is to **supersede the fact**, which retires the concepts only that fact named from the enrichment pass's reach (nothing is deleted; existing links stay). Spelling binds the node you create, but not the links that follow: the enrichment pass groups known spellings of one concept and attaches to the form already most used.
+Entities are written once, at first write, by the save itself — never by REM, which writes no edges and no labels of any kind (`decision:1664`). Decisions and retrospectives name none of their own, inheriting topics from the facts they rest on (see the judgement sections below). A phrase you type here becomes a node for good — the one way back is to **supersede the fact**: `GENUINELY_REFERENCED_ENTITY_RULE` requires at least one incoming, non-superseded `MENTIONS` edge, so an entity named only by facts that are now superseded stops counting as genuinely referenced (nothing is deleted; existing links stay). Spelling binds the node you create at the moment you save it — the ingress gate above rewrites a registered alias or case/punctuation variant to its canonical spelling before storage; there is no later pass that re-groups spellings after the fact.
 
-**`project` is REQUIRED on a fact AND on a decision, and checked against a registry — a save with none is REJECTED (400).** (A retrospective supplies none: it inherits the project of the decision it judges.) NREM keys community summaries on **(entity, project)**; facts sharing an entity but carrying different projects are never fused into one summary, and a fact whose project does not resolve is not folded at all — it is skipped, never pooled with other untagged facts, because an absence is not a subject. **Omit `project` and the client derives it from the project folder name** (walking up to the nearest `.git`/`CLAUDE.md`/`AGENTS.md`; `SHARED_MEMORY_PROJECT` overrides; failing that, from an **absolute** `source_ref`'s directory). An explicit value always wins, so **do not hand-type a project that differs from the folder** — state the derived tag when saving work belonging to a *different* project than the current directory.
+**`project` is REQUIRED on a fact AND on a decision, and checked against a registry — a save with none is REJECTED (400).** (A retrospective supplies none: it inherits the project of the decision it judges.) NREM keys community summaries on **`project`+`domain`** (fact 1215), never entities; a fact whose project does not resolve is not folded at all — it is skipped, never pooled with other untagged facts, because an absence is not a subject. **Omit `project` and the client derives it from the project folder name** (walking up to the nearest `.git`/`CLAUDE.md`/`AGENTS.md`; `SHARED_MEMORY_PROJECT` overrides; failing that, from an **absolute** `source_ref`'s directory). An explicit value always wins, so **do not hand-type a project that differs from the folder** — state the derived tag when saving work belonging to a *different* project than the current directory.
 
 **When a save is rejected, ASK THE OPERATOR — never infer a project.** A plausible wrong project is worse than none: parked is visible and repairable, wrong is neither. Two outcomes, both carrying a `message` and (for a near miss) `proposals` drawn from the registry: `project_required` — nothing was supplied, so the save came from outside any project root; `project_unknown` — the value is not registered, meaning it is either a typo for one of the `proposals` or a genuinely new project. **The second submission is accepted in any of three forms:** pick a proposal, re-send with `"new_project": true` to register the value, or park it. **Only these three end the exchange** — re-sending the same unregistered name is refused however many times it is asked.
 
@@ -330,7 +330,7 @@ Record architectural or design decisions with full PROV-O provenance — who dec
 1. Coordinator validates required decision fields at ingress (before any DB write)
 2. Upserts into Postgres `technical_docs` (same idempotency as plain facts)
 3. Outbox worker writes Decision→Human→Project→AIAgent subgraph in Neo4j with PROV-O edges: `WAS_ATTRIBUTED_TO`, `PROJECT_OF`, `WAS_ASSISTED_BY`, plus `GROUNDED_IN` to each cited fact
-4. `MENTIONS` edges are then **inherited** — every entity on the grounding facts, operator-asserted grounding first, falling back to the decision's latest live retrospective's facts when it grounds nothing itself
+4. Nothing else is written: **a decision carries no entities of its own** (`decision:1664`). Its topics are answered later, on READ, by walking the grounding chain to the facts it rests on (`decision:1736`) — never materialised as a `MENTIONS` edge on the decision node itself
 
 **Query decisions later:**
 ```
@@ -611,7 +611,7 @@ minting all live in **[Documentation/server-setup.md](Documentation/server-setup
 ```bash
 # Liveness (anonymous — status/version/api_version only, v0.9.9 S-10):
 curl http://localhost:8888/health
-# → {"status":"ok","api_version":4,"version":"0.9.72"}
+# → {"status":"ok","api_version":4,"version":"0.9.73"}
 
 # Liveness + API contract check (this client vs the gateway):
 python ~/.claude/skills/shared-memory/scripts/memory_bridge.py doctor
@@ -683,7 +683,7 @@ must be running — see [Documentation/server-setup.md](Documentation/server-set
 
 ## Reference
 
-- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.72", "api_version": 4, "tool": "shared-memory-framework"}`
+- **Version:** `python ~/.gemini/skills/shared-memory/scripts/memory_bridge.py --version` → `{"version": "0.9.73", "api_version": 4, "tool": "shared-memory-framework"}`
 
 ### Updating This Skill
 
@@ -730,5 +730,5 @@ separately, on its own host — see [server-setup.md](Documentation/server-setup
 - **Operations runbook:** gateway/daemon install + upgrade — [server-setup.md](Documentation/server-setup.md)
 - **Schema:** Neo4j labels, relationship types, Postgres tables — [schema.md](Documentation/schema.md)
 - **Embedding mandate:** All calls route through the gateway (:8888). Never call port 8070 (BGE-M3) or 8071 (BGE-Reranker) directly — the gateway enforces 1024-dim consistency across all agents.
-- **Ontology:** All Neo4j labels and relationship types are configurable in `shared-memory/ontology.yaml` at the repo root.
+- **Ontology:** Neo4j entity sub-labels (`Component`/`System`/`Model`/`Concept`/`Document`) are configurable in `shared-memory/ontology.yaml` (repo-root fallback for older checkouts) — relationship types are spine, pinned in code, not configurable.
 - **Security posture:** Read-only Cypher guard active. `Authorization: Bearer <token>` auth enforced (v0.3.5). `starlette>=1.0.1` floor enforced (BadHost CVE-2026-48710).
