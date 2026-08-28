@@ -5,6 +5,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.75] — 2026-08-28
+
+### The backend liveness probe authenticates — a 401 now means a rejected key, never a missing one
+
+v0.9.74 started reporting a credentialed LLM backend's 401 as `down` — right about the dependency, but the `/health` probe behind it was still a bare `GET /v1/models` with no Authorization header, and DeepSeek answers 401 to every unauthenticated request on every path. A correct key therefore read `http_401`, `llm_pool` read `degraded` and `status` with it, on the first live reading after the release. The probe now carries the same bearer a real call carries — from the in-process token map, never the environment, never a log line — on both the pool probe and the wedge probe, so `http_401` on `/health` means exactly what the contract says: this gateway's key for that backend is not accepted. Eight test fake sessions gained the `headers` argument; without it the new argument raised inside the probe's own exception handler and read as `down`, which is the very masking this release removes. The removal of the dual-emitted `/health` keys planned for 0.9.75 moves to 0.9.76 — the monitor keeps its full one-release window.
+
 ## [0.9.74] — 2026-08-28
 
 ### The telemetry contract — `/health` answers "can I use it and what to expect", `/memory/telemetry` carries the numbers, logs carry the events
