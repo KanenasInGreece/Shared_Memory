@@ -222,8 +222,17 @@ def test_require_no_plaintext_agent_tokens_passes_with_mixed_registry_all_digest
 # ── auth_middleware — helpers ─────────────────────────────────────────────────
 
 def _make_request(path: str, auth_header: str | None = None, method: str = "POST") -> MagicMock:
+    from yarl import URL
     req = MagicMock()
     req.path = path
+    # Security fix A1 (v0.9.76 fix round): the _UNPROTECTED_PATHS exemption
+    # compares `rel_url.path_safe` — the string aiohttp's router matches on —
+    # not `request.path`. A double that stamps only `.path` would leave a
+    # MagicMock auto-attribute here, `_router_match_path` would deny on the
+    # non-str, and every exemption test would pass for the wrong reason (or
+    # fail for one). Build it from a REAL yarl URL so the double derives
+    # path_safe exactly as production does and cannot drift from it.
+    req.rel_url = URL(path, encoded=True)
     req.method = method
     headers = {}
     if auth_header is not None:

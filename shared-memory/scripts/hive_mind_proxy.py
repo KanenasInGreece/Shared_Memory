@@ -1443,16 +1443,24 @@ class AsyncHiveMindProxy:
           forwarded to any LLM backend (same voice as the 401/403 replies
           coordinator.auth_middleware raises — fact:1503 class: informative,
           says explicitly what did NOT happen, so a retry can be safe).
-        - Path doesn't match any known resource, but is a trailing-slash
-          NEAR-MISS spelling of a known static one (`/health/`, `/health//`,
-          `/health%2f`, `/pool/status/`) → 404, same voice. Security fix A1,
-          v0.9.76 — see the block below for why this is here and not a
-          second mechanism somewhere else.
         - Path doesn't match any known resource, but starts with a reserved
           framework prefix (/memory/, /admin/) → 404, same voice.
+        - Path doesn't match any known resource and is outside the reserved
+          prefixes, but is a trailing-slash NEAR-MISS spelling of a known
+          static one (`/health/`, `/health//`, `/health%2f`,
+          `/pool/status/`) → 404, same voice. Security fix A1, v0.9.76 — see
+          the block below for why this is here and not a second mechanism
+          somewhere else, and why it runs AFTER the reserved-prefix branch.
         - Anything else → None (today's ROUTING_MAP/LLM behaviour, unchanged
           — the LM Studio passthrough for /v1/chat/completions and any
           non-framework path is a supported contract, not a mistyped call).
+
+        ⚠ SCOPE. The near-miss branch normalises with `rstrip("/")` and
+        therefore covers TRAILING SLASHES ONLY. `//health`, `/pool//status`
+        and `/health/.` are not near-misses to it; on an auth-on install they
+        are a plain 401, and on an auth-off install they reach LLM dispatch
+        exactly like every other unregistered path — that is the auth-off
+        posture, not an A1 residue.
         """
         path = request.path
         methods = None
@@ -1466,6 +1474,25 @@ class AsyncHiveMindProxy:
                 methods = entry["methods"]
                 break
 
+        # ⛔ LOAD-BEARING FOR SECURITY FIX A1 — this branch returns 405 for ANY
+        # known key, INCLUDING one whose method is allowed. That reads like a
+        # bug against its own message ("Method GET not allowed on
+        # /pool/status") and it is tempting to "correct" it to
+        # `if methods is not None and request.method not in methods:`.
+        #
+        # ⛔ DO NOT. `path` here is `request.path`, which is percent-DECODED,
+        # so `GET /pool%2fstatus` arrives with `path == "/pool/status"`, finds
+        # the known key, and is stopped HERE. aiohttp itself matched the request
+        # on `rel_url.path_safe` (`/pool%2Fstatus`), which no route accepts —
+        # that is why an allowed-method request reached the catch-all at all.
+        # Adding the method test would hand `/pool%2fstatus` straight to the LLM
+        # dispatch on every auth-off install, and the full suite would stay
+        # green except for the pin below. Measured, fix round.
+        #
+        # Pinned by tests/test_auth_exemption_route_resolution.py::
+        #   test_encoded_slash_spelling_of_an_owned_route_is_never_proxied
+        # If this branch is ever corrected to match its message, the near-miss
+        # branch below must first be taught to compare `rel_url.path_safe`.
         if methods is not None:
             allow = ", ".join(sorted(methods))
             return web.json_response(
@@ -1476,6 +1503,27 @@ class AsyncHiveMindProxy:
                 status=405,
                 headers={"Allow": allow, "X-SM-Fault-Origin": "gateway"},
             )
+
+        # Reserved-prefix refusal runs BEFORE the near-miss branch below.
+        # Ordering is deliberate (fix round, review SEC-3): every unregistered
+        # `/memory/*` and `/admin/*` path — trailing slash or not — keeps the
+        # refusal message it has always had. When the near-miss branch ran
+        # first it answered for `/memory/save/` and `/admin/backup/` too and
+        # silently changed their 404 body, which on an auth-off install let an
+        # anonymous caller distinguish a registered route name from an
+        # unregistered one by appending a slash. The near-miss branch exists
+        # for the paths this one does NOT cover — gateway-owned routes outside
+        # the reserved prefixes — so running it second is what it means.
+        if path.startswith(RESERVED_ROUTE_PREFIXES):
+            return web.json_response(
+                {"error": f"No such framework route: {path}. This path is "
+                          f"not registered under the framework's reserved "
+                          f"prefix. The request was NOT forwarded to any LLM "
+                          f"backend — correct the path and retry."},
+                status=404,
+                headers={"X-SM-Fault-Origin": "gateway"},
+            )
+
         # Security fix A1 (v0.9.76) — the NEAR-MISS branch.
         #
         # /health and /pool/status are gateway-OWNED routes that sit outside
@@ -1484,7 +1532,9 @@ class AsyncHiveMindProxy:
         # fell straight through to the LLM dispatch. `/memory/search/` and
         # `/memory/telemetry/` were already closed by the prefix branch above
         # — the class was solved once and these two names were left outside
-        # it. This closes them by OWNERSHIP rather than by prefix.
+        # it. This closes them by OWNERSHIP rather than by prefix, which is
+        # exactly why it runs after the prefix branch and not before it: the
+        # paths it is for are the ones that branch cannot reach.
         #
         # It matters most on the SHIPPED DEFAULT install. With AGENT_TOKENS
         # unset (.env.example's backward-compatible default) auth_middleware
@@ -1516,15 +1566,6 @@ class AsyncHiveMindProxy:
                         headers={"X-SM-Fault-Origin": "gateway"},
                     )
 
-        if path.startswith(RESERVED_ROUTE_PREFIXES):
-            return web.json_response(
-                {"error": f"No such framework route: {path}. This path is "
-                          f"not registered under the framework's reserved "
-                          f"prefix. The request was NOT forwarded to any LLM "
-                          f"backend — correct the path and retry."},
-                status=404,
-                headers={"X-SM-Fault-Origin": "gateway"},
-            )
         return None
 
     async def handle_proxy(self, request: web.Request) -> web.StreamResponse:
