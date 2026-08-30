@@ -1,5 +1,11 @@
 .env
 *.env
+# Credential-file backups and temp copies live BESIDE the real .env:
+# bootstrap_tokens.sh mktemps "${ENV_FILE}.XXXXXX", and ad-hoc .env.bak-*
+# copies have been observed inside a live checkout. Neither `.env` nor
+# `*.env` matches those. `.env.example` is tracked and must keep shipping.
+.env.*
+!.env.example
 .venv/
 __pycache__/
 *.pyc
@@ -17,5 +23,4 @@ Local_Documentation/
 research/
 .claude/
 .playwright-mcp/
-.env.mintlock
 HANDOFF.md
