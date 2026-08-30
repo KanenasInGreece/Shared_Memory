@@ -231,7 +231,95 @@ def _check_client_version(request: web.Request) -> None:
 
 # /pool/status is read-only, DB-free in-memory LLM capacity — the REM/NREM daemons
 # poll it (tokenless) to gate dreaming, same trust level as /health.
+#
+# ⛔ INVARIANT (v0.9.76, security fix A1): every member of this set must be the
+# canonical of a registered PLAIN (static) aiohttp resource, and membership is
+# tested by EXACT string equality — never against a normalised spelling. Until
+# v0.9.76 the exemption tested `request.path.rstrip("/")`, which exempted
+# `/health/`, `/health//` and `/health%2f` while the router sent all three to
+# the catch-all LLM proxy: the auth middleware and the router disagreed about
+# what "/health" meant, and the gap between them was an unauthenticated,
+# unaudited path to the LLM backend. `require_unprotected_paths_are_plain_routes`
+# enforces the PlainResource half at startup; `_resolved_route_canonical`
+# below plus the exact-match limb enforce the spelling half per request.
 _UNPROTECTED_PATHS = {"/health", "/pool/status"}
+
+
+def _resolved_route_canonical(request) -> "str | None":
+    """The canonical path of the resource aiohttp's router actually resolved
+    this request to, or None when there is no usable one.
+
+    Security fix A1. The auth exemption must be a property of the RESOLVED
+    ROUTE, not of a string the middleware normalises for itself — a second
+    normalisation is a second opinion, and the router's is the one that
+    decides which handler runs.
+
+    ⚠ Read defensively, and require a `str`. A request whose decoded path
+    contains a newline (`GET /health%0a`) matches NO resource at all: the
+    catch-all `"/{tail:.*}"` compiles to `/(?P<tail>.*)` and `.` excludes
+    `\\n` without re.DOTALL, so aiohttp hands the middleware a MatchInfoError
+    whose route is a SystemRoute with `resource is None`. `OPTIONS *` (a legal
+    RFC 9110 request target, `request.path == "*"`) does the same. An
+    unguarded `request.match_info.route.resource.canonical` raises
+    AttributeError there — and it raises BEFORE the audit block below, so a
+    one-byte anonymous request would become an unlogged, uncounted 500.
+    Measured: those spellings are a clean 401 today and must stay 401.
+
+    Anything that is not a `str` (a None link in the chain, or a test double's
+    auto-attribute) yields None and therefore DENIES — the exemption is never
+    granted on a value whose type we could not establish.
+    """
+    match_info = getattr(request, "match_info", None)
+    route      = getattr(match_info, "route", None)
+    resource   = getattr(route, "resource", None)
+    canonical  = getattr(resource, "canonical", None)
+    return canonical if isinstance(canonical, str) else None
+
+
+def require_unprotected_paths_are_plain_routes(router) -> None:
+    """Startup assertion for the NEW invariant security fix A1 creates
+    (adversarial review A-08): every `_UNPROTECTED_PATHS` entry must be the
+    canonical of a registered PlainResource.
+
+    `canonical` is deliberately MANY-TO-ONE for a dynamic resource —
+    `/memory/status/1` and `/memory/status/2` both report
+    `/memory/status/{pg_id}`. So the moment this set gains a value that
+    happens to be a dynamic canonical, the whole family behind that pattern
+    becomes anonymously reachable, and the offending string looks perfectly
+    innocent in a diff. Fail at startup instead, where an operator sees it.
+
+    Raises RuntimeError naming the offending entry. Called from
+    hive_mind_proxy.main() next to set_known_routes(), i.e. after every real
+    route is registered and before the catch-all — the same window that makes
+    the route snapshot meaningful.
+    """
+    plain: set = set()
+    dynamic: dict = {}
+    for resource in router.resources():
+        canonical = getattr(resource, "canonical", None)
+        if not isinstance(canonical, str):
+            continue
+        if isinstance(resource, web.PlainResource):
+            plain.add(canonical)
+        else:
+            dynamic[canonical] = type(resource).__name__
+    for entry in sorted(_UNPROTECTED_PATHS):
+        if entry in plain:
+            continue
+        if entry in dynamic:
+            raise RuntimeError(
+                f"_UNPROTECTED_PATHS entry {entry!r} resolves to a "
+                f"{dynamic[entry]}, not a PlainResource. A dynamic canonical "
+                f"is many-to-one, so exempting it would make every path "
+                f"behind that pattern anonymous. Register the unauthenticated "
+                f"endpoint as a static route, or drop it from the set."
+            )
+        raise RuntimeError(
+            f"_UNPROTECTED_PATHS entry {entry!r} is not the canonical of any "
+            f"registered route. An exemption for a path the router does not "
+            f"own cannot be honoured by the router — it can only be honoured "
+            f"by the catch-all, which forwards to an LLM backend."
+        )
 
 
 # Plaintext AGENT_TOKENS entries are REFUSED outright, as of v0.9.3 (RULED,
@@ -1841,7 +1929,32 @@ async def auth_middleware(request: web.Request, handler):
         # docstring above for why the two diverge after a daemon token is minted.
         if not AUTH_CONFIGURED_AT_STARTUP:
             return await handler(request)
-        if request.path.rstrip("/") in _UNPROTECTED_PATHS or request.path in _UNPROTECTED_PATHS:
+        # Security fix A1 (v0.9.76). BOTH limbs are exact; neither normalises.
+        #
+        #   limb 1 — the canonical of the resource the ROUTER resolved. This is
+        #            the exemption expressed as a property of the routed handler
+        #            rather than of a string, and it is guarded + type-checked
+        #            (see _resolved_route_canonical: a non-str DENIES).
+        #   limb 2 — the byte-identical path. Required, not belt-and-braces:
+        #            `OPTIONS /health` and `POST /health` resolve to the
+        #            catch-all (canonical "/{tail}"), and dropping this limb
+        #            would turn the anonymous 405 + `Allow: GET, HEAD` that
+        #            fact:1535 requires into a 401 — "get a token" is not why
+        #            that request failed. With this limb they stay 405, because
+        #            the exemption hands them to the catch-all handler whose
+        #            _route_guard answers 405 before any LLM dispatch.
+        #
+        # ⛔ The removed third spelling — `request.path.rstrip("/")` — is the
+        # defect: it exempted `/health/`, `/health//`, `/health%2f` and
+        # `/pool/status/`, none of which the router sends to handle_health, so
+        # each fell through the catch-all into an anonymous, unaudited LLM
+        # proxy call. Do not reintroduce a normalised limb here: normalisation
+        # is legitimate only for a REFUSAL decision (see
+        # AsyncHiveMindProxy._route_guard, which refuses a near-miss spelling
+        # of an owned path), never for a GRANT.
+        _canonical = _resolved_route_canonical(request)
+        if (_canonical is not None and _canonical in _UNPROTECTED_PATHS) \
+                or request.path in _UNPROTECTED_PATHS:
             return await handler(request)
 
         agent_name = resolve_identity(request)

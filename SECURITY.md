@@ -71,6 +71,27 @@ A crafted `Host` header containing `/`, `?`, or `#` causes Starlette to misparse
 
 To opt into all-interfaces binding (e.g. inside a Docker or VM network), set `PROXY_BIND=0.0.0.0` in your `.env` file. **Only safe over an encrypted overlay network (Tailscale, WireGuard) or behind TLS termination.** Bearer tokens are transmitted in plaintext over HTTP and are interceptable on an unencrypted network.
 
+### A1 — A trailing-slash spelling of an unauthenticated endpoint reached the LLM proxy ✅ Fixed (v0.9.76)
+
+**Severity:** HIGH | **Files:** `coordinator.py` `auth_middleware`, `hive_mind_proxy.py` `AsyncHiveMindProxy._route_guard`
+
+Two of the gateway's routes are deliberately unauthenticated — `GET /health` and `GET /pool/status` — because liveness has to answer before a caller has a token, and the dreaming daemons poll pool capacity tokenlessly. The auth middleware recognised them by testing `request.path.rstrip("/")` against the exempt set; the router recognised them by exact registration. The two disagreed about what `/health` meant, and the gap between them fell through the gateway's catch-all route into the reasoning-LLM passthrough.
+
+The effect was that `GET /health/` — one trailing slash — skipped authentication *and* was not served by the health handler. The same held for `/health//`, the percent-encoded `/health%2f`, and `/pool/status/`.
+
+**What an unauthenticated caller obtained.** A request forwarded to the configured LLM backend, and with it: the `X-SM-LLM-Backend` response header naming that backend's URL (which, on a deployment whose backend URL carries credentials in its userinfo or query string, is a credential render to an anonymous caller); an in-flight slot in the LLM pool, which the REM/NREM daemons gate their work on; and the upstream's own response headers. Because the exemption returned before the middleware's audit block, none of these requests produced an audit line or moved the gateway request counters — so the traffic was invisible to `/memory/telemetry` and to the monitor, while the LLM-pool counters moved with nothing to account for them.
+
+**Fix — two mechanisms, and the fix holds regardless of auth state.**
+
+1. **Route-owned refusal.** `_route_guard` — which already refuses a wrong-method or unregistered call under the framework's reserved path prefixes, before any LLM dispatch decision — now also refuses a trailing-slash near-miss of a route the gateway *owns*. `/health` and `/pool/status` sit outside the reserved prefixes, which is why they were the two names the existing guard did not already cover (`/memory/search/` and `/memory/telemetry/` were closed by it all along). The refusal is the guard's existing 404 in its existing voice, and it says explicitly that the request was not forwarded to any LLM backend.
+2. **Resolved-route exemption.** The auth exemption is now a property of the route aiohttp actually resolved — the canonical path of the matched resource — plus the byte-identical request path. Neither limb normalises. Normalisation is now used only to *refuse*, never to *grant*. A startup assertion additionally refuses to launch if an exempt entry is not the canonical of a static route, because a dynamic canonical is many-to-one and would silently exempt a whole pattern family.
+
+**The second mechanism is the one that matters on a fresh install.** `AGENT_TOKENS` unset is the shipped, backward-compatible default, and on an auth-off install the middleware returns before its exemption is ever consulted — so the route-owned refusal in `_route_guard` is what closes this, and it closes it whether authentication is on or off.
+
+**What this was not, and what is not fixed.** This was never an open proxy: traversal off the path was already refused before this fix — `/health/x`, `/healthz`, `/xhealth`, `//health`, `/Health` and every other spelling that is not a trailing-slash form of an owned route were, and remain, 401. The exposure was confined to those two endpoints' slash spellings.
+
+Nor does this close the wider *normalise-here, forward-verbatim* class it is an instance of. Three sites still consult a policy table on a normalised path and then act on the un-normalised one, and they are **known-remaining and deferred**: the credentialed-backend route allowlist in `hive_mind_proxy.py` `handle_proxy` (two comparisons), `coordinator.py` `_read_role_permits`, and the role/quiesce/principal route tuple in `auth_middleware`. The latter two are currently closed only because every route they gate sits under a reserved path prefix that `_route_guard` already refuses — that is a property of today's route table, not a guarantee, and adding an unprefixed gated route would reopen the class there.
+
 ### Agent authentication — implemented (v0.3.5)
 
 `Authorization: Bearer <token>` middleware is now enforced on all coordinator routes. Unregistered callers receive HTTP 401. The verified agent identity is stamped server-side onto every saved artifact — `agent_id` from the request body is no longer trusted.

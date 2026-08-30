@@ -70,6 +70,7 @@ from coordinator import (
     FRAMEWORK_VERSION,
     API_VERSION,
     require_no_plaintext_agent_tokens,
+    require_unprotected_paths_are_plain_routes,
     record_daemon_token_issued,
     record_credentialed_route_denied,
     record_llm_gateway_fault,
@@ -1442,6 +1443,11 @@ class AsyncHiveMindProxy:
           forwarded to any LLM backend (same voice as the 401/403 replies
           coordinator.auth_middleware raises — fact:1503 class: informative,
           says explicitly what did NOT happen, so a retry can be safe).
+        - Path doesn't match any known resource, but is a trailing-slash
+          NEAR-MISS spelling of a known static one (`/health/`, `/health//`,
+          `/health%2f`, `/pool/status/`) → 404, same voice. Security fix A1,
+          v0.9.76 — see the block below for why this is here and not a
+          second mechanism somewhere else.
         - Path doesn't match any known resource, but starts with a reserved
           framework prefix (/memory/, /admin/) → 404, same voice.
         - Anything else → None (today's ROUTING_MAP/LLM behaviour, unchanged
@@ -1470,6 +1476,46 @@ class AsyncHiveMindProxy:
                 status=405,
                 headers={"Allow": allow, "X-SM-Fault-Origin": "gateway"},
             )
+        # Security fix A1 (v0.9.76) — the NEAR-MISS branch.
+        #
+        # /health and /pool/status are gateway-OWNED routes that sit outside
+        # RESERVED_ROUTE_PREFIXES, so until now a trailing-slash spelling of
+        # them matched no known key, cleared the reserved-prefix check, and
+        # fell straight through to the LLM dispatch. `/memory/search/` and
+        # `/memory/telemetry/` were already closed by the prefix branch above
+        # — the class was solved once and these two names were left outside
+        # it. This closes them by OWNERSHIP rather than by prefix.
+        #
+        # It matters most on the SHIPPED DEFAULT install. With AGENT_TOKENS
+        # unset (.env.example's backward-compatible default) auth_middleware
+        # returns before its exemption ever runs, so the coordinator-side half
+        # of this fix is inert there and this branch is the only thing between
+        # an anonymous `GET /health/` and the LLM backend.
+        #
+        # Normalised for the REFUSAL, exact for the GRANT: the auth exemption
+        # never matches a normalised spelling (coordinator._UNPROTECTED_PATHS),
+        # so no normalisation here can ever hand anything out — it can only
+        # take the near-miss away from the proxy.
+        #
+        # Static keys only. A dynamic key is a pattern, and every dynamic
+        # route the gateway registers already lives under a reserved prefix,
+        # so widening this to patterns would add no coverage and would risk
+        # 404-ing a legitimate passthrough that merely resembles one.
+        normalised = path.rstrip("/") or "/"
+        if normalised != path:
+            for key, entry in self._known_routes.items():
+                if entry["pattern"] is None and key == normalised:
+                    return web.json_response(
+                        {"error": f"No such framework route: {path}. The "
+                                  f"framework registers {key} exactly — this "
+                                  f"is a near-miss spelling of a gateway route, "
+                                  f"not a passthrough path. The request was NOT "
+                                  f"forwarded to any LLM backend — correct the "
+                                  f"path and retry."},
+                        status=404,
+                        headers={"X-SM-Fault-Origin": "gateway"},
+                    )
+
         if path.startswith(RESERVED_ROUTE_PREFIXES):
             return web.json_response(
                 {"error": f"No such framework route: {path}. This path is "
@@ -5134,6 +5180,14 @@ async def main() -> None:
     # the catch-all below — see set_known_routes()'s docstring for why the
     # ordering is what excludes the catch-all from the snapshot.
     proxy.set_known_routes(app.router)
+    # Security fix A1 / adversarial review A-08: the auth exemption is now a
+    # property of the RESOLVED ROUTE, which creates a new invariant — every
+    # coordinator._UNPROTECTED_PATHS entry must be the canonical of a static
+    # (Plain) resource, because a dynamic canonical is many-to-one and would
+    # silently exempt an entire pattern family. Asserted here, in the same
+    # window as the route snapshot: after every real route, before the
+    # catch-all. Raises RuntimeError naming the offending entry.
+    require_unprotected_paths_are_plain_routes(app.router)
     app.router.add_route("*", "/{tail:.*}", proxy.handle_proxy)
 
     runner = web.AppRunner(app)

@@ -5,7 +5,9 @@ Coverage:
   - _load_agent_tokens: empty env, valid pairs, malformed entries, duplicates
   - auth_middleware: disabled (no tokens), allowlisted paths, valid token,
     missing header, wrong scheme, unknown token
-  - /health trailing-slash passes allowlist
+  - /health and /pool/status trailing-slash spellings are NOT exempt
+    (security fix A1, v0.9.76 — the exemption is exact on both limbs; the
+    real-router behaviour lives in test_auth_exemption_route_resolution.py)
   - source overwrite via authenticated_agent on request
 """
 
@@ -295,11 +297,40 @@ async def test_auth_middleware_health_passes_without_token():
 
 
 @pytest.mark.asyncio
-async def test_auth_middleware_health_trailing_slash_passes():
+async def test_auth_middleware_health_trailing_slash_is_NOT_exempt():
+    """Security fix A1 (v0.9.76), REPLACING a test that CERTIFIED the defect.
+
+    The old test asserted `/health/` passed the middleware, with a
+    `_noop_handler` — so it answered "does the middleware let it through",
+    which is the wrong question: the middleware letting it through IS the
+    defect. The real router does not send `/health/` to handle_health; it
+    falls through the catch-all into the LLM proxy, and a test that supplies
+    its own handler is structurally incapable of seeing that. Measured live:
+    an anonymous `GET /health/` returned llama.cpp's 404 with
+    `X-SM-LLM-Backend: http://localhost:5000` and left no audit line.
+
+    The exemption is now EXACT on both limbs — the resolved route's
+    canonical, and the byte-identical path — so a trailing slash is a 401
+    here. The full behaviour (including the 404 the route guard gives an
+    AUTHENTICATED caller, and the auth-OFF install where this middleware
+    never reaches its exemption at all) is pinned against the real router in
+    tests/test_auth_exemption_route_resolution.py.
+    """
+    from aiohttp.web_exceptions import HTTPUnauthorized
     mod = load_coordinator("claude:tok_abc")
     req = _make_request("/health/")
-    resp = await mod.auth_middleware(req, _noop_handler)
-    assert resp.status == 200
+    with pytest.raises(HTTPUnauthorized):
+        await mod.auth_middleware(req, _noop_handler)
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_pool_status_trailing_slash_is_NOT_exempt():
+    """The other member of _UNPROTECTED_PATHS, same rule."""
+    from aiohttp.web_exceptions import HTTPUnauthorized
+    mod = load_coordinator("claude:tok_abc")
+    req = _make_request("/pool/status/")
+    with pytest.raises(HTTPUnauthorized):
+        await mod.auth_middleware(req, _noop_handler)
 
 
 # ── auth_middleware — valid token ─────────────────────────────────────────────
