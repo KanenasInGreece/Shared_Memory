@@ -153,7 +153,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.75"
+FRAMEWORK_VERSION = "0.9.76"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -231,7 +231,134 @@ def _check_client_version(request: web.Request) -> None:
 
 # /pool/status is read-only, DB-free in-memory LLM capacity — the REM/NREM daemons
 # poll it (tokenless) to gate dreaming, same trust level as /health.
+#
+# ⛔ INVARIANT (v0.9.76, security fix A1): every member of this set must be the
+# canonical of a registered PLAIN (static) aiohttp resource, and membership is
+# tested against `request.rel_url.path_safe` — the string the ROUTER itself
+# compares — by EXACT equality. Never against a normalised or decoded spelling.
+#
+# Until v0.9.76 the exemption tested `request.path.rstrip("/")`, which exempted
+# `/health/`, `/health//` and `/health%2f` while the router sent all three to
+# the catch-all LLM proxy: the auth middleware and the router disagreed about
+# what "/health" meant, and the gap between them was an unauthenticated,
+# unaudited path to the LLM backend.
+#
+# ⛔ The FIRST round of that fix replaced `rstrip` with `request.path` and left
+# the same class open, because `request.path` is fully percent-DECODED:
+# `/pool%2fstatus` decodes to `/pool/status` and was exempted, while the router
+# — which matches on `path_safe`, where `%2F` stays encoded — resolved it to
+# the catch-all. Exempt from auth AND proxied: A1's exact shape, inside A1's
+# own fix. `_router_match_path` below closes it by comparing what the router
+# compares; `require_unprotected_paths_are_plain_routes` enforces at startup
+# the route-ownership half that makes that comparison meaningful.
 _UNPROTECTED_PATHS = {"/health", "/pool/status"}
+
+
+def _router_match_path(request) -> "str | None":
+    """The exact path string aiohttp's router compared this request against,
+    or None when there is no usable one.
+
+    Security fix A1. The auth exemption must test the SAME string the router
+    tests. Any second opinion — a normalisation, a decoding, a rstrip — is a
+    place where the middleware and the router can disagree about what
+    "/health" means, and every A1-class hole lives in that disagreement.
+
+    aiohttp 3.14.3, `web_urldispatcher.Resource.resolve`::
+
+        if (match_dict := self._match(request.rel_url.path_safe)) is None:
+
+    and `PlainResource._match` is `self._path == path`, where `_path` is the
+    resource's `canonical`. So for a PLAIN (static) resource — which
+    `require_unprotected_paths_are_plain_routes` guarantees every exempt entry
+    is — `rel_url.path_safe in _UNPROTECTED_PATHS` is byte-for-byte the
+    router's own admission test, run on the router's own input. The middleware
+    grants exactly when the router will route to the exempt handler.
+
+    ⛔ NOT `request.path`: that is the fully percent-DECODED path, so
+    `/pool%2fstatus` reads as `/pool/status` there while the router sees
+    `/pool%2Fstatus` and matches nothing. `path_safe` keeps `%2F` and `%25`
+    encoded, which is precisely the difference the defect lived in.
+
+    ⚠ Read defensively, and require a `str`. Anything that is not a `str` — a
+    None link in the chain, a test double's auto-attribute — yields None and
+    therefore DENIES: the exemption is never granted on a value whose type we
+    could not establish. A `None` return is not in `_UNPROTECTED_PATHS`, so the
+    caller needs no separate check.
+    """
+    rel_url   = getattr(request, "rel_url", None)
+    path_safe = getattr(rel_url, "path_safe", None)
+    return path_safe if isinstance(path_safe, str) else None
+
+
+def require_unprotected_paths_are_plain_routes(router) -> None:
+    """Startup assertion for the invariant the A1 exemption rests on: every
+    `_UNPROTECTED_PATHS` entry must be the canonical of a registered
+    PlainResource (adversarial review A-08).
+
+    WHY THIS STILL MATTERS AFTER THE FIX ROUND. The per-request test is
+    `_router_match_path(request) in _UNPROTECTED_PATHS`, i.e. the router's own
+    `PlainResource._match` comparison. That equivalence holds *only* for a
+    plain resource: `PlainResource._match` is string equality, but every other
+    resource class matches by pattern or prefix, and `canonical` is deliberately
+    MANY-TO-ONE for them — `/memory/status/1` and `/memory/status/2` both report
+    `/memory/status/{pg_id}`. So the moment this set gains a value that is a
+    dynamic canonical, the middleware's exact compare stops modelling the
+    router's match, and the whole family behind that pattern is at risk of being
+    treated as exempt. The offending string looks perfectly innocent in a diff.
+    Fail at startup instead, where an operator sees it.
+
+    It also guarantees the weaker but load-bearing property that an exempt path
+    is a path some registered route OWNS — an exemption for a path the router
+    does not own can only ever be honoured by the catch-all, which forwards to
+    an LLM backend. That IS the A1 defect, stated as a route-table property.
+
+    Raises RuntimeError naming the offending entry. Called from
+    hive_mind_proxy.main() next to set_known_routes(), i.e. after every real
+    route is registered and before the catch-all — the same window that makes
+    the route snapshot meaningful.
+    """
+    # The exemption reads `rel_url.path_safe` because that is the attribute
+    # `Resource.resolve` passes to `_match`. If the installed yarl does not
+    # expose it, `_router_match_path` returns None for EVERY request and
+    # /health 401s on every auth-on install — a hard availability failure
+    # wearing the shape of a safe deny, and one no unit test that builds its
+    # own request double would ever see. Refuse to boot instead.
+    from yarl import URL as _URL  # aiohttp's own hard dependency; always present
+    if not isinstance(getattr(_URL("/health"), "path_safe", None), str):
+        raise RuntimeError(
+            "the installed yarl does not expose URL.path_safe, which is the "
+            "attribute aiohttp's router matches on and the attribute the "
+            "_UNPROTECTED_PATHS exemption compares. Without it every request "
+            "would be denied the exemption and /health would require a token. "
+            "Install the pinned dependency set (requirements-gateway.lock)."
+        )
+    plain: set = set()
+    dynamic: dict = {}
+    for resource in router.resources():
+        canonical = getattr(resource, "canonical", None)
+        if not isinstance(canonical, str):
+            continue
+        if isinstance(resource, web.PlainResource):
+            plain.add(canonical)
+        else:
+            dynamic[canonical] = type(resource).__name__
+    for entry in sorted(_UNPROTECTED_PATHS):
+        if entry in plain:
+            continue
+        if entry in dynamic:
+            raise RuntimeError(
+                f"_UNPROTECTED_PATHS entry {entry!r} resolves to a "
+                f"{dynamic[entry]}, not a PlainResource. A dynamic canonical "
+                f"is many-to-one, so exempting it would make every path "
+                f"behind that pattern anonymous. Register the unauthenticated "
+                f"endpoint as a static route, or drop it from the set."
+            )
+        raise RuntimeError(
+            f"_UNPROTECTED_PATHS entry {entry!r} is not the canonical of any "
+            f"registered route. An exemption for a path the router does not "
+            f"own cannot be honoured by the router — it can only be honoured "
+            f"by the catch-all, which forwards to an LLM backend."
+        )
 
 
 # Plaintext AGENT_TOKENS entries are REFUSED outright, as of v0.9.3 (RULED,
@@ -1841,7 +1968,37 @@ async def auth_middleware(request: web.Request, handler):
         # docstring above for why the two diverge after a daemon token is minted.
         if not AUTH_CONFIGURED_AT_STARTUP:
             return await handler(request)
-        if request.path.rstrip("/") in _UNPROTECTED_PATHS or request.path in _UNPROTECTED_PATHS:
+        # Security fix A1 (v0.9.76). ONE comparison, and it is the ROUTER's own.
+        #
+        # `rel_url.path_safe` is the exact string aiohttp hands to
+        # `PlainResource._match` (`self._path == path`), so membership in
+        # _UNPROTECTED_PATHS *is* the router's admission test for the two static
+        # routes this set names. The middleware and the router cannot disagree
+        # about what "/health" means, because they compare the same bytes. See
+        # _router_match_path's docstring for the aiohttp source this rests on,
+        # and require_unprotected_paths_are_plain_routes for the startup
+        # assertion that keeps the "plain resource" precondition true.
+        #
+        # This is also why `OPTIONS /health` and `POST /health` keep the
+        # anonymous 405 + `Allow: GET, HEAD` that fact:1535 requires. Their
+        # path_safe IS "/health", so the exemption grants; aiohttp then routes
+        # them to the catch-all (no GET/HEAD route accepts the method) whose
+        # _route_guard answers 405 before any LLM dispatch. "Get a token" is
+        # not why those requests failed.
+        #
+        # ⛔ TWO spellings have been removed from here, and BOTH were the defect:
+        #   `request.path.rstrip("/")` — exempted `/health/`, `/health//`,
+        #        `/health%2f`, `/pool/status/`; the router sends none of them to
+        #        handle_health, so each fell through the catch-all into an
+        #        anonymous, unaudited LLM proxy call.
+        #   `request.path` — the fix round's own first attempt, and the same
+        #        class: `request.path` is fully percent-DECODED, so
+        #        `/pool%2fstatus` read as `/pool/status` and was EXEMPTED while
+        #        the router (matching `/pool%2Fstatus`) sent it to the catch-all.
+        # Do not reintroduce either. Normalisation and decoding are legitimate
+        # for a REFUSAL decision (see AsyncHiveMindProxy._route_guard, which
+        # refuses a near-miss spelling of an owned path), never for a GRANT.
+        if _router_match_path(request) in _UNPROTECTED_PATHS:
             return await handler(request)
 
         agent_name = resolve_identity(request)

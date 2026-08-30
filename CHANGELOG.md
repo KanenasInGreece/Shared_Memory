@@ -5,6 +5,70 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.76] — 2026-08-30
+
+### One trailing slash was the difference between a token wall and an open door
+
+`GET /health/` was exempt from authentication and served by the LLM proxy. The exemption asked whether
+`request.path.rstrip("/")` was an unprotected path; the router asked whether the path matched a
+registered route. Those are different questions, and for `/health/`, `/health//`, `/health%2f` and
+`/pool/status/` they have different answers — the gap between them fell through the catch-all into an
+anonymous call to the reasoning backend, with no audit line and no request counted, because the
+exemption returned before the instrumented block. An unauthenticated caller got the backend URL in a
+response header, an LLM pool slot (sustained traffic would starve REM and NREM), and a request the
+gateway kept no record of.
+
+This was never an open proxy: traversal off the path was already refused, so `/health/../v1/models`
+and its spellings answered 401 throughout. The hole was the literal path, forwarded verbatim.
+
+**The exemption now tests the same string the router tests.** Not a normalised one, not a decoded one —
+`request.rel_url.path_safe`, which is what `PlainResource._match` compares. Any second opinion about
+what `/health` means is a place where the middleware and the router can disagree, and every hole of
+this class lives in that disagreement. The first version of this fix keyed the exemption on the
+resolved route's canonical instead, which was sound in principle and dead in practice: it could never
+grant anything the exact comparison did not, while that comparison ran on the *decoded* path — so
+`GET /pool%2fstatus` stayed anonymously exempt on a request the router had already sent to the proxy.
+The redundant limb is gone and the surviving one was corrected. An adversarial review found that; the
+test suite did not.
+
+**Independently, the route guard now refuses a near-miss spelling of a route the gateway owns**, before
+any dispatch. `/memory/search/` and `/memory/telemetry/` were already closed this way by the reserved
+prefix table; `/health` and `/pool/status` sat outside it, so the class had been solved once and these
+two names left out of the solution. This half matters most on the shipped default: with `AGENT_TOKENS`
+unset the middleware returns before its exemption ever runs, so the route guard is the only thing
+between an anonymous `GET /health/` and the backend. Normalised for the refusal, exact for the grant —
+normalisation can now only take a near-miss away from the proxy, never hand one out.
+
+A startup assertion pins the precondition the design rests on: every unprotected path must be a
+registered static route. The middleware's exact comparison models the router only for a plain
+resource — every other class matches by pattern, and a dynamic canonical is many-to-one, so one
+careless entry would make an entire pattern family anonymous while looking innocent in a diff.
+
+Two supporting repairs. A test that could **hang** rather than fail — an unbounded wait on an event
+only ever set inside a handler, so any non-admission blocked forever and swallowed the reason — now
+bounds and re-raises; this suite has no timeout backstop anywhere, and a test that hangs is a gate
+that never reports. And the mocked request doubles now build a real `yarl.URL`, so they derive the
+path the way production does instead of drifting from it.
+
+**Retraction.** The v0.3.5 entry below advertised "Trailing-slash normalisation (`/health/` passes)"
+as a feature of the original token wall. It was a defect. It is withdrawn here rather than edited out
+of history.
+
+**Known-remaining, named so no reader assumes otherwise.** The same compare-one-form / forward-another
+pattern survives on the credentialed-backend allowlist, and that one is **live**: with a valid gateway
+token, `POST /v1/chat/completions/` reaches an upstream call with the provider key attached. It is
+bounded — the host comes from configuration and never from the request, trailing slashes only, no
+traversal — and it is deferred, not fixed. `_read_role_permits` carries the same pattern but is closed
+today by the reserved-prefix table, which is a weaker guarantee than this release now has. Anonymous
+near-misses are still neither audited nor counted.
+
+**Scheduling note for downstream consumers.** v0.9.75 said the dual-emitted `/health` keys would be
+removed in 0.9.76. They are not: this release is the security fix, and the removal moves again.
+Nothing breaks — dual emit means both key sets are present, so a longer window is strictly safer for a
+consumer, and the monitor keeps reading exactly what it reads today.
+
+---
+
 ## [0.9.75] — 2026-08-28
 
 ### The backend liveness probe authenticates — a 401 now means a rejected key, never a missing one

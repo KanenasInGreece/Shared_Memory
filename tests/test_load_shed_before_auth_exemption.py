@@ -48,13 +48,53 @@ def load_coordinator(agent_tokens: str = "", gateway_inflight_max: str = ""):
 
 def _make_request(path: str, method: str = "GET"):
     from unittest.mock import MagicMock
+    from yarl import URL
     req = MagicMock()
     req.path = path
+    # Security fix A1 (v0.9.76 fix round): the _UNPROTECTED_PATHS exemption
+    # compares `rel_url.path_safe`, the string aiohttp's router matches on.
+    # Stamping only `.path` leaves a MagicMock auto-attribute here, which
+    # `_router_match_path` correctly refuses — /health would then never be
+    # admitted and the flood tests below would block on `first_admitted`.
+    # Build it from a REAL yarl URL so the double cannot drift from the router.
+    req.rel_url = URL(path, encoded=True)
     req.method = method
     req.headers = {}
     req.get = MagicMock(return_value=None)
     req.__setitem__ = MagicMock()
     return req
+
+
+async def _await_admission(task, first_admitted, timeout: float = 5.0):
+    """Wait for the slow handler to signal admission -- BOUNDED, and it
+    surfaces the real reason when admission never happens.
+
+    `first_admitted` is set only INSIDE `_slow_handler`. If the request is
+    not admitted (a 401 from the auth branch, a 503 from the valve), the
+    handler never runs, a bare `await first_admitted.wait()` blocks forever,
+    and `task`'s exception is never retrieved -- so pytest prints the test
+    NAME and nothing else, and the whole suite hangs with no diagnostic.
+    There is no timeout backstop anywhere in this repo (no pytest.ini, no
+    pytest-timeout, no CI workflow), so an unbounded wait here degrades the
+    very instrument the next mutation check will use (retro:1578: an
+    instrument that runs but does not gate). Bound it, and re-raise whatever
+    the middleware actually did instead."""
+    done, _ = await asyncio.wait(
+        [asyncio.ensure_future(first_admitted.wait()), task],
+        timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
+    )
+    if first_admitted.is_set():
+        return
+    if task in done:
+        await task  # re-raises the middleware's own exception -- the real reason
+        raise AssertionError(
+            "the first request completed without ever entering the handler: "
+            "it was refused before admission, not admitted"
+        )
+    raise AssertionError(
+        f"the first request was never admitted within {timeout}s and did not "
+        f"finish either -- _slow_handler never ran"
+    )
 
 
 async def _noop_handler(request):
@@ -193,7 +233,7 @@ async def test_concurrent_anonymous_health_flood_trips_the_valve():
     req2 = _make_request("/health")
 
     task1 = asyncio.create_task(mod.auth_middleware(req1, _slow_handler))
-    await first_admitted.wait()
+    await _await_admission(task1, first_admitted)
     assert mod._inflight == 1, "the first admitted anonymous request must count"
 
     from aiohttp.web_exceptions import HTTPServiceUnavailable
@@ -226,7 +266,7 @@ async def test_concurrent_auth_off_flood_trips_the_valve():
     req2 = _make_request("/memory/save", method="POST")
 
     task1 = asyncio.create_task(mod.auth_middleware(req1, _slow_handler))
-    await first_admitted.wait()
+    await _await_admission(task1, first_admitted)
     assert mod._inflight == 1
 
     from aiohttp.web_exceptions import HTTPServiceUnavailable
