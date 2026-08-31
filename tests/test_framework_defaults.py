@@ -103,6 +103,16 @@ def test_proxy_bind_documented_default_value():
     assert framework_defaults.FRAMEWORK_DEFAULTS["PROXY_BIND"]["default"] == "127.0.0.1"
 
 
+def test_proxy_bind_carries_an_idiom_despite_being_documented_only():
+    """Fold round item 4 (PR #347, QA Q1): PROXY_BIND's idiom now lives here
+    — the ONE authority — even though its 'kind' stays documented-only (no
+    W1 code change at that site); check_config.py used to duplicate this as
+    a hand-written special case, deleted in the fold round."""
+    row = framework_defaults.FRAMEWORK_DEFAULTS["PROXY_BIND"]
+    assert row["kind"] == "documented-only"
+    assert row["idiom"] == "get"
+
+
 def test_port_documented_default_value():
     assert framework_defaults.FRAMEWORK_DEFAULTS["PORT"]["default"] == 8888
 

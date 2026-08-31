@@ -80,8 +80,14 @@ Table shape. Every row is keyed by the framework's own name for the setting
                                        never import this table, so this row
                                        is a documented exclusion, not a
                                        value any server-side code reads.
-  idiom      for an "env-default" row only: which idiom the *consumer site*
-             uses to fall back to the default —
+  idiom      present on every row with a genuine os.environ-reading
+             consumer site (every "env-default" row, PLUS PROXY_BIND —
+             a "documented-only" row with no W1 CODE change, but check_
+             config.py still needs its idiom to render an honest verdict,
+             so it lives here rather than as a second, hand-written
+             authority in that script — fold-round item 4, PR #347):
+             which idiom the *consumer site* uses to fall back to the
+             default —
                "or"   — ``os.environ.get(NAME) or default`` — an EMPTY env
                         value (``NAME=`` in .env) is treated the SAME as an
                         unset one and falls back to the default.
@@ -196,8 +202,17 @@ FRAMEWORK_DEFAULTS = MappingProxyType({
     "PROXY_BIND": MappingProxyType({
         "default": "127.0.0.1",
         "kind": "documented-only",
+        "idiom": "get",
         "consumers": ("hive_mind_proxy.py:5253 (bind_host)",),
-        "note": "Set PROXY_BIND=0.0.0.0 to opt into all-interfaces binding.",
+        "note": (
+            "Set PROXY_BIND=0.0.0.0 to opt into all-interfaces binding. "
+            "Carries an 'idiom' despite 'kind' being documented-only (no W1 "
+            "code change at this site) — see the module docstring's 'idiom' "
+            "field entry for why: check_config.py needs it to render an "
+            "honest present-but-empty verdict, and a second, hand-written "
+            "idiom table in that script would be exactly the duplicate "
+            "authority this module exists to prevent (fold-round item 4)."
+        ),
     }),
     "PORT": MappingProxyType({
         "default": 8888,

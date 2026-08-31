@@ -327,6 +327,14 @@ uv run --with aiohttp --with asyncpg --with httpx --with neo4j \
 | `1` | Readable, but the gateway WILL refuse to start (reachable only once Phase B's import succeeds). |
 | `2` | Could not read/render at all — an unreadable-but-PRESENT `.env`, or a Phase-B import crash. An ABSENT `.env` is NOT exit 2. |
 
+⚠ **A `LLM_BACKENDS_JSON` that fails to PARSE (bad JSON syntax, or valid JSON that isn't an array)
+is NOT exit 2** — `hive_mind_proxy`'s own loader catches that internally and falls back to the
+legacy `LLM_BACKENDS`/`LLM_DEFAULT_TARGET` pool, so the import still succeeds. `check_config.py`
+surfaces this as a prominent `⚠ DECLARED FLEET NOT USABLE` warning before the backend roster,
+exit **0** (the gateway genuinely does boot, just not on the fleet you declared) — never a second
+meaning for exit 1. Exit 2 is reserved for a shape the loader's own try/except does not catch (e.g.
+a JSON array of bare strings instead of objects).
+
 ⛔ **Not wired into `preflight.sh`.** preflight's exit contract is 0/1 (hard requirements only) and
 it deliberately runs before `shared-memory/.env` is expected to exist — this script's 0/1/2
 contract is different on purpose, and it has nothing useful to say that early. Run it any time after

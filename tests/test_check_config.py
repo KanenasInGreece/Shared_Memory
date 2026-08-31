@@ -181,11 +181,17 @@ def test_malformed_llm_backends_json_array_of_strings_is_exit_2_no_traceback(tmp
     """Valid JSON, valid array — but each ENTRY is a string, not an object,
     so hive_mind_proxy's own _load_llm_backends() raises AttributeError at
     import time ('str' object has no attribute 'get'). Phase B must catch
-    this, never let it surface as a raw traceback."""
+    this, never let it surface as a raw traceback. SEC-HIGH (fold round,
+    PR #347): AttributeError is NOT on the safe-message allowlist, so only
+    its TYPE NAME is shown — its own message ('has no attribute') never
+    is, even though this particular message happens to carry no secret;
+    the policy is type-based, not content-sniffed."""
     proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": '["http://a:5000"]'},
                 tmp_path=tmp_path)
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert "UNAVAILABLE" in proc.stdout
+    assert "AttributeError" in proc.stdout
+    assert "has no attribute" not in proc.stdout
     assert "Traceback" not in proc.stderr
     assert "Phase A" in proc.stdout  # Phase A output still printed
 
@@ -193,7 +199,10 @@ def test_malformed_llm_backends_json_array_of_strings_is_exit_2_no_traceback(tmp
 def test_import_crash_bare_host_port_embedder_url_still_prints_phase_a_and_exit_2(tmp_path):
     """The measured-common typo: no scheme at all. urlsplit reads this as
     scheme='embedder', which coordinator._encoder_url raises ValueError on
-    at IMPORT time (before hive_mind_proxy even finishes importing it)."""
+    at IMPORT time (before hive_mind_proxy even finishes importing it).
+    SEC-HIGH (fold round, PR #347): ValueError is NOT on the safe-message
+    allowlist — only the type name is shown, never _encoder_url's own
+    message (which can embed the operator-supplied EMBEDDER_URL value)."""
     proc = _run(env_overrides={"SECURE_ENV_FILE": "", "EMBEDDER_URL": "embedder.internal:8070"},
                 tmp_path=tmp_path)
     assert proc.returncode == 2, proc.stdout + proc.stderr
@@ -201,6 +210,7 @@ def test_import_crash_bare_host_port_embedder_url_still_prints_phase_a_and_exit_
     assert "EMBEDDER_URL" in proc.stdout  # declared state visible in Phase A output too
     assert "UNAVAILABLE" in proc.stdout
     assert "ValueError" in proc.stdout
+    assert "must be an http(s) URL" not in proc.stdout  # _encoder_url's own message, never shown
     assert "Traceback" not in proc.stderr
 
 
@@ -211,29 +221,248 @@ def test_valid_config_with_a_local_backend_is_exit_0(tmp_path):
     assert "none — the gateway would boot with this configuration." in proc.stdout
 
 
+# ── QA Q2 (fold round, PR #347, the substantive finding) — a parse-error
+#    LLM_BACKENDS_JSON is caught INSIDE hive_mind_proxy's own loader and
+#    silently replaced by the legacy fallback: import succeeds, both guard
+#    functions pass, and without the warning line below the report would
+#    read as a clean, intended single-backend roster over a vanished
+#    declared fleet. ───────────────────────────────────────────────────────
+
+def test_llm_pool_fallback_reason_is_rendered_prominently_and_exit_stays_0(tmp_path):
+    """Ruled: exit STAYS 0 — the gateway genuinely DOES boot on the legacy
+    fallback, and exit 1 must keep its one meaning ('would refuse to
+    start'), never acquire a second one ('boots on a fleet you probably
+    didn't intend'). This also corrects the original D3 wording gap: the
+    build brief said this input exits 2 — it does not; this warning is the
+    honest report."""
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": "{not json"},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "DECLARED FLEET NOT USABLE" in proc.stdout
+    assert "legacy fallback" in proc.stdout
+
+
+def test_a_clean_llm_backends_json_shows_no_fallback_warning(tmp_path):
+    """Negative case for the above: a genuinely usable declared fleet gets
+    no fallback warning at all."""
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": '[{"url":"http://a:5000"}]'},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "DECLARED FLEET NOT USABLE" not in proc.stdout
+
+
+# ── SEC-HIGH (fold round, PR #347) — check_config must be unable to print a
+#    raw secret through ANY exception path, in EITHER phase. Policy: ALWAYS
+#    the exception's type name; str(exc) shown (scrubbed) ONLY for the
+#    small known-safe allowlist (ImportError/ModuleNotFoundError — pure
+#    dependency messages, no config payload); every other type gets
+#    type-name-only plus a fixed hint, never its own message. ──────────────
+
+def test_render_exception_allowlisted_type_shows_its_scrubbed_message():
+    out = check_config._render_exception(ImportError("No module named 'x'"), "a hint")
+    assert out == "ImportError: No module named 'x'"
+
+
+def test_render_exception_non_allowlisted_type_shows_type_and_hint_only():
+    out = check_config._render_exception(ValueError("secret-abc-should-not-appear"), "a fixed hint")
+    assert out == "ValueError — a fixed hint"
+    assert "secret-abc-should-not-appear" not in out
+
+
+def test_phase_a_secret_bearing_exception_shows_type_only_never_the_secret(monkeypatch):
+    """secure_env.load_split_env() can raise a ValueError quoting the
+    OFFENDING .env LINE verbatim — i.e. a raw secret, if that line set
+    one. Simulated (the real secure_env parsing code doesn't raise this
+    way today) to prove check_config's OWN defence holds even if it ever
+    does — this is the guard MUTATION-CHECKED in the fold round: remove
+    _render_exception's allowlist gate (render str(exc) unconditionally)
+    and this test is exactly the one that starts failing."""
+    monkeypatch.setenv("SECURE_ENV_FILE", "")
+    secret = "s3cr3t-that-must-never-appear-in-phase-a-output"
+
+    def _boom():
+        raise ValueError(f"malformed .env line: NEO4J_PASSWORD={secret}")
+
+    monkeypatch.setattr(check_config.secure_env, "load_split_env", _boom)
+    lines, ok = check_config.phase_a_render()
+    assert ok is False
+    body = "\n".join(lines)
+    assert "ValueError" in body
+    assert secret not in body
+    assert "Traceback" not in body
+
+
+def test_phase_b_secret_bearing_import_exception_shows_type_only_never_the_secret(monkeypatch):
+    """Same shape as the Phase A test above, for the import-failure branch
+    — also mutation-checked (see that test's docstring); together the two
+    prove BOTH phases' exception paths honour the allowlist gate."""
+    import builtins
+
+    real_import = builtins.__import__
+    secret = "s3cr3t-that-must-never-appear-in-phase-b-output"
+
+    def _boom_import(name, *a, **kw):
+        if name == "hive_mind_proxy":
+            raise ValueError(f"LLM_BACKENDS_JSON token_env resolved to {secret}")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _boom_import)
+    lines, code = check_config.phase_b_render()
+    assert code == 2
+    body = "\n".join(lines)
+    assert "ValueError" in body
+    assert secret not in body
+    assert "Traceback" not in body
+
+
+# ── SEC-MED (fold round, PR #347) — defensive scrub_url_credentials wrap on
+#    the WOULD-REFUSE line and each role_config_errors element. Both were
+#    already construction-scrubbed since v0.9.77 (scrub_url_credentials is
+#    called at the point _load_llm_backends()/require_valid_llm_routing_
+#    config() BUILD these strings) — this wrap is belt-and-braces for a
+#    FUTURE construction-site regression, not a fix for a leak found today.
+#
+#    ⚠ FINDING (not a ruling — flagging for the merger): the wrap can
+#    OVER-redact. Every role_config_errors message is built as
+#    f"{scrub_url_credentials(url)}: ..." with NO space before the colon
+#    (hive_mind_proxy.py's _parse_roles, all four call sites) — so on the
+#    SECOND scrub, scrub_url_credentials' greedy `\S+` regex captures the
+#    trailing colon as part of the "URL", urlsplit() chokes turning
+#    "5000:" into a port, and the whole thing falls back to the function's
+#    own "<url-redacted>" catch-all. Net effect: an already-clean backend
+#    URL displays as "<url-redacted>" in this one spot. This is a SAFE
+#    failure (over-redaction, never a leak) but a display regression —
+#    fixable with a one-character space added at each of the four
+#    hive_mind_proxy.py call sites, deliberately NOT done here since it is
+#    outside this fold round's named scope. ──────────────────────────────
+
+def test_would_refuse_line_and_role_errors_never_leak_a_raw_credential(tmp_path):
+    """The property that actually matters: no unredacted userinfo/query
+    credential reaches output, even accepting the over-redaction above."""
+    backends_json = ('[{"url":"http://svc:s3cr3t-in-url@a:5000","roles":["bogus"]}]')
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": backends_json},
+                tmp_path=tmp_path)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "WOULD REFUSE TO START" in proc.stdout
+    assert "s3cr3t-in-url" not in proc.stdout
+    assert "svc:" not in proc.stdout
+
+
+# ── QA Q1 / fold-round item 4 — PROXY_BIND's idiom now lives in the D1
+#    table, not a second, hand-written authority in this script. ───────────
+
+def test_proxy_bind_idiom_comes_from_the_framework_defaults_table():
+    assert check_config._idiom_for("PROXY_BIND") == framework_defaults.FRAMEWORK_DEFAULTS["PROXY_BIND"]["idiom"]
+    assert framework_defaults.FRAMEWORK_DEFAULTS["PROXY_BIND"]["idiom"] == "get"
+    assert not hasattr(check_config, "_PROXY_BIND_IDIOM"), (
+        "the fold round deleted this hand-written special case — it must not come back")
+
+
+# ── QA Q3 (fold round, LOW) — the three proxy-module symbols this script
+#    reads via guarded getattr() must degrade the report, never crash it,
+#    on a future rename. Same defensive shape as hive_mind_proxy.py's own
+#    _chmod_created_ancestors import guard (hive_mind_proxy.py:39-56). ─────
+
+class _FakeProxyMissingRoleErrors:
+    """A stand-in 'hive_mind_proxy' module missing ONLY the private
+    _LLM_BACKEND_ROLE_CONFIG_ERRORS symbol — everything else phase_b_
+    render() reads is present, so this isolates that one guard."""
+    LLM_BACKENDS = ["http://a:5000"]
+    LLM_WEIGHTS = {"http://a:5000": 1.0}
+    LLM_BACKEND_MODELS = {"http://a:5000": None}
+    LLM_BACKEND_ROLES = {"http://a:5000": None}
+    LLM_BACKEND_NCTX = {"http://a:5000": None}
+    LLM_BACKEND_TOKENS = {"http://a:5000": None}
+    LLM_BACKEND_PRIVATE_OK = {"http://a:5000": True}
+    LLM_BACKEND_PRIVATE_OK_EXPLICIT = {"http://a:5000": False}
+    LLM_POOL_FALLBACK_REASON = None
+
+    @staticmethod
+    def require_auth_when_provider_keys_configured():
+        return None
+
+    @staticmethod
+    def require_valid_llm_routing_config():
+        return None
+
+
+class _FakeProxyMissingGuardFunctions:
+    """A stand-in 'hive_mind_proxy' module missing BOTH guard functions —
+    everything else present, isolating that guard."""
+    LLM_BACKENDS = []
+    LLM_WEIGHTS = {}
+    LLM_BACKEND_MODELS = {}
+    LLM_BACKEND_ROLES = {}
+    LLM_BACKEND_NCTX = {}
+    LLM_BACKEND_TOKENS = {}
+    LLM_BACKEND_PRIVATE_OK = {}
+    LLM_BACKEND_PRIVATE_OK_EXPLICIT = {}
+    LLM_POOL_FALLBACK_REASON = None
+    _LLM_BACKEND_ROLE_CONFIG_ERRORS = []
+
+
+def _patch_import_to_return(monkeypatch, fake_module):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _fake_import(name, *a, **kw):
+        if name == "hive_mind_proxy":
+            return fake_module
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+
+
+def test_missing_role_config_errors_symbol_degrades_honestly_not_a_crash(monkeypatch):
+    _patch_import_to_return(monkeypatch, _FakeProxyMissingRoleErrors)
+    lines, code = check_config.phase_b_render()
+    body = "\n".join(lines)
+    assert "UNKNOWN" in body
+    assert "_LLM_BACKEND_ROLE_CONFIG_ERRORS" in body
+    assert code == 0  # the missing role-errors symbol alone doesn't block the guard-function path
+
+
+def test_missing_guard_functions_degrade_to_exit_2_not_a_crash(monkeypatch):
+    _patch_import_to_return(monkeypatch, _FakeProxyMissingGuardFunctions)
+    lines, code = check_config.phase_b_render()
+    body = "\n".join(lines)
+    assert code == 2
+    assert "UNKNOWN" in body
+    assert "require_auth_when_provider_keys_configured" in body
+    assert "require_valid_llm_routing_config" in body
+
+
 # ── Mutation check: the Phase-B except Exception wrapper actually guards ───
-# (evidence recorded separately in HANDOFF.md per the build brief — this
-# test file's own behaviour under the mutation IS the check; run manually
-# with the wrapper narrowed/removed and confirm this test flips to failing
-# with a raw traceback, then restore.)
+# Mutation-check evidence lives in PR #347's own description (not in a
+# HANDOFF.md — that file dies with the builder's worktree, so it is never a
+# durable reference). The two facts that matter for reading this test:
+# (1) narrowing `except Exception` to `except ValueError` here makes this
+# test die with a raw AttributeError traceback instead of a caught
+# (lines, 2) result — the array-of-strings LLM_BACKENDS_JSON crash test
+# above dies too. (2) restore the wrapper, then confirm `git status` is
+# clean before moving on.
 
 def test_phase_b_render_never_raises_on_a_broken_import(monkeypatch, tmp_path):
     """In-process guard-shape check: phase_b_render() must return a
     (lines, 2) tuple, never propagate, when the import itself is broken —
     simulated by pointing PYTHONPATH-independent sys.modules at a stub that
     raises on import. This is a narrower, faster in-process companion to
-    the subprocess-based crash tests above."""
+    the subprocess-based crash tests above. RuntimeError is NOT on the
+    safe-message allowlist (SEC-HIGH, fold round) — only its TYPE NAME is
+    asserted here, never its message text."""
     import builtins
 
     real_import = builtins.__import__
 
     def _boom_import(name, *a, **kw):
         if name == "hive_mind_proxy":
-            raise RuntimeError("synthetic import failure for this test")
+            raise RuntimeError("synthetic import failure carrying no secret")
         return real_import(name, *a, **kw)
 
     monkeypatch.setattr(builtins, "__import__", _boom_import)
     lines, code = check_config.phase_b_render()
     assert code == 2
     assert any("UNAVAILABLE" in line for line in lines)
-    assert any("synthetic import failure" in line for line in lines)
+    assert any("RuntimeError" in line for line in lines)
+    assert not any("synthetic import failure" in line for line in lines)
