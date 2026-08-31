@@ -466,6 +466,46 @@ def test_plan_case_csv_live_converts_to_json_with_effective_private_ok_true():
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# probe_backend — the wall-clock deadline itself (QA H3 / SEC M-5 follow-up,
+# NEW-1 micro-round: the fix landed with no test proving the deadline is
+# what actually bounds a blocked probe).
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_probe_backend_wall_clock_deadline_returns_promptly_on_a_blocked_probe(monkeypatch):
+    """NEW-1 (micro-round): stubs the opener so `_do_probe`'s
+    `opener.open(...)` call blocks far past a tiny deadline (0.05s) —
+    proving `probe_backend()` still returns promptly, reporting
+    answered=False, because `Thread.join(timeout)` is what actually bounds
+    it, not the underlying network call finishing.
+
+    MUTATION-PROVEN: with `t.join(timeout)` reverted to a bare `t.join()`
+    (no deadline — the exact regression NEW-1 named: mutating join(timeout)
+    to join() kills zero tests without this one), this test FAILS on the
+    elapsed-time assertion below (the join blocks for the full ~2s the
+    stub sleeps, instead of the 0.05s deadline) — a fast, deterministic
+    fail rather than a true hang, because the stub's own sleep is itself
+    bounded. Recorded in the fix-round report: reverting the join() call
+    alone made this test fail on `assert elapsed < 1.0` (elapsed ~= 2.0s).
+    """
+    def _slow_open(req, timeout=None):
+        time.sleep(2.0)  # far longer than the 0.05s deadline below
+        raise AssertionError("must never be reached before the deadline returns")
+
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            return _slow_open(req, timeout=timeout)
+
+    monkeypatch.setattr(m.urllib.request, "build_opener", lambda *a, **k: _FakeOpener())
+
+    started = time.monotonic()
+    result = m.probe_backend("http://a:5000", timeout=0.05)
+    elapsed = time.monotonic() - started
+
+    assert result == {"answered": False, "status": None, "parsed_model_list": False, "n_models": None}
+    assert elapsed < 1.0, f"probe_backend did not return within its deadline: {elapsed:.2f}s"
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # Interactive confirm — y / N / EOF / deadline, probe stubbed both ways
 # ─────────────────────────────────────────────────────────────────────────
 

@@ -569,10 +569,13 @@ def probe_backend(url: str, timeout: float = 3.0) -> dict:
     returns based on `Thread.join(timeout)` — a probe that has not
     finished within `timeout` wall-clock seconds is reported exactly as
     'did not answer', full stop, regardless of what phase it was in. The
-    abandoned thread is never killed (stdlib has no clean way to interrupt
-    a blocking socket call) but is daemonized, so it can never block this
-    process's own exit — an accepted, bounded cost (at most one lingering
-    thread per confirm), not a resource leak across runs."""
+    thread past its deadline is ABANDONED, not CANCELLED — stdlib has no
+    clean way to interrupt a blocking socket call, so it keeps running and
+    keeps HOLDING ITS SOCKET open until whatever it is doing (DNS, connect,
+    or read) eventually finishes or errors on its own; it is daemonized
+    only so it can never block this PROCESS's own exit. An accepted,
+    bounded cost (at most one lingering thread — and one lingering socket
+    — per confirm), not a resource leak across runs."""
     result = {"answered": False, "status": None, "parsed_model_list": False, "n_models": None}
 
     def _do_probe() -> None:
