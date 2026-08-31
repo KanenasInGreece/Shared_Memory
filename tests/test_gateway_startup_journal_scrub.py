@@ -204,8 +204,22 @@ def _restore_module(monkeypatch):
     """Reloading hive_mind_proxy rebinds the module object process-wide --
     restore a clean-env reload after every test so later test files that
     import it fresh do not inherit this file's env (same convention as
-    tests/test_coordinator_encoder_urls.py)."""
+    tests/test_coordinator_encoder_urls.py).
+
+    Handback fix: teardown is LIFO, so this code runs BEFORE monkeypatch's
+    own undo -- the M2-partial scenarios' LLM_BACKENDS_JSON/AGENT_TOKENS/
+    ALLOW_UNAUTHENTICATED_PROVIDER_KEYS monkeypatches were still live at
+    reload time, and coordinator (whose AUTH_CONFIGURED_AT_STARTUP those
+    scenarios also mutate) was never reloaded at all here. Clear the env
+    ourselves (immediate, not dependent on monkeypatch's later undo) and
+    reload coordinator alongside hive_mind_proxy, so a later test can't
+    inherit an auth-off coordinator state and pass for the wrong reason."""
     yield
-    for k in ("EMBEDDER_URL", "RERANKER_URL"):
+    for k in ("EMBEDDER_URL", "RERANKER_URL", "LLM_BACKENDS_JSON", "LLM_BACKENDS",
+              "AGENT_TOKENS", "ALLOW_UNAUTHENTICATED_PROVIDER_KEYS"):
         monkeypatch.delenv(k, raising=False)
+    import secure_env
+    secure_env._secrets.pop("AGENT_TOKENS", None)
+    import coordinator
+    importlib.reload(coordinator)
     importlib.reload(importlib.import_module("hive_mind_proxy"))
