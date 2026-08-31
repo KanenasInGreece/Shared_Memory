@@ -5,6 +5,46 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.80] — 2026-08-31
+
+### An upgrade now proves the pool it leaves behind is the pool it found
+
+The LLM pool has always been a composition — `LLM_BACKENDS_JSON`, falling back to the legacy CSV,
+falling back to a built-in `localhost:5000` — and the effective result lived in no single place an
+operator could read or an upgrade could preserve. This release ships `migrate_env.py`, a standalone
+migration that makes the effective pool explicit `.env` configuration without changing what any
+install does. It computes the pre-image effective state by running the real loader — in a fresh
+subprocess under the gateway's own environment, never the operator's shell — decides exactly one of
+five disjoint cases, writes atomically with an out-of-tree backup, then recomputes and compares in
+two layers: behavioural invariants must be identical, and declaration-status fields may move only in
+the planned direction on only the entries the run reported writing. Any other difference restores
+the backup, byte-verifies the restore, and stops the update before anything restarts. A run that
+plans no writes performs none: the file's hash and mtime are untouched.
+
+What the migration refuses to decide is as deliberate as what it does. An entry carrying `token_env`
+or `roles` is left byte-for-byte alone — an explicit `private_ok` of either value would silence a
+boot-time guard, and the role-less-traffic gap closes in the default-deny release, announced rather
+than frozen in. Keys owned by the systemd unit are reported with the exact line to add, never
+written — and the ownership check survives systemd's real shell-quoted output. A pool served by the
+built-in fallback is materialised only on the operator's explicit confirm, informed by an advisory
+liveness probe whose reading — HTTP status, whether the body parses as a model list — is shown in
+the question; a headless install gets a report and the persistently visible `/health` state, never a
+silent write. Nothing serving means nothing configured.
+
+`update_framework.sh` gains the capture and migrate steps around its data safeguard — the capture
+runs before the pull, with the old code's own copy of the script, so the cross-version guarantee is
+a construction rather than an assumption — plus `--skip-env-migration`, so a migration refusal can
+never hold a security update hostage. `check_config.py` now renders the nothing-declared pool state
+as its own flagged line. Two behaviour notes: the migration also runs on the `--from-restore` path,
+because a restored older `.env` arriving at newer code is exactly the population the guarantee
+exists for (on an already-migrated env it is a no-op); and preservation of untouched entries is
+semantic — values and meaning — rather than literal line bytes when a sibling entry in the same JSON
+array is rewritten.
+
+Chain: brief through three adversarial review rounds (two reviewers) → operator rulings
+(decision:1846) → build → QA + security reviews (fact:1847 / fact:1848) → merger ruling
+(decision:1849) → fix round with per-item pre-fix kills → handback verdict MERGE.
+
 ## [0.9.79] — 2026-08-31
 
 ### An undeclared or ineligible fleet is now visible on /health

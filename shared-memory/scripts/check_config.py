@@ -94,6 +94,16 @@ code: the gateway genuinely DOES boot on that fallback, so 0 stays 0 (exit
 never also mean "the gateway would boot on a configuration you probably
 didn't intend").
 
+W3 (Backend_Declaration_Spec_2026-08-30 §4 / decision:1846): if
+proxy.LLM_POOL_CONFIG_EMPTY is set instead — nothing was declared at ALL
+(no LLM_BACKENDS_JSON, no LLM_BACKENDS) and the gateway is serving the bare
+LLM_DEFAULT_TARGET fallback — that gets its own flagged line too, mutually
+exclusive with the FALLBACK_REASON line by construction (D1: one marks
+EXCLUSION of a declared fleet, the other marks ABSENCE of any declaration
+at all). Also exit 0 — the gateway boots either way — and this is the same
+persistent state migrate_env.py's non-interactive report points an operator
+back at.
+
 On success, renders one line per configured LLM backend: url
 (credential-scrubbed), weight, model, roles, n_ctx, has_credential (a bool,
 never the token), private_ok (effective) and private_ok_explicit (the first
@@ -318,6 +328,21 @@ def phase_b_render() -> "tuple[list[str], int]":
     if fallback_reason:
         lines.append("⚠ DECLARED FLEET NOT USABLE — the gateway would boot on the "
                      "legacy fallback: " + scrub_url_credentials(str(fallback_reason)))
+        lines.append("")
+
+    # W3 build item (Backend_Declaration_Spec_2026-08-30 §4 / R-A): the OTHER
+    # half of D1's pair, rendered as its own flagged line so the instrument
+    # migrate_env.py itself leans on (the non-interactive report line's
+    # "see GET /health" pointer) shows the same state here too. Mutually
+    # exclusive with LLM_POOL_FALLBACK_REASON by construction (D1) — nothing
+    # was declared at all here, vs. a declared fleet that got excluded above
+    # — so this never doubles up with the warning block just printed.
+    config_empty = getattr(proxy, "LLM_POOL_CONFIG_EMPTY", False)
+    if config_empty:
+        lines.append("⚠ NO BACKEND DECLARED — the gateway is falling back to "
+                     + scrub_url_credentials(str(getattr(proxy, "DEFAULT_TARGET", "")))
+                     + " (LLM_DEFAULT_TARGET/its own built-in default). Run "
+                       "migrate_env.py to declare it explicitly.")
         lines.append("")
 
     if not proxy.LLM_BACKENDS:
