@@ -976,7 +976,8 @@ Check that tag out instead, or use the tarball route above.
 export AGENT_TOKEN=<an agent token>      # postflight needs it, or A1/A5/A8 skip and it exits 1
 bash shared-memory/scripts/update_framework.sh --dry-run   # see every step, run nothing
 bash shared-memory/scripts/update_framework.sh             # do it, and prove it
-bash shared-memory/scripts/update_framework.sh --domain-backfill  # also run step 6 (opt-in; skipped by default)
+bash shared-memory/scripts/update_framework.sh --domain-backfill  # also run step 8 (opt-in; skipped by default)
+bash shared-memory/scripts/update_framework.sh --skip-env-migration  # skip steps 0 & 3 below; see there
 ```
 
 **After the script finishes, treat a stack-drift verdict as a step, not an aside.**
@@ -1025,17 +1026,23 @@ always to update the CHECKOUT; the schema cannot be moved backwards.**
 
 | # | Step | Why it is here |
 |---|---|---|
-| 0 | `git pull --ff-only` | skipped with `--from-restore`. Refuses a **detached HEAD** and refuses a tarball tree, rather than failing in a way that reads as broken tooling |
-| 1 | `ops/backup.sh` | migration is the one step nothing can undo. Uses the shipped script so it is the same artifact `restore.sh` can read |
-| 2 | `apply.py` | Postgres, ledger-driven, forward-only (exit 3 = database ahead) |
-| 3 | `verify_neo4j_init.py --apply` | **Neo4j has no ledger** — this is the graph's entire forward-migration |
-| 4 | `reconcile_project_identity.py --apply` | graph half of migration 027; no migration can run it |
-| 5 | restart + wait for `/health` | the running gateway must BE the migrated code |
-| 6 | `backfill_domain_of.py --apply` | **after** the restart — see the guard below; **opt-in** via `--domain-backfill` (skipped by default; `--no-domain-backfill` is a one-release no-op) |
-| 7 | `sync_skills.sh` | after the restart, so it cannot print a false incompatibility warning |
-| 8 | `postflight.sh` | an update is not complete until this passes |
+| 0 | capture pre-upgrade effective config (`migrate_env.py --capture-preimage`) | **upgrade path only**, immediately before the pull — the OLD checkout's own copy, so the pre/post equality below is a construction, not an assumption. Skippable with `--skip-env-migration` (skips this AND step 3) |
+| 1 | `git pull --ff-only` | skipped with `--from-restore`. Refuses a **detached HEAD** and refuses a tarball tree, rather than failing in a way that reads as broken tooling |
+| 2 | `ops/backup.sh` | migration is the one step nothing can undo. Uses the shipped script so it is the same artifact `restore.sh` can read |
+| 3 | migrate `.env` to explicit configuration (`migrate_env.py --apply`) | runs on **both** the upgrade and restore paths; uses step 0's pre-image when it ran, else self-captures with the current loader. See *Migrate `.env` to explicit LLM routing config* below |
+| 4 | `apply.py` | Postgres, ledger-driven, forward-only (exit 3 = database ahead) |
+| 5 | `verify_neo4j_init.py --apply` | **Neo4j has no ledger** — this is the graph's entire forward-migration |
+| 6 | `reconcile_project_identity.py --apply` | graph half of migration 027; no migration can run it |
+| 7 | restart + wait for `/health` | the running gateway must BE the migrated code |
+| 8 | `backfill_domain_of.py --apply` | **after** the restart — see the guard below; **opt-in** via `--domain-backfill` (skipped by default; `--no-domain-backfill` is a one-release no-op) |
+| 9 | `sync_skills.sh` | after the restart, so it cannot print a false incompatibility warning |
+| 10 | `postflight.sh` | an update is not complete until this passes |
 
-⚠ **Step 7 is after step 5 deliberately.** Run before the restart, `update_skill.sh` compares the new
+⚠ **Under `--from-restore`, steps 0 and 1 do not run at all** (no placeholder — the whole
+Step-0 block is skipped, exactly as before W3), so every step number above shifts down by 2 on
+that path (step 3 becomes the first thing that runs; step 10 (`postflight.sh`) becomes step 8).
+
+⚠ **Step 9 is after step 7 deliberately.** Run before the restart, `update_skill.sh` compares the new
 client against the *old* gateway and prints `⚠ Updated to X but still incompatible. The GATEWAY
 itself …` — alarming, self-resolving one step later, and observed on two hosts. The ordering removes
 the false alarm rather than rewording it.
@@ -1049,7 +1056,7 @@ early is safe but pointless. It is **dry-run by default**; nothing is enqueued w
 v0.9.35 the preview belongs to plain `backfill_domain_of.py` (no flag) alone — under it the report
 prints and the function returns before anything is enqueued — and a real (`--apply`) run enqueues
 **once, with no separate preview step**: the same counts the preview would have shown are printed by
-the applied run itself, before it enqueues. The upgrade flow (`update_framework.sh`, step 6 above)
+the applied run itself, before it enqueues. The upgrade flow (`update_framework.sh`, step 8 above)
 therefore invokes it exactly once, with `--apply`; there is no second invocation to read a preview
 from. It is also only needed on a deployment whose records already carry a `domain` in their metadata:
 a new install has none, and every save from here on writes its own edge.
@@ -1076,6 +1083,65 @@ is the right starting state. Sections are registered through ingress the same wa
 ⚠ **Run the Neo4j check on every upgrade, and do not assume it is redundant.** `apply.py` covers Postgres only, and Postgres has a migration ledger that records what has been applied. **Neo4j has none** — `neo4j_init.cypher` is a one-time manual step, so a long-lived instance enforces whatever constraint set was true the day someone last ran it, and a constraint added to the file in a later release reaches new installs and nobody else. A missing uniqueness constraint is silent: `MERGE` keeps working and the only symptom is a duplicate node appearing under a race. Add `--apply` to create what is missing; it exits 1 when a declared constraint is not in force, so it is safe to gate on. *(This is not hypothetical — the deployment this framework was built on was enforcing one of the seven declared constraints, and a plain index on `Entity.name` was blocking a second. `--apply` handles that case; re-running `neo4j_init.cypher` does not.)*
 
 Clients and gateway may drift; `memory_bridge.py doctor` names which side to upgrade on `api_version` skew. `doctor` also names the token's own `agent`/`role` once a gateway reports them (0.9.54+) — a gateway that genuinely predates that is named `role: not reported (gateway <version> predates 0.9.54)`; a current gateway with no `role` in the reply means THIS token was not accepted, named `role: not reported (token not accepted — anonymous payload)`.
+
+### Migrate `.env` to explicit LLM routing config (W3, `migrate_env.py`)
+
+**Steps 0 and 3 above are this tool.** `Backend_Declaration_Spec_2026-08-30.md` §4 rules that an
+upgrade must never change a running install's behaviour — mechanically, not by operator memory —
+so before any release stops defaulting an undeclared pool, every existing install's implicit
+routing config (a bare `LLM_BACKENDS` CSV line, or nothing declared at all) needs to become the
+explicit `LLM_BACKENDS_JSON` form **without changing what actually serves today**. `migrate_env.py`
+is that one-time-per-install migration, standalone (`shared-memory/scripts/migrate_env.py`, no
+other module imports it):
+
+```bash
+migrate_env.py --capture-preimage <out.json>     # capture only (used by update_framework.sh's step 0)
+migrate_env.py [--preimage <in.json>] [--apply]  # evaluate / apply — default is a DRY-RUN PREVIEW
+```
+
+**What it does, per install, first match wins:** an already-usable `LLM_BACKENDS_JSON` gets
+`"private_ok": true` added only to entries with no `token_env`/`roles`/`private_ok` of their own; a
+live `LLM_BACKENDS` (CSV) line gets converted to the JSON form (effective `private_ok: true`) and
+commented out with a dated provenance line, never deleted; nothing declared at all (the bare
+fallback) is **advisory-probed and asks the operator to confirm** — interactively only, with a 60s
+deadline (anything but `y` = no write, and it asks again at the next upgrade); every other
+population (roles-carrying entries, a credentialed backend with neither key, any key the systemd
+unit itself owns, an empty `LLM_BACKENDS_JSON=`) is **left untouched and reported by name** — this
+tool refuses to write in every case where a human decision is actually owed. It proves the
+migration changed nothing BEHAVIOURAL by capturing the effective config before and after and
+comparing them (urls, weights, credentials-present, roles, fit numbers, effective `private_ok`,
+both startup-guard verdicts) — any divergence restores the pre-migration backup and refuses,
+naming it. **Predicted no-op on an install that is already fully explicit** — any write there is a
+finding, not the expected case.
+
+**`--skip-env-migration`** skips both steps 0 and 3 for one run — a capture/migration bug must not
+block a security update. Coverage for that upgrade is deferred to a manual standalone run (below).
+
+**Standalone / headless run** (no `update_framework.sh` in the loop — e.g. a host where
+`shared-memory/.env` does not exist yet, which is the one case `update_framework.sh` itself refuses
+before any step at all): run it directly, same dependencies the gateway itself needs —
+
+```bash
+uv run --no-project --with-requirements requirements-gateway.lock \
+    python shared-memory/scripts/migrate_env.py               # preview (no --preimage: self-captures)
+uv run --no-project --with-requirements requirements-gateway.lock \
+    python shared-memory/scripts/migrate_env.py --apply       # apply, same self-capture
+```
+
+This is also the **live-proof procedure for a host whose running updater predates step 0/3** (see
+the version-jump note below) — the standalone `--apply` run is safe to run at any time; it self-
+captures with the CURRENT loader (valid only while loader semantics are unchanged from the running
+version — true through W3) and is idempotent, so re-running it after it has already migrated a host
+reports "nothing to do" rather than re-touching anything.
+
+⚠ **The pre-W3 → post-W4 version-jump case.** `update_framework.sh` never re-execs after its own
+`git pull` (git replaces the file, the running process keeps its old inode), so **the migration
+step only fires on an upgrade FROM a checkout that already has it** — a host upgrading directly
+from before W3 straight to W4 or later runs a pre-W3 updater with no capture/migrate step at all,
+and lands on the release that starts refusing to default an undeclared pool having never migrated.
+W4's "no backend declared" degraded reason names `migrate_env.py` explicitly for exactly this
+population — treat it as actionable, not silent: run the standalone procedure above once, by hand,
+on any host you know jumped more than one release in a single `git pull`.
 
 ### Reconcile the stack to the shipped pins
 
