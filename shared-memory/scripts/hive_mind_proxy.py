@@ -289,6 +289,13 @@ LLM_BACKEND_PLAINTEXT_OK: dict[str, bool] = {}
 # Set by the loader when LLM_BACKENDS_JSON was present but produced NO usable
 # backend and the legacy fallback took over — surfaced as a degraded llm_pool.
 LLM_POOL_FALLBACK_REASON: "str | None" = None
+# D1 (decision:1832): set by the loader when the legacy DEFAULT_TARGET fallback
+# was substituted for ABSENCE — nothing was declared at all (no LLM_BACKENDS_JSON,
+# no LLM_BACKENDS). Distinct from LLM_POOL_FALLBACK_REASON, which marks
+# EXCLUSION (a fleet WAS declared, every entry excluded). Never inferred from
+# backend_status emptiness — that reads only what got PROBED, and a config fact
+# is knowable before any probe runs.
+LLM_POOL_CONFIG_EMPTY: bool = False
 
 
 def _load_llm_backends() -> tuple[
@@ -502,6 +509,13 @@ def _load_llm_backends() -> tuple[
 
     _raw_backends = [_parse_backend(e) for e in os.environ.get("LLM_BACKENDS", FRAMEWORK_DEFAULTS["LLM_BACKENDS"]["default"]).split(",") if e.strip()]
     if not _raw_backends:
+        # D1: this substitution is ABSENCE (nothing declared) only when it is
+        # not ALREADY the JSON-exclusion case above (LLM_POOL_FALLBACK_REASON
+        # set) — the two markers are mutually exclusive by construction, and
+        # only one may explain a given fallback.
+        global LLM_POOL_CONFIG_EMPTY
+        if not LLM_POOL_FALLBACK_REASON:
+            LLM_POOL_CONFIG_EMPTY = True
         _raw_backends = [(DEFAULT_TARGET, 1.0)]
     urls = [u for u, _ in _raw_backends]
     weights = {u: w for u, w in _raw_backends}
@@ -934,6 +948,25 @@ def _eligible_backends(role: str, est_prompt_tokens: float = 0.0,
     role = (role or "").strip().lower()
     return [b for b in LLM_POOL if _role_eligible(b, role)
             and _fits(b, est_prompt_tokens, effective_max_tokens)]
+
+
+def _all_roles_ineligible() -> "str | None":
+    """D2.4 (decision:1832): the NEW fleet-wide-only eligibility verdict for
+    /health's llm_pool dependency. None normally; a reason string iff
+    `_eligible_backends` comes up EMPTY for role-less traffic AND every
+    ROUTING_ROLE_NAMES role — i.e. the fleet cannot serve ANY traffic class,
+    not merely one. A hole for SOME roles only (a card scoped to `judge` in a
+    fleet with no `extract` backend) must NOT touch llm_pool — a backend
+    serving other traffic fine is not down, and per-role holes stay unsurfaced
+    here (M2, carried to W4).
+
+    Pure, no I/O, no cache: reads LLM_POOL through the same
+    `_eligible_backends` request routing itself calls (`:1109`/`:1621`), so a
+    test that monkeypatches `_eligible_backends` sees the change on the very
+    next call — there is no startup-cached census to go stale (Opus F3)."""
+    if any(_eligible_backends(r) for r in ("",) + tuple(sorted(ROUTING_ROLE_NAMES))):
+        return None
+    return "configured, but no backend is eligible for any traffic"
 
 
 def _classify_no_eligible_constraint(role: str, est_prompt_tokens: float,
@@ -4036,18 +4069,50 @@ def _llm_pool_dependency(backend_status: dict) -> dict:
     Before this, `llm` read `ok` while N-1 of N backends were down — the pool
     tolerates a dead backend, so "any is up" was the right answer for the
     routing question and the wrong answer for the operator's.
+
+    D2 (decision:1832) — LIVENESS FIRST, THEN CONFIGURATION. The order below is
+    load-bearing: a `down` verdict is never softened by what the config MEANS,
+    only explained by it. Checked in this order:
+      1. no backend probed at all -> unknown (nothing to derive a verdict from)
+      2. every probed backend down -> DOWN, unconditionally (M1: the reason is
+         composed when LLM_POOL_CONFIG_EMPTY is also set, so a fresh install
+         reads why its unset fallback is unreachable rather than being told
+         about a URL it never declared)
+      3. LLM_POOL_FALLBACK_REASON set (a declared fleet, every entry EXCLUDED)
+         -> degraded (F6, v0.9.75, unchanged)
+      4. LLM_POOL_CONFIG_EMPTY and the fallback IS serving -> degraded, the NEW
+         state (⚠ a deliberate, ruled change: a legacy zero-config-but-working
+         install used to read `ok` here — visibility before behaviour, ahead
+         of W4 retiring the fallback)
+      5. some (not all) probed backends down -> degraded, unchanged
+      6. all probed backends up, but NO role (role-less or any
+         ROUTING_ROLE_NAMES role) has an eligible backend -> degraded, the NEW
+         fleet-wide eligibility verdict (D2.4). A hole for SOME roles only does
+         NOT reach here (agy 3 / Opus F6).
     """
     if not backend_status:
         return _dep(_STATE_UNKNOWN, "no backend configured")
+    bad = sorted(b for b, s in backend_status.items() if s != "ok")
+    if len(bad) == len(backend_status):
+        if LLM_POOL_CONFIG_EMPTY:
+            return _dep(_STATE_DOWN,
+                        "down: nothing serves the built-in fallback (no backend declared)")
+        return _dep(_STATE_DOWN, f"all {len(bad)} backend(s) down")
     if LLM_POOL_FALLBACK_REASON:
         # F6 (v0.9.75): the configured fleet was entirely excluded and the
         # legacy fallback is serving — a "healthy" pool at the wrong place.
         return _dep(_STATE_DEGRADED, LLM_POOL_FALLBACK_REASON)
-    bad = sorted(b for b, s in backend_status.items() if s != "ok")
-    if len(bad) == len(backend_status):
-        return _dep(_STATE_DOWN, f"all {len(bad)} backend(s) down")
+    if LLM_POOL_CONFIG_EMPTY:
+        # NEW (decision:1832): nothing was declared and the built-in fallback
+        # is up — visible now, rather than reading `ok` like every prior
+        # release. See the docstring's item 4.
+        return _dep(_STATE_DEGRADED,
+                    "no backend declared — serving the built-in localhost:5000 fallback")
     if bad:
         return _dep(_STATE_DEGRADED, f"{len(bad)}/{len(backend_status)} backend(s) down")
+    ineligible_reason = _all_roles_ineligible()
+    if ineligible_reason:
+        return _dep(_STATE_DEGRADED, ineligible_reason)
     return _dep(_STATE_OK)
 
 
@@ -4069,13 +4134,43 @@ def _outbox_dependency(census: object, age_limit_s: int) -> dict:
     return _dep(_STATE_OK)
 
 
+def _dream_slots_impossible_reason() -> "str | None":
+    """D3 (decision:1832): a PURE config fact, knowable before any probe —
+    None normally; the same reason `warn_if_dream_slots_impossible` logs at
+    startup when NO backend counts toward /pool/status free_slots (that
+    function's own predicate, `_counts_free_slot` over `LLM_BACKENDS`). The
+    startup warning stays; this puts the same fact on /health for the
+    gateway's whole lifetime, in the dependency it actually explains
+    (`rem_daemon`/`nrem_daemon`, not a bare log line nobody is tailing)."""
+    if any(_counts_free_slot(b) for b in LLM_BACKENDS):
+        return None
+    return ("no backend counts toward dream slots — REM and NREM will never "
+            "run against this fleet")
+
+
 def _rem_dependency(process_running: bool, dead_lettered: object) -> dict:
     """A PID is not health. `rem_daemon` was a PID check and nothing else, so a
-    REM that was dead-lettering every record it touched read `running`."""
+    REM that was dead-lettering every record it touched read `running`.
+
+    D3/B3 (decision:1832) — ordering: down -> config verdict (dream slots
+    impossible) -> the rest, same logic as `_llm_pool_dependency`'s D2. When
+    BOTH a dead-letter reason and the slots-impossible reason apply, the
+    liveness/dead-letter reason leads and the slots reason APPENDS — a fleet
+    actively dead-lettering has the more urgent story, but an operator needs
+    both facts in one place.
+    """
     if not process_running:
         return _dep(_STATE_DOWN, "process not running")
-    if isinstance(dead_lettered, int) and dead_lettered > 0:
-        return _dep(_STATE_DEGRADED, f"dead_letters:{dead_lettered}")
+    dead_letter_reason = (f"dead_letters:{dead_lettered}"
+                          if isinstance(dead_lettered, int) and dead_lettered > 0
+                          else None)
+    slots_reason = _dream_slots_impossible_reason()
+    if dead_letter_reason and slots_reason:
+        return _dep(_STATE_DEGRADED, f"{dead_letter_reason}; {slots_reason}")
+    if dead_letter_reason:
+        return _dep(_STATE_DEGRADED, dead_letter_reason)
+    if slots_reason:
+        return _dep(_STATE_DEGRADED, slots_reason)
     return _dep(_STATE_OK)
 
 
@@ -4083,15 +4178,29 @@ def _nrem_dependency(process_running: bool, consolidation: object,
                      attempt_floor: int) -> dict:
     """Same argument as REM, plus the middle state `stalled` alone cannot say:
     a daemon that ATTEMPTS folds and succeeds at none is not stalled — it is
-    running, busy, and producing nothing, which reads as perfectly healthy."""
+    running, busy, and producing nothing, which reads as perfectly healthy.
+
+    D3/B3 (decision:1832) — ordering: down -> config verdict (dream slots
+    impossible) -> probe-timing states -> the rest. The `unknown` "not yet
+    probed" state must NOT gate the config verdict: a config fact is knowable
+    before any probe runs, so not-yet-probed AND slots-impossible together
+    read `degraded`, never `unknown`. Once a real snapshot exists, the slots
+    reason still applies and APPENDS to whatever the snapshot says (same
+    lead/append precedence as REM's dead-letters).
+    """
     if not process_running:
         return _dep(_STATE_DOWN, "process not running")
+    slots_reason = _dream_slots_impossible_reason()
     if not isinstance(consolidation, dict):
+        if slots_reason:
+            return _dep(_STATE_DEGRADED, slots_reason)
         return _dep(_STATE_UNKNOWN, "not yet probed")
     if consolidation.get("stalled"):
         types = consolidation.get("stalled_types") or []
-        return _dep(_STATE_DEGRADED,
-                    f"stalled:{','.join(types)}" if types else "stalled")
+        reason = f"stalled:{','.join(types)}" if types else "stalled"
+        if slots_reason:
+            reason = f"{reason}; {slots_reason}"
+        return _dep(_STATE_DEGRADED, reason)
     attempted = 0
     succeeded = 0
     for key, block in consolidation.items():
@@ -4099,7 +4208,12 @@ def _nrem_dependency(process_running: bool, consolidation: object,
             attempted += block.get("folds_attempted_24h") or 0
             succeeded += block.get("folds_succeeded_24h") or 0
     if attempted >= attempt_floor and succeeded == 0:
-        return _dep(_STATE_DEGRADED, f"folds_attempted_24h:{attempted} succeeded:0")
+        reason = f"folds_attempted_24h:{attempted} succeeded:0"
+        if slots_reason:
+            reason = f"{reason}; {slots_reason}"
+        return _dep(_STATE_DEGRADED, reason)
+    if slots_reason:
+        return _dep(_STATE_DEGRADED, slots_reason)
     return _dep(_STATE_OK)
 
 

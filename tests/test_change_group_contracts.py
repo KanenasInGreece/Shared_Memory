@@ -24,20 +24,36 @@ def _read(*parts) -> str:
 
 # ── GROUP 1 — client surface and its delivery ────────────────────────────────
 
-# The four files the release version lives in. Two are client copies, which is
+# The files the release version lives in. Two are client copies, which is
 # why a server-side fix still touches this group.
+#
+# FIFTH PIN (D4, decision:1832): telemetry_contract.py's own VERSION, added
+# because it sat at "0.9.74" through three releases (0.9.75/76/77) of the
+# other four moving without it — nothing compared them, so nobody noticed.
+# ⚠ Builders never touch the first four (merger-owned); the exception is
+# telemetry_contract.py's VERSION itself, which D4 explicitly bumps as part
+# of registering W2's own MEANING_CHANGES entries (which assert against it).
+# Proven against the known-broken state first, per the brief: with
+# telemetry_contract.VERSION at "0.9.79" and the other four still at the
+# v0.9.78 anchor (merger-owned, untouched by this build), this test FAILS —
+# by design, until the merger's own version-bump step brings the other four
+# forward to match at release time. That gap is the fifth pin doing its job,
+# not a build defect (see VERSION's own comment in telemetry_contract.py).
 _VERSION_PINS = {
     ("shared-memory", "scripts", "coordinator.py"): r'^FRAMEWORK_VERSION = "([\d.]+)"',
     ("shared-memory", "scripts", "memory_bridge.py"): r'^VERSION = "([\d.]+)"',
     ("shared-memory-skill", "shared-memory", "scripts", "memory_bridge.py"):
         r'^VERSION = "([\d.]+)"',
     ("mcp", "vector-skill.py"): r'^VERSION = "([\d.]+)"',
+    ("shared-memory", "scripts", "telemetry_contract.py"): r'^VERSION = "([\d.]+)"',
 }
 
 
 def test_all_four_version_pins_agree():
-    """GROUP 1. The version lives in FOUR files and every release moves all of
-    them, so a bump is four edits that nothing has ever checked.
+    """GROUP 1. The version lives in FIVE files (was four; telemetry_contract.py
+    joined as the fifth, D4/decision:1832) and every release moves all of them,
+    so a bump is five edits that nothing had ever checked before this test
+    existed.
 
     A missed one ships a client announcing a version the gateway does not
     recognise, and the only symptom is a compatibility warning from a `doctor`
@@ -50,9 +66,10 @@ def test_all_four_version_pins_agree():
         assert m, f"no version pin found in {'/'.join(parts)}"
         found["/".join(parts)] = m.group(1)
     assert len(set(found.values())) == 1, (
-        f"the four version pins disagree: {found}. Every release moves all four "
-        "— two of them are client copies, which is why even a server-side fix "
-        "touches this group. Then run sync_skills.sh."
+        f"the version pins disagree: {found}. Every release moves all five — "
+        "two of the four legacy ones are client copies (run sync_skills.sh "
+        "after), and telemetry_contract.py's own VERSION now travels with "
+        "them too."
     )
 
 

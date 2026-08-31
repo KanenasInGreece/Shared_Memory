@@ -591,6 +591,22 @@ if [[ "$DRY_RUN" == "0" ]]; then
     grn "   ✓ gateway restarted and running $_running (matches this checkout)"
 fi
 
+# D5 (decision:1832) — report the config the just-restarted gateway is
+# actually running under. AFTER step 5's restart, deliberately: reporting
+# BEFORE the restart would describe the OLD process's world. Phase B (not
+# --phase-a-only, unlike install_framework.sh's fresh-install check) needs
+# the daemon modules, so this is the SAME uv/locked invocation the systemd
+# unit uses (hive-mind-gateway.service's ExecStart) rather than an ad-hoc
+# --with list — `--no-project --with-requirements requirements-gateway.lock`,
+# resolved from REPO_ROOT the same way the unit's WorkingDirectory resolves
+# it. `|| true`: this step REPORTS, it must never abort an update that has
+# already restarted the gateway successfully (Opus F8 — never sits between a
+# run_soft call and its rc=$? capture; it does not use run_soft at all).
+echo
+ylw "── Reporting effective configuration (check_config.py) ──"
+(cd "$REPO_ROOT" && uv run --no-project --with-requirements requirements-gateway.lock \
+    python shared-memory/scripts/check_config.py) || true
+
 # ── Step 6: domain backfill — AFTER the restart, and that is a GUARD ──────────
 #
 # ⛔ ORDERING IS SAFETY, NOT PREFERENCE. This enqueues a narrow repair row that

@@ -911,8 +911,19 @@ def test_the_meaning_change_list_covers_every_re_pointed_key():
     assert ("health", "role") in paths
     assert ("health", "llm_backends.*") in paths
     assert ("health", "status") in paths
+    # W2 (decision:1832) — the fleet-visibility meaning changes.
+    assert ("health", "dependencies.llm_pool.state") in paths
+    assert ("health", "dependencies.rem_daemon.state") in paths
+    assert ("health", "dependencies.nrem_daemon.state") in paths
     for mc in tc.MEANING_CHANGES:
-        assert mc["in_version"] == tc.VERSION
+        # RELAXED (D4, decision:1832, delta re-review B1): a meaning-change
+        # entry keeps its OWN historical stamp rather than silently becoming
+        # "this release" every time VERSION moves — the four 0.9.74 entries
+        # pinned above stay at tc.INTRODUCED_0_9_74 forever. Anything not
+        # authored under that frozen stamp must assert == tc.VERSION, so a
+        # genuinely NEW entry landing with neither of the two legitimate
+        # stamps (a stale version) still fails loudly.
+        assert mc["in_version"] in (tc.VERSION, tc.INTRODUCED_0_9_74)
         assert mc["was"] and mc["now"] and mc["action"]
 
 

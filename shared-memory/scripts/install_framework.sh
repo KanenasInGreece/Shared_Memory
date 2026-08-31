@@ -314,3 +314,16 @@ else
   echo "  being retired — configure explicitly with:"
   echo "    bash shared-memory/ops/install_llm_backends.sh"
 fi
+
+echo
+# D5 (decision:1832): a would-refuse config now REPORTS at install time
+# instead of only being discovered at the gateway's own first boot. Phase A
+# of check_config.py is stdlib-only by design (fact:1585-adjacent — see its
+# own module docstring), so this cannot crash a fresh host on a missing
+# dependency; `|| true` because this script's job is to REPORT the config,
+# never to let the reporter's own exit code kill an installer that has
+# nothing left to fail on past this point (this script is `set -euo
+# pipefail`, so an unguarded non-zero here would abort with .env already
+# written and every prior step already done).
+echo "Checking the configuration this install produced..."
+python3 shared-memory/scripts/check_config.py --phase-a-only || true
