@@ -75,21 +75,61 @@ yesno()        { local v; read -r -p "$1 [y/N]: " v; [[ "$v" =~ ^[Yy]$ ]]; }
 # tests/test_install_llm_backends_role_vocabulary.py)
 #
 # >>> BACKEND_ACCESS
-# yesno_y() lives inside this marker (rather than beside yesno() above) so
-# the block stays SELF-CONTAINED for tests/test_install_llm_backends.py's
-# standalone extraction — build_backend_entry() depends on it.
-yesno_y() { local v; read -r -p "$1 [Y/n]: " v; [[ ! "$v" =~ ^[Nn]$ ]]; }
+# _ROLE_VOCABULARY / yesno_y() / _role_vocabulary_has() /
+# _roles_cover_full_vocabulary() live inside this marker (rather than
+# beside yesno() above) so the block stays SELF-CONTAINED for
+# tests/test_install_llm_backends.py's standalone extraction —
+# build_backend_entry() depends on all four.
+_ROLE_VOCABULARY="extract judge"
 
-# ask_backend_roles() — loops until it has >=1 of {extract, judge} (the
-# gateway's ROUTING_ROLE_NAMES; "summarize" is reserved and always invalid
-# here, same as at the gateway). Blank input (Enter) means "both" — that is
-# the documented default, not a re-ask condition. Anything else that yields
-# zero valid roles (an unknown name, "summarize", or a garbage token) DOES
-# re-ask — it must never fall through to an empty roles list, which is
-# itself a separate fatal shape at the gateway. Exhausted stdin fails loudly
-# (same convention as install_framework.sh's ask_secret) rather than
-# spinning. stdout carries ONLY the final space-separated role list;
-# everything else is stderr.
+# SEC fix round (H-BLOCKING): yesno_y() now guards its own read the same way
+# ask_backend_roles() and the M-5 mode prompt do. Before, an exhausted pipe
+# at THIS prompt left `v` empty, the regex `[[ ! "$v" =~ ^[Nn]$ ]]` matched
+# (empty does not match ^[Nn]$) and the function returned TRUE -- silently
+# writing private_ok:true with no operator answer at all. Now EOF is a
+# THIRD state (return 2), distinct from 0=yes/1=no, so a caller can refuse
+# to guess rather than defaulting to either branch: an unanswered access
+# question must never widen access.
+yesno_y() {
+    local v
+    if ! read -r -p "$1 [Y/n]: " v; then
+        return 2
+    fi
+    [[ ! "$v" =~ ^[Nn]$ ]]
+}
+
+_role_vocabulary_has() {
+    local candidate="$1" r
+    for r in $_ROLE_VOCABULARY; do
+        [[ "$r" == "$candidate" ]] && return 0
+    done
+    return 1
+}
+
+# M5 (fix round): a REAL set comparison -- sorts both sides -- rather than
+# the earlier "does the joined string contain a space" heuristic, which
+# happened to work only because _ROLE_VOCABULARY has exactly two members.
+# A future third role added to _ROLE_VOCABULARY (kept in lockstep with the
+# gateway's ROUTING_ROLE_NAMES) cannot silently break "did the operator
+# choose the full set" detection, because both sides read from the same
+# variable.
+_roles_cover_full_vocabulary() {
+    local chosen_sorted full_sorted
+    chosen_sorted="$(printf '%s\n' $1 | sort | tr '\n' ' ')"
+    full_sorted="$(printf '%s\n' $_ROLE_VOCABULARY | sort | tr '\n' ' ')"
+    [[ "$chosen_sorted" == "$full_sorted" ]]
+}
+
+# ask_backend_roles() — loops until it has >=1 role from _ROLE_VOCABULARY
+# (the gateway's ROUTING_ROLE_NAMES; "summarize" is reserved and always
+# invalid here, same as at the gateway). Blank input (Enter) means "both" —
+# that is the documented default, not a re-ask condition. Anything else
+# that yields zero valid roles (an unknown name, "summarize", or a garbage
+# token) DOES re-ask — it must never fall through to an empty roles list,
+# which is itself a separate fatal shape at the gateway. Exhausted stdin
+# fails loudly (same convention as install_framework.sh's ask_secret)
+# rather than spinning. stdout carries ONLY the final space-separated role
+# list; everything else is stderr.
 ask_backend_roles() {
     local raw role lc valid=() bad
     while true; do
@@ -98,7 +138,7 @@ ask_backend_roles() {
             return 1
         fi
         if [[ -z "$raw" ]]; then
-            printf 'extract judge'
+            printf '%s' "$_ROLE_VOCABULARY"
             return 0
         fi
         raw="${raw//,/ }"
@@ -106,21 +146,20 @@ ask_backend_roles() {
         bad=0
         for role in $raw; do
             lc="$(printf '%s' "$role" | tr '[:upper:]' '[:lower:]')"
-            case "$lc" in
-                extract|judge)
-                    case " ${valid[*]:-} " in
-                        *" $lc "*) ;;
-                        *) valid+=("$lc") ;;
-                    esac
-                    ;;
-                *) bad=1 ;;
-            esac
+            if _role_vocabulary_has "$lc"; then
+                case " ${valid[*]:-} " in
+                    *" $lc "*) ;;
+                    *) valid+=("$lc") ;;
+                esac
+            else
+                bad=1
+            fi
         done
         if [[ "$bad" -eq 0 && ${#valid[@]} -gt 0 ]]; then
             printf '%s' "${valid[*]}"
             return 0
         fi
-        echo "  Enter one or more of: extract, judge (never summarize — reserved)." >&2
+        echo "  Enter one or more of: $_ROLE_VOCABULARY (never summarize — reserved)." >&2
     done
 }
 
@@ -137,9 +176,11 @@ ask_backend_roles() {
 # separate fatal shape at the gateway). Every prompt/warning/caveat goes to
 # stderr; stdout carries only the finished JSON entry — the caller's
 # `entry="$(build_backend_entry ...)"` capture depends on that separation.
+# An unanswered access question (exhausted stdin at ANY point in here)
+# always returns 1 and writes NOTHING to stdout — never a default guess.
 build_backend_entry() {
     local url="$1" weight="$2" model="$3" token_env="$4" env_file="$5"
-    local auth_off=0 priv="" roles_str="" mode=""
+    local auth_off=0 priv="" roles_str="" mode="" general_rc
 
     if [[ -n "$token_env" ]]; then
         # S-05: the gateway refuses to start with ANY credentialed backend
@@ -177,8 +218,16 @@ build_backend_entry() {
             priv="true"
         else
             roles_str="$(ask_backend_roles)" || return 1
+            # This "never serves role-less traffic" claim is TRUE only on
+            # THIS (credentialed) path: an explicit `roles` list with no
+            # `private_ok` key defaults the EFFECTIVE private_ok to false
+            # for a credentialed backend (token is not None), so
+            # _role_eligible's role-less branch (which falls back to
+            # effective private_ok, ignoring `roles`) excludes it. See the
+            # uncredentialed branch below for why the SAME sentence would be
+            # false there.
             echo "  Note: a roles-only backend never serves role-less (ad-hoc) traffic." >&2
-            if [[ "$roles_str" != *" "* ]]; then
+            if ! _roles_cover_full_vocabulary "$roles_str"; then
                 echo "  Note: with only these roles, this backend does not count toward dream" >&2
                 echo "  slots — if no other backend qualifies, REM and NREM will never run" >&2
                 echo "  against this fleet." >&2
@@ -192,9 +241,27 @@ build_backend_entry() {
         if yesno_y "  Does this backend serve general (role-less) traffic?"; then
             priv="true"
         else
+            general_rc=$?
+            # H2 fix round: general_rc is 1 here ("no" answered) UNLESS
+            # yesno_y hit exhausted stdin (2) -- distinguish them rather
+            # than treating any non-zero as "no, go elicit roles".
+            if [[ "$general_rc" -eq 2 ]]; then
+                echo "  No more input on stdin — refusing to guess whether this backend serves" >&2
+                echo "  general traffic (an unanswered access question must never widen access)." >&2
+                return 1
+            fi
             roles_str="$(ask_backend_roles)" || return 1
-            echo "  Note: a roles-only backend never serves role-less (ad-hoc) traffic." >&2
-            if [[ "$roles_str" != *" "* ]]; then
+            # H2 (fix round, QA review): the "never serves role-less
+            # traffic" line is FALSE on THIS (uncredentialed) path --
+            # _role_eligible's role-less branch IGNORES `roles` entirely
+            # and falls back to the EFFECTIVE private_ok, which defaults
+            # TRUE for an uncredentialed backend (no token_env). A
+            # roles-only entry written here WILL still serve role-less
+            # traffic until a default-deny release exists. Only the honest
+            # correction below belongs on this path; the "never serves"
+            # claim printed on the credentialed path above does not apply
+            # here.
+            if ! _roles_cover_full_vocabulary "$roles_str"; then
                 echo "  Note: with only these roles, this backend does not count toward dream" >&2
                 echo "  slots — if no other backend qualifies, REM and NREM will never run" >&2
                 echo "  against this fleet." >&2
@@ -263,6 +330,12 @@ while true; do
         echo "  Full convention: shared-memory/ops/README.md, \"Reasoning-LLM backends\"."
     fi
 
+    # M6 (fix round): tracked so a LATER failure in build_backend_entry
+    # (below) can tell the operator a systemd unit was already created and
+    # started for this backend even though NO config line will be written
+    # for it -- rather than silently exiting with a running, unconfigured
+    # service and no explanation.
+    systemd_unit_created=""
     if command -v systemctl >/dev/null 2>&1 && yesno "  Does THIS machine run this backend, and should it be supervised as a systemd service?"; then
         label="$(ask_required "  Short label for the service (e.g. qwen3-a770 — used in the unit name)")"
         echo "  Paste the exact command that starts this backend (your own llama-server /"
@@ -287,10 +360,21 @@ WantedBy=default.target
 EOF
         systemctl --user daemon-reload
         systemctl --user enable --now "llm-backend-${label}.service"
+        systemd_unit_created="llm-backend-${label}.service"
         grn "  ✓ Installed + started llm-backend-${label}.service"
     fi
 
-    entry="$(build_backend_entry "$url" "$weight" "$model" "$token_env" "$ENV_FILE")" || exit 1
+    if ! entry="$(build_backend_entry "$url" "$weight" "$model" "$token_env" "$ENV_FILE")"; then
+        red "✗ No LLM_BACKENDS_JSON entry was written for this backend — the access"
+        red "  question above was left unanswered."
+        if [[ -n "$systemd_unit_created" ]]; then
+            red "  NOTE: the systemd unit $systemd_unit_created WAS already created and"
+            red "  started for this backend, with NO config line written for it. Disable"
+            red "  it if you don't want that running unconfigured:"
+            red "    systemctl --user disable --now $systemd_unit_created"
+        fi
+        exit 1
+    fi
     entries+=("$entry")
     grn "  Added: $url"
 
@@ -353,3 +437,22 @@ echo "  No literal key was ever written to this file — only env var NAMES, per
 echo "  Restart the gateway to pick this up:"
 echo "    systemctl --user restart hive-mind-gateway.service"
 echo "  (or: bash shared-memory/ops/install_service.sh, if it isn't installed as a service yet)"
+
+# M1 (fix round, QA review): a per-backend S-05 warning printed during
+# elicitation can scroll off-screen by the time the operator reaches
+# "Restart the gateway to pick this up" -- exactly the one state where that
+# restart command will NOT work. Re-check (value-sensitive, same as
+# build_backend_entry's own check; prints nothing itself either way) and, if
+# it still applies, re-print the warning HERE -- the true LAST thing this
+# script prints -- rather than trusting the operator to have scrolled back
+# up to see it.
+if echo "$json_array" | jq -e 'any(.[]; has("token_env"))' >/dev/null 2>&1; then
+    if ! grep -qE '^[[:space:]]*AGENT_TOKENS=[^[:space:]]' "$ENV_FILE" 2>/dev/null; then
+        echo
+        red "⚠ AGENT_TOKENS is still not set — the 'systemctl --user restart' above will"
+        red "  FAIL (S-05: the gateway refuses to start with a credentialed backend"
+        red "  configured and no auth). Mint tokens first:"
+        red "    bash shared-memory/scripts/bootstrap_tokens.sh"
+        red "  — or set the documented override: ALLOW_UNAUTHENTICATED_PROVIDER_KEYS=1"
+    fi
+fi

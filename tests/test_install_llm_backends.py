@@ -69,7 +69,11 @@ def _run(
         shlex.quote(url), shlex.quote(weight), shlex.quote(model),
         shlex.quote(token_env), shlex.quote(str(env_file)),
     )
-    script = source + "\n" + invocation
+    # M7 (fix round): run under the SAME `set -euo pipefail` the real
+    # script has at its own top -- a bug that only misbehaves under set -e
+    # (an unguarded command whose failure would abort the real script)
+    # could otherwise pass here while still being live in production.
+    script = "set -euo pipefail\n" + source + "\n" + invocation
     return subprocess.run(
         ["bash", "-c", script],
         input=stdin_text, capture_output=True, text=True, timeout=timeout,
@@ -117,6 +121,10 @@ def test_credentialed_roles_writes_exact_array_no_private_ok_key(tmp_path):
     entry = json.loads(proc.stdout)
     assert sorted(entry["roles"]) == ["extract", "judge"]
     assert "private_ok" not in entry
+    # H2 fix round: "never serves role-less traffic" is TRUE on the
+    # CREDENTIALED roles path (effective private_ok defaults false there) --
+    # must be printed here.
+    assert "never serves role-less" in proc.stderr
 
 
 def test_credentialed_single_role_writes_exact_array(tmp_path):
@@ -134,11 +142,20 @@ def test_credentialed_single_role_writes_exact_array(tmp_path):
 
 
 def test_credentialed_full_roleset_no_subset_caveat(tmp_path):
+    """H1 fix round: the caveat sentence spans two echo lines ("...does not
+    count toward dream\\n  slots -- ..."), so the assertion below must match
+    a substring that is actually contiguous on ONE line -- "does not count
+    toward dream slots" (with a literal space where the real text has a
+    newline) can never appear even when the caveat DOES fire, which made
+    the original version of this test vacuous. "does not count toward
+    dream" has no line break in it either way, so it is a faithful presence/
+    absence probe. See HANDOFF.md for the mutation check proving this one
+    actually bites."""
     env_file = tmp_path / "auth_on.env"
     env_file.write_text("AGENT_TOKENS=some-real-token\n")
     proc = _run("roles\nextract judge\n", env_file, token_env="DEEPSEEK_API_KEY")
     assert proc.returncode == 0, proc.stderr
-    assert "does not count toward dream slots" not in proc.stderr
+    assert "does not count toward dream" not in proc.stderr
 
 
 def test_credentialed_refusing_both_reasks_no_fatal_shape(tmp_path):
@@ -183,7 +200,7 @@ def test_role_input_summarize_or_invalid_reasks_never_written(tmp_path, roles_in
     import json
     entry = json.loads(proc.stdout)
     assert entry["roles"] == ["extract"]
-    assert "extract, judge" in proc.stderr  # the re-ask guidance line
+    assert "extract judge" in proc.stderr  # the re-ask guidance line
 
 
 def test_blank_role_input_defaults_to_both(tmp_path):
@@ -221,7 +238,32 @@ def test_uncredentialed_blank_defaults_yes(tmp_path):
     assert entry["private_ok"] is True
 
 
+def test_uncredentialed_exhausted_stdin_never_defaults_to_private_ok_true(tmp_path):
+    """SEC-HIGH fix round: before this fix, exhausted stdin at the
+    uncredentialed general-traffic prompt left `v` empty, the regex
+    `[[ ! "$v" =~ ^[Nn]$ ]]` matched (empty does not match ^[Nn]$), and
+    yesno_y silently returned TRUE -- writing private_ok:true with no
+    operator answer at all. An unanswered access question must never widen
+    access: exhausted stdin here must fail loudly, write NOTHING to stdout,
+    and must NOT be indistinguishable from a real "yes"."""
+    env_file = tmp_path / "auth_on.env"
+    env_file.write_text("AGENT_TOKENS=some-real-token\n")
+    proc = _run("", env_file, token_env="")  # closed stdin, not even a blank line
+    assert proc.returncode != 0
+    assert proc.stdout == ""
+    assert '"private_ok":true' not in proc.stdout.replace(" ", "")
+    assert "refusing to guess" in proc.stderr
+
+
 def test_uncredentialed_no_writes_roles_and_honest_caveat(tmp_path):
+    """H2 fix round: the "never serves role-less traffic" claim is FALSE on
+    THIS path -- _role_eligible ignores `roles` entirely for role-less
+    traffic and falls back to the effective private_ok, which defaults TRUE
+    for an uncredentialed backend. That sentence must be ABSENT here even
+    though it is correctly present on the credentialed roles path (see
+    test_credentialed_roles_writes_exact_array_no_private_ok_key) -- only
+    the honest "still routes role-less traffic" correction belongs on this
+    path."""
     env_file = tmp_path / "auth_on.env"
     env_file.write_text("AGENT_TOKENS=some-real-token\n")
     proc = _run("n\nextract\n", env_file, token_env="")
@@ -234,6 +276,8 @@ def test_uncredentialed_no_writes_roles_and_honest_caveat(tmp_path):
     # uncredentialed roles path.
     assert "still routes" in proc.stderr
     assert "role-less" in proc.stderr
+    # The FALSE claim must never appear here.
+    assert "never serves role-less" not in proc.stderr
 
 
 def test_never_writes_private_ok_false(tmp_path):
