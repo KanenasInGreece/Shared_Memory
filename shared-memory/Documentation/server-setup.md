@@ -271,7 +271,7 @@ the network should learn.
 
 ⚠ **A fresh, undeclared install now reads `degraded` on `llm_pool`, not `ok`**
 (W2, decision:1832). Before this, a zero-config gateway with something merely
-*serving* `localhost:5000` (the implicit `LLM_DEFAULT_TARGET` fallback) read
+*serving* the implicit fallback (`LLM_DEFAULT_TARGET`) read
 `ok` — indistinguishable from a deliberately configured fleet. It now reads
 `degraded` with a reason naming exactly that: nothing was declared, and the
 built-in fallback is what answered. This is a deliberate visibility change

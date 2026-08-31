@@ -599,13 +599,30 @@ fi
 # unit uses (hive-mind-gateway.service's ExecStart) rather than an ad-hoc
 # --with list — `--no-project --with-requirements requirements-gateway.lock`,
 # resolved from REPO_ROOT the same way the unit's WorkingDirectory resolves
-# it. `|| true`: this step REPORTS, it must never abort an update that has
-# already restarted the gateway successfully (Opus F8 — never sits between a
-# run_soft call and its rc=$? capture; it does not use run_soft at all).
+# it. Deliberately NOT run_soft (Opus F8 — never sits between a run_soft call
+# and its rc=$? capture).
+#
+# Fix round Q4: gated on DRY_RUN like every other step — a bare unconditional
+# invocation ran for REAL under --dry-run and then the summary at the bottom
+# still claimed "nothing was executed", which was false.
+# Fix round Q5/Q6 (agy MED): report-not-gate is preserved — 0/1/2 are
+# check_config.py's OWN contract codes and all three stay a silent pass, this
+# step REPORTS and must never abort an update that has already restarted the
+# gateway successfully. But a bare `|| true` also swallowed a SIGNAL KILL or
+# crash outside that contract silently, reading exactly like success — rc is
+# captured and anything past the tool's own 0/1/2 vocabulary is surfaced.
 echo
 ylw "── Reporting effective configuration (check_config.py) ──"
-(cd "$REPO_ROOT" && uv run --no-project --with-requirements requirements-gateway.lock \
-    python shared-memory/scripts/check_config.py) || true
+if [[ "$DRY_RUN" == "0" ]]; then
+    rc=0
+    (cd "$REPO_ROOT" && uv run --no-project --with-requirements requirements-gateway.lock \
+        python shared-memory/scripts/check_config.py) || rc=$?
+    if [ "$rc" -gt 2 ]; then
+        echo "⚠ check_config aborted (rc=$rc) — config report incomplete"
+    fi
+else
+    echo "   (dry run — not executed)"
+fi
 
 # ── Step 6: domain backfill — AFTER the restart, and that is a GUARD ──────────
 #

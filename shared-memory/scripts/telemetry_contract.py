@@ -85,6 +85,17 @@ __all__ = [
 #: release time — that gap is the check doing its job, not a build defect.
 VERSION = "0.9.79"
 
+
+def _version_tuple(v: str) -> tuple:
+    """"0.9.79" -> (0, 9, 79) — the same idiom `backfill_domain_of.py`,
+    `backfill_project_of.py`, `backfill_promote_grounded.py` and
+    `reconcile_project_edges.py` already use, so a release string compares
+    numerically (fix round item 1/8, decision:1832): STRING comparison would
+    rank "0.9.9" ahead of "0.9.10", which is exactly the kind of silent wrong
+    answer a version gate must never give."""
+    return tuple(int(p) for p in v.split(".")[:3])
+
+
 #: "present at the v0.9.73 baseline; the release it first appeared in was not
 #: established". Used rather than a guessed version number.
 BASELINE = "<=0.9.73"
@@ -148,15 +159,23 @@ def _k(types: str, category: str, *, unit: str | None = None,
 #: release's literal version string, same as `dependencies.postgres.state`
 #: below does with `INTRODUCED_0_9_74` itself.
 INTRODUCED_0_9_74 = "0.9.74"
-#: The release the dual-emitted /health copies actually stop being emitted.
-#: ⚠ CORRECTED (D4, decision:1832): the code constant sat at "0.9.75" — its
-#: ORIGINAL, never-updated value — through three releases of CHANGELOG prose
-#: saying otherwise (0.9.75 moved the drop to 0.9.76; 0.9.76 moved it again,
-#: undated, because that release became the A1 security fix instead). The
-#: drop has still not happened as of this release (0.9.79) — W2 is visibility
-#: work, not the removal — so this names the earliest release it can still
-#: land in. Whoever ships the removal updates this alongside it.
-DUAL_EMIT_DROP_TARGET = "0.9.80"
+#: The release the dual-emitted /health copies TARGET being dropped in — a
+#: TARGET, never a commitment (fix round item 1 on decision:1832): the drop
+#: is GATED on the monitor-contract step (Group 3 — the monitor must consume
+#: the replacement keys before the originals can go), which has not landed.
+#: See coverage ledger row 11 (dual-emit drop, gated on the monitor-contract
+#: step) — NOT the CHANGELOG, which narrates releases after the fact and is
+#: not where a still-pending obligation is tracked. ⚠ CORRECTED (D4,
+#: decision:1832): the code constant sat at "0.9.75" — its ORIGINAL,
+#: never-updated value — through three releases of CHANGELOG prose saying
+#: otherwise (0.9.75 moved the drop to 0.9.76; 0.9.76 moved it again, undated,
+#: because that release became the A1 security fix instead). This names the
+#: EARLIEST release it can still land in, mutation-checked against VERSION
+#: (test_dual_emit_drop_target_is_strictly_after_this_release) so the target
+#: can never silently fall behind the release that is naming it. Whoever ships
+#: the removal — gated on the monitor-contract step actually landing —
+#: updates this alongside it.
+DUAL_EMIT_DROP_TARGET = "0.9.87"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1290,11 +1309,13 @@ MEANING_CHANGES: tuple[dict, ...] = (
         "in_version": VERSION,
         "was": ("`ok` whenever a probed backend answered — including a "
                 "zero-config install where NOTHING was declared and the "
-                "built-in localhost:5000 fallback happened to be serving, "
-                "and including a fleet where every backend answers but NONE "
-                "is eligible for any traffic class (role+privacy+fit all "
+                "built-in fallback (LLM_DEFAULT_TARGET) happened to be "
+                "serving, and including a fleet where every backend answers "
+                "but NONE is eligible for any traffic class (role+privacy "
                 "empty for role-less traffic and every ROUTING_ROLE_NAMES "
-                "role)"),
+                "role — fit is NOT evaluated here, the check runs at 0/0 "
+                "tokens, so it is vacuous; this is visibility, not a fit "
+                "gate)"),
         "now": ("`degraded` in both of those cases, each with its own "
                 "reason. Liveness is also now checked BEFORE configuration: "
                 "every probed backend down reads `down` unconditionally — a "
@@ -1646,10 +1667,19 @@ def _rows(contract: dict, endpoint: str) -> list[str]:
         lines.append("|---|---|---|---|---|---|---|---|")
         for path, spec in entries:
             note = (spec["note"] or "").replace("|", "\\|").replace("\n", " ")
+            removed_in = spec["removed_in"]
+            # Fix round item 1b (decision:1832): DUAL_EMIT_DROP_TARGET is a
+            # TARGET, never a commitment — render it distinctly so a reader
+            # does not mistake "removed in" for a scheduled date the way the
+            # bare version string invited before.
+            if removed_in == DUAL_EMIT_DROP_TARGET:
+                removed_in_cell = f"{removed_in} (targeted)"
+            else:
+                removed_in_cell = removed_in or "—"
             lines.append(
                 f"| `{path}` | {'/'.join(spec['types'])} | {spec['unit'] or '—'} "
                 f"| {spec['since']} | {'`' + spec['moved_to'] + '`' if spec['moved_to'] else '—'} "
-                f"| {spec['removed_in'] or '—'} | {'`' + spec['log'] + '`' if spec['log'] else '—'} "
+                f"| {removed_in_cell} | {'`' + spec['log'] + '`' if spec['log'] else '—'} "
                 f"| {note or '—'} |"
             )
     return lines
@@ -1725,6 +1755,14 @@ def render_markdown() -> str:
     a("|---|---|---|")
     for rm in REMOVED_IN_0_9_74:
         a(f"| {rm['endpoint']} | `{rm['path']}` | {rm['reason']} |")
+    a("")
+    a("## Dual-emit drop target")
+    a("")
+    a(f"`removed_in: {DUAL_EMIT_DROP_TARGET} (targeted)` marks a key moved off `/health` "
+      "and dual-emitted since v0.9.74. The drop is **gated on the monitor-contract step "
+      "landing first** (Group 3 — the monitor must consume the replacement keys before "
+      f"the originals can go); `{DUAL_EMIT_DROP_TARGET}` names only the earliest release "
+      "it could still happen in, **not a commitment**.")
     a("")
     a("## `GET /health`")
     a("")

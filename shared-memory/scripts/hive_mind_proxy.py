@@ -313,6 +313,10 @@ def _load_llm_backends() -> tuple[
     require_valid_llm_routing_config(), called from main() ONLY — same
     placement reasoning as require_auth_when_provider_keys_configured()."""
     role_config_errors: list[str] = []
+    # Fix round Q11: ONE `global` declaration covering the whole function —
+    # LLM_POOL_CONFIG_EMPTY is SET-ONLY on every return path below, explicit
+    # on both True/False branches, never left to the module-level default.
+    global LLM_POOL_CONFIG_EMPTY
 
     def _parse_roles(url: str, raw) -> "frozenset[str] | None":
         if raw is None:
@@ -498,6 +502,11 @@ def _load_llm_backends() -> tuple[
             price_ins[url] = entry.get("price_per_mtok_in")
             price_outs[url] = entry.get("price_per_mtok_out")
         if urls:
+            # Fix round Q11: SET-ONLY, explicit on this branch too — a
+            # declared, USABLE JSON fleet is unambiguously not the absence
+            # case, so this must not rely on the module-level declaration's
+            # default rather than say so itself.
+            LLM_POOL_CONFIG_EMPTY = False
             return (urls, weights, tokens, models, extras, roles, n_ctxs, private_oks,
                     private_ok_explicit, max_inflights, price_ins, price_outs, role_config_errors)
         log.error("LLM_BACKENDS_JSON produced no usable backend — falling back to LLM_BACKENDS/LLM_DEFAULT_TARGET")
@@ -512,11 +521,14 @@ def _load_llm_backends() -> tuple[
         # D1: this substitution is ABSENCE (nothing declared) only when it is
         # not ALREADY the JSON-exclusion case above (LLM_POOL_FALLBACK_REASON
         # set) — the two markers are mutually exclusive by construction, and
-        # only one may explain a given fallback.
-        global LLM_POOL_CONFIG_EMPTY
-        if not LLM_POOL_FALLBACK_REASON:
-            LLM_POOL_CONFIG_EMPTY = True
+        # only one may explain a given fallback. Fix round Q11: SET-ONLY on
+        # BOTH branches, never left to the module-level declaration's default —
+        # this function's own state must not depend on what an earlier call
+        # (in-process reload, or any future caller) happened to leave behind.
+        LLM_POOL_CONFIG_EMPTY = not LLM_POOL_FALLBACK_REASON
         _raw_backends = [(DEFAULT_TARGET, 1.0)]
+    else:
+        LLM_POOL_CONFIG_EMPTY = False
     urls = [u for u, _ in _raw_backends]
     weights = {u: w for u, w in _raw_backends}
     # Legacy comma form (and the DEFAULT_TARGET fallback) never carries a
@@ -4077,18 +4089,21 @@ def _llm_pool_dependency(backend_status: dict) -> dict:
       2. every probed backend down -> DOWN, unconditionally (M1: the reason is
          composed when LLM_POOL_CONFIG_EMPTY is also set, so a fresh install
          reads why its unset fallback is unreachable rather than being told
-         about a URL it never declared)
-      3. LLM_POOL_FALLBACK_REASON set (a declared fleet, every entry EXCLUDED)
-         -> degraded (F6, v0.9.75, unchanged)
-      4. LLM_POOL_CONFIG_EMPTY and the fallback IS serving -> degraded, the NEW
-         state (⚠ a deliberate, ruled change: a legacy zero-config-but-working
-         install used to read `ok` here — visibility before behaviour, ahead
-         of W4 retiring the fallback)
-      5. some (not all) probed backends down -> degraded, unchanged
-      6. all probed backends up, but NO role (role-less or any
-         ROUTING_ROLE_NAMES role) has an eligible backend -> degraded, the NEW
-         fleet-wide eligibility verdict (D2.4). A hole for SOME roles only does
-         NOT reach here (agy 3 / Opus F6).
+         about a URL it never declared — the EFFECTIVE DEFAULT_TARGET value,
+         scrubbed, never a hardcoded "localhost:5000": our ports are one valid
+         configuration, not the only one, fix round Q2)
+      3+. every DEGRADED reason that applies COMPOSES (fix round Q9 — the same
+         lead/append discipline `_rem_dependency`/`_nrem_dependency` use, so two
+         coexisting facts are never collapsed into one at the cost of the
+         other): LLM_POOL_FALLBACK_REASON (a declared fleet, every entry
+         EXCLUDED — F6, v0.9.75, unchanged), LLM_POOL_CONFIG_EMPTY and the
+         fallback IS serving (⚠ a deliberate, ruled change: a legacy
+         zero-config-but-working install used to read `ok` here — visibility
+         before behaviour, ahead of W4 retiring the fallback), some (not all)
+         probed backends down (unchanged), and the NEW fleet-wide eligibility
+         verdict (D2.4) — NO role (role-less or any ROUTING_ROLE_NAMES role)
+         has an eligible backend. A hole for SOME roles only does NOT reach
+         here (agy 3 / Opus F6).
     """
     if not backend_status:
         return _dep(_STATE_UNKNOWN, "no backend configured")
@@ -4096,23 +4111,28 @@ def _llm_pool_dependency(backend_status: dict) -> dict:
     if len(bad) == len(backend_status):
         if LLM_POOL_CONFIG_EMPTY:
             return _dep(_STATE_DOWN,
-                        "down: nothing serves the built-in fallback (no backend declared)")
+                        f"down: nothing serves the built-in fallback "
+                        f"({scrub_url_credentials(DEFAULT_TARGET)}, no backend declared)")
         return _dep(_STATE_DOWN, f"all {len(bad)} backend(s) down")
+    reasons: list = []
     if LLM_POOL_FALLBACK_REASON:
         # F6 (v0.9.75): the configured fleet was entirely excluded and the
         # legacy fallback is serving — a "healthy" pool at the wrong place.
-        return _dep(_STATE_DEGRADED, LLM_POOL_FALLBACK_REASON)
+        reasons.append(LLM_POOL_FALLBACK_REASON)
     if LLM_POOL_CONFIG_EMPTY:
         # NEW (decision:1832): nothing was declared and the built-in fallback
         # is up — visible now, rather than reading `ok` like every prior
-        # release. See the docstring's item 4.
-        return _dep(_STATE_DEGRADED,
-                    "no backend declared — serving the built-in localhost:5000 fallback")
+        # release. See the docstring's item 3+.
+        reasons.append(
+            f"no backend declared — serving the built-in "
+            f"{scrub_url_credentials(DEFAULT_TARGET)} fallback")
     if bad:
-        return _dep(_STATE_DEGRADED, f"{len(bad)}/{len(backend_status)} backend(s) down")
+        reasons.append(f"{len(bad)}/{len(backend_status)} backend(s) down")
     ineligible_reason = _all_roles_ineligible()
     if ineligible_reason:
-        return _dep(_STATE_DEGRADED, ineligible_reason)
+        reasons.append(ineligible_reason)
+    if reasons:
+        return _dep(_STATE_DEGRADED, "; ".join(reasons))
     return _dep(_STATE_OK)
 
 

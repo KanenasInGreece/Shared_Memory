@@ -915,16 +915,46 @@ def test_the_meaning_change_list_covers_every_re_pointed_key():
     assert ("health", "dependencies.llm_pool.state") in paths
     assert ("health", "dependencies.rem_daemon.state") in paths
     assert ("health", "dependencies.nrem_daemon.state") in paths
+
+    by_path = {(m["endpoint"], m["path"]): m for m in tc.MEANING_CHANGES}
+    # The four 0.9.74 entries (:910-913 above) remain MANDATORY at their own
+    # frozen stamp — they never get bumped just because VERSION moved on.
+    for key in (("telemetry", "breakdown.domains"), ("health", "role"),
+                ("health", "llm_backends.*"), ("health", "status")):
+        assert by_path[key]["in_version"] == tc.INTRODUCED_0_9_74, (
+            f"{key} must stay pinned at INTRODUCED_0_9_74, never re-dated")
+    # W2's three new entries carry THIS release, exactly.
+    for key in (("health", "dependencies.llm_pool.state"),
+               ("health", "dependencies.rem_daemon.state"),
+               ("health", "dependencies.nrem_daemon.state")):
+        assert by_path[key]["in_version"] == tc.VERSION, (
+            f"{key} is new in W2 and must carry tc.VERSION exactly")
+
     for mc in tc.MEANING_CHANGES:
-        # RELAXED (D4, decision:1832, delta re-review B1): a meaning-change
-        # entry keeps its OWN historical stamp rather than silently becoming
-        # "this release" every time VERSION moves — the four 0.9.74 entries
-        # pinned above stay at tc.INTRODUCED_0_9_74 forever. Anything not
-        # authored under that frozen stamp must assert == tc.VERSION, so a
-        # genuinely NEW entry landing with neither of the two legitimate
-        # stamps (a stale version) still fails loudly.
-        assert mc["in_version"] in (tc.VERSION, tc.INTRODUCED_0_9_74)
+        # DURABLE INVARIANT (fix round item 8, decision:1832): a hardcoded
+        # two-constant allowlist (VERSION, INTRODUCED_0_9_74) EXPIRES the
+        # moment a THIRD release adds an entry — the frozen W2 entries above
+        # would then equal neither "today's VERSION" nor INTRODUCED_0_9_74
+        # and this loop would start failing on records nobody touched. The
+        # invariant that survives every future release without editing:
+        # no entry may claim a version LATER than the one asserting it here
+        # (compared as a TUPLE, never a string — "0.9.9" > "0.9.10" as
+        # strings). The specific per-entry checks above catch a genuinely
+        # NEW entry landing with a STALE stamp; this general bound catches
+        # the nonsensical direction (an entry from the future).
+        assert tc._version_tuple(mc["in_version"]) <= tc._version_tuple(tc.VERSION), (
+            f"{mc['path']!r} claims in_version {mc['in_version']!r}, which is "
+            f"AFTER the current release {tc.VERSION!r}")
         assert mc["was"] and mc["now"] and mc["action"]
+
+
+def test_dual_emit_drop_target_is_strictly_after_this_release():
+    """Fix round item 1c (decision:1832): the target cannot name a release
+    that has already happened — DUAL_EMIT_DROP_TARGET must be STRICTLY
+    greater than VERSION, compared as a version TUPLE (a string compare
+    would rank "0.9.9" ahead of "0.9.10")."""
+    assert (tc._version_tuple(tc.DUAL_EMIT_DROP_TARGET)
+            > tc._version_tuple(tc.VERSION))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

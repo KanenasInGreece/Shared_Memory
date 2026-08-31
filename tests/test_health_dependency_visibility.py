@@ -89,14 +89,21 @@ def test_ruled_check_verbatim_fleet_wide_ineligibility_reads_degraded(monkeypatc
 
 def test_a_hole_for_some_roles_only_does_not_touch_llm_pool(monkeypatch):
     """agy 3 / Opus F6: a backend serving OTHER traffic fine must not be
-    reported down/degraded on llm_pool just because ONE role has no home."""
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
-    g = _fresh(monkeypatch)
-    # Role-less traffic is eligible (default private_ok=True, roles absent);
-    # "judge"/"extract" are also eligible (roles absent = serves-all) — so
-    # this reflects a REAL fleet with no hole at all, proving the ok path
-    # still fires when eligibility is not force-emptied.
+    reported down/degraded on llm_pool just because ONE role has no home.
+
+    Fix round Q7: the fleet here has a REAL, verified hole — a single
+    backend declaring roles={"judge"} only (`_partial_role_fleet`, shared
+    with the D3 tests below) leaves "extract" traffic with ZERO eligible
+    backends. Role-less and "judge" traffic both still have a home, so
+    llm_pool must stay `ok` — proving the fleet-wide-only gate (D2.4) does
+    NOT fire on a partial hole, not merely that it doesn't fire on a fleet
+    with no hole at all (the prior version of this test had none, per its
+    own comment — conceding it tested nothing about this claim)."""
+    g = _partial_role_fleet(monkeypatch)
+    assert g._eligible_backends("extract") == [], (
+        "fixture drift: this test needs a REAL hole for 'extract' specifically")
+    assert g._eligible_backends("") and g._eligible_backends("judge"), (
+        "fixture drift: role-less and 'judge' traffic must both still have a home")
     dep = g._llm_pool_dependency({"http://a:5000": "ok"})
     assert dep["state"] == "ok"
 
@@ -118,15 +125,20 @@ def test_ordering_pin_config_empty_and_all_down_reads_literal_down(monkeypatch):
 
 def test_config_empty_and_serving_reads_degraded_the_new_state(monkeypatch):
     """D2 item 3 (decision:1832): the NEW state. A legacy zero-config install
-    with something merely serving localhost:5000 used to read `ok` — now
-    reads `degraded`, visibility ahead of W4 retiring the fallback."""
+    with something merely serving the built-in fallback used to read `ok` —
+    now reads `degraded`, visibility ahead of W4 retiring the fallback.
+
+    Fix round Q2 (portability): the reason names the EFFECTIVE DEFAULT_TARGET
+    value, scrubbed — never a hardcoded "localhost:5000" literal, since our
+    ports are one valid configuration, not the only one."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     g = _fresh(monkeypatch)
     dep = g._llm_pool_dependency({g.LLM_BACKENDS[0]: "ok"})
     assert dep["state"] == "degraded"
     assert dep["reason"] == (
-        "no backend declared — serving the built-in localhost:5000 fallback")
+        f"no backend declared — serving the built-in "
+        f"{g.scrub_url_credentials(g.DEFAULT_TARGET)} fallback")
 
 
 def test_declared_fleet_healthy_still_reads_ok_unchanged(monkeypatch):
@@ -150,6 +162,39 @@ def test_partial_down_still_degraded_unchanged(monkeypatch):
     dep = g._llm_pool_dependency({"http://a:5000": "ok", "http://b:5000": "down"})
     assert dep["state"] == "degraded"
     assert dep["reason"] == "1/2 backend(s) down"
+
+
+def test_coexisting_degraded_reasons_compose_never_drop_a_fact(monkeypatch):
+    """Fix round Q9: llm_pool composes coexisting reasons the same way
+    rem_daemon/nrem_daemon do — a partial-down fact and a fleet-wide
+    ineligibility fact can BOTH be true at once (a hole for `bad`, forced
+    ineligible via monkeypatch), and the old early-return chain would have
+    reported only whichever check ran first, silently dropping the other."""
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000,http://b:5000")
+    g = _fresh(monkeypatch)
+    monkeypatch.setattr(g, "_eligible_backends", lambda *a, **kw: [])
+    dep = g._llm_pool_dependency({"http://a:5000": "ok", "http://b:5000": "down"})
+    assert dep["state"] == "degraded"
+    assert "1/2 backend(s) down" in dep["reason"]
+    assert "no backend is eligible for any traffic" in dep["reason"]
+
+
+def test_config_empty_marker_does_not_leak_across_calls_without_reload(monkeypatch):
+    """Fix round Q11: LLM_POOL_CONFIG_EMPTY is SET-ONLY on every path through
+    _load_llm_backends() — calling it again in the SAME process (no module
+    reload) with a genuinely declared fleet must read False, never retain a
+    prior True from an earlier call that had nothing declared."""
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    g = _fresh(monkeypatch)
+    assert g.LLM_POOL_CONFIG_EMPTY is True
+    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    g._load_llm_backends()   # same process, no importlib.reload this time
+    assert g.LLM_POOL_CONFIG_EMPTY is False, (
+        "LLM_POOL_CONFIG_EMPTY leaked True from the PRIOR call — it must be "
+        "set explicitly on every path, never left to whatever an earlier "
+        "call happened to leave behind")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -49,7 +49,7 @@ _VERSION_PINS = {
 }
 
 
-def test_all_four_version_pins_agree():
+def test_all_five_version_pins_agree():
     """GROUP 1. The version lives in FIVE files (was four; telemetry_contract.py
     joined as the fifth, D4/decision:1832) and every release moves all of them,
     so a bump is five edits that nothing had ever checked before this test
@@ -549,6 +549,51 @@ def test_agents_md_pipes_the_right_number_of_answers_into_install_framework():
         f"{piped_confirm_count} literal y/n answers ('y'/'n', not '%s') — update "
         "AGENTS.md's Phase 1 piped-answer line to match."
     )
+
+
+def test_check_config_invocation_exists_in_both_install_and_update_scripts():
+    """GROUP 5 (D5, decision:1832, fix round Q3 — the brief required this and
+    the build omitted it). Both the fresh-install path and the upgrade path
+    are supposed to report the effective configuration through
+    check_config.py; a source-pin, because the alternative (running each
+    script for real, end to end, against a live host) is not how this is
+    checked."""
+    install_src = _read("shared-memory", "scripts", "install_framework.sh")
+    update_src = _read("shared-memory", "scripts", "update_framework.sh")
+    assert "check_config.py" in install_src, (
+        "install_framework.sh no longer reports through check_config.py")
+    assert "check_config.py" in update_src, (
+        "update_framework.sh no longer reports through check_config.py")
+    # Both are report-not-gate (agy MED, fix round Q5/Q6): the tool's own
+    # 0/1/2 contract codes stay a silent pass; only rc>2 (a signal kill or a
+    # crash outside that contract) surfaces. A bare `|| true` would swallow
+    # that silently, reading exactly like success.
+    for label, src in (("install_framework.sh", install_src),
+                       ("update_framework.sh", update_src)):
+        assert "check_config aborted" in src, (
+            f"{label}'s check_config.py invocation has no rc>2 escape hatch — "
+            f"a signal kill or crash would read as a silent pass")
+        assert "|| rc=$?" in src, (
+            f"{label} does not capture the check_config.py invocation's exit "
+            f"code with the ruled rc-capture form")
+
+
+def test_update_framework_postflight_run_soft_has_nothing_between_it_and_its_rc_capture():
+    """GROUP 5 (Opus F8 — the exact trap this whole codebase keeps re-hitting:
+    a line inserted between a `run_soft` call and its immediate `rc=$?`
+    silently breaks the capture, because `rc=$?` then reads the INSERTED
+    line's exit status instead of run_soft's). Pinned as a source check
+    because this is precisely the kind of edit a later change makes by
+    accident, next to code that looks unrelated."""
+    src = _read("shared-memory", "scripts", "update_framework.sh")
+    lines = src.splitlines()
+    run_soft_idx = next(
+        i for i, line in enumerate(lines)
+        if line.strip().startswith('run_soft "postflight'))
+    next_line = lines[run_soft_idx + 1].strip()
+    assert next_line == "rc=$?", (
+        f"expected 'rc=$?' immediately after the postflight run_soft call, "
+        f"found: {next_line!r}")
 
 
 def test_agents_md_download_command_carries_no_hardcoded_version():
