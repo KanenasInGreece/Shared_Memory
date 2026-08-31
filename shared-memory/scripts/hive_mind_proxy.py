@@ -311,7 +311,7 @@ def _load_llm_backends() -> tuple[
             return None
         if not isinstance(raw, list):
             role_config_errors.append(
-                f"{url}: roles must be a JSON array, got {type(raw).__name__}")
+                f"{scrub_url_credentials(url)}: roles must be a JSON array, got {type(raw).__name__}")
             return frozenset()
         if not raw:
             # R-3 (decision:1357): an EMPTY roles list makes the backend
@@ -320,7 +320,7 @@ def _load_llm_backends() -> tuple[
             # None`). A backend that serves nothing is a config mistake, not
             # a scope; refuse loudly at startup.
             role_config_errors.append(
-                f"{url}: roles is an EMPTY list — this backend would be "
+                f"{scrub_url_credentials(url)}: roles is an EMPTY list — this backend would be "
                 f"eligible for NOTHING (every request refused). Either omit "
                 f"`roles` (serves all) or list at least one of "
                 f"{sorted(ROUTING_ROLE_NAMES)}.")
@@ -331,13 +331,13 @@ def _load_llm_backends() -> tuple[
             reserved_hit = bad & RESERVED_ROLE_NAMES
             if reserved_hit:
                 role_config_errors.append(
-                    f"{url}: roles names {sorted(reserved_hit)} — RESERVED, not "
+                    f"{scrub_url_credentials(url)}: roles names {sorted(reserved_hit)} — RESERVED, not "
                     f"accepted (NREM narrative folds are zero-inference; the only "
                     f"NREM LLM path is judge). Allowed: {sorted(ROUTING_ROLE_NAMES)}")
             unknown = bad - RESERVED_ROLE_NAMES
             if unknown:
                 role_config_errors.append(
-                    f"{url}: unknown role name(s) {sorted(unknown)} — allowed: "
+                    f"{scrub_url_credentials(url)}: unknown role name(s) {sorted(unknown)} — allowed: "
                     f"{sorted(ROUTING_ROLE_NAMES)}")
         return frozenset(names & ROUTING_ROLE_NAMES)
 
@@ -5062,7 +5062,8 @@ def require_valid_llm_routing_config() -> None:
     if needs_explicit_choice:
         raise SystemExit(
             "FATAL: credentialed LLM backend(s) configured with neither "
-            f"`roles` nor an explicit `private_ok`: {', '.join(needs_explicit_choice)}. "
+            f"`roles` nor an explicit `private_ok`: "
+            f"{', '.join(scrub_url_credentials(b) for b in needs_explicit_choice)}. "
             "Pick one in LLM_BACKENDS_JSON: private_ok: true (keep today's "
             "serve-everything behavior) or roles: [\"extract\", \"judge\"] "
             "(per-function opt-in, this backend never receives "
