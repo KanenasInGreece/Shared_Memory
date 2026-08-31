@@ -68,18 +68,26 @@ die() { red "✗ $*"; exit 1; }
 # script sets no other EXIT trap today (verified fe98761: only a prose
 # comment at :141 matches) but a future addition must not clobber the
 # pre-image tmpdir cleanup below by re-assigning `trap ... EXIT` directly —
-# every caller adds a command here instead, and exactly one trap is ever
-# registered, on top of all of them.
-_EXIT_CLEANUP_CMDS=()
+# every caller registers a FUNCTION NAME here instead, and exactly one
+# trap is ever installed, on top of all of them.
+#
+# SEC L-1 (fix round): the original cut stored raw COMMAND STRINGS and ran
+# them through `eval` — `add_exit_cleanup "rm -rf '$PREIMAGE_DIR'"` breaks
+# out of its own single-quoting if $PREIMAGE_DIR (operator/TMPDIR-
+# influenced) ever contained a single quote. Storing FUNCTION NAMES and
+# calling them directly needs no quoting or escaping at all: each caller
+# defines a tiny function closing over its own variables (read at CALL
+# time, never string-interpolated) and registers its name.
+_EXIT_CLEANUP_FUNCS=()
 _run_exit_cleanup() {
-    local cmd
-    if [[ ${#_EXIT_CLEANUP_CMDS[@]} -gt 0 ]]; then
-        for cmd in "${_EXIT_CLEANUP_CMDS[@]}"; do
-            eval "$cmd" 2>/dev/null || true
+    local fn
+    if [[ ${#_EXIT_CLEANUP_FUNCS[@]} -gt 0 ]]; then
+        for fn in "${_EXIT_CLEANUP_FUNCS[@]}"; do
+            "$fn" 2>/dev/null || true
         done
     fi
 }
-add_exit_cleanup() { _EXIT_CLEANUP_CMDS+=("$1"); trap _run_exit_cleanup EXIT; }
+add_exit_cleanup() { _EXIT_CLEANUP_FUNCS+=("$1"); trap _run_exit_cleanup EXIT; }
 
 # ── RULING 1: dry-run-aware refusal for the pre-`git pull` branch guard ─────
 # --dry-run is documented as "print, run nothing" -- the way an operator
@@ -317,9 +325,11 @@ echo
 # ── Preconditions, checked BEFORE anything is fetched or dumped ──────────────
 #
 # These are the cheapest and most certain checks in the whole script, and they
-# used to run LAST — by failing at the first `uv run`, which is step 2. In
-# upgrade mode that means a `git pull` and a FULL BACKUP had already happened
-# before the run died on a missing binary. Cost paid, nothing achieved.
+# used to run LAST — by failing at the first `uv run` (originally step 2,
+# Postgres; the W3 capture step now runs a `uv run` even earlier, at step 0,
+# but the reasoning is unchanged). In upgrade mode a late failure meant a
+# `git pull` and a FULL BACKUP had already happened before the run died on a
+# missing binary. Cost paid, nothing achieved.
 #
 # ⚠ `uv` is the one that actually bites, and not because hosts lack it: the
 # upstream installer puts it in ~/.local/bin, which a LOGIN shell resolves and a
@@ -343,7 +353,8 @@ if [[ -n "$missing" ]]; then
   and if it is there, export PATH=\"\$HOME/.local/bin:\$PATH\" before re-running."
 fi
 
-# ── Step 0: fetch the new code (upgrade entry point only) ────────────────────
+# ── Steps 0–1: capture pre-upgrade effective config (upgrade path only, W3) +
+# fetch the new code ─────────────────────────────────────────────────────────
 #
 # Skipped after a restore: the checkout is already the code we intend to run,
 # and the data is what moved. A `git pull` here would be a second, unrelated
@@ -461,13 +472,24 @@ if [[ "$FROM_RESTORE" == "0" ]]; then
                 echo "   upgrade is deferred to a manual standalone run of migrate_env.py."
             else
                 if [[ "$DRY_RUN" == "0" ]]; then
-                    PREIMAGE_DIR="$(mktemp -d)"
+                    # SEC L-1 (fix round): guarded — under `set -uo pipefail`
+                    # (no -e) a `mktemp` failure would otherwise leave
+                    # PREIMAGE_DIR empty and PREIMAGE_JSON silently pointed at
+                    # "/preimage.json".
+                    PREIMAGE_DIR="$(mktemp -d)" \
+                        || die "could not create a temp directory for the pre-upgrade capture (mktemp failed) — refusing before the pull."
+                    [[ -n "$PREIMAGE_DIR" && -d "$PREIMAGE_DIR" ]] \
+                        || die "mktemp -d returned an unusable path — refusing before the pull."
                     chmod 700 "$PREIMAGE_DIR"
                     PREIMAGE_JSON="$PREIMAGE_DIR/preimage.json"
                     # CHAIN, never replace, any EXIT trap set before this point
                     # (none exists today — verified fe98761 — but a future
-                    # addition must not clobber this cleanup).
-                    add_exit_cleanup "rm -rf '$PREIMAGE_DIR'"
+                    # addition must not clobber this cleanup). A FUNCTION
+                    # NAME, not a command string — no eval, no quoting hazard
+                    # (SEC L-1): $PREIMAGE_DIR is read at CALL time by the
+                    # function body, never string-interpolated.
+                    _cleanup_preimage_dir() { rm -rf -- "$PREIMAGE_DIR"; }
+                    add_exit_cleanup _cleanup_preimage_dir
                 else
                     PREIMAGE_JSON="\$(mktemp -d)/preimage.json"
                 fi
@@ -507,7 +529,7 @@ if [[ "$pull_blocked" == "1" ]]; then
     exit 1
 fi
 
-# ── Step 1: safeguard the data BEFORE any migration touches it ───────────────
+# ── Step 2: safeguard the data BEFORE any migration touches it ───────────────
 #
 # A migration is the one step here that cannot be undone by re-running anything.
 # The backup is taken through the shipped ops script so it is the SAME artifact
@@ -538,7 +560,7 @@ else
     fi
 fi
 
-# ── W3 env migration: migrate .env to explicit configuration ────────────────
+# ── Step 3: migrate .env to explicit configuration (W3 env migration) ───────
 #
 # AFTER the backup (nothing here has touched Postgres/Neo4j yet — a refusal
 # costs only the pull, H5.4) and BEFORE the Postgres migration. Runs on BOTH
@@ -582,7 +604,7 @@ else
     fi
 fi
 
-# ── Step 2: Postgres — forward-only, ledger-driven ───────────────────────────
+# ── Step 4: Postgres — forward-only, ledger-driven ───────────────────────────
 #
 # apply.py resumes from what the database itself records. It now REFUSES (exit 3)
 # a database whose ledger names migrations this checkout does not contain — the
@@ -624,7 +646,7 @@ if [[ "$DRY_RUN" == "0" && "$rc" == "2" ]]; then
 fi
 [[ "$DRY_RUN" == "0" && "$rc" != "0" ]] && die "apply.py failed (exit $rc) — stopping before the graph half."
 
-# ── Step 3: Neo4j — the graph's ENTIRE forward-migration ─────────────────────
+# ── Step 5: Neo4j — the graph's ENTIRE forward-migration ─────────────────────
 #
 # ⛔ Neo4j has NO ledger. neo4j_init.cypher is a one-time manual step, so a
 # long-lived instance enforces whatever constraint set was true the day someone
@@ -640,7 +662,7 @@ rc=$?
   plain index blocking a uniqueness constraint. Stopping BEFORE the restart:
   a missing uniqueness constraint is silent, and MERGE keeps working."
 
-# ── Step 4: the graph half of migration 027 ──────────────────────────────────
+# ── Step 6: the graph half of migration 027 ──────────────────────────────────
 #
 # apply.py creates the registry ids and cannot reach Neo4j, so this stamps the
 # :Project nodes. Skipping it does not break writes — records still save, search
@@ -656,7 +678,7 @@ rc=$?
   synthesis fails CLOSED on unidentified nodes and presents as a quiet corpus
   rather than an error. Fix it here, where it is still visible."
 
-# ── Step 5: restart, so the running gateway IS the migrated code ─────────────
+# ── Step 7: restart, so the running gateway IS the migrated code ─────────────
 # The restart is the hinge: every step after it assumes the running process IS
 # the migrated code. Refuse early and clearly rather than emitting
 # "systemctl: command not found" from the middle of a migration.
@@ -682,7 +704,7 @@ if [[ "$DRY_RUN" == "0" ]]; then
     # command fails — a typo in GATEWAY_RESTART_CMD, a unit that refuses to stop,
     # a supervisor that silently keeps the old process — the PREVIOUS gateway is
     # still listening and answers this check happily. Every later step then runs
-    # against it, and step 6 enqueues repair rows only a current worker
+    # against it, and step 8 enqueues repair rows only a current worker
     # understands: an older one falls through to its ordinary fact branch and
     # BLANKS THE CONTENT of every record it touches. So compare versions, which
     # is the one thing an old process cannot fake.
@@ -739,7 +761,7 @@ else
     echo "   (dry run — not executed)"
 fi
 
-# ── Step 6: domain backfill — AFTER the restart, and that is a GUARD ──────────
+# ── Step 8: domain backfill — AFTER the restart, and that is a GUARD ──────────
 #
 # ⛔ ORDERING IS SAFETY, NOT PREFERENCE. This enqueues a narrow repair row that
 # only a gateway from v0.8.47 understands. An OLDER worker does not recognise the
@@ -793,7 +815,7 @@ else
         "$REPO_ROOT/shared-memory/scripts/backfill_domain_of.py" --apply
 fi
 
-# ── Step 7: refresh the installed client skills ──────────────────────────────
+# ── Step 9: refresh the installed client skills ──────────────────────────────
 #
 # ⚠ AFTER the restart, deliberately. Run before it, update_skill.sh compares the
 # new client against the OLD gateway and prints "Updated to X but still
@@ -860,7 +882,7 @@ _stack_drift_notice() {
     echo
 }
 
-# ── Step 8: prove it ──────────────────────────────────────────────────────────
+# ── Step 10: prove it ─────────────────────────────────────────────────────────
 #
 # ⚠ postflight NEEDS AGENT_TOKEN EXPORTED or A1/A5/A8 skip and it exits 1. That
 # is documented behaviour, not a defect — but it is also the single most common
