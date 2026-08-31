@@ -24,20 +24,36 @@ def _read(*parts) -> str:
 
 # ── GROUP 1 — client surface and its delivery ────────────────────────────────
 
-# The four files the release version lives in. Two are client copies, which is
+# The files the release version lives in. Two are client copies, which is
 # why a server-side fix still touches this group.
+#
+# FIFTH PIN (D4, decision:1832): telemetry_contract.py's own VERSION, added
+# because it sat at "0.9.74" through three releases (0.9.75/76/77) of the
+# other four moving without it — nothing compared them, so nobody noticed.
+# ⚠ Builders never touch the first four (merger-owned); the exception is
+# telemetry_contract.py's VERSION itself, which D4 explicitly bumps as part
+# of registering W2's own MEANING_CHANGES entries (which assert against it).
+# Proven against the known-broken state first, per the brief: with
+# telemetry_contract.VERSION at "0.9.79" and the other four still at the
+# v0.9.78 anchor (merger-owned, untouched by this build), this test FAILS —
+# by design, until the merger's own version-bump step brings the other four
+# forward to match at release time. That gap is the fifth pin doing its job,
+# not a build defect (see VERSION's own comment in telemetry_contract.py).
 _VERSION_PINS = {
     ("shared-memory", "scripts", "coordinator.py"): r'^FRAMEWORK_VERSION = "([\d.]+)"',
     ("shared-memory", "scripts", "memory_bridge.py"): r'^VERSION = "([\d.]+)"',
     ("shared-memory-skill", "shared-memory", "scripts", "memory_bridge.py"):
         r'^VERSION = "([\d.]+)"',
     ("mcp", "vector-skill.py"): r'^VERSION = "([\d.]+)"',
+    ("shared-memory", "scripts", "telemetry_contract.py"): r'^VERSION = "([\d.]+)"',
 }
 
 
-def test_all_four_version_pins_agree():
-    """GROUP 1. The version lives in FOUR files and every release moves all of
-    them, so a bump is four edits that nothing has ever checked.
+def test_all_five_version_pins_agree():
+    """GROUP 1. The version lives in FIVE files (was four; telemetry_contract.py
+    joined as the fifth, D4/decision:1832) and every release moves all of them,
+    so a bump is five edits that nothing had ever checked before this test
+    existed.
 
     A missed one ships a client announcing a version the gateway does not
     recognise, and the only symptom is a compatibility warning from a `doctor`
@@ -50,9 +66,10 @@ def test_all_four_version_pins_agree():
         assert m, f"no version pin found in {'/'.join(parts)}"
         found["/".join(parts)] = m.group(1)
     assert len(set(found.values())) == 1, (
-        f"the four version pins disagree: {found}. Every release moves all four "
-        "— two of them are client copies, which is why even a server-side fix "
-        "touches this group. Then run sync_skills.sh."
+        f"the version pins disagree: {found}. Every release moves all five — "
+        "two of the four legacy ones are client copies (run sync_skills.sh "
+        "after), and telemetry_contract.py's own VERSION now travels with "
+        "them too."
     )
 
 
@@ -532,6 +549,51 @@ def test_agents_md_pipes_the_right_number_of_answers_into_install_framework():
         f"{piped_confirm_count} literal y/n answers ('y'/'n', not '%s') — update "
         "AGENTS.md's Phase 1 piped-answer line to match."
     )
+
+
+def test_check_config_invocation_exists_in_both_install_and_update_scripts():
+    """GROUP 5 (D5, decision:1832, fix round Q3 — the brief required this and
+    the build omitted it). Both the fresh-install path and the upgrade path
+    are supposed to report the effective configuration through
+    check_config.py; a source-pin, because the alternative (running each
+    script for real, end to end, against a live host) is not how this is
+    checked."""
+    install_src = _read("shared-memory", "scripts", "install_framework.sh")
+    update_src = _read("shared-memory", "scripts", "update_framework.sh")
+    assert "check_config.py" in install_src, (
+        "install_framework.sh no longer reports through check_config.py")
+    assert "check_config.py" in update_src, (
+        "update_framework.sh no longer reports through check_config.py")
+    # Both are report-not-gate (agy MED, fix round Q5/Q6): the tool's own
+    # 0/1/2 contract codes stay a silent pass; only rc>2 (a signal kill or a
+    # crash outside that contract) surfaces. A bare `|| true` would swallow
+    # that silently, reading exactly like success.
+    for label, src in (("install_framework.sh", install_src),
+                       ("update_framework.sh", update_src)):
+        assert "check_config aborted" in src, (
+            f"{label}'s check_config.py invocation has no rc>2 escape hatch — "
+            f"a signal kill or crash would read as a silent pass")
+        assert "|| rc=$?" in src, (
+            f"{label} does not capture the check_config.py invocation's exit "
+            f"code with the ruled rc-capture form")
+
+
+def test_update_framework_postflight_run_soft_has_nothing_between_it_and_its_rc_capture():
+    """GROUP 5 (Opus F8 — the exact trap this whole codebase keeps re-hitting:
+    a line inserted between a `run_soft` call and its immediate `rc=$?`
+    silently breaks the capture, because `rc=$?` then reads the INSERTED
+    line's exit status instead of run_soft's). Pinned as a source check
+    because this is precisely the kind of edit a later change makes by
+    accident, next to code that looks unrelated."""
+    src = _read("shared-memory", "scripts", "update_framework.sh")
+    lines = src.splitlines()
+    run_soft_idx = next(
+        i for i, line in enumerate(lines)
+        if line.strip().startswith('run_soft "postflight'))
+    next_line = lines[run_soft_idx + 1].strip()
+    assert next_line == "rc=$?", (
+        f"expected 'rc=$?' immediately after the postflight run_soft call, "
+        f"found: {next_line!r}")
 
 
 def test_agents_md_download_command_carries_no_hardcoded_version():

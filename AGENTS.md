@@ -498,7 +498,12 @@ curl above:
   `"auth_required":true` plus the full payload (`"embedder":"ok"`, `"daemon":"running"`,
   `"rem_daemon":"running"`; `"llm":"down"` only blocks dreaming, not saves/search — check the
   reasoning LLM from Q3). If nothing has been minted yet at this point in the sequence, note that
-  and come back to this authenticated check after Phase 8.
+  and come back to this authenticated check after Phase 8. ⚠ **If Q3's backends have not been
+  configured yet at this point in the sequence, expect `dependencies.llm_pool.state:"degraded"`**
+  (W2, decision:1832) — a declared-nothing install now reads `degraded`, not `ok`, because nothing
+  was declared and the implicit fallback (`LLM_DEFAULT_TARGET`) is what answered instead; this is
+  expected and clears once backends are configured (`bash shared-memory/ops/install_llm_backends.sh`),
+  not a fault in this Phase.
 - **The full payload already, from the bare curl, unauthenticated** — dozens of keys, INCLUDING
   `"auth_required":false` spelled out in the JSON itself — means **auth is OFF**: no token has
   ever been minted (or `bootstrap_tokens.sh` was never run), and every caller who can reach `:8888`

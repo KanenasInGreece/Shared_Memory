@@ -5,6 +5,50 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.79] — 2026-08-31
+
+### An undeclared or ineligible fleet is now visible on /health
+
+Two configuration states could hide behind a healthy-looking gateway. An install that never declared
+a reasoning backend runs on the built-in `localhost:5000` fallback — and if anything happened to be
+serving there, `/health` read `ok`, indistinguishable from a deliberately configured system. And a
+fleet whose backends exist but qualify for nothing — declared so that no backend is eligible for any
+traffic, or none counts toward the dreaming cycle's slots — was a startup log line at best, invisible
+for the gateway's whole lifetime afterwards.
+
+Both now surface, without a single new key. The pool dependency evaluates liveness first — a dead
+fleet still reads `down`, and configuration facts never soften that — then configuration: nothing
+declared reads `degraded` with a reason naming the fallback it is actually serving on, and a fleet
+where no backend is eligible for any traffic reads `degraded` saying exactly that. A fleet that can
+serve chat but can never run consolidation — no backend covers the dreaming roles — now carries that
+fact on the `rem_daemon` and `nrem_daemon` dependencies themselves, in the same words the startup
+warning has always used: the daemons' processes are alive, and the reason string says why that is
+not enough. A structural skip no longer reads as a healthy silence.
+
+**If you upgrade and your gateway starts reading `degraded` with "no backend declared" — nothing
+broke.** Your install has been running on the implicit fallback all along; the release makes that
+visible ahead of the fallback's retirement. Declaring the backend you actually use
+(`bash shared-memory/ops/install_llm_backends.sh`, two answers) returns the reading to `ok`.
+
+### The telemetry contract now records its own changes honestly
+
+The contract file carried a version stamp three releases stale, and its "removed in" column promised
+a removal that never happened — the exact class of quiet falsehood the contract was created to
+prevent. The version now moves with every release and is pinned alongside the framework's other
+version stamps, so it can never silently lag again. The introduction stamps on existing keys are
+frozen at the release that really introduced them — regenerating the documentation re-dates nothing.
+The dual-emitted legacy keys' removal is now labelled as what it is: a target, gated on the
+downstream monitor being checked and restarted first, with the earliest release it can land in named
+and a guard asserting that target stays ahead of the shipping version. The dependency-state
+vocabulary (`ok`, `degraded`, `down`, `unknown`) is documented for the first time, and the three
+state-meaning changes this release makes are registered in the contract's own meaning-change table —
+downstream consumers that switch on those values get the list, not a surprise.
+
+Install and update runs now end with the configuration report introduced in 0.9.78, printed
+report-only: a config the gateway would refuse still installs — and says so plainly — rather than
+dying mid-run with its own report unprinted. A crashed or killed report run is announced instead of
+reading as success.
+
 ## [0.9.78] — 2026-08-31
 
 ### One place says what the defaults are, and one command says what the gateway will do

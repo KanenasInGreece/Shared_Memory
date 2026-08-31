@@ -911,9 +911,79 @@ def test_the_meaning_change_list_covers_every_re_pointed_key():
     assert ("health", "role") in paths
     assert ("health", "llm_backends.*") in paths
     assert ("health", "status") in paths
+    # W2 (decision:1832) — the fleet-visibility meaning changes.
+    assert ("health", "dependencies.llm_pool.state") in paths
+    assert ("health", "dependencies.rem_daemon.state") in paths
+    assert ("health", "dependencies.nrem_daemon.state") in paths
+
+    by_path = {(m["endpoint"], m["path"]): m for m in tc.MEANING_CHANGES}
+    # The four 0.9.74 entries (:910-913 above) remain MANDATORY at their own
+    # frozen stamp — they never get bumped just because VERSION moved on.
+    for key in (("telemetry", "breakdown.domains"), ("health", "role"),
+                ("health", "llm_backends.*"), ("health", "status")):
+        assert by_path[key]["in_version"] == tc.INTRODUCED_0_9_74, (
+            f"{key} must stay pinned at INTRODUCED_0_9_74, never re-dated")
+    # W2's three new entries are FROZEN at INTRODUCED_0_9_79 (handback H1),
+    # NOT at the bare `tc.VERSION` constant — VERSION is the fifth version
+    # pin and moves every release, so pinning a historical entry to it
+    # directly would falsify that entry at the very next bump (the cheapest
+    # "fix" in that moment being to re-date it, exactly the falsification
+    # this whole file exists to prevent). Same pattern as the four 0.9.74
+    # entries above, one release later.
+    for key in (("health", "dependencies.llm_pool.state"),
+               ("health", "dependencies.rem_daemon.state"),
+               ("health", "dependencies.nrem_daemon.state")):
+        assert by_path[key]["in_version"] == tc.INTRODUCED_0_9_79, (
+            f"{key} is new in W2 and must stay pinned at INTRODUCED_0_9_79, "
+            f"never re-dated")
+
     for mc in tc.MEANING_CHANGES:
-        assert mc["in_version"] == tc.VERSION
+        # DURABLE INVARIANT (fix round item 8, decision:1832): no entry may
+        # claim a version LATER than the one asserting it here (compared as
+        # a TUPLE, never a string — "0.9.9" > "0.9.10" as strings). The
+        # specific per-entry checks above catch a genuinely NEW entry
+        # landing with a STALE stamp; this general bound catches the
+        # nonsensical direction (an entry from the future). Because every
+        # entry above is now pinned to a FROZEN stamp constant rather than
+        # the live `tc.VERSION`, this bound survives every future VERSION
+        # bump untouched — see the mutation check below.
+        assert tc._version_tuple(mc["in_version"]) <= tc._version_tuple(tc.VERSION), (
+            f"{mc['path']!r} claims in_version {mc['in_version']!r}, which is "
+            f"AFTER the current release {tc.VERSION!r}")
         assert mc["was"] and mc["now"] and mc["action"]
+
+
+def test_the_w2_entries_are_pinned_to_a_frozen_stamp_not_the_live_version():
+    """Handback H1 — a SOURCE-LEVEL pin, because a runtime check cannot see
+    this bug at all: Python evaluates a dict literal's values ONCE, at
+    import time. `monkeypatch.setattr(tc, "VERSION", ...)` never touches an
+    already-built `MEANING_CHANGES` entry, whichever name authored it — so
+    a test that imports `tc` and THEN patches `VERSION` cannot tell
+    `"in_version": VERSION` apart from `"in_version": INTRODUCED_0_9_79`;
+    both already froze to today's string at import. The real risk (three
+    entries silently tracking whatever VERSION becomes) only shows up the
+    NEXT time a release bumps VERSION *by editing the source* and the module
+    is freshly imported — so the only thing that can catch it NOW, before
+    that happens, is reading the source itself.
+    """
+    src = inspect.getsource(tc)
+    w2_block = src.split("# ── W2 (decision:1832)")[1]
+    assert '"in_version": VERSION,' not in w2_block, (
+        "a W2 MEANING_CHANGES entry is pinned to the LIVE VERSION constant — "
+        "it will silently re-date itself to whatever VERSION becomes at the "
+        "next release. Pin it to INTRODUCED_0_9_79 instead.")
+    assert w2_block.count('"in_version": INTRODUCED_0_9_79,') == 3, (
+        "expected exactly the three W2 entries pinned to the frozen "
+        "INTRODUCED_0_9_79 stamp")
+
+
+def test_dual_emit_drop_target_is_strictly_after_this_release():
+    """Fix round item 1c (decision:1832): the target cannot name a release
+    that has already happened — DUAL_EMIT_DROP_TARGET must be STRICTLY
+    greater than VERSION, compared as a version TUPLE (a string compare
+    would rank "0.9.9" ahead of "0.9.10")."""
+    assert (tc._version_tuple(tc.DUAL_EMIT_DROP_TARGET)
+            > tc._version_tuple(tc.VERSION))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

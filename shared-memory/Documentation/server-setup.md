@@ -261,12 +261,25 @@ the network should learn.
 
 | Field | Meaning | Anonymous? |
 |---|---|---|
-| `status` | `ok` (embedder + reranker reachable) or `degraded` (HTTP 503) | yes |
+| `status` | `ok` \| `degraded` \| `down`, derived from `dependencies` and `warnings` (decision:1785) — the HTTP code is a separate question: **503 iff the embedder or reranker is down**, every other verdict is served 200 with the enum | yes |
 | `version` / `api_version` | build version / wire contract | yes |
+| `dependencies.{postgres,neo4j,embedder,reranker,llm_pool,rem_daemon,nrem_daemon,outbox,registry}` | one `{state, reason}` per dependency — see `Documentation/telemetry-contract.md` for the full enum vocabulary per key | authenticated only |
 | `embedder` / `reranker` / `llm` | upstream backend reachability | authenticated only |
-| `daemon` / `rem_daemon` | NREM / REM liveness | authenticated only |
+| `daemon` / `rem_daemon` | NREM / REM liveness (PID check only — see `dependencies.{rem,nrem}_daemon` above for the actual health verdict) | authenticated only |
 | `auth_required` | whether `AGENT_TOKENS` is set | authenticated only |
 | `config` | resolved LLM backend roster, pool tuning, affinity config | authenticated only |
+
+⚠ **A fresh, undeclared install now reads `degraded` on `llm_pool`, not `ok`**
+(W2, decision:1832). Before this, a zero-config gateway with something merely
+*serving* the implicit fallback (`LLM_DEFAULT_TARGET`) read
+`ok` — indistinguishable from a deliberately configured fleet. It now reads
+`degraded` with a reason naming exactly that: nothing was declared, and the
+built-in fallback is what answered. This is a deliberate visibility change
+ahead of the fallback's eventual retirement — declare backends explicitly
+(`bash shared-memory/ops/install_llm_backends.sh`) to clear it. The same
+principle applies to `rem_daemon`/`nrem_daemon`: a fleet where no backend
+counts toward a dream slot now reads `degraded` there instead of silently
+never running REM/NREM while both read `ok`.
 
 The gateway auto-restarts a crashed daemon with exponential backoff; a circuit
 breaker stops after 5 crashes in 10 minutes (restart the gateway to reset). Set

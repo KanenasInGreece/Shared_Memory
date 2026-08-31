@@ -314,3 +314,27 @@ else
   echo "  being retired — configure explicitly with:"
   echo "    bash shared-memory/ops/install_llm_backends.sh"
 fi
+
+echo
+# D5 (decision:1832): a would-refuse config now REPORTS at install time
+# instead of only being discovered at the gateway's own first boot. Phase A
+# of check_config.py is stdlib-only by design (fact:1585-adjacent — see its
+# own module docstring), so this cannot crash a fresh host on a missing
+# dependency. $SCRIPT_DIR (not a bare CWD-relative path) — consistent with
+# every other invocation in this script.
+#
+# Fix round Q5/Q6 (agy MED): report-not-gate is preserved — 0/1/2 are
+# check_config.py's OWN contract codes (would boot / would refuse / report
+# itself failed) and all three stay a silent pass here, this script's job is
+# to REPORT the config, never to let the reporter's own verdict kill an
+# installer that has nothing left to fail on past this point (this script is
+# `set -euo pipefail`, so an unguarded non-zero would abort with .env already
+# written and every prior step already done). But a bare `|| true` also
+# swallowed a SIGNAL KILL or crash outside that contract silently, reading
+# exactly like success — rc is captured and anything past the tool's own
+# 0/1/2 vocabulary is surfaced.
+echo "Checking the configuration this install produced..."
+rc=0; python3 "$SCRIPT_DIR/check_config.py" --phase-a-only || rc=$?
+if [ "$rc" -gt 2 ]; then
+  echo "⚠ check_config aborted (rc=$rc) — config report incomplete"
+fi
