@@ -32,6 +32,7 @@ from multidict import CIMultiDict
 # rem_loop.py and consolidation_loop.py — see secure_env.py.
 from secure_env import load_split_env, get_secret, is_secret_key  # noqa: E402
 from log_hygiene import append_secure, secure_path, scrub_url_credentials, FILE_MODE  # noqa: E402
+from framework_defaults import FRAMEWORK_DEFAULTS  # noqa: E402
 # A-4: the ROLE RULE, from the module that owns it — never a bare _AGENT_ROLES
 # lookup, which cannot see read_only_agents() and would report a confined
 # identity as write-capable.
@@ -131,8 +132,8 @@ _rem_healthy:    bool = False  # True while the REM subprocess is alive
 # `or`, not a get() default: an EMPTY value (EMBEDDER_URL= in .env) means "the
 # default", the same reading the coordinator gives the same variable — the two
 # consumers must never disagree on where the encoder is.
-EMBEDDER_URL = (os.environ.get("EMBEDDER_URL") or "http://localhost:8070").strip().rstrip("/")
-RERANKER_URL = (os.environ.get("RERANKER_URL") or "http://localhost:8071").strip().rstrip("/")
+EMBEDDER_URL = (os.environ.get("EMBEDDER_URL") or FRAMEWORK_DEFAULTS["EMBEDDER_URL"]["default"]).strip().rstrip("/")
+RERANKER_URL = (os.environ.get("RERANKER_URL") or FRAMEWORK_DEFAULTS["RERANKER_URL"]["default"]).strip().rstrip("/")
 ROUTING_MAP = {
     "/v1/embeddings": EMBEDDER_URL,
     "/v1/reranking":  RERANKER_URL,
@@ -173,7 +174,7 @@ EMBED_RERANK_BUFFER_CAP = int(os.environ.get("EMBED_RERANK_BUFFER_CAP", str(1024
 # Fallback used ONLY when LLM_BACKENDS is unset. Deployments differ — LM Studio
 # defaults to :1234, llama.cpp servers commonly :8080 — so keep this overridable
 # instead of baking one port into the code. LLM_BACKENDS is the real knob.
-DEFAULT_TARGET = os.environ.get("LLM_DEFAULT_TARGET", "http://localhost:5000")
+DEFAULT_TARGET = os.environ.get("LLM_DEFAULT_TARGET", FRAMEWORK_DEFAULTS["LLM_DEFAULT_TARGET"]["default"])
 
 # Reasoning-LLM backend POOL. The gateway owns LLM routing + parallelisation:
 # clients have ONE way in (/v1/chat/completions) and never know how many models
@@ -499,7 +500,7 @@ def _load_llm_backends() -> tuple[
         global LLM_POOL_FALLBACK_REASON
         LLM_POOL_FALLBACK_REASON = "LLM_BACKENDS_JSON produced no usable backend (every entry excluded) — serving the LLM_BACKENDS/LLM_DEFAULT_TARGET fallback"
 
-    _raw_backends = [_parse_backend(e) for e in os.environ.get("LLM_BACKENDS", "").split(",") if e.strip()]
+    _raw_backends = [_parse_backend(e) for e in os.environ.get("LLM_BACKENDS", FRAMEWORK_DEFAULTS["LLM_BACKENDS"]["default"]).split(",") if e.strip()]
     if not _raw_backends:
         _raw_backends = [(DEFAULT_TARGET, 1.0)]
     urls = [u for u, _ in _raw_backends]
