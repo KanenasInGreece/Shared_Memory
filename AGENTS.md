@@ -928,6 +928,28 @@ dropped/reset connection (not a timeout): check
 `capacity` record on authenticated `/health` for this host's derived limits. The mem_limit itself
 is reported-only (decision:1424) — nothing here caps or restarts the container.
 
+**Auditing the effective config WITHOUT a running gateway** — `check_config.py` renders every
+env-overridable default (declared / present-but-empty / inherited), a boolean `has_credential` per
+secret (never the value), and — when its daemon dependencies are available — the resolved LLM
+backend roster plus whether the gateway's own startup guards would refuse to boot. A renderer, not
+an enforcer: it calls the gateway's own guard functions rather than re-implementing their logic.
+
+```bash
+# Phase A only (env half) — plain python3, no third-party packages needed:
+python3 shared-memory/scripts/check_config.py --phase-a-only
+
+# Both phases (needs the daemon deps):
+uv run --with aiohttp --with asyncpg --with httpx --with neo4j \
+    python3 shared-memory/scripts/check_config.py
+```
+
+Exit 0 = readable and the gateway would boot; exit 1 = readable but the gateway will refuse to
+start; exit 2 = could not read/render at all (an unreadable-but-present `.env`, or a daemon-side
+import crash — an absent `.env` is NOT exit 2, that is a legitimate headless install). ⛔ Not wired
+into `preflight.sh` — its 0/1/2 contract differs from preflight's 0/1, and it has nothing useful to
+say before Phase 1 has written `shared-memory/.env`. See `shared-memory/ops/README.md` for the full
+reference.
+
 ### Upgrade (gateway host)
 
 **If this host took the tarball route** (no `git` — see *Before Phase 0*), `git pull` will fail here
