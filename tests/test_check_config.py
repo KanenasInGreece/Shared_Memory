@@ -251,6 +251,43 @@ def test_a_clean_llm_backends_json_shows_no_fallback_warning(tmp_path):
     assert "DECLARED FLEET NOT USABLE" not in proc.stdout
 
 
+# ── W3 (Backend_Declaration_Spec_2026-08-30 §4 / decision:1846) —
+#    LLM_POOL_CONFIG_EMPTY gets its own flagged Phase-B line, mutually
+#    exclusive with LLM_POOL_FALLBACK_REASON's line (D1). ───────────────────
+
+def test_config_empty_is_rendered_as_its_own_flagged_line_and_exit_stays_0(tmp_path):
+    """Nothing declared at all (no LLM_BACKENDS_JSON, no LLM_BACKENDS) ->
+    LLM_POOL_CONFIG_EMPTY is True -> its own NO BACKEND DECLARED line,
+    still exit 0 (the gateway boots on the bare LLM_DEFAULT_TARGET
+    fallback)."""
+    proc = _run(env_overrides={"SECURE_ENV_FILE": ""}, tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "NO BACKEND DECLARED" in proc.stdout
+    assert "DECLARED FLEET NOT USABLE" not in proc.stdout
+
+
+def test_config_empty_line_absent_when_a_backend_is_declared(tmp_path):
+    """The existing FALLBACK_REASON rendering is unchanged, and a genuinely
+    declared, usable fleet shows NEITHER flagged line."""
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS": "http://a:5000"},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "NO BACKEND DECLARED" not in proc.stdout
+    assert "DECLARED FLEET NOT USABLE" not in proc.stdout
+
+
+def test_config_empty_and_fallback_reason_lines_are_mutually_exclusive(tmp_path):
+    """D1: a declared-but-excluded fleet (FALLBACK_REASON) is never ALSO
+    reported as CONFIG_EMPTY (nothing declared at all) — the two states
+    are mutually exclusive by construction, and this is the existing
+    FALLBACK_REASON line's rendering left unchanged by the W3 addition."""
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": "{not json"},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "DECLARED FLEET NOT USABLE" in proc.stdout
+    assert "NO BACKEND DECLARED" not in proc.stdout
+
+
 # ── SEC-HIGH (fold round, PR #347) — check_config must be unable to print a
 #    raw secret through ANY exception path, in EITHER phase. Policy: ALWAYS
 #    the exception's type name; str(exc) shown (scrubbed) ONLY for the
