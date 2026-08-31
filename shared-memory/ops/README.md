@@ -76,9 +76,15 @@ Interactive, per backend: URL, whether this machine should supervise it as a
 systemd service (takes *your* launch command — it won't construct one, GPUs
 and models vary too much), and whether it needs a credential — if so, it takes
 **only** the env-var name, with a shape check that rejects anything that looks
-like a pasted literal key rather than a name. Writes `LLM_BACKENDS_JSON` below.
-Safe to re-run (each run replaces the line fresh). `install_framework.sh` also
-offers this as a prompt at the end of first-time setup.
+like a pasted literal key rather than a name. The script then asks the
+mandatory routing choice too — `private_ok: true` or `roles: [...]` for a
+credentialed backend, general-traffic vs. roles-only for one that isn't —
+and warns loudly, without printing the credential, if `AGENT_TOKENS` isn't
+set yet (the gateway refuses to start with a credentialed backend and no
+auth, S-05, until you mint tokens or set the documented override). Writes
+`LLM_BACKENDS_JSON` below. Safe to re-run (each run replaces the line
+fresh). `install_framework.sh` also offers this as a prompt at the end of
+first-time setup (default Yes, interactively).
 
 By hand: `LLM_BACKENDS_JSON` (see `shared-memory/.env.example`) lets the
 gateway route to more than one reasoning LLM, local or remote, including a

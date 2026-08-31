@@ -12,6 +12,12 @@
 #
 # Safe to re-run: each run REPLACES the LLM_BACKENDS_JSON line with what you
 # enter this run — it does not merge with an earlier run.
+#
+# NON-GOAL (W0, recorded deliberately — not an oversight): a credentialed
+# entry over plaintext http to a PUBLIC host is silently excluded by the
+# gateway's transport rule (hive_mind_proxy.py _bearer_transport_ok,
+# `plaintext_ok`) — this script does not ask about or write `plaintext_ok`.
+# See shared-memory/ops/README.md, "Reasoning-LLM backends", TRANSPORT RULE.
 
 set -euo pipefail
 
@@ -53,6 +59,169 @@ command -v systemctl >/dev/null 2>&1 || ylw "Note: systemctl not found — local
 ask()          { local v; read -r -p "$1 [$2]: " v; printf '%s' "${v:-$2}"; }
 ask_required() { local v; while true; do read -r -p "$1: " v; [[ -n "$v" ]] && { printf '%s' "$v"; return; }; echo "  (required)"; done; }
 yesno()        { local v; read -r -p "$1 [y/N]: " v; [[ "$v" =~ ^[Yy]$ ]]; }
+
+# W0 item ①: the gateway's three startup guards (S-05, M-5, P-5 in
+# shared-memory/scripts/hive_mind_proxy.py) refuse to start on configs this
+# script used to happily write — a credentialed backend with neither
+# `private_ok` nor `roles` (M-5), or any credentialed backend at all while
+# AGENT_TOKENS is unset (S-05, unless the operator has already set the
+# documented override). This block makes the script itself ask the M-5
+# question and warn about S-05, rather than letting the operator discover
+# both only when the gateway refuses to boot.
+#
+# ROLE_VOCABULARY: extract judge
+# (source of truth: hive_mind_proxy.py's ROUTING_ROLE_NAMES; "summarize" is
+# RESERVED_ROLE_NAMES there and is never offered here — pinned by
+# tests/test_install_llm_backends_role_vocabulary.py)
+#
+# >>> BACKEND_ACCESS
+# yesno_y() lives inside this marker (rather than beside yesno() above) so
+# the block stays SELF-CONTAINED for tests/test_install_llm_backends.py's
+# standalone extraction — build_backend_entry() depends on it.
+yesno_y() { local v; read -r -p "$1 [Y/n]: " v; [[ ! "$v" =~ ^[Nn]$ ]]; }
+
+# ask_backend_roles() — loops until it has >=1 of {extract, judge} (the
+# gateway's ROUTING_ROLE_NAMES; "summarize" is reserved and always invalid
+# here, same as at the gateway). Blank input (Enter) means "both" — that is
+# the documented default, not a re-ask condition. Anything else that yields
+# zero valid roles (an unknown name, "summarize", or a garbage token) DOES
+# re-ask — it must never fall through to an empty roles list, which is
+# itself a separate fatal shape at the gateway. Exhausted stdin fails loudly
+# (same convention as install_framework.sh's ask_secret) rather than
+# spinning. stdout carries ONLY the final space-separated role list;
+# everything else is stderr.
+ask_backend_roles() {
+    local raw role lc valid=() bad
+    while true; do
+        if ! read -r -p "  Which roles — extract, judge, or both (Enter = both)? " raw; then
+            echo "  No more input on stdin — refusing to guess which roles this backend serves." >&2
+            return 1
+        fi
+        if [[ -z "$raw" ]]; then
+            printf 'extract judge'
+            return 0
+        fi
+        raw="${raw//,/ }"
+        valid=()
+        bad=0
+        for role in $raw; do
+            lc="$(printf '%s' "$role" | tr '[:upper:]' '[:lower:]')"
+            case "$lc" in
+                extract|judge)
+                    case " ${valid[*]:-} " in
+                        *" $lc "*) ;;
+                        *) valid+=("$lc") ;;
+                    esac
+                    ;;
+                *) bad=1 ;;
+            esac
+        done
+        if [[ "$bad" -eq 0 && ${#valid[@]} -gt 0 ]]; then
+            printf '%s' "${valid[*]}"
+            return 0
+        fi
+        echo "  Enter one or more of: extract, judge (never summarize — reserved)." >&2
+    done
+}
+
+# build_backend_entry(url, weight, model, token_env, env_file) — elicits the
+# M-5 access choice (credentialed) or the general-traffic choice
+# (uncredentialed), prints every S-05/P-5/dream-slot caveat that applies,
+# and echoes the COMPLETE jq backend entry (url/weight/model/token_env plus
+# exactly one of private_ok/roles) on stdout. It NEVER writes
+# "private_ok": false (P-5 keys on the EFFECTIVE map — an uncredentialed
+# backend already defaults to private_ok=true, so an explicit `false` is
+# the one value this script could write that newly bricks an auth-off
+# install; the default-deny builder gets a real, opt-in `false` from a
+# later release, not from this script) and it never writes "roles": [] (a
+# separate fatal shape at the gateway). Every prompt/warning/caveat goes to
+# stderr; stdout carries only the finished JSON entry — the caller's
+# `entry="$(build_backend_entry ...)"` capture depends on that separation.
+build_backend_entry() {
+    local url="$1" weight="$2" model="$3" token_env="$4" env_file="$5"
+    local auth_off=0 priv="" roles_str="" mode=""
+
+    if [[ -n "$token_env" ]]; then
+        # S-05: the gateway refuses to start with ANY credentialed backend
+        # while AGENT_TOKENS is unset/empty, unless the operator has already
+        # set ALLOW_UNAUTHENTICATED_PROVIDER_KEYS=1. Value-sensitive check —
+        # matches only a NON-EMPTY AGENT_TOKENS= line; a cleared
+        # `AGENT_TOKENS=` is auth-OFF too (coordinator.py keys on
+        # bool(_AGENT_TOKENS)). Prints nothing itself either way.
+        if ! grep -qE '^[[:space:]]*AGENT_TOKENS=[^[:space:]]' "$env_file" 2>/dev/null; then
+            auth_off=1
+            echo "  ⚠ AGENT_TOKENS is not set in $env_file — the gateway will REFUSE TO" >&2
+            echo "    START (S-05) with this credentialed backend configured, until you" >&2
+            echo "    mint tokens:" >&2
+            echo "      bash shared-memory/scripts/bootstrap_tokens.sh" >&2
+            echo "    or set the documented override: ALLOW_UNAUTHENTICATED_PROVIDER_KEYS=1" >&2
+        fi
+
+        echo "  This backend is credentialed — the gateway needs to know how it may" >&2
+        echo "  serve traffic (M-5: neither choice below is optional for a credentialed" >&2
+        echo "  backend)." >&2
+        while true; do
+            if ! read -r -p "  Serve any eligible request (private_ok), or only specific roles (roles)? [private_ok/roles]: " mode; then
+                echo "  No more input on stdin — refusing to write a credentialed backend with" >&2
+                echo "  neither private_ok nor roles chosen (the gateway would refuse to start)." >&2
+                return 1
+            fi
+            mode="$(printf '%s' "$mode" | tr '[:upper:]' '[:lower:]')"
+            case "$mode" in
+                private_ok|roles) break ;;
+                *) echo "  Enter exactly 'private_ok' or 'roles'." >&2 ;;
+            esac
+        done
+
+        if [[ "$mode" == "private_ok" ]]; then
+            priv="true"
+        else
+            roles_str="$(ask_backend_roles)" || return 1
+            echo "  Note: a roles-only backend never serves role-less (ad-hoc) traffic." >&2
+            if [[ "$roles_str" != *" "* ]]; then
+                echo "  Note: with only these roles, this backend does not count toward dream" >&2
+                echo "  slots — if no other backend qualifies, REM and NREM will never run" >&2
+                echo "  against this fleet." >&2
+            fi
+            if [[ "$auth_off" -eq 1 ]]; then
+                echo "  Note: with auth off you will hit the S-05 refusal first (see above) —" >&2
+                echo "  P-5 matches this entry too, and the same override covers both." >&2
+            fi
+        fi
+    else
+        if yesno_y "  Does this backend serve general (role-less) traffic?"; then
+            priv="true"
+        else
+            roles_str="$(ask_backend_roles)" || return 1
+            echo "  Note: a roles-only backend never serves role-less (ad-hoc) traffic." >&2
+            if [[ "$roles_str" != *" "* ]]; then
+                echo "  Note: with only these roles, this backend does not count toward dream" >&2
+                echo "  slots — if no other backend qualifies, REM and NREM will never run" >&2
+                echo "  against this fleet." >&2
+            fi
+            echo "  Note: until a future default-deny release, this framework still routes" >&2
+            echo "  role-less (ad-hoc) traffic to a roles-only backend too — this script" >&2
+            echo "  cannot build that restriction yet, only record what you intend." >&2
+        fi
+    fi
+
+    if [[ -n "$priv" ]]; then
+        jq -n --arg url "$url" --arg weight "$weight" --arg model "$model" --arg token_env "$token_env" '
+            {url: $url, weight: ($weight | tonumber)}
+            + (if $model != "" then {model: $model} else {} end)
+            + (if $token_env != "" then {token_env: $token_env} else {} end)
+            + {private_ok: true}
+        '
+    else
+        jq -n --arg url "$url" --arg weight "$weight" --arg model "$model" --arg token_env "$token_env" --arg roles "$roles_str" '
+            {url: $url, weight: ($weight | tonumber)}
+            + (if $model != "" then {model: $model} else {} end)
+            + (if $token_env != "" then {token_env: $token_env} else {} end)
+            + {roles: ($roles | split(" "))}
+        '
+    fi
+}
+# <<< BACKEND_ACCESS
 
 echo "── Shared Memory — configure reasoning-LLM backends ──"
 echo "Each backend is a URL the gateway load-balances across. Add as many as you like:"
@@ -121,11 +290,7 @@ EOF
         grn "  ✓ Installed + started llm-backend-${label}.service"
     fi
 
-    entry=$(jq -n --arg url "$url" --arg weight "$weight" --arg model "$model" --arg token_env "$token_env" '
-        {url: $url, weight: ($weight | tonumber)}
-        + (if $model != "" then {model: $model} else {} end)
-        + (if $token_env != "" then {token_env: $token_env} else {} end)
-    ')
+    entry="$(build_backend_entry "$url" "$weight" "$model" "$token_env" "$ENV_FILE")" || exit 1
     entries+=("$entry")
     grn "  Added: $url"
 
