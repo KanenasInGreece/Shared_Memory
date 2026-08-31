@@ -5,6 +5,45 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.78] — 2026-08-31
+
+### One place says what the defaults are, and one command says what the gateway will do
+
+Until now the framework's fallback endpoints lived as string literals scattered through two daemons —
+the encoder URLs in two files each, the reasoning-LLM target in a third place — and the only way to
+learn what an undeclared setting would resolve to was to read the code that consumes it. Every
+default now lives in `framework_defaults.py`: a table of immutable literals with no imports, no
+environment access, and nothing that can drift when a daemon is reloaded. The four consuming sites
+read the table; the values are byte-identical to what they were, each site keeps its exact
+empty-string semantics (deliberately pinned by new tests, because two different lookup idioms treat
+an empty value differently and "tidying" that would have been an invisible behaviour change), and
+rows the table does not govern — a hardcoded graph URI, deliberately-unconfigurable daemon-internal
+endpoints, client-side settings that must never import server code — are recorded in it as
+documentation with their reasons, so no later change mistakes the list for a to-do.
+
+`check_config.py` is the new audit companion: a standalone script that renders, per endpoint and per
+backend, the effective value and whether it was declared by the operator or inherited from a code
+default — the first surface where that distinction is visible at all. It is built to work exactly
+when things are broken: the environment half runs on the standard library alone and cannot be taken
+down by a malformed config, while the backend half imports the gateway's own code inside a guard, so
+a config the gateway would crash-import on still produces a readable report. Its verdict about boot
+comes from calling the gateway's own startup guards — never a re-implementation that could drift —
+and its exit codes say only what is true: whether the report could be produced, and whether the
+gateway would refuse to start. One deliberately humbling case is rendered loudly: a `LLM_BACKENDS_JSON`
+that fails to parse is silently replaced by the legacy fallback today, so the gateway *boots* — the
+report now leads with the fact that the declared fleet is not what is serving, instead of printing a
+clean roster over a vanished configuration.
+
+Because the tool's whole job is to describe configuration that may contain credentials, its error
+paths were reviewed as attack surface: no exception path prints a raw value — exception types
+always, messages only for dependency errors and only after passing the URL scrubber — and secrets
+appear in the report solely as booleans.
+
+Fifty-three tests accompany the change, including subprocess proof that the environment half really
+runs on a bare standard library, a crash-injection test asserting that a secret planted in a
+malformed configuration line never reaches the output, and pins that keep the pre-existing literal
+default tests fully independent of the new table so they cannot become tautologies.
+
 ## [0.9.77] — 2026-08-31
 
 ### The installer could write a config the gateway refuses to boot on

@@ -288,6 +288,58 @@ log in and re-export/re-import. **A `token_env` delivered via
 like any other systemd-managed secret.** Backends with no `token_env` (local
 hardware) are unaffected either way.
 
+## `check_config.py` — audit the effective config without starting the gateway
+
+Standalone; renders the framework's effective configuration and what the gateway will DO with it,
+without ever booting it. Two phases:
+
+- **Phase A (environment half)** — STDLIB ONLY, never imports a daemon module. Loads
+  `shared-memory/.env` (or reports "environment-only" honestly when there is none — a legitimate
+  headless state, not an error) and renders a three-valued state per env-overridable setting:
+  `declared` (present, non-empty) · `present-but-empty` (present but empty — whether that falls
+  back to the default depends on the SITE'S OWN idiom; both the state and the true effective value
+  are always shown) · `inherited default` (absent entirely). Every secret-classified key
+  (`PG_PASSWORD`, `NEO4J_PASSWORD`, `AGENT_TOKENS`, `PG_CONN`, ...) is answered ONLY as a boolean
+  `has_credential` — the value itself is never rendered, matching the same discipline the
+  authenticated `/health` payload already applies.
+- **Phase B (backend half)** — `import hive_mind_proxy` inside `except Exception`, so a
+  misconfiguration (a bad encoder URL, a malformed `LLM_BACKENDS_JSON` entry, or the daemon
+  dependencies simply not being installed under whatever python ran this) degrades to "Phase A
+  printed, Phase B unavailable, exit 2" rather than a raw traceback. On success, renders one line
+  per configured LLM backend (url — credential-scrubbed, weight, model, roles, `n_ctx`,
+  `has_credential`, `private_ok` effective + explicit) and then calls the gateway's OWN startup
+  guard functions (never re-implementing their predicates) to say whether it would actually boot.
+
+```bash
+# Phase A only — plain python3, no third-party packages needed at all:
+python3 shared-memory/scripts/check_config.py --phase-a-only
+
+# Both phases — needs the daemon dependencies:
+uv run --with aiohttp --with asyncpg --with httpx --with neo4j \
+    python3 shared-memory/scripts/check_config.py
+```
+
+**Exit codes** (a renderer, never an enforcer):
+
+| Code | Meaning |
+|---|---|
+| `0` | Config readable AND neither of the gateway's own startup guards would refuse to boot. |
+| `1` | Readable, but the gateway WILL refuse to start (reachable only once Phase B's import succeeds). |
+| `2` | Could not read/render at all — an unreadable-but-PRESENT `.env`, or a Phase-B import crash. An ABSENT `.env` is NOT exit 2. |
+
+⚠ **A `LLM_BACKENDS_JSON` that fails to PARSE (bad JSON syntax, or valid JSON that isn't an array)
+is NOT exit 2** — `hive_mind_proxy`'s own loader catches that internally and falls back to the
+legacy `LLM_BACKENDS`/`LLM_DEFAULT_TARGET` pool, so the import still succeeds. `check_config.py`
+surfaces this as a prominent `⚠ DECLARED FLEET NOT USABLE` warning before the backend roster,
+exit **0** (the gateway genuinely does boot, just not on the fleet you declared) — never a second
+meaning for exit 1. Exit 2 is reserved for a shape the loader's own try/except does not catch (e.g.
+a JSON array of bare strings instead of objects).
+
+⛔ **Not wired into `preflight.sh`.** preflight's exit contract is 0/1 (hard requirements only) and
+it deliberately runs before `shared-memory/.env` is expected to exist — this script's 0/1/2
+contract is different on purpose, and it has nothing useful to say that early. Run it any time after
+Phase 1 has written the `.env`, especially before a restart when you have just hand-edited it.
+
 ## `backup.sh` / `restore.sh` (+ `shared-memory-backup.{service,timer}`)
 
 Consistent backup of **both** stores (Postgres + Neo4j — the latter holds the

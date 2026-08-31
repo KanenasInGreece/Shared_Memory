@@ -86,6 +86,7 @@ from project_promotion import (
 )
 from project_alias import ALIAS_RESOLVE_SQL, ACTIVE_ALIASES_SQL
 from secure_env import get_secret
+from framework_defaults import FRAMEWORK_DEFAULTS
 from telemetry_instruments import LatencyRing, Counter, safe
 
 log = logging.getLogger("coordinator")
@@ -153,7 +154,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.77"
+FRAMEWORK_VERSION = "0.9.78"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -2184,8 +2185,8 @@ def _encoder_url(env_name: str, default_base: str, path: str) -> str:
         )
     return f"{base}{path}"
 
-EMBED_URL  = _encoder_url("EMBEDDER_URL", "http://localhost:8070", "/v1/embeddings")
-RERANK_URL = _encoder_url("RERANKER_URL", "http://localhost:8071", "/v1/reranking")
+EMBED_URL  = _encoder_url("EMBEDDER_URL", FRAMEWORK_DEFAULTS["EMBEDDER_URL"]["default"], "/v1/embeddings")
+RERANK_URL = _encoder_url("RERANKER_URL", FRAMEWORK_DEFAULTS["RERANKER_URL"]["default"], "/v1/reranking")
 
 # M1 (PR #308 review): this USED to log right here, at module import — but
 # hive_mind_proxy.py imports coordinator (line 55) BEFORE its own
