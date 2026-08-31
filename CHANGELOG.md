@@ -5,6 +5,60 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.77] — 2026-08-31
+
+### The installer could write a config the gateway refuses to boot on
+
+`ops/install_llm_backends.sh` asked whether a backend needs an API credential and then wrote an
+entry carrying neither `roles` nor `private_ok` — exactly the shape the gateway's M-5 startup guard
+refuses, by design, so that a credentialed backend is never silently eligible for everything. The
+framework's own install helper was manufacturing its own fatal config, and on a first install the
+operator met it as a gateway that would not start.
+
+The installer now elicits the access decision it was skipping. A credentialed backend gets the M-5
+choice put plainly — serve any eligible request (`private_ok: true`), or only the roles you name —
+with the role vocabulary read from the gateway's own set and pinned there by a test, so the two can
+never drift apart. An uncredentialed backend gets the same question in its own terms. The script can
+no longer emit a credentialed entry with neither key, an empty roles list, or an invalid role name —
+and it never writes `private_ok: false`, because on an install without agent tokens an explicit
+false is the one thing this script could write that newly prevents the gateway from starting. When
+tokens are not configured yet — which is the normal state at first install, since minting comes
+later — adding a credentialed backend now ends with a plain statement of what will happen and what
+to do, instead of leaving "restart the gateway" as the last words before a refused boot. A prompt
+that ran out of piped input used to be able to fall through as a silent "yes" to the access
+question; an unanswered access question now aborts the entry instead of widening it.
+
+Along the way the choice the operator makes is explained truthfully: the caveat that a roles-only
+backend refuses ad-hoc traffic is printed only where it is true (a credentialed backend), and
+choosing a strict subset of the role set warns — in the gateway's own words — that such a backend
+does not count toward dream slots, so a fleet configured that way would never run its consolidation
+cycles.
+
+### The startup journal no longer prints what the telemetry already scrubs
+
+The gateway scrubs credentials out of URLs everywhere telemetry or clients can see them — and then
+logged the encoder URLs raw in its startup announcement, and the backend URLs raw in the very guard
+messages that exist to protect credentialed backends. A credential embedded in a URL leaked to the
+journal at every boot. All fifteen startup-path renders — the parse-time validation messages, the
+routing announcement, and every startup-guard message and warning — now pass through the same
+scrubber the rest of the system uses, which keeps scheme, host, port and path, so every message
+still names exactly which backend it is talking about.
+
+### The install prompt stops steering past its most important question
+
+`install_framework.sh` defaulted the "configure reasoning-LLM backends now?" prompt to No and then
+advertised the implicit `localhost:5000` fallback as if it were configuration. Interactively the
+prompt now defaults to Yes; piped and non-interactive installs keep the old No so automation is
+undisturbed — with one deliberate improvement: a pipe that runs out at this prompt now completes the
+install on the No path instead of dying mid-run after `.env` was already written. The skip text now
+says what is true: the fallback exists today and is being retired in favour of explicit
+configuration.
+
+Forty-nine tests accompany the change, including non-interactive harnesses for the installer's
+elicitation paths that never touch a real `.env` or real systemd, a pin tying the script's role list
+to the gateway's vocabulary, and leak tests asserting that a credential planted in a URL appears in
+no message the startup path can produce.
+
 ## [0.9.76] — 2026-08-30
 
 ### One trailing slash was the difference between a token wall and an open door

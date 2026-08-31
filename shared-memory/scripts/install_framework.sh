@@ -291,10 +291,26 @@ else
 fi
 
 echo
-read -r -p "Configure reasoning-LLM backend(s) now (local, remote, or a paid cloud API)? [y/N] " llm_yn
-if [[ "${llm_yn:-N}" =~ ^[Yy]$ ]]; then
+# W0 item ③: interactive default is Y (an operator hitting Enter here almost
+# always wants to configure a backend); a non-interactive run (piped stdin)
+# keeps the historical N default. `[ -t 0 ]` picks the default a blank
+# answer resolves to; the guarded read (ask_secret's precedent, above) turns
+# an EXHAUSTED pipe into an explicit "n" rather than a `set -e` death here —
+# .env is already written by this point, so that death used to exit
+# non-zero on a fully scripted install with nothing left to answer. Now it
+# takes the N branch and the installer exits 0 (deliberate, ruled behaviour
+# change — the AGENTS.md piped "n\nn" install still answers explicitly and
+# is unaffected either way).
+_llm_yn_default=N
+[ -t 0 ] && _llm_yn_default=Y
+if ! read -r -p "Configure reasoning-LLM backend(s) now (local, remote, or a paid cloud API)? [Y/n] " llm_yn; then
+  llm_yn=n
+fi
+if [[ "${llm_yn:-$_llm_yn_default}" =~ ^[Yy]$ ]]; then
   bash "$FRAMEWORK_DIR/ops/install_llm_backends.sh"
 else
-  echo "  Skipped. A single default backend at LLM_DEFAULT_TARGET (http://localhost:5000)"
-  echo "  is used until you configure one:  bash shared-memory/ops/install_llm_backends.sh"
+  echo "  Skipped. Until you configure backends, the gateway falls back to"
+  echo "  http://localhost:5000 (LLM_DEFAULT_TARGET). This implicit fallback is"
+  echo "  being retired — configure explicitly with:"
+  echo "    bash shared-memory/ops/install_llm_backends.sh"
 fi

@@ -311,7 +311,7 @@ def _load_llm_backends() -> tuple[
             return None
         if not isinstance(raw, list):
             role_config_errors.append(
-                f"{url}: roles must be a JSON array, got {type(raw).__name__}")
+                f"{scrub_url_credentials(url)}: roles must be a JSON array, got {type(raw).__name__}")
             return frozenset()
         if not raw:
             # R-3 (decision:1357): an EMPTY roles list makes the backend
@@ -320,7 +320,7 @@ def _load_llm_backends() -> tuple[
             # None`). A backend that serves nothing is a config mistake, not
             # a scope; refuse loudly at startup.
             role_config_errors.append(
-                f"{url}: roles is an EMPTY list — this backend would be "
+                f"{scrub_url_credentials(url)}: roles is an EMPTY list — this backend would be "
                 f"eligible for NOTHING (every request refused). Either omit "
                 f"`roles` (serves all) or list at least one of "
                 f"{sorted(ROUTING_ROLE_NAMES)}.")
@@ -331,13 +331,13 @@ def _load_llm_backends() -> tuple[
             reserved_hit = bad & RESERVED_ROLE_NAMES
             if reserved_hit:
                 role_config_errors.append(
-                    f"{url}: roles names {sorted(reserved_hit)} — RESERVED, not "
+                    f"{scrub_url_credentials(url)}: roles names {sorted(reserved_hit)} — RESERVED, not "
                     f"accepted (NREM narrative folds are zero-inference; the only "
                     f"NREM LLM path is judge). Allowed: {sorted(ROUTING_ROLE_NAMES)}")
             unknown = bad - RESERVED_ROLE_NAMES
             if unknown:
                 role_config_errors.append(
-                    f"{url}: unknown role name(s) {sorted(unknown)} — allowed: "
+                    f"{scrub_url_credentials(url)}: unknown role name(s) {sorted(unknown)} — allowed: "
                     f"{sorted(ROUTING_ROLE_NAMES)}")
         return frozenset(names & ROUTING_ROLE_NAMES)
 
@@ -382,7 +382,7 @@ def _load_llm_backends() -> tuple[
                     "gateway's own process environment (see "
                     "shared-memory/ops/README.md, 'Reasoning-LLM backends'). "
                     "Excluding this backend from the pool.",
-                    url, _raw_secret_fields)
+                    scrub_url_credentials(url), _raw_secret_fields)
                 continue
             token_env = entry.get("token_env")
             token = None
@@ -440,7 +440,7 @@ def _load_llm_backends() -> tuple[
                 log.error(
                     "LLM_BACKENDS_JSON entry for %s has a non-object extra_body "
                     "(%r) — excluding this backend from the pool.",
-                    url, type(extra_body).__name__)
+                    scrub_url_credentials(url), type(extra_body).__name__)
                 continue
             # R-2 + Optional (decision:1357): both int fields must be a REAL
             # int >= 1 — bool is an int subclass in Python (True passes a
@@ -455,7 +455,7 @@ def _load_llm_backends() -> tuple[
                 log.error(
                     "LLM_BACKENDS_JSON entry for %s has an invalid n_ctx "
                     "(%r — must be an integer >= 1) — excluding this backend "
-                    "from the pool.", url, n_ctx_raw)
+                    "from the pool.", scrub_url_credentials(url), n_ctx_raw)
                 continue
             max_inflight_raw = entry.get("max_inflight")
             if max_inflight_raw is not None and (not isinstance(max_inflight_raw, int)
@@ -464,14 +464,14 @@ def _load_llm_backends() -> tuple[
                 log.error(
                     "LLM_BACKENDS_JSON entry for %s has an invalid max_inflight "
                     "(%r — must be an integer >= 1) — excluding this backend "
-                    "from the pool.", url, max_inflight_raw)
+                    "from the pool.", scrub_url_credentials(url), max_inflight_raw)
                 continue
             private_ok_raw = entry.get("private_ok")
             if private_ok_raw is not None and not isinstance(private_ok_raw, bool):
                 log.error(
                     "LLM_BACKENDS_JSON entry for %s has a non-boolean private_ok "
                     "(%r) — excluding this backend from the pool.",
-                    url, private_ok_raw)
+                    scrub_url_credentials(url), private_ok_raw)
                 continue
             urls.append(url)
             weights[url] = max(float(entry.get("weight", 1.0) or 1.0), 0.1)
@@ -5008,12 +5008,12 @@ def require_auth_when_provider_keys_configured() -> None:
             "the deliberate override documented in shared-memory/.env.example, not "
             "a default — also visible on GET /health as "
             "config.allow_unauthenticated_provider_keys once the gateway is up.",
-            len(credentialed), ", ".join(credentialed),
+            len(credentialed), ", ".join(scrub_url_credentials(b) for b in credentialed),
         )
         return
     raise SystemExit(
         "FATAL: AGENT_TOKENS is unset but a provider-credentialed backend is "
-        f"configured ({', '.join(credentialed)}) — starting would let any "
+        f"configured ({', '.join(scrub_url_credentials(b) for b in credentialed)}) — starting would let any "
         "caller sign a request with that key. Configure AGENT_TOKENS, or set "
         "ALLOW_UNAUTHENTICATED_PROVIDER_KEYS=1 to run anyway (see "
         "shared-memory/.env.example)."
@@ -5062,7 +5062,8 @@ def require_valid_llm_routing_config() -> None:
     if needs_explicit_choice:
         raise SystemExit(
             "FATAL: credentialed LLM backend(s) configured with neither "
-            f"`roles` nor an explicit `private_ok`: {', '.join(needs_explicit_choice)}. "
+            f"`roles` nor an explicit `private_ok`: "
+            f"{', '.join(scrub_url_credentials(b) for b in needs_explicit_choice)}. "
             "Pick one in LLM_BACKENDS_JSON: private_ok: true (keep today's "
             "serve-everything behavior) or roles: [\"extract\", \"judge\"] "
             "(per-function opt-in, this backend never receives "
@@ -5081,12 +5082,12 @@ def require_valid_llm_routing_config() -> None:
             "the gateway cannot tell one caller from another, so a backend scoped away "
             "from role-less/private traffic has no enforceable meaning. This is the "
             "deliberate override documented in shared-memory/.env.example, not a default.",
-            ", ".join(private_false),
+            ", ".join(scrub_url_credentials(b) for b in private_false),
         )
         return
     raise SystemExit(
         "FATAL: AGENT_TOKENS is unset (auth off) but private_ok=false backend(s) "
-        f"are configured ({', '.join(private_false)}) — the privacy/steering "
+        f"are configured ({', '.join(scrub_url_credentials(b) for b in private_false)}) — the privacy/steering "
         "invariants (I-1/I-6) require a caller identity to enforce, which an "
         "auth-off install cannot provide. Configure AGENT_TOKENS, or set "
         "ALLOW_UNAUTHENTICATED_PROVIDER_KEYS=1 to run anyway (see "
@@ -5176,6 +5177,19 @@ def _default_uds_path() -> str:
     return os.path.join(base, "shared-memory-gw.sock")
 
 
+def _encoder_routing_log_line() -> str:
+    """Pure formatter for the startup encoder-routing announcement (Group 3
+    journal-scrub sweep). Split out from the log.info() call so a test can
+    assert on the exact string without capturing logging output. Scrubbed
+    like every other URL-bearing startup line: EMBEDDER_URL/RERANKER_URL are
+    ordinary env-configured endpoints, never validated to be credential-free,
+    and this line is unconditional at every gateway start."""
+    return (
+        f"### /v1/embeddings->{scrub_url_credentials(EMBEDDER_URL)} | "
+        f"/v1/reranking->{scrub_url_credentials(RERANKER_URL)} | default->LLM pool"
+    )
+
+
 async def main() -> None:
     # RULED (Xenofon, 2026-08-14): a plaintext AGENT_TOKENS entry refuses
     # gateway startup outright, from v0.9.3 — before anything else stands
@@ -5262,8 +5276,7 @@ async def main() -> None:
             uds_site = None
 
     log.info("### Hive-Mind Proxy on :%d [aiohttp]", PORT)
-    log.info("### /v1/embeddings->%s | /v1/reranking->%s | default->LLM pool",
-             EMBEDDER_URL, RERANKER_URL)
+    log.info(_encoder_routing_log_line())
 
     stop_event = asyncio.Event()
     watchdog_task     = asyncio.create_task(_watchdog_daemon(stop_event))
