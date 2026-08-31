@@ -6,12 +6,19 @@
 #   bash shared-memory/scripts/update_framework.sh              # upgrade in place
 #   bash shared-memory/scripts/update_framework.sh --from-restore
 #   bash shared-memory/scripts/update_framework.sh --dry-run    # print, run nothing
-#   bash shared-memory/scripts/update_framework.sh --domain-backfill  # also run step 6 (opt-in)
+#   bash shared-memory/scripts/update_framework.sh --domain-backfill  # also run step 8 (opt-in)
+#   bash shared-memory/scripts/update_framework.sh --skip-env-migration  # see below
 #
 # ⛔ --no-domain-backfill is a ONE-RELEASE no-op, kept only so an existing
 # invocation does not break: the domain backfill is opt-in now (fact:1734 C(d))
-# — omit both flags and step 6 is skipped by default. Pass --domain-backfill to
+# — omit both flags and step 8 is skipped by default. Pass --domain-backfill to
 # run it. The no-op flag and this notice are removed next release.
+#
+# ⛔ --skip-env-migration skips BOTH the pre-pull capture and the post-backup
+# migrate_env.py --apply step (W3, Backend_Declaration_Spec_2026-08-30 §4) —
+# a capture/migration bug must not block a security update. Coverage for
+# THIS upgrade is deferred to a manual standalone run of migrate_env.py; see
+# AGENTS.md.
 #
 # Env overrides: GATEWAY_URL, GATEWAY_UNIT, GATEWAY_RESTART_CMD.
 #
@@ -56,6 +63,23 @@ red() { printf '\033[31m%s\033[0m\n' "$*"; }
 grn() { printf '\033[32m%s\033[0m\n' "$*"; }
 ylw() { printf '\033[33m%s\033[0m\n' "$*"; }
 die() { red "✗ $*"; exit 1; }
+
+# ── EXIT trap registry (W3, env migration) — CHAINS, never replaces. This
+# script sets no other EXIT trap today (verified fe98761: only a prose
+# comment at :141 matches) but a future addition must not clobber the
+# pre-image tmpdir cleanup below by re-assigning `trap ... EXIT` directly —
+# every caller adds a command here instead, and exactly one trap is ever
+# registered, on top of all of them.
+_EXIT_CLEANUP_CMDS=()
+_run_exit_cleanup() {
+    local cmd
+    if [[ ${#_EXIT_CLEANUP_CMDS[@]} -gt 0 ]]; then
+        for cmd in "${_EXIT_CLEANUP_CMDS[@]}"; do
+            eval "$cmd" 2>/dev/null || true
+        done
+    fi
+}
+add_exit_cleanup() { _EXIT_CLEANUP_CMDS+=("$1"); trap _run_exit_cleanup EXIT; }
 
 # ── RULING 1: dry-run-aware refusal for the pre-`git pull` branch guard ─────
 # --dry-run is documented as "print, run nothing" -- the way an operator
@@ -116,6 +140,8 @@ DRY_RUN=0
 SKIP_BACKUP=0
 DOMAIN_BACKFILL=0
 NO_DOMAIN_BACKFILL_NOTICE=0
+SKIP_ENV_MIGRATION=0
+PREIMAGE_JSON=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --from-restore)       FROM_RESTORE=1; shift ;;
@@ -123,6 +149,7 @@ while [[ $# -gt 0 ]]; do
         --skip-backup)        SKIP_BACKUP=1; shift ;;
         --domain-backfill)    DOMAIN_BACKFILL=1; shift ;;
         --no-domain-backfill) NO_DOMAIN_BACKFILL_NOTICE=1; shift ;;
+        --skip-env-migration) SKIP_ENV_MIGRATION=1; shift ;;
         -h|--help)      awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; exit 0 ;;
         *)              die "unknown argument: $1" ;;
     esac
@@ -414,6 +441,50 @@ if [[ "$FROM_RESTORE" == "0" ]]; then
         fi
 
         if [[ "$pull_blocked" == "0" ]]; then
+            # ── W3 env migration (Backend_Declaration_Spec_2026-08-30 §4,
+            # decision:1846): capture the pre-upgrade effective config from
+            # the OLD checkout, IMMEDIATELY BEFORE the pull moves it forward
+            # — the cross-version equality this tool holds
+            # (old_code(pre_env) == new_code(post_env)) is a construction,
+            # not an assumption, only when this runs against the OLD code's
+            # own copy. SM_PRE_UPDATE_VERSION uses the SAME sed idiom the
+            # post-restart guard below uses for FRAMEWORK_VERSION (no
+            # interpreter deps) and is exported BEFORE the capture call,
+            # which stamps captured_by from it.
+            SM_PRE_UPDATE_VERSION="$(sed -n 's/^FRAMEWORK_VERSION[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+                "$REPO_ROOT/shared-memory/scripts/coordinator.py" | head -1)"
+            export SM_PRE_UPDATE_VERSION
+            if [[ "$SKIP_ENV_MIGRATION" == "1" ]]; then
+                step=$((step + 1))
+                echo; ylw "── Step $step: capture pre-upgrade effective config"
+                echo "   SKIPPED — --skip-env-migration given. §4 coverage for this"
+                echo "   upgrade is deferred to a manual standalone run of migrate_env.py."
+            else
+                if [[ "$DRY_RUN" == "0" ]]; then
+                    PREIMAGE_DIR="$(mktemp -d)"
+                    chmod 700 "$PREIMAGE_DIR"
+                    PREIMAGE_JSON="$PREIMAGE_DIR/preimage.json"
+                    # CHAIN, never replace, any EXIT trap set before this point
+                    # (none exists today — verified fe98761 — but a future
+                    # addition must not clobber this cleanup).
+                    add_exit_cleanup "rm -rf '$PREIMAGE_DIR'"
+                else
+                    PREIMAGE_JSON="\$(mktemp -d)/preimage.json"
+                fi
+                run_soft "capture pre-upgrade effective config" \
+                    uv run --no-project --with-requirements "$REPO_ROOT/requirements-gateway.lock" \
+                    python "$REPO_ROOT/shared-memory/scripts/migrate_env.py" \
+                    --capture-preimage "$PREIMAGE_JSON"
+                rc=$?
+                if [[ "$DRY_RUN" == "0" && "$rc" != "0" ]]; then
+                    die "capture pre-upgrade effective config FAILED (exit $rc) — refusing
+  before the pull (nothing has moved; cost zero). SM_PRE_UPDATE_VERSION=
+  $SM_PRE_UPDATE_VERSION. Re-run with --skip-env-migration to defer §4 coverage
+  for this upgrade to a manual standalone run of migrate_env.py, or fix the
+  failure above and re-run."
+                fi
+            fi
+
             run "fetch new code (branch: $branch)" git -C "$REPO_ROOT" pull --ff-only
         fi
     else
@@ -464,6 +535,50 @@ else
         echo "   SKIPPED — post-restore. The dump you just restored IS the safeguard set."
     else
         echo "   SKIPPED — --skip-backup given. You are asserting a current backup exists."
+    fi
+fi
+
+# ── W3 env migration: migrate .env to explicit configuration ────────────────
+#
+# AFTER the backup (nothing here has touched Postgres/Neo4j yet — a refusal
+# costs only the pull, H5.4) and BEFORE the Postgres migration. Runs on BOTH
+# the upgrade and restore paths: restored data can carry the same implicit
+# shapes the upgrade path migrates, and it is always the NEW checkout's own
+# copy of migrate_env.py that must run here, post-pull or post-restore
+# either way. When step 0's capture ran (the upgrade path, not
+# --skip-env-migration), this applies against that pre-image; otherwise
+# (--from-restore, or --skip-env-migration was given for THIS run only —
+# checked again here so a capture failure never partially applies) it
+# self-captures with the CURRENT loader (N-9 — valid only while loader
+# semantics are unchanged from the running version; true at W3).
+if [[ "$SKIP_ENV_MIGRATION" == "1" ]]; then
+    step=$((step + 1))
+    echo; ylw "── Step $step: migrate .env to explicit configuration"
+    echo "   SKIPPED — --skip-env-migration given. §4 coverage for this upgrade"
+    echo "   is deferred to a manual standalone run of migrate_env.py."
+elif [[ -n "$PREIMAGE_JSON" ]]; then
+    run_soft "migrate .env to explicit configuration" \
+        uv run --no-project --with-requirements "$REPO_ROOT/requirements-gateway.lock" \
+        python "$REPO_ROOT/shared-memory/scripts/migrate_env.py" \
+        --apply --preimage "$PREIMAGE_JSON"
+    rc=$?
+    if [[ "$DRY_RUN" == "0" && "$rc" != "0" ]]; then
+        die "migrate .env to explicit configuration FAILED (exit $rc, message above).
+  Re-run with --skip-env-migration to defer §4 coverage for this upgrade to a
+  manual standalone run of migrate_env.py, or fix the failure above and re-run —
+  every earlier step (backup included) is idempotent."
+    fi
+else
+    run_soft "migrate .env to explicit configuration (self-capture)" \
+        uv run --no-project --with-requirements "$REPO_ROOT/requirements-gateway.lock" \
+        python "$REPO_ROOT/shared-memory/scripts/migrate_env.py" \
+        --apply
+    rc=$?
+    if [[ "$DRY_RUN" == "0" && "$rc" != "0" ]]; then
+        die "migrate .env to explicit configuration FAILED (exit $rc, message above).
+  Re-run with --skip-env-migration to defer §4 coverage for this upgrade to a
+  manual standalone run of migrate_env.py, or fix the failure above and re-run —
+  every earlier step (backup included) is idempotent."
     fi
 fi
 
