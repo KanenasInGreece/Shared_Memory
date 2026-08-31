@@ -4086,12 +4086,19 @@ def _llm_pool_dependency(backend_status: dict) -> dict:
     load-bearing: a `down` verdict is never softened by what the config MEANS,
     only explained by it. Checked in this order:
       1. no backend probed at all -> unknown (nothing to derive a verdict from)
-      2. every probed backend down -> DOWN, unconditionally (M1: the reason is
-         composed when LLM_POOL_CONFIG_EMPTY is also set, so a fresh install
-         reads why its unset fallback is unreachable rather than being told
-         about a URL it never declared — the EFFECTIVE DEFAULT_TARGET value,
-         scrubbed, never a hardcoded "localhost:5000": our ports are one valid
-         configuration, not the only one, fix round Q2)
+      2. every probed backend down -> DOWN, unconditionally. Every applicable
+         DOWN-tier reason COMPOSES too (handback H2 — the down branch used to
+         drop LLM_POOL_FALLBACK_REASON entirely: a declared fleet that was
+         entirely EXCLUDED, whose fallback is ALSO down, read a bare "all 1
+         backend(s) down" with the explanatory fact gone. LLM_POOL_FALLBACK_
+         REASON and LLM_POOL_CONFIG_EMPTY never coexist by construction — D1 —
+         so at most one of the two configuration facts joins the liveness
+         fact): LLM_POOL_FALLBACK_REASON (a declared fleet, every entry
+         EXCLUDED — F6, v0.9.75), or LLM_POOL_CONFIG_EMPTY (M1: nothing was
+         declared at all, naming the EFFECTIVE DEFAULT_TARGET value, scrubbed,
+         never a hardcoded "localhost:5000" — our ports are one valid
+         configuration, not the only one, fix round Q2), each followed by the
+         bare liveness fact itself.
       3+. every DEGRADED reason that applies COMPOSES (fix round Q9 — the same
          lead/append discipline `_rem_dependency`/`_nrem_dependency` use, so two
          coexisting facts are never collapsed into one at the cost of the
@@ -4109,11 +4116,19 @@ def _llm_pool_dependency(backend_status: dict) -> dict:
         return _dep(_STATE_UNKNOWN, "no backend configured")
     bad = sorted(b for b, s in backend_status.items() if s != "ok")
     if len(bad) == len(backend_status):
+        down_reasons: list = []
+        if LLM_POOL_FALLBACK_REASON:
+            # H2 (handback, decision:1832): the fleet was DECLARED and
+            # entirely excluded, and the fallback it fell back to is ALSO
+            # unreachable — compose, never drop, the same discipline item 9
+            # applies to the degraded branch below.
+            down_reasons.append(LLM_POOL_FALLBACK_REASON)
         if LLM_POOL_CONFIG_EMPTY:
-            return _dep(_STATE_DOWN,
-                        f"down: nothing serves the built-in fallback "
-                        f"({scrub_url_credentials(DEFAULT_TARGET)}, no backend declared)")
-        return _dep(_STATE_DOWN, f"all {len(bad)} backend(s) down")
+            down_reasons.append(
+                f"nothing serves the built-in fallback "
+                f"({scrub_url_credentials(DEFAULT_TARGET)}, no backend declared)")
+        down_reasons.append(f"all {len(bad)} backend(s) down")
+        return _dep(_STATE_DOWN, "; ".join(down_reasons))
     reasons: list = []
     if LLM_POOL_FALLBACK_REASON:
         # F6 (v0.9.75): the configured fleet was entirely excluded and the

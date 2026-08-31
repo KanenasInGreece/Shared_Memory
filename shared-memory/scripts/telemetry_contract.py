@@ -60,6 +60,7 @@ __all__ = [
     "BASELINE",
     "VERSION",
     "INTRODUCED_0_9_74",
+    "INTRODUCED_0_9_79",
     "DUAL_EMIT_DROP_TARGET",
     "CATEGORIES",
     "HEALTH",
@@ -159,6 +160,18 @@ def _k(types: str, category: str, *, unit: str | None = None,
 #: release's literal version string, same as `dependencies.postgres.state`
 #: below does with `INTRODUCED_0_9_74` itself.
 INTRODUCED_0_9_74 = "0.9.74"
+#: Same pattern, one release later — FROZEN at 0.9.79 (handback H1): the three
+#: W2 MEANING_CHANGES entries below were pinned to the bare `VERSION` constant,
+#: but `VERSION` is now the fifth version pin and moves EVERY release
+#: (test_change_group_contracts.py's `_VERSION_PINS`). Pinning a historical
+#: entry to `VERSION` directly means the very next bump falsifies it — the
+#: cheapest "fix" in that moment is to re-date the entry to the new VERSION,
+#: which is exactly the meaning-change falsification the whole point of this
+#: file exists to prevent (fact:1626). Entries authored under THIS stamp keep
+#: it forever, the same way the four originals keep `INTRODUCED_0_9_74`; the
+#: general `in_version <= VERSION` bound (item 8) stays the durable rule that
+#: catches anything genuinely wrong regardless of which release is current.
+INTRODUCED_0_9_79 = "0.9.79"
 #: The release the dual-emitted /health copies TARGET being dropped in — a
 #: TARGET, never a commitment (fix round item 1 on decision:1832): the drop
 #: is GATED on the monitor-contract step (Group 3 — the monitor must consume
@@ -1302,11 +1315,14 @@ MEANING_CHANGES: tuple[dict, ...] = (
                    "the code from the enum must now read the code itself."),
         "shape_changed": False,
     },
-    # ── W2 (decision:1832) — visibility before behaviour ────────────────────
+    # ── W2 (decision:1832) — visibility before behaviour. FROZEN at
+    # INTRODUCED_0_9_79 (handback H1) — VERSION is the fifth version pin and
+    # moves every release; pinning these three historical entries to the
+    # bare VERSION constant would falsify them at the very next bump.
     {
         "endpoint": "health",
         "path": "dependencies.llm_pool.state",
-        "in_version": VERSION,
+        "in_version": INTRODUCED_0_9_79,
         "was": ("`ok` whenever a probed backend answered — including a "
                 "zero-config install where NOTHING was declared and the "
                 "built-in fallback (LLM_DEFAULT_TARGET) happened to be "
@@ -1330,7 +1346,7 @@ MEANING_CHANGES: tuple[dict, ...] = (
     {
         "endpoint": "health",
         "path": "dependencies.rem_daemon.state",
-        "in_version": VERSION,
+        "in_version": INTRODUCED_0_9_79,
         "was": ("`ok` whenever the REM process was running and dead-letters "
                 "were zero — a fleet where NO backend counts toward "
                 "/pool/status free_slots (warn_if_dream_slots_impossible's "
@@ -1348,7 +1364,7 @@ MEANING_CHANGES: tuple[dict, ...] = (
     {
         "endpoint": "health",
         "path": "dependencies.nrem_daemon.state",
-        "in_version": VERSION,
+        "in_version": INTRODUCED_0_9_79,
         "was": ("the same dream-slots-impossible fleet read `ok` (or "
                 "`unknown` before the first consolidation snapshot) with no "
                 "indication NREM could never run either"),

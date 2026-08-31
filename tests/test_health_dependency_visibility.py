@@ -123,6 +123,27 @@ def test_ordering_pin_config_empty_and_all_down_reads_literal_down(monkeypatch):
     assert "no backend declared" in dep["reason"]
 
 
+def test_excluded_fleet_whose_fallback_is_also_down_composes_both_facts(monkeypatch):
+    """Handback H2: the DOWN branch used to drop LLM_POOL_FALLBACK_REASON
+    entirely — a declared fleet that was entirely EXCLUDED (falls back to
+    the legacy target) whose fallback is ALSO unreachable read a bare
+    "all 1 backend(s) down", with the explanatory fact (WHY the fallback is
+    even in effect) gone. Composed now, the same discipline item 9 applies
+    to the degraded branch."""
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "https://api.x.ai/v1", "token_env": "XAI_API_KEY"},
+    ]))
+    g = _fresh(monkeypatch)
+    assert g.LLM_POOL_FALLBACK_REASON and "no usable backend" in g.LLM_POOL_FALLBACK_REASON
+    assert g.LLM_POOL_CONFIG_EMPTY is False   # mutually exclusive with FALLBACK_REASON (D1)
+    dep = g._llm_pool_dependency({g.LLM_BACKENDS[0]: "down"})
+    assert dep["state"] == "down"
+    assert "no usable backend" in dep["reason"]        # the FALLBACK_REASON fact
+    assert "all 1 backend(s) down" in dep["reason"]     # the liveness fact
+
+
 def test_config_empty_and_serving_reads_degraded_the_new_state(monkeypatch):
     """D2 item 3 (decision:1832): the NEW state. A legacy zero-config install
     with something merely serving the built-in fallback used to read `ok` —
