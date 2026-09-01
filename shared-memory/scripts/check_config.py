@@ -110,8 +110,13 @@ never the token), private_ok (effective) and private_ok_explicit (the first
 place LLM_BACKEND_PRIVATE_OK_EXPLICIT becomes visible outside the code), and
 any collected role_config_errors (each element defensively re-scrubbed —
 belt-and-braces, since _load_llm_backends() already scrubs every URL it
-puts in that list at construction time). extra_body is deliberately NOT
-rendered here — that display belongs to a later wave. QA HIGH-1 (fix
+puts in that list at construction time). W5 (E-reduced, declared half only):
+extra_body's declared thinking-suppression state is rendered too, as a
+RECOGNISED-SHAPE match only (`_render_extra_body_suppression`) — never the
+raw dict, which is operator-supplied and could contain anything, including
+a key; an unrecognised shape renders as "present, unrecognised shape",
+never its contents (N2). The probed-capability/budget half of E stays
+PARKED — see that function's own docstring for why. QA HIGH-1 (fix
 round): a per-entry ⚠ line also renders for the M-5' shape (credentialed,
 neither `roles` nor an explicit `private_ok`) and the P-5' shape (auth
 off, `private_ok` EXPLICITLY false) — the SECOND of the two instruments
@@ -303,6 +308,34 @@ def phase_a_render() -> "tuple[list[str], bool]":
     return lines, True
 
 
+def _render_extra_body_suppression(extra_body) -> str:
+    """W5 E-reduced (declared half only): renders a backend's declared
+    thinking-suppression state as a RECOGNISED-SHAPE match, never the raw
+    `extra_body` dict — it is operator-supplied and could contain anything,
+    including a key (N2, mutation-checked: render the dict here instead and
+    the unrecognised-shape test dies).
+
+    PARKED (ruling 1, `fact:1338`): probe-time `emits_reasoning` detection
+    and any budget factor derived from it. This function renders only what
+    was DECLARED, never anything measured or probed — see the brief's §2
+    for the full set of refutations (H1/H2/H3/H5/M9/ND5) a future designer
+    should read before reopening that half. Reopen trigger: a measured
+    reasoning-caused REM/NREM dead-letter on a live fleet.
+    """
+    if not extra_body:
+        return "none declared"
+    if not isinstance(extra_body, dict):
+        return "present, unrecognised shape"
+    # DeepSeek shape: {"thinking": {"type": "disabled"}}.
+    thinking = extra_body.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "disabled":
+        return "thinking suppression declared (DeepSeek shape: thinking.type=disabled)"
+    # Qwen/DashScope shape: {"enable_thinking": false}.
+    if extra_body.get("enable_thinking") is False:
+        return "thinking suppression declared (enable_thinking=false)"
+    return "present, unrecognised shape"
+
+
 def _w4_census_lines(proxy) -> "list[str]":
     """§6.2 (M11 + case-0 census, W4): three specific present-but-empty /
     composed latents, counted and rendered LOUDLY here — REPORT ONLY, no
@@ -409,6 +442,11 @@ def phase_b_render() -> "tuple[list[str], int]":
         explicit = proxy.LLM_BACKEND_PRIVATE_OK_EXPLICIT.get(url, False)
         private_ok = proxy.LLM_BACKEND_PRIVATE_OK.get(url, False)
         lines.append(f"    private_ok={private_ok} (explicit={explicit})")
+        # W5 E-reduced (declared half only): recognised-shape match, never
+        # the raw extra_body dict — see _render_extra_body_suppression's
+        # own docstring for the parked probe/budget half.
+        extra_body = proxy.LLM_BACKEND_EXTRAS.get(url)
+        lines.append(f"    extra_body: {_render_extra_body_suppression(extra_body)}")
         # R-B announce (§6.3, W4/decision:1824): a roles-carrying entry with
         # no explicit private_ok used to also serve role-less traffic (the
         # plain default was True); it no longer does. Source-pinned

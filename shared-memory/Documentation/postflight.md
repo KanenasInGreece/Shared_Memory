@@ -14,9 +14,10 @@ bash shared-memory/scripts/postflight.sh
 
 - **Exit code:** `0` iff assertions **A1–A5 and A8** all pass. A6 is a measurement, never a gate;
   A7 holds by construction and is documented below. A8 **SKIPs** (never gates) when no reasoning
-  backend is reported *healthy* on the gateway right now — see A8 below for exactly when that
-  applies (this is deliberately not the same thing as "no backend configured" — see A8's own
-  note on why).
+  backend is reported *healthy* on the gateway right now, **or** when the real completion itself
+  comes back a declared, gateway-origin `no_eligible_backend` refusal (W4 default-deny, an
+  undeclared or ineligible fleet) — see A8 below for exactly when either applies (this is
+  deliberately not the same thing as "no backend configured" — see A8's own note on why).
 - **Configuration:** `GATEWAY_URL` (default `http://localhost:8888`), `AGENT_TOKEN` (environment
   only), `PG_CONTAINER`/`NEO4J_CONTAINER`/`PG_DB` (defaults `postgres-vector`/`neo4j-memory`/
   `agent_data`, as in `init_db.sh`). `shared-memory/.env` is read key-by-key (grep/cut), never
@@ -366,9 +367,17 @@ never appears in argv. This is **never** a `/health` field read, a `/v1/models` 
 TCP connect — none of those observed the D23 incident; only a real completion through the real
 join does.
 
-**Pass criterion.** HTTP `200` **and** a non-empty `choices[0].message.content` string. A `200`
-with empty content is graded a failure, not a pass — liveness is not capability, and a shape check
-is not a content check. This is precisely the D23 signature made testable: `/health` said a
+**Pass criterion.** HTTP `200` **and** a non-empty `choices[0].message.content` string, **or** a
+non-empty `choices[0].message.reasoning_content` string (Item B, W5, measured 2026-08-30): a
+thinking model at A8's `max_tokens: 16` can return 16 tokens of `reasoning_content`, empty
+`content`, `finish_reason: length` — that is still proof a real completion crossed the gateway
+proxy join, the one thing A8 exists to prove. The reasoning check mirrors the content guard
+exactly (a real string, non-whitespace) — a structured `reasoning_content` object (e.g.
+`{"blocks": []}`) does **not** count. **Accepted semantic shift:** a `finish_reason:
+"content_filter"` response carrying reasoning but no content now also grades a pass — correct for
+A8's question (did a completion cross the join?), not "did the model comply". A `200` with BOTH
+fields empty or absent is graded a failure, not a pass — liveness is not capability, and a shape
+check is not a content check. This is precisely the D23 signature made testable: `/health` said a
 backend was `"ok"`, but the real work path did not work.
 
 **Failure meaning.** `404`: the message names the known cause (a doubled `/v1` path segment when
@@ -379,7 +388,7 @@ Any other non-`200`, or `200` with no usable content: the status/shape is stated
 the same healthy-backend list. No response within `CLIENT_TIMEOUT`: reported as a
 timeout-or-connection-failure.
 
-**When A8 SKIPs — and never gates.** Three cases, none of which may ever call the failure path:
+**When A8 SKIPs — and never gates.** Four cases, none of which may ever call the failure path:
 **(1)** `AGENT_TOKEN` missing while auth is configured — same precondition as A4/A5/A6, and marked
 at A1 the same way A5 already is (needed in **every** postflight mode, unlike A4 which re-baseline
 mode exempts). **(2)** The gateway is unreachable — this is a real problem A1 already reports; A8
@@ -387,6 +396,14 @@ marks itself failed here too (matching A2/A4/A5's own cascading-failure conventi
 SKIP, since "unreachable" is not "no healthy backend". **(3)** No backend in the `llm_backends`
 status map reports `"ok"` right now — the honest "no working LLM here" case. This is reachable in
 two realistic shapes: the map is empty, or (the common case, since the *configured* list is never
-empty by construction) every reported backend is `"down"`/`"timeout"`/`"http_<code>"`. **Only case
-(3) prints as a SKIP** (never `bad()`); it exists so A8 can never fail an install that legitimately
-has no working LLM right now.
+empty by construction) every reported backend is `"down"`/`"timeout"`/`"http_<code>"`. **(4)** The
+real completion itself came back `422` with a body naming `no_eligible_backend` and a
+`declaration` (W4 default-deny, `decision:1824`) — an undeclared or ineligible fleet, e.g. no
+backend was ever declared at all, or a credentialed backend declares neither `roles` nor an
+explicit `private_ok` — **provided** `constraint` is not `"fit"` (a genuine oversized-request fit
+refusal stays fatal) **and** the gateway itself stamped the response (`X-SM-Fault-Origin:
+gateway`) — a passed-through *upstream* provider `422` must never be misread as this documented
+state. The skip message names the declaration value (`none` or `no_role_less_opt_in`) and points
+at `check_config.py` for the per-backend detail. **Only cases (3) and (4) print as a SKIP** (never
+`bad()`); they exist so A8 can never fail an install that legitimately has no working LLM right
+now, or one whose fleet is honestly undeclared rather than broken.

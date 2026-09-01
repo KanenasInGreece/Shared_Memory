@@ -123,6 +123,30 @@ def test_the_host_state_directory_is_kept_at_every_level(tmp_path):
         assert str(state) in kept[1], f"{level}: host state not listed as kept"
 
 
+def test_service_level_states_the_env_file_is_left_behind(tmp_path):
+    """M7 (decision:1824 item 3): --level service leaves shared-memory/.env
+    in place untouched -- unlike data/all (which list it under WILL BE
+    REMOVED), nothing said so at service level until now. One plain line
+    stating what is left behind."""
+    root, _s, _d, _m = _fake_install(tmp_path)
+    out = _run(root, ["--level", "service", "--dry-run"], tmp_path / "home").stdout
+    kept = out.split("WILL BE KEPT:", 1)
+    assert len(kept) == 2, "no KEPT section"
+    assert str(root / "shared-memory" / ".env") in kept[1]
+    assert "left in place" in kept[1]
+
+
+def test_data_level_does_not_duplicate_the_service_level_env_line(tmp_path):
+    """The service-level env-kept line must not ALSO appear at data/all --
+    those levels already list shared-memory/.env under WILL BE REMOVED, and
+    a KEPT line there would contradict it."""
+    root, _s, _d, _m = _fake_install(tmp_path)
+    out = _run(root, ["--level", "data", "--dry-run", "--no-backup"], tmp_path / "home").stdout
+    kept = out.split("WILL BE KEPT:", 1)
+    assert len(kept) == 2, "no KEPT section"
+    assert "left in place" not in kept[1]
+
+
 def test_the_repo_checkout_is_never_removed_by_the_script(tmp_path):
     """It is the ground the script stands on; the final rm -rf is the operator's."""
     root, _s, _d, _m = _fake_install(tmp_path)

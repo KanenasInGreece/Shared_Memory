@@ -44,6 +44,12 @@ def _fake_install(tmp_path):
     (root / "shared-memory" / "ops").mkdir(parents=True)
     shutil.copy(INSTALL_SH, root / "shared-memory" / "scripts" / "install_framework.sh")
     shutil.copy(ENV_EXAMPLE, root / "shared-memory" / ".env.example")
+    # W5 (R-D): the encoder-endpoint append-block shells out to
+    # framework_defaults.py (never a second literal in bash) -- a genuine
+    # runtime dependency of every install now, not just the tests that
+    # assert on its output (see test_install_framework_encoder_device_split.py).
+    shutil.copy(REPO_ROOT / "shared-memory" / "scripts" / "framework_defaults.py",
+                root / "shared-memory" / "scripts" / "framework_defaults.py")
     return root
 
 

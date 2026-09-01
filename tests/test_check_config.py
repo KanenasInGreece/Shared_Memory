@@ -421,6 +421,55 @@ def test_no_degraded_warning_qualifier_on_a_fully_explicit_clean_fleet(tmp_path)
     assert "P-5' (W4)" not in proc.stdout
 
 
+# ── W5 E-reduced (declared half only) — check_config renders the RECOGNISED
+#    SHAPE of a backend's declared extra_body thinking-suppression, never
+#    the raw dict (extra_body is operator-supplied and could contain
+#    anything, including a key). N2: mutation-checked below. ───────────────
+
+def test_extra_body_recognised_deepseek_shape_is_rendered(tmp_path):
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "",
+                                "LLM_BACKENDS_JSON":
+                                    '[{"url":"http://a:5000",'
+                                    '"extra_body":{"thinking":{"type":"disabled"}}}]'},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "thinking suppression declared" in proc.stdout
+    assert "DeepSeek" in proc.stdout
+    # Never the raw dict contents alongside the recognised-shape line.
+    assert '"type": "disabled"' not in proc.stdout
+    assert '"type":"disabled"' not in proc.stdout
+
+
+def test_extra_body_absent_renders_none_declared(tmp_path):
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": '[{"url":"http://a:5000"}]'},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "extra_body: none declared" in proc.stdout
+
+
+def test_extra_body_unrecognised_shape_renders_present_unrecognised_never_raw(tmp_path):
+    # N2: the unrecognised case must render its OWN fixed phrase, never the
+    # dict's contents -- extra_body is operator-supplied and could carry
+    # anything, including a key.
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "",
+                                "LLM_BACKENDS_JSON":
+                                    '[{"url":"http://a:5000",'
+                                    '"extra_body":{"some_future_key":"sk-should-never-appear"}}]'},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "present, unrecognised shape" in proc.stdout
+    assert "sk-should-never-appear" not in proc.stdout
+    assert "some_future_key" not in proc.stdout
+
+
+def test_check_config_module_contract_no_longer_says_extra_body_is_a_later_wave():
+    # M10: the module's own docstring claimed extra_body display "belongs to
+    # a later wave" -- W5 IS that wave, and the stale claim must be gone.
+    src = open(os.path.join(os.path.dirname(__file__), "..", "shared-memory",
+                             "scripts", "check_config.py")).read()
+    assert "belongs to a later wave" not in src
+
+
 # ── SEC-HIGH (fold round, PR #347) — check_config must be unable to print a
 #    raw secret through ANY exception path, in EITHER phase. Policy: ALWAYS
 #    the exception's type name; str(exc) shown (scrubbed) ONLY for the
@@ -541,6 +590,7 @@ class _FakeProxyMissingRoleErrors:
     LLM_WEIGHTS = {"http://a:5000": 1.0}
     LLM_BACKEND_MODELS = {"http://a:5000": None}
     LLM_BACKEND_ROLES = {"http://a:5000": None}
+    LLM_BACKEND_EXTRAS = {"http://a:5000": None}
     LLM_BACKEND_NCTX = {"http://a:5000": None}
     LLM_BACKEND_TOKENS = {"http://a:5000": None}
     LLM_BACKEND_PRIVATE_OK = {"http://a:5000": True}
@@ -564,6 +614,7 @@ class _FakeProxyMissingGuardFunctions:
     LLM_WEIGHTS = {}
     LLM_BACKEND_MODELS = {}
     LLM_BACKEND_ROLES = {}
+    LLM_BACKEND_EXTRAS = {}
     LLM_BACKEND_NCTX = {}
     LLM_BACKEND_TOKENS = {}
     LLM_BACKEND_PRIVATE_OK = {}

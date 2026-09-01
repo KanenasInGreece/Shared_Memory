@@ -217,7 +217,18 @@ print(str(len(healthy)) + "|" + ",".join(healthy) + "|" + summary)
 # with unparseable JSON, a missing/non-string "content", or blank content
 # all grade EMPTY — a 200 is not by itself a usable completion (this is the
 # D23 lesson generalised: liveness is not capability, and a shape check is
-# not a content check). SKIP_<declaration> is a NAMED NON-FATAL skip
+# not a content check) — UNLESS "reasoning_content" is itself a non-empty
+# string (Item B, W5, measured 2026-08-30): a thinking model at A8's
+# max_tokens: 16 returns 16 tokens of reasoning_content, EMPTY content,
+# finish_reason: length — that is still proof a real completion crossed the
+# gateway proxy join, which is the ONE thing A8 exists to prove, so it
+# grades OK. The reasoning check mirrors the content guard EXACTLY —
+# isinstance(str) and .strip() — a structured reasoning_content object
+# ({"blocks": []}) must NOT pass. Accepted semantic shift, stated so it is
+# never later read as a hole: a finish_reason: "content_filter" response
+# carrying reasoning but no content now ALSO grades OK — correct for A8's
+# question (did a completion cross the join?), not "did the model comply".
+# SKIP_<declaration> is a NAMED NON-FATAL skip
 # (documented post-0.9.81 state, never a FAIL) for a 422 whose body carries
 # ALL FOUR conjuncts (V3): error == "no_eligible_backend", a `declaration`
 # key present, constraint != "fit" (a genuine oversized-request fit failure
@@ -280,10 +291,16 @@ try:
 except Exception:
     print("EMPTY"); sys.exit(0)
 try:
-    content = (d.get("choices") or [{}])[0].get("message", {}).get("content")
+    message = (d.get("choices") or [{}])[0].get("message", {})
 except (AttributeError, IndexError, TypeError):
-    content = None
-print("OK" if isinstance(content, str) and content.strip() else "EMPTY")
+    message = {}
+if not isinstance(message, dict):
+    message = {}
+content = message.get("content")
+reasoning = message.get("reasoning_content")
+ok = ((isinstance(content, str) and content.strip())
+      or (isinstance(reasoning, str) and reasoning.strip()))
+print("OK" if ok else "EMPTY")
 '
 }
 # <<< A8_GRADE_COMPLETION
@@ -1026,6 +1043,11 @@ echo "A8 — reasoning-backend liveness, end to end:"
 # which would have caught D23 (all three stayed green throughout the live
 # incident).
 reasoning_ms=""
+# ND6: carried into the Summary block below by the SKIP_* case arm — never
+# re-derived there, and never keyed off afail[] (a named skip deliberately
+# leaves afail[A8] untouched, so afail[] alone cannot distinguish "passed
+# clean" from "passed with A8 skipped").
+a8_skip_declaration=""
 if [[ "$token_missing" == "1" ]]; then
     warn "A8 skipped — AGENT_TOKEN missing (see A1)"
 elif [[ "$gateway_down" == "1" ]]; then
@@ -1108,7 +1130,7 @@ print(json.dumps({
                 ok "A8 real completion returned through the gateway proxy path (model $a8_model, ${reasoning_ms} ms)"
                 ;;
             EMPTY)
-                bad A8 "gateway returned HTTP 200 but no usable completion content — a 200 with empty content is a failure, not a pass. Healthy backend(s) at request time: ${backend_urls:-<none>}"
+                bad A8 "gateway returned HTTP 200 but no usable completion content or reasoning_content — a 200 with both fields empty/absent is a failure, not a pass. Healthy backend(s) at request time: ${backend_urls:-<none>}"
                 ;;
             HTTP_404)
                 bad A8 "gateway returned 404 from the reasoning-backend proxy path — the known cause (D23) is a doubled /v1 path segment when a configured base already ends in /v1. Healthy backend(s) at request time: ${backend_urls:-<none>}"
@@ -1117,7 +1139,11 @@ print(json.dumps({
                 # Ruling B(i) (§6.7): a NAMED non-fatal skip, never a FAIL —
                 # postflight exits 0 with this note. Fit and every other
                 # routing/join defect (the D23 class) stay FATAL below.
-                warn "A8 skipped: ${a8_verdict#SKIP_} — documented post-0.9.81 state; run check_config.py to see per-backend declaration status. Healthy backend(s) at request time: ${backend_urls:-<none>}"
+                # ND6: this is the ONE place a8_skip_declaration is set — the
+                # Summary block reads it verbatim, never re-deriving the
+                # verdict or keying off afail[] (untouched by a skip).
+                a8_skip_declaration="${a8_verdict#SKIP_}"
+                warn "A8 skipped: ${a8_skip_declaration} — documented post-0.9.81 state; run check_config.py to see per-backend declaration status. Healthy backend(s) at request time: ${backend_urls:-<none>}"
                 ;;
             HTTP_*)
                 bad A8 "gateway returned HTTP ${a8_verdict#HTTP_} from the reasoning-backend proxy path. Healthy backend(s) at request time: ${backend_urls:-<none>}"
@@ -1136,7 +1162,14 @@ for a in A1 A2 A3 A4 A5 A8; do
     [[ "${afail[$a]:-0}" == "1" ]] && fail=1
 done
 if [[ "$fail" -eq 0 ]]; then
-    grn "Postflight passed (A1–A5, A8). The install works end to end; A6's baseline is your performance reference."
+    if [[ -n "${a8_skip_declaration:-}" ]]; then
+        # ND6: the skip is loud at the A8 check itself, but must survive a
+        # scrolled-past terminal — a passing run with A8 named-skipped reads
+        # identically to a full pass unless the summary says otherwise.
+        grn "Postflight passed (A1–A5, A8 skipped: ${a8_skip_declaration}). The install works end to end for what is declared; A6's baseline is your performance reference."
+    else
+        grn "Postflight passed (A1–A5, A8). The install works end to end; A6's baseline is your performance reference."
+    fi
 else
     failed=""
     for a in A1 A2 A3 A4 A5 A8; do

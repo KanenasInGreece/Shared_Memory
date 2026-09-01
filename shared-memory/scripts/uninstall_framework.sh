@@ -198,6 +198,19 @@ echo "  backups           $BACKUP_DIR   ($(_size "$BACKUP_DIR"))"
 echo "                    ⛔ never removed at any level — it is the only way back."
 echo "  repo checkout     $REPO_ROOT"
 echo "                    this script runs from inside it; the final rm -rf is yours."
+if [[ "$LEVEL" == "service" ]]; then
+    # M7 (decision:1824 item 3): --level service leaves shared-memory/.env in
+    # place untouched (only data/all remove it, already listed above under
+    # WILL BE REMOVED) — one plain line stating that plainly, so an operator
+    # is never left to discover it: every declared LLM backend, its
+    # private_ok/roles/extra_body state and any token_env NAME reference
+    # survives, and a later restart resumes exactly the pool this file
+    # declares.
+    echo "  framework env     $ENV_FILE   (left in place — every declared LLM backend,"
+    echo "                    its private_ok/roles/extra_body state and any token_env"
+    echo "                    NAME reference survives untouched; a later restart resumes"
+    echo "                    exactly the pool this file declares)"
+fi
 echo
 
 # ── The backup gate. Irreversible levels refuse to start unencumbered. ───────
