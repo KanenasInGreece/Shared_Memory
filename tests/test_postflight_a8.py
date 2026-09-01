@@ -533,7 +533,12 @@ def test_summary_plain_pass_unchanged_when_a8_actually_passes():
         result = run_a8_and_summary_live(gateway_url=url, health_full=health)
     assert result.returncode == 0
     assert "Postflight passed (A1" in result.stdout
-    assert "skipped" not in result.stdout.lower()
+    # QA LOW L4: scoped to the SUMMARY line itself (like its sibling test
+    # above), never the whole combined stdout -- a future line anywhere in
+    # the A8 or Summary sections containing "skipped" would break a global
+    # assertion spuriously.
+    summary_text = result.stdout[result.stdout.index("Postflight passed"):]
+    assert "skipped" not in summary_text.lower()
 
 
 def _afail(result: subprocess.CompletedProcess) -> str:
