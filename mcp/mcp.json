@@ -28,14 +28,6 @@
         "COORDINATOR_URL": "http://localhost:8888",
         "AGENT_TOKEN": "YOUR_LM_STUDIO_AGENT_TOKEN"
       }
-    },
-    "filesystem": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-filesystem",
-        "/path/to/your/shared_mem/"
-      ]
     }
   }
 }
