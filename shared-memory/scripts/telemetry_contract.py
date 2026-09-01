@@ -1378,6 +1378,100 @@ MEANING_CHANGES: tuple[dict, ...] = (
                    "already present even during that window"),
         "shape_changed": False,
     },
+    # ── W4 default-deny (decision:1824) — pinned to the bare `VERSION`
+    # constant for now, same as the W2 entries above were AT THE TIME they
+    # were authored (see INTRODUCED_0_9_79's own comment): this build has
+    # not been released yet, so there is no frozen stamp to name — the
+    # merger's version-bump lands VERSION at the assigned release number in
+    # the SAME commit this file ships in, which is exactly when these four
+    # should be frozen into a new INTRODUCED_0_9_8x constant (mirroring how
+    # INTRODUCED_0_9_79 was carved out) so a LATER bump cannot re-date them.
+    {
+        "endpoint": "health",
+        "path": "config.llm_backends[].private_ok",
+        "in_version": VERSION,
+        "was": ("default TRUE for an uncredentialed backend, FALSE for a "
+                "credentialed one (the absent-key case) — `false` on this "
+                "field meant the operator had EITHER explicitly scoped a "
+                "backend away from role-less traffic, or simply attached a "
+                "provider token and never answered the M-5 access choice"),
+        "now": ("default FALSE unconditionally, credentialed or not — "
+                "`false` now means UNDECLARED (no explicit private_ok/roles "
+                "was ever stated for this backend), not 'operator scoped "
+                "away'; an explicit `true` or `false` still always wins over "
+                "the default either way"),
+        "action": ("a consumer reading `private_ok: false` as 'the operator "
+                   "chose to restrict this backend' must now also read "
+                   "`private_ok_explicit`-adjacent context (check_config.py's "
+                   "per-backend census, or the absence of `roles`) to tell "
+                   "an undeclared backend apart from a deliberately-scoped "
+                   "one — the bare bool no longer carries that distinction"),
+        "shape_changed": False,
+    },
+    {
+        "endpoint": "health",
+        # W4 default-deny (decision:1824): a SECOND, distinct meaning change
+        # on the SAME field this wave — the "(legacy-CSV population)" suffix
+        # keeps this entry's key distinct from the immutable, frozen W2
+        # entry above (test_the_meaning_change_list_covers_every_re_pointed_
+        # key pins THAT one to INTRODUCED_0_9_79 forever) rather than
+        # colliding with it in the by_path lookup and silently clobbering it.
+        "path": "dependencies.llm_pool.state (legacy-CSV population)",
+        "in_version": VERSION,
+        "was": ("`ok` for a live legacy `LLM_BACKENDS` CSV (or the bare "
+                "`LLM_DEFAULT_TARGET` fallback) serving role-less traffic — "
+                "a descriptor-less fleet was eligible for everything (I-5a)"),
+        "now": ("`degraded` for the same population — a descriptor-less "
+                "fleet is now eligible for NOTHING under default-deny, "
+                "surfaced by the widened `_all_roles_ineligible` trigger; "
+                "measured: `test_declared_fleet_healthy_still_reads_ok_"
+                "unchanged` flips ok→degraded for exactly this shape"),
+        "action": ("a consumer that treated a live legacy-CSV install as "
+                   "healthy-by-construction must now read `reason` — it "
+                   "names the fix (declare `LLM_BACKENDS_JSON` explicitly) "
+                   "rather than the install being silently fine"),
+        "shape_changed": False,
+    },
+    {
+        "endpoint": "health",
+        "path": "dependencies.rem_daemon.state / dependencies.nrem_daemon.state",
+        "in_version": VERSION,
+        "was": ("the 0.9.79 `degraded` reason (no backend counts toward "
+                "/pool/status free_slots) fired only for a genuinely "
+                "partial-role or private_ok=false-only configuration — a "
+                "deliberate, already-narrow population"),
+        "now": ("the SAME reason string now also fires for every UNDECLARED "
+                "fleet (legacy CSV, bare `LLM_DEFAULT_TARGET`, or an "
+                "explicitly-declared-but-never-opted-in JSON fleet) — W4's "
+                "default-deny flip means none of them count a free dream "
+                "slot any more either, widening the population this reason "
+                "composes for without changing the reason's own wording"),
+        "action": ("a consumer alerting on rem_daemon/nrem_daemon `degraded` "
+                   "will now see this reason far more often post-upgrade — "
+                   "it is the expected, honest surfacing of a fleet that "
+                   "was silently never dreaming before, not a regression"),
+        "shape_changed": False,
+    },
+    {
+        "endpoint": "health",
+        "path": "dependencies.llm_pool.reason",
+        "in_version": VERSION,
+        "was": ("the config-empty reason and `_all_roles_ineligible`'s "
+                "reason each named only the bare fact (no backend declared / "
+                "configured but ineligible), with no remedy"),
+        "now": ("both reason strings, when a legacy declaration key "
+                "(`LLM_BACKENDS` CSV or bare `LLM_DEFAULT_TARGET`) is "
+                "present, APPEND a remedy clause naming `check_config.py` "
+                "and \"declare LLM_BACKENDS_JSON explicitly\" (§6.5, "
+                "decision:1824) — deliberately NOT `migrate_env.py`, whose "
+                "same-generation planning gate (§6.4) means it would "
+                "correctly no-op for this population at runtime"),
+        "action": ("a consumer doing exact-string matching on either reason "
+                   "must now match a PREFIX, not the whole string — the "
+                   "remedy clause is additive text, appended, never a "
+                   "replacement of the original fact"),
+        "shape_changed": False,
+    },
 )
 
 #: Keys REMOVED outright in 0.9.74 (not moved) — each had no writer and had
