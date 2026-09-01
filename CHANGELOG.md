@@ -5,6 +5,51 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.81] — 2026-09-01
+
+### A backend you did not declare no longer serves anything
+
+Since its first release this framework trusted an LLM backend by default: an entry with no
+`private_ok` was assumed private, the legacy CSV form was assumed private, and the built-in
+fallback was assumed private. This release inverts that default everywhere — `private_ok` is now
+`false` unless the entry says otherwise, across all three configuration sources and every
+dict-miss read. A backend the operator never declared is configured, probed, visible on `/health`,
+and eligible for nothing. One deliberate behaviour change rides along, announced since 0.9.80: a
+backend that declares `roles` but no explicit `private_ok` used to also take role-less (ad-hoc)
+traffic, and no longer does — **add `"private_ok": true` to that entry to opt back in**, or run
+`check_config.py` to see exactly which entries on your install are affected.
+
+Two startup checks that used to refuse to boot are now loud, non-fatal warnings, because fatal
+belongs only to unsafety, not incompleteness. A credentialed backend declaring neither `roles` nor
+`private_ok` is genuinely safe by construction under the new default — it will simply never be
+selected, though it still receives liveness probes carrying its bearer, and the warning says so. An
+auth-off install with an explicitly scoped-away backend (`private_ok: false` plus a `roles` list)
+boots with a warning that now tells the truth the old refusal was protecting: those declared roles
+still serve every caller, because with auth off the gateway cannot tell callers apart — configure
+`AGENT_TOKENS` if that scoping was meant to be enforceable. The auth-off-with-a-live-provider-key
+refusal and the invalid-role-name refusal remain fatal, unchanged.
+
+The refusal path speaks declaration language: a 422 `no_eligible_backend` on an undeclared or
+never-opted-in pool carries an additive `declaration` key naming the remedy, ignored by both dream
+daemons and stamped with the gateway's own fault-origin header so a passed-through provider 422 can
+never impersonate it. `postflight.sh`'s A8 recognises exactly that shape as a documented named skip
+instead of a hard failure — every other 422, including fit refusals, stays fatal. `check_config.py`
+renders the two warning states per entry, counts the present-but-empty configuration latents, and
+its closing line no longer reads as an all-clear when a warning fired. `migrate_env.py` learned the
+loader-semantics boundary: it materialises the pre-flip effective pool exactly once, on a genuine
+version-crossing upgrade, refuses loudly when a needed write cannot ask a human, writes a
+provenance comment above anything it materialises, and on any later run plans nothing — re-running
+it can never re-trust an entry the operator left undeclared. The public docs now describe the
+default-deny world; the `AGENTS.md` migration section documents the direct old-version → 0.9.81
+jump, including that nothing is lost and what to declare.
+
+Chain: brief through three adversarial review rounds (two reviewers, five operator rulings:
+decision:1846 R-D scope, plus F/G/H on the build reviews) → staged build (context-bounded, two
+builders) → QA + security reviews (fact:1855 / fact:1856, both MERGE AFTER FIXES, 0 CRITICAL) →
+merger ruling (decision:1857) → 14-item fix round with independently re-verified mutation kills →
+merge. Carried forward to the next wave, deliberately: the installer's write-the-defaults-explicitly
+half (R-D) with its open design question, and the postflight summary wording after a named skip.
+
 ## [0.9.80] — 2026-08-31
 
 ### An upgrade now proves the pool it leaves behind is the pool it found
