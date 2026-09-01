@@ -276,7 +276,10 @@ fi
 [[ "$LEVEL" == "service" ]] && {
     echo
     grn "Uninstall complete (level: service)."
-    echo "The stores, credentials and corpus are untouched. Reverse with:"
+    echo "The stores, credentials and corpus are untouched. $ENV_FILE and every"
+    echo "declaration in it (LLM_BACKENDS_JSON, private_ok/roles, AGENT_TOKENS, ...)"
+    echo "stay exactly as they are — nothing else config-shaped changes at this level."
+    echo "Reverse with:"
     echo "  1. bash shared-memory/ops/install_service.sh"
     echo "     (recreates the systemd unit + linger, starts the gateway)"
     echo "  2. bash shared-memory/scripts/sync_skills.sh --install"

@@ -256,14 +256,14 @@ def test_uncredentialed_exhausted_stdin_never_defaults_to_private_ok_true(tmp_pa
 
 
 def test_uncredentialed_no_writes_roles_and_honest_caveat(tmp_path):
-    """H2 fix round: the "never serves role-less traffic" claim is FALSE on
-    THIS path -- _role_eligible ignores `roles` entirely for role-less
-    traffic and falls back to the effective private_ok, which defaults TRUE
-    for an uncredentialed backend. That sentence must be ABSENT here even
-    though it is correctly present on the credentialed roles path (see
-    test_credentialed_roles_writes_exact_array_no_private_ok_key) -- only
-    the honest "still routes role-less traffic" correction belongs on this
-    path."""
+    """W4 default-deny (decision:1824): the "never serves role-less traffic"
+    claim is now TRUE on THIS path too -- _role_eligible's role-less branch
+    falls back to the effective private_ok, which now defaults FALSE
+    regardless of credential. This sentence is now IDENTICAL to the one
+    printed on the credentialed roles path (see
+    test_credentialed_roles_writes_exact_array_no_private_ok_key); the old
+    "still routes role-less traffic" correction described a pre-W4 gap that
+    no longer exists and must not be printed."""
     env_file = tmp_path / "auth_on.env"
     env_file.write_text("AGENT_TOKENS=some-real-token\n")
     proc = _run("n\nextract\n", env_file, token_env="")
@@ -272,12 +272,10 @@ def test_uncredentialed_no_writes_roles_and_honest_caveat(tmp_path):
     entry = json.loads(proc.stdout)
     assert entry["roles"] == ["extract"]
     assert "private_ok" not in entry
-    # The honest default-deny-not-built-yet correction is specific to the
-    # uncredentialed roles path.
-    assert "still routes" in proc.stderr
-    assert "role-less" in proc.stderr
-    # The FALSE claim must never appear here.
-    assert "never serves role-less" not in proc.stderr
+    # The retired pre-W4 correction must never appear here.
+    assert "still routes" not in proc.stderr
+    # The TRUE claim is now printed on this path too.
+    assert "never serves role-less" in proc.stderr
 
 
 def test_never_writes_private_ok_false(tmp_path):
@@ -340,16 +338,17 @@ def test_uncredentialed_backend_never_triggers_auth_warning(tmp_path):
 
 
 def test_auth_off_roles_path_adds_p5_caveat(tmp_path):
-    """The extra P-5 caveat is specific to the ROLES choice (P-5 keys on the
-    effective private_ok map, which a private_ok:true entry never trips) --
-    must NOT appear on the private_ok:true path even when auth is off."""
+    """W4 (§3, P-5′): the old refusal + override the ROLES-path caveat used
+    to warn about is gone -- P-5′ only fires on an EXPLICIT private_ok:false,
+    which this script never writes on either path, so the roles-path note
+    must now say P-5′ does NOT apply, on both paths."""
     env_file = tmp_path / "no_tokens.env"
     env_file.write_text("SOME_OTHER_KEY=1\n")
 
     proc_roles = _run("roles\nextract judge\n", env_file, token_env="DEEPSEEK_API_KEY")
     assert proc_roles.returncode == 0, proc_roles.stderr
-    assert "P-5 matches this entry too" in proc_roles.stderr
+    assert "does NOT apply to this entry" in proc_roles.stderr
 
     proc_private_ok = _run("private_ok\n", env_file, token_env="DEEPSEEK_API_KEY")
     assert proc_private_ok.returncode == 0, proc_private_ok.stderr
-    assert "P-5 matches this entry too" not in proc_private_ok.stderr
+    assert "does NOT apply to this entry" not in proc_private_ok.stderr

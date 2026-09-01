@@ -226,9 +226,10 @@ def _parse_backend(entry: str) -> tuple[str, float]:
 #                  degenerate case, every existing install unchanged).
 #   n_ctx          int, the model's usable context in tokens. Absent = no fit
 #                  information (this backend always "fits").
-#   private_ok     bool. Default = (no token_env present) — an uncredentialed
-#                  (local) backend defaults True, a provider-credentialed one
-#                  defaults False. An EXPLICIT value always wins either way.
+#   private_ok     bool. Default = False, unconditionally — an undeclared
+#                  backend (credentialed or not) serves no role-less traffic
+#                  until this is set true (W4 default-deny, decision:1824).
+#                  An EXPLICIT value of either true or false always wins.
 #   max_inflight   int, per-backend concurrency ceiling. Absent = unbounded
 #                  (today's behavior).
 #   price_per_mtok_in / price_per_mtok_out — optional operator metadata,
