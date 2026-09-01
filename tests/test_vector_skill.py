@@ -4,6 +4,7 @@ import json
 import asyncio
 import importlib.util
 import os
+import subprocess
 import sys
 from unittest.mock import MagicMock, patch, AsyncMock
 
@@ -754,26 +755,107 @@ def test_manual_env_parser_loads_token_without_dotenv(tmp_path, monkeypatch):
     """An env loader must never silently no-op because its parser dependency is
     missing — that class once reported a CREDENTIALS error for a missing
     DEPENDENCY. Mutation target: reverting _load_env_manually's call (or its
-    body) to `pass` must kill this test."""
+    body) to `pass` must kill this test.
+
+    Probe key renamed PROBE_ONLY_KEY -> PROBE_ONLY_VALUE (MCPW-R2-C5 delta
+    D1): the ported _CLIENT_SECRET_SUFFIXES now contains "_KEY", so the old
+    name was itself secret-shaped and this test would pin the filter working
+    (correctly) rather than what it always meant to pin (the manual parser
+    loads a benign value without dotenv installed).
+
+    QA build review HIGH-1 (2026-09-01, opus): python-dotenv is
+    TRANSITIVELY installed via fastmcp in this suite, so T1/T5 (which spawn
+    a real subprocess) always take the dotenv_values() branch and never
+    exercise _load_env_manually's own guards. This is the ONLY test in the
+    suite that calls _load_env_manually directly — and it used to assert
+    solely on the benign PROBE_ONLY_VALUE, even though its own fixture
+    already wrote AGENT_TOKEN=tok_manual_parse and nothing ever checked it.
+    Proven by the reviewer: deleting BOTH the AGENT_TOKEN diversion and the
+    secret-key skip from _load_env_manually left the FULL SUITE GREEN. The
+    three assertions below close that hole — this is now the sole place I6'
+    is pinned on the manual-fallback path, so do not remove them even if
+    T1/T5 gain their own no-dotenv coverage later."""
     vs = load_vector_skill()
     env = tmp_path / ".env"
     env.write_text("AGENT_TOKEN=tok_manual_parse\n# comment\nBADLINE\n")
-    monkeypatch.delenv("PROBE_ONLY_KEY", raising=False)
-    env.write_text(env.read_text() + "PROBE_ONLY_KEY=probe_val\n")
-    vs._load_env_manually(str(env))
-    assert os.environ.get("PROBE_ONLY_KEY") == "probe_val"
-    monkeypatch.delenv("PROBE_ONLY_KEY", raising=False)
+    monkeypatch.delenv("PROBE_ONLY_VALUE", raising=False)
+    monkeypatch.delenv("AGENT_TOKEN", raising=False)
+    monkeypatch.delenv("FAKE_PROVIDER_SECRET", raising=False)
+    env.write_text(env.read_text() + "PROBE_ONLY_VALUE=probe_val\n"
+                                      "FAKE_PROVIDER_SECRET=shh\n")
+    try:
+        vs._load_env_manually(str(env))
+        # (a) AGENT_TOKEN diverted to the private var, never exported.
+        assert vs._AGENT_TOKEN_FROM_FILE == "tok_manual_parse"
+        assert "AGENT_TOKEN" not in os.environ
+        # (b) a secret-shaped key (suffix _SECRET) is skipped — never exported.
+        assert "FAKE_PROVIDER_SECRET" not in os.environ
+        # (c) the benign key still exports normally.
+        assert os.environ.get("PROBE_ONLY_VALUE") == "probe_val"
+    finally:
+        # try/finally with a DIRECT os.environ.pop — not monkeypatch.delenv
+        # — for the cleanup. Two separate hazards, both measured:
+        #
+        # (1) _load_env_manually writes os.environ DIRECTLY (that is the
+        #     production behaviour under test), so a defect that makes a
+        #     secret-shaped key or AGENT_TOKEN land in os.environ must still
+        #     be cleaned up even though the assertion catching it raises
+        #     first and skips a trailing (non-finally) cleanup line.
+        # (2) monkeypatch.delenv is the WRONG tool for that cleanup, even
+        #     inside finally: pytest's monkeypatch fixture restores every
+        #     tracked change to its PRE-CALL value at fixture teardown, and
+        #     "pre-call value" here is exactly the leaked one this delenv
+        #     call would otherwise seem to remove — so the leak reappears
+        #     the moment this test function returns, one step later than
+        #     expected, and pollutes the NEXT test instead. Reproduced with
+        #     a two-line probe (monkeypatch.delenv on a key set by a direct
+        #     os.environ write, inside finally, then asserted absent from a
+        #     SEPARATE following test — it comes back). os.environ.pop is a
+        #     real, permanent removal monkeypatch's own teardown cannot
+        #     undo.
+        os.environ.pop("PROBE_ONLY_VALUE", None)
+        os.environ.pop("AGENT_TOKEN", None)
+        os.environ.pop("FAKE_PROVIDER_SECRET", None)
 
 
 def test_manual_env_parser_never_overrides_real_env(tmp_path, monkeypatch):
-    """setdefault semantics, same as migrations/apply.py: an externally-set
-    variable wins over the file value."""
+    """setdefault/first-definition-wins semantics, same as migrations/apply.py:
+    an externally-set variable wins over the file value. Probe key renamed
+    PROBE_ONLY_KEY -> PROBE_ONLY_VALUE for the same reason as the test above —
+    "_KEY" is now secret-shaped and would be skipped, making the precedence
+    assertion vacuous.
+
+    QA build review MED-2 (2026-09-01, opus): this test was ITSELF still
+    vacuous against a no-op parser body — the PROBE_ONLY_VALUE assertion
+    passes whether the parser respects precedence, ignores the file
+    entirely, or does nothing at all, because monkeypatch.setenv already
+    set that exact value before the parser ever ran. A second,
+    non-conflicting key in the SAME file makes the test bite: it can only
+    read "env_val" (unchanged) for the first AND "second_val" (freshly
+    loaded) for the second if the parser actually read the file and left
+    the conflicting key alone. Mutation-proven: reverting
+    _load_env_manually's body to `pass` kills the PROBE_SECOND_VALUE
+    assertion (see HANDOFF's mutation table)."""
     vs = load_vector_skill()
     env = tmp_path / ".env"
-    env.write_text("PROBE_ONLY_KEY=file_val\n")
-    monkeypatch.setenv("PROBE_ONLY_KEY", "env_val")
-    vs._load_env_manually(str(env))
-    assert os.environ.get("PROBE_ONLY_KEY") == "env_val"
+    env.write_text("PROBE_ONLY_VALUE=file_val\nPROBE_SECOND_VALUE=second_val\n")
+    monkeypatch.setenv("PROBE_ONLY_VALUE", "env_val")
+    monkeypatch.delenv("PROBE_SECOND_VALUE", raising=False)
+    try:
+        vs._load_env_manually(str(env))
+        assert os.environ.get("PROBE_ONLY_VALUE") == "env_val"
+        assert os.environ.get("PROBE_SECOND_VALUE") == "second_val", (
+            "the parser did not actually load the file — this is what makes "
+            "the precedence assertion above non-vacuous"
+        )
+    finally:
+        # Direct os.environ.pop, not monkeypatch.delenv — see the detailed
+        # note in test_manual_env_parser_loads_token_without_dotenv above:
+        # PROBE_SECOND_VALUE is written directly to os.environ by the code
+        # under test, and monkeypatch.delenv on a key set that way only
+        # defers the leak to this test's own fixture teardown instead of
+        # actually removing it.
+        os.environ.pop("PROBE_SECOND_VALUE", None)
 
 
 def test_audit_log_write_is_offloaded_and_ordered(tmp_path, monkeypatch):
@@ -795,3 +877,159 @@ def test_audit_log_write_is_offloaded_and_ordered(tmp_path, monkeypatch):
     logfile = tmp_path / "probe_tool.log"
     if logfile.exists():
         assert "probe_event" in logfile.read_text()
+
+
+# ── MCPW-R2-C5: wall the MCP client's secrets out of os.environ ─────────────
+# (MCPW_R2C5_Builder_Brief.md, origin fact:1816) — ports memory_bridge.py's
+# reviewed S-18/A2-finding-7/R6 loader shape onto this door.
+
+_VECTOR_SKILL_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "mcp", "vector-skill.py"))
+
+
+def test_walled_env_secrets_never_reach_os_environ_subprocess(tmp_path):
+    """T1 (brief §4) — pins I6' (no secret-shaped file value ever enters
+    os.environ) + I7 (loader runs before the first module-level config read).
+    SUBPROCESS MANDATORY (Opus M4): the in-process module cache
+    (sys.modules["vector_skill"], populated at collection time by
+    load_vector_skill()) means a second in-process import proves nothing
+    about a real cold start reading a real walled .env.
+
+    ⚠ The two `not in os.environ` assertions are VACUOUS ALONE in this
+    checkout — there is no mcp/.env on disk to accidentally load instead
+    (Opus L6/M4) — so the header + COORDINATOR_BASE assertions below are
+    what actually exercises the new loader end to end.
+
+    Mutation check: reverting the loader to `load_dotenv(_ENV_PATH)` (the
+    pre-fix behaviour) makes the token-absence assertions die — subprocess
+    isolation means there is no leftover os.environ residue from an earlier
+    test to hide behind, unlike an in-process check would have."""
+    env_file = tmp_path / "walled.env"
+    env_file.write_text(
+        "AGENT_TOKEN=tok_wall\n"
+        "FAKE_PROVIDER_SECRET=shh\n"
+        "COORDINATOR_URL=http://localhost:9\n"
+        "PROBE_BENIGN=x\n"
+    )
+    child_script = f"""
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("vector_skill_t1", {_VECTOR_SKILL_PATH!r})
+vs = importlib.util.module_from_spec(spec)
+sys.modules["vector_skill_t1"] = vs
+spec.loader.exec_module(vs)
+assert "AGENT_TOKEN" not in os.environ, "AGENT_TOKEN leaked into os.environ"
+assert "FAKE_PROVIDER_SECRET" not in os.environ, "FAKE_PROVIDER_SECRET leaked into os.environ"
+assert os.environ.get("PROBE_BENIGN") == "x", "benign config did not reach os.environ"
+assert vs.COORDINATOR_BASE == "http://localhost:9", "loader ran AFTER the COORDINATOR_BASE read"
+headers = vs._auth_headers()
+assert headers.get("Authorization") == "Bearer tok_wall", headers
+print("T1_OK")
+"""
+    env = dict(os.environ)
+    # Strip any ambient value another test in this same pytest session set
+    # directly on os.environ (not via monkeypatch, so never auto-reverted —
+    # e.g. test_memory_bridge.py's own dotenv tests setdefault a real
+    # COORDINATOR_URL). This test's isolation must not depend on suite run
+    # order; only VECTOR_SKILL_ENV + the walled file drive the assertions.
+    env.pop("COORDINATOR_URL", None)
+    env.pop("AGENT_TOKEN", None)
+    env["VECTOR_SKILL_ENV"] = str(env_file)
+    result = subprocess.run([sys.executable, "-c", child_script],
+                            capture_output=True, text=True, env=env, timeout=30)
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "T1_OK" in result.stdout
+
+
+def test_real_env_agent_token_beats_file_token(monkeypatch):
+    """T2 (brief §4) — I1: real env wins over file, exactly as before."""
+    vs = load_vector_skill()
+    monkeypatch.setattr(vs, "_AGENT_TOKEN_FROM_FILE", "tok_wall")
+    monkeypatch.setenv("AGENT_TOKEN", "tok_real")
+    assert vs._auth_headers().get("Authorization") == "Bearer tok_real"
+
+
+def test_exported_empty_agent_token_falls_back_to_file_token(monkeypatch):
+    """T2 (brief §4) — the named §2.4 deliberate behaviour change: an
+    exported AGENT_TOKEN="" used to suppress the header even when the file
+    held a real token; under the ported truthiness form the file token is
+    used instead, for parity with the CLI door (memory_bridge.py:494). This
+    is the test the comment at _auth_headers's token-read line names — do not
+    rename it without updating that comment too."""
+    vs = load_vector_skill()
+    monkeypatch.setattr(vs, "_AGENT_TOKEN_FROM_FILE", "tok_wall")
+    monkeypatch.setenv("AGENT_TOKEN", "")
+    assert vs._auth_headers().get("Authorization") == "Bearer tok_wall"
+
+
+def test_missing_walled_env_file_imports_cleanly(tmp_path, monkeypatch):
+    """T4 (brief §4) — I3: an absent client .env is silent, import does not
+    raise, and defaults hold. VECTOR_SKILL_ENV is pointed at a REAL tmp path
+    that happens not to exist yet — never the empty string (Delta D2: unlike
+    memory_bridge's SECURE_ENV_FILE contract, an empty VECTOR_SKILL_ENV does
+    NOT mean load-nothing here — `:85` falls back to the script-adjacent
+    default on empty string, which is real on a gateway host).
+
+    Also delenv's COORDINATOR_URL/AGENT_TOKEN: another test earlier in this
+    same pytest session may have set one directly on os.environ (not via
+    monkeypatch, so never auto-reverted — see test_memory_bridge.py's own
+    dotenv tests), and this test's job is specifically to pin the DEFAULT
+    that applies when nothing — file or real env — supplies a value."""
+    missing = tmp_path / "does_not_exist.env"
+    monkeypatch.setenv("VECTOR_SKILL_ENV", str(missing))
+    monkeypatch.delenv("COORDINATOR_URL", raising=False)
+    monkeypatch.delenv("AGENT_TOKEN", raising=False)
+    vs = load_vector_skill()
+    assert vs.COORDINATOR_BASE == "http://localhost:8888"
+    assert vs._AGENT_TOKEN_FROM_FILE == ""
+    assert vs._auth_headers().get("Authorization") is None
+
+
+def test_server_shaped_env_end_to_end_refusal_subprocess(tmp_path):
+    """T5 (brief §4, Opus M3 — "the most valuable test in the change") —
+    pins I2 END TO END. test_server_env_is_recognised_and_refused (above)
+    pins only the pure `_looks_like_server_env` predicate; this exercises the
+    whole refusal branch: nothing from a refused file — not the token, not a
+    server key, not benign config — reaches this process. Subprocess for the
+    same cold-start reason as T1."""
+    env_file = tmp_path / "server.env"
+    env_file.write_text(
+        "AGENT_TOKEN=tok_should_not_load\n"
+        "AGENT_TOKENS=claude:tok_a,grok:tok_b\n"
+        "PG_PASSWORD=hunter2\n"
+        "NEO4J_PASSWORD=hunter2\n"
+        "COORDINATOR_URL=http://localhost:9\n"
+    )
+    child_script = f"""
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("vector_skill_t5", {_VECTOR_SKILL_PATH!r})
+vs = importlib.util.module_from_spec(spec)
+sys.modules["vector_skill_t5"] = vs
+spec.loader.exec_module(vs)
+assert vs._AGENT_TOKEN_FROM_FILE == "", "AGENT_TOKEN from a refused server env still loaded"
+assert "AGENT_TOKEN" not in os.environ
+assert "AGENT_TOKENS" not in os.environ
+assert "PG_PASSWORD" not in os.environ
+assert "NEO4J_PASSWORD" not in os.environ
+assert vs.COORDINATOR_BASE == "http://localhost:8888", "the refused file's COORDINATOR_URL leaked through"
+print("T5_OK")
+"""
+    env = dict(os.environ)
+    # Same isolation note as T1 above, widened: this test's assertions cover
+    # AGENT_TOKENS/PG_PASSWORD/NEO4J_PASSWORD too, and several OTHER test
+    # modules in this suite (test_auth.py, test_backup_quiesce.py,
+    # test_credential_audit_trail.py, etc.) set those directly on
+    # os.environ, not via monkeypatch, so they are never auto-reverted and
+    # can still be sitting in this parent process's environment from an
+    # earlier test in the same session. Strip them from the CHILD's env so
+    # "not in os.environ" inside the subprocess unambiguously tests what
+    # THIS import of vector-skill.py did with THIS walled file, not
+    # leftover state from unrelated tests this PR does not own.
+    for _leak_key in ("COORDINATOR_URL", "AGENT_TOKEN", "AGENT_TOKENS",
+                      "PG_PASSWORD", "NEO4J_PASSWORD"):
+        env.pop(_leak_key, None)
+    env["VECTOR_SKILL_ENV"] = str(env_file)
+    result = subprocess.run([sys.executable, "-c", child_script],
+                            capture_output=True, text=True, env=env, timeout=30)
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "T5_OK" in result.stdout
+    assert "refusing to load" in result.stderr, result.stderr

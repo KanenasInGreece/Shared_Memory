@@ -61,7 +61,9 @@ from fastmcp import FastMCP
 #
 # VECTOR_SKILL_ENV overrides the path outright, for an install that keeps its
 # client env somewhere else. An MCP host that injects AGENT_TOKEN through its own
-# config block (mcp.json's `env`) needs no file at all — that path is unaffected.
+# config block (mcp.json's `env`) needs no file at all — that path is unaffected
+# BY CONSTRUCTION: the host writes it into this process's os.environ before this
+# module is ever imported, which is outside this loader's reach either way.
 _SERVER_ONLY_KEYS = ("AGENT_TOKENS=", "PG_PASSWORD=", "NEO4J_PASSWORD=")
 
 
@@ -82,42 +84,162 @@ def _looks_like_server_env(path: str) -> bool:
     return False
 
 
+# AGENT_TOKEN is read into a private variable and NEVER exported into this
+# process's own os.environ (ported from memory_bridge.py:86-97, S-18 /
+# MCPW-R2-C5 — origin fact:1816): this door used to load its whole .env —
+# AGENT_TOKEN included, and after the MCP-W mint a write-capable one — into
+# os.environ, the same "secret sitting in a long-lived process's own
+# environment" class the CLI door already closed (visible via this process's
+# own /proc/<pid>/environ, same UID, and to anything that later snapshots the
+# environment). An operator's own real `export AGENT_TOKEN=...` still wins —
+# checked FIRST on every call, before any file value is considered (see
+# _auth_headers below). _AGENT_TOKEN_FROM_FILE is populated once below, from
+# the file only, and is the seam tests use to neutralise a real on-disk .env
+# during isolated runs
+# (monkeypatch.setattr(vs, "_AGENT_TOKEN_FROM_FILE", "")).
+_AGENT_TOKEN_FROM_FILE = ""
+
+# Duplicated (not imported) from memory_bridge.py:129-148 — both clients ship
+# alone, so neither may depend on the other or on a server-only module (the
+# same reason memory_bridge doesn't import secure_env). A contract test
+# (test_client_secret_mirror_parity.py) pins both copies against secure_env.
+# py's own KNOWN_SECRET_NAMES / _SECRET_SUFFIXES so a future drift fails
+# loudly instead of needing a fresh probe to find (the R6 lesson, reopened
+# here if this mirror is ever edited alone).
+_CLIENT_KNOWN_SECRET_NAMES = {
+    "PG_PASSWORD", "NEO4J_PASSWORD", "TAVILY_API_KEY", "AGENT_TOKENS",
+    "BACKUP_ADMIN_TOKEN", "PG_CONN",
+}
+_CLIENT_SECRET_SUFFIXES = (
+    "_PASSWORD", "_TOKEN", "_API_KEY", "_SECRET", "_KEY",
+    "_CREDENTIAL", "_CREDENTIALS",
+)
+
+
+def _is_client_secret_key(name: str) -> bool:
+    """True if `name` must never be exported into this client's own
+    os.environ (mirrors secure_env.is_secret_key(), narrowed to what this
+    client can ever encounter). AGENT_TOKEN is excluded -- it has its own
+    private-variable path and is never routed through this predicate."""
+    if name == "AGENT_TOKEN":
+        return False
+    if name in _CLIENT_KNOWN_SECRET_NAMES:
+        return True
+    return name.upper().endswith(_CLIENT_SECRET_SUFFIXES)
+
+
 _ENV_PATH = os.environ.get("VECTOR_SKILL_ENV", "").strip() or os.path.join(
     os.path.dirname(os.path.realpath(__file__)), ".env")
+
+
 def _load_env_manually(path: str) -> None:
     """Fallback parser for when python-dotenv is absent. An env loader must
     NEVER silently no-op because its parser dependency is missing — that class
-    once made two verifiers report a CREDENTIALS error for a missing DEPENDENCY.
-    Same setdefault semantics as migrations/apply.py, which has never had this
-    failure: real env vars win over file values."""
+    once made two verifiers report a CREDENTIALS error for a missing
+    DEPENDENCY. Same structure as memory_bridge.py's manual fallback: strip,
+    skip comments/no-`=` lines, divert AGENT_TOKEN to _AGENT_TOKEN_FROM_FILE
+    (never exported), skip any secret-shaped key (never exported either), and
+    first-definition-wins for everything else — real env vars still win
+    because they were already set before this ever runs."""
+    global _AGENT_TOKEN_FROM_FILE
     try:
-        with open(path) as f:
+        # utf-8-sig: a file saved as UTF-8-with-BOM has its first three bytes
+        # decoded to a leading U+FEFF on the FIRST key otherwise — SEC round
+        # HIGH-2 (2026-09-01, gemini). Belt and braces with the per-key
+        # lstrip below, which also catches a BOM character that ended up
+        # embedded mid-file some other way (e.g. a bad concatenation).
+        with open(path, encoding="utf-8-sig") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, _, val = line.partition("=")
-                os.environ.setdefault(key.strip(), val.strip())
+                key = key.strip()
+                val = val.strip()
+                if not key:
+                    continue
+                # SEC round HIGH-1 + HIGH-2 (2026-09-01, gemini), H-1
+                # follow-up fix (2026-09-01 — regression in the first
+                # pass): normalize for FILTERING/DIVERSION ONLY, at this
+                # call site — never inside _is_client_secret_key, which
+                # stays a BYTE-IDENTICAL mirror of memory_bridge.py's (the
+                # parity test pins it). str.strip() does NOT remove U+FEFF
+                # (it is not whitespace), so a stray BOM or a lowercase
+                # spelling used to sail past both the AGENT_TOKEN divert
+                # and the secret-suffix/name check below and land straight
+                # in os.environ. `key` itself — never `key_norm` — is
+                # still what gets exported when the key isn't filtered:
+                # this only changes what counts as secret/AGENT_TOKEN,
+                # never the exported name's casing.
+                #
+                # H-1: key_norm is upper-cased HERE, once, and BOTH the
+                # AGENT_TOKEN comparison and the predicate call use this
+                # single already-uppercased value. The first pass instead
+                # compared the token key case-SENSITIVELY
+                # (`key_norm == "AGENT_TOKEN"` with key_norm only
+                # lstripped+stripped) while calling the predicate with
+                # `key_norm.upper()` — so a lowercase `agent_token=` line
+                # folded onto "AGENT_TOKEN" for the predicate's OWN
+                # deliberate early-return exemption (`_is_client_secret_
+                # key`: `if name == "AGENT_TOKEN": return False`, which
+                # exists BECAUSE the token has its own diversion path)
+                # while never matching the still-case-sensitive diversion
+                # check above it — caught by NEITHER, exported by the
+                # setdefault below. This deliberately now catches every
+                # case-variant spelling of the token — a SAFER-direction
+                # divergence from memory_bridge.py's exact-case diversion,
+                # recorded there as a SEC-round twins item, not fixed here
+                # (memory_bridge.py, the CLI door, is not this file's to
+                # touch).
+                key_norm = key.lstrip("\ufeff").strip().upper()
+                if key_norm == "AGENT_TOKEN":
+                    if not _AGENT_TOKEN_FROM_FILE:
+                        _AGENT_TOKEN_FROM_FILE = val
+                    continue
+                if _is_client_secret_key(key_norm):
+                    continue
+                if key not in os.environ:   # first definition wins
+                    os.environ[key] = val
     except OSError:
         pass  # absent file = rely on externally-set env vars, same as dotenv
 
 
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    load_dotenv = None  # fall back to the manual parser below
-if True:
-    if os.path.isfile(_ENV_PATH) and _looks_like_server_env(_ENV_PATH):
-        sys.stderr.write(
-            f"[rag-orchestrator] refusing to load {_ENV_PATH}: it holds "
-            "server-only keys (AGENT_TOKENS / PG_PASSWORD / NEO4J_PASSWORD), so "
-            "it is the framework env, not this client's. Give this MCP client its "
-            "own directory with its own .env containing only AGENT_TOKEN (and "
-            "optionally COORDINATOR_URL / AGENT_ID), set VECTOR_SKILL_ENV to that "
-            "file, or inject AGENT_TOKEN via the MCP host's own env block.\n")
-    elif load_dotenv is not None:
-        load_dotenv(_ENV_PATH)
-    else:
+if os.path.isfile(_ENV_PATH) and _looks_like_server_env(_ENV_PATH):
+    sys.stderr.write(
+        f"[rag-orchestrator] refusing to load {_ENV_PATH}: it holds "
+        "server-only keys (AGENT_TOKENS / PG_PASSWORD / NEO4J_PASSWORD), so "
+        "it is the framework env, not this client's. Give this MCP client its "
+        "own directory with its own .env containing only AGENT_TOKEN (and "
+        "optionally COORDINATOR_URL / AGENT_ID), set VECTOR_SKILL_ENV to that "
+        "file, or inject AGENT_TOKEN via the MCP host's own env block.\n")
+else:
+    try:
+        from dotenv import dotenv_values  # parses without touching os.environ
+        if os.path.isfile(_ENV_PATH):
+            for _k, _v in dotenv_values(_ENV_PATH).items():
+                if _v is None or not _k:
+                    continue
+                # SEC round HIGH-1 + HIGH-2 (2026-09-01, gemini), H-1
+                # follow-up fix — same rationale AND same shape as
+                # _load_env_manually above: _k_norm is uppercased ONCE and
+                # used for BOTH the AGENT_TOKEN comparison and the
+                # predicate call, so a lowercase `agent_token=` cannot slip
+                # through the case-sensitive-vs-normalized mismatch that
+                # made the first pass's two separate `.upper()` calls a
+                # regression (see the detailed note above). `_k` — never
+                # `_k_norm` — is still what gets exported.
+                _k_norm = _k.lstrip("\ufeff").strip().upper()
+                if _k_norm == "AGENT_TOKEN":
+                    if not _AGENT_TOKEN_FROM_FILE:
+                        _AGENT_TOKEN_FROM_FILE = _v.strip()
+                    continue
+                if _is_client_secret_key(_k_norm):
+                    continue
+                os.environ.setdefault(_k, _v)
+    except ImportError:
+        # python-dotenv not installed — manually parse the client .env so
+        # config/token are found when running bare `python` or
+        # `uv run --with httpx`.
         _load_env_manually(_ENV_PATH)
 
 # Configure logging to stderr for MCP visibility
@@ -140,7 +262,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.9.81"
+VERSION = "0.9.82"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 # This client's own FRAMEWORK VERSION, distinct from the wire API_VERSION: two
 # clients can speak api_version 4 while one of them is forty releases behind on
@@ -328,12 +450,27 @@ async def _gateway_capacity() -> dict | None:
 def _auth_headers() -> dict:
     """Headers for every coordinator request.
 
-    Advertises this server's API_VERSION so the gateway can log version skew,
-    and adds the Bearer token when AGENT_TOKEN is set.
+    Advertises this server's API_VERSION so the gateway can log version skew.
+    Adds the Bearer token when AGENT_TOKEN is set — checked fresh on every
+    call so an operator export or a test's monkeypatch.setenv/setattr always
+    wins, falling back to the value this module parsed out of its own .env at
+    import time (never itself exported to os.environ — see
+    _AGENT_TOKEN_FROM_FILE above). An MCP host that injects AGENT_TOKEN
+    through its own env block (mcp.json's `env`) is unaffected by any of
+    this: the host writes it into os.environ before this module is even
+    imported, outside this module's reach either way.
     """
     headers = {CLIENT_VERSION_HEADER: str(API_VERSION),
                CLIENT_BUILD_HEADER: VERSION}
-    token = os.environ.get("AGENT_TOKEN", "").strip()
+    # ⚠ Deliberate TRUTHINESS, not an emptiness/None check (MCPW_R2C5_Builder_
+    # Brief.md §2.4, pinned by test_exported_empty_agent_token_falls_back_to_
+    # file_token): an exported AGENT_TOKEN="" used to suppress the header even
+    # when the file held a real token. Full parity with the CLI door
+    # (memory_bridge.py:494, byte-identical expression) is chosen over
+    # preserving that edge — a blank export reads as a mistake-shaped input,
+    # not a documented kill switch, and one precedence rule across both doors
+    # beats a silent divergence. Do not "fix" this back to a presence check.
+    token = os.environ.get("AGENT_TOKEN", "").strip() or _AGENT_TOKEN_FROM_FILE
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return headers

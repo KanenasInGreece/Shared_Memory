@@ -5,6 +5,39 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.82] — 2026-09-01
+
+### The MCP client's secrets no longer live in its process environment
+
+The MCP front door (`mcp/vector-skill.py`) used to load its walled client `.env` into the
+process-global environment wholesale — `AGENT_TOKEN` included — leaving a live bearer credential
+visible to `/proc/<pid>/environ` and to anything that snapshots the environment of a long-lived
+process. The CLI front door closed exactly this class some releases ago; this release ports that
+shape to the MCP door. The token now lives in a private module variable, never exported; every
+secret-shaped key (the same classification the gateway's own `secure_env` uses, duplicated as a
+pinned mirror) is skipped rather than exported; benign configuration still reaches the environment
+exactly as before, so proxy variables, TLS overrides and every documented client knob keep working.
+The server-env refusal — a client pointed at the framework's own `.env` refuses to load it — stays
+in front, and now has an end-to-end test rather than only a predicate test.
+
+The secret classification is hardened beyond the CLI door's copy at the call sites: keys are
+normalised before classification, so a lowercase `pg_conn` or a BOM-prefixed key from a UTF-8-BOM
+editor can no longer slip past the filter, and a BOM-prefixed `AGENT_TOKEN` is still recognised as
+the token. The classifier itself stays byte-identical to the CLI door's, pinned against drift by
+an extended parity test suite that now covers both clients and their agreement with each other.
+
+One deliberate behaviour change, for cross-door parity: an exported but *empty* `AGENT_TOKEN` used
+to suppress the Authorization header even when the walled file held a valid token; the MCP door now
+matches the CLI door and falls back to the file token. A blank export is a mistake-shaped input —
+an unfilled host env block — and both doors now treat it the same way, so identical environments
+can no longer produce a working CLI door beside a silently unauthenticated MCP door.
+
+python-dotenv remains supported and preferred when present (`dotenv_values` parses without touching
+the environment); the manual fallback parser carries the same diversion and filtering, and — the
+review's sharpest catch — is now covered by direct tests, since python-dotenv turns out to be
+transitively present via fastmcp in every normal MCP run, meaning no suite run ever exercised the
+fallback before.
+
 ## [0.9.81] — 2026-09-01
 
 ### A backend you did not declare no longer serves anything
