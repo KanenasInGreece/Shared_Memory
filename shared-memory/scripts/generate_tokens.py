@@ -611,6 +611,19 @@ def _write_agent_token_file(path: str, token: str) -> bool:
     """
     skill_dir = os.path.dirname(path)
     leaf = os.path.basename(path)
+    if not leaf:
+        # Defensive guard (L1) — every known caller validates a
+        # directory-shaped path BEFORE reaching this shared writer
+        # (add_agent()'s _validate_registry_field block), so this should
+        # be unreachable in practice. It exists because this function is
+        # the shared writer for every mint path: an empty leaf must raise
+        # a clear, named error here rather than reach `os.rename(tmp, "")`,
+        # which raises a bare FileNotFoundError after a temp file was
+        # already created in `skill_dir`.
+        raise ValueError(
+            f"install path {path!r} names a directory, not a file — "
+            "refused before any write"
+        )
 
     try:
         dir_fd = _resolve_symlink_free_dir_fd(skill_dir)
@@ -972,6 +985,38 @@ def add_agent(
         _validate_registry_field(name, "agent name")
         if install_path is not None:
             _validate_registry_field(install_path, "install path")
+            # L1 — a directory-shaped --install-path used to reach
+            # _write_agent_token_file() and crash there: leaf =
+            # os.path.basename(path) is "" for a trailing slash, so
+            # os.rename(tmp_name, "") raises a cryptic
+            # FileNotFoundError AFTER a temp file was already created.
+            # Caught here, before anything is minted or written, with a
+            # message that names the fix (--install-path is the agent's
+            # .env FILE, e.g. ~/.codex/skills/shared-memory/.env — never
+            # its containing directory).
+            #
+            # MF1 fix-round finding (security+QA review, reproduced): this
+            # USED TO call os.path.basename(install_path.rstrip("/")) --
+            # stripping the trailing slash before taking the basename
+            # recovers a non-empty leaf name (e.g. "newdir") for a
+            # trailing-slash path to a directory that does not exist yet,
+            # which also fails os.path.isdir() (nothing there to be a
+            # directory). Both clauses of this check then passed, and the
+            # refusal never fired -- the mint proceeded and
+            # _write_agent_token_file()'s OWN defensive guard (an empty
+            # `os.path.basename(path)`, computed WITHOUT stripping) caught
+            # it instead, as an uncaught ValueError, since add_agent()'s
+            # call site only catches AgentEnvIsSymlink/OSError around that
+            # write. os.path.basename() already returns "" for ANY
+            # trailing-slash path on its own -- stripping first was never
+            # needed to detect one, and only served to defeat this exact
+            # case. No .rstrip() here now: an empty basename is the correct
+            # signal for a trailing slash, existing directory or not.
+            if not os.path.basename(install_path) or os.path.isdir(install_path):
+                raise ValueError(
+                    "--install-path must be the .env FILE, not a directory "
+                    "(e.g. …/shared-memory-mcp/.env)."
+                )
     except ValueError as exc:
         print(f"✗ {exc}", file=sys.stderr)
         return 1, None
@@ -1131,6 +1176,29 @@ def add_agent(
             print("  Registered as an MCP install: sync_skills.sh delivers the CONNECTOR")
             print("  package here (vector-skill.py, CONSTITUTION_SNIPPET_MCP.md,")
             print("  system-prompt.md) and never the CLI skill package.")
+        # L2 — a token is read from this file ONCE, at import (both
+        # vector-skill.py's _AGENT_TOKEN_FROM_FILE and memory_bridge.py's
+        # own load populate it at load time), so a re-mint rotates the
+        # digest immediately while an already-running process keeps
+        # presenting the PREVIOUS token until it re-reads this file — every
+        # request, reads included, 401s until then. Measured live: toggling
+        # just the affected MCP server off/on in the host was sufficient; a
+        # full host restart was not required.
+        print()
+        if install_kind == "mcp":
+            # MF2 fix-round finding (QA review, LOW/cosmetic): give this
+            # branch the same "if already running" hedge the CLI branch
+            # below always had -- a fresh --add --mcp install has nothing
+            # running yet to respawn, so an unconditional "Respawn ..."
+            # overclaimed on the common first-install path.
+            print("⚠ If this agent's memory MCP server is already running, respawn it so")
+            print("  it re-reads the rotated token — a full host restart works, or a")
+            print("  per-server reload/disable-enable if your host offers one; until then")
+            print("  it keeps the old token.")
+        else:
+            print("⚠ If this agent's process is already running, restart it so it")
+            print("  re-reads the token — it keeps presenting the previous one until")
+            print("  then, and every request (reads included) will fail auth.")
     else:
         print()
         print(f"  {name:15}  REMOTE / no install path given.")

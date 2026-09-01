@@ -5,6 +5,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.85] — 2026-09-01
+
+### Two mint footguns turned into guardrails
+
+Minting a write-capable token for an MCP agent surfaced two rough edges any deployer would hit, so
+this release smooths both. `generate_tokens.py --install-path` now rejects a directory-shaped path
+up front with a clear message — it must be the `.env` FILE — instead of crashing deep in the write
+with a cryptic empty-rename error after a temp file was already created. And a successful
+`--remint`/`--add` now prints a reminder that a token is read once at client startup: an MCP agent's
+memory server must be respawned (a full host restart, or a per-server reload if the host offers one)
+and a long-running CLI session restarted, or the client keeps presenting its previous token and every
+request — reads included — fails auth after the rotation.
+
+The operations docs gain the matching runbook: `server-setup.md` and `AGENTS.md` now spell out that
+`--install-path` is the client `.env` file, that rotating a running client's token requires respawning
+it, and that widening a read-only identity to full is a deliberate `AGENT_ROLES` edit (a sparse
+narrowing map — absence means full) followed by a re-mint and a gateway restart. Guardrails and docs
+only; no behaviour on the mint, write, or registry path changed.
+
 ## [0.9.84] — 2026-09-01
 
 ### The MCP surface is ready for a write-capable client
