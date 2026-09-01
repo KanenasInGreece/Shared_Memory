@@ -324,6 +324,92 @@ def test_auth_on_plus_private_ok_false_is_fine(monkeypatch):
     g.require_valid_llm_routing_config()   # must not raise
 
 
+# ── SEC H-1 (fix round) — the roles-absent/roles-carrying split, both texts
+#    told truthfully rather than one blanket "safe by construction" claim.
+
+def test_p5_roles_absent_explicit_false_says_safe_by_construction(monkeypatch, caplog):
+    """SEC H-1: the roles-ABSENT subset really is safe by construction (no
+    roles + private_ok=false serves nothing at all) — that must be the
+    wording for this subset specifically, never the roles-carrying one."""
+    monkeypatch.delenv("ALLOW_UNAUTHENTICATED_PROVIDER_KEYS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://a:5000", "private_ok": False},
+    ]))
+    g = _fresh(monkeypatch)
+    assert g.AUTH_CONFIGURED_AT_STARTUP is False
+    import logging
+    with caplog.at_level(logging.WARNING):
+        g.require_valid_llm_routing_config()   # must not raise
+    assert any("safe by construction" in r.message and "http://a:5000" in r.message
+               for r in caplog.records)
+    assert not any("NOT safe by construction" in r.message for r in caplog.records)
+
+
+def test_p5_roles_carrying_explicit_false_says_not_safe_by_construction(monkeypatch, caplog):
+    """SEC H-1 (MUTATION TARGET — the false claim this fixes): a
+    roles-carrying entry with explicit private_ok=false is NOT safe by
+    construction under auth-off — those roles still serve every caller.
+    This must be said plainly, never papered over as safe."""
+    monkeypatch.delenv("ALLOW_UNAUTHENTICATED_PROVIDER_KEYS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://a:5000", "private_ok": False, "roles": ["extract"]},
+    ]))
+    g = _fresh(monkeypatch)
+    assert g.AUTH_CONFIGURED_AT_STARTUP is False
+    import logging
+    with caplog.at_level(logging.WARNING):
+        g.require_valid_llm_routing_config()   # must not raise
+    assert any("NOT safe by construction" in r.message and "http://a:5000" in r.message
+               for r in caplog.records)
+
+
+def test_p5_mixed_roles_absent_and_carrying_backends_get_their_own_warning_each(monkeypatch, caplog):
+    """Both populations can coexist in one fleet — each gets exactly the
+    warning that is true of it, and neither message's URL list leaks into
+    the other's."""
+    monkeypatch.delenv("ALLOW_UNAUTHENTICATED_PROVIDER_KEYS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://safe:5000", "private_ok": False},
+        {"url": "http://scoped:5000", "private_ok": False, "roles": ["extract"]},
+    ]))
+    g = _fresh(monkeypatch)
+    assert g.AUTH_CONFIGURED_AT_STARTUP is False
+    import logging
+    with caplog.at_level(logging.WARNING):
+        g.require_valid_llm_routing_config()   # must not raise
+    safe_msgs = [r.message for r in caplog.records if "safe by construction" in r.message
+                 and "NOT safe by construction" not in r.message]
+    not_safe_msgs = [r.message for r in caplog.records if "NOT safe by construction" in r.message]
+    assert any("http://safe:5000" in m for m in safe_msgs)
+    assert not any("http://scoped:5000" in m for m in safe_msgs)
+    assert any("http://scoped:5000" in m for m in not_safe_msgs)
+    assert not any("http://safe:5000" in m for m in not_safe_msgs)
+
+
+# ── QA MED-5 (fix round) — explicit "module import never raises" test. The
+#    property held incidentally before (other tests' own reloads never
+#    raised); this names it directly under both trigger conditions. ────────
+
+def test_module_import_never_raises_under_m5_or_p5_triggering_env(monkeypatch):
+    """§7 'module import never raises' (explicit test, agy-5): M-5'/P-5'
+    are evaluated ONLY inside require_valid_llm_routing_config(), called
+    from main() — never at import/reload time — so a config that would
+    trigger either must still reload hive_mind_proxy cleanly."""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY"},
+    ]))
+    g = _fresh(monkeypatch)   # M-5'-triggering — must not raise on import/reload
+    assert g is not None
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://a:5000", "private_ok": False},
+    ]))
+    g2 = _fresh(monkeypatch)   # P-5'-triggering — must not raise on import/reload
+    assert g2 is not None
+
+
 # ── Eligibility (I-1) ─────────────────────────────────────────────────────────
 
 def test_explicit_roles_is_the_privacy_opt_in_even_when_private_ok_false(monkeypatch):
@@ -622,7 +708,7 @@ def test_declaration_gap_none_for_the_fit_case(monkeypatch):
     assert g._declaration_gap() is None
 
 
-def test_declaration_gap_none_undeclared_legacy_csv(monkeypatch):
+def test_declaration_gap_renders_none_string_undeclared_legacy_csv(monkeypatch):
     """Ruling E(α2) arm 2: a live legacy CSV — every entry has
     private_ok_explicit False AND roles None — is "nothing was EVER
     declared", pinned as `declaration == "none"`."""
@@ -632,7 +718,7 @@ def test_declaration_gap_none_undeclared_legacy_csv(monkeypatch):
     assert g._declaration_gap() == "none"
 
 
-def test_declaration_gap_none_undeclared_builtin_fallback(monkeypatch):
+def test_declaration_gap_renders_none_string_undeclared_builtin_fallback(monkeypatch):
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
     monkeypatch.delenv("LLM_BACKENDS", raising=False)
     g = _fresh(monkeypatch)

@@ -5292,10 +5292,15 @@ def require_valid_llm_routing_config() -> None:
        private_ok=false" predicate because under default-deny that is now
        the pervasive, unremarkable default for every undeclared backend —
        only an OPERATOR-STATED false (a deliberate scoping decision) is
-       still worth a word, and even that is safe by construction (the
-       backend simply serves nothing role-less). The old
-       ALLOW_UNAUTHENTICATED_PROVIDER_KEYS override branch is gone with the
-       exit it existed to bypass — S-05's own use of that knob
+       still worth a word. SEC H-1 (fix round): "safe by construction" is
+       true ONLY for the roles-ABSENT subset — no `roles` plus
+       `private_ok=false` really does serve nothing. A backend that ALSO
+       carries `roles` is NOT safe by construction: those roles still serve
+       EVERY caller, and with auth off the gateway cannot tell callers
+       apart — the scoping is unenforceable, not harmless. The two
+       populations get two separate warnings below, worded accordingly. The
+       old ALLOW_UNAUTHENTICATED_PROVIDER_KEYS override branch is gone with
+       the exit it existed to bypass — S-05's own use of that knob
        (require_auth_when_provider_keys_configured) is untouched.
     """
     if _LLM_BACKEND_ROLE_CONFIG_ERRORS:
@@ -5313,11 +5318,18 @@ def require_valid_llm_routing_config() -> None:
         and not LLM_BACKEND_PRIVATE_OK_EXPLICIT.get(b, False)
     )
     if needs_explicit_choice:
+        # SEC M-1 (fix round): say the credential-still-probed consequence
+        # here too, not just in check_config's per-entry rendering — the
+        # startup log is the FIRST of the two nominated instruments and an
+        # operator who never runs check_config.py should see it here.
         log.warning(
             "credentialed LLM backend(s) configured with neither `roles` nor "
             "an explicit `private_ok` — configured, but will never be "
             "selected under default-deny (declare `roles` or `private_ok` "
-            "explicitly): %s. See shared-memory/.env.example / check_config.py.",
+            "explicitly): %s. Its credential is still sent on every /health "
+            "probe cycle even though it can serve nothing — remove the "
+            "entry if you did not mean to attach the key. See "
+            "shared-memory/.env.example / check_config.py.",
             ", ".join(scrub_url_credentials(b) for b in needs_explicit_choice),
         )
 
@@ -5330,15 +5342,33 @@ def require_valid_llm_routing_config() -> None:
     )
     if not private_false_explicit:
         return
-    log.warning(
-        "AGENT_TOKENS is unset (auth off) but private_ok=false backend(s) are "
-        "EXPLICITLY configured (%s) — without caller identities the privacy/"
-        "steering invariants (I-1/I-6) have nothing to enforce against, but "
-        "this is safe by construction under default-deny: these backends "
-        "simply serve no role-less traffic. Configure AGENT_TOKENS if that "
-        "scoping was meant to matter.",
-        ", ".join(scrub_url_credentials(b) for b in private_false_explicit),
-    )
+    # SEC H-1 (fix round): "safe by construction" was claimed for BOTH
+    # subsets below; it is only true for the roles-ABSENT one. Split so
+    # each population gets the text that is actually true of it — see
+    # this function's own docstring for the mechanism (_may_steer_llm
+    # returns True unconditionally when auth is off; _role_eligible never
+    # consults private_ok on the role-carrying branch, by design, I-1).
+    roles_absent = sorted(b for b in private_false_explicit if LLM_BACKEND_ROLES.get(b) is None)
+    roles_carrying = sorted(b for b in private_false_explicit if LLM_BACKEND_ROLES.get(b) is not None)
+    if roles_absent:
+        log.warning(
+            "AGENT_TOKENS is unset (auth off) but private_ok=false backend(s) "
+            "with NO `roles` are EXPLICITLY configured (%s) — without caller "
+            "identities the privacy/steering invariants (I-1/I-6) have "
+            "nothing to enforce against, but this subset really is safe by "
+            "construction: no roles plus private_ok=false serves nothing at "
+            "all. Configure AGENT_TOKENS if that scoping was meant to matter.",
+            ", ".join(scrub_url_credentials(b) for b in roles_absent),
+        )
+    if roles_carrying:
+        log.warning(
+            "AGENT_TOKENS is unset (auth off) and role-scoped backend(s) also "
+            "carry an EXPLICITLY configured private_ok=false (%s) — this is "
+            "NOT safe by construction: those roles still serve EVERY caller, "
+            "and with auth off the gateway cannot tell callers apart. Set "
+            "AGENT_TOKENS if that scoping was meant to be enforceable.",
+            ", ".join(scrub_url_credentials(b) for b in roles_carrying),
+        )
 
 
 def warn_if_dream_slots_impossible() -> None:
@@ -5446,7 +5476,8 @@ async def main() -> None:
     # refuses to start — see require_auth_when_provider_keys_configured()'s
     # docstring for why this call lives here too.
     require_auth_when_provider_keys_configured()
-    # Model-attributes routing (M-5/P-5/unknown-role refusals) — see
+    # Model-attributes routing (unknown-role refusal; M-5'/P-5' are
+    # DEGRADED WARNINGS since W4/decision:1824, no longer refusals) — see
     # require_valid_llm_routing_config()'s docstring for why this call
     # lives here too.
     require_valid_llm_routing_config()
