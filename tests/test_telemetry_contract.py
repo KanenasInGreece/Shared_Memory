@@ -295,8 +295,8 @@ class _StubCoordinator:
 
 @pytest.fixture
 def gateway(monkeypatch):
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://localhost:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://localhost:5000", "private_ok": True}]))
     monkeypatch.setenv("AGENT_TOKENS", "claude:tok_contract_test")
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)
@@ -967,7 +967,14 @@ def test_the_w2_entries_are_pinned_to_a_frozen_stamp_not_the_live_version():
     that happens, is reading the source itself.
     """
     src = inspect.getsource(tc)
-    w2_block = src.split("# ── W2 (decision:1832)")[1]
+    # W4 (decision:1824) bounds the slice's END too, not just its start —
+    # unbounded (split(...)[1], to EOF) this block used to also swallow
+    # every LATER MEANING_CHANGES section, including W4's, which legitimately
+    # pins its own not-yet-released entries to the bare VERSION constant
+    # (exactly the practice this docstring says W2 itself followed before it
+    # was frozen) — an unbounded slice would have permanently forbidden any
+    # future wave from doing the same thing at authorship time.
+    w2_block = src.split("# ── W2 (decision:1832)")[1].split("# ── W4 default-deny")[0]
     assert '"in_version": VERSION,' not in w2_block, (
         "a W2 MEANING_CHANGES entry is pinned to the LIVE VERSION constant — "
         "it will silently re-date itself to whatever VERSION becomes at the "

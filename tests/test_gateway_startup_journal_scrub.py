@@ -152,14 +152,17 @@ def _s05_systemexit_text(monkeypatch, caplog):
     return str(exc_info.value)
 
 
-def _m5_systemexit_text(monkeypatch, caplog):
+def _m5_warning_text(monkeypatch, caplog):
+    """M-5′ (W4, decision:1824): a credentialed backend with neither roles
+    nor an explicit private_ok is a loud WARNING now, never a SystemExit —
+    was _m5_systemexit_text."""
     monkeypatch.setenv("SM_TEST_TOKEN_M5", "resolved-token-value")
     g = _reload_with_backends(monkeypatch, agent_tokens="claude:tok_abc", backends_json=[
         {"url": USERINFO_URL, "token_env": "SM_TEST_TOKEN_M5"},  # neither roles nor private_ok
     ])
-    with pytest.raises(SystemExit) as exc_info:
-        g.require_valid_llm_routing_config()
-    return str(exc_info.value)
+    with caplog.at_level(logging.WARNING, logger="hive-proxy"):
+        g.require_valid_llm_routing_config()   # must NOT raise
+    return caplog.text
 
 
 def _p5_warning_text(monkeypatch, caplog):
@@ -171,22 +174,29 @@ def _p5_warning_text(monkeypatch, caplog):
     return caplog.text
 
 
-def _p5_systemexit_text(monkeypatch, caplog):
+def _p5_no_override_warning_text(monkeypatch, caplog):
+    """P-5′ (W4, decision:1824): auth-off + an EXPLICIT private_ok=false
+    backend is a loud WARNING now, never a SystemExit, and no longer needs
+    ALLOW_UNAUTHENTICATED_PROVIDER_KEYS to avoid one — that override branch
+    is deleted with the exit it existed to bypass. Was
+    _p5_systemexit_text; _p5_warning_text above covers the same predicate
+    with the (now-inert) override env var still set, kept for its own
+    scrub coverage."""
     g = _reload_with_backends(monkeypatch, agent_tokens="", backends_json=[
         {"url": USERINFO_URL, "private_ok": False},
     ])
-    with pytest.raises(SystemExit) as exc_info:
-        g.require_valid_llm_routing_config()
-    return str(exc_info.value)
+    with caplog.at_level(logging.WARNING, logger="hive-proxy"):
+        g.require_valid_llm_routing_config()   # must NOT raise
+    return caplog.text
 
 
 _LEAK_SCENARIOS = {
     "role_config_errors": _role_config_errors_text,
     "s05_warning": _s05_warning_text,
     "s05_systemexit": _s05_systemexit_text,
-    "m5_systemexit": _m5_systemexit_text,
+    "m5_warning": _m5_warning_text,
     "p5_warning": _p5_warning_text,
-    "p5_systemexit": _p5_systemexit_text,
+    "p5_no_override_warning": _p5_no_override_warning_text,
 }
 
 

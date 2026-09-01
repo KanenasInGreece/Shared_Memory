@@ -61,6 +61,33 @@ def _write_env(tmp_path, text):
     return p
 
 
+def _aged_preimage(tmp_path, gateway_unit=None):
+    """Ruling A(a) (§6.4): a REAL --capture-preimage, downgraded to look
+    like an OLD-code (pre-W4) capture — private_ok True for every backend
+    without an explicit false (the pre-flip default), and no
+    "loader_semantics" key (absence reads as 1, the old generation).
+    private_ok's default direction is the ONLY thing that changed between
+    generations, so this is exactly what an old-code self-capture (or an
+    old-code --capture-preimage) would have produced for THIS install —
+    used to open migrate_env's loader-semantics boundary in a test without
+    hand-maintaining a parallel loader. `gateway_unit` defaults to
+    `_NO_UNIT` (a module-level constant elsewhere in this file — resolved
+    at call time, so definition order does not matter)."""
+    pre_path = tmp_path / "pre.json"
+    rc = m.do_capture(str(pre_path), gateway_unit or _NO_UNIT)
+    assert rc == m.EXIT_OK, "aging fixture: capture itself failed"
+    payload = json.loads(pre_path.read_text())
+    image = payload["image"]
+    explicit = image.get("private_ok_explicit", {})
+    private_ok = image.get("private_ok", {})
+    for url in image.get("urls", []):
+        if not explicit.get(url):
+            private_ok[url] = True   # the pre-W4 default this url would have carried
+    image.pop("loader_semantics", None)
+    pre_path.write_text(json.dumps(payload))
+    return str(pre_path)
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # systemctl output parsing (pure)
 # ─────────────────────────────────────────────────────────────────────────
@@ -437,7 +464,11 @@ def test_plan_json_usable_mixed_array_untouched_entry_is_semantically_preserved(
 
 
 def test_e2e_mixed_array_untouched_entry_survives_semantically(tmp_path, monkeypatch):
-    """End-to-end companion (SEC M-6): the real apply path, real file."""
+    """End-to-end companion (SEC M-6): the real apply path, real file.
+    W4 (§6.4): the touched entry's private_ok addition is a
+    boundary-crossing materialisation (the ORIGINAL claim this test pins —
+    the array's OTHER entry survives byte-for-semantic-identity regardless
+    of the boundary), so this now runs against an aged --preimage."""
     _force_no_unit(monkeypatch)
     original = (
         'EMBEDDER_URL=http://a:8070\nRERANKER_URL=http://a:8071\n'
@@ -447,7 +478,8 @@ def test_e2e_mixed_array_untouched_entry_survives_semantically(tmp_path, monkeyp
     env_path = _write_env(tmp_path, original)
     monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
     monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT)
+    preimage_path = _aged_preimage(tmp_path)
+    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT)
     assert rc == m.EXIT_OK
     text = env_path.read_text()
     json_line = next(l for l in text.splitlines() if l.startswith("LLM_BACKENDS_JSON="))
@@ -572,12 +604,16 @@ def test_e2e_fallback_case_non_interactive_dry_run_says_not_probed_not_did_not_a
         tmp_path, monkeypatch, capsys):
     """End-to-end companion: a non-interactive DRY RUN (no TTY, no
     injected reader) must render the 'not probed' wording in its preview
-    of the question a real run would ask, never 'did not answer'."""
+    of the question a real run would ask, never 'did not answer'.
+
+    W4 (§6.4): aged --preimage so the preview path is actually reached
+    (same-generation self-capture would short-circuit before it)."""
     _force_no_unit(monkeypatch)
     env_path = _write_env(tmp_path, "EMBEDDER_URL=http://a:8070\n")
     monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
+    preimage_path = _aged_preimage(tmp_path)
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False, raising=False)
-    rc = m.do_apply_or_dryrun(None, False, _NO_UNIT, confirm_reader=None)
+    rc = m.do_apply_or_dryrun(preimage_path, False, _NO_UNIT, confirm_reader=None)
     out = capsys.readouterr().out
     assert rc == m.EXIT_OK
     assert "not probed" in out
@@ -662,11 +698,16 @@ def test_two_layer_compare_url_set_changed_fails():
 
 
 @pytest.mark.parametrize("field", ["weights", "has_token", "models", "roles", "n_ctx",
-                                    "max_inflight", "extra_body", "private_ok"])
+                                    "max_inflight", "extra_body"])
 def test_two_layer_compare_any_behavioural_field_drift_fails(field):
     """The 'make the migration write a wrong value' mutant, applied per
     Layer-1 field: a single wrong value anywhere in the behavioural set
-    must be caught."""
+    must be caught. `private_ok` is deliberately NOT parametrized here
+    (QA MED-3, fix round) — it left Layer-1 equality for Layer-2
+    planned-direction comparison (`_URL_KEYED_FIELDS` at migrate_env.py:800,
+    ruling A(a)/§6.4); its own coverage now lives in the direction-rule
+    tests below (same-generation True->False refusal, boundary-crossing
+    True->False allow, unreported False->True refusal)."""
     pre = _full_image()
     post = _full_image()
     post[field] = dict(post[field])
@@ -723,6 +764,135 @@ def test_two_layer_compare_config_empty_moves_only_on_confirmed_fallback_write()
     ok2, msg2 = m.two_layer_compare(
         pre, post, reported_writes={"http://x:5000", "__fallback_materialised__"})
     assert ok2, msg2
+
+
+# ── private_ok direction rules (ruling A(a)/§6.4) — QA HIGH-2/MED-2/MED-3 ──
+# `private_ok` left the Layer-1 equality set for this Layer-2
+# planned-direction comparison; these three tests are its ONLY remaining
+# coverage (the parametrized drift test above no longer includes it).
+
+def test_two_layer_compare_private_ok_false_to_true_on_unreported_entry_fails():
+    """Rule 1 (§6.4 A(a)): False->True on private_ok is legitimate ONLY on
+    an entry THIS RUN reported writing. An unreported False->True move is
+    exactly the shape a real widening regression would take."""
+    pre = _full_image(private_ok={"http://a:5000": False})
+    post = _full_image(private_ok={"http://a:5000": True})
+    ok, msg = m.two_layer_compare(pre, post, reported_writes=set())
+    assert not ok, "unreported private_ok False->True must fail"
+    assert "http://a:5000" in msg
+
+
+def test_two_layer_compare_private_ok_same_generation_true_to_false_on_untouched_entry_fails():
+    """A3 (§6.4, QA HIGH-2 — MUTATION TARGET, migrate_env.py's rule 2): with
+    private_ok out of Layer 1, a same-generation True->False on an entry
+    this run left untouched is the ONLY remaining detector for a real
+    regression on that field. Both images here carry the SAME (default)
+    loader_semantics, so boundary_crossed is False — rule 2 must NOT excuse
+    this move, and it must name the entry."""
+    pre = _full_image(private_ok={"http://a:5000": True})
+    post = _full_image(private_ok={"http://a:5000": False})
+    ok, msg = m.two_layer_compare(pre, post, reported_writes=set())
+    assert not ok, "same-generation True->False on an untouched entry must be refused"
+    assert "http://a:5000" in msg
+
+
+def test_two_layer_compare_private_ok_boundary_crossing_true_to_false_on_untouched_entry_is_ok():
+    """Rule 2 (§6.4 A(a)): a True->False move IS legitimate when it crosses
+    the loader-semantics boundary (an old-code pre-image re-measured under
+    new-code semantics) on an entry this run left untouched — and it must
+    be REPORTED per-entry by name, never silent (QA MED-2 — MUTATION
+    TARGET, migrate_env.py's `if report_lines is not None:` gate)."""
+    pre = _full_image(private_ok={"http://a:5000": True}, loader_semantics=1)
+    post = _full_image(private_ok={"http://a:5000": False}, loader_semantics=m.LOADER_SEMANTICS)
+    report_lines = []
+    ok, msg = m.two_layer_compare(pre, post, reported_writes=set(), report_lines=report_lines)
+    assert ok, msg
+    assert any("http://a:5000" in line and "True -> False" in line for line in report_lines), (
+        "the boundary-crossing move must be reported per-entry by name (QA MED-2)")
+
+
+# ── loader_semantics type guard (SEC M-4) ───────────────────────────────────
+
+@pytest.mark.parametrize("bad_value", [None, "1", [], True, 1.5])
+def test_two_layer_compare_malformed_pre_loader_semantics_fails_never_raises(bad_value):
+    """SEC M-4 (fix round): a malformed loader_semantics must fail the
+    comparison cleanly (False, message) — never a raw TypeError from the
+    `<` comparison. Pinned directly on two_layer_compare, independent of
+    do_apply_or_dryrun's own earlier gate (the two guards are deliberately
+    redundant — see that guard's own comment for why)."""
+    pre = _full_image(loader_semantics=bad_value)
+    post = _full_image()
+    ok, msg = m.two_layer_compare(pre, post, reported_writes=set())
+    assert not ok
+    assert "loader_semantics" in msg
+
+
+@pytest.mark.parametrize("bad_value", [None, "1", [], True, 1.5])
+def test_two_layer_compare_malformed_post_loader_semantics_fails_never_raises(bad_value):
+    pre = _full_image()
+    post = _full_image(loader_semantics=bad_value)
+    ok, msg = m.two_layer_compare(pre, post, reported_writes=set())
+    assert not ok
+    assert "loader_semantics" in msg
+
+
+@pytest.mark.parametrize("bad_value", [None, "1", [], True, 1.5])
+def test_malformed_loader_semantics_in_preimage_exits_stop_never_crashes(tmp_path, monkeypatch, bad_value):
+    """SEC M-4 (fix round), end to end: an operator-supplied --preimage
+    with a malformed loader_semantics must EXIT_STOP with a named message,
+    never a raw traceback — matching the isinstance(schema, int) idiom
+    capture_schema already gets a few lines above this guard."""
+    _force_no_unit(monkeypatch)
+    env_path = _write_env(tmp_path, "LLM_BACKENDS=http://a:5000\n")
+    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
+    preimage = tmp_path / "pre.json"
+    image = {"urls": ["http://a:5000"], "loader_semantics": bad_value}
+    preimage.write_text(json.dumps({"capture_schema": m.CAPTURE_SCHEMA, "image": image}))
+    rc = m.do_apply_or_dryrun(str(preimage), False, _NO_UNIT)
+    assert rc == m.EXIT_STOP
+
+
+# ── provenance comment on a materialising write (QA MED-4) ─────────────────
+
+def test_e2e_csv_live_materialisation_writes_a_provenance_comment_above_the_json_line(
+        tmp_path, monkeypatch):
+    """QA MED-4 (fix round): materialising LLM_BACKENDS_JSON (case 3) must
+    carry its own one-line provenance comment naming the tool and what it
+    did — distinct from the existing 'migrated to ... original:' comment
+    left on the now-dead CSV line, which only explains where the CSV went,
+    never why a brand-new JSON line appeared."""
+    _force_no_unit(monkeypatch)
+    env_path = _write_env(tmp_path, "LLM_BACKENDS=http://localhost:5000\n")
+    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
+    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
+    preimage_path = _aged_preimage(tmp_path)
+    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT)
+    assert rc == m.EXIT_OK
+    lines = env_path.read_text().splitlines()
+    json_idx = next(i for i, l in enumerate(lines) if l.startswith("LLM_BACKENDS_JSON="))
+    assert lines[json_idx - 1].startswith("# migrate_env.py "), (
+        "the materialising write must carry a provenance comment on the line directly above it")
+    assert "materialised the pre-W4 effective pool" in lines[json_idx - 1]
+
+
+def test_e2e_fallback_materialisation_writes_a_provenance_comment_above_the_json_line(
+        tmp_path, monkeypatch):
+    """Same obligation as above, case 4 (fallback confirm)."""
+    _force_no_unit(monkeypatch)
+    env_path = _write_env(tmp_path, "EMBEDDER_URL=http://a:8070\n")
+    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
+    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
+    preimage_path = _aged_preimage(tmp_path)
+    monkeypatch.setattr(m, "probe_backend", lambda url, timeout=3.0: {
+        "answered": False, "status": None, "parsed_model_list": False, "n_models": None})
+    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT, confirm_reader=lambda: "y\n")
+    assert rc == m.EXIT_OK
+    lines = env_path.read_text().splitlines()
+    json_idx = next(i for i, l in enumerate(lines) if l.startswith("LLM_BACKENDS_JSON="))
+    assert lines[json_idx - 1].startswith("# migrate_env.py "), (
+        "the materialising write must carry a provenance comment on the line directly above it")
+    assert "materialised the pre-W4 effective pool" in lines[json_idx - 1]
+    assert "LLM_DEFAULT_TARGET" not in lines[json_idx - 1], "R-A: never spell the literal key name"
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -897,18 +1067,27 @@ def test_e2e_non_utf8_env_file_refuses_cleanly_never_a_traceback(tmp_path, monke
 
 
 def test_e2e_csv_live_dry_run_then_apply_then_second_run_is_a_true_noop(tmp_path, monkeypatch, capsys):
+    """W4 (§6.4 V2): a live CSV's private_ok materialisation is a
+    boundary-crossing act now — self-capture alone (same generation) would
+    correctly no-op (that IS the true-noop half of this test's name, now
+    structural rather than incidental). The dry-run PREVIEW and the first
+    APPLY exercise the genuine version-jump path via an aged --preimage
+    (`_aged_preimage`); the SECOND apply reverts to plain self-capture,
+    proving the re-run is a true no-op for its OWN (V2 same-generation)
+    reason, not merely "already explicit"."""
     _force_no_unit(monkeypatch)
     env_path = _write_env(tmp_path, "LLM_BACKENDS=http://localhost:5000\n")
     monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
     monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
+    preimage_path = _aged_preimage(tmp_path)
 
-    rc = m.do_apply_or_dryrun(None, False, _NO_UNIT)
+    rc = m.do_apply_or_dryrun(preimage_path, False, _NO_UNIT)
     assert rc == m.EXIT_OK
     dry_out = capsys.readouterr().out
     assert "DRY RUN" in dry_out
     assert env_path.read_text() == "LLM_BACKENDS=http://localhost:5000\n", "dry run wrote to the file"
 
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT)
+    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT)
     assert rc == m.EXIT_OK
     applied_text = env_path.read_text()
     assert "LLM_BACKENDS_JSON=" in applied_text
@@ -918,8 +1097,9 @@ def test_e2e_csv_live_dry_run_then_apply_then_second_run_is_a_true_noop(tmp_path
     hash_after_first_apply = applied_text
     time.sleep(0.05)
 
-    # SECOND RUN — must be a true no-op: file hash AND mtime unchanged
-    # (M-D10: no planned writes -> no temp+mv at all).
+    # SECOND RUN — self-capture (no --preimage): now the SAME generation as
+    # what it just wrote, so V2's gate alone guarantees a true no-op — file
+    # hash AND mtime unchanged (M-D10: no planned writes -> no temp+mv at all).
     rc2 = m.do_apply_or_dryrun(None, True, _NO_UNIT)
     assert rc2 == m.EXIT_OK
     assert env_path.stat().st_mtime == mtime_after_first_apply, "mtime moved on a no-op re-run"
@@ -927,12 +1107,19 @@ def test_e2e_csv_live_dry_run_then_apply_then_second_run_is_a_true_noop(tmp_path
 
 
 def test_e2e_case1_json_usable_adds_private_ok_and_is_idempotent(tmp_path, monkeypatch):
+    """W4 (§6.4 V2): adding private_ok to a role-less, credential-less entry
+    is a boundary-crossing materialisation now (that entry would otherwise
+    correctly stay ineligible under the CURRENT generation) — exercised via
+    an aged --preimage. The second, self-capture re-run proves idempotency
+    for the SAME reason as the CSV-live case above: same generation, V2
+    gate, true no-op."""
     _force_no_unit(monkeypatch)
     env_path = _write_env(tmp_path, 'LLM_BACKENDS_JSON=[{"url":"http://a:5000"}]\n')
     monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
     monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
+    preimage_path = _aged_preimage(tmp_path)
 
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT)
+    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT)
     assert rc == m.EXIT_OK
     text = env_path.read_text()
     assert '"private_ok": true' in text
@@ -1020,7 +1207,9 @@ def test_e2e_case2_deleting_the_json_line_from_the_fixture_kills_the_survival_cl
     fallback_reason (nothing to parse), classify() lands in CASE_CSV_LIVE
     instead of CASE_JSON_UNUSABLE, and the CSV DOES get converted — proving
     the case-2 test above is actually pinned to the JSON key's presence,
-    not merely to 'nothing changes for some other reason'."""
+    not merely to 'nothing changes for some other reason'.
+
+    W4 (§6.4): the conversion is boundary-crossing now — aged --preimage."""
     _force_no_unit(monkeypatch)
     mutated = (
         'EMBEDDER_URL=http://a:8070\nRERANKER_URL=http://a:8071\n'
@@ -1029,7 +1218,8 @@ def test_e2e_case2_deleting_the_json_line_from_the_fixture_kills_the_survival_cl
     env_path = _write_env(tmp_path, mutated)
     monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
     monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT)
+    preimage_path = _aged_preimage(tmp_path)
+    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT)
     assert rc == m.EXIT_OK
     text = env_path.read_text()
     assert "LLM_BACKENDS_JSON=" in text, (
@@ -1050,6 +1240,11 @@ def test_e2e_roles_carrying_entry_left_byte_for_byte(tmp_path, monkeypatch):
 
 
 def test_e2e_credentialed_neither_key_entry_untouched_and_reported(tmp_path, monkeypatch, capsys):
+    """W4 (§6.4): aged --preimage so the plan_case_json_usable eligibility
+    check actually runs (a same-generation run would short-circuit before
+    it with a DIFFERENT, also-true message) — this entry is excluded by
+    its own token_env regardless of the boundary, so "already fully
+    explicit" is still the right wording once the boundary is open."""
     _force_no_unit(monkeypatch)
     original = ('EMBEDDER_URL=http://a:8070\nRERANKER_URL=http://a:8071\n'
                 'LLM_BACKENDS_JSON=[{"url":"https://api.example.com/v1","token_env":"X_KEY"}]\n'
@@ -1058,7 +1253,8 @@ def test_e2e_credentialed_neither_key_entry_untouched_and_reported(tmp_path, mon
     monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
     monkeypatch.setenv("X_KEY", "some-token-value")
     monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT)
+    preimage_path = _aged_preimage(tmp_path)
+    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT)
     assert rc == m.EXIT_OK
     assert env_path.read_text() == original
     out = capsys.readouterr().out  # QA MED-8: the capsys fixture was never read
@@ -1130,6 +1326,9 @@ def test_e2e_crlf_host_with_no_changes_stays_crlf_unwritten(tmp_path, monkeypatc
 
 
 def test_e2e_symlinked_env_file_is_resolved_and_target_is_operated_on(tmp_path, monkeypatch):
+    """W4 (§6.4): the CSV->JSON conversion this test observes is a
+    boundary-crossing materialisation now — aged --preimage, same as the
+    other case-3/4 mechanics tests above."""
     _force_no_unit(monkeypatch)
     real_target = tmp_path / "real.env"
     real_target.write_text("LLM_BACKENDS=http://a:5000\n")
@@ -1137,7 +1336,8 @@ def test_e2e_symlinked_env_file_is_resolved_and_target_is_operated_on(tmp_path, 
     link.symlink_to(real_target)
     monkeypatch.setenv("SECURE_ENV_FILE", str(link))
     monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT)
+    preimage_path = _aged_preimage(tmp_path)
+    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT)
     assert rc == m.EXIT_OK
     assert "LLM_BACKENDS_JSON=" in real_target.read_text()
     assert link.is_symlink(), "the symlink itself must survive (operate on the target, not replace the link)"
@@ -1171,14 +1371,19 @@ def test_e2e_read_only_file_in_a_writable_directory_still_applies(tmp_path, monk
     directory must NOT be refused — the write is a rename via a fresh
     temp file in the same directory, which needs directory permission,
     never the target inode's own write bit. The old (file-level) precheck
-    would have refused this case; the fix must not."""
+    would have refused this case; the fix must not.
+
+    W4 (§6.4): the CSV->JSON conversion is a boundary-crossing
+    materialisation now — aged --preimage, captured (read-only) BEFORE the
+    chmod below."""
     _force_no_unit(monkeypatch)
     env_path = _write_env(tmp_path, "LLM_BACKENDS=http://a:5000\n")
-    env_path.chmod(0o444)
     monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
     monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
+    preimage_path = _aged_preimage(tmp_path)
+    env_path.chmod(0o444)
     try:
-        rc = m.do_apply_or_dryrun(None, True, _NO_UNIT)
+        rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT)
         assert rc == m.EXIT_OK, "a read-only FILE in a writable directory must not refuse"
         assert "LLM_BACKENDS_JSON=" in env_path.read_text()
     finally:
@@ -1205,6 +1410,12 @@ def test_e2e_read_only_env_file_with_no_planned_write_is_a_silent_pass(tmp_path,
 
 
 def test_e2e_fallback_case_non_interactive_writes_nothing(tmp_path, monkeypatch, capsys):
+    """W4 (§6.4 V2): SAME generation (self-capture, no --preimage) — the
+    whole case-4 body short-circuits to the "nothing to materialise"
+    no-op before it even asks whether a human is present. The genuinely
+    NEW non-interactive behaviour (boundary crossing + no human = STOP) is
+    covered by test_e2e_fallback_case_boundary_crossing_non_interactive_stops
+    below."""
     _force_no_unit(monkeypatch)
     env_path = _write_env(tmp_path, "EMBEDDER_URL=http://a:8070\n")
     monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
@@ -1214,17 +1425,43 @@ def test_e2e_fallback_case_non_interactive_writes_nothing(tmp_path, monkeypatch,
     assert rc == m.EXIT_OK
     assert "LLM_BACKENDS_JSON=" not in env_path.read_text()
     out = capsys.readouterr().out
-    assert "Non-interactive" in out
+    assert "already the CURRENT loader generation" in out
 
 
-def test_e2e_fallback_case_interactive_confirm_yes_writes_and_freezes_default_target(tmp_path, monkeypatch):
+def test_e2e_fallback_case_boundary_crossing_non_interactive_stops(tmp_path, monkeypatch, capsys):
+    """Ruling D(a) V1 (§6.4), the NEW invariant this wave adds: a
+    version-jump install (aged --preimage — the fallback WAS serving
+    role-less traffic under the old default) with no human present must
+    STOP (EXIT_STOP), never quietly exit 0 into a gateway that now serves
+    nothing. Mutation-checked in HANDOFF.md (M-kill: reverting this
+    `return EXIT_STOP` to the old "report and fall through to EXIT_OK"
+    behaviour must make this test fail)."""
     _force_no_unit(monkeypatch)
     env_path = _write_env(tmp_path, "EMBEDDER_URL=http://a:8070\n")
     monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
     monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
+    preimage_path = _aged_preimage(tmp_path)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False, raising=False)
+    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT, confirm_reader=None)
+    assert rc == m.EXIT_STOP
+    assert "LLM_BACKENDS_JSON=" not in env_path.read_text(), "R-A: no write without a human"
+    out = capsys.readouterr().out
+    assert "no human is present" in out
+    assert "--skip-env-migration" in out
+
+
+def test_e2e_fallback_case_interactive_confirm_yes_writes_and_freezes_default_target(tmp_path, monkeypatch):
+    """W4 (§6.4): materialising the fallback is a boundary-crossing act —
+    aged --preimage opens it; R-A's interactive confirm is otherwise
+    unchanged."""
+    _force_no_unit(monkeypatch)
+    env_path = _write_env(tmp_path, "EMBEDDER_URL=http://a:8070\n")
+    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
+    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
+    preimage_path = _aged_preimage(tmp_path)
     monkeypatch.setattr(m, "probe_backend", lambda url, timeout=3.0: {
         "answered": False, "status": None, "parsed_model_list": False, "n_models": None})
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT, confirm_reader=lambda: "y\n")
+    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT, confirm_reader=lambda: "y\n")
     assert rc == m.EXIT_OK
     text = env_path.read_text()
     assert "LLM_BACKENDS_JSON=" in text
@@ -1238,41 +1475,51 @@ def test_e2e_fallback_case_trailing_slash_confirm_yes_does_not_abort(tmp_path, m
     bare LLM_DEFAULT_TARGET carrying a trailing slash made a correctly
     CONFIRMED 'y' abort the whole upgrade with POST-IMAGE DIVERGED,
     reproduced live pre-fix. Must now go through clean: rc == EXIT_OK, no
-    'DIVERGED' anywhere in the report."""
+    'DIVERGED' anywhere in the report.
+
+    W4 (§6.4): materialisation is boundary-crossing now — aged --preimage."""
     _force_no_unit(monkeypatch)
     env_path = _write_env(
         tmp_path, "EMBEDDER_URL=http://a:8070\nLLM_DEFAULT_TARGET=http://localhost:5000/\n")
     monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
     monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
+    preimage_path = _aged_preimage(tmp_path)
     monkeypatch.setattr(m, "probe_backend", lambda url, timeout=3.0: {
         "answered": False, "status": None, "parsed_model_list": False, "n_models": None})
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT, confirm_reader=lambda: "y\n")
+    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT, confirm_reader=lambda: "y\n")
     assert rc == m.EXIT_OK, "a trailing slash on LLM_DEFAULT_TARGET must not abort a confirmed write"
     text = env_path.read_text()
     assert "LLM_BACKENDS_JSON=" in text
 
 
 def test_e2e_fallback_case_interactive_confirm_no_writes_nothing(tmp_path, monkeypatch):
+    """W4 (§6.4): aged --preimage so the interactive confirm path is
+    actually reached (a same-generation run would short-circuit before it,
+    which is not what this test is about)."""
     _force_no_unit(monkeypatch)
     env_path = _write_env(tmp_path, "EMBEDDER_URL=http://a:8070\n")
     monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
     monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
+    preimage_path = _aged_preimage(tmp_path)
     monkeypatch.setattr(m, "probe_backend", lambda url, timeout=3.0: {
         "answered": False, "status": None, "parsed_model_list": False, "n_models": None})
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT, confirm_reader=lambda: "n\n")
+    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT, confirm_reader=lambda: "n\n")
     assert rc == m.EXIT_OK
     assert "LLM_BACKENDS_JSON=" not in env_path.read_text()
 
 
 def test_e2e_fallback_case_empty_default_target_never_probed_never_materialised(tmp_path, monkeypatch):
+    """W4 (§6.4): aged --preimage so the probeable-target check is actually
+    reached."""
     _force_no_unit(monkeypatch)
     env_path = _write_env(tmp_path, "EMBEDDER_URL=http://a:8070\nLLM_DEFAULT_TARGET=\n")
     monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
     monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
+    preimage_path = _aged_preimage(tmp_path)
     probed = []
     monkeypatch.setattr(m, "probe_backend", lambda url, timeout=3.0: probed.append(url) or {
         "answered": True, "status": 200, "parsed_model_list": True, "n_models": 1})
-    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT, confirm_reader=lambda: "y\n")
+    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT, confirm_reader=lambda: "y\n")
     assert rc == m.EXIT_OK
     assert probed == [], "an empty effective target must never be probed"
     assert "LLM_BACKENDS_JSON=" not in env_path.read_text()
@@ -1438,6 +1685,43 @@ def test_restore_or_die_prints_pending_lines_before_a_restore_failure_never_a_tr
     assert "PRE-EXISTING DIAGNOSIS LINE" in out
     assert "RESTORE FAILED" in out
     assert "Traceback" not in out
+
+
+_H9_ENDPOINTS = "EMBEDDER_URL=http://a:8070\nRERANKER_URL=http://a:8071\n"
+
+
+@pytest.mark.parametrize("fixture_text", [
+    _H9_ENDPOINTS + 'LLM_BACKENDS_JSON=[{"url":"http://a:5000"}]\n',    # CASE_JSON_USABLE
+    _H9_ENDPOINTS + "LLM_BACKENDS=http://a:5000\n",                    # CASE_CSV_LIVE
+    _H9_ENDPOINTS,                                                     # CASE_FALLBACK
+], ids=["case1_json_usable", "case3_csv_live", "case4_fallback"])
+def test_h9_same_generation_reapply_is_a_true_noop_property(tmp_path, monkeypatch, fixture_text):
+    """§6.4 obligation 4 / H9 (the whole point of the V2 same-generation
+    gate): a post-W4 `--apply` self-capture re-run on EVERY W3 case fixture
+    (case 1 JSON-usable, case 3 CSV-live, case 4 fallback) asserts THREE
+    things — rc == EXIT_OK, the file is BYTE-IDENTICAL, and NO NEW BACKUP
+    FILE appears (glob before/after) — because there is no boundary to
+    cross and therefore nothing effective to preserve. Mutation-checked
+    against the un-gated tool in HANDOFF.md (M-kill: removing the
+    `if not boundary_open` gate on cases 1/3/4 makes this go red for the
+    first two fixtures — case 4's non-interactive/no-preimage path already
+    happened to no-op pre-gate too, so it alone would not have caught the
+    regression; the property is asserted over the WHOLE set for that
+    reason)."""
+    _force_no_unit(monkeypatch)
+    env_path = _write_env(tmp_path, fixture_text)
+    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
+    home = tmp_path / "fake-home"
+    monkeypatch.setenv("HOME", str(home))
+    backup_dir = home / ".shared-memory" / "env-backups"
+    before = set(backup_dir.glob("*")) if backup_dir.exists() else set()
+
+    rc = m.do_apply_or_dryrun(None, True, _NO_UNIT)
+
+    assert rc == m.EXIT_OK
+    assert env_path.read_text() == fixture_text, "same-generation re-run must be byte-identical"
+    after = set(backup_dir.glob("*")) if backup_dir.exists() else set()
+    assert after == before, f"a same-generation no-op must never create a backup file: {after - before}"
 
 
 def test_glob_no_stray_temp_file_left_after_a_write(tmp_path, monkeypatch):

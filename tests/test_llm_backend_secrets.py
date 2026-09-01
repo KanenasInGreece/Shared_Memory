@@ -39,8 +39,8 @@ class _Req:
 
 
 def test_client_authorization_never_forwarded_to_llm_backend(monkeypatch):
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -124,7 +124,7 @@ def test_legacy_llm_backends_unaffected_when_json_unset(monkeypatch):
 
 def test_backend_model_override_rewrites_request_body(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "model": "custom-model-id"},
+        {"url": "http://a:5000", "model": "custom-model-id", "private_ok": True},
     ]))
     import hive_mind_proxy as g
     importlib.reload(g)
@@ -212,7 +212,10 @@ def test_all_json_backends_excluded_falls_back_LOUDLY_and_health_says_so(monkeyp
     importlib.reload(g)
 
     assert len(g.LLM_BACKENDS) > 0                  # fell back, never empty
-    assert g._select_llm_backend("", None)           # does not raise
+    # W4 default-deny (decision:1824): the fallback backend is undeclared, so
+    # it is no longer eligible for role-less traffic — _select_llm_backend
+    # returns None (the 422 case), never raises. Was: silently routed there.
+    assert g._select_llm_backend("", None) is None
     # RE-RULED v0.9.75 (review F6): the fallback still happens — an empty pool
     # would crash the selector — but it is no longer silent: the reason is
     # remembered and the llm_pool dependency reports DEGRADED with it.

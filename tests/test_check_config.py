@@ -288,6 +288,139 @@ def test_config_empty_and_fallback_reason_lines_are_mutually_exclusive(tmp_path)
     assert "NO BACKEND DECLARED" not in proc.stdout
 
 
+# ── §6.2 (M11 + case-0 census, W4/decision:1824) — present-but-empty /
+#    composed latents, report-only, rendered in Phase B as one scannable
+#    block. ────────────────────────────────────────────────────────────────
+
+def test_w4_census_zero_latents_on_a_clean_declared_fleet(tmp_path):
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "",
+                                "LLM_BACKENDS_JSON": '[{"url":"http://a:5000","private_ok":true}]'},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "W4 census" in proc.stdout
+    assert "0 latent case(s) present on this install." in proc.stdout
+
+
+def test_w4_census_counts_present_but_empty_encoder_key(tmp_path):
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS": "http://a:5000",
+                                "EMBEDDER_URL": ""},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "EMBEDDER_URL is present but EMPTY" in proc.stdout
+    assert "1 latent case(s) present on this install." in proc.stdout
+
+
+def test_w4_census_counts_present_but_empty_llm_backends_json(tmp_path):
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": ""},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "LLM_BACKENDS_JSON is present but EMPTY" in proc.stdout
+
+
+def test_w4_census_counts_the_llm_default_target_composed_empty_latent(tmp_path):
+    """The known latent framework_defaults.py documents: LLM_DEFAULT_TARGET
+    present-but-empty, with neither LLM_BACKENDS nor LLM_BACKENDS_JSON
+    declared, composes to `LLM_BACKENDS == ['']`."""
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_DEFAULT_TARGET": ""},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "LLM_BACKENDS composed to ['']" in proc.stdout
+
+
+# ── §6.3 (R-B announce, W4/decision:1824) — a roles-carrying entry with no
+#    explicit private_ok no longer serves role-less traffic. ───────────────
+
+def test_r_b_announce_on_a_roles_only_entry_with_no_explicit_private_ok(tmp_path):
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "",
+                                "LLM_BACKENDS_JSON": '[{"url":"http://a:5000","roles":["extract"]}]'},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "R-B (W4): role-less traffic no longer reaches this backend" in proc.stdout
+
+
+def test_r_b_announce_absent_when_private_ok_is_explicit(tmp_path):
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "",
+                                "LLM_BACKENDS_JSON":
+                                    '[{"url":"http://a:5000","roles":["extract"],"private_ok":true}]'},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "R-B (W4)" not in proc.stdout
+
+
+# ── QA HIGH-1 (fix round) — check_config renders M-5'/P-5' per-entry, the
+#    SECOND of the two nominated instruments (the startup log is the
+#    first). The closing "Gateway startup refusals ... none" line must
+#    also stop reading as an unqualified all-clear once either fires. ──────
+
+def test_m5_announce_on_a_credentialed_backend_with_neither_roles_nor_private_ok(tmp_path):
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "AGENT_TOKENS": "claude:tok_abc",
+                                "DEEPSEEK_API_KEY": "sk-test",
+                                "LLM_BACKENDS_JSON":
+                                    '[{"url":"https://api.deepseek.com/v1","token_env":"DEEPSEEK_API_KEY"}]'},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "M-5' (W4): configured but will NEVER be selected" in proc.stdout
+    assert "SEC M-1" in proc.stdout
+    assert "none — the gateway would boot with this configuration." in proc.stdout
+    assert "Degraded, not clean" in proc.stdout
+
+
+def test_m5_announce_absent_when_roles_are_declared(tmp_path):
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "AGENT_TOKENS": "claude:tok_abc",
+                                "DEEPSEEK_API_KEY": "sk-test",
+                                "LLM_BACKENDS_JSON":
+                                    '[{"url":"https://api.deepseek.com/v1","token_env":"DEEPSEEK_API_KEY",'
+                                    '"roles":["extract"]}]'},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "M-5' (W4)" not in proc.stdout
+    assert "Degraded, not clean" not in proc.stdout
+
+
+def test_p5_announce_roles_absent_says_safe_by_construction(tmp_path):
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "AGENT_TOKENS": "",
+                                "LLM_BACKENDS_JSON":
+                                    '[{"url":"http://a:5000","private_ok":false}]'},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "P-5' (W4)" in proc.stdout
+    assert "safe by construction" in proc.stdout
+    assert "NOT safe by construction" not in proc.stdout
+    assert "Degraded, not clean" in proc.stdout
+
+
+def test_p5_announce_roles_carrying_says_not_safe_by_construction(tmp_path):
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "AGENT_TOKENS": "",
+                                "LLM_BACKENDS_JSON":
+                                    '[{"url":"http://a:5000","private_ok":false,"roles":["extract"]}]'},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "P-5' (W4)" in proc.stdout
+    assert "NOT safe by construction" in proc.stdout
+
+
+def test_p5_announce_absent_on_an_undeclared_backend(tmp_path):
+    """The narrowed predicate (`private_ok_explicit AND not private_ok`)
+    must NOT fire on the pervasive, unremarkable default -- an undeclared
+    backend never states private_ok at all."""
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "AGENT_TOKENS": "",
+                                "LLM_BACKENDS_JSON": '[{"url":"http://a:5000","roles":["extract"]}]'},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "P-5' (W4)" not in proc.stdout
+
+
+def test_no_degraded_warning_qualifier_on_a_fully_explicit_clean_fleet(tmp_path):
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "AGENT_TOKENS": "claude:tok_abc",
+                                "LLM_BACKENDS_JSON": '[{"url":"http://a:5000","private_ok":true}]'},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "none — the gateway would boot with this configuration." in proc.stdout
+    assert "Degraded, not clean" not in proc.stdout
+    assert "M-5' (W4)" not in proc.stdout
+    assert "P-5' (W4)" not in proc.stdout
+
+
 # ── SEC-HIGH (fold round, PR #347) — check_config must be unable to print a
 #    raw secret through ANY exception path, in EITHER phase. Policy: ALWAYS
 #    the exception's type name; str(exc) shown (scrubbed) ONLY for the
@@ -413,6 +546,7 @@ class _FakeProxyMissingRoleErrors:
     LLM_BACKEND_PRIVATE_OK = {"http://a:5000": True}
     LLM_BACKEND_PRIVATE_OK_EXPLICIT = {"http://a:5000": False}
     LLM_POOL_FALLBACK_REASON = None
+    AUTH_CONFIGURED_AT_STARTUP = True  # QA HIGH-1 (fix round): now read for P-5' rendering
 
     @staticmethod
     def require_auth_when_provider_keys_configured():
@@ -436,6 +570,7 @@ class _FakeProxyMissingGuardFunctions:
     LLM_BACKEND_PRIVATE_OK_EXPLICIT = {}
     LLM_POOL_FALLBACK_REASON = None
     _LLM_BACKEND_ROLE_CONFIG_ERRORS = []
+    AUTH_CONFIGURED_AT_STARTUP = True
 
 
 def _patch_import_to_return(monkeypatch, fake_module):

@@ -184,7 +184,7 @@ real id — the shipped default only suits servers that ignore the field. A sing
 non-default port is `LLM_DEFAULT_TARGET`. All framework and helper tooling reads `shared-memory/.env`
 first, with a repo-root `.env` honoured as a pre-0.6 fallback.
 
-**If Q3 turned up a backend needing a credential, use `LLM_BACKENDS_JSON` instead of `LLM_BACKENDS`.** This applies to a LOCAL backend behind a token (a llama-server on the LAN or tailnet) exactly as to a cloud API — same `token_env`, same key file under `~/.shared-memory/creds/<name>` (mode 600); tell the operator where to put the file and never ask for its contents. Plaintext `http` to a private address is accepted; to a public one the entry is excluded unless the operator sets `"plaintext_ok": true` (ops/README, "Reasoning-LLM backends"). The complete numbered walkthrough (encrypted store → `LoadCredential=` or a `<VAR_NAME>_FILE` runtime pointer → JSON entry with `token_env` plus the mandatory `private_ok`/`roles` choice → restart → verify on `/health`) and the full per-entry parameter table both live in `shared-memory/ops/README.md`, "Reasoning-LLM backends" — **follow them verbatim rather than improvising**; `.env.example` carries the short form beside `LLM_BACKENDS_JSON`. Three rules they encode: the literal key never goes in any file this framework writes — only the env-var **name**; the key at rest belongs in an encrypted store (`pass`/GPG/`systemd-creds`), with **`LoadCredential=` or a runtime `<VAR_NAME>_FILE`** (SEC-06, PR A4) preferred over `systemctl --user import-environment`, which is deprecated (readable by any same-uid process via `show-environment`, and inherited by every user unit); and a credentialed entry with neither `roles` nor an explicit `private_ok` refuses gateway startup by design — ask the operator which they want; never pick for them.
+**If Q3 turned up a backend needing a credential, use `LLM_BACKENDS_JSON` instead of `LLM_BACKENDS`.** This applies to a LOCAL backend behind a token (a llama-server on the LAN or tailnet) exactly as to a cloud API — same `token_env`, same key file under `~/.shared-memory/creds/<name>` (mode 600); tell the operator where to put the file and never ask for its contents. Plaintext `http` to a private address is accepted; to a public one the entry is excluded unless the operator sets `"plaintext_ok": true` (ops/README, "Reasoning-LLM backends"). The complete numbered walkthrough (encrypted store → `LoadCredential=` or a `<VAR_NAME>_FILE` runtime pointer → JSON entry with `token_env` plus the mandatory `private_ok`/`roles` choice → restart → verify on `/health`) and the full per-entry parameter table both live in `shared-memory/ops/README.md`, "Reasoning-LLM backends" — **follow them verbatim rather than improvising**; `.env.example` carries the short form beside `LLM_BACKENDS_JSON`. Three rules they encode: the literal key never goes in any file this framework writes — only the env-var **name**; the key at rest belongs in an encrypted store (`pass`/GPG/`systemd-creds`), with **`LoadCredential=` or a runtime `<VAR_NAME>_FILE`** (SEC-06, PR A4) preferred over `systemctl --user import-environment`, which is deprecated (readable by any same-uid process via `show-environment`, and inherited by every user unit); and a credentialed entry with neither `roles` nor an explicit `private_ok` is never selected under default-deny (safe by construction, but loudly warned about at startup and by `check_config.py`) — ask the operator which they want; never pick for them.
 
 ### Phase 2 — Preflight
 
@@ -1099,19 +1099,32 @@ migrate_env.py --capture-preimage <out.json>     # capture only (used by update_
 migrate_env.py [--preimage <in.json>] [--apply]  # evaluate / apply — default is a DRY-RUN PREVIEW
 ```
 
-**What it does, per install, first match wins:** an already-usable `LLM_BACKENDS_JSON` gets
-`"private_ok": true` added only to entries with no `token_env`/`roles`/`private_ok` of their own; a
-live `LLM_BACKENDS` (CSV) line gets converted to the JSON form (effective `private_ok: true`) and
-commented out with a dated provenance line, never deleted; nothing declared at all (the bare
-fallback) is **advisory-probed and asks the operator to confirm** — interactively only, with a 60s
-deadline (anything but `y` = no write, and it asks again at the next upgrade); every other
-population (roles-carrying entries, a credentialed backend with neither key, any key the systemd
-unit itself owns, an empty `LLM_BACKENDS_JSON=`) is **left untouched and reported by name** — this
-tool refuses to write in every case where a human decision is actually owed. It proves the
-migration changed nothing BEHAVIOURAL by capturing the effective config before and after and
-comparing them (urls, weights, credentials-present, roles, fit numbers, effective `private_ok`,
-both startup-guard verdicts) — any divergence restores the pre-migration backup and refuses,
-naming it. **Predicted no-op on an install that is already fully explicit** — any write there is a
+**What it does, per install, first match wins — GATED on an actual loader-semantics boundary
+(Ruling A(a)/V2, W4):** every write this tool can make (`private_ok: true` added to an
+already-usable `LLM_BACKENDS_JSON`'s bare entries; a live `LLM_BACKENDS` CSV converted to the JSON
+form; the bare `LLM_DEFAULT_TARGET` fallback materialised) exists **only to preserve a pre-W4
+install's effective behaviour across the default-deny flip.** It therefore plans a write **only
+when the pre-image it is comparing against was captured by OLD (pre-W4) loader code** — i.e. the
+boundary between "undeclared defaults to on" and "undeclared defaults to off" is actually crossed.
+When the pre-image is already current-generation (which a **self-capture run always is** — pre and
+post are both computed by the loader you are currently running), there is no prior effective
+behaviour to preserve, so the tool reports "already reflects the CURRENT loader generation... would
+be an OPINION, not a preserved behaviour" and **writes nothing** — even for cases that would
+otherwise be eligible (an already-usable JSON with bare entries, a live CSV, an undeclared
+fallback). Nothing declared at all, WHEN the boundary is genuinely open, is still
+**advisory-probed and asks the operator to confirm** — interactively only, with a 60s deadline
+(anything but `y` = no write, and it asks again at the next upgrade); non-interactively, with the
+boundary open and a materialisation genuinely needed, it now **refuses (`EXIT_STOP`)** rather than
+silently leaving the gateway serving nothing (Ruling D(a) V1) — re-run interactively, declare
+`LLM_BACKENDS_JSON` yourself, or pass `--skip-env-migration`. Every other population (roles-carrying
+entries, a credentialed backend with neither key, any key the systemd unit itself owns, an empty
+`LLM_BACKENDS_JSON=`) is **left untouched and reported by name** regardless of boundary state — this
+tool refuses to write in every case where a human decision is actually owed. It proves any
+boundary-crossing migration changed nothing BEHAVIOURAL by capturing the effective config before
+and after and comparing them (urls, weights, credentials-present, roles, fit numbers, effective
+`private_ok` under Layer-2 planned-direction rules, both startup-guard verdicts) — any divergence
+restores the pre-migration backup and refuses, naming it. **Predicted no-op on an install that is
+already fully explicit, or already on the current loader generation** — any write there is a
 finding, not the expected case.
 
 **`--skip-env-migration`** skips both steps 0 and 3 for one run — a capture/migration bug must not
@@ -1128,20 +1141,33 @@ uv run --no-project --with-requirements requirements-gateway.lock \
     python shared-memory/scripts/migrate_env.py --apply       # apply, same self-capture
 ```
 
-This is also the **live-proof procedure for a host whose running updater predates step 0/3** (see
-the version-jump note below) — the standalone `--apply` run is safe to run at any time; it self-
-captures with the CURRENT loader (valid only while loader semantics are unchanged from the running
-version — true through W3) and is idempotent, so re-running it after it has already migrated a host
-reports "nothing to do" rather than re-touching anything.
+This standalone `--apply` run is safe to run at any time and is idempotent — but on a post-W4
+checkout **it self-captures with the CURRENT (post-flip) loader, so pre and post are always the
+same generation and the boundary never opens.** It proves the tool is a true no-op on an
+already-current install (the §6.4 H9 property test is exactly this, mutation-checked); it does
+**not** materialise anything for a host that skipped the flip.
 
-⚠ **The pre-W3 → post-W4 version-jump case.** `update_framework.sh` never re-execs after its own
-`git pull` (git replaces the file, the running process keeps its old inode), so **the migration
-step only fires on an upgrade FROM a checkout that already has it** — a host upgrading directly
-from before W3 straight to W4 or later runs a pre-W3 updater with no capture/migrate step at all,
-and lands on the release that starts refusing to default an undeclared pool having never migrated.
-W4's "no backend declared" degraded reason names `migrate_env.py` explicitly for exactly this
-population — treat it as actionable, not silent: run the standalone procedure above once, by hand,
-on any host you know jumped more than one release in a single `git pull`.
+⚠ **The pre-W3 → post-W4 version-jump case (H8, §6.5 — remedy honesty).**
+`update_framework.sh` never re-execs after its own `git pull` (git replaces the file, the running
+process keeps its old inode), so **the migration step only fires on an upgrade FROM a checkout
+that already has it** — a host upgrading directly from before W3 straight to W4 or later runs a
+pre-W3 updater with no capture/migrate step at all, and lands on the release that starts refusing
+to default an undeclared pool having never migrated. **`migrate_env.py` cannot repair this after
+the fact by self-capturing** — a self-capture on the now-running post-W4 checkout is
+same-generation by construction (see above), so it plans nothing for exactly the population that
+needs it. W4's degraded `/health` reasons therefore do **not** name `migrate_env.py` for this
+runtime case — they name `check_config.py` and declaring `LLM_BACKENDS_JSON` explicitly, because a
+remedy that will correctly no-op is a false remedy. `migrate_env.py` remains the right tool only
+where it can still act: **during the update itself**, when `update_framework.sh` step 0 captures
+the pre-image with the OLD checkout BEFORE `git pull` — that pre-image genuinely predates the flip,
+so `--apply --preimage <that JSON>` after the pull crosses the boundary correctly. If you know a
+host jumped straight from before W3, its update never took that capture — the recovery is to
+**declare `LLM_BACKENDS_JSON` explicitly yourself** (see `check_config.py`'s per-backend census and
+`shared-memory/ops/README.md`, "Reasoning-LLM backends"), not to invoke `migrate_env.py`
+standalone after the fact. **Nothing is lost:** declare the SAME URL(s) the old `LLM_BACKENDS` CSV
+(or bare `LLM_DEFAULT_TARGET`) named, adding `"private_ok": true` to each one you want serving
+role-less traffic exactly as before — a one-line edit, not a data-losing operation; the corpus, the
+credentials, and every other config are unaffected either way.
 
 ### Reconcile the stack to the shipped pins
 

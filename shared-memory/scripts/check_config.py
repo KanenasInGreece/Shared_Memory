@@ -111,7 +111,14 @@ place LLM_BACKEND_PRIVATE_OK_EXPLICIT becomes visible outside the code), and
 any collected role_config_errors (each element defensively re-scrubbed —
 belt-and-braces, since _load_llm_backends() already scrubs every URL it
 puts in that list at construction time). extra_body is deliberately NOT
-rendered here — that display belongs to a later wave.
+rendered here — that display belongs to a later wave. QA HIGH-1 (fix
+round): a per-entry ⚠ line also renders for the M-5' shape (credentialed,
+neither `roles` nor an explicit `private_ok`) and the P-5' shape (auth
+off, `private_ok` EXPLICITLY false) — the SECOND of the two instruments
+the brief nominated for those checks, alongside the gateway's own startup
+log line. The "Gateway startup refusals ... none" closing line is
+qualified whenever either fires, so it never reads as an all-clear for a
+degraded pool.
 
 Three proxy-module symbols this script depends on (QA Q3, fold round) are
 accessed via guarded getattr(), same defensive shape hive_mind_proxy.py
@@ -296,6 +303,38 @@ def phase_a_render() -> "tuple[list[str], bool]":
     return lines, True
 
 
+def _w4_census_lines(proxy) -> "list[str]":
+    """§6.2 (M11 + case-0 census, W4): three specific present-but-empty /
+    composed latents, counted and rendered LOUDLY here — REPORT ONLY, no
+    behaviour change (0 on our fleet is the expected, verified reading).
+    Phase B (not Phase A) because the third item needs the gateway's own
+    COMPUTED LLM_BACKENDS to observe the composition, and grouping all
+    three here makes it one scannable block instead of three facts
+    scattered across two phases."""
+    lines: "list[str]" = ["", "W4 census (present-but-empty / composed latents — report only, "
+                               "no behaviour change):"]
+    count = 0
+    for key in ("EMBEDDER_URL", "RERANKER_URL"):
+        raw = os.environ.get(key)
+        if raw is not None and raw.strip() == "":
+            lines.append(f"  {key} is present but EMPTY (distinct from absent) — the "
+                         f"'or'-idiom falls back to the framework default anyway.")
+            count += 1
+    raw_json = os.environ.get("LLM_BACKENDS_JSON")
+    if raw_json is not None and raw_json.strip() == "":
+        lines.append("  LLM_BACKENDS_JSON is present but EMPTY — never used; the legacy "
+                     "LLM_BACKENDS/LLM_DEFAULT_TARGET pool is what actually serves "
+                     "(migrate_env.py's own case 0, CASE_JSON_PRESENT_EMPTY).")
+        count += 1
+    if list(getattr(proxy, "LLM_BACKENDS", [])) == [""]:
+        lines.append("  LLM_BACKENDS composed to [''] — LLM_DEFAULT_TARGET is present but "
+                     "EMPTY and neither LLM_BACKENDS nor LLM_BACKENDS_JSON is declared; "
+                     "the gateway will attempt to route to an empty URL.")
+        count += 1
+    lines.append(f"  {count} latent case(s) present on this install.")
+    return lines
+
+
 def phase_b_render() -> "tuple[list[str], int]":
     """Returns (lines, exit_code). Never raises: a daemon-side import
     failure (bad encoder URL, a malformed LLM_BACKENDS_JSON entry shape, or
@@ -339,14 +378,25 @@ def phase_b_render() -> "tuple[list[str], int]":
     # — so this never doubles up with the warning block just printed.
     config_empty = getattr(proxy, "LLM_POOL_CONFIG_EMPTY", False)
     if config_empty:
+        # Remedy honesty (§6.5): migrate_env.py's same-generation gate means
+        # it correctly plans NOTHING for an install already on the current
+        # loader semantics — naming it here as the fix would be a false
+        # remedy. Declare LLM_BACKENDS_JSON directly instead.
         lines.append("⚠ NO BACKEND DECLARED — the gateway is falling back to "
                      + scrub_url_credentials(str(getattr(proxy, "DEFAULT_TARGET", "")))
-                     + " (LLM_DEFAULT_TARGET/its own built-in default). Run "
-                       "migrate_env.py to declare it explicitly.")
+                     + " (LLM_DEFAULT_TARGET/its own built-in default), and it is now "
+                       "INELIGIBLE for role-less traffic (W4 default-deny). Declare "
+                       "LLM_BACKENDS_JSON yourself.")
         lines.append("")
 
     if not proxy.LLM_BACKENDS:
         lines.append("(no backends configured)")
+    # QA HIGH-1 (fix round): M-5'/P-5' are DEGRADED WARNINGS now (never a
+    # SystemExit) — set True the moment either fires anywhere in the fleet,
+    # so the "Gateway startup refusals" closing line below can stop reading
+    # as an unqualified all-clear (neither guard function raises for
+    # either shape, so "none" alone would say "clean" for a degraded pool).
+    any_degraded_warnings = False
     for url in proxy.LLM_BACKENDS:
         lines.append(f"  {scrub_url_credentials(url)}")
         lines.append(f"    weight={proxy.LLM_WEIGHTS.get(url, 1.0)}")
@@ -354,11 +404,64 @@ def phase_b_render() -> "tuple[list[str], int]":
         roles = proxy.LLM_BACKEND_ROLES.get(url)
         lines.append(f"    roles={sorted(roles) if roles else None}")
         lines.append(f"    n_ctx={proxy.LLM_BACKEND_NCTX.get(url)}")
-        lines.append(f"    has_credential={proxy.LLM_BACKEND_TOKENS.get(url) is not None}")
-        lines.append(
-            f"    private_ok={proxy.LLM_BACKEND_PRIVATE_OK.get(url, True)} "
-            f"(explicit={proxy.LLM_BACKEND_PRIVATE_OK_EXPLICIT.get(url, False)})"
-        )
+        has_credential = proxy.LLM_BACKEND_TOKENS.get(url) is not None
+        lines.append(f"    has_credential={has_credential}")
+        explicit = proxy.LLM_BACKEND_PRIVATE_OK_EXPLICIT.get(url, False)
+        private_ok = proxy.LLM_BACKEND_PRIVATE_OK.get(url, False)
+        lines.append(f"    private_ok={private_ok} (explicit={explicit})")
+        # R-B announce (§6.3, W4/decision:1824): a roles-carrying entry with
+        # no explicit private_ok used to also serve role-less traffic (the
+        # plain default was True); it no longer does. Source-pinned
+        # alongside the CHANGELOG opt-back line this release drafts.
+        if roles and not explicit:
+            lines.append(
+                "    ⚠ R-B (W4): role-less traffic no longer reaches this backend — "
+                "add \"private_ok\": true to opt back in."
+            )
+        # M-5' announce (QA HIGH-1, fix round): mirrors
+        # require_valid_llm_routing_config()'s own predicate exactly — a
+        # credentialed backend with NEITHER `roles` NOR an explicit
+        # `private_ok` is configured but will NEVER be selected under
+        # default-deny. The gateway boots (a WARNING, never a refusal) —
+        # this is the per-entry rendering the brief named as the SECOND
+        # of the two instruments for this check, alongside the startup
+        # log line. SEC M-1: the credential is still probed on every
+        # /health cycle even though the backend can serve nothing.
+        if has_credential and roles is None and not explicit:
+            any_degraded_warnings = True
+            lines.append(
+                "    ⚠ M-5' (W4): configured but will NEVER be selected — declare "
+                "\"roles\" or \"private_ok\" explicitly. Its credential is still "
+                "sent on every /health probe cycle even though it can serve "
+                "nothing (SEC M-1) — remove the entry if you did not mean to "
+                "attach the key."
+            )
+        # P-5' announce (QA HIGH-1 / SEC H-1, fix round): mirrors
+        # require_valid_llm_routing_config()'s own narrowed predicate — auth
+        # is OFF (AGENT_TOKENS unset) and this entry's private_ok was
+        # EXPLICITLY set false. SEC H-1: "safe by construction" is true only
+        # for the roles-ABSENT subset (no roles + private_ok=false really
+        # does serve nothing); a `roles`-carrying entry in this state still
+        # serves every caller those roles — auth off means the gateway
+        # cannot tell callers apart — so this is said honestly, not
+        # papered over as a blanket safety claim.
+        if not proxy.AUTH_CONFIGURED_AT_STARTUP and explicit and not private_ok:
+            any_degraded_warnings = True
+            if roles:
+                lines.append(
+                    "    ⚠ P-5' (W4): AGENT_TOKENS is unset (auth off) and private_ok "
+                    "is explicitly false, but this entry still declares "
+                    f"roles={sorted(roles)} — NOT safe by construction: those roles "
+                    "still serve EVERY caller, and with auth off the gateway cannot "
+                    "tell callers apart. Set AGENT_TOKENS if that scoping was meant "
+                    "to be enforceable."
+                )
+            else:
+                lines.append(
+                    "    ⚠ P-5' (W4): AGENT_TOKENS is unset (auth off) and private_ok "
+                    "is explicitly false — safe by construction (no roles, so this "
+                    "backend already serves nothing)."
+                )
 
     # QA Q3 (fold round, LOW): guarded getattr on the one PRIVATE proxy
     # symbol this script reads, same defensive shape hive_mind_proxy.py
@@ -380,6 +483,8 @@ def phase_b_render() -> "tuple[list[str], int]":
             # against a future change to that construction site silently
             # dropping the scrub.
             lines.append(f"    {scrub_url_credentials(str(e))}")
+
+    lines.extend(_w4_census_lines(proxy))
 
     lines.append("")
     lines.append("Gateway startup refusals (calling the gateway's own guard functions):")
@@ -408,7 +513,17 @@ def phase_b_render() -> "tuple[list[str], int]":
         # time; this re-wrap guards against a future change there.
         lines.append("  WOULD REFUSE TO START: " + scrub_url_credentials(str(exc)))
         return lines, 1
-    lines.append("  none — the gateway would boot with this configuration.")
+    # QA HIGH-1 (fix round): "none" here used to be read as an unqualified
+    # all-clear — but neither guard function raises for M-5'/P-5' any more,
+    # so a fleet with one or more ⚠ lines above would print this exact
+    # sentence too. Qualify it rather than let "none" carry a meaning it no
+    # longer has; the base sentence text is left intact (tests key on it).
+    closing = "  none — the gateway would boot with this configuration."
+    if any_degraded_warnings:
+        closing += (" ⚠ Degraded, not clean — see the M-5'/P-5' warning(s) above: "
+                    "the gateway boots, but not every backend you configured serves "
+                    "what you may have intended.")
+    lines.append(closing)
     return lines, 0
 
 

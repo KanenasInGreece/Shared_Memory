@@ -716,3 +716,39 @@ def test_a_table_the_chain_drops_is_dropped_by_its_own_migration():
             f"{drops[table]} — the DROP must be in a later-numbered migration, "
             "or an already-upgraded install never loses the table."
         )
+
+
+# ── §2b source-pin (W4 default-deny, decision:1824) — QA MED-1, fix round ──
+# The brief's own accounting was off by one: 8 `.get(..., False)` sites
+# survive repo-wide, not 7 (the P-5' rewrite kept a dict-miss read at
+# hive_mind_proxy.py:5329 — correct code, wrong count in the brief). The
+# behaviourally important half is the SECOND assertion: zero sites anywhere
+# read a `True` default — that would silently widen the default's reach.
+
+def test_llm_backend_private_ok_default_source_pin():
+    """§2b (QA MED-1, fix round): the honest measured count of every
+    `LLM_BACKEND_PRIVATE_OK.get(..., False)` read repo-wide — 8, not the
+    brief's original 7 — plus the invariant that actually matters: no site
+    anywhere reads a `True` default for this field. A regression on either
+    count is a real widening of default-deny's reach, not a cosmetic
+    accounting slip."""
+    total_false_default = 0
+    true_default_hits = []
+    for fname in sorted(os.listdir(_SCRIPTS)):
+        if not fname.endswith(".py"):
+            continue
+        text = _read("shared-memory", "scripts", fname)
+        total_false_default += len(
+            re.findall(r"LLM_BACKEND_PRIVATE_OK\.get\([^)]*,\s*False\)", text))
+        true_default_hits += [
+            f"{fname}: {hit}" for hit in
+            re.findall(r"LLM_BACKEND_PRIVATE_OK\.get\([^)]*,\s*True\)", text)
+        ]
+    assert total_false_default == 8, (
+        f"expected exactly 8 `.get(..., False)` sites on LLM_BACKEND_PRIVATE_OK, "
+        f"found {total_false_default} — count moved, re-verify against the ruled default"
+    )
+    assert true_default_hits == [], (
+        f"a `.get(..., True)` default on LLM_BACKEND_PRIVATE_OK exists — this "
+        f"silently widens default-deny's reach: {true_default_hits}"
+    )

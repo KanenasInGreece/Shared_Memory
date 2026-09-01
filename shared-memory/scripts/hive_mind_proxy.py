@@ -226,9 +226,10 @@ def _parse_backend(entry: str) -> tuple[str, float]:
 #                  degenerate case, every existing install unchanged).
 #   n_ctx          int, the model's usable context in tokens. Absent = no fit
 #                  information (this backend always "fits").
-#   private_ok     bool. Default = (no token_env present) — an uncredentialed
-#                  (local) backend defaults True, a provider-credentialed one
-#                  defaults False. An EXPLICIT value always wins either way.
+#   private_ok     bool. Default = False, unconditionally — an undeclared
+#                  backend (credentialed or not) serves no role-less traffic
+#                  until this is set true (W4 default-deny, decision:1824).
+#                  An EXPLICIT value of either true or false always wins.
 #   max_inflight   int, per-backend concurrency ceiling. Absent = unbounded
 #                  (today's behavior).
 #   price_per_mtok_in / price_per_mtok_out — optional operator metadata,
@@ -494,11 +495,12 @@ def _load_llm_backends() -> tuple[
             roles[url] = _parse_roles(url, entry.get("roles"))
             n_ctxs[url] = n_ctx_raw
             max_inflights[url] = max_inflight_raw
-            # Default = (no token_env present): uncredentialed/local backend
-            # defaults True, provider-credentialed defaults False. Explicit
-            # value (private_ok_raw is not None) always wins either way.
+            # W4 default-deny (decision:1824): an entry with no explicit
+            # private_ok defaults to False — undeclared backends serve
+            # nothing, credentialed or not. Explicit value
+            # (private_ok_raw is not None) always wins either way.
             private_ok_explicit[url] = private_ok_raw is not None
-            private_oks[url] = private_ok_raw if private_ok_raw is not None else (token is None)
+            private_oks[url] = private_ok_raw if private_ok_raw is not None else False
             price_ins[url] = entry.get("price_per_mtok_in")
             price_outs[url] = entry.get("price_per_mtok_out")
         if urls:
@@ -531,11 +533,14 @@ def _load_llm_backends() -> tuple[
         LLM_POOL_CONFIG_EMPTY = False
     urls = [u for u, _ in _raw_backends]
     weights = {u: w for u, w in _raw_backends}
-    # Legacy comma form (and the DEFAULT_TARGET fallback) never carries a
-    # credential, so every backend it produces defaults private_ok=True,
-    # roles absent (serves-all) — I-5a: byte-identical to v0.9.12 selection.
+    # Legacy comma form (and the DEFAULT_TARGET fallback) never declares
+    # private_ok explicitly, so W4 default-deny (decision:1824) applies:
+    # every backend it produces defaults private_ok=False, roles absent
+    # (serves-all traffic reaches none of them until declared). Retired
+    # invariant, no longer true: a descriptor-less fleet used to be
+    # eligible for everything (I-5a); it is now eligible for nothing.
     return (urls, weights, {u: None for u in urls}, {u: None for u in urls}, {u: None for u in urls},
-            {u: None for u in urls}, {u: None for u in urls}, {u: True for u in urls},
+            {u: None for u in urls}, {u: None for u in urls}, {u: False for u in urls},
             {u: False for u in urls}, {u: None for u in urls}, {u: None for u in urls},
             {u: None for u in urls}, [])
 
@@ -555,6 +560,30 @@ LLM_BACKEND_PRICE_OUT: dict[str, "float | None"]
  LLM_BACKEND_ROLES, LLM_BACKEND_NCTX, LLM_BACKEND_PRIVATE_OK, LLM_BACKEND_PRIVATE_OK_EXPLICIT,
  LLM_BACKEND_MAX_INFLIGHT, LLM_BACKEND_PRICE_IN, LLM_BACKEND_PRICE_OUT,
  _LLM_BACKEND_ROLE_CONFIG_ERRORS) = _load_llm_backends()
+
+# W4 default-deny (§6.5, decision:1824) — a PURE environment-presence question,
+# computed ONCE at module level, NEVER inside _load_llm_backends(): the JSON
+# path RETURNS at its own branch and never reaches the legacy-CSV/fallback
+# branch, so a fact assigned only there would be silently defaulted (False)
+# for every JSON-declared install. True iff this install still carries either
+# legacy declaration shape (a live LLM_BACKENDS CSV, or a bare
+# LLM_DEFAULT_TARGET override) — the population a version jump from pre-W4
+# can land on with a now-ineligible fleet. Read directly wherever needed;
+# never cached inside a function (A8-purity, Opus A8).
+LLM_POOL_LEGACY_KEY_PRESENT: bool = (
+    "LLM_BACKENDS" in os.environ or "LLM_DEFAULT_TARGET" in os.environ)
+
+# Remedy honesty (§6.5): post-W4, at RUNTIME, migrate_env.py's same-generation
+# gate (§6.4 V2) means it deliberately plans nothing for an install already on
+# current loader semantics — naming it here would be a false remedy ("run this
+# tool" when the tool will correctly no-op). The actionable remedy at runtime
+# is check_config.py's per-backend census plus declaring LLM_BACKENDS_JSON
+# explicitly; migrate_env.py is named instead where it CAN act: its own
+# boundary-crossing report during an update, and AGENTS.md's documented
+# pre-W3 -> post-W4 jump procedure.
+_LLM_POOL_LEGACY_REMEDY = (
+    "run check_config.py and declare LLM_BACKENDS_JSON explicitly "
+    "(private_ok/roles) — see GET /health")
 
 
 def _apply_backend_body_overrides(body: bytes, model: "str | None",
@@ -920,24 +949,28 @@ def _serves_all(url: str) -> bool:
     gated by private_ok (the ONLY place private_ok gates a serves-all
     candidate; an explicit roles list is its own opt-in and is never gated
     by private_ok, see _role_eligible)."""
-    return LLM_BACKEND_ROLES.get(url) is None and LLM_BACKEND_PRIVATE_OK.get(url, True)
+    return LLM_BACKEND_ROLES.get(url) is None and LLM_BACKEND_PRIVATE_OK.get(url, False)
 
 
 def _role_eligible(url: str, role: str) -> bool:
     """Role+privacy eligibility (P-1/P-3, I-1a) — the HARD PRE-FILTER's role
-    axis, independent of health/cooldown/reserved/cap. Role-carrying traffic:
-    eligible iff (roles absent AND private_ok) OR role in roles — an explicit
-    roles list is itself the per-function privacy opt-in (I-1), so a
-    private_ok=false backend CAN be eligible for a role it explicitly lists.
-    Role-less traffic: eligible on any private_ok backend; the roles list is
-    IGNORED (a local card pinned to "extract" must not refuse an ad-hoc
-    authenticated chat, R-3) — and a private_ok=false backend is NEVER
-    eligible for role-less traffic, regardless of its roles list."""
+    axis, independent of health/cooldown/reserved/cap. R-3′ (decision:1824,
+    reversing R-3/decision:1357): role-less traffic reaches ONLY backends
+    with an explicit private_ok: true; a roles-carrying backend without it
+    serves exactly its declared roles; an undeclared backend serves nothing.
+    Role-carrying traffic: eligible iff (roles absent AND private_ok) OR role
+    in roles — an explicit roles list is itself the per-function privacy
+    opt-in (I-1), so a private_ok=false backend CAN be eligible for a role it
+    explicitly lists. Role-less traffic: eligible ONLY on an explicit
+    private_ok=true backend; the roles list is IGNORED for role-less
+    traffic — a role-carrying backend with no privacy opt-in now serves
+    nothing role-less (R-B, W4), and a private_ok=false/undeclared backend is
+    NEVER eligible for role-less traffic, regardless of its roles list."""
     roles = LLM_BACKEND_ROLES.get(url)
     if not role:
-        return LLM_BACKEND_PRIVATE_OK.get(url, True)
+        return LLM_BACKEND_PRIVATE_OK.get(url, False)
     if roles is None:
-        return LLM_BACKEND_PRIVATE_OK.get(url, True)
+        return LLM_BACKEND_PRIVATE_OK.get(url, False)
     return role in roles
 
 
@@ -978,7 +1011,51 @@ def _all_roles_ineligible() -> "str | None":
     next call — there is no startup-cached census to go stale (Opus F3)."""
     if any(_eligible_backends(r) for r in ("",) + tuple(sorted(ROUTING_ROLE_NAMES))):
         return None
-    return "configured, but no backend is eligible for any traffic"
+    reason = "configured, but no backend is eligible for any traffic"
+    if LLM_POOL_LEGACY_KEY_PRESENT:
+        # W4 (§6.5): the canonical version-jump shape — a live LLM_BACKENDS
+        # CSV (or bare LLM_DEFAULT_TARGET) that used to serve role-less
+        # traffic implicitly and now serves nothing. LLM_POOL_CONFIG_EMPTY is
+        # False for a live CSV (D1), so this is the ONLY reason string that
+        # carries the remedy for that shape.
+        reason = f"{reason}; {_LLM_POOL_LEGACY_REMEDY}"
+    return reason
+
+
+def _declaration_gap() -> "str | None":
+    """Ruling E(α2) 2026-09-01 (§5, decision:1824): a two-valued fact the
+    422 body's `declaration` key carries when the POOL'S SHAPE, not merely
+    which gate fired, explains why nothing is eligible. Iterates
+    ``LLM_POOL`` (:698 — the map the refusal was actually computed over;
+    NOT ``LLM_BACKENDS``, which the dream-side functions iterate). Arms
+    evaluated IN ORDER (V6):
+
+    1. ANY entry carries an explicit `private_ok` of EITHER value -> None.
+       Something was deliberately declared — including a fleet that
+       explicitly scoped itself AWAY from role-less traffic; that is not a
+       misconfiguration, it keeps the plain refusal and a FATAL A8.
+    2. "none" iff every entry has `private_ok_explicit` False AND `roles`
+       None — nothing was EVER declared (legacy CSV and the built-in
+       fallback land here). An EMPTY LLM_POOL vacuously satisfies this arm
+       (`all()` over nothing is True) -> "none", deliberately (pinned by
+       test — arm 1's `any()` over nothing is False, so it falls through
+       here rather than short-circuiting to None).
+    3. else "no_role_less_opt_in" — roles exist somewhere, but no privacy
+       intent was EVER stated (the R-B population; the refusal carries the
+       opt-back remedy this wave announces).
+    """
+    if any(LLM_BACKEND_PRIVATE_OK_EXPLICIT.get(b, False) for b in LLM_POOL):
+        return None
+    if all(LLM_BACKEND_PRIVATE_OK_EXPLICIT.get(b, False) is False
+           and LLM_BACKEND_ROLES.get(b) is None for b in LLM_POOL):
+        return "none"
+    return "no_role_less_opt_in"
+
+
+_DECLARATION_GAP_REMEDY = {
+    "none": "declare LLM_BACKENDS_JSON explicitly (private_ok/roles); see check_config.py / migrate_env.py",
+    "no_role_less_opt_in": "add \"private_ok\": true to a role-less-eligible entry, or opt back in explicitly; see check_config.py",
+}
 
 
 def _classify_no_eligible_constraint(role: str, est_prompt_tokens: float,
@@ -1064,7 +1141,7 @@ def _counts_free_slot(url: str) -> bool:
     LOUDLY at startup for that case instead of leaving it silent."""
     roles = LLM_BACKEND_ROLES.get(url)
     if roles is None:
-        return LLM_BACKEND_PRIVATE_OK.get(url, True)
+        return LLM_BACKEND_PRIVATE_OK.get(url, False)
     return ROUTING_ROLE_NAMES <= roles
 
 
@@ -1671,6 +1748,18 @@ class AsyncHiveMindProxy:
                 _record_no_eligible_backend(constraint)
                 refusal_body = {"error": "no_eligible_backend",
                                 "constraint": constraint, "role": role or None}
+                # Ruling C(α)/E(α2) (§5): additive `declaration` key — never
+                # touches the `constraint` vocabulary or either daemon's
+                # three-keys-only parse (rem_loop.py:161-ish,
+                # consolidation_loop.py:833-ish both `.get` three keys).
+                declaration = _declaration_gap()
+                if declaration is not None:
+                    refusal_body["declaration"] = declaration
+                    log.warning(
+                        "no_eligible_backend refusal carries declaration=%s "
+                        "(role=%s, constraint=%s) — remedy: %s",
+                        declaration, role or "(role-less)", constraint,
+                        _DECLARATION_GAP_REMEDY.get(declaration, "declare explicitly"))
                 if constraint == "fit":
                     # R-5 disposition (decision:1357): retry-without-charge
                     # STANDS as ruled (F-1: a config gap is not a record
@@ -4138,9 +4227,16 @@ def _llm_pool_dependency(backend_status: dict) -> dict:
         # NEW (decision:1832): nothing was declared and the built-in fallback
         # is up — visible now, rather than reading `ok` like every prior
         # release. See the docstring's item 3+.
-        reasons.append(
+        config_empty_reason = (
             f"no backend declared — serving the built-in "
             f"{scrub_url_credentials(DEFAULT_TARGET)} fallback")
+        if LLM_POOL_LEGACY_KEY_PRESENT:
+            # W4 (§6.5): a bare LLM_DEFAULT_TARGET override is a legacy shape
+            # too (Operator ruling: it alone is NOT a declaration) — the
+            # remedy rides this reason exactly like it rides
+            # _all_roles_ineligible's below.
+            config_empty_reason = f"{config_empty_reason}; {_LLM_POOL_LEGACY_REMEDY}"
+        reasons.append(config_empty_reason)
     if bad:
         reasons.append(f"{len(bad)}/{len(backend_status)} backend(s) down")
     ineligible_reason = _all_roles_ineligible()
@@ -4497,7 +4593,7 @@ def _config_snapshot() -> dict:
              # itself stays price-agnostic (M-4).
              "roles": sorted(LLM_BACKEND_ROLES[b]) if LLM_BACKEND_ROLES.get(b) else None,
              "n_ctx": LLM_BACKEND_NCTX.get(b),
-             "private_ok": LLM_BACKEND_PRIVATE_OK.get(b, True),
+             "private_ok": LLM_BACKEND_PRIVATE_OK.get(b, False),
              "max_inflight": LLM_BACKEND_MAX_INFLIGHT.get(b),
              "price_per_mtok_in": LLM_BACKEND_PRICE_IN.get(b),
              "price_per_mtok_out": LLM_BACKEND_PRICE_OUT.get(b)}
@@ -5180,20 +5276,32 @@ def require_valid_llm_routing_config() -> None:
     collection itself, not just a genuinely misconfigured gateway.
 
     1. Unknown `roles` entry — collected by _load_llm_backends() into
-       _LLM_BACKEND_ROLE_CONFIG_ERRORS at parse time; raised here.
-    2. M-5 (Critical): a credentialed (token_env resolved) backend with
-       NEITHER `roles` NOR an EXPLICIT `private_ok` would silently go dark
-       under the plain default — a cloud-only install bricked on upgrade.
-       Demands the operator pick one: private_ok: true (today's
-       serve-everything) or roles: [...] (per-function opt-in).
-    3. P-5: auth OFF (no AGENT_TOKENS configured) + ANY private_ok=false
-       backend configured → refuse (without identities, I-1/I-6 privacy and
-       steering invariants cannot hold — a backend deliberately scoped away
-       from serving arbitrary/private traffic is meaningless if every
-       caller is anonymous and indistinguishable). Governed by the SAME
-       override env S-05 uses (ALLOW_UNAUTHENTICATED_PROVIDER_KEYS=1) —
-       reusing S-05's precedent rather than inventing a second knob for the
-       same "I have decided the risk is acceptable" declaration.
+       _LLM_BACKEND_ROLE_CONFIG_ERRORS at parse time; raised here. UNCHANGED
+       by W4 — still fatal.
+    2. M-5′ (W4, decision:1824 — was Critical/fatal, now a DEGRADED WARNING):
+       a credentialed (token_env resolved) backend with NEITHER `roles` NOR
+       an EXPLICIT `private_ok` used to be bricked SILENT under the old
+       default (private_ok defaulted True for it); under default-deny it is
+       simply never selected (private_ok defaults False) — safe by
+       construction, so refusing startup over it is no longer warranted.
+       Loud startup log instead, plus check_config's per-entry rendering
+       (H2/H3 posture — no new /health surface, decision:1785).
+    3. P-5′ (W4): auth OFF (no AGENT_TOKENS configured) AND a backend whose
+       `private_ok` was EXPLICITLY set to false (not merely defaulted) →
+       loud startup log, never a refusal. Narrowed from the old "ANY
+       private_ok=false" predicate because under default-deny that is now
+       the pervasive, unremarkable default for every undeclared backend —
+       only an OPERATOR-STATED false (a deliberate scoping decision) is
+       still worth a word. SEC H-1 (fix round): "safe by construction" is
+       true ONLY for the roles-ABSENT subset — no `roles` plus
+       `private_ok=false` really does serve nothing. A backend that ALSO
+       carries `roles` is NOT safe by construction: those roles still serve
+       EVERY caller, and with auth off the gateway cannot tell callers
+       apart — the scoping is unenforceable, not harmless. The two
+       populations get two separate warnings below, worded accordingly. The
+       old ALLOW_UNAUTHENTICATED_PROVIDER_KEYS override branch is gone with
+       the exit it existed to bypass — S-05's own use of that knob
+       (require_auth_when_provider_keys_configured) is untouched.
     """
     if _LLM_BACKEND_ROLE_CONFIG_ERRORS:
         raise SystemExit(
@@ -5210,39 +5318,57 @@ def require_valid_llm_routing_config() -> None:
         and not LLM_BACKEND_PRIVATE_OK_EXPLICIT.get(b, False)
     )
     if needs_explicit_choice:
-        raise SystemExit(
-            "FATAL: credentialed LLM backend(s) configured with neither "
-            f"`roles` nor an explicit `private_ok`: "
-            f"{', '.join(scrub_url_credentials(b) for b in needs_explicit_choice)}. "
-            "Pick one in LLM_BACKENDS_JSON: private_ok: true (keep today's "
-            "serve-everything behavior) or roles: [\"extract\", \"judge\"] "
-            "(per-function opt-in, this backend never receives "
-            "role-less/other-function traffic). See shared-memory/.env.example."
+        # SEC M-1 (fix round): say the credential-still-probed consequence
+        # here too, not just in check_config's per-entry rendering — the
+        # startup log is the FIRST of the two nominated instruments and an
+        # operator who never runs check_config.py should see it here.
+        log.warning(
+            "credentialed LLM backend(s) configured with neither `roles` nor "
+            "an explicit `private_ok` — configured, but will never be "
+            "selected under default-deny (declare `roles` or `private_ok` "
+            "explicitly): %s. Its credential is still sent on every /health "
+            "probe cycle even though it can serve nothing — remove the "
+            "entry if you did not mean to attach the key. See "
+            "shared-memory/.env.example / check_config.py.",
+            ", ".join(scrub_url_credentials(b) for b in needs_explicit_choice),
         )
 
     if AUTH_CONFIGURED_AT_STARTUP:
         return
-    private_false = sorted(b for b in LLM_BACKENDS if not LLM_BACKEND_PRIVATE_OK.get(b, True))
-    if not private_false:
-        return
-    if os.environ.get("ALLOW_UNAUTHENTICATED_PROVIDER_KEYS", "").strip().lower() in ("1", "true", "yes", "on"):
-        log.warning(
-            "ALLOW_UNAUTHENTICATED_PROVIDER_KEYS is set — starting UNAUTHENTICATED "
-            "with private_ok=false backend(s) configured: %s. Without agent identities "
-            "the gateway cannot tell one caller from another, so a backend scoped away "
-            "from role-less/private traffic has no enforceable meaning. This is the "
-            "deliberate override documented in shared-memory/.env.example, not a default.",
-            ", ".join(scrub_url_credentials(b) for b in private_false),
-        )
-        return
-    raise SystemExit(
-        "FATAL: AGENT_TOKENS is unset (auth off) but private_ok=false backend(s) "
-        f"are configured ({', '.join(scrub_url_credentials(b) for b in private_false)}) — the privacy/steering "
-        "invariants (I-1/I-6) require a caller identity to enforce, which an "
-        "auth-off install cannot provide. Configure AGENT_TOKENS, or set "
-        "ALLOW_UNAUTHENTICATED_PROVIDER_KEYS=1 to run anyway (see "
-        "shared-memory/.env.example)."
+    private_false_explicit = sorted(
+        b for b in LLM_BACKENDS
+        if LLM_BACKEND_PRIVATE_OK_EXPLICIT.get(b, False)
+        and not LLM_BACKEND_PRIVATE_OK.get(b, False)
     )
+    if not private_false_explicit:
+        return
+    # SEC H-1 (fix round): "safe by construction" was claimed for BOTH
+    # subsets below; it is only true for the roles-ABSENT one. Split so
+    # each population gets the text that is actually true of it — see
+    # this function's own docstring for the mechanism (_may_steer_llm
+    # returns True unconditionally when auth is off; _role_eligible never
+    # consults private_ok on the role-carrying branch, by design, I-1).
+    roles_absent = sorted(b for b in private_false_explicit if LLM_BACKEND_ROLES.get(b) is None)
+    roles_carrying = sorted(b for b in private_false_explicit if LLM_BACKEND_ROLES.get(b) is not None)
+    if roles_absent:
+        log.warning(
+            "AGENT_TOKENS is unset (auth off) but private_ok=false backend(s) "
+            "with NO `roles` are EXPLICITLY configured (%s) — without caller "
+            "identities the privacy/steering invariants (I-1/I-6) have "
+            "nothing to enforce against, but this subset really is safe by "
+            "construction: no roles plus private_ok=false serves nothing at "
+            "all. Configure AGENT_TOKENS if that scoping was meant to matter.",
+            ", ".join(scrub_url_credentials(b) for b in roles_absent),
+        )
+    if roles_carrying:
+        log.warning(
+            "AGENT_TOKENS is unset (auth off) and role-scoped backend(s) also "
+            "carry an EXPLICITLY configured private_ok=false (%s) — this is "
+            "NOT safe by construction: those roles still serve EVERY caller, "
+            "and with auth off the gateway cannot tell callers apart. Set "
+            "AGENT_TOKENS if that scoping was meant to be enforceable.",
+            ", ".join(scrub_url_credentials(b) for b in roles_carrying),
+        )
 
 
 def warn_if_dream_slots_impossible() -> None:
@@ -5350,7 +5476,8 @@ async def main() -> None:
     # refuses to start — see require_auth_when_provider_keys_configured()'s
     # docstring for why this call lives here too.
     require_auth_when_provider_keys_configured()
-    # Model-attributes routing (M-5/P-5/unknown-role refusals) — see
+    # Model-attributes routing (unknown-role refusal; M-5'/P-5' are
+    # DEGRADED WARNINGS since W4/decision:1824, no longer refusals) — see
     # require_valid_llm_routing_config()'s docstring for why this call
     # lives here too.
     require_valid_llm_routing_config()

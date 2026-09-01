@@ -20,6 +20,7 @@ selection surfaces in _select_llm_backend's routing choice, which we observe
 indirectly by checking which backend actually gets called."""
 import asyncio
 import importlib
+import json
 import os
 import sys
 
@@ -63,8 +64,8 @@ def _load_gateway(monkeypatch):
     coordinator's own module-load time, so a caller that needs it to reflect
     a freshly-set AGENT_TOKENS must reload coordinator before hive_mind_
     proxy re-imports the name by value."""
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True}]))
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)  # see test_auth.load_coordinator's docstring
     import coordinator

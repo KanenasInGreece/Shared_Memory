@@ -60,14 +60,18 @@ ask()          { local v; read -r -p "$1 [$2]: " v; printf '%s' "${v:-$2}"; }
 ask_required() { local v; while true; do read -r -p "$1: " v; [[ -n "$v" ]] && { printf '%s' "$v"; return; }; echo "  (required)"; done; }
 yesno()        { local v; read -r -p "$1 [y/N]: " v; [[ "$v" =~ ^[Yy]$ ]]; }
 
-# W0 item ①: the gateway's three startup guards (S-05, M-5, P-5 in
-# shared-memory/scripts/hive_mind_proxy.py) refuse to start on configs this
-# script used to happily write — a credentialed backend with neither
-# `private_ok` nor `roles` (M-5), or any credentialed backend at all while
-# AGENT_TOKENS is unset (S-05, unless the operator has already set the
-# documented override). This block makes the script itself ask the M-5
-# question and warn about S-05, rather than letting the operator discover
-# both only when the gateway refuses to boot.
+# W0 item ① (SEC M-2, fix round — this header itself was stale after W4):
+# of the gateway's three startup guards (S-05, M-5, P-5 in
+# shared-memory/scripts/hive_mind_proxy.py), only S-05 still refuses to
+# start — any credentialed backend at all while AGENT_TOKENS is unset,
+# unless the operator has already set the documented override. M-5 and P-5
+# are loud, non-fatal startup WARNINGS since W4/decision:1824: a
+# credentialed backend with neither `private_ok` nor `roles` (M-5) is safe
+# by construction (simply never selected); auth-off plus an EXPLICIT
+# private_ok=false (P-5) is safe by construction only for a backend that
+# also carries no `roles` — one still worth asking about up front rather
+# than leaving the operator to discover it from a startup log line. This
+# block makes the script itself ask the M-5 question and warn about S-05.
 #
 # ROLE_VOCABULARY: extract judge
 # (source of truth: hive_mind_proxy.py's ROUTING_ROLE_NAMES; "summarize" is
@@ -167,14 +171,17 @@ ask_backend_roles() {
 # M-5 access choice (credentialed) or the general-traffic choice
 # (uncredentialed), prints every S-05/P-5/dream-slot caveat that applies,
 # and echoes the COMPLETE jq backend entry (url/weight/model/token_env plus
-# exactly one of private_ok/roles) on stdout. It NEVER writes
-# "private_ok": false (P-5 keys on the EFFECTIVE map — an uncredentialed
-# backend already defaults to private_ok=true, so an explicit `false` is
-# the one value this script could write that newly bricks an auth-off
-# install; the default-deny builder gets a real, opt-in `false` from a
-# later release, not from this script) and it never writes "roles": [] (a
-# separate fatal shape at the gateway). Every prompt/warning/caveat goes to
-# stderr; stdout carries only the finished JSON entry — the caller's
+# exactly one of private_ok/roles) on stdout. It ALWAYS writes an EXPLICIT
+# choice — "private_ok": true (general-traffic) or "roles": [...]
+# (role-scoped) — on every path, credentialed or not: under W4 default-deny
+# (decision:1824) an entry with neither key defaults to private_ok=false and
+# serves no role-less traffic (M-5 is a startup WARNING now, not a refusal,
+# but this script's own output never triggers it either way, since it always
+# writes one of the two). It never writes an explicit "private_ok": false
+# (that is a real, opt-in scoping decision an operator states by hand, not
+# one this script guesses on their behalf) and it never writes "roles": []
+# (a separate fatal shape at the gateway). Every prompt/warning/caveat goes
+# to stderr; stdout carries only the finished JSON entry — the caller's
 # `entry="$(build_backend_entry ...)"` capture depends on that separation.
 # An unanswered access question (exhausted stdin at ANY point in here)
 # always returns 1 and writes NOTHING to stdout — never a default guess.
@@ -204,7 +211,8 @@ build_backend_entry() {
         while true; do
             if ! read -r -p "  Serve any eligible request (private_ok), or only specific roles (roles)? [private_ok/roles]: " mode; then
                 echo "  No more input on stdin — refusing to write a credentialed backend with" >&2
-                echo "  neither private_ok nor roles chosen (the gateway would refuse to start)." >&2
+                echo "  neither private_ok nor roles chosen (M-5: the gateway would boot but" >&2
+                echo "  never select it — declare one explicitly)." >&2
                 return 1
             fi
             mode="$(printf '%s' "$mode" | tr '[:upper:]' '[:lower:]')"
@@ -218,14 +226,15 @@ build_backend_entry() {
             priv="true"
         else
             roles_str="$(ask_backend_roles)" || return 1
-            # This "never serves role-less traffic" claim is TRUE only on
-            # THIS (credentialed) path: an explicit `roles` list with no
-            # `private_ok` key defaults the EFFECTIVE private_ok to false
-            # for a credentialed backend (token is not None), so
-            # _role_eligible's role-less branch (which falls back to
-            # effective private_ok, ignoring `roles`) excludes it. See the
-            # uncredentialed branch below for why the SAME sentence would be
-            # false there.
+            # W4 default-deny (decision:1824): this "never serves role-less
+            # traffic" claim is now TRUE on BOTH paths — credentialed and
+            # uncredentialed alike. An explicit `roles` list with no
+            # `private_ok` key leaves the EFFECTIVE private_ok at its
+            # default, FALSE, for every backend regardless of credential —
+            # `_role_eligible`'s role-less branch (which falls back to
+            # effective private_ok, ignoring `roles`) excludes it either
+            # way. The uncredentialed branch below prints the identical
+            # note now, rather than the inverted one it used to need.
             echo "  Note: a roles-only backend never serves role-less (ad-hoc) traffic." >&2
             if ! _roles_cover_full_vocabulary "$roles_str"; then
                 echo "  Note: with only these roles, this backend does not count toward dream" >&2
@@ -234,7 +243,9 @@ build_backend_entry() {
             fi
             if [[ "$auth_off" -eq 1 ]]; then
                 echo "  Note: with auth off you will hit the S-05 refusal first (see above) —" >&2
-                echo "  P-5 matches this entry too, and the same override covers both." >&2
+                echo "  P-5′ (the auth-off degraded warning) does NOT apply to this entry: it" >&2
+                echo "  only fires on an EXPLICIT private_ok:false, and this script never" >&2
+                echo "  writes one." >&2
             fi
         fi
     else
@@ -251,24 +262,19 @@ build_backend_entry() {
                 return 1
             fi
             roles_str="$(ask_backend_roles)" || return 1
-            # H2 (fix round, QA review): the "never serves role-less
-            # traffic" line is FALSE on THIS (uncredentialed) path --
-            # _role_eligible's role-less branch IGNORES `roles` entirely
-            # and falls back to the EFFECTIVE private_ok, which defaults
-            # TRUE for an uncredentialed backend (no token_env). A
-            # roles-only entry written here WILL still serve role-less
-            # traffic until a default-deny release exists. Only the honest
-            # correction below belongs on this path; the "never serves"
-            # claim printed on the credentialed path above does not apply
-            # here.
+            # W4 default-deny (decision:1824): the "never serves role-less
+            # traffic" claim is now TRUE on THIS (uncredentialed) path too —
+            # _role_eligible's role-less branch falls back to the EFFECTIVE
+            # private_ok, which now defaults to FALSE regardless of
+            # credential. A roles-only entry written here correctly serves
+            # no role-less traffic; this is the identical note the
+            # credentialed path above prints.
+            echo "  Note: a roles-only backend never serves role-less (ad-hoc) traffic." >&2
             if ! _roles_cover_full_vocabulary "$roles_str"; then
                 echo "  Note: with only these roles, this backend does not count toward dream" >&2
                 echo "  slots — if no other backend qualifies, REM and NREM will never run" >&2
                 echo "  against this fleet." >&2
             fi
-            echo "  Note: until a future default-deny release, this framework still routes" >&2
-            echo "  role-less (ad-hoc) traffic to a roles-only backend too — this script" >&2
-            echo "  cannot build that restriction yet, only record what you intend." >&2
         fi
     fi
 

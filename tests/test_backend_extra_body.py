@@ -123,7 +123,7 @@ def test_legacy_comma_form_has_no_extras(monkeypatch):
 def test_routed_payload_carries_the_backend_overrides(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "http://a:5000", "model": "real-model-id",
-         "extra_body": {"thinking": {"type": "disabled"}}},
+         "extra_body": {"thinking": {"type": "disabled"}}, "private_ok": True},
     ]))
     g = _fresh()
     proxy = g.AsyncHiveMindProxy()

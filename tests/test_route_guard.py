@@ -201,7 +201,7 @@ def test_v1_embeddings_still_dispatches_unchanged(monkeypatch):
 
 
 def test_v1_chat_completions_still_dispatches_unchanged(monkeypatch):
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000"}]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True}]))
     g = _fresh_gateway(monkeypatch)
     _, proxy = _build_proxy_with_known_routes(g)
     session = _CapturingSession()

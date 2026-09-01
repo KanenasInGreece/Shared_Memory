@@ -73,6 +73,28 @@ import secure_env  # noqa: E402
 from log_hygiene import scrub_url_credentials, _chmod_created_ancestors  # noqa: E402
 
 CAPTURE_SCHEMA = 1
+# Ruling A(a) 2026-08-31 (§6.4): a LOADER-SEMANTICS marker, distinct from
+# CAPTURE_SCHEMA — CAPTURE_SCHEMA versions the pre-image FORMAT (this
+# script's own JSON shape); LOADER_SEMANTICS versions what the GATEWAY's
+# loader computes for a given raw env (private_ok's default direction,
+# here). Bump this whenever such a default changes; never fold it into
+# CAPTURE_SCHEMA. An image with no "loader_semantics" key (an old-code
+# capture, or a hand-built test fixture) reads as 1 — trust-by-default —
+# by construction wherever this is read (`.get("loader_semantics", 1)`).
+LOADER_SEMANTICS = 2
+
+
+def _valid_loader_semantics(value) -> bool:
+    """SEC M-4 (fix round): the type guard `loader_semantics` never had.
+    A plain int only — never a bool (JSON `true`/`false` decode to Python
+    `bool`, a subclass of `int`, so `isinstance(value, int)` alone would
+    silently accept `true` as `1`) and never a string/float/None/list/dict.
+    Mirrors the `isinstance(schema, int)` idiom `do_apply_or_dryrun`
+    already applies to `capture_schema` (see its own guard below). Callers
+    treat a False return as EXIT_STOP-worthy — never guess a direction."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 DEFAULT_GATEWAY_UNIT = "hive-mind-gateway.service"
 MANAGED_KEYS = ("EMBEDDER_URL", "RERANKER_URL", "LLM_DEFAULT_TARGET",
                 "LLM_BACKENDS", "LLM_BACKENDS_JSON")
@@ -307,7 +329,7 @@ image = {{
     "n_ctx": {{u: proxy.LLM_BACKEND_NCTX.get(u) for u in proxy.LLM_BACKENDS}},
     "max_inflight": {{u: proxy.LLM_BACKEND_MAX_INFLIGHT.get(u) for u in proxy.LLM_BACKENDS}},
     "extra_body": {{u: proxy.LLM_BACKEND_EXTRAS.get(u) for u in proxy.LLM_BACKENDS}},
-    "private_ok": {{u: proxy.LLM_BACKEND_PRIVATE_OK.get(u, True) for u in proxy.LLM_BACKENDS}},
+    "private_ok": {{u: proxy.LLM_BACKEND_PRIVATE_OK.get(u, False) for u in proxy.LLM_BACKENDS}},
     "private_ok_explicit": {{u: proxy.LLM_BACKEND_PRIVATE_OK_EXPLICIT.get(u, False) for u in proxy.LLM_BACKENDS}},
     "fallback_reason": proxy.LLM_POOL_FALLBACK_REASON,
     "config_empty": proxy.LLM_POOL_CONFIG_EMPTY,
@@ -315,6 +337,7 @@ image = {{
     "env_file": (str(env_path) if env_path else None),
     "guard_routing": _guard(proxy.require_valid_llm_routing_config),
     "guard_auth": _guard(proxy.require_auth_when_provider_keys_configured),
+    "loader_semantics": {loader_semantics},
 }}
 print(json.dumps(image))
 """
@@ -331,7 +354,7 @@ def run_loader(faithful_env: "dict[str, str]") -> dict:
     — an unparseable LLM_BACKENDS_JSON shape (array of strings, which makes
     `import hive_mind_proxy` itself raise), a missing dependency, or a crash
     of any other kind."""
-    snippet = _LOADER_SNIPPET.format(here=str(HERE))
+    snippet = _LOADER_SNIPPET.format(here=str(HERE), loader_semantics=LOADER_SEMANTICS)
     try:
         proc = subprocess.run(
             [sys.executable, "-c", snippet],
@@ -788,8 +811,15 @@ def _restore_or_die(lines: "list[str]", env_path: Path, backup_path: Path, reaso
 # ─────────────────────────────────────────────────────────────────────────
 
 _LAYER1_PER_URL_FIELDS = ("weights", "has_token", "models", "roles", "n_ctx",
-                           "max_inflight", "extra_body", "private_ok")
-_URL_KEYED_FIELDS = _LAYER1_PER_URL_FIELDS + ("private_ok_explicit",)
+                           "max_inflight", "extra_body")
+# Ruling A(a) (§6.4): `private_ok` moved OUT of Layer 1 (must-be-EQUAL) and
+# into the Layer-2 planned-direction set below, alongside
+# `private_ok_explicit` — a loader-semantics generation bump (W4
+# default-deny) can legitimately move it True->False on an entry this run
+# left untouched, which plain equality would misreport as a regression.
+# Still url-keyed for normalisation purposes (SEC H-4), so both stay listed
+# here even though only the first tuple is asserted EQUAL below.
+_URL_KEYED_FIELDS = _LAYER1_PER_URL_FIELDS + ("private_ok", "private_ok_explicit")
 
 
 def _normalize_url_key(url: str) -> str:
@@ -818,13 +848,33 @@ def _normalize_image(image: dict) -> dict:
     return out
 
 
-def two_layer_compare(pre: dict, post: dict, reported_writes: "set[str]") -> "tuple[bool, str]":
+def two_layer_compare(pre: dict, post: dict, reported_writes: "set[str]",
+                       report_lines: "list[str] | None" = None) -> "tuple[bool, str]":
     """Layer 1 (behavioural invariants) must be EQUAL. Layer 2
     (declaration-status fields) may move ONLY in the planned direction on
-    ONLY the reported entries. Returns (ok, message)."""
+    ONLY the reported entries. `report_lines`, when given, receives one
+    informational line per ALLOWED boundary-crossing private_ok movement
+    (Ruling A(a): "reported per-entry by name — never silent") — it never
+    affects the (ok, message) verdict. Returns (ok, message)."""
     pre = _normalize_image(pre)
     post = _normalize_image(post)
     reported_writes = {_normalize_url_key(w) for w in reported_writes}
+    # SEC M-4 (fix round): same type guard as do_apply_or_dryrun's own
+    # boundary_open computation, independently applied here — this
+    # function is reached AFTER a write in the real call site, so a
+    # TypeError here would be a write-then-crash-without-restore path.
+    # Today `boundary_open` always raises first on the same malformed
+    # image (unreachable), but that stops being true the moment anyone
+    # reorders or caches it; a pure (False, message) return instead of a
+    # raised exception is also strictly better here, since it flows
+    # straight into the caller's existing _restore_or_die().
+    for _image, _label in ((pre, "pre-image"), (post, "post-image")):
+        _sem = _image.get("loader_semantics", 1)
+        if not _valid_loader_semantics(_sem):
+            return False, (f"{_label} loader_semantics={_sem!r} is not a plain integer — "
+                            f"refusing rather than guess whether a loader-semantics boundary "
+                            f"was crossed")
+    boundary_crossed = pre.get("loader_semantics", 1) < post.get("loader_semantics", 1)
     if sorted(pre.get("urls", [])) != sorted(post.get("urls", [])):
         return False, f"backend URL set changed: {sorted(pre.get('urls', []))} -> {sorted(post.get('urls', []))}"
     for field in _LAYER1_PER_URL_FIELDS:
@@ -851,6 +901,39 @@ def two_layer_compare(pre: dict, post: dict, reported_writes: "set[str]") -> "tu
             return False, (f"private_ok_explicit moved for {_scrub(url)} "
                             f"({pre_explicit.get(url)} -> {post_explicit.get(url)}) "
                             f"but that entry was not among the reported writes")
+
+    # Ruling A(a) (§6.4): private_ok direction, Layer 2. Two, and only two,
+    # movements are legitimate:
+    #   rule 1 — False->True on an entry THIS RUN reported writing (every
+    #            write materialises true: :504/:526/:1144 — presence changes
+    #            are caught by the url-set equality above; a written entry
+    #            never goes True->False, so that direction is unreachable).
+    #   rule 2 — True->False on an entry the run LEFT UNTOUCHED, but ONLY
+    #            when the comparison crosses the loader-semantics boundary
+    #            (an old-code pre-image recomputed under new-code semantics
+    #            — exactly what a version-jump self-capture-free --preimage
+    #            run measures). Reported per-entry by name, never silent.
+    # Anything else (None<->bool, True->False within the same generation,
+    # False->True on an unreported entry) is a REAL regression — refuse.
+    pre_private = pre.get("private_ok", {})
+    post_private = post.get("private_ok", {})
+    for url in pre.get("urls", []):
+        pv, qv = pre_private.get(url), post_private.get(url)
+        if pv == qv:
+            continue
+        if pv is False and qv is True and url in reported_writes:
+            continue
+        if pv is True and qv is False and boundary_crossed and url not in reported_writes:
+            if report_lines is not None:
+                report_lines.append(
+                    f"private_ok for {_scrub(url)} moved True -> False across the "
+                    f"loader-semantics boundary (untouched this run) — the "
+                    f"pre-W4 effective value is no longer the default; declare "
+                    f"it explicitly if it must be preserved.")
+            continue
+        return False, (f"private_ok moved for {_scrub(url)} ({pv!r} -> {qv!r}) "
+                        f"outside the two ruled directions (A(a)) — refusing "
+                        f"rather than risk a silent eligibility regression")
 
     pre_empty, post_empty = bool(pre.get("config_empty")), bool(post.get("config_empty"))
     if pre_empty != post_empty:
@@ -1059,6 +1142,33 @@ def do_apply_or_dryrun(preimage_path: "str | None", apply: bool, gateway_unit: s
         # (unit_query.status == "query_failed") already returned above.
         case = classify(pre_image, occurrences, raw_lines)
 
+    # V2 (§6.4, obligation 4): the same-generation planning gate. Cases 1, 3
+    # and 4's eligibility predicates are semantics-blind — every condition
+    # they check still holds post-W4 for a deliberately-undeclared entry, so
+    # an ungated run would PLAN a write on an install that was never
+    # upgrading from anything (self-capture, no --preimage: pre and post are
+    # both computed by the CURRENT loader). Without a semantics boundary to
+    # cross there is no prior effective behaviour to preserve, so any such
+    # write would be an OPINION ("turn this on"), not a materialisation —
+    # outside this tool's job. Only a genuine version-jump (a captured
+    # pre-image from OLD code, carrying no "loader_semantics" key or an
+    # older one) opens the gate.
+    #
+    # SEC M-4 (fix round): pre_image is OPERATOR-SUPPLIED (--preimage is a
+    # path they name) — a truncated capture, a hand edit, or a future
+    # capture format writing null/a string/a float there must never reach
+    # the `<` comparison below as a raw TypeError. Guarded the same way
+    # capture_schema already is a few lines up: name the field, EXIT_STOP,
+    # never silently open or close the boundary on a guess.
+    if pre_image and not _valid_loader_semantics(pre_image.get("loader_semantics", 1)):
+        _report(lines, f"--preimage loader_semantics={pre_image.get('loader_semantics')!r} is "
+                        f"not a plain integer — cannot determine whether a loader-semantics "
+                        f"boundary is being crossed. Re-run 'migrate_env.py --apply' with no "
+                        f"--preimage to self-capture with the CURRENT loader instead.")
+        print("\n".join(lines))
+        return EXIT_STOP
+    boundary_open = bool(pre_image) and pre_image.get("loader_semantics", 1) < LOADER_SEMANTICS
+
     if case == CASE_JSON_PRESENT_EMPTY:
         _report(lines, "LLM_BACKENDS_JSON is present but EMPTY in the file — never "
                         "written to, reported by name, counted for W4. This install "
@@ -1069,59 +1179,88 @@ def do_apply_or_dryrun(preimage_path: "str | None", apply: bool, gateway_unit: s
                         f"{_scrub(pre_image.get('fallback_reason') or '')}. Touching "
                         f"nothing (JSON key, CSV key, and the pool half all left as-is).")
     elif case == CASE_JSON_USABLE:
-        json_idx = occurrences["LLM_BACKENDS_JSON"][0]
-        raw_json_text = _line_value(raw_lines, json_idx)
-        new_entries, touched = plan_case_json_usable(pre_image, raw_json_text)
-        if new_entries is None:
-            # QA MED-3 (fix round): an unparseable shape means "cannot
-            # safely mutate — touch NOTHING", full stop. The report and the
-            # action must agree — falling through to the CSV cleanup below
-            # would write while claiming not to.
-            _report(lines, "LLM_BACKENDS_JSON does not parse as a JSON array of objects — "
-                            "cannot safely add private_ok — touching nothing "
-                            "(the live CSV line, if any, is also left untouched).")
+        if not boundary_open:
+            _report(lines, "LLM_BACKENDS_JSON already reflects the CURRENT loader "
+                            "generation — no boundary to cross, so adding "
+                            "\"private_ok\": true now would be an OPINION, not a "
+                            "preserved behaviour. Declare private_ok/roles yourself "
+                            "for any entry you want role-less-eligible.")
         else:
-            if not touched:
-                _report(lines, "LLM_BACKENDS_JSON already fully explicit — nothing to do.")
+            json_idx = occurrences["LLM_BACKENDS_JSON"][0]
+            raw_json_text = _line_value(raw_lines, json_idx)
+            new_entries, touched = plan_case_json_usable(pre_image, raw_json_text)
+            if new_entries is None:
+                # QA MED-3 (fix round): an unparseable shape means "cannot
+                # safely mutate — touch NOTHING", full stop. The report and the
+                # action must agree — falling through to the CSV cleanup below
+                # would write while claiming not to.
+                _report(lines, "LLM_BACKENDS_JSON does not parse as a JSON array of objects — "
+                                "cannot safely add private_ok — touching nothing "
+                                "(the live CSV line, if any, is also left untouched).")
             else:
-                new_json = json.dumps(new_entries)
-                raw_lines[json_idx] = f"LLM_BACKENDS_JSON={new_json}"
-                reported_writes |= set(touched)
-                planned_key_names.add("LLM_BACKENDS_JSON")
-                planned_new_lines = raw_lines
-                _report(lines, f"LLM_BACKENDS_JSON: adding \"private_ok\": true to "
-                                f"{len(touched)} entr{'y' if len(touched) == 1 else 'ies'}: "
-                                f"{', '.join(_scrub(u) for u in touched)}.")
-            csv_idxs = occurrences.get("LLM_BACKENDS") or []
-            if csv_idxs and _line_value(raw_lines, csv_idxs[0]):
-                orig = raw_lines[csv_idxs[0]]
-                raw_lines[csv_idxs[0]] = (
-                    f"# migrated to LLM_BACKENDS_JSON by migrate_env.py {_utc_stamp()} "
-                    f"— original: {orig}")
-                planned_key_names.add("LLM_BACKENDS")
-                planned_new_lines = raw_lines
-                _report(lines, "a live LLM_BACKENDS (CSV) line is provably dead under "
-                                "LLM_BACKENDS_JSON — commented out with provenance, never deleted.")
+                if not touched:
+                    _report(lines, "LLM_BACKENDS_JSON already fully explicit — nothing to do.")
+                else:
+                    new_json = json.dumps(new_entries)
+                    raw_lines[json_idx] = f"LLM_BACKENDS_JSON={new_json}"
+                    reported_writes |= set(touched)
+                    planned_key_names.add("LLM_BACKENDS_JSON")
+                    planned_new_lines = raw_lines
+                    _report(lines, f"LLM_BACKENDS_JSON: adding \"private_ok\": true to "
+                                    f"{len(touched)} entr{'y' if len(touched) == 1 else 'ies'}: "
+                                    f"{', '.join(_scrub(u) for u in touched)}.")
+                csv_idxs = occurrences.get("LLM_BACKENDS") or []
+                if csv_idxs and _line_value(raw_lines, csv_idxs[0]):
+                    orig = raw_lines[csv_idxs[0]]
+                    raw_lines[csv_idxs[0]] = (
+                        f"# migrated to LLM_BACKENDS_JSON by migrate_env.py {_utc_stamp()} "
+                        f"— original: {orig}")
+                    planned_key_names.add("LLM_BACKENDS")
+                    planned_new_lines = raw_lines
+                    _report(lines, "a live LLM_BACKENDS (CSV) line is provably dead under "
+                                    "LLM_BACKENDS_JSON — commented out with provenance, never deleted.")
     elif case == CASE_CSV_LIVE:
-        csv_idx = occurrences["LLM_BACKENDS"][0]
-        csv_value = _line_value(raw_lines, csv_idx)
-        new_entries = plan_case_csv_live(pre_image, csv_value)
-        new_json = json.dumps(new_entries)
-        orig = raw_lines[csv_idx]
-        raw_lines[csv_idx] = (
-            f"# migrated to LLM_BACKENDS_JSON by migrate_env.py {_utc_stamp()} "
-            f"— original: {orig}")
-        appended.append(f"LLM_BACKENDS_JSON={new_json}")
-        reported_writes |= {e["url"] for e in new_entries}
-        planned_key_names |= {"LLM_BACKENDS", "LLM_BACKENDS_JSON"}
-        planned_new_lines = raw_lines
-        _report(lines, f"LLM_BACKENDS (CSV) is live and the only declared pool — "
-                        f"converting {len(new_entries)} entr{'y' if len(new_entries) == 1 else 'ies'} "
-                        f"to LLM_BACKENDS_JSON (effective private_ok=true), CSV commented out "
-                        f"with provenance.")
+        if not boundary_open:
+            _report(lines, "LLM_BACKENDS (CSV) is live but already reflects the CURRENT "
+                            "loader generation — its role-less traffic is undeclared and "
+                            "correctly serves nothing under default-deny; converting it to "
+                            "JSON now would OPINE it into private_ok=true rather than "
+                            "preserve prior behaviour. Declare LLM_BACKENDS_JSON yourself "
+                            "if you want this fleet eligible.")
+        else:
+            csv_idx = occurrences["LLM_BACKENDS"][0]
+            csv_value = _line_value(raw_lines, csv_idx)
+            new_entries = plan_case_csv_live(pre_image, csv_value)
+            new_json = json.dumps(new_entries)
+            orig = raw_lines[csv_idx]
+            raw_lines[csv_idx] = (
+                f"# migrated to LLM_BACKENDS_JSON by migrate_env.py {_utc_stamp()} "
+                f"— original: {orig}")
+            # QA MED-4 (fix round, §6.4): the brief's own provenance
+            # obligation for a materialising write — distinct from the
+            # comment above, which explains where the OLD CSV line went,
+            # not why this NEW JSON line exists.
+            appended.append(f"# migrate_env.py {_utc_stamp()} materialised the pre-W4 "
+                             f"effective pool from live LLM_BACKENDS (CSV)")
+            appended.append(f"LLM_BACKENDS_JSON={new_json}")
+            reported_writes |= {e["url"] for e in new_entries}
+            planned_key_names |= {"LLM_BACKENDS", "LLM_BACKENDS_JSON"}
+            planned_new_lines = raw_lines
+            _report(lines, f"LLM_BACKENDS (CSV) is live and the only declared pool — "
+                            f"converting {len(new_entries)} entr{'y' if len(new_entries) == 1 else 'ies'} "
+                            f"to LLM_BACKENDS_JSON (effective private_ok=true), CSV commented out "
+                            f"with provenance.")
     elif case == CASE_FALLBACK:
         default_target = pre_image.get("default_target", "")
-        if not _effective_url_probeable(default_target):
+        if not boundary_open:
+            shown = _scrub(default_target) if default_target else "(empty)"
+            _report(lines, f"no backend declared — the effective fallback target "
+                            f"({shown}) is already the CURRENT loader generation, "
+                            f"carrying no pre-W4 grandfathering to preserve — "
+                            f"migrate_env only materialises PRE-W4 EFFECTIVE state, "
+                            f"never a fresh opinion. Declare LLM_BACKENDS_JSON yourself "
+                            f"(see check_config.py / GET /health).")
+        elif not _effective_url_probeable(default_target):
             shown = _scrub(default_target) if default_target else "(empty)"
             _report(lines, f"no backend declared, and the effective fallback target "
                             f"({shown}) is empty or unparseable — never probed, "
@@ -1142,6 +1281,12 @@ def do_apply_or_dryrun(preimage_path: "str | None", apply: bool, gateway_unit: s
             lines = []
             if answered_yes:
                 new_entries = [{"url": default_target.rstrip("/"), "weight": 1, "private_ok": True}]
+                # QA MED-4 (fix round, §6.4): same provenance obligation as
+                # the CASE_CSV_LIVE materialisation above. R-A: never write
+                # the literal key name of the fallback env var itself, even
+                # in a comment — describe it, don't spell it.
+                appended.append(f"# migrate_env.py {_utc_stamp()} materialised the pre-W4 "
+                                 f"effective pool from the confirmed fallback target")
                 appended.append(f"LLM_BACKENDS_JSON={json.dumps(new_entries)}")
                 reported_writes.add("__fallback_materialised__")
                 reported_writes.add(default_target)
@@ -1156,12 +1301,22 @@ def do_apply_or_dryrun(preimage_path: "str | None", apply: bool, gateway_unit: s
                                 "LLM_BACKENDS_JSON yourself) — the repetition is designed, not "
                                 "forgetfulness.")
         else:
-            _report(lines, f"no backend declared — falling back to {_scrub(default_target)}. "
-                            f"Non-interactive: nothing written. Declare LLM_BACKENDS_JSON "
-                            f"yourself, e.g.:\n"
-                            f"  LLM_BACKENDS_JSON=[{{\"url\": {_scrub(default_target)!r}, "
-                            f"\"weight\": 1, \"private_ok\": true}}]\n"
-                            f"See GET /health for the persistent 'no backend declared' state.")
+            # Ruling D(a) V1 (§6.4): boundary crossing + apply + no human
+            # present + a real materialisation is NEEDED to preserve this
+            # pre-W4 install's effective behaviour (its fallback WAS serving
+            # role-less traffic) — STOP rather than exit 0 into a gateway
+            # that now silently serves nothing. R-A is preserved exactly:
+            # still no write without a human.
+            _report(lines, f"no backend declared — falling back to {_scrub(default_target)}, "
+                            f"and this is an upgrade from a pre-default-deny install where "
+                            f"that fallback WAS serving role-less traffic implicitly. A "
+                            f"materialisation is needed to preserve it and no human is "
+                            f"present to confirm one (non-interactive). Refusing rather than "
+                            f"silently leaving it dark — re-run interactively, declare "
+                            f"LLM_BACKENDS_JSON yourself, or pass --skip-env-migration to "
+                            f"proceed without migrating.")
+            print("\n".join(lines))
+            return EXIT_STOP
 
     has_writes = bool(appended) or (planned_new_lines is not None)
 
@@ -1216,7 +1371,7 @@ def do_apply_or_dryrun(preimage_path: "str | None", apply: bool, gateway_unit: s
             f"SM_PRE_UPDATE_VERSION={os.environ.get('SM_PRE_UPDATE_VERSION', '(unset)')}. "
             f"Re-run standalone once fixed: migrate_env.py --apply --preimage <captured JSON>.")
 
-    ok, msg = two_layer_compare(pre_image, post_image, reported_writes)
+    ok, msg = two_layer_compare(pre_image, post_image, reported_writes, report_lines=lines)
     if not ok:
         return _restore_or_die(
             lines, env_path, backup_path,
