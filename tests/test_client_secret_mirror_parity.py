@@ -190,6 +190,113 @@ def test_vector_skill_mirror_agrees_with_memory_bridge_mirror():
     assert set(vector_skill._CLIENT_SECRET_SUFFIXES) == set(memory_bridge._CLIENT_SECRET_SUFFIXES)
 
 
+# ── MCPW-R2-C5 SEC round (F3): filter-bypass fix at the CALL SITES ─────────
+# SEC build review HIGH-1 (case sensitivity) + HIGH-2 (BOM) (2026-09-01,
+# gemini): _is_client_secret_key is an exact-match-then-suffix predicate, so
+# `pg_conn` (lowercase) or a BOM-prefixed `PG_CONN`/`AGENT_TOKEN` sailed past
+# both the AGENT_TOKEN divert and the secret check and landed straight in
+# os.environ. Fixed at the two LOADER CALL SITES in mcp/vector-skill.py
+# (both the dotenv_values() loop and _load_env_manually), never inside
+# _is_client_secret_key itself — it stays a byte-identical mirror of
+# memory_bridge's, pinned above; the ruling was explicit that mirror parity
+# must not drift. These pins therefore run the fix THROUGH THE LOADER, not
+# against the bare predicate (which cannot see case/BOM handling that lives
+# one level up the call stack) — the SEC reviewer's own finding 6 was that
+# predicate-only pins can pass while the loader still leaks.
+#
+# The BOM-prefixed keys are placed AFTER a first, neutral line: dotenv_values
+# (and Python's `utf-8-sig` codec, used by _load_env_manually) only strip a
+# BOM that sits at byte offset 0 of the FILE — i.e. only the very first key
+# would be auto-cleaned "for free". Placing the BOM-carrying keys later in
+# the file (measured, both loaders confirmed to still see the raw
+# character there) is what actually exercises the call-site .lstrip("﻿")
+# fix rather than accidentally relying on a library that already handles the
+# leading-byte case.
+_BOM = "\ufeff"
+
+
+def _write_bypass_fixture(path):
+    path.write_text(
+        "PROBE_FIRST_LINE=neutral\n"
+        f"{_BOM}AGENT_TOKEN=tok_bom_prefixed\n"
+        "pg_conn=postgresql://leaked_lowercase\n"
+        f"{_BOM}PG_CONN=postgresql://leaked_bom\n"
+        "probe_lower=benign_val\n"
+    )
+
+
+_BYPASS_ENV_KEYS = ("PROBE_FIRST_LINE", "AGENT_TOKEN", f"{_BOM}AGENT_TOKEN",
+                    "pg_conn", "PG_CONN", f"{_BOM}PG_CONN", "probe_lower")
+
+
+def test_manual_parser_filters_lowercase_and_bom_prefixed_secrets(tmp_path, monkeypatch):
+    """Through _load_env_manually (the no-dotenv fallback path) — the second
+    of the two call sites the ruling requires fixed. Mutation check: removing
+    the `.upper()` from this loop's `_is_client_secret_key(key_norm.upper())`
+    call makes the lowercase `pg_conn` pin below die (recorded in HANDOFF)."""
+    for key in _BYPASS_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    env_file = tmp_path / "bypass.env"
+    _write_bypass_fixture(env_file)
+    monkeypatch.setattr(vector_skill, "_AGENT_TOKEN_FROM_FILE", "")
+    try:
+        vector_skill._load_env_manually(str(env_file))
+        assert "pg_conn" not in os.environ, "lowercase pg_conn leaked past the filter"
+        assert "PG_CONN" not in os.environ, "BOM-prefixed PG_CONN leaked under its bare name"
+        assert f"{_BOM}PG_CONN" not in os.environ, "BOM-prefixed PG_CONN leaked under its raw key"
+        assert vector_skill._AGENT_TOKEN_FROM_FILE == "tok_bom_prefixed", (
+            "the BOM-prefixed AGENT_TOKEN was not diverted to the private variable"
+        )
+        assert "AGENT_TOKEN" not in os.environ
+        assert f"{_BOM}AGENT_TOKEN" not in os.environ
+        assert os.environ.get("probe_lower") == "benign_val", (
+            "a benign lowercase key must still export under its ORIGINAL name — "
+            "normalization is for filtering only, never for the exported name"
+        )
+    finally:
+        # try/finally with a DIRECT os.environ.pop, not monkeypatch.delenv:
+        # the loader writes os.environ DIRECTLY, never via monkeypatch, and
+        # monkeypatch.delenv on a key set that way only restores it again
+        # at THIS test's own fixture teardown (measured — see
+        # tests/test_vector_skill.py's twin fix and its detailed note) —
+        # which would silently re-leak it into the next test to run.
+        for key in _BYPASS_ENV_KEYS:
+            os.environ.pop(key, None)
+
+
+def test_dotenv_values_path_filters_lowercase_and_bom_prefixed_secrets(tmp_path, monkeypatch):
+    """Through the dotenv_values() primary path — the branch actually taken
+    at real import time in THIS suite, since python-dotenv is transitively
+    installed via fastmcp (QA build review MED-1, 2026-09-01). Mutation
+    check: removing the `.upper()` from this loop's
+    `_is_client_secret_key(_k_norm.upper())` call makes the lowercase
+    `pg_conn` pin below die."""
+    for key in _BYPASS_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    env_file = tmp_path / "bypass.env"
+    _write_bypass_fixture(env_file)
+    monkeypatch.setenv("VECTOR_SKILL_ENV", str(env_file))
+    try:
+        fresh = _load_vector_skill()
+        assert "pg_conn" not in os.environ, "lowercase pg_conn leaked past the filter"
+        assert "PG_CONN" not in os.environ, "BOM-prefixed PG_CONN leaked under its bare name"
+        assert f"{_BOM}PG_CONN" not in os.environ, "BOM-prefixed PG_CONN leaked under its raw key"
+        assert fresh._AGENT_TOKEN_FROM_FILE == "tok_bom_prefixed", (
+            "the BOM-prefixed AGENT_TOKEN was not diverted to the private variable"
+        )
+        assert "AGENT_TOKEN" not in os.environ
+        assert f"{_BOM}AGENT_TOKEN" not in os.environ
+        assert os.environ.get("probe_lower") == "benign_val", (
+            "a benign lowercase key must still export under its ORIGINAL name — "
+            "normalization is for filtering only, never for the exported name"
+        )
+    finally:
+        # Direct os.environ.pop, not monkeypatch.delenv — see the sibling
+        # test above (same reason, same measured behaviour).
+        for key in _BYPASS_ENV_KEYS:
+            os.environ.pop(key, None)
+
+
 def test_both_tracked_memory_bridge_copies_stay_byte_identical():
     """Group 1 standing rule: the framework copy and the shared-memory-skill
     tracked copy must never diverge — sync_skills.sh's whole job is copying

@@ -761,15 +761,61 @@ def test_manual_env_parser_loads_token_without_dotenv(tmp_path, monkeypatch):
     D1): the ported _CLIENT_SECRET_SUFFIXES now contains "_KEY", so the old
     name was itself secret-shaped and this test would pin the filter working
     (correctly) rather than what it always meant to pin (the manual parser
-    loads a benign value without dotenv installed)."""
+    loads a benign value without dotenv installed).
+
+    QA build review HIGH-1 (2026-09-01, opus): python-dotenv is
+    TRANSITIVELY installed via fastmcp in this suite, so T1/T5 (which spawn
+    a real subprocess) always take the dotenv_values() branch and never
+    exercise _load_env_manually's own guards. This is the ONLY test in the
+    suite that calls _load_env_manually directly — and it used to assert
+    solely on the benign PROBE_ONLY_VALUE, even though its own fixture
+    already wrote AGENT_TOKEN=tok_manual_parse and nothing ever checked it.
+    Proven by the reviewer: deleting BOTH the AGENT_TOKEN diversion and the
+    secret-key skip from _load_env_manually left the FULL SUITE GREEN. The
+    three assertions below close that hole — this is now the sole place I6'
+    is pinned on the manual-fallback path, so do not remove them even if
+    T1/T5 gain their own no-dotenv coverage later."""
     vs = load_vector_skill()
     env = tmp_path / ".env"
     env.write_text("AGENT_TOKEN=tok_manual_parse\n# comment\nBADLINE\n")
     monkeypatch.delenv("PROBE_ONLY_VALUE", raising=False)
-    env.write_text(env.read_text() + "PROBE_ONLY_VALUE=probe_val\n")
-    vs._load_env_manually(str(env))
-    assert os.environ.get("PROBE_ONLY_VALUE") == "probe_val"
-    monkeypatch.delenv("PROBE_ONLY_VALUE", raising=False)
+    monkeypatch.delenv("AGENT_TOKEN", raising=False)
+    monkeypatch.delenv("FAKE_PROVIDER_SECRET", raising=False)
+    env.write_text(env.read_text() + "PROBE_ONLY_VALUE=probe_val\n"
+                                      "FAKE_PROVIDER_SECRET=shh\n")
+    try:
+        vs._load_env_manually(str(env))
+        # (a) AGENT_TOKEN diverted to the private var, never exported.
+        assert vs._AGENT_TOKEN_FROM_FILE == "tok_manual_parse"
+        assert "AGENT_TOKEN" not in os.environ
+        # (b) a secret-shaped key (suffix _SECRET) is skipped — never exported.
+        assert "FAKE_PROVIDER_SECRET" not in os.environ
+        # (c) the benign key still exports normally.
+        assert os.environ.get("PROBE_ONLY_VALUE") == "probe_val"
+    finally:
+        # try/finally with a DIRECT os.environ.pop — not monkeypatch.delenv
+        # — for the cleanup. Two separate hazards, both measured:
+        #
+        # (1) _load_env_manually writes os.environ DIRECTLY (that is the
+        #     production behaviour under test), so a defect that makes a
+        #     secret-shaped key or AGENT_TOKEN land in os.environ must still
+        #     be cleaned up even though the assertion catching it raises
+        #     first and skips a trailing (non-finally) cleanup line.
+        # (2) monkeypatch.delenv is the WRONG tool for that cleanup, even
+        #     inside finally: pytest's monkeypatch fixture restores every
+        #     tracked change to its PRE-CALL value at fixture teardown, and
+        #     "pre-call value" here is exactly the leaked one this delenv
+        #     call would otherwise seem to remove — so the leak reappears
+        #     the moment this test function returns, one step later than
+        #     expected, and pollutes the NEXT test instead. Reproduced with
+        #     a two-line probe (monkeypatch.delenv on a key set by a direct
+        #     os.environ write, inside finally, then asserted absent from a
+        #     SEPARATE following test — it comes back). os.environ.pop is a
+        #     real, permanent removal monkeypatch's own teardown cannot
+        #     undo.
+        os.environ.pop("PROBE_ONLY_VALUE", None)
+        os.environ.pop("AGENT_TOKEN", None)
+        os.environ.pop("FAKE_PROVIDER_SECRET", None)
 
 
 def test_manual_env_parser_never_overrides_real_env(tmp_path, monkeypatch):
@@ -777,13 +823,39 @@ def test_manual_env_parser_never_overrides_real_env(tmp_path, monkeypatch):
     an externally-set variable wins over the file value. Probe key renamed
     PROBE_ONLY_KEY -> PROBE_ONLY_VALUE for the same reason as the test above —
     "_KEY" is now secret-shaped and would be skipped, making the precedence
-    assertion vacuous."""
+    assertion vacuous.
+
+    QA build review MED-2 (2026-09-01, opus): this test was ITSELF still
+    vacuous against a no-op parser body — the PROBE_ONLY_VALUE assertion
+    passes whether the parser respects precedence, ignores the file
+    entirely, or does nothing at all, because monkeypatch.setenv already
+    set that exact value before the parser ever ran. A second,
+    non-conflicting key in the SAME file makes the test bite: it can only
+    read "env_val" (unchanged) for the first AND "second_val" (freshly
+    loaded) for the second if the parser actually read the file and left
+    the conflicting key alone. Mutation-proven: reverting
+    _load_env_manually's body to `pass` kills the PROBE_SECOND_VALUE
+    assertion (see HANDOFF's mutation table)."""
     vs = load_vector_skill()
     env = tmp_path / ".env"
-    env.write_text("PROBE_ONLY_VALUE=file_val\n")
+    env.write_text("PROBE_ONLY_VALUE=file_val\nPROBE_SECOND_VALUE=second_val\n")
     monkeypatch.setenv("PROBE_ONLY_VALUE", "env_val")
-    vs._load_env_manually(str(env))
-    assert os.environ.get("PROBE_ONLY_VALUE") == "env_val"
+    monkeypatch.delenv("PROBE_SECOND_VALUE", raising=False)
+    try:
+        vs._load_env_manually(str(env))
+        assert os.environ.get("PROBE_ONLY_VALUE") == "env_val"
+        assert os.environ.get("PROBE_SECOND_VALUE") == "second_val", (
+            "the parser did not actually load the file — this is what makes "
+            "the precedence assertion above non-vacuous"
+        )
+    finally:
+        # Direct os.environ.pop, not monkeypatch.delenv — see the detailed
+        # note in test_manual_env_parser_loads_token_without_dotenv above:
+        # PROBE_SECOND_VALUE is written directly to os.environ by the code
+        # under test, and monkeypatch.delenv on a key set that way only
+        # defers the leak to this test's own fixture teardown instead of
+        # actually removing it.
+        os.environ.pop("PROBE_SECOND_VALUE", None)
 
 
 def test_audit_log_write_is_offloaded_and_ordered(tmp_path, monkeypatch):
