@@ -604,6 +604,8 @@ server rather than a PATH problem. `sync_skills.sh` warns when this host's `uv` 
 environment once, at spawn. And auth is **startup-frozen**: the mint writes the new digest into the
 gateway `.env` while the running gateway keeps the old one, so an install reported "done" without
 `systemctl --user restart hive-mind-gateway.service` is a 401 on the next session.
+*(A full host restart is not always required for the MCP-server side — see the re-mint runbook
+below for what "the client re-reads its token" actually means and how narrowly it can be satisfied.)*
 
 ⚠ **Already registered?** `--add` refuses a name already in `AGENT_TOKENS` — deliberately, since
 there is no silent single-agent rotation. Re-homing an existing identity onto a walled directory is
@@ -755,10 +757,29 @@ bash shared-memory/scripts/bootstrap_tokens.sh --remint lm_studio --reveal lm_st
 bash shared-memory/scripts/bootstrap_tokens.sh --remint codex --install-path ~/.codex/skills/shared-memory/.env
 ```
 
+⚠ **`--install-path` is the agent's `.env` FILE, never its directory** — a directory-shaped path
+(a trailing slash, or a path naming an existing directory) is refused outright, before anything is
+minted or written.
+
 ⚠ It **invalidates that agent's current token**, so pair it with `--reveal` or `--install-path` — the
 agent must receive the new one. ⚠ **Restart the gateway afterwards: auth is startup-frozen.**
 ⛔ Run `--reveal` yourself, never through an agent — a transcript turns "shown once" into "stored
 forever".
+
+⚠ **A running CLIENT must ALSO re-read its token, separately from the gateway restart above.**
+`vector-skill.py`'s MCP server and `memory_bridge.py`'s CLI client each cache their token in memory
+once, at import — a re-mint rotates the registered digest immediately, so a process that was
+already running keeps presenting the *previous* token until it re-reads the file, and every
+request (reads included) 401s until then. What "re-reads" requires differs by shape, measured
+against a live MCP conversion: a full host restart is **not** always necessary.
+- **MCP agent** — respawn the memory MCP server: a full host restart works, or, if the host can
+  reload / disable-then-re-enable one server on its own, that alone is enough.
+- **CLI/skill agent** — `memory_bridge.py` reads its token fresh on every process start, so a
+  one-shot invocation already picks up the rotation automatically; only a long-running CLI
+  session held open across the rotation needs restarting.
+
+Verify with a successful authenticated call (or the gateway audit log) after the respawn/restart;
+re-mint again only if the agent still shows the old token afterward.
 
 `bootstrap_tokens.sh` (bare) refuses to touch an existing registry and `--force` rotates
 **everyone** — neither is what you want for one new agent. `--add` (v0.9.27) is the purpose-built

@@ -107,6 +107,59 @@ None of these ship with the skill. See [`sync_skills.sh`](../scripts/sync_skills
 
 ---
 
+## Adding, rotating, and delivering an agent's token
+
+Two footguns, measured on a live MCP-agent mint (2026-09-01), worth stating explicitly:
+
+- **`--install-path` is the agent's `.env` FILE, never its directory.** A directory-shaped
+  path (a trailing slash, or a path that names an existing directory) is refused up front
+  with a clear message — before anything is minted or written. Example:
+  `~/.config/opencode/shared-memory-mcp/.env`, not `~/.config/opencode/shared-memory-mcp/`.
+- **Rotating a token for a RUNNING agent requires it to re-read the file.** A token is read
+  from its `.env` **once, at import** — both `vector-skill.py`'s MCP server and
+  `memory_bridge.py`'s CLI client cache it in memory at load time. Re-minting rotates the
+  registered digest immediately, so an already-running process keeps presenting the
+  **previous** token until it re-reads the file — every request, reads included, 401s until
+  then. What "re-read" means differs by agent shape (refined against a live MCP conversion —
+  a full restart is *not* always required):
+  - **MCP agent** — respawn the memory MCP server process: a full host restart works, or, if
+    your MCP host can reload or disable-then-re-enable a single server, that alone is enough
+    to pick up the new token without restarting anything else.
+  - **CLI/skill agent** — `memory_bridge.py` reads its token fresh on every process start, so
+    a one-shot invocation already gets the new token automatically; only a long-running CLI
+    session (one process held open across the rotation) needs to be restarted.
+  - **Recovery order:** re-mint → deliver (write-through or `--reveal`) → respawn/restart the
+    agent → verify with a successful authenticated call (or the gateway audit log, if
+    `AUDIT_LOG_PATH` is set) → re-mint again **only if** the agent still presents the old
+    token after the respawn/restart.
+
+**Widening a read-only identity to full access is a deliberate two-step, never a mint alone.**
+`generate_tokens.py` refuses `--role full` on an identity declared `read` in `AGENT_ROLES`, by
+design — the mint is not where access is widened. `AGENT_ROLES` is a **sparse narrowing map**:
+absence from it means full access; an agent is listed there only to *restrict* it (`read` or
+`admin`). To widen one: edit the `AGENT_ROLES` declaration in `shared-memory/.env` first
+(remove the entry, or change it), **then** re-mint.
+
+**End-to-end order for an MCP agent** (new or re-issued):
+
+1. Decide the role first, separately from minting — `AGENT_ROLES` absent = full; add
+   `name:read` or `name:admin` to `shared-memory/.env` only to narrow it.
+2. Mint and deliver in one command:
+   - new agent: `generate_tokens.py --add <name> --mcp --install-path <connector-dir>/.env`
+   - re-issue an existing one: `generate_tokens.py --remint <name> --mcp --install-path <connector-dir>/.env`
+3. Apply the printed `AGENT_TOKENS=` (and `AGENT_INSTALLS=`, and `AGENT_ROLES=` if a role
+   changed) line(s) to the gateway `.env`.
+4. Restart the gateway so it picks up the new digest/role.
+5. Respawn the agent's memory MCP server (full host restart, or a per-server reload /
+   disable-then-re-enable) so it re-reads the freshly written token file.
+6. Verify with a successful authenticated call from that agent, then re-mint only if it
+   still shows the old token.
+
+(Audit-log interpretation of who authenticated as whom is an operator concern, not covered
+here — see `AUDIT_LOG_PATH` under *Health and observability* below.)
+
+---
+
 ## Credential delivery — the default tier, and the hardened tier
 
 **The default tier — `shared-memory/.env`, mode 600 — is fine for a
