@@ -61,6 +61,7 @@ __all__ = [
     "VERSION",
     "INTRODUCED_0_9_74",
     "INTRODUCED_0_9_79",
+    "INTRODUCED_0_9_81",
     "DUAL_EMIT_DROP_TARGET",
     "CATEGORIES",
     "HEALTH",
@@ -84,7 +85,7 @@ __all__ = [
 #: coordinator.py's FRAMEWORK_VERSION et al. until the merger's own version-
 #: bump step (which those four files stay reserved for) catches up to it at
 #: release time — that gap is the check doing its job, not a build defect.
-VERSION = "0.9.80"
+VERSION = "0.9.81"
 
 
 def _version_tuple(v: str) -> tuple:
@@ -172,6 +173,13 @@ INTRODUCED_0_9_74 = "0.9.74"
 #: general `in_version <= VERSION` bound (item 8) stays the durable rule that
 #: catches anything genuinely wrong regardless of which release is current.
 INTRODUCED_0_9_79 = "0.9.79"
+
+#: W4's four MEANING_CHANGES entries froze here at release time (QA MED-8 of
+#: the v0.9.81 cycle): they were authored against bare ``VERSION`` while the
+#: wave was in flight and pinned to this constant at the version bump, the
+#: same carve-out INTRODUCED_0_9_79 got — so no later release can silently
+#: re-date them.
+INTRODUCED_0_9_81 = "0.9.81"
 #: The release the dual-emitted /health copies TARGET being dropped in — a
 #: TARGET, never a commitment (fix round item 1 on decision:1832): the drop
 #: is GATED on the monitor-contract step (Group 3 — the monitor must consume
@@ -1389,7 +1397,7 @@ MEANING_CHANGES: tuple[dict, ...] = (
     {
         "endpoint": "health",
         "path": "config.llm_backends[].private_ok",
-        "in_version": VERSION,
+        "in_version": INTRODUCED_0_9_81,
         "was": ("default TRUE for an uncredentialed backend, FALSE for a "
                 "credentialed one (the absent-key case) — `false` on this "
                 "field meant the operator had EITHER explicitly scoped a "
@@ -1417,7 +1425,7 @@ MEANING_CHANGES: tuple[dict, ...] = (
         # key pins THAT one to INTRODUCED_0_9_79 forever) rather than
         # colliding with it in the by_path lookup and silently clobbering it.
         "path": "dependencies.llm_pool.state (legacy-CSV population)",
-        "in_version": VERSION,
+        "in_version": INTRODUCED_0_9_81,
         "was": ("`ok` for a live legacy `LLM_BACKENDS` CSV (or the bare "
                 "`LLM_DEFAULT_TARGET` fallback) serving role-less traffic — "
                 "a descriptor-less fleet was eligible for everything (I-5a)"),
@@ -1435,7 +1443,7 @@ MEANING_CHANGES: tuple[dict, ...] = (
     {
         "endpoint": "health",
         "path": "dependencies.rem_daemon.state / dependencies.nrem_daemon.state",
-        "in_version": VERSION,
+        "in_version": INTRODUCED_0_9_81,
         "was": ("the 0.9.79 `degraded` reason (no backend counts toward "
                 "/pool/status free_slots) fired only for a genuinely "
                 "partial-role or private_ok=false-only configuration — a "
@@ -1455,7 +1463,7 @@ MEANING_CHANGES: tuple[dict, ...] = (
     {
         "endpoint": "health",
         "path": "dependencies.llm_pool.reason",
-        "in_version": VERSION,
+        "in_version": INTRODUCED_0_9_81,
         "was": ("the config-empty reason and `_all_roles_ineligible`'s "
                 "reason each named only the bare fact (no backend declared / "
                 "configured but ineligible), with no remedy"),
