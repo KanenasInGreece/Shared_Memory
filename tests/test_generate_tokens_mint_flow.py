@@ -604,6 +604,92 @@ def test_add_refuses_missing_directory_and_mints_nothing(tmp_path):
     assert not os.path.exists(missing_path)
 
 
+# ── L1 (Mint_Flow_Lessons brief): --install-path must be the .env FILE ──────
+#
+# generate_tokens.py:568 `_write_agent_token_file` computes
+# `leaf = os.path.basename(path)` then `os.rename(tmp_name, leaf, ...)`. A
+# directory-shaped --install-path (trailing slash, or a path that names a
+# directory) makes `leaf` empty, and `os.rename(tmp, "")` raised a cryptic
+# FileNotFoundError AFTER a temp file was already created -- a live footgun,
+# measured on a real MCP-agent mint. Fixed with a fail-fast check in
+# add_agent(), before anything is minted or written, plus a defensive guard
+# in the shared writer itself.
+
+def test_add_refuses_directory_shaped_install_path_trailing_slash(tmp_path):
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    skill_dir = tmp_path / "shared-memory-mcp"
+    skill_dir.mkdir()
+    dir_shaped_path = str(skill_dir) + "/"
+    before = set(skill_dir.glob("*"))
+
+    (rc, token), err = _capture_err(
+        gt.add_agent, "codex", install_path=dir_shaped_path, env_path=str(env_path),
+    )
+
+    assert rc == 1
+    assert token is None
+    assert "must be the .env FILE, not a directory" in err
+    after = set(skill_dir.glob("*"))
+    assert after == before, f"nothing should have been written: {after - before}"
+    assert not env_path.exists(), "the gateway .env is never touched by add_agent()"
+
+
+def test_add_refuses_directory_shaped_install_path_existing_directory(tmp_path):
+    """No trailing slash this time -- `os.path.basename` is non-empty
+    (`"shared-memory-mcp"`), so this exercises the SECOND guard clause:
+    the path exists and IS a directory."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    skill_dir = tmp_path / "shared-memory-mcp"
+    skill_dir.mkdir()
+    dir_shaped_path = str(skill_dir)  # no trailing slash
+    before = set(skill_dir.glob("*"))
+
+    (rc, token), err = _capture_err(
+        gt.add_agent, "codex", install_path=dir_shaped_path, env_path=str(env_path),
+    )
+
+    assert rc == 1
+    assert token is None
+    assert "must be the .env FILE, not a directory" in err
+    after = set(skill_dir.glob("*"))
+    assert after == before, f"nothing should have been written: {after - before}"
+
+
+def test_add_directory_shaped_install_path_prints_no_registry_lines(tmp_path):
+    """The refusal fires before ANY registry line is computed -- stdout
+    must carry neither a merged AGENT_TOKENS= nor AGENT_INSTALLS= line."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    skill_dir = tmp_path / "shared-memory-mcp"
+    skill_dir.mkdir()
+
+    (rc, token), out = _capture(
+        gt.add_agent, "codex", install_path=str(skill_dir) + "/", env_path=str(env_path),
+    )
+
+    assert rc == 1
+    assert "AGENT_TOKENS=" not in out
+    assert "AGENT_INSTALLS=" not in out
+
+
+def test_write_agent_token_file_refuses_directory_shaped_path_directly(tmp_path):
+    """Defensive guard in the shared writer itself (_write_agent_token_file)
+    -- exercised directly, bypassing add_agent()'s own guard, since this
+    function is the shared writer for every mint path (bulk mint too)."""
+    gt = load_generate_tokens()
+    skill_dir = tmp_path / "shared-memory-mcp"
+    skill_dir.mkdir()
+    before = set(skill_dir.glob("*"))
+
+    with pytest.raises(ValueError, match="directory"):
+        gt._write_agent_token_file(str(skill_dir) + "/", "tok_never_used_placeholder")
+
+    after = set(skill_dir.glob("*"))
+    assert after == before, f"no temp file should have been created: {after - before}"
+
+
 def test_add_refuses_shared_path_that_would_clobber_a_live_token(tmp_path):
     """I-A2 (second clause): two agents MAY legitimately share an install
     path (one tool reading another's skill directory), but a write-through
@@ -730,6 +816,92 @@ def test_add_flag_refuses_reveal_for_a_different_name(tmp_path, monkeypatch):
     rc = gt.main(["--add", "codex", "--reveal", "someone_else"])
 
     assert rc == 1
+
+
+# ── L2 (Mint_Flow_Lessons brief): re-mint/add reminds to re-init the client ──
+#
+# A token is read from its .env file ONCE, at import (vector-skill.py's
+# _AGENT_TOKEN_FROM_FILE and memory_bridge.py's own load both populate it at
+# load time). Re-minting rotates the registered digest immediately, so an
+# ALREADY-RUNNING client keeps presenting the previous token until it
+# re-reads the file -- every request, reads included, 401s until then. This
+# was invisible: the mint printed the written path and merged registry
+# lines, but never said so. Wording differs by install kind (refined live,
+# 2026-09-01): an MCP install needs its MCP SERVER respawned (a full host
+# restart, or a per-server reload/disable-enable where the host offers
+# one -- a full restart is not required), while a CLI skill install needs
+# its process restarted outright.
+
+def test_remint_success_prints_mcp_server_respawn_reminder(tmp_path):
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    mcp_dir = tmp_path / "shared-memory-mcp"
+    mcp_dir.mkdir()
+    mcp_env = str(mcp_dir / ".env")
+    mcp_env_path = mcp_dir / ".env"
+    mcp_env_path.write_text("AGENT_TOKEN=tok_old_value\n")
+    env_path.write_text(
+        f"AGENT_TOKENS=codex:sha256:{_digest('tok_old_value')}\n"
+        f"AGENT_INSTALLS=codex:mcp:{mcp_env}\n",
+    )
+
+    (rc, token), out = _capture(
+        gt.add_agent, "codex", install_path=mcp_env, env_path=str(env_path),
+        replace=True, install_kind="mcp",
+    )
+
+    assert rc == 0
+    assert token is not None
+    assert "Respawn" in out and "memory MCP server" in out
+    assert "re-reads the rotated" in out
+    assert token not in out, "no plaintext without --reveal"
+
+
+def test_add_success_prints_skill_process_restart_reminder(tmp_path):
+    """Default install kind (a CLI skill, not an MCP connector) gets the
+    plainer 'restart the process' wording, not the MCP-server framing."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    codex_dir = tmp_path / "codex_skill"
+    codex_dir.mkdir()
+
+    (rc, token), out = _capture(
+        gt.add_agent, "codex", install_path=str(codex_dir / ".env"), env_path=str(env_path),
+    )
+
+    assert rc == 0
+    assert "restart it" in out
+    assert "re-reads the token" in out
+    assert "Respawn" not in out and "memory MCP server" not in out
+
+
+def test_add_remote_agent_no_install_path_prints_no_respawn_reminder(tmp_path):
+    """No write happened (no install path), so there is no local process to
+    respawn/restart -- the reminder must not appear."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+
+    (rc, token), out = _capture(
+        gt.add_agent, "codex", install_path=None, env_path=str(env_path),
+    )
+
+    assert rc == 0
+    assert "Respawn" not in out
+    assert "restart it" not in out
+
+
+def test_reveal_refusal_path_prints_no_respawn_reminder(tmp_path):
+    """A pure --reveal refusal (unknown agent name, bulk-mint surface) never
+    reaches add_agent()/mint() at all -- the reminder, which only ever
+    prints on a SUCCESSFUL add_agent() call, must not appear."""
+    gt = load_generate_tokens()
+    gt.LOCAL_SKILL_ENV_PATHS = {}
+
+    rc, out = _capture(gt.main, ["--reveal", "nonexistent_agent"])
+
+    assert rc == 1
+    assert "Respawn" not in out
+    assert "restart it" not in out
 
 
 # ── I-A7: a symlink at ANY component of the registered path is refused ──────

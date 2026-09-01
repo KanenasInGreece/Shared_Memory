@@ -611,6 +611,19 @@ def _write_agent_token_file(path: str, token: str) -> bool:
     """
     skill_dir = os.path.dirname(path)
     leaf = os.path.basename(path)
+    if not leaf:
+        # Defensive guard (L1) — every known caller validates a
+        # directory-shaped path BEFORE reaching this shared writer
+        # (add_agent()'s _validate_registry_field block), so this should
+        # be unreachable in practice. It exists because this function is
+        # the shared writer for every mint path: an empty leaf must raise
+        # a clear, named error here rather than reach `os.rename(tmp, "")`,
+        # which raises a bare FileNotFoundError after a temp file was
+        # already created in `skill_dir`.
+        raise ValueError(
+            f"install path {path!r} names a directory, not a file — "
+            "refused before any write"
+        )
 
     try:
         dir_fd = _resolve_symlink_free_dir_fd(skill_dir)
@@ -972,6 +985,21 @@ def add_agent(
         _validate_registry_field(name, "agent name")
         if install_path is not None:
             _validate_registry_field(install_path, "install path")
+            # L1 — a directory-shaped --install-path used to reach
+            # _write_agent_token_file() and crash there: leaf =
+            # os.path.basename(path) is "" for a trailing slash, so
+            # os.rename(tmp_name, "") raises a cryptic
+            # FileNotFoundError AFTER a temp file was already created.
+            # Caught here, before anything is minted or written, with a
+            # message that names the fix (--install-path is the agent's
+            # .env FILE, e.g. ~/.codex/skills/shared-memory/.env — never
+            # its containing directory).
+            if (not os.path.basename(install_path.rstrip("/"))
+                    or os.path.isdir(install_path)):
+                raise ValueError(
+                    "--install-path must be the .env FILE, not a directory "
+                    "(e.g. …/shared-memory-mcp/.env)."
+                )
     except ValueError as exc:
         print(f"✗ {exc}", file=sys.stderr)
         return 1, None
@@ -1131,6 +1159,23 @@ def add_agent(
             print("  Registered as an MCP install: sync_skills.sh delivers the CONNECTOR")
             print("  package here (vector-skill.py, CONSTITUTION_SNIPPET_MCP.md,")
             print("  system-prompt.md) and never the CLI skill package.")
+        # L2 — a token is read from this file ONCE, at import (both
+        # vector-skill.py's _AGENT_TOKEN_FROM_FILE and memory_bridge.py's
+        # own load populate it at load time), so a re-mint rotates the
+        # digest immediately while an already-running process keeps
+        # presenting the PREVIOUS token until it re-reads this file — every
+        # request, reads included, 401s until then. Measured live: toggling
+        # just the affected MCP server off/on in the host was sufficient; a
+        # full host restart was not required.
+        print()
+        if install_kind == "mcp":
+            print("⚠ Respawn this agent's memory MCP server so it re-reads the rotated")
+            print("  token — a full host restart works, or a per-server reload/disable-")
+            print("  enable if your host offers one; until then it keeps the old token.")
+        else:
+            print("⚠ If this agent's process is already running, restart it so it")
+            print("  re-reads the token — it keeps presenting the previous one until")
+            print("  then, and every request (reads included) will fail auth.")
     else:
         print()
         print(f"  {name:15}  REMOTE / no install path given.")
