@@ -42,10 +42,13 @@ def test_the_cli_snippet_carries_v5():
         "will not read as drifted and Phase 8c will not re-propose it")
 
 
-def test_the_mcp_snippet_carries_v4():
+def test_the_mcp_snippet_carries_v5():
+    # Pin moved v4 -> v5 for the MCP-W write-gate review (B3): the snippet
+    # gained the corpus-poisoning warning ported from SKILL.md:257, so an
+    # installed v4 block must read as drifted and Phase 8c must re-propose it.
     text = _read(_MCP_SNIPPET)
-    assert "<!-- shared-memory:mcp-constitution-snippet v4 -->" in text, (
-        "the MCP snippet's marker did not advance to v4 — an installed block "
+    assert "<!-- shared-memory:mcp-constitution-snippet v5 -->" in text, (
+        "the MCP snippet's marker did not advance to v5 — an installed block "
         "will not read as drifted and Phase 8c will not re-propose it")
 
 
