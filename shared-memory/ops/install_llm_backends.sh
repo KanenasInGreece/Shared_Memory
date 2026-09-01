@@ -60,14 +60,18 @@ ask()          { local v; read -r -p "$1 [$2]: " v; printf '%s' "${v:-$2}"; }
 ask_required() { local v; while true; do read -r -p "$1: " v; [[ -n "$v" ]] && { printf '%s' "$v"; return; }; echo "  (required)"; done; }
 yesno()        { local v; read -r -p "$1 [y/N]: " v; [[ "$v" =~ ^[Yy]$ ]]; }
 
-# W0 item ①: the gateway's three startup guards (S-05, M-5, P-5 in
-# shared-memory/scripts/hive_mind_proxy.py) refuse to start on configs this
-# script used to happily write — a credentialed backend with neither
-# `private_ok` nor `roles` (M-5), or any credentialed backend at all while
-# AGENT_TOKENS is unset (S-05, unless the operator has already set the
-# documented override). This block makes the script itself ask the M-5
-# question and warn about S-05, rather than letting the operator discover
-# both only when the gateway refuses to boot.
+# W0 item ① (SEC M-2, fix round — this header itself was stale after W4):
+# of the gateway's three startup guards (S-05, M-5, P-5 in
+# shared-memory/scripts/hive_mind_proxy.py), only S-05 still refuses to
+# start — any credentialed backend at all while AGENT_TOKENS is unset,
+# unless the operator has already set the documented override. M-5 and P-5
+# are loud, non-fatal startup WARNINGS since W4/decision:1824: a
+# credentialed backend with neither `private_ok` nor `roles` (M-5) is safe
+# by construction (simply never selected); auth-off plus an EXPLICIT
+# private_ok=false (P-5) is safe by construction only for a backend that
+# also carries no `roles` — one still worth asking about up front rather
+# than leaving the operator to discover it from a startup log line. This
+# block makes the script itself ask the M-5 question and warn about S-05.
 #
 # ROLE_VOCABULARY: extract judge
 # (source of truth: hive_mind_proxy.py's ROUTING_ROLE_NAMES; "summarize" is
@@ -207,7 +211,8 @@ build_backend_entry() {
         while true; do
             if ! read -r -p "  Serve any eligible request (private_ok), or only specific roles (roles)? [private_ok/roles]: " mode; then
                 echo "  No more input on stdin — refusing to write a credentialed backend with" >&2
-                echo "  neither private_ok nor roles chosen (the gateway would refuse to start)." >&2
+                echo "  neither private_ok nor roles chosen (M-5: the gateway would boot but" >&2
+                echo "  never select it — declare one explicitly)." >&2
                 return 1
             fi
             mode="$(printf '%s' "$mode" | tr '[:upper:]' '[:lower:]')"

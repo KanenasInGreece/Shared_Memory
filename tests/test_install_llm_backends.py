@@ -1,11 +1,14 @@
-"""install_llm_backends.sh -- M-5/S-05-aware access elicitation (W0 item ①).
+"""install_llm_backends.sh -- M-5'/S-05-aware access elicitation (W0 item ①).
 
 Before this, the script wrote {url, weight, model?, token_env?} only -- never
-`private_ok` or `roles` -- so a credentialed backend it just configured made
-the gateway refuse to start (M-5: a credentialed backend needs an EXPLICIT
-private_ok or roles choice). Auth-off installs additionally hit S-05
-(AGENT_TOKENS unset + any credentialed backend -> SystemExit) with no
-warning from this script at all.
+`private_ok` or `roles` -- so a credentialed backend it just configured was
+left with neither declared. Under W4 default-deny (decision:1824, SEC M-2
+fix round: this docstring itself was stale) that is M-5': a loud,
+NON-FATAL startup WARNING (the backend is simply never selected) -- pre-W4
+it was a fatal `SystemExit`, which is the world this docstring used to
+describe. Auth-off installs additionally hit S-05 (AGENT_TOKENS unset + any
+credentialed backend -> SystemExit, UNCHANGED by W4) with no warning from
+this script at all.
 
 The fix: `build_backend_entry()` (between the `# >>> BACKEND_ACCESS` /
 `# <<< BACKEND_ACCESS` markers in the real script) now elicits the M-5
