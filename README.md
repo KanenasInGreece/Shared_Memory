@@ -1003,13 +1003,13 @@ local cards can't hold — each is useful, and each breaks the assumption that a
 take any job. The `.env` lets you say so per backend, in `LLM_BACKENDS_JSON`:
 
 - **`roles`** — which dreaming functions this backend may serve (`extract`, `verify`,
-  `judge`). Leave it out and the backend serves everything, which is exactly what a
-  uniform local pool wants.
+  `judge`). Leave it out and the backend serves nothing until you also declare
+  `private_ok: true` — saying what a backend is for is now part of declaring it.
 - **`n_ctx`** — the model's usable context. Declared, it lets the gateway keep a job that
   cannot fit away from a backend that would truncate it.
-- **`private_ok`** — may record content land here as ordinary, unrestricted traffic? A
-  local backend defaults to yes; a credentialed provider defaults to no, and asks you to
-  choose out loud.
+- **`private_ok`** — may record content land here as ordinary, unrestricted traffic?
+  Nothing defaults to yes any more: every backend, local or credentialed, serves only
+  what its entry explicitly declares — the installer asks you to choose out loud.
 - **`max_inflight`** — how many simultaneous requests this backend may hold, for the
   metered or fragile ones.
 
@@ -1018,8 +1018,9 @@ The dilemma these knobs settle is real and worth stating plainly: an external LL
 context** than the cards in the box. There is no universally right answer; there is only
 your answer, per function, per install. Naming a provider's entry `roles: ["judge"]` says
 insight folds may go out but raw record enrichment never does; `private_ok: true` says the
-provider is trusted like a local card; leaving both unsaid is refused at startup rather
-than guessed at.
+provider is trusted like a local card; leaving both unsaid leaves the backend configured
+but never selected: the gateway boots, says so at startup and in `check_config`, and waits
+for your declaration.
 
 Three properties hold however you configure it:
 
