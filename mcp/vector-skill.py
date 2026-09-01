@@ -262,7 +262,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.9.83"
+VERSION = "0.9.84"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 # This client's own FRAMEWORK VERSION, distinct from the wire API_VERSION: two
 # clients can speak api_version 4 while one of them is forty releases behind on
@@ -1607,8 +1607,9 @@ async def memory_telemetry() -> str:
 async def record_lineage(ref: str) -> str:
     """
 
-    Requires a write-capable agent token: a read-only token receives an
-    honest HTTP 403 role refusal from the gateway — expected, do not retry.
+    This is a READ — GET /memory/status/{ref} makes no mutation, so it is on
+    the gateway's read-role allowlist and a read-only agent token reaches it
+    fine, no 403.
     "What happened to this record?" — its state, its dream-cycle stamps
     (applied → rem_reviewed → consolidated), and which summary it was folded
     into, with the fact→summary latency.

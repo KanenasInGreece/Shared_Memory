@@ -5,6 +5,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.84] — 2026-09-01
+
+### The MCP surface is ready for a write-capable client
+
+Before an autonomous MCP agent can hold a write-capable token to the shared corpus, the second front
+door had to close three gaps an adversarial threat review found. The bundled `mcp.json` no longer
+ships a filesystem MCP server rooted over the directory that holds the walled `.env` — an injected
+agent can no longer be steered into reading its own credential file and exfiltrating it in a save.
+The corpus-poisoning warning that the CLI surface has always carried — never save raw web-retrieved
+text without reviewing it for instructional language, because a crafted document contaminates the
+thematic summaries every agent then reads as trusted context — now also appears on all three MCP
+surfaces (the system prompt, the README, and the MCP constitution snippet), so the autonomous
+web-reading agent is finally told the one thing it most needs to know. And `record_lineage`'s
+description no longer claims a write-capable token is required: lineage is a read, on the read-role
+allowlist, and saying otherwise only pushed operators toward over-granting.
+
+No tool was added or removed and no behaviour changed; this is a client-surface and documentation
+release.
+
 ## [0.9.83] — 2026-09-01
 
 ### A thinking model is proof of life, not a failure — and what your config declares is visible
