@@ -172,6 +172,44 @@ def test_config_empty_and_serving_reads_degraded_the_new_state(monkeypatch):
         f"; configured, but no backend is eligible for any traffic")
 
 
+def test_llm_default_target_alone_pin(monkeypatch):
+    """§8: LLM_DEFAULT_TARGET-alone pin. A bare LLM_DEFAULT_TARGET override
+    (no LLM_BACKENDS, no LLM_BACKENDS_JSON) is a legacy shape too (Operator
+    ruling 2026-08-31: it alone is NOT a declaration) — config_empty stays
+    True, the fleet is fleet-wide ineligible, and BOTH composed reasons
+    carry the remedy since LLM_POOL_LEGACY_KEY_PRESENT is True here."""
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_DEFAULT_TARGET", "http://custom-fallback:9000")
+    g = _fresh(monkeypatch)
+    assert g.LLM_POOL_CONFIG_EMPTY is True
+    assert g.LLM_POOL_LEGACY_KEY_PRESENT is True
+    dep = g._llm_pool_dependency({g.LLM_BACKENDS[0]: "ok"})
+    assert dep["state"] == "degraded"
+    assert dep["reason"] == (
+        "no backend declared — serving the built-in "
+        "http://custom-fallback:9000 fallback; " + g._LLM_POOL_LEGACY_REMEDY
+        + "; configured, but no backend is eligible for any traffic; "
+        + g._LLM_POOL_LEGACY_REMEDY)
+
+
+def test_dream_slot_composition_pin_undeclared_fleet(monkeypatch):
+    """§8: dream-slot composition pin. An undeclared (legacy CSV) fleet ->
+    _counts_free_slot reads False for it (private_ok defaults False) ->
+    _dream_slots_impossible_reason() fires -> both W2 dream dependencies
+    read degraded with the SAME reason string _rem_dependency/
+    _nrem_dependency have always used."""
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    g = _fresh(monkeypatch)
+    assert g._counts_free_slot("http://a:5000") is False
+    assert g._dream_slots_impossible_reason() == (
+        "no backend counts toward dream slots — REM and NREM will never "
+        "run against this fleet")
+    assert g._rem_dependency(True, None)["state"] == "degraded"
+    assert g._nrem_dependency(True, {"stalled": False}, 5)["state"] == "degraded"
+
+
 def test_declared_fleet_healthy_still_reads_ok_unchanged(monkeypatch):
     """MEANING CHANGE (W4, §7 MEANING_CHANGES ①②): a legacy LLM_BACKENDS CSV
     fleet is no longer "genuinely declared" in the private_ok sense — W4

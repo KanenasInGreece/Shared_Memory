@@ -62,6 +62,8 @@ import re
 import shlex
 import subprocess
 import threading
+
+import pytest
 from pathlib import Path
 
 POSTFLIGHT = (Path(__file__).parent.parent / "shared-memory" / "scripts"
@@ -220,9 +222,9 @@ def test_backend_info_reads_the_status_map_never_the_configured_list():
 
 # ── a8_grade_completion (pure) ─────────────────────────────────────────────
 
-def run_a8_grade_completion(status: str, body: str) -> subprocess.CompletedProcess:
+def run_a8_grade_completion(status: str, body: str, fault_origin: str = "") -> subprocess.CompletedProcess:
     source = _extract_marked_block("# >>> A8_GRADE_COMPLETION", "# <<< A8_GRADE_COMPLETION")
-    cmd = source + f"\na8_grade_completion {shlex.quote(status)}"
+    cmd = source + f"\na8_grade_completion {shlex.quote(status)} {shlex.quote(fault_origin)}"
     return subprocess.run(
         ["bash", "-c", cmd],
         input=body, capture_output=True, text=True, timeout=15,
@@ -290,6 +292,62 @@ def test_grade_500_is_HTTP_500():
     assert result.stdout.strip() == "HTTP_500"
 
 
+def _refusal_body(declaration="none", constraint="privacy", error="no_eligible_backend"):
+    body = {"error": error, "constraint": constraint, "role": None}
+    if declaration is not None:
+        body["declaration"] = declaration
+    return json.dumps(body)
+
+
+@pytest.mark.parametrize("declaration", ["none", "no_role_less_opt_in"])
+def test_grade_422_skips_on_both_declaration_values_when_gateway_origin(declaration):
+    """Ruling B(i)/E(alpha2) (§6.7): a named non-fatal skip on EITHER
+    declaration value, but ONLY when the gateway itself stamped the
+    fault-origin header."""
+    result = run_a8_grade_completion("422", _refusal_body(declaration=declaration), "gateway")
+    assert result.returncode == 0
+    assert result.stdout.strip() == f"SKIP_{declaration}"
+
+
+def test_grade_422_stays_fatal_on_fit_constraint_even_with_declaration():
+    """Fit and every other routing/join defect (the D23 class) stay FATAL —
+    a genuinely oversized request must never be misread as an undeclared-
+    fleet skip just because `declaration` happens to be present."""
+    result = run_a8_grade_completion("422", _refusal_body(declaration="none", constraint="fit"), "gateway")
+    assert result.returncode == 0
+    assert result.stdout.strip() == "HTTP_422"
+
+
+def test_grade_422_stays_fatal_when_no_declaration_key_present():
+    """An explicitly-declared, correctly-scoped fleet's plain refusal
+    (no `declaration` key at all) must stay FATAL — this is not
+    misconfiguration, per Ruling E(alpha2) arm 1."""
+    result = run_a8_grade_completion("422", _refusal_body(declaration=None), "gateway")
+    assert result.returncode == 0
+    assert result.stdout.strip() == "HTTP_422"
+
+
+def test_grade_422_stays_fatal_when_fault_origin_is_not_gateway():
+    """A passed-through UPSTREAM 422 (fault_origin != 'gateway', including
+    the empty-header case) must never be misread as a gateway refusal —
+    the same discipline rem_loop.py/consolidation_loop.py enforce."""
+    result = run_a8_grade_completion("422", _refusal_body(), "upstream")
+    assert result.returncode == 0
+    assert result.stdout.strip() == "HTTP_422"
+
+
+def test_grade_422_stays_fatal_when_fault_origin_header_absent():
+    result = run_a8_grade_completion("422", _refusal_body(), "")
+    assert result.returncode == 0
+    assert result.stdout.strip() == "HTTP_422"
+
+
+def test_grade_422_unparseable_body_stays_fatal_never_crashes():
+    result = run_a8_grade_completion("422", "not json at all", "gateway")
+    assert result.returncode == 0
+    assert result.stdout.strip() == "HTTP_422"
+
+
 def test_grade_000_is_NO_RESPONSE():
     result = run_a8_grade_completion("000", "")
     assert result.returncode == 0
@@ -312,6 +370,7 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
     status_code = 200
     body = b'{"choices":[{"message":{"content":"ok"}}]}'
     seen_auth_header = None
+    extra_headers = {}
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -320,6 +379,8 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
         type(self).seen_path = self.path
         self.send_response(self.status_code)
         self.send_header("Content-Type", "application/json")
+        for name, value in self.extra_headers.items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(self.body)
 
@@ -328,10 +389,12 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
 
 
 @contextlib.contextmanager
-def _stub_server(status_code=200, body=b'{"choices":[{"message":{"content":"ok"}}]}'):
+def _stub_server(status_code=200, body=b'{"choices":[{"message":{"content":"ok"}}]}',
+                  extra_headers=None):
     handler_cls = type("Handler", (_StubHandler,), {
         "status_code": status_code, "body": body,
         "seen_auth_header": None, "seen_path": None,
+        "extra_headers": extra_headers or {},
     })
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -463,6 +526,46 @@ def test_a8_404_fails_and_names_the_D23_known_cause():
     assert "doubled" in result.stdout
     assert "https://provider.example/v1" in result.stdout  # names the healthy backend
     assert _afail(result) == "1"
+
+
+def test_a8_422_with_gateway_declaration_skips_not_fails():
+    """Ruling B(i) (§6.7), end to end through the SECOND edit site (curl
+    header capture, outside the verbatim-extracted A8_GRADE_COMPLETION
+    block): a live 422 stamped X-SM-Fault-Origin: gateway with a
+    `declaration` key must WARN and pass (afail=0), never FAIL."""
+    body = json.dumps({"error": "no_eligible_backend", "constraint": "privacy",
+                        "role": None, "declaration": "no_role_less_opt_in"}).encode()
+    with _stub_server(422, body, extra_headers={"X-SM-Fault-Origin": "gateway"}) as (url, _):
+        health = json.dumps({"llm_backends": {"http://example:5000": "ok"}})
+        result = run_a8_live(gateway_url=url, health_full=health)
+    assert _afail(result) == "0"
+    assert "A8 skipped" in result.stdout
+    assert "no_role_less_opt_in" in result.stdout
+    assert "✗ A8" not in result.stdout
+
+
+def test_a8_422_upstream_origin_still_fails():
+    """The same 422 body, but stamped X-SM-Fault-Origin: upstream — a REAL
+    provider refusal passed through must never be misread as the
+    documented undeclared-fleet state."""
+    body = json.dumps({"error": "no_eligible_backend", "constraint": "privacy",
+                        "role": None, "declaration": "no_role_less_opt_in"}).encode()
+    with _stub_server(422, body, extra_headers={"X-SM-Fault-Origin": "upstream"}) as (url, _):
+        health = json.dumps({"llm_backends": {"http://example:5000": "ok"}})
+        result = run_a8_live(gateway_url=url, health_full=health)
+    assert _afail(result) == "1"
+    assert "✗ A8" in result.stdout
+
+
+def test_a8_422_without_declaration_still_fails():
+    """A genuinely-scoped, explicitly-declared fleet's plain 422 (no
+    `declaration` key) must stay FATAL — Ruling E(alpha2) arm 1."""
+    body = json.dumps({"error": "no_eligible_backend", "constraint": "privacy", "role": None}).encode()
+    with _stub_server(422, body, extra_headers={"X-SM-Fault-Origin": "gateway"}) as (url, _):
+        health = json.dumps({"llm_backends": {"http://example:5000": "ok"}})
+        result = run_a8_live(gateway_url=url, health_full=health)
+    assert _afail(result) == "1"
+    assert "✗ A8" in result.stdout
 
 
 def test_a8_500_fails_with_status_named():

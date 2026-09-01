@@ -210,18 +210,53 @@ print(str(len(healthy)) + "|" + ",".join(healthy) + "|" + summary)
 # VERBATIM and runs it standalone via subprocess with fixture argv/stdin —
 # same technique as SELECT_SUMMARY_PHRASE above. Pure function: given the
 # HTTP status code postflight's own curl call to POST $GATEWAY_URL/v1/chat/
-# completions returned (argv 1) and that response's BODY on stdin, prints
-# exactly one verdict token: OK | EMPTY | NO_RESPONSE | HTTP_<code>. A 200
+# completions returned (argv 1), the response's X-SM-Fault-Origin header
+# value (argv 2, W4/Ruling B(i)/E(alpha2) — empty string when absent) and
+# that response's BODY on stdin, prints exactly one verdict token:
+# OK | EMPTY | NO_RESPONSE | HTTP_<code> | SKIP_<declaration>. A 200
 # with unparseable JSON, a missing/non-string "content", or blank content
 # all grade EMPTY — a 200 is not by itself a usable completion (this is the
 # D23 lesson generalised: liveness is not capability, and a shape check is
-# not a content check). This function only GRADES; the human-readable
-# message (e.g. naming the D23 known-cause on a 404) is composed at the A8
-# call site below — same split SELECT_SUMMARY_PHRASE has from A5.
-a8_grade_completion() {  # a8_grade_completion <status_code>  (body on stdin)
+# not a content check). SKIP_<declaration> is a NAMED NON-FATAL skip
+# (documented post-0.9.81 state, never a FAIL) for a 422 whose body carries
+# ALL FOUR conjuncts (V3): error == "no_eligible_backend", a `declaration`
+# key present, constraint != "fit" (a genuine oversized-request fit failure
+# stays FATAL), and the response actually originated at the GATEWAY (argv 2
+# == "gateway") — a passed-through UPSTREAM 422 must never be misread as a
+# gateway refusal, the same discipline rem_loop.py/consolidation_loop.py
+# enforce on their own refusal parse. This function only GRADES; the
+# human-readable message is composed at the A8 call site below — same
+# split SELECT_SUMMARY_PHRASE has from A5.
+a8_grade_completion() {  # a8_grade_completion <status_code> <fault_origin_header>  (body on stdin)
     local status="$1"
+    local fault_origin="$2"
     if [[ -z "$status" || "$status" == "000" ]]; then
         echo "NO_RESPONSE"
+        return
+    fi
+    if [[ "$status" == "422" ]]; then
+        # Body read FIRST, before the generic HTTP_$status branch below —
+        # the caller cannot discriminate afterward (it rm -f's the body
+        # file before its own case statement).
+        local body skip
+        body="$(cat)"
+        skip="$(printf '%s' "$body" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not isinstance(d, dict):
+    sys.exit(0)
+if (d.get("error") == "no_eligible_backend" and d.get("declaration") is not None
+        and d.get("constraint") != "fit"):
+    print(d["declaration"])
+')"
+        if [[ -n "$skip" && "$fault_origin" == "gateway" ]]; then
+            echo "SKIP_$skip"
+            return
+        fi
+        echo "HTTP_422"
         return
     fi
     if [[ "$status" != "200" ]]; then
@@ -1013,6 +1048,7 @@ else
         [[ -z "$a8_model" ]] && a8_model="local-model"
         a8_body_file="$(mktemp)"
         a8_resp_file="$(mktemp)"
+        a8_header_file="$(mktemp)"
         python3 -c '
 import json, sys
 print(json.dumps({
@@ -1031,20 +1067,29 @@ print(json.dumps({
             a8_status="$(curl -s --compressed --max-time "$CLIENT_TIMEOUT" -K - \
                     -H "Content-Type: application/json" \
                     --data-binary @"$a8_body_file" \
-                    -o "$a8_resp_file" -w '%{http_code}' \
+                    -D "$a8_header_file" -o "$a8_resp_file" -w '%{http_code}' \
                     "$GATEWAY_URL/v1/chat/completions" \
                     <<< "header = \"Authorization: Bearer $AGENT_TOKEN\"" 2>/dev/null)"
         else
             a8_status="$(curl -s --compressed --max-time "$CLIENT_TIMEOUT" \
                     -H "Content-Type: application/json" \
                     --data-binary @"$a8_body_file" \
-                    -o "$a8_resp_file" -w '%{http_code}' \
+                    -D "$a8_header_file" -o "$a8_resp_file" -w '%{http_code}' \
                     "$GATEWAY_URL/v1/chat/completions" 2>/dev/null)"
         fi
         t1="$(now_ms)"
         rm -f "$a8_body_file"
 
-        a8_verdict="$(a8_grade_completion "$a8_status" < "$a8_resp_file")"
+        # W4 (§6.7): the second edit site, OUTSIDE the verbatim-extracted
+        # A8_GRADE_COMPLETION block — a passed-through UPSTREAM 422 must
+        # never be misread as a gateway refusal, so the discriminator needs
+        # the header the gateway itself stamps (hive_mind_proxy.py:1696).
+        # `tail -1` takes the LAST occurrence in case of a redirect chain.
+        a8_fault_origin="$(grep -i '^X-SM-Fault-Origin:' "$a8_header_file" 2>/dev/null \
+                | tail -1 | cut -d: -f2- | tr -d ' \t\r\n')"
+        rm -f "$a8_header_file"
+
+        a8_verdict="$(a8_grade_completion "$a8_status" "$a8_fault_origin" < "$a8_resp_file")"
         rm -f "$a8_resp_file"
 
         case "$a8_verdict" in
@@ -1057,6 +1102,12 @@ print(json.dumps({
                 ;;
             HTTP_404)
                 bad A8 "gateway returned 404 from the reasoning-backend proxy path — the known cause (D23) is a doubled /v1 path segment when a configured base already ends in /v1. Healthy backend(s) at request time: ${backend_urls:-<none>}"
+                ;;
+            SKIP_*)
+                # Ruling B(i) (§6.7): a NAMED non-fatal skip, never a FAIL —
+                # postflight exits 0 with this note. Fit and every other
+                # routing/join defect (the D23 class) stay FATAL below.
+                warn "A8 skipped: ${a8_verdict#SKIP_} — documented post-0.9.81 state; run check_config.py to see per-backend declaration status. Healthy backend(s) at request time: ${backend_urls:-<none>}"
                 ;;
             HTTP_*)
                 bad A8 "gateway returned HTTP ${a8_verdict#HTTP_} from the reasoning-backend proxy path. Healthy backend(s) at request time: ${backend_urls:-<none>}"
