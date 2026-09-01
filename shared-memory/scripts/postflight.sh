@@ -1043,6 +1043,11 @@ echo "A8 — reasoning-backend liveness, end to end:"
 # which would have caught D23 (all three stayed green throughout the live
 # incident).
 reasoning_ms=""
+# ND6: carried into the Summary block below by the SKIP_* case arm — never
+# re-derived there, and never keyed off afail[] (a named skip deliberately
+# leaves afail[A8] untouched, so afail[] alone cannot distinguish "passed
+# clean" from "passed with A8 skipped").
+a8_skip_declaration=""
 if [[ "$token_missing" == "1" ]]; then
     warn "A8 skipped — AGENT_TOKEN missing (see A1)"
 elif [[ "$gateway_down" == "1" ]]; then
@@ -1134,7 +1139,11 @@ print(json.dumps({
                 # Ruling B(i) (§6.7): a NAMED non-fatal skip, never a FAIL —
                 # postflight exits 0 with this note. Fit and every other
                 # routing/join defect (the D23 class) stay FATAL below.
-                warn "A8 skipped: ${a8_verdict#SKIP_} — documented post-0.9.81 state; run check_config.py to see per-backend declaration status. Healthy backend(s) at request time: ${backend_urls:-<none>}"
+                # ND6: this is the ONE place a8_skip_declaration is set — the
+                # Summary block reads it verbatim, never re-deriving the
+                # verdict or keying off afail[] (untouched by a skip).
+                a8_skip_declaration="${a8_verdict#SKIP_}"
+                warn "A8 skipped: ${a8_skip_declaration} — documented post-0.9.81 state; run check_config.py to see per-backend declaration status. Healthy backend(s) at request time: ${backend_urls:-<none>}"
                 ;;
             HTTP_*)
                 bad A8 "gateway returned HTTP ${a8_verdict#HTTP_} from the reasoning-backend proxy path. Healthy backend(s) at request time: ${backend_urls:-<none>}"
@@ -1153,7 +1162,14 @@ for a in A1 A2 A3 A4 A5 A8; do
     [[ "${afail[$a]:-0}" == "1" ]] && fail=1
 done
 if [[ "$fail" -eq 0 ]]; then
-    grn "Postflight passed (A1–A5, A8). The install works end to end; A6's baseline is your performance reference."
+    if [[ -n "${a8_skip_declaration:-}" ]]; then
+        # ND6: the skip is loud at the A8 check itself, but must survive a
+        # scrolled-past terminal — a passing run with A8 named-skipped reads
+        # identically to a full pass unless the summary says otherwise.
+        grn "Postflight passed (A1–A5, A8 skipped: ${a8_skip_declaration}). The install works end to end for what is declared; A6's baseline is your performance reference."
+    else
+        grn "Postflight passed (A1–A5, A8). The install works end to end; A6's baseline is your performance reference."
+    fi
 else
     failed=""
     for a in A1 A2 A3 A4 A5 A8; do

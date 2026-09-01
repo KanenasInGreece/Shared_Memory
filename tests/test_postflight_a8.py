@@ -482,6 +482,60 @@ def run_a8_live(*, gateway_url, health_full="{}", auth_on="0", token_missing="0"
     )
 
 
+def run_a8_and_summary_live(*, gateway_url, health_full="{}", auth_on="0",
+                             token_missing="0", gateway_down="0", agent_token=None,
+                             client_timeout="10"):
+    # ND6: A8's own section PLUS the real Summary section, run together --
+    # the summary must carry a named skip's declaration itself, from a
+    # variable the SKIP_* arm sets (never re-derived from afail[], which a
+    # skip deliberately leaves untouched -- see postflight.sh's own ND6
+    # comment at the SKIP_* case).
+    prefix = _extract_prefix()
+    a8 = _extract_a8_section()
+    summary = _extract_summary_section()
+    lines = [
+        prefix,
+        "set -uo pipefail",
+        f"GATEWAY_URL={shlex.quote(gateway_url)}",
+        f"CLIENT_TIMEOUT={shlex.quote(client_timeout)}",
+        f"auth_on={shlex.quote(auth_on)}",
+        f"token_missing={shlex.quote(token_missing)}",
+        f"gateway_down={shlex.quote(gateway_down)}",
+        f"health_full={shlex.quote(health_full)}",
+    ]
+    if agent_token is not None:
+        lines.append(f"AGENT_TOKEN={shlex.quote(agent_token)}")
+    lines.append(a8)
+    lines.append(summary)
+    harness = "\n".join(lines)
+    return subprocess.run(
+        ["bash", "-c", harness], capture_output=True, text=True, timeout=30,
+    )
+
+
+def test_summary_names_the_declaration_on_a_named_a8_skip():
+    body = json.dumps({"error": "no_eligible_backend", "constraint": "privacy",
+                        "role": None, "declaration": "no_role_less_opt_in"}).encode()
+    with _stub_server(422, body, extra_headers={"X-SM-Fault-Origin": "gateway"}) as (url, _):
+        health = json.dumps({"llm_backends": {"http://example:5000": "ok"}})
+        result = run_a8_and_summary_live(gateway_url=url, health_full=health)
+    assert result.returncode == 0
+    assert "no_role_less_opt_in" in result.stdout
+    # Named in the SUMMARY block itself (after "A8 skipped:" -- the check's
+    # own per-check line), not only in the per-check warn() line above it.
+    summary_text = result.stdout[result.stdout.index("Postflight passed"):]
+    assert "no_role_less_opt_in" in summary_text
+
+
+def test_summary_plain_pass_unchanged_when_a8_actually_passes():
+    with _stub_server(200, b'{"choices":[{"message":{"content":"ok"}}]}') as (url, _):
+        health = json.dumps({"llm_backends": {"http://example:5000": "ok"}})
+        result = run_a8_and_summary_live(gateway_url=url, health_full=health)
+    assert result.returncode == 0
+    assert "Postflight passed (A1" in result.stdout
+    assert "skipped" not in result.stdout.lower()
+
+
 def _afail(result: subprocess.CompletedProcess) -> str:
     m = re.search(r"^AFAIL_A8=(\S*)$", result.stdout, re.M)
     assert m, f"AFAIL_A8 marker missing from stdout:\n{result.stdout}\n{result.stderr}"
