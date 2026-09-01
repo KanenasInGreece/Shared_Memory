@@ -657,6 +657,37 @@ def test_add_refuses_directory_shaped_install_path_existing_directory(tmp_path):
     assert after == before, f"nothing should have been written: {after - before}"
 
 
+def test_add_refuses_trailing_slash_install_path_to_a_nonexistent_directory(tmp_path):
+    """MF1 fix-round regression (security+QA review, reproduced live): a
+    trailing-slash --install-path to a directory that does NOT exist yet
+    used to pass BOTH clauses of the up-front guard -- the OLD check called
+    os.path.basename(install_path.rstrip("/")), and stripping the trailing
+    slash before taking the basename recovers a non-empty leaf name (e.g.
+    "newdir"), while os.path.isdir() is False for a path that doesn't
+    exist. The refusal never fired; the mint proceeded, and
+    _write_agent_token_file()'s OWN defensive guard (which checks
+    os.path.basename() WITHOUT stripping) caught it instead -- as an
+    UNCAUGHT ValueError, since add_agent()'s call site only catches
+    AgentEnvIsSymlink/OSError around that write. A crash, not the clean
+    rc=1 refusal every other invalid --install-path gets. Fixed by
+    dropping the .rstrip("/") in the up-front check."""
+    gt = load_generate_tokens()
+    env_path = tmp_path / ".env"
+    nonexistent_dir_path = str(tmp_path / "newdir") + "/"  # "newdir" is never created
+    before = set(tmp_path.glob("*"))
+
+    (rc, token), err = _capture_err(
+        gt.add_agent, "codex", install_path=nonexistent_dir_path, env_path=str(env_path),
+    )
+
+    assert rc == 1
+    assert token is None
+    assert "must be the .env FILE, not a directory" in err
+    after = set(tmp_path.glob("*"))
+    assert after == before, f"nothing should have been written: {after - before}"
+    assert not os.path.exists(str(tmp_path / "newdir"))
+
+
 def test_add_directory_shaped_install_path_prints_no_registry_lines(tmp_path):
     """The refusal fires before ANY registry line is computed -- stdout
     must carry neither a merged AGENT_TOKENS= nor AGENT_INSTALLS= line."""
@@ -852,7 +883,8 @@ def test_remint_success_prints_mcp_server_respawn_reminder(tmp_path):
 
     assert rc == 0
     assert token is not None
-    assert "Respawn" in out and "memory MCP server" in out
+    assert "respawn it" in out and "memory MCP server" in out
+    assert "already running" in out
     assert "re-reads the rotated" in out
     assert token not in out, "no plaintext without --reveal"
 
@@ -872,7 +904,7 @@ def test_add_success_prints_skill_process_restart_reminder(tmp_path):
     assert rc == 0
     assert "restart it" in out
     assert "re-reads the token" in out
-    assert "Respawn" not in out and "memory MCP server" not in out
+    assert "respawn it" not in out and "memory MCP server" not in out
 
 
 def test_add_remote_agent_no_install_path_prints_no_respawn_reminder(tmp_path):
@@ -886,7 +918,7 @@ def test_add_remote_agent_no_install_path_prints_no_respawn_reminder(tmp_path):
     )
 
     assert rc == 0
-    assert "Respawn" not in out
+    assert "respawn it" not in out
     assert "restart it" not in out
 
 
@@ -900,7 +932,7 @@ def test_reveal_refusal_path_prints_no_respawn_reminder(tmp_path):
     rc, out = _capture(gt.main, ["--reveal", "nonexistent_agent"])
 
     assert rc == 1
-    assert "Respawn" not in out
+    assert "respawn it" not in out
     assert "restart it" not in out
 
 

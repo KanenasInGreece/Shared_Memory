@@ -994,8 +994,25 @@ def add_agent(
             # message that names the fix (--install-path is the agent's
             # .env FILE, e.g. ~/.codex/skills/shared-memory/.env — never
             # its containing directory).
-            if (not os.path.basename(install_path.rstrip("/"))
-                    or os.path.isdir(install_path)):
+            #
+            # MF1 fix-round finding (security+QA review, reproduced): this
+            # USED TO call os.path.basename(install_path.rstrip("/")) --
+            # stripping the trailing slash before taking the basename
+            # recovers a non-empty leaf name (e.g. "newdir") for a
+            # trailing-slash path to a directory that does not exist yet,
+            # which also fails os.path.isdir() (nothing there to be a
+            # directory). Both clauses of this check then passed, and the
+            # refusal never fired -- the mint proceeded and
+            # _write_agent_token_file()'s OWN defensive guard (an empty
+            # `os.path.basename(path)`, computed WITHOUT stripping) caught
+            # it instead, as an uncaught ValueError, since add_agent()'s
+            # call site only catches AgentEnvIsSymlink/OSError around that
+            # write. os.path.basename() already returns "" for ANY
+            # trailing-slash path on its own -- stripping first was never
+            # needed to detect one, and only served to defeat this exact
+            # case. No .rstrip() here now: an empty basename is the correct
+            # signal for a trailing slash, existing directory or not.
+            if not os.path.basename(install_path) or os.path.isdir(install_path):
                 raise ValueError(
                     "--install-path must be the .env FILE, not a directory "
                     "(e.g. …/shared-memory-mcp/.env)."
@@ -1169,9 +1186,15 @@ def add_agent(
         # full host restart was not required.
         print()
         if install_kind == "mcp":
-            print("⚠ Respawn this agent's memory MCP server so it re-reads the rotated")
-            print("  token — a full host restart works, or a per-server reload/disable-")
-            print("  enable if your host offers one; until then it keeps the old token.")
+            # MF2 fix-round finding (QA review, LOW/cosmetic): give this
+            # branch the same "if already running" hedge the CLI branch
+            # below always had -- a fresh --add --mcp install has nothing
+            # running yet to respawn, so an unconditional "Respawn ..."
+            # overclaimed on the common first-install path.
+            print("⚠ If this agent's memory MCP server is already running, respawn it so")
+            print("  it re-reads the rotated token — a full host restart works, or a")
+            print("  per-server reload/disable-enable if your host offers one; until then")
+            print("  it keeps the old token.")
         else:
             print("⚠ If this agent's process is already running, restart it so it")
             print("  re-reads the token — it keeps presenting the previous one until")
