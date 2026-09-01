@@ -221,19 +221,35 @@ def _write_bypass_fixture(path):
         f"{_BOM}AGENT_TOKEN=tok_bom_prefixed\n"
         "pg_conn=postgresql://leaked_lowercase\n"
         f"{_BOM}PG_CONN=postgresql://leaked_bom\n"
+        # H-1 (2026-09-01 follow-up, blocking regression in 5d40292): a
+        # lowercase agent_token= line. This one is deliberately placed
+        # AFTER the BOM-prefixed AGENT_TOKEN above, so first-definition-
+        # wins means it does NOT itself become _AGENT_TOKEN_FROM_FILE here
+        # — this fixture only proves it is never exported under any
+        # casing. Diversion-when-first is pinned separately below in a
+        # dedicated minimal fixture (this shared one already carries a
+        # higher-precedence token line, so it cannot deterministically
+        # prove that half here).
+        "agent_token=tok_lower_variant\n"
         "probe_lower=benign_val\n"
     )
 
 
 _BYPASS_ENV_KEYS = ("PROBE_FIRST_LINE", "AGENT_TOKEN", f"{_BOM}AGENT_TOKEN",
-                    "pg_conn", "PG_CONN", f"{_BOM}PG_CONN", "probe_lower")
+                    "agent_token", "pg_conn", "PG_CONN", f"{_BOM}PG_CONN",
+                    "probe_lower")
 
 
 def test_manual_parser_filters_lowercase_and_bom_prefixed_secrets(tmp_path, monkeypatch):
     """Through _load_env_manually (the no-dotenv fallback path) — the second
     of the two call sites the ruling requires fixed. Mutation check: removing
     the `.upper()` from this loop's `_is_client_secret_key(key_norm.upper())`
-    call makes the lowercase `pg_conn` pin below die (recorded in HANDOFF)."""
+    call makes the lowercase `pg_conn` pin below die (recorded in HANDOFF).
+
+    H-1 follow-up: also pins the lowercase `agent_token=` line is never
+    exported under either casing — this fixture's own precedence rules
+    mean it is NOT the one diverted (see _write_bypass_fixture's comment);
+    diversion-when-first is a separate, dedicated test below."""
     for key in _BYPASS_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
     env_file = tmp_path / "bypass.env"
@@ -249,6 +265,9 @@ def test_manual_parser_filters_lowercase_and_bom_prefixed_secrets(tmp_path, monk
         )
         assert "AGENT_TOKEN" not in os.environ
         assert f"{_BOM}AGENT_TOKEN" not in os.environ
+        assert "agent_token" not in os.environ, (
+            "H-1: a lowercase agent_token= line leaked the bearer into os.environ"
+        )
         assert os.environ.get("probe_lower") == "benign_val", (
             "a benign lowercase key must still export under its ORIGINAL name — "
             "normalization is for filtering only, never for the exported name"
@@ -270,7 +289,10 @@ def test_dotenv_values_path_filters_lowercase_and_bom_prefixed_secrets(tmp_path,
     installed via fastmcp (QA build review MED-1, 2026-09-01). Mutation
     check: removing the `.upper()` from this loop's
     `_is_client_secret_key(_k_norm.upper())` call makes the lowercase
-    `pg_conn` pin below die."""
+    `pg_conn` pin below die.
+
+    H-1 follow-up: also pins the lowercase `agent_token=` line is never
+    exported under either casing (diversion-when-first is separate, below)."""
     for key in _BYPASS_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
     env_file = tmp_path / "bypass.env"
@@ -286,6 +308,9 @@ def test_dotenv_values_path_filters_lowercase_and_bom_prefixed_secrets(tmp_path,
         )
         assert "AGENT_TOKEN" not in os.environ
         assert f"{_BOM}AGENT_TOKEN" not in os.environ
+        assert "agent_token" not in os.environ, (
+            "H-1: a lowercase agent_token= line leaked the bearer into os.environ"
+        )
         assert os.environ.get("probe_lower") == "benign_val", (
             "a benign lowercase key must still export under its ORIGINAL name — "
             "normalization is for filtering only, never for the exported name"
@@ -294,6 +319,73 @@ def test_dotenv_values_path_filters_lowercase_and_bom_prefixed_secrets(tmp_path,
         # Direct os.environ.pop, not monkeypatch.delenv — see the sibling
         # test above (same reason, same measured behaviour).
         for key in _BYPASS_ENV_KEYS:
+            os.environ.pop(key, None)
+
+
+# ── H-1 (2026-09-01 follow-up, blocking): diversion-when-first, minimal ────
+# fixtures. The shared bypass fixture above already carries a HIGHER-
+# precedence token (the BOM-prefixed AGENT_TOKEN, first in the file), so it
+# cannot deterministically prove a lowercase agent_token= line diverts —
+# first-definition-wins means the earlier line always claims
+# _AGENT_TOKEN_FROM_FILE first. These two tests use a fixture with ONLY a
+# lowercase token line (plus one benign key) so the diversion assertion is
+# unambiguous.
+
+_LOWERCASE_TOKEN_ONLY_KEYS = ("agent_token", "AGENT_TOKEN", "probe_lower")
+
+
+def _write_lowercase_token_only_fixture(path):
+    path.write_text(
+        "agent_token=tok_lower_variant\n"
+        "probe_lower=benign_val\n"
+    )
+
+
+def test_manual_parser_diverts_lowercase_agent_token_when_first(tmp_path, monkeypatch):
+    """H-1: a lowercase agent_token= line, as the ONLY token line in the
+    file, must be diverted to _AGENT_TOKEN_FROM_FILE — not exported under
+    any casing. Mutation check: reverting to the pre-fix shape (`.upper()`
+    only at the two predicate calls, key_norm/​_k_norm left case-sensitive)
+    makes this assertion die (recorded in HANDOFF)."""
+    for key in _LOWERCASE_TOKEN_ONLY_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    env_file = tmp_path / "lower_token.env"
+    _write_lowercase_token_only_fixture(env_file)
+    monkeypatch.setattr(vector_skill, "_AGENT_TOKEN_FROM_FILE", "")
+    try:
+        vector_skill._load_env_manually(str(env_file))
+        assert vector_skill._AGENT_TOKEN_FROM_FILE == "tok_lower_variant", (
+            "H-1: the lowercase agent_token= line was not diverted when it "
+            "was the only token line present"
+        )
+        assert "agent_token" not in os.environ
+        assert "AGENT_TOKEN" not in os.environ
+        assert os.environ.get("probe_lower") == "benign_val"
+    finally:
+        for key in _LOWERCASE_TOKEN_ONLY_KEYS:
+            os.environ.pop(key, None)
+
+
+def test_dotenv_values_path_diverts_lowercase_agent_token_when_first(tmp_path, monkeypatch):
+    """H-1, dotenv_values() twin of the test above — same fixture, same
+    assertions, through the branch actually taken at real import time in
+    this suite (python-dotenv transitively installed via fastmcp)."""
+    for key in _LOWERCASE_TOKEN_ONLY_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    env_file = tmp_path / "lower_token.env"
+    _write_lowercase_token_only_fixture(env_file)
+    monkeypatch.setenv("VECTOR_SKILL_ENV", str(env_file))
+    try:
+        fresh = _load_vector_skill()
+        assert fresh._AGENT_TOKEN_FROM_FILE == "tok_lower_variant", (
+            "H-1: the lowercase agent_token= line was not diverted when it "
+            "was the only token line present"
+        )
+        assert "agent_token" not in os.environ
+        assert "AGENT_TOKEN" not in os.environ
+        assert os.environ.get("probe_lower") == "benign_val"
+    finally:
+        for key in _LOWERCASE_TOKEN_ONLY_KEYS:
             os.environ.pop(key, None)
 
 

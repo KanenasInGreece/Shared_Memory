@@ -158,26 +158,45 @@ def _load_env_manually(path: str) -> None:
                 val = val.strip()
                 if not key:
                     continue
-                # SEC round HIGH-1 + HIGH-2 (2026-09-01, gemini): normalize
-                # for FILTERING/DIVERSION ONLY, at this call site — never
-                # inside _is_client_secret_key, which stays a BYTE-IDENTICAL
-                # mirror of memory_bridge.py's (the parity test pins it).
-                # str.strip() does NOT remove U+FEFF (it is not whitespace),
-                # so a stray BOM or a lowercase spelling used to sail past
-                # both the AGENT_TOKEN divert and the secret-suffix/name
-                # check below and land straight in os.environ. `key` itself
-                # — never `key_norm` — is still what gets exported when the
-                # key isn't filtered: this only changes what counts as
-                # secret/AGENT_TOKEN, never the exported name's casing.
-                # (memory_bridge.py, the CLI door, has the identical gap —
-                # a recorded SEC-round item there, not fixed here: this
-                # file's ownership does not extend to memory_bridge.py.)
-                key_norm = key.lstrip("\ufeff").strip()
+                # SEC round HIGH-1 + HIGH-2 (2026-09-01, gemini), H-1
+                # follow-up fix (2026-09-01 — regression in the first
+                # pass): normalize for FILTERING/DIVERSION ONLY, at this
+                # call site — never inside _is_client_secret_key, which
+                # stays a BYTE-IDENTICAL mirror of memory_bridge.py's (the
+                # parity test pins it). str.strip() does NOT remove U+FEFF
+                # (it is not whitespace), so a stray BOM or a lowercase
+                # spelling used to sail past both the AGENT_TOKEN divert
+                # and the secret-suffix/name check below and land straight
+                # in os.environ. `key` itself — never `key_norm` — is
+                # still what gets exported when the key isn't filtered:
+                # this only changes what counts as secret/AGENT_TOKEN,
+                # never the exported name's casing.
+                #
+                # H-1: key_norm is upper-cased HERE, once, and BOTH the
+                # AGENT_TOKEN comparison and the predicate call use this
+                # single already-uppercased value. The first pass instead
+                # compared the token key case-SENSITIVELY
+                # (`key_norm == "AGENT_TOKEN"` with key_norm only
+                # lstripped+stripped) while calling the predicate with
+                # `key_norm.upper()` — so a lowercase `agent_token=` line
+                # folded onto "AGENT_TOKEN" for the predicate's OWN
+                # deliberate early-return exemption (`_is_client_secret_
+                # key`: `if name == "AGENT_TOKEN": return False`, which
+                # exists BECAUSE the token has its own diversion path)
+                # while never matching the still-case-sensitive diversion
+                # check above it — caught by NEITHER, exported by the
+                # setdefault below. This deliberately now catches every
+                # case-variant spelling of the token — a SAFER-direction
+                # divergence from memory_bridge.py's exact-case diversion,
+                # recorded there as a SEC-round twins item, not fixed here
+                # (memory_bridge.py, the CLI door, is not this file's to
+                # touch).
+                key_norm = key.lstrip("\ufeff").strip().upper()
                 if key_norm == "AGENT_TOKEN":
                     if not _AGENT_TOKEN_FROM_FILE:
                         _AGENT_TOKEN_FROM_FILE = val
                     continue
-                if _is_client_secret_key(key_norm.upper()):
+                if _is_client_secret_key(key_norm):
                     continue
                 if key not in os.environ:   # first definition wins
                     os.environ[key] = val
@@ -200,18 +219,21 @@ else:
             for _k, _v in dotenv_values(_ENV_PATH).items():
                 if _v is None or not _k:
                     continue
-                # SEC round HIGH-1 + HIGH-2 (2026-09-01, gemini) — same
-                # rationale as _load_env_manually above: normalize for
-                # filtering/diversion ONLY, at this call site, never inside
-                # _is_client_secret_key (byte-identical mirror, pinned by
-                # test_client_secret_mirror_parity.py). `_k` — never
+                # SEC round HIGH-1 + HIGH-2 (2026-09-01, gemini), H-1
+                # follow-up fix — same rationale AND same shape as
+                # _load_env_manually above: _k_norm is uppercased ONCE and
+                # used for BOTH the AGENT_TOKEN comparison and the
+                # predicate call, so a lowercase `agent_token=` cannot slip
+                # through the case-sensitive-vs-normalized mismatch that
+                # made the first pass's two separate `.upper()` calls a
+                # regression (see the detailed note above). `_k` — never
                 # `_k_norm` — is still what gets exported.
-                _k_norm = _k.lstrip("\ufeff").strip()
+                _k_norm = _k.lstrip("\ufeff").strip().upper()
                 if _k_norm == "AGENT_TOKEN":
                     if not _AGENT_TOKEN_FROM_FILE:
                         _AGENT_TOKEN_FROM_FILE = _v.strip()
                     continue
-                if _is_client_secret_key(_k_norm.upper()):
+                if _is_client_secret_key(_k_norm):
                     continue
                 os.environ.setdefault(_k, _v)
     except ImportError:
