@@ -247,6 +247,42 @@ if [ "$EMBEDDER_DEVICE" = "gpu" ] || [ "$RERANKER_DEVICE" = "gpu" ]; then
   echo "  ✓ Encoder device split written: embedder=$EMBEDDER_DEVICE reranker=$RERANKER_DEVICE GPU_RENDER_GID=$GPU_RENDER_GID"
 fi
 
+# W5 (R-D, decision:1824 §3): write the shipped compose's default encoder
+# ENDPOINTS explicitly too — same append-block precedent as the Q3b block
+# just above (EMBEDDER_URL/RERANKER_URL are commented in the template, so
+# the awk substitution above cannot fill them in). Values come from
+# framework_defaults.py via a shell-out, never a second literal in bash
+# (precedent: hive_mind_proxy.py:176 reads
+# FRAMEWORK_DEFAULTS[...]["default"]) — one source of truth for what the
+# bundled compose actually serves on. Written unconditionally, regardless
+# of the device answers above: this documents what a bundled install is
+# actually using, not a device choice. Reranker: default written, never
+# elicited here — an operator whose encoders live elsewhere (Q2's
+# "existing endpoint" answer) edits both lines directly; AGENTS.md's
+# Phase 4 already covers that path, including the vLLM reranker shim case.
+_embedder_url_default="$(python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from framework_defaults import FRAMEWORK_DEFAULTS
+print(FRAMEWORK_DEFAULTS["EMBEDDER_URL"]["default"])
+' "$SCRIPT_DIR")"
+_reranker_url_default="$(python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from framework_defaults import FRAMEWORK_DEFAULTS
+print(FRAMEWORK_DEFAULTS["RERANKER_URL"]["default"])
+' "$SCRIPT_DIR")"
+{
+  echo ""
+  echo "# ── Encoder endpoints (install_framework.sh writes the framework's default explicitly) ──"
+  echo "# This installs the bundled compose's own default port for each encoder. If your"
+  echo "# encoders run somewhere else (Q2's 'existing endpoint' answer), edit these two lines —"
+  echo "# see AGENTS.md Phase 4."
+  echo "EMBEDDER_URL=$_embedder_url_default"
+  echo "RERANKER_URL=$_reranker_url_default"
+} >> "$ENV_FILE"
+echo "  ✓ Encoder endpoints written: EMBEDDER_URL=$_embedder_url_default RERANKER_URL=$_reranker_url_default (edit if yours differ)"
+
 mkdir -p "$NEO4J_HOST_DIR"/{data,logs,import,plugins} "$PG_DATA_DIR"
 
 # The neo4j container drops to uid 7474 and demands WRITE access to its

@@ -50,6 +50,12 @@ def _fake_install(tmp_path):
     (root / "shared-memory" / "ops").mkdir(parents=True)
     shutil.copy(INSTALL_SH, root / "shared-memory" / "scripts" / "install_framework.sh")
     shutil.copy(ENV_EXAMPLE, root / "shared-memory" / ".env.example")
+    # W5 (R-D): the encoder-endpoint append-block shells out to
+    # framework_defaults.py (never a second literal in bash) -- a genuine
+    # runtime dependency of every install now, not just the tests that
+    # assert on its output.
+    shutil.copy(REPO_ROOT / "shared-memory" / "scripts" / "framework_defaults.py",
+                root / "shared-memory" / "scripts" / "framework_defaults.py")
     return root
 
 
@@ -203,6 +209,42 @@ def test_unrecognised_answer_treated_as_cpu_with_a_warning(tmp_path):
     # Coerced to cpu -- never a literal "banana" written, and (both
     # effectively cpu) nothing appended at all.
     assert not any(l.startswith("EMBEDDER_CPU_REPLICAS=") for l in live)
+
+
+# ── W5 (R-D, decision:1824 §3) — encoder ENDPOINTS written explicitly ──────
+
+def test_embedder_reranker_url_written_explicitly_with_framework_defaults(tmp_path):
+    """The shipped compose's default encoder endpoints are no longer an
+    invisible commented-out fallback -- install_framework.sh writes them
+    explicitly, sourced from framework_defaults.py (never a second literal
+    in bash)."""
+    root = _fake_install(tmp_path)
+    home = tmp_path / "home"
+    answers = _base_answers(str(tmp_path / "models")) + ["n", "n"]
+    proc = _run(root, answers, home)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    live = _live_lines(root)
+    assert "EMBEDDER_URL=http://localhost:8070" in live
+    assert "RERANKER_URL=http://localhost:8071" in live
+    # Exactly one LIVE line per key -- never duplicated into the commented
+    # template section higher up the same file.
+    assert sum(1 for l in live if l.startswith("EMBEDDER_URL=")) == 1
+    assert sum(1 for l in live if l.startswith("RERANKER_URL=")) == 1
+
+
+def test_embedder_reranker_url_written_regardless_of_device_answers(tmp_path):
+    """Unconditional -- unlike the per-service replica vars, the endpoint
+    lines are written even when both encoders stay on cpu (the common
+    case)."""
+    root = _fake_install(tmp_path)
+    home = tmp_path / "home"
+    answers = _base_answers(str(tmp_path / "models"), embedder="gpu", reranker="gpu") + ["n", "n"]
+    proc = _run(root, answers, home)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    live = _live_lines(root)
+    assert any(l.startswith("EMBEDDER_URL=") for l in live)
+    assert any(l.startswith("RERANKER_URL=") for l in live)
 
 
 def test_blank_models_dir_still_asks_the_device_questions(tmp_path):
