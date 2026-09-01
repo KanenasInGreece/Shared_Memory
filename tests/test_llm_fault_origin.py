@@ -204,8 +204,9 @@ def _credentialed_backend(monkeypatch, url="http://a:5000", token_var="SM_TEST_T
 # ── 1 + 2. X-SM-Fault-Origin header + verbatim passthrough ──────────────────
 
 def test_upstream_fault_gets_upstream_origin_header_and_verbatim_body(monkeypatch):
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
     written = _patch_stream_response(monkeypatch)
@@ -226,8 +227,9 @@ def test_upstream_fault_gets_upstream_origin_header_and_verbatim_body(monkeypatc
 def test_successful_response_never_gets_fault_origin_header(monkeypatch):
     """MUTATION TARGET: the header must be additive on faults only — a 200
     must never carry it."""
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
     written = _patch_stream_response(monkeypatch)
@@ -243,8 +245,9 @@ def test_successful_response_never_gets_fault_origin_header(monkeypatch):
 def test_embedding_route_fault_also_gets_upstream_origin_header(monkeypatch):
     """The header is not LLM-pool-only — any proxied backend's fault status
     (embeddings/reranking included) is upstream-origin too."""
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
     written = _patch_stream_response(monkeypatch)
@@ -269,8 +272,9 @@ def test_embedding_route_fault_also_gets_upstream_origin_header(monkeypatch):
 
 
 def test_gateway_origin_error_gets_gateway_fault_origin_header(monkeypatch):
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -283,8 +287,9 @@ def test_gateway_origin_error_gets_gateway_fault_origin_header(monkeypatch):
 
 
 def test_gateway_timeout_gets_gateway_fault_origin_header(monkeypatch):
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -297,8 +302,9 @@ def test_gateway_timeout_gets_gateway_fault_origin_header(monkeypatch):
 
 
 def test_gateway_generic_exception_gets_gateway_fault_origin_header(monkeypatch):
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -346,8 +352,9 @@ def test_uncredentialed_401_still_counted_but_not_logged(monkeypatch, tmp_path):
     line is credentialed-calls-only."""
     log_path = tmp_path / "credential-audit.jsonl"
     monkeypatch.setenv("CREDENTIAL_AUDIT_LOG_PATH", str(log_path))
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")   # no token_env -> not credentialed
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))   # no token_env -> not credentialed
     import coordinator
     importlib.reload(coordinator)
     import hive_mind_proxy as g
@@ -387,8 +394,9 @@ def test_gateway_connect_failure_on_credentialed_call_records_gateway_fault(monk
 def test_empty_body_fault_response_still_classified(monkeypatch):
     """An empty-bodied 401 (no chunks at all from iter_any()) must still be
     recorded — the fallback classification after the streaming loop."""
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))
     import coordinator
     import hive_mind_proxy as g
     importlib.reload(g)
@@ -419,8 +427,9 @@ def test_backend_and_key_attached_stashed_when_credentialed(monkeypatch):
 
 
 def test_key_attached_not_stashed_when_backend_has_no_token(monkeypatch):
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -458,8 +467,9 @@ def test_upstream_success_cannot_spoof_fault_origin_header(monkeypatch):
     the header on a fault status — on success nothing overwrites an
     upstream-supplied value. MUTATION TARGET: drop strip_gateway_namespace
     from the response-direction _filter_headers call and this fails."""
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
     written = _patch_stream_response(monkeypatch)
@@ -485,8 +495,9 @@ def test_upstream_fault_cannot_spoof_a_different_backend_label(monkeypatch):
     """Same property on the fault path — the gateway's own
     X-SM-Fault-Origin: upstream assignment must not be pre-empted by
     whatever the upstream itself sent under that name."""
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
     written = _patch_stream_response(monkeypatch)
@@ -505,8 +516,9 @@ def test_request_direction_headers_unaffected_by_gateway_namespace_strip(monkeyp
     """The stricter filtering is RESPONSE-direction only — a client sending
     an X-SM-* header upstream (unusual, but must not silently vanish and
     break some future legitimate use) is unaffected."""
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -524,8 +536,9 @@ def test_classification_exception_never_truncates_the_passthrough(monkeypatch):
     record_llm_upstream_fault call site and this fails with a truncated
     body (today: only the in-loop site is exercised here, since a body-
     bearing response always hits that site, never the fallback)."""
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
     monkeypatch.setattr(g, "record_llm_upstream_fault",
@@ -546,8 +559,9 @@ def test_classification_exception_never_truncates_the_passthrough(monkeypatch):
 
 def test_classification_exception_on_empty_body_fallback_never_breaks_the_response(monkeypatch):
     """Same property for the FALLBACK call site (empty-bodied fault)."""
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
     monkeypatch.setattr(g, "record_llm_upstream_fault",
@@ -573,8 +587,9 @@ def test_gzip_compressed_429_body_classifies_as_credential_end_to_end(monkeypatc
     otherwise see gzip framing bytes, not JSON). MUTATION TARGET: remove the
     _decompress_prefix_for_parse call in handle_proxy and this fails."""
     import gzip
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))
     import coordinator
     import hive_mind_proxy as g
     importlib.reload(g)
@@ -599,8 +614,9 @@ def test_gzip_compressed_body_passthrough_stays_compressed_bytes(monkeypatch):
     receive the original compressed bytes, unchanged, with the original
     Content-Encoding header (the client, not the gateway, decompresses)."""
     import gzip
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
     written = _patch_stream_response(monkeypatch)
@@ -635,8 +651,9 @@ class _InvalidURLLikeSession:
 
 def test_client_error_body_never_echoes_exception_text(monkeypatch):
     """O-6: the client-visible body uses the exception's CLASS NAME only."""
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -659,8 +676,9 @@ def test_client_error_log_line_scrubs_url_credentials(monkeypatch, caplog):
     never reach the journal via an exception's rendered text. MUTATION
     TARGET: remove the _scrub_url_credentials wrapping and this fails."""
     import logging
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 
@@ -677,8 +695,9 @@ def test_client_error_log_line_scrubs_url_credentials(monkeypatch, caplog):
 
 def test_generic_exception_body_and_log_never_echo_text(monkeypatch, caplog):
     import logging
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 

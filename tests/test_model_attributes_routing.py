@@ -1,10 +1,12 @@
 """Model-attributes routing (Model_Attributes_Routing_Plan_2026-08-18, REVISED
 DESIGN) — Unit 1 (gateway). Descriptor schema (roles/n_ctx/private_ok/
-max_inflight), startup refusals (unknown role, M-5, P-5), the eligibility
+max_inflight), startup refusals (unknown role, M-5′, P-5′), the eligibility
 hard pre-filter (I-1a enumerated "never" paths), the 422 no_eligible_backend
-refusal (I-2a), the fit check (I-3), backward compat for descriptor-less
-fleets (I-5a), P-6 steering-header hygiene, the max_inflight concurrency cap
-(I-8/I-8b), and the H-1/H-3 health-display fixes.
+refusal (I-2a), the fit check (I-3), a descriptor-less fleet now eligible
+for NOTHING under default-deny (W4, decision:1824 — the retired invariant
+formerly named here served the opposite claim), P-6 steering-header
+hygiene, the max_inflight concurrency cap (I-8/I-8b), and the H-1/H-3
+health-display fixes.
 
 Uses the request/session patterns proven in tests/test_llm_backend_secrets.py,
 tests/test_llm_affinity.py and tests/test_llm_steering_headers.py."""
@@ -97,15 +99,21 @@ def test_roles_ncontext_private_ok_max_inflight_parsed(monkeypatch):
     assert g.LLM_BACKEND_MAX_INFLIGHT["http://b:4000"] is None
 
 
-def test_private_ok_default_from_token_env_presence(monkeypatch):
+def test_private_ok_default_is_false_regardless_of_token_env_presence(monkeypatch):
+    """W4 default-deny (decision:1824, MUTATION TARGET — was
+    test_private_ok_default_from_token_env_presence): the default no
+    longer depends on whether a credential is attached — an undeclared
+    entry defaults private_ok=False whether or not it carries a
+    token_env. Explicit values still always win (test_explicit_private_ok_
+    always_wins, unaffected)."""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "http://local:5000"},
         {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "roles": ["extract"]},
     ]))
     g = _fresh(monkeypatch)
-    assert g.LLM_BACKEND_PRIVATE_OK["http://local:5000"] is True   # no token -> default True
-    assert g.LLM_BACKEND_PRIVATE_OK["https://api.deepseek.com/v1"] is False  # has token -> default False
+    assert g.LLM_BACKEND_PRIVATE_OK["http://local:5000"] is False   # W4: undeclared -> False, no token needed
+    assert g.LLM_BACKEND_PRIVATE_OK["https://api.deepseek.com/v1"] is False  # has token -> also False (unchanged)
     assert g.LLM_BACKEND_PRIVATE_OK_EXPLICIT["http://local:5000"] is False
     assert g.LLM_BACKEND_PRIVATE_OK_EXPLICIT["https://api.deepseek.com/v1"] is False
 
@@ -123,13 +131,21 @@ def test_explicit_private_ok_always_wins(monkeypatch):
     assert g.LLM_BACKEND_PRIVATE_OK_EXPLICIT["http://local:5000"] is True
 
 
-def test_legacy_comma_form_is_serves_all_and_private_ok_true(monkeypatch):
+def test_legacy_comma_form_is_serves_all_but_private_ok_now_defaults_false(monkeypatch):
+    """W4 default-deny (decision:1824 — I-5a RETIRED, was
+    test_legacy_comma_form_is_serves_all_and_private_ok_true): the legacy
+    CSV/fallback branch still produces a "roles absent" (serves-all-shaped)
+    descriptor, but that class is no longer eligible for anything until
+    private_ok is declared — a descriptor-less fleet used to be eligible
+    for everything (I-5a: "byte-identical to v0.9.12 selection"); it is now
+    eligible for nothing. See test_i5a_descriptor_less_fleet_eligible_set_
+    is_the_full_pool's successor below for the eligibility-set half."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
     monkeypatch.setenv("LLM_BACKENDS", "http://a:5000,http://b:4000")
     g = _fresh(monkeypatch)
     for b in g.LLM_BACKENDS:
         assert g.LLM_BACKEND_ROLES[b] is None
-        assert g.LLM_BACKEND_PRIVATE_OK[b] is True
+        assert g.LLM_BACKEND_PRIVATE_OK[b] is False
         assert g.LLM_BACKEND_PRIVATE_OK_EXPLICIT[b] is False
         assert g.LLM_BACKEND_MAX_INFLIGHT[b] is None
     assert g._LLM_BACKEND_ROLE_CONFIG_ERRORS == []
@@ -161,8 +177,8 @@ def test_price_metadata_never_read_by_selection(monkeypatch):
     the "cheaper" one has MORE inflight, and confirm least-in-flight (not
     price) still decides."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://cheap:5000", "price_per_mtok_in": 0.01},
-        {"url": "http://pricey:4000", "price_per_mtok_in": 100.0},
+        {"url": "http://cheap:5000", "price_per_mtok_in": 0.01, "private_ok": True},
+        {"url": "http://pricey:4000", "price_per_mtok_in": 100.0, "private_ok": True},
     ]))
     g = _fresh(monkeypatch)
     g._llm_inflight["http://cheap:5000"] = 5
@@ -185,16 +201,18 @@ def test_unknown_role_refuses_startup(monkeypatch):
         assert "not_a_real_role" in str(e)
 
 
-def test_m5_credentialed_backend_with_no_choice_refuses_startup(monkeypatch):
-    """MUTATION TARGET (M-5 Critical): a credentialed backend with neither
-    roles nor an explicit private_ok would silently go dark under the plain
-    default — must refuse rather than brick a cloud-only install on upgrade.
+def test_m5_credentialed_backend_with_no_choice_degrades_not_refuses(monkeypatch, caplog):
+    """M-5′ (W4, decision:1824 — MUTATION TARGET, was
+    test_m5_credentialed_backend_with_no_choice_refuses_startup): a
+    credentialed backend with neither roles nor an explicit private_ok used
+    to be bricked SILENT under the old default (private_ok defaulted True
+    for it, M-5's whole reason to exist); under default-deny it simply
+    defaults False and is never selected — safe by construction, so this is
+    now a loud startup WARNING, never a SystemExit.
 
-    Auth is configured ON here so P-5 cannot ALSO independently refuse this
-    exact scenario (private_ok defaults False for a credentialed backend,
-    which P-5 would catch on an auth-off install regardless of M-5) —
-    isolating M-5 as the SOLE possible cause of the refusal is what makes
-    this test actually prove M-5 works, not just "some refusal happened"."""
+    Auth is configured ON here so P-5′ (narrowed to EXPLICIT private_ok
+    false only) cannot ALSO independently warn about this exact scenario —
+    isolating M-5′ as the sole source of the warning."""
     monkeypatch.setenv("AGENT_TOKENS", "claude:tok_m5_isolated_test")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
@@ -207,11 +225,11 @@ def test_m5_credentialed_backend_with_no_choice_refuses_startup(monkeypatch):
     import hive_mind_proxy as g
     importlib.reload(g)
     assert g.AUTH_CONFIGURED_AT_STARTUP is True
-    try:
-        g.require_valid_llm_routing_config()
-        assert False, "expected SystemExit"
-    except SystemExit as e:
-        assert "api.deepseek.com" in str(e)
+    import logging
+    with caplog.at_level(logging.WARNING):
+        g.require_valid_llm_routing_config()   # must NOT raise (MUTATION TARGET)
+    assert any("api.deepseek.com" in r.message and "never be selected" in r.message
+               for r in caplog.records)
 
 
 def test_m5_satisfied_by_explicit_private_ok_true(monkeypatch):
@@ -244,30 +262,51 @@ def test_m5_satisfied_by_roles(monkeypatch):
     g.require_valid_llm_routing_config()   # must not raise
 
 
-def test_p5_auth_off_plus_private_ok_false_refuses_startup(monkeypatch):
-    """MUTATION TARGET (P-5): without identities the privacy/steering
-    invariants cannot hold — auth-off install with a private_ok=false
-    backend must refuse."""
+def test_p5_auth_off_plus_explicit_private_ok_false_degrades_not_refuses(monkeypatch, caplog):
+    """P-5′ (W4, decision:1824 — MUTATION TARGET, was
+    test_p5_auth_off_plus_private_ok_false_refuses_startup): auth-off with
+    an EXPLICITLY private_ok=false backend used to refuse startup (Spec
+    §3.1's old predicate: ANY private_ok=false backend). Narrowed now that
+    False is the pervasive, unremarkable default for every undeclared
+    backend under default-deny — safe by construction (the backend simply
+    serves no role-less traffic), so this is a loud warning, never a
+    SystemExit. The old ALLOW_UNAUTHENTICATED_PROVIDER_KEYS override branch
+    this scenario used to also exercise is DELETED with the exit it existed
+    to bypass (bucket iii, its own test below is removed for that reason)."""
     monkeypatch.delenv("ALLOW_UNAUTHENTICATED_PROVIDER_KEYS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "http://a:5000", "private_ok": False, "roles": ["extract"]},
     ]))
     g = _fresh(monkeypatch)
     assert g.AUTH_CONFIGURED_AT_STARTUP is False
-    try:
-        g.require_valid_llm_routing_config()
-        assert False, "expected SystemExit"
-    except SystemExit as e:
-        assert "private_ok=false" in str(e) or "AGENT_TOKENS" in str(e)
+    import logging
+    with caplog.at_level(logging.WARNING):
+        g.require_valid_llm_routing_config()   # must NOT raise (MUTATION TARGET)
+    assert any("EXPLICITLY configured" in r.message and "http://a:5000" in r.message
+               for r in caplog.records)
 
 
-def test_p5_override_env_warns_instead_of_refusing(monkeypatch):
-    monkeypatch.setenv("ALLOW_UNAUTHENTICATED_PROVIDER_KEYS", "1")
+def test_p5_auth_off_plus_undeclared_backend_never_fires(monkeypatch, caplog):
+    """P-5′ truth table (§8): auth-off + an UNDECLARED backend (private_ok
+    defaults False, never stated) must NOT fire the P-5′ warning at all —
+    the narrowed predicate is `private_ok_explicit[u] AND not
+    private_ok[u]`, and this population fails the explicit half. This is
+    the entire reason the predicate was narrowed: under the old "ANY
+    private_ok=false" reading this would have warned (or refused) on every
+    single default-deny install with auth off, which is exactly the
+    noise W4 rules out."""
+    monkeypatch.delenv("ALLOW_UNAUTHENTICATED_PROVIDER_KEYS", raising=False)
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "private_ok": False, "roles": ["extract"]},
+        {"url": "http://a:5000", "roles": ["extract"]},
     ]))
     g = _fresh(monkeypatch)
-    g.require_valid_llm_routing_config()   # must not raise
+    assert g.AUTH_CONFIGURED_AT_STARTUP is False
+    assert g.LLM_BACKEND_PRIVATE_OK["http://a:5000"] is False
+    assert g.LLM_BACKEND_PRIVATE_OK_EXPLICIT["http://a:5000"] is False
+    import logging
+    with caplog.at_level(logging.WARNING):
+        g.require_valid_llm_routing_config()   # must not raise
+    assert not any("EXPLICITLY configured" in r.message for r in caplog.records)
 
 
 def test_auth_on_plus_private_ok_false_is_fine(monkeypatch):
@@ -301,15 +340,35 @@ def test_explicit_roles_is_the_privacy_opt_in_even_when_private_ok_false(monkeyp
 
 
 def test_role_scoped_private_ok_backend_still_serves_role_less_traffic(monkeypatch):
-    """R-3: role-less traffic ignores a backend's roles list ENTIRELY and is
-    gated purely on private_ok — a local card pinned to "extract" must not
-    refuse an ad-hoc authenticated chat, so a private_ok=True, roles=
-    ["extract"] backend IS eligible for role-less traffic."""
+    """R-3′ (decision:1824, reversing R-3/decision:1357 — MUTATION TARGET):
+    role-less traffic ignores a backend's roles list ENTIRELY and is gated
+    purely on private_ok — a local card pinned to "extract" must not
+    refuse an ad-hoc authenticated chat, so a private_ok=True (now
+    EXPLICIT, W4), roles=["extract"] backend IS eligible for role-less
+    traffic. Without the explicit opt-in a roles-carrying backend now
+    serves ONLY its declared roles (R-B) — see the sibling test just below
+    for that half, unaffected by the flip since it was already False."""
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://a:5000", "roles": ["extract"], "private_ok": True},
+    ]))
+    g = _fresh(monkeypatch)
+    assert g._role_eligible("http://a:5000", "") is True
+
+
+def test_r_b_role_scoped_backend_with_no_explicit_private_ok_serves_no_role_less_traffic(monkeypatch):
+    """R-B (W4, decision:1824 — the NEW invariant this wave adds, distinct
+    from the pre-existing "explicit private_ok=false" case below): a
+    roles-carrying backend that never states private_ok AT ALL used to
+    default True (serves role-less too, I-5a-adjacent); it now defaults
+    False like everything undeclared — it serves ONLY its listed roles.
+    Announced in the CHANGELOG opt-back line and check_config's per-entry
+    rendering (§6.3)."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "http://a:5000", "roles": ["extract"]},
     ]))
     g = _fresh(monkeypatch)
-    assert g._role_eligible("http://a:5000", "") is True
+    assert g._role_eligible("http://a:5000", "") is False
+    assert g._role_eligible("http://a:5000", "extract") is True
 
 
 def test_role_scoped_private_ok_false_backend_never_serves_role_less_traffic(monkeypatch):
@@ -323,23 +382,30 @@ def test_role_scoped_private_ok_false_backend_never_serves_role_less_traffic(mon
 
 
 def test_serves_all_degenerate_case_eligible_for_role_less_and_every_role(monkeypatch):
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000"}]))
+    """W4 (decision:1824): the serves-all degenerate class (roles absent)
+    still needs its private_ok opt-in EXPLICIT — an undeclared entry is now
+    eligible for NOTHING (see test_i5a below for the retired-invariant
+    half). This test now pins the OPT-IN case."""
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True}]))
     g = _fresh(monkeypatch)
     assert g._role_eligible("http://a:5000", "") is True
     assert g._role_eligible("http://a:5000", "extract") is True
     assert g._role_eligible("http://a:5000", "judge") is True
 
 
-def test_i5a_descriptor_less_fleet_eligible_set_is_the_full_pool(monkeypatch):
-    """I-5a: nothing new restricts a descriptor-less (legacy comma-form)
-    fleet — the eligible set for ANY role/role-less traffic is the whole
-    pool, exactly like pre-routing-cycle behavior."""
+def test_i5a_descriptor_less_fleet_eligible_set_is_now_empty(monkeypatch):
+    """I-5a RETIRED (W4, decision:1824 — was
+    test_i5a_descriptor_less_fleet_eligible_set_is_the_full_pool): a
+    descriptor-less (legacy comma-form) fleet used to be eligible for
+    EVERYTHING, "byte-identical to v0.9.12 selection"; default-deny flips
+    this exactly — the eligible set for ANY role/role-less traffic is now
+    EMPTY until the operator declares private_ok/roles explicitly."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
     monkeypatch.setenv("LLM_BACKENDS", "http://a:5000,http://b:4000")
     g = _fresh(monkeypatch)
-    assert set(g._eligible_backends("")) == set(g.LLM_BACKENDS)
-    assert set(g._eligible_backends("extract")) == set(g.LLM_BACKENDS)
-    assert set(g._eligible_backends("judge")) == set(g.LLM_BACKENDS)
+    assert g._eligible_backends("") == []
+    assert g._eligible_backends("extract") == []
+    assert g._eligible_backends("judge") == []
 
 
 # ── I-1a: enumerated "never" paths, each its own mutation-checked test ──────
@@ -390,7 +456,7 @@ def test_i1a_cooldown_ignoring_last_resort_stays_within_eligible(monkeypatch):
     """A single-backend eligible pool in cooldown must still serve (the
     long-standing "one card always serves" behavior) rather than 422 or
     return None purely from cooldown."""
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000"}]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True}]))
     g = _fresh(monkeypatch)
     import time
     g._llm_unhealthy_until["http://a:5000"] = time.monotonic() + 300
@@ -402,7 +468,7 @@ def test_i1a_reserved_backend_deprioritised_but_last_resort_within_eligible(monk
     an available eligible peer, but a SOLE eligible+reserved backend is
     still the last-resort pick (never an ineligible peer)."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000"}, {"url": "http://b:4000"},
+        {"url": "http://a:5000", "private_ok": True}, {"url": "http://b:4000", "private_ok": True},
     ]))
     g = _fresh(monkeypatch)
     g._llm_reserved.add("http://a:5000")
@@ -425,7 +491,12 @@ def test_422_role_constraint_when_nothing_serves_the_function(monkeypatch):
     resp = asyncio.run(proxy.handle_proxy(req))
     assert resp.status == 422
     body = json.loads(resp.body.decode())
-    assert body == {"error": "no_eligible_backend", "constraint": "role", "role": "judge"}
+    # Ruling C(α)/E(α2) (§5, W4): this fleet has no explicit private_ok
+    # anywhere and one roles-carrying entry — "no_role_less_opt_in" is the
+    # ADDITIVE declaration key the refusal now carries alongside the
+    # unchanged three original keys.
+    assert body == {"error": "no_eligible_backend", "constraint": "role", "role": "judge",
+                     "declaration": "no_role_less_opt_in"}
     assert resp.headers["X-SM-Fault-Origin"] == "gateway"
 
 
@@ -446,7 +517,7 @@ def test_422_privacy_constraint_when_role_less_and_all_backends_private_false(mo
 
 def test_422_fit_constraint_when_oversized(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "n_ctx": 100},
+        {"url": "http://a:5000", "n_ctx": 100, "private_ok": True},
     ]))
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
@@ -505,6 +576,89 @@ def test_422_never_waits(monkeypatch):
     assert resp.status == 422
 
 
+# ── §5: _declaration_gap() — the 422 body's additive two-valued fact ───────
+
+def test_declaration_gap_none_when_anything_is_explicitly_declared(monkeypatch):
+    """Ruling E(α2) arm 1: an entry with EITHER explicit private_ok value
+    means something was deliberately declared — even a fleet that
+    explicitly scoped itself AWAY from role-less traffic. `declaration` is
+    absent (None), keeping the plain refusal and a FATAL A8."""
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://a:5000", "private_ok": False, "roles": ["extract"]},
+    ]))
+    g = _fresh(monkeypatch)
+    assert g._declaration_gap() is None
+
+
+def test_declaration_gap_none_for_a_credentialed_backend_with_explicit_true(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "https://api.deepseek.com/v1", "token_env": "DEEPSEEK_API_KEY", "private_ok": True},
+    ]))
+    g = _fresh(monkeypatch)
+    assert g._declaration_gap() is None
+
+
+def test_declaration_gap_none_when_a_role_only_entry_also_declares_explicit_private_ok(monkeypatch):
+    """A mixed fleet: one entry states nothing, another states private_ok
+    explicitly — arm 1's `any()` fires on the SECOND entry, so the whole
+    pool reads None even though the first entry alone would have been
+    'no_role_less_opt_in'."""
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://a:5000", "roles": ["extract"]},
+        {"url": "http://b:4000", "private_ok": True},
+    ]))
+    g = _fresh(monkeypatch)
+    assert g._declaration_gap() is None
+
+
+def test_declaration_gap_none_for_the_fit_case(monkeypatch):
+    """The declaration key must not fire just because a request happens to
+    be oversized (constraint=fit) on an explicitly-declared fleet."""
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://a:5000", "n_ctx": 100, "private_ok": True},
+    ]))
+    g = _fresh(monkeypatch)
+    assert g._declaration_gap() is None
+
+
+def test_declaration_gap_none_undeclared_legacy_csv(monkeypatch):
+    """Ruling E(α2) arm 2: a live legacy CSV — every entry has
+    private_ok_explicit False AND roles None — is "nothing was EVER
+    declared", pinned as `declaration == "none"`."""
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000,http://b:4000")
+    g = _fresh(monkeypatch)
+    assert g._declaration_gap() == "none"
+
+
+def test_declaration_gap_none_undeclared_builtin_fallback(monkeypatch):
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    g = _fresh(monkeypatch)
+    assert g._declaration_gap() == "none"
+
+
+def test_declaration_gap_none_vacuous_empty_pool(monkeypatch):
+    """⚠ V6: an EMPTY LLM_POOL vacuously satisfies arm 2 (`all()` over
+    nothing is True) — deliberately pinned, per the brief."""
+    g = _fresh(monkeypatch)
+    monkeypatch.setattr(g, "LLM_POOL", [])
+    assert g._declaration_gap() == "none"
+
+
+def test_declaration_gap_no_role_less_opt_in_for_a_roles_only_fleet(monkeypatch):
+    """Ruling E(α2) arm 3: roles exist somewhere but no privacy intent was
+    EVER stated — the R-B population; the refusal carries the opt-back
+    remedy this wave announces."""
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://a:5000", "roles": ["extract"]},
+        {"url": "http://b:4000", "roles": ["judge"]},
+    ]))
+    g = _fresh(monkeypatch)
+    assert g._declaration_gap() == "no_role_less_opt_in"
+
+
 # ── I-3: fit is a ceiling, never a body mutation ────────────────────────────
 
 def test_fits_backend_without_nctx_always_fits(monkeypatch):
@@ -527,7 +681,7 @@ def test_fit_never_rewrites_max_tokens_in_the_forwarded_body(monkeypatch):
     """I-3: the fit check may only EXCLUDE a backend; it must never modify
     the request. A backend declaring n_ctx must forward the caller's body
     byte-for-byte (no max_tokens injected) when the caller sent none."""
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "n_ctx": 100000}]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "n_ctx": 100000, "private_ok": True}]))
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     session = _CaptureSession()
@@ -646,8 +800,8 @@ def test_p6_daemon_role_header_still_stripped_before_upstream_forward(monkeypatc
     stripped before the forward. Deliberately supersedes the old assertion
     in tests/test_llm_steering_headers.py (see that file's updated docstring)."""
     monkeypatch.setenv("AGENT_TOKENS", "consolidation:tok_daemon_test")
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True}]))
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)
     import coordinator
@@ -689,8 +843,8 @@ def test_i8_capped_backend_excluded_when_an_alternative_eligible_backend_exists(
     """MUTATION TARGET (I-8): a backend AT its cap must not be selected when
     another eligible backend has room."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "max_inflight": 1},
-        {"url": "http://b:4000"},
+        {"url": "http://a:5000", "max_inflight": 1, "private_ok": True},
+        {"url": "http://b:4000", "private_ok": True},
     ]))
     g = _fresh(monkeypatch)
     g._llm_inflight["http://a:5000"] = 1   # AT cap
@@ -724,7 +878,7 @@ def test_i8_sole_eligible_backend_at_cap_frees_up_during_wait(monkeypatch):
     WAITS rather than refusing immediately -- if capacity frees up inside
     the wait window, it is selected."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "max_inflight": 1},
+        {"url": "http://a:5000", "max_inflight": 1, "private_ok": True},
     ]))
     g = _fresh(monkeypatch)
     g._llm_inflight["http://a:5000"] = 1
@@ -745,7 +899,7 @@ def test_i8_sole_eligible_backend_at_cap_frees_up_during_wait(monkeypatch):
 
 def test_i8b_capacity_wait_exhausted_never_touches_inflight(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "max_inflight": 1},
+        {"url": "http://a:5000", "max_inflight": 1, "private_ok": True},
     ]))
     g = _fresh(monkeypatch)
     g._llm_inflight["http://a:5000"] = 1
@@ -803,8 +957,8 @@ def test_i7_role_routed_counter_increments_on_successful_dispatch(monkeypatch):
 
 def test_f3_free_slots_excludes_role_scoped_backend(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "roles": ["extract"]},   # NOT serves-all
-        {"url": "http://b:4000"},                          # serves-all
+        {"url": "http://a:5000", "roles": ["extract"]},                    # NOT serves-all
+        {"url": "http://b:4000", "private_ok": True},                      # serves-all
     ]))
     g = _fresh(monkeypatch)
     resp = asyncio.run(g.handle_pool_status(None))
@@ -856,7 +1010,7 @@ def test_i4_no_gateway_retry_on_a_4xx_5xx_status(monkeypatch):
     behavior; the capacity WAIT loop never issues an upstream call at all
     (see test_i8b_capacity_wait_exhausted_never_touches_inflight), and the
     eligibility/fit pre-filter runs entirely before any upstream call too."""
-    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000"}]))
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True}]))
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
     session = _FixedFaultBodySession()

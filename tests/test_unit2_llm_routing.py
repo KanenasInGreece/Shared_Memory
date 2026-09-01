@@ -101,6 +101,30 @@ def test_routing_refusal_recognizes_no_eligible_backend(mod):
     assert refusal == {"error": "no_eligible_backend", "constraint": "role", "role": "extract"}
 
 
+class _RefusalRespWithDeclaration(_RefusalResp):
+    """W4 Ruling C(α)/E(α2) (§5): the additive `declaration` key the
+    gateway's 422 body now carries on an undeclared/opt-in-less fleet."""
+    def __init__(self, declaration="none", **kw):
+        super().__init__(**kw)
+        self._body["declaration"] = declaration
+        self.text = str(self._body)
+
+
+@pytest.mark.parametrize("mod", _ROUTING_MODULES, ids=["rem_loop", "consolidation_loop"])
+@pytest.mark.parametrize("declaration", ["none", "no_role_less_opt_in"])
+def test_routing_refusal_ignores_the_additive_declaration_key(mod, declaration):
+    """§5 (Ruling C(α)/E(α2)): both daemons' _routing_refusal() build their
+    return value from an explicit three-key dict literal
+    (`{"error": ..., "constraint": ..., "role": ...}`) — an ADDITIVE
+    `declaration` key on the gateway's 422 body must never surface in the
+    daemon's own parsed refusal, by construction. MUTATION TARGET: were
+    either daemon to instead do `dict(body)` or otherwise pass the raw
+    body through, this test would start seeing a 4th key."""
+    refusal = mod._routing_refusal(_RefusalRespWithDeclaration(declaration=declaration))
+    assert refusal == {"error": "no_eligible_backend", "constraint": "role", "role": "extract"}
+    assert "declaration" not in refusal
+
+
 @pytest.mark.parametrize("mod", _ROUTING_MODULES, ids=["rem_loop", "consolidation_loop"])
 def test_routing_refusal_recognizes_backend_at_capacity(mod):
     resp = _RefusalResp(error="backend_at_capacity", constraint=None, role=None, status_code=503)

@@ -27,7 +27,11 @@ def _auth_off_gateway(monkeypatch):
 
 
 def test_pool_status_reports_free_slots(monkeypatch):
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000,http://b:4000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://a:5000", "private_ok": True},
+        {"url": "http://b:4000", "private_ok": True},
+    ]))
     g = _auth_off_gateway(monkeypatch)
     g._llm_inflight["http://a:5000"] = 1          # A busy, B free
     resp = asyncio.run(g.handle_pool_status(None))
@@ -47,7 +51,11 @@ def test_pool_status_none_free_when_all_busy(monkeypatch):
 
 
 def test_pool_status_excludes_reserved(monkeypatch):
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000,http://b:4000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://a:5000", "private_ok": True},
+        {"url": "http://b:4000", "private_ok": True},
+    ]))
     g = _auth_off_gateway(monkeypatch)
     g._llm_reserved.add("http://b:4000")          # reserved → not available
     d = json.loads(asyncio.run(g.handle_pool_status(None)).body)
@@ -148,7 +156,8 @@ class _ResetOnceThenBoomSession:
 
 
 def test_retries_once_on_client_connection_reset(monkeypatch):
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 

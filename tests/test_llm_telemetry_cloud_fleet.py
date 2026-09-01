@@ -183,8 +183,12 @@ def _fresh(monkeypatch, backends="http://a:5000"):
     re-created fresh by the reload, so no manual reset is needed between
     tests."""
     monkeypatch.delenv("AGENT_TOKENS", raising=False)
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", backends)
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    # W4 default-deny: this fixture is about telemetry counters, not privacy
+    # — declare every backend with an explicit private_ok opt-in so role-less
+    # traffic still reaches it (mirrors test_llm_affinity.py's fixture).
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps(
+        [{"url": u.strip(), "private_ok": True} for u in backends.split(",") if u.strip()]))
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)
     import coordinator

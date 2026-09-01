@@ -9,7 +9,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory"
 
 
 def _fresh(monkeypatch):
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000,http://b:4000")
+    # W4 default-deny: role-less traffic now needs an explicit private_ok
+    # opt-in — this fixture is about affinity/cache routing, not privacy, so
+    # both backends declare it explicitly (fact:1195-safe public fixture names).
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": "http://a:5000", "private_ok": True},
+        {"url": "http://b:4000", "private_ok": True},
+    ]))
     import hive_mind_proxy
     importlib.reload(hive_mind_proxy)
     return hive_mind_proxy

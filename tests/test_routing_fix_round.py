@@ -85,7 +85,7 @@ def test_c1_partial_roles_backend_does_not_count(monkeypatch):
 
 def test_c1_serves_all_still_counts_and_private_false_roleless_does_not(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000"},
+        {"url": "http://a:5000", "private_ok": True},
         {"url": "http://b:4000", "private_ok": False},
     ]))
     g = _fresh(monkeypatch)
@@ -123,7 +123,7 @@ def test_c1_startup_warning_when_no_dream_slot_possible(monkeypatch, caplog):
 def test_c1_no_warning_when_a_dream_slot_exists(monkeypatch, caplog):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "http://a:5000", "roles": ["extract"]},
-        {"url": "http://b:4000"},
+        {"url": "http://b:4000", "private_ok": True},
     ]))
     g = _fresh(monkeypatch)
     import logging
@@ -136,7 +136,7 @@ def test_c1_no_warning_when_a_dream_slot_exists(monkeypatch, caplog):
 
 def test_r1_capacity_503_increments_counter_and_last_ts(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "max_inflight": 1},
+        {"url": "http://a:5000", "max_inflight": 1, "private_ok": True},
     ]))
     monkeypatch.setenv("LLM_MAX_INFLIGHT_WAIT_S", "0.05")
     g = _fresh(monkeypatch)
@@ -214,7 +214,7 @@ def test_r3_empty_roles_does_not_sidestep_m5(monkeypatch):
 
 def test_r4_waiter_cap_immediate_503_beyond_cap(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "max_inflight": 1},
+        {"url": "http://a:5000", "max_inflight": 1, "private_ok": True},
     ]))
     monkeypatch.setenv("LLM_MAX_INFLIGHT_WAIT_S", "5")
     g = _fresh(monkeypatch)
@@ -234,7 +234,7 @@ def test_r4_waiter_cap_immediate_503_beyond_cap(monkeypatch):
 
 def test_r4_waiter_count_released_after_wait(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "max_inflight": 1},
+        {"url": "http://a:5000", "max_inflight": 1, "private_ok": True},
     ]))
     monkeypatch.setenv("LLM_MAX_INFLIGHT_WAIT_S", "0.05")
     g = _fresh(monkeypatch)
@@ -278,7 +278,7 @@ def test_r4_mixed_fleet_not_doomed_falls_through(monkeypatch):
     # (if it picked the credentialed one, the post-selection S-04 check would
     # 403 — pre-existing behavior, not the doomed-denial under test here).
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://local:5000"},
+        {"url": "http://local:5000", "private_ok": True},
         {"url": "https://api.example.com/v1", "token_env": "SM_TEST_PROVIDER_KEY",
          "private_ok": True},
     ]))
@@ -304,7 +304,7 @@ def test_r4_mixed_fleet_not_doomed_falls_through(monkeypatch):
 
 def test_r5_fit_422_names_the_estimate(monkeypatch):
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
-        {"url": "http://a:5000", "n_ctx": 100},
+        {"url": "http://a:5000", "n_ctx": 100, "private_ok": True},
     ]))
     g = _fresh(monkeypatch)
     proxy = g.AsyncHiveMindProxy()
@@ -322,7 +322,11 @@ def test_r5_fit_422_names_the_estimate(monkeypatch):
     assert body["est_prompt_tokens"] > 100   # sanity: bigger than n_ctx
 
 
-def test_r5_role_422_body_shape_unchanged(monkeypatch):
+def test_r5_role_422_body_gains_only_the_additive_declaration_key(monkeypatch):
+    """W4 (§5, Ruling C(α)/E(α2), was
+    test_r5_role_422_body_shape_unchanged): the three ORIGINAL keys are
+    still exactly unchanged; the body now ALSO carries the additive
+    `declaration` key for this undeclared, roles-only fleet."""
     monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
         {"url": "http://a:5000", "roles": ["extract"]},
     ]))
@@ -331,7 +335,8 @@ def test_r5_role_422_body_shape_unchanged(monkeypatch):
     proxy.session = _RaisingSession()
     resp = asyncio.run(proxy.handle_proxy(_req({"X-SM-LLM-Role": "judge"}, _body())))
     body = json.loads(resp.body.decode())
-    assert body == {"error": "no_eligible_backend", "constraint": "role", "role": "judge"}
+    assert body == {"error": "no_eligible_backend", "constraint": "role", "role": "judge",
+                     "declaration": "no_role_less_opt_in"}
 
 
 # ── R-6: operator-declared extra steer-permitted names ──────────────────────

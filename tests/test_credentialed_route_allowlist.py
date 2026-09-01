@@ -130,8 +130,8 @@ def test_arbitrary_path_to_credentialed_backend_403s(monkeypatch):
 def test_uncredentialed_backend_keeps_full_pass_through(monkeypatch):
     """The allowlist binds ONLY the credentialed branch -- a local backend
     with no token_env is unaffected, same as before this change."""
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://a:5000", "private_ok": True}]))
     import hive_mind_proxy as g
     importlib.reload(g)
 

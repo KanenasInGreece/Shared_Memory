@@ -295,8 +295,8 @@ class _StubCoordinator:
 
 @pytest.fixture
 def gateway(monkeypatch):
-    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
-    monkeypatch.setenv("LLM_BACKENDS", "http://localhost:5000")
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([{"url": "http://localhost:5000", "private_ok": True}]))
     monkeypatch.setenv("AGENT_TOKENS", "claude:tok_contract_test")
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)
