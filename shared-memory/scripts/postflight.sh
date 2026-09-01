@@ -227,6 +227,16 @@ print(str(len(healthy)) + "|" + ",".join(healthy) + "|" + summary)
 # enforce on their own refusal parse. This function only GRADES; the
 # human-readable message is composed at the A8 call site below — same
 # split SELECT_SUMMARY_PHRASE has from A5.
+#
+# SEC L-3 (fix round) — accepted residue, joining §7's list: for this
+# undeclared-fleet population, check_config.py's own exit code ALSO stays
+# 0 now (the guard functions it calls no longer raise for M-5'/P-5'), so
+# exit 1 there no longer distinguishes "undeclared" from "clean" either —
+# a fourth green-but-dark leg alongside top-level /health `llm` liveness,
+# postflight A1, and this SKIP_<declaration>. `/health`
+# `dependencies.llm_pool` going `degraded` (with its remedy) and
+# check_config's own per-entry ⚠ M-5'/P-5' lines are the surfaces that
+# still tell the truth about this population.
 a8_grade_completion() {  # a8_grade_completion <status_code> <fault_origin_header>  (body on stdin)
     local status="$1"
     local fault_origin="$2"

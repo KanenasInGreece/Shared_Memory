@@ -571,8 +571,11 @@ fi
 # --skip-env-migration), this applies against that pre-image; otherwise
 # (--from-restore, or --skip-env-migration was given for THIS run only —
 # checked again here so a capture failure never partially applies) it
-# self-captures with the CURRENT loader (N-9 — valid only while loader
-# semantics are unchanged from the running version; true at W3).
+# self-captures with the CURRENT loader (N-9 — QA LOW-2, fix round: post-W4
+# this self-capture is ALWAYS same-generation by construction, so
+# migrate_env.py's V2 gate makes it a deliberate true no-op rather than a
+# real materialisation; only an aged --preimage from an OLDER loader
+# actually opens the boundary and plans a write).
 if [[ "$SKIP_ENV_MIGRATION" == "1" ]]; then
     step=$((step + 1))
     echo; ylw "── Step $step: migrate .env to explicit configuration"
