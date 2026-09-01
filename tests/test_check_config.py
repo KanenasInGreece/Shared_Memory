@@ -288,6 +288,65 @@ def test_config_empty_and_fallback_reason_lines_are_mutually_exclusive(tmp_path)
     assert "NO BACKEND DECLARED" not in proc.stdout
 
 
+# ── §6.2 (M11 + case-0 census, W4/decision:1824) — present-but-empty /
+#    composed latents, report-only, rendered in Phase B as one scannable
+#    block. ────────────────────────────────────────────────────────────────
+
+def test_w4_census_zero_latents_on_a_clean_declared_fleet(tmp_path):
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "",
+                                "LLM_BACKENDS_JSON": '[{"url":"http://a:5000","private_ok":true}]'},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "W4 census" in proc.stdout
+    assert "0 latent case(s) present on this install." in proc.stdout
+
+
+def test_w4_census_counts_present_but_empty_encoder_key(tmp_path):
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS": "http://a:5000",
+                                "EMBEDDER_URL": ""},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "EMBEDDER_URL is present but EMPTY" in proc.stdout
+    assert "1 latent case(s) present on this install." in proc.stdout
+
+
+def test_w4_census_counts_present_but_empty_llm_backends_json(tmp_path):
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": ""},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "LLM_BACKENDS_JSON is present but EMPTY" in proc.stdout
+
+
+def test_w4_census_counts_the_llm_default_target_composed_empty_latent(tmp_path):
+    """The known latent framework_defaults.py documents: LLM_DEFAULT_TARGET
+    present-but-empty, with neither LLM_BACKENDS nor LLM_BACKENDS_JSON
+    declared, composes to `LLM_BACKENDS == ['']`."""
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_DEFAULT_TARGET": ""},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "LLM_BACKENDS composed to ['']" in proc.stdout
+
+
+# ── §6.3 (R-B announce, W4/decision:1824) — a roles-carrying entry with no
+#    explicit private_ok no longer serves role-less traffic. ───────────────
+
+def test_r_b_announce_on_a_roles_only_entry_with_no_explicit_private_ok(tmp_path):
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "",
+                                "LLM_BACKENDS_JSON": '[{"url":"http://a:5000","roles":["extract"]}]'},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "R-B (W4): role-less traffic no longer reaches this backend" in proc.stdout
+
+
+def test_r_b_announce_absent_when_private_ok_is_explicit(tmp_path):
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "",
+                                "LLM_BACKENDS_JSON":
+                                    '[{"url":"http://a:5000","roles":["extract"],"private_ok":true}]'},
+                tmp_path=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "R-B (W4)" not in proc.stdout
+
+
 # ── SEC-HIGH (fold round, PR #347) — check_config must be unable to print a
 #    raw secret through ANY exception path, in EITHER phase. Policy: ALWAYS
 #    the exception's type name; str(exc) shown (scrubbed) ONLY for the

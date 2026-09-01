@@ -296,6 +296,38 @@ def phase_a_render() -> "tuple[list[str], bool]":
     return lines, True
 
 
+def _w4_census_lines(proxy) -> "list[str]":
+    """§6.2 (M11 + case-0 census, W4): three specific present-but-empty /
+    composed latents, counted and rendered LOUDLY here — REPORT ONLY, no
+    behaviour change (0 on our fleet is the expected, verified reading).
+    Phase B (not Phase A) because the third item needs the gateway's own
+    COMPUTED LLM_BACKENDS to observe the composition, and grouping all
+    three here makes it one scannable block instead of three facts
+    scattered across two phases."""
+    lines: "list[str]" = ["", "W4 census (present-but-empty / composed latents — report only, "
+                               "no behaviour change):"]
+    count = 0
+    for key in ("EMBEDDER_URL", "RERANKER_URL"):
+        raw = os.environ.get(key)
+        if raw is not None and raw.strip() == "":
+            lines.append(f"  {key} is present but EMPTY (distinct from absent) — the "
+                         f"'or'-idiom falls back to the framework default anyway.")
+            count += 1
+    raw_json = os.environ.get("LLM_BACKENDS_JSON")
+    if raw_json is not None and raw_json.strip() == "":
+        lines.append("  LLM_BACKENDS_JSON is present but EMPTY — never used; the legacy "
+                     "LLM_BACKENDS/LLM_DEFAULT_TARGET pool is what actually serves "
+                     "(migrate_env.py's own case 0, CASE_JSON_PRESENT_EMPTY).")
+        count += 1
+    if list(getattr(proxy, "LLM_BACKENDS", [])) == [""]:
+        lines.append("  LLM_BACKENDS composed to [''] — LLM_DEFAULT_TARGET is present but "
+                     "EMPTY and neither LLM_BACKENDS nor LLM_BACKENDS_JSON is declared; "
+                     "the gateway will attempt to route to an empty URL.")
+        count += 1
+    lines.append(f"  {count} latent case(s) present on this install.")
+    return lines
+
+
 def phase_b_render() -> "tuple[list[str], int]":
     """Returns (lines, exit_code). Never raises: a daemon-side import
     failure (bad encoder URL, a malformed LLM_BACKENDS_JSON entry shape, or
@@ -339,10 +371,15 @@ def phase_b_render() -> "tuple[list[str], int]":
     # — so this never doubles up with the warning block just printed.
     config_empty = getattr(proxy, "LLM_POOL_CONFIG_EMPTY", False)
     if config_empty:
+        # Remedy honesty (§6.5): migrate_env.py's same-generation gate means
+        # it correctly plans NOTHING for an install already on the current
+        # loader semantics — naming it here as the fix would be a false
+        # remedy. Declare LLM_BACKENDS_JSON directly instead.
         lines.append("⚠ NO BACKEND DECLARED — the gateway is falling back to "
                      + scrub_url_credentials(str(getattr(proxy, "DEFAULT_TARGET", "")))
-                     + " (LLM_DEFAULT_TARGET/its own built-in default). Run "
-                       "migrate_env.py to declare it explicitly.")
+                     + " (LLM_DEFAULT_TARGET/its own built-in default), and it is now "
+                       "INELIGIBLE for role-less traffic (W4 default-deny). Declare "
+                       "LLM_BACKENDS_JSON yourself.")
         lines.append("")
 
     if not proxy.LLM_BACKENDS:
@@ -356,9 +393,18 @@ def phase_b_render() -> "tuple[list[str], int]":
         lines.append(f"    n_ctx={proxy.LLM_BACKEND_NCTX.get(url)}")
         lines.append(f"    has_credential={proxy.LLM_BACKEND_TOKENS.get(url) is not None}")
         lines.append(
-            f"    private_ok={proxy.LLM_BACKEND_PRIVATE_OK.get(url, True)} "
+            f"    private_ok={proxy.LLM_BACKEND_PRIVATE_OK.get(url, False)} "
             f"(explicit={proxy.LLM_BACKEND_PRIVATE_OK_EXPLICIT.get(url, False)})"
         )
+        # R-B announce (§6.3, W4/decision:1824): a roles-carrying entry with
+        # no explicit private_ok used to also serve role-less traffic (the
+        # plain default was True); it no longer does. Source-pinned
+        # alongside the CHANGELOG opt-back line this release drafts.
+        if roles and not proxy.LLM_BACKEND_PRIVATE_OK_EXPLICIT.get(url, False):
+            lines.append(
+                "    ⚠ R-B (W4): role-less traffic no longer reaches this backend — "
+                "add \"private_ok\": true to opt back in."
+            )
 
     # QA Q3 (fold round, LOW): guarded getattr on the one PRIVATE proxy
     # symbol this script reads, same defensive shape hive_mind_proxy.py
@@ -380,6 +426,8 @@ def phase_b_render() -> "tuple[list[str], int]":
             # against a future change to that construction site silently
             # dropping the scrub.
             lines.append(f"    {scrub_url_credentials(str(e))}")
+
+    lines.extend(_w4_census_lines(proxy))
 
     lines.append("")
     lines.append("Gateway startup refusals (calling the gateway's own guard functions):")
