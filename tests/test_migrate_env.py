@@ -698,11 +698,16 @@ def test_two_layer_compare_url_set_changed_fails():
 
 
 @pytest.mark.parametrize("field", ["weights", "has_token", "models", "roles", "n_ctx",
-                                    "max_inflight", "extra_body", "private_ok"])
+                                    "max_inflight", "extra_body"])
 def test_two_layer_compare_any_behavioural_field_drift_fails(field):
     """The 'make the migration write a wrong value' mutant, applied per
     Layer-1 field: a single wrong value anywhere in the behavioural set
-    must be caught."""
+    must be caught. `private_ok` is deliberately NOT parametrized here
+    (QA MED-3, fix round) — it left Layer-1 equality for Layer-2
+    planned-direction comparison (`_URL_KEYED_FIELDS` at migrate_env.py:800,
+    ruling A(a)/§6.4); its own coverage now lives in the direction-rule
+    tests below (same-generation True->False refusal, boundary-crossing
+    True->False allow, unreported False->True refusal)."""
     pre = _full_image()
     post = _full_image()
     post[field] = dict(post[field])
@@ -759,6 +764,135 @@ def test_two_layer_compare_config_empty_moves_only_on_confirmed_fallback_write()
     ok2, msg2 = m.two_layer_compare(
         pre, post, reported_writes={"http://x:5000", "__fallback_materialised__"})
     assert ok2, msg2
+
+
+# ── private_ok direction rules (ruling A(a)/§6.4) — QA HIGH-2/MED-2/MED-3 ──
+# `private_ok` left the Layer-1 equality set for this Layer-2
+# planned-direction comparison; these three tests are its ONLY remaining
+# coverage (the parametrized drift test above no longer includes it).
+
+def test_two_layer_compare_private_ok_false_to_true_on_unreported_entry_fails():
+    """Rule 1 (§6.4 A(a)): False->True on private_ok is legitimate ONLY on
+    an entry THIS RUN reported writing. An unreported False->True move is
+    exactly the shape a real widening regression would take."""
+    pre = _full_image(private_ok={"http://a:5000": False})
+    post = _full_image(private_ok={"http://a:5000": True})
+    ok, msg = m.two_layer_compare(pre, post, reported_writes=set())
+    assert not ok, "unreported private_ok False->True must fail"
+    assert "http://a:5000" in msg
+
+
+def test_two_layer_compare_private_ok_same_generation_true_to_false_on_untouched_entry_fails():
+    """A3 (§6.4, QA HIGH-2 — MUTATION TARGET, migrate_env.py's rule 2): with
+    private_ok out of Layer 1, a same-generation True->False on an entry
+    this run left untouched is the ONLY remaining detector for a real
+    regression on that field. Both images here carry the SAME (default)
+    loader_semantics, so boundary_crossed is False — rule 2 must NOT excuse
+    this move, and it must name the entry."""
+    pre = _full_image(private_ok={"http://a:5000": True})
+    post = _full_image(private_ok={"http://a:5000": False})
+    ok, msg = m.two_layer_compare(pre, post, reported_writes=set())
+    assert not ok, "same-generation True->False on an untouched entry must be refused"
+    assert "http://a:5000" in msg
+
+
+def test_two_layer_compare_private_ok_boundary_crossing_true_to_false_on_untouched_entry_is_ok():
+    """Rule 2 (§6.4 A(a)): a True->False move IS legitimate when it crosses
+    the loader-semantics boundary (an old-code pre-image re-measured under
+    new-code semantics) on an entry this run left untouched — and it must
+    be REPORTED per-entry by name, never silent (QA MED-2 — MUTATION
+    TARGET, migrate_env.py's `if report_lines is not None:` gate)."""
+    pre = _full_image(private_ok={"http://a:5000": True}, loader_semantics=1)
+    post = _full_image(private_ok={"http://a:5000": False}, loader_semantics=m.LOADER_SEMANTICS)
+    report_lines = []
+    ok, msg = m.two_layer_compare(pre, post, reported_writes=set(), report_lines=report_lines)
+    assert ok, msg
+    assert any("http://a:5000" in line and "True -> False" in line for line in report_lines), (
+        "the boundary-crossing move must be reported per-entry by name (QA MED-2)")
+
+
+# ── loader_semantics type guard (SEC M-4) ───────────────────────────────────
+
+@pytest.mark.parametrize("bad_value", [None, "1", [], True, 1.5])
+def test_two_layer_compare_malformed_pre_loader_semantics_fails_never_raises(bad_value):
+    """SEC M-4 (fix round): a malformed loader_semantics must fail the
+    comparison cleanly (False, message) — never a raw TypeError from the
+    `<` comparison. Pinned directly on two_layer_compare, independent of
+    do_apply_or_dryrun's own earlier gate (the two guards are deliberately
+    redundant — see that guard's own comment for why)."""
+    pre = _full_image(loader_semantics=bad_value)
+    post = _full_image()
+    ok, msg = m.two_layer_compare(pre, post, reported_writes=set())
+    assert not ok
+    assert "loader_semantics" in msg
+
+
+@pytest.mark.parametrize("bad_value", [None, "1", [], True, 1.5])
+def test_two_layer_compare_malformed_post_loader_semantics_fails_never_raises(bad_value):
+    pre = _full_image()
+    post = _full_image(loader_semantics=bad_value)
+    ok, msg = m.two_layer_compare(pre, post, reported_writes=set())
+    assert not ok
+    assert "loader_semantics" in msg
+
+
+@pytest.mark.parametrize("bad_value", [None, "1", [], True, 1.5])
+def test_malformed_loader_semantics_in_preimage_exits_stop_never_crashes(tmp_path, monkeypatch, bad_value):
+    """SEC M-4 (fix round), end to end: an operator-supplied --preimage
+    with a malformed loader_semantics must EXIT_STOP with a named message,
+    never a raw traceback — matching the isinstance(schema, int) idiom
+    capture_schema already gets a few lines above this guard."""
+    _force_no_unit(monkeypatch)
+    env_path = _write_env(tmp_path, "LLM_BACKENDS=http://a:5000\n")
+    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
+    preimage = tmp_path / "pre.json"
+    image = {"urls": ["http://a:5000"], "loader_semantics": bad_value}
+    preimage.write_text(json.dumps({"capture_schema": m.CAPTURE_SCHEMA, "image": image}))
+    rc = m.do_apply_or_dryrun(str(preimage), False, _NO_UNIT)
+    assert rc == m.EXIT_STOP
+
+
+# ── provenance comment on a materialising write (QA MED-4) ─────────────────
+
+def test_e2e_csv_live_materialisation_writes_a_provenance_comment_above_the_json_line(
+        tmp_path, monkeypatch):
+    """QA MED-4 (fix round): materialising LLM_BACKENDS_JSON (case 3) must
+    carry its own one-line provenance comment naming the tool and what it
+    did — distinct from the existing 'migrated to ... original:' comment
+    left on the now-dead CSV line, which only explains where the CSV went,
+    never why a brand-new JSON line appeared."""
+    _force_no_unit(monkeypatch)
+    env_path = _write_env(tmp_path, "LLM_BACKENDS=http://localhost:5000\n")
+    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
+    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
+    preimage_path = _aged_preimage(tmp_path)
+    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT)
+    assert rc == m.EXIT_OK
+    lines = env_path.read_text().splitlines()
+    json_idx = next(i for i, l in enumerate(lines) if l.startswith("LLM_BACKENDS_JSON="))
+    assert lines[json_idx - 1].startswith("# migrate_env.py "), (
+        "the materialising write must carry a provenance comment on the line directly above it")
+    assert "materialised the pre-W4 effective pool" in lines[json_idx - 1]
+
+
+def test_e2e_fallback_materialisation_writes_a_provenance_comment_above_the_json_line(
+        tmp_path, monkeypatch):
+    """Same obligation as above, case 4 (fallback confirm)."""
+    _force_no_unit(monkeypatch)
+    env_path = _write_env(tmp_path, "EMBEDDER_URL=http://a:8070\n")
+    monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
+    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
+    preimage_path = _aged_preimage(tmp_path)
+    monkeypatch.setattr(m, "probe_backend", lambda url, timeout=3.0: {
+        "answered": False, "status": None, "parsed_model_list": False, "n_models": None})
+    rc = m.do_apply_or_dryrun(preimage_path, True, _NO_UNIT, confirm_reader=lambda: "y\n")
+    assert rc == m.EXIT_OK
+    lines = env_path.read_text().splitlines()
+    json_idx = next(i for i, l in enumerate(lines) if l.startswith("LLM_BACKENDS_JSON="))
+    assert lines[json_idx - 1].startswith("# migrate_env.py "), (
+        "the materialising write must carry a provenance comment on the line directly above it")
+    assert "materialised the pre-W4 effective pool" in lines[json_idx - 1]
+    assert "LLM_DEFAULT_TARGET" not in lines[json_idx - 1], "R-A: never spell the literal key name"
 
 
 # ─────────────────────────────────────────────────────────────────────────

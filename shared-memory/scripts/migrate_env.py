@@ -82,6 +82,19 @@ CAPTURE_SCHEMA = 1
 # capture, or a hand-built test fixture) reads as 1 — trust-by-default —
 # by construction wherever this is read (`.get("loader_semantics", 1)`).
 LOADER_SEMANTICS = 2
+
+
+def _valid_loader_semantics(value) -> bool:
+    """SEC M-4 (fix round): the type guard `loader_semantics` never had.
+    A plain int only — never a bool (JSON `true`/`false` decode to Python
+    `bool`, a subclass of `int`, so `isinstance(value, int)` alone would
+    silently accept `true` as `1`) and never a string/float/None/list/dict.
+    Mirrors the `isinstance(schema, int)` idiom `do_apply_or_dryrun`
+    already applies to `capture_schema` (see its own guard below). Callers
+    treat a False return as EXIT_STOP-worthy — never guess a direction."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 DEFAULT_GATEWAY_UNIT = "hive-mind-gateway.service"
 MANAGED_KEYS = ("EMBEDDER_URL", "RERANKER_URL", "LLM_DEFAULT_TARGET",
                 "LLM_BACKENDS", "LLM_BACKENDS_JSON")
@@ -846,6 +859,21 @@ def two_layer_compare(pre: dict, post: dict, reported_writes: "set[str]",
     pre = _normalize_image(pre)
     post = _normalize_image(post)
     reported_writes = {_normalize_url_key(w) for w in reported_writes}
+    # SEC M-4 (fix round): same type guard as do_apply_or_dryrun's own
+    # boundary_open computation, independently applied here — this
+    # function is reached AFTER a write in the real call site, so a
+    # TypeError here would be a write-then-crash-without-restore path.
+    # Today `boundary_open` always raises first on the same malformed
+    # image (unreachable), but that stops being true the moment anyone
+    # reorders or caches it; a pure (False, message) return instead of a
+    # raised exception is also strictly better here, since it flows
+    # straight into the caller's existing _restore_or_die().
+    for _image, _label in ((pre, "pre-image"), (post, "post-image")):
+        _sem = _image.get("loader_semantics", 1)
+        if not _valid_loader_semantics(_sem):
+            return False, (f"{_label} loader_semantics={_sem!r} is not a plain integer — "
+                            f"refusing rather than guess whether a loader-semantics boundary "
+                            f"was crossed")
     boundary_crossed = pre.get("loader_semantics", 1) < post.get("loader_semantics", 1)
     if sorted(pre.get("urls", [])) != sorted(post.get("urls", [])):
         return False, f"backend URL set changed: {sorted(pre.get('urls', []))} -> {sorted(post.get('urls', []))}"
@@ -1125,6 +1153,20 @@ def do_apply_or_dryrun(preimage_path: "str | None", apply: bool, gateway_unit: s
     # outside this tool's job. Only a genuine version-jump (a captured
     # pre-image from OLD code, carrying no "loader_semantics" key or an
     # older one) opens the gate.
+    #
+    # SEC M-4 (fix round): pre_image is OPERATOR-SUPPLIED (--preimage is a
+    # path they name) — a truncated capture, a hand edit, or a future
+    # capture format writing null/a string/a float there must never reach
+    # the `<` comparison below as a raw TypeError. Guarded the same way
+    # capture_schema already is a few lines up: name the field, EXIT_STOP,
+    # never silently open or close the boundary on a guess.
+    if pre_image and not _valid_loader_semantics(pre_image.get("loader_semantics", 1)):
+        _report(lines, f"--preimage loader_semantics={pre_image.get('loader_semantics')!r} is "
+                        f"not a plain integer — cannot determine whether a loader-semantics "
+                        f"boundary is being crossed. Re-run 'migrate_env.py --apply' with no "
+                        f"--preimage to self-capture with the CURRENT loader instead.")
+        print("\n".join(lines))
+        return EXIT_STOP
     boundary_open = bool(pre_image) and pre_image.get("loader_semantics", 1) < LOADER_SEMANTICS
 
     if case == CASE_JSON_PRESENT_EMPTY:
@@ -1194,6 +1236,12 @@ def do_apply_or_dryrun(preimage_path: "str | None", apply: bool, gateway_unit: s
             raw_lines[csv_idx] = (
                 f"# migrated to LLM_BACKENDS_JSON by migrate_env.py {_utc_stamp()} "
                 f"— original: {orig}")
+            # QA MED-4 (fix round, §6.4): the brief's own provenance
+            # obligation for a materialising write — distinct from the
+            # comment above, which explains where the OLD CSV line went,
+            # not why this NEW JSON line exists.
+            appended.append(f"# migrate_env.py {_utc_stamp()} materialised the pre-W4 "
+                             f"effective pool from live LLM_BACKENDS (CSV)")
             appended.append(f"LLM_BACKENDS_JSON={new_json}")
             reported_writes |= {e["url"] for e in new_entries}
             planned_key_names |= {"LLM_BACKENDS", "LLM_BACKENDS_JSON"}
@@ -1233,6 +1281,12 @@ def do_apply_or_dryrun(preimage_path: "str | None", apply: bool, gateway_unit: s
             lines = []
             if answered_yes:
                 new_entries = [{"url": default_target.rstrip("/"), "weight": 1, "private_ok": True}]
+                # QA MED-4 (fix round, §6.4): same provenance obligation as
+                # the CASE_CSV_LIVE materialisation above. R-A: never write
+                # the literal key name of the fallback env var itself, even
+                # in a comment — describe it, don't spell it.
+                appended.append(f"# migrate_env.py {_utc_stamp()} materialised the pre-W4 "
+                                 f"effective pool from the confirmed fallback target")
                 appended.append(f"LLM_BACKENDS_JSON={json.dumps(new_entries)}")
                 reported_writes.add("__fallback_materialised__")
                 reported_writes.add(default_target)
