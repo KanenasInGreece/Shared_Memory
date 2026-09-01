@@ -191,6 +191,66 @@ _ncpu="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null \
 LLAMA_CPU_THREADS="$(( _ncpu / 2 + 1 ))"
 [ "$LLAMA_CPU_THREADS" -lt 1 ] && LLAMA_CPU_THREADS=1
 
+# Fix round F1 (SEC HIGH) + F2 (QA MED-2): derive the default encoder
+# endpoints NOW, before the FIRST byte of shared-memory/.env is written
+# below — a failure here must never leave a half-configured install (F2),
+# and a poisoned/malformed value must never reach the file at all (F1).
+#
+# F2: guarded with the same `|| rc=$?` capture idiom this script's
+# pre-existing python3 site already uses (its own comment there: "this
+# script is set -euo pipefail, so an unguarded non-zero would abort with
+# .env already written"). AGENTS.md runs this script in Phase 1 and
+# preflight.sh (which diagnoses a missing python3 by name) in Phase 2 — an
+# unguarded failure here would abort from the WRONG phase with no named
+# remedy, so a missing/broken python3 is named explicitly and preflight.sh
+# is pointed at as the diagnostic.
+#
+# F1: SANITIZE-AND-REFUSE, not shell-quoting — quoting the echo below would
+# still let a crafted default land in .env as a value nothing then checks;
+# the actual defense is refusing to write anything unless the extracted
+# value is non-empty, carries no whitespace/control character (the shape a
+# newline-smuggled second KEY=VALUE line would take when later echoed), and
+# is URL-shaped (scheme://host[:port]).
+_check_encoder_default() {  # _check_encoder_default <VAR_NAME> <value>
+    local name="$1" val="$2"
+    if [[ -z "$val" ]]; then
+        echo "✗ ERROR: could not derive a default for $name (python3/framework_defaults.py returned nothing) — refusing to write shared-memory/.env. If python3 is missing or broken, run shared-memory/scripts/preflight.sh first; it diagnoses this directly and names the fix." >&2
+        exit 1
+    fi
+    if [[ "$val" =~ [[:space:][:cntrl:]] ]]; then
+        echo "✗ ERROR: the derived default for $name contains whitespace or a control character — refusing to write shared-memory/.env (this is exactly the shape a value-injection attack, e.g. a smuggled second KEY=VALUE line, would take)." >&2
+        exit 1
+    fi
+    if [[ ! "$val" =~ ^[A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then
+        echo "✗ ERROR: the derived default for $name ('$val') is not URL-shaped (scheme://host[:port]) — refusing to write shared-memory/.env." >&2
+        exit 1
+    fi
+}
+_encoder_default_rc=0
+_embedder_url_default="$(python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from framework_defaults import FRAMEWORK_DEFAULTS
+print(FRAMEWORK_DEFAULTS["EMBEDDER_URL"]["default"])
+' "$SCRIPT_DIR")" || _encoder_default_rc=$?
+if [ "$_encoder_default_rc" -ne 0 ]; then
+    echo "✗ ERROR: python3 failed while deriving the default EMBEDDER_URL from framework_defaults.py (rc=$_encoder_default_rc) — refusing to write shared-memory/.env. If python3 is missing or broken, run shared-memory/scripts/preflight.sh first; it diagnoses this directly and names the fix." >&2
+    exit 1
+fi
+_check_encoder_default "EMBEDDER_URL" "$_embedder_url_default"
+_encoder_default_rc=0
+_reranker_url_default="$(python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from framework_defaults import FRAMEWORK_DEFAULTS
+print(FRAMEWORK_DEFAULTS["RERANKER_URL"]["default"])
+' "$SCRIPT_DIR")" || _encoder_default_rc=$?
+if [ "$_encoder_default_rc" -ne 0 ]; then
+    echo "✗ ERROR: python3 failed while deriving the default RERANKER_URL from framework_defaults.py (rc=$_encoder_default_rc) — refusing to write shared-memory/.env. If python3 is missing or broken, run shared-memory/scripts/preflight.sh first; it diagnoses this directly and names the fix." >&2
+    exit 1
+fi
+_check_encoder_default "RERANKER_URL" "$_reranker_url_default"
+
 # S-07: NEO4J_HOST_DIR/PG_DATA_DIR/LLM_MODELS_DIR/LLAMA_CPU_THREADS are plain
 # config — safe to export at the top level, and install_service.sh /
 # install_llm_backends.sh (spawned below, neither of which needs a DB
@@ -250,28 +310,16 @@ fi
 # W5 (R-D, decision:1824 §3): write the shipped compose's default encoder
 # ENDPOINTS explicitly too — same append-block precedent as the Q3b block
 # just above (EMBEDDER_URL/RERANKER_URL are commented in the template, so
-# the awk substitution above cannot fill them in). Values come from
-# framework_defaults.py via a shell-out, never a second literal in bash
-# (precedent: hive_mind_proxy.py:176 reads
-# FRAMEWORK_DEFAULTS[...]["default"]) — one source of truth for what the
-# bundled compose actually serves on. Written unconditionally, regardless
-# of the device answers above: this documents what a bundled install is
-# actually using, not a device choice. Reranker: default written, never
-# elicited here — an operator whose encoders live elsewhere (Q2's
-# "existing endpoint" answer) edits both lines directly; AGENTS.md's
+# the awk substitution above cannot fill them in). Written unconditionally,
+# regardless of the device answers above: this documents what a bundled
+# install is actually using, not a device choice. Reranker: default
+# written, never elicited here — an operator whose encoders live elsewhere
+# (Q2's "existing endpoint" answer) edits both lines directly; AGENTS.md's
 # Phase 4 already covers that path, including the vLLM reranker shim case.
-_embedder_url_default="$(python3 -c '
-import sys
-sys.path.insert(0, sys.argv[1])
-from framework_defaults import FRAMEWORK_DEFAULTS
-print(FRAMEWORK_DEFAULTS["EMBEDDER_URL"]["default"])
-' "$SCRIPT_DIR")"
-_reranker_url_default="$(python3 -c '
-import sys
-sys.path.insert(0, sys.argv[1])
-from framework_defaults import FRAMEWORK_DEFAULTS
-print(FRAMEWORK_DEFAULTS["RERANKER_URL"]["default"])
-' "$SCRIPT_DIR")"
+# Fix round F1/F2: the actual extraction + validation runs EARLY, above,
+# before shared-memory/.env has been written at all — $_embedder_url_default/
+# $_reranker_url_default are already-validated plain script-level vars by
+# the time this block runs.
 {
   echo ""
   echo "# ── Encoder endpoints (install_framework.sh writes the framework's default explicitly) ──"
