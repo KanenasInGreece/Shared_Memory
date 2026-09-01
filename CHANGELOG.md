@@ -5,6 +5,43 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.83] — 2026-09-01
+
+### A thinking model is proof of life, not a failure — and what your config declares is visible
+
+`postflight.sh`'s A8 check exists to prove one thing: that a real completion crossed the gateway's
+proxy path. A thinking model at A8's tiny token budget spends every token on `reasoning_content`
+and returns an empty `content` — which proves the join just as well, yet used to fail a healthy
+install. A8 now grades a 200 with empty content but a non-empty `reasoning_content` string as OK,
+under exactly the same type guard the content check uses, so a structured reasoning object or a
+whitespace-only value still reads as empty. Every failure mode stays a failure: no output of any
+kind, HTTP errors, and fit refusals are as fatal as ever, and the W4 named-skip discipline is
+untouched. One consequence is stated rather than hidden: a response that was content-filtered but
+carries reasoning now passes A8, because A8's question is whether a completion crossed the join,
+not whether the model said anything printable. The postflight summary line now also restates a
+named A8 skip, so a scrolled-past terminal still shows it, and both places where the
+documentation's skip enumeration had fallen behind W4 are caught up.
+
+`check_config.py` now shows, per backend, whether thinking-suppression is declared in that entry's
+`extra_body` — the workstation's DeepSeek entry has carried exactly that in production, invisibly,
+which is why one host never met the thinking problem while another did. The render is a
+shape-match that prints fixed strings only; `extra_body` is operator-supplied and its contents are
+never echoed. The rest of the R9 ruling — detecting reasoning as a probed backend capability and
+sizing dream-cycle budgets from it — is deliberately parked, with its refutations recorded: the
+capability probe never runs completions (and a cadence completion-probe would bill paid providers
+around the clock), and the daemons choose budgets before a backend is chosen. It returns if a
+measured reasoning-caused failure ever appears on a live fleet.
+
+The installer now writes the shipped compose's default encoder endpoints into `.env` as explicit,
+labelled lines instead of leaving them implicit, with the values read from `framework_defaults.py`
+so no second copy of an endpoint exists — and those extracted values are validated before anything
+is written: a value carrying whitespace, control characters or a non-URL shape aborts the install
+untouched. Both new python3 invocations are guarded and fail before any `.env` write, naming the
+missing dependency and the preflight script that diagnoses it. `LLM_DEFAULT_TARGET` stays a
+commented line by ruling, and its guidance now says to declare backends via `LLM_BACKENDS_JSON`
+rather than uncommenting it — a bare `LLM_DEFAULT_TARGET` is treated as a legacy shape.
+`uninstall_framework.sh` says plainly what a service-level uninstall leaves behind.
+
 ## [0.9.82] — 2026-09-01
 
 ### The MCP client's secrets no longer live in its process environment

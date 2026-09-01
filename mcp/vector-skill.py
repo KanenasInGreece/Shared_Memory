@@ -262,7 +262,7 @@ AGENT_ID = os.environ.get("AGENT_ID", "vector_skill")
 # submission is accepted in three forms: a proposal, new_project=true, or the
 # reserved sentinel general_discussion.
 API_VERSION = 4
-VERSION = "0.9.82"
+VERSION = "0.9.83"
 CLIENT_VERSION_HEADER = "X-SM-Api-Version"
 # This client's own FRAMEWORK VERSION, distinct from the wire API_VERSION: two
 # clients can speak api_version 4 while one of them is forty releases behind on
