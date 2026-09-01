@@ -217,7 +217,18 @@ print(str(len(healthy)) + "|" + ",".join(healthy) + "|" + summary)
 # with unparseable JSON, a missing/non-string "content", or blank content
 # all grade EMPTY — a 200 is not by itself a usable completion (this is the
 # D23 lesson generalised: liveness is not capability, and a shape check is
-# not a content check). SKIP_<declaration> is a NAMED NON-FATAL skip
+# not a content check) — UNLESS "reasoning_content" is itself a non-empty
+# string (Item B, W5, measured 2026-08-30): a thinking model at A8's
+# max_tokens: 16 returns 16 tokens of reasoning_content, EMPTY content,
+# finish_reason: length — that is still proof a real completion crossed the
+# gateway proxy join, which is the ONE thing A8 exists to prove, so it
+# grades OK. The reasoning check mirrors the content guard EXACTLY —
+# isinstance(str) and .strip() — a structured reasoning_content object
+# ({"blocks": []}) must NOT pass. Accepted semantic shift, stated so it is
+# never later read as a hole: a finish_reason: "content_filter" response
+# carrying reasoning but no content now ALSO grades OK — correct for A8's
+# question (did a completion cross the join?), not "did the model comply".
+# SKIP_<declaration> is a NAMED NON-FATAL skip
 # (documented post-0.9.81 state, never a FAIL) for a 422 whose body carries
 # ALL FOUR conjuncts (V3): error == "no_eligible_backend", a `declaration`
 # key present, constraint != "fit" (a genuine oversized-request fit failure
@@ -280,10 +291,16 @@ try:
 except Exception:
     print("EMPTY"); sys.exit(0)
 try:
-    content = (d.get("choices") or [{}])[0].get("message", {}).get("content")
+    message = (d.get("choices") or [{}])[0].get("message", {})
 except (AttributeError, IndexError, TypeError):
-    content = None
-print("OK" if isinstance(content, str) and content.strip() else "EMPTY")
+    message = {}
+if not isinstance(message, dict):
+    message = {}
+content = message.get("content")
+reasoning = message.get("reasoning_content")
+ok = ((isinstance(content, str) and content.strip())
+      or (isinstance(reasoning, str) and reasoning.strip()))
+print("OK" if ok else "EMPTY")
 '
 }
 # <<< A8_GRADE_COMPLETION
@@ -1108,7 +1125,7 @@ print(json.dumps({
                 ok "A8 real completion returned through the gateway proxy path (model $a8_model, ${reasoning_ms} ms)"
                 ;;
             EMPTY)
-                bad A8 "gateway returned HTTP 200 but no usable completion content — a 200 with empty content is a failure, not a pass. Healthy backend(s) at request time: ${backend_urls:-<none>}"
+                bad A8 "gateway returned HTTP 200 but no usable completion content or reasoning_content — a 200 with both fields empty/absent is a failure, not a pass. Healthy backend(s) at request time: ${backend_urls:-<none>}"
                 ;;
             HTTP_404)
                 bad A8 "gateway returned 404 from the reasoning-backend proxy path — the known cause (D23) is a doubled /v1 path segment when a configured base already ends in /v1. Healthy backend(s) at request time: ${backend_urls:-<none>}"

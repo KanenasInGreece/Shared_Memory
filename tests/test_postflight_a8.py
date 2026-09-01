@@ -280,6 +280,48 @@ def test_grade_200_with_non_string_content_envelope_is_EMPTY():
     assert result.stdout.strip() == "EMPTY"
 
 
+def test_grade_200_with_reasoning_content_and_empty_content_is_OK():
+    # Item B (W5): a thinking model at A8's max_tokens: 16 returns 16 tokens
+    # of reasoning_content, EMPTY content, finish_reason: length -- that is
+    # still proof a real completion crossed the gateway proxy join.
+    body = json.dumps({"choices": [{"message": {"content": "",
+                                                  "reasoning_content": "let me think..."},
+                                     "finish_reason": "length"}]})
+    result = run_a8_grade_completion("200", body)
+    assert result.returncode == 0
+    assert result.stdout.strip() == "OK"
+
+
+def test_grade_200_with_structured_reasoning_content_is_EMPTY():
+    # N1: the reasoning check mirrors the content guard exactly -- a
+    # structured reasoning_content object ({"blocks": []}) must NOT pass.
+    body = json.dumps({"choices": [{"message": {"content": "",
+                                                  "reasoning_content": {"blocks": []}}}]})
+    result = run_a8_grade_completion("200", body)
+    assert result.returncode == 0
+    assert result.stdout.strip() == "EMPTY"
+
+
+def test_grade_200_with_both_content_and_reasoning_empty_is_EMPTY():
+    body = json.dumps({"choices": [{"message": {"content": "",
+                                                  "reasoning_content": ""}}]})
+    result = run_a8_grade_completion("200", body)
+    assert result.returncode == 0
+    assert result.stdout.strip() == "EMPTY"
+
+
+def test_grade_200_with_reasoning_content_and_content_filter_is_OK():
+    # Accepted semantic shift (Item B): a finish_reason: content_filter
+    # response carrying reasoning but no content now grades OK -- correct
+    # for A8's question (did a completion cross the join?).
+    body = json.dumps({"choices": [{"message": {"content": "",
+                                                  "reasoning_content": "reasoning tokens here"},
+                                     "finish_reason": "content_filter"}]})
+    result = run_a8_grade_completion("200", body)
+    assert result.returncode == 0
+    assert result.stdout.strip() == "OK"
+
+
 def test_grade_404_is_HTTP_404():
     result = run_a8_grade_completion("404", "")
     assert result.returncode == 0
@@ -500,6 +542,18 @@ def test_a8_real_completion_passes_and_never_gates():
     assert "✓" in result.stdout and "A8 real completion returned" in result.stdout
     assert _afail(result) == "0"
     assert handler.seen_path == "/v1/chat/completions"
+
+
+def test_a8_reasoning_only_completion_passes_end_to_end():
+    # ND4: the existing end-to-end stub above returns *content* -- pin the
+    # reasoning-only shape through the REAL caller path (curl -> a8_status ->
+    # a8_grade_completion), not just the pure function in isolation.
+    body = b'{"choices":[{"message":{"content":"","reasoning_content":"thinking..."},"finish_reason":"length"}]}'
+    with _stub_server(200, body) as (url, _):
+        health = json.dumps({"llm_backends": {"http://example:5000": "ok"}})
+        result = run_a8_live(gateway_url=url, health_full=health)
+    assert "✓" in result.stdout and "A8 real completion returned" in result.stdout
+    assert _afail(result) == "0"
 
 
 def test_a8_200_with_empty_content_fails_and_gates():
