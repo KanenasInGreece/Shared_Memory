@@ -306,6 +306,21 @@ tested client path).
   embedder to the OOM killer once, which is why the row says 14. Search: ~1.3 s in unranked
   vector order, 79–81 s with the reranker scoring the full default payload. The client sizes
   its wait from the gateway's own projection, so a slow host answers late rather than never.
+- **GPU-less VM, both encoders and the LLM on one LAN box — a small reasoning model is enough.**
+  The setup above taken one step further: the same LM Studio box on the LAN serves not only the
+  BGE-M3 embedder but the reasoning model too — a small quantized Gemma (~2B parameters, ~7K
+  context). The gateway host then runs no GPU and no local LLM at all; Postgres, Neo4j and the
+  CPU reranker are its whole footprint, and one modest LAN box does every embedding and every
+  generation. Declared as a single uncredentialed `LLM_BACKENDS_JSON` entry — `private_ok: true`,
+  a LAN `url`, an `n_ctx` so the fit check knows the small window — with `EMBEDDER_URL` pointed at
+  the same box and the reranker left on CPU (LM Studio serves the embedding model but no rerank
+  endpoint the gateway can drive). Verified end to end: postflight passes — A8's live completion
+  crosses the proxy on a *thinking* model that returns its answer as reasoning tokens (the reason
+  A8 grades that as proof of life) — saves and search round-trip, and REM summarisation runs
+  against the small model and returns a clean, faithful summary. Evidence that the reasoning
+  backend need not be large or online, only an OpenAI-compatible endpoint the gateway can reach.
+  (Fold-to-insight, the other LLM path, needs a decision-and-retrospective set to exercise and has
+  not been run on this box.)
 - **Below the floor — a 2018 budget laptop, for the record.** Two AMD cores, 3.2 GB usable RAM,
   integrated graphics. Not a supported configuration; a measured account of what breaks and in
   what order. The stack would not start as shipped (Neo4j's RAM check); with the small-host
@@ -478,7 +493,7 @@ Neo4j plugins, and the reranker dial, which is tuning after the install is prove
 | **Neo4j crash-loops: "neo4j/… is invalid"** | The password contains `/` (base64 output does), which `NEO4J_AUTH=neo4j/<password>` cannot carry. | Generate hex (`openssl rand -hex 20`), update `.env`, recreate the container. The installer's prompts accept hex only and refuse an empty entry. |
 | **Neo4j: "Invalid memory configuration — exceeds physical memory"** | Host RAM is below the shipped heap + pagecache (~8 GB is the no-override floor). | Set the small-host preset (`NEO4J_HEAP_INITIAL/MAX`, `NEO4J_PAGECACHE`) from `.env.example`; preflight's RAM check tells you which tier you are on. |
 | **Neo4j does not come up on first boot, no network** | `NEO4J_PLUGINS` fetches APOC and Graph Data Science at container start — first boot needs internet, and a crash-loop refetches on every retry. | Give the host a route out for the first start, or pre-place the plugin jars in `plugins/`. |
-| **401 Unauthorized** | `AGENT_TOKEN` missing from the agent's skill `.env`, or minted after the gateway last started — the registry is read at startup. | `doctor` names which side is at fault. Restart the gateway after minting (`bootstrap_tokens.sh` says so); restart LM Studio **fully** after changing its token (§19, §21). |
+| **401 Unauthorized** | `AGENT_TOKEN` missing from the agent's skill `.env`, or minted after the gateway last started — the registry is read at startup. A **re-minted** token is a third case: rotating an identity replaces its registered digest, so a client still holding the previous token now fails auth on **every** request, reads included, until it re-reads the file. | `doctor` names which side is at fault. Restart the gateway after minting (`bootstrap_tokens.sh` says so). A client reads its token once at startup, so after a re-mint make it re-read: respawn the memory **MCP server** — a full host restart, or disabling then re-enabling just that server where the host supports per-server reload (§19, §21) — or restart a long-running CLI agent; a one-shot CLI invocation already picks it up on its next run. |
 | **"Gateway refused this request (HTTP 403): Read-only token…"** on save | The token is valid but minted with `--role read`; the gateway refuses the write and says why. | Use a write-capable identity for that agent, or accept that this one only searches. (Older clients reported this as "coordinator unreachable" — upgrade the skill if you see that.) |
 | **First save refused: `project_unknown`** | A fresh corpus has no registered projects; the gateway never registers one on the strength of a save. | Answer the refusal: confirm the spelling and re-send with `new_project` (the skill asks you first — see `SKILL.md`). Expected on every new install — it is the guard against a typo becoming a project. |
 | **503 on save/search** | Embedder or reranker down or `unhealthy` — usually a wrong model path. | `docker compose ps` first, then `curl :8888/health` (§15, §17). Saves abort rather than store a record without a vector. |
