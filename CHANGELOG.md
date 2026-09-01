@@ -5,6 +5,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.86] — 2026-09-01
+
+### Documentation: a fully-LAN, GPU-less example, and the re-mint restart rule
+
+Two README additions. A tested machine example: a gateway host with no GPU and no local LLM, where
+one LM Studio box on the LAN serves both the BGE-M3 embedder and a small quantized reasoning model
+while the reranker stays on CPU — declared with a single uncredentialed `LLM_BACKENDS_JSON` entry
+(`private_ok: true`, an `n_ctx` for the fit check) and `EMBEDDER_URL` at the same box. It verifies
+end to end, and the small model happens to be a thinking model, so its A8 liveness completion returns
+its answer as reasoning tokens — the case A8 learned to grade as proof of life. Evidence that the
+reasoning backend need not be large or online, only an OpenAI-compatible endpoint the gateway can
+reach. And the 401 troubleshooting note now covers a re-minted token: rotating an identity replaces
+its registered digest, so a client still holding the previous token fails auth on every request,
+reads included, until it re-reads — respawn its memory MCP server (a full host restart, or a
+per-server reload where the host supports one) or restart a long-running CLI agent. Documentation only.
+
 ## [0.9.85] — 2026-09-01
 
 ### Two mint footguns turned into guardrails
