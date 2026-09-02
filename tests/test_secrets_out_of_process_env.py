@@ -538,6 +538,22 @@ def test_get_secret_exact_match_still_wins_over_canonical_fallback(monkeypatch):
     assert secure_env.get_secret("PG_PASSWORD") == "exact"
 
 
+def test_get_secret_operator_environment_always_beats_the_file_store(monkeypatch):
+    """Fix round F3 (SEC1 HIGH-1): the whole lookup order is os.environ
+    EXACT -> os.environ CANONICAL -> _secrets EXACT -> _secrets CANONICAL.
+    Prove-failing-first: on unmodified code, `_secrets` (exact) was checked
+    BEFORE the canonical form of os.environ, so a case-VARIANT operator
+    export lost to a value the file store resolved under the exact name a
+    caller happens to use -- probed exactly as SEC1 measured it:
+    _secrets["AGENT_TOKENS"]="from-file" + os.environ["agent_tokens"]=
+    "from-operator" must still return "from-operator", never "from-file"."""
+    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    monkeypatch.delenv("agent_tokens", raising=False)
+    secure_env._secrets["AGENT_TOKENS"] = "from-file"
+    monkeypatch.setenv("agent_tokens", "from-operator")
+    assert secure_env.get_secret("AGENT_TOKENS") == "from-operator"
+
+
 def test_load_split_env_dynamic_token_env_still_reachable_under_its_own_case(monkeypatch, tmp_path):
     """A dynamically-discovered token_env name, looked up by
     _load_llm_backends() using ITS OWN raw-case spelling (get_secret(token_env)),
@@ -654,3 +670,175 @@ def test_consolidation_loop_startup_check_fails_loud_with_malformed_llm_backends
     importlib.reload(cl)
     with pytest.raises(SystemExit, match="LLM_BACKENDS_JSON"):
         secure_env.require_llm_backends_json_parses("consolidation_loop")
+
+
+# ── Fix round F4 (SEC1 HIGH-2): LLM_BACKENDS_JSON config-key read must SEE
+#    a case-variant / BOM-prefixed spelling, not treat it as absent ─────────
+
+def test_load_split_env_sees_lowercase_llm_backends_json_key(monkeypatch, tmp_path):
+    """Prove-failing-first: on unmodified code, `file_values.get(
+    "LLM_BACKENDS_JSON")` is exact-case, so a lowercase
+    `llm_backends_json=` line reads as ABSENT (parse_failed stays False,
+    not True) rather than malformed — bypassing D.1's refusal entirely and
+    letting the token_env-named provider key it declares reach os.environ
+    unclassified. Probed exactly per SEC1 finding 2."""
+    fake_file = _write_env_file(
+        tmp_path,
+        'llm_backends_json=[{"url":"https://x","token_env":"OPENROUTER_CRED"}]\n'
+        "OPENROUTER_CRED=sk-should-be-secret\n"
+    )
+    monkeypatch.setattr(secure_env, "__file__", str(fake_file))
+    for key in ("llm_backends_json", "LLM_BACKENDS_JSON", "OPENROUTER_CRED", "openrouter_cred"):
+        monkeypatch.delenv(key, raising=False)
+
+    secure_env.load_split_env()
+
+    assert secure_env.is_secret_key("OPENROUTER_CRED")
+    assert "OPENROUTER_CRED" not in os.environ
+    assert "openrouter_cred" not in os.environ
+    assert secure_env.get_secret("OPENROUTER_CRED") == "sk-should-be-secret"
+
+
+def test_load_split_env_sees_bom_prefixed_llm_backends_json_key(monkeypatch, tmp_path):
+    """Same defect, BOM-prefixed spelling of the correct case (the BOM
+    lands on the file's FIRST key when saved as UTF-8-with-BOM)."""
+    fake_file = _write_env_file(
+        tmp_path,
+        '﻿LLM_BACKENDS_JSON=[{"url":"https://x","token_env":"OPENROUTER_CRED"}]\n'
+        "OPENROUTER_CRED=sk-should-be-secret\n"
+    )
+    monkeypatch.setattr(secure_env, "__file__", str(fake_file))
+    for key in ("LLM_BACKENDS_JSON", "OPENROUTER_CRED"):
+        monkeypatch.delenv(key, raising=False)
+
+    secure_env.load_split_env()
+
+    assert secure_env.is_secret_key("OPENROUTER_CRED")
+    assert "OPENROUTER_CRED" not in os.environ
+
+
+# ── Fix round F5 (SEC1 HIGH-3 + MED-5): "export KEY=" is stripped at parse
+#    time, case-insensitively, before classification ─────────────────────
+
+def test_load_split_env_strips_lowercase_export_prefix(monkeypatch, tmp_path):
+    """Prove-failing-first: on unmodified code, the stored key is the
+    literal string "export AGENT_TOKENS" — not in KNOWN_SECRET_NAMES
+    (exact-match) and not matching the "_TOKEN" suffix (it ends in
+    "TOKENS" with "export " still attached) — so this line's registry was
+    exported straight into os.environ."""
+    fake_file = _write_env_file(tmp_path, "export AGENT_TOKENS=claude:tok_via_export\n")
+    monkeypatch.setattr(secure_env, "__file__", str(fake_file))
+    for key in ("AGENT_TOKENS", "export AGENT_TOKENS"):
+        monkeypatch.delenv(key, raising=False)
+
+    secure_env.load_split_env()
+
+    assert "export AGENT_TOKENS" not in os.environ
+    assert "AGENT_TOKENS" not in os.environ
+    assert secure_env.get_secret("AGENT_TOKENS") == "claude:tok_via_export"
+
+
+def test_load_split_env_strips_uppercase_export_prefix(monkeypatch, tmp_path):
+    fake_file = _write_env_file(tmp_path, "EXPORT AGENT_TOKENS=claude:tok_via_EXPORT\n")
+    monkeypatch.setattr(secure_env, "__file__", str(fake_file))
+    for key in ("AGENT_TOKENS", "EXPORT AGENT_TOKENS"):
+        monkeypatch.delenv(key, raising=False)
+
+    secure_env.load_split_env()
+
+    assert "EXPORT AGENT_TOKENS" not in os.environ
+    assert "AGENT_TOKENS" not in os.environ
+    assert secure_env.get_secret("AGENT_TOKENS") == "claude:tok_via_EXPORT"
+
+
+# ── Fix round F6 (SEC1 HIGH-4): file_values collapses to canonical keys
+#    ONCE, deterministically LAST-DEFINITION-WINS ──────────────────────────
+
+def test_load_split_env_collapse_last_definition_wins_stale_first(monkeypatch, tmp_path):
+    """Prove-failing-first: on unmodified code, which spelling wins the
+    storage slot depended on SET ITERATION ORDER (candidate_secret_keys is
+    a set), not file order — probed by SEC1 as non-deterministic and, in
+    this exact ordering, landing on the STALE (first) line instead of the
+    corrected (second, later) one."""
+    fake_file = _write_env_file(tmp_path, "agent_tokens=stale-first\nAGENT_TOKENS=current-second\n")
+    monkeypatch.setattr(secure_env, "__file__", str(fake_file))
+    for key in ("agent_tokens", "AGENT_TOKENS"):
+        monkeypatch.delenv(key, raising=False)
+
+    secure_env.load_split_env()
+
+    assert secure_env.get_secret("AGENT_TOKENS") == "current-second"
+
+
+def test_load_split_env_collapse_last_definition_wins_reversed_order(monkeypatch, tmp_path):
+    """The other ordering from the report — deterministic means the FILE's
+    own last line always wins, regardless of which spelling looks
+    "newer" by name; this pins the direction, not a value judgement."""
+    fake_file = _write_env_file(tmp_path, "AGENT_TOKENS=current-first\nagent_tokens=stale-second\n")
+    monkeypatch.setattr(secure_env, "__file__", str(fake_file))
+    for key in ("agent_tokens", "AGENT_TOKENS"):
+        monkeypatch.delenv(key, raising=False)
+
+    secure_env.load_split_env()
+
+    assert secure_env.get_secret("AGENT_TOKENS") == "stale-second"
+
+
+# ── Fix round F11 (SEC1 MED-7 + LOW-8): one shared normaliser, robust to
+#    BOM+whitespace in EITHER interleaving order ───────────────────────────
+
+def test_is_secret_key_normalizer_handles_bom_then_space():
+    """Prove-failing-first: a single strip()-then-lstrip(BOM) pass leaves a
+    stray leading space when the BOM precedes it — probed by SEC1 as
+    classifying secret on one side (client order) and config on the other
+    (server's pre-fix order)."""
+    assert secure_env.is_secret_key("﻿ AGENT_TOKENS")
+
+
+def test_is_secret_key_normalizer_handles_space_then_bom():
+    """The other ordering from the report — the reverse fixed order alone
+    fails THIS one instead."""
+    assert secure_env.is_secret_key(" ﻿AGENT_TOKENS")
+
+
+# ── Fix round F12 (SEC1 LOW-9): case-fold the <K>_FILE pointer suffix ──────
+
+def test_load_split_env_resolves_lowercase_file_pointer_suffix(monkeypatch, tmp_path):
+    """Prove-failing-first: on unmodified code the exact-case `name.endswith
+    ("_FILE")` check never matches a lowercase `agent_tokens_file=` line's
+    actual suffix ("_file") — the pointer is silently ignored (no
+    candidate derived, no warning either, since that branch is also
+    suffix-gated) and get_secret("AGENT_TOKENS") stays None even with the
+    file present, readable and correctly formatted."""
+    secret_file = tmp_path / "agent_tokens_secret"
+    secret_file.write_text("claude:tok_from_lowercase_pointer")
+    fake_file = _write_env_file(tmp_path, f"agent_tokens_file={secret_file}\n")
+    monkeypatch.setattr(secure_env, "__file__", str(fake_file))
+    for key in ("AGENT_TOKENS", "agent_tokens", "AGENT_TOKENS_FILE", "agent_tokens_file"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+
+    secure_env.load_split_env()
+
+    assert secure_env.get_secret("AGENT_TOKENS") == "claude:tok_from_lowercase_pointer"
+    # The _FILE pointer's own VALUE (a path) is ordinary config, not itself
+    # sensitive — only the derived SECRET must stay out of os.environ.
+    assert "AGENT_TOKENS" not in os.environ
+    assert "agent_tokens" not in os.environ
+
+
+def test_derive_file_pointer_candidates_case_folds_an_os_environ_pointer_name(monkeypatch, tmp_path):
+    """F12's remaining exposure once F6 already canonicalises FILE-sourced
+    keys: an OS.ENVIRON pointer (never touched by the .env-file collapse)
+    spelled lowercase must still be detected as a `<K>_FILE` pointer."""
+    secret_file = tmp_path / "agent_tokens_secret_env"
+    secret_file.write_text("claude:tok_from_lowercase_environ_pointer")
+    monkeypatch.setenv("agent_tokens_file", str(secret_file))
+    fake_file = _write_env_file(tmp_path, "")
+    monkeypatch.setattr(secure_env, "__file__", str(fake_file))
+    for key in ("AGENT_TOKENS", "AGENT_TOKENS_FILE"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+
+    candidates = secure_env._derive_file_pointer_candidates({})
+    assert "AGENT_TOKENS" in candidates

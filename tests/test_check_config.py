@@ -166,6 +166,20 @@ def test_uncredentialed_secret_shows_false(tmp_path):
     assert "has_credential=False" in proc.stdout
 
 
+def test_secret_census_notes_canonical_normalisation(monkeypatch):
+    """QA finding 7: D.2 stores every discovered token_env name canonically
+    (upper-cased), so a lowercase-declared spelling ("token_env":
+    "openrouter_cred") renders as OPENROUTER_CRED — a name that appears
+    nowhere in the operator's own .env/JSON. The census must say so rather
+    than silently implying an exact-spelling match."""
+    monkeypatch.setenv("SECURE_ENV_FILE", "")
+    lines, ok = check_config.phase_a_render()
+    assert ok
+    body = "\n".join(lines)
+    assert "CANONICAL" in body or "canonical" in body
+    assert "normalised" in body or "normalized" in body
+
+
 # ── Phase B: role-error → exit 1, malformed config → exit 2 (no traceback) ─
 
 def test_role_config_error_leads_to_exit_1_would_refuse_to_start(tmp_path):
@@ -573,6 +587,26 @@ def test_would_refuse_line_and_role_errors_never_leak_a_raw_credential(tmp_path)
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "WOULD REFUSE TO START" in proc.stdout
     assert "s3cr3t-in-url" not in proc.stdout
+
+
+def test_userinfo_credential_username_never_reaches_check_config_output(tmp_path):
+    """Finding 10 (QA LOW): the retargeted query-string fixture above only
+    restored the PASSWORD-never-leaks half of the original test's property.
+    The original also asserted the userinfo USERNAME never reaches output
+    ("svc:") -- dropped when the fixture moved to a query-string credential,
+    since A now refuses userinfo upstream and no _load_llm_backends() output
+    path can carry it any more. Pinned here directly, so the coverage is a
+    deliberate decision (check_config's own render surface never leaks
+    either half of a userinfo credential, even for an entry A excludes
+    before check_config ever sees a role/refusal path for it), not an
+    accidental drop."""
+    backends_json = '[{"url":"http://svc:s3cr3t-userinfo-pw@a:5000"}]'
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": backends_json},
+                tmp_path=tmp_path)
+    full_output = proc.stdout + proc.stderr
+    assert "svc:" not in full_output
+    assert "s3cr3t-userinfo-pw" not in full_output
+    assert "Traceback" not in full_output
 
 
 # ── QA Q1 / fold-round item 4 — PROXY_BIND's idiom now lives in the D1

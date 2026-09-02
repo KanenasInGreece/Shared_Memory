@@ -409,6 +409,64 @@ async def test_watchdog_daemon_clean_exit_leaves_no_live_digest(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_start_daemon_publishes_daemon_proc_before_returning(monkeypatch):
+    """Fix round finding 9 (QA LOW): `_daemon_proc` must be set the instant
+    `asyncio.create_subprocess_exec` returns — inside `_start_daemon()`
+    itself — not left to the watchdog's own later assignment a few lines
+    after its `await _start_daemon()`. Prove-failing-first: calling
+    `_start_daemon()` directly (bypassing the watchdog entirely) leaves
+    `g._daemon_proc` at its pre-call value on unmodified code, since only
+    the WATCHDOG used to set it. A real cancellation delivered while the
+    watchdog's own `await _start_daemon()` is still unwinding back up the
+    call stack (after the subprocess is already live) used to leave
+    `_daemon_proc` unset — the drain's terminate step then skips a daemon
+    that is already running, orphaning it holding a token G's own
+    watchdog-`finally` had just revoked."""
+    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    import coordinator
+    importlib.reload(coordinator)
+    import hive_mind_proxy as g
+    importlib.reload(g)
+
+    fake_proc = _FakeDaemonProc()
+
+    async def _fake_create_subprocess_exec(*a, **kw):
+        return fake_proc
+
+    monkeypatch.setattr(g, "_find_uv", lambda: "/usr/bin/true")
+    monkeypatch.setattr(g.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    assert g._daemon_proc is None
+    proc = await g._start_daemon()
+    assert proc is fake_proc
+    assert g._daemon_proc is fake_proc
+
+
+@pytest.mark.asyncio
+async def test_start_rem_daemon_publishes_rem_proc_before_returning(monkeypatch):
+    """Parity with test_start_daemon_publishes_daemon_proc_before_returning,
+    for the REM daemon's `_rem_proc`."""
+    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    import coordinator
+    importlib.reload(coordinator)
+    import hive_mind_proxy as g
+    importlib.reload(g)
+
+    fake_proc = _FakeDaemonProc()
+
+    async def _fake_create_subprocess_exec(*a, **kw):
+        return fake_proc
+
+    monkeypatch.setattr(g, "_find_uv", lambda: "/usr/bin/true")
+    monkeypatch.setattr(g.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    assert g._rem_proc is None
+    proc = await g._start_rem_daemon()
+    assert proc is fake_proc
+    assert g._rem_proc is fake_proc
+
+
+@pytest.mark.asyncio
 async def test_watchdog_rem_daemon_clean_exit_leaves_no_live_digest(monkeypatch):
     """Parity with the consolidation watchdog above, for the REM daemon."""
     monkeypatch.delenv("AGENT_TOKENS", raising=False)

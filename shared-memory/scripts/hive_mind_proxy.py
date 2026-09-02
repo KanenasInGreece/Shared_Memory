@@ -2596,6 +2596,20 @@ def _find_uv() -> "str | None":
 
 
 async def _start_daemon() -> "asyncio.subprocess.Process | None":
+    """Fix round finding 9 (QA LOW): `_daemon_proc` is published HERE,
+    synchronously, the instant `create_subprocess_exec` returns — not left
+    to the caller's own assignment a few lines later in
+    `_watchdog_daemon()`. `asyncio.create_subprocess_exec` is this
+    function's only `await` before returning; a cancellation can only be
+    delivered AT an await point, so once it returns there is no further
+    suspension between the spawn succeeding and the global being set. Before
+    this fix, a cancel delivered while the CALLER's `proc = await
+    _start_daemon()` was still unwinding back up the call stack (after the
+    subprocess was already live) left `_daemon_proc` unset — the drain's
+    terminate step then skipped a daemon that was already running, orphaning
+    it holding a live token that G's own watchdog-`finally` had just
+    revoked."""
+    global _daemon_proc
     daemon_path = Path(__file__).parent / "consolidation_loop.py"
     if not daemon_path.exists():
         log.warning("Daemon script not found at %s — consolidation will not run", daemon_path)
@@ -2615,6 +2629,7 @@ async def _start_daemon() -> "asyncio.subprocess.Process | None":
             env=env,
             pass_fds=(read_fd,) if read_fd is not None else (),
         )
+        _daemon_proc = proc
     except Exception:
         # Nit fix (finding 10): the token was already minted and registered
         # before spawn was attempted -- if spawn itself failed, nothing
@@ -2631,6 +2646,9 @@ async def _start_daemon() -> "asyncio.subprocess.Process | None":
 
 
 async def _start_rem_daemon() -> "asyncio.subprocess.Process | None":
+    """Fix round finding 9 (QA LOW): see _start_daemon()'s docstring —
+    identical reasoning, mirrored here for `_rem_proc`."""
+    global _rem_proc
     rem_path = Path(__file__).parent / "rem_loop.py"
     if not rem_path.exists():
         log.warning("REM script not found at %s — REM enrichment will not run", rem_path)
@@ -2650,6 +2668,7 @@ async def _start_rem_daemon() -> "asyncio.subprocess.Process | None":
             env=env,
             pass_fds=(read_fd,) if read_fd is not None else (),
         )
+        _rem_proc = proc
     except Exception:
         if read_fd is not None:
             _revoke_daemon_token(_REM_DAEMON_AGENT_NAME)

@@ -301,6 +301,15 @@ def phase_a_render() -> "tuple[list[str], bool]":
 
     lines.append("")
     lines.append("Credentials (boolean only — the value is never rendered):")
+    # Fix round QA finding 7: D.2 (SEC round) now stores every discovered
+    # token_env name CANONICALLY (upper-cased) in _dynamic_secret_names —
+    # correct for classification, but a name declared lowercase in the
+    # operator's own .env/JSON (e.g. "token_env": "openrouter_cred") is
+    # rendered here as OPENROUTER_CRED, a spelling that appears nowhere in
+    # their config. Noted explicitly so the census stays honest about what
+    # it shows, rather than silently implying an exact-spelling match.
+    lines.append("  (names below are CANONICAL/upper-cased — a lowercase-"
+                  "declared token_env spelling is normalised for display)")
     for name in _secret_names():
         has_cred = secure_env.get_secret(name) is not None
         lines.append(f"  {name:<20} has_credential={has_cred}")

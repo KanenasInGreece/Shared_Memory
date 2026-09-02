@@ -159,7 +159,7 @@ FRAMEWORK_DEFAULTS = MappingProxyType({
         "default": "",
         "kind": "env-default",
         "idiom": "get",
-        "consumers": ("hive_mind_proxy.py:502-504 (_load_llm_backends fallback)",),
+        "consumers": ("hive_mind_proxy.py:693-731 (_load_llm_backends fallback)",),
         "note": (
             "An absent or empty LLM_BACKENDS falls back to a single-entry "
             "pool: [(LLM_DEFAULT_TARGET, 1.0)]. See the LLM_DEFAULT_TARGET "

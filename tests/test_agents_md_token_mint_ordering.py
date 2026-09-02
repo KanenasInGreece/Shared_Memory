@@ -289,10 +289,15 @@ def test_agents_md_agent_token_reads_use_the_non_executing_sed_shape():
         r"""AGENT_TOKEN=\$\(sed -n 's/\^AGENT_TOKEN=//p' "\$AGENT_ENV" \| head -1\); export AGENT_TOKEN""",
         agents_md,
     )
-    assert len(occurrences) == 2, (
-        f"expected exactly 2 AGENT_ENV/sed-shaped AGENT_TOKEN reads (Phase 9 + "
-        f"Upgrade), found {len(occurrences)} -- update this pin if a new one "
-        f"was legitimately added"
+    # Fix round finding 11 (QA LOW): a count pin (`== 2`) fails a
+    # legitimately ADDED third site for no reason -- the property that
+    # actually matters ("every AGENT_TOKEN read uses this safe shape") is
+    # what the sibling negative test above already covers; this positive
+    # pin only needs to confirm the two KNOWN sites (Phase 9, Upgrade)
+    # still use it, not that nothing else ever will.
+    assert len(occurrences) >= 2, (
+        f"expected at least 2 AGENT_ENV/sed-shaped AGENT_TOKEN reads (Phase 9 + "
+        f"Upgrade), found {len(occurrences)}"
     )
     assert not re.search(r"^\s*\.\s+\$?\{?AGENT_ENV\}?\s*$", agents_md, re.M), (
         "AGENTS.md sources the skill .env with `. file` somewhere -- that "
