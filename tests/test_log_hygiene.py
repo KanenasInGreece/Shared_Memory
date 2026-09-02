@@ -315,6 +315,9 @@ def test_ipv6_with_userinfo_scrubs_to_bracketed_form_intact():
     "http://u:p@10.0.0.1:8000",             # IPv4 + userinfo
     "http://u:p@myhost:8000",               # hostname + userinfo
     "http://MyHost:8000",                   # mixed-case, no userinfo
+    "HTTP://MyHost:8000",                   # mixed-case host + uppercase scheme
+    "postgresql://postgres:ab/cd@localhost:5432/agent_data",  # F2: slash-in-password DSN
+    "http://user:http://nested@host/path",                    # F2: nested-scheme userinfo
     "plain log text with no url in it at all",
 ])
 def test_scrub_is_idempotent(text):
@@ -322,6 +325,57 @@ def test_scrub_is_idempotent(text):
     once = lh.scrub_url_credentials(text)
     twice = lh.scrub_url_credentials(once)
     assert once == twice
+
+
+# ── Fix round F8 (QA MED-3): scheme CASE is part of byte-identity too ──────
+# `parsed.scheme` lowercases (urlsplit's own contract) — the old
+# reconstruction used it directly, so a credential-free `HTTP://MyHost:8000`
+# rendered `http://MyHost:8000`: host/port/brackets preserved, scheme
+# silently lowercased. Prove-failing-first: this assertion fails against the
+# unmodified (parsed.scheme-based) reconstruction.
+
+def test_uppercase_scheme_byte_identical_when_credential_free():
+    lh = _load()
+    assert lh.scrub_url_credentials("HTTP://MyHost:8000") == "HTTP://MyHost:8000"
+
+
+def test_uppercase_scheme_with_userinfo_preserves_scheme_case_after_scrub():
+    lh = _load()
+    out = lh.scrub_url_credentials("HTTP://u:p@MyHost:8000")
+    assert out == "HTTP://MyHost:8000"
+
+
+# ── Fix round F2 (SEC2 HIGH-1): fail CLOSED, not open, when a malformed
+#    authority hides userinfo inside the PATH (a "/" in the password makes
+#    urlsplit end the netloc early, so the old netloc-based strip left the
+#    "@"-bearing tail — credential included — completely untouched: both
+#    fixtures below passed through byte-identical on unmodified code,
+#    confirmed by running these two assertions against it before this fix). ─
+
+def test_dsn_with_slash_in_password_fails_closed_not_leaked():
+    lh = _load()
+    raw = "postgresql://postgres:ab/cd@localhost:5432/agent_data"
+    out = lh.scrub_url_credentials(raw)
+    assert out == "<url-redacted>"
+    assert "ab/cd" not in out
+    assert out != raw
+
+
+def test_nested_scheme_shaped_userinfo_fails_closed_not_leaked():
+    lh = _load()
+    raw = "http://user:http://nested@host/path"
+    out = lh.scrub_url_credentials(raw)
+    assert out == "<url-redacted>"
+    assert "nested" not in out
+    assert out != raw
+
+
+def test_clean_url_with_at_sign_only_in_query_still_scrubs_query_and_keeps_no_at():
+    """A query-string "@" (dropped anyway, R-2) must never trip the F2 fail-
+    closed guard — only an "@" in the authority/path portion is ambiguous."""
+    lh = _load()
+    out = lh.scrub_url_credentials("http://host:8000/path?token=abc@def")
+    assert out == "http://host:8000/path"
 
 
 def test_secure_path_uses_fchmod_not_a_separate_chmod_by_path(tmp_path):

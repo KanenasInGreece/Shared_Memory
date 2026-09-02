@@ -207,13 +207,54 @@ def scrub_url_credentials(text: str) -> str:
     dropped (R-2's render-scrub policy). Idempotent: a second pass over
     already-scrubbed output is a no-op. Only scheme/host/port/path survive;
     never raises (a "URL" urlsplit chokes on is replaced outright, not
-    echoed)."""
+    echoed).
+
+    Fix round F2/F8 (SEC2 HIGH-1, QA MED-3): two corrections to the
+    reconstruction above.
+
+    F8 — scheme case: `parsed.scheme` LOWERCASES (urlsplit's own contract),
+    so `HTTP://MyHost:8000` was rendered `http://MyHost:8000` — not byte
+    identical despite the host/port/brackets being preserved. Rebuilt from
+    the RAW match text instead (`raw[: raw.index("://")]`) — the regex
+    already guarantees the first "://" in `raw` is the scheme separator
+    (the scheme character class excludes "/" and ":"), so this is exact,
+    never a guess.
+
+    F2 — fail CLOSED, not open, when userinfo removal cannot be proven:
+    `urlsplit()`'s own authority/path split is naive about a malformed
+    authority whose USERINFO contains "/" — e.g.
+    `postgresql://postgres:ab/cd@localhost:5432/agent_data` (a real DSN
+    shape: an operator-chosen password containing "/") or
+    `http://user:http://nested@host/path`. In both, urlsplit ends `netloc`
+    at the first "/", so the "@" that should have been stripped lands in
+    `parsed.path` instead — `netloc.rpartition("@")` finds nothing, and the
+    old reconstruction echoed the credential BYTE-IDENTICAL to the input
+    (measured — this was a silent regression, not a cosmetic gap). The
+    proof this function needs before it can trust the netloc-based strip:
+    is there an "@" anywhere in the raw authority+path text before the
+    first "?"/"#" (query/fragment are already dropped, so an "@" inside
+    either is never at risk) that `netloc` does NOT already account for? If
+    so, `rpartition` could not have removed it — redact the whole match
+    rather than echo a URL that might still carry a credential. This can
+    over-redact a rare legitimate path segment containing "@" with no
+    userinfo at all (e.g. `/users/@handle`) when the host has no userinfo
+    of its own — accepted: failing closed on an ambiguous parse is the
+    point."""
     def _scrub(m: "re.Match") -> str:
         raw = m.group(0)
         try:
+            scheme = raw[: raw.index("://")]
             parsed = urllib.parse.urlsplit(raw)
             netloc = parsed.netloc.rpartition("@")[2]
-            return f"{parsed.scheme}://{netloc}{parsed.path}"
+            after_scheme = raw[len(scheme) + 3:]
+            boundary = len(after_scheme)
+            for stop_char in ("?", "#"):
+                idx = after_scheme.find(stop_char)
+                if idx != -1:
+                    boundary = min(boundary, idx)
+            if "@" in after_scheme[:boundary] and "@" not in parsed.netloc:
+                return "<url-redacted>"
+            return f"{scheme}://{netloc}{parsed.path}"
         except Exception:
             return "<url-redacted>"
     return _URL_RE.sub(_scrub, text)
