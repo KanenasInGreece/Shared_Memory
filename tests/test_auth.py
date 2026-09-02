@@ -546,12 +546,22 @@ class _HealthWireProbeSession:
         return _HealthWireProbeCm()
 
 
-def _load_health_wire_gateway(agent_tokens: str):
+def _load_health_wire_gateway(monkeypatch, agent_tokens: str):
     """Same reload order/idiom as test_auth_exemption_route_resolution.py's
     _load_gateway — coordinator first (so AUTH_CONFIGURED_AT_STARTUP is
     captured from THIS env), then hive_mind_proxy (which binds auth_
     middleware from coordinator at import time, so both must be the SAME
-    module objects a private-spec load would not give)."""
+    module objects a private-spec load would not give).
+
+    Every env mutation goes through `monkeypatch` — NOT a direct os.environ
+    write — so it reverts automatically at test teardown. A prior cut of
+    this helper used `os.environ.setdefault("LLM_BACKENDS_JSON", "")`
+    directly; that leaked a present-but-empty LLM_BACKENDS_JSON into the
+    REAL process environment, which a later, unrelated subprocess-based
+    check_config.py test then inherited (`_run()`'s `env = dict(os.environ)`
+    copies the live parent environment) — an extra W4 "latent case" that
+    made `test_w4_census_counts_present_but_empty_encoder_key` fail only
+    when run as part of the full suite, never in isolation."""
     scripts_dir = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts")
     )
@@ -560,11 +570,11 @@ def _load_health_wire_gateway(agent_tokens: str):
     import secure_env
     secure_env._secrets.pop("AGENT_TOKENS", None)
     if agent_tokens:
-        os.environ["AGENT_TOKENS"] = agent_tokens
+        monkeypatch.setenv("AGENT_TOKENS", agent_tokens)
     else:
-        os.environ.pop("AGENT_TOKENS", None)
-    os.environ.setdefault("LLM_BACKENDS_JSON", "")
-    os.environ.pop("LLM_BACKENDS", None)
+        monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
     import coordinator
     importlib.reload(coordinator)
     import hive_mind_proxy as g
@@ -600,8 +610,8 @@ async def _probe_health_wire(app, *, token=None):
         await client.close()
 
 
-def test_wire_anonymous_get_health_is_slim_and_unaudited():
-    c, g = _load_health_wire_gateway("claude:tok_wire_abc")
+def test_wire_anonymous_get_health_is_slim_and_unaudited(monkeypatch):
+    c, g = _load_health_wire_gateway(monkeypatch, "claude:tok_wire_abc")
     app = _build_health_wire_app(c, g)
     status, body = asyncio.run(_probe_health_wire(app))
     assert status == 200
@@ -609,15 +619,15 @@ def test_wire_anonymous_get_health_is_slim_and_unaudited():
     assert c._credential_counters["token_verify_failed"] == 0
 
 
-def test_wire_bad_bearer_get_health_is_slim_byte_unchanged_and_audited():
+def test_wire_bad_bearer_get_health_is_slim_byte_unchanged_and_audited(monkeypatch):
     """F's whole point, at the wire: a bad bearer on /health is audited as
     a side effect, but the RESPONSE the client actually receives is
     byte-identical to the anonymous slim shape — auditing never gates."""
-    c, g = _load_health_wire_gateway("claude:tok_wire_abc")
+    c, g = _load_health_wire_gateway(monkeypatch, "claude:tok_wire_abc")
     app_anon = _build_health_wire_app(c, g)
     status_anon, body_anon = asyncio.run(_probe_health_wire(app_anon))
 
-    c2, g2 = _load_health_wire_gateway("claude:tok_wire_abc")
+    c2, g2 = _load_health_wire_gateway(monkeypatch, "claude:tok_wire_abc")
     app_bad = _build_health_wire_app(c2, g2)
     status_bad, body_bad = asyncio.run(_probe_health_wire(app_bad, token="tok_wrong"))
 
@@ -627,8 +637,8 @@ def test_wire_bad_bearer_get_health_is_slim_byte_unchanged_and_audited():
     assert c2._credential_counters["token_verify_failed"] == 1
 
 
-def test_wire_valid_bearer_get_health_is_the_full_payload():
-    c, g = _load_health_wire_gateway("claude:tok_wire_abc")
+def test_wire_valid_bearer_get_health_is_the_full_payload(monkeypatch):
+    c, g = _load_health_wire_gateway(monkeypatch, "claude:tok_wire_abc")
     app = _build_health_wire_app(c, g)
     status, body = asyncio.run(_probe_health_wire(app, token="tok_wire_abc"))
     assert status == 200
