@@ -342,6 +342,85 @@ async def test_auth_middleware_pool_status_trailing_slash_is_NOT_exempt():
         await mod.auth_middleware(req, _noop_handler)
 
 
+# ── F (S4): token-oracle audit on the UNPROTECTED-path branch ───────────────
+# These run inside a running event loop (@pytest.mark.asyncio), so the
+# credential-audit writer's WRITE goes through its async queue+drain path
+# rather than the synchronous fallback — assertions here stick to the
+# in-memory COUNTER (immediately observable either way) and the RESPONSE
+# CONTRACT, never a file read. File-based assertions on the audit LINE
+# itself (event name, digest-only, bucket isolation) live in
+# tests/test_credential_audit_trail.py, run without a loop so the
+# synchronous fallback applies.
+
+@pytest.mark.asyncio
+async def test_auth_middleware_bad_bearer_on_health_counts_and_response_unchanged():
+    mod = load_coordinator("claude:tok_abc")
+    req = _make_request("/health", auth_header="Bearer tok_wrong", method="GET")
+    resp = await mod.auth_middleware(req, _noop_handler)
+    assert resp.status == 200, (
+        "a bad bearer on an unprotected path must still reach the handler "
+        "unchanged -- auditing is a side effect, never a gate"
+    )
+    assert mod._credential_counters["token_verify_failed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_bad_bearer_lowercase_scheme_on_health_also_counted():
+    """ADV2-15: the scheme match for THIS audit is case-insensitive, unlike
+    the protected-path identity resolver."""
+    mod = load_coordinator("claude:tok_abc")
+    req = _make_request("/health", auth_header="bearer tok_wrong", method="GET")
+    resp = await mod.auth_middleware(req, _noop_handler)
+    assert resp.status == 200
+    assert mod._credential_counters["token_verify_failed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_valid_bearer_on_health_not_audited():
+    mod = load_coordinator("claude:tok_abc")
+    req = _make_request("/health", auth_header="Bearer tok_abc", method="GET")
+    resp = await mod.auth_middleware(req, _noop_handler)
+    assert resp.status == 200
+    assert mod._credential_counters["token_verify_failed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_no_header_on_health_not_audited():
+    mod = load_coordinator("claude:tok_abc")
+    req = _make_request("/health", method="GET")  # no Authorization header at all
+    resp = await mod.auth_middleware(req, _noop_handler)
+    assert resp.status == 200
+    assert mod._credential_counters["token_verify_failed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_bad_bearer_on_pool_status_also_counted():
+    mod = load_coordinator("claude:tok_abc")
+    req = _make_request("/pool/status", auth_header="Bearer tok_wrong", method="GET")
+    resp = await mod.auth_middleware(req, _noop_handler)
+    assert resp.status == 200
+    assert mod._credential_counters["token_verify_failed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_bad_bearer_on_unprotected_then_protected_each_record_once():
+    """No cross-talk: an unprotected-path failure and a protected-path
+    failure each bump the shared counter exactly once -- neither double-
+    counts nor suppresses the other."""
+    from aiohttp.web_exceptions import HTTPUnauthorized
+    mod = load_coordinator("claude:tok_abc")
+
+    req1 = _make_request("/health", auth_header="Bearer tok_wrong", method="GET")
+    resp = await mod.auth_middleware(req1, _noop_handler)
+    assert resp.status == 200
+
+    req2 = _make_request("/memory/save", auth_header="Bearer tok_wrong")
+    with pytest.raises(HTTPUnauthorized):
+        await mod.auth_middleware(req2, _noop_handler)
+
+    assert mod._credential_counters["token_verify_failed"] == 2
+
+
 # ── auth_middleware — valid token ─────────────────────────────────────────────
 
 @pytest.mark.asyncio
