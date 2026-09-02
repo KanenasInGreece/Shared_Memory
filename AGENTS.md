@@ -726,7 +726,13 @@ automatically to re-baseline mode once the corpus holds real summaries — no ne
 path is proven against that real content instead (see `postflight.md`).
 
 ```bash
-export AGENT_TOKEN=...   # auth-on installs: any minted agent token, from that agent's skill .env
+# auth-on installs only: read AGENT_TOKEN from the skill .env — NEVER `. file` (that EXECUTES it) and
+# never cat/grep it (fact:1499 — a raw credential must never pass through an agent's own transcript).
+# AGENT_ENV below is Claude's path; the same shape works for any agent install — swap in
+# ~/.grok/skills/shared-memory/.env, ~/.codex/skills/shared-memory/.env, or
+# ~/.gemini/skills/shared-memory/.env for that agent's own skill directory.
+AGENT_ENV=${AGENT_ENV:-$HOME/.claude/skills/shared-memory/.env}
+AGENT_TOKEN=$(sed -n 's/^AGENT_TOKEN=//p' "$AGENT_ENV" | head -1); export AGENT_TOKEN
 bash shared-memory/scripts/postflight.sh
 ```
 
@@ -994,7 +1000,11 @@ Check that tag out instead, or use the tarball route above.
 **Use the script. It is the procedure.**
 
 ```bash
-export AGENT_TOKEN=<an agent token>      # postflight needs it, or A1/A5/A8 skip and it exits 1
+# Same non-executing read as Phase 9 above — never `. file`, never cat/grep the .env (fact:1499).
+# AGENT_ENV is Claude's path; swap in ~/.grok/, ~/.codex/, or ~/.gemini/skills/shared-memory/.env
+# for that agent's own install.
+AGENT_ENV=${AGENT_ENV:-$HOME/.claude/skills/shared-memory/.env}
+AGENT_TOKEN=$(sed -n 's/^AGENT_TOKEN=//p' "$AGENT_ENV" | head -1); export AGENT_TOKEN  # postflight needs it, or A1/A5/A8 skip and it exits 1
 bash shared-memory/scripts/update_framework.sh --dry-run   # see every step, run nothing
 bash shared-memory/scripts/update_framework.sh             # do it, and prove it
 bash shared-memory/scripts/update_framework.sh --domain-backfill  # also run step 8 (opt-in; skipped by default)
