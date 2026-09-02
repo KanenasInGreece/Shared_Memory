@@ -11,14 +11,18 @@ Coverage:
   - source overwrite via authenticated_agent on request
 """
 
+import asyncio
 import hashlib
 import importlib.util
+import json
 import logging
 import os
 import sys
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiohttp.test_utils import TestClient, TestServer
+from yarl import URL
 
 
 def _digest(token: str) -> str:
@@ -505,6 +509,132 @@ async def test_auth_middleware_mixed_registry_both_forms_authenticate():
     req2 = _make_request("/memory/save", auth_header="Bearer tok_xyz")
     resp2 = await mod.auth_middleware(req2, _noop_handler)
     assert resp2.status == 200
+
+
+# ── Fix round F10 (QA MED-5): F's WIRE contract, composed through the real
+#    app — auth_middleware + the real handle_health, driven over a real
+#    socket (aiohttp TestClient/TestServer, per the ground rule: this is NOT
+#    port binding). The tests above call auth_middleware directly with
+#    _noop_handler, which proves the middleware's side effect and its OWN
+#    return value, but never observes a /health BODY at all — the payload
+#    half rested entirely on test_health_anonymous_slimming.py, which calls
+#    handle_health() directly and never runs it through auth_middleware. A
+#    future change that made the audit branch consume the request or mutate
+#    headers would have passed the whole suite. These three tests close
+#    that gap: anonymous and bad-bearer both get the SLIM 3-key shape
+#    byte-unchanged, a valid bearer gets the FULL payload — through the
+#    actual composed path a real request takes.
+
+class _HealthWireProbeResp:
+    status = 200
+
+
+class _HealthWireProbeCm:
+    async def __aenter__(self):
+        return _HealthWireProbeResp()
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _HealthWireProbeSession:
+    """No real network, no port — mirrors test_health_anonymous_slimming.py's
+    _HealthProbeSession: every upstream probe (embedder/reranker/backend
+    /health, /v1/models) just reports 200, so the composed handler reaches
+    HTTP 200 without needing a real LLM backend or a listening socket."""
+    def get(self, url, timeout=None, headers=None, **_kw):
+        return _HealthWireProbeCm()
+
+
+def _load_health_wire_gateway(agent_tokens: str):
+    """Same reload order/idiom as test_auth_exemption_route_resolution.py's
+    _load_gateway — coordinator first (so AUTH_CONFIGURED_AT_STARTUP is
+    captured from THIS env), then hive_mind_proxy (which binds auth_
+    middleware from coordinator at import time, so both must be the SAME
+    module objects a private-spec load would not give)."""
+    scripts_dir = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts")
+    )
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import secure_env
+    secure_env._secrets.pop("AGENT_TOKENS", None)
+    if agent_tokens:
+        os.environ["AGENT_TOKENS"] = agent_tokens
+    else:
+        os.environ.pop("AGENT_TOKENS", None)
+    os.environ.setdefault("LLM_BACKENDS_JSON", "")
+    os.environ.pop("LLM_BACKENDS", None)
+    import coordinator
+    importlib.reload(coordinator)
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    g._daemon_healthy = True
+    g._rem_healthy = True
+    return coordinator, g
+
+
+def _build_health_wire_app(c, g):
+    """The real auth_middleware in front of the real handle_health — the
+    exact composition a live request takes (mirrors hive_mind_proxy.main()'s
+    own app-building order for these two pieces)."""
+    from aiohttp import web
+    app = web.Application(middlewares=[c.auth_middleware])
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _HealthWireProbeSession()
+    app["proxy"] = proxy
+    app.router.add_get("/health", g.handle_health)
+    return app
+
+
+async def _probe_health_wire(app, *, token=None):
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        resp = await client.request("GET", URL("/health", encoded=True), headers=headers)
+        body = await resp.read()
+        return resp.status, json.loads(body)
+    finally:
+        await client.close()
+
+
+def test_wire_anonymous_get_health_is_slim_and_unaudited():
+    c, g = _load_health_wire_gateway("claude:tok_wire_abc")
+    app = _build_health_wire_app(c, g)
+    status, body = asyncio.run(_probe_health_wire(app))
+    assert status == 200
+    assert set(body.keys()) == {"status", "version", "api_version"}
+    assert c._credential_counters["token_verify_failed"] == 0
+
+
+def test_wire_bad_bearer_get_health_is_slim_byte_unchanged_and_audited():
+    """F's whole point, at the wire: a bad bearer on /health is audited as
+    a side effect, but the RESPONSE the client actually receives is
+    byte-identical to the anonymous slim shape — auditing never gates."""
+    c, g = _load_health_wire_gateway("claude:tok_wire_abc")
+    app_anon = _build_health_wire_app(c, g)
+    status_anon, body_anon = asyncio.run(_probe_health_wire(app_anon))
+
+    c2, g2 = _load_health_wire_gateway("claude:tok_wire_abc")
+    app_bad = _build_health_wire_app(c2, g2)
+    status_bad, body_bad = asyncio.run(_probe_health_wire(app_bad, token="tok_wrong"))
+
+    assert status_bad == status_anon == 200
+    assert body_bad == body_anon
+    assert set(body_bad.keys()) == {"status", "version", "api_version"}
+    assert c2._credential_counters["token_verify_failed"] == 1
+
+
+def test_wire_valid_bearer_get_health_is_the_full_payload():
+    c, g = _load_health_wire_gateway("claude:tok_wire_abc")
+    app = _build_health_wire_app(c, g)
+    status, body = asyncio.run(_probe_health_wire(app, token="tok_wire_abc"))
+    assert status == 200
+    assert set(body.keys()) != {"status", "version", "api_version"}
+    assert "llm_backends" in body or "dependencies" in body
+    assert c._credential_counters["token_verify_failed"] == 0
 
 
 def test_lookup_agent_by_token_uses_hmac_compare_digest(monkeypatch):
