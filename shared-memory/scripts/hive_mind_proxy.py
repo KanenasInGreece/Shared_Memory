@@ -4735,16 +4735,29 @@ def _scrub_backend_keyed_dict(d: dict, *, context: str) -> dict:
     differ only in userinfo). With item A fatal on any userinfo URL this
     cannot happen for a production pool — but this guard exists for a
     test-seeded pool or a future ingest-path bypass: on a collapse this logs
-    an error and returns the RAW (unscrubbed) dict rather than silently
-    losing an entry (a `logger.error` + keep-raw is the brief's own
-    acceptable shape; silent collapse is not)."""
+    an error and returns SCRUBBED keys, positionally de-duplicated, rather
+    than silently losing an entry.
+
+    Fix round F7 (QA MED-2): the first cut of this guard, on a collapse,
+    returned the RAW (unscrubbed) dict — i.e. its own escape hatch did
+    exactly what item B exists to prevent. `/pool/status` is a member of
+    `_UNPROTECTED_PATHS` (reachable anonymously), so a collapse there used
+    to hand an anonymous caller both original URLs verbatim, userinfo and
+    all — strictly worse than the plain unscrubbed dict this function
+    guards against everywhere else. Never acceptable, even as a rare/
+    test-only escape hatch: this now scrubs every key regardless, and
+    disambiguates a collapse with a positional suffix (`#0`, `#1`, ...) so
+    every entry survives and NO credential ever reaches the render."""
     scrubbed = {scrub_url_credentials(k): v for k, v in d.items()}
     if len(scrubbed) != len(d):
         log.error(
             "%s: scrubbing backend URL keys collapsed %d distinct key(s) into "
-            "%d — rendering RAW (unscrubbed) keys instead of silently losing "
-            "an entry.", context, len(d), len(scrubbed))
-        return dict(d)
+            "%d — rendering scrubbed, positionally de-duplicated keys instead "
+            "of the raw (credential-bearing) originals.", context, len(d), len(scrubbed))
+        return {
+            f"{scrub_url_credentials(k)}#{i}": v
+            for i, (k, v) in enumerate(d.items())
+        }
     return scrubbed
 
 

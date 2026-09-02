@@ -54,7 +54,11 @@ def test_scrub_backend_keyed_dict_scrubs_credentialed_keys(monkeypatch):
     assert SECRET not in json.dumps(out)
 
 
-def test_scrub_backend_keyed_dict_collapse_guard_keeps_raw_and_logs(monkeypatch, caplog):
+def test_scrub_backend_keyed_dict_collapse_guard_scrubs_and_dedupes_and_logs(monkeypatch, caplog):
+    """Fix round F7 (QA MED-2): a collapse must NEVER render the raw
+    (credential-bearing) dict — both entries survive, but scrubbed and
+    positionally de-duplicated, and the secret never appears in the
+    output."""
     g = _load()
     src = {
         f"https://u1:{SECRET}@backend.example.test/v1": {"a": 1},
@@ -62,9 +66,13 @@ def test_scrub_backend_keyed_dict_collapse_guard_keeps_raw_and_logs(monkeypatch,
     }
     with caplog.at_level(logging.ERROR, logger="hive-proxy"):
         out = g._scrub_backend_keyed_dict(src, context="collapse-guard-test")
-    # Both entries survive (raw, unscrubbed) — nothing silently lost.
-    assert out == src
     assert len(out) == 2
+    assert SECRET not in json.dumps(out)
+    assert set(out.keys()) == {
+        "https://backend.example.test/v1#0",
+        "https://backend.example.test/v1#1",
+    }
+    assert list(out.values()) == [{"a": 1}, {"b": 2}]  # order + values preserved
     assert any("collapsed" in r.getMessage() for r in caplog.records)
 
 
@@ -187,7 +195,10 @@ def test_pool_status_scrubs_a_directly_seeded_credentialed_backend(monkeypatch):
 
 def test_pool_status_key_collapse_guard(monkeypatch, caplog):
     """Two distinct credentialed backends that scrub to the SAME key must
-    not silently merge — ADV1-14."""
+    not silently merge — ADV1-14. Fix round F7 (QA MED-2): /pool/status is
+    UNPROTECTED (anonymous-reachable), so the collapse guard must render
+    SCRUBBED, de-duplicated keys here of all places — never the raw
+    (credential-bearing) originals the pre-fix guard fell back to."""
     monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
     monkeypatch.setenv("LLM_BACKENDS", "http://a:5000")
     g = _load()
@@ -199,11 +210,17 @@ def test_pool_status_key_collapse_guard(monkeypatch, caplog):
 
     with caplog.at_level(logging.ERROR, logger="hive-proxy"):
         resp = asyncio.run(g.handle_pool_status(None))
-    d = json.loads(resp.body)
-    # Collapse guard: BOTH raw (unscrubbed) keys survive rather than one
-    # silently overwriting the other.
-    assert url1 in d["backends"]
-    assert url2 in d["backends"]
+    raw = resp.body.decode()
+    assert SECRET not in raw
+    d = json.loads(raw)
+    # Collapse guard: every entry survives (the base backend too — a
+    # collapse de-duplicates the WHOLE dict positionally, not just the
+    # colliding pair), scrubbed, rather than one silently overwriting the
+    # other OR the raw credential-bearing keys reaching this anonymous
+    # endpoint.
+    scrubbed_bases = {k.rsplit("#", 1)[0] for k in d["backends"]}
+    assert scrubbed_bases == {"http://a:5000", "https://backend.example.test/v1"}
+    assert len(d["backends"]) == 3
     assert any("collapsed" in r.getMessage() for r in caplog.records)
 
 
