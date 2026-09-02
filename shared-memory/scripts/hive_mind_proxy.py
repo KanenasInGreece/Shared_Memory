@@ -2083,8 +2083,14 @@ class AsyncHiveMindProxy:
                         )
                         # Stamp the serving backend so daemons can attribute per-backend
                         # telemetry (obs tok/s) without learning routing — observability only.
+                        # SEC B (defense in depth, second wall behind A): scrubbed through
+                        # scrub_url_credentials — for a clean, query-less backend URL this is
+                        # byte-identical to the raw pool key (item C), so rem_loop.py /
+                        # consolidation_loop.py's record_llm_call(backend=...) attribution
+                        # round-trips unchanged; a query-bearing backend's attribution
+                        # degrades (R-2 accepted cost, HANDOFF note).
                         if llm_backend is not None:
-                            proxy_resp.headers["X-SM-LLM-Backend"] = llm_backend
+                            proxy_resp.headers["X-SM-LLM-Backend"] = scrub_url_credentials(llm_backend)
                         # Client-facing standard messaging (PR A3): a fault status
                         # from ANY upstream (LLM, embedder, reranker) is an upstream-
                         # origin error — the body still passes through verbatim below,
@@ -2780,6 +2786,10 @@ async def handle_pool_status(request: web.Request) -> web.Response:
             entry["suspect_wedged"] = not await _probe_backend_alive(_session, b)
         backends[b] = entry
         free += 1 if (avail and counts_free) else 0
+    # SEC B (defense in depth, second wall behind A): scrub every backend URL
+    # KEY before this client-facing response — byte-identical for a clean,
+    # query-less URL (item C); collapse-guarded (ADV1-14).
+    backends = _scrub_backend_keyed_dict(backends, context="/pool/status")
     return web.json_response({"free_slots": free, "backends": backends})
 
 
@@ -4605,6 +4615,31 @@ def _log_health_transitions(dependencies: dict, warnings: list) -> None:
         pass
 
 
+def _scrub_backend_keyed_dict(d: dict, *, context: str) -> dict:
+    """SEC B (ADV1-14): scrub every KEY of a backend-URL-keyed dict through
+    scrub_url_credentials before it reaches a client-facing render. For a
+    clean, query-less URL this is byte-identical (item C guarantees it) —
+    the whole point is that a normal install's /health and /memory/telemetry
+    output does not change one byte.
+
+    Key-collapse guard: scrubbing can, in principle, merge two DISTINCT
+    backend keys into one rendered key (e.g. two credentialed URLs that
+    differ only in userinfo). With item A fatal on any userinfo URL this
+    cannot happen for a production pool — but this guard exists for a
+    test-seeded pool or a future ingest-path bypass: on a collapse this logs
+    an error and returns the RAW (unscrubbed) dict rather than silently
+    losing an entry (a `logger.error` + keep-raw is the brief's own
+    acceptable shape; silent collapse is not)."""
+    scrubbed = {scrub_url_credentials(k): v for k, v in d.items()}
+    if len(scrubbed) != len(d):
+        log.error(
+            "%s: scrubbing backend URL keys collapsed %d distinct key(s) into "
+            "%d — rendering RAW (unscrubbed) keys instead of silently losing "
+            "an entry.", context, len(d), len(scrubbed))
+        return dict(d)
+    return scrubbed
+
+
 def _llm_runtime_snapshot(backend_status: dict | None = None) -> dict:
     """The whole in-memory llm_* family, built ONCE.
 
@@ -4613,34 +4648,62 @@ def _llm_runtime_snapshot(backend_status: dict | None = None) -> dict:
     as the health path. `backend_status` is the liveness map the health probe
     already computed — passed in rather than re-probed, because a telemetry
     request must never fire N network probes of its own.
+
+    SEC B: every backend-URL-keyed dict below is scrubbed at the very end
+    (via _scrub_backend_keyed_dict, with its key-collapse guard) before
+    returning — this is THE single builder feeding BOTH /health and
+    /memory/telemetry, so scrubbing here once covers both. `backend_status`
+    is scrubbed a second, harmless time (idempotent — item C) since its
+    caller (_build_health_checks) already scrubs it for checks["llm_backends"];
+    defense in depth for any other/future caller that does not.
     """
     now = time.monotonic()
     total_routed = sum(_llm_routed.values()) or 1
     aff_total = _llm_affinity_hits + _llm_affinity_misses
+    pool = {
+        b: {
+            "weight": LLM_WEIGHTS.get(b, 1.0),
+            "inflight": _llm_inflight.get(b, 0),
+            "routed": _llm_routed.get(b, 0),
+            "routed_pct": round(100 * _llm_routed.get(b, 0) / total_routed, 1),
+            "fails": _llm_fail_total.get(b, 0),
+            "cooldown": round(max(0.0, _llm_unhealthy_until.get(b, 0.0) - now), 1),
+            "reserved": b in _llm_reserved,
+        }
+        for b in LLM_BACKENDS
+    }
+    token_usage = {
+        b: {
+            "tokens_prompt_total": _llm_tokens_prompt_total.get(b, 0),
+            "tokens_completion_total": _llm_tokens_completion_total.get(b, 0),
+            "tokens_last_ts": _llm_tokens_last_ts.get(b),
+        }
+        for b in LLM_BACKENDS
+    }
+    latency = {
+        b: {
+            "requests_total": _llm_requests_total.get(b, 0),
+            "requests_failed_total": _llm_requests_failed_total.get(b, 0),
+            "latency_sum_s": round(_llm_latency_sum_s.get(b, 0.0), 6),
+            "latency_max_s": round(_llm_latency_max_s.get(b, 0.0), 6),
+            "latency_last_ts": _llm_latency_last_ts.get(b),
+        }
+        for b in LLM_BACKENDS
+    }
     return {
-        "backends": dict(backend_status or {}),
-        "reserved": sorted(_llm_reserved),
+        "backends": _scrub_backend_keyed_dict(dict(backend_status or {}),
+                                              context="_llm_runtime_snapshot.backends"),
+        "reserved": sorted(scrub_url_credentials(b) for b in _llm_reserved),
         # Parallelisation: per-backend weight, current in-flight, cumulative
         # routed (check the realised split against weights), fails, cooldown.
-        "pool": {
-            b: {
-                "weight": LLM_WEIGHTS.get(b, 1.0),
-                "inflight": _llm_inflight.get(b, 0),
-                "routed": _llm_routed.get(b, 0),
-                "routed_pct": round(100 * _llm_routed.get(b, 0) / total_routed, 1),
-                "fails": _llm_fail_total.get(b, 0),
-                "cooldown": round(max(0.0, _llm_unhealthy_until.get(b, 0.0) - now), 1),
-                "reserved": b in _llm_reserved,
-            }
-            for b in LLM_BACKENDS
-        },
+        "pool": _scrub_backend_keyed_dict(pool, context="_llm_runtime_snapshot.pool"),
         # Cache affinity: hit rate + which backend holds each hot prefix, so the
         # KV-cache win is observable.
         "affinity": {
             "hits": _llm_affinity_hits,
             "misses": _llm_affinity_misses,
             "hit_rate": round(_llm_affinity_hits / aff_total, 3) if aff_total else None,
-            "hot_prefixes": {k[:8]: {"backend": v[0], "hits": v[2]}
+            "hot_prefixes": {k[:8]: {"backend": scrub_url_credentials(v[0]), "hits": v[2]}
                              for k, v in _llm_affinity.items()
                              if now - v[1] <= AFFINITY_TTL},
         },
@@ -4662,29 +4725,13 @@ def _llm_runtime_snapshot(backend_status: dict | None = None) -> dict:
         # Per-backend cumulative token counters, IN-PROCESS ONLY (reset on
         # restart — deliberate; the ts pairing is what makes a restart-aware
         # delta computable).
-        "token_usage": {
-            b: {
-                "tokens_prompt_total": _llm_tokens_prompt_total.get(b, 0),
-                "tokens_completion_total": _llm_tokens_completion_total.get(b, 0),
-                "tokens_last_ts": _llm_tokens_last_ts.get(b),
-            }
-            for b in LLM_BACKENDS
-        },
+        "token_usage": _scrub_backend_keyed_dict(token_usage, context="_llm_runtime_snapshot.token_usage"),
         # Per-backend request latency (local-vs-online comparison). latency_sum_s
         # + requests_total makes the average derivable on the read side without
         # the gateway ever deciding what "average" means; requests_failed_total
         # is separate so a string of fast failures cannot dilute the success
         # average.
-        "latency": {
-            b: {
-                "requests_total": _llm_requests_total.get(b, 0),
-                "requests_failed_total": _llm_requests_failed_total.get(b, 0),
-                "latency_sum_s": round(_llm_latency_sum_s.get(b, 0.0), 6),
-                "latency_max_s": round(_llm_latency_max_s.get(b, 0.0), 6),
-                "latency_last_ts": _llm_latency_last_ts.get(b),
-            }
-            for b in LLM_BACKENDS
-        },
+        "latency": _scrub_backend_keyed_dict(latency, context="_llm_runtime_snapshot.latency"),
     }
 
 
@@ -4700,8 +4747,11 @@ def _config_snapshot() -> dict:
     someone goes looking (fact 898).
     """
     cfg = {
+        # SEC B: "url" is scrub_url_credentials(b) — a list of per-backend
+        # dicts, so no key-collapse is possible (unlike the dict-keyed
+        # builders); byte-identical for a clean, query-less URL (item C).
         "llm_backends": [
-            {"url": b, "weight": LLM_WEIGHTS.get(b, 1.0),
+            {"url": scrub_url_credentials(b), "weight": LLM_WEIGHTS.get(b, 1.0),
              "has_credential": LLM_BACKEND_TOKENS.get(b) is not None,
              "model": LLM_BACKEND_MODELS.get(b),
              # Model-attributes routing descriptor fields (additive) — never
@@ -4761,7 +4811,11 @@ def telemetry_extras() -> dict:
         "routing": rt["routing"],
         "token_usage": rt["token_usage"],
         "latency": rt["latency"],
-        "faults": _llm_faults_snapshot(),
+        # SEC B: _llm_faults_snapshot() lives in coordinator.py (out of this
+        # section's touched-files list) and returns its dict keyed by raw
+        # backend URL — scrubbed here, at the render call site, with the
+        # same key-collapse guard as every other backend-keyed dict.
+        "faults": _scrub_backend_keyed_dict(_llm_faults_snapshot(), context="telemetry_extras.faults"),
     }
     return {
         "llm": llm,
@@ -4917,6 +4971,14 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
             backend_status[b] = "timeout"
         except Exception:
             backend_status[b] = "down"
+    # SEC B (defense in depth, second wall behind A): scrub every backend URL
+    # KEY before this dict reaches ANY client-facing surface — it feeds BOTH
+    # checks["llm_backends"] below AND _llm_runtime_snapshot()'s "backends"
+    # field (/memory/telemetry). For a clean, query-less URL this is
+    # byte-identical (item C). Collapse guard (ADV1-14): cannot fire in
+    # production with A fatal on userinfo, but guards a test-seeded/future
+    # bypass from silently merging two distinct backends into one key.
+    backend_status = _scrub_backend_keyed_dict(backend_status, context="/health backend_status")
     checks["llm"] = "ok" if any(s == "ok" for s in backend_status.values()) else "down"
     # Wedge visibility: reachability alone reported "ok" through a GPU-driver
     # hang (the accept thread answers while the generation engine is dead).
@@ -4932,7 +4994,10 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
             for b, a in _ages.items():
                 if a is not None and a > LLM_WEDGE_SUSPECT_AGE:
                     if not await _probe_backend_alive(proxy.session, b):
-                        _wedged.append(b)
+                        # SEC B: scrubbed for the same reason as backend_status
+                        # above — this list renders straight onto
+                        # checks["llm_suspect_wedged"].
+                        _wedged.append(scrub_url_credentials(b))
             if _wedged:
                 checks["llm_suspect_wedged"] = _wedged
     # Gate on ANY configured backend, not "more than one" — the original
@@ -5570,14 +5635,17 @@ def _emit_token_lifecycle_sums(reason: str) -> None:
         c = _llm_tokens_completion_total.get(b, 0)
         if p == 0 and c == 0:
             continue
+        # SEC B: scrubbed for both the journal line and the audit JSONL —
+        # byte-identical for a clean, query-less URL (item C).
+        _b_scrubbed = scrub_url_credentials(b)
         log.info(
             "llm-token-lifecycle-sum backend=%s reason=%s tokens_prompt_total=%d "
-            "tokens_completion_total=%d", b, reason, p, c)
+            "tokens_completion_total=%d", _b_scrubbed, reason, p, c)
         if GATEWAY_AUDIT_LOG_PATH:
             try:
                 append_secure(GATEWAY_AUDIT_LOG_PATH, json.dumps({
                     "ts": ts, "kind": "llm_token_lifecycle_sum", "reason": reason,
-                    "backend": b, "tokens_prompt_total": p, "tokens_completion_total": c,
+                    "backend": _b_scrubbed, "tokens_prompt_total": p, "tokens_completion_total": c,
                 }))
             except Exception as exc:
                 log.warning("token lifecycle sum audit write failed: %s", exc)
