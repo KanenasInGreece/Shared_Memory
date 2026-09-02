@@ -557,14 +557,22 @@ def test_phase_b_secret_bearing_import_exception_shows_type_only_never_the_secre
 
 def test_would_refuse_line_and_role_errors_never_leak_a_raw_credential(tmp_path):
     """The property that actually matters: no unredacted userinfo/query
-    credential reaches output, even accepting the over-redaction above."""
-    backends_json = ('[{"url":"http://svc:s3cr3t-in-url@a:5000","roles":["bogus"]}]')
+    credential reaches output, even accepting the over-redaction above.
+
+    SEC A (R-1, 2026-09-02): this test's original fixture had the credential
+    in USERINFO ("http://svc:cred@a:5000") — that shape is now refused/
+    excluded at _load_llm_backends() parse time, before roles are even
+    parsed, so it can no longer reach the role_config_errors path this test
+    targets (userinfo-URL coverage lives in
+    tests/test_llm_backend_secrets.py's SEC-A tests instead). A query-string
+    credential (R-2, NOT refused by A) is the fixture that still reaches
+    _parse_roles unmodified, keeping this test's actual point intact."""
+    backends_json = ('[{"url":"http://a:5000?key=s3cr3t-in-url","roles":["bogus"]}]')
     proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": backends_json},
                 tmp_path=tmp_path)
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "WOULD REFUSE TO START" in proc.stdout
     assert "s3cr3t-in-url" not in proc.stdout
-    assert "svc:" not in proc.stdout
 
 
 # ── QA Q1 / fold-round item 4 — PROXY_BIND's idiom now lives in the D1

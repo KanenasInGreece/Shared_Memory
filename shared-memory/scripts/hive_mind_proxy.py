@@ -206,8 +206,85 @@ DEFAULT_TARGET = os.environ.get("LLM_DEFAULT_TARGET", FRAMEWORK_DEFAULTS["LLM_DE
 # `model` overrides the global LLM_MODEL for that backend only — see the model
 # rewrite in handle_proxy. See shared-memory/ops/README.md for how to get the
 # named var into the gateway's process env (systemd EnvironmentFile, etc.).
+def _backend_url_credential_error(url: str) -> "str | None":
+    """SEC A (R-1, fatal): flag a backend URL whose userinfo carries a
+    credential (`user:pass@host` or a bare `user@host`). Shared by BOTH
+    ingest paths — the LLM_BACKENDS_JSON per-entry loop and the legacy CSV
+    form — so neither can admit a credentialed URL string into the pool:
+    the framework's only accepted channel for a backend credential is
+    `token_env` (a NAME resolved from the gateway's own process env), never
+    a literal in the URL. A bare QUERY STRING is deliberately NOT flagged
+    here (R-2, refining the 2026-08-28 "userinfo/query" wording) — an
+    Azure-style `?api-version=` backend stays loadable; queries are instead
+    scrubbed from every RENDER (log_hygiene.scrub_url_credentials / item B),
+    accepting degraded per-backend dream attribution for such backends (none
+    in our own fleet) as the documented cost. Returns None for a clean URL,
+    else a scrubbed, human-readable message naming the offending URL —
+    scrubbed THROUGH the fixed (item C) scrub_url_credentials, never the raw
+    credential itself."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except Exception:
+        return None
+    if parsed.username is None and parsed.password is None:
+        return None
+    return (
+        f"{scrub_url_credentials(url)}: URL embeds a credential in its userinfo "
+        "(user:pass@host or user@host) — this framework never accepts a "
+        "credential inside the URL string itself. Use token_env instead: the "
+        "backend gets its Authorization header from a NAMED env var already "
+        "exported in the gateway's own process environment (see "
+        "shared-memory/ops/README.md, 'Reasoning-LLM backends')."
+    )
+
+
+# SEC A.3 (ADV1-4 + ADV2-6): a finite numeric token, never bare float() (which
+# accepts "nan"/"inf" as valid weights — those must fall through to "the
+# whole entry is the URL" instead).
+_BACKEND_WEIGHT_TOKEN_RE = re.compile(r"^[+-]?\d+(\.\d+)?$")
+
+
 def _parse_backend(entry: str) -> tuple[str, float]:
-    url, _, w = entry.strip().partition("@")
+    """SEC A.3: split on the LAST "@" (rpartition), not the first
+    (ADV1-4 — the old `entry.partition("@")` mis-split a credentialed URL
+    like "http://u:p@h:8000" into url="http://u:p", weight=1.0, silently
+    discarding the real host AND leaving the URL's own userinfo behind as
+    if it were the whole url).
+
+    The tail is treated as a WEIGHT only when it is a finite numeric token
+    (see _BACKEND_WEIGHT_TOKEN_RE) AND `head` already reads as a
+    self-terminated authority: either a bare token with no scheme at all
+    (the plain "url@weight" legacy shorthand) or a "scheme://host:port" that
+    already carries an explicit port. Both conditions are necessary —
+    "head has no userinfo" ALONE cannot tell "http://a:5000@2" (host:port
+    already present -> unambiguously url@weight) apart from "http://user@10"
+    (no port -> "user" IS this URL's own credential, "10" its host): both
+    give `urlsplit(head).username is None`, confirmed by direct execution.
+    Getting this wrong would silently turn a credentialed URL into
+    url="http://user" weight=10, discarding the very credential the new
+    _backend_url_credential_error() refusal exists to catch (ADV2-6) — see
+    HANDOFF.md for this deviation from the brief's literal wording. When the
+    tail is not treated as a weight, the WHOLE entry is the URL, which then
+    hits _backend_url_credential_error() at the call site.
+
+    Legit "url@1.5" and the existing fixture "http://a:5000@2" keep parsing
+    unchanged."""
+    entry = entry.strip()
+    head, sep, tail = entry.rpartition("@")
+    if sep and _BACKEND_WEIGHT_TOKEN_RE.match(tail):
+        try:
+            head_parts = urllib.parse.urlsplit(head)
+        except Exception:
+            head_parts = None
+        head_is_bare_token = head_parts is not None and not head_parts.scheme
+        head_has_port = head_parts is not None and head_parts.port is not None
+        head_has_username = head_parts is not None and head_parts.username is not None
+        if not head_has_username and (head_is_bare_token or head_has_port):
+            url, w = head, tail
+        else:
+            url, w = entry, ""
+    else:
+        url, w = entry, ""
     try:
         weight = float(w) if w else 1.0
     except ValueError:
@@ -303,17 +380,31 @@ def _load_llm_backends() -> tuple[
         list[str], dict[str, float], dict[str, "str | None"], dict[str, "str | None"],
         dict[str, "dict | None"], dict[str, "frozenset[str] | None"], dict[str, "int | None"],
         dict[str, bool], dict[str, bool], dict[str, "int | None"],
-        dict[str, "float | None"], dict[str, "float | None"], list[str]]:
+        dict[str, "float | None"], dict[str, "float | None"], list[str], list[str]]:
     """Returns (urls, weights, tokens, models, extras, roles, n_ctx, private_ok,
-    private_ok_explicit, max_inflight, price_in, price_out, role_config_errors).
+    private_ok_explicit, max_inflight, price_in, price_out, role_config_errors,
+    url_credential_errors).
 
     `role_config_errors` collects a human-readable message per backend whose
     `roles` list names something outside ROUTING_ROLE_NAMES — collected here
     (module import time, so every test that imports this module freely still
     collects cleanly) rather than raised here. The actual SystemExit lives in
     require_valid_llm_routing_config(), called from main() ONLY — same
-    placement reasoning as require_auth_when_provider_keys_configured()."""
+    placement reasoning as require_auth_when_provider_keys_configured().
+
+    `url_credential_errors` (SEC A, R-1) collects one message per backend URL
+    (from EITHER ingest path — LLM_BACKENDS_JSON or the legacy CSV form)
+    whose userinfo carries a credential — see _backend_url_credential_error().
+    Collected here for the SAME reason (module import must stay clean); its
+    own SystemExit lives in require_no_backend_url_credentials(), called from
+    main() ONLY, same placement/shape as role_config_errors above. R-1
+    (fatal): the offending entry is still EXCLUDED from the returned pool
+    here (so this function itself never raises), but ANY non-empty
+    url_credential_errors makes main() refuse to start — never a silent
+    exclude-and-continue that would let the gateway come up healthy pointed
+    at the legacy/default fallback instead (ruled out)."""
     role_config_errors: list[str] = []
+    url_credential_errors: list[str] = []
     # Fix round Q11: ONE `global` declaration covering the whole function —
     # LLM_POOL_CONFIG_EMPTY is SET-ONLY on every return path below, explicit
     # on both True/False branches, never left to the module-level default.
@@ -378,6 +469,17 @@ def _load_llm_backends() -> tuple[
         for entry in entries:
             url = str(entry.get("url", "")).rstrip("/")
             if not url:
+                continue
+            # SEC A (R-1, fatal): a URL that embeds its own credential in
+            # userinfo — checked BEFORE every other per-entry validation
+            # below, since a credentialed URL string is refused outright
+            # regardless of what else the entry configures. Excluded from
+            # the pool here (this function must never raise); the loud
+            # SystemExit is require_no_backend_url_credentials(), main()
+            # only. Query strings are NOT flagged (R-2).
+            _cred_err = _backend_url_credential_error(url)
+            if _cred_err:
+                url_credential_errors.append(_cred_err)
                 continue
             # Refuse a literal secret in config, loudly — the schema only ever
             # reads token_env (a NAME). Silently ignoring a stray "token"/"api_key"
@@ -510,7 +612,8 @@ def _load_llm_backends() -> tuple[
             # default rather than say so itself.
             LLM_POOL_CONFIG_EMPTY = False
             return (urls, weights, tokens, models, extras, roles, n_ctxs, private_oks,
-                    private_ok_explicit, max_inflights, price_ins, price_outs, role_config_errors)
+                    private_ok_explicit, max_inflights, price_ins, price_outs, role_config_errors,
+                    url_credential_errors)
         log.error("LLM_BACKENDS_JSON produced no usable backend — falling back to LLM_BACKENDS/LLM_DEFAULT_TARGET")
         # Group 3: a fleet that silently became localhost:5000 read as a healthy
         # pool pointing at the wrong place (v0.9.75 review F6). Remember WHY,
@@ -518,7 +621,20 @@ def _load_llm_backends() -> tuple[
         global LLM_POOL_FALLBACK_REASON
         LLM_POOL_FALLBACK_REASON = "LLM_BACKENDS_JSON produced no usable backend (every entry excluded) — serving the LLM_BACKENDS/LLM_DEFAULT_TARGET fallback"
 
-    _raw_backends = [_parse_backend(e) for e in os.environ.get("LLM_BACKENDS", FRAMEWORK_DEFAULTS["LLM_BACKENDS"]["default"]).split(",") if e.strip()]
+    # SEC A (R-1, fatal + ADV1-4): the legacy CSV form had NO per-entry
+    # validation of any kind before this — an explicit loop (not the old
+    # one-line list comprehension) so each parsed URL can be checked through
+    # the SAME shared helper as the JSON path before it ever reaches `urls`.
+    _raw_backends: list[tuple[str, float]] = []
+    for _e in os.environ.get("LLM_BACKENDS", FRAMEWORK_DEFAULTS["LLM_BACKENDS"]["default"]).split(","):
+        if not _e.strip():
+            continue
+        _u, _w = _parse_backend(_e)
+        _cred_err = _backend_url_credential_error(_u)
+        if _cred_err:
+            url_credential_errors.append(_cred_err)
+            continue
+        _raw_backends.append((_u, _w))
     if not _raw_backends:
         # D1: this substitution is ABSENCE (nothing declared) only when it is
         # not ALREADY the JSON-exclusion case above (LLM_POOL_FALLBACK_REASON
@@ -542,7 +658,7 @@ def _load_llm_backends() -> tuple[
     return (urls, weights, {u: None for u in urls}, {u: None for u in urls}, {u: None for u in urls},
             {u: None for u in urls}, {u: None for u in urls}, {u: False for u in urls},
             {u: False for u in urls}, {u: None for u in urls}, {u: None for u in urls},
-            {u: None for u in urls}, [])
+            {u: None for u in urls}, [], url_credential_errors)
 
 
 LLM_BACKENDS: list[str]
@@ -559,7 +675,7 @@ LLM_BACKEND_PRICE_OUT: dict[str, "float | None"]
 (LLM_BACKENDS, LLM_WEIGHTS, LLM_BACKEND_TOKENS, LLM_BACKEND_MODELS, LLM_BACKEND_EXTRAS,
  LLM_BACKEND_ROLES, LLM_BACKEND_NCTX, LLM_BACKEND_PRIVATE_OK, LLM_BACKEND_PRIVATE_OK_EXPLICIT,
  LLM_BACKEND_MAX_INFLIGHT, LLM_BACKEND_PRICE_IN, LLM_BACKEND_PRICE_OUT,
- _LLM_BACKEND_ROLE_CONFIG_ERRORS) = _load_llm_backends()
+ _LLM_BACKEND_ROLE_CONFIG_ERRORS, _LLM_BACKEND_URL_CREDENTIAL_ERRORS) = _load_llm_backends()
 
 # W4 default-deny (§6.5, decision:1824) — a PURE environment-presence question,
 # computed ONCE at module level, NEVER inside _load_llm_backends(): the JSON
@@ -5189,6 +5305,42 @@ async def handle_health(request: web.Request) -> web.Response:
 # --------------------------------------------------------------------------- #
 # Startup / shutdown
 # --------------------------------------------------------------------------- #
+def require_no_backend_url_credentials() -> None:
+    """SEC A (R-1, fatal, RULED — Xenofon 2026-09-02): a backend URL whose
+    userinfo carries a credential (user:pass@host, or a bare user@host) is a
+    startup refusal, never a silent exclude-and-continue. Collected at parse
+    time by _load_llm_backends() (BOTH ingest paths — LLM_BACKENDS_JSON and
+    the legacy CSV form — via the shared _backend_url_credential_error()
+    helper) into _LLM_BACKEND_URL_CREDENTIAL_ERRORS; raised here, same
+    placement reasoning as require_auth_when_provider_keys_configured() and
+    require_valid_llm_routing_config() below: every test in this repo
+    imports this module freely, many with deliberately-invalid backend
+    config, so an unconditional check at import/parse time would kill test
+    collection itself, not just a genuinely misconfigured gateway.
+
+    Refusing here (rather than excluding the entry and continuing) is the
+    R-1 ruling: excluding would let a JSON fleet that is ENTIRELY
+    credentialed URLs fall through to the legacy/default fallback and come
+    up healthy pointed at localhost — silently serving from the wrong place
+    with no operator-visible signal beyond a log line. The message is built
+    entirely from strings _backend_url_credential_error() already ran
+    through the fixed (item C) scrub_url_credentials — never a raw
+    credential."""
+    if not _LLM_BACKEND_URL_CREDENTIAL_ERRORS:
+        return
+    raise SystemExit(
+        "FATAL: backend URL(s) embed a credential in userinfo "
+        "(user:pass@host) — this framework never accepts a credential "
+        "inside the URL string itself:\n  "
+        + "\n  ".join(_LLM_BACKEND_URL_CREDENTIAL_ERRORS)
+        + "\nUse token_env instead (LLM_BACKENDS_JSON form): the backend "
+          "gets its Authorization header from a NAMED env var already "
+          "exported in the gateway's own process environment, never from "
+          "the URL. A bare query string (e.g. \"?api-version=...\") is NOT "
+          "refused — only userinfo is."
+    )
+
+
 def _unauthenticated_provider_keys_override_active() -> bool:
     """True iff this process is running with the S-05 override ACTUALLY in
     effect — auth off, a provider key attached to a configured backend, and
@@ -5472,6 +5624,11 @@ async def main() -> None:
     # up. See coordinator.require_no_plaintext_agent_tokens()'s docstring
     # for why this call lives here (the real entrypoint) and nowhere else.
     require_no_plaintext_agent_tokens()
+    # SEC A (R-1, RULED — Xenofon 2026-09-02): a backend URL embedding its
+    # own credential in userinfo also refuses to start — see
+    # require_no_backend_url_credentials()'s docstring for why this call
+    # lives here too.
+    require_no_backend_url_credentials()
     # S-05 (RULED — decision:1303): auth-off + a live provider key also
     # refuses to start — see require_auth_when_provider_keys_configured()'s
     # docstring for why this call lives here too.

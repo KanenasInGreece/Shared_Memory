@@ -9,6 +9,8 @@ import json
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
 
@@ -472,3 +474,126 @@ def test_the_gateway_cold_imports_with_a_credentialed_backend(tmp_path):
     assert r.returncode == 0, r.stderr[-1500:]
     assert "https://api.example.com/v1" in r.stdout and "http://llama-box:8000/v1" in r.stdout
     assert "sk-test-cold-import" not in r.stdout + r.stderr
+
+
+# ── SEC A (R-1/R-2, ADV1-4/ADV2-6): backend URL credential hygiene at load ──
+# Prove-failing-first evidence (run against unmodified hive_mind_proxy.py, at
+# the commit just before this SEC-A fix): NONE of these behaviours existed.
+# - A JSON entry with userinfo flowed straight into LLM_BACKENDS with its
+#   credential intact; there was no _backend_url_credential_error(),
+#   _LLM_BACKEND_URL_CREDENTIAL_ERRORS, or require_no_backend_url_credentials
+#   at all (AttributeError on `g._LLM_BACKEND_URL_CREDENTIAL_ERRORS`).
+# - The legacy CSV path had NO per-entry validation of any kind: an
+#   entry.partition("@") (FIRST "@") mis-split "http://u:p@h:8000" into
+#   url="http://u:p" (weight defaulted to 1.0, the real host "h:8000" and the
+#   credential were both silently discarded) — no refusal, no exclusion, no
+#   trace the entry was ever malformed.
+# - "http://user@10" partitioned the same way old code would (bare
+#   `partition`) into url="http://user", weight=10 — the embedded credential
+#   "user" vanished into a discarded weight field.
+# Confirmed by running exactly the assertions below against that code via
+# `git stash` of only shared-memory/scripts/hive_mind_proxy.py.
+
+_URL_CRED_SECRET = "sm-test-secret-9f3a"
+
+
+def test_json_entry_with_userinfo_excluded_and_flagged_for_fatal_refusal(monkeypatch):
+    """SEC A: a JSON backend URL with userinfo must never reach the pool, and
+    must make require_no_backend_url_credentials() (main()'s startup guard)
+    refuse. Import itself stays CLEAN (invariant 6) — the refusal is
+    deferred to the guard function, never raised merely by importing."""
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": f"https://leakuser:{_URL_CRED_SECRET}@backend.example.test/v1", "private_ok": True},
+    ]))
+    import hive_mind_proxy as g
+    importlib.reload(g)   # must not raise
+    assert not any("leakuser" in b for b in g.LLM_BACKENDS)
+    assert g._LLM_BACKEND_URL_CREDENTIAL_ERRORS, "the credentialed entry was never flagged"
+    assert _URL_CRED_SECRET not in " ".join(g._LLM_BACKEND_URL_CREDENTIAL_ERRORS)
+    with pytest.raises(SystemExit) as exc_info:
+        g.require_no_backend_url_credentials()
+    assert _URL_CRED_SECRET not in str(exc_info.value)
+    assert "backend.example.test" in str(exc_info.value)
+
+
+def test_csv_entry_with_userinfo_excluded_and_flagged_for_fatal_refusal(monkeypatch):
+    """The legacy CSV form had NO per-entry validation at all before this."""
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", f"http://leakuser:{_URL_CRED_SECRET}@backend.example.test:8000")
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    assert not any("leakuser" in b for b in g.LLM_BACKENDS)
+    assert g._LLM_BACKEND_URL_CREDENTIAL_ERRORS
+    assert _URL_CRED_SECRET not in " ".join(g._LLM_BACKEND_URL_CREDENTIAL_ERRORS)
+    with pytest.raises(SystemExit) as exc_info:
+        g.require_no_backend_url_credentials()
+    assert _URL_CRED_SECRET not in str(exc_info.value)
+
+
+def test_query_string_backend_url_loads_r2(monkeypatch):
+    """R-2: a bare query string is NOT flagged — an Azure-style
+    ?api-version= backend stays loadable, and require_no_backend_url_
+    credentials() does not refuse over it."""
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    azure_url = "https://my-res.openai.azure.com/openai?api-version=2024-02-01"
+    monkeypatch.setenv("LLM_BACKENDS_JSON", json.dumps([
+        {"url": azure_url, "private_ok": True},
+    ]))
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    assert azure_url in g.LLM_BACKENDS
+    assert not g._LLM_BACKEND_URL_CREDENTIAL_ERRORS
+    g.require_no_backend_url_credentials()   # must not raise
+
+
+def test_csv_weight_forms_unchanged(monkeypatch):
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", "url@2,url2@1.5")
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    assert g.LLM_WEIGHTS["url"] == 2.0
+    assert g.LLM_WEIGHTS["url2"] == 1.5
+    assert not g._LLM_BACKEND_URL_CREDENTIAL_ERRORS
+
+
+def test_csv_existing_at_weight_fixture_keeps_parsing(monkeypatch):
+    """Regression guard: the pre-existing fixture from
+    test_legacy_llm_backends_unaffected_when_json_unset must still split
+    into url="http://a:5000", weight=2.0 under the new rpartition logic."""
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000@2,http://b:4000")
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    assert set(g.LLM_BACKENDS) == {"http://a:5000", "http://b:4000"}
+    assert g.LLM_WEIGHTS["http://a:5000"] == 2.0
+    assert not g._LLM_BACKEND_URL_CREDENTIAL_ERRORS
+
+
+def test_csv_nan_weight_is_not_a_bare_float_never_treated_as_weight(monkeypatch):
+    """NOT bare float() — "nan" must never parse as a weight; the whole
+    entry becomes the url instead, per the brief's own stated outcome."""
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", "http://a:5000@nan")
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    assert "http://a:5000" not in g.LLM_BACKENDS   # never split into url="http://a:5000", weight=nan
+    # The whole string "http://a:5000@nan" parses as one URL with userinfo
+    # "a:5000" -- caught by the credential refusal rather than silently lost.
+    assert g._LLM_BACKEND_URL_CREDENTIAL_ERRORS
+
+
+def test_ambiguous_user_at_numeric_host_not_silently_treated_as_weight(monkeypatch):
+    """ADV2-6: "http://user@10" must NOT become url="http://user" weight=10
+    — that would silently discard "user" (this URL's own embedded
+    credential) without ever routing it through the new refusal. See
+    HANDOFF.md for why the brief's literal "head username is None" rule
+    alone cannot distinguish this from the http://a:5000@2 fixture above."""
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", "http://user@10")
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    assert "http://user" not in g.LLM_BACKENDS
+    assert g._LLM_BACKEND_URL_CREDENTIAL_ERRORS
+    joined = " ".join(g._LLM_BACKEND_URL_CREDENTIAL_ERRORS)
+    assert "user@10" not in joined   # scrubbed — host "10" survives, "user" doesn't
