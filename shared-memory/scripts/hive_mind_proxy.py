@@ -2604,65 +2604,82 @@ async def _watchdog_rem_daemon(stop_event: asyncio.Event) -> None:
 
     Uses identical watchdog logic to the consolidation daemon:
     exponential backoff, stable-uptime reset, and circuit-breaker trip.
+
+    G (S6): the whole body is wrapped in try/finally so this agent's
+    ephemeral daemon token is revoked on EVERY exit path of this watchdog —
+    clean exit, circuit-breaker trip, AND cancellation — not only the three
+    spawn-failure paths _revoke_daemon_token() already covered before this
+    fix. `finally` also fires on asyncio.CancelledError (this coroutine
+    being cancelled) — SAFE here ONLY because of the shutdown ORDER main()
+    enforces in its drain sequence: both daemon processes are terminated
+    (unblocking each watchdog's own `proc.wait()`) BEFORE
+    watchdog_task/rem_watchdog_task.cancel() ever runs, so a cancel can
+    never revoke a token still held by a LIVE daemon process — see the
+    comment at that drain sequence, where this order is now load-bearing.
+    Revoking twice is harmless: _revoke_daemon_token() pops with a default
+    and is a no-op the second time.
     """
     global _rem_proc, _rem_healthy
 
-    restart_times: list[float] = []
-    backoff = 1.0
+    try:
+        restart_times: list[float] = []
+        backoff = 1.0
 
-    while not stop_event.is_set():
-        proc = await _start_rem_daemon()
-        if proc is None:
+        while not stop_event.is_set():
+            proc = await _start_rem_daemon()
+            if proc is None:
+                _rem_healthy = False
+                return
+
+            _rem_proc    = proc
+            _rem_healthy = True
+            t_start = asyncio.get_event_loop().time()
+
+            await proc.wait()
             _rem_healthy = False
-            return
 
-        _rem_proc    = proc
-        _rem_healthy = True
-        t_start = asyncio.get_event_loop().time()
+            if stop_event.is_set():
+                break
 
-        await proc.wait()
-        _rem_healthy = False
+            uptime   = asyncio.get_event_loop().time() - t_start
+            exitcode = proc.returncode
 
-        if stop_event.is_set():
-            break
+            if exitcode in (0, -signal.SIGTERM):
+                log.info("REM daemon exited cleanly (code %d).", exitcode)
+                break
 
-        uptime   = asyncio.get_event_loop().time() - t_start
-        exitcode = proc.returncode
-
-        if exitcode in (0, -signal.SIGTERM):
-            log.info("REM daemon exited cleanly (code %d).", exitcode)
-            break
-
-        log.warning(
-            "REM daemon crashed (code %d, uptime %.1fs) — evaluating restart.",
-            exitcode, uptime,
-        )
-
-        if uptime >= _DAEMON_MIN_STABLE_SEC:
-            backoff = 1.0
-
-        now = asyncio.get_event_loop().time()
-        restart_times = [t for t in restart_times if now - t < _DAEMON_RESTART_WINDOW]
-        if len(restart_times) >= _DAEMON_MAX_RESTARTS:
-            log.critical(
-                "REM daemon crashed %d times in %ds — circuit breaker open.",
-                _DAEMON_MAX_RESTARTS, _DAEMON_RESTART_WINDOW,
+            log.warning(
+                "REM daemon crashed (code %d, uptime %.1fs) — evaluating restart.",
+                exitcode, uptime,
             )
-            break
 
-        restart_times.append(now)
-        log.info(
-            "Restarting REM daemon in %.1fs (crash %d/%d this window)...",
-            backoff, len(restart_times), _DAEMON_MAX_RESTARTS,
-        )
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=backoff)
-            break
-        except asyncio.TimeoutError:
-            pass
-        backoff = min(backoff * 2, _DAEMON_MAX_BACKOFF_SEC)
+            if uptime >= _DAEMON_MIN_STABLE_SEC:
+                backoff = 1.0
 
-    log.info("REM daemon watchdog exiting.")
+            now = asyncio.get_event_loop().time()
+            restart_times = [t for t in restart_times if now - t < _DAEMON_RESTART_WINDOW]
+            if len(restart_times) >= _DAEMON_MAX_RESTARTS:
+                log.critical(
+                    "REM daemon crashed %d times in %ds — circuit breaker open.",
+                    _DAEMON_MAX_RESTARTS, _DAEMON_RESTART_WINDOW,
+                )
+                break
+
+            restart_times.append(now)
+            log.info(
+                "Restarting REM daemon in %.1fs (crash %d/%d this window)...",
+                backoff, len(restart_times), _DAEMON_MAX_RESTARTS,
+            )
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+                break
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(backoff * 2, _DAEMON_MAX_BACKOFF_SEC)
+
+        log.info("REM daemon watchdog exiting.")
+    finally:
+        _revoke_daemon_token(_REM_DAEMON_AGENT_NAME)
 
 
 async def _watchdog_daemon(stop_event: asyncio.Event) -> None:
@@ -2674,71 +2691,78 @@ async def _watchdog_daemon(stop_event: asyncio.Event) -> None:
     - Backoff resets when the daemon ran stably for ≥ _DAEMON_MIN_STABLE_SEC.
     - Circuit breaker: ≥ _DAEMON_MAX_RESTARTS crashes inside _DAEMON_RESTART_WINDOW
       seconds → log CRITICAL and stop restarting (requires gateway restart to reset).
+
+    G (S6): see _watchdog_rem_daemon's docstring — identical try/finally
+    revoke-on-every-exit-path reasoning, mirrored here for the
+    consolidation daemon's own ephemeral token.
     """
     global _daemon_proc, _daemon_healthy
 
-    restart_times: list[float] = []
-    backoff = 1.0
+    try:
+        restart_times: list[float] = []
+        backoff = 1.0
 
-    while not stop_event.is_set():
-        proc = await _start_daemon()
-        if proc is None:
+        while not stop_event.is_set():
+            proc = await _start_daemon()
+            if proc is None:
+                _daemon_healthy = False
+                return
+
+            _daemon_proc    = proc
+            _daemon_healthy = True
+            t_start = asyncio.get_event_loop().time()
+
+            await proc.wait()
             _daemon_healthy = False
-            return
 
-        _daemon_proc    = proc
-        _daemon_healthy = True
-        t_start = asyncio.get_event_loop().time()
+            if stop_event.is_set():
+                # Clean shutdown — gateway is going down; don't restart.
+                break
 
-        await proc.wait()
-        _daemon_healthy = False
+            uptime   = asyncio.get_event_loop().time() - t_start
+            exitcode = proc.returncode
 
-        if stop_event.is_set():
-            # Clean shutdown — gateway is going down; don't restart.
-            break
+            if exitcode in (0, -signal.SIGTERM):
+                log.info("Consolidation daemon exited cleanly (code %d).", exitcode)
+                break
 
-        uptime   = asyncio.get_event_loop().time() - t_start
-        exitcode = proc.returncode
-
-        if exitcode in (0, -signal.SIGTERM):
-            log.info("Consolidation daemon exited cleanly (code %d).", exitcode)
-            break
-
-        log.warning(
-            "Consolidation daemon crashed (code %d, uptime %.1fs) — evaluating restart.",
-            exitcode, uptime,
-        )
-
-        # Reset backoff if the daemon was stable long enough — avoids penalising
-        # recoverable transient failures (brief Postgres blip, LLM timeout).
-        if uptime >= _DAEMON_MIN_STABLE_SEC:
-            backoff = 1.0
-
-        # Circuit breaker: count crashes inside the rolling window.
-        now = asyncio.get_event_loop().time()
-        restart_times = [t for t in restart_times if now - t < _DAEMON_RESTART_WINDOW]
-        if len(restart_times) >= _DAEMON_MAX_RESTARTS:
-            log.critical(
-                "Consolidation daemon crashed %d times in %ds — "
-                "circuit breaker open. Restart the gateway to reset.",
-                _DAEMON_MAX_RESTARTS, _DAEMON_RESTART_WINDOW,
+            log.warning(
+                "Consolidation daemon crashed (code %d, uptime %.1fs) — evaluating restart.",
+                exitcode, uptime,
             )
-            break
 
-        restart_times.append(now)
-        log.info(
-            "Restarting consolidation daemon in %.1fs (crash %d/%d this window)...",
-            backoff, len(restart_times), _DAEMON_MAX_RESTARTS,
-        )
-        try:
-            # Sleep with backoff — but wake immediately if shutdown fires.
-            await asyncio.wait_for(stop_event.wait(), timeout=backoff)
-            break  # stop_event fired during backoff — clean exit
-        except asyncio.TimeoutError:
-            pass
-        backoff = min(backoff * 2, _DAEMON_MAX_BACKOFF_SEC)
+            # Reset backoff if the daemon was stable long enough — avoids penalising
+            # recoverable transient failures (brief Postgres blip, LLM timeout).
+            if uptime >= _DAEMON_MIN_STABLE_SEC:
+                backoff = 1.0
 
-    log.info("Daemon watchdog exiting.")
+            # Circuit breaker: count crashes inside the rolling window.
+            now = asyncio.get_event_loop().time()
+            restart_times = [t for t in restart_times if now - t < _DAEMON_RESTART_WINDOW]
+            if len(restart_times) >= _DAEMON_MAX_RESTARTS:
+                log.critical(
+                    "Consolidation daemon crashed %d times in %ds — "
+                    "circuit breaker open. Restart the gateway to reset.",
+                    _DAEMON_MAX_RESTARTS, _DAEMON_RESTART_WINDOW,
+                )
+                break
+
+            restart_times.append(now)
+            log.info(
+                "Restarting consolidation daemon in %.1fs (crash %d/%d this window)...",
+                backoff, len(restart_times), _DAEMON_MAX_RESTARTS,
+            )
+            try:
+                # Sleep with backoff — but wake immediately if shutdown fires.
+                await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+                break  # stop_event fired during backoff — clean exit
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(backoff * 2, _DAEMON_MAX_BACKOFF_SEC)
+
+        log.info("Daemon watchdog exiting.")
+    finally:
+        _revoke_daemon_token(_CONSOLIDATION_AGENT_NAME)
 
 
 # --------------------------------------------------------------------------- #
@@ -5733,6 +5757,58 @@ def _resolve_proxy_bind_host() -> str:
     return resolved
 
 
+async def _drain_watchdogs_and_daemons(
+        watchdog_task: "asyncio.Task", rem_watchdog_task: "asyncio.Task",
+        other_tasks: "tuple[asyncio.Task, ...]" = ()) -> None:
+    """Steps 3-4 of main()'s drain sequence (see the comment at its call
+    site) — terminate both daemon processes (unblocking each watchdog's own
+    `proc.wait()`), THEN cancel and await the watchdog tasks (plus any other
+    background tasks passed in), THEN revoke both daemons' ephemeral tokens
+    as an idempotent BACKSTOP.
+
+    G (S6, ADV2-9): the backstop revoke below is deliberately placed AFTER
+    the awaited cancellation of both watchdog tasks — never a concurrent
+    mutator racing a still-running watchdog. Each watchdog's own try/finally
+    (see _watchdog_daemon / _watchdog_rem_daemon) already revokes its
+    agent's token on every exit path, including this cancel; this call
+    costs nothing extra when the token is already gone
+    (_revoke_daemon_token() pops with a default) and only matters if some
+    future change to a watchdog body ever loses its own revoke.
+
+    Extracted from main() into its own coroutine so this ORDER — terminate
+    BEFORE cancel, which G's own cancel-safety argument depends on — is
+    directly testable (FakeProc doubles, no real subprocess or listening
+    socket) rather than only provable by reading main() end to end.
+    """
+    if _daemon_proc and _daemon_proc.returncode is None:
+        log.info("Stopping consolidation daemon (pid %d)...", _daemon_proc.pid)
+        _daemon_proc.terminate()
+        try:
+            await asyncio.wait_for(_daemon_proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            log.warning("Consolidation daemon did not exit in 5 s — sending SIGKILL")
+            _daemon_proc.kill()
+    if _rem_proc and _rem_proc.returncode is None:
+        log.info("Stopping REM daemon (pid %d)...", _rem_proc.pid)
+        _rem_proc.terminate()
+        try:
+            await asyncio.wait_for(_rem_proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            log.warning("REM daemon did not exit in 5 s — sending SIGKILL")
+            _rem_proc.kill()
+    watchdog_task.cancel()
+    rem_watchdog_task.cancel()
+    for t in other_tasks:
+        t.cancel()
+    for task in (watchdog_task, rem_watchdog_task, *other_tasks):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    _revoke_daemon_token(_CONSOLIDATION_AGENT_NAME)
+    _revoke_daemon_token(_REM_DAEMON_AGENT_NAME)
+
+
 async def main() -> None:
     # RULED (Xenofon, 2026-08-14): a plaintext AGENT_TOKENS entry refuses
     # gateway startup outright, from v0.9.3 — before anything else stands
@@ -5866,37 +5942,23 @@ async def main() -> None:
     # 3. terminate daemon — unblocks watchdog's proc.wait()
     # 4. watchdog_task    — wait for watchdog to confirm it has exited
     # 5. coordinator/proxy cleanup last
+    #
+    # G (S6, ADV1-13): step 3 before step 4 is now ALSO why cancelling the
+    # watchdog tasks below (whose bodies revoke their own agent's ephemeral
+    # daemon token in a `finally`, which also fires on CancelledError — see
+    # _watchdog_daemon / _watchdog_rem_daemon) is safe: by the time
+    # _drain_watchdogs_and_daemons() cancels them, both daemon processes
+    # have already been terminated and awaited, so no cancel-triggered
+    # revoke can ever race a still-live daemon that still holds that token.
+    # Do NOT reorder step 3 after step 4.
     log.info("Stopping listener...")
     await site.stop()
     if uds_site is not None:
         await uds_site.stop()
     log.info("Draining in-flight requests...")
     await runner.cleanup()
-    if _daemon_proc and _daemon_proc.returncode is None:
-        log.info("Stopping consolidation daemon (pid %d)...", _daemon_proc.pid)
-        _daemon_proc.terminate()
-        try:
-            await asyncio.wait_for(_daemon_proc.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            log.warning("Consolidation daemon did not exit in 5 s — sending SIGKILL")
-            _daemon_proc.kill()
-    if _rem_proc and _rem_proc.returncode is None:
-        log.info("Stopping REM daemon (pid %d)...", _rem_proc.pid)
-        _rem_proc.terminate()
-        try:
-            await asyncio.wait_for(_rem_proc.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            log.warning("REM daemon did not exit in 5 s — sending SIGKILL")
-            _rem_proc.kill()
-    watchdog_task.cancel()
-    rem_watchdog_task.cancel()
-    capability_task.cancel()
-    token_lifecycle_task.cancel()
-    for task in (watchdog_task, rem_watchdog_task, capability_task, token_lifecycle_task):
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    await _drain_watchdogs_and_daemons(
+        watchdog_task, rem_watchdog_task, (capability_task, token_lifecycle_task))
     # A2: unconditional lifecycle sum on graceful shutdown — DIRECT
     # SYNCHRONOUS write (see _emit_token_lifecycle_sums' docstring), so it
     # runs here rather than through proxy.cleanup()/coordinator.stop().
