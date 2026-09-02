@@ -35,6 +35,7 @@ import concurrent.futures
 import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime
 
@@ -64,7 +65,21 @@ from fastmcp import FastMCP
 # config block (mcp.json's `env`) needs no file at all — that path is unaffected
 # BY CONSTRUCTION: the host writes it into this process's os.environ before this
 # module is ever imported, which is outside this loader's reach either way.
-_SERVER_ONLY_KEYS = ("AGENT_TOKENS=", "PG_PASSWORD=", "NEO4J_PASSWORD=")
+_SERVER_ONLY_KEYS = frozenset({"AGENT_TOKENS", "PG_PASSWORD", "NEO4J_PASSWORD"})
+
+# D.4 (SEC round, ADV1-15): key = the text before the first "=", with an
+# optional leading "export " stripped — so `export AGENT_TOKENS=...` (a
+# legitimate shell-sourceable form some deployers use) is recognised by its
+# KEY, not lost the way a naive re-parse could. The previous implementation
+# matched "AGENT_TOKENS=" etc. as a bare SUBSTRING of the whole line, which
+# happened to also catch the `export` form (the substring is still present
+# after the word "export ") but for the wrong reason — it would just as
+# readily match the same text appearing inside an unrelated VALUE (a comment
+# quoting the line, a value containing "AGENT_TOKENS=" as literal text).
+# Matching the parsed KEY instead is the correct check either way; handling
+# `export` explicitly is what keeps that one legitimate form recognised
+# under the corrected approach.
+_ENV_KEY_RE = re.compile(r"^(?:export\s+)?([^=\s]+)\s*=")
 
 
 def _looks_like_server_env(path: str) -> bool:
@@ -74,10 +89,14 @@ def _looks_like_server_env(path: str) -> bool:
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
-                stripped = line.lstrip()
-                if stripped.startswith("#"):
+                stripped = line.lstrip().lstrip("﻿")
+                if not stripped or stripped.startswith("#"):
                     continue
-                if any(key in stripped for key in _SERVER_ONLY_KEYS):
+                m = _ENV_KEY_RE.match(stripped)
+                if not m:
+                    continue
+                key = m.group(1).strip().upper()
+                if key in _SERVER_ONLY_KEYS:
                     return True
     except OSError:
         return False

@@ -31,7 +31,9 @@ from multidict import CIMultiDict
 # private _load_env() that dumped the whole .env into os.environ, including
 # every secret it held. It is now the shared split loader also used by
 # rem_loop.py and consolidation_loop.py — see secure_env.py.
-from secure_env import load_split_env, get_secret, is_secret_key  # noqa: E402
+from secure_env import (  # noqa: E402
+    load_split_env, get_secret, is_secret_key, require_llm_backends_json_parses,
+)
 from log_hygiene import append_secure, secure_path, scrub_url_credentials, FILE_MODE  # noqa: E402
 from framework_defaults import FRAMEWORK_DEFAULTS  # noqa: E402
 # A-4: the ROLE RULE, from the module that owns it — never a bare _AGENT_ROLES
@@ -5737,6 +5739,11 @@ async def main() -> None:
     # up. See coordinator.require_no_plaintext_agent_tokens()'s docstring
     # for why this call lives here (the real entrypoint) and nowhere else.
     require_no_plaintext_agent_tokens()
+    # D.1 (SEC round, ADV1-2): a malformed LLM_BACKENDS_JSON also refuses to
+    # start — see secure_env.require_llm_backends_json_parses()'s docstring
+    # for why this call lives here too (never at bare import time), and why
+    # check_config.py deliberately does NOT gain this same call.
+    require_llm_backends_json_parses("hive_mind_proxy")
     # SEC A (R-1, RULED — Xenofon 2026-09-02): a backend URL embedding its
     # own credential in userinfo also refuses to start — see
     # require_no_backend_url_credentials()'s docstring for why this call

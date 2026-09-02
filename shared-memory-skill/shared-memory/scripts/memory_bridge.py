@@ -156,11 +156,23 @@ try:
         for _k, _v in dotenv_values(_env).items():
             if _v is None or not _k:
                 continue
-            if _k == "AGENT_TOKEN":
+            # D.3 (SEC round, ADV1-1/H-1 twin fix — mirrors mcp/vector-
+            # skill.py:221-237 exactly): key_norm is computed ONCE per key
+            # and used for BOTH the AGENT_TOKEN diversion check AND the
+            # _is_client_secret_key() call. Before this fix the two checks
+            # normalised differently (one case-sensitive, one upper-cased),
+            # which is a REGRESSION in the SAFER direction only by accident
+            # — a lowercase `agent_token=` or a BOM-prefixed key could slip
+            # past one check but not the other, in either order. `_k` —
+            # never `_k_norm` — is still what gets exported when the key
+            # isn't filtered: this only changes what counts as
+            # secret/AGENT_TOKEN, never the exported name's casing.
+            _k_norm = _k.lstrip("﻿").strip().upper()
+            if _k_norm == "AGENT_TOKEN":
                 if not _AGENT_TOKEN_FROM_FILE:
                     _AGENT_TOKEN_FROM_FILE = _v.strip()
                 continue
-            if _is_client_secret_key(_k):
+            if _is_client_secret_key(_k_norm):
                 continue
             os.environ.setdefault(_k, _v)
 except ImportError:
@@ -169,7 +181,12 @@ except ImportError:
     def _read_env_file(path: str) -> None:
         global _AGENT_TOKEN_FROM_FILE
         try:
-            with open(path) as _f:
+            # utf-8-sig (D.3, ADV1-20): aligns this fallback parser's file
+            # encoding with mcp/vector-skill.py's own manual parser — a file
+            # saved as UTF-8-with-BOM otherwise decodes a leading U+FEFF onto
+            # the FIRST key, which the per-key .lstrip("﻿") below also
+            # catches (belt and braces) but should not have to rely on alone.
+            with open(path, encoding="utf-8-sig") as _f:
                 for _line in _f:
                     _line = _line.strip()
                     if not _line or _line.startswith("#") or "=" not in _line:
@@ -179,11 +196,16 @@ except ImportError:
                     _v = _v.strip()
                     if not _k:
                         continue
-                    if _k == "AGENT_TOKEN":
+                    # D.3: key_norm computed ONCE, used for BOTH checks —
+                    # see the dotenv_values() branch above for the full
+                    # rationale (identical fix, same shape, mirrors
+                    # mcp/vector-skill.py's _load_env_manually exactly).
+                    _k_norm = _k.lstrip("﻿").strip().upper()
+                    if _k_norm == "AGENT_TOKEN":
                         if not _AGENT_TOKEN_FROM_FILE:
                             _AGENT_TOKEN_FROM_FILE = _v
                         continue
-                    if _is_client_secret_key(_k):
+                    if _is_client_secret_key(_k_norm):
                         continue
                     if _k not in os.environ:   # first definition wins
                         os.environ[_k] = _v

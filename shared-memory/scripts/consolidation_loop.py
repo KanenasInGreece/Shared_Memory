@@ -98,6 +98,7 @@ from dream_telemetry import (record_llm_call, adaptive_ceiling, embed_ceiling,
 from record_ref import make_ref
 from secure_env import (
     load_split_env, get_secret, require_db_credentials, read_daemon_token_from_fd,
+    require_llm_backends_json_parses,
 )
 
 # Configuration — set via environment variables or .env file
@@ -4518,4 +4519,9 @@ async def main():
 
 if __name__ == "__main__":
     _require_db_credentials()
+    # D.1 (SEC round, ADV1-2): same placement reasoning as
+    # _require_db_credentials() above — never at bare import time (this
+    # module is imported freely by tests with a malformed LLM_BACKENDS_JSON
+    # on purpose), only at the actual daemon entrypoint.
+    require_llm_backends_json_parses("consolidation_loop")
     asyncio.run(main())

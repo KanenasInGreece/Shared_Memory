@@ -570,6 +570,32 @@ def test_missing_file_is_not_a_server_env(tmp_path):
     assert vs._looks_like_server_env(str(tmp_path / "nope.env")) is False
 
 
+# ── D.4 (SEC round, ADV1-15): key-parsed, case/whitespace/export-tolerant ───
+
+@pytest.mark.parametrize("line", [
+    "agent_tokens=claude:tok_a",
+    "Agent_Tokens=claude:tok_a",
+    "AGENT_TOKENS =claude:tok_a",
+    "export AGENT_TOKENS=claude:tok_a",
+])
+def test_server_env_recognised_regardless_of_case_whitespace_or_export(tmp_path, line):
+    vs = _vs_module()
+    f = tmp_path / "variant.env"
+    f.write_text(f"COORDINATOR_URL=http://localhost:8888\n{line}\n")
+    assert vs._looks_like_server_env(str(f)) is True, line
+
+
+def test_server_env_not_falsely_triggered_by_a_value_containing_the_substring(tmp_path):
+    """The corrected KEY-based check must not fire on a line whose VALUE
+    merely contains 'AGENT_TOKENS=' as literal text -- the pre-D.4 substring
+    check could have (a false positive in the SAFE direction, but still a
+    behaviour worth pinning as the fix's own justification)."""
+    vs = _vs_module()
+    f = tmp_path / "value_substring.env"
+    f.write_text("SOME_NOTE=see AGENT_TOKENS=... in the docs\nAGENT_TOKEN=tok_mine\n")
+    assert vs._looks_like_server_env(str(f)) is False
+
+
 def test_agent_id_is_read_in_exactly_one_place():
     """AGENT_ID is a LOCAL label only — the gateway overwrites metadata["source"]
     with the authenticated token identity (coordinator.py), so per-origin
