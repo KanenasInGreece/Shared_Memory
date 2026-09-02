@@ -614,3 +614,74 @@ def test_ambiguous_user_at_numeric_host_not_silently_treated_as_weight(monkeypat
     assert g._LLM_BACKEND_URL_CREDENTIAL_ERRORS
     joined = " ".join(g._LLM_BACKEND_URL_CREDENTIAL_ERRORS)
     assert "user@10" not in joined   # scrubbed — host "10" survives, "user" doesn't
+
+
+# ── Fix round F1 (QA HIGH-1): port-less, path-bearing "url@weight" ─────────
+# README.md's own generic "LLM_BACKENDS=url@weight,..." form, applied to a
+# URL with a path but no port, used to silently mis-split: the stray "@2"
+# landed in urlsplit's PATH (not netloc), so no refusal fired either — the
+# backend loaded with weight 1.0 and a URL nothing answers at. Prove-
+# failing-first: this assertion fails on unmodified code (git stash),
+# yielding url="https://api.example.com/v1@2", weight=1.0, no refusal.
+
+def test_port_less_path_at_weight_recovers_correctly(monkeypatch):
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", "https://api.example.com/v1@2")
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    assert "https://api.example.com/v1" in g.LLM_BACKENDS
+    assert g.LLM_WEIGHTS["https://api.example.com/v1"] == 2.0
+    assert not g._LLM_BACKEND_URL_CREDENTIAL_ERRORS
+
+
+def test_port_less_no_path_at_weight_stays_genuinely_ambiguous_and_refuses(monkeypatch):
+    """"http://myhost@2" has neither a port nor a path — _parse_backend
+    cannot tell "myhost" is a credential (host "2") apart from a missing-
+    port weight shorthand, so this stays a fatal refusal (F1 recovers only
+    the path-bearing case, per the brief's own scoping)."""
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", "http://myhost@2")
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    assert "http://myhost" not in g.LLM_BACKENDS
+    assert g._LLM_BACKEND_URL_CREDENTIAL_ERRORS
+
+
+def test_genuinely_ambiguous_weight_shaped_entry_gets_the_improved_refusal_message(monkeypatch):
+    """F1: the improved message names the ambiguity and both remedies,
+    rather than the generic 'URL embeds a credential' text."""
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", "http://user@10")
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    joined = " ".join(g._LLM_BACKEND_URL_CREDENTIAL_ERRORS)
+    assert "ambiguous" in joined
+    assert "explicit" in joined and "port" in joined
+    assert "LLM_BACKENDS_JSON" in joined
+
+
+def test_plain_credentialed_url_keeps_the_generic_refusal_message(monkeypatch):
+    """A real credentialed URL with an explicit port is NOT ambiguous —
+    it must keep the original 'URL embeds a credential' wording, not the
+    new ambiguity message (which only applies to a weight-shaped tail)."""
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.setenv("LLM_BACKENDS", "http://u:p@host:8000")
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    joined = " ".join(g._LLM_BACKEND_URL_CREDENTIAL_ERRORS)
+    assert "embeds a credential" in joined
+    assert "ambiguous" not in joined
+
+
+# ── Fix round finding 6 (QA LOW): unparseable URL fails CLOSED, not open ───
+
+def test_unparseable_backend_url_refuses_rather_than_silently_admitted(monkeypatch):
+    """Prove-failing-first: urlsplit("http://u:p@[::1") raises ValueError
+    (invalid IPv6 URL) — on unmodified code _backend_url_credential_error
+    caught that exception and returned None ("clean"), admitting a
+    credentialed, unparseable URL to the pool with no refusal at all."""
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    err = g._backend_url_credential_error("http://u:p@[::1")
+    assert err is not None
+    assert "unparseable" in err

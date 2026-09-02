@@ -224,11 +224,24 @@ def _backend_url_credential_error(url: str) -> "str | None":
     in our own fleet) as the documented cost. Returns None for a clean URL,
     else a scrubbed, human-readable message naming the offending URL —
     scrubbed THROUGH the fixed (item C) scrub_url_credentials, never the raw
-    credential itself."""
+    credential itself.
+
+    Fix round finding 6 (QA LOW): an unparseable URL used to fail OPEN
+    (`except Exception: return None`, i.e. "clean") — measured:
+    `urlsplit("http://u:p@[::1")` raises `ValueError: Invalid IPv6 URL`, so
+    that entry was admitted to the pool with its credential intact in
+    process state (renders were still safe — scrub_url_credentials's own
+    `except` redacts unconditionally — but this function's contract is
+    "refuse anything credential-shaped", and an unparseable string cannot be
+    proven clean). Now refuses instead."""
     try:
         parsed = urllib.parse.urlsplit(url)
     except Exception:
-        return None
+        return (
+            f"backend URL is unparseable — refusing (this framework never "
+            "guesses whether an unparseable URL string carries a credential; "
+            "fix the URL or use LLM_BACKENDS_JSON with a token_env instead)."
+        )
     if parsed.username is None and parsed.password is None:
         return None
     return (
@@ -271,7 +284,29 @@ def _parse_backend(entry: str) -> tuple[str, float]:
     hits _backend_url_credential_error() at the call site.
 
     Legit "url@1.5" and the existing fixture "http://a:5000@2" keep parsing
-    unchanged."""
+    unchanged.
+
+    Fix round F1 (QA HIGH-1): the port-or-bare-token condition above (see
+    Finding 1 in HANDOFF.md) left one documented form silently broken — a
+    port-LESS, scheme'd URL whose "@weight" landed in the PATH rather than
+    the netloc, e.g. "https://api.example.com/v1@2" (README.md's own
+    generic "url@weight" example, applied to a path-bearing URL). Measured:
+    `head` there is "https://api.example.com/v1" — no port, not a bare
+    token — so neither existing disjunct fires, and the whole entry falls
+    through as one URL with the stray "@2" left attached: no refusal (the
+    "@" is in the path, so `urlsplit(url).username` is None), just a silent
+    weight of 1.0 and a URL nothing will ever answer at. The fix: also
+    treat the tail as a weight when the WHOLE ENTRY (not just `head`) has
+    no userinfo of its own — `urlsplit(entry).username is None` proves the
+    entry's own last "@" cannot be a real userinfo separator (if it were,
+    urlsplit would have found it), so the "@" the CSV form's rpartition
+    just consumed can only have been the weight separator. This recovers
+    the silent path-"@" case (loads correctly, no refusal) while the
+    genuinely ambiguous port-less, path-less form ("http://user@10",
+    ADV2-6) stays refusing — there `urlsplit(entry).username` IS "user"
+    (the "@" WAS the netloc's own userinfo separator), so the new disjunct
+    does not fire and the whole entry still reaches the credential check
+    below, unchanged from before this fix."""
     entry = entry.strip()
     head, sep, tail = entry.rpartition("@")
     if sep and _BACKEND_WEIGHT_TOKEN_RE.match(tail):
@@ -282,7 +317,14 @@ def _parse_backend(entry: str) -> tuple[str, float]:
         head_is_bare_token = head_parts is not None and not head_parts.scheme
         head_has_port = head_parts is not None and head_parts.port is not None
         head_has_username = head_parts is not None and head_parts.username is not None
-        if not head_has_username and (head_is_bare_token or head_has_port):
+        try:
+            entry_username = urllib.parse.urlsplit(entry).username
+        except Exception:
+            entry_username = "<unparseable>"   # never treat as "no userinfo"
+        entry_has_no_userinfo_of_its_own = entry_username is None
+        if not head_has_username and (
+            head_is_bare_token or head_has_port or entry_has_no_userinfo_of_its_own
+        ):
             url, w = head, tail
         else:
             url, w = entry, ""
@@ -654,6 +696,26 @@ def _load_llm_backends() -> tuple[
         _u, _w = _parse_backend(_e)
         _cred_err = _backend_url_credential_error(_u)
         if _cred_err:
+            # F1 (QA HIGH-1): when the whole entry was kept as-is (never
+            # split) BECAUSE it looked exactly like "url@weight" but was
+            # genuinely ambiguous (no port, no path — _parse_backend
+            # couldn't tell "the userinfo's own credential" from "a missing
+            # port before the weight separator"), say so explicitly rather
+            # than emitting the generic credential message: this is a
+            # config-shape problem the operator can fix two ways, not just
+            # a URL that happens to carry a password.
+            _stripped_e = _e.strip()
+            _tail_candidate = _stripped_e.rpartition("@")[2]
+            if _u == _stripped_e and _BACKEND_WEIGHT_TOKEN_RE.match(_tail_candidate):
+                _cred_err = (
+                    f"{scrub_url_credentials(_u)}: ambiguous LLM_BACKENDS entry — "
+                    "this could be a credentialed URL, or a bare 'url@weight' "
+                    "shorthand for a URL with no port. Refusing rather than "
+                    "silently guessing. Fix by either: (1) adding an explicit "
+                    "port to the URL, so 'host:port@weight' parses "
+                    "unambiguously, or (2) declaring this backend via "
+                    "LLM_BACKENDS_JSON instead of the LLM_BACKENDS CSV form."
+                )
             url_credential_errors.append(_cred_err)
             continue
         _raw_backends.append((_u, _w))
