@@ -181,24 +181,39 @@ class AsyncLineWriter:
                 self._task = None
 
 
+_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+")
+
+
 def scrub_url_credentials(text: str) -> str:
-    """Security review O-6: strip userinfo (user:pass@) and the query string
-    from any http(s) URL found in `text` before it reaches a client-visible
-    body or a log. An exception's own __str__ can render the full request URL
-    (aiohttp's InvalidURL and httpx's HTTPStatusError both do), and a real
-    provider pattern puts a credential in a URL — a `?key=...` query parameter,
-    or userinfo — so echoing that text verbatim is a key-leakage path. Shared
-    here because BOTH the gateway (LLM backends) and the coordinator (its own
-    EMBEDDER_URL / RERANKER_URL calls) render such errors; the coordinator
-    cannot import the gateway module. Only scheme/host/port/path survive; never
-    raises (a "URL" urlsplit chokes on is replaced outright, not echoed)."""
+    """Security review O-6 (widened R3-4): strip userinfo (user:pass@) and the
+    query string from any URL found in `text` before it reaches a
+    client-visible body or a log. An exception's own __str__ can render the
+    full request URL (aiohttp's InvalidURL and httpx's HTTPStatusError both
+    do), and a real provider pattern puts a credential in a URL — a
+    `?key=...` query parameter, or userinfo — so echoing that text verbatim is
+    a key-leakage path. Shared here because BOTH the gateway (LLM backends)
+    and the coordinator (its own EMBEDDER_URL / RERANKER_URL calls) render
+    such errors; the coordinator cannot import the gateway module.
+
+    Scheme-generic (not http(s)-only): matches ANY `scheme://` prefix,
+    including `postgresql://`, `bolt://`, `redis://` DSNs and mixed/upper
+    -case schemes (`HTTP://…`). The netloc is rebuilt byte-preservingly —
+    everything after the LAST "@" in the ORIGINAL netloc is kept verbatim
+    (case, IPv6 brackets, port intact); only the userinfo before that "@" is
+    dropped. This deliberately avoids `parsed.hostname` (which lowercases the
+    host and strips IPv6 brackets) and `urlunsplit` (which drops one slash of
+    a netloc-less DSN like `postgresql:///agent_data`) — reconstruction is
+    `f"{scheme}://{netloc}{path}"` directly. Query and fragment are always
+    dropped (R-2's render-scrub policy). Idempotent: a second pass over
+    already-scrubbed output is a no-op. Only scheme/host/port/path survive;
+    never raises (a "URL" urlsplit chokes on is replaced outright, not
+    echoed)."""
     def _scrub(m: "re.Match") -> str:
+        raw = m.group(0)
         try:
-            parsed = urllib.parse.urlsplit(m.group(0))
-            netloc = parsed.hostname or ""
-            if parsed.port:
-                netloc += f":{parsed.port}"
-            return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+            parsed = urllib.parse.urlsplit(raw)
+            netloc = parsed.netloc.rpartition("@")[2]
+            return f"{parsed.scheme}://{netloc}{parsed.path}"
         except Exception:
             return "<url-redacted>"
-    return re.sub(r"https?://\S+", _scrub, text)
+    return _URL_RE.sub(_scrub, text)
