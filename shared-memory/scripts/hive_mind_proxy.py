@@ -5706,6 +5706,31 @@ def _encoder_routing_log_line() -> str:
     )
 
 
+def _resolve_proxy_bind_host() -> str:
+    """The interface hive_mind_proxy binds to — pure (reads os.environ,
+    performs no I/O, opens no socket), so it can be unit-tested without a
+    real TCPSite.
+
+    SEC H (R-3, RULED — Xenofon 2026-09-02, measured on glxvm):
+    TCPSite(runner, "", port) binds ALL interfaces (0.0.0.0 + [::]);
+    "127.0.0.1" binds loopback only. A PRESENT-BUT-EMPTY PROXY_BIND
+    (`PROXY_BIND=` in the env file, or an EnvironmentFile line whose value
+    was blanked) must NOT fall through to the empty string — the `or`
+    idiom (deliberately not `.get()`'s own default, which would honour an
+    empty value AS empty) catches both "unset" and "set-but-empty" the
+    same way and resolves both to loopback. All-interfaces stays the
+    explicit PROXY_BIND=0.0.0.0 opt-in — a deliberate, recorded reversal of
+    the W1 "never normalise an idiom" position, for this one site."""
+    raw = os.environ.get("PROXY_BIND", "")
+    resolved = raw.strip() or "127.0.0.1"
+    if "PROXY_BIND" in os.environ and not raw.strip():
+        log.warning(
+            "PROXY_BIND is set but empty — falling back to 127.0.0.1 "
+            "(loopback), never all-interfaces. Set PROXY_BIND=0.0.0.0 "
+            "explicitly to opt into all-interfaces binding.")
+    return resolved
+
+
 async def main() -> None:
     # RULED (Xenofon, 2026-08-14): a plaintext AGENT_TOKENS entry refuses
     # gateway startup outright, from v0.9.3 — before anything else stands
@@ -5772,7 +5797,7 @@ async def main() -> None:
     # Bind to localhost by default. Set PROXY_BIND=0.0.0.0 to opt into
     # all-interfaces binding — only safe over an encrypted overlay network
     # (Tailscale, WireGuard) or behind TLS. Bearer tokens are plaintext over HTTP.
-    bind_host = os.environ.get("PROXY_BIND", "127.0.0.1")
+    bind_host = _resolve_proxy_bind_host()
     site = web.TCPSite(runner, bind_host, PORT)
     await site.start()
 

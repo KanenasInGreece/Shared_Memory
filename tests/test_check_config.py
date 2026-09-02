@@ -579,8 +579,10 @@ def test_would_refuse_line_and_role_errors_never_leak_a_raw_credential(tmp_path)
 #    table, not a second, hand-written authority in this script. ───────────
 
 def test_proxy_bind_idiom_comes_from_the_framework_defaults_table():
+    """SEC H (R-3, RULED 2026-09-02): idiom flipped "get" -> "or" — see
+    framework_defaults.py's PROXY_BIND row note."""
     assert check_config._idiom_for("PROXY_BIND") == framework_defaults.FRAMEWORK_DEFAULTS["PROXY_BIND"]["idiom"]
-    assert framework_defaults.FRAMEWORK_DEFAULTS["PROXY_BIND"]["idiom"] == "get"
+    assert framework_defaults.FRAMEWORK_DEFAULTS["PROXY_BIND"]["idiom"] == "or"
     assert not hasattr(check_config, "_PROXY_BIND_IDIOM"), (
         "the fold round deleted this hand-written special case — it must not come back")
 
