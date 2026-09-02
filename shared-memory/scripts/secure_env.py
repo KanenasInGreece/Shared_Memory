@@ -152,6 +152,21 @@ _SECRET_SUFFIXES = (
 # harness that owns the module's lifetime (see the test file's fixture).
 _dynamic_secret_names: set[str] = set()
 
+# D.1 (SEC round, ADV1-2): set by _token_env_names() on a genuine parse
+# failure of a non-empty LLM_BACKENDS_JSON (invalid JSON, or valid JSON that
+# is not an array) -- consulted by require_llm_backends_json_parses() below.
+# _token_env_names() itself must NEVER raise (load_split_env() runs at
+# module IMPORT time in hive_mind_proxy.py/rem_loop.py/consolidation_loop.py,
+# and every test in this repo imports those modules freely, many with a
+# deliberately malformed env) -- this flag is how a parse failure that must
+# stay silent at import time still becomes a LOUD, named refusal at the
+# actual entrypoint (main()/a daemon's __main__ guard), same placement
+# pattern as require_db_credentials(). Reset on every call so a LATER,
+# corrected LLM_BACKENDS_JSON (an operator's fix, or a test re-invoking
+# load_split_env() with a clean value) clears a stale failure rather than
+# wedging every subsequent check permanently fatal.
+_llm_backends_json_parse_failed: bool = False
+
 # In-process only. Populated by load_split_env(); read by get_secret(). Never
 # written to os.environ and never handed to a subprocess env dict wholesale —
 # see hive_mind_proxy._daemon_env(), which filters by is_secret_key() instead
@@ -171,16 +186,89 @@ _advised_exec_env_names: set[str] = set()
 _advised_ignored_file_pointer_names: set[str] = set()
 
 
+def _normalize_key(name: str) -> str:
+    """Fix round F11 (SEC1 MED-7 + LOW-8): THE one key normaliser every
+    classification/lookup site in this module uses — is_secret_key(),
+    _token_env_names()'s storage insert, get_secret()'s canonical fallback,
+    load_split_env()'s canonical collapse, and both derived-candidate
+    helpers. Strips BOM (U+FEFF) and whitespace from both ends, in EITHER
+    order and any interleaving, then upper-cases.
+
+    Why a loop instead of one `.strip().lstrip("﻿")` (or the reverse)
+    pass: a single fixed order only handles ONE of the two orderings a raw
+    line can carry. Probed (SEC1 finding 8): "﻿ AGENT_TOKENS" (BOM
+    THEN space) needs BOM stripped first, or the space survives as a
+    leftover middle character once lstrip("﻿") alone is applied
+    second; " ﻿AGENT_TOKENS" (space THEN BOM) needs the reverse order.
+    A fixed single-order strip therefore classifies the SAME logical key
+    (AGENT_TOKENS with incidental BOM/whitespace noise) as secret on one
+    side and config on the other, depending only on which order that
+    particular caller happened to use. This loop strips whichever
+    character is at each end, repeatedly, so both orderings — and any
+    number of repeats — normalise identically."""
+    s = name
+    while s and (s[0].isspace() or s[0] == "﻿"):
+        s = s[1:]
+    while s and (s[-1].isspace() or s[-1] == "﻿"):
+        s = s[:-1]
+    return s.upper()
+
+
+_EXPORT_PREFIX_RE = re.compile(r"^export\s+", re.IGNORECASE)
+
+
+def _strip_export_prefix(key: str) -> str:
+    """Fix round F5 (SEC1 HIGH-3 + MED-5): strip an optional leading shell
+    `export ` keyword — CASE-INSENSITIVELY — from a raw .env line's key
+    text, at PARSE time, before it is stored anywhere or classified.
+    "export AGENT_TOKENS=..." / "EXPORT AGENT_TOKENS=..." both become the
+    classifiable key "AGENT_TOKENS", exactly as a plain "AGENT_TOKENS=..."
+    line would. Without this, the stored key was the literal string
+    "export AGENT_TOKENS" — not in KNOWN_SECRET_NAMES (exact-match only)
+    and not matching the "_TOKEN" suffix (it ends in "TOKENS", the plural,
+    with "export " still attached) — so a shell-sourceable .env using this
+    legitimate form had its registry exported straight into os.environ,
+    fail-OPEN on the exact form D.4 had just finished blessing on the MCP
+    detection side. BOM/whitespace is stripped before AND after the prefix
+    check, since either can precede or follow the keyword."""
+    s = name = key
+    while s and (s[0].isspace() or s[0] == "﻿"):
+        s = s[1:]
+    s = _EXPORT_PREFIX_RE.sub("", s, count=1)
+    while s and (s[0].isspace() or s[0] == "﻿"):
+        s = s[1:]
+    return s
+
+
 def is_secret_key(name: str) -> bool:
     """True if `name` must never be exported to os.environ or forwarded into
     a child process environment — the known-config allowlist (checked first,
     so it always wins), then the known-name list / dynamically-discovered
-    token_env names, then the suffix pattern (case-insensitive, fix #6)."""
-    if name in KNOWN_CONFIG_NAMES:
+    token_env names, then the suffix pattern (case-insensitive, fix #6).
+
+    D.2 (SEC round, ADV1-3): `name` is normalised ONCE, here, before every
+    comparison, via the shared _normalize_key() (F11 — strip surrounding
+    whitespace and a stray leading BOM, U+FEFF, in either order; upper-
+    case). Before this fix the exact-match checks (KNOWN_CONFIG_NAMES /
+    KNOWN_SECRET_NAMES / _dynamic_secret_names) compared the RAW candidate,
+    so a lowercase or BOM-prefixed spelling of a well-known name (a
+    lowercase `agent_tokens=` line, in particular — AGENT_TOKENS does not
+    even match the suffix pattern, since it ends in the PLURAL "_TOKENS",
+    not "_TOKEN") fell through every check and was misclassified as
+    ordinary config, then exported to os.environ by load_split_env()'s
+    config loop and forwarded into a daemon's child env by _daemon_env().
+    Both callers already pass this same normalised form to
+    _dynamic_secret_names (see _token_env_names below) and to
+    load_split_env()'s own storage key (see the CANONICAL-key comment
+    there), so this is the matching normalisation on the lookup side —
+    fixing only one side would be a classification INVERSION (ADV1-3), not
+    a fix."""
+    key_norm = _normalize_key(name)
+    if key_norm in KNOWN_CONFIG_NAMES:
         return False
-    if name in KNOWN_SECRET_NAMES or name in _dynamic_secret_names:
+    if key_norm in KNOWN_SECRET_NAMES or key_norm in _dynamic_secret_names:
         return True
-    return name.upper().endswith(_SECRET_SUFFIXES)
+    return key_norm.endswith(_SECRET_SUFFIXES)
 
 
 def _token_env_names(raw_json: str) -> set[str]:
@@ -189,22 +277,86 @@ def _token_env_names(raw_json: str) -> set[str]:
     doesn't happen to match the suffix pattern. Malformed/absent JSON yields
     an empty set; hive_mind_proxy._load_llm_backends() does the real
     (stricter) validation later — this is classification only, and must not
-    raise on input it will reject anyway."""
+    raise on input it will reject anyway.
+
+    D.1 (SEC round, ADV1-2): a genuine parse failure of a NON-EMPTY
+    raw_json — invalid JSON, or valid JSON that isn't a list — sets the
+    module-level _llm_backends_json_parse_failed flag (still returning the
+    empty set; this function must never raise). An absent/empty raw_json is
+    NOT a failure (nothing was ever declared) and clears the flag, as does a
+    later call that parses cleanly — so a corrected value (an operator's
+    fix, or a test's own re-invocation with a clean env) un-wedges the
+    fatal-at-main() check require_llm_backends_json_parses() enforces below.
+
+    D.2 (ADV1-3): every discovered name is normalised (see is_secret_key's
+    docstring) BEFORE it lands in _dynamic_secret_names, so a lowercase or
+    BOM-prefixed `token_env` value classifies correctly regardless of the
+    case is_secret_key() is later asked about."""
+    global _llm_backends_json_parse_failed
     names: set[str] = set()
     if not raw_json:
+        _llm_backends_json_parse_failed = False
         return names
     try:
         entries = json.loads(raw_json)
     except (json.JSONDecodeError, ValueError):
+        _llm_backends_json_parse_failed = True
         return names
     if not isinstance(entries, list):
+        _llm_backends_json_parse_failed = True
         return names
+    _llm_backends_json_parse_failed = False
     for entry in entries:
         if isinstance(entry, dict):
             token_env = entry.get("token_env")
             if isinstance(token_env, str) and token_env:
-                names.add(token_env)
+                names.add(_normalize_key(token_env))
     return names
+
+
+def llm_backends_json_parse_failed() -> bool:
+    """True iff the most recent load_split_env() call found a non-empty
+    LLM_BACKENDS_JSON that failed to parse as a JSON array (D.1). Consulted
+    by require_llm_backends_json_parses(), never by classification logic
+    itself."""
+    return _llm_backends_json_parse_failed
+
+
+def require_llm_backends_json_parses(daemon_name: str) -> None:
+    """FATAL, one line, naming LLM_BACKENDS_JSON — D.1 (SEC round, ADV1-2).
+
+    Call from hive_mind_proxy.main() and each daemon's own __main__ guard
+    ONLY, matching require_db_credentials()'s established placement: every
+    test in this repo imports these modules with a malformed
+    LLM_BACKENDS_JSON on purpose (to test hive_mind_proxy's OWN, separate,
+    non-fatal fallback-to-legacy-pool handling of the same malformed value —
+    see _load_llm_backends() and check_config.py's
+    test_llm_pool_fallback_reason_is_rendered_prominently_and_exit_stays_0),
+    so an unconditional check at import time would kill test collection AND
+    contradict that RULED, exit-stays-0 behaviour. This function is never
+    called from check_config.py for exactly that reason — check_config is an
+    audit tool that must keep reporting on a config the gateway would
+    refuse, per its own established architecture (A.4's identical exclusion
+    for require_no_backend_url_credentials()).
+
+    Why this refusal exists at all rather than leaving the existing
+    fallback-to-legacy behaviour as the whole story: a malformed
+    LLM_BACKENDS_JSON silently loses every dynamically-discovered
+    token_env name (_token_env_names() returns an empty set on a parse
+    failure, by design — it must never raise), so a provider key whose name
+    doesn't happen to match the suffix pattern stays classified as ordinary
+    config and can reach _daemon_env()'s copy set into a spawned daemon's
+    child environment — a fail-OPEN specifically because the developer typo'd
+    a comma, not because they intended plaintext delivery. Refusing to start
+    at all closes that path outright rather than degrading it.
+    """
+    if llm_backends_json_parse_failed():
+        raise SystemExit(
+            f"FATAL ({daemon_name}): LLM_BACKENDS_JSON is set but is not "
+            "valid JSON (or not a JSON array) — fix the syntax (a trailing "
+            "comma or an unescaped quote is the usual cause) or unset the "
+            "variable entirely."
+        )
 
 
 # R1 (fix round 1, Opus review, probe-confirmed): hard ceiling on a single
@@ -544,18 +696,29 @@ def _derive_file_pointer_candidates(file_values: dict) -> set[str]:
     ambient name on EVERY `load_split_env()` call, un-deduplicated — probe-
     confirmed live on `SSL_CERT_FILE`/`GIT_INDEX_FILE`. De-duplicated per
     process via `_advised_ignored_file_pointer_names`, the same pattern
-    `_advised_exec_env_names` already uses for the SEC-06 (ii) advisory."""
+    `_advised_exec_env_names` already uses for the SEC-06 (ii) advisory.
+
+    Fix round F12 (SEC1 LOW-9): the `_FILE` suffix check used to be exact-
+    case (`name.endswith("_FILE")`), so a lowercase `agent_tokens_file=`
+    line's actual suffix ("_file") never matched at all — the pointer was
+    silently ignored with no candidate derived and no warning (the warning
+    branch is also suffix-gated, so it never fired either). Now case-folds
+    each candidate name via _normalize_key() (F11) before the suffix check,
+    same as every other classification site in this module."""
     candidates: set[str] = set()
-    for name in set(os.environ) | set(file_values):
-        if not name.endswith("_FILE"):
+    file_keys_canonical = set(file_values)   # already canonical (F6 collapse)
+    for name in set(os.environ) | file_keys_canonical:
+        key_candidate = _normalize_key(name)
+        if not key_candidate.endswith("_FILE"):
             continue
-        key = name[: -len("_FILE")]
+        key = key_candidate[: -len("_FILE")]
         if not key:
             continue
         if is_secret_key(key):
             candidates.add(key)
-        elif name in file_values and name not in _advised_ignored_file_pointer_names:
-            _advised_ignored_file_pointer_names.add(name)
+        elif (key_candidate in file_keys_canonical
+              and key_candidate not in _advised_ignored_file_pointer_names):
+            _advised_ignored_file_pointer_names.add(key_candidate)
             print(f"[secure_env] WARNING: {name} is set, but {key!r} is not "
                   f"classified as a secret — its _FILE pointer is ignored "
                   f"(only a secret-classified key can be delivered this way)",
@@ -645,6 +808,24 @@ def load_split_env() -> None:
     headless systemd deployment with NO plaintext shared-memory/.env at all
     can resolve ANY secret-classified credential purely from
     LoadCredential=/_FILE — not only the ones on the fixed list.
+
+    Fix round F5/F6 (SEC1 HIGH-3/MED-5, HIGH-4): each raw line's key has an
+    optional leading `export ` keyword stripped (case-insensitively, via
+    _strip_export_prefix — F5) before it is stored anywhere, so
+    "export AGENT_TOKENS=..."/"EXPORT AGENT_TOKENS=..." classify exactly
+    like a plain "AGENT_TOKENS=..." line. `file_values` (F6) is now
+    collapsed to CANONICAL keys ONCE, here, with the file's own last
+    definition winning deterministically for a given canonical key — before
+    this fix, two case-variant spellings of the same secret competed for
+    the storage slot via SET ITERATION ORDER (`candidate_secret_keys` is a
+    set), not file order, so which line won was unspecified and could even
+    be a STALE line despite a later correction in the same file. This is
+    ALSO the fix for F4 (SEC1 HIGH-2): `LLM_BACKENDS_JSON`'s own file-value
+    read used to be an exact-case `file_values.get("LLM_BACKENDS_JSON")`,
+    so a `llm_backends_json=`/BOM-prefixed spelling was invisible — read as
+    ABSENT, not malformed, bypassing D.1's refusal entirely and leaking any
+    token_env-named provider key the JSON declared. With `file_values`
+    already canonical, the same exact-case read now sees every spelling.
     """
     env_path = _select_env_file()
 
@@ -655,22 +836,38 @@ def load_split_env() -> None:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, _, val = line.partition("=")
-            raw_pairs.append((key.strip(), val.strip()))
+            key = _strip_export_prefix(key).strip()
+            if not key:
+                continue
+            raw_pairs.append((key, val.strip()))
 
-    # Review fix #2: the EFFECTIVE LLM_BACKENDS_JSON — os.environ first (an
-    # operator/systemd-exported value, the documented provider-key delivery
-    # path — AGENTS.md / ops/README.md), the file second. Same precedence as
-    # get_secret() (fix #1): an exported value always wins. Computed even
-    # when no .env file exists at all, since the mainline case is an
-    # exec-env-only deployment.
-    file_values = dict(raw_pairs)
+    # F6: collapse to canonical keys ONCE, before anything else reads
+    # `file_values` — deterministically LAST-DEFINITION-WINS (file order),
+    # regardless of which case variant each line used. Every downstream
+    # consumer of `file_values` (the LLM_BACKENDS_JSON read just below, and
+    # the secret-resolution loop further down) now sees one unambiguous
+    # value per canonical key instead of racing a set's iteration order.
+    file_values: dict[str, str] = {}
+    for key, val in raw_pairs:
+        file_values[_normalize_key(key)] = val
+
+    # Review fix #2 (F4 fixed, see docstring above): the EFFECTIVE
+    # LLM_BACKENDS_JSON — os.environ first (an operator/systemd-exported
+    # value, the documented provider-key delivery path — AGENTS.md /
+    # ops/README.md), the file second (now canonical — any spelling is
+    # SEEN). Same precedence as get_secret() (fix #1): an exported value
+    # always wins. Computed even when no .env file exists at all, since the
+    # mainline case is an exec-env-only deployment.
     llm_json = os.environ.get("LLM_BACKENDS_JSON") or file_values.get("LLM_BACKENDS_JSON", "")
     _dynamic_secret_names.update(_token_env_names(llm_json))
 
     # Config keys: unchanged from every prior release — setdefault into
-    # os.environ. Secret-classified keys are skipped here entirely; they are
-    # resolved below, through the three-tier secret path instead (SEC-06 i:
-    # they must never touch os.environ by any route, including this one).
+    # os.environ, under the RAW (export-stripped, but not case-folded)
+    # spelling raw_pairs carries, so an operator's own literal config-var
+    # casing survives. Secret-classified keys are skipped here entirely;
+    # they are resolved below, through the three-tier secret path instead
+    # (SEC-06 i: they must never touch os.environ by any route, including
+    # this one).
     for key, val in raw_pairs:
         if not is_secret_key(key):
             os.environ.setdefault(key, val)
@@ -686,20 +883,40 @@ def load_split_env() -> None:
     # and DEEPSEEK_API_KEY_FILE, both of which resolved to None even with the
     # file present, readable, and correctly formatted.
     candidate_secret_keys = (
-        {k for k, _ in raw_pairs if is_secret_key(k)}
+        {k for k in file_values if is_secret_key(k)}
         | KNOWN_SECRET_NAMES
         | _dynamic_secret_names
         | _derive_file_pointer_candidates(file_values)
         | _derive_credentials_directory_candidates()
     )
+    # D.2 (ADV1-3), storage key canonicalisation: `key` here can be ANY case
+    # a candidate arrived in (KNOWN_SECRET_NAMES / the dynamic token_env set
+    # / the two derived-candidate helpers are already canonical; `file_values`
+    # is now ALSO already canonical, per F6 above). $CREDENTIALS_DIRECTORY/
+    # <key> and <KEY>_FILE are resolved against the CANONICAL form — the
+    # systemd/Docker convention both already assume an upper-case env-var
+    # name, and this is what lets a lowercase `agent_tokens=` line's implied
+    # `AGENT_TOKENS_FILE` pointer resolve too. The plaintext .env value
+    # itself is looked up under that SAME canonical form — `file_values` no
+    # longer holds any other spelling to look up. The STORE is always the
+    # canonical form: get_secret("AGENT_TOKENS") (used throughout this
+    # codebase as a fixed upper-case literal) must reach a value that was
+    # declared as `agent_tokens=` in the .env file, not silently miss it
+    # because load_split_env() filed it under the raw spelling instead —
+    # exactly the bug ADV1-3 describes ("auth silently turns off on that
+    # install"). setdefault() is still what keeps this additive: the first
+    # TIER to resolve for a given canonical key wins (unchanged); F6 is what
+    # makes the plaintext-.env TIER itself deterministic when two spellings
+    # of the same key are both present.
     for key in candidate_secret_keys:
-        value = _credentials_directory_secret(key)
+        canonical = _normalize_key(key)
+        value = _credentials_directory_secret(canonical)
         if value is None:
-            value = _file_indirection_secret(key, file_values)
+            value = _file_indirection_secret(canonical, file_values)
         if value is None:
-            value = file_values.get(key)
+            value = file_values.get(canonical)
         if value is not None:
-            _secrets.setdefault(key, value)
+            _secrets.setdefault(canonical, value)
 
     _warn_secrets_in_exec_environment(candidate_secret_keys)
 
@@ -717,11 +934,51 @@ def get_secret(name: str, default: "str | None" = None) -> "str | None":
     checkout that also has a real shared-memory/.env, that made
     os.environ-based configuration of a secret key unreachable — including
     coordinator.py's own AGENT_TOKENS test pattern.
-    """
+
+    D.2 (ADV1-3) canonical fallback: an EXACT match on `name` (os.environ)
+    is tried FIRST and unconditionally wins — this preserves every existing
+    exact-case caller byte for byte, including a dynamic token_env lookup
+    that legitimately uses a non-canonical spelling. Only when THAT misses
+    does this fall back to the CANONICAL (stripped/BOM-stripped/upper-cased)
+    form of `name` in os.environ, then the exact form in the in-process
+    store, then the canonical form there — which is where load_split_env()
+    now always stores a secret it resolved (see the storage-key
+    canonicalisation note there). Without the exact-vs-canonical fallback,
+    get_secret("AGENT_TOKENS") (used throughout this codebase as a fixed
+    upper-case literal) would never see a value the .env file declared as
+    `agent_tokens=`, even though is_secret_key() now correctly classifies it
+    as secret and keeps it out of os.environ.
+
+    Fix round F3 (SEC1 HIGH-1): the lookup order used to check the in-
+    process store (`_secrets`, exact match) BEFORE the canonical form of
+    os.environ — so a value the deployer's .env file resolved into
+    `_secrets` won over a case-variant value the OPERATOR had exported
+    directly into the process environment. Probed exactly as SEC1 measured
+    it: `_secrets["AGENT_TOKENS"]="from-file"` +
+    `os.environ["agent_tokens"]="from-operator"` must return
+    "from-operator", never "from-file". The operator's own environment must
+    always beat the file store, at BOTH the exact and the canonical step —
+    this reorders the four checks so every os.environ tier (exact, then
+    canonical) runs before either _secrets tier.
+
+    The os.environ CANONICAL step is a case-insensitive SCAN of
+    os.environ's actual key names, not a second exact lookup of
+    `canonical(name)` — os.environ is a real, case-SENSITIVE mapping on
+    POSIX (confirmed: setting `os.environ["agent_tokens"]` leaves
+    `"AGENT_TOKENS" in os.environ` False), so a fixed-case second lookup
+    can never find a genuinely lowercase operator export in the first
+    place. A second exact-match probe would silently do nothing; the
+    fallback this docstring promises requires actually looking."""
     if name in os.environ:
         return os.environ[name]
+    canonical = _normalize_key(name)
+    for env_key, env_val in os.environ.items():
+        if _normalize_key(env_key) == canonical:
+            return env_val
     if name in _secrets:
         return _secrets[name]
+    if canonical in _secrets:
+        return _secrets[canonical]
     return default
 
 

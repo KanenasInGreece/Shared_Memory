@@ -21,8 +21,12 @@
 # backend is reported healthy right now). Run after first install (AGENTS.md
 # Phase 9) and after every upgrade:
 #
-#   export AGENT_TOKEN=...   # auth-on installs: any minted agent token,
-#                            # from that agent's skill .env
+#   # auth-on installs: read AGENT_TOKEN from a minted agent's skill .env —
+#   # NEVER `. file` (EXECUTES it) and never cat/grep it (fact:1499). Example
+#   # for Claude's skill path (swap in ~/.grok/, ~/.codex/, ~/.gemini/ for
+#   # another agent install):
+#   AGENT_ENV=${AGENT_ENV:-$HOME/.claude/skills/shared-memory/.env}
+#   AGENT_TOKEN=$(sed -n 's/^AGENT_TOKEN=//p' "$AGENT_ENV" | head -1); export AGENT_TOKEN
 #   bash shared-memory/scripts/postflight.sh
 
 set -uo pipefail   # not -e: we run every assertion and summarise, never abort early
@@ -410,10 +414,16 @@ print(",".join(k for k in ("daemon", "backend_capability", "config") if k not in
             # token in BOTH modes (it is a live gateway call regardless of
             # community_summaries state), so it is marked unconditionally,
             # the same way A5 already is.
+            # Fix round F9 (QA MED-4): the message used to instruct pasting
+            # the raw token straight onto an `export` line — followed
+            # literally with a real minted token typed in, that puts the
+            # bearer on the command line and in shell history. Points at
+            # postflight.md's own non-executing read shape (AGENT_ENV +
+            # sed) instead, the same fix AGENTS.md already carries.
             if [[ "$POSTFLIGHT_MODE" == "re-baseline" ]]; then
-                bad A1 "auth is configured but AGENT_TOKEN is not set — export AGENT_TOKEN=<any minted agent token, from that agent's skill .env> and re-run. A5, A6 and A8 are skipped for this same missing token (A4 needs no token in re-baseline mode)."
+                bad A1 "auth is configured but AGENT_TOKEN is not set — read it from a minted agent's skill .env per postflight.md's Quick Start (AGENT_ENV + sed, never a pasted export) and re-run. A5, A6 and A8 are skipped for this same missing token (A4 needs no token in re-baseline mode)."
             else
-                bad A1 "auth is configured but AGENT_TOKEN is not set — export AGENT_TOKEN=<any minted agent token, from that agent's skill .env> and re-run. A4, A5, A6 and A8 are skipped for this same missing token."
+                bad A1 "auth is configured but AGENT_TOKEN is not set — read it from a minted agent's skill .env per postflight.md's Quick Start (AGENT_ENV + sed, never a pasted export) and re-run. A4, A5, A6 and A8 are skipped for this same missing token."
                 afail[A4]=1
             fi
             token_missing=1

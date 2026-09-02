@@ -11,14 +11,18 @@ Coverage:
   - source overwrite via authenticated_agent on request
 """
 
+import asyncio
 import hashlib
 import importlib.util
+import json
 import logging
 import os
 import sys
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiohttp.test_utils import TestClient, TestServer
+from yarl import URL
 
 
 def _digest(token: str) -> str:
@@ -342,6 +346,85 @@ async def test_auth_middleware_pool_status_trailing_slash_is_NOT_exempt():
         await mod.auth_middleware(req, _noop_handler)
 
 
+# ── F (S4): token-oracle audit on the UNPROTECTED-path branch ───────────────
+# These run inside a running event loop (@pytest.mark.asyncio), so the
+# credential-audit writer's WRITE goes through its async queue+drain path
+# rather than the synchronous fallback — assertions here stick to the
+# in-memory COUNTER (immediately observable either way) and the RESPONSE
+# CONTRACT, never a file read. File-based assertions on the audit LINE
+# itself (event name, digest-only, bucket isolation) live in
+# tests/test_credential_audit_trail.py, run without a loop so the
+# synchronous fallback applies.
+
+@pytest.mark.asyncio
+async def test_auth_middleware_bad_bearer_on_health_counts_and_response_unchanged():
+    mod = load_coordinator("claude:tok_abc")
+    req = _make_request("/health", auth_header="Bearer tok_wrong", method="GET")
+    resp = await mod.auth_middleware(req, _noop_handler)
+    assert resp.status == 200, (
+        "a bad bearer on an unprotected path must still reach the handler "
+        "unchanged -- auditing is a side effect, never a gate"
+    )
+    assert mod._credential_counters["token_verify_failed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_bad_bearer_lowercase_scheme_on_health_also_counted():
+    """ADV2-15: the scheme match for THIS audit is case-insensitive, unlike
+    the protected-path identity resolver."""
+    mod = load_coordinator("claude:tok_abc")
+    req = _make_request("/health", auth_header="bearer tok_wrong", method="GET")
+    resp = await mod.auth_middleware(req, _noop_handler)
+    assert resp.status == 200
+    assert mod._credential_counters["token_verify_failed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_valid_bearer_on_health_not_audited():
+    mod = load_coordinator("claude:tok_abc")
+    req = _make_request("/health", auth_header="Bearer tok_abc", method="GET")
+    resp = await mod.auth_middleware(req, _noop_handler)
+    assert resp.status == 200
+    assert mod._credential_counters["token_verify_failed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_no_header_on_health_not_audited():
+    mod = load_coordinator("claude:tok_abc")
+    req = _make_request("/health", method="GET")  # no Authorization header at all
+    resp = await mod.auth_middleware(req, _noop_handler)
+    assert resp.status == 200
+    assert mod._credential_counters["token_verify_failed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_bad_bearer_on_pool_status_also_counted():
+    mod = load_coordinator("claude:tok_abc")
+    req = _make_request("/pool/status", auth_header="Bearer tok_wrong", method="GET")
+    resp = await mod.auth_middleware(req, _noop_handler)
+    assert resp.status == 200
+    assert mod._credential_counters["token_verify_failed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_bad_bearer_on_unprotected_then_protected_each_record_once():
+    """No cross-talk: an unprotected-path failure and a protected-path
+    failure each bump the shared counter exactly once -- neither double-
+    counts nor suppresses the other."""
+    from aiohttp.web_exceptions import HTTPUnauthorized
+    mod = load_coordinator("claude:tok_abc")
+
+    req1 = _make_request("/health", auth_header="Bearer tok_wrong", method="GET")
+    resp = await mod.auth_middleware(req1, _noop_handler)
+    assert resp.status == 200
+
+    req2 = _make_request("/memory/save", auth_header="Bearer tok_wrong")
+    with pytest.raises(HTTPUnauthorized):
+        await mod.auth_middleware(req2, _noop_handler)
+
+    assert mod._credential_counters["token_verify_failed"] == 2
+
+
 # ── auth_middleware — valid token ─────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -426,6 +509,142 @@ async def test_auth_middleware_mixed_registry_both_forms_authenticate():
     req2 = _make_request("/memory/save", auth_header="Bearer tok_xyz")
     resp2 = await mod.auth_middleware(req2, _noop_handler)
     assert resp2.status == 200
+
+
+# ── Fix round F10 (QA MED-5): F's WIRE contract, composed through the real
+#    app — auth_middleware + the real handle_health, driven over a real
+#    socket (aiohttp TestClient/TestServer, per the ground rule: this is NOT
+#    port binding). The tests above call auth_middleware directly with
+#    _noop_handler, which proves the middleware's side effect and its OWN
+#    return value, but never observes a /health BODY at all — the payload
+#    half rested entirely on test_health_anonymous_slimming.py, which calls
+#    handle_health() directly and never runs it through auth_middleware. A
+#    future change that made the audit branch consume the request or mutate
+#    headers would have passed the whole suite. These three tests close
+#    that gap: anonymous and bad-bearer both get the SLIM 3-key shape
+#    byte-unchanged, a valid bearer gets the FULL payload — through the
+#    actual composed path a real request takes.
+
+class _HealthWireProbeResp:
+    status = 200
+
+
+class _HealthWireProbeCm:
+    async def __aenter__(self):
+        return _HealthWireProbeResp()
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _HealthWireProbeSession:
+    """No real network, no port — mirrors test_health_anonymous_slimming.py's
+    _HealthProbeSession: every upstream probe (embedder/reranker/backend
+    /health, /v1/models) just reports 200, so the composed handler reaches
+    HTTP 200 without needing a real LLM backend or a listening socket."""
+    def get(self, url, timeout=None, headers=None, **_kw):
+        return _HealthWireProbeCm()
+
+
+def _load_health_wire_gateway(monkeypatch, agent_tokens: str):
+    """Same reload order/idiom as test_auth_exemption_route_resolution.py's
+    _load_gateway — coordinator first (so AUTH_CONFIGURED_AT_STARTUP is
+    captured from THIS env), then hive_mind_proxy (which binds auth_
+    middleware from coordinator at import time, so both must be the SAME
+    module objects a private-spec load would not give).
+
+    Every env mutation goes through `monkeypatch` — NOT a direct os.environ
+    write — so it reverts automatically at test teardown. A prior cut of
+    this helper used `os.environ.setdefault("LLM_BACKENDS_JSON", "")`
+    directly; that leaked a present-but-empty LLM_BACKENDS_JSON into the
+    REAL process environment, which a later, unrelated subprocess-based
+    check_config.py test then inherited (`_run()`'s `env = dict(os.environ)`
+    copies the live parent environment) — an extra W4 "latent case" that
+    made `test_w4_census_counts_present_but_empty_encoder_key` fail only
+    when run as part of the full suite, never in isolation."""
+    scripts_dir = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts")
+    )
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import secure_env
+    secure_env._secrets.pop("AGENT_TOKENS", None)
+    if agent_tokens:
+        monkeypatch.setenv("AGENT_TOKENS", agent_tokens)
+    else:
+        monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    monkeypatch.delenv("LLM_BACKENDS_JSON", raising=False)
+    monkeypatch.delenv("LLM_BACKENDS", raising=False)
+    import coordinator
+    importlib.reload(coordinator)
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    g._daemon_healthy = True
+    g._rem_healthy = True
+    return coordinator, g
+
+
+def _build_health_wire_app(c, g):
+    """The real auth_middleware in front of the real handle_health — the
+    exact composition a live request takes (mirrors hive_mind_proxy.main()'s
+    own app-building order for these two pieces)."""
+    from aiohttp import web
+    app = web.Application(middlewares=[c.auth_middleware])
+    proxy = g.AsyncHiveMindProxy()
+    proxy.session = _HealthWireProbeSession()
+    app["proxy"] = proxy
+    app.router.add_get("/health", g.handle_health)
+    return app
+
+
+async def _probe_health_wire(app, *, token=None):
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        resp = await client.request("GET", URL("/health", encoded=True), headers=headers)
+        body = await resp.read()
+        return resp.status, json.loads(body)
+    finally:
+        await client.close()
+
+
+def test_wire_anonymous_get_health_is_slim_and_unaudited(monkeypatch):
+    c, g = _load_health_wire_gateway(monkeypatch, "claude:tok_wire_abc")
+    app = _build_health_wire_app(c, g)
+    status, body = asyncio.run(_probe_health_wire(app))
+    assert status == 200
+    assert set(body.keys()) == {"status", "version", "api_version"}
+    assert c._credential_counters["token_verify_failed"] == 0
+
+
+def test_wire_bad_bearer_get_health_is_slim_byte_unchanged_and_audited(monkeypatch):
+    """F's whole point, at the wire: a bad bearer on /health is audited as
+    a side effect, but the RESPONSE the client actually receives is
+    byte-identical to the anonymous slim shape — auditing never gates."""
+    c, g = _load_health_wire_gateway(monkeypatch, "claude:tok_wire_abc")
+    app_anon = _build_health_wire_app(c, g)
+    status_anon, body_anon = asyncio.run(_probe_health_wire(app_anon))
+
+    c2, g2 = _load_health_wire_gateway(monkeypatch, "claude:tok_wire_abc")
+    app_bad = _build_health_wire_app(c2, g2)
+    status_bad, body_bad = asyncio.run(_probe_health_wire(app_bad, token="tok_wrong"))
+
+    assert status_bad == status_anon == 200
+    assert body_bad == body_anon
+    assert set(body_bad.keys()) == {"status", "version", "api_version"}
+    assert c2._credential_counters["token_verify_failed"] == 1
+
+
+def test_wire_valid_bearer_get_health_is_the_full_payload(monkeypatch):
+    c, g = _load_health_wire_gateway(monkeypatch, "claude:tok_wire_abc")
+    app = _build_health_wire_app(c, g)
+    status, body = asyncio.run(_probe_health_wire(app, token="tok_wire_abc"))
+    assert status == 200
+    assert set(body.keys()) != {"status", "version", "api_version"}
+    assert "llm_backends" in body or "dependencies" in body
+    assert c._credential_counters["token_verify_failed"] == 0
 
 
 def test_lookup_agent_by_token_uses_hmac_compare_digest(monkeypatch):

@@ -159,7 +159,7 @@ FRAMEWORK_DEFAULTS = MappingProxyType({
         "default": "",
         "kind": "env-default",
         "idiom": "get",
-        "consumers": ("hive_mind_proxy.py:502-504 (_load_llm_backends fallback)",),
+        "consumers": ("hive_mind_proxy.py:693-731 (_load_llm_backends fallback)",),
         "note": (
             "An absent or empty LLM_BACKENDS falls back to a single-entry "
             "pool: [(LLM_DEFAULT_TARGET, 1.0)]. See the LLM_DEFAULT_TARGET "
@@ -202,8 +202,8 @@ FRAMEWORK_DEFAULTS = MappingProxyType({
     "PROXY_BIND": MappingProxyType({
         "default": "127.0.0.1",
         "kind": "documented-only",
-        "idiom": "get",
-        "consumers": ("hive_mind_proxy.py:5253 (bind_host)",),
+        "idiom": "or",
+        "consumers": ("hive_mind_proxy.py:5709 (_resolve_proxy_bind_host)",),
         "note": (
             "Set PROXY_BIND=0.0.0.0 to opt into all-interfaces binding. "
             "Carries an 'idiom' despite 'kind' being documented-only (no W1 "
@@ -211,7 +211,16 @@ FRAMEWORK_DEFAULTS = MappingProxyType({
             "field entry for why: check_config.py needs it to render an "
             "honest present-but-empty verdict, and a second, hand-written "
             "idiom table in that script would be exactly the duplicate "
-            "authority this module exists to prevent (fold-round item 4)."
+            "authority this module exists to prevent (fold-round item 4). "
+            "SEC H (R-3, RULED — Xenofon 2026-09-02, measured on glxvm): "
+            "flipped 'get' -> 'or'. TCPSite(runner, '', port) binds "
+            "ALL interfaces (0.0.0.0 + [::]), never loopback — so a "
+            "present-but-empty PROXY_BIND ('PROXY_BIND=' in the env file) "
+            "must fall back to the default exactly like an absent one, or "
+            "check_config would tell the operator empty means "
+            "all-interfaces while the gateway actually binds loopback. A "
+            "deliberate, recorded reversal of the W1 no-normalise "
+            "position, for this one site."
         ),
     }),
     "PORT": MappingProxyType({

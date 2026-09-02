@@ -8,6 +8,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import sys
 import ipaddress
 import urllib.parse
@@ -30,7 +31,9 @@ from multidict import CIMultiDict
 # private _load_env() that dumped the whole .env into os.environ, including
 # every secret it held. It is now the shared split loader also used by
 # rem_loop.py and consolidation_loop.py — see secure_env.py.
-from secure_env import load_split_env, get_secret, is_secret_key  # noqa: E402
+from secure_env import (  # noqa: E402
+    load_split_env, get_secret, is_secret_key, require_llm_backends_json_parses,
+)
 from log_hygiene import append_secure, secure_path, scrub_url_credentials, FILE_MODE  # noqa: E402
 from framework_defaults import FRAMEWORK_DEFAULTS  # noqa: E402
 # A-4: the ROLE RULE, from the module that owns it — never a bare _AGENT_ROLES
@@ -206,8 +209,127 @@ DEFAULT_TARGET = os.environ.get("LLM_DEFAULT_TARGET", FRAMEWORK_DEFAULTS["LLM_DE
 # `model` overrides the global LLM_MODEL for that backend only — see the model
 # rewrite in handle_proxy. See shared-memory/ops/README.md for how to get the
 # named var into the gateway's process env (systemd EnvironmentFile, etc.).
+def _backend_url_credential_error(url: str) -> "str | None":
+    """SEC A (R-1, fatal): flag a backend URL whose userinfo carries a
+    credential (`user:pass@host` or a bare `user@host`). Shared by BOTH
+    ingest paths — the LLM_BACKENDS_JSON per-entry loop and the legacy CSV
+    form — so neither can admit a credentialed URL string into the pool:
+    the framework's only accepted channel for a backend credential is
+    `token_env` (a NAME resolved from the gateway's own process env), never
+    a literal in the URL. A bare QUERY STRING is deliberately NOT flagged
+    here (R-2, refining the 2026-08-28 "userinfo/query" wording) — an
+    Azure-style `?api-version=` backend stays loadable; queries are instead
+    scrubbed from every RENDER (log_hygiene.scrub_url_credentials / item B),
+    accepting degraded per-backend dream attribution for such backends (none
+    in our own fleet) as the documented cost. Returns None for a clean URL,
+    else a scrubbed, human-readable message naming the offending URL —
+    scrubbed THROUGH the fixed (item C) scrub_url_credentials, never the raw
+    credential itself.
+
+    Fix round finding 6 (QA LOW): an unparseable URL used to fail OPEN
+    (`except Exception: return None`, i.e. "clean") — measured:
+    `urlsplit("http://u:p@[::1")` raises `ValueError: Invalid IPv6 URL`, so
+    that entry was admitted to the pool with its credential intact in
+    process state (renders were still safe — scrub_url_credentials's own
+    `except` redacts unconditionally — but this function's contract is
+    "refuse anything credential-shaped", and an unparseable string cannot be
+    proven clean). Now refuses instead."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except Exception:
+        return (
+            f"backend URL is unparseable — refusing (this framework never "
+            "guesses whether an unparseable URL string carries a credential; "
+            "fix the URL or use LLM_BACKENDS_JSON with a token_env instead)."
+        )
+    if parsed.username is None and parsed.password is None:
+        return None
+    return (
+        f"{scrub_url_credentials(url)}: URL embeds a credential in its userinfo "
+        "(user:pass@host or user@host) — this framework never accepts a "
+        "credential inside the URL string itself. Use token_env instead: the "
+        "backend gets its Authorization header from a NAMED env var already "
+        "exported in the gateway's own process environment (see "
+        "shared-memory/ops/README.md, 'Reasoning-LLM backends')."
+    )
+
+
+# SEC A.3 (ADV1-4 + ADV2-6): a finite numeric token, never bare float() (which
+# accepts "nan"/"inf" as valid weights — those must fall through to "the
+# whole entry is the URL" instead).
+_BACKEND_WEIGHT_TOKEN_RE = re.compile(r"^[+-]?\d+(\.\d+)?$")
+
+
 def _parse_backend(entry: str) -> tuple[str, float]:
-    url, _, w = entry.strip().partition("@")
+    """SEC A.3: split on the LAST "@" (rpartition), not the first
+    (ADV1-4 — the old `entry.partition("@")` mis-split a credentialed URL
+    like "http://u:p@h:8000" into url="http://u:p", weight=1.0, silently
+    discarding the real host AND leaving the URL's own userinfo behind as
+    if it were the whole url).
+
+    The tail is treated as a WEIGHT only when it is a finite numeric token
+    (see _BACKEND_WEIGHT_TOKEN_RE) AND `head` already reads as a
+    self-terminated authority: either a bare token with no scheme at all
+    (the plain "url@weight" legacy shorthand) or a "scheme://host:port" that
+    already carries an explicit port. Both conditions are necessary —
+    "head has no userinfo" ALONE cannot tell "http://a:5000@2" (host:port
+    already present -> unambiguously url@weight) apart from "http://user@10"
+    (no port -> "user" IS this URL's own credential, "10" its host): both
+    give `urlsplit(head).username is None`, confirmed by direct execution.
+    Getting this wrong would silently turn a credentialed URL into
+    url="http://user" weight=10, discarding the very credential the new
+    _backend_url_credential_error() refusal exists to catch (ADV2-6) — see
+    HANDOFF.md for this deviation from the brief's literal wording. When the
+    tail is not treated as a weight, the WHOLE entry is the URL, which then
+    hits _backend_url_credential_error() at the call site.
+
+    Legit "url@1.5" and the existing fixture "http://a:5000@2" keep parsing
+    unchanged.
+
+    Fix round F1 (QA HIGH-1): the port-or-bare-token condition above (see
+    Finding 1 in HANDOFF.md) left one documented form silently broken — a
+    port-LESS, scheme'd URL whose "@weight" landed in the PATH rather than
+    the netloc, e.g. "https://api.example.com/v1@2" (README.md's own
+    generic "url@weight" example, applied to a path-bearing URL). Measured:
+    `head` there is "https://api.example.com/v1" — no port, not a bare
+    token — so neither existing disjunct fires, and the whole entry falls
+    through as one URL with the stray "@2" left attached: no refusal (the
+    "@" is in the path, so `urlsplit(url).username` is None), just a silent
+    weight of 1.0 and a URL nothing will ever answer at. The fix: also
+    treat the tail as a weight when the WHOLE ENTRY (not just `head`) has
+    no userinfo of its own — `urlsplit(entry).username is None` proves the
+    entry's own last "@" cannot be a real userinfo separator (if it were,
+    urlsplit would have found it), so the "@" the CSV form's rpartition
+    just consumed can only have been the weight separator. This recovers
+    the silent path-"@" case (loads correctly, no refusal) while the
+    genuinely ambiguous port-less, path-less form ("http://user@10",
+    ADV2-6) stays refusing — there `urlsplit(entry).username` IS "user"
+    (the "@" WAS the netloc's own userinfo separator), so the new disjunct
+    does not fire and the whole entry still reaches the credential check
+    below, unchanged from before this fix."""
+    entry = entry.strip()
+    head, sep, tail = entry.rpartition("@")
+    if sep and _BACKEND_WEIGHT_TOKEN_RE.match(tail):
+        try:
+            head_parts = urllib.parse.urlsplit(head)
+        except Exception:
+            head_parts = None
+        head_is_bare_token = head_parts is not None and not head_parts.scheme
+        head_has_port = head_parts is not None and head_parts.port is not None
+        head_has_username = head_parts is not None and head_parts.username is not None
+        try:
+            entry_username = urllib.parse.urlsplit(entry).username
+        except Exception:
+            entry_username = "<unparseable>"   # never treat as "no userinfo"
+        entry_has_no_userinfo_of_its_own = entry_username is None
+        if not head_has_username and (
+            head_is_bare_token or head_has_port or entry_has_no_userinfo_of_its_own
+        ):
+            url, w = head, tail
+        else:
+            url, w = entry, ""
+    else:
+        url, w = entry, ""
     try:
         weight = float(w) if w else 1.0
     except ValueError:
@@ -279,6 +401,25 @@ def _bearer_transport_ok(backend_url: str, plaintext_ok: bool = False) -> bool:
     except ValueError:
         pass
     if host in ("localhost",) or "." not in host:
+        # SEC E (S3, measured): a dotless host can still be a numeric IPv4
+        # literal in a form the RESOLVER accepts but ipaddress.ip_address()
+        # above already refused as non-dotted-quad — a decimal dword
+        # ("16909060" == 1.2.3.4) or hex ("0x7f000001" == 127.0.0.1) —
+        # letting either through here would carry a bearer to whatever
+        # public address the resolver actually connects to.
+        # `int(host, 0)` is NOT sufficient: it rejects a leading-zero octal
+        # string ("00100403004") that the resolver still accepts — measured,
+        # socket.inet_aton("00100403004") -> 1.2.6.4, a PUBLIC address.
+        # Refuse whenever inet_aton succeeds — it accepts exactly the
+        # literal alphabet (decimal dword, 0x hex, leading-zero octal) the
+        # resolver does. A bare alphabetic hostname ("myhost", or a
+        # hex-alphabet name like "beef" WITHOUT "0x") still passes below —
+        # deliberate, inet_aton refuses both.
+        try:
+            socket.inet_aton(host)
+            return False
+        except OSError:
+            pass
         return True
     return host.endswith(_PRIVATE_NAME_SUFFIXES)
 
@@ -303,17 +444,31 @@ def _load_llm_backends() -> tuple[
         list[str], dict[str, float], dict[str, "str | None"], dict[str, "str | None"],
         dict[str, "dict | None"], dict[str, "frozenset[str] | None"], dict[str, "int | None"],
         dict[str, bool], dict[str, bool], dict[str, "int | None"],
-        dict[str, "float | None"], dict[str, "float | None"], list[str]]:
+        dict[str, "float | None"], dict[str, "float | None"], list[str], list[str]]:
     """Returns (urls, weights, tokens, models, extras, roles, n_ctx, private_ok,
-    private_ok_explicit, max_inflight, price_in, price_out, role_config_errors).
+    private_ok_explicit, max_inflight, price_in, price_out, role_config_errors,
+    url_credential_errors).
 
     `role_config_errors` collects a human-readable message per backend whose
     `roles` list names something outside ROUTING_ROLE_NAMES — collected here
     (module import time, so every test that imports this module freely still
     collects cleanly) rather than raised here. The actual SystemExit lives in
     require_valid_llm_routing_config(), called from main() ONLY — same
-    placement reasoning as require_auth_when_provider_keys_configured()."""
+    placement reasoning as require_auth_when_provider_keys_configured().
+
+    `url_credential_errors` (SEC A, R-1) collects one message per backend URL
+    (from EITHER ingest path — LLM_BACKENDS_JSON or the legacy CSV form)
+    whose userinfo carries a credential — see _backend_url_credential_error().
+    Collected here for the SAME reason (module import must stay clean); its
+    own SystemExit lives in require_no_backend_url_credentials(), called from
+    main() ONLY, same placement/shape as role_config_errors above. R-1
+    (fatal): the offending entry is still EXCLUDED from the returned pool
+    here (so this function itself never raises), but ANY non-empty
+    url_credential_errors makes main() refuse to start — never a silent
+    exclude-and-continue that would let the gateway come up healthy pointed
+    at the legacy/default fallback instead (ruled out)."""
     role_config_errors: list[str] = []
+    url_credential_errors: list[str] = []
     # Fix round Q11: ONE `global` declaration covering the whole function —
     # LLM_POOL_CONFIG_EMPTY is SET-ONLY on every return path below, explicit
     # on both True/False branches, never left to the module-level default.
@@ -378,6 +533,17 @@ def _load_llm_backends() -> tuple[
         for entry in entries:
             url = str(entry.get("url", "")).rstrip("/")
             if not url:
+                continue
+            # SEC A (R-1, fatal): a URL that embeds its own credential in
+            # userinfo — checked BEFORE every other per-entry validation
+            # below, since a credentialed URL string is refused outright
+            # regardless of what else the entry configures. Excluded from
+            # the pool here (this function must never raise); the loud
+            # SystemExit is require_no_backend_url_credentials(), main()
+            # only. Query strings are NOT flagged (R-2).
+            _cred_err = _backend_url_credential_error(url)
+            if _cred_err:
+                url_credential_errors.append(_cred_err)
                 continue
             # Refuse a literal secret in config, loudly — the schema only ever
             # reads token_env (a NAME). Silently ignoring a stray "token"/"api_key"
@@ -510,7 +676,8 @@ def _load_llm_backends() -> tuple[
             # default rather than say so itself.
             LLM_POOL_CONFIG_EMPTY = False
             return (urls, weights, tokens, models, extras, roles, n_ctxs, private_oks,
-                    private_ok_explicit, max_inflights, price_ins, price_outs, role_config_errors)
+                    private_ok_explicit, max_inflights, price_ins, price_outs, role_config_errors,
+                    url_credential_errors)
         log.error("LLM_BACKENDS_JSON produced no usable backend — falling back to LLM_BACKENDS/LLM_DEFAULT_TARGET")
         # Group 3: a fleet that silently became localhost:5000 read as a healthy
         # pool pointing at the wrong place (v0.9.75 review F6). Remember WHY,
@@ -518,7 +685,40 @@ def _load_llm_backends() -> tuple[
         global LLM_POOL_FALLBACK_REASON
         LLM_POOL_FALLBACK_REASON = "LLM_BACKENDS_JSON produced no usable backend (every entry excluded) — serving the LLM_BACKENDS/LLM_DEFAULT_TARGET fallback"
 
-    _raw_backends = [_parse_backend(e) for e in os.environ.get("LLM_BACKENDS", FRAMEWORK_DEFAULTS["LLM_BACKENDS"]["default"]).split(",") if e.strip()]
+    # SEC A (R-1, fatal + ADV1-4): the legacy CSV form had NO per-entry
+    # validation of any kind before this — an explicit loop (not the old
+    # one-line list comprehension) so each parsed URL can be checked through
+    # the SAME shared helper as the JSON path before it ever reaches `urls`.
+    _raw_backends: list[tuple[str, float]] = []
+    for _e in os.environ.get("LLM_BACKENDS", FRAMEWORK_DEFAULTS["LLM_BACKENDS"]["default"]).split(","):
+        if not _e.strip():
+            continue
+        _u, _w = _parse_backend(_e)
+        _cred_err = _backend_url_credential_error(_u)
+        if _cred_err:
+            # F1 (QA HIGH-1): when the whole entry was kept as-is (never
+            # split) BECAUSE it looked exactly like "url@weight" but was
+            # genuinely ambiguous (no port, no path — _parse_backend
+            # couldn't tell "the userinfo's own credential" from "a missing
+            # port before the weight separator"), say so explicitly rather
+            # than emitting the generic credential message: this is a
+            # config-shape problem the operator can fix two ways, not just
+            # a URL that happens to carry a password.
+            _stripped_e = _e.strip()
+            _tail_candidate = _stripped_e.rpartition("@")[2]
+            if _u == _stripped_e and _BACKEND_WEIGHT_TOKEN_RE.match(_tail_candidate):
+                _cred_err = (
+                    f"{scrub_url_credentials(_u)}: ambiguous LLM_BACKENDS entry — "
+                    "this could be a credentialed URL, or a bare 'url@weight' "
+                    "shorthand for a URL with no port. Refusing rather than "
+                    "silently guessing. Fix by either: (1) adding an explicit "
+                    "port to the URL, so 'host:port@weight' parses "
+                    "unambiguously, or (2) declaring this backend via "
+                    "LLM_BACKENDS_JSON instead of the LLM_BACKENDS CSV form."
+                )
+            url_credential_errors.append(_cred_err)
+            continue
+        _raw_backends.append((_u, _w))
     if not _raw_backends:
         # D1: this substitution is ABSENCE (nothing declared) only when it is
         # not ALREADY the JSON-exclusion case above (LLM_POOL_FALLBACK_REASON
@@ -542,7 +742,7 @@ def _load_llm_backends() -> tuple[
     return (urls, weights, {u: None for u in urls}, {u: None for u in urls}, {u: None for u in urls},
             {u: None for u in urls}, {u: None for u in urls}, {u: False for u in urls},
             {u: False for u in urls}, {u: None for u in urls}, {u: None for u in urls},
-            {u: None for u in urls}, [])
+            {u: None for u in urls}, [], url_credential_errors)
 
 
 LLM_BACKENDS: list[str]
@@ -559,7 +759,7 @@ LLM_BACKEND_PRICE_OUT: dict[str, "float | None"]
 (LLM_BACKENDS, LLM_WEIGHTS, LLM_BACKEND_TOKENS, LLM_BACKEND_MODELS, LLM_BACKEND_EXTRAS,
  LLM_BACKEND_ROLES, LLM_BACKEND_NCTX, LLM_BACKEND_PRIVATE_OK, LLM_BACKEND_PRIVATE_OK_EXPLICIT,
  LLM_BACKEND_MAX_INFLIGHT, LLM_BACKEND_PRICE_IN, LLM_BACKEND_PRICE_OUT,
- _LLM_BACKEND_ROLE_CONFIG_ERRORS) = _load_llm_backends()
+ _LLM_BACKEND_ROLE_CONFIG_ERRORS, _LLM_BACKEND_URL_CREDENTIAL_ERRORS) = _load_llm_backends()
 
 # W4 default-deny (§6.5, decision:1824) — a PURE environment-presence question,
 # computed ONCE at module level, NEVER inside _load_llm_backends(): the JSON
@@ -1967,8 +2167,14 @@ class AsyncHiveMindProxy:
                         )
                         # Stamp the serving backend so daemons can attribute per-backend
                         # telemetry (obs tok/s) without learning routing — observability only.
+                        # SEC B (defense in depth, second wall behind A): scrubbed through
+                        # scrub_url_credentials — for a clean, query-less backend URL this is
+                        # byte-identical to the raw pool key (item C), so rem_loop.py /
+                        # consolidation_loop.py's record_llm_call(backend=...) attribution
+                        # round-trips unchanged; a query-bearing backend's attribution
+                        # degrades (R-2 accepted cost, HANDOFF note).
                         if llm_backend is not None:
-                            proxy_resp.headers["X-SM-LLM-Backend"] = llm_backend
+                            proxy_resp.headers["X-SM-LLM-Backend"] = scrub_url_credentials(llm_backend)
                         # Client-facing standard messaging (PR A3): a fault status
                         # from ANY upstream (LLM, embedder, reranker) is an upstream-
                         # origin error — the body still passes through verbatim below,
@@ -2390,6 +2596,20 @@ def _find_uv() -> "str | None":
 
 
 async def _start_daemon() -> "asyncio.subprocess.Process | None":
+    """Fix round finding 9 (QA LOW): `_daemon_proc` is published HERE,
+    synchronously, the instant `create_subprocess_exec` returns — not left
+    to the caller's own assignment a few lines later in
+    `_watchdog_daemon()`. `asyncio.create_subprocess_exec` is this
+    function's only `await` before returning; a cancellation can only be
+    delivered AT an await point, so once it returns there is no further
+    suspension between the spawn succeeding and the global being set. Before
+    this fix, a cancel delivered while the CALLER's `proc = await
+    _start_daemon()` was still unwinding back up the call stack (after the
+    subprocess was already live) left `_daemon_proc` unset — the drain's
+    terminate step then skipped a daemon that was already running, orphaning
+    it holding a live token that G's own watchdog-`finally` had just
+    revoked."""
+    global _daemon_proc
     daemon_path = Path(__file__).parent / "consolidation_loop.py"
     if not daemon_path.exists():
         log.warning("Daemon script not found at %s — consolidation will not run", daemon_path)
@@ -2409,6 +2629,7 @@ async def _start_daemon() -> "asyncio.subprocess.Process | None":
             env=env,
             pass_fds=(read_fd,) if read_fd is not None else (),
         )
+        _daemon_proc = proc
     except Exception:
         # Nit fix (finding 10): the token was already minted and registered
         # before spawn was attempted -- if spawn itself failed, nothing
@@ -2425,6 +2646,9 @@ async def _start_daemon() -> "asyncio.subprocess.Process | None":
 
 
 async def _start_rem_daemon() -> "asyncio.subprocess.Process | None":
+    """Fix round finding 9 (QA LOW): see _start_daemon()'s docstring —
+    identical reasoning, mirrored here for `_rem_proc`."""
+    global _rem_proc
     rem_path = Path(__file__).parent / "rem_loop.py"
     if not rem_path.exists():
         log.warning("REM script not found at %s — REM enrichment will not run", rem_path)
@@ -2444,6 +2668,7 @@ async def _start_rem_daemon() -> "asyncio.subprocess.Process | None":
             env=env,
             pass_fds=(read_fd,) if read_fd is not None else (),
         )
+        _rem_proc = proc
     except Exception:
         if read_fd is not None:
             _revoke_daemon_token(_REM_DAEMON_AGENT_NAME)
@@ -2460,65 +2685,82 @@ async def _watchdog_rem_daemon(stop_event: asyncio.Event) -> None:
 
     Uses identical watchdog logic to the consolidation daemon:
     exponential backoff, stable-uptime reset, and circuit-breaker trip.
+
+    G (S6): the whole body is wrapped in try/finally so this agent's
+    ephemeral daemon token is revoked on EVERY exit path of this watchdog —
+    clean exit, circuit-breaker trip, AND cancellation — not only the three
+    spawn-failure paths _revoke_daemon_token() already covered before this
+    fix. `finally` also fires on asyncio.CancelledError (this coroutine
+    being cancelled) — SAFE here ONLY because of the shutdown ORDER main()
+    enforces in its drain sequence: both daemon processes are terminated
+    (unblocking each watchdog's own `proc.wait()`) BEFORE
+    watchdog_task/rem_watchdog_task.cancel() ever runs, so a cancel can
+    never revoke a token still held by a LIVE daemon process — see the
+    comment at that drain sequence, where this order is now load-bearing.
+    Revoking twice is harmless: _revoke_daemon_token() pops with a default
+    and is a no-op the second time.
     """
     global _rem_proc, _rem_healthy
 
-    restart_times: list[float] = []
-    backoff = 1.0
+    try:
+        restart_times: list[float] = []
+        backoff = 1.0
 
-    while not stop_event.is_set():
-        proc = await _start_rem_daemon()
-        if proc is None:
+        while not stop_event.is_set():
+            proc = await _start_rem_daemon()
+            if proc is None:
+                _rem_healthy = False
+                return
+
+            _rem_proc    = proc
+            _rem_healthy = True
+            t_start = asyncio.get_event_loop().time()
+
+            await proc.wait()
             _rem_healthy = False
-            return
 
-        _rem_proc    = proc
-        _rem_healthy = True
-        t_start = asyncio.get_event_loop().time()
+            if stop_event.is_set():
+                break
 
-        await proc.wait()
-        _rem_healthy = False
+            uptime   = asyncio.get_event_loop().time() - t_start
+            exitcode = proc.returncode
 
-        if stop_event.is_set():
-            break
+            if exitcode in (0, -signal.SIGTERM):
+                log.info("REM daemon exited cleanly (code %d).", exitcode)
+                break
 
-        uptime   = asyncio.get_event_loop().time() - t_start
-        exitcode = proc.returncode
-
-        if exitcode in (0, -signal.SIGTERM):
-            log.info("REM daemon exited cleanly (code %d).", exitcode)
-            break
-
-        log.warning(
-            "REM daemon crashed (code %d, uptime %.1fs) — evaluating restart.",
-            exitcode, uptime,
-        )
-
-        if uptime >= _DAEMON_MIN_STABLE_SEC:
-            backoff = 1.0
-
-        now = asyncio.get_event_loop().time()
-        restart_times = [t for t in restart_times if now - t < _DAEMON_RESTART_WINDOW]
-        if len(restart_times) >= _DAEMON_MAX_RESTARTS:
-            log.critical(
-                "REM daemon crashed %d times in %ds — circuit breaker open.",
-                _DAEMON_MAX_RESTARTS, _DAEMON_RESTART_WINDOW,
+            log.warning(
+                "REM daemon crashed (code %d, uptime %.1fs) — evaluating restart.",
+                exitcode, uptime,
             )
-            break
 
-        restart_times.append(now)
-        log.info(
-            "Restarting REM daemon in %.1fs (crash %d/%d this window)...",
-            backoff, len(restart_times), _DAEMON_MAX_RESTARTS,
-        )
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=backoff)
-            break
-        except asyncio.TimeoutError:
-            pass
-        backoff = min(backoff * 2, _DAEMON_MAX_BACKOFF_SEC)
+            if uptime >= _DAEMON_MIN_STABLE_SEC:
+                backoff = 1.0
 
-    log.info("REM daemon watchdog exiting.")
+            now = asyncio.get_event_loop().time()
+            restart_times = [t for t in restart_times if now - t < _DAEMON_RESTART_WINDOW]
+            if len(restart_times) >= _DAEMON_MAX_RESTARTS:
+                log.critical(
+                    "REM daemon crashed %d times in %ds — circuit breaker open.",
+                    _DAEMON_MAX_RESTARTS, _DAEMON_RESTART_WINDOW,
+                )
+                break
+
+            restart_times.append(now)
+            log.info(
+                "Restarting REM daemon in %.1fs (crash %d/%d this window)...",
+                backoff, len(restart_times), _DAEMON_MAX_RESTARTS,
+            )
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+                break
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(backoff * 2, _DAEMON_MAX_BACKOFF_SEC)
+
+        log.info("REM daemon watchdog exiting.")
+    finally:
+        _revoke_daemon_token(_REM_DAEMON_AGENT_NAME)
 
 
 async def _watchdog_daemon(stop_event: asyncio.Event) -> None:
@@ -2530,71 +2772,78 @@ async def _watchdog_daemon(stop_event: asyncio.Event) -> None:
     - Backoff resets when the daemon ran stably for ≥ _DAEMON_MIN_STABLE_SEC.
     - Circuit breaker: ≥ _DAEMON_MAX_RESTARTS crashes inside _DAEMON_RESTART_WINDOW
       seconds → log CRITICAL and stop restarting (requires gateway restart to reset).
+
+    G (S6): see _watchdog_rem_daemon's docstring — identical try/finally
+    revoke-on-every-exit-path reasoning, mirrored here for the
+    consolidation daemon's own ephemeral token.
     """
     global _daemon_proc, _daemon_healthy
 
-    restart_times: list[float] = []
-    backoff = 1.0
+    try:
+        restart_times: list[float] = []
+        backoff = 1.0
 
-    while not stop_event.is_set():
-        proc = await _start_daemon()
-        if proc is None:
+        while not stop_event.is_set():
+            proc = await _start_daemon()
+            if proc is None:
+                _daemon_healthy = False
+                return
+
+            _daemon_proc    = proc
+            _daemon_healthy = True
+            t_start = asyncio.get_event_loop().time()
+
+            await proc.wait()
             _daemon_healthy = False
-            return
 
-        _daemon_proc    = proc
-        _daemon_healthy = True
-        t_start = asyncio.get_event_loop().time()
+            if stop_event.is_set():
+                # Clean shutdown — gateway is going down; don't restart.
+                break
 
-        await proc.wait()
-        _daemon_healthy = False
+            uptime   = asyncio.get_event_loop().time() - t_start
+            exitcode = proc.returncode
 
-        if stop_event.is_set():
-            # Clean shutdown — gateway is going down; don't restart.
-            break
+            if exitcode in (0, -signal.SIGTERM):
+                log.info("Consolidation daemon exited cleanly (code %d).", exitcode)
+                break
 
-        uptime   = asyncio.get_event_loop().time() - t_start
-        exitcode = proc.returncode
-
-        if exitcode in (0, -signal.SIGTERM):
-            log.info("Consolidation daemon exited cleanly (code %d).", exitcode)
-            break
-
-        log.warning(
-            "Consolidation daemon crashed (code %d, uptime %.1fs) — evaluating restart.",
-            exitcode, uptime,
-        )
-
-        # Reset backoff if the daemon was stable long enough — avoids penalising
-        # recoverable transient failures (brief Postgres blip, LLM timeout).
-        if uptime >= _DAEMON_MIN_STABLE_SEC:
-            backoff = 1.0
-
-        # Circuit breaker: count crashes inside the rolling window.
-        now = asyncio.get_event_loop().time()
-        restart_times = [t for t in restart_times if now - t < _DAEMON_RESTART_WINDOW]
-        if len(restart_times) >= _DAEMON_MAX_RESTARTS:
-            log.critical(
-                "Consolidation daemon crashed %d times in %ds — "
-                "circuit breaker open. Restart the gateway to reset.",
-                _DAEMON_MAX_RESTARTS, _DAEMON_RESTART_WINDOW,
+            log.warning(
+                "Consolidation daemon crashed (code %d, uptime %.1fs) — evaluating restart.",
+                exitcode, uptime,
             )
-            break
 
-        restart_times.append(now)
-        log.info(
-            "Restarting consolidation daemon in %.1fs (crash %d/%d this window)...",
-            backoff, len(restart_times), _DAEMON_MAX_RESTARTS,
-        )
-        try:
-            # Sleep with backoff — but wake immediately if shutdown fires.
-            await asyncio.wait_for(stop_event.wait(), timeout=backoff)
-            break  # stop_event fired during backoff — clean exit
-        except asyncio.TimeoutError:
-            pass
-        backoff = min(backoff * 2, _DAEMON_MAX_BACKOFF_SEC)
+            # Reset backoff if the daemon was stable long enough — avoids penalising
+            # recoverable transient failures (brief Postgres blip, LLM timeout).
+            if uptime >= _DAEMON_MIN_STABLE_SEC:
+                backoff = 1.0
 
-    log.info("Daemon watchdog exiting.")
+            # Circuit breaker: count crashes inside the rolling window.
+            now = asyncio.get_event_loop().time()
+            restart_times = [t for t in restart_times if now - t < _DAEMON_RESTART_WINDOW]
+            if len(restart_times) >= _DAEMON_MAX_RESTARTS:
+                log.critical(
+                    "Consolidation daemon crashed %d times in %ds — "
+                    "circuit breaker open. Restart the gateway to reset.",
+                    _DAEMON_MAX_RESTARTS, _DAEMON_RESTART_WINDOW,
+                )
+                break
+
+            restart_times.append(now)
+            log.info(
+                "Restarting consolidation daemon in %.1fs (crash %d/%d this window)...",
+                backoff, len(restart_times), _DAEMON_MAX_RESTARTS,
+            )
+            try:
+                # Sleep with backoff — but wake immediately if shutdown fires.
+                await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+                break  # stop_event fired during backoff — clean exit
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(backoff * 2, _DAEMON_MAX_BACKOFF_SEC)
+
+        log.info("Daemon watchdog exiting.")
+    finally:
+        _revoke_daemon_token(_CONSOLIDATION_AGENT_NAME)
 
 
 # --------------------------------------------------------------------------- #
@@ -2664,6 +2913,10 @@ async def handle_pool_status(request: web.Request) -> web.Response:
             entry["suspect_wedged"] = not await _probe_backend_alive(_session, b)
         backends[b] = entry
         free += 1 if (avail and counts_free) else 0
+    # SEC B (defense in depth, second wall behind A): scrub every backend URL
+    # KEY before this client-facing response — byte-identical for a clean,
+    # query-less URL (item C); collapse-guarded (ADV1-14).
+    backends = _scrub_backend_keyed_dict(backends, context="/pool/status")
     return web.json_response({"free_slots": free, "backends": backends})
 
 
@@ -4489,6 +4742,44 @@ def _log_health_transitions(dependencies: dict, warnings: list) -> None:
         pass
 
 
+def _scrub_backend_keyed_dict(d: dict, *, context: str) -> dict:
+    """SEC B (ADV1-14): scrub every KEY of a backend-URL-keyed dict through
+    scrub_url_credentials before it reaches a client-facing render. For a
+    clean, query-less URL this is byte-identical (item C guarantees it) —
+    the whole point is that a normal install's /health and /memory/telemetry
+    output does not change one byte.
+
+    Key-collapse guard: scrubbing can, in principle, merge two DISTINCT
+    backend keys into one rendered key (e.g. two credentialed URLs that
+    differ only in userinfo). With item A fatal on any userinfo URL this
+    cannot happen for a production pool — but this guard exists for a
+    test-seeded pool or a future ingest-path bypass: on a collapse this logs
+    an error and returns SCRUBBED keys, positionally de-duplicated, rather
+    than silently losing an entry.
+
+    Fix round F7 (QA MED-2): the first cut of this guard, on a collapse,
+    returned the RAW (unscrubbed) dict — i.e. its own escape hatch did
+    exactly what item B exists to prevent. `/pool/status` is a member of
+    `_UNPROTECTED_PATHS` (reachable anonymously), so a collapse there used
+    to hand an anonymous caller both original URLs verbatim, userinfo and
+    all — strictly worse than the plain unscrubbed dict this function
+    guards against everywhere else. Never acceptable, even as a rare/
+    test-only escape hatch: this now scrubs every key regardless, and
+    disambiguates a collapse with a positional suffix (`#0`, `#1`, ...) so
+    every entry survives and NO credential ever reaches the render."""
+    scrubbed = {scrub_url_credentials(k): v for k, v in d.items()}
+    if len(scrubbed) != len(d):
+        log.error(
+            "%s: scrubbing backend URL keys collapsed %d distinct key(s) into "
+            "%d — rendering scrubbed, positionally de-duplicated keys instead "
+            "of the raw (credential-bearing) originals.", context, len(d), len(scrubbed))
+        return {
+            f"{scrub_url_credentials(k)}#{i}": v
+            for i, (k, v) in enumerate(d.items())
+        }
+    return scrubbed
+
+
 def _llm_runtime_snapshot(backend_status: dict | None = None) -> dict:
     """The whole in-memory llm_* family, built ONCE.
 
@@ -4497,34 +4788,62 @@ def _llm_runtime_snapshot(backend_status: dict | None = None) -> dict:
     as the health path. `backend_status` is the liveness map the health probe
     already computed — passed in rather than re-probed, because a telemetry
     request must never fire N network probes of its own.
+
+    SEC B: every backend-URL-keyed dict below is scrubbed at the very end
+    (via _scrub_backend_keyed_dict, with its key-collapse guard) before
+    returning — this is THE single builder feeding BOTH /health and
+    /memory/telemetry, so scrubbing here once covers both. `backend_status`
+    is scrubbed a second, harmless time (idempotent — item C) since its
+    caller (_build_health_checks) already scrubs it for checks["llm_backends"];
+    defense in depth for any other/future caller that does not.
     """
     now = time.monotonic()
     total_routed = sum(_llm_routed.values()) or 1
     aff_total = _llm_affinity_hits + _llm_affinity_misses
+    pool = {
+        b: {
+            "weight": LLM_WEIGHTS.get(b, 1.0),
+            "inflight": _llm_inflight.get(b, 0),
+            "routed": _llm_routed.get(b, 0),
+            "routed_pct": round(100 * _llm_routed.get(b, 0) / total_routed, 1),
+            "fails": _llm_fail_total.get(b, 0),
+            "cooldown": round(max(0.0, _llm_unhealthy_until.get(b, 0.0) - now), 1),
+            "reserved": b in _llm_reserved,
+        }
+        for b in LLM_BACKENDS
+    }
+    token_usage = {
+        b: {
+            "tokens_prompt_total": _llm_tokens_prompt_total.get(b, 0),
+            "tokens_completion_total": _llm_tokens_completion_total.get(b, 0),
+            "tokens_last_ts": _llm_tokens_last_ts.get(b),
+        }
+        for b in LLM_BACKENDS
+    }
+    latency = {
+        b: {
+            "requests_total": _llm_requests_total.get(b, 0),
+            "requests_failed_total": _llm_requests_failed_total.get(b, 0),
+            "latency_sum_s": round(_llm_latency_sum_s.get(b, 0.0), 6),
+            "latency_max_s": round(_llm_latency_max_s.get(b, 0.0), 6),
+            "latency_last_ts": _llm_latency_last_ts.get(b),
+        }
+        for b in LLM_BACKENDS
+    }
     return {
-        "backends": dict(backend_status or {}),
-        "reserved": sorted(_llm_reserved),
+        "backends": _scrub_backend_keyed_dict(dict(backend_status or {}),
+                                              context="_llm_runtime_snapshot.backends"),
+        "reserved": sorted(scrub_url_credentials(b) for b in _llm_reserved),
         # Parallelisation: per-backend weight, current in-flight, cumulative
         # routed (check the realised split against weights), fails, cooldown.
-        "pool": {
-            b: {
-                "weight": LLM_WEIGHTS.get(b, 1.0),
-                "inflight": _llm_inflight.get(b, 0),
-                "routed": _llm_routed.get(b, 0),
-                "routed_pct": round(100 * _llm_routed.get(b, 0) / total_routed, 1),
-                "fails": _llm_fail_total.get(b, 0),
-                "cooldown": round(max(0.0, _llm_unhealthy_until.get(b, 0.0) - now), 1),
-                "reserved": b in _llm_reserved,
-            }
-            for b in LLM_BACKENDS
-        },
+        "pool": _scrub_backend_keyed_dict(pool, context="_llm_runtime_snapshot.pool"),
         # Cache affinity: hit rate + which backend holds each hot prefix, so the
         # KV-cache win is observable.
         "affinity": {
             "hits": _llm_affinity_hits,
             "misses": _llm_affinity_misses,
             "hit_rate": round(_llm_affinity_hits / aff_total, 3) if aff_total else None,
-            "hot_prefixes": {k[:8]: {"backend": v[0], "hits": v[2]}
+            "hot_prefixes": {k[:8]: {"backend": scrub_url_credentials(v[0]), "hits": v[2]}
                              for k, v in _llm_affinity.items()
                              if now - v[1] <= AFFINITY_TTL},
         },
@@ -4546,29 +4865,13 @@ def _llm_runtime_snapshot(backend_status: dict | None = None) -> dict:
         # Per-backend cumulative token counters, IN-PROCESS ONLY (reset on
         # restart — deliberate; the ts pairing is what makes a restart-aware
         # delta computable).
-        "token_usage": {
-            b: {
-                "tokens_prompt_total": _llm_tokens_prompt_total.get(b, 0),
-                "tokens_completion_total": _llm_tokens_completion_total.get(b, 0),
-                "tokens_last_ts": _llm_tokens_last_ts.get(b),
-            }
-            for b in LLM_BACKENDS
-        },
+        "token_usage": _scrub_backend_keyed_dict(token_usage, context="_llm_runtime_snapshot.token_usage"),
         # Per-backend request latency (local-vs-online comparison). latency_sum_s
         # + requests_total makes the average derivable on the read side without
         # the gateway ever deciding what "average" means; requests_failed_total
         # is separate so a string of fast failures cannot dilute the success
         # average.
-        "latency": {
-            b: {
-                "requests_total": _llm_requests_total.get(b, 0),
-                "requests_failed_total": _llm_requests_failed_total.get(b, 0),
-                "latency_sum_s": round(_llm_latency_sum_s.get(b, 0.0), 6),
-                "latency_max_s": round(_llm_latency_max_s.get(b, 0.0), 6),
-                "latency_last_ts": _llm_latency_last_ts.get(b),
-            }
-            for b in LLM_BACKENDS
-        },
+        "latency": _scrub_backend_keyed_dict(latency, context="_llm_runtime_snapshot.latency"),
     }
 
 
@@ -4584,8 +4887,11 @@ def _config_snapshot() -> dict:
     someone goes looking (fact 898).
     """
     cfg = {
+        # SEC B: "url" is scrub_url_credentials(b) — a list of per-backend
+        # dicts, so no key-collapse is possible (unlike the dict-keyed
+        # builders); byte-identical for a clean, query-less URL (item C).
         "llm_backends": [
-            {"url": b, "weight": LLM_WEIGHTS.get(b, 1.0),
+            {"url": scrub_url_credentials(b), "weight": LLM_WEIGHTS.get(b, 1.0),
              "has_credential": LLM_BACKEND_TOKENS.get(b) is not None,
              "model": LLM_BACKEND_MODELS.get(b),
              # Model-attributes routing descriptor fields (additive) — never
@@ -4645,7 +4951,11 @@ def telemetry_extras() -> dict:
         "routing": rt["routing"],
         "token_usage": rt["token_usage"],
         "latency": rt["latency"],
-        "faults": _llm_faults_snapshot(),
+        # SEC B: _llm_faults_snapshot() lives in coordinator.py (out of this
+        # section's touched-files list) and returns its dict keyed by raw
+        # backend URL — scrubbed here, at the render call site, with the
+        # same key-collapse guard as every other backend-keyed dict.
+        "faults": _scrub_backend_keyed_dict(_llm_faults_snapshot(), context="telemetry_extras.faults"),
     }
     return {
         "llm": llm,
@@ -4801,6 +5111,14 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
             backend_status[b] = "timeout"
         except Exception:
             backend_status[b] = "down"
+    # SEC B (defense in depth, second wall behind A): scrub every backend URL
+    # KEY before this dict reaches ANY client-facing surface — it feeds BOTH
+    # checks["llm_backends"] below AND _llm_runtime_snapshot()'s "backends"
+    # field (/memory/telemetry). For a clean, query-less URL this is
+    # byte-identical (item C). Collapse guard (ADV1-14): cannot fire in
+    # production with A fatal on userinfo, but guards a test-seeded/future
+    # bypass from silently merging two distinct backends into one key.
+    backend_status = _scrub_backend_keyed_dict(backend_status, context="/health backend_status")
     checks["llm"] = "ok" if any(s == "ok" for s in backend_status.values()) else "down"
     # Wedge visibility: reachability alone reported "ok" through a GPU-driver
     # hang (the accept thread answers while the generation engine is dead).
@@ -4816,7 +5134,10 @@ async def _build_health_checks(proxy: "AsyncHiveMindProxy", coordinator) -> dict
             for b, a in _ages.items():
                 if a is not None and a > LLM_WEDGE_SUSPECT_AGE:
                     if not await _probe_backend_alive(proxy.session, b):
-                        _wedged.append(b)
+                        # SEC B: scrubbed for the same reason as backend_status
+                        # above — this list renders straight onto
+                        # checks["llm_suspect_wedged"].
+                        _wedged.append(scrub_url_credentials(b))
             if _wedged:
                 checks["llm_suspect_wedged"] = _wedged
     # Gate on ANY configured backend, not "more than one" — the original
@@ -5189,6 +5510,42 @@ async def handle_health(request: web.Request) -> web.Response:
 # --------------------------------------------------------------------------- #
 # Startup / shutdown
 # --------------------------------------------------------------------------- #
+def require_no_backend_url_credentials() -> None:
+    """SEC A (R-1, fatal, RULED — Xenofon 2026-09-02): a backend URL whose
+    userinfo carries a credential (user:pass@host, or a bare user@host) is a
+    startup refusal, never a silent exclude-and-continue. Collected at parse
+    time by _load_llm_backends() (BOTH ingest paths — LLM_BACKENDS_JSON and
+    the legacy CSV form — via the shared _backend_url_credential_error()
+    helper) into _LLM_BACKEND_URL_CREDENTIAL_ERRORS; raised here, same
+    placement reasoning as require_auth_when_provider_keys_configured() and
+    require_valid_llm_routing_config() below: every test in this repo
+    imports this module freely, many with deliberately-invalid backend
+    config, so an unconditional check at import/parse time would kill test
+    collection itself, not just a genuinely misconfigured gateway.
+
+    Refusing here (rather than excluding the entry and continuing) is the
+    R-1 ruling: excluding would let a JSON fleet that is ENTIRELY
+    credentialed URLs fall through to the legacy/default fallback and come
+    up healthy pointed at localhost — silently serving from the wrong place
+    with no operator-visible signal beyond a log line. The message is built
+    entirely from strings _backend_url_credential_error() already ran
+    through the fixed (item C) scrub_url_credentials — never a raw
+    credential."""
+    if not _LLM_BACKEND_URL_CREDENTIAL_ERRORS:
+        return
+    raise SystemExit(
+        "FATAL: backend URL(s) embed a credential in userinfo "
+        "(user:pass@host) — this framework never accepts a credential "
+        "inside the URL string itself:\n  "
+        + "\n  ".join(_LLM_BACKEND_URL_CREDENTIAL_ERRORS)
+        + "\nUse token_env instead (LLM_BACKENDS_JSON form): the backend "
+          "gets its Authorization header from a NAMED env var already "
+          "exported in the gateway's own process environment, never from "
+          "the URL. A bare query string (e.g. \"?api-version=...\") is NOT "
+          "refused — only userinfo is."
+    )
+
+
 def _unauthenticated_provider_keys_override_active() -> bool:
     """True iff this process is running with the S-05 override ACTUALLY in
     effect — auth off, a provider key attached to a configured backend, and
@@ -5418,14 +5775,17 @@ def _emit_token_lifecycle_sums(reason: str) -> None:
         c = _llm_tokens_completion_total.get(b, 0)
         if p == 0 and c == 0:
             continue
+        # SEC B: scrubbed for both the journal line and the audit JSONL —
+        # byte-identical for a clean, query-less URL (item C).
+        _b_scrubbed = scrub_url_credentials(b)
         log.info(
             "llm-token-lifecycle-sum backend=%s reason=%s tokens_prompt_total=%d "
-            "tokens_completion_total=%d", b, reason, p, c)
+            "tokens_completion_total=%d", _b_scrubbed, reason, p, c)
         if GATEWAY_AUDIT_LOG_PATH:
             try:
                 append_secure(GATEWAY_AUDIT_LOG_PATH, json.dumps({
                     "ts": ts, "kind": "llm_token_lifecycle_sum", "reason": reason,
-                    "backend": b, "tokens_prompt_total": p, "tokens_completion_total": c,
+                    "backend": _b_scrubbed, "tokens_prompt_total": p, "tokens_completion_total": c,
                 }))
             except Exception as exc:
                 log.warning("token lifecycle sum audit write failed: %s", exc)
@@ -5466,12 +5826,99 @@ def _encoder_routing_log_line() -> str:
     )
 
 
+def _resolve_proxy_bind_host() -> str:
+    """The interface hive_mind_proxy binds to — pure (reads os.environ,
+    performs no I/O, opens no socket), so it can be unit-tested without a
+    real TCPSite.
+
+    SEC H (R-3, RULED — Xenofon 2026-09-02, measured on glxvm):
+    TCPSite(runner, "", port) binds ALL interfaces (0.0.0.0 + [::]);
+    "127.0.0.1" binds loopback only. A PRESENT-BUT-EMPTY PROXY_BIND
+    (`PROXY_BIND=` in the env file, or an EnvironmentFile line whose value
+    was blanked) must NOT fall through to the empty string — the `or`
+    idiom (deliberately not `.get()`'s own default, which would honour an
+    empty value AS empty) catches both "unset" and "set-but-empty" the
+    same way and resolves both to loopback. All-interfaces stays the
+    explicit PROXY_BIND=0.0.0.0 opt-in — a deliberate, recorded reversal of
+    the W1 "never normalise an idiom" position, for this one site."""
+    raw = os.environ.get("PROXY_BIND", "")
+    resolved = raw.strip() or "127.0.0.1"
+    if "PROXY_BIND" in os.environ and not raw.strip():
+        log.warning(
+            "PROXY_BIND is set but empty — falling back to 127.0.0.1 "
+            "(loopback), never all-interfaces. Set PROXY_BIND=0.0.0.0 "
+            "explicitly to opt into all-interfaces binding.")
+    return resolved
+
+
+async def _drain_watchdogs_and_daemons(
+        watchdog_task: "asyncio.Task", rem_watchdog_task: "asyncio.Task",
+        other_tasks: "tuple[asyncio.Task, ...]" = ()) -> None:
+    """Steps 3-4 of main()'s drain sequence (see the comment at its call
+    site) — terminate both daemon processes (unblocking each watchdog's own
+    `proc.wait()`), THEN cancel and await the watchdog tasks (plus any other
+    background tasks passed in), THEN revoke both daemons' ephemeral tokens
+    as an idempotent BACKSTOP.
+
+    G (S6, ADV2-9): the backstop revoke below is deliberately placed AFTER
+    the awaited cancellation of both watchdog tasks — never a concurrent
+    mutator racing a still-running watchdog. Each watchdog's own try/finally
+    (see _watchdog_daemon / _watchdog_rem_daemon) already revokes its
+    agent's token on every exit path, including this cancel; this call
+    costs nothing extra when the token is already gone
+    (_revoke_daemon_token() pops with a default) and only matters if some
+    future change to a watchdog body ever loses its own revoke.
+
+    Extracted from main() into its own coroutine so this ORDER — terminate
+    BEFORE cancel, which G's own cancel-safety argument depends on — is
+    directly testable (FakeProc doubles, no real subprocess or listening
+    socket) rather than only provable by reading main() end to end.
+    """
+    if _daemon_proc and _daemon_proc.returncode is None:
+        log.info("Stopping consolidation daemon (pid %d)...", _daemon_proc.pid)
+        _daemon_proc.terminate()
+        try:
+            await asyncio.wait_for(_daemon_proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            log.warning("Consolidation daemon did not exit in 5 s — sending SIGKILL")
+            _daemon_proc.kill()
+    if _rem_proc and _rem_proc.returncode is None:
+        log.info("Stopping REM daemon (pid %d)...", _rem_proc.pid)
+        _rem_proc.terminate()
+        try:
+            await asyncio.wait_for(_rem_proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            log.warning("REM daemon did not exit in 5 s — sending SIGKILL")
+            _rem_proc.kill()
+    watchdog_task.cancel()
+    rem_watchdog_task.cancel()
+    for t in other_tasks:
+        t.cancel()
+    for task in (watchdog_task, rem_watchdog_task, *other_tasks):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    _revoke_daemon_token(_CONSOLIDATION_AGENT_NAME)
+    _revoke_daemon_token(_REM_DAEMON_AGENT_NAME)
+
+
 async def main() -> None:
     # RULED (Xenofon, 2026-08-14): a plaintext AGENT_TOKENS entry refuses
     # gateway startup outright, from v0.9.3 — before anything else stands
     # up. See coordinator.require_no_plaintext_agent_tokens()'s docstring
     # for why this call lives here (the real entrypoint) and nowhere else.
     require_no_plaintext_agent_tokens()
+    # D.1 (SEC round, ADV1-2): a malformed LLM_BACKENDS_JSON also refuses to
+    # start — see secure_env.require_llm_backends_json_parses()'s docstring
+    # for why this call lives here too (never at bare import time), and why
+    # check_config.py deliberately does NOT gain this same call.
+    require_llm_backends_json_parses("hive_mind_proxy")
+    # SEC A (R-1, RULED — Xenofon 2026-09-02): a backend URL embedding its
+    # own credential in userinfo also refuses to start — see
+    # require_no_backend_url_credentials()'s docstring for why this call
+    # lives here too.
+    require_no_backend_url_credentials()
     # S-05 (RULED — decision:1303): auth-off + a live provider key also
     # refuses to start — see require_auth_when_provider_keys_configured()'s
     # docstring for why this call lives here too.
@@ -5527,7 +5974,7 @@ async def main() -> None:
     # Bind to localhost by default. Set PROXY_BIND=0.0.0.0 to opt into
     # all-interfaces binding — only safe over an encrypted overlay network
     # (Tailscale, WireGuard) or behind TLS. Bearer tokens are plaintext over HTTP.
-    bind_host = os.environ.get("PROXY_BIND", "127.0.0.1")
+    bind_host = _resolve_proxy_bind_host()
     site = web.TCPSite(runner, bind_host, PORT)
     await site.start()
 
@@ -5589,37 +6036,23 @@ async def main() -> None:
     # 3. terminate daemon — unblocks watchdog's proc.wait()
     # 4. watchdog_task    — wait for watchdog to confirm it has exited
     # 5. coordinator/proxy cleanup last
+    #
+    # G (S6, ADV1-13): step 3 before step 4 is now ALSO why cancelling the
+    # watchdog tasks below (whose bodies revoke their own agent's ephemeral
+    # daemon token in a `finally`, which also fires on CancelledError — see
+    # _watchdog_daemon / _watchdog_rem_daemon) is safe: by the time
+    # _drain_watchdogs_and_daemons() cancels them, both daemon processes
+    # have already been terminated and awaited, so no cancel-triggered
+    # revoke can ever race a still-live daemon that still holds that token.
+    # Do NOT reorder step 3 after step 4.
     log.info("Stopping listener...")
     await site.stop()
     if uds_site is not None:
         await uds_site.stop()
     log.info("Draining in-flight requests...")
     await runner.cleanup()
-    if _daemon_proc and _daemon_proc.returncode is None:
-        log.info("Stopping consolidation daemon (pid %d)...", _daemon_proc.pid)
-        _daemon_proc.terminate()
-        try:
-            await asyncio.wait_for(_daemon_proc.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            log.warning("Consolidation daemon did not exit in 5 s — sending SIGKILL")
-            _daemon_proc.kill()
-    if _rem_proc and _rem_proc.returncode is None:
-        log.info("Stopping REM daemon (pid %d)...", _rem_proc.pid)
-        _rem_proc.terminate()
-        try:
-            await asyncio.wait_for(_rem_proc.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            log.warning("REM daemon did not exit in 5 s — sending SIGKILL")
-            _rem_proc.kill()
-    watchdog_task.cancel()
-    rem_watchdog_task.cancel()
-    capability_task.cancel()
-    token_lifecycle_task.cancel()
-    for task in (watchdog_task, rem_watchdog_task, capability_task, token_lifecycle_task):
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    await _drain_watchdogs_and_daemons(
+        watchdog_task, rem_watchdog_task, (capability_task, token_lifecycle_task))
     # A2: unconditional lifecycle sum on graceful shutdown — DIRECT
     # SYNCHRONOUS write (see _emit_token_lifecycle_sums' docstring), so it
     # runs here rather than through proxy.cleanup()/coordinator.stop().

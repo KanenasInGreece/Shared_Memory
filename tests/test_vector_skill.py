@@ -570,6 +570,38 @@ def test_missing_file_is_not_a_server_env(tmp_path):
     assert vs._looks_like_server_env(str(tmp_path / "nope.env")) is False
 
 
+# ── D.4 (SEC round, ADV1-15): key-parsed, case/whitespace/export-tolerant ───
+
+@pytest.mark.parametrize("line", [
+    "agent_tokens=claude:tok_a",
+    "Agent_Tokens=claude:tok_a",
+    "AGENT_TOKENS =claude:tok_a",
+    "export AGENT_TOKENS=claude:tok_a",
+    "EXPORT AGENT_TOKENS=claude:tok_a",
+])
+def test_server_env_recognised_regardless_of_case_whitespace_or_export(tmp_path, line):
+    """Fix round F5 (SEC1 HIGH-3 + MED-5): _ENV_KEY_RE's "export " match
+    was case-SENSITIVE, so "EXPORT AGENT_TOKENS=..." matched no branch of
+    the regex at all — _looks_like_server_env() never even saw a key to
+    compare, and an "EXPORT "-prefixed framework .env loaded as if it were
+    this client's own."""
+    vs = _vs_module()
+    f = tmp_path / "variant.env"
+    f.write_text(f"COORDINATOR_URL=http://localhost:8888\n{line}\n")
+    assert vs._looks_like_server_env(str(f)) is True, line
+
+
+def test_server_env_not_falsely_triggered_by_a_value_containing_the_substring(tmp_path):
+    """The corrected KEY-based check must not fire on a line whose VALUE
+    merely contains 'AGENT_TOKENS=' as literal text -- the pre-D.4 substring
+    check could have (a false positive in the SAFE direction, but still a
+    behaviour worth pinning as the fix's own justification)."""
+    vs = _vs_module()
+    f = tmp_path / "value_substring.env"
+    f.write_text("SOME_NOTE=see AGENT_TOKENS=... in the docs\nAGENT_TOKEN=tok_mine\n")
+    assert vs._looks_like_server_env(str(f)) is False
+
+
 def test_agent_id_is_read_in_exactly_one_place():
     """AGENT_ID is a LOCAL label only — the gateway overwrites metadata["source"]
     with the authenticated token identity (coordinator.py), so per-origin
@@ -816,6 +848,43 @@ def test_manual_env_parser_loads_token_without_dotenv(tmp_path, monkeypatch):
         os.environ.pop("PROBE_ONLY_VALUE", None)
         os.environ.pop("AGENT_TOKEN", None)
         os.environ.pop("FAKE_PROVIDER_SECRET", None)
+
+
+def test_manual_env_parser_strips_export_prefix_before_classifying(tmp_path, monkeypatch):
+    """Fix round F5 (SEC1 HIGH-3 + MED-5): before this fix, the stored key
+    for an "export AGENT_TOKENS=..." line was the literal string "export
+    AGENT_TOKENS" — matching neither the AGENT_TOKEN diversion nor
+    _is_client_secret_key's exact-name list (it ends in the plural
+    "TOKENS" with "export " still attached) — so this legitimate shell-
+    sourceable form exported the registry straight into os.environ. Probed
+    with both "export " and "EXPORT " prefixes, mirroring _looks_like_
+    server_env's own two forms."""
+    vs = load_vector_skill()
+    env = tmp_path / ".env"
+    env.write_text("export AGENT_TOKENS=claude:tok_a,grok:tok_b\n"
+                    "EXPORT PG_PASSWORD=hunter2\n")
+    for key in ("AGENT_TOKENS", "export AGENT_TOKENS", "PG_PASSWORD", "EXPORT PG_PASSWORD"):
+        monkeypatch.delenv(key, raising=False)
+    try:
+        vs._load_env_manually(str(env))
+        assert "export AGENT_TOKENS" not in os.environ
+        assert "AGENT_TOKENS" not in os.environ
+        assert "EXPORT PG_PASSWORD" not in os.environ
+        assert "PG_PASSWORD" not in os.environ
+    finally:
+        for key in ("AGENT_TOKENS", "export AGENT_TOKENS", "PG_PASSWORD", "EXPORT PG_PASSWORD"):
+            os.environ.pop(key, None)
+
+
+def test_is_client_secret_key_normalises_a_raw_lowercase_key(tmp_path):
+    """Fix round F11 (SEC1 MED-7): _is_client_secret_key() now normalises
+    INTERNALLY — a raw (un-normalised) lowercase key must still classify
+    secret, not rely on every call site pre-normalising it."""
+    vs = load_vector_skill()
+    assert vs._is_client_secret_key("agent_tokens") is True
+    assert vs._is_client_secret_key("Pg_Password") is True
+    assert vs._is_client_secret_key("agent_token") is False   # the exemption
+    assert vs._is_client_secret_key("﻿ agent_tokens") is True  # BOM+space
 
 
 def test_manual_env_parser_never_overrides_real_env(tmp_path, monkeypatch):

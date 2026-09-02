@@ -92,10 +92,22 @@ def test_main_actually_calls_the_helper(monkeypatch):
 # M2-partial (fix round, merger ruling): no raw userinfo secret in the rest
 # of the closed scrub set -- the four role_config_errors construction sites
 # and the five S-05/M-5/P-5 guard-message renders.
+#
+# SEC A (R-1, 2026-09-02): this fixture originally embedded its SECRET in
+# USERINFO ("https://leakuser:{SECRET}@backend.example.test/v1") -- that
+# shape is now refused/excluded by _load_llm_backends() at parse time,
+# BEFORE roles/token_env/private_ok are ever inspected, so it can no longer
+# reach any of the scenarios below (userinfo-URL coverage for the NEW
+# refusal itself lives in tests/test_llm_backend_secrets.py's SEC-A tests).
+# A query-string credential (R-2, deliberately NOT refused by A) is the
+# fixture that still reaches every one of these later code paths
+# unmodified, keeping this file's actual point -- scrub_url_credentials
+# drops queries exactly like it drops userinfo, so the property under test
+# is unchanged.
 # ---------------------------------------------------------------------------
 
 SECRET = "sm-test-must-never-leak-9f3ac2"
-USERINFO_URL = f"https://leakuser:{SECRET}@backend.example.test/v1"
+QUERY_CREDENTIAL_URL = f"https://backend.example.test/v1?key={SECRET}"
 
 
 def _reload_with_backends(monkeypatch, *, agent_tokens="", backends_json=None,
@@ -126,7 +138,7 @@ def _reload_with_backends(monkeypatch, *, agent_tokens="", backends_json=None,
 
 def _role_config_errors_text(monkeypatch, caplog):
     g = _reload_with_backends(monkeypatch, agent_tokens="claude:tok_abc", backends_json=[
-        {"url": USERINFO_URL, "roles": "not-a-list"},
+        {"url": QUERY_CREDENTIAL_URL, "roles": "not-a-list"},
     ])
     assert g._LLM_BACKEND_ROLE_CONFIG_ERRORS, "fixture didn't even reach role_config_errors"
     return " ".join(g._LLM_BACKEND_ROLE_CONFIG_ERRORS)
@@ -135,7 +147,7 @@ def _role_config_errors_text(monkeypatch, caplog):
 def _s05_warning_text(monkeypatch, caplog):
     monkeypatch.setenv("SM_TEST_TOKEN_S05_WARN", "resolved-token-value")
     g = _reload_with_backends(monkeypatch, agent_tokens="", backends_json=[
-        {"url": USERINFO_URL, "token_env": "SM_TEST_TOKEN_S05_WARN", "private_ok": True},
+        {"url": QUERY_CREDENTIAL_URL, "token_env": "SM_TEST_TOKEN_S05_WARN", "private_ok": True},
     ], allow_unauth="1")
     with caplog.at_level(logging.WARNING, logger="hive-proxy"):
         g.require_auth_when_provider_keys_configured()
@@ -145,7 +157,7 @@ def _s05_warning_text(monkeypatch, caplog):
 def _s05_systemexit_text(monkeypatch, caplog):
     monkeypatch.setenv("SM_TEST_TOKEN_S05_EXIT", "resolved-token-value")
     g = _reload_with_backends(monkeypatch, agent_tokens="", backends_json=[
-        {"url": USERINFO_URL, "token_env": "SM_TEST_TOKEN_S05_EXIT", "private_ok": True},
+        {"url": QUERY_CREDENTIAL_URL, "token_env": "SM_TEST_TOKEN_S05_EXIT", "private_ok": True},
     ])
     with pytest.raises(SystemExit) as exc_info:
         g.require_auth_when_provider_keys_configured()
@@ -158,7 +170,7 @@ def _m5_warning_text(monkeypatch, caplog):
     was _m5_systemexit_text."""
     monkeypatch.setenv("SM_TEST_TOKEN_M5", "resolved-token-value")
     g = _reload_with_backends(monkeypatch, agent_tokens="claude:tok_abc", backends_json=[
-        {"url": USERINFO_URL, "token_env": "SM_TEST_TOKEN_M5"},  # neither roles nor private_ok
+        {"url": QUERY_CREDENTIAL_URL, "token_env": "SM_TEST_TOKEN_M5"},  # neither roles nor private_ok
     ])
     with caplog.at_level(logging.WARNING, logger="hive-proxy"):
         g.require_valid_llm_routing_config()   # must NOT raise
@@ -167,7 +179,7 @@ def _m5_warning_text(monkeypatch, caplog):
 
 def _p5_warning_text(monkeypatch, caplog):
     g = _reload_with_backends(monkeypatch, agent_tokens="", backends_json=[
-        {"url": USERINFO_URL, "private_ok": False},  # uncredentialed -- avoids S-05/M-5 entirely
+        {"url": QUERY_CREDENTIAL_URL, "private_ok": False},  # uncredentialed -- avoids S-05/M-5 entirely
     ], allow_unauth="1")
     with caplog.at_level(logging.WARNING, logger="hive-proxy"):
         g.require_valid_llm_routing_config()
@@ -183,7 +195,7 @@ def _p5_no_override_warning_text(monkeypatch, caplog):
     with the (now-inert) override env var still set, kept for its own
     scrub coverage."""
     g = _reload_with_backends(monkeypatch, agent_tokens="", backends_json=[
-        {"url": USERINFO_URL, "private_ok": False},
+        {"url": QUERY_CREDENTIAL_URL, "private_ok": False},
     ])
     with caplog.at_level(logging.WARNING, logger="hive-proxy"):
         g.require_valid_llm_routing_config()   # must NOT raise

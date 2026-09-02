@@ -22,6 +22,7 @@ auth_middleware end to end) and test_secrets_out_of_process_env.py
      AGENT_TOKENS entry refuses gateway startup outright as of v0.9.3 — no
      deprecation window).
 """
+import asyncio
 import hashlib
 import importlib
 import os
@@ -353,3 +354,314 @@ async def test_main_does_not_refuse_with_digest_only_registry(monkeypatch):
     with pytest.raises(RuntimeError) as exc_info:
         await g.main()
     assert exc_info.value is sentinel
+
+
+# ── G (S6): ephemeral daemon-token revoke on watchdog exit + drain ─────────
+# No real subprocess and no listening socket anywhere below — `_start_daemon`
+# / `_start_rem_daemon` are monkeypatched to fake coroutines returning a
+# minimal process double, per the ground rule (no process may bind a
+# network port / spawn a real child here).
+
+class _FakeDaemonProc:
+    """Minimal double for asyncio.subprocess.Process — just enough for the
+    watchdogs' own `proc.wait()` / `.returncode` / `.terminate()` / `.kill()`
+    / `.pid` usage."""
+    def __init__(self, returncode=None, pid=4242):
+        self.returncode = returncode
+        self.pid = pid
+        self._done = asyncio.Event()
+        if returncode is not None:
+            self._done.set()
+
+    def terminate(self):
+        self.returncode = -15
+        self._done.set()
+
+    def kill(self):
+        self.returncode = -9
+        self._done.set()
+
+    async def wait(self):
+        await self._done.wait()
+        return self.returncode
+
+
+@pytest.mark.asyncio
+async def test_watchdog_daemon_clean_exit_leaves_no_live_digest(monkeypatch):
+    """Prove failing first: before G's try/finally, a clean (returncode 0)
+    exit left the just-minted ephemeral digest live in the registry forever
+    (nothing on that path ever called _revoke_daemon_token)."""
+    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    import coordinator
+    importlib.reload(coordinator)
+    import hive_mind_proxy as g
+    importlib.reload(g)
+
+    async def _fake_start_daemon():
+        g._mint_daemon_token(g._CONSOLIDATION_AGENT_NAME)
+        return _FakeDaemonProc(returncode=0)
+
+    monkeypatch.setattr(g, "_start_daemon", _fake_start_daemon)
+    await g._watchdog_daemon(asyncio.Event())
+
+    assert g._CONSOLIDATION_AGENT_NAME not in g._ephemeral_daemon_token_digests
+    assert len(coordinator._AGENT_TOKENS) == 0
+
+
+@pytest.mark.asyncio
+async def test_start_daemon_publishes_daemon_proc_before_returning(monkeypatch):
+    """Fix round finding 9 (QA LOW): `_daemon_proc` must be set the instant
+    `asyncio.create_subprocess_exec` returns — inside `_start_daemon()`
+    itself — not left to the watchdog's own later assignment a few lines
+    after its `await _start_daemon()`. Prove-failing-first: calling
+    `_start_daemon()` directly (bypassing the watchdog entirely) leaves
+    `g._daemon_proc` at its pre-call value on unmodified code, since only
+    the WATCHDOG used to set it. A real cancellation delivered while the
+    watchdog's own `await _start_daemon()` is still unwinding back up the
+    call stack (after the subprocess is already live) used to leave
+    `_daemon_proc` unset — the drain's terminate step then skips a daemon
+    that is already running, orphaning it holding a token G's own
+    watchdog-`finally` had just revoked."""
+    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    import coordinator
+    importlib.reload(coordinator)
+    import hive_mind_proxy as g
+    importlib.reload(g)
+
+    fake_proc = _FakeDaemonProc()
+
+    async def _fake_create_subprocess_exec(*a, **kw):
+        return fake_proc
+
+    monkeypatch.setattr(g, "_find_uv", lambda: "/usr/bin/true")
+    monkeypatch.setattr(g.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    assert g._daemon_proc is None
+    proc = await g._start_daemon()
+    assert proc is fake_proc
+    assert g._daemon_proc is fake_proc
+
+
+@pytest.mark.asyncio
+async def test_start_rem_daemon_publishes_rem_proc_before_returning(monkeypatch):
+    """Parity with test_start_daemon_publishes_daemon_proc_before_returning,
+    for the REM daemon's `_rem_proc`."""
+    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    import coordinator
+    importlib.reload(coordinator)
+    import hive_mind_proxy as g
+    importlib.reload(g)
+
+    fake_proc = _FakeDaemonProc()
+
+    async def _fake_create_subprocess_exec(*a, **kw):
+        return fake_proc
+
+    monkeypatch.setattr(g, "_find_uv", lambda: "/usr/bin/true")
+    monkeypatch.setattr(g.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    assert g._rem_proc is None
+    proc = await g._start_rem_daemon()
+    assert proc is fake_proc
+    assert g._rem_proc is fake_proc
+
+
+@pytest.mark.asyncio
+async def test_watchdog_rem_daemon_clean_exit_leaves_no_live_digest(monkeypatch):
+    """Parity with the consolidation watchdog above, for the REM daemon."""
+    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    import coordinator
+    importlib.reload(coordinator)
+    import hive_mind_proxy as g
+    importlib.reload(g)
+
+    async def _fake_start_rem_daemon():
+        g._mint_daemon_token(g._REM_DAEMON_AGENT_NAME)
+        return _FakeDaemonProc(returncode=0)
+
+    monkeypatch.setattr(g, "_start_rem_daemon", _fake_start_rem_daemon)
+    await g._watchdog_rem_daemon(asyncio.Event())
+
+    assert g._REM_DAEMON_AGENT_NAME not in g._ephemeral_daemon_token_digests
+    assert len(coordinator._AGENT_TOKENS) == 0
+
+
+@pytest.mark.asyncio
+async def test_watchdog_daemon_circuit_breaker_leaves_no_live_digest(monkeypatch):
+    """Prove failing first: the circuit-breaker `break` is a different exit
+    path from the clean-exit one above, and before G's fix it ALSO left the
+    digest live forever. _DAEMON_MAX_RESTARTS=0 trips on the very first
+    crash, with no backoff sleep -- restart_times starts empty and
+    len([]) >= 0 is already True."""
+    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    import coordinator
+    importlib.reload(coordinator)
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    monkeypatch.setattr(g, "_DAEMON_MAX_RESTARTS", 0)
+
+    async def _fake_start_daemon():
+        g._mint_daemon_token(g._CONSOLIDATION_AGENT_NAME)
+        return _FakeDaemonProc(returncode=1)  # non-clean exit
+
+    monkeypatch.setattr(g, "_start_daemon", _fake_start_daemon)
+    await g._watchdog_daemon(asyncio.Event())
+
+    assert g._CONSOLIDATION_AGENT_NAME not in g._ephemeral_daemon_token_digests
+    assert len(coordinator._AGENT_TOKENS) == 0
+
+
+@pytest.mark.asyncio
+async def test_watchdog_daemon_exactly_one_live_digest_mid_respawn_regression_guard(monkeypatch):
+    """REGRESSION GUARD (ADV1-18): this already held before G — re-minting
+    for the same agent pops the previous digest first (_mint_daemon_token,
+    :2306-2308-area) — this test pins it THROUGH the watchdog loop, with
+    G's own revoke logic present. The observation point is inside the
+    SECOND FakeProc's own `wait()` — i.e. AFTER `_start_daemon()` has
+    already returned and the watchdog has already run its own
+    `_daemon_proc = proc; _daemon_healthy = True` lines — so a mutation
+    that inserted an extra `_revoke_daemon_token()` call anywhere in the
+    loop body between `proc = await _start_daemon()` and `await
+    proc.wait()` (the shape ADV1-18 warns about: "moving the revoke inside
+    the respawn loop") would revoke the digest the SECOND mint just
+    registered before this observation runs, and the assertion below would
+    see zero live digests instead of exactly one. Mutation-checked
+    (recorded in HANDOFF): inserting
+    `_revoke_daemon_token(_CONSOLIDATION_AGENT_NAME)` immediately after
+    `proc = await _start_daemon()` inside _watchdog_daemon's loop makes
+    this fail."""
+    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    import coordinator
+    importlib.reload(coordinator)
+    import hive_mind_proxy as g
+    importlib.reload(g)
+    monkeypatch.setattr(g, "_DAEMON_MAX_RESTARTS", 100)  # never trips in this test
+
+    stop_event = asyncio.Event()
+    call_count = 0
+    observed = {}
+
+    class _ObservingFakeProc(_FakeDaemonProc):
+        """Crashes (returncode=1) like a normal respawn trigger, but
+        records the live-digest count the moment the watchdog starts
+        awaiting it — i.e. strictly AFTER every line the loop body runs
+        between `_start_daemon()` returning and this await."""
+        def __init__(self, token):
+            super().__init__(returncode=1)
+            self._token = token
+
+        async def wait(self):
+            observed["live_digest_count"] = len(coordinator._AGENT_TOKENS)
+            observed["second_token_verifies"] = (
+                coordinator._lookup_agent_by_token(self._token) == g._CONSOLIDATION_AGENT_NAME)
+            return await super().wait()
+
+    async def _fake_start_daemon():
+        nonlocal call_count
+        call_count += 1
+        token = g._mint_daemon_token(g._CONSOLIDATION_AGENT_NAME)
+        if call_count == 2:
+            stop_event.set()
+            return _ObservingFakeProc(token)
+        return _FakeDaemonProc(returncode=1)  # crash -> triggers a respawn
+
+    monkeypatch.setattr(g, "_start_daemon", _fake_start_daemon)
+    await g._watchdog_daemon(stop_event)
+
+    assert observed["live_digest_count"] == 1, (
+        "exactly one live digest expected mid-respawn — the previous "
+        "ephemeral token must already be popped by the SECOND mint, not by "
+        "an out-of-band revoke"
+    )
+    assert observed["second_token_verifies"] is True
+    assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_drain_watchdogs_and_daemons_terminates_before_cancelling(monkeypatch):
+    """Drain order pinned (ADV1-13): a spying _revoke_daemon_token records
+    each daemon's OWN returncode at the moment it is called — every
+    observation must show a returncode already set (i.e. terminate() ran
+    first). MUTATION CHECK (recorded in HANDOFF): swapping
+    _drain_watchdogs_and_daemons() to cancel the watchdog tasks BEFORE
+    terminating the daemon processes makes this fail — the cancelled
+    watchdog's own finally-revoke fires while its FakeProc's returncode is
+    still None (still "alive")."""
+    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    import coordinator
+    importlib.reload(coordinator)
+    import hive_mind_proxy as g
+    importlib.reload(g)
+
+    cons_proc = _FakeDaemonProc(returncode=None, pid=111)
+    rem_proc  = _FakeDaemonProc(returncode=None, pid=222)
+
+    async def _fake_start_daemon():
+        g._mint_daemon_token(g._CONSOLIDATION_AGENT_NAME)
+        return cons_proc
+
+    async def _fake_start_rem_daemon():
+        g._mint_daemon_token(g._REM_DAEMON_AGENT_NAME)
+        return rem_proc
+
+    monkeypatch.setattr(g, "_start_daemon", _fake_start_daemon)
+    monkeypatch.setattr(g, "_start_rem_daemon", _fake_start_rem_daemon)
+
+    observations = []
+    _real_revoke = g._revoke_daemon_token
+
+    def _spying_revoke(agent_name):
+        observations.append((agent_name, cons_proc.returncode, rem_proc.returncode))
+        return _real_revoke(agent_name)
+
+    monkeypatch.setattr(g, "_revoke_daemon_token", _spying_revoke)
+
+    stop_event = asyncio.Event()
+    watchdog_task = asyncio.create_task(g._watchdog_daemon(stop_event))
+    rem_watchdog_task = asyncio.create_task(g._watchdog_rem_daemon(stop_event))
+
+    # Let both watchdogs run past their mint and reach the blocking
+    # `await proc.wait()` on their respective FakeProc.
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    stop_event.set()  # mirrors _on_shutdown_signal(), which always runs
+                       # before the drain sequence in main()
+    monkeypatch.setattr(g, "_daemon_proc", cons_proc)
+    monkeypatch.setattr(g, "_rem_proc", rem_proc)
+
+    await g._drain_watchdogs_and_daemons(watchdog_task, rem_watchdog_task, ())
+
+    assert observations, "no revoke was observed at all"
+    for agent_name, cons_rc, rem_rc in observations:
+        if agent_name == g._CONSOLIDATION_AGENT_NAME:
+            assert cons_rc is not None, (
+                "consolidation daemon's token was revoked BEFORE its "
+                "process was terminated — drain order violated")
+        if agent_name == g._REM_DAEMON_AGENT_NAME:
+            assert rem_rc is not None, (
+                "REM daemon's token was revoked BEFORE its process was "
+                "terminated — drain order violated")
+    assert g._CONSOLIDATION_AGENT_NAME not in g._ephemeral_daemon_token_digests
+    assert g._REM_DAEMON_AGENT_NAME not in g._ephemeral_daemon_token_digests
+    assert len(coordinator._AGENT_TOKENS) == 0
+
+
+@pytest.mark.asyncio
+async def test_drain_watchdogs_and_daemons_is_an_idempotent_backstop(monkeypatch):
+    """ADV2-9: calling the backstop revoke when the watchdogs' own finally
+    already cleared everything must not raise and must not resurrect a
+    stale entry — pop-with-default is a no-op the second time."""
+    monkeypatch.delenv("AGENT_TOKENS", raising=False)
+    import coordinator
+    importlib.reload(coordinator)
+    import hive_mind_proxy as g
+    importlib.reload(g)
+
+    async def _noop_task():
+        return None
+
+    t1 = asyncio.create_task(_noop_task())
+    t2 = asyncio.create_task(_noop_task())
+    await g._drain_watchdogs_and_daemons(t1, t2, ())  # no daemons ever started
+    assert len(coordinator._AGENT_TOKENS) == 0  # no exception, nothing to revoke

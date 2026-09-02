@@ -154,7 +154,7 @@ def _short(value: Any, cap: int = 200) -> str:
 # ships with the skill) and this coordinator. Bump it ONLY when the request or
 # response shape, auth scheme, or routes change in a way that breaks older clients.
 # Client and server build-versions are allowed to drift; their API_VERSION must agree.
-FRAMEWORK_VERSION = "0.9.86"
+FRAMEWORK_VERSION = "0.9.87"
 # v2 (retro-as-record): /memory/retrospective now creates a full record (own
 # pg_id, embedding, Retrospective node) and accepts rating enum + grounding —
 # the response shape changed (returns the retro's own pg_id).
@@ -661,6 +661,22 @@ def _extract_bearer_token(request: web.Request) -> str | None:
     digest_prefix; no token at all gets the bare challenge and no digest."""
     parts = request.headers.get("Authorization", "").split(maxsplit=1)
     if len(parts) != 2 or parts[0] != "Bearer":
+        return None
+    return parts[1]
+
+
+def _extract_bearer_token_ci(request: web.Request) -> str | None:
+    """Like _extract_bearer_token, but the scheme match is CASE-INSENSITIVE
+    (F, S4, ADV2-15 — RFC 7235 SS2.1: an auth-scheme token is compared
+    case-insensitively). Used ONLY by the unprotected-path token-oracle
+    audit in auth_middleware below, which must see -- and count as a
+    verify-failure attempt -- a presented `bearer`/`BEARER` scheme just as
+    readily as `Bearer`. _extract_bearer_token itself, the PROTECTED-path
+    helper, keeps its existing case-sensitive match unchanged: widening it
+    would be a distinct, unscoped behaviour change to identity resolution,
+    not this item's job."""
+    parts = request.headers.get("Authorization", "").split(maxsplit=1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
         return None
     return parts[1]
 
@@ -1772,6 +1788,89 @@ def _record_token_verify_failed(request: web.Request, presented_token: str | Non
     _write_credential_audit_line("token_verify_failed", origin="gateway", **fields)
 
 
+# F (S4, ADV1-16): a SEPARATE token bucket for verify failures observed on
+# an UNPROTECTED path (/health, /pool/status). Same shape and rate as
+# _tvf_bucket_* above, but kept as independent state — a caller flooding
+# /health with a bad bearer must not be able to exhaust the budget the
+# protected-path forensic lines above depend on (bucket isolation).
+_tvf_unprotected_bucket_tokens: float = float(TOKEN_VERIFY_FAILED_LOG_RATE)
+_tvf_unprotected_bucket_last_refill: float = time.monotonic()
+_tvf_unprotected_suppressed_count: int = 0
+_tvf_unprotected_suppressed_since: float | None = None
+
+
+def _tvf_unprotected_rate_limit_allow() -> bool:
+    """Own bucket, identical refill logic to _tvf_rate_limit_allow() — see
+    that function's docstring. Kept SEPARATE so unprotected-path noise
+    cannot suppress a protected-path line (ADV1-16)."""
+    global _tvf_unprotected_bucket_tokens, _tvf_unprotected_bucket_last_refill
+    now = time.monotonic()
+    elapsed = max(0.0, now - _tvf_unprotected_bucket_last_refill)
+    _tvf_unprotected_bucket_last_refill = now
+    refill_rate = (TOKEN_VERIFY_FAILED_LOG_RATE / TOKEN_VERIFY_FAILED_LOG_WINDOW
+                   if TOKEN_VERIFY_FAILED_LOG_WINDOW > 0 else 0.0)
+    _tvf_unprotected_bucket_tokens = min(
+        float(TOKEN_VERIFY_FAILED_LOG_RATE),
+        _tvf_unprotected_bucket_tokens + elapsed * refill_rate,
+    )
+    if _tvf_unprotected_bucket_tokens >= 1.0:
+        _tvf_unprotected_bucket_tokens -= 1.0
+        return True
+    return False
+
+
+def _record_unprotected_path_token_verify_failed(request: web.Request, presented_token: str) -> None:
+    """F (S4): a bearer PRESENTED on an UNPROTECTED path (/health,
+    /pool/status) that fails to verify — a token-oracle probe. Never gates
+    the response: the caller still gets exactly the same anonymous/slim
+    payload it always did (auth_middleware's own unprotected-path exemption
+    is unchanged; this is a pure side-effect audit call). This is what makes
+    such an attempt visible for forensics, the same way a bad bearer on a
+    protected path already is.
+
+    Shares _record_token_verify_failed's COUNTER
+    (credentials.token_verify_failed) and event name — decision:1785 rules
+    out a new /health-only telemetry key, so the existing
+    /memory/telemetry consumer sees this signal too, unchanged in shape.
+    Only the LOG-LINE rate limit is separate (its own bucket, above), so a
+    caller flooding /health with a bad bearer cannot exhaust the budget a
+    protected-path failure depends on to be seen."""
+    global _tvf_unprotected_suppressed_count, _tvf_unprotected_suppressed_since
+    _credential_counters["token_verify_failed"] += 1
+    _credential_last_ts["token_verify_failed"] = datetime.now(timezone.utc).isoformat()
+    if not _tvf_unprotected_rate_limit_allow():
+        if _tvf_unprotected_suppressed_count == 0:
+            _tvf_unprotected_suppressed_since = time.monotonic()
+        _tvf_unprotected_suppressed_count += 1
+        return
+    if _tvf_unprotected_suppressed_count:
+        window_s = (round(time.monotonic() - _tvf_unprotected_suppressed_since, 1)
+                    if _tvf_unprotected_suppressed_since is not None else None)
+        _write_credential_audit_line(
+            "token_verify_failed_suppressed", origin="gateway",
+            count=_tvf_unprotected_suppressed_count, window_s=window_s,
+        )
+        _tvf_unprotected_suppressed_count = 0
+        _tvf_unprotected_suppressed_since = None
+
+    fields: dict[str, Any] = {
+        "claimed_agent": None,
+        "digest_prefix": _token_digest(presented_token)[:8],
+        "path": request.path,
+        "transport": _transport_kind(request),
+        "unprotected_path": True,
+    }
+    principal = _peer_identity(request)
+    if principal:
+        fields["principal"] = principal.get("user")
+        fields["connected_from"] = {
+            k: principal[k] for k in
+            ("uid", "gid", "pid", "login_uid", "login_user", "session")
+            if k in principal
+        }
+    _write_credential_audit_line("token_verify_failed", origin="gateway", **fields)
+
+
 def record_daemon_token_issued(agent_name: str) -> None:
     """Bump the daemon-tokens-issued counter and log the mint — daemon name
     and timestamp only, never token material. Called by
@@ -2000,6 +2099,20 @@ async def auth_middleware(request: web.Request, handler):
         # for a REFUSAL decision (see AsyncHiveMindProxy._route_guard, which
         # refuses a near-miss spelling of an owned path), never for a GRANT.
         if _router_match_path(request) in _UNPROTECTED_PATHS:
+            # F (S4, ADV1-16/ADV2-1/ADV2-15): a bearer PRESENTED on this
+            # unprotected path that fails to verify is a token-oracle probe
+            # — audit the attempt, but the RESPONSE must stay byte-identical
+            # either way (ADV2-1: falling through to the 401 branch below
+            # would break the anonymous contract every daemon and doctor
+            # relies on). A VALID bearer still reaches the full
+            # authenticated payload — handle_health resolves identity itself
+            # via _safe_resolve_identity, entirely independent of this
+            # audit-only side effect. Scheme match is case-insensitive here
+            # (unlike the protected-path helper) so a lower-case `bearer`
+            # scheme is audited too, not silently ignored.
+            _unprotected_presented = _extract_bearer_token_ci(request)
+            if _unprotected_presented is not None and not _lookup_agent_by_token(_unprotected_presented):
+                _record_unprotected_path_token_verify_failed(request, _unprotected_presented)
             return await handler(request)
 
         agent_name = resolve_identity(request)

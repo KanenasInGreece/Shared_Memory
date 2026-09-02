@@ -35,7 +35,7 @@ from datetime import datetime
 
 import httpx
 
-VERSION = "0.9.86"
+VERSION = "0.9.87"
 # Wire contract this client was built against. Must match the gateway's
 # api_version (reported by GET /health). Bump only on breaking protocol changes.
 # v4 (project registry): a fact save without a REGISTERED metadata.project is
@@ -136,16 +136,62 @@ _CLIENT_SECRET_SUFFIXES = (
 )
 
 
+def _client_key_norm(name: str) -> str:
+    """Fix round F11 (SEC1 MED-7 + LOW-8): shared client-side key
+    normaliser — mirrors secure_env._normalize_key() exactly (duplicated,
+    not imported: this client ships alone and may not depend on a
+    server-only module). BOM (U+FEFF) + whitespace stripped from both
+    ends, in EITHER order and any interleaving, then upper-cased. A single
+    fixed-order strip (e.g. .strip().lstrip(BOM)) only handles ONE of the
+    two orderings a raw line can carry — probed by SEC1: "﻿ AGENT_TOKENS"
+    (BOM then space) and " ﻿AGENT_TOKENS" (space then BOM) each defeat
+    exactly one fixed order."""
+    s = name
+    while s and (s[0].isspace() or s[0] == "﻿"):
+        s = s[1:]
+    while s and (s[-1].isspace() or s[-1] == "﻿"):
+        s = s[:-1]
+    return s.upper()
+
+
+_EXPORT_PREFIX_RE = re.compile(r"^export\s+", re.IGNORECASE)
+
+
+def _strip_export_prefix(key: str) -> str:
+    """Fix round F5 (SEC1 HIGH-3 + MED-5): strip an optional leading shell
+    `export ` keyword (case-insensitive) from a raw .env line's key text,
+    at parse time, in the MANUAL fallback parser only (the dotenv_values()
+    path already strips a lowercase "export " natively and silently drops
+    an uppercase "EXPORT " line entirely — neither reaches this function).
+    Mirrors secure_env._strip_export_prefix() exactly."""
+    s = key
+    while s and (s[0].isspace() or s[0] == "﻿"):
+        s = s[1:]
+    s = _EXPORT_PREFIX_RE.sub("", s, count=1)
+    while s and (s[0].isspace() or s[0] == "﻿"):
+        s = s[1:]
+    return s
+
+
 def _is_client_secret_key(name: str) -> bool:
     """True if `name` must never be exported into this client's own
     os.environ (mirrors secure_env.is_secret_key(), narrowed to what this
     client can ever encounter). AGENT_TOKEN is excluded -- it has its own
-    private-variable path and is never routed through this predicate."""
-    if name == "AGENT_TOKEN":
+    private-variable path and is never routed through this predicate.
+
+    Fix round F11 (SEC1 MED-7): normalises internally via
+    _client_key_norm(), so ANY caller — pre-normalised or raw — classifies
+    correctly. Before this fix, `_is_client_secret_key("agent_tokens")` was
+    False (exact-match-only against the upper-cased name list, no internal
+    normalisation) — defused today only because every call site happens to
+    pass an already-`.upper()`d key; a future caller passing a raw key
+    would silently re-open a live `agent_tokens=` export."""
+    key_norm = _client_key_norm(name)
+    if key_norm == "AGENT_TOKEN":
         return False
-    if name in _CLIENT_KNOWN_SECRET_NAMES:
+    if key_norm in _CLIENT_KNOWN_SECRET_NAMES:
         return True
-    return name.upper().endswith(_CLIENT_SECRET_SUFFIXES)
+    return key_norm.endswith(_CLIENT_SECRET_SUFFIXES)
 
 
 try:
@@ -156,11 +202,23 @@ try:
         for _k, _v in dotenv_values(_env).items():
             if _v is None or not _k:
                 continue
-            if _k == "AGENT_TOKEN":
+            # D.3 (SEC round, ADV1-1/H-1 twin fix — mirrors mcp/vector-
+            # skill.py:221-237 exactly): key_norm is computed ONCE per key
+            # and used for BOTH the AGENT_TOKEN diversion check AND the
+            # _is_client_secret_key() call. Before this fix the two checks
+            # normalised differently (one case-sensitive, one upper-cased),
+            # which is a REGRESSION in the SAFER direction only by accident
+            # — a lowercase `agent_token=` or a BOM-prefixed key could slip
+            # past one check but not the other, in either order. `_k` —
+            # never `_k_norm` — is still what gets exported when the key
+            # isn't filtered: this only changes what counts as
+            # secret/AGENT_TOKEN, never the exported name's casing.
+            _k_norm = _client_key_norm(_k)
+            if _k_norm == "AGENT_TOKEN":
                 if not _AGENT_TOKEN_FROM_FILE:
                     _AGENT_TOKEN_FROM_FILE = _v.strip()
                 continue
-            if _is_client_secret_key(_k):
+            if _is_client_secret_key(_k_norm):
                 continue
             os.environ.setdefault(_k, _v)
 except ImportError:
@@ -169,21 +227,38 @@ except ImportError:
     def _read_env_file(path: str) -> None:
         global _AGENT_TOKEN_FROM_FILE
         try:
-            with open(path) as _f:
+            # utf-8-sig (D.3, ADV1-20): aligns this fallback parser's file
+            # encoding with mcp/vector-skill.py's own manual parser — a file
+            # saved as UTF-8-with-BOM otherwise decodes a leading U+FEFF onto
+            # the FIRST key, which the per-key .lstrip("﻿") below also
+            # catches (belt and braces) but should not have to rely on alone.
+            with open(path, encoding="utf-8-sig") as _f:
                 for _line in _f:
                     _line = _line.strip()
                     if not _line or _line.startswith("#") or "=" not in _line:
                         continue
                     _k, _, _v = _line.partition("=")
-                    _k = _k.strip()
+                    # F5 (SEC1 HIGH-3/MED-5): strip an optional leading
+                    # "export "/"EXPORT " prefix before classification —
+                    # without this, the stored key for an "export
+                    # AGENT_TOKENS=..." line was the literal "export
+                    # AGENT_TOKENS", matching neither the AGENT_TOKEN
+                    # diversion nor _is_client_secret_key's exact-name list,
+                    # exporting the registry straight into os.environ.
+                    _k = _strip_export_prefix(_k).strip()
                     _v = _v.strip()
                     if not _k:
                         continue
-                    if _k == "AGENT_TOKEN":
+                    # D.3: key_norm computed ONCE, used for BOTH checks —
+                    # see the dotenv_values() branch above for the full
+                    # rationale (identical fix, same shape, mirrors
+                    # mcp/vector-skill.py's _load_env_manually exactly).
+                    _k_norm = _client_key_norm(_k)
+                    if _k_norm == "AGENT_TOKEN":
                         if not _AGENT_TOKEN_FROM_FILE:
                             _AGENT_TOKEN_FROM_FILE = _v
                         continue
-                    if _is_client_secret_key(_k):
+                    if _is_client_secret_key(_k_norm):
                         continue
                     if _k not in os.environ:   # first definition wins
                         os.environ[_k] = _v

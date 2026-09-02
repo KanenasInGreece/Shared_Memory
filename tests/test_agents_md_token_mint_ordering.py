@@ -29,6 +29,8 @@ neither.
 import os
 import re
 
+import pytest
+
 _ROOT = os.path.join(os.path.dirname(__file__), "..")
 
 
@@ -251,4 +253,82 @@ def test_phase7_check_keys_on_payload_shape_not_status_or_bare_auth_required_tru
         "Phase 7 still reads like it expects auth_required:true from the "
         "bare/anonymous curl -- that response is never able to produce it; "
         "it is either the 3-key slim shape or auth_required:false."
+    )
+
+
+# ── I.1 (SEC round, ADV1-9): no `export AGENT_TOKEN=<...>`-shaped paste ─────
+
+def test_agents_md_has_no_export_agent_token_paste_shape():
+    """The old instructional shape -- `export AGENT_TOKEN=...` or
+    `export AGENT_TOKEN=<an agent token>` -- required an operator (or an
+    agent) to already HOLD the raw token value to paste in, which for an
+    agent means reading it out of the skill .env first: `. file` EXECUTES
+    the file rather than just reading it, and cat/grep puts the raw
+    credential in the agent's own transcript (fact:1499). AGENTS.md now
+    reads the value via `sed` into a shell variable, never sourcing the
+    file and never printing the value anywhere. This test greps the whole
+    document for any surviving `export AGENT_TOKEN=<`-shaped paste (the
+    ellipsis/placeholder forms this fix removed), rather than pinning the
+    two known line numbers, so a THIRD site introduced later fails here
+    too."""
+    agents_md = _read("AGENTS.md")
+    assert not re.search(r"export AGENT_TOKEN=", agents_md), (
+        "AGENTS.md still has an `export AGENT_TOKEN=<value>`-shaped paste -- "
+        "read it via the AGENT_ENV + sed shape instead (see Phase 9 / "
+        "Upgrade), never `. file` (executes it) and never cat/grep it "
+        "(fact:1499: a raw credential must never pass through an agent's "
+        "own transcript)"
+    )
+
+
+# ── Fix round F9 (QA MED-4): the same no-paste grep, widened past AGENTS.md
+#    to the rest of the agent-readable doc/script set. README.md:459 is
+#    deliberately excluded -- it is the human-voice Quick Start, which per
+#    this repo's own ground rules a builder never rewrites (a fix there is
+#    a proposal in the operator's own voice, left for the merger).
+
+@pytest.mark.parametrize("relpath", [
+    "shared-memory/Documentation/postflight.md",
+    "shared-memory/scripts/postflight.sh",
+])
+def test_doc_set_has_no_export_agent_token_paste_shape(relpath):
+    """postflight.md's Quick Start and postflight.sh's own header comment +
+    runtime A1 failure messages used to instruct the same unsafe paste
+    AGENTS.md's fix already closed -- an agent following postflight.md, or
+    reading postflight.sh's own error message after a failed run, would do
+    exactly what fact:1499 forbids. Same grep, same property, different
+    file."""
+    text = _read(relpath)
+    assert not re.search(r"export AGENT_TOKEN=", text), (
+        f"{relpath} still has an `export AGENT_TOKEN=<value>`-shaped paste -- "
+        "read it via the AGENT_ENV + sed shape instead (see AGENTS.md Phase 9 "
+        "/ Upgrade for the pattern), never `. file` (executes it) and never "
+        "cat/grep it (fact:1499)"
+    )
+
+
+def test_agents_md_agent_token_reads_use_the_non_executing_sed_shape():
+    """Positive pin: both surviving AGENT_TOKEN reads (Phase 9, Upgrade) use
+    the `sed -n 's/^AGENT_TOKEN=//p' "$AGENT_ENV"` shape -- never `. file`
+    (which EXECUTES the env file as shell) and never cat/grep the file
+    (which would put the raw value in a tool-call transcript)."""
+    agents_md = _read("AGENTS.md")
+    occurrences = re.findall(
+        r"""AGENT_TOKEN=\$\(sed -n 's/\^AGENT_TOKEN=//p' "\$AGENT_ENV" \| head -1\); export AGENT_TOKEN""",
+        agents_md,
+    )
+    # Fix round finding 11 (QA LOW): a count pin (`== 2`) fails a
+    # legitimately ADDED third site for no reason -- the property that
+    # actually matters ("every AGENT_TOKEN read uses this safe shape") is
+    # what the sibling negative test above already covers; this positive
+    # pin only needs to confirm the two KNOWN sites (Phase 9, Upgrade)
+    # still use it, not that nothing else ever will.
+    assert len(occurrences) >= 2, (
+        f"expected at least 2 AGENT_ENV/sed-shaped AGENT_TOKEN reads (Phase 9 + "
+        f"Upgrade), found {len(occurrences)}"
+    )
+    assert not re.search(r"^\s*\.\s+\$?\{?AGENT_ENV\}?\s*$", agents_md, re.M), (
+        "AGENTS.md sources the skill .env with `. file` somewhere -- that "
+        "EXECUTES the credential file rather than reading one value out of "
+        "it (ADV1-9)"
     )

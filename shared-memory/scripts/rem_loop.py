@@ -71,6 +71,7 @@ from dream_telemetry import (
 )
 from secure_env import (
     load_split_env, get_secret, require_db_credentials, read_daemon_token_from_fd,
+    require_llm_backends_json_parses,
 )
 
 
@@ -1884,4 +1885,11 @@ async def main() -> None:
 
 if __name__ == "__main__":
     _require_db_credentials()
+    # D.1 (SEC round, ADV1-2): same placement reasoning as
+    # _require_db_credentials() above — never at bare import time (this
+    # module is imported freely by tests with a malformed LLM_BACKENDS_JSON
+    # on purpose), only at the actual daemon entrypoint. A daemon must not
+    # crash-loop on a bare import traceback that reads as "daemon crashed",
+    # never as "LLM_BACKENDS_JSON typo".
+    require_llm_backends_json_parses("rem_loop")
     asyncio.run(main())

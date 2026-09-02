@@ -181,24 +181,80 @@ class AsyncLineWriter:
                 self._task = None
 
 
+_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+")
+
+
 def scrub_url_credentials(text: str) -> str:
-    """Security review O-6: strip userinfo (user:pass@) and the query string
-    from any http(s) URL found in `text` before it reaches a client-visible
-    body or a log. An exception's own __str__ can render the full request URL
-    (aiohttp's InvalidURL and httpx's HTTPStatusError both do), and a real
-    provider pattern puts a credential in a URL — a `?key=...` query parameter,
-    or userinfo — so echoing that text verbatim is a key-leakage path. Shared
-    here because BOTH the gateway (LLM backends) and the coordinator (its own
-    EMBEDDER_URL / RERANKER_URL calls) render such errors; the coordinator
-    cannot import the gateway module. Only scheme/host/port/path survive; never
-    raises (a "URL" urlsplit chokes on is replaced outright, not echoed)."""
+    """Security review O-6 (widened R3-4): strip userinfo (user:pass@) and the
+    query string from any URL found in `text` before it reaches a
+    client-visible body or a log. An exception's own __str__ can render the
+    full request URL (aiohttp's InvalidURL and httpx's HTTPStatusError both
+    do), and a real provider pattern puts a credential in a URL — a
+    `?key=...` query parameter, or userinfo — so echoing that text verbatim is
+    a key-leakage path. Shared here because BOTH the gateway (LLM backends)
+    and the coordinator (its own EMBEDDER_URL / RERANKER_URL calls) render
+    such errors; the coordinator cannot import the gateway module.
+
+    Scheme-generic (not http(s)-only): matches ANY `scheme://` prefix,
+    including `postgresql://`, `bolt://`, `redis://` DSNs and mixed/upper
+    -case schemes (`HTTP://…`). The netloc is rebuilt byte-preservingly —
+    everything after the LAST "@" in the ORIGINAL netloc is kept verbatim
+    (case, IPv6 brackets, port intact); only the userinfo before that "@" is
+    dropped. This deliberately avoids `parsed.hostname` (which lowercases the
+    host and strips IPv6 brackets) and `urlunsplit` (which drops one slash of
+    a netloc-less DSN like `postgresql:///agent_data`) — reconstruction is
+    `f"{scheme}://{netloc}{path}"` directly. Query and fragment are always
+    dropped (R-2's render-scrub policy). Idempotent: a second pass over
+    already-scrubbed output is a no-op. Only scheme/host/port/path survive;
+    never raises (a "URL" urlsplit chokes on is replaced outright, not
+    echoed).
+
+    Fix round F2/F8 (SEC2 HIGH-1, QA MED-3): two corrections to the
+    reconstruction above.
+
+    F8 — scheme case: `parsed.scheme` LOWERCASES (urlsplit's own contract),
+    so `HTTP://MyHost:8000` was rendered `http://MyHost:8000` — not byte
+    identical despite the host/port/brackets being preserved. Rebuilt from
+    the RAW match text instead (`raw[: raw.index("://")]`) — the regex
+    already guarantees the first "://" in `raw` is the scheme separator
+    (the scheme character class excludes "/" and ":"), so this is exact,
+    never a guess.
+
+    F2 — fail CLOSED, not open, when userinfo removal cannot be proven:
+    `urlsplit()`'s own authority/path split is naive about a malformed
+    authority whose USERINFO contains "/" — e.g.
+    `postgresql://postgres:ab/cd@localhost:5432/agent_data` (a real DSN
+    shape: an operator-chosen password containing "/") or
+    `http://user:http://nested@host/path`. In both, urlsplit ends `netloc`
+    at the first "/", so the "@" that should have been stripped lands in
+    `parsed.path` instead — `netloc.rpartition("@")` finds nothing, and the
+    old reconstruction echoed the credential BYTE-IDENTICAL to the input
+    (measured — this was a silent regression, not a cosmetic gap). The
+    proof this function needs before it can trust the netloc-based strip:
+    is there an "@" anywhere in the raw authority+path text before the
+    first "?"/"#" (query/fragment are already dropped, so an "@" inside
+    either is never at risk) that `netloc` does NOT already account for? If
+    so, `rpartition` could not have removed it — redact the whole match
+    rather than echo a URL that might still carry a credential. This can
+    over-redact a rare legitimate path segment containing "@" with no
+    userinfo at all (e.g. `/users/@handle`) when the host has no userinfo
+    of its own — accepted: failing closed on an ambiguous parse is the
+    point."""
     def _scrub(m: "re.Match") -> str:
+        raw = m.group(0)
         try:
-            parsed = urllib.parse.urlsplit(m.group(0))
-            netloc = parsed.hostname or ""
-            if parsed.port:
-                netloc += f":{parsed.port}"
-            return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+            scheme = raw[: raw.index("://")]
+            parsed = urllib.parse.urlsplit(raw)
+            netloc = parsed.netloc.rpartition("@")[2]
+            after_scheme = raw[len(scheme) + 3:]
+            boundary = len(after_scheme)
+            for stop_char in ("?", "#"):
+                idx = after_scheme.find(stop_char)
+                if idx != -1:
+                    boundary = min(boundary, idx)
+            if "@" in after_scheme[:boundary] and "@" not in parsed.netloc:
+                return "<url-redacted>"
+            return f"{scheme}://{netloc}{parsed.path}"
         except Exception:
             return "<url-redacted>"
-    return re.sub(r"https?://\S+", _scrub, text)
+    return _URL_RE.sub(_scrub, text)

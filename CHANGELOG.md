@@ -5,6 +5,42 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.87] — 2026-09-02
+
+### The security round — credential-URL hygiene, case-blind classification closed, refusals audited
+
+A backend URL carrying an embedded credential (`user:pass@`) is now a fatal startup refusal on both
+config paths — the JSON loader and the legacy CSV form, whose parser previously split a credentialed
+URL on the wrong `@` and quietly enrolled the fragment as a backend. Query strings stay loadable
+(an Azure-style `?api-version=` backend is legitimate) but are scrubbed from every render. The URL
+scrubber itself grew up: scheme-generic (Postgres/Neo4j/Redis DSNs now scrub, measured passing
+through verbatim before), byte-preserving on clean URLs (IPv6 brackets, host and scheme case), and
+fail-closed on malformed authorities — the review round caught that the first rewrite echoed a
+password containing `/` verbatim, so proving that class now redacts is what the new fixtures pin.
+Every render of a backend URL — response header, `/pool/status`, `/health`, telemetry snapshots,
+audit lines — passes through it, and `_bearer_transport_ok` no longer mistakes a numeric-literal
+host (`16909060`, `0x7f000001`, leading-zero octal) for a private LAN name.
+
+Secret classification stopped being case-blind, on every door with one shared normaliser: a
+lowercase `agent_tokens=`, a BOM-prefixed key, or an `export `-prefixed line now classifies exactly
+like its canonical spelling — on the gateway, in the CLI client, and in the MCP client — and the
+operator's own environment now always beats the file store on lookup. A malformed
+`LLM_BACKENDS_JSON` refuses startup loudly at `main()` on the gateway and both daemons instead of
+silently classifying provider keys as plain config, and a case-variant spelling of that key counts
+as present, not absent. A bearer presented and rejected on `/health` or `/pool/status` is now
+audited (its own rate bucket, never the token itself) where before it was a silent oracle; the
+ephemeral daemon tokens are revoked at every watchdog exit and at shutdown, not only on spawn
+failure. `PROXY_BIND=` present-but-empty now falls back to loopback — measured before the fix:
+an empty value bound every interface on both stacks against the documented default.
+
+The operational docs and scripts follow: the token-bearing runbook lines in `AGENTS.md` and
+`postflight` read the value from the agent's skill `.env` without echoing it on a command line
+or source-executing the file, and `bootstrap_tokens.sh` cleans up its temporary registry copies on
+interrupt. Chain for the record: two adversarial design reviews before any code, two builders in a
+worktree, QA plus two security reviews on the diff (which found the fail-open scrubber regression
+and the silent CSV mis-parse), a fourteen-item ruled fix round, and handback probes on every
+regression-class fix.
+
 ## [0.9.86] — 2026-09-01
 
 ### Documentation: a fully-LAN, GPU-less example, and the re-mint restart rule

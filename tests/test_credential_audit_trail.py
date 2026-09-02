@@ -811,3 +811,80 @@ def test_write_credential_audit_line_event_origin_are_protected_by_signature_bin
     mod = load_coordinator()
     with pytest.raises(TypeError):
         mod._write_credential_audit_line("real_event", origin="gateway", event="shadow")
+
+
+# ── F (S4): token-oracle audit on the UNPROTECTED-path branch ───────────────
+# Plain sync tests (no `@pytest.mark.asyncio`, no running loop) so
+# AsyncLineWriter.write() takes its documented synchronous fallback and a
+# read right after the call sees the line — same pattern as every other
+# file-based assertion above. auth_middleware's own end-to-end wiring
+# (response-contract byte-identity, valid vs bad bearer) is covered in
+# tests/test_auth.py, where a running loop means only the in-memory COUNTER
+# is asserted, never the file.
+
+def test_record_unprotected_path_token_verify_failed_bumps_the_shared_counter():
+    """Same counter/telemetry keys as the protected-path event (decision:
+    1785 — no new /health-only key)."""
+    mod = load_coordinator()
+    mod._record_unprotected_path_token_verify_failed(_FakeRequest("/health"), "tok_bad")
+    assert mod._credential_counters["token_verify_failed"] == 1
+
+
+def test_record_unprotected_path_token_verify_failed_writes_the_same_event_name(tmp_path):
+    target = tmp_path / "credential-audit.jsonl"
+    mod = load_coordinator(credential_audit_log_path=str(target))
+    mod._record_unprotected_path_token_verify_failed(_FakeRequest("/health"), "tok_bad")
+    line = json.loads(target.read_text().strip())
+    assert line["event"] == "token_verify_failed"
+    assert line["path"] == "/health"
+
+
+def test_record_unprotected_path_token_verify_failed_never_carries_the_raw_token(tmp_path):
+    target = tmp_path / "credential-audit.jsonl"
+    mod = load_coordinator(credential_audit_log_path=str(target))
+    mod._record_unprotected_path_token_verify_failed(_FakeRequest("/pool/status"), "tok_super_secret_value")
+    content = target.read_text()
+    assert "tok_super_secret_value" not in content
+    line = json.loads(content.strip())
+    assert line["digest_prefix"] == _digest("tok_super_secret_value")[:8]
+
+
+def test_unprotected_path_flood_does_not_suppress_a_subsequent_protected_path_line(tmp_path, monkeypatch):
+    """ADV1-16, bucket isolation: exhausting the UNPROTECTED-path bucket must
+    not silence the PROTECTED-path line right behind it — the two buckets
+    are independent state. MUTATION CHECK (recorded in HANDOFF): pointing
+    _record_unprotected_path_token_verify_failed at the SHARED
+    _tvf_rate_limit_allow() instead of its own bucket makes this test fail
+    (the protected-path line becomes the one that gets suppressed)."""
+    target = tmp_path / "credential-audit.jsonl"
+    monkeypatch.setenv("TOKEN_VERIFY_FAILED_LOG_RATE", "3")
+    monkeypatch.setenv("TOKEN_VERIFY_FAILED_LOG_WINDOW", "60")
+    mod = load_coordinator(credential_audit_log_path=str(target))
+
+    # Flood the UNPROTECTED bucket well past its burst capacity.
+    for i in range(10):
+        mod._record_unprotected_path_token_verify_failed(_FakeRequest("/health"), f"tok_health_{i}")
+
+    # A single protected-path failure right behind the flood must still be
+    # written — its own, separate bucket has never been touched.
+    mod._record_token_verify_failed(_FakeRequest("/memory/save"), "tok_protected")
+
+    lines = [json.loads(l) for l in target.read_text().splitlines()]
+    protected_lines = [l for l in lines
+                        if l["event"] == "token_verify_failed" and l.get("path") == "/memory/save"]
+    assert len(protected_lines) == 1, (
+        "the protected-path line was suppressed by unprotected-path flood — "
+        "bucket isolation broken"
+    )
+    # And the counter still saw all 11 attempts regardless of which lines
+    # were rate-limited off disk.
+    assert mod._credential_counters["token_verify_failed"] == 11
+
+
+def test_unprotected_path_rate_limit_allow_has_its_own_independent_bucket():
+    """Direct unit check: exhausting _tvf_unprotected_rate_limit_allow()
+    leaves _tvf_rate_limit_allow() (the protected-path bucket) untouched."""
+    mod = load_coordinator()
+    mod._tvf_unprotected_bucket_tokens = 0.0
+    assert mod._tvf_unprotected_rate_limit_allow() is False
+    assert mod._tvf_rate_limit_allow() is True

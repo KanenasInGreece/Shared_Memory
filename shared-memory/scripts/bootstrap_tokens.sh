@@ -75,6 +75,51 @@ red() { printf '\033[31m%s\033[0m\n' "$*"; }
 grn() { printf '\033[32m%s\033[0m\n' "$*"; }
 ylw() { printf '\033[33m%s\033[0m\n' "$*"; }
 
+# I.2 (SEC round, ADV1-8): script-scope temp-file cleanup registry.
+#
+# A naive `trap 'rm -f "$tmp"' EXIT` set INSIDE replace_registry_lines()
+# below would be a NO-OP: bash traps are process-global, but `local tmp`
+# goes out of scope the moment the function RETURNS, so by the time the
+# trap actually FIRES (at script exit) the variable has long since expanded
+# to an empty string — an interrupt between mktemp and the final mv would
+# leak that temp file forever. Tracking every mktemp PATH in this
+# script-scope array instead, with ONE trap registered ONCE here at top
+# level, is what survives an interrupt (Ctrl+C, a killed session) mid-
+# function. `rm -f` on a path already `mv`'d away by a successful run is a
+# harmless no-op — `rm -f` never errors on a missing target — so cleaning
+# up every path this array has ever seen, unconditionally, is safe.
+_CLEANUP_PATHS=()
+_cleanup_temp_files() {
+    local p
+    for p in "${_CLEANUP_PATHS[@]:-}"; do
+        [[ -n "$p" ]] && rm -f -- "$p"
+    done
+    # ⛔ MEASURED FOOTGUN: under `set -e` (this script's own top-of-file
+    # setting), an EXIT-trap FUNCTION's own last command's exit status
+    # becomes the SCRIPT's final exit status if not explicitly overridden --
+    # `[[ -n "$p" ]] && rm -f ...` evaluates to 1 (false) on the empty-array
+    # case (the common one: nothing to clean up), which silently turned
+    # every `exit 0` in this script into an observed exit 1 (measured: the
+    # "AGENT_TOKENS already set, refusing" quiet-refusal path). This `return
+    # 0` is load-bearing, not decorative -- it is what makes the trap
+    # invisible to callers that check this script's own exit code.
+    return 0
+}
+# EXIT alone would leave INT/TERM's default disposition intact for anything
+# ELSE the signal does — bash overrides a signal's default action for a
+# trap that ONLY names EXIT not at all, but naming INT/TERM alongside EXIT
+# without an explicit `exit` in their own handler leaves the script
+# RESUMING at the interrupted line once the handler returns (bash's
+# documented trap semantics), which is the opposite of what an operator
+# hitting Ctrl+C mid-mint expects. INT/TERM get their own handler that
+# cleans up AND exits with the conventional 128+signum code; the plain
+# EXIT trap alone covers every OTHER exit path (normal return, `set -e`,
+# an explicit `exit` elsewhere in the script) without double-registering
+# the same work three times over.
+trap _cleanup_temp_files EXIT
+trap '_cleanup_temp_files; exit 130' INT
+trap '_cleanup_temp_files; exit 143' TERM
+
 # Rewrites ENV_FILE in place, replacing the first LIVE *or* commented-out
 # "$1=" assignment with "$2" (verbatim), appending it if no such line exists
 # at all. D20 (fresh-host finding): the old code only ever APPENDED, which
@@ -105,11 +150,13 @@ replace_registry_lines() {
     # Args: key1 line1 [key2 line2 ...]. A key whose line is empty is skipped,
     # so a caller need not know which optional registries were produced.
     local tmp; tmp="$(mktemp "${ENV_FILE}.XXXXXX")"
+    _CLEANUP_PATHS+=("$tmp")
     cp "$ENV_FILE" "$tmp"
     while [[ $# -gt 0 ]]; do
         local key="$1" value_line="$2"; shift 2
         [[ -z "$value_line" ]] && continue
         local inner; inner="$(mktemp "${ENV_FILE}.XXXXXX")"
+        _CLEANUP_PATHS+=("$inner")
         grep -vE "^[[:space:]]*#?[[:space:]]*${key}=" "$tmp" > "$inner" || true
         printf '%s\n' "$value_line" >> "$inner"
         mv "$inner" "$tmp"

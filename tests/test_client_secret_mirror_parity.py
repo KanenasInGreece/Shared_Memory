@@ -33,6 +33,8 @@ import importlib.util
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
 import memory_bridge  # noqa: E402
@@ -387,6 +389,143 @@ def test_dotenv_values_path_diverts_lowercase_agent_token_when_first(tmp_path, m
     finally:
         for key in _LOWERCASE_TOKEN_ONLY_KEYS:
             os.environ.pop(key, None)
+
+
+# ── D.3 (SEC round, ADV1-1): the CLI door's own call-site normalisation ────
+# memory_bridge.py never had vector-skill.py's case/BOM fix at its two
+# loader call sites (the dotenv_values() branch and the manual-parse
+# fallback) until this round — these pins run the fix THROUGH THE LOADER,
+# through a fresh module import from a controlled tmp skill tree (the same
+# helper test_memory_bridge.py's own S-18 tests use), never against the bare
+# predicate alone (predicate-only pins cannot see loader-level case/BOM
+# handling).
+
+def _load_memory_bridge_from_skill_dir(skill_dir):
+    """Same fresh-import-from-tmp-tree idiom as test_memory_bridge.py's own
+    _load_memory_bridge_from() -- duplicated rather than imported, since
+    that helper lives in a sibling test module and this file already avoids
+    importing test_vector_skill.py's loader for the same reason."""
+    import importlib.util
+    import shutil
+    import uuid
+    scripts_dir = os.path.join(skill_dir, "scripts")
+    os.makedirs(scripts_dir, exist_ok=True)
+    src = os.path.join(
+        os.path.dirname(__file__), "..", "shared-memory-skill", "shared-memory",
+        "scripts", "memory_bridge.py",
+    )
+    dest = os.path.join(scripts_dir, "memory_bridge.py")
+    shutil.copy(src, dest)
+    mod_name = f"memory_bridge_bypass_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(mod_name, dest)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_memory_bridge_dotenv_path_filters_lowercase_and_bom_prefixed_secrets(tmp_path, monkeypatch):
+    """Through the dotenv_values() primary path -- the branch actually taken
+    at real import time (python-dotenv is transitively installed via
+    fastmcp). Mutation check: removing the key_norm computation and reverting
+    to the two separate `.upper()` calls the fix replaced makes the
+    lowercase `pg_conn` / BOM-prefixed pins below die (recorded in HANDOFF)."""
+    for key in _BYPASS_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    _pin = os.environ.pop("SECURE_ENV_FILE", None)
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    _write_bypass_fixture(skill_dir / ".env")
+    try:
+        mod = _load_memory_bridge_from_skill_dir(str(skill_dir))
+        assert "pg_conn" not in os.environ, "lowercase pg_conn leaked past the filter"
+        assert "PG_CONN" not in os.environ, "BOM-prefixed PG_CONN leaked under its bare name"
+        assert f"{_BOM}PG_CONN" not in os.environ, "BOM-prefixed PG_CONN leaked under its raw key"
+        assert mod._AGENT_TOKEN_FROM_FILE == "tok_bom_prefixed", (
+            "the BOM-prefixed AGENT_TOKEN was not diverted to the private variable"
+        )
+        assert "AGENT_TOKEN" not in os.environ
+        assert f"{_BOM}AGENT_TOKEN" not in os.environ
+        assert "agent_token" not in os.environ, (
+            "a lowercase agent_token= line leaked the bearer into os.environ"
+        )
+        assert os.environ.get("probe_lower") == "benign_val", (
+            "a benign lowercase key must still export under its ORIGINAL name — "
+            "normalization is for filtering only, never for the exported name"
+        )
+    finally:
+        for key in _BYPASS_ENV_KEYS:
+            os.environ.pop(key, None)
+        if _pin is not None:
+            os.environ["SECURE_ENV_FILE"] = _pin
+
+
+def test_memory_bridge_dotenv_path_diverts_lowercase_agent_token_when_first(tmp_path, monkeypatch):
+    """H-1 twin: a lowercase agent_token= line, as the ONLY token line in
+    the file, must be diverted -- not exported under any casing."""
+    for key in _LOWERCASE_TOKEN_ONLY_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    _pin = os.environ.pop("SECURE_ENV_FILE", None)
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    _write_lowercase_token_only_fixture(skill_dir / ".env")
+    try:
+        mod = _load_memory_bridge_from_skill_dir(str(skill_dir))
+        assert mod._AGENT_TOKEN_FROM_FILE == "tok_lower_variant"
+        assert "agent_token" not in os.environ
+        assert "AGENT_TOKEN" not in os.environ
+        assert os.environ.get("probe_lower") == "benign_val"
+    finally:
+        for key in _LOWERCASE_TOKEN_ONLY_KEYS:
+            os.environ.pop(key, None)
+        if _pin is not None:
+            os.environ["SECURE_ENV_FILE"] = _pin
+
+
+# ── Fix round F11 (SEC1 MED-7 + LOW-8): _is_client_secret_key normalises
+#    internally on BOTH client doors, unified BOM/whitespace order ─────────
+
+def test_memory_bridge_predicate_normalises_a_raw_lowercase_key():
+    """Before this fix, _is_client_secret_key("agent_tokens") was False —
+    exact-match-only against the upper-cased name list, no internal
+    normalisation — defused today only because every call site happened to
+    pass an already-.upper()d key."""
+    assert memory_bridge._is_client_secret_key("agent_tokens") is True
+    assert memory_bridge._is_client_secret_key("Pg_Password") is True
+    assert memory_bridge._is_client_secret_key("agent_token") is False  # exemption
+
+
+def test_vector_skill_predicate_normalises_a_raw_lowercase_key():
+    assert vector_skill._is_client_secret_key("agent_tokens") is True
+    assert vector_skill._is_client_secret_key("Pg_Password") is True
+    assert vector_skill._is_client_secret_key("agent_token") is False
+
+
+@pytest.mark.parametrize("probe", ["﻿ AGENT_TOKENS", " ﻿AGENT_TOKENS"])
+def test_memory_bridge_predicate_handles_bom_whitespace_either_order(probe):
+    """SEC1 finding 8: BOM-then-space and space-then-BOM each defeat
+    exactly one fixed-order strip -- both client doors must classify
+    secret on both orderings."""
+    assert memory_bridge._is_client_secret_key(probe) is True
+
+
+@pytest.mark.parametrize("probe", ["﻿ AGENT_TOKENS", " ﻿AGENT_TOKENS"])
+def test_vector_skill_predicate_handles_bom_whitespace_either_order(probe):
+    assert vector_skill._is_client_secret_key(probe) is True
+
+
+# ── Fix round F5 (SEC1 HIGH-3 + MED-5): memory_bridge's manual-parser
+#    export-prefix strip (pure function, directly testable) ────────────────
+
+def test_memory_bridge_strip_export_prefix_lowercase_and_uppercase():
+    assert memory_bridge._strip_export_prefix("export AGENT_TOKENS") == "AGENT_TOKENS"
+    assert memory_bridge._strip_export_prefix("EXPORT AGENT_TOKENS") == "AGENT_TOKENS"
+    assert memory_bridge._strip_export_prefix("AGENT_TOKENS") == "AGENT_TOKENS"
+
+
+def test_vector_skill_strip_export_prefix_lowercase_and_uppercase():
+    assert vector_skill._strip_export_prefix("export AGENT_TOKENS") == "AGENT_TOKENS"
+    assert vector_skill._strip_export_prefix("EXPORT AGENT_TOKENS") == "AGENT_TOKENS"
+    assert vector_skill._strip_export_prefix("AGENT_TOKENS") == "AGENT_TOKENS"
 
 
 def test_both_tracked_memory_bridge_copies_stay_byte_identical():

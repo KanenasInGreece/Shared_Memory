@@ -166,6 +166,20 @@ def test_uncredentialed_secret_shows_false(tmp_path):
     assert "has_credential=False" in proc.stdout
 
 
+def test_secret_census_notes_canonical_normalisation(monkeypatch):
+    """QA finding 7: D.2 stores every discovered token_env name canonically
+    (upper-cased), so a lowercase-declared spelling ("token_env":
+    "openrouter_cred") renders as OPENROUTER_CRED — a name that appears
+    nowhere in the operator's own .env/JSON. The census must say so rather
+    than silently implying an exact-spelling match."""
+    monkeypatch.setenv("SECURE_ENV_FILE", "")
+    lines, ok = check_config.phase_a_render()
+    assert ok
+    body = "\n".join(lines)
+    assert "CANONICAL" in body or "canonical" in body
+    assert "normalised" in body or "normalized" in body
+
+
 # ── Phase B: role-error → exit 1, malformed config → exit 2 (no traceback) ─
 
 def test_role_config_error_leads_to_exit_1_would_refuse_to_start(tmp_path):
@@ -557,22 +571,52 @@ def test_phase_b_secret_bearing_import_exception_shows_type_only_never_the_secre
 
 def test_would_refuse_line_and_role_errors_never_leak_a_raw_credential(tmp_path):
     """The property that actually matters: no unredacted userinfo/query
-    credential reaches output, even accepting the over-redaction above."""
-    backends_json = ('[{"url":"http://svc:s3cr3t-in-url@a:5000","roles":["bogus"]}]')
+    credential reaches output, even accepting the over-redaction above.
+
+    SEC A (R-1, 2026-09-02): this test's original fixture had the credential
+    in USERINFO ("http://svc:cred@a:5000") — that shape is now refused/
+    excluded at _load_llm_backends() parse time, before roles are even
+    parsed, so it can no longer reach the role_config_errors path this test
+    targets (userinfo-URL coverage lives in
+    tests/test_llm_backend_secrets.py's SEC-A tests instead). A query-string
+    credential (R-2, NOT refused by A) is the fixture that still reaches
+    _parse_roles unmodified, keeping this test's actual point intact."""
+    backends_json = ('[{"url":"http://a:5000?key=s3cr3t-in-url","roles":["bogus"]}]')
     proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": backends_json},
                 tmp_path=tmp_path)
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "WOULD REFUSE TO START" in proc.stdout
     assert "s3cr3t-in-url" not in proc.stdout
-    assert "svc:" not in proc.stdout
+
+
+def test_userinfo_credential_username_never_reaches_check_config_output(tmp_path):
+    """Finding 10 (QA LOW): the retargeted query-string fixture above only
+    restored the PASSWORD-never-leaks half of the original test's property.
+    The original also asserted the userinfo USERNAME never reaches output
+    ("svc:") -- dropped when the fixture moved to a query-string credential,
+    since A now refuses userinfo upstream and no _load_llm_backends() output
+    path can carry it any more. Pinned here directly, so the coverage is a
+    deliberate decision (check_config's own render surface never leaks
+    either half of a userinfo credential, even for an entry A excludes
+    before check_config ever sees a role/refusal path for it), not an
+    accidental drop."""
+    backends_json = '[{"url":"http://svc:s3cr3t-userinfo-pw@a:5000"}]'
+    proc = _run(env_overrides={"SECURE_ENV_FILE": "", "LLM_BACKENDS_JSON": backends_json},
+                tmp_path=tmp_path)
+    full_output = proc.stdout + proc.stderr
+    assert "svc:" not in full_output
+    assert "s3cr3t-userinfo-pw" not in full_output
+    assert "Traceback" not in full_output
 
 
 # ── QA Q1 / fold-round item 4 — PROXY_BIND's idiom now lives in the D1
 #    table, not a second, hand-written authority in this script. ───────────
 
 def test_proxy_bind_idiom_comes_from_the_framework_defaults_table():
+    """SEC H (R-3, RULED 2026-09-02): idiom flipped "get" -> "or" — see
+    framework_defaults.py's PROXY_BIND row note."""
     assert check_config._idiom_for("PROXY_BIND") == framework_defaults.FRAMEWORK_DEFAULTS["PROXY_BIND"]["idiom"]
-    assert framework_defaults.FRAMEWORK_DEFAULTS["PROXY_BIND"]["idiom"] == "get"
+    assert framework_defaults.FRAMEWORK_DEFAULTS["PROXY_BIND"]["idiom"] == "or"
     assert not hasattr(check_config, "_PROXY_BIND_IDIOM"), (
         "the fold round deleted this hand-written special case — it must not come back")
 

@@ -107,10 +107,15 @@ def test_proxy_bind_carries_an_idiom_despite_being_documented_only():
     """Fold round item 4 (PR #347, QA Q1): PROXY_BIND's idiom now lives here
     — the ONE authority — even though its 'kind' stays documented-only (no
     W1 code change at that site); check_config.py used to duplicate this as
-    a hand-written special case, deleted in the fold round."""
+    a hand-written special case, deleted in the fold round.
+
+    SEC H (R-3, RULED 2026-09-02): idiom flipped "get" -> "or" — measured
+    on glxvm, TCPSite(runner, "", port) binds ALL interfaces, so a
+    present-but-empty PROXY_BIND must fall back to the default exactly
+    like an absent one, matching the gateway's actual (fixed) behaviour."""
     row = framework_defaults.FRAMEWORK_DEFAULTS["PROXY_BIND"]
     assert row["kind"] == "documented-only"
-    assert row["idiom"] == "get"
+    assert row["idiom"] == "or"
 
 
 def test_port_documented_default_value():

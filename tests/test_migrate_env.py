@@ -920,26 +920,34 @@ def test_capture_json_never_contains_a_token_env_value_only_has_token_bool(tmp_p
     assert payload["image"]["has_token"]["https://api.example.com/v1"] is True
 
 
-def test_capture_json_keeps_a_raw_userinfo_url_by_ruled_design(tmp_path, monkeypatch):
+def test_capture_json_keeps_a_raw_query_credential_url_by_ruled_design(tmp_path, monkeypatch):
     """RULED (W3 brief, 'The capture JSON'): raw URLs are needed for the
-    equality and stay — a userinfo URL is NOT scrubbed inside the capture
-    JSON itself (unlike every report/die path, which IS scrubbed — see the
-    scrub test below). Fixture form only, per fact:1195.
+    equality and stay — a query-string credential is NOT scrubbed inside
+    the capture JSON itself (unlike every report/die path, which IS
+    scrubbed — see the scrub test below). Fixture form only, per fact:1195.
 
-    Uses the LLM_BACKENDS_JSON form deliberately, not the legacy CSV form:
-    hive_mind_proxy._parse_backend()'s own `entry.partition("@")` (the
-    url@weight split) mis-splits a userinfo URL's OWN '@' — a pre-existing
-    behaviour in that function, out of W3's scope, not something to route
-    a new test through."""
+    SEC A (R-1, 2026-09-02): a USERINFO-embedded URL (this test's original
+    fixture, "http://svc:cred@a:5000") is now refused/excluded at
+    _load_llm_backends() parse time — it never becomes part of
+    proxy.LLM_BACKENDS (the source of this capture's "urls" list) at all,
+    so it can no longer exercise "does the capture keep it raw". A
+    query-string credential (R-2, NOT refused by A) is the fixture that
+    still reaches LLM_BACKENDS unscrubbed, preserving this test's actual
+    point — userinfo forms are covered instead by
+    tests/test_llm_backend_secrets.py's SEC-A coverage.
+
+    Uses the LLM_BACKENDS_JSON form deliberately, not the legacy CSV form
+    (unaffected by _parse_backend()'s url@weight split, which only applies
+    to that form)."""
     _force_no_unit(monkeypatch)
-    env_text = 'LLM_BACKENDS_JSON=[{"url":"http://svc:form-only-fixture-credential@a:5000"}]\n'
+    env_text = 'LLM_BACKENDS_JSON=[{"url":"http://a:5000?token=form-only-fixture-credential"}]\n'
     env_path = _write_env(tmp_path, env_text)
     monkeypatch.setenv("SECURE_ENV_FILE", str(env_path))
     out_path = tmp_path / "pre.json"
     rc = m.do_capture(str(out_path), "hive-mind-gateway-does-not-exist.service")
     assert rc == m.EXIT_OK
     raw = out_path.read_text()
-    assert "svc:form-only-fixture-credential@a:5000" in raw
+    assert "a:5000?token=form-only-fixture-credential" in raw
 
 
 def test_capture_refuses_a_preplanted_symlink_never_writes_through_it(tmp_path, monkeypatch):
