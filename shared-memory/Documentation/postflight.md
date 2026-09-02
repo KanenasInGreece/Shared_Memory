@@ -7,8 +7,14 @@ script and this document disagree, this document wins and the script is the defe
 
 ```bash
 # On the gateway host, from the repo root. Auth-on installs need a minted agent
-# token (any agent's — copy it from that agent's skill .env):
-export AGENT_TOKEN=...
+# token — read it from that agent's skill .env, NEVER `. file` (EXECUTES it) and
+# never cat/grep it (fact:1499 — a raw credential must never pass through an
+# agent's own transcript). AGENT_ENV below is Claude's path; the same shape
+# works for any agent install — swap in ~/.grok/skills/shared-memory/.env,
+# ~/.codex/skills/shared-memory/.env, or ~/.gemini/skills/shared-memory/.env
+# for that agent's own skill directory.
+AGENT_ENV=${AGENT_ENV:-$HOME/.claude/skills/shared-memory/.env}
+AGENT_TOKEN=$(sed -n 's/^AGENT_TOKEN=//p' "$AGENT_ENV" | head -1); export AGENT_TOKEN
 bash shared-memory/scripts/postflight.sh
 ```
 

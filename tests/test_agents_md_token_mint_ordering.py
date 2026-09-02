@@ -29,6 +29,8 @@ neither.
 import os
 import re
 
+import pytest
+
 _ROOT = os.path.join(os.path.dirname(__file__), "..")
 
 
@@ -276,6 +278,32 @@ def test_agents_md_has_no_export_agent_token_paste_shape():
         "Upgrade), never `. file` (executes it) and never cat/grep it "
         "(fact:1499: a raw credential must never pass through an agent's "
         "own transcript)"
+    )
+
+
+# ── Fix round F9 (QA MED-4): the same no-paste grep, widened past AGENTS.md
+#    to the rest of the agent-readable doc/script set. README.md:459 is
+#    deliberately excluded -- it is the human-voice Quick Start, which per
+#    this repo's own ground rules a builder never rewrites (a fix there is
+#    a proposal in the operator's own voice, left for the merger).
+
+@pytest.mark.parametrize("relpath", [
+    "shared-memory/Documentation/postflight.md",
+    "shared-memory/scripts/postflight.sh",
+])
+def test_doc_set_has_no_export_agent_token_paste_shape(relpath):
+    """postflight.md's Quick Start and postflight.sh's own header comment +
+    runtime A1 failure messages used to instruct the same unsafe paste
+    AGENTS.md's fix already closed -- an agent following postflight.md, or
+    reading postflight.sh's own error message after a failed run, would do
+    exactly what fact:1499 forbids. Same grep, same property, different
+    file."""
+    text = _read(relpath)
+    assert not re.search(r"export AGENT_TOKEN=", text), (
+        f"{relpath} still has an `export AGENT_TOKEN=<value>`-shaped paste -- "
+        "read it via the AGENT_ENV + sed shape instead (see AGENTS.md Phase 9 "
+        "/ Upgrade for the pattern), never `. file` (executes it) and never "
+        "cat/grep it (fact:1499)"
     )
 
 
