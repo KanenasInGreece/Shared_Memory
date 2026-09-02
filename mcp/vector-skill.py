@@ -79,7 +79,35 @@ _SERVER_ONLY_KEYS = frozenset({"AGENT_TOKENS", "PG_PASSWORD", "NEO4J_PASSWORD"})
 # Matching the parsed KEY instead is the correct check either way; handling
 # `export` explicitly is what keeps that one legitimate form recognised
 # under the corrected approach.
-_ENV_KEY_RE = re.compile(r"^(?:export\s+)?([^=\s]+)\s*=")
+#
+# Fix round F5 (SEC1 HIGH-3 + MED-5): re.IGNORECASE added. The "export "
+# in the pattern above was case-SENSITIVE, so "EXPORT AGENT_TOKENS=..."
+# matched NEITHER the export branch NOR the bare-key branch (the whole
+# "EXPORT" token, followed by a space then more non-"=" text, satisfies
+# neither `(?:export\s+)?` case-sensitively nor `[^=\s]+\s*=` at position
+# 0) — probed: this regex returned no match at all for an "EXPORT "-
+# prefixed server-only key, so _looks_like_server_env() never detected the
+# framework .env and this client loaded it.
+_ENV_KEY_RE = re.compile(r"^(?:export\s+)?([^=\s]+)\s*=", re.IGNORECASE)
+
+
+_EXPORT_PREFIX_RE = re.compile(r"^export\s+", re.IGNORECASE)
+
+
+def _strip_export_prefix(key: str) -> str:
+    """Fix round F5: strip an optional leading shell `export ` keyword
+    (case-insensitive) from a raw .env line's key text, at parse time, in
+    the MANUAL fallback parser (_load_env_manually) only — the dotenv_
+    values() path already strips a lowercase "export " natively and
+    silently drops an uppercase "EXPORT " line entirely (neither reaches
+    this function). Mirrors secure_env._strip_export_prefix() exactly."""
+    s = key
+    while s and (s[0].isspace() or s[0] == "﻿"):
+        s = s[1:]
+    s = _EXPORT_PREFIX_RE.sub("", s, count=1)
+    while s and (s[0].isspace() or s[0] == "﻿"):
+        s = s[1:]
+    return s
 
 
 def _looks_like_server_env(path: str) -> bool:
@@ -135,16 +163,43 @@ _CLIENT_SECRET_SUFFIXES = (
 )
 
 
+def _client_key_norm(name: str) -> str:
+    """Fix round F11 (SEC1 MED-7 + LOW-8): shared client-side key
+    normaliser — mirrors secure_env._normalize_key() exactly (duplicated,
+    not imported: this client ships alone and may not depend on a
+    server-only module). BOM (U+FEFF) + whitespace stripped from both
+    ends, in EITHER order and any interleaving, then upper-cased. A single
+    fixed-order strip (e.g. .strip().lstrip(BOM)) only handles ONE of the
+    two orderings a raw line can carry — probed by SEC1: "﻿ AGENT_TOKENS"
+    (BOM then space) and " ﻿AGENT_TOKENS" (space then BOM) each defeat
+    exactly one fixed order."""
+    s = name
+    while s and (s[0].isspace() or s[0] == "﻿"):
+        s = s[1:]
+    while s and (s[-1].isspace() or s[-1] == "﻿"):
+        s = s[:-1]
+    return s.upper()
+
+
 def _is_client_secret_key(name: str) -> bool:
     """True if `name` must never be exported into this client's own
     os.environ (mirrors secure_env.is_secret_key(), narrowed to what this
     client can ever encounter). AGENT_TOKEN is excluded -- it has its own
-    private-variable path and is never routed through this predicate."""
-    if name == "AGENT_TOKEN":
+    private-variable path and is never routed through this predicate.
+
+    Fix round F11 (SEC1 MED-7): normalises internally via
+    _client_key_norm(), so ANY caller — pre-normalised or raw — classifies
+    correctly. Before this fix, `_is_client_secret_key("agent_tokens")` was
+    False (exact-match-only against the upper-cased name list, no internal
+    normalisation) — defused today only because every call site happens to
+    pass an already-`.upper()`d key; a future caller passing a raw key
+    would silently re-open a live `agent_tokens=` export."""
+    key_norm = _client_key_norm(name)
+    if key_norm == "AGENT_TOKEN":
         return False
-    if name in _CLIENT_KNOWN_SECRET_NAMES:
+    if key_norm in _CLIENT_KNOWN_SECRET_NAMES:
         return True
-    return name.upper().endswith(_CLIENT_SECRET_SUFFIXES)
+    return key_norm.endswith(_CLIENT_SECRET_SUFFIXES)
 
 
 _ENV_PATH = os.environ.get("VECTOR_SKILL_ENV", "").strip() or os.path.join(
@@ -173,7 +228,14 @@ def _load_env_manually(path: str) -> None:
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, _, val = line.partition("=")
-                key = key.strip()
+                # F5 (SEC1 HIGH-3/MED-5): strip an optional leading
+                # "export "/"EXPORT " prefix before classification —
+                # without this, the stored key for an "export
+                # AGENT_TOKENS=..." line was the literal "export
+                # AGENT_TOKENS", matching neither the AGENT_TOKEN diversion
+                # nor _is_client_secret_key's exact-name list, exporting
+                # the registry straight into os.environ.
+                key = _strip_export_prefix(key).strip()
                 val = val.strip()
                 if not key:
                     continue
@@ -210,7 +272,7 @@ def _load_env_manually(path: str) -> None:
                 # recorded there as a SEC-round twins item, not fixed here
                 # (memory_bridge.py, the CLI door, is not this file's to
                 # touch).
-                key_norm = key.lstrip("\ufeff").strip().upper()
+                key_norm = _client_key_norm(key)
                 if key_norm == "AGENT_TOKEN":
                     if not _AGENT_TOKEN_FROM_FILE:
                         _AGENT_TOKEN_FROM_FILE = val
@@ -247,7 +309,7 @@ else:
                 # made the first pass's two separate `.upper()` calls a
                 # regression (see the detailed note above). `_k` — never
                 # `_k_norm` — is still what gets exported.
-                _k_norm = _k.lstrip("\ufeff").strip().upper()
+                _k_norm = _client_key_norm(_k)
                 if _k_norm == "AGENT_TOKEN":
                     if not _AGENT_TOKEN_FROM_FILE:
                         _AGENT_TOKEN_FROM_FILE = _v.strip()

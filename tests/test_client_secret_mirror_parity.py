@@ -33,6 +33,8 @@ import importlib.util
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared-memory", "scripts"))
 
 import memory_bridge  # noqa: E402
@@ -477,6 +479,53 @@ def test_memory_bridge_dotenv_path_diverts_lowercase_agent_token_when_first(tmp_
             os.environ.pop(key, None)
         if _pin is not None:
             os.environ["SECURE_ENV_FILE"] = _pin
+
+
+# ── Fix round F11 (SEC1 MED-7 + LOW-8): _is_client_secret_key normalises
+#    internally on BOTH client doors, unified BOM/whitespace order ─────────
+
+def test_memory_bridge_predicate_normalises_a_raw_lowercase_key():
+    """Before this fix, _is_client_secret_key("agent_tokens") was False —
+    exact-match-only against the upper-cased name list, no internal
+    normalisation — defused today only because every call site happened to
+    pass an already-.upper()d key."""
+    assert memory_bridge._is_client_secret_key("agent_tokens") is True
+    assert memory_bridge._is_client_secret_key("Pg_Password") is True
+    assert memory_bridge._is_client_secret_key("agent_token") is False  # exemption
+
+
+def test_vector_skill_predicate_normalises_a_raw_lowercase_key():
+    assert vector_skill._is_client_secret_key("agent_tokens") is True
+    assert vector_skill._is_client_secret_key("Pg_Password") is True
+    assert vector_skill._is_client_secret_key("agent_token") is False
+
+
+@pytest.mark.parametrize("probe", ["﻿ AGENT_TOKENS", " ﻿AGENT_TOKENS"])
+def test_memory_bridge_predicate_handles_bom_whitespace_either_order(probe):
+    """SEC1 finding 8: BOM-then-space and space-then-BOM each defeat
+    exactly one fixed-order strip -- both client doors must classify
+    secret on both orderings."""
+    assert memory_bridge._is_client_secret_key(probe) is True
+
+
+@pytest.mark.parametrize("probe", ["﻿ AGENT_TOKENS", " ﻿AGENT_TOKENS"])
+def test_vector_skill_predicate_handles_bom_whitespace_either_order(probe):
+    assert vector_skill._is_client_secret_key(probe) is True
+
+
+# ── Fix round F5 (SEC1 HIGH-3 + MED-5): memory_bridge's manual-parser
+#    export-prefix strip (pure function, directly testable) ────────────────
+
+def test_memory_bridge_strip_export_prefix_lowercase_and_uppercase():
+    assert memory_bridge._strip_export_prefix("export AGENT_TOKENS") == "AGENT_TOKENS"
+    assert memory_bridge._strip_export_prefix("EXPORT AGENT_TOKENS") == "AGENT_TOKENS"
+    assert memory_bridge._strip_export_prefix("AGENT_TOKENS") == "AGENT_TOKENS"
+
+
+def test_vector_skill_strip_export_prefix_lowercase_and_uppercase():
+    assert vector_skill._strip_export_prefix("export AGENT_TOKENS") == "AGENT_TOKENS"
+    assert vector_skill._strip_export_prefix("EXPORT AGENT_TOKENS") == "AGENT_TOKENS"
+    assert vector_skill._strip_export_prefix("AGENT_TOKENS") == "AGENT_TOKENS"
 
 
 def test_both_tracked_memory_bridge_copies_stay_byte_identical():
