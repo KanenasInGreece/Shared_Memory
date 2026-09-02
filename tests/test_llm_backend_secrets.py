@@ -449,6 +449,23 @@ def test_bearer_transport_rule_is_strict_about_odd_urls(monkeypatch):
     assert not ok("")
 
 
+def test_bearer_transport_rule_refuses_numeric_literal_hosts_the_resolver_accepts(monkeypatch):
+    """SEC E (S3): a DOTLESS host can still be a numeric IPv4 literal in a
+    form the RESOLVER accepts (inet_aton) even though ipaddress.ip_address
+    already refused it as non-dotted-quad — decimal dword, 0x hex, and
+    leading-zero octal all resolve to a real (here PUBLIC) address."""
+    import hive_mind_proxy as g
+    ok = g._bearer_transport_ok
+    assert not ok("http://16909060:8000")        # decimal dword for 1.2.3.4
+    assert not ok("http://0x7f000001:8000")      # hex for 127.0.0.1
+    assert not ok("http://00100403004:8000")     # leading-zero octal -> 1.2.6.4, PUBLIC (measured)
+    # Deliberate: bare alphabetic hostnames still pass — inet_aton refuses
+    # both (no digit-only/0x/octal alphabet), including a hex-looking name
+    # with no "0x" prefix.
+    assert ok("http://myhost:8000")
+    assert ok("http://beef:8000")
+
+
 def test_the_gateway_cold_imports_with_a_credentialed_backend(tmp_path):
     """v0.9.75 review (Opus): every test here imports hive_mind_proxy through
     importlib.reload, which re-executes in a namespace where every name is

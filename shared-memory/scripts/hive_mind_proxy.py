@@ -8,6 +8,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import sys
 import ipaddress
 import urllib.parse
@@ -356,6 +357,25 @@ def _bearer_transport_ok(backend_url: str, plaintext_ok: bool = False) -> bool:
     except ValueError:
         pass
     if host in ("localhost",) or "." not in host:
+        # SEC E (S3, measured): a dotless host can still be a numeric IPv4
+        # literal in a form the RESOLVER accepts but ipaddress.ip_address()
+        # above already refused as non-dotted-quad — a decimal dword
+        # ("16909060" == 1.2.3.4) or hex ("0x7f000001" == 127.0.0.1) —
+        # letting either through here would carry a bearer to whatever
+        # public address the resolver actually connects to.
+        # `int(host, 0)` is NOT sufficient: it rejects a leading-zero octal
+        # string ("00100403004") that the resolver still accepts — measured,
+        # socket.inet_aton("00100403004") -> 1.2.6.4, a PUBLIC address.
+        # Refuse whenever inet_aton succeeds — it accepts exactly the
+        # literal alphabet (decimal dword, 0x hex, leading-zero octal) the
+        # resolver does. A bare alphabetic hostname ("myhost", or a
+        # hex-alphabet name like "beef" WITHOUT "0x") still passes below —
+        # deliberate, inet_aton refuses both.
+        try:
+            socket.inet_aton(host)
+            return False
+        except OSError:
+            pass
         return True
     return host.endswith(_PRIVATE_NAME_SUFFIXES)
 
