@@ -9214,7 +9214,22 @@ class MemoryCoordinator:
             log.error("graph query error for cypher=%r: %s", cypher[:120], exc, exc_info=True)
             return web.json_response({"status": "error", "message": "query failed"}, status=500)
 
-        return web.json_response({"status": "success", "records": records})
+        # Serialization is a SEPARATE question from "did the query succeed" —
+        # a Neo4j `DateTime`/`Date`/`Time` (or anything else `json.dumps`
+        # chokes on) in a returned property is a bug in OUR coercion, not
+        # evidence the database failed. Deliberately a NARROW try, split from
+        # the query try/except above: only (TypeError, ValueError) — the
+        # exceptions `json.dumps` itself raises — are caught here, and
+        # `_neo4j_tx_failures_total` is NOT touched, so a serialization defect
+        # never reads as a database outage on `/memory/telemetry`.
+        try:
+            body = json.dumps({"status": "success", "records": _json_safe(records)})
+        except (TypeError, ValueError) as exc:
+            log.error("graph query result failed to serialize for cypher=%r: %s",
+                      cypher[:120], exc, exc_info=True)
+            return web.json_response({"status": "error", "message": "query failed"}, status=500)
+
+        return web.json_response(text=body)
 
     # ── GET /memory/status/{pg_id} ────────────────────────────────────────────
 
