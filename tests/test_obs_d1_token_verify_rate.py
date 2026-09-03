@@ -120,15 +120,17 @@ def test_both_bump_sites_append_to_the_ring(monkeypatch):
 
 
 def test_ring_is_stamped_monotonic_not_wall_clock(monkeypatch):
-    """A wall-clock step backward must not be able to move this ring —
-    only time.monotonic() may. Patch datetime hard to something absurd and
-    confirm the ring's own reading is unaffected."""
+    """The ring never reads `datetime`/wall-clock at all — there is nothing
+    to patch — so the discriminator is the STAMP's own magnitude: a
+    `time.monotonic()` value is process uptime (a small-ish float, here well
+    under 5 seconds old), while a `time.time()` or `datetime.now().timestamp()`
+    stamp would land ~1.7e9 away. (QA fix round, finding 6: the previous
+    docstring claimed a hard `datetime` patch that this test does not
+    perform — the assertion below is the real, and sufficient, pin.)"""
     coordinator, g = _fresh(monkeypatch)
     coordinator._record_token_verify_failed(_FakeRequest(), None)
     ts = coordinator.telemetry_token_verify_ring()[0]
     assert isinstance(ts, float)
-    # A monotonic stamp is a small-ish float (process uptime in seconds),
-    # never an epoch/ISO timestamp — the two are easy to confuse by accident.
     import time as _time
     assert abs(ts - _time.monotonic()) < 5.0
 
@@ -194,7 +196,11 @@ def test_fifteen_events_over_ten_minutes_never_warns(monkeypatch):
         coordinator._token_verify_failure_ring.append(base + i * 40.0)
     now = base + 14 * 40.0
     rate = g._token_verify_failure_rate(now=now)
-    assert rate <= 2.0
+    # Events 40s apart, `now` at the last one (i=14): looking back 60s finds
+    # exactly two (i=14 at 0s and i=13 at 40s back); i=12 is 80s back, outside
+    # the window. The construction makes this an EXACT value, not a bound
+    # (fact:1338 / QA fix round finding 7).
+    assert rate == 2.0
     assert not (rate > g.TOKEN_VERIFY_WARN_PER_MIN)
 
     warnings = _warnings_payload(g, coordinator)
