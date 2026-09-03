@@ -87,7 +87,7 @@ __all__ = [
 #: coordinator.py's FRAMEWORK_VERSION et al. until the merger's own version-
 #: bump step (which those four files stay reserved for) catches up to it at
 #: release time — that gap is the check doing its job, not a build defect.
-VERSION = "0.9.87"
+VERSION = "0.9.88"
 
 
 def _version_tuple(v: str) -> tuple:
@@ -207,7 +207,7 @@ INTRODUCED_0_9_88 = "0.9.88"
 #: can never silently fall behind the release that is naming it. Whoever ships
 #: the removal — gated on the monitor-contract step actually landing —
 #: updates this alongside it.
-DUAL_EMIT_DROP_TARGET = "0.9.88"
+DUAL_EMIT_DROP_TARGET = "0.9.89"
 
 #: CG (OBS round) — the enumerated `warnings[].key` vocabulary. Before this,
 #: `warnings[].key` was a free `str` (see the entry below): a renamed or
@@ -1545,7 +1545,7 @@ MEANING_CHANGES: tuple[dict, ...] = (
     {
         "endpoint": "health",
         "path": "warnings[] (key=token_verify_failed_per_min)",
-        "in_version": VERSION,
+        "in_version": INTRODUCED_0_9_88,
         "was": ("a counter delta extrapolated over the gap between health-"
                 "cache BUILDS (HEALTH_CACHE_TTL_S) — poll-cadence-dependent: "
                 "one event read ~24/min at the 3 s TTL default and ~0.1/min "
@@ -1568,7 +1568,7 @@ MEANING_CHANGES: tuple[dict, ...] = (
     {
         "endpoint": "telemetry",
         "path": "gateway.requests_total",
-        "in_version": VERSION,
+        "in_version": INTRODUCED_0_9_88,
         "was": ("counted only AUTHENTICATED, handler-reached requests — the "
                 "gateway's own 401/403/503 responses (load-shed, role "
                 "denial, backup-quiesce) and all auth-off traffic never "
@@ -1585,7 +1585,7 @@ MEANING_CHANGES: tuple[dict, ...] = (
     {
         "endpoint": "telemetry",
         "path": "gateway.by_status.*",
-        "in_version": VERSION,
+        "in_version": INTRODUCED_0_9_88,
         "was": ("only the authenticated, handler-reached path's own status "
                 "was ever counted — a gateway-issued 401/403/503 (load-shed, "
                 "role denial, backup-quiesce) was invisible here"),
