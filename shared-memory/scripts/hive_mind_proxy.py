@@ -79,6 +79,7 @@ from coordinator import (
     record_credentialed_route_denied,
     record_llm_gateway_fault,
     record_llm_upstream_fault,
+    record_llm_client_disconnect,
     _parse_upstream_error_type,
     _decompress_prefix_for_parse,
     _decompress_full_for_usage,
@@ -2166,6 +2167,15 @@ class AsyncHiveMindProxy:
             # to False only at the single success return.
             _llm_req_start_mono = time.monotonic() if llm_backend is not None else None
             _llm_req_failed = True
+            # D9 (OBS round): a CLIENT abort (our caller hung up — either
+            # before we could write response headers, at `prepare()`, or
+            # partway through the streamed body) is the CALLER's event, not
+            # the backend's: neither `_llm_mark_ok` nor `_llm_mark_fail` fires
+            # for it, no gateway fault is recorded, and its duration is not a
+            # service time — set True by either abort window below, read by
+            # the mid-stream success gate and by the `finally` at the bottom
+            # of this method to skip `_record_llm_latency` entirely.
+            _client_aborted = False
 
             for attempt in range(max_attempts):
                 try:
@@ -2197,7 +2207,44 @@ class AsyncHiveMindProxy:
                         # unchanged. This header is additive and never set on success.
                         if upstream.status >= 400:
                             proxy_resp.headers["X-SM-Fault-Origin"] = "upstream"
-                        await proxy_resp.prepare(request)
+                        # D9 (OBS round): a NARROW except scoped to `prepare()`
+                        # ONLY — the same classes the mid-stream write path
+                        # below already catches, `(ConnectionResetError,
+                        # IOError)`. Proved (commit body) that aiohttp's own
+                        # web-writer raises exactly this: `web.StreamResponse`
+                        # defaults `_send_headers_immediately = True`, so
+                        # `prepare()` sends headers SYNCHRONOUSLY via
+                        # `http_writer.StreamWriter._write()`, which raises
+                        # `aiohttp.client_exceptions.ClientConnectionResetError`
+                        # ("Cannot write to closing transport") when OUR
+                        # downstream transport (this client's connection to
+                        # US) is already closing — and that class IS-A builtin
+                        # `ConnectionResetError` (checked via its MRO), so this
+                        # narrow except catches it structurally, with no need
+                        # to name the aiohttp class explicitly. Before this
+                        # fix that exception fell through uncaught to the
+                        # per-attempt `except (ClientConnectionResetError,
+                        # ServerDisconnectedError)` below — the clause meant
+                        # for the UPSTREAM connection-reuse race — which
+                        # treats `proxy_resp is not None` (true here, it was
+                        # already constructed above) as "not the retryable
+                        # case" and re-raises into the `ClientError` handler:
+                        # an "Upstream unreachable" ERROR log + `_llm_mark_fail`
+                        # for a card that never saw a single byte of this
+                        # request. ⛔ Deliberately NOT `asyncio.CancelledError`
+                        # (task cancellation is not a client abort — see the
+                        # existing comments below on why swallowing it would
+                        # stall shutdown); it is a `BaseException`, not caught
+                        # by this tuple regardless.
+                        try:
+                            await proxy_resp.prepare(request)
+                        except (ConnectionResetError, IOError) as e:
+                            log.warning(
+                                "Client disconnected before response headers "
+                                "could be sent: %s — %s", target_url, e)
+                            record_llm_client_disconnect()
+                            _client_aborted = True
+                            return proxy_resp
 
                         # Best-effort credential-fault classification (PR A3): only for
                         # the LLM pool (embeddings/reranking never carry a provider key)
@@ -2298,7 +2345,19 @@ class AsyncHiveMindProxy:
                         except (ConnectionResetError, IOError) as e:
                             # OS-level socket reset from the downstream client.
                             # Nothing more can be sent; log and return.
+                            #
+                            # D9 (OBS round): this branch used to fall through
+                            # to `_llm_mark_ok` below unconditionally — a
+                            # mid-stream client abort on a 200 upstream
+                            # recorded SUCCESS and cleared the backend's fail
+                            # streak, the opposite defect from the prepare()
+                            # window (which recorded a FALSE failure). A
+                            # partial write is not "served": mark neither ok
+                            # nor fail, so a genuinely flaky backend's streak
+                            # survives an unrelated client hangup.
                             log.warning("Client disconnected mid-stream: %s — %s", target_url, e)
+                            record_llm_client_disconnect()
+                            _client_aborted = True
 
                         # Fallback classification (PR A3): the loop above never ran its
                         # body — an empty-bodied fault response, or a disconnect before
@@ -2342,7 +2401,10 @@ class AsyncHiveMindProxy:
                             except Exception:
                                 pass   # not a single-object JSON body (e.g. SSE) — skip, never breaks the proxy path
 
-                        if llm_backend is not None:
+                        # D9: a client abort mid-stream (`_client_aborted`,
+                        # set above) is the CALLER's event, not a verdict on
+                        # this backend — neither ok nor fail fires for it.
+                        if llm_backend is not None and not _client_aborted:
                             _llm_mark_ok(llm_backend)   # connected + served — clear fail streak
                         # The exchange completed and the body was fully
                         # written above (write_eof / the disconnect branches
@@ -2351,7 +2413,9 @@ class AsyncHiveMindProxy:
                         # return (the body passes through verbatim either
                         # way, per the X-SM-Fault-Origin comment above), so
                         # the latency instrument's failed flag reads the
-                        # status here rather than assuming success.
+                        # status here rather than assuming success. Unused
+                        # when `_client_aborted` — the `finally` below skips
+                        # `_record_llm_latency` entirely for an abort.
                         _llm_req_failed = upstream.status >= 400
                         return proxy_resp
 
@@ -2469,7 +2533,14 @@ class AsyncHiveMindProxy:
                 # never reach here with a backend set. _llm_req_failed
                 # defaults True and is flipped only at the single success
                 # return above, reading the upstream status there.
-                if _llm_req_start_mono is not None:
+                #
+                # D9 (OBS round): SKIP this entirely on a client abort
+                # (`_client_aborted`) — a `failed=False` record still updates
+                # `latency_max`, and an abort's duration is not a service
+                # time. Accepted survivor bias: this hides "clients hang up
+                # because the backend is slow" from the latency ring (no
+                # second ring is added to recover it — HANDOFF note).
+                if _llm_req_start_mono is not None and not _client_aborted:
                     _record_llm_latency(
                         llm_backend, time.monotonic() - _llm_req_start_mono, _llm_req_failed)
 

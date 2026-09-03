@@ -738,6 +738,16 @@ TELEMETRY: dict[str, dict] = {
                                note="GATEWAY_INFLIGHT_MAX; 0 = valve disabled"),
     "gateway.shed_503_total": _k("int", "gateway", unit="_total", since=INTRODUCED_0_9_74,
                                  log="health.warning.pool_shedding"),
+    "gateway.client_disconnects_total": _k(
+        "int", "gateway", unit="_total", since=INTRODUCED_0_9_88, note=(
+            "D9 (OBS round): a CALLER of this gateway aborted an LLM-proxy "
+            "request — before response headers could be sent, or partway "
+            "through the streamed body. ⛔ NEVER conditional, 0 when none, "
+            "same contract as shed_503_total: incremented from "
+            "hive_mind_proxy.py's dispatch loop, never a verdict on any "
+            "backend — neither _llm_mark_ok nor _llm_mark_fail fires for it, "
+            "and its duration is excluded from the latency ring entirely "
+            "(a client hang-up is not a service time)")),
 
     # ── outbox (NEW section, 0.9.74) ────────────────────────────────────────
     "outbox.pending": _k("int", "outbox", since=INTRODUCED_0_9_74),

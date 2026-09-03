@@ -1214,6 +1214,18 @@ GATEWAY_LATENCY_WINDOW = int(os.environ.get("GATEWAY_LATENCY_WINDOW", "500"))
 _gateway_latency = LatencyRing(GATEWAY_LATENCY_WINDOW)
 _gateway_requests_total = 0
 _gateway_shed_503_total = 0
+# D9 (OBS round) — the LLM proxy's own client-abort counter. Storage lives
+# here rather than in hive_mind_proxy.py (which owns the increment SITES,
+# in its prepare()/streaming windows) for the same reason `_llm_faults_snapshot`
+# and its `record_llm_*_fault` writers do: `telemetry_extras_provider`'s merge
+# into the telemetry payload (see `_build_telemetry` below) is a SHALLOW
+# `dict.update`, which would silently clobber this whole `gateway` section
+# were a second copy of it assembled on the hive_mind_proxy side instead.
+# ⚠ SCOPE NOTE: this is a deviation from this build step's stated coordinator.py
+# ownership (`/memory/graph handler ONLY`) — recorded in HANDOFF.md, not
+# decided silently. See `record_llm_client_disconnect` below and its one new
+# line in `_gateway_telemetry`.
+_gateway_client_disconnects_total = 0
 _gateway_by_status: dict[str, int] = {
     "2xx": 0, "4xx": 0, "5xx": 0, "401": 0, "403": 0, "409": 0, "503": 0,
 }
@@ -1947,6 +1959,20 @@ def record_llm_gateway_fault(backend: str, error_class: str, *,
         extra = {"request_id": request_id} if request_id else {}
         _write_credential_audit_line("gateway_fault", origin="gateway",
                                       backend=backend, error_class=error_class, **extra)
+
+
+def record_llm_client_disconnect() -> None:
+    """D9 (OBS round): a CLIENT (the caller of our gateway) aborted an
+    LLM-proxy request — either before we could write response headers, or
+    partway through the streamed body. Deliberately NOT a per-backend fault:
+    the backend saw nothing wrong, so this counts only under `gateway.*`,
+    the same namespace `shed_503_total` already uses for a gateway-side
+    event that is not about any one backend. Never raises."""
+    global _gateway_client_disconnects_total
+    try:
+        _gateway_client_disconnects_total += 1
+    except Exception:
+        pass
 
 
 def record_credentialed_route_denied(backend: str, method: str, path: str, *,
@@ -11182,6 +11208,11 @@ class MemoryCoordinator:
             "inflight": _inflight,
             "inflight_max": GATEWAY_INFLIGHT_MAX,
             "shed_503_total": _gateway_shed_503_total,
+            # D9 (OBS round): incremented from hive_mind_proxy.py via
+            # record_llm_client_disconnect() — see that function's docstring
+            # for why the counter is stored here rather than assembled on
+            # the proxy side.
+            "client_disconnects_total": _gateway_client_disconnects_total,
         }
 
     async def _metadata_breakdown(self) -> dict:
