@@ -1227,12 +1227,24 @@ _client_versions_seen: dict[str, int] = {}
 CLIENT_VERSIONS_MAX = int(os.environ.get("CLIENT_VERSIONS_MAX", "64"))
 
 
-def _record_gateway_request(status: int, latency_ms: float) -> None:
-    """Fold one served request into the gateway instrument. Never raises."""
+def _record_gateway_request(status: int, latency_ms: "float | None") -> None:
+    """Fold one served request into the gateway instrument. Never raises.
+
+    D2 (OBS round): ``latency_ms`` is now optional. ``requests_total`` and
+    ``by_status.*`` count EVERY exit `auth_middleware` can take — the shed
+    valve, the auth-off bypass, the unprotected-path exemption, every
+    HTTPException it raises itself, and the original authenticated
+    handler-reached path. The LATENCY RING stays on the OLD boundary only
+    (ruling R-C): a caller passes ``None`` from every one of the nine
+    early-exit sites, and only the authenticated, handler-reached call
+    site (where ``started`` is taken) ever passes a real float. Gateway
+    counting therefore widened; the meaning of ``gateway.latency_p50/p95_ms``
+    did not move, so there is no MEANING_CHANGES entry for it."""
     global _gateway_requests_total
     try:
         _gateway_requests_total += 1
-        _gateway_latency.record(latency_ms)
+        if latency_ms is not None:
+            _gateway_latency.record(latency_ms)
         cls = f"{status // 100}xx"
         if cls in _gateway_by_status:
             _gateway_by_status[cls] += 1
@@ -2083,6 +2095,14 @@ async def auth_middleware(request: web.Request, handler):
             _gateway_shed_503_total += 1
         except Exception:
             pass
+        # D2 (OBS round): a shed request is never admitted, so it never
+        # reaches the deep `finally` below either — this is the ONLY place
+        # it can be counted into gateway.requests_total/by_status.503 at
+        # all. No latency ring entry (R-C): this exit never takes
+        # `started`, and `by_status.503` from here is now only
+        # `>= shed_503_total`, not equal-by-construction on the shed class
+        # alone (see MEANING_CHANGES).
+        _record_gateway_request(503, None)
         raise web.HTTPServiceUnavailable(
             reason="gateway at capacity", headers={"Retry-After": "1"},
             **_error_body("Gateway at capacity — too many requests in flight; "
@@ -2105,7 +2125,27 @@ async def auth_middleware(request: web.Request, handler):
         # happens to be non-empty right now -- see AUTH_CONFIGURED_AT_STARTUP's
         # docstring above for why the two diverge after a daemon token is minted.
         if not AUTH_CONFIGURED_AT_STARTUP:
-            return await handler(request)
+            # D2 (OBS round): count this request too — auth-off traffic used
+            # to be entirely invisible to gateway.requests_total/by_status.
+            # `_audit` is UNTOUCHED and still never fires on this path (its
+            # variable dependencies — agent_name/started/request_id — are
+            # never established here; ADV1's traced UnboundLocalError trap
+            # only exists if `_audit` itself moves into this block, which it
+            # does not). No latency ring entry (R-C): this exit never takes
+            # `started` either. `_status` defaults to 500 exactly like the
+            # deep block below's own fallback, for any exception this
+            # bypass does not special-case (it never converted
+            # asyncio.TimeoutError before, and still does not).
+            _status = 500
+            try:
+                resp = await handler(request)
+                _status = resp.status
+                return resp
+            except web.HTTPException as exc:
+                _status = exc.status
+                raise
+            finally:
+                _record_gateway_request(_status, None)
         # Security fix A1 (v0.9.76). ONE comparison, and it is the ROUTER's own.
         #
         # `rel_url.path_safe` is the exact string aiohttp hands to
@@ -2151,7 +2191,24 @@ async def auth_middleware(request: web.Request, handler):
             _unprotected_presented = _extract_bearer_token_ci(request)
             if _unprotected_presented is not None and not _lookup_agent_by_token(_unprotected_presented):
                 _record_unprotected_path_token_verify_failed(request, _unprotected_presented)
-            return await handler(request)
+            # D2 (OBS round): count this request too — /health and
+            # /pool/status traffic used to be entirely invisible to
+            # gateway.requests_total/by_status. A stale-bearer probe here
+            # still serves the SAME anonymous 200 it always did (the
+            # response is untouched above), so it lands in `by_status.2xx`,
+            # never `by_status.401` — that 401-shaped signal already went
+            # to `credentials.token_verify_failed` and the D1 ring above.
+            # No latency ring entry (R-C): this exit never takes `started`.
+            _status = 500
+            try:
+                resp = await handler(request)
+                _status = resp.status
+                return resp
+            except web.HTTPException as exc:
+                _status = exc.status
+                raise
+            finally:
+                _record_gateway_request(_status, None)
 
         agent_name = resolve_identity(request)
         if not agent_name:
@@ -2162,6 +2219,11 @@ async def auth_middleware(request: web.Request, handler):
             presented = _extract_bearer_token(request)
             _record_token_verify_failed(request, presented)
             www_authenticate = 'Bearer error="invalid_token"' if presented else "Bearer"
+            # D2 (OBS round): the gateway's own 401 used to be invisible to
+            # gateway.requests_total/by_status — only the D1 ring and
+            # credentials.token_verify_failed saw it. No latency ring entry
+            # (R-C): this exit never takes `started`.
+            _record_gateway_request(401, None)
             raise web.HTTPUnauthorized(
                 reason="Authorization: a valid Bearer token is required",
                 # X-SM-Fault-Origin alongside the RFC 6750 challenge (security
@@ -2186,7 +2248,13 @@ async def auth_middleware(request: web.Request, handler):
         # can only pause/resume backups.
         role  = effective_role(agent_name, _AGENT_ROLES.get(agent_name))
         route = (request.method, request.path.rstrip("/") or "/")
+        # D2 (OBS round): every HTTPException `auth_middleware` raises itself
+        # (this one and the four below) used to be invisible to
+        # gateway.requests_total/by_status — only the deep `finally` at the
+        # bottom of this function ever recorded anything. No latency ring
+        # entry on any of them (R-C): none of these exits take `started`.
         if role == "read" and not _read_role_permits(request):
+            _record_gateway_request(403, None)
             raise web.HTTPForbidden(
                 reason="Read-only token: this route requires a write-capable agent token",
                 **_error_body("Read-only token: this route requires a write-capable "
@@ -2196,6 +2264,7 @@ async def auth_middleware(request: web.Request, handler):
             )
         if route in _ADMIN_ROUTES:
             if role != "admin":
+                _record_gateway_request(403, None)
                 raise web.HTTPForbidden(
                     reason="This route requires an admin-role token",
                     **_error_body("This route requires an admin-role token. The "
@@ -2203,6 +2272,7 @@ async def auth_middleware(request: web.Request, handler):
                 )
         else:
             if role == "admin":
+                _record_gateway_request(403, None)
                 raise web.HTTPForbidden(
                     reason="Admin token is confined to /admin/* routes",
                     **_error_body("Admin token is confined to /admin/* routes. The "
@@ -2210,6 +2280,9 @@ async def auth_middleware(request: web.Request, handler):
                                   "for this route."),
                 )
             if _backup_quiesce and route in _WRITE_ROUTES:
+                # Also feeds gateway.by_status.503 alongside the shed valve
+                # and pool-saturated — see MEANING_CHANGES.
+                _record_gateway_request(503, None)
                 raise web.HTTPServiceUnavailable(
                     reason="backup in progress — writes are briefly paused",
                     headers={"Retry-After": str(BACKUP_RETRY_AFTER)},
@@ -2218,6 +2291,7 @@ async def auth_middleware(request: web.Request, handler):
                                   "retry after the Retry-After interval."),
                 )
             if GATEWAY_REQUIRE_PRINCIPAL and route in _WRITE_ROUTES and principal is None:
+                _record_gateway_request(403, None)
                 raise web.HTTPForbidden(
                     reason="writes require a kernel-attested principal — connect over the "
                            "gateway Unix socket (GATEWAY_UDS_PATH), not TCP",

@@ -1507,6 +1507,49 @@ MEANING_CHANGES: tuple[dict, ...] = (
                    "threshold-0 semantics, are unchanged"),
         "shape_changed": False,
     },
+    # ── OBS round D2 (2026-09, ruling R-A) — same not-yet-shipped pinning
+    # practice as D1's entry above.
+    {
+        "endpoint": "telemetry",
+        "path": "gateway.requests_total",
+        "in_version": VERSION,
+        "was": ("counted only AUTHENTICATED, handler-reached requests — the "
+                "gateway's own 401/403/503 responses (load-shed, role "
+                "denial, backup-quiesce) and all auth-off traffic never "
+                "reached the single `_record_gateway_request` call site"),
+        "now": ("counts every request entering the gateway, at every exit "
+                "the middleware can take — exactly one "
+                "`_record_gateway_request` per request"),
+        "action": ("expect this counter to STEP UP on deploy — health "
+                   "polls and previously-invisible gateway-issued "
+                   "401/403/503 now count. Magnitude is unmeasured; observe "
+                   "post-deploy rather than predicting"),
+        "shape_changed": False,
+    },
+    {
+        "endpoint": "telemetry",
+        "path": "gateway.by_status.*",
+        "in_version": VERSION,
+        "was": ("only the authenticated, handler-reached path's own status "
+                "was ever counted — a gateway-issued 401/403/503 (load-shed, "
+                "role denial, backup-quiesce) was invisible here"),
+        "now": ("every exit the middleware can take is counted, so "
+                "`by_status.401` now includes protected-path bearer "
+                "failures, `by_status.403` includes role denials, and "
+                "`by_status.503` now includes load-shed and backup-quiesce "
+                "alongside pool-saturated — `shed_503_total` is therefore "
+                "only `<= by_status.503` from now on, no longer equal-by-"
+                "construction on the shed class alone"),
+        "action": ("a consumer that treated `shed_503_total == by_status."
+                   "503` as an invariant must drop that assumption; a "
+                   "401 from a protected path now shows up here AND in the "
+                   "D1 rate window AND in `credentials.token_verify_failed` "
+                   "— same event, three surfaces. The v0.9.87 stale-token-"
+                   "monitor `/health` case is unaffected here: it serves "
+                   "200, so it moves only the D1 window and "
+                   "`requests_total`/`by_status.2xx`, never `by_status.401`"),
+        "shape_changed": False,
+    },
 )
 
 #: Keys REMOVED outright in 0.9.74 (not moved) — each had no writer and had
