@@ -5,6 +5,39 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.88] — 2026-09-03
+
+### The observability round — meters that tell the truth
+
+The gateway's numbers stopped lying in six places. The `token_verify_failed_per_min` warning was
+never a rate: it extrapolated the counter delta over the gap between health-cache rebuilds, so one
+bad bearer read as 24-per-minute under a 3-second poll and a tenth-per-minute under a slow one —
+the same event, inverted by whoever was watching. It is now a true count over a monotonic
+60-second window, and the whole-gateway `degraded` it triggers finally means what it says. Request
+accounting widened to the entire middleware: the gateway's own 401s, 403s and load-shed 503s —
+previously invisible, because every early exit left before the counter — now land in
+`by_status`, and `requests_total` counts every request that enters; the latency percentiles
+deliberately stay on the old authenticated-handler boundary so they keep measuring real work
+rather than liveness polls (an operator ruling, recorded).
+
+A client hanging up is no longer the backend's fault: an abort during response-header writing was
+logged as "Upstream unreachable", charged to the backend's fail counters, and two such aborts
+could park a healthy card in a five-minute cooldown — aborts in either window now count under a
+new `gateway.client_disconnects_total`, mark the backend neither ok nor failed, and stay out of
+the latency ring. `/memory/graph` returns temporal properties instead of a bare 500. The dead
+`LLM_MAX_TRIES` knob is gone along with the comment promising cross-backend failover that never
+existed; the property its name obscured — one backend, one credential, never carried across —
+is now pinned by a test that exercises the real retry. The telemetry contract gained a declared
+warning-key vocabulary (renames were previously invisible to every guard), lost a silently
+duplicated key that Python had been collapsing, and five stale log-annotations now point at what
+the code actually emits.
+
+Chain: evidence re-sweep (two of the ledger's mechanism claims corrected before design), two
+adversarial design reviews that caught the brief specifying two regressions-in-disguise, one
+operator ruling (latency scope), two-step build, QA plus security review on the diff, a six-item
+fix round closing a measured test gap (the recorded status values had no pin at all), and a
+merger handback that re-ran the reviewer's mutation to watch the new pins die.
+
 ## [0.9.87] — 2026-09-02
 
 ### The security round — credential-URL hygiene, case-blind classification closed, refusals audited
