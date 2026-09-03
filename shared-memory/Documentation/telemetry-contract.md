@@ -15,6 +15,17 @@ Contract version **0.9.87**. Every key the gateway emits on `GET /health` and `G
 
 The logs are the final word on *what happened at 03:12*: every dependency state transition and every warning raised or cleared writes one line named after the key that changed (the **log twin** column). Never a line per poll.
 
+## Warning keys
+
+`warnings[].key` (CG, OBS round) is one of this enumerated set — never a free string. Each is produced by exactly one `_warning(...)` call site in `hive_mind_proxy.py`'s health-build function; the log line it writes when raised or cleared is `health.warning.<key>`.
+
+- `encoder_embedder_projected_ms`
+- `encoder_reranker_projected_ms`
+- `gateway_shed_503_total`
+- `outbox_oldest_pending_age_s`
+- `rem_dead_lettered`
+- `token_verify_failed_per_min`
+
 ## HTTP status codes — unchanged by this release
 
 `/health` returns **503 if and only if the embedder or the reranker is down**. That is the save mandate: without an encoder a save cannot produce a vector, and a row with no vector is invisible to semantic search. **Every other verdict — a degraded encoder, a dead Postgres, a failing outbox, a stalled daemon — is served 200 with the enum in the body.** A consumer that inferred the verdict from the status code must read `status` and `dependencies` instead.
@@ -52,6 +63,15 @@ Not moved — **removed**. Each had no writer and had therefore read `0` since i
 | telemetry | `entity_graph.alias_covered_entities` | same writer-less ALIASES relationship |
 | telemetry | `entity_graph.alias_components` | read Entity.alias_component, which the retired gds.wcc caller was the only writer of |
 | telemetry | `entity_graph.largest_alias_component` | same retired gds.wcc stamp |
+
+## Removed outright in 0.9.88
+
+Not moved — **removed**. Each had no writer.
+
+| endpoint | key | why |
+|---|---|---|
+| health | `config.llm_pool_tuning.max_tries` | no writer — LLM_MAX_TRIES was read by nothing but this render; the comments beside it promised cross-backend failover the pool never implemented |
+| telemetry | `config.llm_pool_tuning.max_tries` | same dead LLM_MAX_TRIES constant, dual-emitted copy |
 
 ## Dual-emit drop target
 
@@ -100,7 +120,7 @@ Paths are relative to the response object.
 | key | type | unit | since | moved to | removed in | log twin | notes |
 |---|---|---|---|---|---|---|---|
 | `warnings[]` | list | — | 0.9.74 | — | — | — | One entry per limit crossing. The THRESHOLD lives server-side so every consumer sees the same verdict — the monitor stops deriving health from telemetry numbers client-side. |
-| `warnings[].key` | str | — | 0.9.74 | — | — | `health.warning.<key>` | — |
+| `warnings[].key` | str | — | 0.9.74 | — | — | `health.warning.<key>` | one of WARNING_KEYS — see that constant's docstring |
 | `warnings[].limit` | int/float | — | 0.9.74 | — | — | — | — |
 | `warnings[].observed` | int/float | — | 0.9.74 | — | — | — | — |
 | `warnings[].unit` | str | — | 0.9.74 | — | — | — | — |
@@ -188,7 +208,6 @@ Paths are relative to the response object.
 | `config.llm_pool_tuning.cooldown_s` | float/int | _s | <=0.9.73 | `telemetry:config.llm_pool_tuning.cooldown_s` | 0.9.88 (targeted) | — | — |
 | `config.llm_pool_tuning.fail_threshold` | int | — | <=0.9.73 | `telemetry:config.llm_pool_tuning.fail_threshold` | 0.9.88 (targeted) | — | — |
 | `config.llm_pool_tuning.fail_window_s` | float/int | _s | <=0.9.73 | `telemetry:config.llm_pool_tuning.fail_window_s` | 0.9.88 (targeted) | — | — |
-| `config.llm_pool_tuning.max_tries` | int | — | <=0.9.73 | `telemetry:config.llm_pool_tuning.max_tries` | 0.9.88 (targeted) | — | — |
 | `consolidation.gpu_probe.consecutive_hangs` | int | — | <=0.9.73 | — | — | — | — |
 | `consolidation.gpu_probe.leaked_children` | int | — | <=0.9.73 | — | — | — | — |
 | `consolidation.gpu_probe.state` | str | — | <=0.9.73 | — | — | — | — |
@@ -360,7 +379,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `encoders.embed.last_payload_chars` | int/null | _chars | 0.9.74 | — | — | — | — |
 | `encoders.embed.max_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
 | `encoders.embed.p50_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
-| `encoders.embed.p95_ms` | float/null | _ms | 0.9.74 | — | — | `health.warning.encoder_p95_ms` | — |
+| `encoders.embed.p95_ms` | float/null | _ms | 0.9.74 | — | — | `health.warning.encoder_embedder_projected_ms` | — |
 | `encoders.embed.window` | int | — | 0.9.74 | — | — | — | observations the percentiles were computed over — NOT the ring's capacity. p95 over 3 calls is not a p95. |
 | `encoders.limit_ms` | float/null | _ms | 0.9.74 | — | — | — | ENCODER_LATENCY_WARN_MS — the limit the p95s above are compared against; null means it is derived per-encoder from backend_capability.ceiling_s rather than pinned by env. |
 | `encoders.rerank.calls` | int | — | 0.9.74 | — | — | — | — |
@@ -369,7 +388,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `encoders.rerank.last_payload_chars` | int/null | _chars | 0.9.74 | — | — | — | — |
 | `encoders.rerank.max_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
 | `encoders.rerank.p50_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
-| `encoders.rerank.p95_ms` | float/null | _ms | 0.9.74 | — | — | `health.warning.encoder_p95_ms` | — |
+| `encoders.rerank.p95_ms` | float/null | _ms | 0.9.74 | — | — | `health.warning.encoder_reranker_projected_ms` | — |
 | `encoders.rerank.window` | int | — | 0.9.74 | — | — | — | — |
 | `rerank_fallbacks_last_ts` | str/null | — | <=0.9.73 | — | — | — | — |
 | `rerank_fallbacks_total` | int | _total | <=0.9.73 | — | — | — | — |
@@ -389,13 +408,14 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `gateway.by_status.4xx` | int | — | 0.9.74 | — | — | — | — |
 | `gateway.by_status.503` | int | — | 0.9.74 | — | — | — | — |
 | `gateway.by_status.5xx` | int | — | 0.9.74 | — | — | — | — |
+| `gateway.client_disconnects_total` | int | _total | 0.9.88 | — | — | — | D9 (OBS round): a CALLER of this gateway aborted an LLM-proxy request — before response headers could be sent, or partway through the streamed body. ⛔ NEVER conditional, 0 when none, same contract as shed_503_total: incremented from hive_mind_proxy.py's dispatch loop, never a verdict on any backend — neither _llm_mark_ok nor _llm_mark_fail fires for it, and its duration is excluded from the latency ring entirely (a client hang-up is not a service time) |
 | `gateway.inflight` | int | — | 0.9.74 | — | — | — | — |
 | `gateway.inflight_max` | int | — | 0.9.74 | — | — | — | GATEWAY_INFLIGHT_MAX; 0 = valve disabled |
 | `gateway.latency_p50_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
 | `gateway.latency_p95_ms` | float/null | _ms | 0.9.74 | — | — | — | — |
 | `gateway.latency_window` | int | — | 0.9.74 | — | — | — | — |
 | `gateway.requests_total` | int | _total | 0.9.74 | — | — | — | — |
-| `gateway.shed_503_total` | int | _total | 0.9.74 | — | — | `health.warning.pool_shedding` | — |
+| `gateway.shed_503_total` | int | _total | 0.9.74 | — | — | `health.warning.gateway_shed_503_total` | — |
 
 ### outbox
 
@@ -410,7 +430,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `outbox.error` | str | — | 0.9.74 | — | — | — | present only when this section's own query failed |
 | `outbox.failed` | int | — | 0.9.74 | — | — | `health.outbox` | ⛔ ALWAYS PRESENT, 0 when zero. The pre-0.9.74 `postgres.outbox` census omitted the key entirely at zero, so absence and zero were indistinguishable to every consumer. |
 | `outbox.oldest_failed_age_s` | int/null | _s | 0.9.74 | — | — | — | — |
-| `outbox.oldest_pending_age_s` | int/null | _s | 0.9.74 | — | — | `health.warning.outbox_age` | — |
+| `outbox.oldest_pending_age_s` | int/null | _s | 0.9.74 | — | — | `health.warning.outbox_oldest_pending_age_s` | — |
 | `outbox.pending` | int | — | 0.9.74 | — | — | — | — |
 | `outbox.rem_reviewed` | int | — | 0.9.74 | — | — | — | — |
 | `postgres.outbox` | dict | — | <=0.9.73 | `telemetry:outbox` | 0.9.88 (targeted) | — | emitted as an empty dict when the outbox is empty |
@@ -468,7 +488,6 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `config.llm_pool_tuning.cooldown_s` | float/int | _s | 0.9.74 | — | — | — | — |
 | `config.llm_pool_tuning.fail_threshold` | int | — | 0.9.74 | — | — | — | — |
 | `config.llm_pool_tuning.fail_window_s` | float/int | _s | 0.9.74 | — | — | — | — |
-| `config.llm_pool_tuning.max_tries` | int | — | 0.9.74 | — | — | — | — |
 | `gpu_probe` | null | — | 0.9.74 | — | — | — | null until the first probe |
 | `gpu_probe.consecutive_hangs` | int | — | 0.9.74 | — | — | — | — |
 | `gpu_probe.leaked_children` | int | — | 0.9.74 | — | — | — | — |
@@ -663,7 +682,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `registry.as_of` | str/null | — | 0.9.74 | — | — | — | when the census last SUCCEEDED. null before the first success |
 | `registry.census_failures_total` | int | _total | 0.9.74 | — | — | `health.registry` | failures of the row-count query behind registry.*. Deliberately SEPARATE from read_failures_total: a failed census means these numbers are stale, a failed axis read means a SEARCH silently answered from the literal string — same subsystem, different incidents |
 | `registry.domains` | int | — | 0.9.74 | — | — | — | rows in `project_domains`. A domain is (project_id, name), so the same NAME under two projects is two rows — they are different sections |
-| `registry.error` | str | — | 0.9.74 | — | — | — | present only when this section's own query failed |
+| `registry.error` | str | — | 0.9.74 | — | — | — | two different producers, same key, never both at once: _registry_telemetry() (coordinator.py) sets it while the LAST CENSUS attempt failed — the counts beside it are the last good ones; the try/except wrapping that call's OWN invocation sets it instead, replacing the whole registry.* section with just {"error": ...}, when the section-query call itself raises (a bug in _registry_telemetry, not a failed census) |
 | `registry.projects` | int | — | 0.9.74 | — | — | — | rows in `projects`. ⛔ NEVER NULL: on a failed census the LAST GOOD value is served with `as_of` and `error` beside it, because a null would make a failed query look like a deployment with no projects |
 | `registry.read_failures_total` | int | _total | 0.9.74 | — | — | `health.registry` | the SEARCH path: a filter that could not be resolved |
 | `registry.refusals.axis_conflict` | int | — | 0.9.74 | — | — | — | — |
@@ -686,7 +705,7 @@ The envelope is `{"status": "success", "telemetry": {…}}`; paths below are rel
 | `credentials.credentialed_route_denied_last_ts` | str/null | — | <=0.9.73 | — | — | — | — |
 | `credentials.daemon_tokens_issued` | int | — | <=0.9.73 | — | — | — | — |
 | `credentials.daemon_tokens_issued_last_ts` | str/null | — | <=0.9.73 | — | — | — | — |
-| `credentials.token_verify_failed` | int | — | <=0.9.73 | — | — | `health.warning.token_verify_failed` | — |
+| `credentials.token_verify_failed` | int | — | <=0.9.73 | — | — | `health.warning.token_verify_failed_per_min` | — |
 | `credentials.token_verify_failed_last_ts` | str/null | — | <=0.9.73 | — | — | — | — |
 | `credentials.token_verify_warn_per_min` | int/float | — | 0.9.74 | — | — | — | TOKEN_VERIFY_WARN_PER_MIN — the limit the warning is raised at |
 | `llm.faults.*.llm.credential.count` | int | — | 0.9.74 | — | — | — | — |

@@ -64,6 +64,7 @@ __all__ = [
     "INTRODUCED_0_9_81",
     "INTRODUCED_0_9_88",
     "DUAL_EMIT_DROP_TARGET",
+    "WARNING_KEYS",
     "CATEGORIES",
     "HEALTH",
     "TELEMETRY",
@@ -208,6 +209,27 @@ INTRODUCED_0_9_88 = "0.9.88"
 #: updates this alongside it.
 DUAL_EMIT_DROP_TARGET = "0.9.88"
 
+#: CG (OBS round) — the enumerated `warnings[].key` vocabulary. Before this,
+#: `warnings[].key` was a free `str` (see the entry below): a renamed or
+#: added warning key was invisible to every guard, and three existing
+#: `log="health.warning.*"` annotations elsewhere in this file (fixed in the
+#: same change) named keys NO producer ever emitted. Re-derived from the six
+#: `_warning(...)` call sites in `hive_mind_proxy.py`'s health-build function
+#: — never hand-maintained independently of them — and pinned by an AST/
+#: source walk in `tests/test_obs_cg_warning_keys.py` in both directions:
+#: every literal `_warning(` first-arg (the encoder pair's f-string expands
+#: via its `("embedder", "reranker")` loop) is a member of this set, and
+#: every member of this set has a producer. Rendered into the generated doc
+#: by `render_markdown()` below.
+WARNING_KEYS: frozenset[str] = frozenset({
+    "encoder_embedder_projected_ms",
+    "encoder_reranker_projected_ms",
+    "outbox_oldest_pending_age_s",
+    "rem_dead_lettered",
+    "gateway_shed_503_total",
+    "token_verify_failed_per_min",
+})
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GET /health — the authenticated payload (an auth-off install serves the same
@@ -300,7 +322,8 @@ HEALTH: dict[str, dict] = {
         "consumer sees the same verdict — the monitor stops deriving health from "
         "telemetry numbers client-side.")),
     "warnings[].key": _k("str", "warnings", since=INTRODUCED_0_9_74,
-                         log="health.warning.<key>"),
+                         log="health.warning.<key>",
+                         note="one of WARNING_KEYS — see that constant's docstring"),
     "warnings[].limit": _k("int|float", "warnings", since=INTRODUCED_0_9_74),
     "warnings[].observed": _k("int|float", "warnings", since=INTRODUCED_0_9_74),
     "warnings[].unit": _k("str", "warnings", since=INTRODUCED_0_9_74),
@@ -698,7 +721,7 @@ TELEMETRY: dict[str, dict] = {
     "encoders.embed.errors": _k("int", "encoders", since=INTRODUCED_0_9_74),
     "encoders.embed.p50_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.embed.p95_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74,
-                                log="health.warning.encoder_p95_ms"),
+                                log="health.warning.encoder_embedder_projected_ms"),
     "encoders.embed.max_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.embed.last_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.embed.last_payload_chars": _k("int|null", "encoders", unit="_chars",
@@ -710,7 +733,7 @@ TELEMETRY: dict[str, dict] = {
     "encoders.rerank.errors": _k("int", "encoders", since=INTRODUCED_0_9_74),
     "encoders.rerank.p50_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.rerank.p95_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74,
-                                 log="health.warning.encoder_p95_ms"),
+                                 log="health.warning.encoder_reranker_projected_ms"),
     "encoders.rerank.max_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.rerank.last_ms": _k("float|null", "encoders", unit="_ms", since=INTRODUCED_0_9_74),
     "encoders.rerank.last_payload_chars": _k("int|null", "encoders", unit="_chars",
@@ -737,7 +760,7 @@ TELEMETRY: dict[str, dict] = {
     "gateway.inflight_max": _k("int", "gateway", since=INTRODUCED_0_9_74,
                                note="GATEWAY_INFLIGHT_MAX; 0 = valve disabled"),
     "gateway.shed_503_total": _k("int", "gateway", unit="_total", since=INTRODUCED_0_9_74,
-                                 log="health.warning.pool_shedding"),
+                                 log="health.warning.gateway_shed_503_total"),
     "gateway.client_disconnects_total": _k(
         "int", "gateway", unit="_total", since=INTRODUCED_0_9_88, note=(
             "D9 (OBS round): a CALLER of this gateway aborted an LLM-proxy "
@@ -759,7 +782,7 @@ TELEMETRY: dict[str, dict] = {
     "outbox.rem_reviewed": _k("int", "outbox", since=INTRODUCED_0_9_74),
     "outbox.oldest_failed_age_s": _k("int|null", "outbox", unit="_s", since=INTRODUCED_0_9_74),
     "outbox.oldest_pending_age_s": _k("int|null", "outbox", unit="_s", since=INTRODUCED_0_9_74,
-                                      log="health.warning.outbox_age"),
+                                      log="health.warning.outbox_oldest_pending_age_s"),
     "outbox.apply_latency_p50_s": _k("float|null", "outbox", unit="_s", since=INTRODUCED_0_9_74),
     "outbox.apply_latency_p95_s": _k("float|null", "outbox", unit="_s", since=INTRODUCED_0_9_74),
     "outbox.apply_latency_window": _k("int", "outbox", since=INTRODUCED_0_9_74),
@@ -1278,7 +1301,7 @@ TELEMETRY: dict[str, dict] = {
 
     # ── credentials ─────────────────────────────────────────────────────────
     "credentials.token_verify_failed": _k("int", "credentials",
-                                          log="health.warning.token_verify_failed"),
+                                          log="health.warning.token_verify_failed_per_min"),
     "credentials.token_verify_failed_last_ts": _k("str|null", "credentials"),
     "credentials.daemon_tokens_issued": _k("int", "credentials"),
     "credentials.daemon_tokens_issued_last_ts": _k("str|null", "credentials"),
@@ -1943,6 +1966,16 @@ def render_markdown() -> str:
     a("The logs are the final word on *what happened at 03:12*: every dependency "
       "state transition and every warning raised or cleared writes one line named "
       "after the key that changed (the **log twin** column). Never a line per poll.")
+    a("")
+    a("## Warning keys")
+    a("")
+    a("`warnings[].key` (CG, OBS round) is one of this enumerated set — never a "
+      "free string. Each is produced by exactly one `_warning(...)` call site in "
+      "`hive_mind_proxy.py`'s health-build function; the log line it writes when "
+      "raised or cleared is `health.warning.<key>`.")
+    a("")
+    for key in sorted(WARNING_KEYS):
+        a(f"- `{key}`")
     a("")
     a("## HTTP status codes — unchanged by this release")
     a("")
