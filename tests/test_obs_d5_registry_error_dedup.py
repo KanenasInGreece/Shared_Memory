@@ -127,12 +127,21 @@ def test_guard_scoping_ignores_k_helper_keyword_repeats():
 
 
 def test_registry_error_documents_both_producers_once():
-    """The merged entry exists exactly once and its note names both the
-    census producer and the section-query producer, so a reader is not left
-    to rediscover the two-producer shape by reading `coordinator.py`."""
-    entries = [k for k in tc.TELEMETRY if k == "registry.error"]
-    assert entries == ["registry.error"]
+    """The merged entry is the SUITE's only declaration of `registry.error`
+    — an AST scan of the actual dict-literal keys (QA finding 4: the prior
+    `[k for k in tc.TELEMETRY if k == "registry.error"] == ["registry.error"]`
+    shape is a tautology a Python dict cannot violate — it was ALREADY
+    deduplicated by the time this test ever saw it, so it survived QA's
+    planted-duplicate mutation while the real AST guards above died. This
+    reuses `_duplicate_string_keys`, the same instrument those guards use,
+    and asserts the VALUE `"registry.error" not in dupes` rather than an
+    equality no input could ever falsify) and its note names both producers
+    by their real phrase, not via an `or` chain that any sufficiently long
+    note satisfies."""
+    tree = _module_ast()
+    node = _dict_literal_for(tree, "TELEMETRY")
+    dupes = _duplicate_string_keys(node)
+    assert "registry.error" not in dupes, dupes
     note = tc.TELEMETRY["registry.error"].get("note", "")
     assert "census" in note.lower()
-    assert "section-query" in note.lower() or "section's own query" in note.lower() \
-        or "raises" in note.lower()
+    assert "section-query" in note.lower()
