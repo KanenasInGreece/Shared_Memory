@@ -44,7 +44,7 @@ import struct
 import time
 import urllib.parse
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from typing import Any
 
@@ -1263,6 +1263,20 @@ def telemetry_credential_counters() -> dict:
     return dict(_credential_counters)
 
 
+def telemetry_token_verify_ring() -> list:
+    """D1: a synchronous snapshot of the token_verify_failed rate ring — the
+    monotonic timestamp of every event, bounded to the most recent 256 (see
+    `_token_verify_failure_ring`'s declaration for why 256 is fixed).
+
+    A plain list copy, never the deque itself: the proxy's
+    `_token_verify_failure_rate` walks this with an injectable `now` (tests
+    inject the clock; production passes None and reads the live one) and
+    counts entries within a true 60 s window. No await anywhere in this
+    path — the ring is appended synchronously at both bump sites in this
+    module, and read synchronously here."""
+    return list(_token_verify_failure_ring)
+
+
 class _TimedAcquire:
     """Times a pool acquire without changing anything about it.
 
@@ -1453,6 +1467,28 @@ _credential_last_ts: dict[str, str | None] = {
     "daemon_tokens_issued": None,
     "credentialed_route_denied": None,
 }
+
+# D1 (OBS round): a FIXED, bounded ring of the monotonic timestamp of every
+# token_verify_failed event — replaces the old health-build-gap extrapolation
+# (`hive_mind_proxy._delta_per_min`), whose reading was poll-cadence-dependent
+# (one event read ~24/min at the 3 s HEALTH_CACHE_TTL_S, 0.1/min under 600 s
+# polling — the poll cadence WAS the reading, not the event rate).
+#
+# ⛔ `maxlen=256` is a FIXED bound, deliberately NOT derived from
+# TOKEN_VERIFY_WARN_PER_MIN (an env-overridable float defined ~800 lines
+# below the two bump sites this ring is appended from) — deriving the ring's
+# capacity from that threshold invites a NameError at import order, a
+# maxlen=0 crash if the operator ever sets the threshold to 0, or an
+# unbounded ring if they set it to something that reads as infinite. A flood
+# inside one 60 s window therefore saturates at exactly 256 counted events,
+# not the true rate — the warning still fires; the unbounded lifetime total
+# stays visible at credentials.token_verify_failed. See
+# telemetry_token_verify_ring()'s docstring for the read side.
+#
+# Stamped with time.monotonic(), NEVER wall-clock: a wall-clock step
+# backward would make every past event look freshly-arrived and stick the
+# gateway `degraded` until the ring drains 256 entries later.
+_token_verify_failure_ring: "deque[float]" = deque(maxlen=256)
 
 
 def _fault_entry(backend: str) -> dict:
@@ -1748,6 +1784,7 @@ def _record_token_verify_failed(request: web.Request, presented_token: str | Non
     secret."""
     global _tvf_suppressed_count, _tvf_suppressed_since
     _credential_counters["token_verify_failed"] += 1
+    _token_verify_failure_ring.append(time.monotonic())
     # Stamped before the C-1 early return, so the no-token class — the one
     # that never produces a log line — still carries a "when". This is the
     # single piece of information the byte-identical line would have added,
@@ -1837,6 +1874,7 @@ def _record_unprotected_path_token_verify_failed(request: web.Request, presented
     protected-path failure depends on to be seen."""
     global _tvf_unprotected_suppressed_count, _tvf_unprotected_suppressed_since
     _credential_counters["token_verify_failed"] += 1
+    _token_verify_failure_ring.append(time.monotonic())
     _credential_last_ts["token_verify_failed"] = datetime.now(timezone.utc).isoformat()
     if not _tvf_unprotected_rate_limit_allow():
         if _tvf_unprotected_suppressed_count == 0:

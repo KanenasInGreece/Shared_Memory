@@ -94,6 +94,7 @@ from coordinator import (
     NREM_FOLD_ATTEMPT_WARN,
     telemetry_gateway_counters,
     telemetry_credential_counters,
+    telemetry_token_verify_ring,
     _llm_faults_snapshot,
 )
 
@@ -4635,12 +4636,21 @@ def _warning(key: str, limit, observed, unit: str) -> dict:
     return {"key": key, "limit": limit, "observed": observed, "unit": unit}
 
 
-# ⛔ A WARNING MUST BE ABLE TO CLEAR, so neither of the two below is read off a
-# cumulative counter. A `shed_503_total > 0` warning raised once would stay
-# raised until the process restarted, and an alert that never clears is an alert
-# an operator learns to close. Both take the DELTA since the previous health
-# build (the TTL bounds how often that is), which falls back to zero on its own
-# as soon as the condition stops.
+# ⛔ A WARNING MUST BE ABLE TO CLEAR, so `_gateway_shed_rate` below is not read
+# off a cumulative counter. A `shed_503_total > 0` warning raised once would
+# stay raised until the process restarted, and an alert that never clears is
+# an alert an operator learns to close. It takes the DELTA since the previous
+# health build (the TTL bounds how often that is), which falls back to zero
+# on its own as soon as the condition stops.
+#
+# D1 (OBS round): `token_verify_failed`'s warning USED to share this
+# health-build-delta pattern via `_delta_per_min` below — it no longer does
+# (see `_token_verify_failure_rate`'s docstring for why that reading was
+# poll-cadence-dependent, not a true rate). `_delta_per_min` now has no
+# caller left (left in place, unmodified — out of this round's scope);
+# `_rate_marks` still backs `_gateway_shed_rate`'s "shed" key, untouched
+# (HANDOFF note: `_gateway_shed_rate`'s own cadence sensitivity is out of
+# this round's scope too).
 _rate_marks: dict[str, tuple[int, float]] = {}
 
 
@@ -4681,12 +4691,42 @@ def _gateway_shed_rate() -> int:
         return 0
 
 
-def _token_verify_failure_rate() -> float | None:
-    """token_verify_failed per minute since the previous health build."""
+def _token_verify_failure_rate(now: float | None = None) -> float | None:
+    """D1: the COUNT of token_verify_failed events in a true 60 s monotonic
+    window — replaces the old `_delta_per_min` extrapolation, which divided
+    the lifetime counter's delta by the gap between health-cache BUILDS
+    (HEALTH_CACHE_TTL_S), not by a fixed window. That made the "reading"
+    entirely poll-cadence-dependent: one event read ~24/min at the 3 s TTL
+    default and ~0.1/min under 600 s polling of the same single event —
+    the poll cadence WAS the number, never the actual rate.
+
+    Walks a synchronous snapshot of the coordinator's fixed-256 ring
+    (`telemetry_token_verify_ring()`, appended with `time.monotonic()` at
+    both bump sites) and counts entries within 60.0 seconds of `now`. No
+    await anywhere in the walk.
+
+    `now` is injectable — tests pass an explicit monotonic float to control
+    which ring entries fall inside the window, rather than patching
+    `datetime` (the ring never reads wall-clock time, so patching
+    `datetime` would not move it at all). Production callers always pass
+    None and get the live `time.monotonic()`.
+
+    Saturates at the ring's fixed 256-entry cap: a 60 s flood of more than
+    256 events reads exactly 256, not the true rate — documented, not a
+    bug (see coordinator._token_verify_failure_ring's declaration and
+    HANDOFF.md). The warning still fires at a saturated reading; only the
+    unbounded lifetime total remains at credentials.token_verify_failed.
+
+    Returns 0.0 (never None) when the ring is empty — unlike the old
+    "None on the very first call" semantics, an honest window has nothing
+    to distinguish "never happened" from "not yet warmed up"; a genuinely
+    empty 60 s window IS zero events.
+    """
     try:
-        return _delta_per_min(
-            "token_verify_failed",
-            telemetry_credential_counters().get("token_verify_failed", 0))
+        if now is None:
+            now = time.monotonic()
+        return float(sum(1 for ts in telemetry_token_verify_ring()
+                          if now - ts <= 60.0))
     except Exception:
         return None
 

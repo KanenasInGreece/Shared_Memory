@@ -1480,6 +1480,33 @@ MEANING_CHANGES: tuple[dict, ...] = (
                    "replacement of the original fact"),
         "shape_changed": False,
     },
+    # ── OBS round D1 (2026-09, ruling R-A) — pinned to the bare `VERSION`
+    # constant: this build has not shipped yet, so there is no frozen stamp
+    # to name (same practice the W2/W4 entries above followed at THEIR
+    # authorship time, before the merger's version-bump froze them into
+    # INTRODUCED_0_9_79 / INTRODUCED_0_9_81). At release the merger freezes
+    # these into a new INTRODUCED_0_9_8x constant the same way.
+    {
+        "endpoint": "health",
+        "path": "warnings[] (key=token_verify_failed_per_min)",
+        "in_version": VERSION,
+        "was": ("a counter delta extrapolated over the gap between health-"
+                "cache BUILDS (HEALTH_CACHE_TTL_S) — poll-cadence-dependent: "
+                "one event read ~24/min at the 3 s TTL default and ~0.1/min "
+                "under 600 s polling of the exact same single event"),
+        "now": ("the count of token_verify_failed events in a true 60 s "
+                "monotonic window, capped at 256 (the coordinator ring's "
+                "fixed bound — a flood inside one 60 s window reads exactly "
+                "256, not the true rate; the warning still fires at a "
+                "saturated reading)"),
+        "action": ("a consumer alerting on this warning's `observed` value "
+                   "now reads an honest per-minute count instead of a "
+                   "number that moved with how often something else polled "
+                   "/health; the warning key name and the "
+                   "`> TOKEN_VERIFY_WARN_PER_MIN` comparison, including its "
+                   "threshold-0 semantics, are unchanged"),
+        "shape_changed": False,
+    },
 )
 
 #: Keys REMOVED outright in 0.9.74 (not moved) — each had no writer and had
