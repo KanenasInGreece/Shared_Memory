@@ -851,8 +851,13 @@ TELEMETRY: dict[str, dict] = {
     "registry.as_of": _k("str|null", "axes/registry", since=INTRODUCED_0_9_74, note=(
         "when the census last SUCCEEDED. null before the first success")),
     "registry.error": _k("str", "axes/registry", since=INTRODUCED_0_9_74, note=(
-        "present only while the last census attempt failed; the counts beside "
-        "it are the last good ones")),
+        "two different producers, same key, never both at once: "
+        "_registry_telemetry() (coordinator.py) sets it while the LAST CENSUS "
+        "attempt failed — the counts beside it are the last good ones; the "
+        "try/except wrapping that call's OWN invocation sets it instead, "
+        "replacing the whole registry.* section with just {\"error\": ...}, "
+        "when the section-query call itself raises (a bug in "
+        "_registry_telemetry, not a failed census)")),
     "registry.census_failures_total": _k(
         "int", "axes/registry", unit="_total", since=INTRODUCED_0_9_74, log="health.registry",
         note=("failures of the row-count query behind registry.*. Deliberately "
@@ -878,8 +883,6 @@ TELEMETRY: dict[str, dict] = {
         "aggregates the domain-naming refusals: domain_unnameable, "
         "domain_spelling_variant, domain_confusable, domain_unknown, "
         "domain_without_project, domain_not_allowed_on_judgement")),
-    "registry.error": _k("str", "axes/registry", since=INTRODUCED_0_9_74,
-                         note="present only when this section's own query failed"),
 
     # ── clients (NEW, 0.9.74) ───────────────────────────────────────────────
     "clients.versions_seen": _k("dict", "versions", since=INTRODUCED_0_9_74,
